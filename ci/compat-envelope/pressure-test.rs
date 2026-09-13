@@ -1513,12 +1513,49 @@ struct RetainedExecutionV1 {
     outcomes: Vec<RetainedOutcomeV1>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RetainedOutcomeV3 {
+    tag: String,
+    ok: bool,
+    duration_s: f64,
+    returncode: Option<i64>,
+    oomed: bool,
+    oom_kills: i64,
+    timed_out: bool,
+    cpu_timed_out: bool,
+    reason: String,
+    aborted: bool,
+    output_log: String,
+}
+
+impl RetainedOutcomeV3 {
+    fn into_typed(self) -> (RetainedOutcome, String) {
+        (
+            RetainedOutcome {
+                tag: self.tag,
+                ok: self.ok,
+                duration_s: self.duration_s,
+                returncode: self.returncode,
+                oomed: self.oomed,
+                oom_kills: self.oom_kills,
+                timed_out: self.timed_out,
+                cpu_timed_out: self.cpu_timed_out,
+                reason: self.reason,
+                aborted: self.aborted,
+            },
+            self.output_log,
+        )
+    }
+}
+
+
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RetainedExecutionV3 {
     schema: u64,
     scheduler_passes: usize,
-    outcomes: Vec<JsonValue>,
+    outcomes: Vec<RetainedOutcomeV3>,
 }
 
 struct ExecutionEvidence {
@@ -1739,7 +1776,7 @@ fn retain_execution_evidence(
             )
         })?;
         environmental_block_observations.push(environmental_block_observation(&output));
-        let mut retained_outcome = serde_json::to_value(RetainedOutcome {
+        retained.push(RetainedOutcomeV3 {
             tag: outcome.tag.clone(),
             ok: outcome.ok,
             duration_s: outcome.duration_s,
@@ -1750,18 +1787,17 @@ fn retain_execution_evidence(
             cpu_timed_out: outcome.cpu_timed_out,
             reason: outcome.reason.clone(),
             aborted: outcome.aborted,
-        }).map_err(|error| format!("cannot serialize typed scheduler outcome: {error}"))?;
-        retained_outcome["output_log"] = json!(output_log
-            .strip_prefix(results)
-            .expect("runner output is below results")
-            .to_string_lossy());
-        retained.push(retained_outcome);
+            output_log: output_log
+                .strip_prefix(results)
+                .expect("runner output is below results")
+                .to_string_lossy().into_owned(),
+        });
     }
-    let document = json!({
-        "schema": 3,
-        "scheduler_passes": execution.passes,
-        "outcomes": retained,
-    });
+    let document = RetainedExecutionV3 {
+        schema: 3,
+        scheduler_passes: execution.passes,
+        outcomes: retained,
+    };
     let mut text = serde_json::to_string_pretty(&document)
         .map_err(|error| format!("cannot serialize typed scheduler outcomes: {error}"))?;
     text.push('\n');
@@ -1876,13 +1912,8 @@ fn load_retained_runner_evidence(
                 .map_err(|error| format!("invalid output-bearing {}: {error}", path.display()))?;
             debug_assert_eq!(retained.schema, 3);
             let _ = retained.scheduler_passes;
-            for mut value in retained.outcomes {
-                let output_log = value.as_object_mut()
-                    .and_then(|row| row.remove("output_log"))
-                    .and_then(|path| path.as_str().map(str::to_owned))
-                    .ok_or("typed scheduler evidence requires a string output_log")?;
-                let outcome: RetainedOutcome = serde_json::from_value(value)
-                    .map_err(|error| format!("invalid output-bearing outcome: {error}"))?;
+            for output_outcome in retained.outcomes {
+                let (outcome, output_log) = output_outcome.into_typed();
                 if outcome.aborted {
                     return Err(format!("typed scheduler evidence retained aborted outcome {} as terminal", outcome.tag));
                 }
@@ -5156,19 +5187,48 @@ fn classify_result(
     verification_logs_retained: bool,
     verification_evidence_valid: bool,
 ) -> &'static str {
+    // These are the existing row, capture, golden and resource-evidence gates.
+    // A diagnostic may refine an otherwise non-product result, but cannot
+    // remove an independently admissible PASS or comparison divergence.
+    let typed = classify_result_from_typed_evidence(
+        runner,
+        harness_status,
+        outcome,
+        row_valid,
+        reason,
+        mode,
+        verification_verdict,
+        verification_logs_retained,
+        verification_evidence_valid,
+    );
+    if matches!(typed, "pass" | "determinism-failure" | "replay-failure") {
+        return typed;
+    }
+    if runner.seen {
+        if let EnvBlockObservation::Denied(class) = runner.environmental_block_observation {
+            return if class == EnvBlockClass::BpfjailerBanner {
+                "sandbox-denied"
+            } else {
+                "infrastructure-error"
+            };
+        }
+    }
+    typed
+}
+
+fn classify_result_from_typed_evidence(
+    runner: RunnerEvidence,
+    harness_status: Option<i32>,
+    outcome: &str,
+    row_valid: bool,
+    reason: Option<&str>,
+    mode: &str,
+    verification_verdict: Option<&str>,
+    verification_logs_retained: bool,
+    verification_evidence_valid: bool,
+) -> &'static str {
     if !runner.seen {
         "infrastructure-error"
-    } else if let EnvBlockObservation::Denied(class) = runner.environmental_block_observation {
-        // The retained node output is stronger evidence than any downstream
-        // timeout, missing receipt, or assertion text caused by the denied
-        // operation. Keep it out of every product-failure bucket. Only the
-        // BPFJailer class is a sandbox denial; the other shared environmental
-        // classes stay infrastructure errors rather than being mislabeled.
-        if class == EnvBlockClass::BpfjailerBanner {
-            "sandbox-denied"
-        } else {
-            "infrastructure-error"
-        }
     } else if runner.oom {
         if is_proven_oom_attempt(runner, harness_status) && verification_evidence_valid {
             "oom"
@@ -5218,6 +5278,7 @@ fn reconcile_recorded_result(
     recorded_result: Option<ObservedResult>,
     failure_class: Option<FailureClass>,
     derived_result: &'static str,
+    captured_attempts: &[AttemptResult],
 ) -> Result<&'static str, String> {
     let Some(recorded_result) = recorded_result else {
         return Ok(derived_result);
@@ -5234,11 +5295,31 @@ fn reconcile_recorded_result(
         recorded_result,
         ObservedResult::SandboxDenied | ObservedResult::InfrastructureError
     ) {
-        // The framework owns the exact captured attempt output and serialized
-        // this non-product result beside the checkout SHA. The outer retained
-        // runner log remains corroborating evidence, not a second authority
-        // that reconstructs the result from human-readable output.
-        return Ok(recorded_result.as_str());
+        let captured_class = captured_attempts.iter().find_map(|attempt| {
+            environmental_block_observation(&format!("{}\n{}", attempt.stdout, attempt.stderr))
+                .block_class()
+        });
+        let supported_result = captured_class.map(|class| {
+            if class == EnvBlockClass::BpfjailerBanner {
+                ObservedResult::SandboxDenied
+            } else {
+                ObservedResult::InfrastructureError
+            }
+        });
+        if supported_result != Some(recorded_result) {
+            return Err(format!(
+                "framework result {} has no matching captured environmental evidence: {:?}",
+                recorded_result.as_str(),
+                captured_class
+            ));
+        }
+        // The producer owns its captured output. It may refine an otherwise
+        // unclassified/infrastructure-only result, never contradictory valid
+        // product evidence. Required artifacts are checked by the caller before
+        // this function, and its errors remain in sample accounting.
+        if derived_result == "infrastructure-error" || derived_result == recorded_result.as_str() {
+            return Ok(recorded_result.as_str());
+        }
     }
     if recorded_result.as_str() != derived_result {
         return Err(format!(
@@ -5248,6 +5329,7 @@ fn reconcile_recorded_result(
     }
     Ok(recorded_result.as_str())
 }
+
 
 fn repeated_result_description(
     terminal_passes: usize,
@@ -6775,7 +6857,7 @@ fn summarize(
             // authority that reconstructs a current result after execution.
             let mut result = derived_result;
             if row_valid && evidence_errors.is_empty() {
-                match reconcile_recorded_result(recorded_result, failure_class, derived_result) {
+                match reconcile_recorded_result(recorded_result, failure_class, derived_result, &cell_result_after_retries(&result_rows_for_history)?.attempts) {
                     Ok(recorded) => result = recorded,
                     Err(error) => evidence_errors.push(error),
                 }
@@ -7419,11 +7501,17 @@ fn retained_termination_self_test(scratch: &Path) -> Result<(), String> {
         scheduler_wall_s: 0.0,
         step_profile_rows: Vec::new(),
     };
+    let output = results.join(RUNNER_STEP_OUTPUT_DIR);
+    fs::create_dir_all(&output).map_err(|error| error.to_string())?;
+    for outcome in &execution.outcomes {
+        fs::write(output.join(format!("{}.log", sanitize_step_tag(&outcome.tag))), "ordinary output\n")
+            .map_err(|error| error.to_string())?;
+    }
     let immediate = retain_execution_evidence(&results, &execution)?;
     let retained_bytes = fs::read(&path).map_err(|error| error.to_string())?;
     let retained: JsonValue =
         serde_json::from_slice(&retained_bytes).map_err(|error| error.to_string())?;
-    if retained["schema"] != 2 || retained["scheduler_passes"] != 1 {
+    if retained["schema"] != 3 || retained["scheduler_passes"] != 1 {
         return Err("typed termination writer did not emit the current schema".into());
     }
     let loaded =
@@ -7449,6 +7537,22 @@ fn retained_termination_self_test(scratch: &Path) -> Result<(), String> {
         return Err("loading current termination evidence changed its bytes".into());
     }
 
+    let mut typed_v2 = retained.clone();
+    typed_v2["schema"] = json!(2);
+    for row in typed_v2["outcomes"].as_array_mut().unwrap() {
+        row.as_object_mut().unwrap().remove("output_log");
+    }
+    fs::write(&path, serde_json::to_vec(&typed_v2).map_err(|error| error.to_string())?)
+        .map_err(|error| error.to_string())?;
+    let legacy_typed = load_retained_runner_evidence(&results)?.ok_or("schema-2 evidence disappeared")?;
+    if legacy_typed.len() != 40 || legacy_typed.iter().any(|(tag, old)| {
+        let new = immediate[tag];
+        old.seen != new.seen || old.ok != new.ok || old.timed_out != new.timed_out || old.oom != new.oom
+            || old.output_log_available || old.environmental_block_observation != EnvBlockObservation::NothingObserved
+    }) {
+        return Err("schema-2 typed facts changed or acquired invented output".into());
+    }
+
     let mut document = retained.clone();
     document["outcomes"] = json!([retained["outcomes"][0].clone()]);
     let refuse = |label: &str, value: &JsonValue| -> Result<(), String> {
@@ -7466,7 +7570,7 @@ fn retained_termination_self_test(scratch: &Path) -> Result<(), String> {
     };
     for schema in [
         json!(0),
-        json!(3),
+        json!(4),
         json!(-1),
         json!("2"),
         json!(true),
@@ -7507,9 +7611,12 @@ fn retained_termination_self_test(scratch: &Path) -> Result<(), String> {
         }
         refuse("successful resource termination", &bad)?;
     }
-    for schema in [1, 2] {
+    for schema in [1, 2, 3] {
         let mut exact = document.clone();
         exact["schema"] = json!(schema);
+        if schema < 3 {
+            exact["outcomes"][0].as_object_mut().unwrap().remove("output_log");
+        }
         if schema == 1 {
             for field in ["oomed", "oom_kills", "timed_out", "cpu_timed_out"] {
                 exact["outcomes"][0].as_object_mut().unwrap().remove(field);
@@ -7530,6 +7637,16 @@ fn retained_termination_self_test(scratch: &Path) -> Result<(), String> {
         let mut unknown = exact;
         unknown["outcomes"][0]["unrecognized"] = json!(true);
         refuse("unknown outcome field", &unknown)?;
+    }
+    for duplicate in [
+        serde_json::to_string(&document).map_err(|e| e.to_string())?.replacen("\"schema\":3", "\"schema\":3,\"schema\":3", 1),
+        serde_json::to_string(&document).map_err(|e| e.to_string())?.replacen("\"ok\":false", "\"ok\":false,\"ok\":false", 1),
+    ] {
+        fs::write(&path, &duplicate).map_err(|e| e.to_string())?;
+        let error = load_retained_runner_evidence(&results).expect_err("duplicate schema-3 JSON field was accepted");
+        if !error.contains("duplicate field") {
+            return Err(format!("schema-3 duplicate field lost its diagnostic: {error}"));
+        }
     }
     let mut relabelled = document.clone();
     relabelled["schema"] = json!(1);
@@ -7563,6 +7680,7 @@ fn retained_termination_self_test(scratch: &Path) -> Result<(), String> {
                 ok: false,
                 timed_out: true,
                 oom: false,
+                ..RunnerEvidence::default()
             },
         ),
         (
@@ -7572,6 +7690,7 @@ fn retained_termination_self_test(scratch: &Path) -> Result<(), String> {
                 ok: false,
                 timed_out: false,
                 oom: true,
+                ..RunnerEvidence::default()
             },
         ),
         (
@@ -7581,6 +7700,7 @@ fn retained_termination_self_test(scratch: &Path) -> Result<(), String> {
                 ok: false,
                 timed_out: true,
                 oom: false,
+                ..RunnerEvidence::default()
             },
         ),
     ]);
@@ -11482,6 +11602,7 @@ fn self_test(root: &Path) -> Result<(), String> {
             current_sandbox_row.result,
             current_sandbox_row.failure_class,
             retained_bpf_result,
+            &current_sandbox_row.attempts,
         )? != "sandbox-denied"
     {
         return Err(
@@ -11496,6 +11617,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         wrongly_typed_product.result,
         wrongly_typed_product.failure_class,
         retained_bpf_result,
+        &wrongly_typed_product.attempts,
     )
     .expect_err("a product result that disagrees with retained BPF evidence was accepted");
     if !disagreement.contains("crash-error") || !disagreement.contains("sandbox-denied") {
@@ -13337,6 +13459,262 @@ mod pressure_sample_tests {
     }
 
     #[test]
+    fn environmental_refinement_preserves_admissible_product_evidence_and_guards() {
+        for class in [EnvBlockClass::BpfjailerBanner, EnvBlockClass::ProxyEgress] {
+            let runner = RunnerEvidence {
+                seen: true,
+                output_log_available: true,
+                environmental_block_observation: EnvBlockObservation::Denied(class),
+                ..RunnerEvidence::default()
+            };
+            let environmental = if class == EnvBlockClass::BpfjailerBanner {
+                "sandbox-denied"
+            } else {
+                "infrastructure-error"
+            };
+            for (mode, expected) in [
+                ("verify", "determinism-failure"),
+                ("replay", "replay-failure"),
+            ] {
+                assert_eq!(
+                    classify_result(
+                        runner,
+                        Some(1),
+                        "FAIL",
+                        true,
+                        None,
+                        mode,
+                        Some("diverged"),
+                        true,
+                        true
+                    ),
+                    expected
+                );
+                assert_eq!(
+                    classify_result(
+                        runner,
+                        Some(0),
+                        "PASS",
+                        true,
+                        None,
+                        mode,
+                        Some("matched"),
+                        true,
+                        true
+                    ),
+                    "pass"
+                );
+                assert_eq!(
+                    classify_result(
+                        runner,
+                        Some(1),
+                        "ERROR",
+                        true,
+                        None,
+                        mode,
+                        Some("diverged"),
+                        true,
+                        false
+                    ),
+                    environmental
+                );
+                assert_eq!(
+                    classify_result(
+                        runner,
+                        Some(1),
+                        "ERROR",
+                        false,
+                        None,
+                        mode,
+                        Some("diverged"),
+                        true,
+                        true
+                    ),
+                    environmental
+                );
+                assert_eq!(
+                    classify_result(
+                        runner,
+                        Some(1),
+                        "ERROR",
+                        true,
+                        None,
+                        mode,
+                        Some("infrastructure_error"),
+                        true,
+                        true
+                    ),
+                    environmental
+                );
+                assert_eq!(
+                    classify_result(
+                        RunnerEvidence {
+                            timed_out: true,
+                            ..runner
+                        },
+                        Some(1),
+                        "FAIL",
+                        true,
+                        None,
+                        mode,
+                        Some("diverged"),
+                        true,
+                        true
+                    ),
+                    environmental
+                );
+                assert_eq!(
+                    classify_result(
+                        RunnerEvidence {
+                            oom: true,
+                            ..runner
+                        },
+                        Some(1),
+                        "FAIL",
+                        true,
+                        None,
+                        mode,
+                        Some("diverged"),
+                        true,
+                        true
+                    ),
+                    environmental
+                );
+            }
+            assert_eq!(
+                classify_result(
+                    runner,
+                    Some(1),
+                    "FAIL",
+                    true,
+                    None,
+                    "verify",
+                    Some("diverged"),
+                    false,
+                    true
+                ),
+                environmental
+            );
+            assert_eq!(
+                classify_result(
+                    RunnerEvidence {
+                        seen: false,
+                        ..runner
+                    },
+                    Some(1),
+                    "FAIL",
+                    true,
+                    None,
+                    "verify",
+                    Some("diverged"),
+                    true,
+                    true
+                ),
+                "infrastructure-error"
+            );
+        }
+    }
+
+    #[test]
+    fn environmental_reconciliation_requires_consistent_captured_evidence() {
+        for (banner, result) in [
+            (
+                "An action was blocked on this server based on a security policy!",
+                ObservedResult::SandboxDenied,
+            ),
+            (
+                "fatal: Could not resolve proxy",
+                ObservedResult::InfrastructureError,
+            ),
+        ] {
+            let mut attempt = comparison_attempt("verify", 0);
+            attempt.stderr = banner.into();
+            let captured = [attempt];
+            let bytes = serde_json::to_vec(&captured).unwrap();
+            for contradictory in [
+                "pass",
+                "determinism-failure",
+                "replay-failure",
+                "crash-error",
+                "timeout",
+                "oom",
+            ] {
+                let error = reconcile_recorded_result(
+                    Some(result),
+                    result.failure_class(),
+                    contradictory,
+                    &captured,
+                )
+                .unwrap_err();
+                assert!(
+                    error.contains(&format!(
+                        "disagrees with pressure consistency check {contradictory}"
+                    )),
+                    "{error}"
+                );
+            }
+            assert_eq!(
+                reconcile_recorded_result(
+                    Some(result),
+                    result.failure_class(),
+                    "infrastructure-error",
+                    &captured
+                )
+                .unwrap(),
+                result.as_str()
+            );
+            assert_eq!(
+                reconcile_recorded_result(
+                    Some(result),
+                    result.failure_class(),
+                    result.as_str(),
+                    &captured
+                )
+                .unwrap(),
+                result.as_str()
+            );
+            let error = reconcile_recorded_result(
+                Some(result),
+                Some(FailureClass::ProductFailure),
+                "infrastructure-error",
+                &captured,
+            )
+            .unwrap_err();
+            assert!(error.contains("carries failure_class"), "{error}");
+            for missing in [Vec::new(), vec![comparison_attempt("verify", 0)]] {
+                let error = reconcile_recorded_result(
+                    Some(result),
+                    result.failure_class(),
+                    "infrastructure-error",
+                    &missing,
+                )
+                .unwrap_err();
+                assert!(
+                    error.contains("no matching captured environmental evidence"),
+                    "{error}"
+                );
+            }
+            let other = if result == ObservedResult::SandboxDenied {
+                ObservedResult::InfrastructureError
+            } else {
+                ObservedResult::SandboxDenied
+            };
+            let error = reconcile_recorded_result(
+                Some(other),
+                other.failure_class(),
+                "infrastructure-error",
+                &captured,
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("no matching captured environmental evidence"),
+                "{error}"
+            );
+            assert_eq!(serde_json::to_vec(&captured).unwrap(), bytes);
+        }
+    }
+
+    #[test]
     fn summary_requires_retained_canonical_captures_and_golden_before_confirmed_failure() {
         let root = Path::new(file!())
             .canonicalize()
@@ -13565,6 +13943,60 @@ mod pressure_sample_tests {
         );
         fs::write(&retained_report_path, original_report).unwrap();
         fs::write(&first_row_path, original_row).unwrap();
+
+        // Keep every original missing-capture/golden/history control above. Now
+        // retain incidental environmental text on the actual ten typed rows,
+        // then make one producer record contradict their independently valid
+        // comparison. The same summary path must keep product accounting and
+        // reject that contradiction without granting a missing-artifact case.
+        for (banner, class, recorded) in [
+            ("An action was blocked on this server based on a security policy!", EnvBlockClass::BpfjailerBanner, ObservedResult::SandboxDenied),
+            ("fatal: Could not resolve proxy", EnvBlockClass::ProxyEgress, ObservedResult::InfrastructureError),
+        ] {
+            let mut saved_rows = Vec::new();
+            for repetition in 1..=PROMOTION_REPETITIONS {
+                let slug = cell_run_slug(&selected.id, Some(repetition));
+                let path = results.join("cells").join(&slug).join("results.jsonl");
+                let bytes = fs::read(&path).unwrap();
+                let mut row: CellResult = serde_json::from_slice(&bytes).unwrap();
+                row.attempts[0].stderr = banner.into();
+                fs::write(&path, serde_json::to_vec(&row).unwrap()).unwrap();
+                saved_rows.push((path, bytes));
+                let runner = evidence.get_mut(&format!("cell.{slug}")).unwrap();
+                runner.output_log_available = true;
+                runner.environmental_block_observation = EnvBlockObservation::Denied(class);
+            }
+            summarize(&root, &results, false, Some(&evidence), true).unwrap();
+            let incidental = read();
+            assert_eq!(incidental["repeated_cells"][0]["terminal_product_failures"], 10);
+            assert_eq!(incidental["repeated_cells"][0]["unknown_history_repetitions"], 0);
+            assert_eq!(incidental["repeated_cells"][0]["classification"], "confirmed-failing");
+            let path = &saved_rows[0].0;
+            let valid_row = fs::read(path).unwrap();
+            let mut contradiction: CellResult = serde_json::from_slice(&valid_row).unwrap();
+            contradiction.result = Some(recorded);
+            contradiction.failure_class = Some(FailureClass::UnderstoodInfrastructureFailure);
+            fs::write(path, serde_json::to_vec(&contradiction).unwrap()).unwrap();
+            let error = summarize(&root, &results, false, Some(&evidence), true).unwrap_err();
+            assert!(error.contains("no trustworthy result"), "{error}");
+            let rejected = read();
+            assert_eq!(rejected["repeated_cells"][0]["classification"], "incomplete");
+            assert_eq!(rejected["repeated_cells"][0]["unknown_history_repetitions"], 1);
+            assert_eq!(rejected["rows"][0]["result"], "infrastructure-error");
+            assert!(rejected["rows"][0]["evidence_errors"].to_string().contains("disagrees with pressure consistency check determinism-failure"));
+            fs::write(path, valid_row).unwrap();
+            for missing in [&run1, &golden] {
+                let saved = fs::read(missing).unwrap();
+                fs::remove_file(missing).unwrap();
+                assert!(summarize(&root, &results, false, Some(&evidence), true).is_err());
+                let incomplete = read();
+                assert_eq!(incomplete["repeated_cells"][0]["classification"], "incomplete");
+                assert_eq!(incomplete["repeated_cells"][0]["unknown_history_repetitions"], 1);
+                assert_eq!(incomplete["repeated_cells"][0]["terminal_product_failures"], 9);
+                fs::write(missing, saved).unwrap();
+            }
+            for (path, bytes) in saved_rows { fs::write(path, bytes).unwrap(); }
+        }
 
         cleanup.remove().unwrap();
     }

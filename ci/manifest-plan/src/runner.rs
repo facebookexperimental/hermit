@@ -1389,7 +1389,7 @@ impl CellResult {
                 (
                     Some(ObservedResult::SandboxDenied | ObservedResult::InfrastructureError),
                     Some(FailureClass::UnderstoodInfrastructureFailure),
-                ) => Ok(()),
+                ) => {}
                 (
                     None,
                     Some(
@@ -2934,8 +2934,20 @@ fn observed_result(
     attempts: &[AttemptResult],
     error_kind: Option<&str>,
 ) -> Option<ObservedResult> {
-    if outcome == "PASS" {
-        return Some(ObservedResult::Pass);
+    // Preserve the existing terminal evidence and timeout guards before using
+    // a typed product verdict. Incidental diagnostic text cannot erase a valid
+    // comparison, but an earlier divergence cannot revive an unusable terminal
+    // framework/evidence result either.
+    let typed = observed_result_from_typed_evidence(mode, outcome, attempts, error_kind);
+    if matches!(
+        typed,
+        Some(
+            ObservedResult::Pass
+                | ObservedResult::DeterminismFailure
+                | ObservedResult::ReplayFailure
+        )
+    ) {
+        return typed;
     }
     if let Some(class) = attempts.iter().find_map(|attempt| {
         let output = format!("{}\n{}", attempt.stdout, attempt.stderr);
@@ -2946,6 +2958,18 @@ fn observed_result(
         } else {
             ObservedResult::InfrastructureError
         });
+    }
+    typed
+}
+
+fn observed_result_from_typed_evidence(
+    mode: &str,
+    outcome: &str,
+    attempts: &[AttemptResult],
+    error_kind: Option<&str>,
+) -> Option<ObservedResult> {
+    if outcome == "PASS" {
+        return Some(ObservedResult::Pass);
     }
     // A later framework or evidence failure decides whether this cell produced
     // a usable product result. An earlier attempt can still retain a located
@@ -6813,6 +6837,97 @@ backends_disabled:
             ),
             Some(FailureClass::NoResult)
         );
+    }
+
+    #[test]
+    fn framework_keeps_typed_product_results_with_incidental_environment_text() {
+        let report = r#"{"verified":false,"bitwise_parity":false,"verdict":"diverged","comparison":{"strictness":"canonical","compare_logs":true,"record_envelope":"all_records_v1"},"compared_log_messages":{"left":1,"right":1},"first_divergent_scheduler_turn":4,"first_divergent_virtual_nanoseconds":7,"first_divergent_record":9,"first_divergent_syscall":2,"first_divergent_left_message":"left","first_divergent_right_message":"right"}"#;
+        for banner in [
+            "An action was blocked on this server based on a security policy!",
+            "fatal: Could not resolve proxy",
+        ] {
+            for (mode, expected) in [
+                ("verify", ObservedResult::DeterminismFailure),
+                ("replay", ObservedResult::ReplayFailure),
+            ] {
+                for earlier in [false, true] {
+                    let mut divergence = attempt_with_sabre_evidence("");
+                    divergence.outcome = "FAIL".into();
+                    divergence.status = Some(1);
+                    divergence.verification_report = Some(report.into());
+                    let mut diagnostic = divergence.clone();
+                    diagnostic.verification_report = None;
+                    diagnostic.stderr = banner.into();
+                    let attempts = if earlier {
+                        vec![diagnostic, divergence]
+                    } else {
+                        divergence.stderr = banner.into();
+                        vec![divergence]
+                    };
+                    let bytes = serde_json::to_vec(&attempts).unwrap();
+                    let result = observed_result(mode, "FAIL", &attempts, None);
+                    assert_eq!(
+                        result,
+                        Some(expected),
+                        "{mode}, earlier={earlier}, {banner}"
+                    );
+                    assert_eq!(
+                        failure_class("FAIL", result, None),
+                        Some(FailureClass::ProductFailure)
+                    );
+                    assert_eq!(serde_json::to_vec(&attempts).unwrap(), bytes);
+                }
+                let mut passed = attempt_with_sabre_evidence("");
+                passed.stderr = banner.into();
+                assert_eq!(
+                    observed_result(mode, "PASS", &[passed], None),
+                    Some(ObservedResult::Pass)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn framework_terminal_refusal_cannot_revive_incidental_divergence() {
+        let mut divergence = attempt_with_sabre_evidence("");
+        divergence.outcome = "FAIL".into();
+        divergence.status = Some(1);
+        divergence.verification_report = Some(
+            r#"{"verified":false,"bitwise_parity":false,"verdict":"diverged","comparison":{"strictness":"canonical","compare_logs":true,"record_envelope":"all_records_v1"},"compared_log_messages":{"left":1,"right":1},"first_divergent_scheduler_turn":4,"first_divergent_virtual_nanoseconds":7,"first_divergent_record":9,"first_divergent_syscall":2,"first_divergent_left_message":"left","first_divergent_right_message":"right"}"#.into(),
+        );
+        for error in [
+            "infrastructure",
+            "result-publication",
+            "invalid-backend-evidence",
+            "incomplete-verification-evidence",
+        ] {
+            for (banner, expected) in [
+                (
+                    "An action was blocked on this server based on a security policy!",
+                    ObservedResult::SandboxDenied,
+                ),
+                (
+                    "fatal: Could not resolve proxy",
+                    ObservedResult::InfrastructureError,
+                ),
+            ] {
+                let mut terminal = attempt_with_sabre_evidence("");
+                terminal.outcome = "ERROR".into();
+                terminal.error_kind = Some(error.into());
+                terminal.stderr = banner.into();
+                let attempts = [divergence.clone(), terminal];
+                let bytes = serde_json::to_vec(&attempts).unwrap();
+                for mode in ["verify", "replay"] {
+                    let result = observed_result(mode, "ERROR", &attempts, Some(error));
+                    assert_eq!(result, Some(expected), "{mode}, {error}, {banner}");
+                    assert_eq!(
+                        failure_class("ERROR", result, Some(error)),
+                        Some(FailureClass::UnderstoodInfrastructureFailure)
+                    );
+                }
+                assert_eq!(serde_json::to_vec(&attempts).unwrap(), bytes);
+            }
+        }
     }
 
     #[test]
