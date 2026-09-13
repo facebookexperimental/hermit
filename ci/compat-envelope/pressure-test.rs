@@ -21,7 +21,6 @@ mod safe_ci_scope;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::env;
-use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -33,8 +32,6 @@ use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-use dagrun::LOG_DIR_ENV;
-use dagrun::NO_LOGS_ENV;
 use dagrun::attribution::sanitize as sanitize_step_tag;
 use dagrun::io::dag_from_json;
 use dagrun::io::dag_to_json;
