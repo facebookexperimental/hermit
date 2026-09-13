@@ -77,7 +77,7 @@ Selection options:
   --include-occasional             Include occasional cells
   --include-manual                 Include manual cells; requires exact test and mode
   --probe-disabled                 Run one exact disabled cell
-  --parity-reference <ptrace>      Measure selected verify cells against ptrace
+  --parity-reference <ptrace>       Compare non-ptrace verify cells; other selected cells run normally
 
 Execution and output options:
   --prebuilt                       Reuse prepared test programs (run only)
@@ -194,7 +194,7 @@ fn print_command_help(command: &str) -> bool {
              --include-occasional             Include occasional cells\n  \
              --include-manual                 Include manual cells; requires exact test and mode\n  \
              --probe-disabled                 Run one disabled cell; requires exact test/mode/backend\n  \
-             --parity-reference <ptrace>      Measure selected verify cells against ptrace\n  \
+             --parity-reference <ptrace>       Compare non-ptrace verify cells; other selected cells run normally\n  \
              --prebuilt                       Reuse prepared test programs\n  \
              --allow-empty                    Permit an empty CI selection; requires --ci-only and category\n  \
              --results <PATH>                 Write JSONL cell results to PATH\n  \
@@ -503,14 +503,13 @@ fn validate_args(command: &str, args: &Args) {
         if reference != "ptrace" {
             fail("--parity-reference currently requires ptrace");
         }
-        if args.selection.mode.as_deref() != Some("verify") {
-            fail("--parity-reference requires --mode verify");
+        if let Some(mode) = args.selection.mode.as_deref() {
+            if mode != "verify" {
+                fail("--parity-reference requires --mode verify when a mode is explicit");
+            }
         }
-        let Some(candidate) = args.selection.backend.as_deref() else {
-            fail("--parity-reference requires an explicit candidate --backend");
-        };
-        if candidate == reference {
-            fail("--parity-reference must differ from the candidate --backend");
+        if args.selection.backend.as_deref() == Some(reference) {
+            fail("--parity-reference must differ from the explicit candidate --backend");
         }
     }
     if args.allow_empty {
@@ -2044,8 +2043,17 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                 |attempt| {
                     let attempt_context = context.with_attempt(attempt);
                     let result = match args.parity_reference.as_deref() {
-                        Some(reference) => run_cell_with_parity(&attempt_context, cell, reference),
-                        None => run_cell(&attempt_context, cell),
+                        Some(reference)
+                            if cell.id.mode == "verify"
+                                && cell
+                                    .id
+                                    .backend
+                                    .as_deref()
+                                    .is_some_and(|backend| backend != reference) =>
+                        {
+                            run_cell_with_parity(&attempt_context, cell, reference)
+                        }
+                        _ => run_cell(&attempt_context, cell),
                     };
                     match result {
                         Ok(result) => result,
@@ -2297,6 +2305,346 @@ mod tests {
         assert_eq!(args.selection.backend.as_deref(), Some("kvm"));
         assert!(args.probe_disabled);
         assert!(HELP.contains("--parity-reference <ptrace>"));
+    }
+
+    #[test]
+    fn production_mixed_selection_routes_only_candidate_verification_to_parity() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::PathBuf;
+        use std::process::Command;
+        use std::process::ExitCode;
+
+        use hermit_manifest_plan::backend_parity::BackendParityVerdict;
+        use hermit_manifest_plan::runner::ObservedResult;
+        use serde_json::json;
+
+        const CHILD: &str = "HERMIT_MIXED_PARITY_FIXTURE";
+        const TEST: &str =
+            "tests::production_mixed_selection_routes_only_candidate_verification_to_parity";
+        if let Some(fixture) = std::env::var_os(CHILD) {
+            let fixture = PathBuf::from(fixture);
+            let scenario = fs::read_to_string(fixture.join("scenario")).unwrap();
+            let mut values = vec![
+                "--parity-reference".into(),
+                "ptrace".into(),
+                "--category".into(),
+                "parity".into(),
+                "--ci-only".into(),
+                "--prebuilt".into(),
+                "--jobs".into(),
+                "1".into(),
+                "--results".into(),
+                fixture.join("results.jsonl").display().to_string(),
+                "--junit".into(),
+                fixture.join("junit.xml").display().to_string(),
+            ];
+            match scenario.as_str() {
+                "explicit-chaos" => values.extend(["--mode".into(), "chaos".into()]),
+                "explicit-ptrace" => values.extend(["--backend".into(), "ptrace".into()]),
+                "broad-disabled" => values.push("--probe-disabled".into()),
+                _ => {}
+            }
+            let args = parse(values.into_iter());
+            validate_args("run", &args);
+            let manifests = ManifestSet::load(&fixture).unwrap();
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .canonicalize()
+                .unwrap();
+            let result = super::run(&root, &manifests, &args);
+            assert_eq!(
+                result,
+                if scenario == "matched" {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                }
+            );
+            return;
+        }
+
+        for scenario in [
+            "matched",
+            "diverged",
+            "incomplete-reference",
+            "explicit-chaos",
+            "explicit-ptrace",
+            "broad-disabled",
+        ] {
+            let fixture = tempfile::tempdir().unwrap();
+            let path = fixture.path();
+            fs::write(path.join("scenario"), scenario).unwrap();
+            let manifests = path.join("tests/e2e/manifests");
+            fs::create_dir_all(&manifests).unwrap();
+            fs::write(
+                manifests.join("defaults.yaml"),
+                "schema: 3\ntimeout_seconds: 10\ncpu_timeout_seconds: 5\n",
+            )
+            .unwrap();
+            let disabled = json!({"ci": false, "backends_enabled": [], "backends_disabled": {
+                "ptrace": "Not selected by this control", "dbt": "Not selected by this control",
+                "kvm": "Not selected by this control", "sabre": "Not selected by this control",
+                "liteinst": "Not selected by this control"
+            }});
+            fs::write(manifests.join("parity.yaml"), serde_json::to_vec(&json!({
+                "schema": 3, "bucket": "parity", "test": [{
+                    "id": "parity/mixed", "description": "Native mixed routing control",
+                    "lane": "portable", "occasional": false, "direct": ["/bin/true"],
+                    "observation": {"status": true, "stdout": true, "stderr": true},
+                    "modes": {
+                        "verify": {"ci": true, "backends_enabled": ["ptrace", "kvm"],
+                            "backends_disabled": {"dbt": "Not selected", "sabre": "Not selected", "liteinst": "Not selected"}},
+                        "naked": {"ci": true, "backends_enabled": ["native"], "runs": 1, "assert": {"min_distinct": 1}},
+                        "chaos": disabled, "replay": disabled, "custom": disabled
+                    }
+                }]
+            })).unwrap()).unwrap();
+            let output = json!({"exit_code": 0, "signal": null,
+                "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "stdout_bytes": 0, "stderr_bytes": 0});
+            let verification = json!({
+                "verified": true, "bitwise_parity": true, "verdict": "matched",
+                "no_result_reason": null, "infrastructure_error": null,
+                "comparison": {"strictness": "canonical", "display_name": "BitwiseInfoV1",
+                    "compare_logs": true, "compare_io_buffers": true, "log_scope": "info",
+                    "record_envelope": "all_records_v1", "virtualize_time": true,
+                    "strip_lines": false, "canonicalize_addresses": true, "full_trace": true,
+                    "exact_remainder": true, "stripped_prefixes": ["real-wall-clock-prefix/v1"],
+                    "canonicalizations": ["host-address-to-first-appearance-ordinal/v1"],
+                    "ignore_lines": false, "skip_commit": false, "skip_detlog": false},
+                "compared_log_messages": {"left": 2, "right": 2},
+                "compared_outputs": {"left": output, "right": output},
+                "guest_exit_code": 0, "guest_signal": null,
+                "first_divergent_scheduler_turn": null, "first_divergent_virtual_nanoseconds": null,
+                "first_divergent_record": null, "first_divergent_syscall": null,
+                "first_divergent_left_message": null, "first_divergent_right_message": null
+            });
+            hermit_manifest_plan::canonical_verdict::VerificationReport::from_current_json_slice(
+                &serde_json::to_vec(&verification).unwrap(),
+            )
+            .unwrap()
+            .require_canonical_match()
+            .unwrap();
+            fs::write(
+                path.join("verification.json"),
+                serde_json::to_vec(&verification).unwrap(),
+            )
+            .unwrap();
+            fs::write(path.join("comparison.json"), serde_json::to_vec(&json!({
+                "schema": 1, "verdict": "matched", "selected_messages": {"left": 2, "right": 2},
+                "records": {"compared": 2, "available_left": 2, "available_right": 2, "withheld_incomplete_tail": false},
+                "comparison": {"stream": "info", "record_envelope": "cross_backend_detcore_v1",
+                    "unsafe_strip_lines": false, "canonicalize_host_addresses": true,
+                    "require_structured_events": true, "ignored_line_substrings": [],
+                    "skip_commit": false, "skip_detlog": false,
+                    "included_detlog_kinds": ["syscall", "syscall_result", "other"], "git_diff": false},
+                "first_divergent_syscall": null, "first_divergent_scheduler_turn": null,
+                "first_divergent_virtual_nanoseconds": null, "first_divergent_left_message": null,
+                "first_divergent_right_message": null
+            })).unwrap()).unwrap();
+            let backend = path.join("native-backend-adapter");
+            fs::write(&backend, r#"#!/usr/bin/python3
+import json,pathlib,sys
+root=pathlib.Path(__file__).parent
+a=sys.argv[1:]
+if '--help' in a:
+ print('--verify-strict');sys.exit(0)
+if not a or a[0] not in ('run','log-diff'):sys.exit(0)
+scenario=(root/'scenario').read_text()
+def record(value):
+ with (root/'invocations').open('a') as f:f.write(json.dumps(value)+'\n')
+if a[0]=='log-diff':
+ if len(a)==2:
+  record({'kind':'normalize','argv':a});sys.stdout.buffer.write(pathlib.Path(a[1]).read_bytes());sys.exit(0)
+ assert a[3]=='--json' and a[5:]==['--record-envelope','cross-backend-detcore-v1'],a
+ record({'kind':'compare','argv':a})
+ same=pathlib.Path(a[1]).read_bytes()==pathlib.Path(a[2]).read_bytes()
+ report=json.loads((root/'comparison.json').read_text())
+ if not same:
+  report.update(verdict='diverged',first_divergent_record=1,first_divergent_scheduler_turn=7,
+                first_divergent_virtual_nanoseconds=18,first_divergent_left_message='reference',first_divergent_right_message='candidate')
+ pathlib.Path(a[4]).write_text(json.dumps(report));sys.exit(0 if same else 1)
+backend=a[a.index('--backend')+1]
+report=pathlib.Path(a[a.index('--verify-json')+1])
+logdir=pathlib.Path(a[a.index('--verify-log-dir')+1])
+reference='parity-reference' in str(logdir)
+record({'kind':'run','backend':backend,'reference':reference,'argv':a})
+assert '--verify-strict' in a and '--verify' in a,a
+if scenario=='incomplete-reference' and reference:sys.exit(7)
+logdir.mkdir(parents=True,exist_ok=True)
+value='different' if scenario=='diverged' and backend=='kvm' else 'shared'
+(logdir/'run1_log_fixture.log').write_text('INFO detcore: '+value+'\nINFO detcore: complete\n')
+report.write_bytes((root/'verification.json').read_bytes())
+"#).unwrap();
+            fs::set_permissions(&backend, fs::Permissions::from_mode(0o755)).unwrap();
+            let result = Command::new("timeout")
+                .args(["--kill-after=2s", "30s"])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env(CHILD, path)
+                .env("HERMIT_BIN", &backend)
+                .env("E2E_RESULT_ROOT", path.join("artifacts"))
+                .env("E2E_BUILD_ROOT", path.join("build"))
+                .env("E2E_RUN_ID", "mixed-parity-control")
+                .env("E2E_MACHINE_SHORTNAME", "native-control")
+                .env("E2E_KERNEL_VERSION", "native-control")
+                .env("E2E_KEEP_VERIFY_LOGS", "1")
+                .env("DAGRUN_TEST_COUNTS_PATH", path.join("counts.json"))
+                .output()
+                .unwrap();
+            fs::write(path.join("child.stdout"), &result.stdout).unwrap();
+            fs::write(path.join("child.stderr"), &result.stderr).unwrap();
+            let refusal = match scenario {
+                "explicit-chaos" => Some("requires --mode verify when a mode is explicit"),
+                "explicit-ptrace" => Some("must differ from the explicit candidate --backend"),
+                "broad-disabled" => {
+                    Some("--probe-disabled requires exact --test, --mode, and --backend filters")
+                }
+                _ => None,
+            };
+            if let Some(refusal) = refusal {
+                assert_eq!(result.status.code(), Some(2));
+                assert!(String::from_utf8_lossy(&result.stderr).contains(refusal));
+                assert!(!path.join("results.jsonl").exists());
+                assert!(!path.join("invocations").exists());
+                continue;
+            }
+            assert!(
+                result.status.success(),
+                "{scenario}: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let rows = fs::read_to_string(path.join("results.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| {
+                    serde_json::from_str::<hermit_manifest_plan::runner::CellResult>(line).unwrap()
+                })
+                .collect::<Vec<_>>();
+            let calls = fs::read_to_string(path.join("invocations"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            let candidates = rows
+                .iter()
+                .filter(|row| row.mode == "verify" && row.backend.as_deref() == Some("kvm"))
+                .collect::<Vec<_>>();
+            let repetitions = if scenario == "diverged" { 2 } else { 1 };
+            assert_eq!(candidates.len(), repetitions);
+            assert_eq!(rows.len(), repetitions + 2);
+            for row in &rows {
+                row.require_current_classification().unwrap();
+                row.require_current_timeout_policy().unwrap();
+                assert_eq!(row.execution_cpu_timeout_seconds, Some(5));
+                assert_eq!(row.execution_wall_timeout_seconds, Some(10));
+                if row.mode != "verify" || row.backend.as_deref() == Some("ptrace") {
+                    assert_eq!(row.outcome, "PASS");
+                    assert!(row.backend_parity.is_none());
+                    assert_eq!(row.attempts.len(), 1);
+                }
+            }
+            assert_eq!(rows.iter().filter(|row| row.mode == "naked").count(), 1);
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row.mode == "verify" && row.backend.as_deref() == Some("ptrace"))
+                    .count(),
+                1
+            );
+            for row in candidates {
+                assert_eq!(row.attempts.len(), 2);
+                if scenario == "incomplete-reference" {
+                    assert_eq!(row.outcome, "ERROR");
+                    assert_eq!(row.result, None);
+                    assert_eq!(
+                        row.failure_class,
+                        Some(hermit_manifest_plan::runner::FailureClass::NoResult)
+                    );
+                    assert_eq!(
+                        row.error_kind.as_deref(),
+                        Some("incomplete-parity-evidence")
+                    );
+                    assert!(row.backend_parity.is_none());
+                } else {
+                    let report = row.backend_parity.as_ref().unwrap();
+                    report.validate("kvm").unwrap();
+                    report
+                        .reference
+                        .verification
+                        .require_canonical_match()
+                        .unwrap();
+                    report
+                        .candidate
+                        .verification
+                        .require_canonical_match()
+                        .unwrap();
+                    assert_eq!(report.reference.backend, "ptrace");
+                    assert_eq!(report.candidate.backend, "kvm");
+                    assert_eq!(
+                        report.verdict,
+                        if scenario == "matched" {
+                            BackendParityVerdict::Matched
+                        } else {
+                            BackendParityVerdict::Diverged
+                        }
+                    );
+                    assert_eq!(
+                        row.result,
+                        Some(if scenario == "matched" {
+                            ObservedResult::Pass
+                        } else {
+                            ObservedResult::ParityFailure
+                        })
+                    );
+                    assert_eq!(
+                        row.outcome,
+                        if scenario == "matched" {
+                            "PASS"
+                        } else {
+                            "FAIL"
+                        }
+                    );
+                }
+            }
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| call["kind"] == "compare")
+                    .count(),
+                if scenario == "incomplete-reference" {
+                    0
+                } else {
+                    repetitions
+                }
+            );
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| call["kind"] == "run" && call["backend"] == "kvm")
+                    .count(),
+                repetitions
+            );
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| call["kind"] == "run" && call["reference"] == true)
+                    .count(),
+                repetitions
+            );
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| call["kind"] == "run"
+                        && call["backend"] == "ptrace"
+                        && call["reference"] == false)
+                    .count(),
+                1
+            );
+        }
     }
 
     #[test]
