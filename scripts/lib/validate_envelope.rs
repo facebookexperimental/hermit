@@ -191,7 +191,8 @@ pub fn nodes(hermit_bin: &str, reps: i64, build_dep: &str) -> Vec<Step> {
 /// is exactly what the bash's `p4=0` default did when L2 failed.
 pub fn score(outcomes: &[StepOutcome], reps: i64, commit: &str) -> serde_json::Value {
     score_with_passed(reps, commit, |tag| {
-        outcomes.iter().any(|outcome| outcome.tag == tag && outcome.ok && !outcome.aborted)
+        outcomes.iter().find(|outcome| outcome.tag == tag)
+            .map(|outcome| outcome.ok && !outcome.aborted).unwrap_or(false)
     })
 }
 

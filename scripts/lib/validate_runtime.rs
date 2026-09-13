@@ -296,14 +296,14 @@ pub fn environmental_block_class(output: &str) -> Option<&'static str> {
     environmental_block_observation(output).class()
 }
 
-/// A diagnosed infrastructure cause in one node's own captured detail.
+/// Infrastructure diagnostics in one node's own captured detail.
 ///
-/// Environmental denials remain the common case. The two additional signatures
-/// are separately measured causes that the owner classified as infrastructure:
-/// a PMU RCB overshoot, and the container-spawn EPERM produced when TMPDIR lives
-/// on a filesystem carrying `nosuid` or `nodev`. Both matches require the
-/// producer's exact diagnostic shape; a guest merely printing one phrase is not
-/// enough to move its failure out of the product bucket.
+/// The owner classified PMU RCB overshoot and the existing environmental denial
+/// cases as infrastructure. Full diagnostic shapes narrow the match; captured
+/// text is not source authentication. The caller must preserve measured product
+/// failures even when the same node also carries one of these diagnostics.
+/// Generic container mount EPERM does not identify the historically diagnosed
+/// TMPDIR nosuid/nodev cause, so that signature alone remains a product failure.
 pub fn understood_infrastructure_class(output: &str) -> Option<&'static str> {
     let lower = output.to_ascii_lowercase();
     // Unlike the retry classifier, this does NOT accept a bare mention of
@@ -328,12 +328,6 @@ pub fn understood_infrastructure_class(output: &str) -> Option<&'static str> {
         && lower.contains("rcbs, but should have trapped at")
     {
         return Some("PMU RCB overshoot");
-    }
-    if lower.contains("hermit_internal_failure class=cli-error")
-        && lower.contains("sandbox container failed to spawn")
-        && lower.contains("mount failed: -1")
-    {
-        return Some("TMPDIR nosuid/nodev mount permission");
     }
     None
 }
@@ -1712,11 +1706,6 @@ pub fn self_test() -> Result<String, String> {
             "2026-08-27 ERROR detcore: prehook: PMU RCB overshoot! Clock_value: 16249. \
              Stepped forward 139 RCBs, but should have trapped at 100",
         ),
-        (
-            "TMPDIR nosuid/nodev mount permission",
-            "HERMIT_INTERNAL_FAILURE class=cli-error\nError: Sandbox container failed to spawn\n\
-             Caused by: mount failed: -1",
-        ),
     ] {
         if understood_infrastructure_class(text) != Some(want) {
             return Err(format!(
@@ -1725,6 +1714,8 @@ pub fn self_test() -> Result<String, String> {
         }
     }
     for text in [
+        "HERMIT_INTERNAL_FAILURE class=cli-error\nError: Sandbox container failed to spawn\n\
+         Caused by: mount failed: -1",
         "[e2e.metadata] Bunnylol `scuba bpfjailer_enforce` for more details",
         "error: failed to run custom build command for `reverie-dbi v0.1.0`",
         "guest wrote: prehook: PMU RCB overshoot!",

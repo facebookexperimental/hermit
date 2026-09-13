@@ -9522,7 +9522,7 @@ fn compat_summary_with_attempts(
         let classification = node_classification(o, attempts);
         if classification == NodeClassification::NoResult {
             println!(
-                "  NO_RESULT {label} produced no completed child execution; excluded from the measured denominator"
+                "  NO_RESULT {label} produced no product result; excluded from the measured denominator"
             );
             continue;
         }

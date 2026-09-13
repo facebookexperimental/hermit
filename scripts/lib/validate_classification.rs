@@ -498,6 +498,21 @@ fn populations_bracket() -> Result<(), String> {
             "classification prerequisite authority changed: {row}"
         ));
     }
+    let host = validate_plan::HostInapplicableNode {
+        tag: "host.kvm".into(),
+        capability: validate_plan::HostCapability::Kvm,
+        evidence: "fixture host lacks /dev/kvm".into(),
+    };
+    let host_plan = BTreeSet::from([host.tag.clone()]);
+    let unavailable = classify_run(&[], &[], &[], &host_plan, &[host]);
+    if unavailable.understood_prerequisite_failure_nodes != host_plan
+        || unavailable.no_results() != 1
+        || validation_is_complete(true, &unavailable, &host_plan)
+    {
+        return Err(
+            "classification: host-inapplicable selection was lost or promoted to completion".into(),
+        );
+    }
     // Missing super repetitions keep the committed denominator and never become
     // measured failures. Both raw and classified rates agree for complete input.
     let complete: Vec<_> = super::validate_super::STRESS_PROBES
@@ -525,6 +540,29 @@ fn populations_bracket() -> Result<(), String> {
         || super::print_super_stress_verdict(&partial, 2, 1, 1) != 0
     {
         return Err("classification super rates invented a failed repetition".into());
+    }
+    let empty_rates = stress_rates(&RunClassification::default(), 2);
+    if empty_rates
+        .iter()
+        .any(|rate| (rate.passed, rate.ran, rate.planned) != (0, 0, 2))
+        || super::print_super_stress_verdict(&empty_rates, 2, 1, 1) != 0
+        || super::print_super_stress_verdict(&new, 1, 1, 1) != 0
+    {
+        return Err("classification super rates changed absent or complete populations".into());
+    }
+    let mut nonblocking = RunClassification::default();
+    for probe in super::validate_super::STRESS_PROBES
+        .iter()
+        .filter(|probe| probe.nonblocking())
+    {
+        let tag = format!("superstress.{}_1", probe.slug().replace('-', "_"));
+        nonblocking.product_result_nodes.insert(tag.clone());
+        nonblocking.product_failure_nodes.insert(tag);
+    }
+    if super::print_super_stress_verdict(&stress_rates(&nonblocking, 2), 2, 1, 1) != 0 {
+        return Err(
+            "classification super rates changed the existing nonblocking probe policy".into(),
+        );
     }
     let mut failed = classes;
     failed.product_failure_nodes.insert(complete[0].tag.clone());
