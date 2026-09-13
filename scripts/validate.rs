@@ -4257,6 +4257,139 @@ fn super_plan_bracket() -> Result<(), String> {
     Ok(())
 }
 
+fn envelope_verbosity_bracket(tag: &str, command: &str) -> Result<(), String> {
+    // The same guarded shell decoder used by timeout accounting exposes the
+    // real payload. Outer wrapper quoting and arguments are not probe evidence.
+    let source = manifest_command_source(tag, command)?;
+    for fixture in [
+        "run_probe true '/bin/true'",
+        "run_probe echo '/bin/echo hermit-envelope'",
+        "run_probe date '/bin/date -u +%Y'",
+    ] {
+        if !source.contains(fixture) {
+            return Err(format!(
+                "verbosity: envelope lost stable identity fixture {fixture:?}"
+            ));
+        }
+    }
+    if !source.contains("printf '##TEST-START %s\\n' \"$id\" >&2")
+        || !source.contains("printf '##TEST-END %s PASS\\n' \"$id\" >&2")
+    {
+        return Err(
+            "verbosity: envelope START/END must use the same whitespace-free identity".into(),
+        );
+    }
+    if source.matches("\"$id\" >&2").count() != 2 || source.matches("</dev/null >&2").count() != 4 {
+        return Err(
+            "verbosity: envelope markers and Hermit diagnostics must share stderr ordering".into(),
+        );
+    }
+    for fixture in [
+        "trap publish_counts EXIT",
+        "EXECUTED=$((EXECUTED + 1))",
+        "RESULTS+=(\"envelope/$id\" pass 1)",
+        "RESULTS+=(\"envelope/$CURRENT_TEST\" fail 1)",
+        "./ci/write-structured-test-counts.sh \"$EXECUTED\" 0 \"${RESULTS[@]}\"",
+    ] {
+        if !source.contains(fixture) {
+            return Err(format!(
+                "verbosity: envelope lost structured count fixture {fixture:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod envelope_verbosity_tests {
+    use super::*;
+
+    #[test]
+    fn actual_envelope_payload_preserves_markers_and_refuses_outer_decoys() {
+        let root = Path::new(file!()).parent().unwrap().parent().unwrap();
+        let cfg = validate_plan::validation_config(root).unwrap();
+        let step = cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "test.envelope_levels")
+            .unwrap();
+        let host = cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "test.envelope_levels_on_host")
+            .unwrap();
+        let source = manifest_command_source(&step.tag(), &step.cmd).unwrap();
+        let host_source = manifest_command_source(&host.tag(), &host.cmd).unwrap();
+        // The portable source adds only its already-shipped execution root.
+        // Every other payload byte must equal the raw hosted counterpart.
+        let original_args =
+            "ARGS='run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled'";
+        let isolated_args = "ARGS='run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --mount=type=tmpfs,target=/test --workdir=/test'";
+        assert_eq!(host_source.matches(original_args).count(), 1);
+        assert_eq!(
+            source,
+            host_source.replacen(original_args, isolated_args, 1)
+        );
+        envelope_verbosity_bracket(&step.tag(), &step.cmd).unwrap();
+        envelope_verbosity_bracket(&host.tag(), &host.cmd).unwrap();
+
+        let argv = shell_words::split(&step.cmd).unwrap();
+        let boundary = argv.iter().position(|arg| arg == "--").unwrap();
+        let render = |args: &[String]| {
+            format!(
+                "{} {}",
+                args[0],
+                args[1..]
+                    .iter()
+                    .map(|arg| validate_plan::shell_quote(arg))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        };
+        for (before, after, diagnostic) in [
+            (
+                "run_probe true '/bin/true'",
+                "run_probe true '/bin/false'",
+                "lost stable identity fixture",
+            ),
+            ("##TEST-START", "##TEST-REMOVED", "START/END"),
+            ("</dev/null >&2", "</dev/null", "share stderr ordering"),
+            (
+                "trap publish_counts EXIT",
+                "trap publish_counts RETURN",
+                "lost structured count fixture",
+            ),
+        ] {
+            assert!(argv[boundary + 5].contains(before));
+            let mut changed = argv.clone();
+            changed[boundary + 5] = changed[boundary + 5].replacen(before, after, 1);
+            // A complete, correct-looking decoy in the outer output-path value
+            // must not supply evidence missing from the decoded command.
+            let out = changed.iter().position(|arg| arg == "--out").unwrap();
+            changed[out + 1] = format!("/tmp/envelope-decoy {}", argv[boundary + 5]);
+            let error = envelope_verbosity_bracket(&step.tag(), &render(&changed)).unwrap_err();
+            assert!(error.contains(diagnostic), "{diagnostic}: {error}");
+        }
+        let mut guard = argv.clone();
+        guard[boundary + 3].push_str("; true");
+        let error = envelope_verbosity_bracket(&step.tag(), &render(&guard)).unwrap_err();
+        assert!(
+            error.contains("unrecognized pinned-root invocation"),
+            "{error}"
+        );
+        let mut extra = argv.clone();
+        extra.push("extra".into());
+        let error = envelope_verbosity_bracket(&step.tag(), &render(&extra)).unwrap_err();
+        assert!(
+            error.contains("unrecognized pinned-root invocation"),
+            "{error}"
+        );
+        let error =
+            envelope_verbosity_bracket(&step.tag(), &(step.cmd.clone() + " '")).unwrap_err();
+        assert!(error.contains("invalid wrapper quoting"), "{error}");
+    }
+}
+
 fn verbosity_cli_bracket(root: &Path) -> Result<(), String> {
     let level = |args: &[&str]| -> Result<i64, String> {
         parse_argv(&args.iter().map(|s| (*s).to_string()).collect::<Vec<_>>())
@@ -4285,44 +4418,7 @@ fn verbosity_cli_bracket(root: &Path) -> Result<(), String> {
         .iter()
         .find(|step| step.tag() == "test.envelope_levels")
         .ok_or("verbosity: full plan lost test.envelope_levels")?;
-    for fixture in [
-        "run_probe true '/bin/true'",
-        "run_probe echo '/bin/echo hermit-envelope'",
-        "run_probe date '/bin/date -u +%Y'",
-    ] {
-        if !envelope.cmd.contains(fixture) {
-            return Err(format!("verbosity: envelope lost stable identity fixture {fixture:?}"));
-        }
-    }
-    if !envelope
-        .cmd
-        .contains("printf '##TEST-START %s\\n' \"$id\" >&2")
-        || !envelope
-            .cmd
-            .contains("printf '##TEST-END %s PASS\\n' \"$id\" >&2")
-    {
-        return Err("verbosity: envelope START/END must use the same whitespace-free identity".into());
-    }
-    if envelope.cmd.matches("\"$id\" >&2").count() != 2
-        || envelope.cmd.matches("</dev/null >&2").count() != 4
-    {
-        return Err(
-            "verbosity: envelope markers and Hermit diagnostics must share stderr ordering".into(),
-        );
-    }
-    for fixture in [
-        "trap publish_counts EXIT",
-        "EXECUTED=$((EXECUTED + 1))",
-        "RESULTS+=(\"envelope/$id\" pass 1)",
-        "RESULTS+=(\"envelope/$CURRENT_TEST\" fail 1)",
-        "./ci/write-structured-test-counts.sh \"$EXECUTED\" 0 \"${RESULTS[@]}\"",
-    ] {
-        if !envelope.cmd.contains(fixture) {
-            return Err(format!(
-                "verbosity: envelope lost structured count fixture {fixture:?}"
-            ));
-        }
-    }
+    envelope_verbosity_bracket(&envelope.tag(), &envelope.cmd)?;
     let non_nextest_test_nodes = plan
         .cfg
         .steps
