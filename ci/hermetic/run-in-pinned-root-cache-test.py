@@ -217,5 +217,129 @@ class CargoCacheMounts(unittest.TestCase):
                     self.assertEqual(Path(file).read_bytes(), contents, file)
 
 
+    def test_relocates_gitfile_roots_and_common_metadata_without_global_git_overrides(self):
+        git_bin = shutil.which("git")
+        self.assertIsNotNone(git_bin)
+        git_env = os.environ.copy()
+        git_env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+                       GIT_OPTIONAL_LOCKS="0")
+
+        def git(root, *args):
+            result = subprocess.run(
+                [git_bin, "-c", "protocol.file.allow=always", "-c", "user.name=fixture",
+                 "-c", "user.email=fixture@example.invalid", "-C", str(root), *args],
+                env=git_env, capture_output=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            return result.stdout
+
+        def seed(name):
+            root = self.root / name
+            root.mkdir()
+            git(root, "init", "-q")
+            (root / "payload").write_text(name + "\n")
+            git(root, "add", "payload")
+            git(root, "commit", "-qm", "fixture")
+            return root
+
+        leaf = seed("root-leaf-seed")
+        product = seed("root-product-seed")
+        git(product, "submodule", "add", "-q", str(leaf), "nested module")
+        git(product, "commit", "-qam", "nested product fixture")
+        parent = seed("root-parent-seed")
+        git(parent, "submodule", "add", "-q", str(product), "hermit")
+        git(parent, "commit", "-qam", "product submodule fixture")
+
+        for topology in ("parent-submodule", "absolute-worktree", "relative-worktree"):
+            with self.subTest(topology=topology):
+                checkout = self.root / topology
+                if topology == "parent-submodule":
+                    # The failing production topology: Hermit itself is a submodule
+                    # of a parent's linked worktree, with a relative root gitfile.
+                    git(parent, "worktree", "add", "--detach", str(checkout))
+                    git(checkout, "submodule", "update", "--init", "--recursive")
+                    source = checkout / "hermit"
+                else:
+                    git(product, "worktree", "add", "--detach", str(checkout))
+                    source = checkout
+                    git(source, "submodule", "update", "--init", "--recursive")
+                    if topology == "relative-worktree":
+                        directory = git(source, "rev-parse", "--absolute-git-dir").decode().strip()
+                        (source / ".git").write_text(
+                            "gitdir: " + os.path.relpath(directory, source) + "\n")
+
+                directory = Path(git(source, "rev-parse", "--absolute-git-dir").decode().strip())
+                common = Path(git(source, "rev-parse", "--path-format=absolute",
+                                  "--git-common-dir").decode().strip())
+                git(source, "config", "extensions.worktreeConfig", "true")
+                git(source, "config", "--worktree", "core.worktree", str(source))
+                git(source, "config", "--worktree", "fixture.value", "keep root-only value")
+                nested = source / "nested module"
+                nested_dir = Path(git(nested, "rev-parse", "--absolute-git-dir").decode().strip())
+                metadata_dirs = set((directory, common, nested_dir))
+                before = {str(f): f.read_bytes() for d in metadata_dirs
+                          for name in ("config", "config.worktree", "HEAD", "index", "commondir")
+                          if (f := d / name).is_file()}
+                identities = {str(repo): (git(repo, "rev-parse", "HEAD"),
+                                         git(repo, "ls-files", "--stage", "-z"),
+                                         git(repo, "show", "HEAD:payload"))
+                              for repo in (source, nested)}
+                raw = (source / ".git").read_text().removeprefix("gitdir: ").strip()
+                guest_dir = os.path.normpath(os.path.join("/src", raw))
+                self.assertEqual(os.path.isabs(raw), topology == "absolute-worktree")
+                if topology != "absolute-worktree":
+                    self.assertNotEqual(guest_dir, str(directory))
+                common_raw = ((directory / "commondir").read_text().strip()
+                              if (directory / "commondir").is_file() else ".")
+                guest_common = os.path.normpath(os.path.join(guest_dir, common_raw))
+                self.assertEqual(directory == common, topology == "parent-submodule")
+                self.capture.unlink(missing_ok=True)
+                result, calls = self.invoke(source=source)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(calls), 2)
+                argv = calls[1]
+                mounts = [dict(field.split("=", 1) for field in argv[i + 1].split(","))
+                          for i, arg in enumerate(argv) if arg == "--mount"]
+                destinations = {m["destination"]: m for m in mounts}
+                self.assertIn(guest_dir, destinations,
+                              "root gitfile must resolve to the actual root metadata mount")
+                self.assertEqual(destinations[guest_dir]["source"], str(directory))
+                self.assertEqual(destinations[guest_dir]["ro"], "true")
+                self.assertIn(guest_common, destinations,
+                              "relative commondir must resolve to the actual common metadata")
+                self.assertEqual(destinations[guest_common]["source"], str(common))
+                self.assertEqual(destinations[guest_common]["ro"], "true")
+                for actual, destination in ((common / "config", guest_common + "/config"),
+                                             (directory / "config.worktree", guest_dir + "/config.worktree")):
+                    overlay = destinations[destination]
+                    self.assertEqual(overlay["ro"], "true")
+                    copied = Path(overlay["source"])
+                    self.assertNotEqual(copied, actual)
+                    self.assertTrue(copied.is_relative_to(self.root / "output"))
+                    self.assertEqual(git(source, "config", "--file", str(copied),
+                                         "--get", "core.worktree").decode().strip(), "/src")
+                    def non_worktree(config):
+                        values = git(source, "config", "--file", str(config),
+                                     "--null", "--list").split(b"\0")
+                        return [value for value in values if not value.startswith(b"core.worktree\n")]
+                    self.assertEqual(non_worktree(copied), non_worktree(actual))
+                nested_raw = (nested / ".git").read_text().removeprefix("gitdir: ").strip()
+                guest_nested = os.path.normpath(os.path.join("/src/nested module", nested_raw))
+                self.assertEqual(destinations[guest_nested]["source"], str(nested_dir))
+                nested_copy = destinations[guest_nested + "/config"]
+                self.assertEqual(nested_copy["ro"], "true")
+                self.assertEqual(git(source, "config", "--file", nested_copy["source"],
+                                     "--get", "core.worktree").decode().strip(), "/src/nested module")
+                self.assertEqual(argv[-3:], ["fixture@sha256:unused", "/not-executed/command", "literal argument"])
+                self.assertFalse(any(value.startswith(("GIT_DIR=", "GIT_WORK_TREE=", "GIT_CONFIG_COUNT="))
+                                     for value in argv), "root Git overrides must not leak to nested Git")
+                for filename, data in before.items():
+                    self.assertEqual(Path(filename).read_bytes(), data, filename)
+                for repo in (source, nested):
+                    self.assertEqual((git(repo, "rev-parse", "HEAD"),
+                                      git(repo, "ls-files", "--stage", "-z"),
+                                      git(repo, "show", "HEAD:payload")), identities[str(repo)])
+
+
 if __name__ == "__main__":
     unittest.main()

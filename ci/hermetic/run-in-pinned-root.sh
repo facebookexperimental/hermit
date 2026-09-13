@@ -97,8 +97,48 @@ cargo_mount=(); cargo_home_in=/build/.cargo
 git_mounts=()
 if [[ -f "$src/.git" ]]; then
     git_common_dir=$(git -C "$src" rev-parse --path-format=absolute --git-common-dir)
+    root_git_dir=$(git -C "$src" rev-parse --path-format=absolute --git-dir)
+    raw_root_git_dir=$(sed -n "s/^gitdir: //p" "$src/.git")
+    guest_root_git_dir=$(realpath -m "/src/$raw_root_git_dir")
+    if [[ $raw_root_git_dir == /* ]]; then
+        guest_root_git_dir=$raw_root_git_dir
+    fi
+    guest_common_dir=$guest_root_git_dir
+    if [[ -f "$root_git_dir/commondir" ]]; then
+        raw_common_dir=$(cat "$root_git_dir/commondir")
+        if [[ $raw_common_dir == /* ]]; then
+            guest_common_dir=$raw_common_dir
+        else
+            guest_common_dir=$(realpath -m "$guest_root_git_dir/$raw_common_dir")
+        fi
+    fi
+    # Keep the host-absolute common path for existing object/alternate references,
+    # and also mount the paths that the unchanged gitfile/commondir resolve to
+    # after the source is relocated to /src. Mount ancestors before descendants.
     git_mounts+=(--mount "type=bind,source=$git_common_dir,destination=$git_common_dir,ro=true")
-
+    if [[ $guest_common_dir != "$git_common_dir" ]]; then
+        git_mounts+=(--mount "type=bind,source=$git_common_dir,destination=$guest_common_dir,ro=true")
+    fi
+    if [[ $root_git_dir != "$git_common_dir" || $guest_root_git_dir != "$guest_common_dir" ]]; then
+        git_mounts+=(--mount "type=bind,source=$root_git_dir,destination=$guest_root_git_dir,ro=true")
+    fi
+    # A submodule root's core.worktree points back to its host parent. Override
+    # only private config copies, never shared metadata or a global Git env var:
+    # nested git -C commands must continue to discover their own repositories.
+    root_config_dir=$(mktemp -d "$out/git-root-configs.XXXXXX")
+    for config_name in config config.worktree; do
+        config_source="$git_common_dir/config"
+        config_destination="$guest_common_dir/config"
+        if [[ $config_name == config.worktree ]]; then
+            config_source="$root_git_dir/config.worktree"
+            config_destination="$guest_root_git_dir/config.worktree"
+        fi
+        [[ -f $config_source ]] || continue
+        config_copy="$root_config_dir/$config_name"
+        cp -- "$config_source" "$config_copy"
+        git config --file "$config_copy" core.worktree /src
+        git_mounts+=(--mount "type=bind,source=$config_copy,destination=$config_destination,ro=true")
+    done
 fi
 if [[ -e "$src/.git" ]]; then
     # Relocate each submodule's Git metadata without changing the shared host
