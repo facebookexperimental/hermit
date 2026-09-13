@@ -42,16 +42,113 @@ core_job_has() {
     grep -Fq -- "$1" <<<"$core_review_job"
 }
 
+# Recover the one logical shell command that invokes the review linter.  A
+# binding elsewhere in the job is not evidence that the linter receives it.
+core_linter_invocation=$(awk '
+    {
+        lines[NR] = $0
+        if ($0 ~ /(^|[[:space:]])bash scripts\/core-review-protocol-lint[.]sh/) {
+            invocation_line = NR
+            invocation_count++
+        }
+    }
+    END {
+        if (invocation_count != 1) exit 1
+        first = invocation_line
+        while (first > 1 && lines[first - 1] ~ /\\[[:space:]]*$/) first--
+        for (line = first; line <= invocation_line; line++) {
+            sub(/\\[[:space:]]*$/, "", lines[line])
+            printf "%s%s", (line == first ? "" : " "), lines[line]
+        }
+        print ""
+    }
+' <<<"$core_review_job") ||
+    fail "core-review protocol must contain exactly one linter invocation"
+
+validate_core_linter_invocation() {
+    local invocation=$1 bash_index=-1 binding_count index word
+    local -a invocation_words
+
+    # Match assignment words in the command prefix, not their text inside an
+    # unused variable or another executable command.
+    read -r -a invocation_words <<<"$invocation"
+    [[ ${invocation_words[0]-} == if ]] || {
+        echo "core-review linter invocation must be the command governed by its if statement" >&2
+        return 1
+    }
+    for index in "${!invocation_words[@]}"; do
+        [[ ${invocation_words[$index]} == bash ]] && bash_index=$index
+    done
+    if [[ $bash_index -lt 2 || ${invocation_words[$((bash_index + 1))]-} != 'scripts/core-review-protocol-lint.sh;' ||
+          ${invocation_words[$((bash_index + 2))]-} != 'then' ||
+          $((bash_index + 3)) -ne ${#invocation_words[@]} ]]; then
+        echo "core-review linter invocation must execute scripts/core-review-protocol-lint.sh directly" >&2
+        return 1
+    fi
+
+    binding_count=0
+    for ((index = 1; index < bash_index; index++)); do
+        word=${invocation_words[$index]}
+        [[ $word == "PR_HEAD_SHA=\"\$pr_head\"" ]] && ((binding_count += 1))
+    done
+    if [[ $binding_count -ne 1 ]]; then
+        echo "core-review linter invocation must bind PR_HEAD_SHA exactly once" >&2
+        return 1
+    fi
+
+    binding_count=0
+    for ((index = 1; index < bash_index; index++)); do
+        word=${invocation_words[$index]}
+        [[ $word == "PR_COMMENTS_FILE=\"\$pr_comments_file\"" ]] && ((binding_count += 1))
+    done
+    if [[ $binding_count -ne 1 ]]; then
+        echo "core-review linter invocation must bind PR_COMMENTS_FILE exactly once" >&2
+        return 1
+    fi
+
+    for ((index = 1; index < bash_index; index++)); do
+        word=${invocation_words[$index]}
+        [[ $word =~ ^[a-zA-Z_][a-zA-Z_0-9]*= ]] || {
+            echo "core-review linter invocation contains executable token before the linter: $word" >&2
+            return 1
+        }
+    done
+}
+
+invocation_error=$(validate_core_linter_invocation "$core_linter_invocation" 2>&1) ||
+    fail "$invocation_error"
+
+# Negative controls exercise the production invocation parser.  Both deleting
+# a binding and retaining its literal text as an argument to an executable
+# shell command must fail with the missing binding's name.
+expect_binding_mutation_rejected() {
+    local test_name=$1 expected_name=$2 mutation=$3 error
+    if error=$(validate_core_linter_invocation "$mutation" 2>&1); then
+        fail "$test_name mutation was accepted"
+    fi
+    [[ $error == *"$expected_name"* ]] ||
+        fail "$test_name mutation did not name $expected_name: $error"
+}
+
+head_binding=" PR_HEAD_SHA=\"\$pr_head\""
+head_deleted=${core_linter_invocation/"$head_binding"/}
+expect_binding_mutation_rejected "deleted head binding" PR_HEAD_SHA "$head_deleted"
+head_decoy_replacement=" printf '%s' 'PR_HEAD_SHA=\"\$pr_head\"' &&"
+head_decoy=${core_linter_invocation/"$head_binding"/$head_decoy_replacement}
+expect_binding_mutation_rejected "executable head decoy" PR_HEAD_SHA "$head_decoy"
+comments_binding=" PR_COMMENTS_FILE=\"\$pr_comments_file\""
+comments_deleted=${core_linter_invocation/"$comments_binding"/}
+expect_binding_mutation_rejected "deleted comment binding" PR_COMMENTS_FILE "$comments_deleted"
+comments_decoy_replacement=" printf '%s' 'PR_COMMENTS_FILE=\"\$pr_comments_file\"' &&"
+comments_decoy=${core_linter_invocation/"$comments_binding"/$comments_decoy_replacement}
+expect_binding_mutation_rejected "executable comment decoy" PR_COMMENTS_FILE "$comments_decoy"
+
 core_job_has 'pr_head="$(jq -r '\''.head.sha'\'' <<< "$pr_json")"' ||
     fail "core-review protocol must read the exact pull-request head"
 core_job_has 'issues/${pr_number}/comments?per_page=100' ||
     fail "core-review protocol must fetch the complete issue-comment history"
 core_job_has '--paginate --slurp | jq -c '\''add // []'\'' > "$pr_comments_file"' ||
     fail "core-review comment fetch must preserve all pages in one JSON array"
-core_job_has 'PR_HEAD_SHA="$pr_head"' ||
-    fail "core-review linter must receive the exact pull-request head"
-core_job_has 'PR_COMMENTS_FILE="$pr_comments_file"' ||
-    fail "core-review linter must receive the fetched comment history"
 core_job_has 'grep -qiE '\''kvm'\'' <<< "$files" || files_kvm_status=$?' ||
     fail "KVM changed-file grep status must be captured"
 core_job_has 'grep -Fixq kvm <<< "$labels" || labels_kvm_status=$?' ||
