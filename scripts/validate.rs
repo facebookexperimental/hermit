@@ -2135,11 +2135,42 @@ fn self_test() -> Result<(), String> {
     }
 
     let permissionless_path = Path::new("/proc/self/validation-service-result.json");
-    let permission_error = write_validation_service_result(permissionless_path, &service_summary)
-        .expect_err("service-result publication unexpectedly wrote beneath /proc/self");
-    if !permission_error.contains("cannot create validation service result beside") {
+    let mut permissionless_summary = RunSummary::new(Verdict::Pass, 0, "full", Vec::new());
+    permissionless_summary.nodes_executed = 1;
+    permissionless_summary.executed_tests = Some(1);
+    permissionless_summary.passed_tests = Some(1);
+    let permission_error = publish_validation_service_result_or_refuse(
+        Some(permissionless_path),
+        &mut permissionless_summary,
+    )
+    .expect_err("service-result publication unexpectedly wrote beneath /proc/self");
+    if !permission_error.contains("cannot create validation service result beside")
+        || permissionless_summary.verdict != Verdict::NoResult
+        || permissionless_summary.exit_code != COULD_NOT_RUN_EXIT_CODE
+        || run_summary_lines(&permissionless_summary, std::time::Instant::now())
+            .last()
+            .map(String::as_str)
+            != Some("FINAL_VALIDATE_STATUS: COULD_NOT_RUN")
+    {
         return Err(format!(
-            "summary: permissionless service-result publication failure was unclear: {permission_error}"
+            "summary: permissionless service-result publication did not fail clearly as COULD_NOT_RUN: {permission_error}; verdict={:?}; exit={}",
+            permissionless_summary.verdict,
+            permissionless_summary.exit_code,
+        ));
+    }
+    let failure_publish_error = publish_validation_service_result_or_refuse(
+        Some(permissionless_path),
+        &mut failed_summary,
+    )
+    .expect_err("failed service result unexpectedly wrote beneath /proc/self");
+    if !failure_publish_error.contains("cannot create validation service result beside")
+        || failed_summary.verdict != Verdict::Fail
+        || failed_summary.exit_code != 1
+    {
+        return Err(format!(
+            "summary: publication failure overwrote a genuine product failure: {failure_publish_error}; verdict={:?}; exit={}",
+            failed_summary.verdict,
+            failed_summary.exit_code,
         ));
     }
     if !usage().contains("COULD_NOT_RUN service result carries the ordered refusal detail") {
@@ -10051,6 +10082,17 @@ fn exit_code_with_verdict_refusals(exit_code: u8, refusals: &[String]) -> u8 {
     }
 }
 
+/// Evidence retained after execution is part of certification, not the product
+/// result. Refuse an otherwise-clean certification without overwriting either
+/// an earlier refusal or a genuine product failure.
+fn exit_code_with_evidence_refusal(exit_code: u8) -> u8 {
+    if exit_code == 0 {
+        NO_RESULT_EXIT_CODE as u8
+    } else {
+        exit_code
+    }
+}
+
 fn completed_verdict(exit_code: u8) -> Verdict {
     match exit_code {
         0 => Verdict::Pass,
@@ -10664,6 +10706,25 @@ fn verdict_refusal_bracket() -> Result<(), String> {
             "verdict: a zero-exit completeness refusal must become exit {NO_RESULT_EXIT_CODE}/COULD_NOT_RUN, got exit {refusal_exit}/{:?}",
             completed_verdict(refusal_exit)
         ));
+    }
+    let refusal_after_cell_retention = exit_code_with_evidence_refusal(refusal_exit);
+    let refusal_after_coverage_retention =
+        exit_code_with_evidence_refusal(refusal_after_cell_retention);
+    if refusal_after_coverage_retention != NO_RESULT_EXIT_CODE as u8
+        || completed_verdict(refusal_after_coverage_retention) != Verdict::NoResult
+    {
+        return Err(format!(
+            "verdict: post-run evidence refusals overwrote a completeness refusal: exit {refusal_after_coverage_retention}/{:?}",
+            completed_verdict(refusal_after_coverage_retention)
+        ));
+    }
+    if exit_code_with_evidence_refusal(0) != NO_RESULT_EXIT_CODE as u8
+        || exit_code_with_evidence_refusal(1) != 1
+    {
+        return Err(
+            "verdict: a post-run evidence refusal must refuse a clean run and preserve a product failure"
+                .into(),
+        );
     }
     let failed_exit = exit_code_with_verdict_refusals(1, &zero_executed);
     if failed_exit != 1 || completed_verdict(failed_exit) != Verdict::Fail {
@@ -18605,6 +18666,25 @@ fn publish_validation_service_result(
     write_validation_service_result(path, summary)
 }
 
+fn publish_validation_service_result_or_refuse(
+    path: Option<&Path>,
+    summary: &mut RunSummary,
+) -> Result<(), String> {
+    match publish_validation_service_result(path, summary) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            summary
+                .detail
+                .push(format!("validation service result could not be published: {error}"));
+            if final_validate_status(summary.verdict) == Some(FinalValidateStatus::Passed) {
+                summary.verdict = Verdict::NoResult;
+                summary.exit_code = COULD_NOT_RUN_EXIT_CODE;
+            }
+            Err(error)
+        }
+    }
+}
+
 /// `--probe-host-capability <name>`: report THIS machine's verdict for one
 /// capability and exit, printing `PRESENT\t<evidence>` or `ABSENT\t<evidence>`.
 ///
@@ -18934,8 +19014,10 @@ fn main() -> ExitCode {
 
     // The durable log outlives `run` so the summary lands INSIDE it.
     let mut durable: Option<DurableLog> = None;
-    let summary = run(&mut durable, service_result_path.as_deref());
-    if let Err(error) = publish_validation_service_result(service_result_path.as_deref(), &summary) {
+    let mut summary = run(&mut durable, service_result_path.as_deref());
+    if let Err(error) =
+        publish_validation_service_result_or_refuse(service_result_path.as_deref(), &mut summary)
+    {
         eprintln!("validate: ERROR: {error}");
     }
     print_run_summary(&summary, started);
@@ -20714,6 +20796,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     // not open or satisfy a cell-specific failure obligation. Retain the typed
     // rows before appending the ledger entry so schema 7 is emitted only when
     // the artifact has actually been published and bound by checksum.
+    let mut evidence_refusal_details = Vec::new();
     let should_retain_cells = plan.suite_complete || plan.cell_evidence_expected.is_some();
     let retained_cell_results = if !nesting.nested
         && !args.allow_local_off_the_record_run
@@ -20735,11 +20818,12 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
         match result {
             Ok(results) => Some(results),
             Err(error) => {
-                eprintln!(
-                    "validate: ERROR: cannot retain complete per-cell evidence: {error}; \
-                     refusing a schema-7 receipt"
+                let detail = format!(
+                    "cannot retain complete per-cell evidence: {error}; refusing a schema-7 receipt"
                 );
-                exit_code = 1;
+                eprintln!("validate: ERROR: {detail}");
+                evidence_refusal_details.push(detail);
+                exit_code = exit_code_with_evidence_refusal(exit_code);
                 None
             }
         }
@@ -20803,11 +20887,12 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
                     Some(scope)
                 }
                 Err(error) => {
-                    eprintln!(
-                        "validate: ERROR: cannot retain complete coverage evidence: {error}; \
-                         refusing a full receipt"
+                    let detail = format!(
+                        "cannot retain complete coverage evidence: {error}; refusing a full receipt"
                     );
-                    exit_code = 1;
+                    eprintln!("validate: ERROR: {detail}");
+                    evidence_refusal_details.push(detail);
+                    exit_code = exit_code_with_evidence_refusal(exit_code);
                     None
                 }
             }
@@ -20976,6 +21061,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
             "direct compatibility rows could not produce an exact test count: {error}"
         ));
     }
+    detail.extend(evidence_refusal_details);
     if !timed_out_nodes(&outcomes).is_empty() {
         detail.push(format!(
             "{} node(s) hit a wall or CPU budget; a timeout IS a recorded result: {}",
@@ -21867,6 +21953,11 @@ mod final_validate_status_tests {
             final_validate_status(completed_verdict(refused_exit)),
             Some(FinalValidateStatus::CouldNotRun)
         );
+        let after_cell_retention = exit_code_with_evidence_refusal(refused_exit);
+        let after_coverage_retention = exit_code_with_evidence_refusal(after_cell_retention);
+        assert_eq!(after_coverage_retention, COULD_NOT_RUN_EXIT_CODE);
+        assert_eq!(completed_verdict(after_coverage_retention), Verdict::NoResult);
+        assert_eq!(exit_code_with_evidence_refusal(0), COULD_NOT_RUN_EXIT_CODE);
 
         let failed_exit = exit_code_with_verdict_refusals(1, &refusals);
         assert_eq!(failed_exit, 1);
@@ -21956,12 +22047,30 @@ mod final_validate_status_tests {
         let collision = write_validation_service_result(&passed_path, &passed).unwrap_err();
         assert!(collision.contains("without replacing an existing result"));
 
-        let permissionless = write_validation_service_result(
-            Path::new("/proc/self/validation-service-result.json"),
-            &passed,
+        let permissionless_path = Path::new("/proc/self/validation-service-result.json");
+        let permissionless = publish_validation_service_result_or_refuse(
+            Some(permissionless_path),
+            &mut passed,
         )
         .unwrap_err();
         assert!(permissionless.contains("cannot create validation service result beside"));
+        assert_eq!(passed.verdict, Verdict::NoResult);
+        assert_eq!(passed.exit_code, COULD_NOT_RUN_EXIT_CODE);
+        assert_eq!(
+            run_summary_lines(&passed, std::time::Instant::now())
+                .last()
+                .map(String::as_str),
+            Some("FINAL_VALIDATE_STATUS: COULD_NOT_RUN")
+        );
+
+        let failed_publish = publish_validation_service_result_or_refuse(
+            Some(permissionless_path),
+            &mut failed,
+        )
+        .unwrap_err();
+        assert!(failed_publish.contains("cannot create validation service result beside"));
+        assert_eq!(failed.verdict, Verdict::Fail);
+        assert_eq!(failed.exit_code, 1);
     }
 }
 
