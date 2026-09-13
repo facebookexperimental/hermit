@@ -5,6 +5,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
+use dagrun::model::Step;
 use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
@@ -234,6 +235,34 @@ impl HistoryRow {
         let evidence = value.schema9()?;
         evidence.validate_for_row(self)?;
         Ok(Some(evidence))
+    }
+
+    /// Verify the exact canonical JSONL bytes bound by schema-9 test evidence.
+    ///
+    /// The producer population is derived here from the constructed validation
+    /// plan's declared result manifests (plus its explicit compatibility
+    /// producer), never from the artifact rows. Requiring the plan here
+    /// prevents a missing producer from shrinking both the artifact and its
+    /// self-reported denominator.
+    ///
+    /// Historical and future schemas remain readable but receive no schema-9
+    /// artifact authority.
+    pub fn verify_test_results_artifact_bytes(
+        &self,
+        constructed_plan_steps: &[Step],
+        compatibility_selected: bool,
+        artifact_bytes: &[u8],
+    ) -> Result<Option<VerifiedTestResultsArtifactV9>, String> {
+        let Some(evidence) = self.test_results_evidence()? else {
+            return Ok(None);
+        };
+        let planned_selected = TestResultsSelectedPopulation::from_constructed_plan_steps(
+            constructed_plan_steps,
+            compatibility_selected,
+        )?;
+        evidence
+            .verify_artifact_bytes(&planned_selected, artifact_bytes)
+            .map(Some)
     }
 
     /// Return the number of nodes for which at least one child execution
@@ -835,6 +864,10 @@ pub enum TestResultVerdict {
 }
 
 /// One producer-owned terminal test row in the retained JSONL artifact.
+///
+/// Canonical artifacts contain one compact serialization of this struct per
+/// line, with a trailing newline. Node rows sort by `(node, id)` and precede
+/// compatibility rows, which sort by `id`.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TestResultArtifactRow {
@@ -916,6 +949,33 @@ pub struct TestResultsSelectedPopulation {
     pub compatibility: bool,
 }
 
+impl TestResultsSelectedPopulation {
+    /// Derive the exact count-bearing population from one already-constructed
+    /// validation plan. Dependencies without a structured-result declaration
+    /// are intentionally absent; every declared producer is included before
+    /// any outcome or artifact row is observed.
+    fn from_constructed_plan_steps(steps: &[Step], compatibility: bool) -> Result<Self, String> {
+        let mut nodes = BTreeSet::new();
+        for step in steps {
+            if step.structured_test_results_manifest()?.is_some() {
+                let tag = step.tag();
+                if !nodes.insert(tag.clone()) {
+                    return Err(format!(
+                        "constructed validation plan repeats test-result producer {tag}"
+                    ));
+                }
+            }
+        }
+        if nodes.is_empty() && !compatibility {
+            return Err("constructed validation plan selects no test-result producers".into());
+        }
+        Ok(Self {
+            nodes: nodes.into_iter().collect(),
+            compatibility,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TestResultTotals {
@@ -967,6 +1027,57 @@ pub struct TestResultsEvidenceV9 {
     pub compatibility: Option<CompatibilityTestResultSummary>,
     pub totals: TestResultTotals,
     pub artifact: TestResultsArtifact,
+}
+
+/// Values independently reconstructed from one verified schema-9 artifact.
+///
+/// The filtered counts come from the ledger's per-producer summaries because
+/// filtered tests do not have terminal artifact rows. Executed, passed, failed,
+/// row-count, producer-population, and identity values are all recomputed from
+/// the artifact bytes and checked against those summaries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedTestResultsArtifactV9 {
+    pub selected: TestResultsSelectedPopulation,
+    pub nodes: Vec<NodeTestResultSummary>,
+    pub compatibility: Option<CompatibilityTestResultSummary>,
+    pub totals: TestResultTotals,
+    pub row_count: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum TestResultProducerIdentity {
+    Node(String),
+    Compatibility,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct TestResultArtifactRowKey {
+    producer: TestResultProducerIdentity,
+    id: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RecomputedTestResultCounts {
+    executed_tests: u64,
+    passed_tests: u64,
+    failed_tests: u64,
+}
+
+impl RecomputedTestResultCounts {
+    fn add(&mut self, verdict: TestResultVerdict) -> Result<(), String> {
+        self.executed_tests = self
+            .executed_tests
+            .checked_add(1)
+            .ok_or("schema 9 artifact executed_tests overflowed u64")?;
+        let count = match verdict {
+            TestResultVerdict::Pass => &mut self.passed_tests,
+            TestResultVerdict::Fail => &mut self.failed_tests,
+        };
+        *count = count
+            .checked_add(1)
+            .ok_or("schema 9 artifact verdict count overflowed u64")?;
+        Ok(())
+    }
 }
 
 fn is_lower_hex(value: &str, length: usize) -> bool {
@@ -1139,10 +1250,269 @@ impl TestResultsEvidenceV9 {
         }
         Ok(())
     }
+
+    fn verify_artifact_bytes(
+        &self,
+        planned_selected: &TestResultsSelectedPopulation,
+        artifact_bytes: &[u8],
+    ) -> Result<VerifiedTestResultsArtifactV9, String> {
+        if planned_selected.nodes.is_empty() && !planned_selected.compatibility {
+            return Err("schema 9 planned test-result producer population is empty".into());
+        }
+        if !planned_selected
+            .nodes
+            .iter()
+            .all(|node| nonblank_component(node))
+            || !planned_selected
+                .nodes
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+        {
+            return Err(
+                "schema 9 planned test-result nodes are malformed, duplicate, or unsorted".into(),
+            );
+        }
+        if &self.selected != planned_selected {
+            return Err(
+                "schema 9 test_results selected population differs from constructed plan".into(),
+            );
+        }
+        if artifact_bytes.is_empty() || !artifact_bytes.ends_with(b"\n") {
+            return Err(
+                "schema 9 test-results artifact is empty or lacks its final newline".into(),
+            );
+        }
+
+        let mut counts = BTreeMap::<TestResultProducerIdentity, RecomputedTestResultCounts>::new();
+        let mut seen = BTreeSet::<TestResultArtifactRowKey>::new();
+        let mut previous = None::<TestResultArtifactRowKey>;
+        let mut parsed_row_count = 0u64;
+
+        for (index, line) in artifact_bytes
+            .split_inclusive(|byte| *byte == b'\n')
+            .enumerate()
+        {
+            let row_bytes = &line[..line.len() - 1];
+            if row_bytes.is_empty() {
+                return Err(format!(
+                    "schema 9 test-results artifact row {} is empty",
+                    index + 1
+                ));
+            }
+            let row: TestResultArtifactRow =
+                serde_json::from_slice(row_bytes).map_err(|error| {
+                    format!(
+                        "schema 9 test-results artifact row {} is malformed: {error}",
+                        index + 1
+                    )
+                })?;
+            let mut canonical = serde_json::to_vec(&row).map_err(|error| {
+                format!(
+                    "cannot encode schema 9 test-results artifact row {}: {error}",
+                    index + 1
+                )
+            })?;
+            canonical.push(b'\n');
+            if canonical != line {
+                return Err(format!(
+                    "schema 9 test-results artifact row {} is not canonical",
+                    index + 1
+                ));
+            }
+            if row.run_id != self.run_id {
+                return Err(format!(
+                    "schema 9 test-results artifact row {} has wrong run_id",
+                    index + 1
+                ));
+            }
+            if row.hermit_sha != self.hermit_sha {
+                return Err(format!(
+                    "schema 9 test-results artifact row {} has wrong hermit_sha",
+                    index + 1
+                ));
+            }
+            if row.path != self.path {
+                return Err(format!(
+                    "schema 9 test-results artifact row {} has wrong validation path",
+                    index + 1
+                ));
+            }
+
+            let producer = match &row.producer {
+                TestResultProducer::Node {
+                    node,
+                    outer_attempt,
+                } => {
+                    let summary = self
+                        .nodes
+                        .binary_search_by(|summary| summary.node.as_str().cmp(node.as_str()))
+                        .ok()
+                        .map(|position| &self.nodes[position])
+                        .ok_or_else(|| {
+                            format!(
+                                "schema 9 test-results artifact row {} names unselected node {}",
+                                index + 1,
+                                node
+                            )
+                        })?;
+                    if *outer_attempt != summary.outer_attempt {
+                        return Err(format!(
+                            "schema 9 test-results artifact row {} has wrong outer_attempt for {}",
+                            index + 1,
+                            node
+                        ));
+                    }
+                    TestResultProducerIdentity::Node(node.clone())
+                }
+                TestResultProducer::Compatibility => {
+                    if self.compatibility.is_none() {
+                        return Err(format!(
+                            "schema 9 test-results artifact row {} names unselected compatibility producer",
+                            index + 1
+                        ));
+                    }
+                    TestResultProducerIdentity::Compatibility
+                }
+            };
+            let key = TestResultArtifactRowKey {
+                producer: producer.clone(),
+                id: row.id.clone(),
+            };
+            if !seen.insert(key.clone()) {
+                return Err(format!(
+                    "schema 9 test-results artifact has duplicate producer/test row at row {}",
+                    index + 1
+                ));
+            }
+            if previous.as_ref().is_some_and(|previous| previous >= &key) {
+                return Err(format!(
+                    "schema 9 test-results artifact row {} is not in canonical order",
+                    index + 1
+                ));
+            }
+            previous = Some(key);
+            counts.entry(producer).or_default().add(row.result)?;
+            parsed_row_count = parsed_row_count
+                .checked_add(1)
+                .ok_or("schema 9 artifact row count overflowed u64")?;
+        }
+
+        let digest = format!("{:x}", Sha256::digest(artifact_bytes));
+        if digest != self.artifact.sha256 {
+            return Err("schema 9 test-results artifact sha256 mismatch".into());
+        }
+        if parsed_row_count != self.artifact.row_count || parsed_row_count != self.recorded_count {
+            return Err("schema 9 test-results artifact row_count mismatch".into());
+        }
+
+        let mut verified_nodes = Vec::with_capacity(self.nodes.len());
+        let mut verified_totals = TestResultTotals {
+            executed_tests: 0,
+            passed_tests: 0,
+            failed_tests: 0,
+            filtered_tests: 0,
+        };
+        let mut add_verified = |counts: RecomputedTestResultCounts,
+                                filtered_tests: u64|
+         -> Result<TestResultTotals, String> {
+            let totals = TestResultTotals {
+                executed_tests: counts.executed_tests,
+                passed_tests: counts.passed_tests,
+                failed_tests: counts.failed_tests,
+                filtered_tests,
+            };
+            verified_totals.executed_tests = verified_totals
+                .executed_tests
+                .checked_add(totals.executed_tests)
+                .ok_or("schema 9 verified executed_tests overflowed u64")?;
+            verified_totals.passed_tests = verified_totals
+                .passed_tests
+                .checked_add(totals.passed_tests)
+                .ok_or("schema 9 verified passed_tests overflowed u64")?;
+            verified_totals.failed_tests = verified_totals
+                .failed_tests
+                .checked_add(totals.failed_tests)
+                .ok_or("schema 9 verified failed_tests overflowed u64")?;
+            verified_totals.filtered_tests = verified_totals
+                .filtered_tests
+                .checked_add(totals.filtered_tests)
+                .ok_or("schema 9 verified filtered_tests overflowed u64")?;
+            Ok(totals)
+        };
+
+        for summary in &self.nodes {
+            let producer = TestResultProducerIdentity::Node(summary.node.clone());
+            let recomputed = counts.remove(&producer).ok_or_else(|| {
+                format!(
+                    "schema 9 test-results artifact omits selected producer {}",
+                    summary.node
+                )
+            })?;
+            if recomputed.executed_tests != summary.row_count
+                || recomputed.executed_tests != summary.totals.executed_tests
+                || recomputed.passed_tests != summary.totals.passed_tests
+                || recomputed.failed_tests != summary.totals.failed_tests
+            {
+                return Err(format!(
+                    "schema 9 test-results artifact totals differ for producer {}",
+                    summary.node
+                ));
+            }
+            let totals = add_verified(recomputed, summary.totals.filtered_tests)?;
+            verified_nodes.push(NodeTestResultSummary {
+                node: summary.node.clone(),
+                outer_attempt: summary.outer_attempt,
+                totals,
+                row_count: recomputed.executed_tests,
+            });
+        }
+
+        let verified_compatibility = match &self.compatibility {
+            Some(summary) => {
+                let recomputed = counts
+                    .remove(&TestResultProducerIdentity::Compatibility)
+                    .ok_or_else(|| {
+                        "schema 9 test-results artifact omits selected compatibility producer"
+                            .to_string()
+                    })?;
+                if recomputed.executed_tests != summary.row_count
+                    || recomputed.executed_tests != summary.totals.executed_tests
+                    || recomputed.passed_tests != summary.totals.passed_tests
+                    || recomputed.failed_tests != summary.totals.failed_tests
+                {
+                    return Err(
+                        "schema 9 test-results artifact totals differ for compatibility producer"
+                            .into(),
+                    );
+                }
+                let totals = add_verified(recomputed, summary.totals.filtered_tests)?;
+                Some(CompatibilityTestResultSummary {
+                    totals,
+                    row_count: recomputed.executed_tests,
+                })
+            }
+            None => None,
+        };
+        if !counts.is_empty() {
+            return Err("schema 9 test-results artifact contains an extra producer".into());
+        }
+        if verified_totals != self.totals {
+            return Err("schema 9 test-results artifact checked totals mismatch".into());
+        }
+
+        Ok(VerifiedTestResultsArtifactV9 {
+            selected: planned_selected.clone(),
+            nodes: verified_nodes,
+            compatibility: verified_compatibility,
+            totals: verified_totals,
+            row_count: parsed_row_count,
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use dagrun::io::dag_from_json;
     use sha2::Digest;
     use sha2::Sha256;
 
@@ -1716,6 +2086,138 @@ mod tests {
         })
     }
 
+    fn schema9_artifact_rows() -> Vec<TestResultArtifactRow> {
+        vec![
+            TestResultArtifactRow {
+                run_id: "run-9".into(),
+                hermit_sha: "a".repeat(40),
+                path: ValidatePath::Full,
+                producer: TestResultProducer::Node {
+                    node: "test.alpha".into(),
+                    outer_attempt: 2,
+                },
+                id: "a".into(),
+                result: TestResultVerdict::Pass,
+                attempts: 1,
+            },
+            TestResultArtifactRow {
+                run_id: "run-9".into(),
+                hermit_sha: "a".repeat(40),
+                path: ValidatePath::Full,
+                producer: TestResultProducer::Node {
+                    node: "test.alpha".into(),
+                    outer_attempt: 2,
+                },
+                id: "z".into(),
+                result: TestResultVerdict::Fail,
+                attempts: 2,
+            },
+            TestResultArtifactRow {
+                run_id: "run-9".into(),
+                hermit_sha: "a".repeat(40),
+                path: ValidatePath::Full,
+                producer: TestResultProducer::Node {
+                    node: "test.beta".into(),
+                    outer_attempt: 1,
+                },
+                id: "same-id".into(),
+                result: TestResultVerdict::Pass,
+                attempts: 1,
+            },
+            TestResultArtifactRow {
+                run_id: "run-9".into(),
+                hermit_sha: "a".repeat(40),
+                path: ValidatePath::Full,
+                producer: TestResultProducer::Compatibility,
+                id: "same-id".into(),
+                result: TestResultVerdict::Pass,
+                attempts: 1,
+            },
+        ]
+    }
+
+    fn schema9_artifact_bytes(rows: &[TestResultArtifactRow]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for row in rows {
+            bytes.extend(serde_json::to_vec(row).unwrap());
+            bytes.push(b'\n');
+        }
+        bytes
+    }
+
+    fn bind_schema9_artifact(value: &mut Value, bytes: &[u8], row_count: u64) {
+        value["test_results"]["artifact"]["sha256"] =
+            serde_json::json!(format!("{:x}", Sha256::digest(bytes)));
+        value["test_results"]["artifact"]["row_count"] = serde_json::json!(row_count);
+    }
+
+    fn schema9_constructed_plan_steps() -> Vec<Step> {
+        dag_from_json(
+            r#"{
+                "steps": [{
+                    "group": "test",
+                    "job": "beta",
+                    "cmd": "true",
+                    "result_manifests": [{
+                        "kind": "structured-test-results",
+                        "schema": 2,
+                        "path_env": "DAGRUN_TEST_COUNTS_PATH",
+                        "owner": "test.beta"
+                    }]
+                }, {
+                    "group": "setup",
+                    "job": "dependency",
+                    "cmd": "true",
+                    "result_manifests": []
+                }, {
+                    "group": "test",
+                    "job": "alpha",
+                    "cmd": "true",
+                    "result_manifests": [{
+                        "kind": "structured-test-results",
+                        "schema": 2,
+                        "path_env": "DAGRUN_TEST_COUNTS_PATH",
+                        "owner": "test.alpha"
+                    }]
+                }]
+            }"#,
+        )
+        .unwrap()
+        .steps
+    }
+
+    fn schema9_row_with_artifact() -> (HistoryRow, Vec<Step>, Vec<u8>) {
+        let bytes = schema9_artifact_bytes(&schema9_artifact_rows());
+        let mut value = schema9_row();
+        bind_schema9_artifact(&mut value, &bytes, 4);
+        (
+            serde_json::from_value(value).unwrap(),
+            schema9_constructed_plan_steps(),
+            bytes,
+        )
+    }
+
+    fn assert_schema9_artifact_refused(
+        value: Value,
+        constructed_plan_steps: &[Step],
+        compatibility_selected: bool,
+        bytes: &[u8],
+        expected: &str,
+    ) {
+        let row: HistoryRow = serde_json::from_value(value).unwrap();
+        let error = row
+            .verify_test_results_artifact_bytes(
+                constructed_plan_steps,
+                compatibility_selected,
+                bytes,
+            )
+            .expect_err("mutated schema 9 artifact must refuse");
+        assert!(
+            error.contains(expected),
+            "schema 9 artifact refusal {error:?} did not name {expected:?}"
+        );
+    }
+
     fn assert_schema9_refused(value: Value, expected: &str) {
         let row: HistoryRow = serde_json::from_value(value).unwrap();
         let error = row
@@ -1743,6 +2245,371 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&row).unwrap()["test_results"],
             value["test_results"]
+        );
+    }
+
+    #[test]
+    fn schema9_artifact_bytes_recompute_exact_population_and_totals() {
+        let (row, constructed_plan_steps, bytes) = schema9_row_with_artifact();
+        let verified = row
+            .verify_test_results_artifact_bytes(&constructed_plan_steps, true, &bytes)
+            .unwrap()
+            .expect("schema 9 should verify its exact artifact bytes");
+        assert_eq!(
+            verified.selected,
+            TestResultsSelectedPopulation {
+                nodes: vec!["test.alpha".into(), "test.beta".into()],
+                compatibility: true,
+            }
+        );
+        assert_eq!(verified.row_count, 4);
+        assert_eq!(verified.nodes.len(), 2);
+        assert_eq!(verified.nodes[0].node, "test.alpha");
+        assert_eq!(verified.nodes[0].outer_attempt, 2);
+        assert_eq!(verified.nodes[0].totals.executed_tests, 2);
+        assert_eq!(verified.nodes[0].totals.passed_tests, 1);
+        assert_eq!(verified.nodes[0].totals.failed_tests, 1);
+        assert_eq!(verified.nodes[0].totals.filtered_tests, 3);
+        assert_eq!(verified.compatibility.unwrap().totals.executed_tests, 1);
+        assert_eq!(verified.totals.executed_tests, 4);
+        assert_eq!(verified.totals.passed_tests, 3);
+        assert_eq!(verified.totals.failed_tests, 1);
+        assert_eq!(verified.totals.filtered_tests, 7);
+
+        let mut wrong_owner = constructed_plan_steps.clone();
+        let declaration = wrong_owner[0]
+            .result_manifests
+            .as_mut()
+            .unwrap()
+            .iter_mut()
+            .find_map(|manifest| match manifest {
+                dagrun::model::ResultManifest::StructuredTestResults(declaration) => {
+                    Some(declaration)
+                }
+                dagrun::model::ResultManifest::ManifestCell(_) => None,
+            })
+            .unwrap();
+        declaration.owner = "test.someone-else".into();
+        let error = row
+            .verify_test_results_artifact_bytes(&wrong_owner, true, &bytes)
+            .expect_err("a constructed plan with a false result owner must refuse");
+        assert!(error.contains("owner"), "unexpected owner refusal: {error}");
+
+        for schema in [6, 7, 8, 10] {
+            let mut value = schema9_row();
+            value["schema_version"] = serde_json::json!(schema);
+            let historical: HistoryRow = serde_json::from_value(value).unwrap();
+            assert!(
+                historical
+                    .verify_test_results_artifact_bytes(&constructed_plan_steps, true, &bytes)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn schema9_artifact_refuses_row_identity_producer_and_attempt_mutations() {
+        let (_, constructed_plan_steps, _) = schema9_row_with_artifact();
+        for (field, replacement, expected) in [
+            ("run_id", serde_json::json!("other-run"), "wrong run_id"),
+            (
+                "hermit_sha",
+                serde_json::json!("c".repeat(40)),
+                "wrong hermit_sha",
+            ),
+            ("path", serde_json::json!("quick"), "wrong validation path"),
+        ] {
+            let mut rows = schema9_artifact_rows();
+            let mut row = serde_json::to_value(&rows[0]).unwrap();
+            row[field] = replacement;
+            rows[0] = serde_json::from_value(row).unwrap();
+            let bytes = schema9_artifact_bytes(&rows);
+            let mut value = schema9_row();
+            bind_schema9_artifact(&mut value, &bytes, 4);
+            assert_schema9_artifact_refused(value, &constructed_plan_steps, true, &bytes, expected);
+        }
+
+        let mut rows = schema9_artifact_rows();
+        rows[0].producer = TestResultProducer::Node {
+            node: "test.gamma".into(),
+            outer_attempt: 2,
+        };
+        let bytes = schema9_artifact_bytes(&rows);
+        let mut value = schema9_row();
+        bind_schema9_artifact(&mut value, &bytes, 4);
+        assert_schema9_artifact_refused(
+            value,
+            &constructed_plan_steps,
+            true,
+            &bytes,
+            "unselected node",
+        );
+
+        let mut rows = schema9_artifact_rows();
+        rows[0].producer = TestResultProducer::Node {
+            node: "test.alpha".into(),
+            outer_attempt: 3,
+        };
+        let bytes = schema9_artifact_bytes(&rows);
+        let mut value = schema9_row();
+        bind_schema9_artifact(&mut value, &bytes, 4);
+        assert_schema9_artifact_refused(
+            value,
+            &constructed_plan_steps,
+            true,
+            &bytes,
+            "wrong outer_attempt",
+        );
+    }
+
+    #[test]
+    fn schema9_artifact_refuses_missing_extra_duplicate_and_shrunk_populations() {
+        let (_, constructed_plan_steps, _) = schema9_row_with_artifact();
+
+        let mut missing_row = schema9_artifact_rows();
+        missing_row.remove(1);
+        let bytes = schema9_artifact_bytes(&missing_row);
+        let mut value = schema9_row();
+        bind_schema9_artifact(&mut value, &bytes, 4);
+        assert_schema9_artifact_refused(
+            value,
+            &constructed_plan_steps,
+            true,
+            &bytes,
+            "row_count mismatch",
+        );
+
+        let mut extra = schema9_artifact_rows();
+        extra.insert(
+            3,
+            TestResultArtifactRow {
+                run_id: "run-9".into(),
+                hermit_sha: "a".repeat(40),
+                path: ValidatePath::Full,
+                producer: TestResultProducer::Node {
+                    node: "test.gamma".into(),
+                    outer_attempt: 1,
+                },
+                id: "extra".into(),
+                result: TestResultVerdict::Pass,
+                attempts: 1,
+            },
+        );
+        let bytes = schema9_artifact_bytes(&extra);
+        let mut value = schema9_row();
+        bind_schema9_artifact(&mut value, &bytes, 4);
+        assert_schema9_artifact_refused(
+            value,
+            &constructed_plan_steps,
+            true,
+            &bytes,
+            "unselected node",
+        );
+
+        let mut duplicate = schema9_artifact_rows();
+        duplicate.insert(1, duplicate[0].clone());
+        let bytes = schema9_artifact_bytes(&duplicate);
+        let mut value = schema9_row();
+        bind_schema9_artifact(&mut value, &bytes, 4);
+        assert_schema9_artifact_refused(
+            value,
+            &constructed_plan_steps,
+            true,
+            &bytes,
+            "duplicate producer/test row",
+        );
+
+        let rows = schema9_artifact_rows()
+            .into_iter()
+            .filter(|row| {
+                !matches!(
+                    &row.producer,
+                    TestResultProducer::Node { node, .. } if node == "test.beta"
+                )
+            })
+            .collect::<Vec<_>>();
+        let bytes = schema9_artifact_bytes(&rows);
+        let mut omitted = schema9_row();
+        omitted["test_results"]["nodes"][1]["totals"] = serde_json::json!({
+            "executed_tests": 0,
+            "passed_tests": 0,
+            "failed_tests": 0,
+            "filtered_tests": 4
+        });
+        omitted["test_results"]["nodes"][1]["row_count"] = serde_json::json!(0);
+        omitted["test_results"]["totals"]["executed_tests"] = serde_json::json!(3);
+        omitted["test_results"]["totals"]["passed_tests"] = serde_json::json!(2);
+        omitted["test_results"]["recorded_count"] = serde_json::json!(3);
+        omitted["executed_tests"] = serde_json::json!(3);
+        omitted["passed_tests"] = serde_json::json!(2);
+        bind_schema9_artifact(&mut omitted, &bytes, 3);
+        assert_schema9_artifact_refused(
+            omitted,
+            &constructed_plan_steps,
+            true,
+            &bytes,
+            "omits selected producer",
+        );
+
+        let mut compatibility_omitted_rows = schema9_artifact_rows();
+        compatibility_omitted_rows.pop();
+        let compatibility_omitted_bytes = schema9_artifact_bytes(&compatibility_omitted_rows);
+        let mut compatibility_omitted = schema9_row();
+        compatibility_omitted["test_results"]["compatibility"]["totals"] = serde_json::json!({
+            "executed_tests": 0,
+            "passed_tests": 0,
+            "failed_tests": 0,
+            "filtered_tests": 0
+        });
+        compatibility_omitted["test_results"]["compatibility"]["row_count"] = serde_json::json!(0);
+        compatibility_omitted["test_results"]["totals"]["executed_tests"] = serde_json::json!(3);
+        compatibility_omitted["test_results"]["totals"]["passed_tests"] = serde_json::json!(2);
+        compatibility_omitted["test_results"]["recorded_count"] = serde_json::json!(3);
+        compatibility_omitted["executed_tests"] = serde_json::json!(3);
+        compatibility_omitted["passed_tests"] = serde_json::json!(2);
+        bind_schema9_artifact(&mut compatibility_omitted, &compatibility_omitted_bytes, 3);
+        assert_schema9_artifact_refused(
+            compatibility_omitted,
+            &constructed_plan_steps,
+            true,
+            &compatibility_omitted_bytes,
+            "omits selected compatibility producer",
+        );
+
+        let mut compatibility_unselected = schema9_row();
+        compatibility_unselected["test_results"]["selected"]["compatibility"] =
+            serde_json::json!(false);
+        compatibility_unselected["test_results"]["selected_count"] = serde_json::json!(2);
+        compatibility_unselected["test_results"]["compatibility"] = serde_json::Value::Null;
+        compatibility_unselected["test_results"]["totals"] = serde_json::json!({
+            "executed_tests": 3,
+            "passed_tests": 2,
+            "failed_tests": 1,
+            "filtered_tests": 7
+        });
+        compatibility_unselected["test_results"]["recorded_count"] = serde_json::json!(3);
+        compatibility_unselected["executed_tests"] = serde_json::json!(3);
+        compatibility_unselected["passed_tests"] = serde_json::json!(2);
+        let unselected_population = TestResultsSelectedPopulation {
+            nodes: vec!["test.alpha".into(), "test.beta".into()],
+            compatibility: false,
+        };
+        compatibility_unselected["test_results"]["population_sha256"] = serde_json::json!(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&unselected_population).unwrap())
+        ));
+        bind_schema9_artifact(
+            &mut compatibility_unselected,
+            &schema9_artifact_bytes(&schema9_artifact_rows()),
+            3,
+        );
+        assert_schema9_artifact_refused(
+            compatibility_unselected,
+            &constructed_plan_steps,
+            false,
+            &schema9_artifact_bytes(&schema9_artifact_rows()),
+            "unselected compatibility producer",
+        );
+
+        let shrunk_selected = TestResultsSelectedPopulation {
+            nodes: vec!["test.alpha".into()],
+            compatibility: true,
+        };
+        let mut shrunk = schema9_row();
+        shrunk["test_results"]["selected"] = serde_json::to_value(&shrunk_selected).unwrap();
+        shrunk["test_results"]["selected_count"] = serde_json::json!(2);
+        shrunk["test_results"]["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        shrunk["test_results"]["totals"] = serde_json::json!({
+            "executed_tests": 3,
+            "passed_tests": 2,
+            "failed_tests": 1,
+            "filtered_tests": 3
+        });
+        shrunk["test_results"]["recorded_count"] = serde_json::json!(3);
+        shrunk["executed_tests"] = serde_json::json!(3);
+        shrunk["passed_tests"] = serde_json::json!(2);
+        shrunk["filtered_tests"] = serde_json::json!(3);
+        shrunk["test_results"]["population_sha256"] = serde_json::json!(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&shrunk_selected).unwrap())
+        ));
+        bind_schema9_artifact(&mut shrunk, &bytes, 3);
+        assert_schema9_artifact_refused(
+            shrunk,
+            &constructed_plan_steps,
+            true,
+            &bytes,
+            "differs from constructed plan",
+        );
+    }
+
+    #[test]
+    fn schema9_artifact_refuses_malformed_noncanonical_digest_and_total_mutations() {
+        let (_, constructed_plan_steps, valid_bytes) = schema9_row_with_artifact();
+
+        let mut value = schema9_row();
+        bind_schema9_artifact(&mut value, &valid_bytes, 4);
+        assert_schema9_artifact_refused(
+            value.clone(),
+            &constructed_plan_steps,
+            true,
+            &valid_bytes[..valid_bytes.len() - 1],
+            "final newline",
+        );
+        assert_schema9_artifact_refused(
+            value.clone(),
+            &constructed_plan_steps,
+            true,
+            b"{\n",
+            "malformed",
+        );
+
+        let mut noncanonical = valid_bytes.clone();
+        noncanonical.insert(1, b' ');
+        assert_schema9_artifact_refused(
+            value.clone(),
+            &constructed_plan_steps,
+            true,
+            &noncanonical,
+            "not canonical",
+        );
+
+        value["test_results"]["artifact"]["sha256"] = serde_json::json!("c".repeat(64));
+        assert_schema9_artifact_refused(
+            value,
+            &constructed_plan_steps,
+            true,
+            &valid_bytes,
+            "sha256 mismatch",
+        );
+
+        let mut rows = schema9_artifact_rows();
+        rows[0].result = TestResultVerdict::Fail;
+        let bytes = schema9_artifact_bytes(&rows);
+        let mut totals = schema9_row();
+        bind_schema9_artifact(&mut totals, &bytes, 4);
+        assert_schema9_artifact_refused(
+            totals,
+            &constructed_plan_steps,
+            true,
+            &bytes,
+            "totals differ for producer test.alpha",
+        );
+
+        let mut wrong_path = schema9_row();
+        wrong_path["test_results"]["artifact"]["path"] =
+            serde_json::json!("ignored/validate/artifacts/run-9/other.jsonl");
+        bind_schema9_artifact(&mut wrong_path, &valid_bytes, 4);
+        assert_schema9_artifact_refused(
+            wrong_path,
+            &constructed_plan_steps,
+            true,
+            &valid_bytes,
+            "artifact binding is malformed",
         );
     }
 
