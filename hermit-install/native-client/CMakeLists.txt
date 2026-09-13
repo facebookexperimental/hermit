@@ -29,6 +29,17 @@ use_DynamoRIO_extension(reverie_dbt_client drx)
 use_DynamoRIO_extension(reverie_dbt_client drwrap)
 target_link_libraries(reverie_dbt_client detcore_dbt_link_stub)
 
+# DynamoRIO's private x86 loader implements traditional GNU TLS, but not
+# R_X86_64_TLSDESC. Newer GNU compilers can otherwise emit the unsupported ABI
+# for the native client's protected callback-depth variable.
+if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+  target_compile_options(reverie_dbt_client PRIVATE -mtls-dialect=gnu)
+endif()
+
+# The private loader needs these paths while loading transitive dependencies.
+# DT_RUNPATH may not be visited before an earlier dependency imports libc.
+target_link_options(reverie_dbt_client PRIVATE "LINKER:--disable-new-dtags")
+
 set(hermit_rpath
     "$ORIGIN;$ORIGIN/dynamorio/lib64/release;$ORIGIN/dynamorio/ext/lib64/release")
 set_target_properties(
