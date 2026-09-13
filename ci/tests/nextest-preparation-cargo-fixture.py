@@ -57,6 +57,10 @@ packages["hermetic_infra_hermit_tests"] = {
     name: {"name": name, "kind": ["bin"]} for name in guest_names
 }
 
+packages["hermit-manifest-plan"] = {
+    "nextest-cpu-wrapper": {"name": "nextest-cpu-wrapper", "kind": ["bin"]}
+}
+
 if args[:1] == ["metadata"]:
     print(json.dumps({
         "workspace_root": str(root), "target_directory": str(target),
@@ -86,12 +90,25 @@ elif args[:2] == ["nextest", "list"] and "--binaries-metadata" not in args:
             binaries[duplicate["binary-id"]] = duplicate
     print(json.dumps({"rust-build-meta": {"target-directory": str(target), "non-test-binaries": {}},
                       "rust-binaries": binaries}))
-elif args[:2] == ["nextest", "list"] and "--binaries-metadata" in args:
+elif args[:2] in (["nextest", "list"], ["nextest", "run"]) and "--binaries-metadata" in args:
     # Metadata-only enumeration must not retain any Cargo build selector.
     assert not any(arg in args for arg in ["-p", "--features", "--test", "--lib", "--bins", "--workspace"]), args
+    assert "--cargo-metadata" in args, args
     metadata = json.loads(Path(args[args.index("--binaries-metadata") + 1]).read_text())
     assert all(Path(binary["binary-path"]).is_file() for binary in metadata["rust-binaries"].values())
     print(json.dumps({"rust-suites": {}}))
+elif args[:1] == ["build"] and "hermit-manifest-plan" in args:
+    assert args == ["build", "--locked", "--message-format=json-render-diagnostics", "-p", "hermit-manifest-plan", "--bin", "nextest-cpu-wrapper"], args
+    mode = os.environ.get("CARGO_ARTIFACT_MODE", "current")
+    path = target / "debug" / "nextest-cpu-wrapper"
+    if mode != "wrapper-missing":
+        write_binary(path)
+    event = {"reason": "compiler-artifact", "package_id": package_id("hermit-manifest-plan"),
+             "target": {"name": "nextest-cpu-wrapper", "kind": ["bin"]},
+             "profile": {"test": mode == "wrapper-wrong"}, "executable": str(path)}
+    print(json.dumps(event))
+    if mode == "wrapper-ambiguous":
+        print(json.dumps(event))
 elif args[:1] == ["build"] and "hermetic_infra_hermit_tests" in args:
     for name in guest_names:
         path = target / "debug" / name

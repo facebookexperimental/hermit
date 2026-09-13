@@ -17,8 +17,9 @@ success-output = "never"
 # the completing data-handling/dd-partial-transfers observation:
 # ceil(4 * 14.019s) = 57s. This remains alongside the manifest runner's CPU
 # budget because a wedged process can consume no CPU. Machine-specific wall
-# scaling from HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER is applied to this canonical
-# file by ci/run-nextest-counted.sh.
+# scaling from HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER and the per-execution CPU
+# measurement wrapper are added to a temporary copy of this canonical file by
+# ci/run-nextest-counted.sh.
 slow-timeout = { period = "57s", terminate-after = 1, grace-period = "2s" }
 global-timeout = "60m"
 

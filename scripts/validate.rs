@@ -20801,12 +20801,48 @@ mod fused_privileged_build_tests {
         for selection in expected.values() {
             assert_eq!(builds.iter().filter(|args| args.ends_with(selection)).count(), 1, "missing or duplicated selection {selection:?}");
         }
-        assert_eq!(calls.iter().filter(|args| args.first().map(String::as_str) == Some("build")).count(), 1, "the 21 Cargo guests are built together once");
+        assert_eq!(calls.iter().filter(|args| args.first().map(String::as_str) == Some("build") && args.iter().any(|a| a == "hermetic_infra_hermit_tests")).count(), 1, "the 21 Cargo guests are built together once");
+        assert_eq!(calls.iter().filter(|args| args.first().map(String::as_str) == Some("build") && args.iter().any(|a| a == "nextest-cpu-wrapper")).count(), 1, "the normal measurement wrapper is built once, outside every test consumer");
+        assert_eq!(calls.iter().filter(|args| args.first().map(String::as_str) == Some("build")).count(), 2, "no other builds were introduced");
         let read_only = run_build(&consumer.cmd, root.path(), &bin, &log, "current");
         assert!(read_only.status.success(), "{}", String::from_utf8_lossy(&read_only.stderr));
         assert_eq!(std::fs::read_to_string(&log).unwrap(), before, "the privileged consumer must not invoke Cargo after preparation");
         let record_path = root.path().join("target/ci/nextest-binaries/current.json");
         let published_record = std::fs::read(&record_path).unwrap();
+        let wrapper_query = run_build("./ci/nextest-binaries.rs cpu-wrapper", root.path(), &bin, &log, "current");
+        assert!(wrapper_query.status.success(), "{}", String::from_utf8_lossy(&wrapper_query.stderr));
+        let wrapper = PathBuf::from(String::from_utf8(wrapper_query.stdout).unwrap().trim());
+        assert_eq!(wrapper, root.path().join("custom-cargo-target/debug/nextest-cpu-wrapper"));
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), before, "a wrapper lookup must not build");
+        let wrapper_bytes = std::fs::read(&wrapper).unwrap();
+        for mode in ["missing", "stale"] {
+            if mode == "missing" { std::fs::remove_file(&wrapper).unwrap(); }
+            else { std::fs::write(&wrapper, "#!/bin/sh\nexit 23\n").unwrap(); }
+            assert!(!run_build("./ci/nextest-binaries.rs cpu-wrapper", root.path(), &bin, &log, "current").status.success(), "accepted {mode} wrapper");
+            assert!(!run_build(&consumer.cmd, root.path(), &bin, &log, "current").status.success(), "accepted {mode} wrapper through the barrier");
+            assert_eq!(std::fs::read_to_string(&log).unwrap(), before, "a {mode} wrapper cannot cause a fallback build");
+            write_executable(&wrapper, std::str::from_utf8(&wrapper_bytes).unwrap());
+            // write_executable uses 0700; preserve the producer's original mode.
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let no_build = run_build("HERMIT_PREPARED_NEXTEST_REQUIRED=1 ./ci/nextest-binaries.rs build-cpu-wrapper", root.path(), &bin, &log, "current");
+        assert!(!no_build.status.success(), "an official consumer cannot invoke standalone preparation");
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), before);
+        let selection = expected.values().next().unwrap();
+        let declaration = validate_plan::shell_quote(&serde_json::to_string(selection).unwrap());
+        let selectors = selection.iter().map(|arg| validate_plan::shell_quote(arg)).collect::<Vec<_>>().join(" ");
+        for operation in ["list", "run"] {
+            let cmd = format!("HERMIT_PREPARED_NEXTEST_REQUIRED=1 NEXTEST_PREPARED_BUILD_SELECTION={declaration} HERMIT_NEXTEST_CPU_WRAPPER_BIN={} ./ci/nextest-binaries.rs {operation} {selectors}", validate_plan::shell_quote(&wrapper.to_string_lossy()));
+            let result = run_build(&cmd, root.path(), &bin, &log, "current");
+            assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        }
+        let after_readers = std::fs::read_to_string(&log).unwrap();
+        let added = after_readers.strip_prefix(&before).unwrap().lines().map(|line| serde_json::from_str::<Vec<String>>(line).unwrap()).collect::<Vec<_>>();
+        assert_eq!(added.len(), 2);
+        for (args, operation) in added.iter().zip(["list", "run"]) {
+            assert_eq!(&args[..2], ["nextest", operation]);
+            assert!(args.iter().any(|a| a == "--cargo-metadata") && args.iter().any(|a| a == "--binaries-metadata"));
+        }
         let declined = run_build(preparation, root.path(), &bin, &log, "declined");
         assert_eq!(declined.status.code(), Some(75), "a declined Cargo preparation must remain no-result");
         assert_eq!(std::fs::read(&record_path).unwrap(), published_record, "a declined replacement must preserve the prior complete record");
@@ -20851,7 +20887,7 @@ mod fused_privileged_build_tests {
         assert!(!wrong_declaration.status.success(), "a different build selection cannot satisfy the direct target");
         assert_eq!(std::fs::read_to_string(&privileged_log).unwrap(), before, "direct consumers and refusals must not invoke Cargo");
 
-        for mode in ["missing", "wrong", "ambiguous"] {
+        for mode in ["missing", "wrong", "ambiguous", "wrapper-missing", "wrapper-wrong", "wrapper-ambiguous"] {
             let (root, bin, log) = cold_fixture(repository, &helper);
             let result = run_build(preparation, root.path(), &bin, &log, mode);
             assert!(!result.status.success(), "the actual producer accepted Cargo artifact mode {mode}");

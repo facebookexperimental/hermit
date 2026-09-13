@@ -44,6 +44,22 @@ fn run() -> Result<i32, String> {
             println!("{}", hermit_manifest_plan::nextest_binaries::executable(&root, &package, &name)?.display());
             Ok(0)
         }
+        Some(operation @ ("cpu-wrapper" | "build-cpu-wrapper")) => {
+            if args.next().is_some() { return Err("unexpected CPU wrapper query argument".into()); }
+            let path = if operation == "cpu-wrapper" {
+                hermit_manifest_plan::nextest_binaries::cpu_wrapper(&root)?
+            } else {
+                match hermit_manifest_plan::nextest_binaries::build_cpu_wrapper(&root) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        eprintln!("prepared-nextest: {error}");
+                        return Ok(i32::from(error.status));
+                    }
+                }
+            };
+            println!("{}", path.display());
+            Ok(0)
+        }
         Some(operation @ ("run" | "list")) => {
             let mut remaining = args.collect::<Vec<_>>();
             let config = if remaining.first().map(String::as_str) == Some("--config-file") {

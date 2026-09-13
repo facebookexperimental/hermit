@@ -26,8 +26,11 @@ use sha2::Sha256;
 
 pub const SELECTION_ENV: &str = "NEXTEST_PREPARED_BUILD_SELECTION";
 pub const REQUIRED_ENV: &str = "HERMIT_PREPARED_NEXTEST_REQUIRED";
-const RECORD_SCHEMA: u32 = 1;
+const RECORD_SCHEMA: u32 = 2;
 pub const GUESTS_ENV: &str = "HERMIT_PREPARED_CARGO_GUESTS";
+pub const CPU_WRAPPER_ENV: &str = "HERMIT_NEXTEST_CPU_WRAPPER_BIN";
+const CPU_WRAPPER_PACKAGE: &str = "hermit-manifest-plan";
+const CPU_WRAPPER_TARGET: &str = "nextest-cpu-wrapper";
 
 #[path = "../../cargo-guest-binaries.rs"]
 mod cargo_guests;
@@ -337,6 +340,126 @@ struct PreparedRecord {
     cargo_metadata: FileIdentity,
     selections: BTreeMap<String, SelectionRecord>,
     guests: Vec<FileIdentity>,
+    cpu_wrapper: CpuWrapperRecord,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct CpuWrapperRecord {
+    metadata: FileIdentity,
+    executable: FileIdentity,
+}
+
+fn cpu_wrapper_artifact(
+    events: &str,
+    cargo: &Value,
+    target: &Path,
+) -> Result<FileIdentity, String> {
+    let packages = cargo["packages"]
+        .as_array()
+        .ok_or("missing Cargo packages")?;
+    let packages = packages
+        .iter()
+        .filter(|p| p["name"] == CPU_WRAPPER_PACKAGE)
+        .collect::<Vec<_>>();
+    if packages.len() != 1 {
+        return Err("CPU wrapper package is missing or ambiguous".into());
+    }
+    let package = packages[0];
+    let package_id = string(package, "id")?;
+    let targets = package["targets"]
+        .as_array()
+        .ok_or("missing CPU wrapper targets")?;
+    if targets
+        .iter()
+        .filter(|t| t["name"] == CPU_WRAPPER_TARGET && t["kind"] == serde_json::json!(["bin"]))
+        .count()
+        != 1
+    {
+        return Err("CPU wrapper Cargo target is missing or ambiguous".into());
+    }
+    let mut found = None;
+    for line in events.lines() {
+        let event: Value = serde_json::from_str(line)
+            .map_err(|e| format!("invalid CPU wrapper Cargo event: {e}"))?;
+        if event["reason"] != "compiler-artifact" || event["target"]["name"] != CPU_WRAPPER_TARGET {
+            continue;
+        }
+        if event["package_id"] != package_id
+            || event["target"]["kind"] != serde_json::json!(["bin"])
+            || event["profile"]["test"] != false
+        {
+            return Err("CPU wrapper artifact has the wrong package, target, or profile".into());
+        }
+        let path = target_path(target, string(&event, "executable")?)?;
+        if found.replace(file_identity(&path, true)?).is_some() {
+            return Err("Cargo emitted ambiguous CPU wrapper artifacts".into());
+        }
+    }
+    found.ok_or_else(|| "Cargo did not report the normal CPU wrapper executable".into())
+}
+
+fn verify_cpu_wrapper(record: &PreparedRecord, cargo: &Value) -> Result<(), String> {
+    check_identity(&record.cpu_wrapper.metadata, false)?;
+    let events =
+        fs::read_to_string(&record.cpu_wrapper.metadata.path).map_err(|e| e.to_string())?;
+    if cpu_wrapper_artifact(&events, cargo, &record.target)? != record.cpu_wrapper.executable {
+        return Err("prepared CPU wrapper executable changed".into());
+    }
+    if let Some(configured) = std::env::var_os(CPU_WRAPPER_ENV) {
+        if Path::new(&configured) != record.cpu_wrapper.executable.path {
+            return Err("configured CPU wrapper differs from the prepared executable".into());
+        }
+    }
+    Ok(())
+}
+
+fn prepare_cpu_wrapper(root: &Path, destination: &Path) -> Result<(), PreparationError> {
+    cargo_output(
+        root,
+        &[
+            "build",
+            "--locked",
+            "--message-format=json-render-diagnostics",
+            "-p",
+            CPU_WRAPPER_PACKAGE,
+            "--bin",
+            CPU_WRAPPER_TARGET,
+        ]
+        .map(String::from),
+        destination,
+    )
+}
+
+/// Explicit standalone preparation. Official test consumers never call this.
+pub fn build_cpu_wrapper(root: &Path) -> Result<PathBuf, PreparationError> {
+    if std::env::var(REQUIRED_ENV).as_deref() == Ok("1") {
+        return Err("an official consumer cannot build a CPU wrapper".into());
+    }
+    let root = root.canonicalize().map_err(|e| e.to_string())?;
+    let artifacts = LockedArtifacts::open(&root, true)?;
+    let cargo_path = artifacts.root.join("standalone-cargo.json");
+    cargo_output(
+        &root,
+        &["metadata", "--locked", "--format-version", "1"].map(String::from),
+        &cargo_path,
+    )?;
+    let cargo = read_json(&cargo_path)?;
+    let events = artifacts.root.join("standalone-cpu-wrapper.jsonl");
+    prepare_cpu_wrapper(&root, &events)?;
+    Ok(cpu_wrapper_artifact(
+        &fs::read_to_string(events).map_err(|e| e.to_string())?,
+        &cargo,
+        Path::new(string(&cargo, "target_directory")?),
+    )?
+    .path)
+}
+
+pub fn cpu_wrapper(root: &Path) -> Result<PathBuf, String> {
+    let root = root.canonicalize().map_err(|e| e.to_string())?;
+    let artifacts = LockedArtifacts::open(&root, false)?;
+    let record = artifacts.current()?;
+    verify_record(&root, &record)?;
+    Ok(record.cpu_wrapper.executable.path)
 }
 
 fn build_environment() -> BTreeMap<String, String> {
@@ -726,6 +849,7 @@ fn verify_record(root: &Path, record: &PreparedRecord) -> Result<Value, String> 
     {
         return Err("prepared executables are stale: compiler, Cargo configuration, or build environment changed".into());
     }
+    verify_cpu_wrapper(record, &cargo)?;
     Ok(cargo)
 }
 
@@ -905,6 +1029,8 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
             &guest_path,
         )?;
     }
+    let cpu_wrapper_path = generation.join("cpu-wrapper.jsonl");
+    prepare_cpu_wrapper(&root, &cpu_wrapper_path)?;
     // Hash only after every Cargo selection has completed. Shared paths may be
     // rebuilt by another selection; every published record names the final files.
     let mut recorded_selections = BTreeMap::new();
@@ -948,7 +1074,7 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
     let record = PreparedRecord {
         schema: RECORD_SCHEMA,
         repository: root.clone(),
-        target,
+        target: target.clone(),
         sources: before_sources,
         rustc: before_rustc,
         cargo_config: before_config,
@@ -956,6 +1082,14 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
         cargo_metadata: file_identity(&cargo_path, false)?,
         selections: recorded_selections,
         guests,
+        cpu_wrapper: CpuWrapperRecord {
+            executable: cpu_wrapper_artifact(
+                &fs::read_to_string(&cpu_wrapper_path).map_err(|e| e.to_string())?,
+                &cargo,
+                &target,
+            )?,
+            metadata: file_identity(&cpu_wrapper_path, false)?,
+        },
     };
     let checked_cargo = verify_record(&root, &record)?;
     for selection in record.selections.values() {
@@ -1155,6 +1289,7 @@ mod tests {
             };
             let cargo = self.root.join("cargo.json");
             fs::write(&cargo, serde_json::to_vec(&self.cargo).unwrap()).unwrap();
+            let cpu_wrapper = self.cpu_wrapper();
             (
                 PreparedRecord {
                     schema: RECORD_SCHEMA,
@@ -1167,9 +1302,43 @@ mod tests {
                     cargo_metadata: file_identity(&cargo, false).unwrap(),
                     selections: BTreeMap::from([(selection_key(&args), selected)]),
                     guests: vec![],
+                    cpu_wrapper,
                 },
                 args,
             )
+        }
+
+        fn cpu_wrapper(&self) -> CpuWrapperRecord {
+            let executable = self.target.join(CPU_WRAPPER_TARGET);
+            fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+            let metadata = self.root.join("cpu-wrapper.jsonl");
+            fs::write(
+                &metadata,
+                serde_json::to_vec(&serde_json::json!({
+                    "reason": "compiler-artifact", "package_id": "wrapper-package",
+                    "target": {"name": CPU_WRAPPER_TARGET, "kind": ["bin"]},
+                    "profile": {"test": false}, "executable": executable,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            CpuWrapperRecord {
+                metadata: file_identity(&metadata, false).unwrap(),
+                executable: file_identity(&executable, true).unwrap(),
+            }
+        }
+
+        fn wrapper_cargo(&self) -> Value {
+            let mut cargo = self.cargo.clone();
+            cargo["packages"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "name": CPU_WRAPPER_PACKAGE, "id": "wrapper-package",
+                    "targets": [{"name": CPU_WRAPPER_TARGET, "kind": ["bin"]}],
+                }));
+            cargo
         }
     }
     impl Drop for Fixture {
@@ -1230,6 +1399,84 @@ mod tests {
         );
         assert!(split_arguments(&argv(&["--cargo-profile", "ci"])).is_err());
         assert!(split_arguments(&argv(&["--release"])).is_err());
+    }
+
+    #[test]
+    fn prepared_cpu_wrapper_requires_exact_normal_package_target_and_unique_artifact() {
+        let f = Fixture::new();
+        let wrapper = f.cpu_wrapper();
+        let cargo = f.wrapper_cargo();
+        let events = fs::read_to_string(&wrapper.metadata.path).unwrap();
+        assert_eq!(
+            cpu_wrapper_artifact(&events, &cargo, &f.target).unwrap(),
+            wrapper.executable
+        );
+        for (field, value) in [
+            ("package_id", serde_json::json!("another-package")),
+            (
+                "target",
+                serde_json::json!({"name": CPU_WRAPPER_TARGET, "kind": ["test"]}),
+            ),
+            ("profile", serde_json::json!({"test": true})),
+            ("executable", Value::Null),
+        ] {
+            let mut event: Value = serde_json::from_str(&events).unwrap();
+            event[field] = value;
+            assert!(
+                cpu_wrapper_artifact(&event.to_string(), &cargo, &f.target).is_err(),
+                "accepted {field}"
+            );
+        }
+        for bad in [
+            String::new(),
+            "not JSON".into(),
+            format!("{events}\n{events}\n"),
+        ] {
+            assert!(cpu_wrapper_artifact(&bad, &cargo, &f.target).is_err());
+        }
+        let mut ambiguous = cargo.clone();
+        ambiguous["packages"]
+            .as_array_mut()
+            .unwrap()
+            .push(cargo["packages"][1].clone());
+        assert!(cpu_wrapper_artifact(&events, &ambiguous, &f.target).is_err());
+        assert!(cpu_wrapper_artifact(&events, &cargo, &f.root.join("other-target")).is_err());
+    }
+
+    #[test]
+    fn prepared_cpu_wrapper_refuses_missing_stale_and_nonexecutable_bytes_without_rebuilding() {
+        for mode in ["metadata", "binary", "changed", "mode"] {
+            let f = Fixture::new();
+            let (record, _) = f.selection();
+            let cargo = f.wrapper_cargo();
+            assert!(verify_cpu_wrapper(&record, &cargo).is_ok());
+            match mode {
+                "metadata" => fs::remove_file(&record.cpu_wrapper.metadata.path).unwrap(),
+                "binary" => fs::remove_file(&record.cpu_wrapper.executable.path).unwrap(),
+                "changed" => {
+                    fs::write(&record.cpu_wrapper.executable.path, "#!/bin/sh\nexit 23\n").unwrap()
+                }
+                "mode" => fs::set_permissions(
+                    &record.cpu_wrapper.executable.path,
+                    fs::Permissions::from_mode(0o644),
+                )
+                .unwrap(),
+                _ => unreachable!(),
+            }
+            assert!(
+                verify_cpu_wrapper(&record, &cargo).is_err(),
+                "accepted {mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_cpu_wrapper_cannot_be_omitted_from_a_record() {
+        let f = Fixture::new();
+        let (record, _) = f.selection();
+        let mut value = serde_json::to_value(record).unwrap();
+        value.as_object_mut().unwrap().remove("cpu_wrapper");
+        assert!(serde_json::from_value::<PreparedRecord>(value).is_err());
     }
 
     #[test]

@@ -12,6 +12,8 @@ use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
+use toml_edit::value;
+use toml_edit::Array;
 use toml_edit::ArrayOfTables;
 use toml_edit::DocumentMut;
 use toml_edit::InlineTable;
@@ -25,6 +27,9 @@ mod rust_script_prelude;
 #[allow(dead_code)]
 #[path = "manifest-plan/src/timeouts.rs"]
 mod timeouts;
+
+const CPU_WRAPPER_BIN_ENV: &str = "HERMIT_NEXTEST_CPU_WRAPPER_BIN";
+const CPU_WRAPPER_NAME: &str = "hermit-per-test-cpu";
 
 fn usage() -> &'static str {
     "usage: nextest-timeout-config.rs SOURCE MULTIPLIER OUTPUT"
@@ -113,7 +118,119 @@ fn visit_item(item: &mut Item, multiplier: f64, scaled: &mut usize) -> Result<()
     }
 }
 
-fn scaled_config(source: &str, multiplier: f64) -> Result<String, String> {
+fn run_wrapper_count(document: &DocumentMut, profile: &str) -> Result<usize, String> {
+    let Some(profile_table) = document
+        .get("profile")
+        .and_then(Item::as_table)
+        .and_then(|profiles| profiles.get(profile))
+        .and_then(Item::as_table)
+    else {
+        return Ok(0);
+    };
+    let Some(scripts) = profile_table.get("scripts") else {
+        return Ok(0);
+    };
+    let scripts = scripts
+        .as_array_of_tables()
+        .ok_or_else(|| format!("profile.{profile}.scripts must be an array of tables"))?;
+    Ok(scripts
+        .iter()
+        .filter(|script| script.contains_key("run-wrapper"))
+        .count())
+}
+
+fn add_cpu_wrapper(document: &mut DocumentMut, wrapper_bin: &Path) -> Result<(), String> {
+    if !wrapper_bin.is_absolute() {
+        return Err("nextest CPU wrapper executable must be absolute".into());
+    }
+    for profile in ["default", "ci"] {
+        let count = run_wrapper_count(document, profile)?;
+        if count != 0 {
+            return Err(format!(
+                "profile.{profile} already defines {count} run-wrapper rule(s); refusing to make per-test CPU measurement partial or ambiguous"
+            ));
+        }
+    }
+
+    let experimental = document
+        .entry("experimental")
+        .or_insert_with(|| Item::Value(Value::Array(Array::new())))
+        .as_array_mut()
+        .ok_or_else(|| "experimental must be an array".to_string())?;
+    let wrapper_feature_count = experimental
+        .iter()
+        .filter(|value| value.as_str() == Some("wrapper-scripts"))
+        .count();
+    if wrapper_feature_count > 1 {
+        return Err("experimental contains wrapper-scripts more than once".into());
+    }
+    if wrapper_feature_count == 0 {
+        experimental.push("wrapper-scripts");
+    }
+
+    if document
+        .get("scripts")
+        .and_then(Item::as_table)
+        .and_then(|scripts| scripts.get("wrapper"))
+        .and_then(Item::as_table)
+        .is_some_and(|wrappers| wrappers.contains_key(CPU_WRAPPER_NAME))
+    {
+        return Err(format!(
+            "scripts.wrapper.{CPU_WRAPPER_NAME} is already defined"
+        ));
+    }
+    let wrapper_path = wrapper_bin
+        .to_str()
+        .ok_or_else(|| "nextest CPU wrapper executable path is not UTF-8".to_string())?;
+    let mut command = InlineTable::new();
+    // An argv array preserves spaces and shell punctuation in a target path.
+    let mut argv = Array::new();
+    argv.push(wrapper_path);
+    command.insert("command-line", Value::Array(argv));
+    command.insert("relative-to", Value::from("none"));
+    let scripts = document
+        .entry("scripts")
+        .or_insert_with(|| Item::Table(Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| "scripts must be a table".to_string())?;
+    let wrappers = scripts
+        .entry("wrapper")
+        .or_insert_with(|| Item::Table(Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| "scripts.wrapper must be a table".to_string())?;
+    let mut wrapper = Table::new();
+    wrapper["command"] = value(command);
+    wrapper["target-runner"] = value("within-wrapper");
+    wrappers.insert(CPU_WRAPPER_NAME, Item::Table(wrapper));
+
+    let scripts = &mut document["profile"]["default"]["scripts"];
+    if scripts.is_none() {
+        *scripts = Item::ArrayOfTables(ArrayOfTables::new());
+    }
+    let scripts = scripts
+        .as_array_of_tables_mut()
+        .ok_or_else(|| "profile.default.scripts must be an array of tables".to_string())?;
+    let mut binding = Table::new();
+    binding["filter"] = value("all()");
+    binding["run-wrapper"] = value(CPU_WRAPPER_NAME);
+    scripts.push(binding);
+
+    if run_wrapper_count(document, "default")? != 1
+        || run_wrapper_count(document, "ci")? != 0
+    {
+        return Err(
+            "generated nextest config does not define exactly one inherited run wrapper for default and ci"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn scaled_config(
+    source: &str,
+    multiplier: f64,
+    cpu_wrapper: Option<&Path>,
+) -> Result<String, String> {
     timeouts::validate_timeout_multiplier(multiplier, "wall multiplier")?;
     let mut document = source
         .parse::<DocumentMut>()
@@ -123,7 +240,14 @@ fn scaled_config(source: &str, multiplier: f64) -> Result<String, String> {
     if scaled == 0 {
         return Err("nextest config contains no slow-timeout.period values".into());
     }
+    if let Some(wrapper_bin) = cpu_wrapper {
+        add_cpu_wrapper(&mut document, wrapper_bin)?;
+    }
     Ok(document.to_string())
+}
+
+fn cpu_wrapper_from_env() -> Option<std::path::PathBuf> {
+    env::var_os(CPU_WRAPPER_BIN_ENV).map(Into::into)
 }
 
 fn run() -> Result<(), String> {
@@ -143,7 +267,12 @@ fn run() -> Result<(), String> {
     }
     let source_text = fs::read_to_string(Path::new(&source))
         .map_err(|error| format!("cannot read {}: {error}", Path::new(&source).display()))?;
-    let rendered = scaled_config(&source_text, multiplier)?;
+    let cpu_wrapper = cpu_wrapper_from_env();
+    let rendered = scaled_config(
+        &source_text,
+        multiplier,
+        cpu_wrapper.as_deref(),
+    )?;
     fs::write(Path::new(&output), rendered)
         .map_err(|error| format!("cannot write {}: {error}", Path::new(&output).display()))
 }
@@ -176,7 +305,7 @@ mod tests {
             "filter = \"test(example)\"\n",
             "slow-timeout = { period = \"3s\", terminate-after = 1 }\n",
         );
-        let rendered = scaled_config(source, 1.25).unwrap();
+        let rendered = scaled_config(source, 1.25, None).unwrap();
         assert!(rendered.contains("# retained comment"));
         assert!(rendered.contains("unrelated = \"kept\""));
         assert!(rendered.contains("filter = \"test(example)\""));
@@ -192,18 +321,22 @@ mod tests {
             let source = format!(
                 "[profile.default]\nslow-timeout = {{ period = {period:?}, terminate-after = 1 }}\n"
             );
-            assert!(scaled_config(&source, 1.0).is_err(), "accepted {period}");
+            assert!(
+                scaled_config(&source, 1.0, None).is_err(),
+                "accepted {period}"
+            );
         }
         assert!(
             scaled_config(
                 "[profile.default]\nslow-timeout = { terminate-after = 1 }\n",
-                1.0
+                1.0,
+                None,
             )
             .unwrap_err()
             .contains("missing period")
         );
         assert!(
-            scaled_config("[profile.default]\nfail-fast = false\n", 1.0)
+            scaled_config("[profile.default]\nfail-fast = false\n", 1.0, None)
                 .unwrap_err()
                 .contains("no slow-timeout.period")
         );
@@ -214,7 +347,60 @@ mod tests {
         let source =
             "[profile.default]\nslow-timeout = { period = \"57s\", terminate-after = 1 }\n";
         for multiplier in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-            assert!(scaled_config(source, multiplier).is_err());
+            assert!(scaled_config(source, multiplier, None).is_err());
         }
+    }
+
+    #[test]
+    fn adds_one_default_wrapper_inherited_by_ci_without_changing_wall_scaling() {
+        let source = concat!(
+            "nextest-version = \"0.9.100\"\n",
+            "[profile.default]\n",
+            "slow-timeout = { period = \"57s\", terminate-after = 1, grace-period = \"2s\" }\n",
+            "[profile.ci]\n",
+            "status-level = \"slow\"\n",
+        );
+        let rendered = scaled_config(
+            source,
+            1.5,
+            Some(Path::new("/tmp/wrapper")),
+        )
+        .unwrap();
+        let document = rendered.parse::<DocumentMut>().unwrap();
+        assert_eq!(run_wrapper_count(&document, "default").unwrap(), 1);
+        assert_eq!(run_wrapper_count(&document, "ci").unwrap(), 0);
+        assert_eq!(rendered.matches("run-wrapper").count(), 1);
+        assert!(rendered.contains("period = \"86s\""));
+        assert!(rendered.contains("wrapper-scripts"));
+        assert!(rendered.contains("target-runner = \"within-wrapper\""));
+    }
+
+    #[test]
+    fn refuses_a_second_default_or_ci_run_wrapper() {
+        for profile in ["default", "ci"] {
+            let source = format!(
+                "[profile.default]\nslow-timeout = {{ period = \"57s\" }}\n[[profile.{profile}.scripts]]\nfilter = \"all()\"\nrun-wrapper = \"other\"\n"
+            );
+            let error = scaled_config(
+                &source,
+                1.0,
+                Some(Path::new("/tmp/wrapper")),
+            )
+            .unwrap_err();
+            assert!(error.contains(&format!("profile.{profile} already defines")));
+        }
+    }
+
+    #[test]
+    fn wrapper_path_is_one_literal_argument() {
+        let path = "/tmp/a path/it's-$(literal)-wrapper";
+        let rendered = scaled_config(
+            "[profile.default]\nslow-timeout = { period = \"57s\" }\n",
+            1.0, Some(Path::new(path)),
+        ).unwrap();
+        let document = rendered.parse::<DocumentMut>().unwrap();
+        let argv = document["scripts"]["wrapper"][CPU_WRAPPER_NAME]["command"]["command-line"].as_array().unwrap();
+        assert_eq!(argv.len(), 1);
+        assert_eq!(argv.get(0).unwrap().as_str(), Some(path));
     }
 }

@@ -4,7 +4,9 @@
 //! ```cargo
 //! [dependencies]
 //! dagrun = { path = "../agent-utils/rs/dagrun" }
+//! serde = { version = "1", features = ["derive"] }
 //! serde_json = "1"
+//! sha2 = "0.10"
 //! ```
 
 use std::collections::BTreeMap;
@@ -15,13 +17,25 @@ use std::process::ExitCode;
 
 use dagrun::TestResult;
 use dagrun::TestResults;
+use nextest_cpu::{
+    read_attempt_records, read_binary_map, write_binary_map_atomic, write_report_atomic,
+    AttemptIdentity, AttemptRecord, BinaryMap, CpuReport,
+};
 use serde_json::Value;
 
 #[path = "../scripts/lib/rust_script_prelude.rs"]
 mod rust_script_prelude;
 
+#[path = "manifest-plan/src/nextest_cpu.rs"]
+// This shared module also contains the writer used by the compiled wrapper.
+// The event adapter intentionally uses only its reader and report writer.
+#[allow(dead_code)]
+mod nextest_cpu;
+
 fn usage() {
-    println!("usage: nextest-test-results.rs EVENTS_JSONL NEXTEST_STATUS OUTPUT_OR_DASH");
+    println!(
+        "usage: nextest-test-results.rs EVENTS_JSONL NEXTEST_STATUS OUTPUT_OR_DASH [ATTEMPT_RECORD_DIR BINARY_MAP CPU_REPORT_OR_DASH]\n       nextest-test-results.rs --write-binary-map NEXTEST_INVENTORY_JSON OUTPUT"
+    );
 }
 
 fn required_string<'a>(value: &'a Value, field: &str, line: usize) -> Result<&'a str, String> {
@@ -152,6 +166,15 @@ struct ParsedEvents {
     executed_tests: u64,
     filtered_tests: u64,
     results: Vec<TestResult>,
+    expected_attempts: Vec<ExpectedAttempt>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ExpectedAttempt {
+    suite: SuiteIdentity,
+    test: String,
+    attempt: u64,
+    passed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -204,6 +227,7 @@ fn suite_population(
 
 fn parse_event_text(text: &str) -> Result<ParsedEvents, String> {
     let mut results = BTreeMap::new();
+    let mut expected_attempts = Vec::new();
     // Test rows carry package/binary but not target kind. Keep every currently
     // open typed suite by that rendered key so interleaved distinct suites stay
     // attributable. Two open suites with the same key are ambiguous and must
@@ -311,6 +335,14 @@ fn parse_event_text(text: &str) -> Result<ParsedEvents, String> {
                     &suite.identity.kind,
                     suite.identity.stress_index,
                 );
+                for attempt in 1..=attempts {
+                    expected_attempts.push(ExpectedAttempt {
+                        suite: suite.identity.clone(),
+                        test: test.clone(),
+                        attempt,
+                        passed: event == "ok" && attempt == attempts,
+                    });
+                }
                 let result = TestResult::new(id.clone(), event == "ok", attempts)?;
                 if results.insert(id.clone(), result).is_some() {
                     return Err(format!(
@@ -367,7 +399,87 @@ fn parse_event_text(text: &str) -> Result<ParsedEvents, String> {
         executed_tests,
         filtered_tests,
         results,
+        expected_attempts,
     })
+}
+
+fn reconcile_cpu_attempts(
+    parsed: &ParsedEvents,
+    directory: &Path,
+    binary_map: &BinaryMap,
+) -> Result<CpuReport, String> {
+    let records = read_attempt_records(directory)?;
+    let mut expected = BTreeMap::<AttemptIdentity, bool>::new();
+    for attempt in &parsed.expected_attempts {
+        // The declared Nextest version has no stress-run wrapper identity.
+        // Historical count-only parsing still preserves stress_index; never
+        // alias such events onto an ordinary measured attempt.
+        if attempt.suite.stress_index.is_some() {
+            return Err("CPU reconciliation does not support stress_index identities".into());
+        }
+        let (package, binary) = binary_map.identity_for_suite(
+            &attempt.suite.package,
+            &attempt.suite.binary,
+            &attempt.suite.kind,
+        )?;
+        let identity = AttemptIdentity {
+            package: package.into(),
+            binary: binary.into(),
+            test: attempt.test.clone(),
+            attempt: attempt.attempt,
+        };
+        if expected.insert(identity.clone(), attempt.passed).is_some() {
+            return Err(format!(
+                "typed nextest events contain duplicate CPU attempt identity {identity:?}"
+            ));
+        }
+    }
+    let mut actual = BTreeMap::<AttemptIdentity, AttemptRecord>::new();
+    let mut run_id = None::<String>;
+    for record in records {
+        match &run_id {
+            Some(expected) if expected != &record.run_id => {
+                return Err(format!(
+                    "nextest CPU attempt records mix run ids {expected:?} and {:?}",
+                    record.run_id
+                ));
+            }
+            None => run_id = Some(record.run_id.clone()),
+            _ => {}
+        }
+        if actual.insert(record.identity.clone(), record).is_some() {
+            return Err("duplicate CPU attempt record for one binary/test/attempt identity".into());
+        }
+    }
+
+    let missing = expected
+        .keys()
+        .filter(|identity| !actual.contains_key(*identity))
+        .cloned()
+        .collect::<Vec<_>>();
+    let unexpected = actual
+        .keys()
+        .filter(|identity| !expected.contains_key(*identity))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() || !unexpected.is_empty() {
+        return Err(format!(
+            "nextest CPU attempt identities disagree with typed events; missing={missing:?}; unexpected={unexpected:?}"
+        ));
+    }
+    for (identity, passed) in &expected {
+        let recorded_success = actual
+            .get(identity)
+            .expect("identity sets were checked above")
+            .completion
+            .is_success();
+        if *passed != recorded_success {
+            return Err(format!(
+                "typed nextest event and attempt record disagree on whether {identity:?} exited successfully"
+            ));
+        }
+    }
+    Ok(CpuReport::new(run_id, actual.into_values().collect()))
 }
 
 fn parse_events(path: &Path) -> Result<ParsedEvents, String> {
@@ -392,6 +504,21 @@ fn run() -> Result<(), String> {
         usage();
         return Ok(());
     }
+    if first == "--write-binary-map" {
+        let inventory = args
+            .next()
+            .ok_or_else(|| "nextest-test-results missing NEXTEST_INVENTORY_JSON".to_string())?;
+        let output = args
+            .next()
+            .ok_or_else(|| "nextest-test-results missing binary-map OUTPUT".to_string())?;
+        if args.next().is_some() {
+            return Err("nextest-test-results binary-map mode received too many arguments".into());
+        }
+        let bytes = fs::read(&inventory)
+            .map_err(|error| format!("cannot read nextest inventory {inventory}: {error}"))?;
+        let map = BinaryMap::from_nextest_inventory(&bytes)?;
+        return write_binary_map_atomic(Path::new(&output), &map);
+    }
     let events = first;
     let status = parse_u64(
         args.next()
@@ -401,8 +528,18 @@ fn run() -> Result<(), String> {
     let output = args
         .next()
         .ok_or_else(|| "nextest-test-results missing OUTPUT".to_string())?;
+    let attempt_records = args.next();
+    let binary_map = args.next();
+    let cpu_report = args.next();
     if args.next().is_some() {
-        return Err("nextest-test-results received more than three arguments".into());
+        return Err("nextest-test-results received too many arguments".into());
+    }
+    if attempt_records.is_some() != binary_map.is_some()
+        || attempt_records.is_some() != cpu_report.is_some()
+    {
+        return Err(
+            "nextest-test-results requires ATTEMPT_RECORD_DIR, BINARY_MAP, and CPU_REPORT_OR_DASH together".into(),
+        );
     }
     let parsed = parse_events(Path::new(&events))?;
     let passed = u64::try_from(parsed.results.iter().filter(|result| result.passed).count())
@@ -416,6 +553,15 @@ fn run() -> Result<(), String> {
             "nextest-test-results: successful nextest status disagrees with {failed} failed typed result(s)"
         ));
     }
+    let cpu_report = match (attempt_records, binary_map, cpu_report) {
+        (Some(records), Some(binary_map), Some(output)) => {
+            let binary_map = read_binary_map(Path::new(&binary_map))?;
+            let report = reconcile_cpu_attempts(&parsed, Path::new(&records), &binary_map)?;
+            Some((report, output))
+        }
+        (None, None, None) => None,
+        _ => unreachable!("argument pairing was checked above"),
+    };
     let report =
         TestResults::current(parsed.executed_tests, parsed.filtered_tests, parsed.results)?;
     if let Some(expected) = match env::var("NEXTEST_EXPECTED_EXECUTED") {
@@ -434,6 +580,11 @@ fn run() -> Result<(), String> {
     }
     if output != "-" {
         report.write_current(Path::new(&output))?;
+    }
+    if let Some((cpu_report, output)) = cpu_report {
+        if output != "-" {
+            write_report_atomic(Path::new(&output), &cpu_report)?;
+        }
     }
     println!("running {} tests", report.executed_tests);
     if status == 0 {
@@ -464,6 +615,85 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nextest_cpu::{write_attempt_atomic, AttemptCompletion, BinaryMapEntry};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_SCRATCH: AtomicU64 = AtomicU64::new(0);
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            let sequence = NEXT_SCRATCH.fetch_add(1, Ordering::Relaxed);
+            let path = env::temp_dir().join(format!(
+                "hermit-nextest-test-results-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn sample_events() -> &'static str {
+        concat!(
+            r#"{"type":"suite","event":"started","test_count":2,"nextest":{"crate":"suite","test_binary":"suite","kind":"lib"}}"#,
+            "\n",
+            r#"{"type":"test","event":"ok","name":"suite::suite$passes"}"#,
+            "\n",
+            r#"{"type":"test","event":"ok","name":"suite::suite$recovers#2"}"#,
+            "\n",
+            r#"{"type":"suite","event":"ok","passed":2,"failed":0,"ignored":0,"filtered_out":0,"nextest":{"crate":"suite","test_binary":"suite","kind":"lib"}}"#,
+        )
+    }
+
+    fn attempt(test: &str, attempt: u64, completion: AttemptCompletion) -> AttemptRecord {
+        identified_attempt("suite", "suite", test, attempt, completion)
+    }
+
+    fn identified_attempt(
+        package: &str,
+        binary: &str,
+        test: &str,
+        attempt: u64,
+        completion: AttemptCompletion,
+    ) -> AttemptRecord {
+        AttemptRecord::new(
+            "sample-run".into(),
+            AttemptIdentity {
+                package: package.into(),
+                binary: binary.into(),
+                test: test.into(),
+                attempt,
+            },
+            12_345,
+            67,
+            completion,
+        )
+    }
+
+    fn write_record(directory: &Path, record: &AttemptRecord) {
+        write_attempt_atomic(directory, record).unwrap();
+    }
+
+    fn sample_binary_map() -> BinaryMap {
+        BinaryMap {
+            schema: nextest_cpu::BINARY_MAP_SCHEMA,
+            entries: vec![BinaryMapEntry {
+                executable: "/tmp/suite-binary".into(),
+                package: "suite".into(),
+                binary: "suite".into(),
+                binary_name: "suite".into(),
+                kind: "lib".into(),
+            }],
+        }
+    }
 
     #[test]
     fn raw_names_keep_the_suite_identity_and_retry_count() {
@@ -513,6 +743,53 @@ mod tests {
                 TestResult::new("hermit::hermit$shared_case".into(), true, 1).unwrap(),
             ]
         );
+        let map = BinaryMap {
+            schema: nextest_cpu::BINARY_MAP_SCHEMA,
+            entries: vec![
+                BinaryMapEntry {
+                    executable: "/tmp/hermit-lib".into(),
+                    package: "hermit".into(),
+                    binary: "hermit".into(),
+                    binary_name: "hermit".into(),
+                    kind: "lib".into(),
+                },
+                BinaryMapEntry {
+                    executable: "/tmp/hermit-bin".into(),
+                    package: "hermit".into(),
+                    binary: "hermit::bin/hermit".into(),
+                    binary_name: "hermit".into(),
+                    kind: "bin".into(),
+                },
+            ],
+        };
+        let scratch = Scratch::new();
+        for record in [
+            identified_attempt(
+                "hermit",
+                "hermit",
+                "shared_case",
+                1,
+                AttemptCompletion::Exit { code: 23 },
+            ),
+            identified_attempt(
+                "hermit",
+                "hermit",
+                "shared_case",
+                2,
+                AttemptCompletion::Exit { code: 0 },
+            ),
+            identified_attempt(
+                "hermit",
+                "hermit::bin/hermit",
+                "shared_case",
+                1,
+                AttemptCompletion::Exit { code: 0 },
+            ),
+        ] {
+            write_record(&scratch.0, &record);
+        }
+        let report = reconcile_cpu_attempts(&parsed, &scratch.0, &map).unwrap();
+        assert_eq!(report.attempts.len(), 3);
     }
 
     #[test]
@@ -745,5 +1022,174 @@ mod tests {
             .contains(
                 "typed suite records report 1 executed test(s), but typed terminal test records report 0"
             ));
+    }
+
+    #[test]
+    fn historical_stress_events_remain_distinct_and_refuse_unscoped_cpu_records() {
+        let events = sample_events().replace("\"kind\":\"lib\"", "\"kind\":\"lib\",\"stress_index\":1").replace("suite::suite$", "suite::suite@stress-1$");
+        let parsed = parse_event_text(&events).unwrap();
+        assert_eq!(parsed.executed_tests, 2);
+        assert!(parsed.results.iter().all(|row| row.id.contains("@stress-1")));
+        let scratch = Scratch::new();
+        let error = reconcile_cpu_attempts(&parsed, &scratch.0, &sample_binary_map()).unwrap_err();
+        assert!(error.contains("does not support stress_index identities"), "{error}");
+    }
+
+    #[test]
+    fn cpu_attempts_reconcile_with_typed_retries() {
+        let scratch = Scratch::new();
+        write_record(
+            &scratch.0,
+            &attempt("passes", 1, AttemptCompletion::Exit { code: 0 }),
+        );
+        write_record(
+            &scratch.0,
+            &attempt("recovers", 1, AttemptCompletion::Exit { code: 23 }),
+        );
+        write_record(
+            &scratch.0,
+            &attempt("recovers", 2, AttemptCompletion::Exit { code: 0 }),
+        );
+        let report = reconcile_cpu_attempts(
+            &parse_event_text(sample_events()).unwrap(),
+            &scratch.0,
+            &sample_binary_map(),
+        )
+        .unwrap();
+        assert_eq!(report.run_id.as_deref(), Some("sample-run"));
+        assert_eq!(report.attempts.len(), 3);
+    }
+
+    #[test]
+    fn cpu_reconciliation_refuses_missing_and_unexpected_attempts() {
+        let missing = Scratch::new();
+        write_record(
+            &missing.0,
+            &attempt("passes", 1, AttemptCompletion::Exit { code: 0 }),
+        );
+        let error = reconcile_cpu_attempts(
+            &parse_event_text(sample_events()).unwrap(),
+            &missing.0,
+            &sample_binary_map(),
+        )
+        .unwrap_err();
+        assert!(error.contains("missing="), "{error}");
+
+        let unexpected = Scratch::new();
+        for record in [
+            attempt("passes", 1, AttemptCompletion::Exit { code: 0 }),
+            attempt("recovers", 1, AttemptCompletion::Exit { code: 23 }),
+            attempt("recovers", 2, AttemptCompletion::Exit { code: 0 }),
+            attempt("other", 1, AttemptCompletion::Exit { code: 0 }),
+        ] {
+            write_record(&unexpected.0, &record);
+        }
+        let error = reconcile_cpu_attempts(
+            &parse_event_text(sample_events()).unwrap(),
+            &unexpected.0,
+            &sample_binary_map(),
+        )
+        .unwrap_err();
+        assert!(error.contains("unexpected="), "{error}");
+    }
+
+    #[test]
+    fn cpu_record_reader_refuses_duplicate_substituted_and_malformed_rows() {
+        let duplicate = Scratch::new();
+        let record = attempt("passes", 1, AttemptCompletion::Exit { code: 0 });
+        let original = write_attempt_atomic(&duplicate.0, &record).unwrap();
+        fs::copy(&original, duplicate.0.join("zzzz-duplicate.json")).unwrap();
+        let error = read_attempt_records(&duplicate.0).unwrap_err();
+        assert!(error.contains("duplicate attempt record"), "{error}");
+
+        let substituted = Scratch::new();
+        fs::write(
+            substituted.0.join("wrong-name.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        let error = read_attempt_records(&substituted.0).unwrap_err();
+        assert!(error.contains("is substituted"), "{error}");
+
+        let malformed = Scratch::new();
+        fs::write(malformed.0.join("malformed.json"), b"not JSON\n").unwrap();
+        let error = read_attempt_records(&malformed.0).unwrap_err();
+        assert!(error.contains("malformed attempt record"), "{error}");
+    }
+
+    #[test]
+    fn cpu_reconciliation_refuses_false_pass() {
+        let false_pass = Scratch::new();
+        write_record(
+            &false_pass.0,
+            &attempt("passes", 1, AttemptCompletion::Exit { code: 23 }),
+        );
+        write_record(
+            &false_pass.0,
+            &attempt("recovers", 1, AttemptCompletion::Exit { code: 23 }),
+        );
+        write_record(
+            &false_pass.0,
+            &attempt("recovers", 2, AttemptCompletion::Exit { code: 0 }),
+        );
+        let error = reconcile_cpu_attempts(
+            &parse_event_text(sample_events()).unwrap(),
+            &false_pass.0,
+            &sample_binary_map(),
+        )
+        .unwrap_err();
+        assert!(error.contains("disagree on whether"), "{error}");
+
+        let false_failure = Scratch::new();
+        write_record(
+            &false_failure.0,
+            &attempt("passes", 1, AttemptCompletion::Exit { code: 0 }),
+        );
+        write_record(
+            &false_failure.0,
+            &attempt("recovers", 1, AttemptCompletion::Exit { code: 0 }),
+        );
+        write_record(
+            &false_failure.0,
+            &attempt("recovers", 2, AttemptCompletion::Exit { code: 0 }),
+        );
+        let error = reconcile_cpu_attempts(
+            &parse_event_text(sample_events()).unwrap(),
+            &false_failure.0,
+            &sample_binary_map(),
+        )
+        .unwrap_err();
+        assert!(error.contains("disagree on whether"), "{error}");
+    }
+
+    #[test]
+    fn binary_map_refuses_ambiguous_and_substituted_paths() {
+        let inventory = br#"{
+            "rust-suites": {
+                "suite": {
+                    "package-name": "suite",
+                    "binary-id": "suite",
+                    "binary-name": "suite",
+                    "kind": "lib",
+                    "binary-path": "/tmp/shared-binary"
+                },
+                "suite::bin/suite": {
+                    "package-name": "suite",
+                    "binary-id": "suite::bin/suite",
+                    "binary-name": "suite",
+                    "kind": "bin",
+                    "binary-path": "/tmp/shared-binary"
+                }
+            }
+        }"#;
+        let error = BinaryMap::from_nextest_inventory(inventory).unwrap_err();
+        assert!(error.contains("executable path"), "{error}");
+        assert!(error.contains("is ambiguous"), "{error}");
+
+        let map = sample_binary_map();
+        let error = map
+            .identity_for_executable(Path::new("/tmp/substituted-binary"))
+            .unwrap_err();
+        assert!(error.contains("absent from the typed inventory"), "{error}");
     }
 }
