@@ -8394,6 +8394,47 @@ esac
     }
 
     #[test]
+    fn selected_portable_parity_candidates_preserve_identical_guest_arguments() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifests = ManifestSet::load(&root).unwrap();
+        let cells = manifests
+            .select(&Selection {
+                lane: Some("portable".into()),
+                category: Some("backend-parity-c".into()),
+                population: Some(Population::Required),
+                ..Selection::default()
+            })
+            .unwrap();
+        let candidates = cells
+            .iter()
+            .filter(|cell| cell.id.mode == "verify" && cell.id.backend.as_deref() != Some("ptrace"))
+            .collect::<Vec<_>>();
+        assert_eq!(candidates.len(), 79);
+        assert!(candidates.iter().any(|cell| cell.id.test
+            == "backend-parity-c/readdir-order-identity"
+            && cell.id.backend.as_deref() == Some("kvm")));
+        for cell in candidates {
+            let mode = &cell.test.modes["verify"];
+            let candidate = cell.id.backend.as_deref().unwrap();
+            assert!(
+                mode.backends_enabled
+                    .iter()
+                    .any(|backend| backend == "ptrace")
+            );
+            assert_eq!(
+                mode.guest_args.get(candidate).cloned().unwrap_or_default(),
+                mode.guest_args.get("ptrace").cloned().unwrap_or_default(),
+                "{}",
+                cell.id.test
+            );
+            if cell.id.test == "backend-parity-c/readdir-order-identity" {
+                assert_eq!(mode.guest_args[candidate], ["--require-small-determinized"]);
+                assert_eq!(mode.guest_args["ptrace"], ["--require-small-determinized"]);
+            }
+        }
+    }
+
+    #[test]
     fn production_backend_parity_reports_matches_and_divergences() {
         let (matched, matched_invocations) = run_production_parity_fixture("parity-match", "kvm");
         assert_eq!(matched.outcome, "PASS", "{matched:#?}");
