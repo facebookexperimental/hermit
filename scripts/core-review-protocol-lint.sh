@@ -687,11 +687,16 @@ scan_lane() {
             verdict_line=$(strip_structural_prefix "$undecorated")
             if [[ $verdict_line =~ $REJECT_LEGACY_RE ]]; then
                 rejected_sha=${BASH_REMATCH[1]}
-                if verdict_is_citation "$author" refused '*' "$rejected_sha" \
+                if [ -z "$approver_refusal" ] \
+                   && verdict_is_citation "$author" refused '*' "$rejected_sha" \
                     "${issued_verdicts[@]}"; then
                     continue
                 fi
-                issued_verdicts+=("$author"$'\x1f'"refused"$'\x1f'"*"$'\x1f'"$rejected_sha")
+                # Keep every untrusted refusal, but do not let its claimed
+                # author suppress a later real refusal as a citation.
+                if [ -z "$approver_refusal" ]; then
+                    issued_verdicts+=("$author"$'\x1f'"refused"$'\x1f'"*"$'\x1f'"$rejected_sha")
+                fi
                 rejected=1
                 refusing_issuer=$author
                 outstanding+=("$cid $idx $rejected_sha ${refusing_issuer:-<unattributed>}")
@@ -702,11 +707,14 @@ scan_lane() {
                 if [ "${rejected_lane,,}" = "$lane" ]; then
                     rejected_sha=${BASH_REMATCH[2]}
                     local refusal_marker_issuer=${BASH_REMATCH[4]-}
-                    if verdict_is_citation "$author" refused "$lane" "$rejected_sha" \
+                    if [ -z "$approver_refusal" ] \
+                       && verdict_is_citation "$author" refused "$lane" "$rejected_sha" \
                         "${issued_verdicts[@]}"; then
                         continue
                     fi
-                    issued_verdicts+=("$author"$'\x1f'"refused"$'\x1f'"$lane"$'\x1f'"$rejected_sha")
+                    if [ -z "$approver_refusal" ]; then
+                        issued_verdicts+=("$author"$'\x1f'"refused"$'\x1f'"$lane"$'\x1f'"$rejected_sha")
+                    fi
                     rejected=1
                     refusing_issuer=${refusal_marker_issuer:-$author}
                     refusing_issuer=${refusing_issuer,,}

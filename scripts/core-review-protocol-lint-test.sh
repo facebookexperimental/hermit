@@ -1026,6 +1026,128 @@ run_raw_case "an untrusted approval copy cannot consume a later trusted issuance
       {\"author_association\": \"NONE\", \"body\": \"${REVIEWER_901}\nAPPROVED-AT: claude ${HEAD_SHA}\"},
       {\"author_association\": \"OWNER\", \"body\": \"${REVIEWER_901}\nAPPROVED-AT: claude ${HEAD_SHA}\"}]"
 
+# Public comments may copy a disclosure but cannot establish or use citation
+# history to suppress a refusal. They still count as standing refusals.
+run_raw_message_case "an untrusted refusal cannot consume a later trusted refusal" 1 "1 standing refusal(s) remain for claude" \
+    "[
+  {
+    \"author_association\": \"OWNER\",
+    \"body\": \"${REVIEWER_903}\\nAPPROVED-AT: codex ${HEAD_SHA}\"
+  },
+  {
+    \"author_association\": \"NONE\",
+    \"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"
+  },
+  {
+    \"author_association\": \"OWNER\",
+    \"body\": \"${REVIEWER_901}\\nAPPROVED-AT: claude ${HEAD_SHA}\"
+  },
+  {
+    \"author_association\": \"OWNER\",
+    \"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"
+  }
+]"
+
+run_raw_message_case "an untrusted legacy refusal cannot consume a later trusted refusal" 1 "1 standing refusal(s) remain for claude" \
+    "[
+  {
+    \"author_association\": \"NONE\",
+    \"body\": \"${REVIEWER_901}\\nREQUEST CHANGES AT ${HEAD_SHA}\"
+  },
+  {
+    \"author_association\": \"OWNER\",
+    \"body\": \"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\"
+  },
+  {
+    \"author_association\": \"OWNER\",
+    \"body\": \"${REVIEWER_901}\\nAPPROVED-AT: claude ${HEAD_SHA}\"
+  },
+  {
+    \"author_association\": \"OWNER\",
+    \"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"
+  }
+]"
+
+run_raw_message_case "an untrusted refusal cannot use a trusted refusal's citation history" 1 "1 standing refusal(s) remain for claude" \
+    "[
+  {
+    \"author_association\": \"OWNER\",
+    \"body\": \"${REVIEWER_903}\\nAPPROVED-AT: codex ${HEAD_SHA}\"
+  },
+  {
+    \"author_association\": \"OWNER\",
+    \"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"
+  },
+  {
+    \"author_association\": \"OWNER\",
+    \"body\": \"${REVIEWER_901}\\nAPPROVED-AT: claude ${HEAD_SHA}\"
+  },
+  {
+    \"author_association\": \"NONE\",
+    \"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"
+  }
+]"
+
+run_raw_case "an authenticated repeated refusal retains its citation behavior" 0 \
+    "[
+  {
+    \"author_association\": \"OWNER\",
+    \"body\": \"${REVIEWER_903}\\nAPPROVED-AT: codex ${HEAD_SHA}\"
+  },
+  {
+    \"author_association\": \"OWNER\",
+    \"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"
+  },
+  {
+    \"author_association\": \"OWNER\",
+    \"body\": \"${REVIEWER_901}\\nAPPROVED-AT: claude ${HEAD_SHA}\"
+  },
+  {
+    \"author_association\": \"OWNER\",
+    \"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"
+  }
+]"
+
+run_raw_case "an untrusted legacy refusal cannot use trusted citation history" 1 \
+    "[
+  {
+    \"author_association\": \"OWNER\",
+    \"body\": \"${REVIEWER_901}\\nREQUEST CHANGES AT ${HEAD_SHA}\"
+  },
+  {
+    \"author_association\": \"OWNER\",
+    \"body\": \"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\"
+  },
+  {
+    \"author_association\": \"OWNER\",
+    \"body\": \"${REVIEWER_901}\\nAPPROVED-AT: claude ${HEAD_SHA}\"
+  },
+  {
+    \"author_association\": \"NONE\",
+    \"body\": \"${REVIEWER_901}\\nREQUEST CHANGES AT ${HEAD_SHA}\"
+  }
+]"
+
+run_raw_case "an authenticated repeated legacy refusal retains its citation behavior" 0 \
+    "[
+  {
+    \"author_association\": \"OWNER\",
+    \"body\": \"${REVIEWER_901}\\nREQUEST CHANGES AT ${HEAD_SHA}\"
+  },
+  {
+    \"author_association\": \"OWNER\",
+    \"body\": \"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\"
+  },
+  {
+    \"author_association\": \"OWNER\",
+    \"body\": \"${REVIEWER_901}\\nAPPROVED-AT: claude ${HEAD_SHA}\"
+  },
+  {
+    \"author_association\": \"OWNER\",
+    \"body\": \"${REVIEWER_901}\\nREQUEST CHANGES AT ${HEAD_SHA}\"
+  }
+]"
+
 # The fleet's tag shapes vary and the interior is deliberately not parsed;
 # approval_binding.py measured that reading it produces wrong verdicts.
 run_raw_case "a legacy-shaped role tag is accepted (interior is not parsed)" 0 \
