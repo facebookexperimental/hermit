@@ -189,17 +189,175 @@ const NEXTEST_PRIVILEGED_ASSERT_COMMAND: &str = "./ci/nextest-binaries.rs assert
 const TESTS_MISC_EXECUTABLE_READ_COMMAND: &str = r#"tests_misc="$(./ci/nextest-binaries.rs executable hermit-detcore tests_misc)" || exit 1"#;
 
 
+fn integration_artifact_producer(command: &str) -> &'static str {
+    if command.starts_with("./ci/hermetic/run-in-pinned-root.sh ") {
+        "build.e2e_artifact_in_pinned_root"
+    } else {
+        "build.e2e_artifact"
+    }
+}
+
 fn hermit_integration_uses_published_artifact(step: &Step) -> bool {
-    step
-        .cmd
+    let Ok(source) = guarded_command_source(&step.tag(), &step.cmd) else {
+        return false;
+    };
+    source
         .strip_prefix(RUST_SCRIPT_COMMAND_PREFIX)
         .is_some_and(|command| command.starts_with(INTEGRATION_ARTIFACT_WRAPPER))
         && step
             .deps
             .iter()
-            .any(|dependency| dependency == "build.e2e_artifact")
+            .any(|dependency| dependency == integration_artifact_producer(&step.cmd))
 }
 
+// Only the self-test mutations use this reconstruction. Decode the same exact
+// guard first, then replace the payload while preserving every outer argument.
+fn bracket_command_with_payload(step: &Step, payload: &str) -> Result<String, String> {
+    guarded_command_source(&step.tag(), &step.cmd)?;
+    if !step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh ") {
+        return Ok(payload.to_owned());
+    }
+    let mut argv = shell_words::split(&step.cmd).map_err(|error| error.to_string())?;
+    let boundary = argv
+        .iter()
+        .position(|arg| arg == "--")
+        .expect("decoded boundary");
+    argv[boundary + 5] = payload.to_owned();
+    Ok(format!(
+        "{} {}",
+        argv[0],
+        argv[1..]
+            .iter()
+            .map(|arg| validate_plan::shell_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" ")
+    ))
+}
+
+fn integration_artifact_bracket(integration: &Step) -> Result<(), String> {
+    if !hermit_integration_uses_published_artifact(integration) {
+        return Err(format!(
+            "full-plan bracket: Hermit integration tests can consume a mutable Hermit binary: cmd={} deps={:?}",
+            integration.cmd, integration.deps
+        ));
+    }
+    let source = guarded_command_source(&integration.tag(), &integration.cmd)?;
+    let after_rust_script_prefix = source
+        .strip_prefix(RUST_SCRIPT_COMMAND_PREFIX)
+        .ok_or("full-plan bracket: integration node lost its rust-script prefix")?;
+    let without_wrapper = after_rust_script_prefix
+        .strip_prefix(INTEGRATION_ARTIFACT_WRAPPER)
+        .ok_or("full-plan bracket: cannot plant missing integration artifact wrapper")?;
+    let mut missing_wrapper = integration.clone();
+    missing_wrapper.cmd = bracket_command_with_payload(
+        integration,
+        &format!("{RUST_SCRIPT_COMMAND_PREFIX}{without_wrapper}"),
+    )?;
+    if hermit_integration_uses_published_artifact(&missing_wrapper) {
+        return Err(
+            "full-plan bracket: removing the integration artifact wrapper was accepted".into(),
+        );
+    }
+    let producer = integration_artifact_producer(&integration.cmd);
+    let mut missing_dependency = integration.clone();
+    missing_dependency
+        .deps
+        .retain(|dependency| dependency != producer);
+    if hermit_integration_uses_published_artifact(&missing_dependency) {
+        return Err(
+            "full-plan bracket: removing the integration artifact dependency was accepted".into(),
+        );
+    }
+    let other_producer = if producer == "build.e2e_artifact" {
+        "build.e2e_artifact_in_pinned_root"
+    } else {
+        "build.e2e_artifact"
+    };
+    missing_dependency.deps.push(other_producer.into());
+    if hermit_integration_uses_published_artifact(&missing_dependency) {
+        return Err(
+            "full-plan bracket: the other execution root's artifact producer was accepted".into(),
+        );
+    }
+    if integration
+        .cmd
+        .starts_with("./ci/hermetic/run-in-pinned-root.sh ")
+    {
+        let mut argv =
+            shell_words::split(&missing_wrapper.cmd).map_err(|error| error.to_string())?;
+        let out = argv
+            .iter()
+            .position(|arg| arg == "--out")
+            .ok_or("full-plan bracket: no outer output fixture")?;
+        argv[out + 1] = format!("/tmp/artifact-decoy {source}");
+        missing_wrapper.cmd = format!(
+            "{} {}",
+            argv[0],
+            argv[1..]
+                .iter()
+                .map(|arg| validate_plan::shell_quote(arg))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        if hermit_integration_uses_published_artifact(&missing_wrapper) {
+            return Err("full-plan bracket: outer artifact-wrapper decoy was accepted".into());
+        }
+        let mut malformed = integration.clone();
+        malformed.cmd = malformed
+            .cmd
+            .replacen("hermit_payload=$1", "hermit_payload=ignored", 1);
+        if hermit_integration_uses_published_artifact(&malformed) {
+            return Err("full-plan bracket: malformed pinned-root guard was accepted".into());
+        }
+    }
+    Ok(())
+}
+
+fn privileged_artifact_barriers(build: &Step) -> Result<(), String> {
+    for required in [
+        "build.e2e_artifact_in_pinned_root",
+        "build.liteinst_runtime_release_in_pinned_root",
+    ] {
+        if !build.deps.iter().any(|dependency| dependency == required) {
+            return Err(format!(
+                "full-plan bracket: privileged build can start before required build barrier {required}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod artifact_plan_tests {
+    use super::*;
+
+    #[test]
+    fn actual_host_and_pinned_consumers_require_their_artifact_and_resource_producers() {
+        let cfg = validate_plan::validation_config(&repo_root()).unwrap();
+        for tag in ["test.hermit_integration", "test.hermit_integration_on_host"] {
+            let step = cfg.steps.iter().find(|step| step.tag() == tag).unwrap();
+            integration_artifact_bracket(step).unwrap();
+        }
+        let build = cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "privileged-build.privileged_tests")
+            .unwrap();
+        privileged_artifact_barriers(build).unwrap();
+        for required in [
+            "build.e2e_artifact_in_pinned_root",
+            "build.liteinst_runtime_release_in_pinned_root",
+        ] {
+            let mut missing = build.clone();
+            missing.deps.retain(|dependency| dependency != required);
+            missing
+                .deps
+                .push(required.strip_suffix("_in_pinned_root").unwrap().into());
+            let error = privileged_artifact_barriers(&missing).unwrap_err();
+            assert!(error.contains(required), "{error}");
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ValidationStepIdentity {
@@ -2843,37 +3001,7 @@ cleared-caps refusal names {} starved step(s)",
             .iter()
             .find(|s| s.tag() == "test.hermit_integration")
             .ok_or("full-plan bracket: Hermit integration node disappeared")?;
-        if !hermit_integration_uses_published_artifact(integration) {
-            return Err(format!(
-                "full-plan bracket: Hermit integration tests can consume a mutable Hermit binary: cmd={} deps={:?}",
-                integration.cmd, integration.deps
-            ));
-        }
-        let mut missing_wrapper = integration.clone();
-        let after_rust_script_prefix = missing_wrapper
-            .cmd
-            .strip_prefix(RUST_SCRIPT_COMMAND_PREFIX)
-            .ok_or("full-plan bracket: integration node lost its rust-script prefix")?;
-        let without_wrapper = after_rust_script_prefix
-            .strip_prefix(INTEGRATION_ARTIFACT_WRAPPER)
-            .ok_or("full-plan bracket: cannot plant missing integration artifact wrapper")?;
-        missing_wrapper.cmd = format!("{RUST_SCRIPT_COMMAND_PREFIX}{without_wrapper}");
-        if hermit_integration_uses_published_artifact(&missing_wrapper) {
-            return Err(
-                "full-plan bracket: removing the integration artifact wrapper was accepted"
-                    .into(),
-            );
-        }
-        let mut missing_dependency = integration.clone();
-        missing_dependency
-            .deps
-            .retain(|dependency| dependency != "build.e2e_artifact");
-        if hermit_integration_uses_published_artifact(&missing_dependency) {
-            return Err(
-                "full-plan bracket: removing the integration artifact dependency was accepted"
-                    .into(),
-            );
-        }
+        integration_artifact_bracket(integration)?;
         let manifest_consumers: Vec<_> = full
             .cfg
             .steps
@@ -2989,13 +3117,7 @@ cleared-caps refusal names {} starved step(s)",
             .iter()
             .find(|s| s.tag() == "privileged-build.privileged_tests")
             .ok_or("full-plan bracket: privileged focused build disappeared")?;
-        for required in ["build.e2e_artifact", "build.liteinst_runtime_release"] {
-            if !privileged_build.deps.iter().any(|dependency| dependency == required) {
-                return Err(format!(
-                    "full-plan bracket: privileged build can start before required build barrier {required}"
-                ));
-            }
-        }
+        privileged_artifact_barriers(privileged_build)?;
         if !privileged_build.cmd.contains("verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path")
             || !privileged_build.cmd.contains(NEXTEST_PRIVILEGED_ASSERT_COMMAND)
             || !privileged_build.cmd.contains(TESTS_MISC_EXECUTABLE_READ_COMMAND)
@@ -11457,7 +11579,7 @@ fn require_resolved_outer_timeout_headroom(
 // Decode the known pinned-root shell transport before inspecting the actual
 // harness argv. A filename or an outer-wrapper argument named --prebuilt must
 // never remove the fixture-preparation window from timeout accounting.
-fn manifest_command_source(tag: &str, command: &str) -> Result<String, String> {
+fn guarded_command_source(tag: &str, command: &str) -> Result<String, String> {
     let mut source = command.to_owned();
     if command.starts_with("./ci/hermetic/run-in-pinned-root.sh ") {
         let argv = shell_words::split(command)
@@ -11474,6 +11596,11 @@ fn manifest_command_source(tag: &str, command: &str) -> Result<String, String> {
         }
         source = tail[5].clone();
     }
+    Ok(source)
+}
+
+fn manifest_command_source(tag: &str, command: &str) -> Result<String, String> {
+    let source = guarded_command_source(tag, command)?;
     let source = source
         .strip_prefix(RUST_SCRIPT_COMMAND_PREFIX)
         .unwrap_or(&source);
