@@ -234,6 +234,128 @@ pub struct SeriesPressureComparison {
     pub no_result_kind: Option<SeriesNoVerdictKind>,
 }
 
+impl SeriesPressureAttempt {
+    /// Validate one retained invocation without changing its framework outcome.
+    /// Callers that have original report bytes must additionally validate their
+    /// digest and report semantics before constructing these compact facts.
+    pub fn validate_for_mode(&self, mode: &str) -> Result<(), String> {
+        let comparison_mode = matches!(mode, "verify" | "replay" | "chaos");
+        if !matches!(self.outcome.as_str(), "PASS" | "FAIL" | "ERROR") {
+            return Err("pressure_evidence has an unsupported inner outcome".into());
+        }
+        if self
+            .error_kind
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty())
+            || self.status.is_some_and(|status| status < 0)
+            || self.signal.is_some_and(|signal| signal <= 0)
+            || (self.status.is_some() && self.signal.is_some())
+        {
+            return Err("pressure_evidence has an invalid process disposition".into());
+        }
+        let nonzero_process = self.status.is_some_and(|status| status > 0) || self.signal.is_some();
+        let completed_pass = self.outcome == "PASS" && !self.timed_out && self.error_kind.is_none();
+        if self.outcome == "PASS"
+            && (!completed_pass || (self.status.is_none() && self.signal.is_none()))
+        {
+            return Err(
+                "pressure_evidence passing invocation lacks a completed process disposition".into(),
+            );
+        }
+        let Some(comparison) = &self.comparison else {
+            let prelaunch_timeout = self.outcome == "ERROR"
+                && self.timed_out
+                && matches!(
+                    self.error_kind.as_deref(),
+                    Some("incomplete-verification-evidence" | "cpu-timeout" | "wall-timeout")
+                );
+            if !comparison_mode
+                && self.status.is_none()
+                && self.signal.is_none()
+                && !prelaunch_timeout
+            {
+                return Err(
+                    "pressure_evidence noncomparison invocation lacks a process disposition".into(),
+                );
+            }
+            if comparison_mode
+                && !(self.outcome == "ERROR"
+                    && self.timed_out
+                    && self.error_kind.is_some()
+                    && nonzero_process)
+            {
+                return Err("pressure_evidence comparison invocation omitted its report without a typed timeout".into());
+            }
+            return Ok(());
+        };
+        if !comparison_mode {
+            return Err("pressure_evidence comparison appears on a noncomparison mode".into());
+        }
+        if !is_sha256(&comparison.report_sha256) {
+            return Err(
+                "pressure_evidence comparison report_sha256 must be lowercase 64-hex".into(),
+            );
+        }
+        if comparison.canonical
+            && !matches!(comparison.verdict, Verdict::Matched | Verdict::Diverged)
+        {
+            return Err("pressure_evidence non-verdict cannot claim a canonical comparison".into());
+        }
+        if comparison.verdict != Verdict::NoResult && comparison.no_result_kind.is_some() {
+            return Err("pressure_evidence comparison carries an unrelated no_result_kind".into());
+        }
+        let valid = match comparison.verdict {
+            Verdict::Matched => {
+                completed_pass
+                    && self.signal.is_none()
+                    && self
+                        .status
+                        .is_some_and(|status| mode == "chaos" || status == 0)
+            }
+            Verdict::Diverged => {
+                self.outcome == "FAIL"
+                    && !self.timed_out
+                    && self.error_kind.is_none()
+                    && nonzero_process
+            }
+            Verdict::InfrastructureError => {
+                self.outcome == "ERROR" && !self.timed_out && nonzero_process
+            }
+            Verdict::NoResult => match comparison.no_result_kind {
+                Some(SeriesNoVerdictKind::NotRun) => {
+                    let prelaunch_timeout = self.timed_out
+                        && self.status.is_none()
+                        && self.signal.is_none()
+                        && matches!(
+                            self.error_kind.as_deref(),
+                            Some(
+                                "incomplete-verification-evidence" | "cpu-timeout" | "wall-timeout"
+                            )
+                        );
+                    self.outcome == "ERROR"
+                        && self.error_kind.is_some()
+                        && (nonzero_process || prelaunch_timeout)
+                }
+                Some(SeriesNoVerdictKind::FirstRunRejected) => {
+                    self.outcome == "FAIL"
+                        && !self.timed_out
+                        && self.error_kind.is_none()
+                        && self.status.is_some_and(|status| status > 0)
+                        && self.signal.is_none()
+                }
+                _ => false,
+            },
+        };
+        if !valid {
+            return Err(format!(
+                "pressure_evidence {} report contradicts its inner process disposition",
+                comparison.verdict
+            ));
+        }
+        Ok(())
+    }
+}
+
 fn is_prelaunch_timeout_disposition(disposition: &SeriesAttemptDisposition) -> bool {
     disposition.timed_out
         && disposition.status.is_none()
@@ -546,118 +668,12 @@ impl SeriesRow {
             return Err("pressure_evidence.attempts must retain a nonempty inner history".into());
         }
         let mode = self.series.cell.rsplit('/').nth(1).unwrap_or_default();
-        let comparison_mode = matches!(mode, "verify" | "replay" | "chaos");
         let mut indices = std::collections::BTreeSet::new();
         for attempt in &evidence.attempts {
             if attempt.index.trim().is_empty() || !indices.insert(&attempt.index) {
                 return Err("pressure_evidence attempt indices must be nonempty and unique".into());
             }
-            if !matches!(attempt.outcome.as_str(), "PASS" | "FAIL" | "ERROR") {
-                return Err("pressure_evidence has an unsupported inner outcome".into());
-            }
-            if attempt
-                .error_kind
-                .as_ref()
-                .is_some_and(|value| value.trim().is_empty())
-                || attempt.status.is_some_and(|status| status < 0)
-                || attempt.signal.is_some_and(|signal| signal <= 0)
-                || (attempt.status.is_some() && attempt.signal.is_some())
-            {
-                return Err("pressure_evidence has an invalid process disposition".into());
-            }
-            let nonzero_process =
-                attempt.status.is_some_and(|status| status > 0) || attempt.signal.is_some();
-            let completed_pass =
-                attempt.outcome == "PASS" && !attempt.timed_out && attempt.error_kind.is_none();
-            if attempt.outcome == "PASS"
-                && (!completed_pass || (attempt.status.is_none() && attempt.signal.is_none()))
-            {
-                return Err(
-                    "pressure_evidence passing invocation lacks a completed process disposition"
-                        .into(),
-                );
-            }
-            let Some(comparison) = &attempt.comparison else {
-                if comparison_mode
-                    && !(attempt.outcome == "ERROR"
-                        && attempt.timed_out
-                        && attempt.error_kind.is_some()
-                        && nonzero_process)
-                {
-                    return Err("pressure_evidence comparison invocation omitted its report without a typed timeout".into());
-                }
-                continue;
-            };
-            if !comparison_mode {
-                return Err("pressure_evidence comparison appears on a noncomparison mode".into());
-            }
-            if !is_sha256(&comparison.report_sha256) {
-                return Err(
-                    "pressure_evidence comparison report_sha256 must be lowercase 64-hex".into(),
-                );
-            }
-            if comparison.canonical
-                && !matches!(comparison.verdict, Verdict::Matched | Verdict::Diverged)
-            {
-                return Err(
-                    "pressure_evidence non-verdict cannot claim a canonical comparison".into(),
-                );
-            }
-            if comparison.verdict != Verdict::NoResult && comparison.no_result_kind.is_some() {
-                return Err(
-                    "pressure_evidence comparison carries an unrelated no_result_kind".into(),
-                );
-            }
-            let valid = match comparison.verdict {
-                Verdict::Matched => {
-                    completed_pass
-                        && attempt.signal.is_none()
-                        && attempt
-                            .status
-                            .is_some_and(|status| mode == "chaos" || status == 0)
-                }
-                Verdict::Diverged => {
-                    attempt.outcome == "FAIL"
-                        && !attempt.timed_out
-                        && attempt.error_kind.is_none()
-                        && nonzero_process
-                }
-                Verdict::InfrastructureError => {
-                    attempt.outcome == "ERROR" && !attempt.timed_out && nonzero_process
-                }
-                Verdict::NoResult => match comparison.no_result_kind {
-                    Some(SeriesNoVerdictKind::NotRun) => {
-                        let prelaunch_timeout = attempt.timed_out
-                            && attempt.status.is_none()
-                            && attempt.signal.is_none()
-                            && matches!(
-                                attempt.error_kind.as_deref(),
-                                Some(
-                                    "incomplete-verification-evidence"
-                                        | "cpu-timeout"
-                                        | "wall-timeout"
-                                )
-                            );
-                        attempt.outcome == "ERROR"
-                            && attempt.error_kind.is_some()
-                            && (nonzero_process || prelaunch_timeout)
-                    }
-                    Some(SeriesNoVerdictKind::FirstRunRejected) => {
-                        attempt.outcome == "FAIL"
-                            && !attempt.timed_out
-                            && attempt.error_kind.is_none()
-                            && attempt.status.is_some_and(|status| status > 0)
-                            && attempt.signal.is_none()
-                    }
-                    _ => false,
-                },
-            };
-            if !valid {
-                return Err(format!(
-                    "pressure_evidence {} report contradicts its inner process disposition",
-                    comparison.verdict
-                ));
-            }
+            attempt.validate_for_mode(mode)?;
         }
         if let Some(other) = &self.series.no_verdict_evidence {
             for disposition in &other.attempts {
@@ -1782,6 +1798,27 @@ mod tests {
                 serde_json::json!(unknown);
             assert!(serde_json::from_value::<SeriesRow>(raw).is_err());
         }
+        for outcome in ["PASS", "FAIL", "ERROR"] {
+            let mut native = good.clone();
+            native.series.cell = "fixture/test/naked/native".into();
+            let inner = &mut native.series.pressure_evidence.as_mut().unwrap().attempts[0];
+            inner.outcome = outcome.into();
+            inner.comparison = None;
+            inner.status = None;
+            assert!(
+                native.validate_for_read().is_err(),
+                "missing {outcome} process"
+            );
+        }
+        let mut native = good.clone();
+        native.series.cell = "fixture/test/naked/native".into();
+        let inner = &mut native.series.pressure_evidence.as_mut().unwrap().attempts[0];
+        inner.outcome = "ERROR".into();
+        inner.comparison = None;
+        inner.status = None;
+        inner.timed_out = true;
+        inner.error_kind = Some("cpu-timeout".into());
+        native.validate_for_read().unwrap();
         let mut raw = serde_json::to_value(&good).unwrap();
         raw["series"]["pressure_evidence"]["attempts"][0]["timed_out"] = serde_json::json!("false");
         assert!(serde_json::from_value::<SeriesRow>(raw).is_err());
