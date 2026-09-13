@@ -586,6 +586,13 @@ def run_signal(
         assert row["result"] == ("fail" if prior_failure else "no_result"), row
         assert row["raw_result"] == "fail", row
         assert row["gates_run"] == row["checks"] == 2, row
+        assert row["gates_expected"] == 2, row
+        assert row["validation_complete"] is False, row
+        assert row["product_result_node_count"] == 2, row
+        assert len(row["product_result_nodes"]) == 2, row
+        assert row["understood_infrastructure_failure_nodes"] == {}, row
+        assert row["understood_prerequisite_failure_nodes"] == [], row
+        assert row["no_result_nodes"] == [], row
         assert row["failures"] == (1 if prior_failure else 0), row
         assert row["interruption_signal"] == sig.name.removeprefix("SIG"), row
 
@@ -617,7 +624,9 @@ def run_incomplete_exit() -> None:
         # An ordinary early exit is not an operator stop. It remains a raw
         # failure unless the producer carries an explicit interruption signal.
         assert row["result"] == "fail", row
-        assert row["gates_run"] == 2 and row["gates_expected"] is None, row
+        assert row["gates_run"] == row["gates_expected"] == 2, row
+        assert row["validation_complete"] is False, row
+        assert row["product_result_node_count"] == 2, row
         assert row["interruption_signal"] is None, row
 
 

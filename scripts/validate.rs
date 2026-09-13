@@ -85,6 +85,14 @@ mod validate_receipt;
 #[path = "lib/validate_runtime.rs"]
 mod validate_runtime;
 
+#[path = "lib/validate_classification.rs"]
+mod validate_classification;
+
+use validate_classification::{
+    NodeClassification, attempt_classification, classify_run, node_classification,
+    validation_completeness_detail, validation_is_complete,
+};
+
 #[path = "lib/safe_ci_scope.rs"]
 mod safe_ci_scope;
 
@@ -2532,6 +2540,7 @@ fn self_test() -> Result<(), String> {
         validate_history::self_test()?,
         validate_receipt::self_test()?,
         validate_runtime::self_test()?,
+        validate_classification::self_test()?,
         prebuilt_rust_script_plan_bracket(&root)?,
     ] {
         println!("  {line}");
@@ -9005,6 +9014,33 @@ fn blocking_listing<'a>(
         .filter(|o| outcome_is_failure(o) && !nonblocking.contains(&o.tag))
         .map(|o| o.tag.as_str())
         .collect();
+    let unclassified = outcomes.iter()
+        .filter(|outcome| !outcome.ok && !nonblocking.contains(&outcome.tag))
+        .map(|outcome| outcome.tag.as_str())
+        .filter(|tag| !named.contains(tag)).collect();
+    format_blocking_listing(named, unclassified, effective_failures)
+}
+
+fn classified_blocking_listing<'a>(
+    classification: &'a validate_classification::RunClassification,
+    nonblocking: &BTreeSet<String>,
+    effective_failures: usize,
+) -> (Vec<&'a str>, String) {
+    let named = classification.product_failure_nodes.iter()
+        .filter(|tag| !nonblocking.contains(*tag)).map(String::as_str).collect();
+    let unclassified = classification.no_result_nodes.iter()
+        .chain(classification.understood_infrastructure_failure_nodes.keys())
+        .chain(classification.understood_prerequisite_failure_nodes.iter())
+        .filter(|tag| !nonblocking.contains(*tag))
+        .map(String::as_str).collect();
+    format_blocking_listing(named, unclassified, effective_failures)
+}
+
+fn format_blocking_listing<'a>(
+    named: Vec<&'a str>,
+    unclassified: Vec<&str>,
+    effective_failures: usize,
+) -> (Vec<&'a str>, String) {
     // A cap is defensible; a SILENT cap is not. Name the remainder as a number.
     const NAMED_CAP: usize = 12;
     let shown = named.len().min(NAMED_CAP);
@@ -9050,12 +9086,6 @@ fn blocking_listing<'a>(
     // claim the run never established — the same distinction, destroyed in the
     // other direction. It gets its OWN count and its OWN names, which is what
     // "not a pass, not a failure, and not nothing" requires.
-    let unclassified: Vec<&str> = outcomes
-        .iter()
-        .filter(|o| !o.ok && !nonblocking.contains(&o.tag))
-        .map(|o| o.tag.as_str())
-        .filter(|tag| !named.contains(tag))
-        .collect();
     if !unclassified.is_empty() {
         listing.push_str(&format!(
             " ⚠️ plus {} node(s) that did NOT pass and produced NO VERDICT (budget kill, \
@@ -9301,18 +9331,94 @@ fn completed_exit_code(
     run_timed_out: bool,
     unexplained_runner_failure: bool,
 ) -> u8 {
-    if effective_failures > 0 || run_timed_out || unexplained_runner_failure {
+    if effective_failures > 0 || unexplained_runner_failure {
         1
-    } else if no_results > 0 {
+    } else if no_results > 0 || run_timed_out {
         NO_RESULT_EXIT_CODE as u8
     } else {
         0
     }
 }
 
+/// Print the super stress table without turning absent product results into
+/// product failures. `rates` must be computed from product-result outcomes
+/// only; `planned - ran` is therefore the number of selected repetitions that
+/// produced no product result and belongs to the run's incomplete accounting.
+fn print_super_stress_verdict(
+    rates: &[validate_super::ProbeRate],
+    reps: i64,
+    jobs: i64,
+    host_cpus: usize,
+) -> usize {
+    println!("\n== Super stress pass rates ==");
+    println!("Repetitions: {reps}; scheduler width: {jobs}; online CPUs: {host_cpus}");
+    let mut blocking = 0usize;
+    for rate in rates {
+        let slug = rate.probe.slug();
+        let product_failures = rate.ran.saturating_sub(rate.passed);
+        let without_product_result = rate.planned.saturating_sub(rate.ran);
+        if rate.ran == 0 {
+            println!(
+                "  NO_RESULT {slug:<24} 0/{} selected repetition(s) produced a product result",
+                rate.planned
+            );
+            continue;
+        }
+        let pct = 100 * rate.passed / rate.ran.max(1);
+        if product_failures == 0 && without_product_result == 0 {
+            println!("  ✅ {slug:<24} {}/{} (100%)", rate.passed, rate.ran);
+        } else if product_failures == 0 {
+            println!(
+                "  NO_RESULT {slug:<24} {}/{} product result(s) passed ({pct}%); {} of {} \
+                 selected repetition(s) did not produce a product result",
+                rate.passed,
+                rate.ran,
+                without_product_result,
+                rate.planned,
+            );
+        } else if rate.probe.nonblocking() {
+            println!(
+                "  ⚠️  {slug:<24} {}/{} product result(s) passed ({pct}%){} — NONBLOCKING: this \
+                 row was dead code in validate.sh (`backend_selector_supported` is undefined, so \
+                 the guard was always false) and has never been measured; reporting it, not \
+                 ratcheting it.",
+                rate.passed,
+                rate.ran,
+                if without_product_result == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        "; {without_product_result} of {} selected repetition(s) did not produce \
+                         a product result",
+                        rate.planned
+                    )
+                },
+            );
+        } else {
+            println!(
+                "  ⚠️  {slug:<24} {}/{} product result(s) passed ({pct}%){}",
+                rate.passed,
+                rate.ran,
+                if without_product_result == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        "; {without_product_result} of {} selected repetition(s) did not produce \
+                         a product result",
+                        rate.planned
+                    )
+                },
+            );
+            blocking += 1;
+        }
+    }
+    blocking
+}
+
 /// Per-node cost table, built entirely from typed `StepOutcome` fields.
 fn print_cost_table(
     outcomes: &[StepOutcome],
+    attempts: &[NodeAttempt],
     skipped: &[String],
     host_inapplicable: &[validate_plan::HostInapplicableNode],
 ) {
@@ -9322,14 +9428,12 @@ fn print_cost_table(
     let mut total = 0.0_f64;
     for o in outcomes {
         total += o.duration_s;
-        let status = if o.ok {
-            "ok"
-        } else if o.aborted {
-            "ABORTED"
-        } else if outcome_is_no_result(o) {
-            "NO_RESULT"
-        } else {
-            "FAIL"
+        let status = match node_classification(o, attempts) {
+            NodeClassification::Pass => "ok",
+            NodeClassification::ProductFailure => "FAIL",
+            NodeClassification::UnderstoodInfrastructureFailure => "INFRA",
+            NodeClassification::UnderstoodPrerequisiteFailure => "PREREQ",
+            NodeClassification::NoResult => "NO_RESULT",
         };
         let detail = if !o.reason.is_empty() {
             o.reason.clone()
@@ -9370,11 +9474,13 @@ fn print_compat_summary(
     mode: CompatMode,
     prefix: &str,
     outcomes: &[StepOutcome],
+    attempts: &[NodeAttempt],
 ) -> (usize, usize, Vec<String>, BTreeSet<String>) {
-    compat_summary_with_tables(
+    compat_summary_with_attempts(
         mode,
         prefix,
         outcomes,
+        attempts,
         &validate_corpus::known_failclosed(),
         &validate_corpus::portable_diagnostic(),
     )
@@ -9394,6 +9500,17 @@ fn compat_summary_with_tables(
     known: &BTreeMap<&'static str, &'static str>,
     diag: &BTreeMap<&'static str, &'static str>,
 ) -> (usize, usize, Vec<String>, BTreeSet<String>) {
+    compat_summary_with_attempts(mode, prefix, outcomes, &[], known, diag)
+}
+
+fn compat_summary_with_attempts(
+    mode: CompatMode,
+    prefix: &str,
+    outcomes: &[StepOutcome],
+    attempts: &[NodeAttempt],
+    known: &BTreeMap<&'static str, &'static str>,
+    diag: &BTreeMap<&'static str, &'static str>,
+) -> (usize, usize, Vec<String>, BTreeSet<String>) {
     let mut per_cat: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
     let mut passed = 0usize;
     let mut measured = 0usize;
@@ -9402,13 +9519,14 @@ fn compat_summary_with_tables(
     let mut measured_labels: BTreeSet<String> = BTreeSet::new();
     for o in outcomes {
         let Some(label) = o.tag.strip_prefix(prefix) else { continue };
-        if outcome_execution(o) == AttemptExecution::Unknown {
+        let classification = node_classification(o, attempts);
+        if classification == NodeClassification::NoResult {
             println!(
                 "  NO_RESULT {label} produced no completed child execution; excluded from the measured denominator"
             );
             continue;
         }
-        if outcome_is_no_result(o) {
+        if matches!(classification, NodeClassification::UnderstoodInfrastructureFailure | NodeClassification::UnderstoodPrerequisiteFailure) {
             println!(
                 "  NO_RESULT {label} could not determine its condition; excluded from the measured denominator"
             );
@@ -9419,7 +9537,7 @@ fn compat_summary_with_tables(
         e.1 += 1;
         measured += 1;
         measured_labels.insert(label.to_string());
-        if o.ok {
+        if classification == NodeClassification::Pass {
             e.0 += 1;
             passed += 1;
         }
@@ -9436,7 +9554,7 @@ fn compat_summary_with_tables(
         };
         let disposition = validate_plan::classify_compat_outcome(
             mode,
-            o.ok,
+            classification == NodeClassification::Pass,
             known.contains_key(label),
             diag.contains_key(label),
         );
@@ -9474,7 +9592,7 @@ fn compat_summary_with_tables(
         }
         if disposition.is_blocking() {
             blocking_failures.push(label.to_string());
-        } else if !o.ok {
+        } else if classification == NodeClassification::ProductFailure {
             nonblocking_failure_tags.insert(o.tag.clone());
         }
     }
@@ -9571,7 +9689,7 @@ fn verdict_refusals(
 /// profile may allow a fully measured failing row, but no profile may turn a
 /// partial run into exit zero.
 fn exit_code_with_execution_completeness(exit_code: u8, execution_complete: bool) -> u8 {
-    if execution_complete { exit_code } else { exit_code.max(1) }
+    if execution_complete || exit_code != 0 { exit_code } else { NO_RESULT_EXIT_CODE as u8 }
 }
 
 /// A missing pin gate invalidates a passing receipt, not an explicitly
@@ -10434,6 +10552,10 @@ struct NodeAttempt {
     /// region. This is kept separately from `retry_class`: a classified attempt
     /// may never execute again, and that distinction is the UNCONFIRMED verdict.
     environmental_class: Option<String>,
+    /// A strict terminal infrastructure signature from this node's own detail.
+    /// Broader environmental hypotheses and raw failure attribution remain
+    /// separate; a measured product failure always takes precedence.
+    understood_infrastructure_class: Option<String>,
     /// Whether this attempt's own round emitted a detail region, even if that
     /// region carried no environmental signature. Without this bit, "banner
     /// gone" is indistinguishable from "no new evidence was captured".
@@ -10534,6 +10656,7 @@ fn reported_attempt(outcome: &StepOutcome, attempt: usize) -> NodeAttempt {
         retry_class: None,
         retry_detail: None,
         environmental_class: None,
+        understood_infrastructure_class: None,
         detail_observed: false,
         failure_detail: (failure_class == Some(FailureClass::NoResult)
             && !outcome.reason.is_empty())
@@ -10564,6 +10687,7 @@ fn unreported_attempt(tag: String, attempt: usize) -> NodeAttempt {
         retry_class: None,
         retry_detail: None,
         environmental_class: None,
+        understood_infrastructure_class: None,
         detail_observed: false,
         failure_class: Some(FailureClass::NoResult),
         failure_detail: Some("no completion payload was reported for this node".into()),
@@ -10590,11 +10714,13 @@ fn stamp_attempt_detail(
     attempts: &mut [NodeAttempt],
     tag: &str,
     environmental_class: Option<&str>,
+    understood_infrastructure_class: Option<&str>,
     failure: Option<(FailureClass, &str)>,
 ) {
     if let Some(attempt) = latest_reported_failure_mut(attempts, tag) {
         attempt.detail_observed = true;
         attempt.environmental_class = environmental_class.map(str::to_string);
+        attempt.understood_infrastructure_class = understood_infrastructure_class.map(str::to_string);
         if attempt.failure_class == Some(FailureClass::ProductFailure) {
             if let Some((failure_class, failure_detail)) = failure {
                 attempt.failure_class = Some(failure_class);
@@ -13601,7 +13727,9 @@ fn run_lane_once(
 
     // Keep environmental and producer-owned failure classification as evidence,
     // but never use it to grant a second outer execution. Without a rerun an
-    // environmental hypothesis remains UNCONFIRMED and the node remains red.
+    // environmental hypothesis remains UNCONFIRMED. Only the stricter terminal
+    // diagnostic matcher can establish infrastructure failure; typed failed tests
+    // and completed node budget breaches still take precedence over that diagnosis.
     if let Some(log) = read_log_since_settled(log_path, log_start) {
         for outcome in outcomes
             .iter()
@@ -13610,7 +13738,10 @@ fn run_lane_once(
             if let Some(detail) = validate_runtime::extract_node_detail(&log, &outcome.tag) {
                 let class = validate_runtime::environmental_block_class(&detail);
                 let failure = validate_runtime::failure_class_from_detail(&detail);
-                stamp_attempt_detail(&mut attempts, &outcome.tag, class, failure);
+                stamp_attempt_detail(
+                    &mut attempts, &outcome.tag, class,
+                    validate_runtime::understood_infrastructure_class(&detail), failure,
+                );
                 if class.is_some() {
                     if let Some(line) =
                         terminal_environmental_observation(&attempts, &outcome.tag)
@@ -13749,7 +13880,7 @@ fn terminal_environmental_observation(attempts: &[NodeAttempt], tag: &str) -> Op
     };
     Some(format!(
         "🧱 {tag}: observed environmental signature {class} on attempt {}; terminal hypothesis \
-         {verdict}; node remains RED.",
+         {verdict}; aggregate result is reported separately in the node table.",
         attempt.attempt
     ))
 }
@@ -15372,14 +15503,12 @@ fn ledger_gate(outcome: &StepOutcome) -> serde_json::Value {
     gate
 }
 
-/// Serialize one gate from the attempt ledger, not merely cumulative `by_tag`.
+/// Serialize the aggregate gate result alongside its latest raw observation.
 ///
-/// `by_tag` deliberately retains the last reported outcome so later retries can
-/// still reason about it. If the latest scheduler invocation returned no payload,
-/// however, that retained outcome is not the terminal execution fact. Promote the
-/// latest attempt's explicit UNKNOWN state into the gate row so JSON consumers do
-/// not read an earlier failure (or pass) as the result of an execution that never
-/// completed.
+/// Historical multiple-attempt rows can have a stale cumulative outcome or a
+/// latest UNKNOWN attempt. The aggregate failure_class/result agree with the
+/// run's fold; raw_result/raw_failure_class/raw_aborted and the unchanged attempt
+/// list retain what was actually observed. No raw timeout/OOM fact is synthesized.
 fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) -> serde_json::Value {
     let node_attempts_raw: Vec<&NodeAttempt> =
         attempts.iter().filter(|attempt| attempt.tag == outcome.tag).collect();
@@ -15399,6 +15528,7 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
                 // arrived, which is not the same as a failure and must never be
                 // readable as a pass.
                 "result": attempt_result(a),
+                "understood_infrastructure_class": a.understood_infrastructure_class,
                 "reported": a.reported,
                 "execution": a.execution.as_str(),
                 "exit_code": a.returncode,
@@ -15466,6 +15596,45 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
         }
         set_gate_failure_evidence(&mut gate, attempt_is_failure(attempt));
     }
+    // Keep the latest raw observation, including UNKNOWN, alongside the node's
+    // aggregate result. A later actual pass recovers a failure; an unknown or
+    // infrastructure attempt cannot erase a recorded product failure.
+    let classification = node_classification(outcome, attempts);
+    gate["raw_result"] = gate["result"].clone();
+    gate["raw_aborted"] = gate["aborted"].clone();
+    if matches!(classification, NodeClassification::Pass | NodeClassification::ProductFailure) {
+        // Parent readers discard aborted gates before consulting failure_class.
+        // This is the aggregate result, while raw_aborted and the attempts retain
+        // the latest actual cancellation without erasing an earlier failure.
+        gate["aborted"] = serde_json::json!(false);
+    }
+    gate["result"] = serde_json::json!(classification.result());
+    // Existing readers use failure_class as the gate's authority. Preserve the
+    // observation it replaces explicitly and leave every attempt unchanged.
+    for field in ["failure_class", "failure_detail"] {
+        if let Some(raw) = gate.get(field).cloned() {
+            gate[format!("raw_{field}")] = raw;
+        }
+        gate.as_object_mut().expect("gate is an object").remove(field);
+    }
+    if classification != NodeClassification::Pass {
+        gate["failure_class"] = serde_json::json!(classification.as_str());
+        let cause = node_attempts_raw.iter().rev()
+            .find(|attempt| attempt_classification(attempt) == classification);
+        if let Some(cause) = cause {
+            if classification == NodeClassification::UnderstoodInfrastructureFailure {
+                gate["failure_detail"] = serde_json::json!(cause.understood_infrastructure_class);
+            } else if classification == NodeClassification::ProductFailure {
+                if !cause.reason.is_empty() {
+                    gate["failure_detail"] = serde_json::json!(cause.reason);
+                }
+            } else if let Some(detail) = &cause.failure_detail {
+                gate["failure_detail"] = serde_json::json!(detail);
+            }
+        }
+    }
+    gate["non_product_failure_bucket"] = serde_json::json!(classification.non_product_failure_bucket());
+    set_gate_failure_evidence(&mut gate, classification == NodeClassification::ProductFailure);
     gate["attempts"] = serde_json::json!(node_attempts);
     gate["retries"] = serde_json::json!(node_attempts_raw.len().saturating_sub(1));
     gate["first_attempt_result"] = serde_json::json!(first.and_then(attempt_result));
@@ -15539,9 +15708,11 @@ fn typed_gate_round_trip_bracket() -> Result<Vec<serde_json::Value>, String> {
         }
         if passed["result"] != "pass"
             || passed.get("failure_class").is_some()
-            || unknown.get("result") != Some(&serde_json::Value::Null)
-            || unknown["failure_class"] != "no_result"
-            || unknown["failure_detail"] != "no completion payload was reported for this node"
+            || unknown.get("raw_result") != Some(&serde_json::Value::Null)
+            || unknown["result"] != "fail"
+            || unknown["failure_class"] != "product_failure"
+            || unknown["raw_failure_class"] != "no_result"
+            || unknown["raw_failure_detail"] != "no completion payload was reported for this node"
         {
             return Err(format!(
                 "typed gate {bits}: latest verdict did not follow its attempt"
@@ -15634,6 +15805,7 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
                                outcome: &StepOutcome,
                                attempts: &[NodeAttempt],
                                expected_result: Option<&str>,
+                               aggregate_result: &str,
                                expected_reported: bool,
                                expected_execution: &str,
                                expected_failure: bool|
@@ -15643,7 +15815,7 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
             .as_array()
             .and_then(|attempts| attempts.last())
             .ok_or_else(|| format!("ledger gate origin: {label} omitted attempt history"))?;
-        let result = row.get("result").and_then(serde_json::Value::as_str);
+        let result = row.get("raw_result").and_then(serde_json::Value::as_str);
         let origin = row
             .get("failure_origin")
             .and_then(serde_json::Value::as_str);
@@ -15654,6 +15826,7 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
             origin.is_none() && row.get("failed_substeps").is_none()
         };
         if result != expected_result
+            || row["result"] != aggregate_result
             || row["reported"].as_bool() != Some(expected_reported)
             || row["execution"].as_str() != Some(expected_execution)
             || latest.get("result").and_then(serde_json::Value::as_str) != expected_result
@@ -15676,6 +15849,7 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
         &failed,
         std::slice::from_ref(&failed_attempt),
         Some("fail"),
+        "fail",
         true,
         "completed",
         true,
@@ -15685,6 +15859,7 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
         &passed,
         std::slice::from_ref(&passed_attempt),
         Some("pass"),
+        "pass",
         true,
         "completed",
         false,
@@ -15694,6 +15869,7 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
         &aborted,
         std::slice::from_ref(&aborted_attempt),
         None,
+        "no_result",
         true,
         "unknown",
         false,
@@ -15707,6 +15883,7 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
         &failed,
         &fail_then_pass,
         Some("pass"),
+        "pass",
         true,
         "completed",
         false,
@@ -15719,9 +15896,10 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
         &failed,
         &fail_then_aborted,
         None,
+        "fail",
         true,
         "unknown",
-        false,
+        true,
     )?;
     let unreported_retry = unreported_attempt(failed.tag.clone(), 2);
     let fail_then_unreported = [failed_attempt.clone(), unreported_retry];
@@ -15756,6 +15934,7 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
         &passed,
         &pass_then_failure,
         Some("fail"),
+        "fail",
         true,
         "completed",
         true,
@@ -15782,11 +15961,12 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
             std::slice::from_mut(&mut classified),
             &failed.tag,
             environmental,
+            validate_runtime::understood_infrastructure_class(detail),
             failure,
         );
         let row = ledger_gate_with_attempts(&failed, std::slice::from_ref(&classified));
-        if row["failure_class"] != want_class.as_str()
-            || row["failure_detail"] != want_detail
+        if row["raw_failure_class"] != want_class.as_str()
+            || row["raw_failure_detail"] != want_detail
             || row["attempts"][0]["failure_class"] != want_class.as_str()
             || row["attempts"][0]["failure_detail"] != want_detail
         {
@@ -16633,8 +16813,12 @@ fn no_result_propagation_bracket() -> Result<(), String> {
         return Err("no-result propagation: a sibling exit 75 hid a genuine failure".into());
     }
 
-    if completed_exit_code(0, 1, true, false) != 1 {
-        return Err("no-result propagation: a run timeout was weakened to NO_RESULT".into());
+    // A whole-run cutoff leaves selected work unmeasured. It never erases a
+    // completed product failure, including an individually collected node limit.
+    if completed_exit_code(0, 1, true, false) != NO_RESULT_EXIT_CODE as u8
+        || completed_exit_code(1, 1, true, false) != 1
+    {
+        return Err("no-result propagation: run cutoff lost incomplete/product-failure distinction".into());
     }
     if completed_exit_code(0, 1, false, true) != 1 {
         return Err(
@@ -16673,7 +16857,7 @@ fn write_ledger(
     wall_s: f64,
     exit_code: u8,
     log_file: &str,
-    suite_complete: bool,
+    execution_complete: bool,
     coverage: serde_json::Value,
     cell_results: Option<&validate_cell_results::RetainedCellResults>,
 ) {
@@ -16687,8 +16871,10 @@ fn write_ledger(
     let gate_records = outcomes.len();
     let executed_nodes = u64::try_from(completed_node_count(outcomes, attempts))
         .expect("executed node count fits u64");
-    let failures = outcomes.iter().filter(|o| outcome_is_failure(o)).count();
-    let no_results = outcomes.iter().filter(|o| outcome_is_no_result(o)).count();
+    let classification = classify_run(outcomes, attempts, skipped, planned_tags, host_inapplicable);
+    let failures = classification.product_failure_nodes.len();
+    let no_results = classification.no_results();
+    let validation_complete = validation_is_complete(execution_complete, &classification, planned_tags);
     // An operator stop learned nothing new about the product. Preserve the raw
     // shell outcome for forensics, but do not mint a FAILED verdict unless a
     // completed gate had already established one before the stop
@@ -16700,16 +16886,10 @@ fn write_ledger(
     // one carrying `corrects: <this id>`, which is what keeps the shard
     // append-only and safe to union across machines.
     let record_id = format!("{}-{}-{}", ctx.host, epoch_now(), std::process::id());
-    // The PLANNED denominator, not the executed one. A node withheld as
-    // host-inapplicable is added back here, so withholding can never shrink the
-    // contract a green is measured against; the consumer's accounting
-    // (`executed + intentionally skipped == expected`) then has to balance.
-    // With nothing withheld this is byte-identical to what it has always been.
-    let gates_expected = if ctx.profile == "full" && suite_complete {
-        serde_json::json!(gate_records + host_inapplicable.len())
-    } else {
-        serde_json::Value::Null
-    };
+    // Retain the exact selected denominator on incomplete and focused runs too.
+    // Scope, source authority and test/cell coverage still decide qualification;
+    // knowing which work was selected does not mean it completed.
+    let gates_expected = planned_tags.len();
     // A host-inapplicable node is NEVER in `gates`: that array is the executed
     // PASS/FAIL list, and a node that did not run belongs in neither state. It
     // is carried in its own typed field instead, with the observation behind the
@@ -16846,6 +17026,12 @@ fn write_ledger(
         "filtered_tests": ctx.filtered_tests,
         "gates_run": gate_records,
         "gates_expected": gates_expected,
+        "validation_complete": validation_complete,
+        "product_result_node_count": classification.product_result_nodes.len(),
+        "product_result_nodes": classification.product_result_nodes,
+        "understood_infrastructure_failure_nodes": classification.understood_infrastructure_failure_nodes,
+        "understood_prerequisite_failure_nodes": classification.understood_prerequisite_failure_nodes,
+        "no_result_nodes": classification.no_result_nodes,
         "skipped_nodes": skipped.len() + intentional_skipped_nodes.len(),
         // Typed pre-spawn omissions: nodes this MACHINE provably cannot run.
         // The reason vocabulary is closed on BOTH sides. The parent consumer
@@ -19675,7 +19861,13 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
             run_timeout.unwrap_or(0)
         );
     }
-    print_cost_table(&outcomes, &skipped, &plan.host_inapplicable);
+    let classification = classify_run(
+        &outcomes, &attempts, &skipped, &planned_tags, &plan.host_inapplicable,
+    );
+    let validation_complete = validation_is_complete(
+        execution_complete, &classification, &planned_tags,
+    );
+    print_cost_table(&outcomes, &attempts, &skipped, &plan.host_inapplicable);
     print_retry_ledger(&attempts);
 
     // ---- the single cleanup / evidence-commit point (validate.sh:1812) -------
@@ -19832,8 +20024,8 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     // silently dropped: `scripts/test_validate_stop_paths.py` is the durable
     // consumer contract for exactly this row (result `no_result`, raw_result
     // `fail`, interruption_signal named), and every reader already knows the
-    // no_result verdict. A TIMEOUT, by contrast, is a completed run and falls
-    // through to the normal verdict below.
+    // no_result verdict. Collected node limits remain failed conditions; a
+    // whole-run deadline is incomplete and falls through to the normal fold below.
     if let Some(sig) = &interruption {
         if !nesting.nested && !args.allow_local_off_the_record_run {
             write_ledger(
@@ -19864,10 +20056,8 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
         drop(run_record);
         let _ = std::fs::remove_dir_all(&tmp);
         let mut detail = vec![
-            format!("stopped by SIG{sig}; recorded as a NO-RESULT, not a failure"),
-            "an interrupt learned nothing about the tree, so it does not establish a product \
-             verdict — a TIMEOUT, by contrast, does"
-                .into(),
+            format!("stopped by SIG{sig}; prior measured product failures remain failures"),
+            validation_completeness_detail(false, classification.product_result_nodes.len(), planned_tags.len()),
         ];
         if let Some(error) = &series_error {
             detail.push(format!(
@@ -19881,7 +20071,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
             detail,
         );
         s.nodes_executed = completed_node_count(&outcomes, &attempts);
-        s.nodes_failed = outcomes.iter().filter(|o| outcome_is_failure(o)).count();
+        s.nodes_failed = classification.product_failure_nodes.len();
         s.nodes_skipped = skipped.len();
         s.nodes_host_inapplicable = plan.host_inapplicable.len();
         s.executed_tests = executed_tests;
@@ -19909,7 +20099,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
             .compat_prefix
             .expect("compatibility plans carry their committed tag prefix");
         let (passed, measured, blocking, nonblocking) =
-            print_compat_summary(mode, prefix, &outcomes);
+            print_compat_summary(mode, prefix, &outcomes, &attempts);
         compat_blocking = blocking.len();
         compat_nonblocking = nonblocking;
         compat_measured = Some(measured);
@@ -19934,11 +20124,11 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     // Super stress pass rates, from typed outcomes rather than a scraped report.
     if plan.super_mode {
         let reps = validate_super::repetitions();
-        let rates = validate_super::stress_rates(&outcomes, reps);
+        let rates = validate_classification::stress_rates(&classification, reps);
         // This is a per-PROBE display summary. The failed repetition nodes are
         // already in `blocking_failures`, so the grouped count must not be added
         // to the final node count.
-        validate_super::stress_verdict(&rates, reps, jobs, host_cpus);
+        print_super_stress_verdict(&rates, reps, jobs, host_cpus);
     }
 
     // Working-envelope vector: score, emit JSON, print the human summary, and
@@ -19947,7 +20137,10 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     let mut envelope_error: Option<(u8, String)> = None;
     if let Some(env) = &plan.envelope {
         let short = sh("git", &["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".into());
-        let vector = validate_envelope::score(&outcomes, env.reps, &short);
+        let vector = validate_envelope::score_with_passed(env.reps, &short, |tag| {
+            classification.product_result_nodes.contains(tag)
+                && !classification.product_failure_nodes.contains(tag)
+        });
         let json_file = validate_envelope::json_path(&root);
         let text = validate_envelope::to_ordered_json(&vector);
         if let Err(e) = std::fs::write(&json_file, format!("{text}\n")) {
@@ -19965,13 +20158,13 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
         }
     }
 
-    let failures = outcomes.iter().filter(|o| outcome_is_failure(o)).count();
-    let no_result_nodes: Vec<&str> = outcomes
-        .iter()
-        .filter(|o| outcome_is_no_result(o))
-        .map(|o| o.tag.as_str())
-        .collect();
-    let no_results = no_result_nodes.len();
+    let failures = classification.product_failure_nodes.len();
+    let no_results = classification.no_results();
+    let no_result_nodes: BTreeSet<&str> = classification.no_result_nodes.iter()
+        .chain(classification.understood_infrastructure_failure_nodes.keys())
+        .chain(classification.understood_prerequisite_failure_nodes.iter())
+        .map(String::as_str).collect();
+    let no_result_nodes: Vec<&str> = no_result_nodes.into_iter().collect();
     // The verdict is the RATCHET, not the raw node count.
     //
     // Three profiles deliberately have a verdict narrower than "every node
@@ -19982,24 +20175,14 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     //     their first measurement is reported rather than ratcheted;
     //   * envelope — it is a measurement, so probe failures lower a count and
     //     only the build/preflight spine can fail it.
-    let blocking_failures = outcomes
-        .iter()
-        .filter(|o| outcome_is_failure(o) && !plan.nonblocking.contains(&o.tag))
-        .count();
+    let blocking_failures = classification.blocking_failures(&plan.nonblocking);
     // Failures OUTSIDE the measured matrix: the build/prep/gate spine. `compat.*`
     // rows are excluded because the compat ratchet already judges them (and
     // excuses the known-fail-closed ones), so counting them here would both
     // double-count and re-block rows policy has excused. Everything else — a
     // failed `compatprep.*`, `pre.*`, `gate.*`, `build.*` — is a node whose
     // failure can EMPTY the matrix, and no matrix ratchet can speak to that.
-    let structural_failures = outcomes
-        .iter()
-        .filter(|o| {
-            outcome_is_failure(o)
-                && !o.tag.starts_with("compat.")
-                && !plan.nonblocking.contains(&o.tag)
-        })
-        .count();
+    let structural_failures = classification.structural_failures(&plan.nonblocking);
     let effective_failures = effective_failure_count(
         plan.compat,
         blocking_failures,
@@ -20016,7 +20199,8 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     // fully explains why the runner returned non-ok; any other unexplained
     // non-ok state remains a failure.
     let unexplained_runner_failure =
-        plan.nonblocking.is_empty() && plan.compat.is_none() && !ok && no_results == 0;
+        plan.nonblocking.is_empty() && plan.compat.is_none() && !ok && no_results == 0
+            && failures == 0 && !run_timed_out && !outcomes.iter().any(|o| outcome_is_failure(o));
     let mut exit_code = completed_exit_code(
         effective_failures,
         no_results,
@@ -20042,7 +20226,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
              incomplete and cannot report PASS."
         );
     }
-    exit_code = exit_code_with_execution_completeness(exit_code, execution_complete);
+    exit_code = exit_code_with_execution_completeness(exit_code, validation_complete);
 
     // Completeness is not the ratchet's to decide. A ratchet narrows WHICH
     // measured rows may fail; it cannot answer whether anything was measured, so
@@ -20223,7 +20407,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
             wall,
             exit_code,
             &log_path.to_string_lossy(),
-            plan.suite_complete && execution_complete,
+            execution_complete,
             coverage,
             retained_cell_results.as_ref(),
         );
@@ -20268,11 +20452,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     // Read the individual results before removing the disposable build root: a
     // caller may deliberately place E2E_RESULT_ROOT there. The scheduler is
     // finished, and `read_log_since_settled` flushes the live tee before reading.
-    let failed_finally: BTreeSet<String> = outcomes
-        .iter()
-        .filter(|o| outcome_is_failure(o))
-        .map(|o| o.tag.clone())
-        .collect();
+    let failed_finally = classification.product_failure_nodes.clone();
     let nextest_nodes = plan
         .cfg
         .steps
@@ -20307,7 +20487,9 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
 
     // The completed-run summary. Names the excused rows explicitly, so a green
     // verdict that ignored some failures can never read as "everything passed".
-    let mut detail = Vec::new();
+    let mut detail = vec![validation_completeness_detail(
+        validation_complete, classification.product_result_nodes.len(), planned_tags.len(),
+    )];
     let excused = failures.saturating_sub(effective_failures);
     if exit_code == 0 {
         detail.push(format!("every blocking gate passed ({} node(s) ran)", outcomes.len()));
@@ -20318,8 +20500,9 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
             no_result_nodes.join(", ")
         ));
     } else {
-        let (_named, listing) =
-            blocking_listing(&outcomes, &summary_nonblocking, effective_failures);
+        let (_named, listing) = classified_blocking_listing(
+            &classification, &summary_nonblocking, effective_failures,
+        );
         detail.push(format!("{effective_failures} blocking failure(s){listing}"));
     }
     if exit_code != NO_RESULT_EXIT_CODE as u8 && no_results > 0 {
@@ -20564,9 +20747,8 @@ fn stop_test_seam(
         passed_tests: None,
         filtered_tests: None,
     };
-    // `suite_complete: false` — a fixture that ran two synthetic gates must never
-    // publish a gates_expected obligation, which is what would make it look like
-    // a completed full profile.
+    // `execution_complete: false` keeps this synthetic fixture incomplete. Its
+    // selected denominator is retained without claiming a completed full profile.
     // The fixture plans exactly the synthetic gates it ran, withholds nothing,
     // and leaves nothing unaccounted.
     let planned_tags: BTreeSet<String> = outcomes.iter().map(|o| o.tag.clone()).collect();

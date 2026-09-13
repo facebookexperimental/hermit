@@ -296,6 +296,48 @@ pub fn environmental_block_class(output: &str) -> Option<&'static str> {
     environmental_block_observation(output).class()
 }
 
+/// A diagnosed infrastructure cause in one node's own captured detail.
+///
+/// Environmental denials remain the common case. The two additional signatures
+/// are separately measured causes that the owner classified as infrastructure:
+/// a PMU RCB overshoot, and the container-spawn EPERM produced when TMPDIR lives
+/// on a filesystem carrying `nosuid` or `nodev`. Both matches require the
+/// producer's exact diagnostic shape; a guest merely printing one phrase is not
+/// enough to move its failure out of the product bucket.
+pub fn understood_infrastructure_class(output: &str) -> Option<&'static str> {
+    let lower = output.to_ascii_lowercase();
+    // Unlike the retry classifier, this does NOT accept a bare mention of
+    // `bpfjailer`: that broad match is an explicit retry-favouring trade and is
+    // unsafe for removing a terminal failure from the product bucket.
+    if lower.contains("blocked on this server based on a security policy")
+        || lower.contains("enforcer: fs, reason:")
+        || lower.contains("enforcer: exec, reason:")
+        || lower.contains("enforcer: net, reason:")
+    {
+        return Some("bpfjailer-banner");
+    }
+    match environmental_block_class(output) {
+        Some(class @ ("proxy-egress" | "toolchain-eperm" | "vcs-fs-denial")) => {
+            return Some(class);
+        }
+        _ => {}
+    }
+    if lower.contains("prehook: pmu rcb overshoot!")
+        && lower.contains("clock_value:")
+        && lower.contains("stepped forward")
+        && lower.contains("rcbs, but should have trapped at")
+    {
+        return Some("PMU RCB overshoot");
+    }
+    if lower.contains("hermit_internal_failure class=cli-error")
+        && lower.contains("sandbox container failed to spawn")
+        && lower.contains("mount failed: -1")
+    {
+        return Some("TMPDIR nosuid/nodev mount permission");
+    }
+    None
+}
+
 pub fn environmental_block_observation(output: &str) -> EnvBlockObservation {
     // NOTHING TO EVALUATE IS ITS OWN ANSWER. An empty region means the step
     // produced no output, which is not evidence that it ran unblocked.
@@ -1654,6 +1696,44 @@ pub fn self_test() -> Result<String, String> {
         if failure_class_from_detail(text).is_some() {
             return Err(format!(
                 "failure class: product or absent evidence was reclassified: {text:?}"
+            ));
+        }
+    }
+
+    // ---- understood infrastructure: exact measured signatures only ----
+    for (want, text) in [
+        (
+            "bpfjailer-banner",
+            "An action was blocked on this server based on a security policy!\n\
+             Enforcer: FS, Reason: FILE_OPEN",
+        ),
+        (
+            "PMU RCB overshoot",
+            "2026-08-27 ERROR detcore: prehook: PMU RCB overshoot! Clock_value: 16249. \
+             Stepped forward 139 RCBs, but should have trapped at 100",
+        ),
+        (
+            "TMPDIR nosuid/nodev mount permission",
+            "HERMIT_INTERNAL_FAILURE class=cli-error\nError: Sandbox container failed to spawn\n\
+             Caused by: mount failed: -1",
+        ),
+    ] {
+        if understood_infrastructure_class(text) != Some(want) {
+            return Err(format!(
+                "understood infrastructure: measured signature did not classify as {want}: {text:?}"
+            ));
+        }
+    }
+    for text in [
+        "[e2e.metadata] Bunnylol `scuba bpfjailer_enforce` for more details",
+        "error: failed to run custom build command for `reverie-dbi v0.1.0`",
+        "guest wrote: prehook: PMU RCB overshoot!",
+        "guest wrote: mount failed: -1",
+        "Error: Sandbox container failed to spawn\nCaused by: No such file or directory",
+    ] {
+        if understood_infrastructure_class(text).is_some() {
+            return Err(format!(
+                "understood infrastructure: an incomplete or guest-only phrase was excused: {text:?}"
             ));
         }
     }
