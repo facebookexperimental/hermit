@@ -10,6 +10,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -39,7 +40,7 @@ class CargoCacheMounts(unittest.TestCase):
         )
         fake.chmod(0o755)
 
-    def invoke(self, cargo_home="cargo", run_state=None):
+    def invoke(self, cargo_home="cargo", run_state=None, source="source"):
         env = os.environ.copy()
         env["PATH"] = str(self.root / "tools") + os.pathsep + env["PATH"]
         env["PINNED_ROOT_CAPTURE"] = str(self.capture)
@@ -49,7 +50,7 @@ class CargoCacheMounts(unittest.TestCase):
             forwarded = ["--env", "VALIDATE_RUN_STATE"]
         result = subprocess.run(
             [
-                "bash", str(WRAPPER), "--src", "source", "--out", "output",
+                "bash", str(WRAPPER), "--src", str(source), "--out", "output",
                 "--cargo-home", cargo_home, "--digest", "fixture@sha256:unused",
                 *forwarded,
                 "--", "/not-executed/command", "literal argument",
@@ -118,6 +119,102 @@ class CargoCacheMounts(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("VALIDATE_RUN_STATE must be absolute", result.stderr)
         self.assertEqual(calls, [["image", "exists", "fixture@sha256:unused"]])
+
+    def test_relocates_real_nested_submodule_configs_without_changing_host_metadata(self):
+        git_bin = shutil.which("git")
+        self.assertIsNotNone(git_bin)
+        git_env = os.environ.copy()
+        git_env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+                       GIT_OPTIONAL_LOCKS="0")
+
+        def git(root, *args):
+            result = subprocess.run(
+                [git_bin, "-c", "protocol.file.allow=always", "-c", "user.name=fixture",
+                 "-c", "user.email=fixture@example.invalid", "-C", str(root), *args],
+                env=git_env, capture_output=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            return result.stdout
+
+        def seed(name):
+            root = self.root / name
+            root.mkdir()
+            git(root, "init", "-q")
+            (root / "payload").write_text(name + "\n")
+            git(root, "add", "payload")
+            git(root, "commit", "-qm", "fixture")
+            return root
+
+        leaf = seed("leaf-seed")
+        child = seed("child-seed")
+        git(child, "submodule", "add", "-q", str(leaf), "nested child")
+        git(child, "commit", "-qam", "nested fixture")
+        superproject = seed("super-seed")
+        git(superproject, "submodule", "add", "-q", str(child), "third-party/fixture")
+        git(superproject, "commit", "-qam", "submodule fixture")
+
+        for separate_metadata in (False, True):
+            with self.subTest(separate_metadata=separate_metadata):
+                source = self.root / ("separate-source" if separate_metadata else "plain-source")
+                options = (["--separate-git-dir", str(self.root / "super-metadata")]
+                           if separate_metadata else [])
+                git(self.root, "clone", "-q", *options, str(superproject), str(source))
+                git(source, "submodule", "update", "--init", "--recursive")
+                paths = ["third-party/fixture", "third-party/fixture/nested child"]
+                metadata = {}
+                for path in paths:
+                    directory = Path(git(source / path, "rev-parse", "--absolute-git-dir").decode().strip())
+                    metadata[path] = directory
+                nested = metadata[paths[1]]
+                original_worktree = git(source / paths[1], "config", "--get", "core.worktree").decode().strip()
+                git(source / paths[1], "config", "extensions.worktreeConfig", "true")
+                git(source / paths[1], "config", "--file", str(nested / "config.worktree"),
+                    "core.worktree", original_worktree)
+                git(source / paths[1], "config", "--file", str(nested / "config.worktree"),
+                    "fixture.value", "preserve this value")
+                before = {
+                    str(file): file.read_bytes()
+                    for directory in metadata.values()
+                    for file in (directory / "config", directory / "config.worktree", directory / "index")
+                    if file.exists()
+                }
+                heads = {path: git(source / path, "rev-parse", "HEAD") for path in paths}
+                indexes = {path: git(source / path, "ls-files", "--stage", "-z") for path in paths}
+                objects = {path: git(source / path, "show", "HEAD:payload") for path in paths}
+                self.capture.unlink(missing_ok=True)
+                result, calls = self.invoke(source=source)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(calls), 2)
+                argv = calls[1]
+                mounts = [argv[i + 1] for i, arg in enumerate(argv) if arg == "--mount"]
+                overlays = {}
+                for mount in mounts:
+                    fields = dict(part.split("=", 1) for part in mount.split(","))
+                    if "/git-configs." in fields.get("source", ""):
+                        self.assertEqual(fields["ro"], "true")
+                        overlays[fields["destination"]] = Path(fields["source"])
+                self.assertEqual(len(overlays), 3, "both nested configs and config.worktree must relocate")
+                for path, directory in metadata.items():
+                    raw = (source / path / ".git").read_text().removeprefix("gitdir: ").strip()
+                    guest_dir = os.path.normpath(os.path.join("/src", path, raw))
+                    for name in ("config", "config.worktree"):
+                        original = directory / name
+                        if not original.exists():
+                            continue
+                        copied = overlays[guest_dir + "/" + name]
+                        self.assertEqual(
+                            git(source, "config", "--file", str(copied), "--get", "core.worktree").decode().strip(),
+                            "/src/" + path,
+                        )
+                        def other_values(config):
+                            values = git(source, "config", "--file", str(config), "--null", "--list").split(b"\0")
+                            return [value for value in values if not value.startswith(b"core.worktree\n")]
+                        self.assertEqual(other_values(copied), other_values(original))
+                    self.assertEqual(git(source / path, "rev-parse", "HEAD"), heads[path])
+                    self.assertEqual(git(source / path, "ls-files", "--stage", "-z"), indexes[path])
+                    self.assertEqual(git(source / path, "show", "HEAD:payload"), objects[path])
+                for file, contents in before.items():
+                    self.assertEqual(Path(file).read_bytes(), contents, file)
 
 
 if __name__ == "__main__":

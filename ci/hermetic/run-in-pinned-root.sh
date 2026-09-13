@@ -99,10 +99,16 @@ if [[ -f "$src/.git" ]]; then
     git_common_dir=$(git -C "$src" rev-parse --path-format=absolute --git-common-dir)
     git_mounts+=(--mount "type=bind,source=$git_common_dir,destination=$git_common_dir,ro=true")
 
-    # A linked worktree gives each initialized submodule a relative .git file.
-    # Relocating the source to /src changes what that relative path means, so
-    # reproduce both the resolved git-dir and its configured worktree path.
+fi
+if [[ -e "$src/.git" ]]; then
+    # Relocate each submodule's Git metadata without changing the shared host
+    # configuration. Recreating its old worktree path makes Git report that
+    # alias instead of /src/<path>, which the strict submodule verifier refuses.
+    # Keep objects and indexes read-only; overlay only private config copies.
+    git_config_root=""
+    submodule_paths=$(git -C "$src" submodule foreach --quiet --recursive 'printf "%s\n" "$displaypath"')
     while IFS= read -r submodule_path; do
+        [[ -n $submodule_path ]] || continue
         submodule_root="$src/$submodule_path"
         [[ -f "$submodule_root/.git" ]] || continue
         submodule_git_dir=$(git -C "$submodule_root" rev-parse --path-format=absolute --git-dir)
@@ -113,12 +119,18 @@ if [[ -f "$src/.git" ]]; then
             guest_git_dir=$(realpath -m "/src/$submodule_path/$raw_git_dir")
         fi
         git_mounts+=(--mount "type=bind,source=$submodule_git_dir,destination=$guest_git_dir,ro=true")
-        core_worktree=$(git -C "$submodule_root" config --local --get core.worktree || true)
-        if [[ -n $core_worktree ]]; then
-            guest_worktree=$(realpath -m "$guest_git_dir/$core_worktree")
-            git_mounts+=(--mount "type=bind,source=$submodule_root,destination=$guest_worktree,$src_mode")
+        if [[ -z $git_config_root ]]; then
+            git_config_root=$(mktemp -d "$out/git-configs.XXXXXX")
         fi
-    done < <(git -C "$src" submodule foreach --quiet 'printf "%s\n" "$sm_path"')
+        mkdir -p "$git_config_root/$submodule_path"
+        for config_name in config config.worktree; do
+            [[ -f "$submodule_git_dir/$config_name" ]] || continue
+            config_copy="$git_config_root/$submodule_path/$config_name"
+            cp -- "$submodule_git_dir/$config_name" "$config_copy"
+            git config --file "$config_copy" core.worktree "/src/$submodule_path"
+            git_mounts+=(--mount "type=bind,source=$config_copy,destination=$guest_git_dir/$config_name,ro=true")
+        done
+    done <<< "$submodule_paths"
 fi
 if [[ -n "$cargo_home" ]]; then
     [[ -d "$cargo_home" ]] || {
