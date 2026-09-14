@@ -11210,8 +11210,11 @@ red/`measured-and-passed` count is **0**.",
         },
     };
     series_row.validate_for_read()?;
-    let row_snapshot_value =
-        scorecard_snapshot_fixture_value(&source_commit, &source_tree, &[series_row.clone()])?;
+    let row_snapshot_value = scorecard_snapshot_fixture_value(
+        &source_commit,
+        &source_tree,
+        std::slice::from_ref(&series_row),
+    )?;
     let row_snapshot_path = snapshot_root.join("with-current-row.json");
     let row_snapshot_sha =
         write_scorecard_snapshot_fixture(&row_snapshot_path, &row_snapshot_value)?;
