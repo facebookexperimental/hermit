@@ -23,6 +23,14 @@ use dagrun::model::Step;
 use dagrun::model::StepClass;
 use dagrun::model::StructuredTestResultsManifest;
 
+pub(super) const RUST_SCRIPT_PRODUCER_COMMAND: &str = r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/prepare-rust-scripts.sh"########;
+const RUST_SCRIPT_PRODUCER_DESCRIPTION: &str = r########"DISCOVERED PRODUCER 2026-08-31: every tracked rust-script entrypoint is generated as a Cargo package, checked with the existing clippy policy, built as a release executable, and, when it carries tests, built as a test harness. The outputs are copied into target/ci/rust-scripts after checkout and pin verification, and all compiling consumers wait for this node. Repository graph commands resolve rust-script through ci/rust-script-bin, which executes only the published binaries and never invokes Cargo; sources owned by external operational tooling remain that tooling's responsibility. Two concurrent rust-script --force probes sharing one cache measured a real Cargo build-directory lock wait; separate caches removed the wait but duplicated compilation. Keeping one writer and read-only consumers makes compilation placement deterministic without creating per-node target directories. RESOURCE BOUNDS measured 2026-09-14 at Hermit 7b8be60708c29b4926f36f06be8793523841d6ba: the old 2-GiB hard cap killed the cold width-8 producer in run 1812 and in a focused width-4 control. With the unchanged 28-entrypoint/17-harness workload and width 8, three ordinary cold runs with memory.max=6442450944 bytes passed with cgroup peaks 3836551168, 3845783552, and 3841757184 bytes; three pinned-root cold runs under that same memory.max passed with peaks 3803856896, 3721408512, and 3691466752 bytes. All six recorded memory.events max=0, oom=0, and oom_kill=0. The 4-GiB baseline rounds above the measured high-water mark for scheduler accounting; the 6-GiB hard cap adds more than 2.4 GiB of runaway headroom while fitting the project's 8-GiB minimum runner. preferred_inner_jobs=8 remains paired with CARGO_BUILD_JOBS so the scheduler reserves the same eight-CPU width Cargo actually uses. The ordinary producer's 900-second wall bound is the width-8 wall equivalent of its unchanged 7200-second CPU bound. Quick and super use a distinct 1200-second CPU budget and zero duration estimate: 1200 is the next project 300-second bucket above 1.5 times the largest measured 737.730-second CPU sample. The Step constructor orders these as wall, CPU, then memory."########;
+pub(super) const RUST_SCRIPT_PRODUCER_WALL_SECONDS: i64 = 900;
+pub(super) const RUST_SCRIPT_PRODUCER_RSS_BASELINE_BYTES: i64 = 4 * 1024 * 1024 * 1024;
+pub(super) const RUST_SCRIPT_PRODUCER_HARD_MEM_MAX_BYTES: i64 = 6 * 1024 * 1024 * 1024;
+pub(super) const RUST_SCRIPT_PRODUCER_INNER_JOBS: i64 = 8;
+pub(super) const RUST_SCRIPT_PRODUCER_QUICK_SUPER_CPU_SECONDS: i64 = 1200;
+
 /// The controlled writer a static validation step invokes.
 ///
 /// This is authored metadata, not command-string inference. The generator audits
@@ -630,7 +638,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"build"########,
         job: r########"rust_scripts"########,
         desc: r########"Build every tracked rust-script before graph consumers run"########,
-        description: r########"DISCOVERED PRODUCER 2026-08-31: every tracked rust-script entrypoint is generated as a Cargo package, checked with the existing clippy policy, built as a release executable, and, when it carries tests, built as a test harness. The outputs are copied into target/ci/rust-scripts after checkout and pin verification, and all compiling consumers wait for this node. Repository graph commands resolve rust-script through ci/rust-script-bin, which executes only the published binaries and never invokes Cargo; sources owned by external operational tooling remain that tooling's responsibility. Two concurrent rust-script --force probes sharing one cache measured a real Cargo build-directory lock wait; separate caches removed the wait but duplicated compilation. Keeping one writer and read-only consumers makes compilation placement deterministic without creating per-node target directories."########,
+        description: RUST_SCRIPT_PRODUCER_DESCRIPTION,
         labels: &[
             r########"full"########,
             r########"hosted-portable"########,
@@ -638,7 +646,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"quick"########,
             r########"super"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/prepare-rust-scripts.sh"########,
+        cmd: RUST_SCRIPT_PRODUCER_COMMAND,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -647,16 +655,16 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         hint: HintSpec {
             resources: &[],
             est_duration_s: 190.0,
-            rss_baseline_bytes: Some(1073741824),
-            hard_mem_max_bytes: Some(2147483648),
+            rss_baseline_bytes: Some(RUST_SCRIPT_PRODUCER_RSS_BASELINE_BYTES),
+            hard_mem_max_bytes: Some(RUST_SCRIPT_PRODUCER_HARD_MEM_MAX_BYTES),
             classification: StepClass::CpuBound,
-            preferred_inner_jobs: Some(8),
+            preferred_inner_jobs: Some(RUST_SCRIPT_PRODUCER_INNER_JOBS),
             measured_effective_cores: None,
             measured_cpu_utilization: None,
         },
         networkonly: false,
         engine_only: false,
-        timeout: 300,
+        timeout: RUST_SCRIPT_PRODUCER_WALL_SECONDS,
         cpu_timeout: 7200,
         jobs_flag: Some(r########""########),
         jobs_env: Some(r########"CARGO_BUILD_JOBS"########),
@@ -5770,9 +5778,9 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         group: r########"build"########,
         job: r########"rust_scripts_on_host"########,
         desc: r########"Build every tracked rust-script before graph consumers run"########,
-        description: r########"DISCOVERED PRODUCER 2026-08-31: every tracked rust-script entrypoint is generated as a Cargo package, checked with the existing clippy policy, built as a release executable, and, when it carries tests, built as a test harness. The outputs are copied into target/ci/rust-scripts after checkout and pin verification, and all compiling consumers wait for this node. Repository graph commands resolve rust-script through ci/rust-script-bin, which executes only the published binaries and never invokes Cargo; sources owned by external operational tooling remain that tooling's responsibility. Two concurrent rust-script --force probes sharing one cache measured a real Cargo build-directory lock wait; separate caches removed the wait but duplicated compilation. Keeping one writer and read-only consumers makes compilation placement deterministic without creating per-node target directories."########,
+        description: RUST_SCRIPT_PRODUCER_DESCRIPTION,
         labels: &[r########"hosted-privileged"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/prepare-rust-scripts.sh"########,
+        cmd: RUST_SCRIPT_PRODUCER_COMMAND,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -5781,16 +5789,16 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         hint: HintSpec {
             resources: &[],
             est_duration_s: 190.0,
-            rss_baseline_bytes: Some(1073741824),
-            hard_mem_max_bytes: Some(2147483648),
+            rss_baseline_bytes: Some(RUST_SCRIPT_PRODUCER_RSS_BASELINE_BYTES),
+            hard_mem_max_bytes: Some(RUST_SCRIPT_PRODUCER_HARD_MEM_MAX_BYTES),
             classification: StepClass::CpuBound,
-            preferred_inner_jobs: Some(8),
+            preferred_inner_jobs: Some(RUST_SCRIPT_PRODUCER_INNER_JOBS),
             measured_effective_cores: None,
             measured_cpu_utilization: None,
         },
         networkonly: false,
         engine_only: false,
-        timeout: 300,
+        timeout: RUST_SCRIPT_PRODUCER_WALL_SECONDS,
         cpu_timeout: 7200,
         jobs_flag: Some(r########""########),
         jobs_env: Some(r########"CARGO_BUILD_JOBS"########),

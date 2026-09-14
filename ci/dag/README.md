@@ -38,10 +38,10 @@ independent source and refuses any command, dependency, or cap drift in the
 committed artifact. `--write` updates this same file; there is no secondary
 runnable DAG.
 
-The local privileged selection contains 19 nodes with the pre-cutover wrapped 3900-second critical
+The local privileged selection contains 19 nodes with a 4500-second critical
 path. The separately labelled hosted privileged smoke preserves its historical
-12-node population and 1500-second critical path, so the manual workflow keeps
-its audited 1560-second launcher bound. The stale hosted file omitted CPU
+12-node population and has a 2100-second critical path, so the manual workflow
+uses an audited 2160-second launcher bound. The stale hosted file omitted CPU
 budgets and therefore inherited dagrun's 10-second fallback; every hosted node
 now carries the corresponding current-plan CPU budget explicitly. This is a
 correctness repair, not a claim that the obsolete fallback was equivalent.

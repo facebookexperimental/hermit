@@ -7121,10 +7121,11 @@ fn rust_script_producer_step() -> Step {
         "Build every tracked rust-script before graph consumers run",
         "./ci/prepare-rust-scripts.sh".into(),
         Vec::new(),
-        300,
-        7200,
-        2 * 1024 * 1024 * 1024,
+        900,  // wall-clock seconds
+        7200, // CPU seconds: eight workers may consume this in 900 wall seconds
+        6 * 1024 * 1024 * 1024,
     );
+    step.hint.rss_baseline_bytes = Some(4 * 1024 * 1024 * 1024);
     step.description = "Discovers every tracked rust-script entrypoint, generates one Cargo workspace, runs the existing clippy, release-build, and test-harness phases over that workspace, and publishes the executables. Cargo schedules packages and shared dependencies internally while the producer remains the only writer. It runs after checkout and pin verification; every compiling consumer resolves rust-script through the read-only manifest, so compilation cost cannot migrate according to scheduler order.".into();
     step.hint.classification = dagrun::model::StepClass::CpuBound;
     step.hint.preferred_inner_jobs = Some(8);
@@ -7365,6 +7366,35 @@ fn prebuilt_rust_script_plan_bracket(root: &Path) -> Result<String, String> {
         return Err(format!(
             "rust-script preflight bracket did not place compilation between pin verification and manifest compilation: producer={producer:?} manifest={manifest_plan:?}"
         ));
+    }
+    let committed = committed_rust_script_producer(root)?;
+    if committed.timeout != 900
+        || committed.cpu_timeout != 7200
+        || committed.hint.rss_baseline_bytes != Some(4 * 1024 * 1024 * 1024)
+        || committed.hint.hard_mem_max_bytes != Some(6 * 1024 * 1024 * 1024)
+        || committed.hint.preferred_inner_jobs != Some(8)
+    {
+        return Err(format!(
+            "rust-script producer bracket lost its wall/CPU/baseline/hard-cap/width tuple: {committed:?}"
+        ));
+    }
+    let mutations: [(&str, fn(&mut Step)); 3] = [
+        ("wall", |step| step.timeout = 300),
+        ("baseline", |step| {
+            step.hint.rss_baseline_bytes = Some(1024 * 1024 * 1024)
+        }),
+        ("hard cap", |step| {
+            step.hint.hard_mem_max_bytes = Some(2 * 1024 * 1024 * 1024)
+        }),
+    ];
+    for (name, mutate) in mutations {
+        let mut changed = committed.clone();
+        mutate(&mut changed);
+        if assert_exact_rust_script_producer(&changed, &committed, name).is_ok() {
+            return Err(format!(
+                "rust-script producer bracket accepted the old {name} value"
+            ));
+        }
     }
     Ok("rust-script build: one producer follows checkout verification and precedes graph consumers; prepared binaries are read-only and duplicate producers refuse".into())
 }

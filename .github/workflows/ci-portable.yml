@@ -246,7 +246,10 @@ jobs:
     # proof-of-inert `skip` (e.g. docs-only) drops it.
     if: needs.select.outputs.decision != 'skip'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # The five selected preflight_nodes form a 3780s committed critical path.
+    # Keep 420s outside that bound for checkout, packages, tool install,
+    # artifact transfer, and runner teardown; test-harness audits both numbers.
+    timeout-minutes: 70
     steps:
       - uses: actions/checkout@v4
         with:

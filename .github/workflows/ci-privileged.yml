@@ -46,16 +46,15 @@ jobs:
     # This is a WALL, not an expected duration: a green run of this job measured
     # 126s end to end on 2026-08-08 (run 31282467953). The wall must still cover
     # the case where every budgeted step spends its whole allowance, which is
-    # 1560s (DAG launcher) + 450s (30s locks + 60s submodule init + 30s hardware
-    # capabilities + 120s boxing probe + 210s occasional KVM probes) + an allowance for the steps
-    # that carry no `timeout` of their own (job setup, checkout, and the two
-    # artifact uploads measured 7s warm, but a cold checkout and a large
-    # artifact upload are far slower). target/debug/test-harness reads the
+    # 2160s (DAG launcher) + 450s (30s locks + 60s submodule init + 30s hardware
+    # capabilities + 120s boxing probe + 210s occasional KVM probes) = 2610s.
+    # The 3000s job bound leaves 390s for steps without their own `timeout`
+    # (job setup, checkout, and the two artifact uploads). target/debug/test-harness reads the
     # privileged launcher and DAG budgets from their deployed files and fails
     # closed on their ordering drift, so
     # raise the step budgets and rerun `target/debug/test-harness validate` rather
     # than guessing here.
-    timeout-minutes: 34
+    timeout-minutes: 50
     env:
       DETCORE_TEST_RUST_LOG: "off"
 
@@ -116,7 +115,7 @@ jobs:
       # execution only in that exact context. A copied/local invocation, or any
       # boxing failure outside Actions, must fail closed instead of silently
       # downgrading through --allow-cgroup-failure.
-      # 1560s exceeds the selected graph's audited 1500s critical path plus 30s
+      # 2160s exceeds the selected graph's audited 2100s critical path plus 30s
       # runner teardown. A warm exact-tree build measured 77s; the first
       # canonical cold-cache run exceeded 180s before completing.
       # This number is the SINGLE AUTHOR
@@ -130,7 +129,7 @@ jobs:
           echo 'privileged DAG: refusing explicit unboxed execution outside GitHub Actions' >&2
           exit 2
         fi
-        timeout --foreground --kill-after=10s 1560s env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 --unsafe-no-cgroups --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v
+        timeout --foreground --kill-after=10s 2160s env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 --unsafe-no-cgroups --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v
     - name: Run non-gating occasional KVM probes
       id: kvm_occasional
       continue-on-error: true

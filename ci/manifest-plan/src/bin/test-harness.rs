@@ -1252,6 +1252,62 @@ fn portable_shard_step<'a>(
         .ok_or_else(|| format!("portable shard names missing DAG node {node}"))
 }
 
+const PORTABLE_PREFLIGHT_CRITICAL_PATH_SECONDS: u64 = 3780;
+const PORTABLE_PREFLIGHT_OVERHEAD_SECONDS: u64 = 420;
+const PRIVILEGED_WORKFLOW_OVERHEAD_SECONDS: u64 = 300;
+
+fn audit_portable_preflight_budget(
+    workflow: &YamlValue,
+    portable: &dagrun::DagConfig,
+    shards: &JsonValue,
+) -> Result<(), String> {
+    let preflight_nodes = shards["preflight_nodes"]
+        .as_array()
+        .ok_or_else(|| "portable shard map has no preflight_nodes array".to_string())?
+        .iter()
+        .map(|node| {
+            node.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| "portable preflight_nodes contains a non-string node".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    // ci/run-node.sh passes --ignore-selected-deps: dependencies outside the
+    // declared preflight population are supplied by the workflow, while edges
+    // among these five selected nodes remain load-bearing.
+    let selected = dagrun::select_steps_by_tags(portable, &preflight_nodes, true)
+        .map_err(|error| format!("cannot select portable preflight closure: {error}"))?;
+    let critical_path = dag_critical_path(&selected)?;
+    if critical_path != PORTABLE_PREFLIGHT_CRITICAL_PATH_SECONDS {
+        return Err(format!(
+            "portable preflight critical path changed from {PORTABLE_PREFLIGHT_CRITICAL_PATH_SECONDS}s to {critical_path}s"
+        ));
+    }
+    let job_bound = workflow_job_timeout(workflow, "preflight")? * 60;
+    let required = critical_path
+        .checked_add(PORTABLE_PREFLIGHT_OVERHEAD_SECONDS)
+        .ok_or_else(|| "portable preflight required budget overflowed".to_string())?;
+    if job_bound < required {
+        return Err(format!(
+            "portable preflight job {job_bound}s must cover its {critical_path}s constructed DAG critical path plus at least {PORTABLE_PREFLIGHT_OVERHEAD_SECONDS}s for checkout, package installation, artifact transfer, and teardown"
+        ));
+    }
+    Ok(())
+}
+
+fn audit_privileged_workflow_overhead(workflow: &YamlValue) -> Result<(), String> {
+    let job_bound = workflow_job_timeout(workflow, "privileged")? * 60;
+    let declared_step_budgets = workflow_step_timeout_sum(workflow, "privileged")?;
+    let required = declared_step_budgets
+        .checked_add(PRIVILEGED_WORKFLOW_OVERHEAD_SECONDS)
+        .ok_or_else(|| "privileged workflow required budget overflowed".to_string())?;
+    if job_bound < required {
+        return Err(format!(
+            "privileged job {job_bound}s must cover {declared_step_budgets}s of explicit inner step budgets plus at least {PRIVILEGED_WORKFLOW_OVERHEAD_SECONDS}s for setup, checkout, artifact transfer, and teardown"
+        ));
+    }
+    Ok(())
+}
+
 fn audit_budget_ordering(root: &Path) -> Result<(), String> {
     audit_workflow_run_dag_runners(root)?;
     let committed = read_dag(&root.join("ci/dag/validate.json"))?;
@@ -1298,6 +1354,7 @@ fn audit_budget_ordering(root: &Path) -> Result<(), String> {
         &fs::read(root.join("ci/portable-shards.json")).map_err(|e| e.to_string())?,
     )
     .map_err(|e| format!("invalid portable shard map: {e}"))?;
+    audit_portable_preflight_budget(&portable_workflow, &portable, &shards)?;
     let portable_steps = portable
         .steps
         .iter()
@@ -1353,13 +1410,7 @@ fn audit_budget_ordering(root: &Path) -> Result<(), String> {
     let launcher_bound = command_timeout_seconds(launcher_line)?
         .ok_or_else(|| "cannot derive privileged launcher timeout".to_string())?;
     let privileged_yaml = parse_yaml(&root.join(".github/workflows/ci-privileged.yml"))?;
-    let privileged_job_bound = workflow_job_timeout(&privileged_yaml, "privileged")? * 60;
-    let declared_step_budgets = workflow_step_timeout_sum(&privileged_yaml, "privileged")?;
-    if privileged_job_bound <= declared_step_budgets {
-        return Err(format!(
-            "privileged job {privileged_job_bound}s must exceed {declared_step_budgets}s of explicit inner step budgets"
-        ));
-    }
+    audit_privileged_workflow_overhead(&privileged_yaml)?;
     let critical_path = dag_critical_path(&privileged)?;
     if launcher_bound <= critical_path + 30 {
         return Err(format!(
@@ -1427,10 +1478,10 @@ fn audit_run_dag_workflow_runner(label: &str, workflow: &YamlValue) -> Result<()
     const DAG_PRIVILEGED: &str =
         "env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 -v";
     const VALIDATION_PRIVILEGED: &str = "env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir \"$RUNNER_TEMP/hermit-privileged-dag-perf\" -v";
-    const STANDALONE_PRIVILEGED: &str = "if [[ ${GITHUB_ACTIONS:-} != true ]]; then\n  echo 'privileged DAG: refusing explicit unboxed execution outside GitHub Actions' >&2\n  exit 2\nfi\ntimeout --foreground --kill-after=10s 1560s env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 --unsafe-no-cgroups --perf-dir \"$RUNNER_TEMP/hermit-privileged-dag-perf\" -v";
+    const STANDALONE_PRIVILEGED: &str = "if [[ ${GITHUB_ACTIONS:-} != true ]]; then\n  echo 'privileged DAG: refusing explicit unboxed execution outside GitHub Actions' >&2\n  exit 2\nfi\ntimeout --foreground --kill-after=10s 2160s env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 --unsafe-no-cgroups --perf-dir \"$RUNNER_TEMP/hermit-privileged-dag-perf\" -v";
     const FIXTURES: &[&str] = &[
         "env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh portable -v",
-        "timeout --foreground --kill-after=10s 1560s env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -v",
+        "timeout --foreground --kill-after=10s 2160s env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -v",
     ];
     let expected: &[(&str, &str)] = match label {
         ".github/workflows/ci-dag.yml" => &[
@@ -2325,6 +2376,45 @@ mod tests {
 "#;
 
     #[test]
+    fn workflow_outer_bounds_cover_constructed_graphs_and_setup() {
+        let root = super::root();
+        let committed = dagrun::dag_from_json(include_str!("../../../dag/validate.json"))
+            .expect("actual committed graph");
+        let portable = dagrun::select_steps_by_labels(&committed, &["hosted-portable".into()])
+            .expect("actual hosted portable selection");
+        let shards: serde_json::Value =
+            serde_json::from_str(include_str!("../../../portable-shards.json")).unwrap();
+        let mut portable_workflow =
+            super::parse_yaml(&root.join(".github/workflows/ci-portable.yml"))
+                .expect("portable workflow");
+        super::audit_portable_preflight_budget(&portable_workflow, &portable, &shards).unwrap();
+        portable_workflow["jobs"]["preflight"]["timeout-minutes"] =
+            serde_yaml::to_value(10_u64).unwrap();
+        let error = super::audit_portable_preflight_budget(&portable_workflow, &portable, &shards)
+            .unwrap_err();
+        assert!(
+            error.contains(
+                "portable preflight job 600s must cover its 3780s constructed DAG critical path plus at least 420s"
+            ),
+            "{error}"
+        );
+
+        let mut privileged_workflow =
+            super::parse_yaml(&root.join(".github/workflows/ci-privileged.yml"))
+                .expect("privileged workflow");
+        super::audit_privileged_workflow_overhead(&privileged_workflow).unwrap();
+        privileged_workflow["jobs"]["privileged"]["timeout-minutes"] =
+            serde_yaml::to_value(44_u64).unwrap();
+        let error = super::audit_privileged_workflow_overhead(&privileged_workflow).unwrap_err();
+        assert!(
+            error.contains(
+                "privileged job 2640s must cover 2610s of explicit inner step budgets plus at least 300s"
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn portable_shard_budgets_resolve_actual_hosted_nodes_without_losing_checks() {
         let committed = dagrun::dag_from_json(include_str!("../../../dag/validate.json"))
             .expect("actual committed graph");
@@ -2476,7 +2566,7 @@ mod tests {
     fn run_dag_workflows_use_a_structured_result_capable_runner() {
         for command in [
             "env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh portable -v",
-            "timeout --foreground --kill-after=10s 1560s env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -v",
+            "timeout --foreground --kill-after=10s 2160s env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -v",
         ] {
             let workflow: serde_yaml::Value = serde_yaml::from_str(&format!(
                 "jobs:\n  validation:\n    steps:\n      - run: {command}\n"
@@ -2567,10 +2657,10 @@ mod tests {
     #[test]
     fn privileged_launcher_timeout_does_not_depend_on_an_env_prefix() {
         for command in [
-            "timeout --foreground --kill-after=10s 1560s ci/run-dag.sh privileged -v",
-            "timeout --foreground --kill-after=10s 1560s env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -v",
+            "timeout --foreground --kill-after=10s 2160s ci/run-dag.sh privileged -v",
+            "timeout --foreground --kill-after=10s 2160s env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -v",
         ] {
-            assert_eq!(command_timeout_seconds(command).unwrap(), Some(1560));
+            assert_eq!(command_timeout_seconds(command).unwrap(), Some(2160));
         }
     }
 

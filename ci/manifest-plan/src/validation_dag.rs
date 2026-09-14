@@ -739,9 +739,9 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
 }
 
 // These six shared ancestors need separate immutable IDs because quick/super
-// retain their 900-second Rust-script CPU budget, while the other profiles keep
-// the established 7200-second cold-build budget. This is generation, not a
-// runtime rewrite of the selected graph.
+// use the measured 1200-second Rust-script CPU budget, while the other profiles
+// keep the established 7200-second cold-build budget. This is generation, not
+// a runtime rewrite of the selected graph.
 const QUICK_SUPER_VARIANTS: &[&str] = &[
     "build.rust_scripts",
     "build.rust_scripts_in_pinned_root",
@@ -765,8 +765,13 @@ fn materialize_quick_super_budgets(cfg: &mut DagConfig) {
             variant.labels.retain(|label| is_quick_super(label));
             variant.fail_fast_family = Some(variant.tag());
             if step.group == "build" {
-                variant.cpu_timeout = 900;
-                variant.hint.rss_baseline_bytes = Some(2 * 1024 * 1024 * 1024);
+                variant.timeout = crate::validation_dag_static::RUST_SCRIPT_PRODUCER_WALL_SECONDS;
+                variant.cpu_timeout =
+                    crate::validation_dag_static::RUST_SCRIPT_PRODUCER_QUICK_SUPER_CPU_SECONDS;
+                variant.hint.rss_baseline_bytes =
+                    Some(crate::validation_dag_static::RUST_SCRIPT_PRODUCER_RSS_BASELINE_BYTES);
+                variant.hint.hard_mem_max_bytes =
+                    Some(crate::validation_dag_static::RUST_SCRIPT_PRODUCER_HARD_MEM_MAX_BYTES);
                 variant.hint.est_duration_s = 0.0;
             }
             step.labels.retain(|label| !is_quick_super(label));
@@ -1234,6 +1239,113 @@ fn expected_for_label<'a>(label: &str, cells: &'a [DagManifest]) -> Vec<&'a DagM
         .collect()
 }
 
+fn assert_rust_script_producer_contract(cfg: &DagConfig) -> Result<(), String> {
+    let expected: &[(&str, &[&str], &[&str], i64, f64)] = &[
+        (
+            "build.rust_scripts",
+            &["full", "hosted-portable", "portable"],
+            &["pre.reverie_pin"],
+            7200,
+            190.0,
+        ),
+        (
+            "build.rust_scripts_on_host",
+            &["hosted-privileged"],
+            &["pre.reverie_pin_on_host"],
+            7200,
+            190.0,
+        ),
+        (
+            "build.rust_scripts_in_pinned_root",
+            &["full", "portable"],
+            &["pre.reverie_pin", "setup.pinned_root_fetch"],
+            7200,
+            190.0,
+        ),
+        (
+            "quick-super-build.rust_scripts",
+            &["quick", "super"],
+            &["pre.reverie_pin"],
+            crate::validation_dag_static::RUST_SCRIPT_PRODUCER_QUICK_SUPER_CPU_SECONDS,
+            0.0,
+        ),
+        (
+            "quick-super-build.rust_scripts_in_pinned_root",
+            &["quick", "super"],
+            &["pre.reverie_pin", "setup.pinned_root_fetch"],
+            crate::validation_dag_static::RUST_SCRIPT_PRODUCER_QUICK_SUPER_CPU_SECONDS,
+            0.0,
+        ),
+    ];
+    let expected_tags = expected
+        .iter()
+        .map(|(tag, ..)| (*tag).to_string())
+        .collect::<BTreeSet<_>>();
+    let actual_producers = cfg
+        .steps
+        .iter()
+        .filter(|step| {
+            matches!(
+                step.job.as_str(),
+                "rust_scripts" | "rust_scripts_on_host" | "rust_scripts_in_pinned_root"
+            )
+        })
+        .collect::<Vec<_>>();
+    let actual_tags = actual_producers
+        .iter()
+        .map(|step| step.tag())
+        .collect::<BTreeSet<_>>();
+    if actual_producers.len() != expected.len() || actual_tags != expected_tags {
+        return Err(format!(
+            "rust-script producer identity population changed: expected={} {expected_tags:?}, actual={} {actual_tags:?}",
+            expected.len(),
+            actual_producers.len(),
+        ));
+    }
+
+    for (tag, labels, deps, cpu_timeout, est_duration_s) in expected {
+        let step = cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == *tag)
+            .ok_or_else(|| format!("committed DAG lost {tag}"))?;
+        let execution_command = crate::nextest_build_selections::execution_command(step)?;
+        let expected_labels = labels
+            .iter()
+            .map(|label| (*label).to_string())
+            .collect::<Vec<_>>();
+        let expected_deps = deps
+            .iter()
+            .map(|dependency| (*dependency).to_string())
+            .collect::<Vec<_>>();
+        let has_no_result_ownership =
+            step.manifest.is_none() && matches!(step.result_manifests.as_deref(), Some([]));
+        if execution_command != crate::validation_dag_static::RUST_SCRIPT_PRODUCER_COMMAND
+            || step.labels != expected_labels
+            || step.deps != expected_deps
+            || !has_no_result_ownership
+            || step.timeout != crate::validation_dag_static::RUST_SCRIPT_PRODUCER_WALL_SECONDS
+            || step.cpu_timeout != *cpu_timeout
+            || step.hint.est_duration_s != *est_duration_s
+            || step.hint.rss_baseline_bytes
+                != Some(crate::validation_dag_static::RUST_SCRIPT_PRODUCER_RSS_BASELINE_BYTES)
+            || step.hint.hard_mem_max_bytes
+                != Some(crate::validation_dag_static::RUST_SCRIPT_PRODUCER_HARD_MEM_MAX_BYTES)
+            || step.hint.classification != dagrun::model::StepClass::CpuBound
+            || step.hint.preferred_inner_jobs
+                != Some(crate::validation_dag_static::RUST_SCRIPT_PRODUCER_INNER_JOBS)
+            || step.jobs_flag.as_deref() != Some("")
+            || step.jobs_env.as_deref() != Some("CARGO_BUILD_JOBS")
+            || step.fail_fast_family.as_deref() != Some(*tag)
+        {
+            return Err(format!(
+                "{tag} changed its exact rust-script producer identity or resource contract: {step:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn critical_path_wall_seconds(cfg: &DagConfig) -> Result<i64, String> {
     let by_tag = cfg
         .steps
@@ -1287,6 +1399,7 @@ fn critical_path_wall_seconds(cfg: &DagConfig) -> Result<i64, String> {
 fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), String> {
     assert_structured_result_producers(cfg)?;
     crate::nextest_build_selections::assert_preparation_dependencies(cfg)?;
+    assert_rust_script_producer_contract(cfg)?;
     if cfg.steps.len() != 1598 {
         return Err(format!(
             "superset has {} steps, expected 1598",
@@ -1575,18 +1688,18 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
                     .collect::<Vec<_>>()
             ));
         }
-        // The single quick build now consumes Nextest from the pinned image.
-        // Its former 600-second host installation is no longer a prerequisite;
-        // every node's timeout and CPU cap remains unchanged.
-        if profile.label == "quick" && critical_path_wall_seconds(&selected)? != 8580 {
+        // The single quick build consumes Nextest from the pinned image, and
+        // the width-8 rust-script producer now has a 900-second wall boundary
+        // with the measured quick/super 1200-second CPU budget.
+        if profile.label == "quick" && critical_path_wall_seconds(&selected)? != 9180 {
             return Err(format!(
-                "quick selected critical path differs from 8580 seconds with image-owned Nextest: {}",
+                "quick selected critical path differs from 9180 seconds with image-owned Nextest and the measured rust-script wall bound: {}",
                 critical_path_wall_seconds(&selected)?
             ));
         }
-        if profile.label == "privileged" && critical_path_wall_seconds(&selected)? != 3900 {
+        if profile.label == "privileged" && critical_path_wall_seconds(&selected)? != 4500 {
             return Err(format!(
-                "local privileged selected critical path changed from the pre-cutover wrapped 3900 seconds to {}",
+                "local privileged selected critical path differs from 4500 seconds with the measured rust-script wall bound: {}",
                 critical_path_wall_seconds(&selected)?
             ));
         }
@@ -1656,9 +1769,9 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
                 return Err("hosted privileged graph gained an unmeasured resource demand".into());
             }
             let critical = critical_path_wall_seconds(&selected)?;
-            if critical != 1500 {
+            if critical != 2100 {
                 return Err(format!(
-                    "hosted privileged critical path changed from 1500 seconds to {critical}"
+                    "hosted privileged critical path differs from 2100 seconds with the measured rust-script wall bound: {critical}"
                 ));
             }
         }
@@ -1725,7 +1838,11 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
         } else {
             2
         };
-        let expected_cpu = if quick_super { 900 } else { 7200 };
+        let expected_cpu = if quick_super {
+            crate::validation_dag_static::RUST_SCRIPT_PRODUCER_QUICK_SUPER_CPU_SECONDS
+        } else {
+            7200
+        };
         if producers.len() != expected_count
             || producers.iter().any(|step| {
                 step.cpu_timeout != expected_cpu
@@ -2433,15 +2550,15 @@ sys.exit(37)
     }
 
     #[test]
-    fn profile_producers_retain_distinct_pre_cutover_cpu_limits() {
+    fn profile_producers_retain_distinct_measured_cpu_limits() {
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         let cells = expected_cells(&repo_root().unwrap()).unwrap();
         assert_invariants(&committed, &cells).unwrap();
         for (tag, wrong_cpu) in [
-            ("quick-super-build.rust_scripts", 7200),
-            ("quick-super-build.rust_scripts_in_pinned_root", 7200),
-            ("build.rust_scripts", 900),
-            ("build.rust_scripts_in_pinned_root", 900),
+            ("quick-super-build.rust_scripts", 900),
+            ("quick-super-build.rust_scripts_in_pinned_root", 900),
+            ("build.rust_scripts", 1200),
+            ("build.rust_scripts_in_pinned_root", 1200),
         ] {
             let mut changed = committed.clone();
             changed
@@ -2451,8 +2568,101 @@ sys.exit(37)
                 .unwrap()
                 .cpu_timeout = wrong_cpu;
             let error = assert_invariants(&changed, &cells).unwrap_err();
-            assert!(error.contains("CPU budget"), "{tag}: {error}");
+            assert!(
+                error.contains("rust-script producer identity or resource contract"),
+                "{tag}: {error}"
+            );
         }
+    }
+
+    #[test]
+    fn rust_script_producers_retain_exact_identity_and_measured_resources() {
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        assert_rust_script_producer_contract(&committed).unwrap();
+        let tags = [
+            "build.rust_scripts",
+            "build.rust_scripts_on_host",
+            "build.rust_scripts_in_pinned_root",
+            "quick-super-build.rust_scripts",
+            "quick-super-build.rust_scripts_in_pinned_root",
+        ];
+        let old_resource_mutations: [(&str, fn(&mut Step, &str)); 3] = [
+            ("wall", |step, _| step.timeout = 300),
+            ("baseline", |step, tag| {
+                step.hint.rss_baseline_bytes = Some(if tag.starts_with("quick-super-") {
+                    2 * 1024 * 1024 * 1024
+                } else {
+                    1024 * 1024 * 1024
+                })
+            }),
+            ("hard cap", |step, _| {
+                step.hint.hard_mem_max_bytes = Some(2 * 1024 * 1024 * 1024)
+            }),
+        ];
+        for tag in tags {
+            for (name, mutate) in old_resource_mutations {
+                let mut changed = committed.clone();
+                let step = changed
+                    .steps
+                    .iter_mut()
+                    .find(|step| step.tag() == tag)
+                    .unwrap();
+                mutate(step, tag);
+                let error = assert_rust_script_producer_contract(&changed).unwrap_err();
+                assert!(error.contains(tag), "{name} mutation: {error}");
+            }
+        }
+
+        let mut changed_command = committed.clone();
+        changed_command
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "build.rust_scripts")
+            .unwrap()
+            .cmd
+            .push_str(" --planted");
+        assert!(
+            assert_rust_script_producer_contract(&changed_command)
+                .unwrap_err()
+                .contains("build.rust_scripts")
+        );
+
+        let mut changed_deps = committed.clone();
+        changed_deps
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "build.rust_scripts_in_pinned_root")
+            .unwrap()
+            .deps
+            .clear();
+        assert!(
+            assert_rust_script_producer_contract(&changed_deps)
+                .unwrap_err()
+                .contains("build.rust_scripts_in_pinned_root")
+        );
+
+        let mut changed_ownership = committed.clone();
+        changed_ownership
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "build.rust_scripts_on_host")
+            .unwrap()
+            .result_manifests = None;
+        assert!(
+            assert_rust_script_producer_contract(&changed_ownership)
+                .unwrap_err()
+                .contains("build.rust_scripts_on_host")
+        );
+
+        let mut changed_population = committed;
+        changed_population
+            .steps
+            .retain(|step| step.tag() != "quick-super-build.rust_scripts");
+        assert!(
+            assert_rust_script_producer_contract(&changed_population)
+                .unwrap_err()
+                .contains("identity population")
+        );
     }
 
     #[test]

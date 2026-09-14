@@ -376,7 +376,7 @@ mod tests {
         let expected = vec![
             ("pre.submodules".to_string(), 900, 300, Some(2_147_483_648)),
             ("pre.reverie_pin".to_string(), 900, 300, Some(2_147_483_648)),
-            ("build.rust_scripts".to_string(), 300, 7200, Some(2_147_483_648)),
+            ("build.rust_scripts".to_string(), 900, 7200, Some(6_442_450_944)),
             ("setup.manifest_plan".to_string(), 180, 7200, Some(2_147_483_648)),
             ("gate.manifest".to_string(), 900, 600, Some(5_368_709_120)),
         ];
