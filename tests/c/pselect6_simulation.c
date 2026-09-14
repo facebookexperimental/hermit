@@ -64,6 +64,63 @@ struct pselect6_sigmask_arg {
   size_t sigsetsize;
 };
 
+static int run_wrapper_boundary(int unmap_tail) {
+  long page_size = sysconf(_SC_PAGESIZE);
+  if (page_size <= 0) {
+    fputs("invalid pselect wrapper page size\n", stderr);
+    return 1;
+  }
+  char* mapping = mmap(NULL, (size_t)page_size * 2, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (mapping == MAP_FAILED) {
+    perror("pselect wrapper mapping");
+    return 1;
+  }
+  struct pselect6_sigmask_arg* wrapper =
+      (struct pselect6_sigmask_arg*)(mapping + page_size - sizeof(void*));
+  *wrapper = (struct pselect6_sigmask_arg){
+      .sigmask = NULL,
+      .sigsetsize = sizeof(uint64_t),
+  };
+  struct timespec malformed = {.tv_sec = 0, .tv_nsec = 1000000000};
+  errno = 0;
+  long result = syscall(SYS_pselect6, 0, NULL, NULL, NULL, &malformed, wrapper);
+  if (result != -1 || errno != EINVAL) {
+    fprintf(stderr,
+            "readable split pselect6 wrapper: result=%ld errno=%d\n",
+            result, errno);
+    munmap(mapping, (size_t)page_size * 2);
+    return 1;
+  }
+  int changed = unmap_tail
+      ? munmap(mapping + page_size, (size_t)page_size)
+      : mprotect(mapping + page_size, (size_t)page_size, PROT_NONE);
+  if (changed != 0) {
+    perror("pselect wrapper tail access");
+    munmap(mapping, (size_t)page_size * 2);
+    return 1;
+  }
+  int failed = 0;
+  const void* timeouts[] = {&malformed, (void*)1};
+  for (size_t i = 0; i < sizeof(timeouts) / sizeof(timeouts[0]); ++i) {
+    errno = 0;
+    result = syscall(SYS_pselect6, 0, NULL, NULL, NULL, timeouts[i], wrapper);
+    if (result != -1 || errno != EFAULT) {
+      fprintf(stderr,
+              "%s pselect6 wrapper tail before %s timeout: "
+              "result=%ld errno=%d (expected EFAULT)\n",
+              unmap_tail ? "unmapped" : "protected",
+              i == 0 ? "malformed" : "unreadable", result, errno);
+      failed = 1;
+    }
+  }
+  if (munmap(mapping, (size_t)page_size * (unmap_tail ? 1 : 2)) != 0) {
+    perror("munmap pselect wrapper");
+    return 1;
+  }
+  return failed;
+}
+
 static int run_argument_validation_order(void) {
   struct timespec malformed = {.tv_sec = 0, .tv_nsec = 1000000000};
   errno = 0;
@@ -105,6 +162,9 @@ static int run_argument_validation_order(void) {
             "pselect6 timeout validation did not precede signal-mask access: "
             "result=%ld errno=%d\n",
             result, errno);
+    return 1;
+  }
+  if (run_wrapper_boundary(0) != 0 || run_wrapper_boundary(1) != 0) {
     return 1;
   }
   return 0;
@@ -324,8 +384,19 @@ int main(int argc, char** argv) {
     return run_default_workload();
   }
   if (argc != 2) {
-    fprintf(stderr, "usage: %s [argument-validation-order]\n", argv[0]);
+    fprintf(stderr,
+            "usage: %s [argument-validation-order|wrapper-protected-tail|"
+            "wrapper-unmapped-tail]\n", argv[0]);
     return 2;
+  }
+  if (strcmp(argv[1], "wrapper-protected-tail") == 0 ||
+      strcmp(argv[1], "wrapper-unmapped-tail") == 0) {
+    int result = run_wrapper_boundary(
+        strcmp(argv[1], "wrapper-unmapped-tail") == 0);
+    if (result == 0) {
+      puts("pselect6-simulation-ok");
+    }
+    return result;
   }
   if (strcmp(argv[1], "argument-validation-order") == 0) {
     int result = run_argument_validation_order();
@@ -335,6 +406,8 @@ int main(int argc, char** argv) {
     return result;
   }
 
-  fprintf(stderr, "usage: %s [argument-validation-order]\n", argv[0]);
+  fprintf(stderr,
+          "usage: %s [argument-validation-order|wrapper-protected-tail|"
+          "wrapper-unmapped-tail]\n", argv[0]);
   return 2;
 }

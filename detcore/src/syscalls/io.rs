@@ -454,6 +454,34 @@ impl<T: RecordOrReplay> Detcore<T> {
         // pointed-to signal mask remains below, after timeout validation.
         let sigmask_argument = match call.sigmask() {
             Some(argument) => {
+                // A split read can fall back to PTRACE_PEEKDATA for the final
+                // word, bypassing PROT_NONE or reporting EIO for an unmapped
+                // page. Have Linux validate both wrapper words first. It copies
+                // this wrapper before rejecting a malformed timeout, without
+                // reading the inner mask, changing it, waiting, or writing output.
+                let mut stack = guest.stack().await;
+                let validation_timeout = stack.reserve::<Timespec>();
+                let _guard = stack.commit()?;
+                guest.memory().write_value(
+                    validation_timeout,
+                    &Timespec {
+                        tv_sec: 0,
+                        tv_nsec: 1_000_000_000,
+                    },
+                )?;
+                let validation = syscalls::Pselect6::new()
+                    .with_nfds(0)
+                    .with_readfds(None)
+                    .with_writefds(None)
+                    .with_exceptfds(None)
+                    .with_timeout(Some(validation_timeout))
+                    .with_sigmask(Some(argument));
+                match guest.inject(validation).await {
+                    Err(Errno::EINVAL) => {}
+                    Err(errno) => return Err(errno.into()),
+                    // Success would mean the backend did not validate the probe.
+                    Ok(_) => return Err(Errno::EIO.into()),
+                }
                 let argument: Pselect6SigmaskArg = guest.memory().read_value(argument.cast())?;
                 Some(argument)
             }
