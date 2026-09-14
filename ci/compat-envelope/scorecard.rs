@@ -5805,6 +5805,36 @@ fn direct_representation(
         ));
     }
 
+    // A verdict belonging to another current attempt can be ignored here only
+    // when that exact event has a unique, independently bound direct record.
+    // An event's claimed attempt alone cannot authorize the legacy projector
+    // to absorb it into an unrelated compact result.
+    let mut represented_verdict_attempts = BTreeMap::new();
+    for (key, count) in &direct {
+        if !matches!(key.kind, DirectEvidenceKind::Result(_)) || *count != 1 {
+            continue;
+        }
+        let Some(attempt) = bound_attempts
+            .get(key)
+            .filter(|attempts| attempts.len() == 1)
+            .and_then(|attempts| attempts.first().copied())
+        else {
+            continue;
+        };
+        let candidates = source.get(&key.base).map(Vec::as_slice).unwrap_or(&[]);
+        let exact = candidates
+            .iter()
+            .filter(|(candidate, _, source_attempt, num_runs)| {
+                candidate.as_ref() == Some(key)
+                    && source_attempt.unwrap_or(1) == attempt
+                    && *num_runs == 1
+            })
+            .collect::<Vec<_>>();
+        if let [(_, event_id, _, _)] = exact.as_slice() {
+            represented_verdict_attempts.insert(event_id.clone(), attempt);
+        }
+    }
+
     let mut represented_event_ids = BTreeSet::new();
     let mut represented_direct = BTreeSet::new();
     for (direct_key, direct_count) in &direct {
@@ -5827,15 +5857,21 @@ fn direct_representation(
         };
         let candidates = candidates
             .iter()
-            .filter(|(candidate, _, _, num_runs)| {
+            .filter(|(candidate, event_id, _, num_runs)| {
                 // The projector preserves typed no-verdict rows by event ID,
                 // so proven different attempts can remain in that form. Its
                 // legacy verdict matcher has no such proof and stays strict.
-                !matches!(
+                let separate_no_verdict = matches!(
                     (direct_attempt, candidate.as_ref().map(|key| &key.kind)),
                     (Some(direct), Some(DirectEvidenceKind::ExactInvocation { attempt, .. }))
                         if direct != *attempt && *num_runs == 1
-                )
+                );
+                let separately_represented_verdict = direct_attempt.is_some_and(|direct| {
+                    represented_verdict_attempts
+                        .get(event_id)
+                        .is_some_and(|attempt| *attempt != direct)
+                });
+                !separate_no_verdict && !separately_represented_verdict
             })
             .collect::<Vec<_>>();
         for (candidate, _, attempt, _) in &candidates {
@@ -11031,7 +11067,7 @@ red/`measured-and-passed` count is **0**.",
         ));
     }
     let fifo_output = run_snapshot_command(&fifo_snapshot_path, &empty_snapshot_sha)?;
-    if fifo_output.status.code() != Some(1)
+    if fifo_output.status.code() != Some(2)
         || !String::from_utf8_lossy(&fifo_output.stderr).contains("not a regular file")
         || read_generated_files(&result_command_root)? != combined_baseline
     {
@@ -11543,6 +11579,7 @@ red/`measured-and-passed` count is **0**.",
         source.run_id = row.run_id.clone();
         source.event_id = event_id.to_string();
         source.series.attempt = Some(attempt);
+        source.series.run_index = attempt;
         source
             .series
             .no_verdict_evidence
@@ -11634,7 +11671,7 @@ red/`measured-and-passed` count is **0**.",
         true,
     )?;
 
-    let (_, different_attempt_claim) =
+    let (different_attempt_no_result, different_attempt_claim) =
         no_result_claim(&replay_row.run_id, 2, "fixture-distinct-attempt-no-result")?;
     let different_rows = vec![series_row.clone(), different_attempt_claim.clone()];
     let different_written = reconcile_control(
@@ -11721,6 +11758,123 @@ red/`measured-and-passed` count is **0**.",
         None,
         true,
     )?;
+
+    // The real result directory may retain more than one current outer
+    // attempt. Each exact event must reconcile with its own direct record,
+    // while conflicting current records for one attempt still refuse.
+    for (label, additional, source_rows, refuse) in [
+        (
+            "multiple-current-attempts",
+            &different_attempt_no_result,
+            different_rows.clone(),
+            false,
+        ),
+        (
+            "conflicting-current-attempts",
+            &same_attempt_no_result,
+            vec![
+                series_row.clone(),
+                no_result_claim(&replay_row.run_id, 1, "fixture-current-conflict")?.1,
+            ],
+            true,
+        ),
+    ] {
+        restore_combined_baseline()?;
+        let mut encoded = Vec::new();
+        for row in [&replay_row, additional] {
+            encoded.extend(serde_json::to_vec(row).map_err(|error| error.to_string())?);
+            encoded.push(b'\n');
+        }
+        fs::write(&result_path, encoded).map_err(|error| error.to_string())?;
+        let mut source_rows = source_rows;
+        source_rows.sort_by(|a, b| {
+            a.emitted_at
+                .cmp(&b.emitted_at)
+                .then(a.event_id.cmp(&b.event_id))
+        });
+        let value = scorecard_snapshot_fixture_value(&source_commit, &source_tree, &source_rows)?;
+        let path = snapshot_root.join(format!("reconcile-{label}.json"));
+        let sha = write_scorecard_snapshot_fixture(&path, &value)?;
+        let before = read_generated_files(&result_command_root)?;
+        let run = || {
+            project_and_observe_results(
+                &result_command_root,
+                &path,
+                &sha,
+                &result_root,
+                &fixture_head,
+                "fixture-refresh",
+            )
+        };
+        if refuse {
+            let error =
+                run().expect_err("contradictory current outer-attempt records were accepted");
+            if !error.contains("conflicting evidence for outer attempt 1")
+                || read_generated_files(&result_command_root)? != before
+            {
+                return Err(format!(
+                    "{label} refusal changed the pair or lost its cause: {error}"
+                ));
+            }
+            println!("scorecard self-test: reconciliation {label} refused unchanged");
+            continue;
+        }
+        run()?;
+        let first = read_generated_files(&result_command_root)?;
+        run()?;
+        if read_generated_files(&result_command_root)? != first {
+            return Err(
+                "repeating the multiple-current-attempt write changed its generated pair".into(),
+            );
+        }
+        let written: TrackedCells = read_json(&result_command_root.join(CELLS))?;
+        let observations = &written
+            .cells
+            .iter()
+            .find(|cell| cell.id == replay_id)
+            .ok_or("multiple-current-attempt write lost its cell")?
+            .observations;
+        let invocations = observations
+            .iter()
+            .flat_map(|observation| &observation.invocations)
+            .filter(|invocation| invocation.run_id == replay_row.run_id)
+            .collect::<Vec<_>>();
+        let no_result_digest = different_attempt_no_result.evidence_identity()?;
+        if invocations.len() != 2
+            || invocations
+                .iter()
+                .filter(|invocation| invocation.result == Some(ObservedResult::Pass))
+                .count()
+                != 1
+            || invocations
+                .iter()
+                .filter(|invocation| {
+                    invocation.result.is_none()
+                        && invocation.attempt == Some(2)
+                        && invocation.evidence_sha256.as_deref() == Some(no_result_digest.as_str())
+                })
+                .count()
+                != 1
+            || observations
+                .iter()
+                .map(|observation| observation.canonical_comparisons.len())
+                .sum::<usize>()
+                != 1
+            || observations
+                .iter()
+                .any(|observation| !observation.event_ids.is_empty())
+            || written
+                .projection
+                .as_ref()
+                .is_none_or(|projection| projection.rows_read != 2 || projection.pre_series_corpus)
+        {
+            return Err(
+                "multiple current attempts were lost, duplicated or assigned an invented result"
+                    .into(),
+            );
+        }
+        println!("scorecard self-test: reconciliation {label} passed twice identically");
+    }
 
     for (label, result_row, source_row) in [
         ("FAIL", &fail_row, &fail_series),
