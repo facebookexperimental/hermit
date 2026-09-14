@@ -5238,10 +5238,42 @@ where
     let mut tracked: TrackedCells = serde_json::from_slice(&original.cells)
         .map_err(|error| format!("cannot parse tracked {CELLS}: {error}"))?;
     let before = tracked.clone();
+    // Validate current inputs on a private copy before either projection can
+    // encounter the old compact run matcher. Reconcile the complete snapshot
+    // first; only exactly represented events may be suppressed. Existing
+    // projected events still undergo their full-source ownership check.
+    let mut preview = tracked.clone();
+    apply_validate_results(
+        &mut preview,
+        &result_rows,
+        &head,
+        &detcore_tree,
+        &depth,
+        true,
+        true,
+    )?;
+    let current_attempts = current_result_attempts(&preview, &result_rows, &detcore_tree)?;
+    let preview_representation =
+        direct_representation(&preview, &snapshot.rows, &current_attempts)?;
+    remove_replaceable_projected_observations(
+        &mut tracked,
+        &snapshot.rows,
+        Some(&snapshot.snapshot.source.path),
+    )?;
+    let initial_rows = snapshot
+        .rows
+        .iter()
+        .filter(|row| {
+            !preview_representation
+                .represented_event_ids
+                .contains(&row.event_id)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     let _initial_projection = apply_series_rows(
         root,
         &mut tracked,
-        &snapshot.rows,
+        &initial_rows,
         Some(&snapshot.snapshot.source.path),
     )?;
     let rows_read = snapshot.snapshot.rows_read;
@@ -5269,7 +5301,7 @@ where
     // its stored representation. Exactly represented events are suppressed in
     // favour of the richer direct invocation; zero matches remain explicit
     // pre-series evidence, while conflicting or multiple matches refuse.
-    let representation = direct_representation(&tracked, &snapshot.rows)?;
+    let representation = direct_representation(&tracked, &snapshot.rows, &current_attempts)?;
     remove_replaceable_projected_observations(
         &mut tracked,
         &snapshot.rows,
@@ -5545,6 +5577,81 @@ struct DirectRepresentation {
     has_unrepresented_direct_evidence: bool,
 }
 
+type CurrentResultAttempts = BTreeMap<(DirectEvidenceBase, String), u64>;
+
+fn current_result_attempts(
+    validated: &TrackedCells,
+    rows: &BTreeMap<CellId, Vec<ResultCandidate>>,
+    detcore_tree: &str,
+) -> Result<CurrentResultAttempts, String> {
+    let mut attempts = CurrentResultAttempts::new();
+    for (id, candidates) in rows {
+        if !validated.cells.iter().any(|cell| &cell.id == id) {
+            continue;
+        }
+        for candidate in candidates {
+            let row = &candidate.row;
+            let base = DirectEvidenceBase {
+                cell: series_cell_key(id),
+                identity: SeriesObservationIdentity::DetcoreTree(detcore_tree.to_string()),
+                provenance: ObservationProvenance::Validate,
+                hermit_sha: row.hermit_sha.clone(),
+                run_id: row.run_id.clone(),
+            };
+            if row.attempt == 0
+                || attempts
+                    .insert((base, candidate.evidence_identity.clone()), row.attempt)
+                    .is_some_and(|previous| previous != row.attempt)
+            {
+                return Err(format!(
+                    "current result has conflicting outer-attempt bindings for run {}",
+                    row.run_id
+                ));
+            }
+        }
+    }
+    Ok(attempts)
+}
+
+fn bound_direct_attempts(
+    tracked: &TrackedCells,
+    current: &CurrentResultAttempts,
+) -> Result<BTreeMap<DirectEvidenceKey, BTreeSet<u64>>, String> {
+    let mut bound = BTreeMap::<DirectEvidenceKey, BTreeSet<u64>>::new();
+    for cell in &tracked.cells {
+        for observation in &cell.observations {
+            if !observation.event_ids.is_empty() {
+                continue;
+            }
+            let identity = SeriesObservationIdentity::from_observation(observation)?;
+            for comparison in &observation.canonical_comparisons {
+                let base = DirectEvidenceBase {
+                    cell: series_cell_key(&cell.id),
+                    identity: identity.clone(),
+                    provenance: observation.provenance,
+                    hermit_sha: comparison.hermit_sha.clone(),
+                    run_id: comparison.run_id.clone(),
+                };
+                // A compact historical result does not prove an outer attempt.
+                // Bind only the actual canonical digest to validated current
+                // input; never infer attempt one from a run/result match.
+                if let Some(attempt) =
+                    current.get(&(base.clone(), comparison.evidence_sha256.clone()))
+                {
+                    bound
+                        .entry(DirectEvidenceKey {
+                            base,
+                            kind: DirectEvidenceKind::Result(comparison.result),
+                        })
+                        .or_default()
+                        .insert(*attempt);
+                }
+            }
+        }
+    }
+    Ok(bound)
+}
+
 fn direct_evidence_keys(
     tracked: &TrackedCells,
 ) -> Result<(BTreeMap<DirectEvidenceKey, usize>, bool), String> {
@@ -5678,18 +5785,24 @@ fn source_direct_evidence_key(
 fn direct_representation(
     tracked: &TrackedCells,
     rows: &[SeriesRow],
+    current_attempts: &CurrentResultAttempts,
 ) -> Result<DirectRepresentation, String> {
     let (direct, opaque) = direct_evidence_keys(tracked)?;
-    let mut source =
-        BTreeMap::<DirectEvidenceBase, Vec<(Option<DirectEvidenceKey>, String)>>::new();
+    let bound_attempts = bound_direct_attempts(tracked, current_attempts)?;
+    let mut source = BTreeMap::<
+        DirectEvidenceBase,
+        Vec<(Option<DirectEvidenceKey>, String, Option<u64>, u64)>,
+    >::new();
     for row in rows {
         let Some((base, key)) = source_direct_evidence_key(row, tracked)? else {
             continue;
         };
-        source
-            .entry(base)
-            .or_default()
-            .push((key, row.event_id.clone()));
+        source.entry(base).or_default().push((
+            key,
+            row.event_id.clone(),
+            row.series.attempt,
+            row.series.num_runs,
+        ));
     }
 
     let mut represented_event_ids = BTreeSet::new();
@@ -5705,9 +5818,39 @@ fn direct_representation(
                 direct_key.base.run_id, direct_key.base.hermit_sha
             ));
         }
+        let direct_attempt = match &direct_key.kind {
+            DirectEvidenceKind::ExactInvocation { attempt, .. } => Some(*attempt),
+            DirectEvidenceKind::Result(_) => bound_attempts
+                .get(direct_key)
+                .filter(|attempts| attempts.len() == 1)
+                .and_then(|attempts| attempts.first().copied()),
+        };
+        let candidates = candidates
+            .iter()
+            .filter(|(candidate, _, _, num_runs)| {
+                // The projector preserves typed no-verdict rows by event ID,
+                // so proven different attempts can remain in that form. Its
+                // legacy verdict matcher has no such proof and stays strict.
+                !matches!(
+                    (direct_attempt, candidate.as_ref().map(|key| &key.kind)),
+                    (Some(direct), Some(DirectEvidenceKind::ExactInvocation { attempt, .. }))
+                        if direct != *attempt && *num_runs == 1
+                )
+            })
+            .collect::<Vec<_>>();
+        for (candidate, _, attempt, _) in &candidates {
+            if candidate.as_ref() != Some(direct_key)
+                || direct_attempt.is_some_and(|direct| direct != attempt.unwrap_or(1))
+            {
+                return Err(format!(
+                    "series evidence for run {} at {} disagrees with its exact direct result or outer attempt",
+                    direct_key.base.run_id, direct_key.base.hermit_sha
+                ));
+            }
+        }
         let exact = candidates
             .iter()
-            .filter(|(candidate, _)| candidate.as_ref() == Some(direct_key))
+            .filter(|(candidate, _, _, _)| candidate.as_ref() == Some(direct_key))
             .collect::<Vec<_>>();
         match exact.as_slice() {
             [] if candidates.is_empty() => {}
@@ -5717,7 +5860,7 @@ fn direct_representation(
                     direct_key.base.run_id, direct_key.base.hermit_sha
                 ));
             }
-            [(_, event_id)] => {
+            [(_, event_id, _, _)] => {
                 if !represented_event_ids.insert(event_id.clone()) {
                     return Err(format!(
                         "series event {event_id} maps to more than one exact direct result"
@@ -6473,16 +6616,94 @@ impl SnapshotPathIdentity {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SnapshotDirectoryIdentity {
+    device: u64,
+    inode: u64,
+    mode: u32,
+}
+
+impl SnapshotDirectoryIdentity {
+    fn from_path_identity(identity: SnapshotPathIdentity) -> Self {
+        // Creating or renaming a sibling output changes directory timestamps
+        // and size without replacing the held directory. The snapshot file
+        // itself still uses the complete metadata identity and byte digest.
+        Self {
+            device: identity.device,
+            inode: identity.inode,
+            mode: identity.mode,
+        }
+    }
+}
+
 struct HeldScorecardSeriesSnapshot {
     path: PathBuf,
     parent: PathBuf,
     _parent_file: File,
     file: File,
-    parent_identity: SnapshotPathIdentity,
+    parent_identity: SnapshotDirectoryIdentity,
     file_identity: SnapshotPathIdentity,
     sha256: String,
     snapshot: ScorecardSeriesSnapshot,
     rows: Vec<SeriesRow>,
+}
+
+struct UniqueJsonFields;
+
+impl<'de> Deserialize<'de> for UniqueJsonFields {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(Self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for UniqueJsonFields {
+    type Value = Self;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("JSON with unique fields in every object")
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self, E> {
+        Ok(self)
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self, E> {
+        Ok(self)
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self, E> {
+        Ok(self)
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self, E> {
+        Ok(self)
+    }
+
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self, E> {
+        Ok(self)
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self, E> {
+        Ok(self)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut sequence: A) -> Result<Self, A::Error> {
+        while sequence.next_element::<Self>()?.is_some() {}
+        Ok(self)
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self, A::Error> {
+        let mut fields = BTreeSet::new();
+        while let Some(field) = map.next_key::<String>()? {
+            if !fields.insert(field.clone()) {
+                return Err(serde::de::Error::custom(format!(
+                    "duplicate JSON field {field:?}"
+                )));
+            }
+            map.next_value::<Self>()?;
+        }
+        Ok(self)
+    }
 }
 
 fn is_sha256(value: &str) -> bool {
@@ -6778,6 +6999,7 @@ impl HeldScorecardSeriesSnapshot {
         }
         let parent = path
             .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf();
         let parent_file = OpenOptions::new()
@@ -6790,11 +7012,16 @@ impl HeldScorecardSeriesSnapshot {
                     parent.display()
                 )
             })?;
-        let parent_identity =
+        let parent_identity = SnapshotDirectoryIdentity::from_path_identity(
             SnapshotPathIdentity::from_metadata(&parent_file.metadata().map_err(|error| {
                 format!("cannot inspect held scorecard snapshot parent: {error}")
-            })?);
-        if snapshot_path_identity(&parent, "directory")? != parent_identity {
+            })?),
+        );
+        if SnapshotDirectoryIdentity::from_path_identity(snapshot_path_identity(
+            &parent,
+            "directory",
+        )?) != parent_identity
+        {
             return Err(format!(
                 "scorecard snapshot parent changed while being opened: {}",
                 parent.display()
@@ -6802,7 +7029,7 @@ impl HeldScorecardSeriesSnapshot {
         }
         let file = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)
             .map_err(|error| {
                 format!(
@@ -6833,6 +7060,11 @@ impl HeldScorecardSeriesSnapshot {
                 "scorecard snapshot digest mismatch: expected {expected_sha256}, got {actual_sha256}"
             ));
         }
+        // Validate original bytes before any Value conversion can collapse
+        // duplicate row, series, or nested detail fields. RawValue still owns
+        // the producer's exact byte spelling for the canonical-row digest.
+        serde_json::from_slice::<UniqueJsonFields>(&payload)
+            .map_err(|error| format!("scorecard snapshot is not valid strict JSON: {error}"))?;
         let snapshot: ScorecardSeriesSnapshot = serde_json::from_slice(&payload)
             .map_err(|error| format!("scorecard snapshot is not valid strict JSON: {error}"))?;
         let rows = validate_scorecard_snapshot(&snapshot, path)?;
@@ -6852,12 +7084,15 @@ impl HeldScorecardSeriesSnapshot {
     }
 
     fn verify(&self) -> Result<(), String> {
-        if SnapshotPathIdentity::from_metadata(
+        if SnapshotDirectoryIdentity::from_path_identity(SnapshotPathIdentity::from_metadata(
             &self._parent_file.metadata().map_err(|error| {
                 format!("cannot inspect held scorecard snapshot parent: {error}")
             })?,
-        ) != self.parent_identity
-            || snapshot_path_identity(&self.parent, "directory")? != self.parent_identity
+        )) != self.parent_identity
+            || SnapshotDirectoryIdentity::from_path_identity(snapshot_path_identity(
+                &self.parent,
+                "directory",
+            )?) != self.parent_identity
         {
             return Err(format!(
                 "scorecard snapshot parent changed while held: {}",
@@ -10745,6 +10980,110 @@ red/`measured-and-passed` count is **0**.",
     HeldScorecardSeriesSnapshot::open(&empty_snapshot_path, &empty_snapshot_sha)
         .map_err(|error| format!("valid empty combined snapshot was refused: {error}"))?;
 
+    // Use the real command in a separately bounded child: a blocking FIFO open
+    // must fail this control without stranding the self-test's writer lock.
+    let run_snapshot_command = |path: &Path, sha: &str| -> Result<std::process::Output, String> {
+        let mut child = Command::new(&executable)
+            .arg("project-and-observe-results")
+            .arg("--snapshot")
+            .arg(path)
+            .arg("--snapshot-sha256")
+            .arg(sha)
+            .arg("--results")
+            .arg(&result_root)
+            .arg("--expected-head")
+            .arg(&fixture_head)
+            .arg("--refreshed-at")
+            .arg("fixture-refresh")
+            .current_dir(&result_command_root)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("cannot start snapshot command control: {error}"))?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                status => {
+                    let killed = child.kill();
+                    let reaped = child.wait();
+                    return Err(format!(
+                        "snapshot command control did not complete: {status:?}; kill={killed:?}; reap={reaped:?}"
+                    ));
+                }
+            }
+        }
+        child
+            .wait_with_output()
+            .map_err(|error| format!("cannot read snapshot command control output: {error}"))
+    };
+    let fifo_snapshot_path = snapshot_root.join("snapshot.fifo");
+    let fifo_name = std::ffi::CString::new(fifo_snapshot_path.as_os_str().as_encoded_bytes())
+        .map_err(|error| format!("cannot name snapshot FIFO control: {error}"))?;
+    // SAFETY: fifo_name is a live NUL-terminated pathname, with no interior NUL.
+    if unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) } != 0 {
+        return Err(format!(
+            "cannot create snapshot FIFO control: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let fifo_output = run_snapshot_command(&fifo_snapshot_path, &empty_snapshot_sha)?;
+    if fifo_output.status.code() != Some(1)
+        || !String::from_utf8_lossy(&fifo_output.stderr).contains("not a regular file")
+        || read_generated_files(&result_command_root)? != combined_baseline
+    {
+        return Err(format!(
+            "snapshot FIFO was not refused without changing the generated pair: status={} stderr={:?}",
+            fifo_output.status,
+            String::from_utf8_lossy(&fifo_output.stderr)
+        ));
+    }
+    // This succeeds only if the refused command released the actual writer
+    // lock and an empty relative parent is resolved as the current directory.
+    let bare_snapshot_path = Path::new("snapshot.json");
+    let bare_snapshot_sha = write_scorecard_snapshot_fixture(
+        &result_command_root.join(bare_snapshot_path),
+        &empty_snapshot_value,
+    )?;
+    let bare_output = run_snapshot_command(bare_snapshot_path, &bare_snapshot_sha)?;
+    let bare_written: TrackedCells = read_json(&result_command_root.join(CELLS))?;
+    if !bare_output.status.success()
+        || !has_current_replay(&bare_written)
+        || bare_written
+            .projection
+            .as_ref()
+            .is_none_or(|projection| projection.rows_read != 0 || !projection.pre_series_corpus)
+    {
+        return Err(format!(
+            "bare snapshot filename did not produce the expected direct evidence: status={} stderr={:?}",
+            bare_output.status,
+            String::from_utf8_lossy(&bare_output.stderr)
+        ));
+    }
+    restore_combined_baseline()?;
+
+    let held_parent_path = snapshot_root.join("held-parent");
+    fs::create_dir(&held_parent_path).map_err(|error| error.to_string())?;
+    let held_parent_snapshot = held_parent_path.join("snapshot.json");
+    let held_parent_sha =
+        write_scorecard_snapshot_fixture(&held_parent_snapshot, &empty_snapshot_value)?;
+    let held_parent = HeldScorecardSeriesSnapshot::open(&held_parent_snapshot, &held_parent_sha)?;
+    fs::rename(&held_parent_path, snapshot_root.join("original-parent"))
+        .map_err(|error| error.to_string())?;
+    fs::create_dir(&held_parent_path).map_err(|error| error.to_string())?;
+    write_scorecard_snapshot_fixture(&held_parent_snapshot, &empty_snapshot_value)?;
+    let parent_error = held_parent
+        .verify()
+        .expect_err("a replacement snapshot parent with identical bytes was accepted");
+    if !parent_error.contains("parent changed while held") {
+        return Err(format!(
+            "snapshot parent refusal lost its cause: {parent_error}"
+        ));
+    }
+
     // Frozen output from Python json.dumps(sort_keys=True, separators=(",", ":"),
     // ensure_ascii=False). RawValue is load-bearing here: Rust reserialization
     // is not the contract for exponent-form floats or non-ASCII strings.
@@ -10842,6 +11181,46 @@ red/`measured-and-passed` count is **0**.",
         write_scorecard_snapshot_fixture(&row_snapshot_path, &row_snapshot_value)?;
     HeldScorecardSeriesSnapshot::open(&row_snapshot_path, &row_snapshot_sha)
         .map_err(|error| format!("valid row-bearing combined snapshot was refused: {error}"))?;
+
+    // Both digests must match the ambiguous original bytes, so rejection tests
+    // duplicate-field validation rather than an unrelated checksum mismatch.
+    let canonical_row =
+        serde_json::to_string(&row_snapshot_value["rows"][0]).map_err(|error| error.to_string())?;
+    let run_field = format!(
+        "\"run_id\":{}",
+        serde_json::to_string(&series_row.run_id).map_err(|error| error.to_string())?
+    );
+    for (label, field, different) in [
+        ("row", run_field.as_str(), "\"run_id\":\"conflicting-run\""),
+        ("series", "\"attempt\":1", "\"attempt\":2"),
+        ("nested", "\"present\":true", "\"present\":false"),
+    ] {
+        if canonical_row.matches(field).count() != 1 {
+            return Err(format!(
+                "duplicate-field {label} fixture has no unique source field"
+            ));
+        }
+        for (kind, first) in [("equal", field), ("conflicting", different)] {
+            let raw_row = canonical_row.replacen(field, &format!("{first},{field}"), 1);
+            let rows_sha = format!("{:x}", Sha256::digest(format!("{raw_row}\n").as_bytes()));
+            let source = serde_json::to_string(&row_snapshot_value["source"])
+                .map_err(|error| error.to_string())?;
+            let payload = format!(
+                "{{\"schema\":\"{SCORECARD_SERIES_SNAPSHOT_SCHEMA}\",\"source\":{source},\"rows_read\":1,\"rows_sha256\":\"{rows_sha}\",\"rows\":[{raw_row}]}}\n"
+            );
+            let path = snapshot_root.join(format!("duplicate-{label}-{kind}.json"));
+            fs::write(&path, payload.as_bytes()).map_err(|error| error.to_string())?;
+            let sha = format!("{:x}", Sha256::digest(payload.as_bytes()));
+            let error = HeldScorecardSeriesSnapshot::open(&path, &sha)
+                .err()
+                .ok_or_else(|| format!("snapshot accepted {kind} duplicate {label} fields"))?;
+            if !error.contains("duplicate JSON field") {
+                return Err(format!(
+                    "duplicate {label} {kind} refusal lost its cause: {error}"
+                ));
+            }
+        }
+    }
 
     let mut wrong_count = row_snapshot_value.clone();
     wrong_count["rows_read"] = serde_json::json!(2);
@@ -11155,6 +11534,193 @@ red/`measured-and-passed` count is **0**.",
         }],
     });
     no_result_series.validate_for_read()?;
+
+    let no_result_claim = |run_id: &str, attempt: u64, event_id: &str| {
+        let mut row = no_result_row.clone();
+        row.run_id = run_id.to_string();
+        row.attempt = attempt;
+        let mut source = no_result_series.clone();
+        source.run_id = row.run_id.clone();
+        source.event_id = event_id.to_string();
+        source.series.attempt = Some(attempt);
+        source
+            .series
+            .no_verdict_evidence
+            .as_mut()
+            .unwrap()
+            .evidence_sha256 = row.evidence_identity()?;
+        source.validate_for_read()?;
+        Ok::<_, String>((row, source))
+    };
+    let reconcile_control = |label: &str,
+                             current: &ResultRow,
+                             mut rows: Vec<SeriesRow>,
+                             seed: Option<&TrackedCells>,
+                             refuse: bool|
+     -> Result<TrackedCells, String> {
+        restore_combined_baseline()?;
+        if let Some(seed) = seed {
+            let pair = generated_files(&combined_derived, seed)?;
+            fs::write(result_command_root.join(SCORECARD), pair.scorecard)
+                .and_then(|()| fs::write(result_command_root.join(CELLS), pair.cells))
+                .map_err(|error| error.to_string())?;
+        }
+        write_result_row(current)?;
+        rows.sort_by(|a, b| {
+            a.emitted_at
+                .cmp(&b.emitted_at)
+                .then(a.event_id.cmp(&b.event_id))
+        });
+        let value = scorecard_snapshot_fixture_value(&source_commit, &source_tree, &rows)?;
+        let path = snapshot_root.join(format!("reconcile-{label}.json"));
+        let sha = write_scorecard_snapshot_fixture(&path, &value)?;
+        let before = read_generated_files(&result_command_root)?;
+        let run = || {
+            project_and_observe_results(
+                &result_command_root,
+                &path,
+                &sha,
+                &result_root,
+                &fixture_head,
+                "fixture-refresh",
+            )
+        };
+        if refuse {
+            let error = run().expect_err("contradictory invocation evidence was accepted");
+            if !error.contains("disagree") || read_generated_files(&result_command_root)? != before
+            {
+                return Err(format!(
+                    "{label} refusal changed the pair or lost its cause: {error}"
+                ));
+            }
+            println!("scorecard self-test: reconciliation {label} refused unchanged");
+        } else {
+            run()?;
+            let first = read_generated_files(&result_command_root)?;
+            run()?;
+            if read_generated_files(&result_command_root)? != first {
+                return Err(format!(
+                    "repeating reconciliation {label} changed the generated pair"
+                ));
+            }
+            println!("scorecard self-test: reconciliation {label} passed twice identically");
+        }
+        read_json(&result_command_root.join(CELLS))
+    };
+    let (same_attempt_no_result, same_attempt_claim) =
+        no_result_claim(&replay_row.run_id, 1, "fixture-conflicting-no-result")?;
+    let contradictory_rows = vec![series_row.clone(), same_attempt_claim];
+    reconcile_control(
+        "pass-and-no-result",
+        &replay_row,
+        contradictory_rows.clone(),
+        None,
+        true,
+    )?;
+    reconcile_control(
+        "no-result-and-pass",
+        &same_attempt_no_result,
+        contradictory_rows,
+        None,
+        true,
+    )?;
+    let mut conflicting_pass = fail_series.clone();
+    conflicting_pass.run_id = replay_row.run_id.clone();
+    reconcile_control(
+        "pass-and-failure",
+        &replay_row,
+        vec![series_row.clone(), conflicting_pass],
+        None,
+        true,
+    )?;
+
+    let (_, different_attempt_claim) =
+        no_result_claim(&replay_row.run_id, 2, "fixture-distinct-attempt-no-result")?;
+    let different_rows = vec![series_row.clone(), different_attempt_claim.clone()];
+    let different_written = reconcile_control(
+        "different-attempt",
+        &replay_row,
+        different_rows.clone(),
+        None,
+        false,
+    )?;
+    let require_retained_no_result =
+        |written: &TrackedCells, event_id: &str| -> Result<(), String> {
+            let observations = written
+                .cells
+                .iter()
+                .flat_map(|cell| &cell.observations)
+                .filter(|observation| observation.event_ids.contains(event_id))
+                .collect::<Vec<_>>();
+            if count_current_result(written) != 1
+                || observations.len() != 1
+                || !observations[0].results.is_empty()
+                || !observations[0].canonical_comparisons.is_empty()
+                || !observations[0].invocations.is_empty()
+                || written.projection.as_ref().is_none_or(|projection| {
+                    projection.rows_read != 2 || projection.pre_series_corpus
+                })
+            {
+                return Err(format!(
+                    "distinct no-result event {event_id} or direct PASS was lost or duplicated"
+                ));
+            }
+            Ok(())
+        };
+    require_retained_no_result(&different_written, &different_attempt_claim.event_id)?;
+    let unrelated_written = reconcile_control(
+        "different-run",
+        &replay_row,
+        vec![series_row.clone(), no_result_series.clone()],
+        None,
+        false,
+    )?;
+    require_retained_no_result(&unrelated_written, &no_result_series.event_id)?;
+
+    let mut projected_seed = combined_baseline_cells.clone();
+    apply_series_rows(
+        &result_command_root,
+        &mut projected_seed,
+        std::slice::from_ref(&series_row),
+        Some("series"),
+    )?;
+    projected_seed.projection = Some(ObservationProjection {
+        source: "series".into(),
+        source_commit: Some(source_commit.clone()),
+        source_tree: Some(source_tree.clone()),
+        refreshed_at: "fixture-before-current".into(),
+        rows_read: 1,
+        pre_series_corpus: false,
+    });
+    refresh_measurement(&mut projected_seed);
+    let replaced_projection = reconcile_control(
+        "previously-projected",
+        &replay_row,
+        different_rows.clone(),
+        Some(&projected_seed),
+        false,
+    )?;
+    require_retained_no_result(&replaced_projection, &different_attempt_claim.event_id)?;
+    let unbound_error = direct_representation(
+        &before_publication,
+        &different_rows,
+        &CurrentResultAttempts::new(),
+    )
+    .expect_err("a compact historical PASS was assumed to prove outer attempt one");
+    if !unbound_error.contains("disagree") {
+        return Err(format!(
+            "unbound outer-attempt refusal lost its cause: {unbound_error}"
+        ));
+    }
+    let mut second_attempt_pass = replay_row.clone();
+    second_attempt_pass.attempt = 2;
+    reconcile_control(
+        "wrong-explicit-attempt",
+        &second_attempt_pass,
+        vec![series_row.clone()],
+        None,
+        true,
+    )?;
 
     for (label, result_row, source_row) in [
         ("FAIL", &fail_row, &fail_series),
@@ -14248,8 +14814,11 @@ red/`measured-and-passed` count is **0**.",
     let mut unrelated_source_row = claimed_source_row.clone();
     unrelated_source_row.run_id = "fixture-unrelated-source-run".into();
     unrelated_source_row.event_id = "fixture-unrelated-source-event".into();
-    let unrelated_representation =
-        direct_representation(&duplicate_history, &[unrelated_source_row])?;
+    let unrelated_representation = direct_representation(
+        &duplicate_history,
+        &[unrelated_source_row],
+        &CurrentResultAttempts::new(),
+    )?;
     if !unrelated_representation.represented_event_ids.is_empty()
         || !unrelated_representation.has_unrepresented_direct_evidence
         || read_generated_files(&result_command_root)? != generated_before_legacy_mapping
@@ -14259,8 +14828,12 @@ red/`measured-and-passed` count is **0**.",
                 .into(),
         );
     }
-    let claimed_duplicate_error = direct_representation(&duplicate_history, &[claimed_source_row])
-        .expect_err("a source event claimed duplicate retained direct evidence");
+    let claimed_duplicate_error = direct_representation(
+        &duplicate_history,
+        &[claimed_source_row],
+        &CurrentResultAttempts::new(),
+    )
+    .expect_err("a source event claimed duplicate retained direct evidence");
     if !claimed_duplicate_error.contains("2 records for that exact identity")
         || read_generated_files(&result_command_root)? != generated_before_legacy_mapping
     {
