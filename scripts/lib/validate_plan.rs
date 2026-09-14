@@ -61,7 +61,8 @@ use crate::validate_corpus::CorpusPaths;
 /// The manifest audit is an executable consumer, so its producer is part of
 /// the always-on preflight spine rather than an incidental lane root.
 pub const MANIFEST_PLAN_PRODUCER_TAG: &str = "setup.manifest_plan";
-pub const MANIFEST_PLAN_BUILD_COMMAND: &str = "cargo build -p hermit-manifest-plan --bins";
+pub const MANIFEST_PLAN_BUILD_COMMAND: &str =
+    "AGENT_UTILS_RS_ENSURE_ONLY=1 ./agent-utils/rs/bin/dagrun && cargo build -p hermit-manifest-plan --bins";
 pub const MANIFEST_AUDIT_COMMAND: &str = "target/debug/test-harness validate";
 
 /// CPU fallback for synthetic configs used by generator and self-test fixtures.
