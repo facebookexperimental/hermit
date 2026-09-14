@@ -1659,6 +1659,7 @@ fn with_self_test_runner_logs<T>(run: impl FnOnce(&Path) -> Result<T, String>) -
 
     let logs = tempfile::Builder::new()
         .prefix("validate-self-test-runner-logs-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
         .tempdir()
         .map_err(|error| format!("self-test runner logs: cannot create private directory: {error}"))?;
     let restore = RestoreLogDir(std::env::var_os("DAGRUN_LOG_DIR"));
@@ -1784,7 +1785,9 @@ fn self_test_runner_log_probe(logs: &Path, outer: &Path) -> Result<(), String> {
 }
 
 fn self_test_runner_log_isolation_bracket() -> Result<String, String> {
-    let outer = tempfile::Builder::new().prefix("validate-runner-log-outer-").tempdir()
+    let outer = tempfile::Builder::new().prefix("validate-runner-log-outer-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
         .map_err(|error| format!("runner log isolation: cannot create outer fixture: {error}"))?;
     for name in ["journal.jsonl", "pre.submodules.log", "setup.manifest_plan.log"] {
         std::fs::write(outer.path().join(name), RUNNER_LOG_SENTINEL)
