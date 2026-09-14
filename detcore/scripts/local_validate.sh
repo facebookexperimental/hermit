@@ -13,7 +13,7 @@ cd "$(dirname "$0")/../"
 
 # For cargo-autocargo:
 export PATH="$PATH:$HOME/fbsource/fbcode/common/rust/cargo_from_buck/bin/"
-CARGO1="$HOME/fbsource/fbcode/third-party-buck/platform007/build/rust/bin/cargo"
+CARGO1="$HOME/fbsource/third-party/rust-toolchain/rustup/current/basic/bin/cargo"
 CARGO2="$HOME/.cargo/bin/cargo"
 
 function banner {
