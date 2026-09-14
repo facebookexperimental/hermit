@@ -877,10 +877,11 @@ impl GlobalTool for GlobalState {
                 && exec_reconnect.is_none()
                 && !is_thread_reconnect
             {
-                self.global_time
-                    .lock()
-                    .unwrap()
-                    .update_global_time(dtid, time_from_guest);
+                self.global_time.lock().unwrap().update_global_time(
+                    dtid,
+                    time_from_guest,
+                    guest_time.inherited_nanos(),
+                );
             }
         }
         if let Some(deregistration) = tombstoned_deregistration {
@@ -3504,6 +3505,7 @@ mod tests {
     use super::GlobalState;
     use super::MountIdPool;
     use super::PendingExecState;
+    use super::ResumeStatus;
     use super::RpcIncarnation;
     use super::SchedulerRpcResult;
     use super::SigWrapper;
@@ -3512,8 +3514,12 @@ mod tests {
     use super::format_unsupported_syscall_warning;
     use crate::Detcore;
     use crate::config::Config;
+    use crate::config::RunsPostFork;
     use crate::ivar::Ivar;
     use crate::preemptions::PreemptionRecord;
+    use crate::resources::ExternalOpId;
+    use crate::resources::Permission;
+    use crate::resources::ResourceID;
     use crate::resources::Resources;
     use crate::scheduler::DEFAULT_PRIORITY;
     use crate::scheduler::SchedRequest;
@@ -3972,6 +3978,485 @@ mod tests {
         );
     }
 
+    async fn child_start_clock_trajectory(
+        start_before_selection: bool,
+        child_first: bool,
+    ) -> (Vec<LogicalTime>, Vec<DetTid>, bool) {
+        let config = Config {
+            sequentialize_threads: true,
+            runs_post_fork: if child_first {
+                RunsPostFork::Child
+            } else {
+                RunsPostFork::Parent
+            },
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config, false);
+        let parent = DetTid::from_raw(17);
+        let parent_pid = parent;
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .thread_tree
+            .add_child(parent, parent, true);
+        let child = DetTid::from_raw(parent.as_raw() + 1);
+        let parent_mm = MmId::initial(parent_pid);
+        let child_mm = MmId::for_clone(parent_mm, child, false);
+        install_test_registration(&state, parent, Ivar::new());
+        let epoch = DetTime::new(&config).as_nanos();
+        let mut parent_clock = DetTime::new(&config);
+        parent_clock.advance_to(epoch + LogicalTime::from_nanos(1_001));
+        let child_clock = parent_clock.clone_for_child();
+
+        // Polling the real parent RPC publishes both admission and
+        // ParentContinue before it waits, just as the clone handler does.
+        let mut registration = Box::pin(state.receive_rpc(
+            Tid::from_raw(parent.as_raw()),
+            (
+                parent_clock.clone(),
+                parent_mm,
+                GlobalRequest::CreateChildThread(
+                    child,
+                    parent_pid,
+                    0,
+                    Some(CloneFlags::empty()),
+                    libc::SIGCHLD,
+                    None,
+                    Some(DEFAULT_PRIORITY),
+                ),
+            ),
+        ));
+        assert!(futures::poll!(&mut registration).is_pending());
+        let child_request = state.sched.lock().unwrap().next_turns[&child].req.clone();
+        let mut startup = Box::pin(state.receive_rpc(
+            Tid::from_raw(child.as_raw()),
+            (
+                child_clock.clone(),
+                child_mm,
+                GlobalRequest::StartNewThread(child, child, None),
+            ),
+        ));
+        if start_before_selection {
+            // recv_start_new_thread yields once before filling its request.
+            assert!(futures::poll!(&mut startup).is_pending());
+            assert!(futures::poll!(&mut startup).is_pending());
+            assert!(child_request.try_read().is_some());
+        }
+
+        let skipped = Err(crate::scheduler::SkipTurn);
+        let mut turn = Box::pin(crate::scheduler::do_a_turn_blocking(
+            state.sched.clone(),
+            state.global_time.clone(),
+            &skipped,
+        ));
+        if !start_before_selection && child_first {
+            assert!(futures::poll!(&mut turn).is_pending());
+            assert_eq!(child_request.to_string(), "<ivar HasWaiter>");
+            assert!(futures::poll!(&mut startup).is_pending());
+            assert!(futures::poll!(&mut startup).is_pending());
+            assert!(child_request.try_read().is_some());
+        }
+        let first = turn.await.expect("first post-fork turn must commit");
+        if !start_before_selection && !child_first {
+            assert!(child_request.try_read().is_none());
+            assert!(futures::poll!(&mut startup).is_pending());
+            assert!(futures::poll!(&mut startup).is_pending());
+            assert!(child_request.try_read().is_some());
+        }
+        let child_resource = ResourceID::MemAddrSpace(child);
+        let parent_resource = ResourceID::ParentContinue { parent, child };
+        let (first_tid, first_resource, first_permission, second_resource, second_permission) =
+            if child_first {
+                (
+                    child,
+                    &child_resource,
+                    Permission::RW,
+                    &parent_resource,
+                    Permission::W,
+                )
+            } else {
+                (
+                    parent,
+                    &parent_resource,
+                    Permission::W,
+                    &child_resource,
+                    Permission::RW,
+                )
+            };
+        assert_eq!(first.tid, first_tid);
+        assert_eq!(first.resources.len(), 1);
+        assert_eq!(first.resources.get(first_resource), Some(&first_permission));
+        if child_first {
+            assert_eq!(
+                startup.as_mut().await,
+                (None, GlobalResponse::StartNewThread(None))
+            );
+        } else {
+            assert_eq!(
+                registration.as_mut().await,
+                (None, GlobalResponse::CreateChildThread(None))
+            );
+        }
+        let first_time = state.sched.lock().unwrap().committed_time;
+        assert_eq!(first_time, epoch + LogicalTime::from_nanos(1_001));
+        assert_eq!(
+            state.global_time.lock().unwrap().threads_time(child),
+            child_clock.as_nanos()
+        );
+
+        // The selected thread's first new nanosecond and the ordinary scheduler
+        // increment must both remain observable on the other thread's turn.
+        let (mut first_clock, first_mm) = if child_first {
+            (child_clock, child_mm)
+        } else {
+            (parent_clock, parent_mm)
+        };
+        first_clock.advance_to(first_clock.as_nanos() + LogicalTime::from_nanos(1));
+        let mut resources = Resources::new(first_tid);
+        resources.insert(ResourceID::MemAddrSpace(first_tid), Permission::RW);
+        let mut work = Box::pin(state.receive_rpc(
+            Tid::from_raw(first_tid.as_raw()),
+            (
+                first_clock,
+                first_mm,
+                GlobalRequest::RequestResources(resources, first_tid),
+            ),
+        ));
+        assert!(futures::poll!(&mut work).is_pending());
+        let second = crate::scheduler::do_a_turn_blocking(
+            state.sched.clone(),
+            state.global_time.clone(),
+            &Ok(first),
+        )
+        .await
+        .expect("other thread's continuation must commit");
+        assert_eq!(second.resources.len(), 1);
+        assert_eq!(
+            second.resources.get(second_resource),
+            Some(&second_permission)
+        );
+        if child_first {
+            assert_eq!(
+                registration.await,
+                (None, GlobalResponse::CreateChildThread(None))
+            );
+        } else {
+            assert_eq!(startup.await, (None, GlobalResponse::StartNewThread(None)));
+        }
+        let mut scheduler = state.sched.lock().unwrap();
+        let next_time = scheduler.committed_time;
+        assert_eq!(next_time, epoch + LogicalTime::from_nanos(501_002));
+        let queue = scheduler.run_queue.tids().copied().collect();
+        let next_random = scheduler.child_runs_first_post_fork(RunsPostFork::Random);
+        (vec![first_time, next_time], queue, next_random)
+    }
+
+    #[tokio::test]
+    async fn child_start_clock_is_independent_of_first_rpc_arrival() {
+        for child_first in [true, false] {
+            assert_eq!(
+                child_start_clock_trajectory(true, child_first).await,
+                child_start_clock_trajectory(false, child_first).await,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn vfork_registration_does_not_charge_inherited_work_before_startup() {
+        let (config, state, parent, parent_pid) = cancellation_test_state();
+        let child = DetTid::from_raw(parent.as_raw() + 1);
+        let mm = MmId::initial(parent_pid);
+        install_test_registration(&state, parent, Ivar::new());
+        let mut parent_clock = DetTime::new(&config);
+        let epoch = parent_clock.as_nanos();
+        parent_clock.advance_to(epoch + LogicalTime::from_nanos(1_001));
+        let child_clock = parent_clock.clone_for_child();
+        let mut resources = Resources::new(parent);
+        resources.insert(
+            ResourceID::BlockingVfork(ExternalOpId::new(parent, 1)),
+            Permission::RW,
+        );
+        let mut blocking = Box::pin(state.receive_rpc(
+            Tid::from_raw(parent.as_raw()),
+            (
+                parent_clock,
+                mm,
+                GlobalRequest::RequestResources(resources, parent_pid),
+            ),
+        ));
+        assert!(futures::poll!(&mut blocking).is_pending());
+        let background = crate::scheduler::do_a_turn_blocking(
+            state.sched.clone(),
+            state.global_time.clone(),
+            &Err(crate::scheduler::SkipTurn),
+        )
+        .await;
+        assert!(background.is_err());
+        assert_eq!(
+            blocking.await,
+            (None, GlobalResponse::RequestResources(ResumeStatus::Normal))
+        );
+        let before_child = state.global_time.lock().unwrap().as_nanos();
+        assert_eq!(before_child, epoch + LogicalTime::from_nanos(1_001));
+
+        // Unlike ordinary clone, this first RPC is sent by the child itself.
+        let created = state
+            .receive_rpc(
+                Tid::from_raw(child.as_raw()),
+                (
+                    child_clock.clone(),
+                    mm,
+                    GlobalRequest::CreateVforkChildThread(
+                        parent,
+                        parent_pid,
+                        child,
+                        0,
+                        CloneFlags::CLONE_VFORK | CloneFlags::CLONE_VM,
+                        libc::SIGCHLD,
+                        Some(DEFAULT_PRIORITY - 1),
+                    ),
+                ),
+            )
+            .await;
+        assert_eq!(created, (None, GlobalResponse::CreateChildThread(None)));
+        assert_eq!(state.global_time.lock().unwrap().as_nanos(), before_child);
+        assert_eq!(
+            state.global_time.lock().unwrap().threads_time(child),
+            child_clock.as_nanos()
+        );
+
+        let mut startup = Box::pin(state.receive_rpc(
+            Tid::from_raw(child.as_raw()),
+            (
+                child_clock,
+                mm,
+                GlobalRequest::StartNewThread(child, child, None),
+            ),
+        ));
+        assert!(futures::poll!(&mut startup).is_pending());
+        assert!(futures::poll!(&mut startup).is_pending());
+        let first = crate::scheduler::do_a_turn_blocking(
+            state.sched.clone(),
+            state.global_time.clone(),
+            &background,
+        )
+        .await
+        .expect("vfork child must receive its first turn");
+        assert_eq!(first.tid, child);
+        assert_eq!(startup.await, (None, GlobalResponse::StartNewThread(None)));
+        assert_eq!(state.global_time.lock().unwrap().as_nanos(), before_child);
+    }
+
+    #[tokio::test]
+    async fn first_nonstartup_rpc_counts_only_new_child_work() {
+        let config = Config {
+            sequentialize_threads: false,
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config, false);
+        let parent = DetTid::from_raw(17);
+        let child = DetTid::from_raw(18);
+        let mut parent_clock = DetTime::new(&config);
+        let epoch = parent_clock.as_nanos();
+        parent_clock.advance_to(epoch + LogicalTime::from_nanos(101));
+        let mut child_clock = parent_clock.clone_for_child();
+        let _ = state
+            .receive_rpc(
+                Tid::from_raw(parent.as_raw()),
+                (
+                    parent_clock,
+                    MmId::initial(parent),
+                    GlobalRequest::GlobalTimeLowerBound,
+                ),
+            )
+            .await;
+        child_clock.advance_to(child_clock.as_nanos() + LogicalTime::from_nanos(1));
+        let observed = state
+            .receive_rpc(
+                Tid::from_raw(child.as_raw()),
+                (
+                    child_clock,
+                    MmId::initial(child),
+                    GlobalRequest::GlobalTimeLowerBound,
+                ),
+            )
+            .await;
+        assert_eq!(
+            observed,
+            (
+                None,
+                GlobalResponse::GlobalTimeLowerBound(epoch + LogicalTime::from_nanos(102))
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_reconnect_retains_inherited_work_accounting_across_local_reload() {
+        let (config, state, leader, detpid) = cancellation_test_state();
+        let ancestor = DetTid::from_raw(leader.as_raw() - 1);
+        let worker = DetTid::from_raw(leader.as_raw() + 1);
+        let old_mm = MmId::initial(detpid);
+        install_test_registration(&state, leader, Ivar::new());
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .thread_tree
+            .add_child(leader, worker, false);
+        install_test_registration(&state, worker, Ivar::new());
+
+        let mut ancestor_clock = DetTime::new(&config);
+        let epoch = ancestor_clock.as_nanos();
+        ancestor_clock.advance_to(epoch + LogicalTime::from_nanos(1_000));
+        let mut leader_clock = ancestor_clock.clone_for_child();
+        leader_clock.advance_to(epoch + LogicalTime::from_nanos(1_100));
+        let mut worker_clock = leader_clock.clone_for_child();
+        worker_clock.advance_to(epoch + LogicalTime::from_nanos(1_350));
+        for (tid, clock) in [
+            (ancestor, ancestor_clock),
+            (leader, leader_clock),
+            (worker, worker_clock.clone()),
+        ] {
+            let _ = state
+                .receive_rpc(
+                    Tid::from_raw(tid.as_raw()),
+                    (clock, old_mm, GlobalRequest::GlobalTimeLowerBound),
+                )
+                .await;
+        }
+        let total = state.global_time.lock().unwrap().as_nanos();
+        assert_eq!(total, epoch + LogicalTime::from_nanos(1_350));
+        // A failed exec cancels its pending transfer without changing either
+        // inherited component. The next successful attempt must use the same
+        // clocks, not charge either component's inherited work again.
+        let _ = state
+            .receive_rpc(
+                Tid::from_raw(worker.as_raw()),
+                (
+                    worker_clock.clone(),
+                    old_mm,
+                    GlobalRequest::PrepareExec(detpid, old_mm, Default::default()),
+                ),
+            )
+            .await;
+        let cancelled = state
+            .receive_rpc(
+                Tid::from_raw(worker.as_raw()),
+                (
+                    worker_clock.clone(),
+                    old_mm,
+                    GlobalRequest::CancelExec(detpid),
+                ),
+            )
+            .await;
+        assert_eq!(cancelled, (None, GlobalResponse::CancelExec(())));
+        assert!(state.pending_exec_states.lock().unwrap().is_empty());
+        assert_eq!(state.global_time.lock().unwrap().as_nanos(), total);
+        assert_eq!(
+            state.global_time.lock().unwrap().threads_time(worker),
+            worker_clock.as_nanos()
+        );
+
+        let prepared = state
+            .receive_rpc(
+                Tid::from_raw(worker.as_raw()),
+                (
+                    worker_clock.clone(),
+                    old_mm,
+                    GlobalRequest::PrepareExec(detpid, old_mm, Default::default()),
+                ),
+            )
+            .await;
+        assert_eq!(prepared, (None, GlobalResponse::PrepareExec(())));
+
+        let mut fresh = DetTime::new(&config);
+        let recreated = state
+            .receive_rpc(
+                Tid::from_raw(leader.as_raw()),
+                (
+                    fresh.clone(),
+                    MmId::initial(leader),
+                    GlobalRequest::CreateChildThread(
+                        leader,
+                        detpid,
+                        0,
+                        None,
+                        libc::SIGCHLD,
+                        None,
+                        Some(DEFAULT_PRIORITY),
+                    ),
+                ),
+            )
+            .await;
+        assert_eq!(
+            recreated,
+            (
+                Some(worker_clock.as_nanos()),
+                GlobalResponse::CreateChildThread(Some(old_mm.for_exec(detpid)))
+            )
+        );
+        // A delayed request from the destroyed image must be rejected before
+        // its absolute clock or its inherited metadata reaches accounting.
+        let stale = state
+            .receive_rpc(
+                Tid::from_raw(leader.as_raw()),
+                (
+                    worker_clock.clone(),
+                    old_mm,
+                    GlobalRequest::RequestResources(Resources::new(leader), detpid),
+                ),
+            )
+            .await;
+        assert_eq!(stale, (None, GlobalResponse::ThreadExited));
+        assert_eq!(state.global_time.lock().unwrap().as_nanos(), total);
+
+        fresh.advance_to(recreated.0.unwrap());
+        assert_eq!(fresh.inherited_nanos(), LogicalTime::ZERO);
+        let mut startup = Box::pin(state.receive_rpc(
+            Tid::from_raw(leader.as_raw()),
+            (
+                fresh.clone(),
+                old_mm.for_exec(detpid),
+                GlobalRequest::StartNewThread(leader, detpid, None),
+            ),
+        ));
+        assert!(futures::poll!(&mut startup).is_pending());
+        assert!(futures::poll!(&mut startup).is_pending());
+        let first = crate::scheduler::do_a_turn_blocking(
+            state.sched.clone(),
+            state.global_time.clone(),
+            &Err(crate::scheduler::SkipTurn),
+        )
+        .await
+        .expect("replacement leader must run");
+        assert_eq!(first.tid, leader);
+        assert_eq!(startup.await, (None, GlobalResponse::StartNewThread(None)));
+        assert_eq!(state.global_time.lock().unwrap().as_nanos(), total);
+
+        fresh.advance_to(fresh.as_nanos() + LogicalTime::from_nanos(1));
+        let observed = state
+            .receive_rpc(
+                Tid::from_raw(leader.as_raw()),
+                (
+                    fresh.clone(),
+                    old_mm.for_exec(detpid),
+                    GlobalRequest::GlobalTimeLowerBound,
+                ),
+            )
+            .await;
+        assert_eq!(
+            observed,
+            (
+                None,
+                GlobalResponse::GlobalTimeLowerBound(total + LogicalTime::from_nanos(1))
+            )
+        );
+        let global = state.global_time.lock().unwrap();
+        assert_eq!(global.threads_time(leader), fresh.as_nanos());
+        assert!(!global.contains_thread(worker));
+    }
+
     #[test]
     fn live_registration_without_next_turn_is_not_terminal() {
         let (_, state, dettid, detpid) = cancellation_test_state();
@@ -4029,11 +4514,11 @@ mod tests {
         let mut existing_time = DetTime::new(&config);
         existing_time.add_syscall();
         existing_time.add_syscall();
-        state
-            .global_time
-            .lock()
-            .unwrap()
-            .update_global_time(dettid, existing_time.as_nanos());
+        state.global_time.lock().unwrap().update_global_time(
+            dettid,
+            existing_time.as_nanos(),
+            LogicalTime::ZERO,
+        );
         let (global_before, thread_before) = {
             let global_time = state.global_time.lock().unwrap();
             (global_time.as_nanos(), global_time.threads_time(dettid))
@@ -4169,8 +4654,8 @@ mod tests {
         worker_clock.add_syscall();
         {
             let mut global_time = state.global_time.lock().unwrap();
-            global_time.update_global_time(leader, leader_clock.as_nanos());
-            global_time.update_global_time(worker, worker_clock.as_nanos());
+            global_time.update_global_time(leader, leader_clock.as_nanos(), LogicalTime::ZERO);
+            global_time.update_global_time(worker, worker_clock.as_nanos(), LogicalTime::ZERO);
         }
         let total_before = state.global_time.lock().unwrap().as_nanos();
         let fd_blocking: ExecFdBlockingOverrides = [42].into_iter().collect();
@@ -4665,11 +5150,11 @@ mod tests {
         install_test_registration(&state, dettid, Ivar::new());
         let mut current_time = DetTime::new(&config);
         current_time.add_syscall();
-        state
-            .global_time
-            .lock()
-            .unwrap()
-            .update_global_time(dettid, current_time.as_nanos());
+        state.global_time.lock().unwrap().update_global_time(
+            dettid,
+            current_time.as_nanos(),
+            LogicalTime::ZERO,
+        );
         state
             .sched
             .lock()
@@ -4706,11 +5191,11 @@ mod tests {
         install_test_registration(&state, dettid, Ivar::new());
         let mut current_time = DetTime::new(&config);
         current_time.add_syscall();
-        state
-            .global_time
-            .lock()
-            .unwrap()
-            .update_global_time(dettid, current_time.as_nanos());
+        state.global_time.lock().unwrap().update_global_time(
+            dettid,
+            current_time.as_nanos(),
+            LogicalTime::ZERO,
+        );
         state
             .sched
             .lock()

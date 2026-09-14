@@ -1473,7 +1473,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // If we had mutable access to the parent state, we could update it here, but
                 // instead we leave that to the clone/fork handling.
                 let (_next_parent_pedigree, child_pedigree) = pts.1.pedigree.fork();
-                let child_logical_time = pts.1.thread_logical_time.clone();
+                let child_logical_time = pts.1.thread_logical_time.clone_for_child();
                 let last_accounted_user_time = child_logical_time.user_cpu_time();
                 let last_accounted_system_time = child_logical_time.system_cpu_time();
                 if !clone_flags.contains(CloneFlags::CLONE_THREAD) {
@@ -3462,6 +3462,45 @@ mod thread_start_identity_tests {
 #[cfg(test)]
 mod thread_cpu_time_tests {
     use super::*;
+
+    #[test]
+    fn cloned_threads_and_processes_keep_absolute_time_without_inheriting_work() {
+        for clone_flags in [
+            CloneFlags::CLONE_THREAD,
+            CloneFlags::empty(),
+            CloneFlags::CLONE_VFORK | CloneFlags::CLONE_VM,
+        ] {
+            let config = Config::default();
+            let tool = <Detcore as Tool>::new(Pid::from_raw(1), &config);
+            let mut parent = ThreadState::new(DetPid::from_raw(1), &config, ());
+            parent.thread_logical_time.add_rcbs(7);
+            parent.thread_logical_time.add_syscall_with_cost(101);
+            parent.clone_flags = Some(clone_flags);
+            let child = <Detcore as Tool>::init_thread_state(
+                &tool,
+                Tid::from_raw(2),
+                Some((Tid::from_raw(1), &parent)),
+            );
+            assert_eq!(
+                child.thread_logical_time.as_nanos(),
+                parent.thread_logical_time.as_nanos()
+            );
+            assert_eq!(
+                child.thread_logical_time.inherited_nanos(),
+                LogicalTime::from_nanos(171)
+            );
+            let mut global = GlobalTime::new(&config);
+            let epoch = global.as_nanos();
+            for thread in [&parent, &child] {
+                global.update_global_time(
+                    thread.dettid,
+                    thread.thread_logical_time.as_nanos(),
+                    thread.thread_logical_time.inherited_nanos(),
+                );
+            }
+            assert_eq!(global.as_nanos(), epoch + LogicalTime::from_nanos(171));
+        }
+    }
 
     #[test]
     fn cloned_thread_and_fork_child_start_with_zero_thread_cpu() {
