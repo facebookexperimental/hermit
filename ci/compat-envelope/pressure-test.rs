@@ -33,6 +33,7 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 use dagrun::attribution::sanitize as sanitize_step_tag;
+use dagrun::attribution::RunEvidence;
 use dagrun::io::dag_from_json;
 use dagrun::io::dag_to_json;
 use dagrun::model::CmdType;
@@ -7399,10 +7400,31 @@ fn prerequisite_scheduler_self_test(canonical: &DagConfig, scratch: &Path) -> Re
     let original: BTreeMap<_, _> = canonical.steps.iter()
         .filter(|step| required.contains(step.tag().as_str()))
         .map(|step| (step.tag(), step.clone())).collect();
+    // Model an enclosing official runner using its actual admissible, private
+    // log files. Nested fixtures must neither append their expected failures to
+    // that journal nor truncate an enclosing step with the same tag.
+    let inherited_results = scratch.join("prerequisites-inherited-logs");
+    let inherited_directory = inherited_results.join(RUNNER_STEP_OUTPUT_DIR);
+    let inherited = RunEvidence::open(Some(inherited_directory.clone()))
+        .ok_or("cannot create admissible inherited runner logs")?;
+    inherited.record("inherited-log-preservation", &[("step", "pre.submodules".into())]);
+    inherited.open_step_log("pre.submodules")
+        .ok_or("cannot create admissible inherited step log")?
+        .write_all(b"enclosing pre.submodules output\n")
+        .map_err(|e| format!("cannot seed inherited step log: {e}"))?;
+    drop(inherited);
+    let inherited_journal = fs::read(inherited_directory.join("journal.jsonl"))
+        .map_err(|e| format!("cannot read inherited journal: {e}"))?;
+    let seed: JsonValue = serde_json::from_slice(&inherited_journal)
+        .map_err(|e| format!("inherited journal seed was not written: {e}"))?;
+    if seed["event"] != "inherited-log-preservation" || seed["step"] != "pre.submodules" {
+        return Err("inherited journal seed differs from its actual logger record".into());
+    }
     for failed in [None, Some("pre.submodules"), Some("pre.reverie_pin"),
         Some("build.rust_scripts"), Some("gate.manifest")]
     {
         let log = scratch.join(format!("prerequisites-{}", failed.unwrap_or("positive")));
+        let fixture_results = scratch.join(format!("prerequisites-runner-{}", failed.unwrap_or("positive")));
         let mut fixture = canonical.clone();
         fixture.steps = original.values().cloned().collect();
         for step in &mut fixture.steps {
@@ -7427,9 +7449,30 @@ fn prerequisite_scheduler_self_test(canonical: &DagConfig, scratch: &Path) -> Re
                 ..ResourceHint::default()
             };
         }
-        let result = with_execution_root(scratch, || {
-            execute_typed_dag(&fixture, 4, None, Instant::now(), 100)
-        });
+        let previous_log_dir = env::var_os(RUNNER_LOG_DIR_ENV);
+        let result = with_runner_log_dir(&inherited_results, || {
+            let inherited_log_dir = env::var_os(RUNNER_LOG_DIR_ENV);
+            let result = with_runner_log_dir(&fixture_results, || {
+                with_execution_root(scratch, || {
+                    execute_typed_dag(&fixture, 4, None, Instant::now(), 100)
+                })
+            });
+            if env::var_os(RUNNER_LOG_DIR_ENV) != inherited_log_dir {
+                return Err(format!("prerequisite fixture {failed:?} did not restore its inherited log directory"));
+            }
+            if fs::read(inherited_directory.join("journal.jsonl"))
+                .map_err(|e| format!("cannot reread inherited journal: {e}"))? != inherited_journal
+                || fs::read(inherited_directory.join("pre.submodules.log"))
+                    .map_err(|e| format!("cannot reread inherited step log: {e}"))?
+                    != b"enclosing pre.submodules output\n"
+            {
+                return Err(format!("prerequisite fixture {failed:?} modified inherited runner evidence"));
+            }
+            Ok(result)
+        })?;
+        if env::var_os(RUNNER_LOG_DIR_ENV) != previous_log_dir {
+            return Err(format!("prerequisite fixture {failed:?} did not restore the caller's log directory"));
+        }
         let mut expected = BTreeSet::new();
         if let Some(failed) = failed {
             let error = result.err().ok_or_else(|| format!("failed prerequisite {failed} was accepted"))?;
@@ -7455,8 +7498,25 @@ fn prerequisite_scheduler_self_test(canonical: &DagConfig, scratch: &Path) -> Re
         if actual != expected || text.lines().count() != expected.len() {
             return Err(format!("prerequisite failure {failed:?} admitted a consumer or lost an ancestor: expected={expected:?} actual={actual:?}"));
         }
+        let journal = fs::read_to_string(fixture_results.join(RUNNER_STEP_OUTPUT_DIR).join("journal.jsonl"))
+            .map_err(|e| format!("cannot read isolated prerequisite journal: {e}"))?;
+        let rows = journal.lines().map(serde_json::from_str::<JsonValue>)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("invalid isolated prerequisite journal: {e}"))?;
+        let ends: Vec<_> = rows.iter().filter(|row| row["event"] == "step_end").collect();
+        let ended: BTreeSet<_> = ends.iter().filter_map(|row| row["step"].as_str()).collect();
+        if ends.len() != expected.len()
+            || ended != expected.iter().map(String::as_str).collect()
+            || ends.iter().any(|row| {
+                row["ok"] != if row["step"].as_str() == failed { "false" } else { "true" }
+                    || row["cpu_limit_s"] != "5" || row["wall_limit_s"] != "5"
+            })
+        {
+            return Err(format!("isolated prerequisite fixture {failed:?} lost its exact terminal evidence"));
+        }
     }
     println!("  prerequisite scheduler: ten-node positive and four failed-preflight controls retain exact execution identities");
+    println!("  prerequisite runner logs: all five fixtures preserve inherited journal/step bytes and restore the log directory");
     Ok(())
 }
 
