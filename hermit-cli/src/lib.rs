@@ -1602,10 +1602,11 @@ async fn run_sabre(
     ]);
     command.program(&sabre);
     command.env(SABRE_RPC_SOCKET_ENV, &socket_path);
-    // Publish the shape of the Config this coordinator will send. The plugin is a
-    // separate artifact in the same target directory, so it can be stale without
-    // looking it; comparing here turns an opaque decode failure at connect into a
-    // message that names the mismatch. See detcore_model::config_wire_fingerprint.
+    // Publish the configuration and clock RPC fingerprint for this coordinator.
+    // The plugin is a separate artifact in the same target directory, so it can
+    // be stale without looking it. Its check before connecting names the mismatch
+    // instead of failing to decode Config or a later DetTime request field.
+    // See detcore_model::config_wire_fingerprint.
     command.env(
         detcore::CONFIG_FINGERPRINT_ENV,
         detcore::config_wire_fingerprint(),

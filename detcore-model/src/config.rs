@@ -1295,40 +1295,43 @@ const CONFIG_DEFINITION_SOURCES: &[&[u8]] = &[
     include_bytes!("happens_before.rs"),
     include_bytes!("pid.rs"),
     include_bytes!("schedule.rs"),
+    include_bytes!("time.rs"),
 ];
 
-/// A fingerprint of this build's [`Config`] wire payload and named shape, for
-/// detecting a plugin and a coordinator compiled from different definitions of it.
+/// A fingerprint of this build's [`Config`] payload and the configuration and
+/// clock RPC definitions shared by a plugin and its coordinator.
 ///
 /// # Why this exists
 ///
 /// An out-of-process plugin such as `libdetcore_sabre.so` is a separate Cargo
 /// artifact that lands in the same target directory as `hermit`. Changing
-/// `Config` -- or merely switching branches -- leaves the plugin stale while
-/// everything still *looks* built. `Config` is transferred during the RPC
-/// handshake, so a stale plugin decodes it against the wrong layout and the
-/// failure surfaces as an opaque codec error: measured, one added `bool` field
+/// `Config` or `DetTime` -- or merely switching branches -- leaves the plugin
+/// stale while everything still *looks* built. `Config` is transferred during
+/// the RPC handshake, and `DetTime` is the first field in every Detcore request.
+/// A stale plugin decodes either against the wrong layout and the failure
+/// surfaces as an opaque codec error: measured, one added `bool` field
 /// produced `Decode(InvalidBooleanValue(20))` at connect, which points nowhere
 /// near "your plugin is from a different build" and cost a long diagnosis while
 /// blocking every SaBRe measurement.
 ///
 /// # What it measures
 ///
-/// Two encodings of `Config::default()` and the source definitions that produce
-/// them are fingerprinted with separate domains:
+/// Two encodings of `Config::default()` and the source definitions for the
+/// configuration and clock RPC fields are fingerprinted with separate domains:
 ///
 /// - the exact legacy-bincode bytes used by Reverie RPC, which detect changes
 ///   such as `u32` to `u64` even when both default to JSON number zero; and
 /// - the JSON encoding, which carries every field name and makes a pure rename
 ///   visible even though bincode is positional; and
-/// - the source files defining `Config` and its local serialized field types,
-///   which catch wire-incompatible changes hidden by a default such as
-///   `Option<u64>::None` to `Option<u32>::None`.
+/// - the source files defining `Config`, its local serialized field types, and
+///   `DetTime`, which catch wire-incompatible changes hidden by a default such
+///   as `Option<u64>::None` to `Option<u32>::None`, or an added clock field that
+///   leaves both encodings of `Config` unchanged.
 ///
 /// The source and JSON domains are deliberately stricter than the wire format
 /// strictly requires. A documentation-only edit in one of these files can
 /// require rebuilding the plugin; missing a wire-incompatible hidden variant
-/// can make it decode the rest of the handshake at the wrong offsets.
+/// can make it decode the handshake or a subsequent request at the wrong offsets.
 pub fn config_wire_fingerprint() -> String {
     let config = Config::default();
     let wire = bincode::serde::encode_to_vec(&config, bincode::config::legacy())
@@ -1579,6 +1582,51 @@ mod tests {
             ..Default::default()
         };
         config.validate();
+    }
+
+    #[test]
+    fn config_fingerprint_includes_clock_rpc_definitions() {
+        let config = Config::default();
+        let wire = bincode::serde::encode_to_vec(&config, bincode::config::legacy()).unwrap();
+        let named_shape = serde_json::to_string(&config).unwrap();
+        let current = config_wire_fingerprint();
+        let clock_source = include_bytes!("time.rs").as_slice();
+
+        // The previous guard covered these same Config bytes and definitions,
+        // but omitted DetTime. Adding a positional clock field could therefore
+        // pass the handshake guard and corrupt the following request on decode.
+        let without_clock: Vec<_> = CONFIG_DEFINITION_SOURCES
+            .iter()
+            .copied()
+            .filter(|source| *source != clock_source)
+            .collect();
+        assert_ne!(
+            fingerprint_of_config_material(&wire, &named_shape, &without_clock),
+            current,
+            "the published fingerprint must reject source inputs that omit the RPC clock"
+        );
+
+        // Hold all Config material fixed and remove only the added serialized
+        // clock field from its definition. A future clock-only change must also
+        // invalidate the existing artifact guard, independently of config.rs.
+        let changed_clock =
+            include_str!("time.rs").replacen("    inherited_nanos: LogicalDuration,", "", 1);
+        assert_ne!(changed_clock.as_bytes(), clock_source);
+        let changed_sources: Vec<_> = CONFIG_DEFINITION_SOURCES
+            .iter()
+            .map(|source| {
+                if *source == clock_source {
+                    changed_clock.as_bytes()
+                } else {
+                    *source
+                }
+            })
+            .collect();
+        assert_ne!(
+            fingerprint_of_config_material(&wire, &named_shape, &changed_sources),
+            current,
+            "a clock-only serialized field change must invalidate the fingerprint"
+        );
     }
 
     #[test]

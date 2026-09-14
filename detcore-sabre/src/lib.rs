@@ -21,7 +21,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
-/// Private env var carrying the coordinator's `Config` wire fingerprint.
+/// Private env var carrying the coordinator's configuration and clock RPC fingerprint.
 pub use detcore::CONFIG_FINGERPRINT_ENV;
 use detcore::Detcore;
 use detcore::config_wire_fingerprint;
@@ -202,13 +202,14 @@ struct Plugin {
 
 impl Plugin {
     /// Refuse to connect when this plugin and the coordinator were built from
-    /// different definitions of `Config`.
+    /// different configuration or clock RPC definitions.
     ///
     /// This plugin is a separate Cargo artifact that lands in the same target
-    /// directory as `hermit`, so changing `Config` -- or merely switching
-    /// branches -- leaves it stale while everything still looks built. `Config`
-    /// crosses the wire during the handshake, so a stale plugin decodes it
-    /// against the wrong layout. The damage was never the staleness; it was the
+    /// directory as `hermit`, so changing `Config` or `DetTime` -- or merely
+    /// switching branches -- leaves it stale while everything still looks built.
+    /// `Config` crosses the wire during the handshake, and `DetTime` is the first
+    /// field in each Detcore request. A stale plugin can decode either against
+    /// the wrong layout. The damage was never the staleness; it was the
     /// diagnosis cost: one added `bool` field surfaced as
     /// `Decode(InvalidBooleanValue(20))` at connect, which names no version and
     /// points nowhere near the plugin, and it blocked every SaBRe measurement
@@ -224,17 +225,18 @@ impl Plugin {
         match expected {
             Some(expected) if expected == ours => {}
             Some(expected) => panic!(
-                "Detcore SaBRe plugin/coordinator MISMATCH: this plugin was built from a \
-                 Config whose shape is {ours}, the coordinator expects {expected}. The plugin \
-                 is a separate artifact in the same target directory and is stale -- rebuild \
+                "Detcore SaBRe plugin/coordinator MISMATCH: this plugin's Config and clock RPC \
+                 definitions have fingerprint {ours}, the coordinator expects {expected}. \
+                 The plugin is a separate artifact in the same target directory and is stale -- rebuild \
                  it against this coordinator: cargo build -p detcore-sabre"
             ),
             // An older coordinator does not publish the fingerprint. Say so and
             // continue: refusing here would break pairs that are actually fine,
             // and a guard that rejects matched pairs is worse than no guard.
             None => eprintln!(
-                "detcore-sabre: coordinator published no Config fingerprint ({CONFIG_FINGERPRINT_ENV} \
-                 unset); proceeding unguarded. This plugin's shape is {ours}."
+                "detcore-sabre: coordinator published no configuration and clock RPC fingerprint \
+                 ({CONFIG_FINGERPRINT_ENV} unset); proceeding unguarded. This plugin's fingerprint \
+                 is {ours}."
             ),
         }
     }
