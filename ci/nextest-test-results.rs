@@ -1070,6 +1070,31 @@ mod tests {
         );
         write_record(
             &scratch.0,
+            &attempt("recovers", 1, AttemptCompletion::Exit { code: 23 }),
+        );
+        write_record(
+            &scratch.0,
+            &attempt("recovers", 2, AttemptCompletion::Exit { code: 0 }),
+        );
+        let report = reconcile_cpu_attempts(
+            &parse_event_text(sample_events()).unwrap(),
+            &scratch.0,
+            &sample_binary_map(),
+        )
+        .unwrap();
+        assert_eq!(report.run_id.as_deref(), Some("sample-run"));
+        assert_eq!(report.attempts.len(), 3);
+    }
+
+    #[test]
+    fn cpu_timeout_attempts_reconcile_with_typed_retries() {
+        let scratch = Scratch::new();
+        write_record(
+            &scratch.0,
+            &attempt("passes", 1, AttemptCompletion::Exit { code: 0 }),
+        );
+        write_record(
+            &scratch.0,
             &attempt(
                 "recovers",
                 1,
@@ -1155,14 +1180,7 @@ mod tests {
         let false_pass = Scratch::new();
         write_record(
             &false_pass.0,
-            &attempt(
-                "passes",
-                1,
-                AttemptCompletion::CpuTimeout {
-                    cpu_budget_usec: 10_000,
-                    observed_cpu_usec: 12_345,
-                },
-            ),
+            &attempt("passes", 1, AttemptCompletion::Exit { code: 23 }),
         );
         write_record(
             &false_pass.0,
@@ -1175,6 +1193,34 @@ mod tests {
         let error = reconcile_cpu_attempts(
             &parse_event_text(sample_events()).unwrap(),
             &false_pass.0,
+            &sample_binary_map(),
+        )
+        .unwrap_err();
+        assert!(error.contains("disagree on whether"), "{error}");
+
+        let false_cpu_timeout = Scratch::new();
+        write_record(
+            &false_cpu_timeout.0,
+            &attempt(
+                "passes",
+                1,
+                AttemptCompletion::CpuTimeout {
+                    cpu_budget_usec: 10_000,
+                    observed_cpu_usec: 12_345,
+                },
+            ),
+        );
+        write_record(
+            &false_cpu_timeout.0,
+            &attempt("recovers", 1, AttemptCompletion::Exit { code: 23 }),
+        );
+        write_record(
+            &false_cpu_timeout.0,
+            &attempt("recovers", 2, AttemptCompletion::Exit { code: 0 }),
+        );
+        let error = reconcile_cpu_attempts(
+            &parse_event_text(sample_events()).unwrap(),
+            &false_cpu_timeout.0,
             &sample_binary_map(),
         )
         .unwrap_err();
@@ -1239,7 +1285,7 @@ mod tests {
         );
         valid.validate().unwrap();
         let mut wrong_source = valid.clone();
-        wrong_source.cpu_source = nextest_cpu::CPU_SOURCE_REAPED.into();
+        wrong_source.cpu_source = nextest_cpu::CPU_SOURCE_REAPED;
         let error = wrong_source.validate().unwrap_err();
         assert!(error.contains("requires cpu_source"), "{error}");
         assert_eq!(

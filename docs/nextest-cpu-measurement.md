@@ -15,27 +15,34 @@ records remains a failure with zero executed tests and an empty CPU report.
 
 Set `HERMIT_NEXTEST_CPU_REPORT_PATH` to retain the report. Otherwise a counted
 run writes `<DAGRUN_TEST_COUNTS_PATH>.cpu.json`; without a count path it retains
-no CPU report. Schema 2 includes the Nextest run ID, typed identities,
-`cpu_usage_usec`, `wall_time_ms`, the CPU source and completion status. A run
+no CPU report. Schema 3 includes the Nextest run ID, typed identities,
+`cpu_usage_usec`, `wall_time_ms`, the CPU source, completion status and every
+successful `wait4` receipt with its raw status and CPU fields. A run
 with no attempt records has a null run ID. Retained stress-index events remain
 readable by the count-only adapter; CPU reconciliation explicitly refuses them
 because the declared Nextest version provides no corresponding wrapper identity.
 
 The production measurement-only path retains Nextest's process group and uses
 the child's final `wait4` accounting; it does not add a polling loop. An
-explicit budget moves the test into a child-owned process group and samples the
-whole live descendant tree using procfs, including descendants that change
-process groups. CPU totals have procfs clock-tick resolution and exclude wrapper
-overhead. The budgeted wrapper samples twice per second so each test adds at
-most two full procfs scans per wall second. At the first sample at or above the
-CPU budget, it records
-the boundary value, sends `SIGTERM`, waits the configured grace period, sends
-`SIGKILL` if needed, reaps the group, and publishes a typed `cpu_timeout`
-completion before returning a failing status to Nextest. External signals and
-ordinary exits remain distinct first causes. On the budgeted path the wrapper
-forwards one external signal to the child group and does not let a later signal
-replace an already observed CPU timeout. Missing live CPU accounting is an
-infrastructure failure, not an unbounded run.
+explicit budget creates an exclusive child cgroup v2 below the wrapper's
+already delegated cgroup and enrolls the test in `pre_exec`, before its program
+can run or fork. The wrapper stays in the parent. The child's `cpu.stat`
+`usage_usec` is the sole budget and final-total authority, so normally
+auto-reaped descendants remain charged while unrelated Nextest peers stay
+outside the attempt. This does not measure the small fork-to-enrollment interval,
+and cgroup membership is not a security boundary against a privileged test that
+deliberately moves itself. The wrapper samples twice per second. At the first
+sample at or above the CPU budget, it records the boundary value, sends
+`SIGTERM` to the direct child through its held pidfd, waits the configured grace
+period, writes the authenticated owned `cgroup.kill` if needed, requires both an
+empty cgroup and `ECHILD`, and publishes a typed `cpu_timeout` completion before
+returning a failing status to Nextest. External signals and ordinary exits
+remain distinct first causes. On the budgeted path the wrapper forwards one
+external signal to the direct child through its held pidfd and does not let a
+later signal replace an already observed CPU timeout. Missing delegation,
+failed enrollment, changed cgroup identity, unreadable counters, incomplete
+cleanup or a decreasing final counter refuses rather than falling back to
+procfs or `wait4` accounting.
 
 On the measurement-only path, an ordinary exit uses the final reaped `wait4`
 total. `supervisor_signal` combines already-reaped `wait4` CPU with the live

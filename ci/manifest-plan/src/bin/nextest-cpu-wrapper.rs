@@ -1,11 +1,17 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::env;
+use std::ffi::CString;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs;
+use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
+use std::os::unix::fs::FileExt;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
@@ -30,8 +36,10 @@ use hermit_manifest_plan::nextest_cpu::BinaryMapEntry;
 use hermit_manifest_plan::nextest_cpu::CPU_BINARY_MAP_ENV;
 use hermit_manifest_plan::nextest_cpu::CPU_RECORD_DIR_ENV;
 use hermit_manifest_plan::nextest_cpu::CPU_REPORT_PATH_ENV;
+use hermit_manifest_plan::nextest_cpu::CPU_SOURCE_CGROUP_V2;
 use hermit_manifest_plan::nextest_cpu::CPU_SOURCE_PROCFS_AND_REAPED;
 use hermit_manifest_plan::nextest_cpu::CPU_SOURCE_REAPED;
+use hermit_manifest_plan::nextest_cpu::Wait4Record;
 use hermit_manifest_plan::nextest_cpu::read_attempt_records;
 use hermit_manifest_plan::nextest_cpu::read_binary_map;
 use hermit_manifest_plan::nextest_cpu::write_attempt_atomic;
@@ -42,19 +50,29 @@ const ATTEMPT_ENV: &str = "__NEXTEST_ATTEMPT";
 const RUN_ID_ENV: &str = "NEXTEST_RUN_ID";
 const PACKAGE_ENV: &str = "CARGO_PKG_NAME";
 const CONTROL_ARM_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL";
+const CONTROL_ACCOUNTING_FAILURE_FILE_ENV: &str =
+    "HERMIT_NEXTEST_CPU_CONTROL_ACCOUNTING_FAILURE_FILE";
 const CONTROL_CWD_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_CWD";
 const CONTROL_CAUSE_FILE_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_CAUSE_FILE";
+const CONTROL_CGROUP_PATH_FILE_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_CGROUP_PATH_FILE";
+const CONTROL_CLEANUP_ERROR_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_CLEANUP_ERROR";
+const CONTROL_ENROLLMENT_FILE_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_ENROLLMENT_FILE";
+const CONTROL_FINAL_CPU_FILE_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_FINAL_CPU_FILE";
+const CONTROL_FINAL_READ_FAILURE_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_FINAL_READ_FAILURE";
+const CONTROL_FINAL_REGRESSION_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_FINAL_REGRESSION";
 const CONTROL_PID_FILE_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_PID_FILE";
 const CONTROL_PROC_ROOT_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_PROC_ROOT";
 const CONTROL_RESERVED_FILE_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_RESERVED_FILE";
 const CONTROL_RESUME_FILE_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_RESUME_FILE";
 const CONTROL_SIGNAL_FILE_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_SIGNAL_FILE";
+const CONTROL_WAIT4_RESUME_FILE_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_WAIT4_RESUME_FILE";
+const CONTROL_WAIT4_STORED_FILE_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_WAIT4_STORED_FILE";
 const CONTROL_SENTINEL_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_SENTINEL";
 const INFRASTRUCTURE_EXIT: u8 = 70;
 const CPU_TIMEOUT_EXIT: u8 = 124;
 const NON_SIGNAL_CAUSE_RESERVED: i32 = -1;
-// A wrapper owns one test process group. Sampling twice per second keeps the
-// full-procfs scan bounded while retaining a sub-second enforcement boundary.
+// A wrapper owns one attempt cgroup. Sampling twice per second retains the
+// original sub-second enforcement boundary without scanning unrelated tasks.
 const CPU_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const CHILD_REAP_DEADLINE: Duration = Duration::from_secs(5);
 
@@ -358,6 +376,382 @@ fn parse_wrapper_invocation(args: Vec<OsString>) -> Result<WrapperInvocation, St
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+fn file_identity(file: &File, label: &str) -> Result<FileIdentity, String> {
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe { libc::fstat(file.as_raw_fd(), &mut stat) } != 0 {
+        return Err(format!(
+            "cannot inspect {label} identity: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    Ok(FileIdentity {
+        device: stat.st_dev,
+        inode: stat.st_ino,
+    })
+}
+
+fn cgroup_text(file: &File, label: &str) -> Result<String, String> {
+    const LIMIT: usize = 8192;
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        let count = file
+            .read_at(&mut chunk, bytes.len() as u64)
+            .map_err(|error| format!("cannot read {label}: {error}"))?;
+        if count == 0 {
+            break;
+        }
+        if bytes.len() + count > LIMIT {
+            return Err(format!("{label} exceeds the {LIMIT}-byte accounting bound"));
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    std::str::from_utf8(&bytes)
+        .map(str::to_owned)
+        .map_err(|error| format!("{label} is not valid UTF-8: {error}"))
+}
+
+fn cgroup_field(file: &File, file_label: &str, field: &str) -> Result<u64, String> {
+    let text = cgroup_text(file, file_label)?;
+    let mut found = None;
+    for line in text.lines() {
+        let mut words = line.split_whitespace();
+        let Some(name) = words.next() else {
+            continue;
+        };
+        let value = words
+            .next()
+            .ok_or_else(|| format!("{file_label} has no value for {name:?}"))?;
+        if words.next().is_some() {
+            return Err(format!("{file_label} has extra fields on line {line:?}"));
+        }
+        if name == field {
+            if found.is_some() {
+                return Err(format!("{file_label} repeats field {field:?}"));
+            }
+            found = Some(
+                value
+                    .parse::<u64>()
+                    .map_err(|error| format!("{file_label} has invalid {field}: {error}"))?,
+            );
+        }
+    }
+    found.ok_or_else(|| format!("{file_label} is missing field {field:?}"))
+}
+
+fn openat_file(directory: &File, name: &str, flags: i32, label: &str) -> Result<File, String> {
+    let name = CString::new(name).expect("owned cgroup control names contain no NUL");
+    let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags, 0) };
+    if fd < 0 {
+        return Err(format!(
+            "cannot open {label}: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn current_cgroup_directory() -> Result<PathBuf, String> {
+    let raw = fs::read_to_string("/proc/self/cgroup")
+        .map_err(|error| format!("cannot read /proc/self/cgroup: {error}"))?;
+    let mut unified = raw.lines().filter_map(|line| line.strip_prefix("0::"));
+    let path = unified
+        .next()
+        .ok_or_else(|| "/proc/self/cgroup has no unified cgroup v2 entry".to_string())?;
+    if unified.next().is_some() {
+        return Err("/proc/self/cgroup has multiple unified cgroup v2 entries".into());
+    }
+    let relative = Path::new(path.trim_start_matches('/'));
+    if relative.components().any(|component| {
+        !matches!(
+            component,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    }) {
+        return Err(format!(
+            "unified cgroup path {path:?} is not a relative kernel path"
+        ));
+    }
+    Ok(Path::new("/sys/fs/cgroup").join(relative))
+}
+
+struct OwnedAttemptCgroup {
+    parent: File,
+    child: File,
+    cpu_stat: File,
+    events: File,
+    procs_read: File,
+    procs_write: File,
+    kill: File,
+    name: CString,
+    identity: FileIdentity,
+    path: PathBuf,
+}
+
+impl OwnedAttemptCgroup {
+    fn create(identity: &AttemptIdentity) -> Result<Self, String> {
+        let parent_path = current_cgroup_directory()?;
+        Self::create_in(&parent_path, identity)
+    }
+
+    fn create_in(parent_path: &Path, identity: &AttemptIdentity) -> Result<Self, String> {
+        let parent = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(parent_path)
+            .map_err(|error| {
+                format!(
+                    "cannot open delegated cgroup {}: {error}",
+                    parent_path.display()
+                )
+            })?;
+        let mut filesystem = unsafe { std::mem::zeroed::<libc::statfs>() };
+        if unsafe { libc::fstatfs(parent.as_raw_fd(), &mut filesystem) } != 0 {
+            return Err(format!(
+                "cannot inspect delegated cgroup filesystem: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        const CGROUP2_SUPER_MAGIC: libc::c_long = 0x6367_7270;
+        if filesystem.f_type != CGROUP2_SUPER_MAGIC {
+            return Err(format!(
+                "delegated cgroup {} is not on cgroup v2",
+                parent_path.display()
+            ));
+        }
+        let name_text = format!(
+            "hermit-nextest-attempt-{}-{}",
+            std::process::id(),
+            &identity.key()[..16]
+        );
+        let name = CString::new(name_text.as_bytes())
+            .map_err(|_| "owned cgroup name contains a NUL byte".to_string())?;
+        if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o755) } != 0 {
+            return Err(format!(
+                "cannot create fresh attempt cgroup {}: {}",
+                parent_path.join(&name_text).display(),
+                io::Error::last_os_error()
+            ));
+        }
+        let result = (|| {
+            let child = openat_file(
+                &parent,
+                &name_text,
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+                "owned attempt cgroup",
+            )?;
+            let identity = file_identity(&child, "owned attempt cgroup")?;
+            let open_control = |control: &str, flags: i32| -> Result<File, String> {
+                let file = openat_file(
+                    &child,
+                    control,
+                    flags | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                    &format!("owned attempt cgroup {control}"),
+                )?;
+                let control_identity = file_identity(&file, control)?;
+                if control_identity.device != identity.device {
+                    return Err(format!(
+                        "owned attempt cgroup {control} is on device {}, expected {}",
+                        control_identity.device, identity.device
+                    ));
+                }
+                Ok(file)
+            };
+            let cpu_stat = open_control("cpu.stat", libc::O_RDONLY)?;
+            let events = open_control("cgroup.events", libc::O_RDONLY)?;
+            let procs_read = open_control("cgroup.procs", libc::O_RDONLY)?;
+            let procs_write = open_control("cgroup.procs", libc::O_WRONLY)?;
+            let kill = open_control("cgroup.kill", libc::O_WRONLY)?;
+            let owned = Self {
+                parent: parent.try_clone().map_err(|error| {
+                    format!("cannot retain delegated cgroup descriptor: {error}")
+                })?,
+                child,
+                cpu_stat,
+                events,
+                procs_read,
+                procs_write,
+                kill,
+                name: name.clone(),
+                identity,
+                path: parent_path.join(&name_text),
+            };
+            owned.verify_identity()?;
+            if owned.cpu_usage_usec()? != 0 {
+                return Err("fresh attempt cgroup has nonzero cpu.stat usage_usec".into());
+            }
+            if owned.populated()? || !owned.procs_empty()? {
+                return Err("fresh attempt cgroup is not empty before enrollment".into());
+            }
+            Ok(owned)
+        })();
+        match result {
+            Ok(owned) => Ok(owned),
+            Err(error) => {
+                if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) }
+                    == 0
+                {
+                    Err(error)
+                } else {
+                    Err(format!(
+                        "{error}; partial owned-cgroup initialization cleanup also failed: {}",
+                        io::Error::last_os_error()
+                    ))
+                }
+            }
+        }
+    }
+
+    fn verify_identity(&self) -> Result<(), String> {
+        let held = file_identity(&self.child, "held attempt cgroup")?;
+        if held != self.identity {
+            return Err("held attempt cgroup identity changed".into());
+        }
+        let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+        if unsafe {
+            libc::fstatat(
+                self.parent.as_raw_fd(),
+                self.name.as_ptr(),
+                &mut stat,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(format!(
+                "cannot authenticate owned attempt cgroup path: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        let named = FileIdentity {
+            device: stat.st_dev,
+            inode: stat.st_ino,
+        };
+        if named != self.identity || stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            return Err("owned attempt cgroup path was replaced".into());
+        }
+        Ok(())
+    }
+
+    fn enrollment_fd(&self) -> i32 {
+        self.procs_write.as_raw_fd()
+    }
+
+    fn cpu_usage_usec(&self) -> Result<u64, String> {
+        self.verify_identity()?;
+        cgroup_field(&self.cpu_stat, "owned attempt cpu.stat", "usage_usec")
+    }
+
+    fn populated(&self) -> Result<bool, String> {
+        self.verify_identity()?;
+        match cgroup_field(&self.events, "owned attempt cgroup.events", "populated")? {
+            0 => Ok(false),
+            1 => Ok(true),
+            value => Err(format!(
+                "owned attempt cgroup.events has invalid populated value {value}"
+            )),
+        }
+    }
+
+    fn procs_empty(&self) -> Result<bool, String> {
+        self.verify_identity()?;
+        Ok(cgroup_text(&self.procs_read, "owned attempt cgroup.procs")?
+            .trim()
+            .is_empty())
+    }
+
+    fn kill(&self) -> Result<(), String> {
+        self.verify_identity()?;
+        loop {
+            let written = unsafe { libc::write(self.kill.as_raw_fd(), b"1\n".as_ptr().cast(), 2) };
+            if written == 2 {
+                return Ok(());
+            }
+            if written < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(if written < 0 {
+                format!(
+                    "cannot kill owned attempt cgroup: {}",
+                    io::Error::last_os_error()
+                )
+            } else {
+                format!("short write to owned attempt cgroup.kill: {written} bytes")
+            });
+        }
+    }
+
+    fn remove_empty(&mut self) -> Result<(), String> {
+        self.verify_identity()?;
+        if self.populated()? || !self.procs_empty()? {
+            return Err("cannot remove populated owned attempt cgroup".into());
+        }
+        if unsafe {
+            libc::unlinkat(
+                self.parent.as_raw_fd(),
+                self.name.as_ptr(),
+                libc::AT_REMOVEDIR,
+            )
+        } != 0
+        {
+            return Err(format!(
+                "cannot remove owned empty attempt cgroup: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        Ok(())
+    }
+}
+
+struct PidFd {
+    file: File,
+    pid: u32,
+}
+
+impl PidFd {
+    fn open(pid: u32) -> Result<Self, String> {
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if fd < 0 {
+            return Err(format!(
+                "cannot open pidfd for direct child {pid}: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        Ok(Self {
+            file: unsafe { File::from_raw_fd(fd as i32) },
+            pid,
+        })
+    }
+
+    fn signal(&self, signal: i32) -> Result<(), String> {
+        if unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.file.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        } == 0
+        {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(format!(
+                "cannot signal direct child pidfd with {signal}: {error}"
+            ))
+        }
+    }
+}
+
 fn install_subreaper() -> Result<(), String> {
     if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {
         return Err(format!(
@@ -382,10 +776,50 @@ fn timeval_usec(value: libc::timeval) -> Result<u64, String> {
         .ok_or_else(|| "wait4 CPU duration overflowed u64".to_string())
 }
 
-fn rusage_usec(usage: &libc::rusage) -> Result<u64, String> {
-    timeval_usec(usage.ru_utime)?
-        .checked_add(timeval_usec(usage.ru_stime)?)
-        .ok_or_else(|| "wait4 CPU duration overflowed u64".to_string())
+fn pause_after_wait4_storage_for_control() -> Result<(), String> {
+    if env::var_os(CONTROL_ARM_ENV).is_none() {
+        return Ok(());
+    }
+    let Some(marker) = env::var_os(CONTROL_WAIT4_STORED_FILE_ENV).map(PathBuf::from) else {
+        return Ok(());
+    };
+    let resume = PathBuf::from(required_env(CONTROL_WAIT4_RESUME_FILE_ENV)?);
+    if !marker.exists() {
+        fs::write(&marker, b"stored\n")
+            .map_err(|error| format!("cannot publish wait4-storage control marker: {error}"))?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !resume.is_file() {
+            if Instant::now() >= deadline {
+                return Err("wait4-storage control was not released".into());
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+    Ok(())
+}
+
+fn controlled_accounting_failure() -> Option<String> {
+    env::var_os(CONTROL_ARM_ENV)?;
+    env::var_os(CONTROL_ACCOUNTING_FAILURE_FILE_ENV)
+        .filter(|path| Path::new(path).is_file())
+        .map(|_| "owned attempt CPU accounting read failed under the self-test control".into())
+}
+
+fn wait4_record(
+    waited: libc::pid_t,
+    status: i32,
+    usage: &libc::rusage,
+) -> Result<Wait4Record, String> {
+    let pid = u32::try_from(waited)
+        .map_err(|_| format!("wait4 returned invalid positive PID {waited}"))?;
+    let record = Wait4Record {
+        pid,
+        status,
+        user_cpu_usec: timeval_usec(usage.ru_utime)?,
+        system_cpu_usec: timeval_usec(usage.ru_stime)?,
+    };
+    record.validate()?;
+    Ok(record)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -398,14 +832,19 @@ fn reap_available_children(
     direct_pid: u32,
     direct_status: &mut Option<ExitStatus>,
     reaped_cpu_usec: &mut u64,
+    wait4: &mut Vec<Wait4Record>,
 ) -> Result<ChildPopulation, String> {
     loop {
         let mut raw_status = 0;
         let mut usage = unsafe { std::mem::zeroed::<libc::rusage>() };
         let waited = unsafe { libc::wait4(-1, &mut raw_status, libc::WNOHANG, &mut usage) };
         if waited > 0 {
+            let receipt = wait4_record(waited, raw_status, &usage)?;
+            let used = receipt.cpu_usage_usec()?;
+            wait4.push(receipt);
+            pause_after_wait4_storage_for_control()?;
             *reaped_cpu_usec = reaped_cpu_usec
-                .checked_add(rusage_usec(&usage)?)
+                .checked_add(used)
                 .ok_or_else(|| "nextest test subtree CPU total overflowed u64".to_string())?;
             if waited as u32 == direct_pid {
                 *direct_status = Some(ExitStatus::from_raw(raw_status));
@@ -426,141 +865,24 @@ fn reap_available_children(
     }
 }
 
-fn child_group_exists(pgid: u32) -> Result<bool, String> {
-    if unsafe { libc::kill(-(pgid as i32), 0) } == 0 {
-        return Ok(true);
-    }
-    let error = io::Error::last_os_error();
-    match error.raw_os_error() {
-        Some(libc::ESRCH) => Ok(false),
-        Some(libc::EPERM) => Ok(true),
-        _ => Err(format!(
-            "cannot inspect child process group {pgid}: {error}"
-        )),
-    }
-}
-
-fn signal_child_group(pgid: u32, signal: i32) -> Result<(), String> {
-    if unsafe { libc::kill(-(pgid as i32), signal) } == 0 {
-        return Ok(());
-    }
-    let error = io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) {
-        Ok(())
-    } else {
-        Err(format!(
-            "cannot signal child process group {pgid} with {signal}: {error}"
-        ))
-    }
-}
-
-fn signal_process(pid: u32, signal: i32) -> Result<(), String> {
-    if unsafe { libc::kill(pid as i32, signal) } == 0 {
-        return Ok(());
-    }
-    let error = io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) {
-        Ok(())
-    } else {
-        Err(format!(
-            "cannot signal child process {pid} with {signal}: {error}"
-        ))
-    }
-}
-
-fn live_descendants() -> Result<Vec<i32>, String> {
-    let root_pid = std::process::id();
-    let samples = scan_processes(Path::new("/proc"))?;
-    descendant_pids(root_pid, &samples)?
-        .into_iter()
-        .map(|pid| i32::try_from(pid).map_err(|_| format!("test descendant PID {pid} exceeds i32")))
-        .collect()
-}
-
-fn signal_live_descendants(signal: i32) -> Result<(), String> {
-    let mut errors = Vec::new();
-    for pid in live_descendants()? {
-        if unsafe { libc::kill(pid, signal) } == 0 {
-            continue;
-        }
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::ESRCH) {
-            errors.push(format!("PID {pid}: {error}"));
-        }
-    }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "cannot signal live test descendants with {signal}: {}",
-            errors.join("; ")
-        ))
-    }
-}
-
-fn hard_kill_descendants_and_reap(
-    direct_pid: u32,
-    direct_status: &mut Option<ExitStatus>,
-    reaped_cpu_usec: &mut u64,
-) -> Result<(), String> {
-    let deadline = Instant::now() + CHILD_REAP_DEADLINE;
-    let mut first_error = None;
-    loop {
-        for result in [
-            signal_process(direct_pid, libc::SIGKILL),
-            signal_live_descendants(libc::SIGKILL),
-        ] {
-            if let Err(error) = result {
-                first_error.get_or_insert(error);
-            }
-        }
-        let population = match reap_available_children(direct_pid, direct_status, reaped_cpu_usec) {
-            Ok(population) => population,
-            Err(error) => {
-                first_error.get_or_insert(error);
-                ChildPopulation::Present
-            }
-        };
-        let descendants_empty = match live_descendants() {
-            Ok(descendants) => descendants.is_empty(),
-            Err(error) => {
-                first_error.get_or_insert(error);
-                false
-            }
-        };
-        if population == ChildPopulation::Empty && descendants_empty {
-            return match first_error {
-                Some(error) => Err(format!(
-                    "test descendants required cleanup after a lifecycle error: {error}"
-                )),
-                None => Ok(()),
-            };
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "cannot prove test descendants were reaped after SIGKILL: {first_error:?}"
-            ));
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-}
-
 fn observed_cpu_usec(reaped_cpu_usec: u64) -> Result<u64, String> {
     reaped_cpu_usec
         .checked_add(descendant_cpu_usec(std::process::id())?)
         .ok_or_else(|| "nextest test subtree CPU total overflowed u64".to_string())
 }
 
-fn reap_until_empty(
+fn reap_owned_cgroup_until_empty(
     direct_pid: u32,
-    pgid: u32,
+    cgroup: &OwnedAttemptCgroup,
     direct_status: &mut Option<ExitStatus>,
     reaped_cpu_usec: &mut u64,
+    wait4: &mut Vec<Wait4Record>,
     deadline: Instant,
 ) -> Result<bool, String> {
     loop {
-        let population = reap_available_children(direct_pid, direct_status, reaped_cpu_usec)?;
-        if population == ChildPopulation::Empty && !child_group_exists(pgid)? {
+        let population =
+            reap_available_children(direct_pid, direct_status, reaped_cpu_usec, wait4)?;
+        if population == ChildPopulation::Empty && !cgroup.populated()? && cgroup.procs_empty()? {
             return Ok(true);
         }
         if Instant::now() >= deadline {
@@ -570,54 +892,72 @@ fn reap_until_empty(
     }
 }
 
-fn terminate_and_reap(
-    direct_pid: u32,
-    pgid: u32,
+struct CleanupOutcome {
+    error: Option<String>,
+}
+
+fn terminate_owned_cgroup(
+    direct_pidfd: &PidFd,
+    cgroup: &OwnedAttemptCgroup,
     signal: i32,
     grace: Duration,
     direct_status: &mut Option<ExitStatus>,
     reaped_cpu_usec: &mut u64,
-) -> Result<(), String> {
-    let mut first_error = signal_child_group(pgid, signal).err();
+    wait4: &mut Vec<Wait4Record>,
+) -> Result<CleanupOutcome, String> {
+    let mut first_error = if env::var_os(CONTROL_ARM_ENV).is_some()
+        && env::var_os(CONTROL_CLEANUP_ERROR_ENV).is_some()
+    {
+        Some("gentle cleanup failed under the self-test control".into())
+    } else if direct_status.is_none() {
+        direct_pidfd.signal(signal).err()
+    } else {
+        None
+    };
     if first_error.is_none() {
-        match reap_until_empty(
-            direct_pid,
-            pgid,
+        match reap_owned_cgroup_until_empty(
+            direct_pidfd.pid,
+            cgroup,
             direct_status,
             reaped_cpu_usec,
+            wait4,
             Instant::now() + grace,
         ) {
-            Ok(true) => return Ok(()),
+            Ok(true) => return Ok(CleanupOutcome { error: None }),
             Ok(false) => {}
             Err(error) => first_error = Some(error),
         }
     }
     let deadline = Instant::now() + CHILD_REAP_DEADLINE;
-    let mut hard_error = None;
+    let mut hard_error = cgroup.kill().err();
     let hard_reaped = loop {
-        for result in [
-            signal_child_group(pgid, libc::SIGKILL),
-            signal_live_descendants(libc::SIGKILL),
-        ] {
-            if let Err(error) = result {
-                hard_error.get_or_insert(error);
-            }
-        }
-        let population = match reap_available_children(direct_pid, direct_status, reaped_cpu_usec) {
+        let population = match reap_available_children(
+            direct_pidfd.pid,
+            direct_status,
+            reaped_cpu_usec,
+            wait4,
+        ) {
             Ok(population) => population,
             Err(error) => {
                 hard_error.get_or_insert(error);
                 ChildPopulation::Present
             }
         };
-        let group_exists = match child_group_exists(pgid) {
-            Ok(exists) => exists,
+        let populated = match cgroup.populated() {
+            Ok(populated) => populated,
             Err(error) => {
                 hard_error.get_or_insert(error);
                 true
             }
         };
-        if population == ChildPopulation::Empty && !group_exists {
+        let procs_empty = match cgroup.procs_empty() {
+            Ok(empty) => empty,
+            Err(error) => {
+                hard_error.get_or_insert(error);
+                false
+            }
+        };
+        if population == ChildPopulation::Empty && !populated && procs_empty {
             break true;
         }
         if Instant::now() >= deadline {
@@ -625,14 +965,72 @@ fn terminate_and_reap(
         }
         thread::sleep(Duration::from_millis(50));
     };
-    match (first_error, hard_error, hard_reaped) {
-        (None, None, true) => Ok(()),
-        (Some(error), None, true) => Err(format!(
-            "test subtree required hard cleanup after a lifecycle error: {error}"
+    if !hard_reaped {
+        return Err(format!(
+            "cannot prove the owned attempt cgroup is empty and adopted descendants were reaped after cgroup.kill: gentle={first_error:?}; hard={hard_error:?}"
+        ));
+    }
+    let error = match (first_error, hard_error) {
+        (None, None) => None,
+        (gentle, hard) => Some(format!(
+            "test subtree required hard cleanup after a lifecycle error: gentle={gentle:?}; hard={hard:?}"
         )),
-        (first_error, hard_error, hard_reaped) => Err(format!(
-            "cannot prove child process group {pgid} and adopted descendants were reaped after SIGKILL: gentle={first_error:?}; hard={hard_error:?}; reaped={hard_reaped}"
-        )),
+    };
+    Ok(CleanupOutcome { error })
+}
+
+fn kill_direct_child_and_reap(
+    direct_pid: u32,
+    direct_pidfd: &PidFd,
+    direct_status: &mut Option<ExitStatus>,
+    reaped_cpu_usec: &mut u64,
+    wait4: &mut Vec<Wait4Record>,
+) -> Result<(), String> {
+    let mut first_error = direct_pidfd.signal(libc::SIGKILL).err();
+    let deadline = Instant::now() + CHILD_REAP_DEADLINE;
+    loop {
+        match reap_available_children(direct_pid, direct_status, reaped_cpu_usec, wait4) {
+            Ok(ChildPopulation::Empty) => {
+                return match first_error {
+                    Some(error) => Err(format!(
+                        "direct child required cleanup after a lifecycle error: {error}"
+                    )),
+                    None => Ok(()),
+                };
+            }
+            Ok(ChildPopulation::Present) => {}
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "cannot prove the direct child was reaped after pidfd SIGKILL: {first_error:?}"
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn kill_owned_cgroup_and_reap(
+    direct_pid: u32,
+    cgroup: &OwnedAttemptCgroup,
+    direct_status: &mut Option<ExitStatus>,
+    reaped_cpu_usec: &mut u64,
+    wait4: &mut Vec<Wait4Record>,
+) -> Result<(), String> {
+    cgroup.kill()?;
+    if reap_owned_cgroup_until_empty(
+        direct_pid,
+        cgroup,
+        direct_status,
+        reaped_cpu_usec,
+        wait4,
+        Instant::now() + CHILD_REAP_DEADLINE,
+    )? {
+        Ok(())
+    } else {
+        Err("cannot prove the owned attempt cgroup is empty and adopted descendants were reaped after cgroup.kill".into())
     }
 }
 
@@ -715,6 +1113,7 @@ fn wait_for_direct_child(
     direct_pid: u32,
     direct_status: &mut Option<ExitStatus>,
     reaped_cpu_usec: &mut u64,
+    wait4: &mut Vec<Wait4Record>,
 ) -> FirstCause {
     loop {
         if let Some(supervisor_signal) = received_external_signal() {
@@ -727,13 +1126,15 @@ fn wait_for_direct_child(
         let waited =
             unsafe { libc::wait4(direct_pid as libc::pid_t, &mut raw_status, 0, &mut usage) };
         if waited == direct_pid as libc::pid_t {
-            if let Err(signal) = reserve_non_signal_cause() {
-                return FirstCause::ExternalSignal { signal };
-            }
-            let used = match rusage_usec(&usage) {
+            let receipt = match wait4_record(waited, raw_status, &usage) {
+                Ok(receipt) => receipt,
+                Err(error) => return FirstCause::AccountingUnavailable { error },
+            };
+            let used = match receipt.cpu_usage_usec() {
                 Ok(used) => used,
                 Err(error) => return FirstCause::AccountingUnavailable { error },
             };
+            wait4.push(receipt);
             *reaped_cpu_usec = match reaped_cpu_usec.checked_add(used) {
                 Some(total) => total,
                 None => {
@@ -744,6 +1145,12 @@ fn wait_for_direct_child(
             };
             let status = ExitStatus::from_raw(raw_status);
             *direct_status = Some(status);
+            if let Err(error) = pause_after_wait4_storage_for_control() {
+                return FirstCause::AccountingUnavailable { error };
+            }
+            if let Err(signal) = reserve_non_signal_cause() {
+                return FirstCause::ExternalSignal { signal };
+            }
             return FirstCause::Exit(status);
         }
         let error = io::Error::last_os_error();
@@ -782,6 +1189,28 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
         install_subreaper()?;
     }
 
+    let mut attempt_cgroup = invocation
+        .cpu_budget_usec
+        .map(|_| OwnedAttemptCgroup::create(&identity))
+        .transpose()?;
+    if let (Some(cgroup), Some(path)) = (
+        attempt_cgroup.as_ref(),
+        env::var_os(CONTROL_CGROUP_PATH_FILE_ENV),
+    ) {
+        if let Err(error) = fs::write(path, format!("{}\n", cgroup.path.display())) {
+            let cleanup = attempt_cgroup
+                .as_mut()
+                .expect("control path requires an owned cgroup")
+                .remove_empty();
+            return Err(match cleanup {
+                Ok(()) => format!("cannot publish owned-cgroup control path: {error}"),
+                Err(cleanup_error) => format!(
+                    "cannot publish owned-cgroup control path ({error}); owned empty cgroup cleanup also failed: {cleanup_error}"
+                ),
+            });
+        }
+    }
+
     let mut command = Command::new(program);
     command.args(child_args);
     command.env_remove(CPU_BINARY_MAP_ENV);
@@ -790,21 +1219,100 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
     command.env_remove(CPU_WRAPPER_ENV);
     command.env_remove(TEST_CPU_TIMEOUT_MULTIPLIER_ENV);
     command.env_remove(CONTROL_CAUSE_FILE_ENV);
+    command.env_remove(CONTROL_ACCOUNTING_FAILURE_FILE_ENV);
+    command.env_remove(CONTROL_CGROUP_PATH_FILE_ENV);
+    command.env_remove(CONTROL_CLEANUP_ERROR_ENV);
+    command.env_remove(CONTROL_FINAL_CPU_FILE_ENV);
+    command.env_remove(CONTROL_FINAL_READ_FAILURE_ENV);
+    command.env_remove(CONTROL_FINAL_REGRESSION_ENV);
     command.env_remove(CONTROL_PROC_ROOT_ENV);
     command.env_remove(CONTROL_RESERVED_FILE_ENV);
     command.env_remove(CONTROL_RESUME_FILE_ENV);
+    command.env_remove(CONTROL_WAIT4_RESUME_FILE_ENV);
+    command.env_remove(CONTROL_WAIT4_STORED_FILE_ENV);
     if invocation.cpu_budget_usec.is_some() {
         command.process_group(0);
+        let enrollment_fd = attempt_cgroup
+            .as_ref()
+            .expect("budgeted path created an attempt cgroup")
+            .enrollment_fd();
+        unsafe {
+            command.pre_exec(move || {
+                loop {
+                    let written = libc::write(enrollment_fd, b"0\n".as_ptr().cast(), 2);
+                    if written == 2 {
+                        return Ok(());
+                    }
+                    if written < 0 {
+                        let error = *libc::__errno_location();
+                        if error == libc::EINTR {
+                            continue;
+                        }
+                        return Err(io::Error::from_raw_os_error(error));
+                    }
+                    return Err(io::Error::from_raw_os_error(libc::EIO));
+                }
+            });
+        }
     }
-    let child = command
-        .spawn()
-        .map_err(|error| format!("cannot execute nextest test command: {error}"))?;
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let cleanup = attempt_cgroup
+                .as_mut()
+                .map(OwnedAttemptCgroup::remove_empty)
+                .transpose();
+            return Err(match cleanup {
+                Ok(_) => format!("cannot execute nextest test command: {error}"),
+                Err(cleanup_error) => format!(
+                    "cannot execute nextest test command ({error}); owned empty cgroup cleanup also failed: {cleanup_error}"
+                ),
+            });
+        }
+    };
     let child_pid = child.id();
+    let direct_pidfd = match PidFd::open(child_pid) {
+        Ok(pidfd) => pidfd,
+        Err(error) => {
+            if let Some(cgroup) = attempt_cgroup.as_mut() {
+                let mut direct_status = None;
+                let mut reaped_cpu_usec = 0;
+                let mut wait4 = Vec::new();
+                drop(child);
+                let cleanup = kill_owned_cgroup_and_reap(
+                    child_pid,
+                    cgroup,
+                    &mut direct_status,
+                    &mut reaped_cpu_usec,
+                    &mut wait4,
+                )
+                .and_then(|()| cgroup.remove_empty());
+                return Err(match cleanup {
+                    Ok(()) => error,
+                    Err(cleanup_error) => {
+                        format!("{error}; owned cgroup cleanup also failed: {cleanup_error}")
+                    }
+                });
+            }
+            let mut child = child;
+            let cleanup = child.kill().and_then(|()| child.wait()).map(|_| ());
+            return Err(match cleanup {
+                Ok(()) => error,
+                Err(cleanup_error) => {
+                    format!("{error}; direct-child cleanup also failed: {cleanup_error}")
+                }
+            });
+        }
+    };
     drop(child);
     let mut direct_status = None;
     let mut reaped_cpu_usec = 0u64;
+    let mut wait4 = Vec::new();
     let mut max_cpu_usec = 0u64;
     let cause = if let Some(cpu_budget_usec) = invocation.cpu_budget_usec {
+        let cgroup = attempt_cgroup
+            .as_ref()
+            .expect("budgeted path created an attempt cgroup");
         let mut next_cpu_poll = Instant::now();
         loop {
             if let Some(supervisor_signal) = received_external_signal() {
@@ -816,20 +1324,41 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
                 child_pid,
                 &mut direct_status,
                 &mut reaped_cpu_usec,
+                &mut wait4,
             ) {
                 Ok(population) => population,
                 Err(error) => {
                     break reserve_or_external(FirstCause::AccountingUnavailable { error });
                 }
             };
+            if let Some(supervisor_signal) = received_external_signal() {
+                break FirstCause::ExternalSignal {
+                    signal: supervisor_signal,
+                };
+            }
             let now = Instant::now();
-            let successful_parent_has_live_descendants = direct_status
-                .is_some_and(|status| status.success())
-                && population == ChildPopulation::Present;
-            let must_resolve_exit = direct_status
-                .is_some_and(|status| !status.success() || population == ChildPopulation::Empty);
-            let must_resolve_non_signal = must_resolve_exit || population == ChildPopulation::Empty;
-            let already_reserved = if must_resolve_non_signal {
+            if let Some(status) = direct_status.filter(|status| !status.success()) {
+                match reserve_non_signal_cause() {
+                    Ok(()) => {
+                        if let Err(error) = pause_after_terminal_reservation_for_control() {
+                            break FirstCause::AccountingUnavailable { error };
+                        }
+                        break FirstCause::Exit(status);
+                    }
+                    Err(signal) => break FirstCause::ExternalSignal { signal },
+                }
+            }
+            let cgroup_empty = match (cgroup.populated(), cgroup.procs_empty()) {
+                (Ok(false), Ok(true)) => true,
+                (Ok(_), Ok(_)) => false,
+                (Err(error), _) | (_, Err(error)) => {
+                    break reserve_or_external(FirstCause::AccountingUnavailable { error });
+                }
+            };
+            let completed_success = direct_status.is_some_and(|status| status.success())
+                && population == ChildPopulation::Empty
+                && cgroup_empty;
+            let already_reserved = if completed_success {
                 match reserve_non_signal_cause() {
                     Ok(()) => {
                         if let Err(error) = pause_after_terminal_reservation_for_control() {
@@ -842,8 +1371,14 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
             } else {
                 false
             };
-            if now >= next_cpu_poll || must_resolve_exit {
-                let observed = match observed_cpu_usec(reaped_cpu_usec) {
+            if now >= next_cpu_poll || completed_success {
+                if let Some(error) = controlled_accounting_failure() {
+                    break reserved_or_external(
+                        FirstCause::AccountingUnavailable { error },
+                        already_reserved,
+                    );
+                }
+                let observed = match cgroup.cpu_usage_usec() {
                     Ok(observed) => observed,
                     Err(error) => {
                         break reserved_or_external(
@@ -852,7 +1387,17 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
                         );
                     }
                 };
-                max_cpu_usec = max_cpu_usec.max(observed);
+                if observed < max_cpu_usec {
+                    break reserved_or_external(
+                        FirstCause::AccountingUnavailable {
+                            error: format!(
+                                "owned attempt cpu.stat regressed from {max_cpu_usec}us to {observed}us"
+                            ),
+                        },
+                        already_reserved,
+                    );
+                }
+                max_cpu_usec = observed;
                 if observed >= cpu_budget_usec {
                     let cause = reserved_or_external(
                         FirstCause::CpuTimeout {
@@ -872,11 +1417,12 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
                     next_cpu_poll = now + CPU_POLL_INTERVAL;
                 }
             }
-            if let Some(status) = direct_status {
-                if !successful_parent_has_live_descendants {
-                    break reserved_or_external(FirstCause::Exit(status), already_reserved);
-                }
-            } else if population == ChildPopulation::Empty {
+            if completed_success {
+                break FirstCause::Exit(
+                    direct_status.expect("completed success has a direct child status"),
+                );
+            }
+            if direct_status.is_none() && population == ChildPopulation::Empty {
                 break reserved_or_external(
                     FirstCause::AccountingUnavailable {
                         error:
@@ -889,7 +1435,12 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
             thread::sleep(Duration::from_millis(10));
         }
     } else {
-        wait_for_direct_child(child_pid, &mut direct_status, &mut reaped_cpu_usec)
+        wait_for_direct_child(
+            child_pid,
+            &mut direct_status,
+            &mut reaped_cpu_usec,
+            &mut wait4,
+        )
     };
 
     if invocation.cpu_budget_usec.is_none() {
@@ -912,8 +1463,13 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
             }
         }
         if let FirstCause::AccountingUnavailable { ref error } = cause {
-            let cleanup =
-                hard_kill_descendants_and_reap(child_pid, &mut direct_status, &mut reaped_cpu_usec);
+            let cleanup = kill_direct_child_and_reap(
+                child_pid,
+                &direct_pidfd,
+                &mut direct_status,
+                &mut reaped_cpu_usec,
+                &mut wait4,
+            );
             return Err(match cleanup {
                 Ok(()) => format!(
                     "CPU accounting became unavailable; stopped the test subtree rather than returning an unmeasured result: {error}"
@@ -937,7 +1493,8 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
             elapsed_ms(started)?,
             completion.clone(),
             cpu_source,
-        );
+        )
+        .with_wait4(wait4);
         write_attempt_atomic(&record_dir, &record)?;
         return match completion {
             AttemptCompletion::Exit { .. } => direct_status
@@ -958,27 +1515,91 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
         FirstCause::ExternalSignal { signal } => signal,
         _ => libc::SIGTERM,
     };
-    if let Err(cleanup_error) = terminate_and_reap(
-        child_pid,
-        child_pid,
+    let cgroup = attempt_cgroup
+        .as_mut()
+        .expect("budgeted path created an attempt cgroup");
+    let cleanup = match terminate_owned_cgroup(
+        &direct_pidfd,
+        cgroup,
         cleanup_signal,
         invocation.termination_grace,
         &mut direct_status,
         &mut reaped_cpu_usec,
+        &mut wait4,
     ) {
-        return Err(match &cause {
-            FirstCause::AccountingUnavailable { error } => format!(
-                "CPU accounting became unavailable ({error}); test-subtree cleanup also failed: {cleanup_error}"
-            ),
-            _ => format!("test-subtree cleanup failed: {cleanup_error}"),
-        });
+        Ok(cleanup) => cleanup,
+        Err(cleanup_error) => {
+            return Err(match &cause {
+                FirstCause::AccountingUnavailable { error } => format!(
+                    "CPU accounting became unavailable ({error}); test-subtree cleanup also failed: {cleanup_error}"
+                ),
+                _ => format!(
+                    "primary outcome {cause:?}; test-subtree cleanup failed: {cleanup_error}"
+                ),
+            });
+        }
+    };
+
+    let final_cpu_result = if env::var_os(CONTROL_ARM_ENV).is_some()
+        && env::var_os(CONTROL_FINAL_READ_FAILURE_ENV).is_some()
+    {
+        Err("final owned cgroup CPU read failed under the self-test control".into())
+    } else {
+        cgroup
+            .cpu_usage_usec()
+            .map_err(|error| format!("final owned cgroup CPU accounting became unavailable: {error}"))
+            .and_then(|actual| {
+                if env::var_os(CONTROL_ARM_ENV).is_some()
+                    && env::var_os(CONTROL_FINAL_REGRESSION_ENV).is_some()
+                {
+                    max_cpu_usec.checked_sub(1).ok_or_else(|| {
+                        "final-regression control had no prior positive CPU observation".into()
+                    })
+                } else {
+                    Ok(actual)
+                }
+            })
+            .and_then(|final_cpu_usec| {
+                if final_cpu_usec < max_cpu_usec {
+                    Err(format!(
+                        "final owned attempt cpu.stat regressed from {max_cpu_usec}us to {final_cpu_usec}us"
+                    ))
+                } else {
+                    Ok(final_cpu_usec)
+                }
+            })
+    };
+    let mut finalization_errors = Vec::new();
+    if let FirstCause::AccountingUnavailable { error } = &cause {
+        finalization_errors.push(format!("CPU accounting became unavailable: {error}"));
     }
-    max_cpu_usec = max_cpu_usec.max(reaped_cpu_usec);
-    if let FirstCause::AccountingUnavailable { ref error } = cause {
+    if let Some(error) = cleanup.error {
+        finalization_errors.push(format!("cleanup completed with an error: {error}"));
+    }
+    let final_cpu_usec = match final_cpu_result {
+        Ok(value) => Some(value),
+        Err(error) => {
+            finalization_errors.push(error);
+            None
+        }
+    };
+    if let (Some(final_cpu_usec), Some(path)) =
+        (final_cpu_usec, env::var_os(CONTROL_FINAL_CPU_FILE_ENV))
+    {
+        if let Err(error) = fs::write(path, format!("{final_cpu_usec}\n")) {
+            finalization_errors.push(format!("cannot publish final cgroup CPU control: {error}"));
+        }
+    }
+    if let Err(error) = cgroup.remove_empty() {
+        finalization_errors.push(format!("owned empty cgroup removal failed: {error}"));
+    }
+    if !finalization_errors.is_empty() {
         return Err(format!(
-            "CPU accounting became unavailable; stopped the test subtree rather than disabling its budget: {error}"
+            "primary outcome {cause:?}; {}",
+            finalization_errors.join("; ")
         ));
     }
+    max_cpu_usec = final_cpu_usec.expect("successful finalization retained final CPU");
 
     let cause = match cause {
         FirstCause::Exit(status) if status.success() && max_cpu_usec >= cpu_budget_usec => {
@@ -1003,8 +1624,9 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
         max_cpu_usec,
         elapsed_ms(started)?,
         completion.clone(),
-        CPU_SOURCE_PROCFS_AND_REAPED,
-    );
+        CPU_SOURCE_CGROUP_V2,
+    )
+    .with_wait4(wait4);
     write_attempt_atomic(&record_dir, &record)?;
 
     match completion {
@@ -1048,7 +1670,7 @@ fn burn_cpu(milliseconds: u64) {
 
 fn control_child(mode: &str, args: &[OsString]) -> Result<ExitCode, String> {
     match mode {
-        "success" | "failure" => {
+        "success" | "failure" | "wait4-race" => {
             let expected = ["--exact", mode, "--nocapture"];
             if args
                 .iter()
@@ -1114,6 +1736,93 @@ fn control_child(mode: &str, args: &[OsString]) -> Result<ExitCode, String> {
         }
         "burn-long" => {
             burn_cpu(500);
+            Ok(ExitCode::SUCCESS)
+        }
+        "failure-after-burn" => {
+            burn_cpu(150);
+            Ok(ExitCode::from(23))
+        }
+        "final-regression" => {
+            burn_cpu(100);
+            Ok(ExitCode::SUCCESS)
+        }
+        "peer-sleep" => {
+            let enrollment = PathBuf::from(required_env(CONTROL_ENROLLMENT_FILE_ENV)?);
+            fs::write(
+                &enrollment,
+                fs::read_to_string("/proc/self/cgroup").map_err(|error| {
+                    format!("cannot read enrolled control cgroup membership: {error}")
+                })?,
+            )
+            .map_err(|error| {
+                format!(
+                    "cannot write enrolled control membership {}: {error}",
+                    enrollment.display()
+                )
+            })?;
+            fs::write(
+                required_env(CONTROL_PID_FILE_ENV)?,
+                format!("{}\n", std::process::id()),
+            )
+            .map_err(|error| format!("cannot write enrolled control PID: {error}"))?;
+            thread::sleep(Duration::from_millis(700));
+            Ok(ExitCode::SUCCESS)
+        }
+        "auto-reap-ignored" | "auto-reap-nocldwait" => {
+            unsafe {
+                if mode == "auto-reap-ignored" {
+                    if libc::signal(libc::SIGCHLD, libc::SIG_IGN) == libc::SIG_ERR {
+                        return Err(format!(
+                            "cannot install SIGCHLD=SIG_IGN control: {}",
+                            io::Error::last_os_error()
+                        ));
+                    }
+                } else {
+                    let mut action = std::mem::zeroed::<libc::sigaction>();
+                    action.sa_sigaction = libc::SIG_DFL;
+                    libc::sigemptyset(&mut action.sa_mask);
+                    action.sa_flags = libc::SA_NOCLDWAIT;
+                    if libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut()) != 0 {
+                        return Err(format!(
+                            "cannot install SA_NOCLDWAIT control: {}",
+                            io::Error::last_os_error()
+                        ));
+                    }
+                }
+            }
+            let executable = env::current_exe().map_err(|error| error.to_string())?;
+            let child = Command::new(executable)
+                .args(["--exact", "burn-auto-reaped", "--nocapture"])
+                .env(CONTROL_ARM_ENV, "1")
+                .spawn()
+                .map_err(|error| format!("cannot spawn auto-reaped CPU child: {error}"))?;
+            let child_pid = child.id() as libc::pid_t;
+            drop(child);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let waited =
+                    unsafe { libc::waitpid(child_pid, std::ptr::null_mut(), libc::WNOHANG) };
+                if waited < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
+                    break;
+                }
+                if waited > 0 {
+                    return Err("auto-reap control unexpectedly returned a wait receipt".into());
+                }
+                if waited < 0 {
+                    return Err(format!(
+                        "auto-reap control waitpid failed: {}",
+                        io::Error::last_os_error()
+                    ));
+                }
+                if Instant::now() >= deadline {
+                    return Err("auto-reap control child did not disappear".into());
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        "burn-auto-reaped" => {
+            burn_cpu(250);
             Ok(ExitCode::SUCCESS)
         }
         "hang" | "stop-hang" | "measurement-signal" => {
@@ -1352,6 +2061,29 @@ fn read_pid(path: &Path) -> Result<i32, String> {
     }
 }
 
+fn require_refusal_and_removed_cgroup(
+    output: &std::process::Output,
+    cgroup_path_file: &Path,
+    expected_error: &str,
+    label: &str,
+) -> Result<(), String> {
+    let path = PathBuf::from(
+        fs::read_to_string(cgroup_path_file)
+            .map_err(|error| format!("cannot read {label} cgroup path: {error}"))?
+            .trim(),
+    );
+    if output.status.code() != Some(INFRASTRUCTURE_EXIT.into())
+        || !String::from_utf8_lossy(&output.stderr).contains(expected_error)
+        || path.exists()
+    {
+        return Err(format!(
+            "{label} did not refuse and remove its proved-empty owned cgroup {}: {output:?}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 fn process_exists(pid: i32) -> bool {
     if unsafe { libc::kill(pid, 0) } == 0 {
         return true;
@@ -1477,6 +2209,52 @@ fn self_test() -> Result<(), String> {
     };
     write_binary_map_atomic(&scratch.0.join("binary-map.json"), &map)?;
 
+    let ownership_identity = AttemptIdentity {
+        package: "fixture".into(),
+        binary: "fixture::bin/fixture_name".into(),
+        test: "cgroup-ownership".into(),
+        attempt: 1,
+    };
+    let mut owned = OwnedAttemptCgroup::create(&ownership_identity)?;
+    if OwnedAttemptCgroup::create(&ownership_identity).is_ok() {
+        return Err("owned attempt cgroup creation clobbered an existing name".into());
+    }
+    owned.remove_empty()?;
+
+    if unsafe { libc::geteuid() } != 0 {
+        let read_only_identity = AttemptIdentity {
+            test: "read-only-cgroup-parent".into(),
+            ..ownership_identity.clone()
+        };
+        let nested_identity = AttemptIdentity {
+            test: "read-only-cgroup-child".into(),
+            ..ownership_identity.clone()
+        };
+        let mut read_only_parent = OwnedAttemptCgroup::create(&read_only_identity)?;
+        fs::set_permissions(&read_only_parent.path, fs::Permissions::from_mode(0o555))
+            .map_err(|error| format!("cannot make cgroup delegation control read-only: {error}"))?;
+        let nested = OwnedAttemptCgroup::create_in(&read_only_parent.path, &nested_identity);
+        fs::set_permissions(&read_only_parent.path, fs::Permissions::from_mode(0o755)).map_err(
+            |error| format!("cannot restore cgroup delegation control permissions: {error}"),
+        )?;
+        if let Ok(mut nested) = nested {
+            nested.remove_empty()?;
+            read_only_parent.remove_empty()?;
+            return Err("read-only cgroup delegation was accepted".into());
+        }
+        read_only_parent.remove_empty()?;
+    }
+    let missing_parent = scratch.0.join("missing-cgroup-parent");
+    if OwnedAttemptCgroup::create_in(&missing_parent, &ownership_identity).is_ok() {
+        return Err("missing cgroup delegation was accepted".into());
+    }
+    let replaced_parent = scratch.0.join("replaced-cgroup-parent");
+    std::os::unix::fs::symlink(current_cgroup_directory()?, &replaced_parent)
+        .map_err(|error| format!("cannot create replaced-cgroup control: {error}"))?;
+    if OwnedAttemptCgroup::create_in(&replaced_parent, &ownership_identity).is_ok() {
+        return Err("a substituted cgroup delegation path was accepted".into());
+    }
+
     let proc_control = scratch.0.join("proc-control");
     write_proc_control(&proc_control, 100, 1, 100, [99, 99, 99, 99])?;
     write_proc_control(&proc_control, 101, 100, 900, [3, 4, 5, 6])?;
@@ -1579,6 +2357,34 @@ fn self_test() -> Result<(), String> {
         ));
     }
 
+    let wait4_stored_file = scratch.0.join("wait4-receipt-stored");
+    let wait4_resume_file = scratch.0.join("resume-after-wait4-receipt");
+    let mut wait4_race_command =
+        control_command(&executable, &test_binary, &scratch.0, "wait4-race", 1);
+    wait4_race_command
+        .env(CONTROL_WAIT4_STORED_FILE_ENV, &wait4_stored_file)
+        .env(CONTROL_WAIT4_RESUME_FILE_ENV, &wait4_resume_file);
+    let wait4_race = wait4_race_command
+        .spawn()
+        .map_err(|error| format!("cannot run wait4-receipt race control: {error}"))?;
+    wait_for_file(&wait4_stored_file, "stored wait4 receipt marker")?;
+    if unsafe { libc::kill(wait4_race.id() as i32, libc::SIGINT) } != 0 {
+        return Err(format!(
+            "cannot deliver signal after wait4 receipt storage: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    fs::write(&wait4_resume_file, b"resume\n")
+        .map_err(|error| format!("cannot release wait4-receipt control: {error}"))?;
+    let wait4_race = wait4_race
+        .wait_with_output()
+        .map_err(|error| format!("cannot wait for wait4-receipt race control: {error}"))?;
+    if wait4_race.status.signal() != Some(libc::SIGINT) {
+        return Err(format!(
+            "wait4-receipt race did not preserve the winning supervisor signal: {wait4_race:?}"
+        ));
+    }
+
     let failure = control_command(&executable, &test_binary, &scratch.0, "failure", 1)
         .output()
         .map_err(|error| format!("cannot run failure control: {error}"))?;
@@ -1624,6 +2430,108 @@ fn self_test() -> Result<(), String> {
     if forced.status.code() != Some(CPU_TIMEOUT_EXIT.into()) {
         return Err(format!("forced CPU-timeout control returned {forced:?}"));
     }
+
+    for mode in ["auto-reap-ignored", "auto-reap-nocldwait"] {
+        let auto_reaped = control_command_with_limits(
+            &executable,
+            &test_binary,
+            &scratch.0,
+            mode,
+            1,
+            150_000,
+            100,
+        )
+        .output()
+        .map_err(|error| format!("cannot run {mode} control: {error}"))?;
+        if auto_reaped.status.code() != Some(CPU_TIMEOUT_EXIT.into()) {
+            return Err(format!(
+                "{mode} CPU was absent from owned-cgroup accounting: {auto_reaped:?}"
+            ));
+        }
+    }
+
+    let exit_over_budget = control_command_with_limits(
+        &executable,
+        &test_binary,
+        &scratch.0,
+        "failure-after-burn",
+        1,
+        50_000,
+        100,
+    )
+    .output()
+    .map_err(|error| format!("cannot run nonzero-exit CPU race control: {error}"))?;
+    if exit_over_budget.status.code() != Some(23) {
+        return Err(format!(
+            "a later budget check replaced an observed nonzero exit: {exit_over_budget:?}"
+        ));
+    }
+
+    let peer_pid_file = scratch.0.join("peer-exclusion-child.pid");
+    let enrollment_file = scratch.0.join("peer-exclusion-membership");
+    let cgroup_path_file = scratch.0.join("peer-exclusion-cgroup");
+    let peer_final_cpu_file = scratch.0.join("peer-exclusion-final-cpu");
+    let peer = Command::new(&executable)
+        .args(["--exact", "burn-long", "--nocapture"])
+        .env(CONTROL_ARM_ENV, "1")
+        .spawn()
+        .map_err(|error| format!("cannot start unrelated CPU peer: {error}"))?;
+    let peer_pid = peer.id();
+    let mut peer_wrapper = control_command_with_limits(
+        &executable,
+        &test_binary,
+        &scratch.0,
+        "peer-sleep",
+        1,
+        100_000,
+        100,
+    );
+    peer_wrapper
+        .env(CONTROL_PID_FILE_ENV, &peer_pid_file)
+        .env(CONTROL_ENROLLMENT_FILE_ENV, &enrollment_file)
+        .env(CONTROL_CGROUP_PATH_FILE_ENV, &cgroup_path_file)
+        .env(CONTROL_FINAL_CPU_FILE_ENV, &peer_final_cpu_file);
+    let peer_wrapper = peer_wrapper
+        .spawn()
+        .map_err(|error| format!("cannot start peer-exclusion wrapper: {error}"))?;
+    wait_for_file(&peer_pid_file, "peer-exclusion child PID")?;
+    wait_for_file(&enrollment_file, "peer-exclusion child membership")?;
+    wait_for_file(&cgroup_path_file, "peer-exclusion cgroup path")?;
+    let enrolled_pid = read_pid(&peer_pid_file)?;
+    let owned_path = PathBuf::from(
+        fs::read_to_string(&cgroup_path_file)
+            .map_err(|error| format!("cannot read peer-exclusion cgroup path: {error}"))?
+            .trim(),
+    );
+    let owned_procs = fs::read_to_string(owned_path.join("cgroup.procs"))
+        .map_err(|error| format!("cannot read peer-exclusion cgroup.procs: {error}"))?;
+    let owned_pids = owned_procs
+        .split_whitespace()
+        .map(|pid| pid.parse::<u32>().map_err(|error| error.to_string()))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if !owned_pids.contains(&(enrolled_pid as u32)) || owned_pids.contains(&peer_pid) {
+        return Err(format!(
+            "owned attempt enrollment or peer exclusion was wrong: child={enrolled_pid}, peer={peer_pid}, members={owned_pids:?}"
+        ));
+    }
+    let peer_wrapper = peer_wrapper
+        .wait_with_output()
+        .map_err(|error| format!("cannot wait for peer-exclusion wrapper: {error}"))?;
+    let peer = peer
+        .wait_with_output()
+        .map_err(|error| format!("cannot wait for unrelated CPU peer: {error}"))?;
+    if !peer_wrapper.status.success() || !peer.status.success() || owned_path.exists() {
+        return Err(format!(
+            "peer-exclusion control failed or leaked its owned cgroup: wrapper={peer_wrapper:?}, peer={peer:?}, path={} exists={}",
+            owned_path.display(),
+            owned_path.exists()
+        ));
+    }
+    let peer_final_cpu = fs::read_to_string(&peer_final_cpu_file)
+        .map_err(|error| format!("cannot read peer-exclusion final CPU: {error}"))?
+        .trim()
+        .parse::<u64>()
+        .map_err(|error| format!("invalid peer-exclusion final CPU: {error}"))?;
 
     let exited_parent_pid_file = scratch.0.join("exited-parent-descendant.pid");
     // This value distinguishes the repaired path from the old implementation
@@ -1701,9 +2609,8 @@ fn self_test() -> Result<(), String> {
     }
 
     let accounting_pid_file = scratch.0.join("accounting-child.pid");
-    let accounting_proc = scratch.0.join("accounting-proc");
-    std::os::unix::fs::symlink("/proc", &accounting_proc)
-        .map_err(|error| format!("cannot link accounting-control procfs: {error}"))?;
+    let accounting_path_file = scratch.0.join("accounting-cgroup.path");
+    let accounting_failure_file = scratch.0.join("accounting-read-failure");
     let mut accounting_command = control_command_with_limits(
         &executable,
         &test_binary,
@@ -1715,14 +2622,24 @@ fn self_test() -> Result<(), String> {
     );
     accounting_command
         .env(CONTROL_PID_FILE_ENV, &accounting_pid_file)
-        .env(CONTROL_PROC_ROOT_ENV, &accounting_proc);
+        .env(CONTROL_CGROUP_PATH_FILE_ENV, &accounting_path_file)
+        .env(
+            CONTROL_ACCOUNTING_FAILURE_FILE_ENV,
+            &accounting_failure_file,
+        );
     let accounting = accounting_command
         .spawn()
         .map_err(|error| format!("cannot run missing-accounting control: {error}"))?;
     wait_for_file(&accounting_pid_file, "missing-accounting child PID")?;
+    wait_for_file(&accounting_path_file, "missing-accounting cgroup path")?;
     let accounting_pid = read_pid(&accounting_pid_file)?;
-    fs::remove_file(&accounting_proc)
-        .map_err(|error| format!("cannot remove accounting-control procfs link: {error}"))?;
+    let accounting_path = PathBuf::from(
+        fs::read_to_string(&accounting_path_file)
+            .map_err(|error| format!("cannot read missing-accounting cgroup path: {error}"))?
+            .trim(),
+    );
+    fs::write(&accounting_failure_file, b"fail\n")
+        .map_err(|error| format!("cannot trigger accounting read failure: {error}"))?;
     let accounting = accounting
         .wait_with_output()
         .map_err(|error| format!("cannot wait for missing-accounting control: {error}"))?;
@@ -1737,6 +2654,78 @@ fn self_test() -> Result<(), String> {
     if process_exists(accounting_pid) {
         return Err(format!(
             "missing-accounting child {accounting_pid} survived fail-closed cleanup"
+        ));
+    }
+    if accounting_path.exists() {
+        return Err(format!(
+            "missing-accounting control leaked owned cgroup {}",
+            accounting_path.display()
+        ));
+    }
+
+    let final_read_path_file = scratch.0.join("final-read-failure-cgroup.path");
+    let mut final_read_command =
+        control_command(&executable, &test_binary, &scratch.0, "success", 4);
+    final_read_command
+        .env(CONTROL_CGROUP_PATH_FILE_ENV, &final_read_path_file)
+        .env(CONTROL_FINAL_READ_FAILURE_ENV, "1");
+    let final_read = final_read_command
+        .output()
+        .map_err(|error| format!("cannot run final-read refusal control: {error}"))?;
+    require_refusal_and_removed_cgroup(
+        &final_read,
+        &final_read_path_file,
+        "final owned cgroup CPU read failed",
+        "final-read refusal control",
+    )?;
+
+    let regression_path_file = scratch.0.join("final-regression-cgroup.path");
+    let mut regression_command =
+        control_command(&executable, &test_binary, &scratch.0, "final-regression", 1);
+    regression_command
+        .env(CONTROL_CGROUP_PATH_FILE_ENV, &regression_path_file)
+        .env(CONTROL_FINAL_REGRESSION_ENV, "1");
+    let regression = regression_command
+        .output()
+        .map_err(|error| format!("cannot run final-regression refusal control: {error}"))?;
+    require_refusal_and_removed_cgroup(
+        &regression,
+        &regression_path_file,
+        "cpu.stat regressed",
+        "final-regression refusal control",
+    )?;
+
+    let cleanup_pid_file = scratch.0.join("cleanup-error-child.pid");
+    let cleanup_path_file = scratch.0.join("cleanup-error-cgroup.path");
+    let mut cleanup_command = control_command(&executable, &test_binary, &scratch.0, "hang", 3);
+    cleanup_command
+        .env(CONTROL_PID_FILE_ENV, &cleanup_pid_file)
+        .env(CONTROL_CGROUP_PATH_FILE_ENV, &cleanup_path_file)
+        .env(CONTROL_CLEANUP_ERROR_ENV, "1");
+    let cleanup = cleanup_command
+        .spawn()
+        .map_err(|error| format!("cannot run proved-hard-cleanup refusal control: {error}"))?;
+    wait_for_file(&cleanup_pid_file, "proved-hard-cleanup child PID")?;
+    wait_for_file(&cleanup_path_file, "proved-hard-cleanup cgroup path")?;
+    let cleanup_pid = read_pid(&cleanup_pid_file)?;
+    if unsafe { libc::kill(cleanup.id() as i32, libc::SIGTERM) } != 0 {
+        return Err(format!(
+            "cannot trigger proved-hard-cleanup control: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    let cleanup = cleanup
+        .wait_with_output()
+        .map_err(|error| format!("cannot wait for proved-hard-cleanup control: {error}"))?;
+    require_refusal_and_removed_cgroup(
+        &cleanup,
+        &cleanup_path_file,
+        "cleanup completed with an error",
+        "proved-hard-cleanup refusal control",
+    )?;
+    if process_exists(cleanup_pid) {
+        return Err(format!(
+            "proved-hard-cleanup child {cleanup_pid} survived cgroup.kill"
         ));
     }
 
@@ -1836,7 +2825,7 @@ fn self_test() -> Result<(), String> {
         .iter()
         .map(|r| r.identity.test.as_str())
         .collect::<std::collections::BTreeSet<_>>();
-    if records.len() != 13
+    if records.len() != 18
         || identities
             != [
                 "success",
@@ -1850,12 +2839,17 @@ fn self_test() -> Result<(), String> {
                 "stop-hang",
                 "wait-for-escaped-burner",
                 "catch-signal",
+                "auto-reap-ignored",
+                "auto-reap-nocldwait",
+                "failure-after-burn",
+                "peer-sleep",
+                "wait4-race",
             ]
             .into_iter()
             .collect()
     {
         return Err(format!(
-            "self-test expected thirteen exact atomic attempt identities, found {identities:?} ({} records)",
+            "self-test expected the original thirteen and five added exact atomic attempt identities, found {identities:?} ({} records)",
             records.len()
         ));
     }
@@ -1865,13 +2859,13 @@ fn self_test() -> Result<(), String> {
     {
         return Err("self-test did not preserve the typed binary identity".into());
     }
-    if find_record_attempt(&records, "success", 1)?.cpu_source != CPU_SOURCE_PROCFS_AND_REAPED
+    if find_record_attempt(&records, "success", 1)?.cpu_source != CPU_SOURCE_CGROUP_V2
         || find_record_attempt(&records, "success", 2)?.cpu_source != CPU_SOURCE_REAPED
-        || find_record_attempt(&records, "success", 3)?.cpu_source != CPU_SOURCE_PROCFS_AND_REAPED
+        || find_record_attempt(&records, "success", 3)?.cpu_source != CPU_SOURCE_CGROUP_V2
         || find_record(&records, "measurement-signal")?.cpu_source != CPU_SOURCE_PROCFS_AND_REAPED
     {
         return Err(
-            "self-test did not distinguish wait4-only from procfs-plus-wait4 CPU sources".into(),
+            "self-test did not distinguish cgroup-v2, wait4-only, and procfs-plus-wait4 CPU sources".into(),
         );
     }
     if !matches!(
@@ -1958,12 +2952,63 @@ fn self_test() -> Result<(), String> {
     ) {
         return Err("late external signal replaced the CPU timeout first cause".into());
     }
+    let exit_over_budget_record = find_record(&records, "failure-after-burn")?;
+    if !matches!(
+        exit_over_budget_record.completion,
+        AttemptCompletion::Exit { code: 23 }
+    ) || exit_over_budget_record.cpu_usage_usec < 50_000
+    {
+        return Err(format!(
+            "nonzero exit was not retained ahead of a later budget result: {exit_over_budget_record:?}"
+        ));
+    }
+    for mode in ["auto-reap-ignored", "auto-reap-nocldwait"] {
+        let record = find_record(&records, mode)?;
+        if record.cpu_source != CPU_SOURCE_CGROUP_V2
+            || !matches!(
+                record.completion,
+                AttemptCompletion::CpuTimeout {
+                    cpu_budget_usec: 150_000,
+                    observed_cpu_usec,
+                } if observed_cpu_usec >= 150_000
+            )
+        {
+            return Err(format!(
+                "{mode} did not retain auto-reaped descendant CPU: {record:?}"
+            ));
+        }
+    }
+    let peer_record = find_record(&records, "peer-sleep")?;
+    if peer_record.cpu_source != CPU_SOURCE_CGROUP_V2
+        || peer_record.cpu_usage_usec >= 100_000
+        || peer_record.cpu_usage_usec != peer_final_cpu
+        || !matches!(peer_record.completion, AttemptCompletion::Exit { code: 0 })
+    {
+        return Err(format!(
+            "unrelated peer CPU entered the owned attempt total: {peer_record:?}"
+        ));
+    }
+    let wait4_race_record = find_record(&records, "wait4-race")?;
+    if !matches!(
+        wait4_race_record.completion,
+        AttemptCompletion::SupervisorSignal {
+            signal: libc::SIGINT
+        }
+    ) || !wait4_race_record
+        .wait4
+        .iter()
+        .any(|receipt| ExitStatus::from_raw(receipt.status).code() == Some(23))
+    {
+        return Err(format!(
+            "wait4 receipt was lost when a signal won terminal classification: {wait4_race_record:?}"
+        ));
+    }
     let duplicate = write_attempt_atomic(&scratch.0.join("attempts"), &records[0]);
     if duplicate.is_ok() {
         return Err("duplicate atomic attempt publication unexpectedly replaced a record".into());
     }
     println!(
-        "nextest-cpu-wrapper: self-test PASS (process tree, success, failure, signal, wall timeout, CPU timeout, 500ms post-parent CPU boundary, stopped low-CPU wall delay, missing accounting fail-closed, CPU and exit first-cause races, no survivors, typed identity, truthful CPU source, substituted path, atomic identity)"
+        "nextest-cpu-wrapper: self-test PASS (owned cgroup v2 accounting, SIG_IGN and SA_NOCLDWAIT auto-reap, peer exclusion, pre-exec enrollment, process tree, success, failure, signal, wall timeout, CPU timeout, 500ms post-parent CPU boundary, stopped low-CPU wall delay, missing and final accounting fail-closed, final-counter regression, recovered hard-cleanup refusal, CPU, exit and wait4 first-cause races, cgroup.kill cleanup, no survivors, typed identity, truthful CPU source, substituted path, atomic identity)"
     );
     Ok(())
 }

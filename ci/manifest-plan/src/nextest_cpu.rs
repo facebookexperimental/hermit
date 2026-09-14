@@ -11,14 +11,15 @@ use serde::Serialize;
 use sha2::Digest;
 use sha2::Sha256;
 
-pub const ATTEMPT_RECORD_SCHEMA: u64 = 2;
+pub const ATTEMPT_RECORD_SCHEMA: u64 = 3;
 pub const BINARY_MAP_SCHEMA: u64 = 1;
-pub const CPU_REPORT_SCHEMA: u64 = 2;
+pub const CPU_REPORT_SCHEMA: u64 = 3;
 pub const CPU_BINARY_MAP_ENV: &str = "HERMIT_NEXTEST_CPU_BINARY_MAP";
 pub const CPU_RECORD_DIR_ENV: &str = "HERMIT_NEXTEST_CPU_RECORD_DIR";
 pub const CPU_REPORT_PATH_ENV: &str = "HERMIT_NEXTEST_CPU_REPORT_PATH";
-pub const CPU_SOURCE_REAPED: &str = "wait4-subtree";
-pub const CPU_SOURCE_PROCFS_AND_REAPED: &str = "procfs-descendants+wait4";
+pub const CPU_SOURCE_REAPED: CpuSource = CpuSource::Wait4Subtree;
+pub const CPU_SOURCE_PROCFS_AND_REAPED: CpuSource = CpuSource::ProcfsDescendantsAndWait4;
+pub const CPU_SOURCE_CGROUP_V2: CpuSource = CpuSource::CgroupV2;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -252,6 +253,47 @@ impl AttemptCompletion {
     }
 }
 
+/// One successful `wait4` receipt, retained independently from the attempt's
+/// terminal cause. The status is the kernel's raw wait status; the CPU fields
+/// are the two accounting fields from the same `rusage` snapshot.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Wait4Record {
+    pub pid: u32,
+    pub status: i32,
+    pub user_cpu_usec: u64,
+    pub system_cpu_usec: u64,
+}
+
+impl Wait4Record {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.pid == 0 {
+            return Err("wait4 record PID must be positive".into());
+        }
+        self.user_cpu_usec
+            .checked_add(self.system_cpu_usec)
+            .ok_or_else(|| "wait4 record CPU duration overflows u64".to_string())?;
+        Ok(())
+    }
+
+    pub fn cpu_usage_usec(&self) -> Result<u64, String> {
+        self.validate()?;
+        self.user_cpu_usec
+            .checked_add(self.system_cpu_usec)
+            .ok_or_else(|| "wait4 record CPU duration overflows u64".to_string())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum CpuSource {
+    #[serde(rename = "wait4-subtree")]
+    Wait4Subtree,
+    #[serde(rename = "procfs-descendants+wait4")]
+    ProcfsDescendantsAndWait4,
+    #[serde(rename = "cgroup-v2")]
+    CgroupV2,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AttemptRecord {
@@ -259,10 +301,11 @@ pub struct AttemptRecord {
     pub key: String,
     pub run_id: String,
     pub identity: AttemptIdentity,
-    pub cpu_source: String,
+    pub cpu_source: CpuSource,
     pub cpu_usage_usec: u64,
     pub wall_time_ms: u64,
     pub completion: AttemptCompletion,
+    pub wait4: Vec<Wait4Record>,
 }
 
 impl AttemptRecord {
@@ -274,7 +317,7 @@ impl AttemptRecord {
         completion: AttemptCompletion,
     ) -> Self {
         let cpu_source = if matches!(completion, AttemptCompletion::CpuTimeout { .. }) {
-            CPU_SOURCE_PROCFS_AND_REAPED
+            CPU_SOURCE_CGROUP_V2
         } else {
             CPU_SOURCE_REAPED
         };
@@ -294,7 +337,7 @@ impl AttemptRecord {
         cpu_usage_usec: u64,
         wall_time_ms: u64,
         completion: AttemptCompletion,
-        cpu_source: &str,
+        cpu_source: CpuSource,
     ) -> Self {
         let key = identity.key();
         Self {
@@ -302,11 +345,17 @@ impl AttemptRecord {
             key,
             run_id,
             identity,
-            cpu_source: cpu_source.into(),
+            cpu_source,
             cpu_usage_usec,
             wall_time_ms,
             completion,
+            wait4: Vec::new(),
         }
+    }
+
+    pub fn with_wait4(mut self, wait4: Vec<Wait4Record>) -> Self {
+        self.wait4 = wait4;
+        self
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -325,19 +374,14 @@ impl AttemptRecord {
                 "attempt record key does not match its binary/test/attempt identity".into(),
             );
         }
-        if self.cpu_source != CPU_SOURCE_REAPED && self.cpu_source != CPU_SOURCE_PROCFS_AND_REAPED {
-            return Err(format!(
-                "attempt record cpu_source {:?} is neither {CPU_SOURCE_REAPED:?} nor {CPU_SOURCE_PROCFS_AND_REAPED:?}",
-                self.cpu_source
-            ));
+        for wait in &self.wait4 {
+            wait.validate()?;
         }
         self.completion.validate()?;
         if matches!(self.completion, AttemptCompletion::CpuTimeout { .. })
-            && self.cpu_source != CPU_SOURCE_PROCFS_AND_REAPED
+            && self.cpu_source != CPU_SOURCE_CGROUP_V2
         {
-            return Err(format!(
-                "CPU-timeout attempt record requires cpu_source {CPU_SOURCE_PROCFS_AND_REAPED:?}"
-            ));
+            return Err("CPU-timeout attempt record requires cpu_source \"cgroup-v2\"".into());
         }
         if let AttemptCompletion::CpuTimeout {
             observed_cpu_usec, ..
