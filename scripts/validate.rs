@@ -1629,6 +1629,204 @@ fn shard_coverage_resource_policy_bracket(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+// This marker selects only a small child of the existing --self-test entrypoint.
+// An ordinary validation invocation never consults it.
+const RUNNER_LOG_SELF_TEST_ENV: &str = "HERMIT_VALIDATE_RUNNER_LOG_SELF_TEST";
+const RUNNER_LOG_SELF_TEST_OK: &str = "runner log isolation: pass and exit 23 retained; outer bytes unchanged";
+const RUNNER_LOG_SENTINEL: &[u8] = b"outer runner evidence\0must not change\xff\n";
+
+/// The standalone self-test owns its journal, including all in-process DAGs and
+/// subprocess fixtures. In particular, the missing-submodule fixture starts an
+/// ordinary validator whose pre.submodules failure is intentional. It must not
+/// append that failure to an enclosing validation run or truncate its step log.
+///
+/// Only the serial standalone self-test calls this helper. Its scheduler calls
+/// and subprocesses have joined before the environment is restored. Scope probe
+/// re-execs inherit this directory from their owning self-test; they do not
+/// create a new temporary owner that would be lost across exec.
+fn with_self_test_runner_logs<T>(run: impl FnOnce(&Path) -> Result<T, String>) -> Result<T, String> {
+    struct RestoreLogDir(Option<std::ffi::OsString>);
+    impl Drop for RestoreLogDir {
+        fn drop(&mut self) {
+            // SAFETY: the serial self-test has joined its fixture threads and
+            // children before returning (including a returned fixture error).
+            match &self.0 {
+                Some(value) => unsafe { std::env::set_var("DAGRUN_LOG_DIR", value) },
+                None => unsafe { std::env::remove_var("DAGRUN_LOG_DIR") },
+            }
+        }
+    }
+
+    let logs = tempfile::Builder::new()
+        .prefix("validate-self-test-runner-logs-")
+        .tempdir()
+        .map_err(|error| format!("self-test runner logs: cannot create private directory: {error}"))?;
+    let restore = RestoreLogDir(std::env::var_os("DAGRUN_LOG_DIR"));
+    // SAFETY: called at the serial self-test boundary, before fixture threads or
+    // subprocesses start. No other environment variable or runner policy changes.
+    unsafe { std::env::set_var("DAGRUN_LOG_DIR", logs.path()) };
+    let result = run(logs.path());
+    drop(restore);
+    let cleanup = logs.close()
+        .map_err(|error| format!("self-test runner logs: cannot remove private directory: {error}"));
+    match (result, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(cleanup)) => Err(format!("{error}; {cleanup}")),
+    }
+}
+
+fn self_test_runner_log_probe(logs: &Path, outer: &Path) -> Result<(), String> {
+    if logs == outer || std::env::var_os("DAGRUN_LOG_DIR").as_deref() != Some(logs.as_os_str()) {
+        return Err("runner log isolation: self-test did not replace the inherited directory".into());
+    }
+    let read = |path: &Path| std::fs::read(path)
+        .map_err(|error| format!("runner log isolation: cannot read {}: {error}", path.display()));
+    for name in ["journal.jsonl", "pre.submodules.log", "setup.manifest_plan.log"] {
+        if read(&outer.join(name))? != RUNNER_LOG_SENTINEL {
+            return Err(format!("runner log isolation: outer {name} changed before dispatch"));
+        }
+    }
+
+    // The child inherits the redirected environment without a command-local
+    // override, just like raw run-dag and the missing-submodule validator.
+    let child = Command::new("sh")
+        .args(["-c", "printf '%s' \"$DAGRUN_LOG_DIR\" > \"$DAGRUN_LOG_DIR/child-directory\"; exit 23"])
+        .output()
+        .map_err(|error| format!("runner log isolation: cannot launch child: {error}"))?;
+    if child.status.code() != Some(23) || !child.stdout.is_empty() || !child.stderr.is_empty()
+        || read(&logs.join("child-directory"))? != logs.as_os_str().as_bytes()
+    {
+        return Err(format!("runner log isolation: child environment/status changed: {:?}", child.status));
+    }
+
+    let step = |group: &str, job: &str, command: &str| step_with_caps(
+        group, job, "runner log isolation fixture", command.into(), Vec::new(),
+        10, 10, 64 * 1024 * 1024,
+    );
+    // Real production labels deliberately collide with the seeded outer files.
+    let cfg = validate_plan::config_from(vec![
+        step("pre", "submodules", "printf 'fixture pass\\n'"),
+        step("setup", "manifest_plan", "printf 'fixture failure\\n'; exit 23"),
+    ], "runner log isolation fixture");
+    let result = run_lane_once(&cfg, 1, true, 0, None, &logs.join("driver.log"), None, false);
+    if !result.complete || result.ok || result.run_timed_out || !result.skipped.is_empty()
+        || result.outcomes.len() != 2 || result.attempts.len() != 2
+    {
+        return Err(format!("runner log isolation: terminal result changed: complete={} ok={} outcomes={:?} skipped={:?}",
+            result.complete, result.ok, result.outcomes, result.skipped));
+    }
+    for (tag, code, bytes) in [
+        ("pre.submodules", 0, b"fixture pass\n".as_slice()),
+        ("setup.manifest_plan", 23, b"fixture failure\n".as_slice()),
+    ] {
+        let outcomes = result.outcomes.iter().filter(|row| row.tag == tag).collect::<Vec<_>>();
+        if outcomes.len() != 1 || outcomes[0].returncode != Some(code)
+            || outcomes[0].ok != (code == 0) || outcomes[0].aborted
+            || outcomes[0].timed_out || outcomes[0].cpu_timed_out
+            || read(&logs.join(format!("{tag}.log")))? != bytes
+        {
+            return Err(format!("runner log isolation: wrong outcome or step bytes for {tag}"));
+        }
+    }
+    let journal = read(&logs.join("journal.jsonl"))?;
+    let rows = journal.split(|byte| *byte == b'\n').filter(|line| !line.is_empty())
+        .map(serde_json::from_slice::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("runner log isolation: malformed private journal: {error}"))?;
+    for (tag, ok) in [("pre.submodules", "true"), ("setup.manifest_plan", "false")] {
+        let starts = rows.iter().filter(|row| row["event"] == "step_start" && row["step"] == tag).count();
+        let ends = rows.iter().filter(|row| row["event"] == "step_end" && row["step"] == tag).collect::<Vec<_>>();
+        if starts != 1 || ends.len() != 1 || ends[0]["ok"] != ok
+            || ends[0]["timed_out"] != "false" || ends[0]["cpu_timed_out"] != "false"
+        {
+            return Err(format!("runner log isolation: missing or changed start/end record for {tag}"));
+        }
+    }
+    for name in ["journal.jsonl", "pre.submodules.log", "setup.manifest_plan.log"] {
+        if read(&outer.join(name))? != RUNNER_LOG_SENTINEL {
+            return Err(format!("runner log isolation: outer {name} changed after dispatch"));
+        }
+    }
+
+    // Exercise the same restoration helper after both successful and failing
+    // work; neither an error nor a previously absent value may leak its path.
+    let previous = std::env::var_os("DAGRUN_LOG_DIR");
+    for fail in [false, true] {
+        let nested = with_self_test_runner_logs(|inner| {
+            if inner == logs || std::env::var_os("DAGRUN_LOG_DIR").as_deref() != Some(inner.as_os_str()) {
+                return Err("runner log isolation: nested directory was not selected".into());
+            }
+            if fail { Err("intentional fixture error".into()) } else { Ok(inner.to_path_buf()) }
+        });
+        if std::env::var_os("DAGRUN_LOG_DIR") != previous
+            || (!fail && !nested.as_ref().is_ok_and(|path| !path.exists()))
+            || (fail && nested.as_ref().err().map(String::as_str) != Some("intentional fixture error"))
+        {
+            return Err("runner log isolation: success/error did not restore the inherited value".into());
+        }
+    }
+    // This probe is single-threaded again after run_lane_once has joined.
+    unsafe { std::env::remove_var("DAGRUN_LOG_DIR") };
+    let absent = with_self_test_runner_logs(|_| Ok(()));
+    let restored_absent = std::env::var_os("DAGRUN_LOG_DIR").is_none();
+    match &previous {
+        Some(value) => unsafe { std::env::set_var("DAGRUN_LOG_DIR", value) },
+        None => unsafe { std::env::remove_var("DAGRUN_LOG_DIR") },
+    }
+    absent?;
+    if !restored_absent {
+        return Err("runner log isolation: absent environment was not restored".into());
+    }
+    println!("{RUNNER_LOG_SELF_TEST_OK}");
+    Ok(())
+}
+
+fn self_test_runner_log_isolation_bracket() -> Result<String, String> {
+    let outer = tempfile::Builder::new().prefix("validate-runner-log-outer-").tempdir()
+        .map_err(|error| format!("runner log isolation: cannot create outer fixture: {error}"))?;
+    for name in ["journal.jsonl", "pre.submodules.log", "setup.manifest_plan.log"] {
+        std::fs::write(outer.path().join(name), RUNNER_LOG_SENTINEL)
+            .map_err(|error| format!("runner log isolation: cannot seed {name}: {error}"))?;
+        std::fs::set_permissions(outer.path().join(name), std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("runner log isolation: cannot make {name} private: {error}"))?;
+    }
+    let inherited = std::env::var_os("DAGRUN_LOG_DIR");
+    // Command-local environment keeps this test from mutating its caller. Use
+    // the actual standalone entrypoint, including the isolation dispatch.
+    let output = Command::new("timeout")
+        .args(["--kill-after=2s", "60s"])
+        .arg(std::env::current_exe().map_err(|error| format!("runner log isolation: executable: {error}"))?)
+        .arg("--self-test")
+        .env(RUNNER_LOG_SELF_TEST_ENV, outer.path())
+        .env("DAGRUN_LOG_DIR", outer.path())
+        .env("DAGRUN_LOG_MAX_BYTES", "4096")
+        .env_remove("DAGRUN_NO_STEP_LOGS")
+        .output()
+        .map_err(|error| format!("runner log isolation: cannot launch CLI probe: {error}"))?;
+    if !output.status.success()
+        || !String::from_utf8_lossy(&output.stdout).lines().any(|line| line == RUNNER_LOG_SELF_TEST_OK)
+        || std::env::var_os("DAGRUN_LOG_DIR") != inherited
+    {
+        return Err(format!("runner log isolation: CLI probe failed: status={} stdout={} stderr={}",
+            output.status, String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr)));
+    }
+    for name in ["journal.jsonl", "pre.submodules.log", "setup.manifest_plan.log"] {
+        if std::fs::read(outer.path().join(name))
+            .map_err(|error| format!("runner log isolation: cannot reread {name}: {error}"))? != RUNNER_LOG_SENTINEL
+        {
+            return Err(format!("runner log isolation: CLI probe changed outer {name}"));
+        }
+    }
+    if std::fs::read_dir(outer.path()).map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?.len() != 3
+    {
+        return Err("runner log isolation: CLI probe wrote extra outer evidence".into());
+    }
+    Ok(RUNNER_LOG_SELF_TEST_OK.into())
+}
+
 /// Inert brackets for the policy predicate and the shell quoter.
 ///
 /// These cannot launch a run or authorize a receipt — they only prove the
@@ -1637,6 +1835,7 @@ fn shard_coverage_resource_policy_bracket(root: &Path) -> Result<(), String> {
 /// on every invocation (validate.sh:308); here they are a `--self-test` subcommand
 /// so the cost is not paid on the hot path.
 fn self_test() -> Result<(), String> {
+    println!("  {}", self_test_runner_log_isolation_bracket()?);
     inner_freshness_skip_cli_bracket()?;
     run_owned_cache_bracket()?;
     run_state_path_bracket()?;
@@ -19209,7 +19408,21 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     }
 
     if args.self_test {
-        return match self_test() {
+        let log_probe = std::env::var_os(RUNNER_LOG_SELF_TEST_ENV);
+        let result = with_self_test_runner_logs(|logs| {
+            if let Some(outer) = &log_probe {
+                self_test_runner_log_probe(logs, Path::new(outer))
+            } else {
+                self_test()
+            }
+        });
+        if log_probe.is_some() {
+            return match result {
+                Ok(()) => RunSummary::new(Verdict::SelfTest, 0, "runner log isolation self-test", vec![RUNNER_LOG_SELF_TEST_OK.into()]),
+                Err(error) => RunSummary::new(Verdict::Fail, 2, "runner log isolation self-test", vec![error]),
+            };
+        }
+        return match result {
             Ok(()) => RunSummary::new(
                 Verdict::SelfTest,
                 0,
