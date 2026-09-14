@@ -26,6 +26,8 @@ pub mod happens_before;
 mod id;
 pub mod instruction_map;
 mod interp;
+pub mod liteinst_bootstrap;
+pub mod liteinst_record;
 mod metadata;
 pub mod run_evidence;
 

@@ -1422,12 +1422,17 @@ mod tests {
     #[tokio::test]
     async fn replay_output_reports_closed_socket_failure() {
         let (output, peer) = UnixStream::pair().unwrap();
+        // A concurrent fork can keep the peer alive after drop(peer). Hold a
+        // duplicate to exercise that case, and shut down their shared socket.
+        let inherited_peer = peer.try_clone().unwrap();
+        peer.shutdown(std::net::Shutdown::Both).unwrap();
         drop(peer);
 
         let error = emit_replay_output(output.as_raw_fd(), b"LOST", None, false)
             .await
             .expect_err("closed replay output socket must fail");
         assert_eq!(error.raw_os_error(), Some(libc::EPIPE));
+        drop(inherited_peer);
     }
 
     #[tokio::test]

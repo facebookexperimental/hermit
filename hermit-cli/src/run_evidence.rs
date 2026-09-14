@@ -1126,11 +1126,20 @@ Apr 09 06:08:02.100  INFO hermit_test: second evidence record\n"
             inspect_run_evidence_directory(&publisher),
             RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::PublicationInProgress)
         );
+        // A concurrent fork can retain this open description after our drop.
+        // Keep a duplicate so that case is deterministic, and explicitly end
+        // this fixture's publication before checking post-publication inspection.
+        let inherited = publisher.try_clone().unwrap();
+        assert_eq!(
+            unsafe { libc::flock(publisher.as_raw_fd(), libc::LOCK_UN) },
+            0
+        );
         drop(publisher);
         assert!(matches!(
             inspect_run_evidence(directory.path()),
             RunEvidenceInspection::Complete(_)
         ));
+        drop(inherited);
     }
 
     #[test]
@@ -1452,6 +1461,11 @@ Apr 09 06:08:02.100  INFO hermit_test: second evidence record\n"
             load_run_evidence(directory.path()),
             Err(RunEvidenceInspectionFailure::PublicationInProgress)
         );
+        // A concurrent fork can retain this open description after our drop.
+        // Keep a duplicate so that case is deterministic, and explicitly end
+        // this fixture's publication before checking post-publication inspection.
+        let inherited = held.try_clone().unwrap();
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) }, 0);
         drop(held);
         let held = open_evidence_directory(directory.path()).unwrap();
         for (failed, expected) in [
@@ -1477,7 +1491,7 @@ Apr 09 06:08:02.100  INFO hermit_test: second evidence record\n"
                     file.sync_all()
                 }
             });
-            assert!(reached);
+            assert!(reached, "sync point {failed:?} was not reached: {loaded:?}");
             assert_eq!(loaded, Err(expected));
         }
         let mut synchronized = Vec::new();
@@ -1495,6 +1509,7 @@ Apr 09 06:08:02.100  INFO hermit_test: second evidence record\n"
             ]
         );
         assert_eq!(loaded.canonical_info, log);
+        drop(inherited);
     }
 
     #[test]

@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
+use hermit::liteinst_bootstrap::EffectiveFilter;
 use tracing::Subscriber;
 use tracing::metadata::LevelFilter;
 use tracing_subscriber::EnvFilter;
@@ -267,9 +268,7 @@ impl<W: Write> Write for BoundedWriter<W> {
 }
 
 fn env_filter(level: LevelFilter) -> EnvFilter {
-    EnvFilter::from_default_env()
-        .add_directive("tokio=debug".parse().expect("correct directive"))
-        .add_directive(level.into())
+    EffectiveFilter::from_default_env(level).into_filter()
 }
 
 /// Keeps a nonblocking public writer alive when one is installed. A private

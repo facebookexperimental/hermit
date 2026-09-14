@@ -37,6 +37,8 @@ rust_library(
         "fbsource//third-party/rust:tempfile",
         "fbsource//third-party/rust:tokio",
         "fbsource//third-party/rust:tracing",
+        "fbsource//third-party/rust:tracing-log",
+        "fbsource//third-party/rust:tracing-subscriber",
         "fbsource//third-party/rust:uuid",
         "//hermetic_infra/hermit/detcore:detcore",
         "//hermetic_infra/reverie:reverie",
