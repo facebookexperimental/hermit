@@ -219,6 +219,23 @@ class RegistrationAuditTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stdout)
         self.assertIn("integration_test_binaries", result.stderr)
 
+    def test_prlimit_nonexecuting_modes_do_not_register_a_binary(self) -> None:
+        for options in (
+            "--help",
+            "--version",
+            "--fsize=67108864:67108864 --help",
+            "--fsize=67108864:67108864 --version",
+            "--pid=1",
+        ):
+            with self.subTest(options=options):
+                result = self._plant_probe_with_dag_command(
+                    f"prlimit {options} -- ./ci/run-nextest-counted.sh "
+                    "-p hermit --test zz_probe",
+                    declared=["zz_probe"],
+                )
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn("integration_test_binaries", result.stderr)
+
     def test_prlimit_wrapped_echo_does_not_register_a_binary(self) -> None:
         result = self._plant_probe_with_dag_command(
             "prlimit --fsize=67108864:67108864 -- "

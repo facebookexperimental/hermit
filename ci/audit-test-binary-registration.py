@@ -69,9 +69,8 @@ _TOP_LEVEL_TEST_RE = re.compile(r"^hermit-cli/tests/([^/]+)\.rs$")
 # the allowlist and are refused.
 _SEGMENT_SPLIT_RE = re.compile(r"&&|\|\||[;|\n]")
 _ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-_KNOWN_RUNNERS = frozenset(
-    {"timeout", "env", "nice", "nohup", "xargs", "exec", "command", "prlimit"}
-)
+_KNOWN_RUNNERS = frozenset({"timeout", "env", "nice", "nohup", "xargs", "exec", "command"})
+_PRLIMIT_FSIZE_RE = re.compile(r"--fsize=(\d+):(\d+)")
 _DURATION_RE = re.compile(r"^\d+[smhd]?$")
 # `--no-run` compiles the binary and never executes it, so it is not coverage.
 _NO_RUN_RE = re.compile(r"(?<![\w-])--no-run(?![\w-])")
@@ -79,7 +78,34 @@ _NO_RUN_RE = re.compile(r"(?<![\w-])--no-run(?![\w-])")
 
 def _prefix_still_runs_cargo(prefix: str) -> bool:
     """Do the tokens before `cargo` leave cargo actually being executed?"""
-    for token in prefix.split():
+    tokens = prefix.split()
+    position = 0
+    while position < len(tokens):
+        token = tokens[position]
+        position += 1
+        if token == "prlimit":
+            # Recognize the limit-setting/exec form used by the DAG. Options
+            # such as --help, --version and --pid do not execute the runner.
+            if position + 1 >= len(tokens):
+                return False
+            limits = _PRLIMIT_FSIZE_RE.fullmatch(tokens[position])
+            if (
+                limits is None
+                or int(limits[1]) > int(limits[2])
+                or tokens[position + 1] != "--"
+            ):
+                return False
+            position += 2
+            # After --, prlimit expects an executable, not shell assignments,
+            # shell builtins or another option. The matched cargo/runner may
+            # immediately follow the prefix, leaving no tokens here.
+            if position < len(tokens) and (
+                tokens[position].startswith("-")
+                or _ENV_ASSIGNMENT_RE.match(tokens[position])
+                or tokens[position] in {"exec", "command"}
+            ):
+                return False
+            continue
         if _ENV_ASSIGNMENT_RE.match(token):
             continue
         if "/" in token or token.endswith(".sh"):
