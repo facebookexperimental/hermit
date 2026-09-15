@@ -2643,6 +2643,534 @@ fn timer_failure_preserves_stock_fallback_but_cannot_hide_overflow() {
     }
 }
 
+fn ansi_layer(
+    records: &Records,
+    ansi: bool,
+    limits: FormatterLimits,
+    status: RecordStatus,
+) -> RecordLayer<FixedTime, impl Fn(&[u8]) -> io::Result<()> + Send + Sync + 'static> {
+    RecordLayer {
+        ansi,
+        ..layer_with_status(limits, capture(records), FixedTime, true, status)
+    }
+}
+
+fn stock_ansi_output<F>(ansi: bool, filter: F, emit: impl FnOnce()) -> Vec<u8>
+where
+    F: tracing_subscriber::layer::Filter<tracing_subscriber::Registry> + Send + Sync + 'static,
+{
+    let output = Output::default();
+    let writer = output.clone();
+    let layer = tracing_subscriber::fmt::layer()
+        .with_timer(FixedTime)
+        .with_ansi(ansi)
+        .with_writer(move || writer.clone())
+        .with_filter(filter);
+    tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), emit);
+    output.0.lock().unwrap().clone()
+}
+
+fn compare_ansi_with_stock(ansi: bool, filter_text: &str, emit: impl Fn()) -> Vec<Vec<u8>> {
+    let expected = stock_ansi_output(ansi, EnvFilter::new(filter_text), &emit);
+    let records = Records::default();
+    let status = RecordStatus::default();
+    let layer = ansi_layer(&records, ansi, baseline_limits(), status.clone())
+        .with_filter(EnvFilter::new(filter_text));
+    tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), emit);
+    let records = records.lock().unwrap().clone();
+    assert_eq!(records.concat(), expected, "ansi={ansi}");
+    assert!(status.failure().is_none());
+    records
+}
+
+#[test]
+fn ansi_full_bytes_match_stock_levels_scopes_updates_and_log_metadata() {
+    for ansi in [false, true] {
+        let records = compare_ansi_with_stock(ansi, "trace", || {
+            structured_events();
+            let root = tracing::info_span!(target: "host_record", "root", id = 1);
+            let _root = root.enter();
+            let child = tracing::info_span!(target: "host_record", "child", id = 2);
+            let _child = child.enter();
+            tracing::trace!(target: "host_record", "context");
+            tracing::debug!(target: "host_record", parent: &root, "explicit");
+            tracing::warn!(target: "host_record", parent: None, "root event");
+            root.record("id", 3);
+            tracing::error!(target: "host_record", "updated ancestor");
+            let empty = tracing::info_span!(target: "", "", v = tracing::field::Empty);
+            let _empty = empty.enter();
+            empty.record("v", tracing::field::Empty);
+            tracing::info!(target: "", "empty span and target");
+            let record = tracing_log::log::Record::builder()
+                .args(format_args!("bridged"))
+                .level(tracing_log::log::Level::Info)
+                .target("actual_log_target")
+                .module_path(Some("source_module"))
+                .file(Some("source.rs"))
+                .line(Some(27))
+                .build();
+            tracing_log::log::Log::log(&tracing_log::LogTracer::new(), &record);
+            tracing::event!(target: "log", tracing::Level::INFO, { message = "ordinary tracing", log.target = "must_not_replace_target" });
+        });
+        assert_eq!(records.len(), 11);
+        // Explicit ANSI on adds stock styling; the named Chunks value keeps its
+        // own ESC even with ANSI off, so ESC presence alone is not an oracle.
+        assert_eq!(records[0].starts_with(b"\x1b[2m"), ansi);
+    }
+}
+
+#[test]
+fn ansi_fields_match_stock_types_dynamic_values_and_error_sanitization() {
+    struct Controls;
+    impl fmt::Display for Controls {
+        fn fmt(&self, writer: &mut fmt::Formatter<'_>) -> fmt::Result {
+            writer.write_str("\x1b[31m\x07\x08\x0c\x7f")?;
+            for value in 0x80..=0x9f {
+                fmt::Write::write_char(writer, char::from_u32(value).unwrap())?;
+            }
+            writer.write_str("\n\r\t é")
+        }
+    }
+    impl fmt::Debug for Controls {
+        fn fmt(&self, writer: &mut fmt::Formatter<'_>) -> fmt::Result {
+            fmt::Display::fmt(self, writer)
+        }
+    }
+    impl std::error::Error for Controls {}
+    #[derive(Debug)]
+    struct Cause<T>(T);
+    impl<T: fmt::Debug> fmt::Display for Cause<T> {
+        fn fmt(&self, writer: &mut fmt::Formatter<'_>) -> fmt::Result {
+            writer.write_str("cause\x1b[32m")
+        }
+    }
+    impl<T: std::error::Error + 'static> std::error::Error for Cause<T> {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+    for ansi in [false, true] {
+        let records = compare_ansi_with_stock(ansi, "trace", || {
+            let error = Cause(Cause(Controls));
+            let span = tracing::info_span!(target: "host_record", "fields", initial = ?Controls,
+                error = &error as &(dyn std::error::Error + 'static), later = tracing::field::Empty);
+            let _entered = span.enter();
+            span.record("later", tracing::field::display(Controls));
+            tracing::info!(target: "host_record", signed = -2i64, unsigned = 3u64, large = i128::MAX,
+                float = 1.25f64, boolean = true, r#type = "é", bytes = ?[0u8, 255],
+                debug = ?Controls, display = %Controls, "{Controls}");
+            tracing::error!(target: "host_record", error = &error as &(dyn std::error::Error + 'static),
+                no_source = &Controls as &(dyn std::error::Error + 'static));
+            tracing::event!(target: "host_record", tracing::Level::INFO,
+                { message = &error as &(dyn std::error::Error + 'static) });
+        });
+        assert_eq!(records.len(), 3);
+        assert!(records.concat().windows(4).any(|part| part == b"\\x1b"));
+        assert!(records.concat().windows(5).any(|part| part == b"\x1b[31m"));
+    }
+}
+
+#[test]
+fn ansi_public_and_plain_private_layers_match_independent_stock_outputs() {
+    // This reuses the original dual-layer callsites. Concurrent first-use
+    // registration can omit dynamic spans in stock EnvFilter before its
+    // callsite matcher is installed. Run this additional stock oracle in its
+    // own process; keep both candidate layers active together and compare all
+    // bytes below. This does not qualify concurrent callsite registration.
+    const TEST: &str = "liteinst_record::tests::ansi_public_and_plain_private_layers_match_independent_stock_outputs";
+    const CHILD: &str = "HERMIT_RECORD_ANSI_STOCK_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        use std::process::Command;
+        use std::process::Stdio;
+        use std::time::Duration;
+        use std::time::Instant;
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                let output = child.wait_with_output().unwrap();
+                panic!("ANSI stock comparison did not return: {output:?}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains(&format!("test {TEST} ... ok")), "{stdout}");
+        assert!(
+            stdout.contains("1 passed; 0 failed; 0 ignored;"),
+            "{stdout}"
+        );
+        return;
+    }
+    const PUBLIC: &str = "off,host_record[work{task=7}]=trace,actual_log_target=info";
+    let expected_public = stock_ansi_output(true, EnvFilter::new(PUBLIC), dual_layer_events);
+    let expected_private = stock_ansi_output(
+        false,
+        tracing::metadata::LevelFilter::INFO,
+        dual_layer_events,
+    );
+    let public = Records::default();
+    let private = Records::default();
+    let public_status = RecordStatus::default();
+    let private_status = RecordStatus::default();
+    let public_layer = ansi_layer(&public, true, baseline_limits(), public_status.clone())
+        .with_filter(EnvFilter::new(PUBLIC));
+    let private_layer = ansi_layer(&private, false, baseline_limits(), private_status.clone())
+        .with_filter(tracing::metadata::LevelFilter::INFO);
+    tracing::subscriber::with_default(
+        tracing_subscriber::registry()
+            .with(public_layer)
+            .with(private_layer),
+        dual_layer_events,
+    );
+    assert_eq!(public.lock().unwrap().concat(), expected_public);
+    assert_eq!(private.lock().unwrap().concat(), expected_private);
+    assert_eq!(public.lock().unwrap().len(), 7);
+    assert_eq!(private.lock().unwrap().len(), 8);
+    assert!(public_status.failure().is_none());
+    assert!(private_status.failure().is_none());
+}
+
+#[test]
+fn ansi_event_budget_counts_every_emitted_byte_at_the_boundary() {
+    let emit = || tracing::info!(target: "host_record", value = "é", "boundary");
+    for ansi in [false, true] {
+        let expected = stock_ansi_output(ansi, tracing::metadata::LevelFilter::INFO, emit);
+        for limit in [expected.len(), expected.len() - 1] {
+            let records = Records::default();
+            let status = RecordStatus::default();
+            let allocations = PayloadAllocations::new(None);
+            let layer = ansi_layer(
+                &records,
+                ansi,
+                FormatterLimits::new(limit, 8).unwrap(),
+                status.clone(),
+            );
+            tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), emit);
+            assert_eq!(allocations.attempts(), 1);
+            if limit == expected.len() {
+                assert_eq!(
+                    records.lock().unwrap().as_slice(),
+                    std::slice::from_ref(&expected)
+                );
+                assert!(status.failure().is_none());
+            } else {
+                assert!(records.lock().unwrap().is_empty());
+                assert!(matches!(status.failure().as_deref(),
+                    Some(RecordFailure::Size { buffer: BufferKind::Event, limit: actual }) if *actual == limit));
+            }
+        }
+    }
+}
+
+#[test]
+fn ansi_span_budget_counts_styles_updates_and_spaces_without_reformatting() {
+    struct Once<'a>(&'a AtomicUsize, u32);
+    impl fmt::Debug for Once<'_> {
+        fn fmt(&self, writer: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            write!(writer, "{}", self.1)
+        }
+    }
+    for ansi in [false, true] {
+        let expected_fields = Arc::new(Mutex::new(String::new()));
+        let expected = stock_ansi_output(ansi, tracing::metadata::LevelFilter::INFO, || {
+            let span = tracing::info_span!(target: "host_record", "small", v = 1);
+            span.record("v", 2);
+            span.with_subscriber(|(id, dispatch)| {
+                let registry = dispatch
+                    .downcast_ref::<tracing_subscriber::Registry>()
+                    .unwrap();
+                *expected_fields.lock().unwrap() = registry
+                    .span(id)
+                    .unwrap()
+                    .extensions()
+                    .get::<FormattedFields<DefaultFields>>()
+                    .unwrap()
+                    .fields
+                    .clone();
+            });
+            tracing::info!(target: "host_record", parent: &span, "boundary");
+        });
+        let expected_fields = expected_fields.lock().unwrap().clone();
+        for limit in [expected_fields.len(), expected_fields.len() - 1] {
+            let records = Records::default();
+            let status = RecordStatus::default();
+            let calls = AtomicUsize::new(0);
+            let layer = ansi_layer(
+                &records,
+                ansi,
+                FormatterLimits::new(1024, limit).unwrap(),
+                status.clone(),
+            );
+            tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+                let allocations = PayloadAllocations::new(None);
+                let span =
+                    tracing::info_span!(target: "host_record", "small", v = ?Once(&calls, 1));
+                let original = cached_span(&span);
+                assert_eq!(original.1, limit);
+                span.record("v", tracing::field::debug(Once(&calls, 2)));
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+                assert_eq!(allocations.attempts(), 2);
+                if limit == expected_fields.len() {
+                    assert_eq!(cached_span(&span), (expected_fields.clone(), limit));
+                } else {
+                    assert_eq!(cached_span(&span), original);
+                }
+                tracing::info!(target: "host_record", parent: &span, "boundary");
+                span.record("v", tracing::field::debug(Once(&calls, 3)));
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    if limit == expected_fields.len() { 3 } else { 2 }
+                );
+                tracing::info!(target: "host_record", "refused after span overflow");
+            });
+            assert!(matches!(status.failure().as_deref(),
+                Some(RecordFailure::Size { buffer: BufferKind::Span, limit: actual }) if *actual == limit));
+            if limit == expected_fields.len() {
+                assert_eq!(
+                    records.lock().unwrap().as_slice(),
+                    std::slice::from_ref(&expected)
+                );
+            } else {
+                assert!(records.lock().unwrap().is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn ansi_initial_span_and_cached_event_obey_their_exact_stock_byte_limits() {
+    for ansi in [false, true] {
+        let expected_fields = Arc::new(Mutex::new(String::new()));
+        let expected = stock_ansi_output(ansi, tracing::metadata::LevelFilter::INFO, || {
+            let span = tracing::info_span!(target: "host_record", "small", v = "é");
+            span.with_subscriber(|(id, dispatch)| {
+                let registry = dispatch
+                    .downcast_ref::<tracing_subscriber::Registry>()
+                    .unwrap();
+                *expected_fields.lock().unwrap() = registry
+                    .span(id)
+                    .unwrap()
+                    .extensions()
+                    .get::<FormattedFields<DefaultFields>>()
+                    .unwrap()
+                    .fields
+                    .clone();
+            });
+            tracing::info!(target: "host_record", parent: &span, "cached");
+        });
+        let expected_fields = expected_fields.lock().unwrap().clone();
+        for (span_limit, event_limit) in [
+            (expected_fields.len(), expected.len()),
+            (expected_fields.len() - 1, expected.len()),
+            (expected_fields.len(), expected.len() - 1),
+        ] {
+            let records = Records::default();
+            let status = RecordStatus::default();
+            let layer = ansi_layer(
+                &records,
+                ansi,
+                FormatterLimits::new(event_limit, span_limit).unwrap(),
+                status.clone(),
+            );
+            tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+                let allocations = PayloadAllocations::new(None);
+                let span = tracing::info_span!(target: "host_record", "small", v = "é");
+                if span_limit == expected_fields.len() {
+                    assert_eq!(cached_span(&span), (expected_fields.clone(), span_limit));
+                } else {
+                    assert!(cached_span(&span).0.is_empty());
+                }
+                tracing::info!(target: "host_record", parent: &span, "cached");
+                assert_eq!(
+                    allocations.attempts(),
+                    if span_limit == expected_fields.len() {
+                        2
+                    } else {
+                        1
+                    }
+                );
+            });
+            if span_limit < expected_fields.len() {
+                assert!(records.lock().unwrap().is_empty());
+                assert!(
+                    matches!(status.failure().as_deref(), Some(RecordFailure::Size {
+                    buffer: BufferKind::Span, limit }) if *limit == span_limit)
+                );
+            } else if event_limit < expected.len() {
+                assert!(records.lock().unwrap().is_empty());
+                assert!(
+                    matches!(status.failure().as_deref(), Some(RecordFailure::Size {
+                    buffer: BufferKind::Event, limit }) if *limit == event_limit)
+                );
+            } else {
+                assert_eq!(
+                    records.lock().unwrap().as_slice(),
+                    std::slice::from_ref(&expected)
+                );
+                assert!(status.failure().is_none());
+            }
+        }
+    }
+}
+
+#[test]
+fn explicit_ansi_constructor_preserves_default_and_failure_independence() {
+    for ansi in [false, true] {
+        let public = Records::default();
+        let private = Records::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let attempts = public.clone();
+        let (public_layer, public_status) = super::record_layer_with_failure_and_ansi(
+            baseline_limits(),
+            move |bytes| {
+                attempts.lock().unwrap().push(bytes.to_vec());
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "ANSI sink"))
+            },
+            move || {
+                seen.fetch_add(1, Ordering::SeqCst);
+            },
+            ansi,
+        );
+        let (private_layer, private_status) =
+            super::record_layer_with_failure(baseline_limits(), capture(&private), || {
+                panic!("private layer must not fail")
+            });
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry()
+                .with(public_layer)
+                .with(private_layer),
+            || {
+                tracing::info!(target: "host_record", "first");
+                tracing::info!(target: "host_record", "second");
+            },
+        );
+        let public = public.lock().unwrap();
+        let private = private.lock().unwrap();
+        assert_eq!(public.len(), 1);
+        assert_eq!(public[0].contains(&0x1b), ansi);
+        assert_eq!(private.len(), 2);
+        assert!(!private.concat().contains(&0x1b));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            matches!(public_status.failure().as_deref(), Some(RecordFailure::Sink(error))
+            if error.kind() == io::ErrorKind::BrokenPipe)
+        );
+        assert!(private_status.failure().is_none());
+    }
+}
+
+#[test]
+fn ansi_format_error_and_panic_keep_failure_and_never_publish_partial_records() {
+    struct Failure<'a>(&'a AtomicUsize, bool);
+    impl fmt::Debug for Failure<'_> {
+        fn fmt(&self, writer: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            writer.write_str("prefix\x1b[31m")?;
+            if self.1 {
+                panic!("ANSI formatter panic");
+            }
+            Err(fmt::Error)
+        }
+    }
+    for panic in [false, true] {
+        for span_field in [false, true] {
+            let records = Records::default();
+            let status = RecordStatus::default();
+            let calls = AtomicUsize::new(0);
+            let layer = ansi_layer(&records, true, baseline_limits(), status.clone());
+            tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+                let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    if span_field {
+                        let _span = tracing::info_span!(target: "host_record", "broken", value = ?Failure(&calls, panic));
+                    } else {
+                        tracing::info!(target: "host_record", value = ?Failure(&calls, panic));
+                    }
+                }));
+                if panic {
+                    assert_eq!(
+                        result.unwrap_err().downcast_ref::<&str>(),
+                        Some(&"ANSI formatter panic")
+                    );
+                    assert!(matches!(
+                        status.failure().as_deref(),
+                        Some(RecordFailure::Unwinding)
+                    ));
+                } else {
+                    assert!(result.is_ok());
+                    assert!(matches!(
+                        status.failure().as_deref(),
+                        Some(RecordFailure::Formatting)
+                    ));
+                }
+                tracing::info!(target: "host_record", value = ?Failure(&calls, panic));
+            });
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(records.lock().unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
+fn ansi_timestamp_fallback_matches_stock_and_cannot_hide_byte_overflow() {
+    #[derive(Clone, Copy)]
+    struct FailingTime;
+    impl FormatTime for FailingTime {
+        fn format_time(&self, writer: &mut Writer<'_>) -> fmt::Result {
+            writer.write_str("prefix")?;
+            Err(fmt::Error)
+        }
+    }
+    let expected = Output::default();
+    let writer = expected.clone();
+    let stock = tracing_subscriber::fmt()
+        .with_timer(FailingTime)
+        .with_ansi(true)
+        .with_writer(move || writer.clone())
+        .finish();
+    let emit = || tracing::info!(target: "host_record", "time");
+    tracing::subscriber::with_default(stock, emit);
+    let expected = expected.0.lock().unwrap().clone();
+    for limit in [expected.len(), expected.len() - 1, 6] {
+        let records = Records::default();
+        let status = RecordStatus::default();
+        let layer = RecordLayer {
+            ansi: true,
+            ..layer_with_status(
+                FormatterLimits::new(limit, 8).unwrap(),
+                capture(&records),
+                FailingTime,
+                true,
+                status.clone(),
+            )
+        };
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), emit);
+        if limit == expected.len() {
+            assert_eq!(
+                records.lock().unwrap().as_slice(),
+                std::slice::from_ref(&expected)
+            );
+            assert!(status.failure().is_none());
+        } else {
+            assert!(records.lock().unwrap().is_empty());
+            assert!(matches!(status.failure().as_deref(),
+                Some(RecordFailure::Size { buffer: BufferKind::Event, limit: actual }) if *actual == limit));
+        }
+    }
+}
+
 const TEARDOWN_CASE: &str = "HERMIT_RECORD_TEARDOWN_CASE";
 const TEARDOWN_OUTPUT: &str = "HERMIT_RECORD_TEARDOWN_OUTPUT";
 const TEARDOWN_RECORD: &[u8] =

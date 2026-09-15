@@ -1,7 +1,8 @@
 //! Bounded complete records using stock tracing field formatting.
 //!
 //! The event envelope matches tracing-subscriber's default Full format with
-//! ANSI disabled. Its public DefaultFields visitor handles fields unchanged.
+//! ANSI disabled by default and optionally enabled by the caller. Non-ANSI
+//! fields use the public DefaultFields visitor unchanged.
 //! This Layer owns per-call event storage and bounded span caches, avoiding the
 //! fmt Layer's destructible TLS output buffer and unbounded initial span cache.
 //! A failed update preserves the previous cache; errors poison later records.
@@ -26,7 +27,10 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use tracing::Event;
+use tracing::Level;
 use tracing::Subscriber;
+use tracing::field::Field;
+use tracing::field::Visit;
 use tracing::span::Attributes;
 use tracing::span::Id;
 use tracing::span::Record;
@@ -34,9 +38,11 @@ use tracing_log::NormalizeEvent;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Layer;
 use tracing_subscriber::field::RecordFields;
+use tracing_subscriber::field::VisitOutput;
 use tracing_subscriber::fmt::FormattedFields;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::fmt::format::DefaultFields;
+use tracing_subscriber::fmt::format::DefaultVisitor;
 use tracing_subscriber::fmt::format::FormatFields;
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::time::FormatTime;
@@ -437,6 +443,7 @@ struct RecordLayer<Timer, Sink> {
     identity: Arc<()>,
     timer: Timer,
     timestamp: bool,
+    ansi: bool,
     limits: FormatterLimits,
     status: RecordStatus,
     writer: RecordWriterFactory<Sink>,
@@ -453,7 +460,7 @@ impl<Timer, Sink> RecordLayer<Timer, Sink> {
         // holding Registry extensions or a cache lock. The latest committed
         // prefix is merged only after this call returns.
         self.status
-            .formatting(|| DefaultFields::new().format_fields(Writer::new(&mut buffer), fields))?;
+            .formatting(|| format_fields(Writer::new(&mut buffer), fields, self.ansi))?;
         if self.status.failure().is_some() {
             return Err(fmt::Error);
         }
@@ -623,20 +630,38 @@ where
                 BoundedBuffer::new(self.limits.event_bytes, BufferKind::Event, &self.status)?;
             self.status.formatting(|| {
                 let mut writer = Writer::new(&mut buffer);
-                // Match stock Full's non-ANSI timestamp fallback and padding.
+                // Match stock Full's timestamp styling, fallback and padding.
                 if self.timestamp {
+                    if self.ansi {
+                        writer.write_str("\x1b[2m")?;
+                    }
                     if self.timer.format_time(&mut writer).is_err() {
                         writer.write_str("<unknown time>")?;
+                    }
+                    if self.ansi {
+                        writer.write_str("\x1b[0m")?;
                     }
                     writer.write_char(' ')?;
                 }
                 let normalized = event.normalized_metadata();
                 let metadata = normalized.as_ref().unwrap_or_else(|| event.metadata());
-                write!(writer, "{:>5} ", metadata.level())?;
+                if self.ansi {
+                    let (color, level) = match *metadata.level() {
+                        Level::TRACE => ("\x1b[35m", "TRACE"),
+                        Level::DEBUG => ("\x1b[34m", "DEBUG"),
+                        Level::INFO => ("\x1b[32m", " INFO"),
+                        Level::WARN => ("\x1b[33m", " WARN"),
+                        Level::ERROR => ("\x1b[31m", "ERROR"),
+                    };
+                    write_styled(&mut writer, color, level, true)?;
+                    writer.write_char(' ')?;
+                } else {
+                    write!(writer, "{:>5} ", metadata.level())?;
+                }
                 if let Some(scope) = context.event_scope(event) {
                     let mut seen = false;
                     for span in scope.from_root() {
-                        writer.write_str(span.metadata().name())?;
+                        write_styled(&mut writer, "\x1b[1m", span.metadata().name(), self.ansi)?;
                         let fields = span
                             .extensions()
                             .get::<SpanCaches>()
@@ -648,18 +673,22 @@ where
                         if let Some(cache) = fields {
                             let fields = cache.snapshot(&self.status)?;
                             if !fields.is_empty() {
-                                write!(writer, "{{{fields}}}")?;
+                                write_styled(&mut writer, "\x1b[1m", "{", self.ansi)?;
+                                write!(writer, "{fields}")?;
+                                write_styled(&mut writer, "\x1b[1m", "}", self.ansi)?;
                             }
                         }
-                        writer.write_char(':')?;
+                        write_styled(&mut writer, "\x1b[2m", ":", self.ansi)?;
                         seen = true;
                     }
                     if seen {
                         writer.write_char(' ')?;
                     }
                 }
-                write!(writer, "{}: ", metadata.target())?;
-                DefaultFields::new().format_fields(writer.by_ref(), event)?;
+                write_styled(&mut writer, "\x1b[2m", metadata.target(), self.ansi)?;
+                write_styled(&mut writer, "\x1b[2m", ":", self.ansi)?;
+                writer.write_char(' ')?;
+                format_fields(writer.by_ref(), event, self.ansi)?;
                 writeln!(writer)
             })?;
             if self.status.failure().is_some() {
@@ -672,6 +701,136 @@ where
                 .writer
                 .write_record(record.text().as_bytes(), self.limits.event_bytes);
         }
+    }
+}
+
+fn write_styled(writer: &mut Writer<'_>, prefix: &str, text: &str, ansi: bool) -> fmt::Result {
+    if ansi {
+        writer.write_str(prefix)?;
+    }
+    writer.write_str(text)?;
+    if ansi {
+        writer.write_str("\x1b[0m")?;
+    }
+    Ok(())
+}
+
+fn format_fields(writer: Writer<'_>, fields: impl RecordFields, ansi: bool) -> fmt::Result {
+    if !ansi {
+        return DefaultFields::new().format_fields(writer, fields);
+    }
+    let mut visitor = AnsiVisitor {
+        writer,
+        is_empty: true,
+        result: Ok(()),
+    };
+    fields.record(&mut visitor);
+    visitor.result
+}
+
+// tracing-subscriber 0.3.23 keeps Writer::with_ansi and the DefaultVisitor's
+// styles private. Follow its Full/DefaultVisitor rules here without an extra
+// fmt Layer, TLS buffer or intermediate allocation. Message escaping still
+// uses the public DefaultVisitor. Independent stock subscribers test the bytes.
+struct AnsiVisitor<'a> {
+    writer: Writer<'a>,
+    is_empty: bool,
+    result: fmt::Result,
+}
+
+impl Visit for AnsiVisitor<'_> {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "message" {
+            self.record_debug(field, &format_args!("{value}"));
+        } else {
+            self.record_debug(field, &value);
+        }
+    }
+
+    fn record_error(&mut self, field: &Field, value: &(dyn std::error::Error + 'static)) {
+        if let Some(source) = value.source() {
+            self.record_debug(
+                field,
+                &format_args!(
+                    "{} \x1b[3m{}\x1b[0m\x1b[3m.sources\x1b[0m\x1b[2m=\x1b[0m{}",
+                    Sanitized(value),
+                    field.name(),
+                    ErrorSources(source),
+                ),
+            );
+        } else {
+            self.record_debug(field, &format_args!("{}", Sanitized(value)));
+        }
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        if self.result.is_err() || field.name().starts_with("log.") {
+            return;
+        }
+        if field.name() == "message" {
+            let mut visitor = DefaultVisitor::new(self.writer.by_ref(), self.is_empty);
+            visitor.record_debug(field, value);
+            self.result = visitor.finish();
+        } else {
+            self.result = (|| {
+                if !self.is_empty {
+                    self.writer.write_char(' ')?;
+                }
+                let name = field.name().strip_prefix("r#").unwrap_or(field.name());
+                write_styled(&mut self.writer, "\x1b[3m", name, true)?;
+                write_styled(&mut self.writer, "\x1b[2m", "=", true)?;
+                write!(self.writer, "{value:?}")
+            })();
+        }
+        self.is_empty = false;
+    }
+}
+
+// Error values and sources use stock's streaming ESC/C1 escaping. Named Debug
+// values deliberately keep their bytes; applying this to all values would
+// change stock's output. This wrapper neither buffers nor revisits the value.
+struct Sanitized<T>(T);
+
+impl<T: fmt::Display> fmt::Display for Sanitized<T> {
+    fn fmt(&self, writer: &mut fmt::Formatter<'_>) -> fmt::Result {
+        struct EscapingWriter<'a, 'b>(&'a mut fmt::Formatter<'b>);
+        impl fmt::Write for EscapingWriter<'_, '_> {
+            fn write_str(&mut self, text: &str) -> fmt::Result {
+                for ch in text.chars() {
+                    match ch {
+                        '\x1b' => self.0.write_str("\\x1b")?,
+                        '\x07' => self.0.write_str("\\x07")?,
+                        '\x08' => self.0.write_str("\\x08")?,
+                        '\x0c' => self.0.write_str("\\x0c")?,
+                        '\x7f' => self.0.write_str("\\x7f")?,
+                        '\u{80}'..='\u{9f}' => write!(self.0, "\\u{{{:x}}}", ch as u32)?,
+                        _ => fmt::Write::write_char(self.0, ch)?,
+                    }
+                }
+                Ok(())
+            }
+        }
+        fmt::Write::write_fmt(&mut EscapingWriter(writer), format_args!("{}", self.0))
+    }
+}
+
+impl<T: fmt::Display> fmt::Debug for Sanitized<T> {
+    fn fmt(&self, writer: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, writer)
+    }
+}
+
+struct ErrorSources<'a>(&'a (dyn std::error::Error + 'static));
+
+impl fmt::Display for ErrorSources<'_> {
+    fn fmt(&self, writer: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut list = writer.debug_list();
+        let mut current = Some(self.0);
+        while let Some(error) = current {
+            list.entry(&Sanitized(error));
+            current = error.source();
+        }
+        list.finish()
     }
 }
 
@@ -790,10 +949,34 @@ where
     Registry: Subscriber + for<'lookup> LookupSpan<'lookup>,
     Sink: Fn(&[u8]) -> io::Result<()> + Send + Sync + 'static,
 {
+    record_layer_with_failure_and_ansi(limits, sink, failure, false)
+}
+
+/// Prepare a complete-record layer with an explicit ANSI formatting policy.
+///
+/// `ansi` is resolved by the host caller before constructing the layer, never
+/// by inspecting terminal state while formatting. `true` matches stock Full
+/// styling; `false` preserves [`record_layer_with_failure`]'s default bytes.
+/// Both event and span limits count all emitted bytes, including escape codes.
+/// The filtering, failure and completion requirements of that constructor
+/// still apply. This option does not install a layer or change CLI output.
+pub fn record_layer_with_failure_and_ansi<Registry, Sink>(
+    limits: FormatterLimits,
+    sink: Sink,
+    failure: impl Fn() + Send + Sync + 'static,
+    ansi: bool,
+) -> (impl Layer<Registry> + Send + Sync, RecordStatus)
+where
+    Registry: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    Sink: Fn(&[u8]) -> io::Result<()> + Send + Sync + 'static,
+{
     let status = RecordStatus::default();
     let _ = status.1.set(Box::new(failure));
     (
-        layer_with_status(limits, sink, SystemTime, true, status.clone()),
+        RecordLayer {
+            ansi,
+            ..layer_with_status(limits, sink, SystemTime, true, status.clone())
+        },
         status,
     )
 }
@@ -828,6 +1011,7 @@ fn layer_with_status<Sink, Timer>(
         identity: Arc::new(()),
         timer,
         timestamp,
+        ansi: false,
         limits,
         status: status.clone(),
         writer: RecordWriterFactory {
