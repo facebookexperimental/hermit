@@ -319,7 +319,39 @@ fn with_active<T>(
 // Keep the standard cache wrapper; only this Layer writes its payload.
 struct CheckedFields;
 
+// Extensions are keyed by Rust type, so two RecordLayers cannot each insert a
+// FormattedFields<CheckedFields>. Retain a separate entry for each layer instead.
+// The Arc stays in the cache as well as the layer: replacing a layer while a
+// span lives cannot reuse an old allocation identity and inherit stale fields.
+#[derive(Default)]
+struct SpanCaches(Vec<(Arc<()>, FormattedFields<CheckedFields>)>);
+
+impl SpanCaches {
+    fn get(&self, identity: &Arc<()>) -> Option<&FormattedFields<CheckedFields>> {
+        self.0
+            .iter()
+            .find(|(owner, _)| Arc::ptr_eq(owner, identity))
+            .map(|(_, fields)| fields)
+    }
+
+    fn get_or_insert(&mut self, identity: &Arc<()>) -> (&mut FormattedFields<CheckedFields>, bool) {
+        if let Some(index) = self
+            .0
+            .iter()
+            .position(|(owner, _)| Arc::ptr_eq(owner, identity))
+        {
+            return (&mut self.0[index].1, true);
+        }
+        self.0.push((
+            identity.clone(),
+            FormattedFields::<CheckedFields>::new(String::new()),
+        ));
+        (&mut self.0.last_mut().unwrap().1, false)
+    }
+}
+
 struct RecordLayer<Timer, Sink> {
+    identity: Arc<()>,
     timer: Timer,
     timestamp: bool,
     limits: FormatterLimits,
@@ -362,13 +394,22 @@ where
 {
     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, context: Context<'_, Registry>) {
         let span = context.span(id).expect("new span is registered");
-        span.extensions_mut()
-            .insert(FormattedFields::<CheckedFields>::new(String::new()));
+        {
+            let mut extensions = span.extensions_mut();
+            if extensions.get_mut::<SpanCaches>().is_none() {
+                extensions.insert(SpanCaches::default());
+            }
+            extensions
+                .get_mut::<SpanCaches>()
+                .unwrap()
+                .get_or_insert(&self.identity);
+        }
         let _ = with_active(&self.status, || {
             let mut extensions = span.extensions_mut();
-            let current = extensions
-                .get_mut::<FormattedFields<CheckedFields>>()
-                .unwrap();
+            let (current, _) = extensions
+                .get_mut::<SpanCaches>()
+                .unwrap()
+                .get_or_insert(&self.identity);
             self.format_span(current, attrs, false)
         });
     }
@@ -377,15 +418,13 @@ where
         let _ = with_active(&self.status, || {
             let span = context.span(id).expect("recorded span is registered");
             let mut extensions = span.extensions_mut();
-            let append = extensions
-                .get_mut::<FormattedFields<CheckedFields>>()
-                .is_some();
-            if !append {
-                extensions.insert(FormattedFields::<CheckedFields>::new(String::new()));
+            if extensions.get_mut::<SpanCaches>().is_none() {
+                extensions.insert(SpanCaches::default());
             }
-            let current = extensions
-                .get_mut::<FormattedFields<CheckedFields>>()
-                .unwrap();
+            let (current, append) = extensions
+                .get_mut::<SpanCaches>()
+                .unwrap()
+                .get_or_insert(&self.identity);
             self.format_span(current, fields, append)
         });
     }
@@ -411,7 +450,9 @@ where
                     for span in scope.from_root() {
                         writer.write_str(span.metadata().name())?;
                         let extensions = span.extensions();
-                        if let Some(fields) = extensions.get::<FormattedFields<CheckedFields>>()
+                        if let Some(fields) = extensions
+                            .get::<SpanCaches>()
+                            .and_then(|caches| caches.get(&self.identity))
                             && !fields.is_empty()
                         {
                             write!(writer, "{{{fields}}}")?;
@@ -535,6 +576,31 @@ where
     subscriber_with_status(filter, limits, sink, SystemTime, true, status)
 }
 
+/// Prepare a complete-record layer without installing it or selecting events.
+///
+/// Apply [`Layer::with_filter`] to each layer independently: the public logger
+/// can use its resolved [`EnvFilter`] while private evidence uses a fixed INFO
+/// selector. A global public filter would also suppress private evidence.
+/// Each layer owns its formatter limits, span fields and retained failure state.
+/// The completion, teardown and transport requirements of
+/// [`record_subscriber_with_failure`] apply equally to this constructor.
+pub fn record_layer_with_failure<Registry, Sink>(
+    limits: FormatterLimits,
+    sink: Sink,
+    failure: impl Fn() + Send + Sync + 'static,
+) -> (impl Layer<Registry> + Send + Sync, RecordStatus)
+where
+    Registry: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    Sink: Fn(&[u8]) -> io::Result<()> + Send + Sync + 'static,
+{
+    let status = RecordStatus::default();
+    let _ = status.1.set(Box::new(failure));
+    (
+        layer_with_status(limits, sink, SystemTime, true, status.clone()),
+        status,
+    )
+}
+
 fn subscriber_with_status<Sink, Timer>(
     filter: EnvFilter,
     limits: FormatterLimits,
@@ -547,7 +613,22 @@ where
     Sink: Fn(&[u8]) -> io::Result<()> + Send + Sync + 'static,
     Timer: FormatTime + Send + Sync + 'static,
 {
-    let layer = RecordLayer {
+    let layer = layer_with_status(limits, sink, timer, timestamp, status.clone());
+    (
+        tracing_subscriber::registry().with(layer).with(filter),
+        status,
+    )
+}
+
+fn layer_with_status<Sink, Timer>(
+    limits: FormatterLimits,
+    sink: Sink,
+    timer: Timer,
+    timestamp: bool,
+    status: RecordStatus,
+) -> RecordLayer<Timer, Sink> {
+    RecordLayer {
+        identity: Arc::new(()),
         timer,
         timestamp,
         limits,
@@ -556,11 +637,7 @@ where
             sink,
             status: status.clone(),
         },
-    };
-    (
-        tracing_subscriber::registry().with(layer).with(filter),
-        status,
-    )
+    }
 }
 
 #[cfg(test)]

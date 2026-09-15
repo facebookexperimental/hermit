@@ -483,7 +483,13 @@ fn cached_span(span: &tracing::Span) -> (String, usize) {
             .unwrap();
         let span = registry.span(identity).unwrap();
         let extensions = span.extensions();
-        let fields = extensions.get::<FormattedFields<CheckedFields>>().unwrap();
+        let caches = extensions.get::<SpanCaches>().unwrap();
+        assert_eq!(
+            caches.0.len(),
+            1,
+            "this helper inspects a single-layer fixture"
+        );
+        let fields = &caches.0[0].1;
         (fields.fields.clone(), fields.fields.capacity())
     })
     .unwrap()
@@ -944,16 +950,17 @@ pub(super) fn before_payload_allocation() -> Result<(), std::collections::TryRes
     }
 }
 
-fn remove_span_cache<Fields: 'static>(span: &tracing::Span) {
+fn remove_span_cache(span: &tracing::Span) {
     span.with_subscriber(|(identity, dispatch)| {
         let registry = dispatch
             .downcast_ref::<tracing_subscriber::Registry>()
             .unwrap();
         let span = registry.span(identity).unwrap();
-        assert!(
-            span.extensions_mut()
-                .remove::<FormattedFields<Fields>>()
-                .is_some()
+        let caches = span.extensions_mut().remove::<SpanCaches>().unwrap();
+        assert_eq!(
+            caches.0.len(),
+            1,
+            "this helper removes a single-layer cache"
         );
     })
     .unwrap();
@@ -1041,7 +1048,7 @@ fn missing_cache_on_record_uses_the_same_fallible_initial_hook() {
     let allocations = PayloadAllocations::new(Some(2));
     tracing::subscriber::with_default(subscriber, || {
         let span = tracing::info_span!(target: "host_record", "small", value = 1);
-        remove_span_cache::<CheckedFields>(&span);
+        remove_span_cache(&span);
         span.record("value", 2);
         assert_eq!(cached_span(&span), (String::new(), 0));
         let first = allocation_failure(&status);
@@ -1280,6 +1287,221 @@ fn log_bridge_metadata_is_normalized_without_reclassifying_tracing_events() {
             b"unchanged-time  INFO log: ordinary tracing\n".to_vec(),
         ]
     );
+}
+
+fn stock_layer_output<F>(filter: F, emit: impl FnOnce()) -> Vec<u8>
+where
+    F: tracing_subscriber::layer::Filter<tracing_subscriber::Registry> + Send + Sync + 'static,
+{
+    let output = Output::default();
+    let writer = output.clone();
+    let layer = tracing_subscriber::fmt::layer()
+        .with_timer(FixedTime)
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .with_filter(filter);
+    tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), emit);
+    output.0.lock().unwrap().clone()
+}
+
+fn dual_layer_events() {
+    tracing::info!(target: "host_record", "outside private INFO");
+    let root = tracing::info_span!(target: "host_record", "root", owner = 1);
+    let _root = root.enter();
+    let work = tracing::info_span!(target: "host_record", "work", task = tracing::field::Empty, later = tracing::field::Empty);
+    work.record("task", 7);
+    work.in_scope(|| {
+        tracing::trace!(target: "host_record", "public TRACE");
+        tracing::info!(target: "host_record", "both current");
+        let detail = tracing::debug_span!(target: "host_record", "detail", step = 2);
+        detail.in_scope(|| tracing::info!(target: "host_record", "different ancestor selection"));
+        root.record("owner", 3);
+        work.record("later", 9);
+        tracing::info!(target: "host_record", "after updates");
+        tracing::info!(target: "host_record", parent: &root, "explicit root");
+        tracing::info!(target: "host_record", parent: None, "no parent");
+        let record = tracing_log::log::Record::builder()
+            .args(format_args!("bridged in span"))
+            .level(tracing_log::log::Level::Info)
+            .target("actual_log_target")
+            .module_path(Some("source_module"))
+            .file(Some("source.rs"))
+            .line(Some(27))
+            .build();
+        tracing_log::log::Log::log(&tracing_log::LogTracer::new(), &record);
+    });
+    tracing::info!(target: "host_record", "after private INFO");
+}
+
+#[test]
+fn complete_layers_keep_independent_stock_bytes_and_filters() {
+    const PUBLIC: &str = "off,host_record[work{task=7}]=trace,actual_log_target=info";
+    // Independent stock subscribers avoid sharing stock's own per-field-type
+    // span cache between the two oracles. Each output defines one layer's bytes.
+    let expected_public = stock_layer_output(EnvFilter::new(PUBLIC), dual_layer_events);
+    let expected_private =
+        stock_layer_output(tracing::metadata::LevelFilter::INFO, dual_layer_events);
+    let public = Records::default();
+    let private = Records::default();
+    let public_status = RecordStatus::default();
+    let private_status = RecordStatus::default();
+    let public_layer = layer_with_status(
+        baseline_limits(),
+        capture(&public),
+        FixedTime,
+        true,
+        public_status.clone(),
+    )
+    .with_filter(EnvFilter::new(PUBLIC));
+    let private_layer = layer_with_status(
+        baseline_limits(),
+        capture(&private),
+        FixedTime,
+        true,
+        private_status.clone(),
+    )
+    .with_filter(tracing::metadata::LevelFilter::INFO);
+    tracing::subscriber::with_default(
+        tracing_subscriber::registry()
+            .with(public_layer)
+            .with(private_layer),
+        dual_layer_events,
+    );
+    let public = public.lock().unwrap();
+    let private = private.lock().unwrap();
+    assert_eq!(public.concat(), expected_public);
+    assert_eq!(private.concat(), expected_private);
+    assert!(public_status.failure().is_none());
+    assert!(private_status.failure().is_none());
+    assert_eq!(public.len(), 7);
+    assert_eq!(private.len(), 8);
+    assert_eq!(
+        public[0],
+        b"unchanged-time TRACE work{task=7}: host_record: public TRACE\n"
+    );
+    assert_eq!(
+        private[0],
+        b"unchanged-time  INFO host_record: outside private INFO\n"
+    );
+    assert_eq!(
+        public[3],
+        b"unchanged-time  INFO work{task=7 later=9}: host_record: after updates\n"
+    );
+    assert_eq!(
+        private[3],
+        b"unchanged-time  INFO root{owner=1 owner=3}:work{task=7 later=9}: host_record: after updates\n"
+    );
+    assert_eq!(
+        public[6],
+        b"unchanged-time  INFO work{task=7 later=9}: actual_log_target: bridged in span\n"
+    );
+}
+
+#[test]
+fn public_layer_constructor_retains_only_its_own_sink_failure() {
+    let private = Records::default();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let public_notifications = Arc::new(AtomicUsize::new(0));
+    let private_notifications = Arc::new(AtomicUsize::new(0));
+    let calls = attempts.clone();
+    let public_failed = public_notifications.clone();
+    let private_failed = private_notifications.clone();
+    let (public_layer, public_status) = super::record_layer_with_failure(
+        baseline_limits(),
+        move |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::from_raw_os_error(libc::EPIPE))
+        },
+        move || {
+            public_failed.fetch_add(1, Ordering::SeqCst);
+        },
+    );
+    let (private_layer, private_status) =
+        super::record_layer_with_failure(baseline_limits(), capture(&private), move || {
+            private_failed.fetch_add(1, Ordering::SeqCst);
+        });
+    tracing::subscriber::with_default(
+        tracing_subscriber::registry()
+            .with(public_layer.with_filter(EnvFilter::new("off,host_record=info")))
+            .with(private_layer.with_filter(tracing::metadata::LevelFilter::INFO)),
+        || {
+            let span = tracing::info_span!(target: "host_record", "work", v = 1);
+            let _entered = span.enter();
+            tracing::info!(target: "host_record", "first");
+            span.record("v", 2);
+            tracing::info!(target: "host_record", "second");
+        },
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(public_notifications.load(Ordering::SeqCst), 1);
+    assert_eq!(private_notifications.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        public_status.failure().as_deref(),
+        Some(RecordFailure::Sink(error)) if error.raw_os_error() == Some(libc::EPIPE)
+    ));
+    assert!(private_status.failure().is_none());
+    let private = private.lock().unwrap();
+    assert_eq!(private.len(), 2);
+    // The public constructor uses real timestamps. Full bytes with a fixed
+    // input timer are checked by the independent stock-oracle test above.
+    assert!(private[0].ends_with(b" INFO work{v=1}: host_record: first\n"));
+    assert!(private[1].ends_with(b" INFO work{v=1 v=2}: host_record: second\n"));
+}
+
+#[test]
+fn span_update_failure_keeps_the_other_layer_complete_in_either_order() {
+    let expected_first = b"unchanged-time  INFO work{v=1}: host_record: before\n";
+    let expected_second = b"unchanged-time  INFO work{v=1 v=2}: host_record: after\n";
+    for small_first in [false, true] {
+        let first = Records::default();
+        let second = Records::default();
+        let first_status = RecordStatus::default();
+        let second_status = RecordStatus::default();
+        let first_layer = layer_with_status(
+            FormatterLimits::new(256, if small_first { 3 } else { 64 }).unwrap(),
+            capture(&first),
+            FixedTime,
+            true,
+            first_status.clone(),
+        );
+        let second_layer = layer_with_status(
+            FormatterLimits::new(256, if small_first { 64 } else { 3 }).unwrap(),
+            capture(&second),
+            FixedTime,
+            true,
+            second_status.clone(),
+        );
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry()
+                .with(first_layer.with_filter(tracing::metadata::LevelFilter::INFO))
+                .with(second_layer.with_filter(tracing::metadata::LevelFilter::INFO)),
+            || {
+                let span = tracing::info_span!(target: "host_record", "work", v = 1);
+                let _entered = span.enter();
+                tracing::info!(target: "host_record", "before");
+                span.record("v", 2);
+                tracing::info!(target: "host_record", "after");
+            },
+        );
+        let (failed_records, failed_status, complete_records, complete_status) = if small_first {
+            (&first, &first_status, &second, &second_status)
+        } else {
+            (&second, &second_status, &first, &first_status)
+        };
+        assert_eq!(*failed_records.lock().unwrap(), [expected_first.to_vec()]);
+        assert!(matches!(
+            failed_status.failure().as_deref(),
+            Some(RecordFailure::Size {
+                buffer: BufferKind::Span,
+                limit: 3,
+            })
+        ));
+        assert_eq!(
+            *complete_records.lock().unwrap(),
+            [expected_first.to_vec(), expected_second.to_vec()]
+        );
+        assert!(complete_status.failure().is_none());
+    }
 }
 
 #[test]
