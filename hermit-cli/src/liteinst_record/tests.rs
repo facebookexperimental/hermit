@@ -1402,6 +1402,250 @@ pub(super) fn before_span_initialization() {
 }
 
 #[test]
+fn records_before_the_new_span_callback_match_stock_without_initial_formatting() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    const TEST: &str = "liteinst_record::tests::records_before_the_new_span_callback_match_stock_without_initial_formatting";
+    if std::env::var("HERMIT_RECORD_LOCK_CASE").as_deref() != Ok("before-new-span") {
+        bounded_record_callback_child(TEST, "before-new-span");
+        return;
+    }
+    struct Before {
+        id: mpsc::Sender<(Id, &'static tracing::Metadata<'static>)>,
+        done: Mutex<mpsc::Receiver<()>>,
+    }
+    impl<S: Subscriber> Layer<S> for Before {
+        fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, _: Context<'_, S>) {
+            self.id.send((id.clone(), attrs.metadata())).unwrap();
+            self.done
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+        }
+    }
+    struct Initial(Arc<AtomicUsize>);
+    impl fmt::Debug for Initial {
+        fn fmt(&self, writer: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            writer.write_str("1")
+        }
+    }
+    for updates in [
+        vec![],
+        vec![Some(2)],
+        vec![None],
+        vec![None, None],
+        vec![None, None, Some(2), None, Some(3)],
+    ] {
+        let mut expected = None;
+        for stock in [true, false] {
+            let output = Output::default();
+            let records = Records::default();
+            let status = RecordStatus::default();
+            let (id_tx, id_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let registry = tracing_subscriber::registry().with(Before {
+                id: id_tx,
+                done: Mutex::new(done_rx),
+            });
+            let dispatch = if stock {
+                let writer = output.clone();
+                tracing::Dispatch::new(
+                    registry.with(
+                        tracing_subscriber::fmt::layer()
+                            .without_time()
+                            .with_ansi(false)
+                            .with_writer(move || writer.clone()),
+                    ),
+                )
+            } else {
+                tracing::Dispatch::new(registry.with(super::layer_with_status(
+                    baseline_limits(),
+                    capture(&records),
+                    (),
+                    false,
+                    status.clone(),
+                )))
+            };
+            let writer_dispatch = dispatch.clone();
+            let values = updates.clone();
+            let writer = std::thread::spawn(move || {
+                let (id, metadata) = id_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                for value in values {
+                    record_initializing_span(&writer_dispatch, &id, metadata, value);
+                }
+                done_tx.send(()).unwrap();
+            });
+            let calls = Arc::new(AtomicUsize::new(0));
+            tracing::dispatcher::with_default(&dispatch, || {
+                let span =
+                    tracing::info_span!(target: "host_record", "work", v = ?Initial(calls.clone()));
+                writer.join().unwrap();
+                tracing::info!(target: "host_record", parent: &span, "created");
+            });
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                usize::from(updates.is_empty()),
+                "stock={stock}, updates={updates:?}"
+            );
+            assert!(status.failure().is_none());
+            if stock {
+                let bytes = output.0.lock().unwrap().clone();
+                assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 1);
+                assert!(bytes.ends_with(b": host_record: created\n"));
+                expected = Some(bytes);
+            } else {
+                assert_eq!(
+                    *records.lock().unwrap(),
+                    vec![expected.take().unwrap()],
+                    "updates={updates:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn events_wait_for_a_record_that_creates_the_first_span_cache() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    const TEST: &str =
+        "liteinst_record::tests::events_wait_for_a_record_that_creates_the_first_span_cache";
+    if std::env::var("HERMIT_RECORD_LOCK_CASE").as_deref() != Ok("first-record-event") {
+        bounded_record_callback_child(TEST, "first-record-event");
+        return;
+    }
+    struct First {
+        started: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+        calls: Arc<AtomicUsize>,
+    }
+    impl fmt::Debug for First {
+        fn fmt(&self, writer: &mut fmt::Formatter<'_>) -> fmt::Result {
+            assert_eq!(self.calls.fetch_add(1, Ordering::SeqCst), 0);
+            self.started.send(()).unwrap();
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+            writer.write_str("2")
+        }
+    }
+    struct Before {
+        id: mpsc::Sender<Id>,
+        first: First,
+        event: mpsc::Sender<()>,
+        dispatch: Arc<std::sync::OnceLock<tracing::dispatcher::WeakDispatch>>,
+    }
+    impl<S: Subscriber> Layer<S> for Before {
+        fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, _: Context<'_, S>) {
+            self.id.send(id.clone()).unwrap();
+            let field = attrs.metadata().fields().field("v").unwrap();
+            let value = tracing::field::debug(&self.first);
+            let values = [(&field, Some(&value as &dyn tracing::field::Value))];
+            // The ambient dispatcher deliberately suppresses recursive lookup
+            // from a callback. Use the actual registered dispatcher explicitly,
+            // retaining it weakly so this observer cannot keep it alive forever.
+            self.dispatch.get().unwrap().upgrade().unwrap().record(
+                id,
+                &Record::new(&attrs.metadata().fields().value_set(&values)),
+            );
+        }
+
+        fn on_event(&self, _: &Event<'_>, _: Context<'_, S>) {
+            self.event.send(()).unwrap();
+        }
+    }
+    let mut expected = None;
+    for stock in [true, false] {
+        let output = Output::default();
+        let records = Records::default();
+        let status = RecordStatus::default();
+        let (id_tx, id_rx) = mpsc::channel();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observer_dispatch = Arc::new(std::sync::OnceLock::new());
+        let registry = tracing_subscriber::registry().with(Before {
+            id: id_tx,
+            dispatch: observer_dispatch.clone(),
+            first: First {
+                started: started_tx,
+                release: Mutex::new(release_rx),
+                calls: calls.clone(),
+            },
+            event: event_tx,
+        });
+        let dispatch = if stock {
+            let writer = output.clone();
+            tracing::Dispatch::new(
+                registry.with(
+                    tracing_subscriber::fmt::layer()
+                        .without_time()
+                        .with_ansi(false)
+                        .with_writer(move || writer.clone()),
+                ),
+            )
+        } else {
+            tracing::Dispatch::new(registry.with(super::layer_with_status(
+                baseline_limits(),
+                capture(&records),
+                (),
+                false,
+                status.clone(),
+            )))
+        };
+        assert!(observer_dispatch.set(dispatch.downgrade()).is_ok());
+        let initializer_dispatch = dispatch.clone();
+        let initializer = std::thread::spawn(move || {
+            tracing::dispatcher::with_default(
+                &initializer_dispatch,
+                || tracing::info_span!(target: "host_record", "work", v = 1),
+            )
+        });
+        let id = id_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let event_dispatch = dispatch.clone();
+        let event = std::thread::spawn(move || {
+            tracing::dispatcher::with_default(&event_dispatch, || {
+                tracing::info!(target: "host_record", parent: &id, "first record");
+            });
+            done_tx.send(()).unwrap();
+        });
+        event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let early = done_rx.recv_timeout(Duration::from_millis(30));
+        let early_stock = output.0.lock().unwrap().clone();
+        let early_records = records.lock().unwrap().clone();
+        release_tx.send(()).unwrap();
+        let span = initializer.join().unwrap();
+        event.join().unwrap();
+        assert!(
+            matches!(early, Err(mpsc::RecvTimeoutError::Timeout)),
+            "stock={stock}: event completed before its first fields: {early:?}"
+        );
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(early_stock.is_empty());
+        assert!(early_records.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(status.failure().is_none());
+        if stock {
+            let bytes = output.0.lock().unwrap().clone();
+            assert_eq!(bytes, b" INFO work{v=2}: host_record: first record\n");
+            expected = Some(bytes);
+        } else {
+            assert_eq!(*records.lock().unwrap(), vec![expected.take().unwrap()]);
+        }
+        drop(span);
+    }
+}
+
+#[test]
 fn span_initialization_keeps_early_updates_and_exact_stock_empty_spaces() {
     use std::sync::mpsc;
     use std::time::Duration;

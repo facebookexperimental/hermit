@@ -560,10 +560,14 @@ where
             if extensions.get_mut::<SpanCaches>().is_none() {
                 extensions.insert(SpanCaches::default());
             }
-            let cache = extensions
-                .get_mut::<SpanCaches>()
-                .unwrap()
-                .get_or_insert(&self.identity);
+            let caches = extensions.get_mut::<SpanCaches>().unwrap();
+            // An inner Layer may expose the ID and record fields before this
+            // callback starts. Stock formatting keeps that existing cache and
+            // does not format the initial attributes again.
+            if caches.get(&self.identity).is_some() {
+                return;
+            }
+            let cache = caches.get_or_insert(&self.identity);
             // Publish the initializing state with the cache. Otherwise another
             // thread can observe an empty ready cache before formatting starts.
             let initializing = cache.initialize(&self.status);
@@ -582,18 +586,31 @@ where
     fn on_record(&self, id: &Id, fields: &Record<'_>, context: Context<'_, Registry>) {
         let _ = with_active(&self.status, || {
             let span = context.span(id).expect("recorded span is registered");
-            let cache = {
+            let (cache, initializing) = {
                 let mut extensions = span.extensions_mut();
                 if extensions.get_mut::<SpanCaches>().is_none() {
                     extensions.insert(SpanCaches::default());
                 }
-                extensions
-                    .get_mut::<SpanCaches>()
-                    .unwrap()
-                    .get_or_insert(&self.identity)
+                let caches = extensions.get_mut::<SpanCaches>().unwrap();
+                if let Some(cache) = caches.get(&self.identity) {
+                    (cache.clone(), None)
+                } else {
+                    let cache = caches.get_or_insert(&self.identity);
+                    // A record callback can create the first cache too. Mark
+                    // it pending before publication so concurrent events wait
+                    // for its complete fields, just as during on_new_span.
+                    let initializing = cache.initialize(&self.status);
+                    (cache, Some(initializing))
+                }
             };
+            let _initializing = initializing;
             let buffer = self.format_span(fields)?;
-            self.commit_update(&cache, buffer).map_err(|failure| {
+            let result = if _initializing.is_some() {
+                self.commit_initial(&cache, buffer)
+            } else {
+                self.commit_update(&cache, buffer)
+            };
+            result.map_err(|failure| {
                 self.status.fail(failure);
                 fmt::Error
             })
