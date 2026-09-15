@@ -838,7 +838,7 @@ fn ignored_span_errors_cannot_commit_partial_cache() {
 }
 
 #[test]
-fn panicking_span_update_matches_upstream_poisoning_and_keeps_failure() {
+fn panicking_span_update_preserves_cache_without_poisoning_registry() {
     let expected_poisoning = match std::env::var("HERMIT_FORMATTER_TEST_REGISTRY_LOCK") {
         Ok(lock) if lock == "std" => Some(true),
         Ok(lock) if lock == "parking_lot" => Some(false),
@@ -856,8 +856,9 @@ fn assert_span_update_panic_contract(expected_poisoning: Option<bool>) {
             panic!("span update panic")
         }
     }
-    fn exercise() -> (String, bool) {
+    fn exercise(check_cache: bool) -> (String, bool) {
         let span = tracing::info_span!(target: "host_record", "small", value = 1);
+        let before = check_cache.then(|| cached_span(&span));
         let panic = std::panic::catch_unwind(AssertUnwindSafe(|| {
             span.record("value", tracing::field::debug(Panics));
         }))
@@ -873,6 +874,9 @@ fn assert_span_update_panic_contract(expected_poisoning: Option<bool>) {
             });
         }))
         .is_err();
+        if let Some(before) = before {
+            assert_eq!(cached_span(&span), before);
+        }
         (message, poisoned)
     }
 
@@ -880,7 +884,7 @@ fn assert_span_update_panic_contract(expected_poisoning: Option<bool>) {
         .with_env_filter(filter())
         .with_writer(io::sink)
         .finish();
-    let baseline = tracing::subscriber::with_default(original, exercise);
+    let baseline = tracing::subscriber::with_default(original, || exercise(false));
     assert_eq!(baseline.0, "span update panic");
     if let Some(expected) = expected_poisoning {
         assert_eq!(baseline.1, expected);
@@ -888,7 +892,12 @@ fn assert_span_update_panic_contract(expected_poisoning: Option<bool>) {
     let records = Records::default();
     let (subscriber, status) = bounded_subscriber(&records, 128, 32);
     tracing::subscriber::with_default(subscriber, || {
-        assert_eq!(exercise(), baseline);
+        let observed = exercise(true);
+        assert_eq!(observed.0, baseline.0);
+        assert!(
+            !observed.1,
+            "user formatting must not poison Registry locks"
+        );
         tracing::info!(target: "host_record", "not a recovered record");
     });
     assert!(records.lock().unwrap().is_empty());
@@ -1302,6 +1311,391 @@ where
         .with_filter(filter);
     tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), emit);
     output.0.lock().unwrap().clone()
+}
+
+fn bounded_record_callback_child(test: &str, case: &str) {
+    use std::process::Command;
+    use std::process::Stdio;
+    use std::time::Duration;
+    use std::time::Instant;
+
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture", "--test-threads=1"])
+        .env("HERMIT_RECORD_LOCK_CASE", case)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!("{case}: callback did not return: {output:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{case}: {output:?}");
+    assert!(output.stderr.is_empty(), "{case}: {output:?}");
+}
+
+#[test]
+fn span_field_logging_with_two_layers_returns_and_retains_reentry_failure() {
+    const TEST: &str = "liteinst_record::tests::span_field_logging_with_two_layers_returns_and_retains_reentry_failure";
+    if std::env::var("HERMIT_RECORD_LOCK_CASE").as_deref() != Ok("record") {
+        bounded_record_callback_child(TEST, "record");
+        return;
+    }
+    struct Emits(tracing::Span, Arc<AtomicUsize>);
+    impl fmt::Debug for Emits {
+        fn fmt(&self, writer: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            tracing::info!(target: "host_record", parent: &self.0, "nested");
+            writer.write_str("updated")
+        }
+    }
+    let first = Records::default();
+    let second = Records::default();
+    let first_status = RecordStatus::default();
+    let second_status = RecordStatus::default();
+    let notifications = Arc::new(AtomicUsize::new(0));
+    for status in [&first_status, &second_status] {
+        let notifications = notifications.clone();
+        assert!(
+            status
+                .1
+                .set(Box::new(move || {
+                    notifications.fetch_add(1, Ordering::SeqCst);
+                }))
+                .is_ok()
+        );
+    }
+    let first_layer = layer_with_status(
+        baseline_limits(),
+        capture(&first),
+        (),
+        false,
+        first_status.clone(),
+    );
+    let second_layer = layer_with_status(
+        baseline_limits(),
+        capture(&second),
+        (),
+        false,
+        second_status.clone(),
+    );
+    let subscriber = tracing_subscriber::registry()
+        .with(first_layer.with_filter(tracing::level_filters::LevelFilter::INFO))
+        .with(second_layer.with_filter(tracing::level_filters::LevelFilter::INFO));
+    let calls = Arc::new(AtomicUsize::new(0));
+    tracing::subscriber::with_default(subscriber, || {
+        let span = tracing::info_span!(target: "host_record", "work", value = 1);
+        span.record(
+            "value",
+            tracing::field::debug(Emits(span.clone(), calls.clone())),
+        );
+        span.with_subscriber(|(id, dispatch)| {
+            let registry = dispatch
+                .downcast_ref::<tracing_subscriber::Registry>()
+                .unwrap();
+            let span = registry.span(id).unwrap();
+            let extensions = span.extensions();
+            let caches = extensions.get::<SpanCaches>().unwrap();
+            assert_eq!(caches.0.len(), 2);
+            assert!(
+                caches
+                    .0
+                    .iter()
+                    .all(|(_, fields)| fields.fields == "value=1")
+            );
+        })
+        .unwrap();
+    });
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(notifications.load(Ordering::SeqCst), 2);
+    for status in [&first_status, &second_status] {
+        assert!(matches!(
+            status.failure().as_deref(),
+            Some(RecordFailure::Reentrant)
+        ));
+    }
+    assert!(first.lock().unwrap().is_empty());
+    assert_eq!(
+        *second.lock().unwrap(),
+        [b" INFO work{value=1}: host_record: nested\n".to_vec()]
+    );
+}
+
+#[test]
+fn new_span_formatter_can_read_its_registry_extensions() {
+    const TEST: &str =
+        "liteinst_record::tests::new_span_formatter_can_read_its_registry_extensions";
+    if std::env::var("HERMIT_RECORD_LOCK_CASE").as_deref() != Ok("new") {
+        bounded_record_callback_child(TEST, "new");
+        return;
+    }
+    struct Observe(Arc<Mutex<Option<Id>>>);
+    impl<S: Subscriber> Layer<S> for Observe {
+        fn on_new_span(&self, _: &Attributes<'_>, id: &Id, _: Context<'_, S>) {
+            *self.0.lock().unwrap() = Some(id.clone());
+        }
+    }
+    struct Reads {
+        dispatch: tracing::Dispatch,
+        id: Arc<Mutex<Option<Id>>>,
+        calls: Arc<AtomicUsize>,
+    }
+    impl fmt::Debug for Reads {
+        fn fmt(&self, writer: &mut fmt::Formatter<'_>) -> fmt::Result {
+            let id = self.id.lock().unwrap().clone().unwrap();
+            let registry = self
+                .dispatch
+                .downcast_ref::<tracing_subscriber::Registry>()
+                .unwrap();
+            let span = registry.span(&id).unwrap();
+            let _extensions = span.extensions();
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            writer.write_str("readable")
+        }
+    }
+    let id = Arc::new(Mutex::new(None));
+    let records = Records::default();
+    let status = RecordStatus::default();
+    let layer = layer_with_status(
+        baseline_limits(),
+        capture(&records),
+        (),
+        false,
+        status.clone(),
+    );
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::registry()
+            .with(Observe(id.clone()))
+            .with(layer),
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    tracing::dispatcher::with_default(&dispatch, || {
+        let span = tracing::info_span!(target: "host_record", "work", value = ?Reads {
+            dispatch: dispatch.clone(), id, calls: calls.clone(),
+        });
+        tracing::info!(target: "host_record", parent: &span, "complete");
+    });
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(status.failure().is_none());
+    assert_eq!(
+        *records.lock().unwrap(),
+        [b" INFO work{value=readable}: host_record: complete\n".to_vec()]
+    );
+}
+
+#[test]
+fn concurrent_span_updates_merge_latest_fields_without_reformatting() {
+    const TEST: &str =
+        "liteinst_record::tests::concurrent_span_updates_merge_latest_fields_without_reformatting";
+    if std::env::var("HERMIT_RECORD_LOCK_CASE").as_deref() != Ok("concurrent") {
+        bounded_record_callback_child(TEST, "concurrent");
+        return;
+    }
+    struct Paused {
+        calls: Arc<AtomicUsize>,
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl fmt::Debug for Paused {
+        fn fmt(&self, writer: &mut fmt::Formatter<'_>) -> fmt::Result {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.entered.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+            }
+            writer.write_str("1")
+        }
+    }
+    struct Counted(Arc<AtomicUsize>);
+    impl fmt::Debug for Counted {
+        fn fmt(&self, writer: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            writer.write_str("2")
+        }
+    }
+    let first = Records::default();
+    let second = Records::default();
+    let first_status = RecordStatus::default();
+    let second_status = RecordStatus::default();
+    let first_layer = layer_with_status(
+        baseline_limits(),
+        capture(&first),
+        (),
+        false,
+        first_status.clone(),
+    );
+    let second_layer = layer_with_status(
+        baseline_limits(),
+        capture(&second),
+        (),
+        false,
+        second_status.clone(),
+    );
+    let subscriber = tracing_subscriber::registry()
+        .with(first_layer)
+        .with(second_layer);
+    let first_calls = Arc::new(AtomicUsize::new(0));
+    let second_calls = Arc::new(AtomicUsize::new(0));
+    tracing::subscriber::with_default(subscriber, || {
+        let span = tracing::info_span!(target: "host_record", "work", v = 0);
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let first_span = span.clone();
+        let calls = first_calls.clone();
+        let first = std::thread::spawn(move || {
+            first_span.record(
+                "v",
+                tracing::field::debug(Paused {
+                    calls,
+                    entered: entered_tx,
+                    release: Mutex::new(release_rx),
+                }),
+            );
+        });
+        entered_rx.recv().unwrap();
+        let second_span = span.clone();
+        let calls = second_calls.clone();
+        std::thread::spawn(move || {
+            second_span.record("v", tracing::field::debug(Counted(calls)));
+        })
+        .join()
+        .unwrap();
+        release_tx.send(()).unwrap();
+        first.join().unwrap();
+        tracing::info!(target: "host_record", parent: &span, "all updates");
+    });
+    assert_eq!(first_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(second_calls.load(Ordering::SeqCst), 2);
+    assert!(first_status.failure().is_none());
+    assert!(second_status.failure().is_none());
+    let expected = [b" INFO work{v=0 v=2 v=1}: host_record: all updates\n".to_vec()];
+    assert_eq!(*first.lock().unwrap(), expected);
+    assert_eq!(*second.lock().unwrap(), expected);
+}
+
+#[test]
+fn span_merge_overflow_keeps_previous_cache_after_formatting_fragment_once() {
+    struct Counted<'a>(&'a AtomicUsize);
+    impl fmt::Debug for Counted<'_> {
+        fn fmt(&self, writer: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            writer.write_str("2")
+        }
+    }
+    let calls = AtomicUsize::new(0);
+    let records = Records::default();
+    let (subscriber, status) = bounded_subscriber(&records, 128, 3);
+    let allocations = PayloadAllocations::new(Some(3));
+    tracing::subscriber::with_default(subscriber, || {
+        let span = tracing::info_span!(target: "host_record", "work", v = 1);
+        let before = cached_span(&span);
+        span.record("v", tracing::field::debug(Counted(&calls)));
+        assert_eq!(cached_span(&span), before);
+    });
+    // Formatting is separate from the serialized merge: unlike stock's
+    // prefix-first writer, this invokes the new value even if the prior cache
+    // already fills the budget. It never invokes it a second time to retry.
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(allocations.attempts(), 2);
+    assert!(matches!(
+        status.failure().as_deref(),
+        Some(RecordFailure::Size {
+            buffer: BufferKind::Span,
+            limit: 3,
+        })
+    ));
+    assert!(records.lock().unwrap().is_empty());
+}
+
+#[test]
+fn span_and_event_failure_notifications_can_update_another_layer() {
+    const TEST: &str =
+        "liteinst_record::tests::span_and_event_failure_notifications_can_update_another_layer";
+    let case = std::env::var("HERMIT_RECORD_LOCK_CASE");
+    let case = match case.as_deref() {
+        Ok("span-notify") => BufferKind::Span,
+        Ok("event-notify") => BufferKind::Event,
+        _ => {
+            for case in ["span-notify", "event-notify"] {
+                bounded_record_callback_child(TEST, case);
+            }
+            return;
+        }
+    };
+    let parent = Arc::new(Mutex::new(None::<tracing::Span>));
+    let notifications = Arc::new(AtomicUsize::new(0));
+    let failed_status = RecordStatus::default();
+    let complete_status = RecordStatus::default();
+    let notify_parent = parent.clone();
+    let notify_count = notifications.clone();
+    assert!(
+        failed_status
+            .1
+            .set(Box::new(move || {
+                notify_count.fetch_add(1, Ordering::SeqCst);
+                let parent = notify_parent.lock().unwrap().clone().unwrap();
+                parent.record("v", 3);
+            }))
+            .is_ok()
+    );
+    let failed = Records::default();
+    let complete = Records::default();
+    let limits = match case {
+        BufferKind::Span => FormatterLimits::new(128, 3).unwrap(),
+        BufferKind::Event => FormatterLimits::new(14, 32).unwrap(),
+    };
+    let failed_layer =
+        layer_with_status(limits, capture(&failed), (), false, failed_status.clone());
+    let complete_layer = layer_with_status(
+        baseline_limits(),
+        capture(&complete),
+        (),
+        false,
+        complete_status.clone(),
+    );
+    let subscriber = tracing_subscriber::registry()
+        .with(failed_layer)
+        .with(complete_layer);
+    tracing::subscriber::with_default(subscriber, || {
+        let span = tracing::info_span!(target: "host_record", "work", v = 1);
+        *parent.lock().unwrap() = Some(span.clone());
+        if case == BufferKind::Span {
+            span.record("v", 2);
+        }
+        tracing::info!(target: "host_record", parent: &span, "complete");
+        *parent.lock().unwrap() = None;
+    });
+    assert_eq!(notifications.load(Ordering::SeqCst), 1);
+    assert!(
+        matches!(failed_status.failure().as_deref(), Some(RecordFailure::Size { buffer, .. }) if *buffer == case)
+    );
+    assert!(complete_status.failure().is_none());
+    assert!(failed.lock().unwrap().is_empty());
+    let expected: &[u8] = match case {
+        BufferKind::Span => b" INFO work{v=1 v=3 v=2}: host_record: complete\n",
+        BufferKind::Event => b" INFO work{v=1 v=3}: host_record: complete\n",
+    };
+    assert_eq!(*complete.lock().unwrap(), [expected.to_vec()]);
+}
+
+#[test]
+fn empty_span_update_fragments_preserve_stock_separator_bytes() {
+    let records = compare_with_stock("trace", || {
+        let span = tracing::info_span!(target: "host_record", "work", v = 1);
+        span.record("v", tracing::field::Empty);
+        span.record("v", tracing::field::Empty);
+        span.record("v", 2);
+        tracing::info!(target: "host_record", parent: &span, "spaces");
+    });
+    assert_eq!(
+        records,
+        [b"unchanged-time  INFO work{v=1   v=2}: host_record: spaces\n".to_vec()]
+    );
 }
 
 fn dual_layer_events() {

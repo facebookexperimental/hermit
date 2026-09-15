@@ -324,29 +324,29 @@ struct CheckedFields;
 // The Arc stays in the cache as well as the layer: replacing a layer while a
 // span lives cannot reuse an old allocation identity and inherit stale fields.
 #[derive(Default)]
-struct SpanCaches(Vec<(Arc<()>, FormattedFields<CheckedFields>)>);
+struct SpanCaches(Vec<(Arc<()>, Arc<FormattedFields<CheckedFields>>)>);
 
 impl SpanCaches {
-    fn get(&self, identity: &Arc<()>) -> Option<&FormattedFields<CheckedFields>> {
+    fn get(&self, identity: &Arc<()>) -> Option<&Arc<FormattedFields<CheckedFields>>> {
         self.0
             .iter()
             .find(|(owner, _)| Arc::ptr_eq(owner, identity))
             .map(|(_, fields)| fields)
     }
 
-    fn get_or_insert(&mut self, identity: &Arc<()>) -> (&mut FormattedFields<CheckedFields>, bool) {
+    fn get_or_insert(&mut self, identity: &Arc<()>) -> &mut Arc<FormattedFields<CheckedFields>> {
         if let Some(index) = self
             .0
             .iter()
             .position(|(owner, _)| Arc::ptr_eq(owner, identity))
         {
-            return (&mut self.0[index].1, true);
+            return &mut self.0[index].1;
         }
         self.0.push((
             identity.clone(),
-            FormattedFields::<CheckedFields>::new(String::new()),
+            Arc::new(FormattedFields::<CheckedFields>::new(String::new())),
         ));
-        (&mut self.0.last_mut().unwrap().1, false)
+        &mut self.0.last_mut().unwrap().1
     }
 }
 
@@ -362,26 +362,50 @@ struct RecordLayer<Timer, Sink> {
 impl<Timer, Sink> RecordLayer<Timer, Sink> {
     fn format_span<Fields: RecordFields>(
         &self,
-        current: &mut FormattedFields<CheckedFields>,
         fields: Fields,
-        append: bool,
-    ) -> fmt::Result {
-        use fmt::Write as _;
-
+    ) -> Result<BoundedBuffer<'_>, fmt::Error> {
         let mut buffer =
             BoundedBuffer::new(self.limits.span_bytes, BufferKind::Span, &self.status)?;
-        if append {
-            buffer.write_str(&current.fields)?;
-            if !current.fields.is_empty() {
-                buffer.write_char(' ')?;
-            }
-        }
+        // User fields may log or update other spans. Format exactly once without
+        // holding Registry extensions or a cache lock. The latest committed
+        // prefix is merged only after this call returns.
         self.status
             .formatting(|| DefaultFields::new().format_fields(Writer::new(&mut buffer), fields))?;
         if self.status.failure().is_some() {
             return Err(fmt::Error);
         }
-        current.fields = buffer.into_string();
+        Ok(buffer)
+    }
+
+    fn commit_span(
+        &self,
+        current: &mut Arc<FormattedFields<CheckedFields>>,
+        mut buffer: BoundedBuffer<'_>,
+        append: bool,
+    ) -> Result<(), RecordFailure> {
+        if append && !current.fields.is_empty() {
+            let prefix = current.fields.len() + 1;
+            let length = buffer.bytes.len();
+            let Some(combined) = prefix
+                .checked_add(length)
+                .filter(|combined| *combined <= buffer.limit)
+            else {
+                // The caller releases extensions before reporting the failure:
+                // its notification callback may itself emit a record.
+                return Err(RecordFailure::Size {
+                    buffer: BufferKind::Span,
+                    limit: buffer.limit,
+                });
+            };
+            // The entire payload capacity was reserved before user formatting.
+            // Move the fragment within that allocation, preserving stock's
+            // separating space even when the new fragment is empty.
+            buffer.bytes.resize(combined, 0);
+            buffer.bytes.copy_within(..length, prefix);
+            buffer.bytes[..current.fields.len()].copy_from_slice(current.fields.as_bytes());
+            buffer.bytes[current.fields.len()] = b' ';
+        }
+        *current = Arc::new(FormattedFields::new(buffer.into_string()));
         Ok(())
     }
 }
@@ -405,27 +429,50 @@ where
                 .get_or_insert(&self.identity);
         }
         let _ = with_active(&self.status, || {
-            let mut extensions = span.extensions_mut();
-            let (current, _) = extensions
-                .get_mut::<SpanCaches>()
-                .unwrap()
-                .get_or_insert(&self.identity);
-            self.format_span(current, attrs, false)
+            let buffer = self.format_span(attrs)?;
+            let committed = {
+                let mut extensions = span.extensions_mut();
+                let current = extensions
+                    .get_mut::<SpanCaches>()
+                    .unwrap()
+                    .get_or_insert(&self.identity);
+                self.commit_span(current, buffer, false)
+            };
+            committed.map_err(|failure| {
+                self.status.fail(failure);
+                fmt::Error
+            })
         });
     }
 
     fn on_record(&self, id: &Id, fields: &Record<'_>, context: Context<'_, Registry>) {
         let _ = with_active(&self.status, || {
             let span = context.span(id).expect("recorded span is registered");
-            let mut extensions = span.extensions_mut();
-            if extensions.get_mut::<SpanCaches>().is_none() {
-                extensions.insert(SpanCaches::default());
+            {
+                let mut extensions = span.extensions_mut();
+                if extensions.get_mut::<SpanCaches>().is_none() {
+                    extensions.insert(SpanCaches::default());
+                }
+                extensions
+                    .get_mut::<SpanCaches>()
+                    .unwrap()
+                    .get_or_insert(&self.identity);
             }
-            let (current, append) = extensions
-                .get_mut::<SpanCaches>()
-                .unwrap()
-                .get_or_insert(&self.identity);
-            self.format_span(current, fields, append)
+            let buffer = self.format_span(fields)?;
+            let committed = {
+                let mut extensions = span.extensions_mut();
+                let current = extensions
+                    .get_mut::<SpanCaches>()
+                    .unwrap()
+                    .get_or_insert(&self.identity);
+                // Concurrent updates append to the cache present at commit,
+                // never to a snapshot taken before user formatting.
+                self.commit_span(current, buffer, true)
+            };
+            committed.map_err(|failure| {
+                self.status.fail(failure);
+                fmt::Error
+            })
         });
     }
 
@@ -449,10 +496,15 @@ where
                     let mut seen = false;
                     for span in scope.from_root() {
                         writer.write_str(span.metadata().name())?;
-                        let extensions = span.extensions();
-                        if let Some(fields) = extensions
+                        let fields = span
+                            .extensions()
                             .get::<SpanCaches>()
                             .and_then(|caches| caches.get(&self.identity))
+                            .cloned();
+                        // Keep a complete immutable cache version while writing;
+                        // even a size-failure notification runs without Registry
+                        // extension locks held.
+                        if let Some(fields) = fields
                             && !fields.is_empty()
                         {
                             write!(writer, "{{{fields}}}")?;
@@ -582,6 +634,9 @@ where
 /// can use its resolved [`EnvFilter`] while private evidence uses a fixed INFO
 /// selector. A global public filter would also suppress private evidence.
 /// Each layer owns its formatter limits, span fields and retained failure state.
+/// Each live span retains a full `span_bytes` allocation per layer; two layers
+/// with the default limits retain 128 KiB per span. Measurements before wiring
+/// must account for layer count and cache versions held by in-flight records.
 /// The completion, teardown and transport requirements of
 /// [`record_subscriber_with_failure`] apply equally to this constructor.
 pub fn record_layer_with_failure<Registry, Sink>(
