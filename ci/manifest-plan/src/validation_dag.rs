@@ -1240,7 +1240,8 @@ fn expected_for_label<'a>(label: &str, cells: &'a [DagManifest]) -> Vec<&'a DagM
 }
 
 fn assert_rust_script_producer_contract(cfg: &DagConfig) -> Result<(), String> {
-    let expected: &[(&str, &[&str], &[&str], i64, f64)] = &[
+    type ProducerContract<'a> = (&'a str, &'a [&'a str], &'a [&'a str], i64, f64);
+    let expected: &[ProducerContract<'_>] = &[
         (
             "build.rust_scripts",
             &["full", "hosted-portable", "portable"],
@@ -2586,7 +2587,8 @@ sys.exit(37)
             "quick-super-build.rust_scripts",
             "quick-super-build.rust_scripts_in_pinned_root",
         ];
-        let old_resource_mutations: [(&str, fn(&mut Step, &str)); 3] = [
+        type ResourceMutation = fn(&mut Step, &str);
+        let old_resource_mutations: [(&str, ResourceMutation); 3] = [
             ("wall", |step, _| step.timeout = 300),
             ("baseline", |step, tag| {
                 step.hint.rss_baseline_bytes = Some(if tag.starts_with("quick-super-") {
