@@ -7,6 +7,8 @@ import subprocess
 import tempfile
 import unittest
 import json
+import os
+import shutil
 from pathlib import Path
 
 
@@ -198,6 +200,123 @@ class RegistrationAuditTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("ci-registered=2", result.stdout)
+
+    def test_prlimit_command_registers_the_wrapped_test_binary(self) -> None:
+        result = self._plant_probe_with_dag_command(
+            'test "${HERMIT_E2E_EMPTY_WORKDIR:-}" = /test && '
+            "prlimit --fsize=67108864:67108864 -- "
+            "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh "
+            "${CI:+--profile ci} -p hermit --features third-party-backends "
+            "--test zz_probe -E 'test(=positive) | test(=negative)' -- --include-ignored",
+            declared=["zz_probe"],
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ci-registered=2", result.stdout)
+
+
+    def test_prlimit_does_not_register_nonexecuting_or_malformed_commands(self) -> None:
+        invocation = "./ci/run-nextest-counted.sh -p hermit --test zz_probe"
+        for command in (
+            f"echo prlimit --fsize=67108864:67108864 -- {invocation}",
+            f"unrelated prlimit --fsize=67108864:67108864 -- {invocation}",
+            f"prlimit --fsize=67108864:67108864 -- echo {invocation}",
+            f"prlimit --fsize=67108864:67108864 -- {invocation} --no-run",
+            f"prlimit --fsize=67108864:67108864 {invocation}",
+            f"prlimit -- {invocation}",
+            f"prlimit --pid=1 -- {invocation}",
+            f"prlimit --help -- {invocation}",
+            f"prlimit --fsize=malformed -- {invocation}",
+            f"prlimit --fsize=67108865:67108864 -- {invocation}",
+            f"prlimit --fsize=18446744073709551616:18446744073709551616 -- {invocation}",
+            f"prlimit --fsize=67108864:67108864 -- --help {invocation}",
+            f"prlimit --fsize=67108864:67108864 -- HERMIT_REVIEW_ASSIGNMENT=1 {invocation}",
+            f"prlimit --fsize=67108864:67108864 -- 30 {invocation}",
+            f"prlimit --fsize=67108864:67108864 -- env --help {invocation}",
+        ):
+            with self.subTest(command=command):
+                result = self._plant_probe_with_dag_command(
+                    command, declared=["zz_probe"]
+                )
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn("integration_test_binaries", result.stderr)
+
+
+    def test_prlimit_assignments_require_shell_position_or_explicit_env(self) -> None:
+        invocation = "./ci/run-nextest-counted.sh -p hermit --test zz_probe"
+        for command in (
+            f"CARGO_BUILD_JOBS=1 prlimit --fsize=67108864:67108864 -- {invocation}",
+            f"prlimit --fsize=67108864:67108864 -- env CARGO_BUILD_JOBS=1 {invocation}",
+        ):
+            with self.subTest(command=command):
+                result = self._plant_probe_with_dag_command(
+                    command, declared=["zz_probe"]
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("ci-registered=2", result.stdout)
+
+
+    def test_prlimit_refuses_unsupported_nested_runner_forms(self) -> None:
+        invocation = "./ci/run-nextest-counted.sh -p hermit --test zz_probe"
+        for prefix in ("timeout 300 FOO=1", "nice FOO=1", "timeout 300", "nice"):
+            with self.subTest(prefix=prefix):
+                # The first two never execute the test command. The latter two
+                # are valid wrappers whose operand grammar is not supported by
+                # this audit, so they must not silently gain coverage credit.
+                result = self._plant_probe_with_dag_command(
+                    f"prlimit --fsize=67108864:67108864 -- {prefix} {invocation}",
+                    declared=["zz_probe"],
+                )
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn("integration_test_binaries", result.stderr)
+
+
+    def test_prlimit_cannot_execute_a_shell_exec_builtin(self) -> None:
+        invocation = "./ci/run-nextest-counted.sh -p hermit --test zz_probe"
+        prlimit = shutil.which("prlimit")
+        env_command = shutil.which("env")
+        self.assertIsNotNone(prlimit)
+        self.assertIsNotNone(env_command)
+        environment = dict(os.environ, PATH=str(self.root))
+        for prefix, argv in (
+            ("exec", ["exec"]),
+            ("env CARGO_BUILD_JOBS=1 exec", [env_command, "CARGO_BUILD_JOBS=1", "exec"]),
+        ):
+            with self.subTest(prefix=prefix):
+                result = self._plant_probe_with_dag_command(
+                    f"prlimit --fsize=67108864:67108864 -- {prefix} {invocation}",
+                    declared=["zz_probe"],
+                )
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn("integration_test_binaries", result.stderr)
+                real = subprocess.run(
+                    [prlimit, "--fsize=67108864:67108864", "--", *argv, "/bin/true"],
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(real.returncode, 127, real.stderr)
+
+
+    def test_shell_exec_before_prlimit_still_executes_the_test_command(self) -> None:
+        result = self._plant_probe_with_dag_command(
+            "exec prlimit --fsize=67108864:67108864 -- "
+            "./ci/run-nextest-counted.sh -p hermit --test zz_probe",
+            declared=["zz_probe"],
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ci-registered=2", result.stdout)
+        real = subprocess.run(
+            [
+                "/bin/sh", "-c", 'exec "$1" --fsize=67108864:67108864 -- /bin/true',
+                "fixture", shutil.which("prlimit"),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(real.returncode, 0, real.stderr)
+
 
     def test_prlimit_budget_wrapper_registers_a_binary(self) -> None:
         result = self._plant_probe_with_dag_command(

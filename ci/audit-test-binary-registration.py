@@ -70,8 +70,12 @@ _TOP_LEVEL_TEST_RE = re.compile(r"^hermit-cli/tests/([^/]+)\.rs$")
 _SEGMENT_SPLIT_RE = re.compile(r"&&|\|\||[;|\n]")
 _ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _KNOWN_RUNNERS = frozenset({"timeout", "env", "nice", "nohup", "xargs", "exec", "command"})
-_PRLIMIT_FSIZE_RE = re.compile(r"--fsize=(\d+):(\d+)")
 _DURATION_RE = re.compile(r"^\d+[smhd]?$")
+# The isolated-workdir nodes execute through this command form of prlimit.
+# Do not accept prlimit's query/help/PID forms, or infer execution without its
+# explicit command delimiter. Other option shapes remain unrecognized.
+_PRLIMIT_FSIZE_RE = re.compile(r"--fsize=[0-9]{1,20}:[0-9]{1,20}")
+_PRLIMIT_SCRIPT_WRAPPERS = frozenset({"./ci/run-with-reverie-dbt-budget.sh"})
 # `--no-run` compiles the binary and never executes it, so it is not coverage.
 _NO_RUN_RE = re.compile(r"(?<![\w-])--no-run(?![\w-])")
 
@@ -84,28 +88,29 @@ def _prefix_still_runs_cargo(prefix: str) -> bool:
         token = tokens[position]
         position += 1
         if token == "prlimit":
-            # Recognize the limit-setting/exec form used by the DAG. Options
-            # such as --help, --version and --pid do not execute the runner.
-            if position + 1 >= len(tokens):
-                return False
-            limits = _PRLIMIT_FSIZE_RE.fullmatch(tokens[position])
             if (
-                limits is None
-                or int(limits[1]) > int(limits[2])
+                position + 1 >= len(tokens)
+                or _PRLIMIT_FSIZE_RE.fullmatch(tokens[position]) is None
                 or tokens[position + 1] != "--"
             ):
                 return False
-            position += 2
-            # After --, prlimit expects an executable, not shell assignments,
-            # shell builtins or another option. The matched cargo/runner may
-            # immediately follow the prefix, leaving no tokens here.
-            if position < len(tokens) and (
-                tokens[position].startswith("-")
-                or _ENV_ASSIGNMENT_RE.match(tokens[position])
-                or tokens[position] in {"exec", "command"}
-            ):
+            limits = tokens[position].removeprefix("--fsize=").split(":")
+            if not 0 <= int(limits[0]) <= int(limits[1]) <= 2**64 - 1:
                 return False
-            continue
+            position += 2
+            # After --, prlimit uses execvp: an assignment is a program name,
+            # not shell syntax. Only an explicit env command can consume it.
+            if position < len(tokens) and tokens[position] == "env":
+                position += 1
+                while position < len(tokens) and _ENV_ASSIGNMENT_RE.match(tokens[position]):
+                    position += 1
+            # Only the actual script wrapper used by these nodes is supported
+            # between prlimit (or env) and the recognized test invocation.
+            # Reusing the shell-prefix grammar here would falsely interpret
+            # `exec`, or assignments after timeout/nice, as shell syntax even
+            # though those programs use execvp. Refuse other wrapper forms until
+            # their operand semantics are handled explicitly.
+            return all(token in _PRLIMIT_SCRIPT_WRAPPERS for token in tokens[position:])
         if _ENV_ASSIGNMENT_RE.match(token):
             continue
         if "/" in token or token.endswith(".sh"):

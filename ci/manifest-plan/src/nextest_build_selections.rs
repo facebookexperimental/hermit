@@ -512,6 +512,42 @@ mod tests {
     use crate::nextest_binaries::SELECTION_ENV;
 
     #[test]
+    fn child_time_rpc_is_prepared_and_executed_in_both_integration_variants() {
+        let graph = dagrun::io::dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        assert_preparation_dependencies(&graph).unwrap();
+        for tag in ["test.hermit_integration", "test.hermit_integration_on_host"] {
+            let step = graph.steps.iter().find(|step| step.tag() == tag).unwrap();
+            assert_command_selection(step).unwrap();
+            let args: Vec<String> = serde_json::from_str(&step.env[SELECTION_ENV]).unwrap();
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--test", "child_time_rpc"])
+            );
+            assert!(
+                step.integration_test_binaries
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .any(|binary| binary == "child_time_rpc")
+            );
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "158");
+
+            let mut omitted_execution = step.clone();
+            omitted_execution.cmd = omitted_execution.cmd.replace("--test child_time_rpc ", "");
+            assert!(assert_command_selection(&omitted_execution).is_err());
+
+            let mut omitted_preparation = step.clone();
+            let mut args = args;
+            let position = args.iter().position(|arg| arg == "child_time_rpc").unwrap();
+            args.drain(position - 1..=position);
+            omitted_preparation
+                .env
+                .insert(SELECTION_ENV.into(), serde_json::to_string(&args).unwrap());
+            assert!(assert_command_selection(&omitted_preparation).is_err());
+        }
+    }
+
+    #[test]
     fn prepared_metadata_requires_the_consumers_filesystem_root() {
         let graph = dagrun::io::dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         assert_preparation_dependencies(&graph).unwrap();
