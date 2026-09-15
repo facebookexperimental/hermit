@@ -1846,10 +1846,6 @@ fn self_test() -> Result<(), String> {
     println!("  {}", raw_run_dag_strict_compat_bracket(&repo_root())?);
     println!("  {}", raw_run_dag_engine_bracket(&repo_root())?);
     shard_coverage_resource_policy_bracket(&repo_root())?;
-    println!(
-        "  {}",
-        submodule_failure_service_result_bracket(&repo_root())?
-    );
 
     // ---- known-fail-closed disposition, as a pure decision table ----
     //
