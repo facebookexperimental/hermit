@@ -14,7 +14,7 @@ clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "w
 colored = "2.1.0"
 detcore = { path = "../detcore" }
 diff = "0.1.13"
-dirs = "6.0"
+dirs = "7.0"
 edit-distance = { path = "../common/edit-distance" }
 fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 goblin = { version = "0.10.7", features = ["elf32", "elf64", "endian_fd"] }
