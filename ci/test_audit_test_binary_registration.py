@@ -199,6 +199,36 @@ class RegistrationAuditTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("ci-registered=2", result.stdout)
 
+    def test_prlimit_budget_wrapper_registers_a_binary(self) -> None:
+        result = self._plant_probe_with_dag_command(
+            "prlimit --fsize=67108864:67108864 -- "
+            "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh "
+            "${CI:+--profile ci} -p hermit --features third-party-backends --test zz_probe",
+            declared=["zz_probe"],
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ci-registered=2", result.stdout)
+
+    def test_prlimit_wrapped_no_run_does_not_register_a_binary(self) -> None:
+        result = self._plant_probe_with_dag_command(
+            "prlimit --fsize=67108864:67108864 -- "
+            "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh "
+            "-p hermit --test zz_probe --no-run",
+            declared=["zz_probe"],
+        )
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("integration_test_binaries", result.stderr)
+
+    def test_prlimit_wrapped_echo_does_not_register_a_binary(self) -> None:
+        result = self._plant_probe_with_dag_command(
+            "prlimit --fsize=67108864:67108864 -- "
+            "./ci/run-with-reverie-dbt-budget.sh echo "
+            "cargo test -p hermit --test zz_probe",
+            declared=["zz_probe"],
+        )
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("integration_test_binaries", result.stderr)
+
     def test_executed_target_without_typed_declaration_is_refused_by_name(self) -> None:
         result = self._plant_probe_with_dag_command(
             "cargo test -p hermit --test zz_probe"

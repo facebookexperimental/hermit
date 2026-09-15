@@ -69,7 +69,9 @@ _TOP_LEVEL_TEST_RE = re.compile(r"^hermit-cli/tests/([^/]+)\.rs$")
 # the allowlist and are refused.
 _SEGMENT_SPLIT_RE = re.compile(r"&&|\|\||[;|\n]")
 _ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-_KNOWN_RUNNERS = frozenset({"timeout", "env", "nice", "nohup", "xargs", "exec", "command"})
+_KNOWN_RUNNERS = frozenset(
+    {"timeout", "env", "nice", "nohup", "xargs", "exec", "command", "prlimit"}
+)
 _DURATION_RE = re.compile(r"^\d+[smhd]?$")
 # `--no-run` compiles the binary and never executes it, so it is not coverage.
 _NO_RUN_RE = re.compile(r"(?<![\w-])--no-run(?![\w-])")

@@ -58,6 +58,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "chaos_stress_pmu_detection",
             "--test",
+            "child_time_rpc",
+            "--test",
             "chown_virtual_root_identity",
             "--test",
             "clock_determinism",
