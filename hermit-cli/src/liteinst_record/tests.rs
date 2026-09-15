@@ -489,8 +489,8 @@ fn cached_span(span: &tracing::Span) -> (String, usize) {
             1,
             "this helper inspects a single-layer fixture"
         );
-        let fields = &caches.0[0].1;
-        (fields.fields.clone(), fields.fields.capacity())
+        let state = caches.0[0].1.0.lock().unwrap();
+        (state.fields.fields.clone(), state.fields.fields.capacity())
     })
     .unwrap()
 }
@@ -910,6 +910,7 @@ fn assert_span_update_panic_contract(expected_poisoning: Option<bool>) {
 struct AllocationControl {
     attempts: usize,
     refuse: Option<usize>,
+    before: Option<Box<dyn FnOnce()>>,
 }
 
 thread_local! {
@@ -925,6 +926,7 @@ impl PayloadAllocations {
             *control.borrow_mut() = Some(AllocationControl {
                 attempts: 0,
                 refuse,
+                before: None,
             });
         });
         Self
@@ -942,6 +944,18 @@ impl Drop for PayloadAllocations {
 }
 
 pub(super) fn before_payload_allocation() -> Result<(), std::collections::TryReserveError> {
+    let before = PAYLOAD_ALLOCATIONS
+        .try_with(|control| {
+            control
+                .borrow_mut()
+                .as_mut()
+                .and_then(|control| control.before.take())
+        })
+        .ok()
+        .flatten();
+    if let Some(before) = before {
+        before();
+    }
     let refused = PAYLOAD_ALLOCATIONS
         .try_with(|control| {
             let mut control = control.borrow_mut();
@@ -1340,6 +1354,451 @@ fn bounded_record_callback_child(test: &str, case: &str) {
     assert!(output.stderr.is_empty(), "{case}: {output:?}");
 }
 
+// Publish the actual registered ID using a public Layer callback. The writer
+// below uses Dispatch::record; it does not manufacture a Span before creation.
+struct ObserveInitializingSpan {
+    span: std::sync::mpsc::Sender<(Id, &'static tracing::Metadata<'static>)>,
+    event: Option<std::sync::mpsc::Sender<()>>,
+}
+
+impl<S: Subscriber> Layer<S> for ObserveInitializingSpan {
+    fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, _: Context<'_, S>) {
+        self.span.send((id.clone(), attrs.metadata())).unwrap();
+    }
+
+    fn on_event(&self, _: &Event<'_>, _: Context<'_, S>) {
+        if let Some(event) = &self.event {
+            event.send(()).unwrap();
+        }
+    }
+}
+
+fn record_initializing_span(
+    dispatch: &tracing::Dispatch,
+    id: &Id,
+    metadata: &'static tracing::Metadata<'static>,
+    value: Option<u64>,
+) {
+    let field = metadata.fields().field("v").unwrap();
+    let empty = tracing::field::Empty;
+    let value: &dyn tracing::field::Value = match &value {
+        Some(value) => value,
+        None => &empty,
+    };
+    let values = [(&field, Some(value))];
+    dispatch.record(id, &Record::new(&metadata.fields().value_set(&values)));
+}
+
+thread_local! {
+    static BEFORE_SPAN_INITIALIZATION: RefCell<Option<Box<dyn FnOnce()>>> =
+        const { RefCell::new(None) };
+}
+
+pub(super) fn before_span_initialization() {
+    let before = BEFORE_SPAN_INITIALIZATION.with(|control| control.borrow_mut().take());
+    if let Some(before) = before {
+        before();
+    }
+}
+
+#[test]
+fn span_initialization_keeps_early_updates_and_exact_stock_empty_spaces() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    const TEST: &str = "liteinst_record::tests::span_initialization_keeps_early_updates_and_exact_stock_empty_spaces";
+    if std::env::var("HERMIT_RECORD_LOCK_CASE").as_deref() != Ok("initial-updates") {
+        bounded_record_callback_child(TEST, "initial-updates");
+        return;
+    }
+    for initial in [None, Some(1)] {
+        for updates in [
+            vec![None, None],
+            vec![None, None, Some(2), None, Some(3)],
+            vec![None; 1030],
+        ] {
+            let expected_overflow = initial.is_some() && updates.len() == 1030;
+            let expected_output = Output::default();
+            let writer = expected_output.clone();
+            let stock = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::with_default(stock, || {
+                let span = tracing::info_span!(target: "host_record", "work", v = initial);
+                for update in &updates {
+                    match update {
+                        Some(value) => {
+                            span.record("v", value);
+                        }
+                        None => {
+                            span.record("v", tracing::field::Empty);
+                        }
+                    }
+                }
+                tracing::info!(target: "host_record", parent: &span, "initialized");
+            });
+            let expected = expected_output.0.lock().unwrap().clone();
+            let records = Records::default();
+            let status = RecordStatus::default();
+            let (id_tx, id_rx) = mpsc::channel();
+            let (started_tx, started_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let registry = tracing_subscriber::registry().with(ObserveInitializingSpan {
+                span: id_tx,
+                event: None,
+            });
+            let layer = super::layer_with_status(
+                baseline_limits(),
+                capture(&records),
+                (),
+                false,
+                status.clone(),
+            );
+            let dispatch = tracing::Dispatch::new(registry.with(layer));
+            let writer_dispatch = dispatch.clone();
+            let writer = std::thread::spawn(move || {
+                let (id, metadata) = id_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                for value in updates {
+                    record_initializing_span(&writer_dispatch, &id, metadata, value);
+                }
+                done_tx.send(()).unwrap();
+            });
+            tracing::dispatcher::with_default(&dispatch, || {
+                let allocations = PayloadAllocations::new(None);
+                // Pausing before initial allocation also covers a truly empty
+                // initial field set, which has no user Debug callback to pause.
+                PAYLOAD_ALLOCATIONS.with(|control| {
+                    control.borrow_mut().as_mut().unwrap().before = Some(Box::new(move || {
+                        started_tx.send(()).unwrap();
+                        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                    }));
+                });
+                let span = tracing::info_span!(target: "host_record", "work", v = initial);
+                assert_eq!(allocations.attempts(), 1);
+                drop(allocations);
+                writer.join().unwrap();
+                tracing::info!(target: "host_record", parent: &span, "initialized");
+            });
+            if expected_overflow {
+                assert!(matches!(
+                    status.failure().as_deref(),
+                    Some(RecordFailure::Size {
+                        buffer: BufferKind::Span,
+                        limit: 1024,
+                    })
+                ));
+                assert!(records.lock().unwrap().is_empty());
+            } else {
+                assert!(status.failure().is_none());
+                assert_eq!(
+                    *records.lock().unwrap(),
+                    vec![expected],
+                    "initial {initial:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn early_span_update_returns_before_initial_debug_and_formats_each_value_once() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    const TEST: &str = "liteinst_record::tests::early_span_update_returns_before_initial_debug_and_formats_each_value_once";
+    if std::env::var("HERMIT_RECORD_LOCK_CASE").as_deref() != Ok("initial-debug") {
+        bounded_record_callback_child(TEST, "initial-debug");
+        return;
+    }
+    struct Initial {
+        started: mpsc::Sender<()>,
+        done: Mutex<mpsc::Receiver<()>>,
+        calls: Arc<AtomicUsize>,
+    }
+    impl fmt::Debug for Initial {
+        fn fmt(&self, writer: &mut fmt::Formatter<'_>) -> fmt::Result {
+            assert_eq!(self.calls.fetch_add(1, Ordering::SeqCst), 0);
+            self.started.send(()).unwrap();
+            self.done
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+            writer.write_str("1")
+        }
+    }
+    let records = Records::default();
+    let status = RecordStatus::default();
+    let (id_tx, id_rx) = mpsc::channel();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let registry = tracing_subscriber::registry().with(ObserveInitializingSpan {
+        span: id_tx,
+        event: None,
+    });
+    let layer = super::layer_with_status(
+        baseline_limits(),
+        capture(&records),
+        (),
+        false,
+        status.clone(),
+    );
+    let dispatch = tracing::Dispatch::new(registry.with(layer));
+    struct Update(Arc<AtomicUsize>);
+    impl fmt::Debug for Update {
+        fn fmt(&self, writer: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            writer.write_str("2")
+        }
+    }
+    let update_calls = Arc::new(AtomicUsize::new(0));
+    let worker_calls = update_calls.clone();
+    let worker_dispatch = dispatch.clone();
+    let writer = std::thread::spawn(move || {
+        let (id, metadata) = id_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let field = metadata.fields().field("v").unwrap();
+        let value = tracing::field::debug(Update(worker_calls));
+        let values = [(&field, Some(&value as &dyn tracing::field::Value))];
+        worker_dispatch.record(&id, &Record::new(&metadata.fields().value_set(&values)));
+        done_tx.send(()).unwrap();
+    });
+    let calls = Arc::new(AtomicUsize::new(0));
+    tracing::dispatcher::with_default(&dispatch, || {
+        let span = tracing::info_span!(target: "host_record", "work", v = ?Initial {
+            started: started_tx, done: Mutex::new(done_rx), calls: calls.clone(),
+        });
+        writer.join().unwrap();
+        tracing::info!(target: "host_record", parent: &span, "initialized");
+    });
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(update_calls.load(Ordering::SeqCst), 1);
+    assert!(status.failure().is_none());
+    assert_eq!(
+        *records.lock().unwrap(),
+        vec![b" INFO work{v=1 v=2}: host_record: initialized\n".to_vec()]
+    );
+}
+
+#[test]
+fn event_waits_for_span_initialization_and_wakes_before_failure_notification() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    const TEST: &str = "liteinst_record::tests::event_waits_for_span_initialization_and_wakes_before_failure_notification";
+    let cases = [
+        "initial-event",
+        "initial-publication",
+        "initial-error",
+        "initial-panic",
+        "initial-overflow",
+        "initial-allocation",
+    ];
+    let Ok(case) = std::env::var("HERMIT_RECORD_LOCK_CASE") else {
+        for case in cases {
+            bounded_record_callback_child(TEST, case);
+        }
+        return;
+    };
+    if !cases.contains(&case.as_str()) {
+        return;
+    }
+    std::panic::set_hook(Box::new(|_| {}));
+    struct Initial {
+        started: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+        calls: Arc<AtomicUsize>,
+        case: String,
+    }
+    impl fmt::Debug for Initial {
+        fn fmt(&self, writer: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.send(()).unwrap();
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+            match self.case.as_str() {
+                "initial-error" => Err(fmt::Error),
+                "initial-panic" => panic!("initial field panic retained"),
+                _ => writer.write_str("1"),
+            }
+        }
+    }
+    let records = Records::default();
+    let status = RecordStatus::default();
+    let notifications = Arc::new(AtomicUsize::new(0));
+    let notified = notifications.clone();
+    let (id_tx, id_rx) = mpsc::channel();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (event_tx, event_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let done_rx = Arc::new(Mutex::new(done_rx));
+    let callback_done = done_rx.clone();
+    assert!(
+        status
+            .1
+            .set(Box::new(move || {
+                notified.fetch_add(1, Ordering::SeqCst);
+                callback_done
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap();
+            }))
+            .is_ok()
+    );
+    let registry = tracing_subscriber::registry().with(ObserveInitializingSpan {
+        span: id_tx,
+        event: Some(event_tx),
+    });
+    let layer = super::layer_with_status(
+        FormatterLimits::new(4096, if case == "initial-overflow" { 3 } else { 128 }).unwrap(),
+        capture(&records),
+        (),
+        false,
+        status.clone(),
+    );
+    let dispatch = tracing::Dispatch::new(registry.with(layer));
+    let initializer_dispatch = dispatch.clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let initial_calls = calls.clone();
+    let initial_case = case.clone();
+    let initializer = std::thread::spawn(move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tracing::dispatcher::with_default(&initializer_dispatch, || {
+                if initial_case == "initial-publication" {
+                    // Pause immediately before marking the cache as initializing,
+                    // while the real Registry extension guard still protects its
+                    // publication. The event must not observe an empty ready cache.
+                    BEFORE_SPAN_INITIALIZATION.with(|control| {
+                        *control.borrow_mut() = Some(Box::new(move || {
+                            started_tx.send(()).unwrap();
+                            release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                        }));
+                    });
+                    return tracing::info_span!(target: "host_record", "work", v = 1);
+                }
+                let allocation = (initial_case == "initial-allocation")
+                    .then(|| PayloadAllocations::new(Some(1)));
+                if allocation.is_some() {
+                    PAYLOAD_ALLOCATIONS.with(|control| {
+                        let started = started_tx.clone();
+                        control.borrow_mut().as_mut().unwrap().before = Some(Box::new(move || {
+                            started.send(()).unwrap();
+                            release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                        }));
+                    });
+                    tracing::info_span!(target: "host_record", "work", v = 1)
+                } else {
+                    tracing::info_span!(target: "host_record", "work", v = ?Initial {
+                        started: started_tx, release: Mutex::new(release_rx),
+                        calls: initial_calls, case: initial_case,
+                    })
+                }
+            })
+        }))
+    });
+    let (id, metadata) = id_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    if case == "initial-overflow" {
+        record_initializing_span(&dispatch, &id, metadata, Some(2));
+    }
+    let inspect_id = id.clone();
+    let event_dispatch = dispatch.clone();
+    let event = std::thread::spawn(move || {
+        tracing::dispatcher::with_default(&event_dispatch, || {
+            tracing::info!(target: "host_record", parent: &id, "during initialization");
+        });
+        done_tx.send(()).unwrap();
+    });
+    event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let before_initial = done_rx
+        .lock()
+        .unwrap()
+        .recv_timeout(Duration::from_millis(30));
+    let records_before_initial = records.lock().unwrap().clone();
+    release_tx.send(()).unwrap();
+    let created = initializer.join().unwrap();
+    event.join().unwrap();
+    assert!(matches!(
+        before_initial,
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+    assert!(records_before_initial.is_empty());
+    if matches!(case.as_str(), "initial-event" | "initial-publication") {
+        done_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        assert!(created.is_ok());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            usize::from(case == "initial-event")
+        );
+        assert!(status.failure().is_none());
+        assert_eq!(notifications.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            *records.lock().unwrap(),
+            vec![b" INFO work{v=1}: host_record: during initialization\n".to_vec()]
+        );
+    } else {
+        assert_eq!(notifications.load(Ordering::SeqCst), 1);
+        assert!(records.lock().unwrap().is_empty());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            usize::from(case != "initial-allocation")
+        );
+        let registry = dispatch
+            .downcast_ref::<tracing_subscriber::Registry>()
+            .unwrap();
+        let span = registry.span(&inspect_id).unwrap();
+        let extensions = span.extensions();
+        let caches = extensions.get::<SpanCaches>().unwrap();
+        let cache = caches.0[0].1.0.lock().unwrap();
+        assert!(cache.pending.is_none());
+        assert_eq!(cache.fields.fields, "");
+        assert_eq!(cache.fields.fields.capacity(), 0);
+        drop(cache);
+        drop(extensions);
+        match case.as_str() {
+            "initial-error" => assert!(matches!(
+                status.failure().as_deref(),
+                Some(RecordFailure::Formatting)
+            )),
+            "initial-panic" => {
+                let panic = created.expect_err("original panic propagated");
+                assert_eq!(
+                    panic.downcast_ref::<&str>(),
+                    Some(&"initial field panic retained")
+                );
+                assert!(matches!(
+                    status.failure().as_deref(),
+                    Some(RecordFailure::Unwinding)
+                ));
+            }
+            "initial-allocation" => assert!(matches!(
+                status.failure().as_deref(),
+                Some(RecordFailure::Allocation)
+            )),
+            "initial-overflow" => assert!(matches!(
+                status.failure().as_deref(),
+                Some(RecordFailure::Size {
+                    buffer: BufferKind::Span,
+                    limit: 3
+                })
+            )),
+            _ => unreachable!(),
+        }
+    }
+}
+
 #[test]
 fn span_field_logging_with_two_layers_returns_and_retains_reentry_failure() {
     const TEST: &str = "liteinst_record::tests::span_field_logging_with_two_layers_returns_and_retains_reentry_failure";
@@ -1407,7 +1866,7 @@ fn span_field_logging_with_two_layers_returns_and_retains_reentry_failure() {
                 caches
                     .0
                     .iter()
-                    .all(|(_, fields)| fields.fields == "value=1")
+                    .all(|(_, cache)| cache.0.lock().unwrap().fields.fields == "value=1")
             );
         })
         .unwrap();

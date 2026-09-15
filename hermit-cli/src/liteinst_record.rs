@@ -21,6 +21,7 @@ use std::fmt;
 use std::io;
 use std::io::Write;
 use std::sync::Arc;
+use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
@@ -142,6 +143,7 @@ impl std::error::Error for RecordFailure {
 pub struct RecordStatus(
     Arc<Mutex<Option<Arc<RecordFailure>>>>,
     Arc<OnceLock<Box<dyn Fn() + Send + Sync>>>,
+    Arc<Condvar>,
 );
 
 impl RecordStatus {
@@ -157,6 +159,9 @@ impl RecordStatus {
         if stored.is_none() {
             *stored = Some(Arc::new(failure));
             drop(stored);
+            // Wake initialization waiters before a user failure callback can
+            // wait for their completion. The retained failure is already set.
+            self.2.notify_all();
             if let Some(notify) = self.1.get() {
                 notify();
             }
@@ -164,6 +169,13 @@ impl RecordStatus {
             drop(stored);
             drop(failure);
         }
+    }
+
+    fn wake_waiters(&self) {
+        // Pair with snapshot's predicate check and Condvar wait under this
+        // mutex, so a completed initialization cannot race a waiter to sleep.
+        let _stored = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        self.2.notify_all();
     }
 
     fn formatting(&self, action: impl FnOnce() -> fmt::Result) -> fmt::Result {
@@ -324,29 +336,100 @@ struct CheckedFields;
 // The Arc stays in the cache as well as the layer: replacing a layer while a
 // span lives cannot reuse an old allocation identity and inherit stale fields.
 #[derive(Default)]
-struct SpanCaches(Vec<(Arc<()>, Arc<FormattedFields<CheckedFields>>)>);
+struct SpanCaches(Vec<(Arc<()>, Arc<SpanCache>)>);
 
 impl SpanCaches {
-    fn get(&self, identity: &Arc<()>) -> Option<&Arc<FormattedFields<CheckedFields>>> {
+    fn get(&self, identity: &Arc<()>) -> Option<&Arc<SpanCache>> {
         self.0
             .iter()
             .find(|(owner, _)| Arc::ptr_eq(owner, identity))
             .map(|(_, fields)| fields)
     }
 
-    fn get_or_insert(&mut self, identity: &Arc<()>) -> &mut Arc<FormattedFields<CheckedFields>> {
-        if let Some(index) = self
-            .0
-            .iter()
-            .position(|(owner, _)| Arc::ptr_eq(owner, identity))
-        {
-            return &mut self.0[index].1;
+    fn get_or_insert(&mut self, identity: &Arc<()>) -> Arc<SpanCache> {
+        if let Some(cache) = self.get(identity) {
+            return cache.clone();
         }
-        self.0.push((
-            identity.clone(),
-            Arc::new(FormattedFields::<CheckedFields>::new(String::new())),
-        ));
-        &mut self.0.last_mut().unwrap().1
+        let cache = Arc::new(SpanCache::default());
+        self.0.push((identity.clone(), cache.clone()));
+        cache
+    }
+}
+
+#[derive(Default)]
+struct PendingUpdates {
+    fields: Arc<FormattedFields<CheckedFields>>,
+    // Empty updates add spaces only if initial fields will be nonempty.
+    // Saturating at limit + 1 is enough to detect every eventual overflow.
+    leading_empty: usize,
+}
+
+#[derive(Default)]
+struct CacheState {
+    fields: Arc<FormattedFields<CheckedFields>>,
+    pending: Option<PendingUpdates>,
+}
+
+#[derive(Default)]
+struct SpanCache(Mutex<CacheState>);
+
+impl SpanCache {
+    fn snapshot(
+        &self,
+        status: &RecordStatus,
+    ) -> Result<Arc<FormattedFields<CheckedFields>>, fmt::Error> {
+        let mut failure = status.0.lock().unwrap_or_else(|error| error.into_inner());
+        loop {
+            if failure.is_some() {
+                return Err(fmt::Error);
+            }
+            {
+                let state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+                if state.pending.is_none() {
+                    return Ok(state.fields.clone());
+                }
+            }
+            // No Registry or cache lock crosses this wait. Same-thread
+            // formatter reentry has already failed in with_active; another
+            // thread must see complete initial fields before its event emits.
+            failure = status
+                .2
+                .wait(failure)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+
+    fn initialize(self: &Arc<Self>, status: &RecordStatus) -> Initializing {
+        #[cfg(test)]
+        tests::before_span_initialization();
+        let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        assert!(
+            state.pending.is_none(),
+            "span initialized twice concurrently"
+        );
+        state.pending = Some(PendingUpdates::default());
+        Initializing {
+            cache: self.clone(),
+            status: status.clone(),
+        }
+    }
+}
+
+struct Initializing {
+    cache: Arc<SpanCache>,
+    status: RecordStatus,
+}
+
+impl Drop for Initializing {
+    fn drop(&mut self) {
+        // Also runs when allocation, formatting, or the final merge fails or
+        // panics. Keep the last readable fields and discard unfinished updates.
+        self.cache
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pending = None;
+        self.status.wake_waiters();
     }
 }
 
@@ -408,6 +491,60 @@ impl<Timer, Sink> RecordLayer<Timer, Sink> {
         *current = Arc::new(FormattedFields::new(buffer.into_string()));
         Ok(())
     }
+
+    fn commit_update(
+        &self,
+        cache: &SpanCache,
+        buffer: BoundedBuffer<'_>,
+    ) -> Result<(), RecordFailure> {
+        let mut state = cache.0.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(pending) = &mut state.pending {
+            let empty = pending.fields.is_empty() && buffer.bytes.is_empty();
+            self.commit_span(&mut pending.fields, buffer, true)?;
+            if empty {
+                pending.leading_empty = (pending.leading_empty + 1).min(self.limits.span_bytes + 1);
+            }
+            Ok(())
+        } else {
+            self.commit_span(&mut state.fields, buffer, true)
+        }
+    }
+
+    fn commit_initial(
+        &self,
+        cache: &SpanCache,
+        mut buffer: BoundedBuffer<'_>,
+    ) -> Result<(), RecordFailure> {
+        let mut state = cache.0.lock().unwrap_or_else(|error| error.into_inner());
+        let pending = state.pending.as_ref().expect("initialization is active");
+        let spaces = if buffer.bytes.is_empty() {
+            0
+        } else {
+            pending.leading_empty + usize::from(!pending.fields.is_empty())
+        };
+        let combined = buffer
+            .bytes
+            .len()
+            .checked_add(spaces)
+            .and_then(|length| length.checked_add(pending.fields.fields.len()))
+            .filter(|length| *length <= buffer.limit);
+        let Some(combined) = combined else {
+            return Err(RecordFailure::Size {
+                buffer: BufferKind::Span,
+                limit: buffer.limit,
+            });
+        };
+        // Initial fields precede every update, even when the update finished
+        // first. Both payloads were reserved fallibly before user formatting.
+        buffer.bytes.resize(buffer.bytes.len() + spaces, b' ');
+        buffer
+            .bytes
+            .extend_from_slice(pending.fields.fields.as_bytes());
+        debug_assert_eq!(buffer.bytes.len(), combined);
+        state.fields = Arc::new(FormattedFields::new(buffer.into_string()));
+        state.pending = None;
+        Ok(())
+    }
 }
 
 impl<Registry, Timer, Sink> Layer<Registry> for RecordLayer<Timer, Sink>
@@ -418,27 +555,24 @@ where
 {
     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, context: Context<'_, Registry>) {
         let span = context.span(id).expect("new span is registered");
-        {
+        let (cache, initializing) = {
             let mut extensions = span.extensions_mut();
             if extensions.get_mut::<SpanCaches>().is_none() {
                 extensions.insert(SpanCaches::default());
             }
-            extensions
+            let cache = extensions
                 .get_mut::<SpanCaches>()
                 .unwrap()
                 .get_or_insert(&self.identity);
-        }
+            // Publish the initializing state with the cache. Otherwise another
+            // thread can observe an empty ready cache before formatting starts.
+            let initializing = cache.initialize(&self.status);
+            (cache, initializing)
+        };
         let _ = with_active(&self.status, || {
+            let _initializing = initializing;
             let buffer = self.format_span(attrs)?;
-            let committed = {
-                let mut extensions = span.extensions_mut();
-                let current = extensions
-                    .get_mut::<SpanCaches>()
-                    .unwrap()
-                    .get_or_insert(&self.identity);
-                self.commit_span(current, buffer, false)
-            };
-            committed.map_err(|failure| {
+            self.commit_initial(&cache, buffer).map_err(|failure| {
                 self.status.fail(failure);
                 fmt::Error
             })
@@ -448,7 +582,7 @@ where
     fn on_record(&self, id: &Id, fields: &Record<'_>, context: Context<'_, Registry>) {
         let _ = with_active(&self.status, || {
             let span = context.span(id).expect("recorded span is registered");
-            {
+            let cache = {
                 let mut extensions = span.extensions_mut();
                 if extensions.get_mut::<SpanCaches>().is_none() {
                     extensions.insert(SpanCaches::default());
@@ -456,20 +590,10 @@ where
                 extensions
                     .get_mut::<SpanCaches>()
                     .unwrap()
-                    .get_or_insert(&self.identity);
-            }
-            let buffer = self.format_span(fields)?;
-            let committed = {
-                let mut extensions = span.extensions_mut();
-                let current = extensions
-                    .get_mut::<SpanCaches>()
-                    .unwrap()
-                    .get_or_insert(&self.identity);
-                // Concurrent updates append to the cache present at commit,
-                // never to a snapshot taken before user formatting.
-                self.commit_span(current, buffer, true)
+                    .get_or_insert(&self.identity)
             };
-            committed.map_err(|failure| {
+            let buffer = self.format_span(fields)?;
+            self.commit_update(&cache, buffer).map_err(|failure| {
                 self.status.fail(failure);
                 fmt::Error
             })
@@ -504,10 +628,11 @@ where
                         // Keep a complete immutable cache version while writing;
                         // even a size-failure notification runs without Registry
                         // extension locks held.
-                        if let Some(fields) = fields
-                            && !fields.is_empty()
-                        {
-                            write!(writer, "{{{fields}}}")?;
+                        if let Some(cache) = fields {
+                            let fields = cache.snapshot(&self.status)?;
+                            if !fields.is_empty() {
+                                write!(writer, "{{{fields}}}")?;
+                            }
                         }
                         writer.write_char(':')?;
                         seen = true;
