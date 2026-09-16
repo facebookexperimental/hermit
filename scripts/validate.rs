@@ -1968,6 +1968,7 @@ fn self_test() -> Result<(), String> {
             executed_tests: None,
             filtered_tests: None,
             test_results: None,
+            test_results_error: None,
             returncode: Some(if ok { 0 } else { 1 }),
             oomed: false,
             oom_kills: 0,
@@ -9774,6 +9775,7 @@ fn summary_listing_bracket() -> Result<String, String> {
         executed_tests: None,
         filtered_tests: None,
         test_results: None,
+        test_results_error: None,
         returncode: Some(if ok { 0 } else { 1 }),
         oomed: false,
         oom_kills: 0,
@@ -11259,6 +11261,8 @@ struct NodeAttempt {
     /// Terminal per-test results written by a controlled runner for this exact attempt.
     /// `None` means no typed result file was published; an empty vector is measured zero.
     test_results: Option<Vec<dagrun::TestResult>>,
+    /// Required-result refusal retained independently of the outer failure reason.
+    test_results_error: Option<String>,
 }
 
 fn attempt_is_no_result(attempt: &NodeAttempt) -> bool {
@@ -11348,9 +11352,10 @@ fn reported_attempt(outcome: &StepOutcome, attempt: usize) -> NodeAttempt {
         detail_observed: false,
         failure_detail: (failure_class == Some(FailureClass::NoResult)
             && !outcome.reason.is_empty())
-            .then(|| outcome.reason.clone()),
+        .then(|| outcome.reason.clone()),
         failure_class,
         test_results: outcome.test_results.clone(),
+        test_results_error: outcome.test_results_error.clone(),
     }
 }
 
@@ -11380,6 +11385,7 @@ fn unreported_attempt(tag: String, attempt: usize) -> NodeAttempt {
         failure_class: Some(FailureClass::NoResult),
         failure_detail: Some("no completion payload was reported for this node".into()),
         test_results: None,
+        test_results_error: None,
     }
 }
 
@@ -15968,6 +15974,7 @@ fn test_node_coverage_bracket() -> Result<(), String> {
         executed_tests,
         filtered_tests: Some(0),
         test_results: None,
+        test_results_error: None,
         returncode: Some(if ok { 0 } else { 100 }),
         oomed: false,
         oom_kills: 0,
@@ -16021,6 +16028,7 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
         executed_tests,
         filtered_tests,
         test_results: None,
+        test_results_error: None,
         returncode: Some(if ok { 0 } else { 100 }),
         oomed: false,
         oom_kills: 0,
@@ -16209,6 +16217,9 @@ fn ledger_gate(outcome: &StepOutcome) -> serde_json::Value {
         "aborted": outcome.aborted,
         "real_seconds": outcome.duration_s,
     });
+    if let Some(error) = &outcome.test_results_error {
+        gate["test_results_error"] = serde_json::json!(error);
+    }
     if let Some(failure_class) = outcome_failure_class(outcome) {
         gate["failure_class"] = serde_json::json!(failure_class);
         if failure_class == FailureClass::NoResult && !outcome.reason.is_empty() {
@@ -16267,6 +16278,9 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
                 "environmental_verdict": environmental_verdict,
                 "environmental_refuted_shape": environmental_refuted_shape,
             });
+            if let Some(error) = &a.test_results_error {
+                attempt["test_results_error"] = serde_json::json!(error);
+            }
             if let Some(failure_class) = a.failure_class {
                 attempt["failure_class"] = serde_json::json!(failure_class);
             }
@@ -16294,6 +16308,13 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
         gate["timed_out"] = serde_json::json!(attempt.timed_out);
         gate["cpu_timed_out"] = serde_json::json!(attempt.cpu_timed_out);
         gate["reason"] = serde_json::json!(attempt.reason);
+        if let Some(error) = &attempt.test_results_error {
+            gate["test_results_error"] = serde_json::json!(error);
+        } else {
+            gate.as_object_mut()
+                .expect("ledger gate must remain a JSON object")
+                .remove("test_results_error");
+        }
         gate["aborted"] = serde_json::json!(attempt.aborted);
         gate["real_seconds"] = serde_json::json!(attempt.reported.then_some(attempt.duration_s));
         if let Some(failure_class) = attempt.failure_class {
@@ -16362,8 +16383,10 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
 fn typed_gate_round_trip_bracket() -> Result<Vec<serde_json::Value>, String> {
     let fields = ["oomed", "oom_kills", "timed_out", "cpu_timed_out"];
     let mut fixtures = Vec::new();
-    for bits in 0_u8..8 {
-        let outcome = StepOutcome::failed(
+    // Keep the original eight combinations without diagnostics, then repeat
+    // them with an independent required-result refusal.
+    for bits in 0_u8..16 {
+        let mut outcome = StepOutcome::failed(
             "test.typed-termination".into(),
             1.0,
             String::new(),
@@ -16381,7 +16404,20 @@ fn typed_gate_round_trip_bracket() -> Result<Vec<serde_json::Value>, String> {
             None,
             None,
         );
+        if bits & 8 != 0 {
+            outcome.test_results_error = Some(format!("typed results refused in fixture {bits}"));
+        }
+        let expected_error = outcome
+            .test_results_error
+            .as_ref()
+            .map(|error| serde_json::json!(error));
         let first = reported_attempt(&outcome, 1);
+        if first.test_results_error != outcome.test_results_error || first.reason != outcome.reason
+        {
+            return Err(format!(
+                "typed gate {bits}: attempt conflated primary and result refusal"
+            ));
+        }
         let expected = serde_json::json!({
             "oomed": bits & 1 != 0,
             "oom_kills": if bits & 1 != 0 { 2 } else { 0 },
@@ -16397,13 +16433,22 @@ fn typed_gate_round_trip_bracket() -> Result<Vec<serde_json::Value>, String> {
                 }
             }
         }
+        for row in [&fallback, &reported, &reported["attempts"][0]] {
+            if row.get("test_results_error") != expected_error.as_ref()
+                || row["reason"] != serde_json::json!(outcome.reason)
+            {
+                return Err(format!(
+                    "typed gate {bits}: separate result refusal was lost: {row}"
+                ));
+            }
+        }
         let pass =
             StepOutcome::passed(outcome.tag.clone(), 1.0, String::new(), Some(0), None, None);
         let passed =
             ledger_gate_with_attempts(&outcome, &[first.clone(), reported_attempt(&pass, 2)]);
         let unknown = ledger_gate_with_attempts(
             &outcome,
-            &[first, unreported_attempt(outcome.tag.clone(), 2)],
+            &[first.clone(), unreported_attempt(outcome.tag.clone(), 2)],
         );
         for field in fields {
             let passed_value = if field == "oom_kills" {
@@ -16422,6 +16467,16 @@ fn typed_gate_round_trip_bracket() -> Result<Vec<serde_json::Value>, String> {
                 ));
             }
         }
+        for row in [&passed, &unknown] {
+            if row.get("test_results_error").is_some()
+                || row["attempts"][1].get("test_results_error").is_some()
+                || row["attempts"][0].get("test_results_error") != expected_error.as_ref()
+            {
+                return Err(format!(
+                    "typed gate {bits}: absent latest diagnostic inherited stale data: {row}"
+                ));
+            }
+        }
         if passed["result"] != "pass"
             || passed.get("failure_class").is_some()
             || unknown.get("raw_result") != Some(&serde_json::Value::Null)
@@ -16434,7 +16489,34 @@ fn typed_gate_round_trip_bracket() -> Result<Vec<serde_json::Value>, String> {
                 "typed gate {bits}: latest verdict did not follow its attempt"
             ));
         }
-        for row in [fallback, reported, passed, unknown] {
+        let mut retry = outcome.clone();
+        retry.reason = format!("independent outer retry reason {bits}");
+        retry.test_results_error = Some(format!("distinct result refusal on retry {bits}"));
+        let mut foreign = retry.clone();
+        foreign.tag = "test.unrelated-diagnostic".into();
+        foreign.test_results_error =
+            Some("unrelated result refusal must not escape its node".into());
+        let retained = ledger_gate_with_attempts(
+            &outcome,
+            &[
+                first,
+                reported_attempt(&retry, 2),
+                reported_attempt(&foreign, 99),
+            ],
+        );
+        let retry_error = serde_json::json!(retry.test_results_error);
+        if retained["attempts"].as_array().map(Vec::len) != Some(2)
+            || retained["attempts"][0].get("test_results_error") != expected_error.as_ref()
+            || retained["attempts"][1].get("test_results_error") != Some(&retry_error)
+            || retained.get("test_results_error") != Some(&retry_error)
+            || retained["reason"] != serde_json::json!(retry.reason)
+            || retained["attempts"][0]["reason"] != serde_json::json!(outcome.reason)
+        {
+            return Err(format!(
+                "typed gate {bits}: result refusals crossed node or attempt identity: {retained}"
+            ));
+        }
+        for row in [fallback, reported, passed, unknown, retained] {
             // The parent imports this exact shared type. Additive fields remain
             // in its extra map, including explicit null and the full attempt list.
             let parsed: hermit_manifest_plan::ledger::GateHistoryRow =
@@ -16442,7 +16524,7 @@ fn typed_gate_round_trip_bracket() -> Result<Vec<serde_json::Value>, String> {
                     .map_err(|error| format!("typed gate reader refused emitted row: {error}"))?;
             let restored = serde_json::to_value(parsed)
                 .map_err(|error| format!("typed gate reader could not serialize row: {error}"))?;
-            for field in fields.into_iter().chain(["attempts"]) {
+            for field in fields.into_iter().chain(["attempts", "test_results_error"]) {
                 if row.get(field) != restored.get(field) {
                     return Err(format!(
                         "typed gate shared reader lost {field}: before={row} after={restored}"
@@ -16464,6 +16546,7 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
         executed_tests: Some(1),
         filtered_tests: Some(0),
         test_results: None,
+        test_results_error: None,
         returncode: Some(1),
         oomed: false,
         oom_kills: 0,
@@ -17407,6 +17490,7 @@ fn possible_missing_artifact_bracket() -> Result<(), String> {
         executed_tests: None,
         filtered_tests: None,
         test_results: None,
+        test_results_error: None,
         returncode,
         oomed: false,
         oom_kills: 0,
@@ -17446,6 +17530,7 @@ fn no_result_propagation_bracket() -> Result<(), String> {
         executed_tests: None,
         filtered_tests: None,
         test_results: None,
+        test_results_error: None,
         returncode: Some(returncode),
         oomed: false,
         oom_kills: 0,
@@ -18407,8 +18492,17 @@ fn nextest_test_observations(
             continue;
         }
         let Some(results) = &attempt.test_results else {
+            let detail = attempt
+                .test_results_error
+                .as_deref()
+                .map(|error| {
+                    format!("the controlled runner refused typed test-result rows: {error}")
+                })
+                .unwrap_or_else(|| {
+                    "the controlled runner published no typed test-result rows".into()
+                });
             errors.push(format!(
-                "individual nextest results are UNKNOWN for node {} attempt {}: the controlled runner published no typed test-result rows",
+                "individual nextest results are UNKNOWN for node {} attempt {}: {detail}",
                 attempt.tag, attempt.attempt
             ));
             continue;
@@ -18418,6 +18512,8 @@ fn nextest_test_observations(
                 id,
                 passed,
                 attempts: inner_attempts,
+                // This terminal summary does not consume schema-3 attempt causes.
+                attempt_results: _,
             } = result;
             let Ok(inner_attempts) = usize::try_from(*inner_attempts) else {
                 errors.push(format!(
@@ -21429,6 +21525,7 @@ fn stop_test_seam(
         executed_tests: None,
         filtered_tests: None,
         test_results: None,
+        test_results_error: None,
         returncode: Some(if ok { 0 } else { 1 }),
         oomed: false,
         oom_kills: 0,
@@ -22375,6 +22472,144 @@ mod typed_termination_tests {
     #[test]
     fn gate_and_attempt_termination_fields_preserve_latest_unknown() {
         ledger_gate_origin_bracket().unwrap();
+    }
+
+    #[test]
+    fn missing_nextest_results_keep_refusal_and_absence_distinct() {
+        let tag = "test.nextest-diagnostic".to_string();
+        let nodes = BTreeSet::from([tag.clone()]);
+        let mut outcome = StepOutcome::passed(tag.clone(), 1.0, String::new(), Some(0), None, None);
+        outcome.ok = false;
+        outcome.test_results_error = Some("required report contained a duplicate test ID".into());
+        let refused = reported_attempt(&outcome, 1);
+        let (observations, errors) =
+            nextest_test_observations(std::slice::from_ref(&refused), &nodes);
+        assert!(observations.is_empty());
+        assert_eq!(
+            errors,
+            vec![format!(
+                "individual nextest results are UNKNOWN for node {tag} attempt 1: the controlled runner refused typed test-result rows: required report contained a duplicate test ID"
+            )]
+        );
+
+        outcome.test_results_error = None;
+        let missing = reported_attempt(&outcome, 2);
+        let (observations, errors) =
+            nextest_test_observations(std::slice::from_ref(&missing), &nodes);
+        assert!(observations.is_empty());
+        assert_eq!(
+            errors,
+            vec![format!(
+                "individual nextest results are UNKNOWN for node {tag} attempt 2: the controlled runner published no typed test-result rows"
+            )]
+        );
+
+        outcome.ok = true;
+        outcome.test_results = Some(Vec::new());
+        let empty = reported_attempt(&outcome, 3);
+        let (observations, errors) =
+            nextest_test_observations(std::slice::from_ref(&empty), &nodes);
+        assert!(observations.is_empty());
+        assert!(errors.is_empty());
+        outcome.test_results = Some(vec![
+            dagrun::TestResult::new("hermit::fixture$inner_retry".into(), true, 2).unwrap(),
+        ]);
+        let measured = reported_attempt(&outcome, 4);
+        let (observations, errors) =
+            nextest_test_observations(std::slice::from_ref(&measured), &nodes);
+        assert!(errors.is_empty());
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].node, tag);
+        assert_eq!(observations[0].attempt, 4);
+        assert_eq!(observations[0].id, "hermit::fixture$inner_retry");
+        assert!(observations[0].passed);
+        assert_eq!(observations[0].inner_attempts, 2);
+
+        let mut foreign = refused;
+        foreign.tag = "test.unrelated-nextest".into();
+        let (observations, errors) =
+            nextest_test_observations(&[unreported_attempt(tag, 5), foreign], &nodes);
+        assert!(observations.is_empty());
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn classified_nextest_results_preserve_terminal_projection_and_outer_failure() {
+        use dagrun::TestAttemptOutcome;
+        use dagrun::TestAttemptResult;
+        use dagrun::TestResult;
+        use dagrun::TestResults;
+
+        let tag = "test.nextest-classified".to_string();
+        let nodes = BTreeSet::from([tag.clone()]);
+        let mut rows = Vec::new();
+        let mut expected = Vec::new();
+        for cause in [
+            TestAttemptOutcome::Passed,
+            TestAttemptOutcome::Failed,
+            TestAttemptOutcome::CpuTimeout,
+            TestAttemptOutcome::WallTimeout,
+            TestAttemptOutcome::Cancelled,
+            TestAttemptOutcome::InfrastructureError,
+            TestAttemptOutcome::NoResult,
+        ] {
+            let passed = cause == TestAttemptOutcome::Passed;
+            let detail = (!passed).then(|| format!("controlled {} fixture", cause.value()));
+            let first = TestAttemptResult::new(1, cause, detail).unwrap();
+            let id = format!("hermit::fixture${}", cause.value());
+            rows.push(
+                TestResult::with_attempt_results(id.clone(), passed, vec![first.clone()]).unwrap(),
+            );
+            expected.push((id, passed, 1));
+            if !passed {
+                let id = format!("hermit::fixture${}_then_passed", cause.value());
+                rows.push(
+                    TestResult::with_attempt_results(
+                        id.clone(),
+                        true,
+                        vec![
+                            first,
+                            TestAttemptResult::new(2, TestAttemptOutcome::Passed, None).unwrap(),
+                        ],
+                    )
+                    .unwrap(),
+                );
+                expected.push((id, true, 2));
+            }
+        }
+        assert_eq!(rows.len(), 13);
+        let report = TestResults::classified(13, 0, rows.clone()).unwrap();
+        let wire = report.to_classified_json().unwrap();
+        let decoded =
+            TestResults::from_declared_schema_json_slice(&wire, dagrun::CLASSIFIED_RESULTS_SCHEMA)
+                .unwrap();
+        assert_eq!(decoded.results.as_ref(), Some(&rows));
+
+        // A valid passing test row cannot erase the independent outer OOM.
+        // The terminal projection intentionally has no field for native attempt causes.
+        let mut outcome = StepOutcome::passed(tag.clone(), 1.0, String::new(), Some(0), None, None);
+        outcome.ok = false;
+        outcome.reason = "oom-killed".into();
+        outcome.oomed = true;
+        outcome.oom_kills = 1;
+        outcome.test_results = decoded.results;
+        let attempt = reported_attempt(&outcome, 4);
+        assert_eq!(attempt.test_results.as_ref(), Some(&rows));
+        assert_eq!(attempt.ok, Some(false));
+        assert_eq!(attempt.oomed, Some(true));
+        assert_eq!(attempt.oom_kills, Some(1));
+        assert_eq!(attempt.reason, "oom-killed");
+        let (observations, errors) =
+            nextest_test_observations(std::slice::from_ref(&attempt), &nodes);
+        assert!(errors.is_empty());
+        assert_eq!(observations.len(), 13);
+        for (observation, (id, passed, inner_attempts)) in observations.iter().zip(expected) {
+            assert_eq!(observation.node, tag);
+            assert_eq!(observation.attempt, 4);
+            assert_eq!(observation.id, id);
+            assert_eq!(observation.passed, passed);
+            assert_eq!(observation.inner_attempts, inner_attempts);
+        }
     }
 
     #[test]

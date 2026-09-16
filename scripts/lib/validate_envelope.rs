@@ -365,6 +365,7 @@ pub fn self_test() -> Result<String, String> {
         executed_tests: None,
         filtered_tests: None,
         test_results: None,
+        test_results_error: None,
         returncode: Some(0),
         oomed: false,
         oom_kills: 0,
