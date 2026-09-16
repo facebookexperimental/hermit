@@ -79,6 +79,13 @@ done
 source=$1
 shift
 
+execute_script() {
+    if [[ $mode == test ]]; then
+        exec "$ROOT_DIR/ci/rust-script-bin/run-test-harness" "$source" -- "$@"
+    fi
+    exec "$@"
+}
+
 [[ -f $MANIFEST ]] || die "missing producer output $MANIFEST; require build.rust_scripts before this node"
 source_abs=$(realpath -- "$source") || die "cannot resolve script path $source"
 case $source_abs in
@@ -102,7 +109,7 @@ case $source_abs in
             # A separate fixture checkout below target owns its own scripts.
             # Failed ownership lookup must never authorize a compiler fallback.
             real_rust_script=$(find_real_rust_script)
-            exec "$real_rust_script" "${original_args[@]}"
+            execute_script "$real_rust_script" "${original_args[@]}"
         fi
         source_rel=${source_abs#"$ROOT_DIR"/}
         ;;
@@ -111,7 +118,7 @@ case $source_abs in
         # by its external operational tooling. This repository cannot prepare
         # those sources, so leave that separate checkout to its own runner.
         real_rust_script=$(find_real_rust_script)
-        exec "$real_rust_script" "${original_args[@]}"
+        execute_script "$real_rust_script" "${original_args[@]}"
         ;;
 esac
 
@@ -139,4 +146,4 @@ case $binary_abs in
     *) die "prepared $mode binary escapes producer output: $binary_abs" ;;
 esac
 
-exec "$binary_abs" "$@"
+execute_script "$binary_abs" "$@"

@@ -32,7 +32,10 @@ for f in $(git ls-files '*.rs' ':!:third-party/**' ':!:scripts/lib/**'); do
 
     total=$((total + 1))
     printf 'run-script-tests: %s\n' "$f"
-    if ! rust-script --test "$f"; then
+    # Also cover ordinary rust-script outside the prepared validation graph.
+    # The prepared dispatcher adds a nested scope of its own; both directories
+    # are retained, and each loop iteration starts with the original outer root.
+    if ! ./ci/rust-script-bin/run-test-harness "$f" -- rust-script --test "$f"; then
         echo "run-script-tests: FAILED ${f}" >&2
         failed=$((failed + 1))
     fi

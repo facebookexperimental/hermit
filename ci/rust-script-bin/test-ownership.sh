@@ -9,6 +9,7 @@ root="$scratch/outer checkout"
 published="$scratch/prepared"
 mkdir -p "$root/ci/rust-script-bin" "$root/scripts" "$published" "$scratch/external" "$scratch/git-control"
 cp "$SOURCE_DIR/rust-script" "$root/ci/rust-script-bin/rust-script"
+cp "$SOURCE_DIR/run-test-harness" "$root/ci/rust-script-bin/run-test-harness"
 wrapper="$root/ci/rust-script-bin/rust-script"
 git -C "$root" init -q
 listed="$root/scripts/listed source.rs"
@@ -32,6 +33,7 @@ export HERMIT_REAL_RUST_SCRIPT="$real_runner"
 export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$published"
 export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1
 export HERMIT_TEST_RUST_SCRIPT_CALLS="$scratch/delegated"
+export DAGRUN_LOG_DIR="$scratch/runner-logs"
 case_label='external and prepared sources'
 
 invoke() {
@@ -70,6 +72,13 @@ invoke --force "$listed" 'two words' ''
 expect_output prepared 'two words' ''
 [[ ! -s "$HERMIT_TEST_RUST_SCRIPT_CALLS" ]]
 invoke --test "$listed" --exact 'test name'
+# A harness now reports its retained private log directory. Keep the original
+# exact stdout/argv and empty remaining-stderr controls after checking that line.
+test_logs=$(sed -n 's/^rust-script test runner logs: //p' "$scratch/stderr")
+[[ -d $test_logs && $test_logs == "$DAGRUN_LOG_DIR"/script-test.* ]]
+printf 'rust-script test runner logs: %s\n' "$test_logs" > "$scratch/expected-stderr"
+cmp "$scratch/expected-stderr" "$scratch/stderr"
+: > "$scratch/stderr"
 expect_output prepared-test --exact 'test name'
 [[ ! -s "$HERMIT_TEST_RUST_SCRIPT_CALLS" ]]
 ln -s "$listed" "$root/scripts/listed-link.rs"

@@ -130,3 +130,4 @@ grep -q 'producer manifest has no unique entry' "$tmp/unlisted.err" || {
 echo "check-script-sigpipe.sh: OK — external tooling delegates; unlisted repository scripts refuse"
 
 ./ci/rust-script-bin/test-ownership.sh
+./ci/rust-script-bin/test-log-isolation.sh
