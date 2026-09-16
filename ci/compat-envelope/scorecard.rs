@@ -1081,6 +1081,14 @@ fn default_attempt() -> u64 {
 }
 
 impl ResultRow {
+    fn has_parity_evidence(&self) -> bool {
+        self.backend_parity.is_some()
+            || self.error_kind.as_deref() == Some("incomplete-parity-evidence")
+            || self.attempts.iter().any(|attempt| {
+                attempt.get("index").and_then(JsonValue::as_str) == Some("parity-reference")
+            })
+    }
+
     /// Normal validation publishes `required` rows. A deliberately selected
     /// disabled cell is admissible only when the row proves that it came from
     /// the parity path, either with its report or the parity-specific no-result
@@ -5382,7 +5390,7 @@ fn import_results(
         .map_err(|e| format!("cannot write {CELLS}: {e}"))?;
 
     println!(
-        "compatibility scorecard: found {} eligible cell(s) with {} terminal canonical or backend-parity comparison(s) in {} retained results.jsonl file(s) containing {} row(s); imported {} retained row(s) and {} current pressure row(s); no guest was executed",
+        "compatibility scorecard: found {} eligible cell(s) with {} ordinary terminal or backend-parity attempt comparison(s) in {} retained results.jsonl file(s) containing {} row(s); imported {} retained row(s) and {} current pressure row(s); no guest was executed",
         retained_cell_count,
         terminal_comparisons,
         files_scanned,
@@ -8265,9 +8273,9 @@ struct RetainedImport {
 /// Read retained validate rows without pretending they belong to the current
 /// checkout. Each row keeps its own Hermit SHA, and only clean canonical
 /// comparisons on HEAD's history are eligible. For each enabled cell or
-/// disabled ptrace-referenced parity candidate, import every terminal
-/// comparison at the newest eligible SHA independently for ordinary and parity
-/// evidence, so disagreement at one revision remains visible instead of being
+/// disabled ptrace-referenced parity candidate, import ordinary terminal
+/// comparisons and complete measured parity attempt histories at the newest
+/// eligible SHA independently for each comparison relation, so disagreement at one revision remains visible instead of being
 /// resolved by file ordering or by a different comparison meaning.
 fn read_retained_results(
     root: &Path,
@@ -8361,6 +8369,61 @@ fn read_retained_results(
     let mut by_cell_and_rank: BTreeMap<(CellId, bool), BTreeMap<usize, Vec<ResultCandidate>>> =
         BTreeMap::new();
     for ((id, sha, _run_id), candidates) in grouped {
+        // A later match or missing reference cannot erase an earlier measured
+        // parity failure from the same run. Validate the complete sequence
+        // before choosing a latest source; ordinary-only runs retain their
+        // historical terminal-row projection below.
+        if candidates
+            .iter()
+            .any(|candidate| candidate.row.has_parity_evidence())
+        {
+            let mut attempts = BTreeMap::<u64, ResultCandidate>::new();
+            for candidate in candidates {
+                if let Some(previous) = attempts.get(&candidate.row.attempt) {
+                    if previous.evidence_identity != candidate.evidence_identity
+                        || previous.row.result != candidate.row.result
+                        || previous.row.failure_class != candidate.row.failure_class
+                        || previous.row.error_kind != candidate.row.error_kind
+                    {
+                        return Err(format!(
+                            "ambiguous retained parity evidence for {} at {sha}, outer attempt {}",
+                            display_id(&id),
+                            candidate.row.attempt
+                        ));
+                    }
+                } else {
+                    attempts.insert(candidate.row.attempt, candidate);
+                }
+            }
+            hermit_manifest_plan::runner::outcome_after_retries(
+                attempts
+                    .iter()
+                    .map(|(number, candidate)| (*number, candidate.row.outcome.as_str())),
+            )?;
+            let mut measured_parity = false;
+            for candidate in attempts.values() {
+                let evidence = candidate
+                    .row
+                    .comparison_evidence_from(ResultInput::Retained)?;
+                measured_parity |= matches!(
+                    evidence,
+                    ValidateRowEvidence::ParityMatched { .. }
+                        | ValidateRowEvidence::ParityDiverged { .. }
+                );
+            }
+            if measured_parity {
+                let rank = *history
+                    .get(&sha)
+                    .expect("history membership checked before grouping");
+                by_cell_and_rank
+                    .entry((id, true))
+                    .or_default()
+                    .entry(rank)
+                    .or_default()
+                    .extend(attempts.into_values());
+            }
+            continue;
+        }
         let terminal_attempt = candidates
             .iter()
             .map(|candidate| candidate.row.attempt)
@@ -8489,7 +8552,19 @@ fn read_retained_results(
                 value
             }
         };
-        terminal_comparisons += candidates.len();
+        for candidate in &candidates {
+            if matches!(
+                candidate
+                    .row
+                    .comparison_evidence_from(ResultInput::Retained)?,
+                ValidateRowEvidence::Matched { .. }
+                    | ValidateRowEvidence::Diverged { .. }
+                    | ValidateRowEvidence::ParityMatched { .. }
+                    | ValidateRowEvidence::ParityDiverged { .. }
+            ) {
+                terminal_comparisons += 1;
+            }
+        }
         cells.push(RetainedCellResults {
             id,
             hermit_sha: sha,
@@ -8712,7 +8787,7 @@ fn retained_coordinate_decision(
     if retained
         .candidates
         .iter()
-        .all(|candidate| candidate.row.backend_parity.is_some())
+        .any(|candidate| candidate.row.backend_parity.is_some())
     {
         return RetainedDecision {
             state: RetainedComparisonState::Uncheckable,
@@ -14298,6 +14373,143 @@ red/`measured-and-passed` count is **0**.",
                         "{command} admitted missing-reference contradiction {field}"
                     ));
                 }
+            }
+        }
+    }
+    // A completed parity failure remains visible after either a matching retry
+    // or an incomplete retry. Exercise actual readers and both public writers.
+    for terminal in ["PASS", "ERROR"] {
+        let mut first = old_parity.clone();
+        first.hermit_sha = fixture_head.clone();
+        first.run_id = format!("parity-failure-then-{terminal}");
+        let mut second = parity_row(&import_parity_id, BackendParityVerdict::Matched)?;
+        second.hermit_sha = fixture_head.clone();
+        second.classification = "required".into();
+        second.run_id = first.run_id.clone();
+        second.attempt = 2;
+        if terminal == "ERROR" {
+            second.outcome = "ERROR".into();
+            second.result = None;
+            second.failure_class = Some(FailureClass::NoResult);
+            second.error_kind = Some("incomplete-parity-evidence".into());
+            second.backend_parity = None;
+            second.attempts[1]["verification_report"] = JsonValue::Null;
+            second.attempts[1]["verification_report_sha256"] = JsonValue::Null;
+            second.attempts[1]["outcome"] = "ERROR".into();
+            second.attempts[1]["status"] = 7.into();
+            second.attempts[1]["error_kind"] = "incomplete-verification-evidence".into();
+        }
+        first.comparison_evidence()?;
+        second.comparison_evidence()?;
+        let first_digest = first.evidence_identity()?;
+        let second_digest = second.evidence_identity()?;
+        for command in ["import-results", "observe-results"] {
+            restored_import_fixture()?;
+            // File ordering and an identical repeated row must not change the
+            // complete two-attempt history or its measurement count.
+            write_import_rows(&[&second, &first, &first])?;
+            let retained = read_retained_results(
+                &result_command_root,
+                &result_root,
+                &BTreeSet::from([import_parity_id.clone()]),
+            )?;
+            if retained.cells.len() != 1
+                || retained.cells[0].candidates.len() != 2
+                || retained.cells[0].hermit_sha != fixture_head
+                || retained.terminal_comparisons != if terminal == "PASS" { 2 } else { 1 }
+                || retained.cells[0]
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.row.attempt)
+                    .collect::<Vec<_>>()
+                    != [1, 2]
+            {
+                return Err(format!(
+                    "retained parity FAIL then {terminal} lost attempt/source/count attribution"
+                ));
+            }
+            let output = run_result_command(
+                command,
+                (command == "import-results").then_some(current_summary.as_path()),
+            )?;
+            let cell = imported_parity_cell()?;
+            let receipts = cell
+                .observations
+                .iter()
+                .flat_map(|observation| &observation.backend_parity_comparisons)
+                .filter(|receipt| receipt.run_id == first.run_id)
+                .collect::<Vec<_>>();
+            if !output.status.success()
+                || receipts.len() != if terminal == "PASS" { 2 } else { 1 }
+                || !receipts.iter().any(|receipt| {
+                    receipt.evidence_sha256 == first_digest
+                        && receipt.hermit_sha == fixture_head
+                        && receipt.result == ObservedResult::ParityFailure
+                })
+                || (terminal == "PASS"
+                    && !receipts.iter().any(|receipt| {
+                        receipt.evidence_sha256 == second_digest
+                            && receipt.hermit_sha == fixture_head
+                            && receipt.result == ObservedResult::Pass
+                    }))
+                || !latest_backend_parity(&cell).is_some_and(|receipt| {
+                    receipt.evidence_sha256 == first_digest
+                        && receipt.result == ObservedResult::ParityFailure
+                })
+                || cell
+                    .observations
+                    .iter()
+                    .flat_map(|observation| &observation.canonical_comparisons)
+                    .any(|receipt| receipt.run_id == first.run_id)
+                || (terminal == "ERROR"
+                    && !cell
+                        .observations
+                        .iter()
+                        .flat_map(|observation| &observation.invocations)
+                        .any(|invocation| {
+                            invocation.run_id == first.run_id
+                                && invocation.attempt == Some(2)
+                                && invocation.evidence_sha256.as_ref() == Some(&second_digest)
+                                && invocation.result.is_none()
+                        }))
+            {
+                return Err(format!(
+                    "{command} lost parity FAIL then {terminal} evidence: {output:?}"
+                ));
+            }
+            let once = read_generated_files(&result_command_root)?;
+            let repeated = run_result_command(
+                command,
+                (command == "import-results").then_some(current_summary.as_path()),
+            )?;
+            if !repeated.status.success() || read_generated_files(&result_command_root)? != once {
+                return Err(format!(
+                    "{command} parity FAIL then {terminal} was not byte-idempotent"
+                ));
+            }
+        }
+        for invalid in ["missing-first", "gap", "conflicting-first"] {
+            restored_import_fixture()?;
+            let mut changed = second.clone();
+            match invalid {
+                "missing-first" => write_import_rows(&[&changed])?,
+                "gap" => {
+                    changed.attempt = 3;
+                    write_import_rows(&[&first, &changed])?;
+                }
+                "conflicting-first" => {
+                    changed.attempt = 1;
+                    write_import_rows(&[&first, &changed])?;
+                }
+                _ => unreachable!(),
+            }
+            let refused = run_result_command("import-results", Some(&current_summary))?;
+            if refused.status.success()
+                || read_generated_files(&result_command_root)? != result_command_before
+            {
+                return Err(format!(
+                    "retained parity admitted invalid {invalid} sequence"
+                ));
             }
         }
     }
