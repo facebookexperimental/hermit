@@ -195,7 +195,16 @@ fi
 # The intervening commit changes only reverie-kvm runtime behavior and its
 # static-ELF tests. The measured native DBT build budget carries unchanged;
 # fresh Hermit validation is still required for the KVM runtime change.
-expected_pin=8c8c0a57649c9ffbf8a7a14291a64320f64b935f
+# CARRY TO a158914e (2026-09-15): both repository inputs to the DynamoRIO
+# content-key miss are byte-identical to 8c8c0a57 by Git object identity:
+#     reverie-dbt/vendor/dynamorio  a3c41e5d3630 -> a3c41e5d3630
+#     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
+# CMAKE and CMAKE_GENERATOR selection is unchanged. The existing 16-job clamp
+# and 1050 effective-job-second threshold carry at recipe key
+# c9c1ee55257cbb0635b56f494a75ee1dc6af839ca8e289231f533b0208340463.
+# This is source identity, not a new timing sample or a validation receipt;
+# fresh Hermit validation is required for the runtime and API changes.
+expected_pin=a158914eceeca02a9ab4c7dd4e9916926d5e5c1e
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

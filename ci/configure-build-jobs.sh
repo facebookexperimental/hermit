@@ -222,8 +222,17 @@ fi
 # The intervening commit changes only reverie-kvm runtime behavior and its
 # static-ELF tests. The measured native DBT build budget carries unchanged;
 # fresh Hermit validation is still required for the KVM runtime change.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 8c8c0a57649c9ffbf8a7a14291a64320f64b935f ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 8c8c0a57649c9ffbf8a7a14291a64320f64b935f (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO a158914e (2026-09-15): both repository inputs to the DynamoRIO
+# content-key miss are byte-identical to 8c8c0a57 by Git object identity:
+#     reverie-dbt/vendor/dynamorio  a3c41e5d3630 -> a3c41e5d3630
+#     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
+# CMAKE and CMAKE_GENERATOR selection is unchanged. The existing 16-job clamp
+# and 1050 effective-job-second threshold carry at recipe key
+# c9c1ee55257cbb0635b56f494a75ee1dc6af839ca8e289231f533b0208340463.
+# This is source identity, not a new timing sample or a validation receipt;
+# fresh Hermit validation is required for the runtime and API changes.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != a158914eceeca02a9ab4c7dd4e9916926d5e5c1e ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie a158914eceeca02a9ab4c7dd4e9916926d5e5c1e (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
