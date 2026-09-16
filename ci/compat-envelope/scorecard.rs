@@ -5250,6 +5250,7 @@ fn import_results(
     }
 
     let mut fold = ValidateFold::default();
+    let mut parity_unavailable = Vec::new();
     let mut historical_without_coordinates = 0usize;
     let mut outcome_counts: BTreeMap<RetainedComparisonState, usize> = BTreeMap::new();
     let mut outcome_rows = Vec::new();
@@ -5286,6 +5287,10 @@ fn import_results(
         }
     }
     for retained in retained_cells {
+        let has_completed_parity = retained
+            .candidates
+            .iter()
+            .any(|candidate| candidate.row.backend_parity.is_some());
         let retained_id = retained.id.clone();
         let has_coordinate = retained.candidates.iter().any(|candidate| {
             candidate.row.outcome == "FAIL"
@@ -5312,7 +5317,11 @@ fn import_results(
             fold.passed += one.passed;
             fold.located += one.located;
             fold.unlocated += one.unlocated;
-            fold.errored.extend(one.errored);
+            if has_completed_parity {
+                parity_unavailable.extend(one.errored);
+            } else {
+                fold.errored.extend(one.errored);
+            }
             None
         };
         let Some(decision) = decision else { continue };
@@ -5339,7 +5348,11 @@ fn import_results(
                 fold.passed += one.passed;
                 fold.located += one.located;
                 fold.unlocated += one.unlocated;
-                fold.errored.extend(one.errored);
+                if has_completed_parity {
+                    parity_unavailable.extend(one.errored);
+                } else {
+                    fold.errored.extend(one.errored);
+                }
             }
             ImportEvidence::None => {}
         }
@@ -5398,6 +5411,13 @@ fn import_results(
         retained_rows_imported,
         current_rows_imported,
     );
+    println!(
+        "  retained {} incomplete parity attempt(s) without comparison credit",
+        parity_unavailable.len()
+    );
+    for reason in &parity_unavailable {
+        println!("    incomplete parity: {reason}");
+    }
     println!(
         "  excluded as stale: {stale_coordinate_rows} older diverging comparison row(s), carrying {stale_coordinates} coordinate value(s), across {} eligible cell(s) whose newest retained canonical result is a pass",
         stale_coordinate_cells.len()
@@ -14440,6 +14460,11 @@ red/`measured-and-passed` count is **0**.",
                 .filter(|receipt| receipt.run_id == first.run_id)
                 .collect::<Vec<_>>();
             if !output.status.success()
+                || (command == "import-results"
+                    && terminal == "ERROR"
+                    && !String::from_utf8_lossy(&output.stdout).contains(
+                        "retained 1 incomplete parity attempt(s) without comparison credit",
+                    ))
                 || receipts.len() != if terminal == "PASS" { 2 } else { 1 }
                 || !receipts.iter().any(|receipt| {
                     receipt.evidence_sha256 == first_digest
