@@ -2866,6 +2866,34 @@ pub(crate) async fn deregister_thread<R>(
     }
 }
 
+/// Account this physical-exit callback's own clock before it joins a staged
+/// robust-list batch. The empty wake request has no scheduler effects, but its
+/// ordinary RPC header is admitted and accounted before it is acknowledged.
+/// A retired incarnation must not contribute to the completed-exit barrier.
+pub(crate) async fn acknowledge_robust_list_exit_time<R>(
+    threads_time: DetTime,
+    reverie: &R,
+    mm: MmId,
+) -> bool
+where
+    R: GlobalRPC<GlobalState>,
+{
+    let response = reverie
+        .send_rpc((threads_time, mm, GlobalRequest::RobustListWakes(Vec::new())))
+        .await;
+    match response.1 {
+        GlobalResponse::RobustListWakes(counts) => {
+            assert!(
+                counts.is_empty(),
+                "an empty exit-clock acknowledgement woke a waiter"
+            );
+            true
+        }
+        GlobalResponse::ThreadExited => false,
+        _ => unreachable!(),
+    }
+}
+
 /// Deliver owner-death wakes from an exit callback that no longer has guest
 /// memory access. The callback runs only after ptrace has observed physical
 /// exit, so Linux's atomic robust-list word update is already complete.
@@ -5718,5 +5746,641 @@ mod tests {
         // Re-determinizing the same host inode is stable, not a fresh mint.
         let (a_again, _) = pool.add_inode(host_a, t);
         assert_eq!(a, a_again, "mapping must be stable per host inode");
+    }
+}
+
+#[cfg(test)]
+mod robust_exit_clock_tests {
+    use std::sync::Mutex;
+    use std::task::Poll;
+
+    use nix::sys::signal::Signal;
+    use reverie::ExitStatus;
+    use reverie::GlobalRPC;
+    use reverie::GlobalTool;
+    use reverie::Tid;
+    use reverie::Tool;
+
+    use super::GlobalRequest;
+    use super::GlobalResponse;
+    use super::GlobalState;
+    use crate::Detcore;
+    use crate::ThreadState;
+    use crate::config::Config;
+    use crate::ivar::Ivar;
+    use crate::resources::Resources;
+    use crate::scheduler::DEFAULT_PRIORITY;
+    use crate::scheduler::SkipTurn;
+    use crate::scheduler::ThreadNextTurn;
+    use crate::tool_local::RobustListExit;
+    use crate::tool_local::RobustListWake;
+    use crate::types::*;
+
+    #[derive(Debug, PartialEq)]
+    struct WakeObservation {
+        wakes: Vec<(DetTid, FutexID)>,
+        counts: Vec<u64>,
+        clocks: serde_json::Value,
+        turn: u64,
+    }
+
+    #[derive(Debug)]
+    struct RpcObservation {
+        sender: DetTid,
+        kind: &'static str,
+        accepted: bool,
+        clocks: serde_json::Value,
+        queued: Vec<DetTid>,
+        waiters: usize,
+        turn: u64,
+    }
+
+    // This is only a sender-bound transport, as in Reverie's WrappedFrom.
+    // Replies, clock accounting, wakes and deregistration come from GlobalState.
+    struct ExitRpc<'a> {
+        state: &'a GlobalState,
+        sender: DetTid,
+        observations: &'a Mutex<Vec<WakeObservation>>,
+        rpc_observations: &'a Mutex<Vec<RpcObservation>>,
+    }
+
+    #[reverie::tool]
+    impl GlobalRPC<GlobalState> for ExitRpc<'_> {
+        async fn send_rpc(
+            &self,
+            request: <GlobalState as GlobalTool>::Request,
+        ) -> <GlobalState as GlobalTool>::Response {
+            let kind = match &request.2 {
+                GlobalRequest::RobustListWakes(wakes) if wakes.is_empty() => "empty-wake",
+                GlobalRequest::RobustListWakes(_) => "wake",
+                GlobalRequest::DeregisterThread(_) => "deregister",
+                _ => panic!("unexpected exit RPC: {:?}", request.2),
+            };
+            let wakes = match &request.2 {
+                GlobalRequest::RobustListWakes(wakes) if !wakes.is_empty() => Some(wakes.clone()),
+                _ => None,
+            };
+            let response = self
+                .state
+                .receive_rpc(Tid::from_raw(self.sender.as_raw()), request)
+                .await;
+            let clocks = serde_json::to_value(&*self.state.global_time.lock().unwrap()).unwrap();
+            {
+                let sched = self.state.sched.lock().unwrap();
+                self.rpc_observations.lock().unwrap().push(RpcObservation {
+                    sender: self.sender,
+                    kind,
+                    accepted: !matches!(response.1, GlobalResponse::ThreadExited),
+                    clocks: clocks.clone(),
+                    queued: sched.run_queue.tids().copied().collect(),
+                    waiters: sched
+                        .blocked
+                        .futex_waiters
+                        .values()
+                        .map(Vec::len)
+                        .sum::<usize>(),
+                    turn: sched.turn,
+                });
+            }
+            if let Some(wakes) = wakes {
+                let GlobalResponse::RobustListWakes(counts) = &response.1 else {
+                    panic!("a complete admitted exit batch was refused: {response:?}");
+                };
+                let clocks =
+                    serde_json::to_value(&*self.state.global_time.lock().unwrap()).unwrap();
+                let turn = self.state.sched.lock().unwrap().turn;
+                self.observations.lock().unwrap().push(WakeObservation {
+                    wakes,
+                    counts: counts.clone(),
+                    clocks,
+                    turn,
+                });
+            }
+            response
+        }
+
+        fn config(&self) -> &Config {
+            &self.state.cfg
+        }
+    }
+
+    struct Fixture {
+        state: GlobalState,
+        tool: Detcore,
+        owners: [ThreadState<()>; 2],
+        initial_clocks: [DetTime; 2],
+        waiters: [DetTid; 2],
+        peer: DetTid,
+        futexes: [FutexID; 2],
+        observations: Mutex<Vec<WakeObservation>>,
+        rpc_observations: Mutex<Vec<RpcObservation>>,
+    }
+
+    impl Fixture {
+        fn new(
+            reason: RobustListExit,
+            equal_clocks: bool,
+            empty_owner: Option<usize>,
+            cancel_killed_thread_rpcs: bool,
+        ) -> Self {
+            let config = Config {
+                sequentialize_threads: true,
+                cancel_killed_thread_rpcs,
+                ..Config::default()
+            };
+            let state = GlobalState::initialize(&config, false);
+            let parent = DetTid::from_raw(1);
+            let leader = DetTid::from_raw(17);
+            let worker = DetTid::from_raw(18);
+            let waiters = [DetTid::from_raw(21), DetTid::from_raw(23)];
+            let peer = DetTid::from_raw(25);
+            let mm = MmId::initial(leader);
+            let mut first = ThreadState::new(leader, &config, ());
+            first.detpid = Some(leader);
+            let mut second = first.clone();
+            second.dettid = worker;
+            let mut inherited = DetTime::new(&config);
+            inherited.add_syscall_with_cost(1_000);
+            let first_initial = inherited.clone_for_child();
+            inherited.add_syscall_with_cost(370);
+            let second_initial = inherited.clone_for_child();
+            first.thread_logical_time = first_initial.clone();
+            second.thread_logical_time = second_initial.clone();
+            first
+                .thread_logical_time
+                .add_syscall_with_cost(if equal_clocks { 407 } else { 37 });
+            second.thread_logical_time.add_syscall_with_cost(37);
+            first.record_robust_list_head(Some(0x404100));
+            second.record_robust_list_head(Some(0x404200));
+            let object = SharedMemoryObjectId::Anonymous {
+                origin: MmId::initial(parent),
+                sequence: 1,
+            };
+            let futexes = [FutexID::shared(object, 0), FutexID::shared(object, 8)];
+            first.stage_robust_list_wakes(
+                reason,
+                vec![
+                    (
+                        worker,
+                        if empty_owner == Some(1) {
+                            Vec::new()
+                        } else {
+                            vec![RobustListWake { futex: futexes[1] }]
+                        },
+                    ),
+                    (
+                        leader,
+                        if empty_owner == Some(0) {
+                            Vec::new()
+                        } else {
+                            vec![RobustListWake { futex: futexes[0] }]
+                        },
+                    ),
+                ],
+            );
+            {
+                let mut sched = state.sched.lock().unwrap();
+                sched.thread_tree.add_child(parent, parent, true);
+                sched.thread_tree.add_child(parent, leader, true);
+                sched.thread_tree.add_child(leader, worker, false);
+                for tid in [waiters[0], waiters[1], peer] {
+                    sched.thread_tree.add_child(parent, tid, true);
+                }
+                for tid in [leader, worker, waiters[0], waiters[1], peer] {
+                    sched.priorities.insert(tid, DEFAULT_PRIORITY);
+                    sched.next_turns.insert(
+                        tid,
+                        ThreadNextTurn {
+                            dettid: tid,
+                            child_tid_addr: 0,
+                            req: Ivar::new(),
+                            resp: Ivar::new(),
+                        },
+                    );
+                    sched.install_test_exec_incarnation(
+                        tid,
+                        if tid == leader || tid == worker {
+                            mm
+                        } else {
+                            MmId::initial(tid)
+                        },
+                    );
+                }
+                // Both owners have returned from their last guest turn and
+                // retain its empty next request until their exit callbacks.
+                // The independent peer is ready, but cannot pass quiescence.
+                sched.runqueue_push_back(leader);
+                sched.runqueue_push_back(worker);
+                sched.runqueue_push_back(peer);
+                sched.next_turns[&peer].req.put(Ok(Resources::new(peer)));
+                for (waiter, futex) in waiters.into_iter().zip(futexes) {
+                    sched.sleep_futex_waiter(&waiter, futex, None, u32::MAX);
+                }
+            }
+            {
+                let mut time = state.global_time.lock().unwrap();
+                for (tid, clock) in [(leader, &first_initial), (worker, &second_initial)] {
+                    time.update_global_time(tid, clock.as_nanos(), clock.inherited_nanos());
+                }
+            }
+            let tool = Detcore::new(Tid::from_raw(leader.as_raw()), &config);
+            Self {
+                state,
+                tool,
+                owners: [first, second],
+                initial_clocks: [first_initial, second_initial],
+                waiters,
+                peer,
+                futexes,
+                observations: Mutex::new(Vec::new()),
+                rpc_observations: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn assert_clocks(&self, completed: &[usize]) -> serde_json::Value {
+            let time = self.state.global_time.lock().unwrap();
+            let snapshot = serde_json::to_value(&*time).unwrap();
+            let epoch = DetTime::new(&self.state.cfg).as_nanos();
+            let mut expected = epoch;
+            for (index, owner) in self.owners.iter().enumerate() {
+                let clock = if completed.contains(&index) {
+                    &owner.thread_logical_time
+                } else {
+                    &self.initial_clocks[index]
+                };
+                assert_eq!(time.threads_time(owner.dettid), clock.as_nanos());
+                assert_eq!(
+                    snapshot["inherited_time"][owner.dettid.as_raw().to_string()],
+                    serde_json::to_value(clock.inherited_nanos()).unwrap()
+                );
+                expected = expected + (clock.as_nanos() - epoch - clock.inherited_nanos());
+            }
+            assert_eq!(
+                time.as_nanos(),
+                expected,
+                "only each owner's own uninherited work contributes"
+            );
+            snapshot
+        }
+
+        async fn exit(&self, index: usize, status: ExitStatus) {
+            self.exit_thread(self.owners[index].clone(), status).await;
+        }
+
+        async fn exit_thread(&self, thread: ThreadState<()>, status: ExitStatus) {
+            let rpc = ExitRpc {
+                state: &self.state,
+                sender: thread.dettid,
+                observations: &self.observations,
+                rpc_observations: &self.rpc_observations,
+            };
+            let exit =
+                self.tool
+                    .on_exit_thread(Tid::from_raw(rpc.sender.as_raw()), &rpc, thread, status);
+            let mut exit = std::pin::pin!(exit);
+            // On the CLI's current-thread ptrace route, Ready on the first
+            // poll excludes a new queued-observer window inside this callback.
+            // Multi-thread embeddings still admit concurrent scheduler reads;
+            // the RPC observations separately check the actual global actions.
+            assert!(
+                matches!(futures::poll!(exit.as_mut()), Poll::Ready(Ok(()))),
+                "exit callback yielded before its accounting and cleanup completed"
+            );
+        }
+
+        async fn nonmember_exit(&self, raw_tid: i32) {
+            let mut thread = self.owners[0].clone();
+            thread.dettid = DetTid::from_raw(raw_tid);
+            thread.thread_logical_time = DetTime::new(&self.state.cfg);
+            let tid = thread.dettid;
+            {
+                let mut sched = self.state.sched.lock().unwrap();
+                sched
+                    .thread_tree
+                    .add_child(self.owners[0].dettid, tid, false);
+                sched.priorities.insert(tid, DEFAULT_PRIORITY);
+                sched.next_turns.insert(
+                    tid,
+                    ThreadNextTurn {
+                        dettid: tid,
+                        child_tid_addr: 0,
+                        req: Ivar::new(),
+                        resp: Ivar::new(),
+                    },
+                );
+                sched.install_test_exec_incarnation(tid, thread.mm_id);
+                sched.runqueue_push_back(tid);
+            }
+            let before = self.rpc_observations.lock().unwrap().len();
+            self.exit_thread(thread, ExitStatus::Exited(0)).await;
+            let observations = self.rpc_observations.lock().unwrap();
+            assert_eq!(
+                observations.len(),
+                before + 1,
+                "a nonmember sent an acknowledgement or wake RPC"
+            );
+            assert_eq!(observations[before].sender, tid);
+            assert_eq!(observations[before].kind, "deregister");
+            assert!(observations[before].accepted);
+        }
+    }
+
+    #[tokio::test]
+    async fn robust_exit_acknowledgements_preserve_global_action_order_and_eligibility() {
+        for order in [[0, 1], [1, 0]] {
+            for empty_owner in [0, 1] {
+                let f = Fixture::new(RobustListExit::ExitGroup, false, Some(empty_owner), false);
+                f.nonmember_exit(30).await;
+                assert!(f.observations.lock().unwrap().is_empty());
+                let queue_before_first: Vec<_> = f
+                    .state
+                    .sched
+                    .lock()
+                    .unwrap()
+                    .run_queue
+                    .tids()
+                    .copied()
+                    .collect();
+                let first_start = f.rpc_observations.lock().unwrap().len();
+                f.exit(order[0], ExitStatus::Exited(0)).await;
+                let first_clocks = f.assert_clocks(&[order[0]]);
+                {
+                    let observations = f.rpc_observations.lock().unwrap();
+                    let actions = &observations[first_start..];
+                    assert_eq!(
+                        actions.iter().map(|a| a.kind).collect::<Vec<_>>(),
+                        ["empty-wake", "deregister"]
+                    );
+                    assert!(actions.iter().all(|a| a.accepted
+                        && a.sender == f.owners[order[0]].dettid
+                        && a.clocks == first_clocks
+                        && a.waiters == 2
+                        && a.turn == 0));
+                    assert_eq!(
+                        actions[0].queued, queue_before_first,
+                        "empty acknowledgement changed scheduler eligibility"
+                    );
+                }
+                f.nonmember_exit(31).await;
+                f.assert_clocks(&[order[0]]);
+                assert!(
+                    f.observations.lock().unwrap().is_empty(),
+                    "a nonmember completed the physical-exit barrier"
+                );
+                let queue_before_last: Vec<_> = f
+                    .state
+                    .sched
+                    .lock()
+                    .unwrap()
+                    .run_queue
+                    .tids()
+                    .copied()
+                    .collect();
+                let last_start = f.rpc_observations.lock().unwrap().len();
+                f.exit(order[1], ExitStatus::Exited(0)).await;
+                let final_clocks = f.assert_clocks(&[0, 1]);
+                {
+                    let observations = f.rpc_observations.lock().unwrap();
+                    let actions = &observations[last_start..];
+                    assert_eq!(
+                        actions.iter().map(|a| a.kind).collect::<Vec<_>>(),
+                        ["empty-wake", "wake", "deregister"]
+                    );
+                    assert!(actions.iter().all(|a| a.accepted
+                        && a.sender == f.owners[order[1]].dettid
+                        && a.clocks == final_clocks
+                        && a.turn == 0));
+                    assert_eq!(actions[0].waiters, 2);
+                    assert_eq!(actions[1].waiters, 1);
+                    assert_eq!(actions[0].queued, queue_before_last);
+                    assert_eq!(
+                        actions[1].queued, queue_before_last,
+                        "wake bypassed deferred admission"
+                    );
+                }
+                f.nonmember_exit(32).await;
+                f.assert_clocks(&[0, 1]);
+                assert_eq!(f.observations.lock().unwrap().len(), 1);
+                let observations = f.rpc_observations.lock().unwrap();
+                for owner in &f.owners {
+                    assert_eq!(
+                        observations
+                            .iter()
+                            .filter(|a| a.sender == owner.dettid && a.kind == "empty-wake")
+                            .count(),
+                        1,
+                        "each unique matching owner, including an empty-wake owner, must acknowledge before the batch clears"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn robust_exit_callbacks_preserve_owner_clocks_across_arrival_orders() {
+        for reason in [
+            RobustListExit::ExitGroup,
+            RobustListExit::Signal(libc::SIGTERM),
+        ] {
+            for equal_clocks in [false, true] {
+                for empty_owner in [None, Some(0), Some(1)] {
+                    let mut results = Vec::new();
+                    for order in [[0, 1], [1, 0]] {
+                        let f = Fixture::new(reason, equal_clocks, empty_owner, false);
+                        let status = match reason {
+                            RobustListExit::ExitGroup => ExitStatus::Exited(0),
+                            RobustListExit::Signal(_) => {
+                                ExitStatus::Signaled(Signal::SIGTERM, false)
+                            }
+                        };
+                        f.exit(order[0], status).await;
+                        f.assert_clocks(&[order[0]]);
+                        assert!(f.observations.lock().unwrap().is_empty());
+                        {
+                            let sched = f.state.sched.lock().unwrap();
+                            assert_eq!(
+                                sched
+                                    .blocked
+                                    .futex_waiters
+                                    .values()
+                                    .map(Vec::len)
+                                    .sum::<usize>(),
+                                2
+                            );
+                            assert_eq!(sched.turn, 0);
+                        }
+                        // An actually runnable peer must still wait for the
+                        // remaining owner's outstanding next request.
+                        {
+                            let last = Err(SkipTurn);
+                            let turn = crate::scheduler::do_a_turn_blocking(
+                                f.state.sched.clone(),
+                                f.state.global_time.clone(),
+                                &last,
+                            );
+                            let mut turn = std::pin::pin!(turn);
+                            assert!(matches!(futures::poll!(turn.as_mut()), Poll::Pending));
+                        }
+                        f.exit(order[0], status).await;
+                        f.assert_clocks(&[order[0]]);
+                        assert!(
+                            f.observations.lock().unwrap().is_empty(),
+                            "duplicate physical exit released an incomplete group"
+                        );
+                        f.exit(order[1], status).await;
+                        let clocks = f.assert_clocks(&[0, 1]);
+                        {
+                            let observations = f.observations.lock().unwrap();
+                            assert_eq!(observations.len(), 1);
+                            let expected: Vec<_> = (0..2)
+                                .filter(|i| Some(*i) != empty_owner)
+                                .map(|i| (f.owners[i].dettid, f.futexes[i]))
+                                .collect();
+                            assert_eq!(observations[0].wakes, expected);
+                            assert_eq!(observations[0].counts, vec![1; expected.len()]);
+                            assert_eq!(
+                                observations[0].clocks, clocks,
+                                "all owner clocks must be accounted before wake admission"
+                            );
+                            assert_eq!(observations[0].turn, 0);
+                        }
+                        f.exit(order[1], status).await;
+                        assert_eq!(f.assert_clocks(&[0, 1]), clocks);
+                        assert_eq!(
+                            f.observations.lock().unwrap().len(),
+                            1,
+                            "repeated cleanup emitted a second batch"
+                        );
+                        {
+                            let sched = f.state.sched.lock().unwrap();
+                            assert!(!sched.run_queue.contains_tid(f.waiters[0]));
+                            assert!(!sched.run_queue.contains_tid(f.waiters[1]));
+                        }
+                        // Drive the real step1/step2 drain and one peer turn;
+                        // no test-only scheduler implementation or reply shim.
+                        let result = crate::scheduler::do_a_turn_blocking(
+                            f.state.sched.clone(),
+                            f.state.global_time.clone(),
+                            &Err(SkipTurn),
+                        )
+                        .await;
+                        assert!(result.is_ok());
+                        let sched = f.state.sched.lock().unwrap();
+                        assert_eq!(sched.turn, 1);
+                        let queued: Vec<_> = sched.run_queue.tids().copied().collect();
+                        for (i, waiter) in f.waiters.iter().enumerate() {
+                            assert_eq!(queued.contains(waiter), Some(i) != empty_owner);
+                        }
+                        assert!(queued.contains(&f.peer));
+                        results.push((
+                            clocks,
+                            queued,
+                            std::mem::take(&mut *f.observations.lock().unwrap()),
+                        ));
+                    }
+                    assert_eq!(
+                        results[0], results[1],
+                        "callback order changed final clocks, typed wake observations or the actual scheduler drain"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn robust_exit_callbacks_keep_rejected_or_mismatched_batches_incomplete() {
+        for rejection in ["old-mm", "tombstone", "wrong-signal", "normal-exit"] {
+            let f = Fixture::new(
+                RobustListExit::Signal(libc::SIGTERM),
+                false,
+                None,
+                rejection == "tombstone",
+            );
+            let rejected = f.owners[0].dettid;
+            let mm = f.owners[0].mm_id;
+            f.exit(1, ExitStatus::Signaled(Signal::SIGTERM, false))
+                .await;
+            let replacement_request = Ivar::new();
+            if rejection == "old-mm" {
+                let mut sched = f.state.sched.lock().unwrap();
+                sched.install_test_exec_incarnation(rejected, mm.for_exec(rejected));
+                sched.next_turns.insert(
+                    rejected,
+                    ThreadNextTurn {
+                        dettid: rejected,
+                        child_tid_addr: 0,
+                        req: replacement_request.clone(),
+                        resp: Ivar::new(),
+                    },
+                );
+                let mut replacement_time = f.owners[0].thread_logical_time.clone();
+                replacement_time.add_syscall_with_cost(500);
+                f.state.global_time.lock().unwrap().update_global_time(
+                    rejected,
+                    replacement_time.as_nanos(),
+                    replacement_time.inherited_nanos(),
+                );
+            } else if rejection == "tombstone" {
+                // Use the real cancelling backend gate; keep its matching Mm.
+                let mut sched = f.state.sched.lock().unwrap();
+                sched.logically_kill_thread(&rejected, &rejected, mm);
+            }
+            let before = serde_json::to_value(&*f.state.global_time.lock().unwrap()).unwrap();
+            let status = match rejection {
+                "wrong-signal" => ExitStatus::Signaled(Signal::SIGKILL, false),
+                "normal-exit" => ExitStatus::Exited(0),
+                _ => ExitStatus::Signaled(Signal::SIGTERM, false),
+            };
+            f.exit(0, status).await;
+            assert!(
+                f.observations.lock().unwrap().is_empty(),
+                "{rejection} released a group"
+            );
+            if rejection == "old-mm" || rejection == "tombstone" {
+                assert_eq!(
+                    serde_json::to_value(&*f.state.global_time.lock().unwrap()).unwrap(),
+                    before,
+                    "rejected acknowledgement changed clock state"
+                );
+            }
+            let sched = f.state.sched.lock().unwrap();
+            assert_eq!(
+                sched
+                    .blocked
+                    .futex_waiters
+                    .values()
+                    .map(Vec::len)
+                    .sum::<usize>(),
+                2,
+                "rejected group lost a real waiter"
+            );
+            assert!(
+                f.waiters
+                    .iter()
+                    .all(|tid| !sched.run_queue.contains_tid(*tid))
+            );
+            if rejection == "old-mm" {
+                assert!(sched.rpc_incarnation_matches(rejected, mm.for_exec(rejected)));
+                assert_eq!(
+                    sched.next_turns[&rejected].req, replacement_request,
+                    "old cleanup destroyed replacement registration"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "Attempted to update tid 17 time")]
+    async fn robust_exit_clock_ack_still_refuses_a_backwards_owner_sample() {
+        let f = Fixture::new(RobustListExit::ExitGroup, false, None, false);
+        let owner = &f.owners[0];
+        let mut later = owner.thread_logical_time.clone();
+        later.add_syscall_with_cost(1);
+        f.state.global_time.lock().unwrap().update_global_time(
+            owner.dettid,
+            later.as_nanos(),
+            later.inherited_nanos(),
+        );
+        f.exit(0, ExitStatus::Exited(0)).await;
     }
 }

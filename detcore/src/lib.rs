@@ -118,6 +118,7 @@ pub use scheduler::runqueue::FIRST_PRIORITY;
 pub use scheduler::runqueue::LAST_PRIORITY;
 pub use tool_global::GlobalState;
 use tool_global::ThreadDeregistration;
+use tool_global::acknowledge_robust_list_exit_time;
 use tool_global::create_child_thread;
 use tool_global::create_vfork_child_thread;
 use tool_global::deregister_thread;
@@ -2866,16 +2867,39 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             ExitStatus::Signaled(signal, _) => Some(*signal as i32),
             ExitStatus::Exited(_) => None,
         };
-        if let Some((request_time, ready)) = thread_state.take_robust_list_wakes_after_exit(
-            exit_signal,
-            thread_state.thread_logical_time.clone(),
-        ) {
+        // Publish each owner's final clock under its own RPC identity before
+        // counting that owner in the complete physical-exit barrier. Otherwise
+        // the group's maximum could be charged to whichever callback finishes
+        // last, followed by a backwards update from its real deregistration.
+        let exit_time_accounted = !thread_state.has_matching_robust_list_exit(exit_signal)
+            || acknowledge_robust_list_exit_time(
+                thread_state.thread_logical_time.clone(),
+                global_state,
+                mm_id,
+            )
+            .await;
+        if !exit_time_accounted {
+            // Preserve benign cleanup for a retired incarnation without
+            // acknowledging an unaccounted owner or releasing its staged wakes.
+            thread_state.record_robust_list_head(None);
+        }
+        if exit_time_accounted
+            && let Some((_group_time, ready)) = thread_state.take_robust_list_wakes_after_exit(
+                exit_signal,
+                thread_state.thread_logical_time.clone(),
+            )
+        {
             let identities: Vec<_> = ready
                 .iter()
                 .map(|(owner, wake)| (*owner, wake.futex))
                 .collect();
-            let counts =
-                robust_list_wakes_after_exit(request_time, global_state, mm_id, ready).await;
+            let counts = robust_list_wakes_after_exit(
+                thread_state.thread_logical_time.clone(),
+                global_state,
+                mm_id,
+                ready,
+            )
+            .await;
             for ((owner, futex), count) in identities.into_iter().zip(counts) {
                 info!(
                     "[detcore, dtid {}] robust-list owner death woke {} waiter(s) on futex {:?} after physical exit",

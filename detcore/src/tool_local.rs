@@ -1605,6 +1605,15 @@ pub(crate) struct PendingRobustListWakes {
     pub(crate) wakes: Vec<RobustListWake>,
 }
 
+impl PendingRobustListWakes {
+    fn matches_exit(&self, exit_signal: Option<i32>) -> bool {
+        match self.reason {
+            RobustListExit::ExitGroup => true,
+            RobustListExit::Signal(expected) => exit_signal == Some(expected),
+        }
+    }
+}
+
 /// Robust-list registrations and staged wakes shared by one Linux thread
 /// group. A forked process starts with an empty instance; `CLONE_THREAD`
 /// members share it.
@@ -2168,6 +2177,15 @@ impl<T> ThreadState<T> {
         process.matched_physical_exits.clear();
     }
 
+    pub(crate) fn has_matching_robust_list_exit(&self, exit_signal: Option<i32>) -> bool {
+        self.robust_list_process
+            .lock()
+            .expect("robust-list process state mutex poisoned")
+            .pending
+            .get(&self.dettid)
+            .is_some_and(|pending| pending.matches_exit(exit_signal))
+    }
+
     pub(crate) fn take_robust_list_wakes_after_exit(
         &self,
         exit_signal: Option<i32>,
@@ -2179,11 +2197,7 @@ impl<T> ThreadState<T> {
             .expect("robust-list process state mutex poisoned");
         process.heads.remove(&self.dettid);
         let pending = process.pending.get(&self.dettid)?;
-        let matches = match pending.reason {
-            RobustListExit::ExitGroup => true,
-            RobustListExit::Signal(expected) => exit_signal == Some(expected),
-        };
-        if !matches {
+        if !pending.matches_exit(exit_signal) {
             return None;
         }
 
