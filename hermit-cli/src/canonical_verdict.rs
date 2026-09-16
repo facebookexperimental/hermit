@@ -519,6 +519,12 @@ impl VerificationReport {
             }
         }
         let report = Self::from_json_value(value)?;
+        // Historical receipts may predate this field. When a matched report
+        // explicitly carries outputs, they must support its claim even if the
+        // receipt was read through the retained-input compatibility path.
+        if report.verdict == Verdict::Matched && report.compared_outputs.is_some() {
+            report.require_exact_output_match()?;
+        }
         if report.verdict == Verdict::NoResult && report.compared_outputs.is_some() {
             return Err(
                 "inconsistent verification report: no_result carries compared_outputs".into(),
@@ -611,6 +617,9 @@ impl VerificationReport {
     /// output-only fallback can report it with zero compared INFO messages.
     pub fn require_canonical_match(&self) -> Result<(), String> {
         self.require_canonical_comparison()?;
+        if self.compared_outputs.is_some() {
+            self.require_exact_output_match()?;
+        }
         if self.verified && self.verdict == Verdict::Matched && self.bitwise_parity {
             Ok(())
         } else {
@@ -1149,6 +1158,68 @@ mod tests {
             "stderr_sha256": "b".repeat(64), "stderr_bytes": 0
         });
         current["compared_outputs"] = serde_json::json!({"left": output, "right": output});
+        for mutation in [
+            "unequal",
+            "bad-digest",
+            "two-dispositions",
+            "wrong-disposition",
+        ] {
+            let mut bad = current.clone();
+            match mutation {
+                "unequal" => {
+                    bad["compared_outputs"]["right"]["stdout_sha256"] = "c".repeat(64).into()
+                }
+                "bad-digest" => {
+                    for side in ["left", "right"] {
+                        bad["compared_outputs"][side]["stdout_sha256"] = "invalid".into();
+                    }
+                }
+                "two-dispositions" => {
+                    for side in ["left", "right"] {
+                        bad["compared_outputs"][side]["signal"] = 9.into();
+                    }
+                }
+                "wrong-disposition" => bad["guest_exit_code"] = 7.into(),
+                _ => unreachable!(),
+            }
+            let bytes = serde_json::to_vec(&bad).unwrap();
+            assert!(
+                VerificationReport::from_current_json_slice(&bytes).is_err(),
+                "{mutation}"
+            );
+            assert!(
+                VerificationReport::from_retained_cell_json_slice(&bytes).is_err(),
+                "{mutation}"
+            );
+            assert!(
+                VerificationReport::from_json_slice(&bytes)
+                    .unwrap()
+                    .require_canonical_match()
+                    .is_err(),
+                "{mutation}"
+            );
+        }
+        let mut historical = current.clone();
+        historical
+            .as_object_mut()
+            .unwrap()
+            .remove("compared_outputs");
+        let bytes = serde_json::to_vec(&historical).unwrap();
+        VerificationReport::from_retained_cell_json_slice(&bytes)
+            .unwrap()
+            .require_canonical_match()
+            .unwrap();
+        assert!(VerificationReport::from_current_json_slice(&bytes).is_err());
+        let mut diverged = current.clone();
+        diverged["verdict"] = "diverged".into();
+        diverged["verified"] = false.into();
+        diverged["bitwise_parity"] = false.into();
+        diverged["compared_outputs"]["right"]["stdout_sha256"] = "c".repeat(64).into();
+        VerificationReport::from_current_json_value(diverged).unwrap();
+        let mut relaxed = current.clone();
+        relaxed["comparison"]["strictness"] = "stripped".into();
+        relaxed["bitwise_parity"] = false.into();
+        VerificationReport::from_current_json_value(relaxed).unwrap();
         let raw = serde_json::to_string(&current).unwrap();
         VerificationReport::from_current_json_slice(raw.as_bytes())
             .unwrap()

@@ -14069,6 +14069,52 @@ red/`measured-and-passed` count is **0**.",
         attempt["verification_report"] = raw.into();
         Ok(())
     };
+    // Explicit output evidence must agree with an ordinary matched claim.
+    // Rehash the changed raw report so these exercise semantic admission,
+    // rather than the earlier report-digest guard, through both public paths.
+    for mutation in [
+        "unequal",
+        "bad-digest",
+        "two-dispositions",
+        "wrong-disposition",
+    ] {
+        restored_import_fixture()?;
+        let mut bad = ordinary_pass.clone();
+        let mut report: JsonValue =
+            serde_json::from_str(bad.attempts[0]["verification_report"].as_str().unwrap()).unwrap();
+        match mutation {
+            "unequal" => {
+                report["compared_outputs"]["right"]["stdout_sha256"] = "c".repeat(64).into()
+            }
+            "bad-digest" => {
+                for side in ["left", "right"] {
+                    report["compared_outputs"][side]["stdout_sha256"] = "invalid".into();
+                }
+            }
+            "two-dispositions" => {
+                for side in ["left", "right"] {
+                    report["compared_outputs"][side]["signal"] = 9.into();
+                }
+            }
+            "wrong-disposition" => report["guest_exit_code"] = 7.into(),
+            _ => unreachable!(),
+        }
+        set_report(&mut bad.attempts[0], &report)?;
+        write_import_rows(&[&bad])?;
+        for command in ["observe-results", "import-results"] {
+            let output = run_result_command(
+                command,
+                (command == "import-results").then_some(current_summary.as_path()),
+            )?;
+            if output.status.success()
+                || read_generated_files(&result_command_root)? != result_command_before
+            {
+                return Err(format!(
+                    "{command} admitted contradictory ordinary matched outputs: {mutation}"
+                ));
+            }
+        }
+    }
     for matched in [true, false] {
         restored_import_fixture()?;
         let mut historical = ordinary_pass.clone();

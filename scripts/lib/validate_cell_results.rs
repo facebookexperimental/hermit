@@ -1072,6 +1072,54 @@ mod tests {
             CellVerdict::ComparedAndMatched { .. }
         ));
         let raw = row["attempts"][0]["verification_report"].as_str().unwrap();
+        for mutation in [
+            "unequal",
+            "bad-digest",
+            "two-dispositions",
+            "wrong-disposition",
+        ] {
+            let mut report: Value = serde_json::from_str(raw).unwrap();
+            match mutation {
+                "unequal" => {
+                    report["compared_outputs"]["right"]["stdout_sha256"] = "c".repeat(64).into()
+                }
+                "bad-digest" => {
+                    for side in ["left", "right"] {
+                        report["compared_outputs"][side]["stdout_sha256"] = "invalid".into();
+                    }
+                }
+                "two-dispositions" => {
+                    for side in ["left", "right"] {
+                        report["compared_outputs"][side]["signal"] = 9.into();
+                    }
+                }
+                "wrong-disposition" => report["guest_exit_code"] = 7.into(),
+                _ => unreachable!(),
+            }
+            let mut bad = row.clone();
+            bad["attempts"][0] = attempt(&serde_json::to_string(&report).unwrap());
+            assert!(
+                matches!(
+                    cell_verdict(&bad).unwrap(),
+                    CellVerdict::UnavailableWithReason { .. }
+                ),
+                "{mutation}"
+            );
+            let parent = tempfile::tempdir().unwrap();
+            let results = parent.path().join("results");
+            write_result(&results, &bad);
+            let retained = retain(
+                parent.path(),
+                &results,
+                string(&bad, "hermit_sha").unwrap(),
+                &expected(&bad),
+            )
+            .unwrap();
+            assert_eq!(
+                retained.evidence["cells"][0]["cell_verdict"]["state"], "unavailable-with-reason",
+                "{mutation}"
+            );
+        }
         for (needle, replacement) in [
             (r#""verified":true"#, r#""verified":false,"verified":true"#),
             (r#""verified":true"#, r#""verified":true,"verified":true"#),
