@@ -129,21 +129,133 @@ fn first_run_rejected_report(
     report
 }
 
+/// Where the private run summaries below are written.
+///
+/// Hermit's isolated /tmp is not the host /tmp, so these cannot go to the
+/// default temporary directory: they must live on a path BOTH run containers
+/// can see, which is why they were written into the checkout in the first
+/// place. That part of the original reasoning is correct and is preserved.
+///
+/// ⚠️ WHAT WAS WRONG WITH THE CHECKOUT ROOT, measured on hermit main
+/// ba3bfc97671666ae946841804624e7a2c355a0e4 in validate run 1819. Prepared
+/// source identity enumerates untracked, non-ignored files:
+///
+///     git ls-files --others --exclude-standard -z
+///
+/// (`ci/manifest-plan/src/nextest_binaries.rs` source_identity, and the
+/// byte-identical enumeration in `ci/prepare-rust-scripts.sh` write_state).
+/// A summary here IS such a file, so creating one and dropping it on the same
+/// run changes the identity, and dropping it between enumeration and hashing
+/// makes it vanish mid-read. Both were observed: 13 nodes refused with
+/// "prepared executables are stale: source identity changed", 6 with "cannot
+/// inspect prepared input <path>: No such file or directory", and one with
+/// "sha256sum: .hermit-verify-summary-...: No such file or directory". That is
+/// 20 of the run's 26 failed nodes, none of which had run a single test.
+///
+/// ⚠️ THE FIX MOVES THE FILE; IT DOES NOT EXCUSE THE NAME. Adding
+/// `.hermit-verify-summary-*` to .gitignore would also satisfy the enumeration,
+/// and it is the wrong repair: `scripts/validate.rs` checkout_attribution_bracket
+/// exists because run 1573 leaked these same files, and its stated property is
+/// "No pathname is excused". Excusing the name would hide a genuine leak
+/// anywhere in the tree -- and that bracket builds its own repository under a
+/// temporary directory, so it would never have read this repo's .gitignore and
+/// would not have caught the weakening.
+///
+/// `ignored/` is the existing directory for exactly this. Its .gitignore entry
+/// reads "Everything under ignored/ is disposable and must not taint source
+/// provenance or the version string." Using it adds no new ignore rule, and a
+/// stray summary left anywhere else is still caught -- verified both ways.
+fn private_summary_dir() -> Result<PathBuf, Error> {
+    summary_dir_under(&std::env::current_dir()?)
+}
+
+/// Whether `<root>/ignored` is actually excluded from source accounting there.
+///
+/// ⚠️ THE WALK ABOVE CANNOT JUST TRUST A `.git`, and this is measured rather
+/// than hypothetical: this host has a `/tmp/.git`. Without this check a run
+/// whose working directory is any temporary directory resolves its "work tree"
+/// to `/tmp` and writes the summary to `/tmp/ignored` -- which is not the
+/// project, and worse, is not visible to both run containers, since Hermit's
+/// isolated /tmp is not the host /tmp. That is the very property the original
+/// comment was protecting.
+///
+/// So the candidate is accepted only where the disposable directory is really
+/// disposable. That also removes an assumption the tests could not see: the
+/// repair depends on `ignored/` being ignored in whichever repository the file
+/// lands in, and nothing previously checked it.
+fn disposable_dir_is_ignored(root: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(root.join(".gitignore")) else {
+        return false;
+    };
+    text.lines()
+        .map(|line| line.split('#').next().unwrap_or_default().trim())
+        .any(|rule| matches!(rule, "ignored/" | "/ignored/" | "ignored" | "/ignored"))
+}
+
+/// Resolve the summary directory for a given starting directory.
+///
+/// Split out from [`private_summary_dir`] for one reason: it is the only part
+/// that can be tested. The reviewer of PR 3026 found that the tests shipped
+/// with the first version of this change lived in `hermit-manifest-plan` and
+/// never named any of these functions -- a private `src/bin` item is not
+/// importable from another crate, so that whole test surface could not reach
+/// the code it was written for, even in principle. Taking the directory as an
+/// argument lets the unit tests below drive every branch.
+fn summary_dir_under(start: &Path) -> Result<PathBuf, Error> {
+    // The enumeration is rooted at the work tree, not at the process cwd, so a
+    // summary in ANY tracked subdirectory still trips it. Resolve the work-tree
+    // root rather than assuming this runs from it.
+    let mut root = start;
+    loop {
+        if root.join(".git").exists() && disposable_dir_is_ignored(root) {
+            let disposable = root.join("ignored");
+            // ⚠️ INSIDE A WORK TREE THIS REFUSES RATHER THAN FALLING BACK.
+            //
+            // The first version returned `cwd` when the directory could not be
+            // created, justifying it as failing soft. It is the opposite: cwd
+            // inside a work tree is exactly where prepared source identity
+            // enumerates, so the fallback silently restored the defect. The
+            // reviewer's case is concrete -- a regular FILE named `ignored`
+            // makes create_dir_all fail -- and a measurement that only checked
+            // writability and directory-ness of checkouts existing at the time
+            // could not have ruled it out for checkouts made later.
+            //
+            // A loud failure here costs one run. The silent fallback costs a
+            // whole validation, which is what it already cost once.
+            std::fs::create_dir_all(&disposable).with_context(|| {
+                format!(
+                    "creating the disposable run-summary directory {}; refusing to fall back to \
+                     the work tree, where this file would be counted as prepared source",
+                    disposable.display()
+                )
+            })?;
+            return Ok(disposable);
+        }
+        match root.parent() {
+            Some(parent) => root = parent,
+            None => break,
+        }
+    }
+    // Outside a work tree only. Nothing enumerates source here, so the previous
+    // location is still correct and still visible to both run containers.
+    Ok(start.to_path_buf())
+}
+
 fn private_verify_summary() -> Result<tempfile::NamedTempFile, Error> {
     tempfile::Builder::new()
         .prefix(".hermit-verify-summary-")
-        // Hermit's isolated /tmp is not the host /tmp. The checkout is visible
-        // to both run containers, and the temporary file is removed on drop.
-        .tempfile_in(std::env::current_dir()?)
+        // See private_summary_dir: visible to both run containers, and outside
+        // prepared source identity. Removed on drop.
+        .tempfile_in(private_summary_dir()?)
         .context("creating private verification run summary")
 }
 
 fn private_backend_engagement_summary() -> Result<tempfile::NamedTempFile, Error> {
     tempfile::Builder::new()
         .prefix(".hermit-backend-engagement-summary-")
-        // Hermit's isolated /tmp is not the host /tmp. The checkout is visible
-        // to the run container, and the temporary file is removed on drop.
-        .tempfile_in(std::env::current_dir()?)
+        // See private_summary_dir: visible to the run container, and outside
+        // prepared source identity. Removed on drop.
+        .tempfile_in(private_summary_dir()?)
         .context("creating private backend-engagement run summary")
 }
 
@@ -5245,6 +5357,167 @@ mod tests {
             "2026-08-02T00:00:00.000000Z INFO detcore: coordinator message\n\
              1970-01-01T00:00:00.000000Z INFO detcore: DETLOG scheduler event\n\
              1970-01-01T00:00:00.000000Z INFO detcore: DETLOG [syscall] finish syscall #1: getpid() = Ok(3)\n",
+        );
+    }
+
+    /// The four branches of [`summary_dir_under`].
+    ///
+    /// ⚠️ THESE EXIST BECAUSE THE FIRST VERSION OF THIS CHANGE HAD NO TEST THAT
+    /// COULD REACH IT. Its tests lived in `hermit-manifest-plan` and asserted
+    /// that a file under `ignored/` is not enumerated as source -- true, useful,
+    /// and silent about whether anything ever writes one there. A private
+    /// `src/bin` item is not importable from another crate, so that surface
+    /// could not name this function even in principle. Two readers found it; I
+    /// had already found and fixed a narrower blind spot in the same tests and
+    /// still missed that the whole set was inert. Hence: same file, same crate,
+    /// driving the function itself.
+    #[test]
+    fn summary_dir_is_the_work_tree_disposable_directory() {
+        let tmp = tempfile::tempdir().expect("fixture root");
+        let root = tmp.path();
+        std::fs::create_dir(root.join(".git")).expect("fixture work tree");
+        std::fs::write(root.join(".gitignore"), "/ignored/\n").expect("fixture ignore rule");
+
+        // From the root.
+        let chosen = summary_dir_under(root).expect("resolving from the work-tree root");
+        assert_eq!(chosen, root.join("ignored"));
+        assert!(chosen.is_dir(), "the disposable directory was not created");
+
+        // From a subdirectory: the enumeration is rooted at the work tree, so a
+        // summary in a tracked subdirectory would still be counted as source.
+        let nested = root.join("hermit-cli").join("src");
+        std::fs::create_dir_all(&nested).expect("fixture subdirectory");
+        assert_eq!(
+            summary_dir_under(&nested).expect("resolving from a subdirectory"),
+            root.join("ignored"),
+            "a summary resolved relative to the subdirectory rather than the work tree"
+        );
+    }
+
+    #[test]
+    fn summary_dir_outside_a_work_tree_is_unchanged() {
+        let tmp = tempfile::tempdir().expect("fixture root");
+        let plain = tmp.path().join("not-a-checkout");
+        std::fs::create_dir(&plain).expect("fixture directory");
+        assert_eq!(
+            summary_dir_under(&plain).expect("resolving outside a work tree"),
+            plain,
+            "the previous behaviour must be kept where nothing enumerates source"
+        );
+    }
+
+    /// A `.git` in an ancestor that does not ignore `ignored/` must be skipped.
+    ///
+    /// MEASURED on this host: `/tmp/.git` exists. An earlier version of this
+    /// walk accepted any ancestor carrying a `.git`, so a run started in any
+    /// temporary directory resolved its work tree to `/tmp` and would have
+    /// written the summary to `/tmp/ignored` -- not the project, and not
+    /// visible to both run containers, which is the property the whole
+    /// arrangement exists to preserve. This test found it; I had not predicted
+    /// it.
+    #[test]
+    fn a_stray_git_that_does_not_ignore_the_directory_is_not_a_work_tree() {
+        let tmp = tempfile::tempdir().expect("fixture root");
+        let stray = tmp.path();
+        std::fs::create_dir(stray.join(".git")).expect("fixture stray git");
+        // No .gitignore at all, as in the real /tmp/.git case.
+        let nested = stray.join("scratch");
+        std::fs::create_dir(&nested).expect("fixture directory");
+        assert_eq!(
+            summary_dir_under(&nested).expect("resolving under a stray git"),
+            nested,
+            "a stray .git without an ignore rule was mistaken for the work tree"
+        );
+
+        // And one that DOES ignore it is accepted, so the check discriminates
+        // rather than refusing everything.
+        std::fs::write(stray.join(".gitignore"), "/ignored/\n").expect("fixture ignore rule");
+        assert_eq!(
+            summary_dir_under(&nested).expect("resolving under a real work tree"),
+            stray.join("ignored"),
+            "a work tree that does ignore the directory was rejected"
+        );
+    }
+
+    /// Serialises the two tests that change the process working directory.
+    ///
+    /// `private_verify_summary` reads the cwd through `private_summary_dir`, so
+    /// exercising the WRITER means setting it. That is process-global, so it
+    /// cannot run beside another test that also depends on it.
+    static CWD_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Both writers must route through the resolver, not merely agree with it.
+    ///
+    /// ⚠️ THIS IS THE THIRD LEVEL OF THE SAME DEFECT ON THIS CHANGE, and the
+    /// reviewer found it by mutation: reverting BOTH writers to
+    /// `tempfile_in(current_dir())` left every test green. The resolver tests
+    /// prove `summary_dir_under` computes the right directory; they say nothing
+    /// about whether anything calls it. A future writer, or a revert of either
+    /// existing one, would restore the original defect undetected.
+    ///
+    /// The earlier two levels were: the first test could not see the real
+    /// .gitignore, and then ALL of them sat in a crate that cannot reach a
+    /// private `src/bin` item. Each level was found by a different reader.
+    ///
+    /// So this calls the writers and looks at where the file actually landed.
+    /// Under the mutation the parent is the work tree itself rather than its
+    /// disposable directory, and both assertions below fail.
+    #[test]
+    fn both_writers_put_their_summary_in_the_disposable_directory() {
+        let _guard = CWD_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tmp = tempfile::tempdir().expect("fixture root");
+        let root = tmp.path().canonicalize().expect("canonical fixture root");
+        std::fs::create_dir(root.join(".git")).expect("fixture work tree");
+        std::fs::write(root.join(".gitignore"), "/ignored/\n").expect("fixture ignore rule");
+
+        let previous = std::env::current_dir().expect("saving the working directory");
+        std::env::set_current_dir(&root).expect("entering the fixture work tree");
+        let produced = [
+            ("verification", private_verify_summary()),
+            ("backend engagement", private_backend_engagement_summary()),
+        ];
+        std::env::set_current_dir(&previous).expect("restoring the working directory");
+
+        let expected = root.join("ignored");
+        for (what, result) in produced {
+            let file = result.unwrap_or_else(|error| panic!("{what} summary: {error:#}"));
+            let parent = file
+                .path()
+                .parent()
+                .expect("a summary has a parent")
+                .canonicalize()
+                .expect("canonical summary parent");
+            assert_eq!(
+                parent,
+                expected,
+                "the {what} summary was written to {} rather than the disposable \
+                 directory, so it is counted as prepared source again",
+                parent.display()
+            );
+        }
+    }
+
+    /// The control, and the reviewer's own case: a regular FILE named `ignored`.
+    ///
+    /// `create_dir_all` fails, and the first version answered by returning the
+    /// work tree itself -- silently putting the summary back exactly where the
+    /// defect was. Refusing is the only safe direction inside a work tree.
+    #[test]
+    fn summary_dir_refuses_rather_than_falling_back_into_the_work_tree() {
+        let tmp = tempfile::tempdir().expect("fixture root");
+        let root = tmp.path();
+        std::fs::create_dir(root.join(".git")).expect("fixture work tree");
+        std::fs::write(root.join(".gitignore"), "/ignored/\n").expect("fixture ignore rule");
+        std::fs::write(root.join("ignored"), b"not a directory").expect("fixture file");
+
+        let error = summary_dir_under(root)
+            .expect_err("a work tree that cannot hold the disposable directory must refuse");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("refusing to fall back"),
+            "the refusal did not say why it refused: {rendered}"
         );
     }
 }

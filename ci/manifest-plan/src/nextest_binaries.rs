@@ -1646,4 +1646,174 @@ mod tests {
         .unwrap();
         assert_ne!(sources(&f.cargo, &f.root).unwrap(), before);
     }
+
+    /// A disposable run summary must not move source identity, and a stray one
+    /// still must.
+    ///
+    /// Validate run 1819 on hermit main ba3bfc9767 failed 26 nodes, 20 of them
+    /// because `hermit run` wrote `.hermit-verify-summary-*` into the checkout
+    /// root. This enumeration counts untracked, non-ignored files, so creating
+    /// and dropping one during a run changed the identity under the prepared
+    /// executables: 13 nodes refused "prepared executables are stale: source
+    /// identity changed" and 6 more could not read a path that had vanished
+    /// between enumeration and hashing. None of them ran a single test.
+    ///
+    /// The repair moves those summaries into `ignored/`, whose .gitignore entry
+    /// already says everything under it "is disposable and must not taint
+    /// source provenance". The SECOND HALF OF THIS TEST IS THE POINT: the fix
+    /// must not be an exemption for the name. `scripts/validate.rs`
+    /// checkout_attribution_bracket exists because run 1573 leaked these same
+    /// files and its stated property is "No pathname is excused" -- so a stray
+    /// summary anywhere the scanner still looks has to keep changing the
+    /// identity, exactly as any other untracked file does.
+    #[test]
+    fn a_disposable_run_summary_is_not_source_but_a_stray_one_still_is() {
+        let f = Fixture::new();
+        fs::write(f.root.join(".gitignore"), "ignored/\n").unwrap();
+        fs::write(f.root.join("Cargo.toml"), "[package]\nname='fixture'\n").unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "Cargo.toml", ".gitignore"],
+            vec![
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        ] {
+            git_bytes(&f.root, &args).unwrap();
+        }
+        let before = sources(&f.cargo, &f.root).unwrap();
+
+        // Positive: the summary where the repair puts it is invisible to source
+        // accounting, both while it exists and after it is dropped. Either
+        // transition is what refused the twenty nodes.
+        let disposable = f.root.join("ignored");
+        fs::create_dir_all(&disposable).unwrap();
+        let summary = disposable.join(".hermit-verify-summary-fixture");
+        fs::write(&summary, "summary").unwrap();
+        assert_eq!(
+            sources(&f.cargo, &f.root).unwrap(),
+            before,
+            "a disposable run summary tainted source identity"
+        );
+        fs::remove_file(&summary).unwrap();
+        assert_eq!(
+            sources(&f.cargo, &f.root).unwrap(),
+            before,
+            "dropping a disposable run summary tainted source identity"
+        );
+
+        // Negative, and it must stay this way: the same file name in the
+        // scanned tree is still an untracked source. A repair that made this
+        // pass too would have excused the pathname instead of moving the file.
+        let stray = f.root.join(".hermit-verify-summary-fixture");
+        fs::write(&stray, "summary").unwrap();
+        assert_ne!(
+            sources(&f.cargo, &f.root).unwrap(),
+            before,
+            "a stray summary in the scanned tree was excused rather than counted"
+        );
+        fs::remove_file(&stray).unwrap();
+        assert_eq!(sources(&f.cargo, &f.root).unwrap(), before);
+    }
+
+    /// Resolve this repository's root the way git does, not by guessing.
+    ///
+    /// ⚠️ AN EARLIER VERSION TOOK THE FIRST ANCESTOR HOLDING A `.gitignore`.
+    /// Adding `ci/.gitignore` — an ordinary thing to do — would have silently
+    /// redirected every assertion below to that file instead, and they would
+    /// all still have passed. Resolving by `.git` and then cross-checking
+    /// against git's own answer removes the guess.
+    fn repository_root() -> PathBuf {
+        let candidate = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .find(|candidate| candidate.join(".git").exists())
+            .expect("locating the repository root by .git")
+            .to_path_buf();
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&candidate)
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .expect("asking git for the work-tree root");
+        assert!(
+            output.status.success(),
+            "git could not resolve the work tree"
+        );
+        let toplevel = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+        assert_eq!(
+            candidate.canonicalize().unwrap(),
+            toplevel.canonicalize().unwrap(),
+            "the resolved root disagrees with git's own"
+        );
+        candidate
+    }
+
+    fn is_ignored(root: &Path, relative: &str) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["check-ignore", "-q", relative])
+            .status()
+            .expect("running git check-ignore")
+            .success()
+    }
+
+    /// This repository must ACTUALLY ignore `ignored/`, and must not exempt a
+    /// run summary by name.
+    ///
+    /// ⚠️ TWO GAPS THIS CLOSES, BOTH FOUND BY A REVIEWER OF PR 3026. The
+    /// fixture-based test above writes its own `.gitignore`, so it proves the
+    /// mechanism and says nothing about this repository's configuration. And
+    /// the earlier version of this test asserted only the ABSENCE of a by-name
+    /// exemption. Between them, deleting `/ignored/` from the real file left
+    /// both passing while the fix silently stopped working — the summaries
+    /// would go back to being counted as prepared source.
+    ///
+    /// So this asks git rather than reading the file: `git check-ignore` is the
+    /// same judgement `git ls-files --others --exclude-standard` makes, so it
+    /// cannot drift from how the rule is spelled.
+    #[test]
+    fn the_repository_really_ignores_the_disposable_directory() {
+        let root = repository_root();
+
+        assert!(
+            is_ignored(&root, "ignored/.hermit-verify-summary-probe"),
+            "{}/.gitignore no longer ignores ignored/, so run summaries written \
+             there are counted as prepared source again",
+            root.display()
+        );
+
+        // Control: the check must discriminate. A tracked source path is not
+        // ignored, so a version of `is_ignored` that answered yes to everything
+        // would fail here.
+        assert!(
+            !is_ignored(&root, "ci/manifest-plan/src/nextest_binaries.rs"),
+            "the ignore check answered yes for a tracked source file, so it is \
+             not measuring anything"
+        );
+
+        // And the name itself must still not be exempted anywhere, so a stray
+        // summary outside ignored/ keeps moving the identity.
+        let text = fs::read_to_string(root.join(".gitignore")).expect("reading .gitignore");
+        for line in text.lines() {
+            let rule = line.split('#').next().unwrap_or_default().trim();
+            assert!(
+                !rule.contains("hermit-verify-summary")
+                    && !rule.contains("hermit-backend-engagement-summary"),
+                "{}/.gitignore exempts a run summary by name ({rule:?}); move the file into \
+                 ignored/ instead of hiding it from source accounting",
+                root.display()
+            );
+        }
+        assert!(
+            !is_ignored(&root, ".hermit-verify-summary-probe"),
+            "a stray summary in the repository root is ignored, so a leak there \
+             would no longer be visible to source accounting"
+        );
+    }
 }
