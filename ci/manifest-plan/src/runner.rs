@@ -64,6 +64,10 @@ use crate::timeouts::KVM_RATCHET_CI_CELL_COUNT;
 use crate::timeouts::KVM_RATCHET_TIMEOUT_CALIBRATIONS;
 #[cfg(test)]
 use crate::timeouts::KVM_RUN_1709_CI_REMOVAL_COUNT;
+#[cfg(test)]
+use crate::timeouts::LITEINST_2026_09_16_SELECTED_CI_CELL_COUNT;
+#[cfg(test)]
+use crate::timeouts::LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS;
 use crate::timeouts::MANIFEST_SCHEMA;
 #[cfg(test)]
 use crate::timeouts::NON_CI_CELL_COUNT;
@@ -4963,12 +4967,28 @@ mod tests {
                 + 2
                 + KVM_2026_09_08_SELECTED_CI_CELL_COUNT
                 + IPC_DETERMINISM_CHAOS_SELECTED_CI_CELL_COUNT
+                + LITEINST_2026_09_16_SELECTED_CI_CELL_COUNT
         );
         assert_eq!(
             enabled.len() - required.len(),
-            NON_CI_CELL_COUNT,
+            NON_CI_CELL_COUNT - LITEINST_2026_09_16_SELECTED_CI_CELL_COUNT,
             "the current manifest census records every enabled ci:false cell"
         );
+
+        // These were already enabled cells. Selection moves them from the
+        // non-CI population without rewriting the earlier retained census.
+        for calibration in LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS {
+            let cell = required
+                .iter()
+                .find(|cell| {
+                    cell.id.test == calibration.test
+                        && cell.id.mode == calibration.mode
+                        && cell.id.backend.as_deref() == Some(calibration.backend)
+                })
+                .expect("a newly qualified LiteInst cell is missing from required selection");
+            assert_eq!(cell.cpu_timeout_seconds, calibration.configured_cpu_seconds);
+            assert_eq!(cell.timeout_seconds, calibration.configured_wall_seconds);
+        }
 
         let observed = enabled
             .iter()

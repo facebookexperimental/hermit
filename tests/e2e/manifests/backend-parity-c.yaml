@@ -21,10 +21,8 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
+          liteinst: true
           kvm: true
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
@@ -90,10 +88,8 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
+          liteinst: true
           kvm: true
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
@@ -162,9 +158,7 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "17107307a33b6f6383c1b7bc2acb364b162b6c8c", "reason": "LiteInst parses host-assigned /proc/self/maps inode digit widths while ptrace PMU counting is active; a 12-RCB (120ns) initial drift accumulates to 672 RCBs (6,720ns), causing guest-visible virtual-time divergence under canonical verification at scheduler turn 10."}
+          liteinst: true
         backends_enabled:
           - ptrace
           - liteinst
@@ -1670,10 +1664,8 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
+          liteinst: true
           kvm: true
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
@@ -2996,10 +2988,8 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
+          liteinst: true
           kvm: true
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
@@ -3251,10 +3241,8 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
+          liteinst: true
           kvm: true
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
@@ -3826,10 +3814,8 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
+          liteinst: true
           kvm: true
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
@@ -4226,10 +4212,8 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
+          liteinst: true
           kvm: true
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "17107307a33b6f6383c1b7bc2acb364b162b6c8c", "reason": "LiteInst parses host-assigned /proc/self/maps inode digit widths while ptrace PMU counting is active; a 12-RCB (120ns) initial drift accumulates to 672 RCBs (6,720ns), causing guest-visible virtual-time divergence under canonical verification at scheduler turn 10."}
         backends_enabled:
           - ptrace
           - liteinst
@@ -4293,10 +4277,8 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
+          liteinst: true
           kvm: true
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
@@ -5157,10 +5139,8 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
+          liteinst: true
           kvm: true
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
@@ -5296,9 +5276,7 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
+          liteinst: true
         backends_enabled:
           - ptrace
           - liteinst
@@ -5367,10 +5345,8 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
+          liteinst: true
           kvm: true
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "e73e7ba0bf56fbbfefffa304f7622c67aac6ea88", "reason": "LiteInst parses host-assigned /proc/self/maps inode digit widths while ptrace PMU counting is active; the resulting 672-RCB (6,720ns) virtual-time divergence caused canonical verification to fail at scheduler turn 10."}
         backends_enabled:
           - ptrace
           - liteinst
@@ -5515,10 +5491,8 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
+          liteinst: true
           kvm: true
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
@@ -5587,9 +5561,7 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
+          liteinst: true
         backends_enabled:
           - ptrace
           - liteinst
@@ -5658,10 +5630,8 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
+          liteinst: true
           kvm: true
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
@@ -6140,9 +6110,7 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
+          liteinst: true
         backends_enabled:
           - ptrace
           - liteinst
@@ -6272,9 +6240,7 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
+          liteinst: true
         backends_enabled:
           - ptrace
           - liteinst
@@ -6338,10 +6304,8 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
+          liteinst: true
           kvm: true
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst

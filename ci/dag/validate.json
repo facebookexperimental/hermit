@@ -1014,6 +1014,13 @@
           "category": "backend-parity-c",
           "test": "backend-parity-c/aio-refusal",
           "mode": "verify",
+          "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/aio-refusal",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -1120,6 +1127,13 @@
           "test": "backend-parity-c/cwd-roundtrip",
           "mode": "verify",
           "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/cwd-roundtrip",
+          "mode": "verify",
+          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -1182,6 +1196,13 @@
           "category": "backend-parity-c",
           "test": "backend-parity-c/event-delivery-ordering",
           "mode": "verify",
+          "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/event-delivery-ordering",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -1190,6 +1211,13 @@
           "test": "backend-parity-c/eventfd-semantics",
           "mode": "verify",
           "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/eventfd-semantics",
+          "mode": "verify",
+          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -1266,6 +1294,13 @@
           "category": "backend-parity-c",
           "test": "backend-parity-c/fcntl-owner",
           "mode": "verify",
+          "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/fcntl-owner",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -1302,6 +1337,13 @@
           "test": "backend-parity-c/file-io-roundtrip",
           "mode": "verify",
           "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/file-io-roundtrip",
+          "mode": "verify",
+          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -1504,6 +1546,13 @@
           "category": "backend-parity-c",
           "test": "backend-parity-c/membarrier-query",
           "mode": "verify",
+          "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/membarrier-query",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -1568,6 +1617,13 @@
           "test": "backend-parity-c/mkdir-rmdir",
           "mode": "verify",
           "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/mkdir-rmdir",
+          "mode": "verify",
+          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -1672,6 +1728,13 @@
           "category": "backend-parity-c",
           "test": "backend-parity-c/o-tmpfile-anon",
           "mode": "verify",
+          "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/o-tmpfile-anon",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -1715,6 +1778,13 @@
           "test": "backend-parity-c/path-file-ops",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/personality-domain",
+          "mode": "verify",
+          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -1785,6 +1855,13 @@
           "test": "backend-parity-c/pipe-capacity",
           "mode": "verify",
           "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/pipe-capacity",
+          "mode": "verify",
+          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -1896,6 +1973,13 @@
           "category": "backend-parity-c",
           "test": "backend-parity-c/record-lock",
           "mode": "verify",
+          "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/record-lock",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -1994,6 +2078,13 @@
           "category": "backend-parity-c",
           "test": "backend-parity-c/sendfile-copy",
           "mode": "verify",
+          "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/sendfile-copy",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -2002,6 +2093,13 @@
           "test": "backend-parity-c/set-tid-address",
           "mode": "verify",
           "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/set-tid-address",
+          "mode": "verify",
+          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -2037,6 +2135,13 @@
           "test": "backend-parity-c/shutdown-socketpair",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/signal-delivery-sequence",
+          "mode": "verify",
+          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -2176,6 +2281,13 @@
           "category": "backend-parity-c",
           "test": "backend-parity-c/symlink-ops",
           "mode": "verify",
+          "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/symlink-ops",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -2225,6 +2337,13 @@
           "category": "backend-parity-c",
           "test": "backend-parity-c/umask-mode",
           "mode": "verify",
+          "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/umask-mode",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -2268,6 +2387,13 @@
           "test": "backend-parity-c/vectored-io",
           "mode": "verify",
           "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/vectored-io",
+          "mode": "verify",
+          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -3028,6 +3154,13 @@
           "category": "c-programs",
           "test": "c-programs/ioctl-fioclex",
           "mode": "verify",
+          "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/ioctl-fioclex",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -3708,6 +3841,13 @@
           "test": "c-programs/netns-cookie-udp4",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/pause-alarm-interrupt",
+          "mode": "verify",
+          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -6268,6 +6408,13 @@
           "category": "system-utils",
           "test": "system-utils/clock-determinism",
           "mode": "verify",
+          "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/clock-determinism",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -6556,6 +6703,13 @@
           "test": "system-utils/record-getpid",
           "mode": "verify",
           "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/record-getpid",
+          "mode": "verify",
+          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -13582,6 +13736,13 @@
           "category": "backend-parity-c",
           "test": "backend-parity-c/aio-refusal",
           "mode": "verify",
+          "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/aio-refusal",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -13688,6 +13849,13 @@
           "test": "backend-parity-c/cwd-roundtrip",
           "mode": "verify",
           "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/cwd-roundtrip",
+          "mode": "verify",
+          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -13750,6 +13918,13 @@
           "category": "backend-parity-c",
           "test": "backend-parity-c/event-delivery-ordering",
           "mode": "verify",
+          "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/event-delivery-ordering",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -13758,6 +13933,13 @@
           "test": "backend-parity-c/eventfd-semantics",
           "mode": "verify",
           "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/eventfd-semantics",
+          "mode": "verify",
+          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -13834,6 +14016,13 @@
           "category": "backend-parity-c",
           "test": "backend-parity-c/fcntl-owner",
           "mode": "verify",
+          "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/fcntl-owner",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -13870,6 +14059,13 @@
           "test": "backend-parity-c/file-io-roundtrip",
           "mode": "verify",
           "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/file-io-roundtrip",
+          "mode": "verify",
+          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -14072,6 +14268,13 @@
           "category": "backend-parity-c",
           "test": "backend-parity-c/membarrier-query",
           "mode": "verify",
+          "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/membarrier-query",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -14136,6 +14339,13 @@
           "test": "backend-parity-c/mkdir-rmdir",
           "mode": "verify",
           "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/mkdir-rmdir",
+          "mode": "verify",
+          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -14240,6 +14450,13 @@
           "category": "backend-parity-c",
           "test": "backend-parity-c/o-tmpfile-anon",
           "mode": "verify",
+          "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/o-tmpfile-anon",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -14283,6 +14500,13 @@
           "test": "backend-parity-c/path-file-ops",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/personality-domain",
+          "mode": "verify",
+          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -14353,6 +14577,13 @@
           "test": "backend-parity-c/pipe-capacity",
           "mode": "verify",
           "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/pipe-capacity",
+          "mode": "verify",
+          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -14464,6 +14695,13 @@
           "category": "backend-parity-c",
           "test": "backend-parity-c/record-lock",
           "mode": "verify",
+          "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/record-lock",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -14562,6 +14800,13 @@
           "category": "backend-parity-c",
           "test": "backend-parity-c/sendfile-copy",
           "mode": "verify",
+          "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/sendfile-copy",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -14570,6 +14815,13 @@
           "test": "backend-parity-c/set-tid-address",
           "mode": "verify",
           "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/set-tid-address",
+          "mode": "verify",
+          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -14605,6 +14857,13 @@
           "test": "backend-parity-c/shutdown-socketpair",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/signal-delivery-sequence",
+          "mode": "verify",
+          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -14744,6 +15003,13 @@
           "category": "backend-parity-c",
           "test": "backend-parity-c/symlink-ops",
           "mode": "verify",
+          "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/symlink-ops",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -14793,6 +15059,13 @@
           "category": "backend-parity-c",
           "test": "backend-parity-c/umask-mode",
           "mode": "verify",
+          "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/umask-mode",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -14836,6 +15109,13 @@
           "test": "backend-parity-c/vectored-io",
           "mode": "verify",
           "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/vectored-io",
+          "mode": "verify",
+          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -15549,6 +15829,13 @@
           "category": "c-programs",
           "test": "c-programs/ioctl-fioclex",
           "mode": "verify",
+          "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/ioctl-fioclex",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -16229,6 +16516,13 @@
           "test": "c-programs/netns-cookie-udp4",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/pause-alarm-interrupt",
+          "mode": "verify",
+          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -18741,6 +19035,13 @@
           "category": "system-utils",
           "test": "system-utils/clock-determinism",
           "mode": "verify",
+          "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/clock-determinism",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -19029,6 +19330,13 @@
           "test": "system-utils/record-getpid",
           "mode": "verify",
           "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/record-getpid",
+          "mode": "verify",
+          "backend": "liteinst"
         },
         {
           "lane": "portable",
