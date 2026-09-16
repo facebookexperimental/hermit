@@ -865,6 +865,7 @@ mod ledger_tests {
                 complete,
                 serde_json::json!({}),
                 None,
+                None,
             );
             let text = std::fs::read_to_string(&path).unwrap();
             assert_eq!(text.lines().count(), 1);

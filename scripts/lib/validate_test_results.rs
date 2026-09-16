@@ -600,7 +600,7 @@ mod tests {
         let mut malformed = valid.clone();
         malformed[0].result_manifests =
             Some(vec![dagrun::model::ResultManifest::StructuredTestResults(
-                dagrun::model::StructuredTestResultsManifest::current("e2e.other".into()),
+                dagrun::model::StructuredTestResultsManifest::current("e2e.other"),
             )]);
         let mut duplicate_declarations = valid.clone();
         duplicate_declarations[0]
