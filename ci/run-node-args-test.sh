@@ -24,7 +24,9 @@ fail() {
 }
 
 run_local() {
-    env -u CI -u GITHUB_ACTIONS -u VALIDATE_RUN_STATE "$@"
+    # A nested plan query retains its real outer run state and ancestry.
+    # Only the hosted-environment switches are removed for these local controls.
+    env -u CI -u GITHUB_ACTIONS "$@"
 }
 
 expect_removed_refusal() {

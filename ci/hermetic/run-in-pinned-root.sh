@@ -91,7 +91,8 @@ if ! podman image exists "$digest"; then
     exit 1
 fi
 
-mkdir -p "$out/target" "$out/home"
+pinned_home="$out/home"
+mkdir -p "$out/target" "$pinned_home"
 
 cargo_mount=(); cargo_home_in=/build/.cargo
 git_mounts=()
@@ -185,10 +186,10 @@ if [[ -n "$cargo_home" ]]; then
     # disabled network, even though the image carries its own pinned clippy.
     # Import only dependency caches into a separate Cargo home so `/bin` remains
     # the sole source of Cargo subcommands in the pinned root.
-    mkdir -p "$out/home/.cargo"
+    mkdir -p "$pinned_home/.cargo"
     for cache in registry git; do
         if [[ -d "$cargo_home/$cache" ]]; then
-            mkdir -p "$out/home/.cargo/$cache"
+            mkdir -p "$pinned_home/.cargo/$cache"
             cargo_mount+=(--mount "type=bind,source=$cargo_home/$cache,destination=/build/.cargo/$cache")
         fi
     done
@@ -252,7 +253,7 @@ exec podman run --rm \
     --tmpfs /test:rw,nosuid,nodev,mode=1777 \
     --mount "type=bind,source=$src,destination=/src,$src_mode" \
     --mount "type=bind,source=$out/target,destination=/src/target" \
-    --mount "type=bind,source=$out/home,destination=/build" \
+    --mount "type=bind,source=$pinned_home,destination=/build" \
     "${cargo_mount[@]}" \
     "${git_mounts[@]}" \
     "${extra_mounts[@]}" \

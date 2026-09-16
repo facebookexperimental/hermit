@@ -40,7 +40,7 @@ class CargoCacheMounts(unittest.TestCase):
         )
         fake.chmod(0o755)
 
-    def invoke(self, cargo_home="cargo", run_state=None, source="source"):
+    def invoke(self, cargo_home="cargo", run_state=None, source="source", output="output"):
         env = os.environ.copy()
         env["PATH"] = str(self.root / "tools") + os.pathsep + env["PATH"]
         env["PINNED_ROOT_CAPTURE"] = str(self.capture)
@@ -50,7 +50,7 @@ class CargoCacheMounts(unittest.TestCase):
             forwarded = ["--env", "VALIDATE_RUN_STATE"]
         result = subprocess.run(
             [
-                "bash", str(WRAPPER), "--src", str(source), "--out", "output",
+                "bash", str(WRAPPER), "--src", str(source), "--out", output,
                 "--cargo-home", cargo_home, "--digest", "fixture@sha256:unused",
                 *forwarded,
                 "--", "/not-executed/command", "literal argument",
@@ -80,6 +80,29 @@ class CargoCacheMounts(unittest.TestCase):
         self.assertIn("CARGO_HOME=/build/.cargo", argv)
         self.assertEqual(argv.count("--cgroups=disabled"), 1)
         self.assertFalse(any(arg.startswith(("--cgroup-parent", "--cgroupns")) for arg in argv))
+        self.assertIn("--network=none", argv)
+        self.assertIn("--http-proxy=false", argv)
+        self.assertEqual(argv[-3:], ["fixture@sha256:unused", "/not-executed/command", "literal argument"])
+
+    def test_normalized_output_with_spaces_keeps_the_exact_private_home(self):
+        result, calls = self.invoke(output="unused directory/../output with spaces")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(calls), 2)
+        argv = calls[1]
+        output = self.root / "output with spaces"
+        private_home = output / "home"
+        mounts = [argv[index + 1] for index, arg in enumerate(argv) if arg == "--mount"]
+        self.assertIn(f"type=bind,source={output / 'target'},destination=/src/target", mounts)
+        self.assertIn(f"type=bind,source={private_home},destination=/build", mounts)
+        for cache in ("registry", "git"):
+            self.assertTrue((private_home / ".cargo" / cache).is_dir(), cache)
+            self.assertIn(
+                f"type=bind,source={self.root / 'cargo' / cache},destination=/build/.cargo/{cache}",
+                mounts,
+            )
+        self.assertFalse((self.root / "unused directory").exists())
+        self.assertIn("HOME=/build", argv)
+        self.assertIn("CARGO_HOME=/build/.cargo", argv)
         self.assertIn("--network=none", argv)
         self.assertIn("--http-proxy=false", argv)
         self.assertEqual(argv[-3:], ["fixture@sha256:unused", "/not-executed/command", "literal argument"])

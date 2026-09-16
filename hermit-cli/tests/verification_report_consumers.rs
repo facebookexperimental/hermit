@@ -427,7 +427,7 @@ fn a_real_match_and_a_typed_verdict_mutation_bracket_every_consumer() {
         let refused = verdict(consumer.requirement, &report_path);
         assert_eq!(
             refused.status.code(),
-            Some(1),
+            Some(1), // EXIT-CLASS: verification-report requirement unmet.
             "{} ignored the mutated typed verdict: {}",
             consumer.path,
             String::from_utf8_lossy(&refused.stderr)
@@ -448,7 +448,7 @@ fn a_real_match_and_a_typed_verdict_mutation_bracket_every_consumer() {
         let refused = verdict(consumer.requirement, &report_path);
         assert_eq!(
             refused.status.code(),
-            Some(1),
+            Some(1), // EXIT-CLASS: verification-report requirement unmet.
             "{} accepted a typed infrastructure error: {}",
             consumer.path,
             String::from_utf8_lossy(&refused.stderr)
@@ -499,6 +499,7 @@ fn current_shape_and_canonical_evidence_fail_by_name() {
     stripped["comparison"]["strictness"] = serde_json::json!("stripped");
     write_report(&report_path, &stripped);
     let refused = verdict("canonical-match", &report_path);
+    // EXIT-CLASS: verification-report canonical-match requirement unmet.
     assert_eq!(refused.status.code(), Some(1));
     assert!(
         String::from_utf8_lossy(&refused.stderr).contains("strictness=stripped"),
