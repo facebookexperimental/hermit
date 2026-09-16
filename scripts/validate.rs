@@ -1342,7 +1342,30 @@ fn strict_flag_missing_from(argv: &[String]) -> bool {
 /// rust-script cannot build the driver; that remains a pre-driver bootstrap
 /// failure and must not manufacture a typed result.
 fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, String> {
-    fn run_fixture(checkout: &Path, result: &Path) -> Result<std::process::Output, String> {
+    fn run_fixture(
+        checkout: &Path,
+        result: &Path,
+        ledger: &Path,
+    ) -> Result<std::process::Output, String> {
+        use std::os::unix::fs::MetadataExt;
+
+        let ledger_identity = |metadata: &std::fs::Metadata| {
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.mode(),
+                metadata.len(),
+                metadata.mtime(),
+                metadata.mtime_nsec(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            )
+        };
+        let ledger_before = std::fs::symlink_metadata(ledger)
+            .map_err(|error| format!("submodule service result: cannot inspect private ledger: {error}"))?;
+        if !ledger_before.is_file() || ledger_before.len() != 0 {
+            return Err("submodule service result: private ledger must be an empty regular file".into());
+        }
         let mut command = Command::new("timeout");
         command
             .args([
@@ -1357,6 +1380,9 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
             ])
             .current_dir(checkout)
             .env(VALIDATE_SERVICE_RESULT_PATH_ENV, result)
+            // This clone still sits under the real parent. Override inherited
+            // history and parent discovery with this fixture's empty input.
+            .env(LEDGER_ENV, ledger)
             .env("DAGRUN_FORCE_SCOPE_ATTEMPT", "1")
             .env_remove("CI")
             .env_remove("GITHUB_ACTIONS")
@@ -1387,9 +1413,15 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
             // instead of consuming this checkout's prepared executable.
             .env_remove("HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED")
             .env_remove("HERMIT_RUST_SCRIPT_ARTIFACT_ROOT");
-        command
+        let output = command
             .output()
-            .map_err(|error| format!("submodule service result: cannot launch fixture: {error}"))
+            .map_err(|error| format!("submodule service result: cannot launch fixture: {error}"))?;
+        let ledger_after = std::fs::symlink_metadata(ledger)
+            .map_err(|error| format!("submodule service result: cannot reread private ledger: {error}"))?;
+        if ledger_identity(&ledger_after) != ledger_identity(&ledger_before) {
+            return Err("submodule service result: child modified the private ledger".into());
+        }
+        Ok(output)
     }
 
     fn checked_command(command: &mut Command, what: &str) -> Result<(), String> {
@@ -1410,6 +1442,8 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
 
     let fixture = tempfile::tempdir()
         .map_err(|error| format!("submodule service result: cannot create fixture: {error}"))?;
+    let ledger = tempfile::NamedTempFile::new_in(fixture.path())
+        .map_err(|error| format!("submodule service result: cannot create private ledger: {error}"))?;
     let checkout = fixture.path().join("hermit");
     checked_command(
         Command::new("git")
@@ -1501,7 +1535,7 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
     }
 
     let bootstrap_result = fixture.path().join("bootstrap-result.json");
-    let bootstrap = run_fixture(&checkout, &bootstrap_result)?;
+    let bootstrap = run_fixture(&checkout, &bootstrap_result, ledger.path())?;
     let bootstrap_output = format!(
         "{}{}",
         String::from_utf8_lossy(&bootstrap.stdout),
@@ -1547,7 +1581,7 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
     )?;
 
     let result_path = fixture.path().join("service-result.json");
-    let output = run_fixture(&checkout, &result_path)?;
+    let output = run_fixture(&checkout, &result_path, ledger.path())?;
     let rendered = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
