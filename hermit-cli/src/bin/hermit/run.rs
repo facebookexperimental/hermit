@@ -1522,7 +1522,7 @@ fn mapped_guest_path_is_resolved_before_host_validation() {
 
 #[test]
 fn non_e9patch_validation_preserves_parent_component_paths() {
-    let ro = RunOpts::parse_from(["fakehermit", "--backend", "ptrace", "/usr/bin/../bin/echo"]);
+    let ro = RunOpts::parse_from(["fakehermit", "--backend", "ptrace", "/bin/../bin/echo"]);
     ro.validate_program().unwrap();
 }
 

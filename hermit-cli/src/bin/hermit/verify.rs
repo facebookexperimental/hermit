@@ -2482,19 +2482,21 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn requested_logs_survive_log_comparison_io_error() {
-        use std::os::unix::fs::PermissionsExt;
-
         let directory = tempfile::tempdir().unwrap();
         let output = output(0, b"hello\n", b"");
         let (left, right) = temp_log_files_in("left", "right", Some(directory.path())).unwrap();
-        fs::write(left.path(), detlog_with_value(7)).unwrap();
-        fs::write(right.path(), detlog_with_value(7)).unwrap();
+        let mut left_bytes = detlog_with_value(7).into_bytes();
+        left_bytes.push(0xff);
+        let right_bytes = detlog_with_value(7).into_bytes();
+        fs::write(left.path(), &left_bytes).unwrap();
+        fs::write(right.path(), &right_bytes).unwrap();
         let left_path = left.path().to_path_buf();
         let right_path = right.path().to_path_buf();
-        fs::set_permissions(&left_path, fs::Permissions::from_mode(0o000)).unwrap();
+        // Invalid UTF-8 reaches the real comparator's I/O error path even when
+        // the test can read files whose permission bits are all clear.
         assert!(
-            fs::read(&left_path).is_err(),
-            "the test must make the run-1 log unreadable"
+            std::str::from_utf8(&fs::read(&left_path).unwrap()).is_err(),
+            "the run-1 log must contain invalid UTF-8"
         );
 
         let result = compare_two_runs(
@@ -2521,7 +2523,14 @@ mod tests {
             },
         );
 
-        assert!(result.is_err(), "unreadable input must fail comparison");
+        let error = result.expect_err("invalid UTF-8 must fail comparison");
+        assert_eq!(
+            error
+                .downcast_ref::<io::Error>()
+                .expect("the real comparator must return an I/O error")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
         assert!(
             left_path.exists(),
             "run-1 log must survive the comparison error"
@@ -2530,7 +2539,13 @@ mod tests {
             right_path.exists(),
             "run-2 log must survive the comparison error"
         );
-        fs::set_permissions(&left_path, fs::Permissions::from_mode(0o600)).unwrap();
+        for (path, expected) in [
+            (&left_path, left_bytes.as_slice()),
+            (&right_path, right_bytes.as_slice()),
+        ] {
+            assert!(fs::symlink_metadata(path).unwrap().file_type().is_file());
+            assert_eq!(fs::read(path).unwrap(), expected);
+        }
         fs::remove_file(left_path).unwrap();
         fs::remove_file(right_path).unwrap();
     }
