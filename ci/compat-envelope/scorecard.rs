@@ -1582,6 +1582,31 @@ impl ResultRow {
     /// strict comparison actually ran; a red produced by a weaker comparison
     /// would lower the standard just as surely as admitting its green.
     fn bitwise_info_comparison(&self) -> Result<(BTreeSet<u64>, BTreeSet<u64>), String> {
+        self.bitwise_info_comparison_from(ResultInput::Current)
+    }
+
+    fn parse_verification_report(
+        &self,
+        bytes: &[u8],
+        input: ResultInput,
+    ) -> Result<canonical_verdict::VerificationReport, String> {
+        let historical_ordinary = input == ResultInput::Retained
+            && self.backend_parity.is_none()
+            && self.error_kind.as_deref() != Some("incomplete-parity-evidence")
+            && !self.attempts.iter().any(|attempt| {
+                attempt.get("index").and_then(JsonValue::as_str) == Some("parity-reference")
+            });
+        if historical_ordinary {
+            canonical_verdict::VerificationReport::from_retained_cell_json_slice(bytes)
+        } else {
+            canonical_verdict::VerificationReport::from_current_json_slice(bytes)
+        }
+    }
+
+    fn bitwise_info_comparison_from(
+        &self,
+        input: ResultInput,
+    ) -> Result<(BTreeSet<u64>, BTreeSet<u64>), String> {
         self.require_provenance()?;
         if !matches!(self.mode.as_str(), "verify" | "replay" | "chaos") {
             return Err(format!(
@@ -1686,10 +1711,9 @@ impl ResultRow {
                     index + 1
                 ));
             }
-            let report = canonical_verdict::VerificationReport::from_current_json_slice(
-                report_text.as_bytes(),
-            )
-            .map_err(|error| format!("attempt {} {error}", index + 1))?;
+            let report = self
+                .parse_verification_report(report_text.as_bytes(), input)
+                .map_err(|error| format!("attempt {} {error}", index + 1))?;
             report.require_canonical_comparison().map_err(|error| {
                 format!(
                     "attempt {} cannot support a scorecard result: {error}",
@@ -1746,6 +1770,10 @@ impl ResultRow {
     /// the whole row unavailable because the scorecard stores cell results,
     /// not independently selectable seed results.
     fn comparison_evidence(&self) -> Result<ValidateRowEvidence, String> {
+        self.comparison_evidence_from(ResultInput::Current)
+    }
+
+    fn comparison_evidence_from(&self, input: ResultInput) -> Result<ValidateRowEvidence, String> {
         self.require_provenance()?;
         self.validate_recorded_classification()?;
         let no_verdict_result = self.no_verdict_result();
@@ -1776,8 +1804,42 @@ impl ResultRow {
                 let signal = attempt.get("signal").and_then(JsonValue::as_i64);
                 let disposition = matches!((status, signal), (Some(status), None) if status != 0)
                     || matches!((status, signal), (None, Some(_)));
+                let timed_out = attempt.get("timed_out").and_then(JsonValue::as_bool);
+                let names_backend = |attempt: &JsonValue, backend: &str| {
+                    attempt
+                        .get("argv")
+                        .and_then(JsonValue::as_array)
+                        .is_some_and(|argv| {
+                            argv.windows(2)
+                                .filter(|pair| pair[0].as_str() == Some("--backend"))
+                                .map(|pair| pair[1].as_str())
+                                .collect::<Vec<_>>()
+                                == [Some(backend)]
+                        })
+                };
+                let missing_reference = index == 1
+                    && self.attempts.len() == 2
+                    && self.mode == "verify"
+                    && self.outcome == "ERROR"
+                    && self.result.is_none()
+                    && self.failure_class == Some(FailureClass::NoResult)
+                    && self.error_kind.as_deref() == Some("incomplete-parity-evidence")
+                    && self.backend_parity.is_none()
+                    && DivergenceCoordinates::from_row(self).is_empty()
+                    && saw_canonical_match
+                    && unavailable.is_none()
+                    && self.attempts[0].get("index").and_then(JsonValue::as_str) == Some("1")
+                    && attempt.get("index").and_then(JsonValue::as_str) == Some("parity-reference")
+                    && self.backend.as_deref().is_some_and(|backend| {
+                        backend != "ptrace" && names_backend(&self.attempts[0], backend)
+                    })
+                    && names_backend(attempt, "ptrace")
+                    && attempt.get("guest_argv") == self.attempts[0].get("guest_argv")
+                    && timed_out == Some(false)
+                    && attempt.get("error_kind").and_then(JsonValue::as_str)
+                        == Some("incomplete-verification-evidence");
                 if attempt.get("outcome").and_then(JsonValue::as_str) != Some("ERROR")
-                    || attempt.get("timed_out").and_then(JsonValue::as_bool) != Some(true)
+                    || !(timed_out == Some(true) || missing_reference)
                     || attempt
                         .get("error_kind")
                         .and_then(JsonValue::as_str)
@@ -1785,15 +1847,16 @@ impl ResultRow {
                     || !disposition
                 {
                     return Err(format!(
-                        "attempt {} has no embedded verification report and no complete timeout disposition",
+                        "attempt {} has no embedded verification report and no complete timeout or ptrace-reference disposition",
                         index + 1
                     ));
                 }
                 unavailable.get_or_insert_with(|| {
-                    format!(
-                        "attempt {} timed out before emitting a verification report",
-                        index + 1
-                    )
+                    if missing_reference {
+                        format!("NO_RESULT: ptrace reference exited before emitting a verification report (status={status:?}, signal={signal:?})")
+                    } else {
+                        format!("attempt {} timed out before emitting a verification report", index + 1)
+                    }
                 });
                 continue;
             };
@@ -1815,10 +1878,9 @@ impl ResultRow {
                     index + 1
                 )
             })?;
-            let report = canonical_verdict::VerificationReport::from_current_json_slice(
-                report_text.as_bytes(),
-            )
-            .map_err(|error| format!("attempt {} {error}", index + 1))?;
+            let report = self
+                .parse_verification_report(report_text.as_bytes(), input)
+                .map_err(|error| format!("attempt {} {error}", index + 1))?;
             operand_verifications.push(report.clone());
 
             if matches!(
@@ -1931,7 +1993,7 @@ impl ResultRow {
                         report.first_divergent_virtual_nanoseconds;
                     single.first_divergent_record = report.first_divergent_record;
                     single.first_divergent_syscall = report.first_divergent_syscall;
-                    match single.bitwise_info_comparison() {
+                    match single.bitwise_info_comparison_from(input) {
                         Ok((left, right)) => {
                             left_info_messages.extend(left);
                             right_info_messages.extend(right);
@@ -3209,7 +3271,7 @@ This is measured ptrace-reference parity, not CI plan membership and not same-ba
 A cell is eligible when the corresponding ptrace `verify` coordinate is Green; this intentionally \
 includes manifest-disabled candidate cells selected through `--probe-disabled`. `Never measured` \
 means no strict typed ptrace-vs-candidate report exists. \
-At the latest recorded Hermit source depth, any divergence outranks a match.\n\n\
+At the latest recorded Hermit source depth, any divergence outranks a match. The portable and hosted-portable `backend-parity-c` nodes measure a subset of these eligible cells; eligibility is not a claim that the activated nodes select or measured every cell.\n\n\
 | Candidate backend | Eligible ptrace-green cells | Disabled probe candidates | Measured match | Parity failure | Never measured |\n\
 | --- | ---: | ---: | ---: | ---: | ---: |\n"
         .to_owned();
@@ -3243,8 +3305,8 @@ At the latest recorded Hermit source depth, any divergence outranks a match.\n\n
 
     out.push_str(
         "\nMeasured pairs are listed individually so a failing backend/test coordinate is visible \
-without interpreting the plan-colour tables. Counts are records/messages actually compared.\n\n\
-| Test | Candidate backend | Result | Compared records | Ptrace INFO | Candidate INFO |\n\
+without interpreting the plan-colour tables. The raw-record column is the smaller of the two complete input record counts, before target and INFO selection. The Ptrace INFO and Candidate INFO columns count the selected Detcore messages used for comparison.\n\n\
+| Test | Candidate backend | Result | Smaller raw record count | Ptrace INFO | Candidate INFO |\n\
 | --- | --- | --- | ---: | ---: | ---: |\n",
     );
     let mut measured = 0usize;
@@ -4634,6 +4696,45 @@ fn apply_validate_results(
     store_invocation: bool,
     store_positions: bool,
 ) -> Result<ValidateFold, String> {
+    apply_validate_results_from(
+        tracked,
+        rows,
+        hermit_sha,
+        detcore_tree,
+        depth,
+        ValidateInput {
+            reports: ResultInput::Current,
+            store_invocation,
+            store_positions,
+        },
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResultInput {
+    Current,
+    Retained,
+}
+
+struct ValidateInput {
+    reports: ResultInput,
+    store_invocation: bool,
+    store_positions: bool,
+}
+
+fn apply_validate_results_from(
+    tracked: &mut TrackedCells,
+    rows: &BTreeMap<CellId, Vec<ResultCandidate>>,
+    hermit_sha: &str,
+    detcore_tree: &str,
+    depth: &BTreeMap<String, SourceDepth>,
+    input: ValidateInput,
+) -> Result<ValidateFold, String> {
+    let ValidateInput {
+        reports,
+        store_invocation,
+        store_positions,
+    } = input;
     let mut updated = tracked.clone();
     let mut fold = ValidateFold::default();
     for (id, candidates) in rows {
@@ -4649,7 +4750,7 @@ fn apply_validate_results(
                     .map_err(|error| format!("{} {error}", display_id(id)))?;
                 candidate
                     .row
-                    .comparison_evidence()
+                    .comparison_evidence_from(reports)
                     .map(|evidence| (candidate, evidence))
                     .map_err(|error| format!("{} {error}", display_id(id)))
             })
@@ -5187,14 +5288,17 @@ fn import_results(
         } else {
             historical_without_coordinates += 1;
             let rows = BTreeMap::from([(retained.id.clone(), retained.candidates.clone())]);
-            let one = apply_validate_results(
+            let one = apply_validate_results_from(
                 &mut tracked,
                 &rows,
                 &retained.hermit_sha,
                 &retained.detcore_tree,
                 &retained.depth,
-                false,
-                true,
+                ValidateInput {
+                    reports: ResultInput::Retained,
+                    store_invocation: false,
+                    store_positions: true,
+                },
             )?;
             retained_rows_imported += retained.candidates.len();
             fold.passed += one.passed;
@@ -5211,14 +5315,17 @@ fn import_results(
                 store_positions,
             } => {
                 let rows = BTreeMap::from([(retained.id.clone(), retained.candidates.clone())]);
-                let one = apply_validate_results(
+                let one = apply_validate_results_from(
                     &mut tracked,
                     &rows,
                     &retained.hermit_sha,
                     &retained.detcore_tree,
                     &retained.depth,
-                    false,
-                    store_positions,
+                    ValidateInput {
+                        reports: ResultInput::Retained,
+                        store_invocation: false,
+                        store_positions,
+                    },
                 )?;
                 retained_rows_imported += retained.candidates.len();
                 fold.passed += one.passed;
@@ -8284,13 +8391,16 @@ fn read_retained_results(
             .into_values()
             .next()
             .expect("distinct terminal evidence is nonempty");
-        let is_parity = match candidate.row.comparison_evidence().map_err(|error| {
-            format!(
-                "malformed retained evidence for {} at {}: {error}",
-                display_id(&id),
-                candidate.path.display()
-            )
-        })? {
+        let is_parity = match candidate
+            .row
+            .comparison_evidence_from(ResultInput::Retained)
+            .map_err(|error| {
+                format!(
+                    "malformed retained evidence for {} at {}: {error}",
+                    display_id(&id),
+                    candidate.path.display()
+                )
+            })? {
             ValidateRowEvidence::NotRun { .. } | ValidateRowEvidence::Unavailable { .. } => {
                 continue;
             }
@@ -10580,6 +10690,16 @@ red/`measured-and-passed` count is **0**.",
                 schema: LOG_DIFF_REPORT_SCHEMA,
                 verdict: log_verdict,
                 refusal: None,
+                inputs: Some(hermit_manifest_plan::logdiff_report::LogDiffInputs {
+                    left: hermit_manifest_plan::logdiff_report::LogDiffInput {
+                        sha256: "b".repeat(64),
+                        bytes: 21,
+                    },
+                    right: hermit_manifest_plan::logdiff_report::LogDiffInput {
+                        sha256: "c".repeat(64),
+                        bytes: 21,
+                    },
+                }),
                 selected_messages: LogDiffMessageCounts { left: 3, right: 3 },
                 records: LogDiffRecords {
                     compared: 3,
@@ -10762,6 +10882,16 @@ red/`measured-and-passed` count is **0**.",
         .expect("fixture carries parity evidence")
         .candidate
         .retained_log_sha256 = "e".repeat(64);
+    conflicting_identity_row
+        .backend_parity
+        .as_mut()
+        .unwrap()
+        .comparison
+        .inputs
+        .as_mut()
+        .unwrap()
+        .right
+        .sha256 = "e".repeat(64);
     if first_identity_row.evidence_identity()? == conflicting_identity_row.evidence_identity()? {
         return Err("backend parity bytes were omitted from the result evidence identity".into());
     }
@@ -13929,6 +14059,203 @@ red/`measured-and-passed` count is **0**.",
                 && receipt.first_divergent_record == Some(2)
         })
     };
+    // Actual retained import accepts ordinary schema-4 receipts which predate
+    // output evidence, while current admission and parity operands still refuse
+    // the same absence. Never synthesize output bytes into historical reports.
+    let set_report = |attempt: &mut JsonValue, report: &JsonValue| -> Result<(), String> {
+        let raw = serde_json::to_string(report).map_err(|error| error.to_string())?;
+        attempt["verification_report_sha256"] =
+            format!("{:x}", Sha256::digest(raw.as_bytes())).into();
+        attempt["verification_report"] = raw.into();
+        Ok(())
+    };
+    for matched in [true, false] {
+        restored_import_fixture()?;
+        let mut historical = ordinary_pass.clone();
+        historical.run_id = format!("historical-ordinary-{matched}");
+        let mut report: JsonValue = serde_json::from_str(
+            historical.attempts[0]["verification_report"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        report.as_object_mut().unwrap().remove("compared_outputs");
+        if !matched {
+            report["verified"] = serde_json::json!(false);
+            report["bitwise_parity"] = serde_json::json!(false);
+            report["verdict"] = serde_json::json!("diverged");
+            historical.outcome = "FAIL".into();
+            historical.result = Some(ObservedResult::DeterminismFailure);
+            historical.failure_class = Some(FailureClass::ProductFailure);
+            historical.attempts[0]["outcome"] = serde_json::json!("FAIL");
+            historical.attempts[0]["status"] = serde_json::json!(1);
+        }
+        set_report(&mut historical.attempts[0], &report)?;
+        let parsed = canonical_verdict::VerificationReport::from_retained_cell_json_slice(
+            historical.attempts[0]["verification_report"]
+                .as_str()
+                .unwrap()
+                .as_bytes(),
+        )?;
+        if parsed.compared_outputs.is_some() {
+            return Err("historical parser fabricated output evidence".into());
+        }
+        historical
+            .comparison_evidence()
+            .expect_err("current receipt omitted outputs");
+        historical.comparison_evidence_from(ResultInput::Retained)?;
+        write_import_rows(&[&historical])?;
+        let retained = read_retained_results(
+            &result_command_root,
+            &result_root,
+            &BTreeSet::from([import_parity_id.clone()]),
+        )?;
+        if retained.terminal_comparisons != 1 {
+            return Err("historical ordinary receipt disappeared from retained reader".into());
+        }
+        let imported = run_result_command("import-results", Some(&current_summary))?;
+        if !imported.status.success()
+            || !imported_parity_cell()?
+                .observations
+                .iter()
+                .any(|observation| {
+                    observation.canonical_comparisons.iter().any(|receipt| {
+                        receipt.run_id == historical.run_id
+                            && Some(receipt.result) == historical.result
+                    })
+                })
+        {
+            return Err(format!("historical ordinary import failed: {imported:?}"));
+        }
+        restored_import_fixture()?;
+        let refused = run_result_command("observe-results", None)?;
+        if refused.status.success()
+            || !String::from_utf8_lossy(&refused.stderr).contains("compared_outputs")
+            || read_generated_files(&result_command_root)? != result_command_before
+        {
+            return Err(
+                "current observer admitted historical output absence or mutated on refusal".into(),
+            );
+        }
+        report.as_object_mut().unwrap().remove("guest_signal");
+        set_report(&mut historical.attempts[0], &report)?;
+        if !historical
+            .comparison_evidence_from(ResultInput::Retained)
+            .unwrap_err()
+            .contains("guest_signal")
+        {
+            return Err("retained parsing relaxed an existing producer field".into());
+        }
+    }
+    for index in [0, 1] {
+        restored_import_fixture()?;
+        let mut malformed = old_parity.clone();
+        let mut report: JsonValue = serde_json::from_str(
+            malformed.attempts[index]["verification_report"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        report.as_object_mut().unwrap().remove("compared_outputs");
+        set_report(&mut malformed.attempts[index], &report)?;
+        write_import_rows(&[&malformed])?;
+        let refused = run_result_command("import-results", Some(&current_summary))?;
+        if refused.status.success()
+            || !String::from_utf8_lossy(&refused.stderr).contains("compared_outputs")
+            || read_generated_files(&result_command_root)? != result_command_before
+        {
+            return Err("retained parity import admitted absent operand outputs".into());
+        }
+    }
+
+    // A ptrace process can fail before creating its report. Keep its absence
+    // and disposition as no-result without aborting other rows in the batch.
+    for signal in [None, Some(11)] {
+        restored_import_fixture()?;
+        let mut missing = parity_row(&import_parity_id, BackendParityVerdict::Matched)?;
+        missing.hermit_sha = fixture_head.clone();
+        missing.classification = "required".into();
+        missing.run_id = format!("missing-reference-{signal:?}");
+        missing.outcome = "ERROR".into();
+        missing.result = None;
+        missing.failure_class = Some(FailureClass::NoResult);
+        missing.error_kind = Some("incomplete-parity-evidence".into());
+        missing.backend_parity = None;
+        let attempt = &mut missing.attempts[1];
+        attempt["verification_report"] = JsonValue::Null;
+        attempt["verification_report_sha256"] = JsonValue::Null;
+        attempt["outcome"] = serde_json::json!("ERROR");
+        attempt["status"] = serde_json::json!(signal.is_none().then_some(7));
+        attempt["signal"] = serde_json::json!(signal);
+        attempt["timed_out"] = serde_json::json!(false);
+        attempt["error_kind"] = serde_json::json!("incomplete-verification-evidence");
+        missing.comparison_evidence()?;
+        write_import_rows(&[&missing, &ordinary_pass])?;
+        let output = run_result_command("observe-results", None)?;
+        let cell = imported_parity_cell()?;
+        if !output.status.success()
+            || !String::from_utf8_lossy(&output.stdout).contains("DETERMINED NOTHING")
+            || !cell.observations.iter().any(|observation| {
+                observation.invocations.iter().any(|invocation| {
+                    invocation.run_id == missing.run_id
+                        && invocation.result.is_none()
+                        && invocation.attempts.len() == 2
+                }) && observation
+                    .canonical_comparisons
+                    .iter()
+                    .any(|receipt| receipt.run_id == ordinary_pass.run_id)
+            })
+        {
+            return Err(format!(
+                "missing reference aborted or corrupted mixed observer batch: {output:?}"
+            ));
+        }
+        restored_import_fixture()?;
+        let output = run_result_command("import-results", Some(&current_summary))?;
+        if !output.status.success()
+            || !imported_parity_cell()?
+                .observations
+                .iter()
+                .any(|observation| {
+                    observation
+                        .canonical_comparisons
+                        .iter()
+                        .any(|receipt| receipt.run_id == ordinary_pass.run_id)
+                })
+        {
+            return Err(format!(
+                "missing reference aborted retained import batch: {output:?}"
+            ));
+        }
+        for (field, value) in [
+            ("outcome", serde_json::json!("PASS")),
+            (
+                "verification_report_sha256",
+                serde_json::json!("a".repeat(64)),
+            ),
+            ("index", serde_json::json!("1")),
+            ("error_kind", serde_json::json!("unknown")),
+        ] {
+            restored_import_fixture()?;
+            let mut malformed = missing.clone();
+            malformed.attempts[1][field] = value;
+            write_import_rows(&[&malformed, &ordinary_pass])?;
+            for command in ["observe-results", "import-results"] {
+                let output = run_result_command(
+                    command,
+                    (command == "import-results").then_some(current_summary.as_path()),
+                )?;
+                if output.status.success()
+                    || read_generated_files(&result_command_root)? != result_command_before
+                {
+                    return Err(format!(
+                        "{command} admitted missing-reference contradiction {field}"
+                    ));
+                }
+            }
+        }
+    }
+    restored_import_fixture()?;
     let mut parity_import_failures = Vec::new();
     restored_import_fixture()?;
     write_import_rows(&[&old_parity, &ordinary_pass])?;

@@ -13459,6 +13459,10 @@ mod pressure_sample_tests {
         report["verdict"] = json!("matched");
         report["no_result_reason"] = JsonValue::Null;
         report["guest_exit_code"] = json!(status);
+        let output = json!({"exit_code": status, "signal": null,
+            "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "stdout_bytes": 0,
+            "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "stderr_bytes": 0});
+        report["compared_outputs"] = json!({"left": output, "right": output});
         report["compared_log_messages"] = json!({"left": 17, "right": 17});
         report["comparison"] = json!({
             "strictness":"canonical", "display_name":"BitwiseInfoV1", "compare_logs":true,

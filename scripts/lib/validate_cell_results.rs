@@ -799,6 +799,9 @@ mod tests {
         virtualize_time: bool,
     ) -> String {
         let matched = verdict == "matched";
+        let output = serde_json::json!({"exit_code": 0, "signal": null,
+            "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "stdout_bytes": 0,
+            "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "stderr_bytes": 0});
         serde_json::json!({
             "verified": matched,
             "verdict": verdict,
@@ -823,6 +826,7 @@ mod tests {
                 "skip_commit": false,
                 "skip_detlog": false
             },
+            "compared_outputs": {"left": output, "right": output},
             "compared_log_messages": {"left": 123, "right": if matched { 123 } else { 124 }},
             "guest_exit_code": 0,
             "guest_signal": null,

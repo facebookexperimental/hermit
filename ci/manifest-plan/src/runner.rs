@@ -3112,6 +3112,7 @@ fn parity_operand(
     spec: &CellRunSpec,
     attempt: &AttemptResult,
     log: &Path,
+    captured_input: &crate::logdiff_report::LogDiffInput,
 ) -> Result<BackendParityOperand, String> {
     let verification = parity_verification_report(label, attempt)?;
     let output = verification
@@ -3122,6 +3123,14 @@ fn parity_operand(
         .clone();
     let log_bytes = fs::read(log)
         .map_err(|error| format!("cannot read retained log {}: {error}", log.display()))?;
+    let retained_log_sha256 = hex_digest(&log_bytes);
+    if retained_log_sha256 != captured_input.sha256
+        || log_bytes.len() as u64 != captured_input.bytes
+    {
+        return Err(format!(
+            "{label} retained log differs from the comparator's captured input"
+        ));
+    }
     let retained_log = log
         .strip_prefix(&spec.cell_dir)
         .unwrap_or(log)
@@ -3132,7 +3141,7 @@ fn parity_operand(
         output,
         verification,
         retained_log,
-        retained_log_sha256: hex_digest(&log_bytes),
+        retained_log_sha256,
     })
 }
 
@@ -3229,6 +3238,7 @@ fn produce_backend_parity_report(
         let comparison: LogDiffReport = serde_json::from_slice(&comparison_bytes)
             .map_err(|error| format!("backend log comparison report is unreadable: {error}"))?;
         comparison.require_cross_backend_evidence()?;
+        let inputs = comparison.inputs.as_ref().expect("required above");
         match (output.status.code(), comparison.verdict) {
             (Some(0), LogDiffVerdict::Matched) | (Some(1), LogDiffVerdict::Diverged) => {}
             (status, verdict) => {
@@ -3243,6 +3253,7 @@ fn produce_backend_parity_report(
             reference_spec,
             reference_attempt,
             &reference_log,
+            &inputs.left,
         )?;
         let candidate = parity_operand(
             "candidate",
@@ -3250,6 +3261,7 @@ fn produce_backend_parity_report(
             candidate_spec,
             candidate_attempt,
             &candidate_log,
+            &inputs.right,
         )?;
         let verdict = if reference.output == candidate.output
             && comparison.verdict == LogDiffVerdict::Matched
@@ -3781,8 +3793,9 @@ fn run_cell_inner(
             outcome = "FAIL".into();
             error_kind = None;
             reason = Some(format!(
-                "{} diverged from ptrace under strict shared-Detcore parity",
-                report.candidate.backend
+                "{} diverged from ptrace: {}",
+                report.candidate.backend,
+                report.differences().join(", ")
             ));
             first_divergent_scheduler_turn = report.comparison.first_divergent_scheduler_turn;
             first_divergent_virtual_nanoseconds =
@@ -8229,6 +8242,20 @@ backends_disabled:
             schema: crate::logdiff_report::LOG_DIFF_REPORT_SCHEMA,
             verdict,
             refusal: None,
+            inputs: Some(crate::logdiff_report::LogDiffInputs {
+                left: crate::logdiff_report::LogDiffInput {
+                    sha256: hex_digest(b"INFO detcore: shared\n"),
+                    bytes: 21,
+                },
+                right: crate::logdiff_report::LogDiffInput {
+                    sha256: hex_digest(if divergent {
+                        b"INFO detcore: candidate-diverged\n"
+                    } else {
+                        b"INFO detcore: shared\n"
+                    }),
+                    bytes: if divergent { 33 } else { 21 },
+                },
+            }),
             selected_messages: crate::logdiff_report::LogDiffMessageCounts { left: 2, right: 2 },
             records: crate::logdiff_report::LogDiffRecords {
                 compared: 2,
@@ -8310,6 +8337,9 @@ if [ "${1-}" = "log-diff" ]; then
   printf 'compare\n' >> "$PWD/invocations"
   if cmp -s "$2" "$3"; then
     cp "$PWD/logdiff-match.json" "$5"
+    if [ "$scenario" = "changed-comparator-input" ]; then
+      printf 'replaced after comparison\n' > "$2"
+    fi
     exit 0
   fi
   cp "$PWD/logdiff-diverge.json" "$5"
@@ -8460,6 +8490,24 @@ esac
         );
         assert_eq!(diverged.first_divergent_record, Some(2));
         assert!(divergent_invocations.ends_with("normalize\ncompare\n"));
+        let (replaced, invocations) =
+            run_production_parity_fixture("changed-comparator-input", "kvm");
+        assert!(invocations.ends_with("normalize\ncompare\n"));
+        assert_eq!(replaced.outcome, "ERROR", "{replaced:#?}");
+        assert_eq!(replaced.result, None);
+        assert_eq!(replaced.failure_class, Some(FailureClass::NoResult));
+        assert_eq!(
+            replaced.error_kind.as_deref(),
+            Some("incomplete-parity-evidence")
+        );
+        assert!(replaced.backend_parity.is_none());
+        assert!(
+            replaced
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("captured input")
+        );
         for banner in [
             "An action was blocked on this server based on a security policy!",
             "fatal: Could not resolve proxy",

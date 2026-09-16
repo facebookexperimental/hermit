@@ -73,7 +73,7 @@ These rows are part of the selected regression denominator even though they are 
 
 ## Cross-backend parity
 
-This is measured ptrace-reference parity, not CI plan membership and not same-backend repeatability. A cell is eligible when the corresponding ptrace `verify` coordinate is Green; this intentionally includes manifest-disabled candidate cells selected through `--probe-disabled`. `Never measured` means no strict typed ptrace-vs-candidate report exists. At the latest recorded Hermit source depth, any divergence outranks a match.
+This is measured ptrace-reference parity, not CI plan membership and not same-backend repeatability. A cell is eligible when the corresponding ptrace `verify` coordinate is Green; this intentionally includes manifest-disabled candidate cells selected through `--probe-disabled`. `Never measured` means no strict typed ptrace-vs-candidate report exists. At the latest recorded Hermit source depth, any divergence outranks a match. The portable and hosted-portable `backend-parity-c` nodes measure a subset of these eligible cells; eligibility is not a claim that the activated nodes select or measured every cell.
 
 | Candidate backend | Eligible ptrace-green cells | Disabled probe candidates | Measured match | Parity failure | Never measured |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -82,9 +82,9 @@ This is measured ptrace-reference parity, not CI plan membership and not same-ba
 | `sabre` | 341 | 197 | 0 | 0 | 341 |
 | `liteinst` | 341 | 290 | 0 | 0 | 341 |
 
-Measured pairs are listed individually so a failing backend/test coordinate is visible without interpreting the plan-colour tables. Counts are records/messages actually compared.
+Measured pairs are listed individually so a failing backend/test coordinate is visible without interpreting the plan-colour tables. The raw-record column is the smaller of the two complete input record counts, before target and INFO selection. The Ptrace INFO and Candidate INFO columns count the selected Detcore messages used for comparison.
 
-| Test | Candidate backend | Result | Compared records | Ptrace INFO | Candidate INFO |
+| Test | Candidate backend | Result | Smaller raw record count | Ptrace INFO | Candidate INFO |
 | --- | --- | --- | ---: | ---: | ---: |
 | _none_ | — | — | — | — | — |
 

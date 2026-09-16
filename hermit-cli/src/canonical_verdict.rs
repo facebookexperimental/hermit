@@ -431,6 +431,26 @@ impl VerificationReport {
     /// honest absence rather than making the whole report unreadable.
     #[allow(dead_code)] // path-included readers use different parse forms
     pub fn from_current_json_value(value: serde_json::Value) -> Result<Self, String> {
+        Self::from_producer_json_value(value, true)
+    }
+
+    /// Parse a retained cell receipt from before exact output evidence was
+    /// added. Preserve that absence while retaining the other producer-field
+    /// and duplicate-key requirements. This is not current producer admission
+    /// and must not be used for either operand of backend parity.
+    #[allow(dead_code)] // only retained cell receipt readers use this form
+    pub fn from_retained_cell_json_slice(bytes: &[u8]) -> Result<Self, String> {
+        let report = Self::from_json_slice(bytes)?;
+        let value = serde_json::from_slice(bytes)
+            .map_err(|error| format!("incomplete verification report: {error}"))?;
+        Self::from_producer_json_value(value, false)?;
+        Ok(report)
+    }
+
+    fn from_producer_json_value(
+        value: serde_json::Value,
+        require_outputs: bool,
+    ) -> Result<Self, String> {
         let object = value
             .as_object()
             .ok_or_else(|| "incomplete verification report: expected an object".to_string())?;
@@ -458,7 +478,8 @@ impl VerificationReport {
             }
         }
         let verdict = object.get("verdict").and_then(serde_json::Value::as_str);
-        if matches!(verdict, Some("matched" | "diverged"))
+        if require_outputs
+            && matches!(verdict, Some("matched" | "diverged"))
             && object
                 .get("compared_outputs")
                 .is_none_or(serde_json::Value::is_null)

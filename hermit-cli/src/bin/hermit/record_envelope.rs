@@ -13,9 +13,9 @@ pub(crate) use hermit::logdiff_report::RecordEnvelopePolicy;
 ///
 /// The predicate and its name travel together in [`RecordEnvelope`], so a
 /// comparison cannot silently filter records while reporting an unfiltered
-/// policy. Only the two fully specified policies are eligible for parity;
-/// caller-defined predicates are deliberately non-qualifying.
-/// A record predicate bound to the versioned policy name that describes it.
+/// policy. AllRecordsV1 and DbtEvidenceTransportV1 support same-backend bitwise
+/// comparison; CrossBackendDetcoreV1 names the separate shared Detcore stream.
+/// Caller-defined predicates cannot support either named comparison contract.
 #[derive(Clone, Copy)]
 pub(crate) struct RecordEnvelope {
     policy: RecordEnvelopePolicy,
@@ -120,12 +120,10 @@ fn keep_dbt_evidence_record(record: &str) -> bool {
 /// Keep only the shared Detcore observation stream when comparing different
 /// execution backends.
 ///
-/// Backend launchers necessarily emit different lifecycle and transport
-/// records.  Those are excluded by this named envelope rather than by ad-hoc
-/// substring ignores.  Once a record belongs to `detcore` or one of its
-/// modules, its complete canonical INFO payload is retained: in particular,
-/// virtual time and RCB values are never rounded, removed, or reset to make two
-/// backends agree.
+/// All targets outside `detcore` and its modules are excluded, including shared
+/// Hermit records as well as backend lifecycle and transport records. Once a
+/// record belongs to Detcore, its complete canonical INFO payload is retained:
+/// virtual time and RCB values are never rounded, removed, or reset.
 fn keep_cross_backend_detcore_record(record: &str) -> bool {
     let Some((level, body)) = record.split_once(' ') else {
         return false;
@@ -149,6 +147,7 @@ mod tests {
     fn dbt_envelope_is_narrowly_keyed_on_the_transport_target() {
         let envelope = RecordEnvelope::dbt_evidence_transport_v1();
         assert!(!envelope.keeps("INFO reverie_dbt::evidence: protected evidence initialized"));
+        assert!(envelope.keeps("INFO hermit::verify: guest exited with status 0"));
         assert!(!envelope.keeps("WARN  reverie_dbt::evidence: direct entry must be refused"));
         assert!(
             envelope.keeps(
@@ -177,6 +176,9 @@ mod tests {
         assert!(!envelope.keeps("INFO reverie_kvm: lifecycle phase timings"));
         assert!(!envelope.keeps("INFO hermit::sabre::fallback: completed"));
         assert!(!envelope.keeps("INFO reverie_dbt::evidence: protected evidence initialized"));
+        // Shared records outside Detcore are excluded too. This policy does
+        // not claim to compare all backend-independent observations.
+        assert!(!envelope.keeps("INFO hermit::verify: guest exited with status 0"));
         assert_eq!(envelope.policy().as_str(), "cross_backend_detcore_v1");
     }
 }

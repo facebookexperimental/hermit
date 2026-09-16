@@ -17,6 +17,8 @@ use detcore::logdiff;
 use hermit::HERMIT_VERIFICATION_DIVERGENCE_EXIT;
 use hermit::logdiff_report::LOG_DIFF_REPORT_SCHEMA;
 use hermit::logdiff_report::LogDiffComparison;
+use hermit::logdiff_report::LogDiffInput;
+use hermit::logdiff_report::LogDiffInputs;
 use hermit::logdiff_report::LogDiffMessageCounts;
 use hermit::logdiff_report::LogDiffRecords;
 use hermit::logdiff_report::LogDiffReport;
@@ -47,8 +49,40 @@ fn try_log_diff_with_records(
     right: &Path,
     options: &logdiff::LogDiffOpts,
     record_envelope: RecordEnvelope,
-) -> std::io::Result<(logdiff::LogDiffSummary, usize, usize)> {
-    logdiff::try_log_diff_with_records_and_filter(left, right, options, record_envelope.predicate())
+) -> std::io::Result<(logdiff::LogDiffSummary, usize, usize, LogDiffInputs)> {
+    let left_bytes = std::fs::read(left)?;
+    let right_bytes = std::fs::read(right)?;
+    let left = strict_log_text(&left_bytes, &left.display().to_string())?;
+    let right = strict_log_text(&right_bytes, &right.display().to_string())?;
+    let summary = logdiff::log_diff_summary_from_strs_with_filter(
+        left,
+        right,
+        options,
+        &mut std::io::stderr(),
+        record_envelope.predicate(),
+    )?;
+    let identity = |bytes: &[u8]| LogDiffInput {
+        sha256: detcore::Digest::new(bytes).to_string(),
+        bytes: bytes.len() as u64,
+    };
+    Ok((
+        summary,
+        logdiff::record_count(left),
+        logdiff::record_count(right),
+        LogDiffInputs {
+            left: identity(&left_bytes),
+            right: identity(&right_bytes),
+        },
+    ))
+}
+
+fn strict_log_text<'a>(bytes: &'a [u8], label: &str) -> std::io::Result<&'a str> {
+    std::str::from_utf8(bytes).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{label} is not UTF-8: {error}"),
+        )
+    })
 }
 
 fn try_bitwise_info_v1_with_records(
@@ -93,11 +127,11 @@ fn compare_complete_prefix(
             writer,
         );
     }
-    let left = String::from_utf8_lossy(left);
-    let right = String::from_utf8_lossy(right);
+    let left = strict_log_text(left, "left log")?;
+    let right = strict_log_text(right, "right log")?;
     logdiff::compare_complete_prefix_with_filter(
-        &left,
-        &right,
+        left,
+        right,
         options,
         writer,
         record_envelope.predicate(),
@@ -268,13 +302,15 @@ impl LogDiffCLIOpts {
             && record_envelope.policy() == RecordEnvelopePolicy::AllRecordsV1
         {
             try_bitwise_info_v1_with_records(&self.file_a, file_b, &options)
+                .map(|(summary, left, right)| (summary, left, right, None))
         } else {
             // The DBT transport envelope remains on its current named-filter
             // path. It is a distinct canonical envelope, not an all-record
             // BitwiseInfoV1 comparison.
             try_log_diff_with_records(&self.file_a, file_b, &options, record_envelope)
+                .map(|(summary, left, right, inputs)| (summary, left, right, Some(inputs)))
         };
-        let (summary, records_left, records_right) = match comparison {
+        let (summary, records_left, records_right, inputs) = match comparison {
             Ok(result) => result,
             Err(error) => {
                 eprintln!(
@@ -315,11 +351,10 @@ impl LogDiffCLIOpts {
             summary.compared_right,
             record_envelope.policy().as_str(),
         );
+        let mut report = json_report(&summary, &options, records, record_envelope.policy());
+        report.inputs = inputs;
         if let Some(path) = &self.json
-            && let Err(error) = write_json(
-                path,
-                &json_report(&summary, &options, records, record_envelope.policy()),
-            )
+            && let Err(error) = write_json(path, &report)
         {
             eprintln!(
                 "hermit log-diff: could not write JSON report to {}: {error}",
@@ -614,6 +649,7 @@ fn json_report(
             right: summary.compared_right,
         },
         records,
+        inputs: None,
         follow_stopped_because: None,
         first_divergent_record: summary.first_divergent_record,
         first_divergent_syscall: summary.first_divergent_syscall,
@@ -844,7 +880,7 @@ Apr 09 06:08:02.100  INFO detcore: DETLOG unfinished\n";
             write_canonical_info(&left, &mut Vec::new(), envelope).unwrap(),
             0
         );
-        let (empty, records_left, records_right) =
+        let (empty, records_left, records_right, _) =
             try_log_diff_with_records(&left, &right, &follow_options(), envelope).unwrap();
         assert!(!empty.matched_with_evidence());
 
@@ -881,7 +917,7 @@ Apr 09 06:08:02.100  INFO detcore: DETLOG unfinished\n";
 
         std::fs::write(&left, transport).unwrap();
         std::fs::write(&right, transport).unwrap();
-        let (summary, _, _) =
+        let (summary, _, _, _) =
             try_log_diff_with_records(&left, &right, &follow_options(), envelope).unwrap();
         assert_eq!((summary.compared_left, summary.compared_right), (1, 1));
         assert!(summary.matched_with_evidence());
@@ -901,7 +937,7 @@ Apr 09 06:08:02.100  INFO detcore: DETLOG unfinished\n";
             write_canonical_info(&left, &mut Vec::new(), envelope).unwrap(),
             1
         );
-        let (one, _, _) =
+        let (one, _, _, _) =
             try_log_diff_with_records(&left, &right, &follow_options(), envelope).unwrap();
         assert_eq!((one.compared_left, one.compared_right), (1, 1));
         assert!(one.matched_with_evidence());
@@ -934,7 +970,7 @@ Apr 09 06:08:02.100  INFO detcore: DETLOG unfinished\n";
             write_canonical_info(&left, &mut Vec::new(), envelope).unwrap(),
             1
         );
-        let (one, _, _) =
+        let (one, _, _, _) =
             try_log_diff_with_records(&left, &right, &follow_options(), envelope).unwrap();
         assert_eq!((one.compared_left, one.compared_right), (1, 1));
         assert!(one.matched_with_evidence());
@@ -951,7 +987,7 @@ Apr 09 06:08:02.100  INFO detcore: DETLOG unfinished\n";
 
         std::fs::write(&left, format!("{transport}\n{real}")).unwrap();
         std::fs::write(&right, real).unwrap();
-        let (summary, _, _) =
+        let (summary, _, _, _) =
             try_log_diff_with_records(&left, &right, &follow_options(), envelope).unwrap();
         assert!(!summary.diff_found);
         assert_eq!((summary.compared_left, summary.compared_right), (1, 1));
@@ -1028,50 +1064,57 @@ Apr 09 06:08:02.100  INFO detcore: DETLOG unfinished\n";
         };
         let ptrace_transport = "2026-09-03T10:00:00.000001Z INFO reverie_ptrace: backend ready\n";
         let kvm_transport = "2026-09-03T10:00:00.000001Z INFO reverie_kvm: backend ready\n";
-        let envelope = RecordEnvelope::cross_backend_detcore_v1();
-        let options = logdiff::LogDiffOpts {
-            comparison: logdiff::LogComparisonMode::Info,
-            canonicalize_addresses: true,
-            require_structured_events: true,
-            ..Default::default()
-        };
-
-        std::fs::write(&reference, format!("{}{ptrace_transport}", record(17))).unwrap();
-        std::fs::write(&candidate, format!("{}{kvm_transport}", record(17))).unwrap();
-        let (matched, left_records, right_records) =
-            try_log_diff_with_records(&reference, &candidate, &options, envelope).unwrap();
-        let matched_report = json_report(
-            &matched,
-            &options,
-            LogDiffRecords {
-                compared: left_records.min(right_records),
-                available_left: left_records,
-                available_right: right_records,
-                withheld_incomplete_tail: false,
-            },
-            envelope.policy(),
-        );
+        let json = directory.path().join("comparison.json");
+        let mut options = LogDiffCLIOpts::new(&reference, &candidate);
+        options.json = Some(json.clone());
+        options.record_envelope = RecordEnvelopeArg::CrossBackendDetcoreV1;
+        let global = GlobalOpts::try_parse_from(["hermit"]).unwrap();
+        let read_report =
+            || -> LogDiffReport { serde_json::from_slice(&std::fs::read(&json).unwrap()).unwrap() };
+        // The shared Hermit target is outside this envelope too, even though
+        // it is not launcher or transport text. Its different payload is
+        // intentionally excluded; this test makes that boundary observable.
+        let shared_reference =
+            "2026-09-03T10:00:00.000002Z INFO hermit::verify: reference observation\n";
+        let shared_candidate =
+            "2026-09-03T10:00:00.000002Z INFO hermit::verify: candidate observation\n";
+        let ptrace_bytes =
+            format!("{}{ptrace_transport}{shared_reference}", record(17)).into_bytes();
+        let kvm_bytes = format!("{}{kvm_transport}{shared_candidate}", record(17)).into_bytes();
+        std::fs::write(&reference, &ptrace_bytes).unwrap();
+        std::fs::write(&candidate, &kvm_bytes).unwrap();
+        assert!(matches!(options.main(&global), ExitStatus::Exited(0)));
+        let matched_report = read_report();
         matched_report.require_cross_backend_evidence().unwrap();
         assert_eq!(matched_report.verdict, LogDiffVerdict::Matched);
         assert_eq!(matched_report.selected_messages.left, 1);
-
-        // Change only a shared Detcore value in the candidate. Backend-specific
-        // lifecycle text still differs in both controls and is intentionally
-        // outside the named comparison envelope.
-        std::fs::write(&candidate, format!("{}{kvm_transport}", record(18))).unwrap();
-        let (diverged, left_records, right_records) =
-            try_log_diff_with_records(&reference, &candidate, &options, envelope).unwrap();
-        let diverged_report = json_report(
-            &diverged,
-            &options,
-            LogDiffRecords {
-                compared: left_records.min(right_records),
-                available_left: left_records,
-                available_right: right_records,
-                withheld_incomplete_tail: false,
-            },
-            envelope.policy(),
+        assert_eq!(matched_report.selected_messages.right, 1);
+        assert_eq!(matched_report.records.available_left, 3);
+        assert_eq!(matched_report.records.available_right, 3);
+        let inputs = matched_report.inputs.as_ref().unwrap();
+        assert_eq!(
+            inputs.left.sha256,
+            detcore::Digest::new(&ptrace_bytes).to_string()
         );
+        assert_eq!(
+            inputs.right.sha256,
+            detcore::Digest::new(&kvm_bytes).to_string()
+        );
+        assert_eq!(inputs.left.bytes, ptrace_bytes.len() as u64);
+        assert_eq!(inputs.right.bytes, kvm_bytes.len() as u64);
+
+        // Change only a shared Detcore value. Transport text remains different
+        // in both controls; the named envelope still preserves every Detcore value.
+        std::fs::write(
+            &candidate,
+            format!("{}{kvm_transport}{shared_candidate}", record(18)),
+        )
+        .unwrap();
+        assert!(matches!(
+            options.main(&global),
+            ExitStatus::Exited(HERMIT_VERIFICATION_DIVERGENCE_EXIT)
+        ));
+        let diverged_report = read_report();
         diverged_report.require_cross_backend_evidence().unwrap();
         assert_eq!(diverged_report.verdict, LogDiffVerdict::Diverged);
         assert_eq!(diverged_report.first_divergent_scheduler_turn, Some(7));
@@ -1079,6 +1122,53 @@ Apr 09 06:08:02.100  INFO detcore: DETLOG unfinished\n";
             diverged_report.first_divergent_virtual_nanoseconds,
             Some(17)
         );
+        assert_ne!(
+            inputs.right.sha256,
+            diverged_report.inputs.unwrap().right.sha256
+        );
+
+        // These invalid payload bytes used to collapse to the same replacement
+        // character before comparison. Exercise the production CLI and writer
+        // in both directions, including two distinct malformed byte streams.
+        let invalid = |byte| {
+            let mut bytes = record(17).into_bytes();
+            let position = bytes.iter().position(|value| *value == b'C').unwrap();
+            bytes.insert(position, byte);
+            bytes
+        };
+        for (left, right) in [
+            (invalid(0x80), kvm_bytes.clone()),
+            (ptrace_bytes.clone(), invalid(0x81)),
+            (invalid(0x80), invalid(0x81)),
+        ] {
+            std::fs::write(&reference, &left).unwrap();
+            std::fs::write(&candidate, &right).unwrap();
+            assert!(matches!(options.main(&global), ExitStatus::Exited(2)));
+            let refused = read_report();
+            assert_eq!(refused.verdict, LogDiffVerdict::Refused);
+            assert!(refused.refusal.unwrap().contains("not UTF-8"));
+            for (path, bytes) in [(&reference, &left), (&candidate, &right)] {
+                if std::str::from_utf8(bytes).is_err() {
+                    let error = write_canonical_info(
+                        path,
+                        &mut Vec::new(),
+                        RecordEnvelope::cross_backend_detcore_v1(),
+                    )
+                    .unwrap_err();
+                    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                }
+            }
+            let error = compare_complete_prefix(
+                &left,
+                &right,
+                &follow_options(),
+                &mut Vec::new(),
+                RecordEnvelope::cross_backend_detcore_v1(),
+                false,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        }
     }
 
     #[test]

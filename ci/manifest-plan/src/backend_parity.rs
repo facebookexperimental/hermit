@@ -43,6 +43,30 @@ pub struct BackendParityReport {
 }
 
 impl BackendParityReport {
+    /// Name the exact components which differ, without changing the verdict.
+    pub fn differences(&self) -> Vec<&'static str> {
+        let mut differences = Vec::new();
+        let reference = &self.reference.output;
+        let candidate = &self.candidate.output;
+        if reference.exit_code != candidate.exit_code || reference.signal != candidate.signal {
+            differences.push("guest exit status or signal");
+        }
+        if reference.stdout_sha256 != candidate.stdout_sha256
+            || reference.stdout_bytes != candidate.stdout_bytes
+        {
+            differences.push("guest stdout");
+        }
+        if reference.stderr_sha256 != candidate.stderr_sha256
+            || reference.stderr_bytes != candidate.stderr_bytes
+        {
+            differences.push("guest stderr");
+        }
+        if self.comparison.verdict == LogDiffVerdict::Diverged {
+            differences.push("shared Detcore INFO records");
+        }
+        differences
+    }
+
     /// Validate all facts needed to turn this report into a scorecard verdict.
     ///
     /// The two same-backend reports must each be strict, non-vacuous matches;
@@ -71,6 +95,14 @@ impl BackendParityReport {
         validate_operand("reference", &self.reference)?;
         validate_operand("candidate", &self.candidate)?;
         self.comparison.require_cross_backend_evidence()?;
+        let inputs = self.comparison.inputs.as_ref().expect("required above");
+        if inputs.left.sha256 != self.reference.retained_log_sha256
+            || inputs.right.sha256 != self.candidate.retained_log_sha256
+        {
+            return Err(
+                "backend parity retained logs differ from the comparator's captured inputs".into(),
+            );
+        }
 
         let outputs_match = self.reference.output == self.candidate.output;
         let logs_match = self.comparison.verdict == LogDiffVerdict::Matched;
@@ -236,6 +268,16 @@ mod tests {
                     BackendParityVerdict::Diverged => LogDiffVerdict::Diverged,
                 },
                 refusal: None,
+                inputs: Some(crate::logdiff_report::LogDiffInputs {
+                    left: crate::logdiff_report::LogDiffInput {
+                        sha256: "b".repeat(64),
+                        bytes: 21,
+                    },
+                    right: crate::logdiff_report::LogDiffInput {
+                        sha256: "c".repeat(64),
+                        bytes: 21,
+                    },
+                }),
                 selected_messages: LogDiffMessageCounts { left: 2, right: 2 },
                 records: LogDiffRecords {
                     compared: 2,
@@ -292,6 +334,7 @@ mod tests {
         assert!(report.validate("kvm").is_err());
         report.verdict = BackendParityVerdict::Diverged;
         report.validate("kvm").unwrap();
+        assert_eq!(report.differences(), ["guest stdout"]);
     }
 
     #[test]
@@ -308,6 +351,7 @@ mod tests {
         assert!(report.validate("kvm").is_err());
         report.verdict = BackendParityVerdict::Diverged;
         report.validate("kvm").unwrap();
+        assert_eq!(report.differences(), ["guest exit status or signal"]);
     }
 
     #[test]
@@ -319,6 +363,39 @@ mod tests {
         let mut relaxed_report = report(BackendParityVerdict::Matched);
         relaxed_report.comparison.comparison.skip_detlog = true;
         assert!(relaxed_report.validate("kvm").is_err());
+
+        let mut missing_inputs = report(BackendParityVerdict::Matched);
+        missing_inputs.comparison.inputs = None;
+        // Historical reports remain readable, but absence cannot become parity.
+        let retained: BackendParityReport =
+            serde_json::from_slice(&serde_json::to_vec(&missing_inputs).unwrap()).unwrap();
+        assert!(
+            retained
+                .validate("kvm")
+                .unwrap_err()
+                .contains("captured input")
+        );
+        for reference in [true, false] {
+            let mut replaced = report(BackendParityVerdict::Matched);
+            if reference {
+                replaced.reference.retained_log_sha256 = "e".repeat(64);
+            } else {
+                replaced.candidate.retained_log_sha256 = "e".repeat(64);
+            }
+            assert!(
+                replaced
+                    .validate("kvm")
+                    .unwrap_err()
+                    .contains("captured inputs")
+            );
+        }
+        for (digest, bytes) in [("z".repeat(64), 21), ("b".repeat(64), 0)] {
+            let mut invalid = report(BackendParityVerdict::Matched);
+            let input = &mut invalid.comparison.inputs.as_mut().unwrap().left;
+            input.sha256 = digest;
+            input.bytes = bytes;
+            assert!(invalid.validate("kvm").is_err());
+        }
     }
 
     #[test]

@@ -598,8 +598,13 @@ pub fn write_canonical_info_with_filter(
     keep_record: impl Fn(&str) -> bool,
 ) -> std::io::Result<usize> {
     let bytes = std::fs::read(file)?;
-    let contents = String::from_utf8_lossy(&bytes);
-    let messages = canonical_info_from_str_with_filter(&contents, keep_record)?;
+    let contents = std::str::from_utf8(&bytes).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is not UTF-8: {error}", file.display()),
+        )
+    })?;
+    let messages = canonical_info_from_str_with_filter(contents, keep_record)?;
     for message in &messages {
         writeln!(writer, "{message}")?;
     }

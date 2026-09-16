@@ -352,6 +352,23 @@ fn measured_match() -> Value {
     })
 }
 
+fn current_synthetic_match() -> Value {
+    // Synthetic current report: the historical measured fixture above remains
+    // unchanged. Both synthetic executions exit zero with empty byte streams.
+    let mut report = measured_match();
+    let output = serde_json::json!({"exit_code": 0, "signal": null,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "stdout_bytes": 0,
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "stderr_bytes": 0});
+    report["compared_outputs"] = serde_json::json!({"left": output, "right": output});
+    report["comparison"]["canonicalize_addresses"] = serde_json::json!(true);
+    report["comparison"]["full_trace"] = serde_json::json!(true);
+    report["comparison"]["stripped_prefixes"] = serde_json::json!(["real-wall-clock-prefix/v1"]);
+    report["comparison"]["canonicalizations"] =
+        serde_json::json!(["host-address-to-first-appearance-ordinal/v1"]);
+    report["compared_log_messages"] = serde_json::json!({"left": 2, "right": 2});
+    report
+}
+
 fn write_report(path: &Path, report: &Value) {
     fs::write(path, format!("{report}\n")).expect("write verification report");
 }
@@ -401,17 +418,30 @@ fn every_named_consumer_delegates_to_the_shared_typed_reader() {
 }
 
 #[test]
-fn a_real_match_and_a_typed_verdict_mutation_bracket_every_consumer() {
+fn current_match_and_a_typed_verdict_mutation_bracket_every_consumer() {
     let temporary = temporary_directory();
     let report_path = temporary.join("verify.json");
-    let matched = measured_match();
+    let historical = measured_match();
+    assert!(historical.get("compared_outputs").is_none());
+    let retained = hermit::canonical_verdict::VerificationReport::from_json_slice(
+        &serde_json::to_vec(&historical).unwrap(),
+    )
+    .unwrap();
+    assert!(retained.compared_outputs.is_none());
+    write_report(&report_path, &historical);
+    for consumer in CONSUMERS {
+        let refused = verdict(consumer.requirement, &report_path);
+        assert_eq!(refused.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("compared_outputs"));
+    }
+    let matched = current_synthetic_match();
     write_report(&report_path, &matched);
 
     for consumer in CONSUMERS {
         let accepted = verdict(consumer.requirement, &report_path);
         assert!(
             accepted.status.success(),
-            "{} did not accept the measured typed match: {}",
+            "{} did not accept the current synthetic typed match: {}",
             consumer.path,
             String::from_utf8_lossy(&accepted.stderr)
         );
@@ -434,7 +464,7 @@ fn a_real_match_and_a_typed_verdict_mutation_bracket_every_consumer() {
         );
     }
 
-    let mut infrastructure_error = measured_match();
+    let mut infrastructure_error = current_synthetic_match();
     infrastructure_error["verified"] = serde_json::json!(false);
     infrastructure_error["bitwise_parity"] = serde_json::json!(false);
     infrastructure_error["verdict"] = serde_json::json!("infrastructure_error");
@@ -468,7 +498,7 @@ fn current_shape_and_canonical_evidence_fail_by_name() {
     let temporary = temporary_directory();
     let report_path = temporary.join("verify.json");
 
-    let mut unknown = measured_match();
+    let mut unknown = current_synthetic_match();
     unknown["verdict"] = serde_json::json!("future_verdict");
     write_report(&report_path, &unknown);
     let refused = verdict("matched", &report_path);
@@ -479,7 +509,7 @@ fn current_shape_and_canonical_evidence_fail_by_name() {
         String::from_utf8_lossy(&refused.stderr)
     );
 
-    let mut incomplete = measured_match();
+    let mut incomplete = current_synthetic_match();
     incomplete
         .as_object_mut()
         .expect("object")
@@ -494,7 +524,7 @@ fn current_shape_and_canonical_evidence_fail_by_name() {
         String::from_utf8_lossy(&refused.stderr)
     );
 
-    let mut stripped = measured_match();
+    let mut stripped = current_synthetic_match();
     stripped["bitwise_parity"] = serde_json::json!(false);
     stripped["comparison"]["strictness"] = serde_json::json!("stripped");
     write_report(&report_path, &stripped);
@@ -514,7 +544,7 @@ fn json_output_retains_failure_evidence_without_satisfying_a_match_requirement()
     let temporary = temporary_directory();
     let report_path = temporary.join("verify.json");
     for name in ["matched", "diverged", "no_result", "infrastructure_error"] {
-        let mut report = measured_match();
+        let mut report = current_synthetic_match();
         report["verdict"] = serde_json::json!(name);
         if name != "matched" {
             report["verified"] = serde_json::json!(false);
@@ -523,6 +553,7 @@ fn json_output_retains_failure_evidence_without_satisfying_a_match_requirement()
         if matches!(name, "no_result" | "infrastructure_error") {
             report["comparison"] = Value::Null;
             report["compared_log_messages"] = Value::Null;
+            report["compared_outputs"] = Value::Null;
         }
         if name == "infrastructure_error" {
             report["infrastructure_error"] =
@@ -565,7 +596,7 @@ fn json_output_retains_failure_evidence_without_satisfying_a_match_requirement()
     }
 
     for malformed in ["missing field", "unknown verdict", "invalid cause"] {
-        let mut report = measured_match();
+        let mut report = current_synthetic_match();
         match malformed {
             "missing field" => {
                 report.as_object_mut().unwrap().remove("guest_signal");
