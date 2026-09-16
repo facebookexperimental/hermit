@@ -2186,7 +2186,7 @@ async fn run_dbt(
         "launching guest through reverie-dbt with Detcore<DbtGuest>",
     );
 
-    let (status, stdout, stderr, global) = if capture_output {
+    let (status, stdout, stderr, mut global) = if capture_output {
         let launch = || {
             runner.output_with_environment_and_global::<detcore::GlobalState>(
                 &guest,
@@ -2203,6 +2203,7 @@ async fn run_dbt(
                 "DynamoRIO client thread failed before guest start; retrying once",
             );
             global.force_shutdown_with_error();
+            global.cancel_internal_scheduler().await;
             global.clean_up(false, &None).await;
             (output, global) = launch().await.map_err(|error| {
                 anyhow!("failed to launch drrun ({}): {error}", drrun.display())
@@ -2226,6 +2227,7 @@ async fn run_dbt(
                 "DynamoRIO client thread failed before guest start; retrying once",
             );
             global.force_shutdown_with_error();
+            global.cancel_internal_scheduler().await;
             global.clean_up(false, &None).await;
             (status, global) = launch().await.map_err(|error| {
                 anyhow!("failed to launch drrun ({}): {error}", drrun.display())
@@ -2236,6 +2238,7 @@ async fn run_dbt(
 
     if !status.success() {
         global.force_shutdown_with_error();
+        global.cancel_internal_scheduler().await;
     }
     global.clean_up(print_summary, &None).await;
     Ok(Output {
