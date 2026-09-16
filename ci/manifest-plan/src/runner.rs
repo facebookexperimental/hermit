@@ -1559,7 +1559,7 @@ impl RunContext {
         // a source SHA.  Whichever spelling executes is retained verbatim in
         // the result row, so this bridge cannot hide the comparison policy.
         let run_verify_strict =
-            command_help_contains(&hermit_bin, &["run", "--help"], "--verify-strict");
+            command_help_contains(&hermit_bin, &["run", "--help"], "--verify-strict")?;
         let isolated_workdir = match std::env::var_os(ISOLATED_WORKDIR_ENV) {
             None => None,
             Some(value) if value == HERMETIC_TEST_WORKDIR => {
@@ -1576,7 +1576,7 @@ impl RunContext {
             &hermit_bin,
             &["record", "start", "--help"],
             "--verify-strict",
-        );
+        )?;
         Ok(Self {
             root,
             hermit_bin,
@@ -4197,16 +4197,55 @@ fn parse_binary_build_info(bytes: &[u8]) -> Option<String> {
     recognised.then_some(sha)
 }
 
-fn command_help_contains(program: &Path, args: &[&str], needle: &str) -> bool {
-    Command::new(program)
-        .args(args)
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .is_some_and(|output| {
-            String::from_utf8_lossy(&output.stdout).contains(needle)
-                || String::from_utf8_lossy(&output.stderr).contains(needle)
-        })
+/// Whether `program args` advertises `needle` in its help output.
+///
+/// This decides which verification spelling the harness passes. The previous
+/// implementation collapsed three distinct outcomes into one `bool`: the
+/// needle is absent, the binary could not be launched, and the binary exited
+/// non-zero all returned `false`. `false` means `--verify-strict` is omitted,
+/// and on a pre-cutover Hermit bare `--verify` is not strict -- so a probe
+/// that merely FAILED silently ran the whole suite with weaker verification
+/// than intended, and every cell still passed. The failure mode produced the
+/// reassuring answer.
+///
+/// The split is by whether the binary will go on to run cells:
+///
+/// - The binary does not exist. Nothing will run, and every cell reports
+///   `cannot execute <path>` exactly, so reporting absence here cannot weaken
+///   a comparison that never happens. Answering `false` keeps that diagnosis
+///   with the execution path that states it precisely.
+/// - The binary exists but the probe did not answer -- it exited non-zero, or
+///   could not be launched for any reason other than absence. Cells WILL run,
+///   so guessing the weaker spelling here is exactly the silent downgrade.
+///   Refuse instead.
+fn command_help_contains(program: &Path, args: &[&str], needle: &str) -> Result<bool, String> {
+    let output = match Command::new(program).args(args).output() {
+        Ok(output) => output,
+        // The execution path reports an absent binary precisely; see above.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "cannot launch {} {} to detect {needle} support: {error}; \
+                 refusing to guess the verification spelling",
+                program.display(),
+                args.join(" ")
+            ));
+        }
+    };
+    if !output.status.success() {
+        return Err(format!(
+            "{} {} exited {} while detecting {needle} support; \
+             refusing to guess the verification spelling",
+            program.display(),
+            args.join(" "),
+            output
+                .status
+                .code()
+                .map_or_else(|| "by signal".to_string(), |code| code.to_string()),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).contains(needle)
+        || String::from_utf8_lossy(&output.stderr).contains(needle))
 }
 
 fn execute_observed_until(
@@ -4233,6 +4272,57 @@ fn execute_observed_until(
 mod tests {
     use super::*;
     use crate::ci_selection::BackendCiDisabledReason;
+
+    /// The four outcomes of the verification-spelling probe.
+    ///
+    /// The first two are answers and must be reported as answers. The last two
+    /// are failures to ask, and the whole point of this test is that they must
+    /// NOT be reported as "the flag is absent" -- that reading omits
+    /// `--verify-strict`, which on a pre-cutover Hermit silently runs the suite
+    /// with weaker verification while every cell still passes.
+    ///
+    /// Reverting `command_help_contains` to the previous
+    /// `.ok().filter(success).is_some_and(..)` form makes the two failure cases
+    /// below return `Ok(false)` and fail; the two answer cases keep passing,
+    /// because the defect was never in the answering path.
+    #[test]
+    fn the_capability_probe_separates_an_answer_from_a_failure_to_ask() {
+        let needle = "--verify-strict";
+
+        // Ran and the flag is advertised.
+        assert_eq!(
+            command_help_contains(Path::new("/bin/echo"), &[needle], needle),
+            Ok(true),
+        );
+
+        // Ran and the flag is genuinely absent. This is the only legitimate
+        // route to omitting the flag.
+        assert_eq!(
+            command_help_contains(Path::new("/bin/echo"), &["--canonical-only"], needle),
+            Ok(false),
+        );
+
+        // The binary does not exist. No cell will run, and the execution path
+        // reports the absent binary exactly, so absence here is safe and is
+        // what `production_run_retries_only_product_failures` depends on.
+        assert_eq!(
+            command_help_contains(
+                Path::new("/nonexistent/hermit-probe-target"),
+                &["run", "--help"],
+                needle,
+            ),
+            Ok(false),
+        );
+
+        // Launched but exited non-zero, so its output is not an answer. This
+        // is the dangerous one: such a binary DOES go on to run cells.
+        let failed = command_help_contains(Path::new("/bin/false"), &[], needle)
+            .expect_err("a probe that exited non-zero must not answer the question");
+        assert!(
+            failed.contains("exited 1") && failed.contains("refusing to guess"),
+            "the refusal must name the exit status, got: {failed}",
+        );
+    }
 
     #[test]
     fn current_runner_reports_refuse_duplicate_fields() {
