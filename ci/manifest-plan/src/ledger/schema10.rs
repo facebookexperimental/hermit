@@ -488,7 +488,43 @@ struct ParityAttemptWire {
 
 impl<'de> Deserialize<'de> for ParityAttempt {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = ParityAttemptWire::deserialize(deserializer)?;
+        // Serde's buffered tagged/untagged enum content does not implement
+        // deserialize_u128. Keep duration_ms an integer and re-enter the JSON
+        // value deserializer, while refusing duplicate keys before buffering.
+        struct AttemptObject;
+        impl<'de> serde::de::Visitor<'de> for AttemptObject {
+            type Value = Value;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an exact parity attempt object")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Value, A::Error> {
+                let mut fields = serde_json::Map::new();
+                while let Some((key, value)) = map.next_entry::<String, Value>()? {
+                    if fields.insert(key.clone(), value).is_some() {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate parity attempt field {key}"
+                        )));
+                    }
+                }
+                Ok(Value::Object(fields))
+            }
+        }
+        let value = deserializer.deserialize_map(AttemptObject)?;
+        // Value cannot represent every u128 without arbitrary_precision. Refuse
+        // overflow and floating-point encodings explicitly; never round a wire
+        // duration. Historical AttemptResult parsing remains unchanged.
+        if value.get("duration_ms").and_then(Value::as_u64).is_none() {
+            return Err(serde::de::Error::custom(
+                "parity attempt duration_ms must be an exact unsigned 64-bit integer",
+            ));
+        }
+        let value: ParityAttemptWire =
+            serde_json::from_value(value).map_err(serde::de::Error::custom)?;
         Ok(Self(AttemptResult {
             index: value.index,
             outcome: value.outcome,

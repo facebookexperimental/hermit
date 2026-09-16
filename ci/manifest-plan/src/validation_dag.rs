@@ -293,8 +293,7 @@ fn expected_cells(root: &Path) -> Result<Vec<DagManifest>, String> {
     let path = root.join(EXPECTED_PLAN);
     let text = fs::read_to_string(&path)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    expected_cells_from_json(&text)
-        .map_err(|error| format!("invalid {}: {error}", path.display()))
+    expected_cells_from_json(&text).map_err(|error| format!("invalid {}: {error}", path.display()))
 }
 
 /// Decode the same source-owned expected population for generation and retained
@@ -308,9 +307,19 @@ pub fn expected_cells_from_json(text: &str) -> Result<Vec<DagManifest>, String> 
     let mut seen = BTreeSet::new();
     let mut cells = Vec::new();
     for cell in plan.cells {
-        if [&cell.lane, &cell.category, &cell.test, &cell.mode, &cell.backend]
-            .iter().any(|field| field.trim().is_empty())
-            || cell.requires_host_capabilities.iter().any(|field| field.trim().is_empty())
+        if [
+            &cell.lane,
+            &cell.category,
+            &cell.test,
+            &cell.mode,
+            &cell.backend,
+        ]
+        .iter()
+        .any(|field| field.trim().is_empty())
+            || cell
+                .requires_host_capabilities
+                .iter()
+                .any(|field| field.trim().is_empty())
         {
             return Err("expected E2E plan contains an empty identity or capability".into());
         }
@@ -2478,12 +2487,22 @@ sys.exit(37)
     }
 
     #[test]
-    fn parity_activation_preserves_the_two_existing_mixed_bucket_selectors() {
+    fn parity_support_preserves_the_two_existing_mixed_bucket_selectors() {
         let dag = generate(&repo_root().unwrap()).unwrap();
+        assert!(
+            dag.steps
+                .iter()
+                .all(|step| !step.cmd.contains("--parity-reference"))
+        );
         let parity = dag
             .steps
             .iter()
-            .filter(|step| step.cmd.contains("--parity-reference"))
+            .filter(|step| {
+                matches!(
+                    step.tag().as_str(),
+                    "e2e.manifest_backend_parity_c" | "e2e.manifest_backend_parity_c_on_host"
+                )
+            })
             .collect::<Vec<_>>();
         assert_eq!(
             parity
@@ -2496,8 +2515,10 @@ sys.exit(37)
             ]
         );
         for step in parity {
-            assert_eq!(step.cmd.matches("--parity-reference ptrace").count(), 1);
-            assert!(step.cmd.contains("--category backend-parity-c --ci-only --allow-empty --prebuilt --parity-reference ptrace --jobs 8"));
+            assert_eq!(step.cmd.matches("--parity-reference ptrace").count(), 0);
+            assert!(step.cmd.contains(
+                "--category backend-parity-c --ci-only --allow-empty --prebuilt --jobs 8"
+            ));
             let selector = step.manifest.as_ref().unwrap();
             assert_eq!(selector.lane, "portable");
             assert_eq!(selector.category, "backend-parity-c");

@@ -324,6 +324,54 @@ fn reference_refusal_and_cross_divergence_never_change_the_candidate_verdict() {
             .ordinary_verdict("ptrace", "parity-reference")
             .is_err()
     );
+    let mut divergent_report: VerificationReport = serde_json::from_str(
+        complete
+            .reference_attempt()
+            .unwrap()
+            .0
+            .verification_report
+            .as_ref()
+            .unwrap(),
+    )
+    .unwrap();
+    divergent_report.verdict = Verdict::Diverged;
+    divergent_report.verified = false;
+    divergent_report.bitwise_parity = false;
+    divergent_report.first_divergent_record = Some(1);
+    let mut divergent_reference = attempt("ptrace", "parity-reference", &divergent_report);
+    divergent_reference.0.outcome = "FAIL".into();
+    divergent_reference.0.status = Some(1);
+    divergent_reference.0.reason = Some("reference strict verification diverged".into());
+    let (row, plan, cells, tests) = fixture(parity(vec![
+        BackendParityCellAttempt::UnavailableWithReason {
+            attempt: 1,
+            candidate_attempt: complete.candidate_attempt().clone(),
+            reference_attempt: RequiredNullable::Value(divergent_reference),
+            reason: "reference strict verification diverged before cross comparison".into(),
+        },
+    ]));
+    let verified = row
+        .verify_schema10_artifact_bytes(&plan, &cells, &tests)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        verified.observations[0].verdict,
+        ComparisonObservationVerdictV10::Matched
+    );
+    assert_eq!(
+        verified.observations[1].verdict,
+        ComparisonObservationVerdictV10::Diverged
+    );
+    assert!(matches!(
+        verified.observations[2].verdict,
+        ComparisonObservationVerdictV10::UnavailableWithReason { .. }
+    ));
+    assert!(!verified.full_backend_parity);
+    assert!(matches!(
+        verified.cell_results.cells[0].cell_verdict,
+        CellVerdict::ComparedAndMatched { .. }
+    ));
+    retain_fixture("reference-diverged", &row, &plan, &cells, &tests);
     let (row, plan, cells, tests) = fixture(parity(vec![
         completed(1, BackendParityVerdict::Diverged),
         completed(2, BackendParityVerdict::Matched),
@@ -362,6 +410,42 @@ fn parity_attempt_decoder_requires_every_nullable_key_and_binds_raw_reports() {
             "missing {key} was accepted"
         );
     }
+    let mut largest_exact = value.clone();
+    largest_exact["duration_ms"] = Value::from(u64::MAX);
+    assert_eq!(
+        serde_json::from_value::<ParityAttempt>(largest_exact)
+            .unwrap()
+            .0
+            .duration_ms,
+        u128::from(u64::MAX)
+    );
+    let text = serde_json::to_string(&value).unwrap();
+    for duration in [
+        "18446744073709551616",
+        "340282366920938463463374607431768211455",
+        "1.0",
+        "1e0",
+    ] {
+        let changed = text.replace(
+            "\"duration_ms\":1,",
+            &format!("\"duration_ms\":{duration},"),
+        );
+        assert_ne!(changed, text);
+        assert!(
+            serde_json::from_str::<ParityAttempt>(&changed).is_err(),
+            "duration {duration} was rounded or coerced"
+        );
+    }
+    let historical = text.replace(
+        "\"duration_ms\":1,",
+        "\"duration_ms\":340282366920938463463374607431768211455,",
+    );
+    assert_eq!(
+        serde_json::from_str::<AttemptResult>(&historical)
+            .unwrap()
+            .duration_ms,
+        u128::MAX
+    );
     let mut extra = value.clone();
     extra["unknown"] = Value::Null;
     assert!(serde_json::from_value::<ParityAttempt>(extra).is_err());
