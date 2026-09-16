@@ -762,6 +762,7 @@ impl ParityAttempt {
         }
         if report.verdict == Verdict::Matched {
             report.require_canonical_match()?;
+            report.require_exact_output_match()?;
             if attempt.outcome != "PASS"
                 || attempt.status != Some(0)
                 || attempt.signal.is_some()

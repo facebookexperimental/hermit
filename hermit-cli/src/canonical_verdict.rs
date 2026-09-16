@@ -574,6 +574,38 @@ impl VerificationReport {
         }
     }
 
+    /// Require complete, identical guest outputs for a current strict operand.
+    /// Historical log-only receipts retain their separate admission path.
+    pub fn require_exact_output_match(&self) -> Result<(), String> {
+        let outputs = self
+            .compared_outputs
+            .as_ref()
+            .ok_or("same-backend verification omitted exact output evidence")?;
+        outputs.require_exact_match()?;
+        let output = &outputs.left;
+        for (field, digest) in [
+            ("stdout_sha256", output.stdout_sha256.as_str()),
+            ("stderr_sha256", output.stderr_sha256.as_str()),
+        ] {
+            if digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(format!("{field} is not a SHA-256 digest"));
+            }
+        }
+        if output.exit_code.is_some() == output.signal.is_some() {
+            return Err(
+                "output must record exactly one guest disposition (exit code or signal)".into(),
+            );
+        }
+        if self.guest_exit_code != output.exit_code || self.guest_signal != output.signal {
+            return Err("output disposition contradicts its verification result".into());
+        }
+        Ok(())
+    }
+
     /// Admit a green only when both the canonical comparison and the match
     /// claim agree. `verified=true` alone is intentionally insufficient: KVM's
     /// output-only fallback can report it with zero compared INFO messages.

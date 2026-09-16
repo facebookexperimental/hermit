@@ -372,6 +372,55 @@ fn reference_refusal_and_cross_divergence_never_change_the_candidate_verdict() {
         CellVerdict::ComparedAndMatched { .. }
     ));
     retain_fixture("reference-diverged", &row, &plan, &cells, &tests);
+    // Rehash every affected container: the parser must reject the actual
+    // contradictory operand, not merely a stale enclosing digest.
+    for mutation in [
+        "mismatched-output",
+        "invalid-digest",
+        "missing-disposition",
+        "guest-disposition",
+    ] {
+        let mut cell: Value = serde_json::from_slice(&cells).unwrap();
+        let candidate = &mut cell["backend_parity"]["attempts"][0]["candidate_attempt"];
+        let mut report: Value =
+            serde_json::from_str(candidate["verification_report"].as_str().unwrap()).unwrap();
+        match mutation {
+            "mismatched-output" => {
+                report["compared_outputs"]["right"]["stdout_sha256"] = Value::String("f".repeat(64))
+            }
+            "invalid-digest" => {
+                report["compared_outputs"]["left"]["stdout_sha256"] =
+                    Value::String("invalid".into());
+                report["compared_outputs"]["right"]["stdout_sha256"] =
+                    Value::String("invalid".into());
+            }
+            "missing-disposition" => {
+                report["compared_outputs"]["left"]["exit_code"] = Value::Null;
+                report["compared_outputs"]["right"]["exit_code"] = Value::Null;
+            }
+            "guest-disposition" => report["guest_exit_code"] = Value::from(9),
+            _ => unreachable!(),
+        }
+        let raw = serde_json::to_string(&report).unwrap();
+        let digest = hex_digest(raw.as_bytes());
+        candidate["verification_report"] = Value::String(raw);
+        candidate["verification_report_sha256"] = Value::String(digest.clone());
+        let mut changed_cells = serde_json::to_vec(&cell).unwrap();
+        changed_cells.push(b'\n');
+        let mut changed_row = serde_json::to_value(&row).unwrap();
+        changed_row["cell_results"]["cells"][0]["backend_parity"]["attempts"][0]["candidate_verification_report_sha256"] =
+            Value::String(digest);
+        changed_row["cell_results"]["artifact"]["sha256"] =
+            Value::String(hex_digest(&changed_cells));
+        let changed_row: HistoryRow = serde_json::from_value(changed_row).unwrap();
+        assert!(
+            changed_row
+                .verify_schema10_artifact_bytes(&plan, &changed_cells, &tests)
+                .is_err(),
+            "{mutation} became an ordinary match while cross comparison was unavailable"
+        );
+    }
+
     let (row, plan, cells, tests) = fixture(parity(vec![
         completed(1, BackendParityVerdict::Diverged),
         completed(2, BackendParityVerdict::Matched),

@@ -126,48 +126,32 @@ fn validate_operand(label: &str, operand: &BackendParityOperand) -> Result<(), S
         .verification
         .require_canonical_match()
         .map_err(|error| format!("{label} same-backend verification is not canonical: {error}"))?;
+    operand
+        .verification
+        .require_exact_output_match()
+        .map_err(|error| format!("{label} same-backend output comparison failed: {error}"))?;
     let compared_outputs = operand
         .verification
         .compared_outputs
         .as_ref()
-        .ok_or_else(|| {
-            format!("{label} same-backend verification omitted exact output evidence")
-        })?;
-    compared_outputs
-        .require_exact_match()
-        .map_err(|error| format!("{label} same-backend output comparison failed: {error}"))?;
+        .expect("exact output comparison established both operands");
     if operand.output != compared_outputs.left {
         return Err(format!(
             "{label} selected output does not match its same-backend verification operand"
         ));
     }
-    if operand.verification.guest_exit_code != operand.output.exit_code
-        || operand.verification.guest_signal != operand.output.signal
+    let digest = operand.retained_log_sha256.as_str();
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
         return Err(format!(
-            "{label} selected output disposition contradicts its verification result"
+            "{label} retained_log_sha256 is not a SHA-256 digest"
         ));
-    }
-    for (field, digest) in [
-        ("stdout_sha256", operand.output.stdout_sha256.as_str()),
-        ("stderr_sha256", operand.output.stderr_sha256.as_str()),
-        ("retained_log_sha256", operand.retained_log_sha256.as_str()),
-    ] {
-        if digest.len() != 64
-            || !digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return Err(format!("{label} {field} is not a SHA-256 digest"));
-        }
     }
     if operand.retained_log.trim().is_empty() {
         return Err(format!("{label} retained_log is empty"));
-    }
-    if operand.output.exit_code.is_some() == operand.output.signal.is_some() {
-        return Err(format!(
-            "{label} must record exactly one guest disposition (exit code or signal)"
-        ));
     }
     Ok(())
 }
