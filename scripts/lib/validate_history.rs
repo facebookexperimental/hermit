@@ -65,7 +65,7 @@ impl CacheHit {
     /// positive executed-node evidence and exact equal test counts.
     pub fn exact_current_pass_counts(&self) -> Option<(i64, i64, i64)> {
         if self.schema_version
-            != Some(crate::validate_cell_results::CELL_RESULTS_LEDGER_SCHEMA_VERSION)
+            != Some(if crate::validate_evidence::ENABLED { 10 } else { crate::validate_cell_results::CELL_RESULTS_LEDGER_SCHEMA_VERSION })
             || !matches!(
                 self.producer.as_str(),
                 "validate.rs" | "hermit-validate-rs"
@@ -271,7 +271,24 @@ fn failure_row_blocks_pass_cache(row: &serde_json::Value, key: &CacheKey<'_>) ->
                     })
                 })
     });
-    if typed_cell_divergence {
+    // Schema 10 keeps reference and cross-backend outcomes separate. This
+    // conservative cache refusal grants no qualification or failure-obligation
+    // authority; those readers authenticate the complete retained artifacts.
+    let parity_divergence = i(row, "schema_version") == Some(10)
+        && row.get("cell_results").and_then(|v| v.get("cells"))
+            .and_then(serde_json::Value::as_array).is_some_and(|cells| cells.iter().any(|cell| {
+                cell.get("cell_verdict").and_then(|v| v.get("state"))
+                    .and_then(serde_json::Value::as_str) == Some("compared-and-diverged")
+                || cell.get("backend_parity").and_then(|v| v.get("attempts"))
+                    .and_then(serde_json::Value::as_array).is_some_and(|attempts| attempts.iter().any(|attempt| {
+                        ["candidate", "reference"].iter().any(|role| attempt.get(role)
+                            .and_then(|v| v.get("state")).and_then(serde_json::Value::as_str)
+                                == Some("compared-and-diverged"))
+                        || attempt.get("cross").and_then(|v| v.get("state"))
+                            .and_then(serde_json::Value::as_str) == Some("diverged")
+                    }))
+            }));
+    if typed_cell_divergence || parity_divergence {
         return true;
     }
     let known_flaky = row.get("known_flaky_failure").and_then(|v| v.as_bool());
@@ -622,6 +639,21 @@ pub fn self_test() -> Result<String, String> {
             "cache: an unsupported newer cell-results schema must not gain failure authority"
                 .into(),
         );
+    }
+
+    for role in ["reference", "cross"] {
+        let mut parity_failure = failing.clone();
+        parity_failure["schema_version"] = serde_json::json!(10);
+        let state = if role == "cross" { "diverged" } else { "compared-and-diverged" };
+        parity_failure["cell_results"] = serde_json::json!({"cells":[{
+            "cell_verdict":{"state":"compared-and-matched"},
+            "backend_parity":{"attempts":[{role:{"state":state}}]}
+        }]});
+        if cache_lookup(&[parity_failure.clone(), rs_pass.clone()], "pass", &key).is_some()
+            || cache_lookup(&[rs_pass.clone(), parity_failure], "pass", &key).is_some()
+        {
+            return Err(format!("cache: an ordinary pass erased a schema-10 {role} divergence"));
+        }
     }
 
     // The two historical orderings are both refused: fail-then-pass and

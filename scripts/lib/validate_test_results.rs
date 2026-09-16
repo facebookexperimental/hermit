@@ -461,7 +461,7 @@ fn fixture_producer_steps(tags: &[&str]) -> Result<Vec<dagrun::model::Step>, Str
             .next()
             .ok_or("test-result fixture has no Step")?;
         step.result_manifests = Some(vec![ResultManifest::StructuredTestResults(
-            StructuredTestResultsManifest::current((*tag).into()),
+            StructuredTestResultsManifest::current(*tag),
         )]);
         steps.push(step);
     }
