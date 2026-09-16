@@ -960,6 +960,111 @@ mod tests {
     }
 
     #[test]
+    fn cumulative_writer_preserves_reference_and_cross_failures_separately() {
+        use hermit_manifest_plan::ledger::ConstructedValidationPlanV10;
+        let plan: ConstructedValidationPlanV10 = serde_json::from_str(
+            include_str!("fixtures/schema10-matched-plan.json")).unwrap();
+        let retained: Value = serde_json::from_str(
+            include_str!("fixtures/schema10-matched-cell.json")).unwrap();
+        let completed = &retained["backend_parity"]["attempts"][0];
+        let base = serde_json::json!({
+            "schema":4, "run_id":plan.run_id, "hermit_sha":plan.hermit_sha,
+            "source_tree_dirty":false, "attempt":1,
+            "test":retained["test"], "category":retained["category"],
+            "lane":retained["lane"], "mode":"verify", "backend":"kvm",
+            "classification":"deterministic", "outcome":"PASS", "result":"pass",
+            "failure_class":null, "error_kind":null, "timeout_seconds":57,
+            "execution_cpu_timeout_seconds":22, "execution_wall_timeout_seconds":57,
+            "argv":[], "guest_argv":[], "env":{}, "cwd":"/home/fixture/work",
+            "shell_command":"synthetic retained writer input", "artifact_dir":"synthetic",
+            "attempts":[completed["candidate_attempt"],completed["reference_attempt"]],
+            "backend_parity":completed["report"]
+        });
+        for case in ["matched", "cross-diverged", "reference-diverged", "reference-no-report", "pass-without-report", "missing-digest"] {
+            let parent = tempfile::tempdir().unwrap();
+            let results = parent.path().join("input");
+            fs::create_dir(&results).unwrap();
+            let mut row = base.clone();
+            match case {
+                "matched" => {},
+                "cross-diverged" => {
+                    row["outcome"] = Value::String("FAIL".into());
+                    row["result"] = Value::String("parity-failure".into());
+                    row["failure_class"] = Value::String("product_failure".into());
+                    row["reason"] = Value::String("synthetic cross divergence".into());
+                    row["backend_parity"]["verdict"] = Value::String("diverged".into());
+                    row["backend_parity"]["comparison"]["verdict"] = Value::String("diverged".into());
+                    row["backend_parity"]["comparison"]["first_divergent_record"] = Value::from(2);
+                },
+                "reference-diverged" => {
+                    let mut report: VerificationReport = serde_json::from_str(
+                        row["attempts"][1]["verification_report"].as_str().unwrap()).unwrap();
+                    report.verdict = VerificationVerdict::Diverged;
+                    report.verified = false;
+                    report.bitwise_parity = false;
+                    report.first_divergent_record = Some(1);
+                    let raw = serde_json::to_string(&report).unwrap();
+                    row["attempts"][1]["verification_report_sha256"] = Value::String(hex_digest(raw.as_bytes()));
+                    row["attempts"][1]["verification_report"] = Value::String(raw);
+                    row["attempts"][1]["first_divergent_record"] = Value::from(1);
+                    row["attempts"][1]["outcome"] = Value::String("FAIL".into());
+                    row["attempts"][1]["status"] = Value::from(1);
+                    row["attempts"][1]["reason"] = Value::String("synthetic reference divergence".into());
+                },
+                "reference-no-report" | "pass-without-report" => {
+                    row["attempts"][1]["verification_report"] = Value::Null;
+                    row["attempts"][1]["verification_report_sha256"] = Value::Null;
+                    if case == "reference-no-report" {
+                        row["attempts"][1]["outcome"] = Value::String("ERROR".into());
+                        row["attempts"][1]["status"] = Value::from(7);
+                        row["attempts"][1]["error_kind"] = Value::String("incomplete-verification-evidence".into());
+                    }
+                },
+                "missing-digest" => row["attempts"][1]["verification_report_sha256"] = Value::Null,
+                _ => unreachable!(),
+            }
+            if matches!(case, "reference-diverged" | "reference-no-report" | "pass-without-report" | "missing-digest") {
+                row["backend_parity"] = Value::Null;
+                row["outcome"] = Value::String("ERROR".into());
+                row["result"] = Value::Null;
+                row["failure_class"] = Value::String("no_result".into());
+                row["error_kind"] = Value::String("incomplete-parity-evidence".into());
+                row["reason"] = Value::String("synthetic reference did not provide a matching strict comparison".into());
+            }
+            fs::write(results.join("results.jsonl"), format!("{}\n", serde_json::to_string(&row).unwrap())).unwrap();
+            let result = retain_v10(parent.path(), &results, &plan);
+            if matches!(case, "pass-without-report" | "missing-digest") {
+                assert!(result.is_err(), "{case} was admitted");
+                continue;
+            }
+            let result = result.unwrap_or_else(|error| panic!("{case}: {error}"));
+            assert_eq!(result.schema_version, 10);
+            let cell = &result.evidence["cells"][0];
+            assert_eq!(cell["cell_verdict"]["state"], "compared-and-matched", "{case}");
+            let attempt = &cell["backend_parity"]["attempts"][0];
+            assert_eq!(attempt["candidate"]["state"], "compared-and-matched");
+            match case {
+                "matched" => assert_eq!(attempt["cross"]["state"], "matched"),
+                "cross-diverged" => assert_eq!(attempt["cross"]["state"], "diverged"),
+                "reference-diverged" => {
+                    assert_eq!(attempt["reference"]["state"], "compared-and-diverged");
+                    assert_eq!(attempt["cross"]["state"], "unavailable-with-reason");
+                },
+                "reference-no-report" => {
+                    assert_eq!(attempt["reference"]["state"], "unavailable-with-reason");
+                    assert!(attempt["reference_verification_report_sha256"].is_null());
+                },
+                _ => unreachable!(),
+            }
+            let artifact = result.evidence["artifact"]["path"].as_str().unwrap();
+            let bytes = fs::read(parent.path().join(artifact)).unwrap();
+            assert_eq!(result.evidence["artifact"]["sha256"], hex_digest(&bytes));
+            assert!(String::from_utf8(bytes).unwrap().contains("/home/fixture/"));
+            assert!(!serde_json::to_string(&result.evidence).unwrap().contains("/home/fixture/"));
+        }
+    }
+
+    #[test]
     fn duplicate_report_fields_cannot_become_compared_cell_evidence() {
         let row = result_row("fixture", "1515151515151515151515151515151515151515");
         assert!(matches!(
