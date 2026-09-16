@@ -100,7 +100,7 @@ fail=0
 # fixture that sets `user` or `author_association` keeps its own, and a
 # fixture that is not a JSON array (the input-validation cases) passes through
 # untouched rather than being silently repaired into something valid.
-readonly DEFAULT_ROLE_TAG='[hermit2, reviewer-default, unresolved, devbig014, role=reviewer]'
+readonly DEFAULT_ROLE_TAG='[hermit2, reviewer-default, unresolved, fixture-host-a, role=reviewer]'
 readonly PR_AUTHOR_FIXTURE='pr-author-fixture'
 authenticate_comments() {
     local json=$1 out
@@ -538,9 +538,9 @@ run_case "a rejection followed by a later approval at the head passes" 0 \
 # A lane contains multiple reviewers. A refusal belongs to its issuer: that
 # reviewer may discharge it, while a different reviewer's approval may bind the
 # lane but must leave the refusal standing.
-readonly REVIEWER_901='[hermit2, hermit-901, unresolved, devbig014, role=reviewer]'
-readonly REVIEWER_902='[hermit2, hermit-902, unresolved, devbig014, role=reviewer]'
-readonly REVIEWER_903='[hermit2, hermit-903, unresolved, devbig014, role=reviewer]'
+readonly REVIEWER_901='[hermit2, hermit-901, unresolved, fixture-host-a, role=reviewer]'
+readonly REVIEWER_902='[hermit2, hermit-902, unresolved, fixture-host-a, role=reviewer]'
+readonly REVIEWER_903='[hermit2, hermit-903, unresolved, fixture-host-a, role=reviewer]'
 readonly REFUSAL_ID=900001
 readonly SECOND_REFUSAL_ID=900002
 readonly WITHDRAWAL_ID=900003
@@ -986,8 +986,8 @@ run_raw_message_case() {
         fail=$((fail + 1))
     fi
 }
-readonly TAG_REVIEWER='[hermit2, hermit-902, unresolved, devbig030, role=reviewer]'
-readonly TAG_RELAY='[hermit2, hermit-bpf-post, unresolved, devbig030, role=relay]'
+readonly TAG_REVIEWER='[hermit2, hermit-902, unresolved, fixture-host-b, role=reviewer]'
+readonly TAG_RELAY='[hermit2, hermit-bpf-post, unresolved, fixture-host-b, role=relay]'
 readonly TAG_LEGACY='[adversarial-reviewer agent, gpt-5.6-sol]'
 
 # THE HOLE. A bare binding, no role tag, posted by the repository OWNER who is
