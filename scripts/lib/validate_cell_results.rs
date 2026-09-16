@@ -76,6 +76,10 @@ fn collect_results_files(path: &Path, output: &mut Vec<PathBuf>) -> Result<(), S
 }
 
 fn read_result_rows(path: &Path) -> Result<Vec<(PathBuf, usize, Value)>, String> {
+    read_result_rows_with(path, false)
+}
+
+fn read_result_rows_with(path: &Path, schema10: bool) -> Result<Vec<(PathBuf, usize, Value)>, String> {
     let mut files = Vec::new();
     collect_results_files(path, &mut files)?;
     files.sort();
@@ -87,7 +91,12 @@ fn read_result_rows(path: &Path) -> Result<Vec<(PathBuf, usize, Value)>, String>
             if line.trim().is_empty() {
                 continue;
             }
-            let row = serde_json::from_str(line).map_err(|error| {
+            let parsed = if schema10 {
+                hermit_manifest_plan::ledger::read_schema10_source_result(line.as_bytes())
+            } else {
+                serde_json::from_str(line).map_err(|error| error.to_string())
+            };
+            let row = parsed.map_err(|error| {
                 format!(
                     "{}:{} malformed result row: {error}",
                     file.display(),
@@ -794,7 +803,7 @@ pub fn retain_v10(
     let parity_candidates = selected_backend_parity.iter().map(|relation| relation.candidate.clone()).collect::<BTreeSet<_>>();
     let mut rows = BTreeMap::<CellIdentity, Vec<(u64, Value)>>::new();
     let mut seen = BTreeSet::new();
-    for (file, line, row) in read_result_rows(result_root)? {
+    for (file, line, row) in read_result_rows_with(result_root, true)? {
         if row.get("schema").and_then(Value::as_u64) != Some(4)
             || string(&row, "hermit_sha")? != plan.hermit_sha
             || string(&row, "run_id")? != plan.run_id
@@ -980,6 +989,24 @@ mod tests {
             "attempts":[completed["candidate_attempt"],completed["reference_attempt"]],
             "backend_parity":completed["report"]
         });
+        let raw = serde_json::to_string(&base).unwrap();
+        for (needle, replacement) in [
+            ("\"status\":0", "\"status\":7,\"status\":0"),
+            ("\"status\":0", "\"status\":0,\"status\":0"),
+            ("\"compared\":3", "\"compared\":0,\"compared\":3"),
+            ("\"compared\":3", "\"compared\":3,\"compared\":3"),
+        ] {
+            assert!(raw.contains(needle), "duplicate control omitted {needle}");
+            let duplicate = raw.replacen(needle, replacement, 1);
+            assert_eq!(serde_json::from_str::<Value>(&duplicate).unwrap(), base);
+            let parent = tempfile::tempdir().unwrap();
+            let results = parent.path().join("input");
+            fs::create_dir(&results).unwrap();
+            fs::write(results.join("results.jsonl"), format!("{duplicate}\n")).unwrap();
+            let error = retain_v10(parent.path(), &results, &plan).unwrap_err();
+            assert!(error.contains("duplicate field"), "{error}");
+            assert!(!parent.path().join("ignored/validate/artifacts").exists());
+        }
         for case in ["matched", "cross-diverged", "reference-diverged", "reference-no-report", "pass-without-report", "missing-digest"] {
             let parent = tempfile::tempdir().unwrap();
             let results = parent.path().join("input");

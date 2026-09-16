@@ -462,6 +462,10 @@ fn parity_attempt_decoder_requires_every_nullable_key_and_binds_raw_reports() {
     let mut largest_exact = value.clone();
     largest_exact["duration_ms"] = Value::from(u64::MAX);
     assert_eq!(
+        read_schema10_source_result(&serde_json::to_vec(&largest_exact).unwrap()).unwrap(),
+        largest_exact
+    );
+    assert_eq!(
         serde_json::from_value::<ParityAttempt>(largest_exact)
             .unwrap()
             .0
@@ -483,6 +487,10 @@ fn parity_attempt_decoder_requires_every_nullable_key_and_binds_raw_reports() {
         assert!(
             serde_json::from_str::<ParityAttempt>(&changed).is_err(),
             "duration {duration} was rounded or coerced"
+        );
+        assert!(
+            read_schema10_source_result(changed.as_bytes()).is_err(),
+            "original duration {duration} was rounded before exact decoding"
         );
     }
     let historical = text.replace(

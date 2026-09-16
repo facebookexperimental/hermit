@@ -17,6 +17,83 @@ use crate::runner::AttemptResult;
 
 pub const VALIDATION_EVIDENCE_SCHEMA_VERSION: u32 = 10;
 
+/// Read the original harness row before any map conversion can erase duplicate
+/// fields. Schema 10 source numbers are exact integers; floating point and
+/// integers outside serde_json's exact signed/unsigned 64-bit range are refused.
+/// Historical runner and ledger decoders retain their existing behavior.
+pub fn read_schema10_source_result(bytes: &[u8]) -> Result<Value, String> {
+    struct ExactValue(Value);
+    impl<'de> Deserialize<'de> for ExactValue {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct Visitor;
+            impl<'de> serde::de::Visitor<'de> for Visitor {
+                type Value = ExactValue;
+
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str("JSON with unique object fields and exact integer numbers")
+                }
+
+                fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                    Ok(ExactValue(Value::Null))
+                }
+
+                fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                    Ok(ExactValue(Value::Bool(value)))
+                }
+
+                fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                    Ok(ExactValue(Value::from(value)))
+                }
+
+                fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                    Ok(ExactValue(Value::from(value)))
+                }
+
+                fn visit_f64<E: serde::de::Error>(self, _value: f64) -> Result<Self::Value, E> {
+                    Err(E::custom(
+                        "schema 10 source number is not an exact 64-bit integer",
+                    ))
+                }
+
+                fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                    Ok(ExactValue(Value::String(value.into())))
+                }
+
+                fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                    self,
+                    mut seq: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let mut values = Vec::new();
+                    while let Some(value) = seq.next_element::<ExactValue>()? {
+                        values.push(value.0);
+                    }
+                    Ok(ExactValue(Value::Array(values)))
+                }
+
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let mut values = serde_json::Map::new();
+                    while let Some(key) = map.next_key::<String>()? {
+                        if values.contains_key(&key) {
+                            return Err(serde::de::Error::custom(format!(
+                                "duplicate field `{key}` in schema 10 source result"
+                            )));
+                        }
+                        values.insert(key, map.next_value::<ExactValue>()?.0);
+                    }
+                    Ok(ExactValue(Value::Object(values)))
+                }
+            }
+            deserializer.deserialize_any(Visitor)
+        }
+    }
+    serde_json::from_slice::<ExactValue>(bytes)
+        .map(|value| value.0)
+        .map_err(|error| format!("malformed schema 10 source result: {error}"))
+}
+
 #[cfg(test)]
 mod tests;
 
