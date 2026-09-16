@@ -173,7 +173,7 @@ fn validate_operand(label: &str, operand: &BackendParityOperand) -> Result<(), S
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::canonical_verdict::ComparedLogMessages;
     use crate::canonical_verdict::ComparedLogScope;
@@ -242,7 +242,7 @@ mod tests {
         }
     }
 
-    fn report(verdict: BackendParityVerdict) -> BackendParityReport {
+    pub(crate) fn report(verdict: BackendParityVerdict) -> BackendParityReport {
         let output = output('a');
         BackendParityReport {
             schema: BACKEND_PARITY_REPORT_SCHEMA,

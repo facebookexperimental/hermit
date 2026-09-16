@@ -1,4 +1,5 @@
 pub mod backend_parity;
+mod backend_parity_policy;
 #[path = "../../../hermit-cli/src/canonical_verdict.rs"]
 pub mod canonical_verdict;
 pub mod ci_selection;

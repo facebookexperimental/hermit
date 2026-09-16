@@ -779,6 +779,88 @@ pub fn retain(
     })
 }
 
+/// Retain full parity attempts in the immutable artifact and only derived,
+/// path-free summaries in schema 10. Ordinary and parity outcomes remain
+/// separate, and the selected population comes from the pre-execution plan.
+pub fn retain_v10(
+    parent: &Path,
+    result_root: &Path,
+    plan: &hermit_manifest_plan::ledger::ConstructedValidationPlanV10,
+) -> Result<RetainedCellResults, String> {
+    use hermit_manifest_plan::ledger::{CellArtifactResultV10, CellBackendParity, CellResultsEvidenceV10};
+    let selected = plan.planned_cells()?;
+    let selected_set = selected.iter().cloned().collect::<BTreeSet<_>>();
+    let selected_backend_parity = plan.planned_backend_parity_relations()?;
+    let parity_candidates = selected_backend_parity.iter().map(|relation| relation.candidate.clone()).collect::<BTreeSet<_>>();
+    let mut rows = BTreeMap::<CellIdentity, Vec<(u64, Value)>>::new();
+    let mut seen = BTreeSet::new();
+    for (file, line, row) in read_result_rows(result_root)? {
+        if row.get("schema").and_then(Value::as_u64) != Some(4)
+            || string(&row, "hermit_sha")? != plan.hermit_sha
+            || string(&row, "run_id")? != plan.run_id
+            || row.get("source_tree_dirty").and_then(Value::as_bool) != Some(false)
+        {
+            return Err(format!("{}:{line} is not a clean current result for the retained plan", file.display()));
+        }
+        require_current_timeout_policy(&row)?;
+        let id = identity(&row)?;
+        let attempt = row.get("attempt").and_then(Value::as_u64).ok_or("current cell result omitted attempt")?;
+        if !selected_set.contains(&id) || !seen.insert((id.clone(), attempt)) {
+            return Err("schema 10 results contain an unselected cell or repeated attempt".into());
+        }
+        rows.entry(id).or_default().push((attempt, row));
+    }
+    let mut full_cells = Vec::new();
+    for (id, mut rows) in rows {
+        rows.sort_by_key(|(attempt, _)| *attempt);
+        let (cell_verdict, backend_parity) = if parity_candidates.contains(&id) {
+            let parity = CellBackendParity::from_result_rows(&id, &rows)?;
+            (parity.candidate_verdict(&id)?, RequiredNullable::Value(parity))
+        } else {
+            if rows.iter().any(|(_, row)| row.get("backend_parity").is_some_and(|value| !value.is_null())
+                || row.get("attempts").and_then(Value::as_array).is_some_and(|attempts| {
+                    attempts.iter().any(|attempt| attempt.get("index").and_then(Value::as_str) == Some("parity-reference"))
+                }))
+            {
+                return Err("ordinary selected cell emitted an unplanned parity comparison".into());
+            }
+            let outcome = outcome_after_retries(rows.iter().map(|(attempt, row)| Ok((*attempt, string(row, "outcome")?)))
+                .collect::<Result<Vec<_>, String>>()?)?;
+            let row = rows.iter().rev().find(|(_, row)| row.get("outcome").and_then(Value::as_str) == Some(outcome))
+                .map(|(_, row)| row).ok_or("ordinary cell has no selected terminal result")?;
+            (cell_verdict(row)?, RequiredNullable::Null)
+        };
+        full_cells.push(CellArtifactResultV10 { lane: id.lane, category: id.category, test: id.test,
+            mode: id.mode, backend: id.backend, cell_verdict, backend_parity });
+    }
+    let mut bytes = Vec::new();
+    let mut cells = Vec::new();
+    for cell in &full_cells {
+        cells.push(cell.summary()?);
+        let mut row = serde_json::to_value(cell).map_err(|error| error.to_string())?;
+        let object = row.as_object_mut().ok_or("schema 10 full cell is not an object")?;
+        object.insert("run_id".into(), Value::String(plan.run_id.clone()));
+        object.insert("hermit_sha".into(), Value::String(plan.hermit_sha.clone()));
+        object.insert("source_tree_dirty".into(), Value::Bool(false));
+        serde_json::to_writer(&mut bytes, &row).map_err(|error| error.to_string())?;
+        bytes.push(b'\n');
+    }
+    let population = serde_json::to_vec(&serde_json::to_value(&selected).map_err(|error| error.to_string())?)
+        .map_err(|error| error.to_string())?;
+    let artifact_path = super::validate_artifacts::publish_run_artifact_noclobber(
+        parent, &plan.run_id, "cell-results.jsonl", &bytes, "retained full cell results")?;
+    let evidence = CellResultsEvidenceV10 {
+        path: plan.path, run_id: plan.run_id.clone(), hermit_sha: plan.hermit_sha.clone(), source_tree_dirty: false,
+        selected_count: selected.len() as u64, recorded_count: cells.len() as u64,
+        population_sha256: hex_digest(&population), artifact: CellResultsArtifact {
+            path: artifact_path, sha256: hex_digest(&bytes), row_count: cells.len() as u64 },
+        selected, selected_backend_parity, cells,
+    };
+    evidence.verify_cell_artifact_bytes(&bytes)?;
+    Ok(RetainedCellResults { schema_version: 10, run_id: plan.run_id.clone(),
+        evidence: serde_json::to_value(evidence).map_err(|error| error.to_string())? })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicU64;

@@ -174,17 +174,22 @@ const PROFILES: [Profile; 7] = [
 ];
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ExpectedPlan {
+    schema: u64,
     cells: Vec<ExpectedCell>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ExpectedCell {
     lane: String,
     category: String,
     test: String,
     mode: String,
     backend: String,
+    #[serde(default)]
+    requires_host_capabilities: Vec<String>,
 }
 
 impl From<ExpectedCell> for DagManifest {
@@ -288,9 +293,34 @@ fn expected_cells(root: &Path) -> Result<Vec<DagManifest>, String> {
     let path = root.join(EXPECTED_PLAN);
     let text = fs::read_to_string(&path)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    let plan: ExpectedPlan = serde_json::from_str(&text)
-        .map_err(|error| format!("invalid {}: {error}", path.display()))?;
-    Ok(plan.cells.into_iter().map(Into::into).collect())
+    expected_cells_from_json(&text)
+        .map_err(|error| format!("invalid {}: {error}", path.display()))
+}
+
+/// Decode the same source-owned expected population for generation and retained
+/// plan verification. Duplicates are refused before constructing any set.
+pub fn expected_cells_from_json(text: &str) -> Result<Vec<DagManifest>, String> {
+    let plan: ExpectedPlan = serde_json::from_str(text)
+        .map_err(|error| format!("invalid expected E2E plan: {error}"))?;
+    if plan.schema != 1 {
+        return Err("expected E2E plan schema must be 1".into());
+    }
+    let mut seen = BTreeSet::new();
+    let mut cells = Vec::new();
+    for cell in plan.cells {
+        if [&cell.lane, &cell.category, &cell.test, &cell.mode, &cell.backend]
+            .iter().any(|field| field.trim().is_empty())
+            || cell.requires_host_capabilities.iter().any(|field| field.trim().is_empty())
+        {
+            return Err("expected E2E plan contains an empty identity or capability".into());
+        }
+        let cell: DagManifest = cell.into();
+        if !seen.insert(result_identity(&cell)) {
+            return Err("expected E2E plan contains a duplicate cell identity".into());
+        }
+        cells.push(cell);
+    }
+    Ok(cells)
 }
 
 fn normalize_step(step: &mut Step, root: &Path, run_state: &Path) -> Result<(), String> {

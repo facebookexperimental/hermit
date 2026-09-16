@@ -1,0 +1,450 @@
+use super::*;
+
+fn retain_fixture(name: &str, row: &HistoryRow, plan: &[u8], cells: &[u8], tests: &[u8]) {
+    use std::io::Write;
+    let Some(root) = std::env::var_os("HERMIT_SCHEMA10_FIXTURE_OUTPUT") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    assert!(
+        root.is_absolute(),
+        "fixture artifact destination must be absolute"
+    );
+    std::fs::create_dir_all(&root).unwrap();
+    let row_bytes = serde_json::to_vec(row).unwrap();
+    for (suffix, bytes) in [
+        ("row.json", row_bytes.as_slice()),
+        ("plan.json", plan),
+        ("cells.jsonl", cells),
+        ("tests.jsonl", tests),
+    ] {
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(root.join(format!("{name}-{suffix}")))
+            .unwrap();
+        output.write_all(bytes).unwrap();
+    }
+}
+
+fn identity() -> CellIdentity {
+    CellIdentity {
+        lane: "portable".into(),
+        category: "backend-parity-c".into(),
+        test: "backend-parity-c/fixture".into(),
+        mode: "verify".into(),
+        backend: "kvm".into(),
+    }
+}
+
+// These are synthetic parser controls, not guest measurements. The existing
+// typed parity fixture supplies complete strict reports and comparison fields.
+fn attempt(backend: &str, index: &str, report: &VerificationReport) -> ParityAttempt {
+    let raw = serde_json::to_string(report).unwrap();
+    ParityAttempt(AttemptResult {
+        index: index.into(),
+        outcome: "PASS".into(),
+        error_kind: None,
+        status: Some(0),
+        signal: None,
+        timed_out: false,
+        duration_ms: 1,
+        cpu_usage_usec: Some(1),
+        observation_sha256: None,
+        argv: vec![
+            "/home/fixture/hermit".into(),
+            "run".into(),
+            "--backend".into(),
+            backend.into(),
+            "--verify".into(),
+            "--verify-strict".into(),
+            "--".into(),
+            "/home/fixture/guest".into(),
+        ],
+        guest_argv: vec!["/home/fixture/guest".into()],
+        env: BTreeMap::new(),
+        cwd: "/home/fixture/work".into(),
+        shell_command: "/home/fixture/hermit run a synthetic fixture".into(),
+        stdout: "fixture output".into(),
+        stderr: String::new(),
+        verification_report_sha256: Some(hex_digest(raw.as_bytes())),
+        verification_report: Some(raw),
+        runtime: report.runtime.clone(),
+        first_divergent_scheduler_turn: report.first_divergent_scheduler_turn,
+        first_divergent_virtual_nanoseconds: report.first_divergent_virtual_nanoseconds,
+        first_divergent_record: report.first_divergent_record,
+        first_divergent_syscall: report.first_divergent_syscall,
+        first_divergent_left_message: report.first_divergent_left_message.clone(),
+        first_divergent_right_message: report.first_divergent_right_message.clone(),
+        sabre_path_evidence: None,
+        sabre_path_evidence_sha256: None,
+        reason: None,
+    })
+}
+
+fn completed(number: u64, verdict: BackendParityVerdict) -> BackendParityCellAttempt {
+    let report = crate::backend_parity::tests::report(verdict);
+    BackendParityCellAttempt::Completed {
+        attempt: number,
+        candidate_attempt: attempt("kvm", "1", &report.candidate.verification),
+        reference_attempt: attempt("ptrace", "parity-reference", &report.reference.verification),
+        report,
+    }
+}
+
+fn parity(attempts: Vec<BackendParityCellAttempt>) -> CellBackendParity {
+    CellBackendParity {
+        reference_backend: "ptrace".into(),
+        record_envelope: RecordEnvelopePolicy::CrossBackendDetcoreV1,
+        attempts,
+    }
+}
+
+fn fixture(parity: CellBackendParity) -> (HistoryRow, Vec<u8>, Vec<u8>, Vec<u8>) {
+    let id = identity();
+    let tag = "e2e.manifest_backend_parity_c_on_host";
+    let cfg = dag_from_json(&serde_json::json!({ "steps": [{
+        "group": "e2e", "job": "manifest_backend_parity_c_on_host",
+        "cmd": crate::backend_parity_policy::HOSTED_PARITY_COMMAND,
+        "manifest": {"lane":"portable", "category":"backend-parity-c"},
+        "result_manifests": [
+            {"lane":id.lane, "category":id.category, "test":id.test, "mode":id.mode, "backend":id.backend},
+            {"kind":"structured-test-results", "schema":2, "path_env":"DAGRUN_TEST_COUNTS_PATH", "owner":tag}
+        ]
+    }] }).to_string()).unwrap();
+    let run_id = "fixture-v10".to_string();
+    let hermit_sha = "a".repeat(40);
+    let plan = ConstructedValidationPlanV10 {
+        schema: 1,
+        run_id: run_id.clone(),
+        hermit_sha: hermit_sha.clone(),
+        path: ValidatePath::Full,
+        compatibility_selected: false,
+        dag_json: dag_to_json(&cfg),
+        expected_e2e_plan_json: serde_json::json!({"schema":1,"cells":[id]}).to_string(),
+    };
+    let plan_bytes = serde_json::to_vec(&plan).unwrap();
+    let cell = CellArtifactResultV10 {
+        lane: id.lane.clone(),
+        category: id.category.clone(),
+        test: id.test.clone(),
+        mode: id.mode.clone(),
+        backend: id.backend.clone(),
+        cell_verdict: parity.candidate_verdict(&id).unwrap(),
+        backend_parity: RequiredNullable::Value(parity),
+    };
+    let mut cell_row = serde_json::to_value(&cell).unwrap();
+    cell_row["run_id"] = Value::String(run_id.clone());
+    cell_row["hermit_sha"] = Value::String(hermit_sha.clone());
+    cell_row["source_tree_dirty"] = Value::Bool(false);
+    let mut cell_bytes = serde_json::to_vec(&cell_row).unwrap();
+    cell_bytes.push(b'\n');
+    let selected = vec![id.clone()];
+    let population = serde_json::to_vec(&serde_json::to_value(&selected).unwrap()).unwrap();
+    let cells = CellResultsEvidenceV10 {
+        path: ValidatePath::Full,
+        run_id: run_id.clone(),
+        hermit_sha: hermit_sha.clone(),
+        source_tree_dirty: false,
+        selected_count: 1,
+        recorded_count: 1,
+        population_sha256: hex_digest(&population),
+        artifact: CellResultsArtifact {
+            path: format!("ignored/validate/artifacts/{run_id}/cell-results.jsonl"),
+            sha256: hex_digest(&cell_bytes),
+            row_count: 1,
+        },
+        selected,
+        selected_backend_parity: vec![BackendParityRelation::ptrace(id)],
+        cells: vec![cell.summary().unwrap()],
+    };
+    let test_row = TestResultArtifactRow {
+        run_id: run_id.clone(),
+        hermit_sha: hermit_sha.clone(),
+        path: ValidatePath::Full,
+        producer: TestResultProducer::Node {
+            node: tag.into(),
+            outer_attempt: 1,
+        },
+        id: "synthetic fixture".into(),
+        result: TestResultVerdict::Pass,
+        attempts: 1,
+    };
+    let mut test_bytes = serde_json::to_vec(&test_row).unwrap();
+    test_bytes.push(b'\n');
+    let selected = TestResultsSelectedPopulation {
+        nodes: vec![tag.into()],
+        compatibility: false,
+    };
+    let totals = TestResultTotals {
+        executed_tests: 1,
+        passed_tests: 1,
+        failed_tests: 0,
+        filtered_tests: 0,
+    };
+    let tests = TestResultsEvidenceV9 {
+        path: ValidatePath::Full,
+        run_id: run_id.clone(),
+        hermit_sha: hermit_sha.clone(),
+        source_tree_dirty: false,
+        selected_count: 1,
+        recorded_count: 1,
+        population_sha256: hex_digest(&serde_json::to_vec(&selected).unwrap()),
+        selected,
+        nodes: vec![NodeTestResultSummary {
+            node: tag.into(),
+            outer_attempt: 1,
+            totals,
+            row_count: 1,
+        }],
+        compatibility: None,
+        totals,
+        artifact: TestResultsArtifact {
+            path: format!("ignored/validate/artifacts/{run_id}/test-results.jsonl"),
+            sha256: hex_digest(&test_bytes),
+            row_count: 1,
+        },
+    };
+    let row = serde_json::from_value(serde_json::json!({"schema_version":10,"run_id":run_id,"commit":hermit_sha,"profile":"full","tree_dirty":false,
+        "executed_tests":1,"passed_tests":1,"filtered_tests":0,"cell_results":cells,"test_results":tests,
+        "constructed_plan":ConstructedPlanArtifact {path:format!("ignored/validate/artifacts/{run_id}/constructed-plan.json"),sha256:hex_digest(&plan_bytes),bytes:plan_bytes.len() as u64}
+    })).unwrap();
+    (row, plan_bytes, cell_bytes, test_bytes)
+}
+
+#[test]
+fn exact_artifacts_derive_compact_summaries_and_refuse_independent_mutations() {
+    let (row, plan, cells, tests) =
+        fixture(parity(vec![completed(1, BackendParityVerdict::Matched)]));
+    let verified = row
+        .verify_schema10_artifact_bytes(&plan, &cells, &tests)
+        .unwrap()
+        .unwrap();
+    assert!(verified.full_backend_parity && verified.full_test_results);
+    retain_fixture("matched", &row, &plan, &cells, &tests);
+    assert_eq!(verified.observations.len(), 3);
+    assert!(verified.missing_cells.is_empty() && verified.missing_backend_parity.is_empty());
+    let compact = serde_json::to_string(&verified.cell_results).unwrap();
+    assert!(!compact.contains("/home/fixture"));
+    assert!(
+        String::from_utf8(cells.clone())
+            .unwrap()
+            .contains("/home/fixture")
+    );
+    for field in [
+        "candidate_verification_report_sha256",
+        "reference_verification_report_sha256",
+    ] {
+        let mut value = serde_json::to_value(&row).unwrap();
+        value["cell_results"]["cells"][0]["backend_parity"]["attempts"][0][field] =
+            Value::String("f".repeat(64));
+        let changed: HistoryRow = serde_json::from_value(value).unwrap();
+        assert!(
+            changed
+                .verify_schema10_artifact_bytes(&plan, &cells, &tests)
+                .unwrap_err()
+                .contains("compact ledger summary")
+        );
+    }
+    let mut changed = plan.clone();
+    changed.push(b' ');
+    assert!(
+        row.verify_schema10_artifact_bytes(&changed, &cells, &tests)
+            .is_err()
+    );
+    let mut value = serde_json::to_value(&row).unwrap();
+    value["cell_results"]["cells"][0]["backend_parity"] = Value::Null;
+    assert!(
+        serde_json::from_value::<HistoryRow>(value)
+            .unwrap()
+            .verify_schema10_artifact_bytes(&plan, &cells, &tests)
+            .is_err()
+    );
+    let mut missing = row.clone();
+    let mut evidence = missing.schema10_cell_results().unwrap().unwrap();
+    evidence.cells.clear();
+    evidence.recorded_count = 0;
+    evidence.artifact.row_count = 0;
+    evidence.artifact.sha256 = hex_digest(b"");
+    missing.cell_results = Some(CellResultsValue::Other(
+        serde_json::to_value(evidence).unwrap(),
+    ));
+    let verified = missing
+        .verify_schema10_artifact_bytes(&plan, b"", &tests)
+        .unwrap()
+        .unwrap();
+    assert_eq!(verified.missing_cells, [identity()]);
+    assert_eq!(
+        verified.missing_backend_parity,
+        [BackendParityRelation::ptrace(identity())]
+    );
+    assert!(!verified.full_backend_parity);
+}
+
+#[test]
+fn reference_refusal_and_cross_divergence_never_change_the_candidate_verdict() {
+    let complete = completed(1, BackendParityVerdict::Matched);
+    let mut reference = complete.reference_attempt().unwrap().clone();
+    reference.0.outcome = "ERROR".into();
+    reference.0.status = Some(7);
+    reference.0.error_kind = Some("incomplete-verification-evidence".into());
+    reference.0.reason = Some("/home/fixture/reference exited before JSON".into());
+    reference.0.verification_report = None;
+    reference.0.verification_report_sha256 = None;
+    let unavailable = BackendParityCellAttempt::UnavailableWithReason {
+        attempt: 1,
+        candidate_attempt: complete.candidate_attempt().clone(),
+        reference_attempt: RequiredNullable::Value(reference.clone()),
+        reason: "/home/fixture/reference did not finish".into(),
+    };
+    let (row, plan, cells, tests) = fixture(parity(vec![unavailable]));
+    let verified = row
+        .verify_schema10_artifact_bytes(&plan, &cells, &tests)
+        .unwrap()
+        .unwrap();
+    assert!(!verified.full_backend_parity);
+    assert_eq!(
+        verified.observations[0].verdict,
+        ComparisonObservationVerdictV10::Matched
+    );
+    assert!(matches!(
+        verified.observations[1].verdict,
+        ComparisonObservationVerdictV10::UnavailableWithReason { .. }
+    ));
+    reference.0.outcome = "PASS".into();
+    assert!(
+        reference
+            .ordinary_verdict("ptrace", "parity-reference")
+            .is_err()
+    );
+    reference.0.outcome = "ERROR".into();
+    reference.0.verification_report_sha256 = Some("a".repeat(64));
+    assert!(
+        reference
+            .ordinary_verdict("ptrace", "parity-reference")
+            .is_err()
+    );
+    let (row, plan, cells, tests) = fixture(parity(vec![
+        completed(1, BackendParityVerdict::Diverged),
+        completed(2, BackendParityVerdict::Matched),
+    ]));
+    let verified = row
+        .verify_schema10_artifact_bytes(&plan, &cells, &tests)
+        .unwrap()
+        .unwrap();
+    assert!(!verified.full_backend_parity);
+    assert_eq!(verified.observations.len(), 6);
+    retain_fixture("cross-diverged-then-matched", &row, &plan, &cells, &tests);
+    assert_eq!(
+        verified.observations[2].verdict,
+        ComparisonObservationVerdictV10::Diverged
+    );
+    assert_eq!(
+        verified.observations[5].verdict,
+        ComparisonObservationVerdictV10::Matched
+    );
+    assert!(matches!(
+        verified.cell_results.cells[0].cell_verdict,
+        CellVerdict::ComparedAndMatched { .. }
+    ));
+}
+
+#[test]
+fn parity_attempt_decoder_requires_every_nullable_key_and_binds_raw_reports() {
+    let completed = completed(1, BackendParityVerdict::Matched);
+    let candidate = completed.candidate_attempt();
+    let value = serde_json::to_value(candidate).unwrap();
+    for key in value.as_object().unwrap().keys() {
+        let mut missing = value.clone();
+        missing.as_object_mut().unwrap().remove(key);
+        assert!(
+            serde_json::from_value::<ParityAttempt>(missing).is_err(),
+            "missing {key} was accepted"
+        );
+    }
+    let mut extra = value.clone();
+    extra["unknown"] = Value::Null;
+    assert!(serde_json::from_value::<ParityAttempt>(extra).is_err());
+    let text = serde_json::to_string(&value).unwrap();
+    let duplicate = text.replacen('{', "{\"status\":0,", 1);
+    assert!(serde_json::from_str::<ParityAttempt>(&duplicate).is_err());
+    let mut changed = candidate.clone();
+    changed.0.verification_report.as_mut().unwrap().push(' ');
+    assert!(
+        changed
+            .ordinary_verdict("kvm", "1")
+            .unwrap_err()
+            .contains("SHA256")
+    );
+    let mut changed = candidate.clone();
+    changed.0.argv.insert(1, "--backend=ptrace".into());
+    assert!(changed.ordinary_verdict("kvm", "1").is_err());
+    let mut changed = completed.clone();
+    if let BackendParityCellAttempt::Completed { report, .. } = &mut changed {
+        report.comparison.inputs = None;
+    }
+    assert!(changed.verdicts(&identity()).is_err());
+}
+
+#[test]
+fn retained_plan_refuses_changed_selection_policy_and_test_denominators() {
+    let (row, plan, cells, tests) =
+        fixture(parity(vec![completed(1, BackendParityVerdict::Matched)]));
+    let original: ConstructedValidationPlanV10 = serde_json::from_slice(&plan).unwrap();
+    for mutation in [
+        "command",
+        "owned-population",
+        "compatibility",
+        "producer",
+        "expected-duplicate",
+    ] {
+        let mut plan = original.clone();
+        let mut cfg = plan.constructed_dag().unwrap();
+        match mutation {
+            "command" => {
+                cfg.steps[0].cmd = cfg.steps[0].cmd.replace("--parity-reference ptrace", "")
+            }
+            "owned-population" => cfg.steps[0]
+                .result_manifests
+                .as_mut()
+                .unwrap()
+                .retain(|item| {
+                    matches!(
+                        item,
+                        dagrun::model::ResultManifest::StructuredTestResults(_)
+                    )
+                }),
+            "producer" => cfg.steps[0]
+                .result_manifests
+                .as_mut()
+                .unwrap()
+                .retain(|item| matches!(item, dagrun::model::ResultManifest::ManifestCell(_))),
+            "compatibility" => plan.compatibility_selected = true,
+            "expected-duplicate" => {
+                plan.expected_e2e_plan_json =
+                    serde_json::json!({"schema":1,"cells":[identity(),identity()]}).to_string()
+            }
+            _ => unreachable!(),
+        }
+        plan.dag_json = dag_to_json(&cfg);
+        let bytes = serde_json::to_vec(&plan).unwrap();
+        let mut row = row.clone();
+        row.extra.insert(
+            "constructed_plan".into(),
+            serde_json::to_value(ConstructedPlanArtifact {
+                path: format!(
+                    "ignored/validate/artifacts/{}/constructed-plan.json",
+                    plan.run_id
+                ),
+                sha256: hex_digest(&bytes),
+                bytes: bytes.len() as u64,
+            })
+            .unwrap(),
+        );
+        assert!(
+            row.verify_schema10_artifact_bytes(&bytes, &cells, &tests)
+                .is_err(),
+            "{mutation} shrank the independently selected population"
+        );
+    }
+}

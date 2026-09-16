@@ -1847,7 +1847,7 @@ impl ResultRow {
                     || !disposition
                 {
                     return Err(format!(
-                        "attempt {} has no embedded verification report and no complete timeout or ptrace-reference disposition",
+                        "attempt {} has no embedded verification report and no complete timeout disposition or ptrace-reference failure disposition",
                         index + 1
                     ));
                 }

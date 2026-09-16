@@ -75,6 +75,10 @@ mod validate_history;
 
 #[path = "lib/validate_cell_results.rs"]
 mod validate_cell_results;
+#[path = "lib/validate_artifacts.rs"]
+mod validate_artifacts;
+#[path = "lib/validate_test_results.rs"]
+mod validate_test_results;
 
 #[path = "lib/validate_plan.rs"]
 mod validate_plan;
@@ -1469,6 +1473,8 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
         "ci/verify-submodules.sh",
         "scripts/validate.rs",
         "scripts/lib/validate_history.rs",
+        "scripts/lib/validate_artifacts.rs",
+        "scripts/lib/validate_test_results.rs",
         "scripts/lib/validate_plan.rs",
         "scripts/lib/validate_super.rs",
         "tests/e2e/manifests/applications.yaml",
@@ -1498,6 +1504,8 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
                 "ci/verify-submodules.sh",
                 "scripts/validate.rs",
                 "scripts/lib/validate_history.rs",
+                "scripts/lib/validate_artifacts.rs",
+                "scripts/lib/validate_test_results.rs",
                 "scripts/lib/validate_plan.rs",
                 "scripts/lib/validate_super.rs",
                 "tests/e2e/manifests/applications.yaml",
@@ -3042,6 +3050,7 @@ fn self_test() -> Result<(), String> {
         validate_super::self_test(&root)?,
         validate_envelope::self_test()?,
         validate_history::self_test()?,
+        validate_test_results::self_test()?,
         validate_receipt::self_test()?,
         validate_runtime::self_test()?,
         validate_classification::self_test()?,

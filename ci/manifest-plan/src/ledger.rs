@@ -15,6 +15,9 @@ use sha2::Sha256;
 
 use crate::runner::FailureClass;
 
+mod schema10;
+pub use schema10::*;
+
 /// The stable fields emitted by `validate/aggregate.py --json` and JSONL stores.
 /// Optional fields reflect honest reconstructed rows where a measurement was not
 /// available; unrecognized fields are retained for forward compatibility.
@@ -954,7 +957,7 @@ impl TestResultsSelectedPopulation {
     /// validation plan. Dependencies without a structured-result declaration
     /// are intentionally absent; every declared producer is included before
     /// any outcome or artifact row is observed.
-    fn from_constructed_plan_steps(steps: &[Step], compatibility: bool) -> Result<Self, String> {
+    pub fn from_constructed_plan_steps(steps: &[Step], compatibility: bool) -> Result<Self, String> {
         let mut nodes = BTreeSet::new();
         for step in steps {
             if step.structured_test_results_manifest()?.is_some() {
@@ -1035,7 +1038,7 @@ pub struct TestResultsEvidenceV9 {
 /// filtered tests do not have terminal artifact rows. Executed, passed, failed,
 /// row-count, producer-population, and identity values are all recomputed from
 /// the artifact bytes and checked against those summaries.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct VerifiedTestResultsArtifactV9 {
     pub selected: TestResultsSelectedPopulation,
     pub nodes: Vec<NodeTestResultSummary>,
