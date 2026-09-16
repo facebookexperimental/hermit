@@ -15,7 +15,7 @@
 # digest says what ran, the lock says how to rebuild it. See README.md.
 #
 #   usage: run-in-pinned-root.sh --src DIR --out DIR [--digest NAME@SHA]
-#                                [--src-rw] [--cargo-home DIR] [--env NAME]... -- CMD...
+#                                [--src-rw] [--cargo-home DIR] [--proc-locks-runtime] [--env NAME]... -- CMD...
 #
 # --src-rw mounts the source WRITABLE. The default is read-only and stays that
 # way, but a test phase legitimately writes into its own tree (target/ci,
@@ -42,6 +42,7 @@ HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 DIGEST_FILE="$HERE/image.digest"
 
 src=""; out=""; digest=""; src_mode="ro=true"; cargo_home=""
+proc_locks_runtime=false
 pass_env=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -50,6 +51,7 @@ while [[ $# -gt 0 ]]; do
         --digest) digest=$2; shift 2 ;;
         --src-rw) src_mode="ro=false"; shift ;;
         --cargo-home) cargo_home=$2; shift 2 ;;
+        --proc-locks-runtime) proc_locks_runtime=true; shift ;;
         --env) pass_env+=("$2"); shift 2 ;;
         --) shift; break ;;
         *) echo "run-in-pinned-root: unexpected argument '$1'" >&2; exit 2 ;;
@@ -239,6 +241,64 @@ for name in "${pass_env[@]}"; do
         *) env_args+=(--env "$name") ;;
     esac
 done
+
+
+# Only the integration node opts in. Native tests and independent containers
+# must flock this same host inode: a per-container lock cannot serialize OFD
+# observations across PID namespaces. Never mount the rest of the host runtime.
+if "$proc_locks_runtime"; then
+    for name in "${pass_env[@]}"; do
+        case "$name" in
+            XDG_RUNTIME_DIR|HERMIT_PROC_LOCKS_LEASE_ID)
+                echo "run-in-pinned-root: proc-locks runtime identity is wrapper-owned" >&2
+                exit 2
+                ;;
+        esac
+    done
+    proc_locks_metadata=$(python3 - <<'PY'
+import os
+import stat
+
+uid = os.geteuid()
+configured = os.environ.get("XDG_RUNTIME_DIR", "")
+runtime = configured if os.path.isabs(configured) else f"/run/user/{uid}"
+# Podman's --mount value is comma-framed; our output is tab-framed. Refuse
+# unrepresentable names rather than reinterpret them or choose another lease.
+if any(character in runtime for character in ",\t\r\n"):
+    raise SystemExit("proc-locks runtime path cannot be represented exactly")
+directory_fd = os.open(runtime, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+try:
+    directory = os.fstat(directory_fd)
+    if not stat.S_ISDIR(directory.st_mode) or directory.st_uid != uid or directory.st_mode & 0o077:
+        raise SystemExit("proc-locks runtime directory is not private and owned by the current user")
+    name = "hermit-proc-locks-determinism.lock"
+    lease_fd = os.open(name, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+                       0o600, dir_fd=directory_fd)
+    try:
+        lease = os.fstat(lease_fd)
+        if not stat.S_ISREG(lease.st_mode) or lease.st_uid != uid or lease.st_mode & 0o077:
+            raise SystemExit("proc-locks lease is not a private regular file owned by the current user")
+        path = os.path.join(runtime, name)
+        current = os.stat(path, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (lease.st_dev, lease.st_ino):
+            raise SystemExit("proc-locks lease path changed while preparing the mount")
+        print(f"{path}\t{lease.st_dev}:{lease.st_ino}")
+    finally:
+        os.close(lease_fd)
+finally:
+    os.close(directory_fd)
+PY
+    )
+    IFS=$'\t' read -r proc_locks_file proc_locks_identity <<< "$proc_locks_metadata"
+    [[ -n "$proc_locks_file" && $proc_locks_identity =~ ^[0-9]+:[0-9]+$ ]] || {
+        echo "run-in-pinned-root: invalid proc-locks mount identity" >&2
+        exit 2
+    }
+    extra_mounts+=(--tmpfs /run/hermit-proc-locks:rw,nosuid,nodev,noexec,mode=0700)
+    extra_mounts+=(--mount "type=bind,source=$proc_locks_file,destination=/run/hermit-proc-locks/hermit-proc-locks-determinism.lock")
+    env_args+=(-e XDG_RUNTIME_DIR=/run/hermit-proc-locks)
+    env_args+=(-e "HERMIT_PROC_LOCKS_LEASE_ID=$proc_locks_identity")
+fi
 
 # `--network=none` is the point, not a precaution: if the run can reach the
 # network it can pick up something the lock does not describe, and the rebuild

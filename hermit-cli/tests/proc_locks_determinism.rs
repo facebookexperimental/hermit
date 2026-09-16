@@ -116,6 +116,43 @@ fn open_proc_locks_snapshot_lease_file(
     Ok(file)
 }
 
+// The pinned launcher records the host file it safely opened. A mount-source
+// replacement or a different inode must fail before any snapshot guest runs.
+fn validate_proc_locks_host_identity(file: &File, expected: Option<&OsStr>) -> io::Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let expected = expected.to_str().ok_or_else(|| {
+        io::Error::new(ErrorKind::InvalidInput, "non-UTF8 proc-locks host identity")
+    })?;
+    let (device, inode) = expected.split_once(':').ok_or_else(|| {
+        io::Error::new(
+            ErrorKind::InvalidInput,
+            "malformed proc-locks host identity",
+        )
+    })?;
+    let parse = |value: &str| -> io::Result<u64> {
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "malformed proc-locks host identity",
+            ));
+        }
+        value
+            .parse()
+            .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))
+    };
+    let expected = (parse(device)?, parse(inode)?);
+    let metadata = file.metadata()?;
+    if (metadata.dev(), metadata.ino()) != expected {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "mounted proc-locks lease differs from the host inode",
+        ));
+    }
+    Ok(())
+}
+
 fn acquire_proc_locks_snapshot_lease() -> ProcLocksSnapshotLease {
     let expected_uid = effective_uid();
     let fallback = PathBuf::from(format!("/run/user/{expected_uid}"));
@@ -125,6 +162,8 @@ fn acquire_proc_locks_snapshot_lease() -> ProcLocksSnapshotLease {
             .expect("validate proc-locks runtime directory");
     let file = open_proc_locks_snapshot_lease_file(&runtime_directory, expected_uid)
         .expect("open proc-locks snapshot lease");
+    validate_proc_locks_host_identity(&file, env::var_os("HERMIT_PROC_LOCKS_LEASE_ID").as_deref())
+        .expect("bind proc-locks snapshot lease to the host inode");
     loop {
         // SAFETY: `file` owns this valid descriptor and remains alive in the
         // returned guard. BSD flock is released by the kernel if the process dies.
@@ -190,6 +229,35 @@ fn proc_locks_snapshot_lease_rejects_unsafe_paths() {
         safe_file.metadata().expect("stat safe lease file").mode() & 0o077,
         0
     );
+    let metadata = safe_file.metadata().expect("stat host identity fixture");
+    let identity = format!("{}:{}", metadata.dev(), metadata.ino());
+    validate_proc_locks_host_identity(&safe_file, None)
+        .expect("native lease needs no mount identity");
+    validate_proc_locks_host_identity(&safe_file, Some(OsStr::new(&identity)))
+        .expect("accept exact host inode");
+    let other_file = File::create(safe.join("different-inode")).expect("create distinct inode");
+    assert_eq!(
+        validate_proc_locks_host_identity(&other_file, Some(OsStr::new(&identity)))
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidData
+    );
+    for malformed in [
+        "",
+        "1",
+        "1:2:3",
+        "+1:2",
+        "1:",
+        "x:2",
+        "18446744073709551616:2",
+    ] {
+        assert_eq!(
+            validate_proc_locks_host_identity(&safe_file, Some(OsStr::new(malformed)))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+    }
     drop(safe_file);
 
     let lease_path = safe.join(PROC_LOCKS_LEASE_NAME);
@@ -489,17 +557,29 @@ fn loud_later_worker_cannot_deadlock_output_collection() {
         .expect("create loud-worker control directory");
     let placeholder_guest = root.path().join("unused-guest");
     let waiter = spawn_proc_locks_worker(root.path(), &placeholder_guest, 0, WAITER_MODE);
-    let loud_holder = spawn_proc_locks_worker(root.path(), &placeholder_guest, 1, LOUD_HOLDER_MODE);
+    let mut loud_holder =
+        spawn_proc_locks_worker(root.path(), &placeholder_guest, 1, LOUD_HOLDER_MODE);
     wait_for_workers(root.path(), 2);
 
     // Wait for worker 0 first on purpose. If worker 1 wrote to an undrained
     // pipe while holding the lease, this ordering would deadlock worker 0.
     let (waiter_success, waiter_stdout, waiter_stderr) = finish_proc_locks_worker(waiter);
+    // Observe the holder without adding a blocking wait to the failed waiter
+    // path. These are current regular-file diagnostics, not an inferred exit.
+    let holder_status = loud_holder
+        .child
+        .try_wait()
+        .expect("observe loud-holder status");
+    let holder_stdout_now = fs::read(&loud_holder.stdout).expect("read current holder stdout");
+    let holder_stderr_now = fs::read(&loud_holder.stderr).expect("read current holder stderr");
     assert!(
         waiter_success,
-        "waiter failed\nstdout:\n{}\nstderr:\n{}",
+        "waiter failed\nstdout:\n{}\nstderr:\n{}\nholder status now: {:?}\nholder stdout now:\n{}\nholder stderr now:\n{}",
         String::from_utf8_lossy(&waiter_stdout),
-        String::from_utf8_lossy(&waiter_stderr)
+        String::from_utf8_lossy(&waiter_stderr),
+        holder_status,
+        String::from_utf8_lossy(&holder_stdout_now),
+        String::from_utf8_lossy(&holder_stderr_now)
     );
     let (holder_success, _, holder_stderr) = finish_proc_locks_worker(loud_holder);
     assert!(!holder_success, "loud holder unexpectedly succeeded");

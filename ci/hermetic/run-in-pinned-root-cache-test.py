@@ -41,14 +41,17 @@ class CargoCacheMounts(unittest.TestCase):
         )
         fake.chmod(0o755)
 
-    def invoke(self, cargo_home="cargo", run_state=None, source="source", output="output"):
+    def invoke(self, cargo_home="cargo", run_state=None, source="source", output="output", proc_locks_runtime=None):
         env = os.environ.copy()
         env["PATH"] = str(self.root / "tools") + os.pathsep + env["PATH"]
         env["PINNED_ROOT_CAPTURE"] = str(self.capture)
         forwarded = []
+        if proc_locks_runtime is not None:
+            env["XDG_RUNTIME_DIR"] = str(proc_locks_runtime)
+            forwarded.append("--proc-locks-runtime")
         if run_state is not None:
             env["VALIDATE_RUN_STATE"] = str(run_state)
-            forwarded = ["--env", "VALIDATE_RUN_STATE"]
+            forwarded += ["--env", "VALIDATE_RUN_STATE"]
         result = subprocess.run(
             [
                 "bash", str(WRAPPER), "--src", str(source), "--out", output,
@@ -84,6 +87,64 @@ class CargoCacheMounts(unittest.TestCase):
         self.assertIn("--network=none", argv)
         self.assertIn("--http-proxy=false", argv)
         self.assertEqual(argv[-3:], ["fixture@sha256:unused", "/not-executed/command", "literal argument"])
+
+    def test_proc_locks_mount_reuses_the_native_host_inode(self):
+        runtime = self.root / "runtime with spaces"
+        runtime.mkdir(mode=0o700)
+        lease = runtime / "hermit-proc-locks-determinism.lock"
+        lease.write_bytes(b"preserve an existing host lease")
+        lease.chmod(0o600)
+        before = lease.stat()
+        for output in ["first-container-output", "second-container-output"]:
+            self.capture.unlink(missing_ok=True)
+            result, calls = self.invoke(output=output, proc_locks_runtime=runtime)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(len(calls), 2)
+            argv = calls[1]
+            self.assertIn("/run/hermit-proc-locks:rw,nosuid,nodev,noexec,mode=0700", argv)
+            self.assertIn(f"type=bind,source={lease},destination=/run/hermit-proc-locks/hermit-proc-locks-determinism.lock", argv)
+            self.assertIn("XDG_RUNTIME_DIR=/run/hermit-proc-locks", argv)
+            self.assertIn(f"HERMIT_PROC_LOCKS_LEASE_ID={before.st_dev}:{before.st_ino}", argv)
+            self.assertFalse(any(f"source={runtime}," in arg for arg in argv))
+            self.assertEqual(lease.read_bytes(), b"preserve an existing host lease")
+            after = lease.stat()
+            self.assertEqual((after.st_dev, after.st_ino, after.st_uid, after.st_mode, after.st_mtime_ns),
+                             (before.st_dev, before.st_ino, before.st_uid, before.st_mode, before.st_mtime_ns))
+        # The real wrapper and host file opens executed above; Podman was a
+        # recorder. This is not a container UID-mapping or flock experiment.
+
+    def test_proc_locks_mount_refuses_unsafe_inputs_before_podman_run(self):
+        for case in ["missing", "public-directory", "directory-symlink", "public-file", "fifo", "file-symlink", "mount-delimiter"]:
+            with self.subTest(case=case):
+                runtime = self.root / case
+                runtime.mkdir(mode=0o700)
+                lease = runtime / "hermit-proc-locks-determinism.lock"
+                if case == "missing":
+                    runtime.rmdir()
+                elif case == "public-directory":
+                    runtime.chmod(0o755)
+                elif case == "directory-symlink":
+                    target = self.root / "real-private-directory"
+                    runtime.rename(target)
+                    runtime.symlink_to(target, target_is_directory=True)
+                elif case == "public-file":
+                    lease.write_bytes(b"preserve unsafe bytes")
+                    lease.chmod(0o666)
+                elif case == "fifo":
+                    os.mkfifo(lease, 0o600)
+                elif case == "file-symlink":
+                    target = runtime / "other-file"
+                    target.write_bytes(b"preserve symlink target")
+                    target.chmod(0o600)
+                    lease.symlink_to(target)
+                elif case == "mount-delimiter":
+                    other = self.root / "invalid,mount"
+                    runtime.rename(other)
+                    runtime = other
+                self.capture.unlink(missing_ok=True)
+                result, calls = self.invoke(proc_locks_runtime=runtime)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(calls, [["image", "exists", "fixture@sha256:unused"]])
 
     def test_normalized_output_with_spaces_keeps_the_exact_private_home(self):
         result, calls = self.invoke(output="unused directory/../output with spaces")

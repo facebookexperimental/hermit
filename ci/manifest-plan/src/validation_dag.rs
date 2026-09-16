@@ -438,6 +438,11 @@ fn pinned_root_command(step: &Step) -> String {
         "--cargo-home".into(),
         "ignored/hermetic/split/cargo".into(),
     ];
+    // Proc-locks snapshots include OFD locks from other PID namespaces. Share
+    // the native host lease inode, not one file per container or validation.
+    if step.tag() == "test.hermit_integration" {
+        argv.push("--proc-locks-runtime".into());
+    }
     for name in env_names {
         argv.extend(["--env".into(), name.into()]);
     }
@@ -464,6 +469,15 @@ fn refresh_pinned_root_environment(tag: &str, command: &str) -> Result<String, S
         .ok_or_else(|| format!("{tag} has an unrecognized pinned-root command boundary"))?;
     let words = header.split_whitespace().collect::<Vec<_>>();
     let mut refreshed = header.to_owned();
+    let lease_options = words
+        .iter()
+        .filter(|word| **word == "--proc-locks-runtime")
+        .count();
+    match (tag == "test.hermit_integration", lease_options) {
+        (true, 0) => refreshed.push_str(" --proc-locks-runtime"),
+        (true, 1) | (false, 0) => {}
+        _ => return Err(format!("{tag} has an unexpected proc-locks runtime option")),
+    }
     for name in PINNED_ROOT_FORWARDED_ENV {
         let count = words
             .windows(2)
@@ -2222,6 +2236,44 @@ sys.exit(37)
 
     #[test]
     fn pinned_root_wrapper_preserves_cache_and_run_state_boundaries() {
+        let steps = crate::validation_dag_static::config().steps;
+        for step in &steps {
+            let command = pinned_root_command(step);
+            assert_eq!(
+                command.matches(" --proc-locks-runtime ").count(),
+                usize::from(step.tag() == "test.hermit_integration")
+            );
+        }
+        let integration = steps
+            .iter()
+            .find(|step| step.tag() == "test.hermit_integration")
+            .unwrap();
+        let command = pinned_root_command(integration);
+        assert_eq!(
+            refresh_pinned_root_environment("test.hermit_integration", &command).unwrap(),
+            command
+        );
+        assert_eq!(
+            refresh_pinned_root_environment(
+                "test.hermit_integration",
+                &command.replace(" --proc-locks-runtime", "")
+            )
+            .unwrap()
+            .matches(" --proc-locks-runtime ")
+            .count(),
+            1
+        );
+        assert!(refresh_pinned_root_environment("test.hermit_unit", &command).is_err());
+        assert!(
+            refresh_pinned_root_environment(
+                "test.hermit_integration",
+                &command.replace(
+                    " --proc-locks-runtime",
+                    " --proc-locks-runtime --proc-locks-runtime"
+                )
+            )
+            .is_err()
+        );
         let script = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../hermetic/run-in-pinned-root-cache-test.py");
         let output = std::process::Command::new("python3")
