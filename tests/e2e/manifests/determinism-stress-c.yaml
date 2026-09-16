@@ -661,7 +661,7 @@ test:
         outcome_classes: 4320
         assert:
           min_distinct: 12
-          min_passes: 1
+          min_passes: 32
           min_failures: 0
           min_normalized_entropy: 0.25
         backends_enabled:

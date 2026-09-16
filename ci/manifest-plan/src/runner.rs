@@ -3312,6 +3312,25 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
             assert.min_normalized_entropy,
         );
         let normalized_entropy = diversity["normalized_entropy"].as_f64().unwrap_or(0.0);
+        // ⚠️ THESE ARE FLOORS, AND A FLOOR OF ZERO IS NOT A CHECK.
+        //
+        // `min_passes` and `min_failures` are both unsigned, so a declared value
+        // of 0 can never fire: `x < 0` is unsatisfiable. In a manifest
+        // `min_failures: 0` READS like a threshold and asserts nothing, which is
+        // the shape that let a required cell stay green while most of its seeds
+        // exited nonzero. Five cells currently declare it; only
+        // `chaos-c/lock-granularity` and one determinism-stress cell declare a
+        // real value, and for those the floor is the point -- they are race
+        // DEMONSTRATORS whose nonzero exits are the intended signal, so a run
+        // with no failures means the race stopped being exposed.
+        //
+        // The matching trap on the other side is a `min_passes` of 1 against a
+        // large seed list: it constrains exit status only to "at least one seed
+        // exited 0", so every other seed may fail. Set `min_passes` to the seed
+        // count unless failures are part of what the cell exists to observe.
+        //
+        // Neither floor bounds the population from ABOVE. Nothing here refuses a
+        // cell whose failures grow, only one whose failures vanish.
         if distinct < assert.min_distinct.unwrap_or(2)
             || pass_count < assert.min_passes.unwrap_or(0)
             || failure_count < assert.min_failures.unwrap_or(0)
