@@ -6026,6 +6026,35 @@ fn current_result_attempts(
     Ok(attempts)
 }
 
+fn direct_comparison_receipts(
+    observation: &Observation,
+) -> impl Iterator<Item = (&str, &str, &str, ObservedResult)> {
+    observation
+        .canonical_comparisons
+        .iter()
+        .map(|comparison| {
+            (
+                comparison.hermit_sha.as_str(),
+                comparison.run_id.as_str(),
+                comparison.evidence_sha256.as_str(),
+                comparison.result,
+            )
+        })
+        .chain(
+            observation
+                .backend_parity_comparisons
+                .iter()
+                .map(|comparison| {
+                    (
+                        comparison.hermit_sha.as_str(),
+                        comparison.run_id.as_str(),
+                        comparison.evidence_sha256.as_str(),
+                        comparison.result,
+                    )
+                }),
+        )
+}
+
 fn bound_direct_attempts(
     tracked: &TrackedCells,
     current: &CurrentResultAttempts,
@@ -6037,24 +6066,24 @@ fn bound_direct_attempts(
                 continue;
             }
             let identity = SeriesObservationIdentity::from_observation(observation)?;
-            for comparison in &observation.canonical_comparisons {
+            for (hermit_sha, run_id, evidence_sha256, result) in
+                direct_comparison_receipts(observation)
+            {
                 let base = DirectEvidenceBase {
                     cell: series_cell_key(&cell.id),
                     identity: identity.clone(),
                     provenance: observation.provenance,
-                    hermit_sha: comparison.hermit_sha.clone(),
-                    run_id: comparison.run_id.clone(),
+                    hermit_sha: hermit_sha.to_string(),
+                    run_id: run_id.to_string(),
                 };
                 // A compact historical result does not prove an outer attempt.
-                // Bind only the actual canonical digest to validated current
+                // Bind only the actual comparison digest to validated current
                 // input; never infer attempt one from a run/result match.
-                if let Some(attempt) =
-                    current.get(&(base.clone(), comparison.evidence_sha256.clone()))
-                {
+                if let Some(attempt) = current.get(&(base.clone(), evidence_sha256.to_string())) {
                     bound
                         .entry(DirectEvidenceKey {
                             base,
-                            kind: DirectEvidenceKind::Result(comparison.result),
+                            kind: DirectEvidenceKind::Result(result),
                         })
                         .or_default()
                         .insert(*attempt);
@@ -6079,19 +6108,19 @@ fn direct_evidence_keys(
             let identity = SeriesObservationIdentity::from_observation(observation)?;
             let mut represented_results = BTreeSet::new();
             let mut units = 0usize;
-            for comparison in &observation.canonical_comparisons {
+            for (hermit_sha, run_id, _, result) in direct_comparison_receipts(observation) {
                 let key = DirectEvidenceKey {
                     base: DirectEvidenceBase {
                         cell: cell_name.clone(),
                         identity: identity.clone(),
                         provenance: observation.provenance,
-                        hermit_sha: comparison.hermit_sha.clone(),
-                        run_id: comparison.run_id.clone(),
+                        hermit_sha: hermit_sha.to_string(),
+                        run_id: run_id.to_string(),
                     },
-                    kind: DirectEvidenceKind::Result(comparison.result),
+                    kind: DirectEvidenceKind::Result(result),
                 };
                 *counts.entry(key).or_default() += 1;
-                represented_results.insert(comparison.result);
+                represented_results.insert(result);
                 units += 1;
             }
             for invocation in &observation.invocations {
@@ -6116,11 +6145,13 @@ fn direct_evidence_keys(
                             opaque = true;
                             continue;
                         };
-                        if observation.canonical_comparisons.iter().any(|comparison| {
-                            comparison.hermit_sha == invocation.hermit_sha
-                                && comparison.run_id == invocation.run_id
-                                && comparison.result == result
-                        }) {
+                        if direct_comparison_receipts(observation).any(
+                            |(hermit_sha, run_id, _, comparison_result)| {
+                                hermit_sha == invocation.hermit_sha
+                                    && run_id == invocation.run_id
+                                    && comparison_result == result
+                            },
+                        ) {
                             continue;
                         }
                         DirectEvidenceKind::Result(result)
@@ -13689,6 +13720,172 @@ red/`measured-and-passed` count is **0**.",
     {
         return Err("parity retirement fixture requires the existing enabled KVM cell".into());
     }
+
+    // The combined writer must bind each parity receipt to its current result
+    // digest before treating another outer attempt as independent evidence.
+    // Exercise the actual writer, including the compact invocation retained
+    // beside a product comparison, for both agreement and divergence.
+    for verdict in [
+        BackendParityVerdict::Matched,
+        BackendParityVerdict::Diverged,
+    ] {
+        let mut current = parity_row(&import_parity_id, verdict)?;
+        current.hermit_sha = fixture_head.clone();
+        current.classification = "required".into();
+        current.run_id = format!("combined-parity-{verdict:?}");
+        current.comparison_evidence()?;
+        let mut source = series_row.clone();
+        source.event_id = format!("fixture-{}", current.run_id);
+        source.run_id = current.run_id.clone();
+        source.series.cell = series_cell_key(&import_parity_id);
+        source.series.result = current.result;
+        source.series.failure_class = current.failure_class;
+        source.series.outcome = if verdict == BackendParityVerdict::Matched {
+            SeriesOutcome::Passed
+        } else {
+            SeriesOutcome::Diverged
+        };
+        source.series.coordinates =
+            (verdict == BackendParityVerdict::Diverged).then_some(SeriesCoordinates {
+                first_divergent_record: current.first_divergent_record,
+                first_divergent_syscall: current.first_divergent_syscall,
+                first_divergent_scheduler_turn: current.first_divergent_scheduler_turn,
+                first_divergent_virtual_nanoseconds: current.first_divergent_virtual_nanoseconds,
+            });
+        source.validate_for_read()?;
+        let (_, mut separate) = no_result_claim(
+            &current.run_id,
+            2,
+            &format!("fixture-{}-second-attempt", current.run_id),
+        )?;
+        separate.series.cell = source.series.cell.clone();
+        separate.validate_for_read()?;
+        let rows = vec![source.clone(), separate.clone()];
+        let written = reconcile_control(
+            &format!("parity-{verdict:?}-independent-attempt"),
+            &current,
+            rows.clone(),
+            None,
+            false,
+        )?;
+        let observations = &written
+            .cells
+            .iter()
+            .find(|cell| cell.id == import_parity_id)
+            .ok_or("combined parity write lost its cell")?
+            .observations;
+        let receipts = observations
+            .iter()
+            .flat_map(|observation| &observation.backend_parity_comparisons)
+            .filter(|comparison| comparison.run_id == current.run_id)
+            .collect::<Vec<_>>();
+        let digest = current.evidence_identity()?;
+        if receipts.len() != 1
+            || receipts[0].result != current.result.unwrap()
+            || receipts[0].evidence_sha256 != digest
+            || receipts[0].first_divergent_record != current.first_divergent_record
+            || receipts[0].first_divergent_syscall != current.first_divergent_syscall
+            || receipts[0].first_divergent_scheduler_turn != current.first_divergent_scheduler_turn
+            || receipts[0].first_divergent_virtual_nanoseconds
+                != current.first_divergent_virtual_nanoseconds
+            || observations
+                .iter()
+                .any(|observation| observation.event_ids.contains(&source.event_id))
+            || observations
+                .iter()
+                .filter(|observation| {
+                    observation.event_ids.contains(&separate.event_id)
+                        && observation.results.is_empty()
+                        && observation.backend_parity_comparisons.is_empty()
+                        && observation.canonical_comparisons.is_empty()
+                })
+                .count()
+                != 1
+            || written
+                .projection
+                .as_ref()
+                .is_none_or(|projection| projection.rows_read != 2 || projection.pre_series_corpus)
+        {
+            return Err("combined parity write lost, duplicated, or altered exact evidence".into());
+        }
+        let current_rows = BTreeMap::from([(
+            import_parity_id.clone(),
+            vec![ResultCandidate {
+                evidence_identity: digest,
+                path: result_path.clone(),
+                row: current.clone(),
+            }],
+        )]);
+        let attempts = current_result_attempts(&written, &current_rows, &fixture_detcore_tree)?;
+        let mut stale = written.clone();
+        for observation in &mut stale
+            .cells
+            .iter_mut()
+            .find(|cell| cell.id == import_parity_id)
+            .unwrap()
+            .observations
+        {
+            observation.backend_parity_comparisons = observation
+                .backend_parity_comparisons
+                .iter()
+                .cloned()
+                .map(|mut comparison| {
+                    if comparison.run_id == current.run_id {
+                        comparison.evidence_sha256 = "0".repeat(64);
+                    }
+                    comparison
+                })
+                .collect();
+        }
+        let error = direct_representation(&stale, &rows, &attempts)
+            .expect_err("a stale parity digest proved an independent current attempt");
+        if !error.contains("disagree") {
+            return Err(format!(
+                "stale parity digest refusal lost its cause: {error}"
+            ));
+        }
+        let mut duplicated = written.clone();
+        let observation = duplicated
+            .cells
+            .iter_mut()
+            .find(|cell| cell.id == import_parity_id)
+            .unwrap()
+            .observations
+            .iter_mut()
+            .find(|observation| !observation.backend_parity_comparisons.is_empty())
+            .unwrap();
+        let mut duplicate = (*receipts[0]).clone();
+        duplicate.evidence_sha256 = "0".repeat(64);
+        observation.backend_parity_comparisons.insert(duplicate);
+        let error = direct_representation(&duplicated, &rows, &attempts)
+            .expect_err("two parity receipts were accepted for one compact result identity");
+        if !error.contains("2 records for that exact identity") {
+            return Err(format!(
+                "duplicate parity receipt refusal lost its cause: {error}"
+            ));
+        }
+
+        let mut wrong_attempt = current.clone();
+        wrong_attempt.attempt = 2;
+        reconcile_control(
+            &format!("parity-{verdict:?}-wrong-attempt"),
+            &wrong_attempt,
+            vec![source.clone()],
+            None,
+            true,
+        )?;
+        separate.series.attempt = Some(1);
+        separate.series.run_index = 1;
+        reconcile_control(
+            &format!("parity-{verdict:?}-contradictory-attempt"),
+            &current,
+            vec![source, separate],
+            None,
+            true,
+        )?;
+    }
+    restore_generated()?;
+
     let older_sha = git_rev_parse(&result_command_root, "HEAD^")?;
     let mut old_parity = parity_row(&import_parity_id, BackendParityVerdict::Diverged)?;
     old_parity.hermit_sha = older_sha.clone();

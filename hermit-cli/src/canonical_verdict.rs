@@ -498,6 +498,11 @@ impl VerificationReport {
             }
         }
         let report = Self::from_json_value(value)?;
+        if report.verdict == Verdict::NoResult && report.compared_outputs.is_some() {
+            return Err(
+                "inconsistent verification report: no_result carries compared_outputs".into(),
+            );
+        }
         match (&report.verdict, &report.no_result_reason) {
             (Verdict::NoResult, Some(NoResultReason::ComparisonRefused { detail }))
                 if detail.trim().is_empty() =>
@@ -881,6 +886,52 @@ mod tests {
         let parsed = VerificationReport::from_current_json_value(current.clone())
             .expect("the typed not-run reason must round-trip");
         assert_eq!(parsed.no_result_reason, Some(NoResultReason::NotRun));
+
+        let mut rejected = VerificationReport::no_result();
+        rejected.no_result_reason = Some(NoResultReason::FirstRunRejected {
+            exit_code: Some(9),
+            signal: None,
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+        });
+        rejected.guest_exit_code = Some(9);
+        let mut rejected_value = serde_json::to_value(&rejected).unwrap();
+        for include_null in [false, true] {
+            if include_null {
+                rejected_value["compared_outputs"] = serde_json::Value::Null;
+            } else {
+                rejected_value
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("compared_outputs");
+            }
+            let parsed = VerificationReport::from_current_json_slice(
+                &serde_json::to_vec(&rejected_value).unwrap(),
+            )
+            .expect("a first-run rejection has no comparison output evidence");
+            assert_eq!(parsed, rejected);
+        }
+        let output = ComparedOutput {
+            exit_code: Some(9),
+            signal: None,
+            stdout_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .into(),
+            stdout_bytes: 0,
+            stderr_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .into(),
+            stderr_bytes: 0,
+        };
+        rejected.compared_outputs = Some(ComparedOutputs {
+            left: output.clone(),
+            right: output,
+        });
+        let error =
+            VerificationReport::from_current_json_slice(&serde_json::to_vec(&rejected).unwrap())
+                .expect_err("a first-run rejection cannot carry comparison output evidence");
+        assert!(
+            error.contains("no_result") && error.contains("compared_outputs"),
+            "{error}"
+        );
 
         let mut missing = current.clone();
         missing.as_object_mut().unwrap().remove("no_result_reason");
