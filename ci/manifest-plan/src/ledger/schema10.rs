@@ -133,7 +133,8 @@ impl ConstructedValidationPlanV10 {
         {
             return Err("schema 10 constructed plan identity is malformed".into());
         }
-        let cfg = dag_from_json(&self.dag_json)?;
+        let cfg = dag_from_json(&self.dag_json)
+            .map_err(|error| format!("invalid schema 10 constructed DAG: {error}"))?;
         if dag_to_json(&cfg) != self.dag_json {
             return Err(
                 "schema 10 constructed plan is not the exact canonical selected DAG".into(),

@@ -454,7 +454,8 @@ fn fixture_producer_steps(tags: &[&str]) -> Result<Vec<dagrun::model::Step>, Str
         let value = serde_json::json!({
             "steps": [{ "group": group, "job": job, "cmd": "true" }]
         });
-        let mut step = dagrun::io::dag_from_json(&value.to_string())?
+        let mut step = dagrun::io::dag_from_json(&value.to_string())
+            .map_err(|error| format!("invalid test-result fixture plan: {error}"))?
             .steps
             .into_iter()
             .next()
