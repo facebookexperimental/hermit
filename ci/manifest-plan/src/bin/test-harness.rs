@@ -2454,7 +2454,7 @@ mod tests {
             })).unwrap()).unwrap();
             let backend = path.join("native-backend-adapter");
             fs::write(&backend, r#"#!/usr/bin/python3
-import json,pathlib,sys
+import hashlib,json,pathlib,sys
 root=pathlib.Path(__file__).parent
 a=sys.argv[1:]
 if '--help' in a:
@@ -2469,8 +2469,11 @@ if a[0]=='log-diff':
   record({'kind':'normalize','argv':a});sys.stdout.buffer.write(pathlib.Path(a[1]).read_bytes());sys.exit(0)
  assert a[3]=='--json' and a[5:]==['--record-envelope','cross-backend-detcore-v1'],a
  record({'kind':'compare','argv':a})
- same=pathlib.Path(a[1]).read_bytes()==pathlib.Path(a[2]).read_bytes()
+ left=pathlib.Path(a[1]).read_bytes();right=pathlib.Path(a[2]).read_bytes()
+ same=left==right
  report=json.loads((root/'comparison.json').read_text())
+ report['inputs']={side:{'sha256':hashlib.sha256(data).hexdigest(),'bytes':len(data)}
+                   for side,data in [('left',left),('right',right)]}
  if not same:
   report.update(verdict='diverged',first_divergent_record=1,first_divergent_scheduler_turn=7,
                 first_divergent_virtual_nanoseconds=18,first_divergent_left_message='reference',first_divergent_right_message='candidate')
