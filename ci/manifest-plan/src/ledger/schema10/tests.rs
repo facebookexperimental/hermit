@@ -448,6 +448,11 @@ fn reference_refusal_and_cross_divergence_never_change_the_candidate_verdict() {
 
 #[test]
 fn parity_attempt_decoder_requires_every_nullable_key_and_binds_raw_reports() {
+    let diversity = br#"{"duration_ms":null,"diversity":{"normalized_entropy":0.5},"env":{"duration_ms":"guest value"},"attempts":[{"duration_ms":1,"env":{"duration_ms":"also a guest value"}}]}"#;
+    assert_eq!(
+        read_schema10_source_result(diversity).unwrap(),
+        serde_json::from_slice::<Value>(diversity).unwrap()
+    );
     let completed = completed(1, BackendParityVerdict::Matched);
     let candidate = completed.candidate_attempt();
     let value = serde_json::to_value(candidate).unwrap();

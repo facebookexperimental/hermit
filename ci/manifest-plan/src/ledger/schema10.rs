@@ -18,8 +18,9 @@ use crate::runner::AttemptResult;
 pub const VALIDATION_EVIDENCE_SCHEMA_VERSION: u32 = 10;
 
 /// Read the original harness row before any map conversion can erase duplicate
-/// fields. Schema 10 source numbers are exact integers; floating point and
-/// integers outside serde_json's exact signed/unsigned 64-bit range are refused.
+/// fields. Non-null durations must fit an exact unsigned 64-bit integer before
+/// buffering; other numbers retain serde_json's existing representation, which
+/// includes legitimate floating-point diversity measurements in ordinary rows.
 /// Historical runner and ledger decoders retain their existing behavior.
 pub fn read_schema10_source_result(bytes: &[u8]) -> Result<Value, String> {
     struct ExactValue(Value);
@@ -30,7 +31,7 @@ pub fn read_schema10_source_result(bytes: &[u8]) -> Result<Value, String> {
                 type Value = ExactValue;
 
                 fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                    f.write_str("JSON with unique object fields and exact integer numbers")
+                    f.write_str("JSON with unique object fields and exact integer durations")
                 }
 
                 fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
@@ -49,10 +50,10 @@ pub fn read_schema10_source_result(bytes: &[u8]) -> Result<Value, String> {
                     Ok(ExactValue(Value::from(value)))
                 }
 
-                fn visit_f64<E: serde::de::Error>(self, _value: f64) -> Result<Self::Value, E> {
-                    Err(E::custom(
-                        "schema 10 source number is not an exact 64-bit integer",
-                    ))
+                fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
+                    serde_json::Number::from_f64(value)
+                        .map(|number| ExactValue(Value::Number(number)))
+                        .ok_or_else(|| E::custom("non-finite JSON number"))
                 }
 
                 fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
@@ -81,7 +82,8 @@ pub fn read_schema10_source_result(bytes: &[u8]) -> Result<Value, String> {
                                 "duplicate field `{key}` in schema 10 source result"
                             )));
                         }
-                        values.insert(key, map.next_value::<ExactValue>()?.0);
+                        let value = map.next_value::<ExactValue>()?.0;
+                        values.insert(key, value);
                     }
                     Ok(ExactValue(Value::Object(values)))
                 }
@@ -89,9 +91,26 @@ pub fn read_schema10_source_result(bytes: &[u8]) -> Result<Value, String> {
             deserializer.deserialize_any(Visitor)
         }
     }
-    serde_json::from_slice::<ExactValue>(bytes)
+    let value = serde_json::from_slice::<ExactValue>(bytes)
         .map(|value| value.0)
-        .map_err(|error| format!("malformed schema 10 source result: {error}"))
+        .map_err(|error| format!("malformed schema 10 source result: {error}"))?;
+    let exact_duration = |object: &Value| {
+        if object
+            .get("duration_ms")
+            .is_some_and(|value| !value.is_null() && value.as_u64().is_none())
+        {
+            Err("schema 10 duration_ms must be an exact unsigned 64-bit integer".to_string())
+        } else {
+            Ok(())
+        }
+    };
+    exact_duration(&value)?;
+    if let Some(attempts) = value.get("attempts").and_then(Value::as_array) {
+        for attempt in attempts {
+            exact_duration(attempt)?;
+        }
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
