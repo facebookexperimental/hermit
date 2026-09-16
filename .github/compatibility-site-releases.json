@@ -1,5 +1,5 @@
 {
-  "latest_identity": "745594574eea79722c740773929048853608e9b4d5ceb2bf81569e8550b500d9",
+  "latest_identity": "95b8e1d88bc919629032fc0bd70b8c80ebc3475021aaaafb94ca19534301e961",
   "release_repository": "rrnewton/hermit",
   "releases": [
     {
@@ -121,6 +121,36 @@
       "recursive_identity_sha256": "862dc13ecc72d3deca7fcc91a2b5744dc5dd7c8e2c189b2552201eeb4102835a",
       "release_title": "Historical compatibility website snapshot 8feef179bed2bb48c81dd0bc8186d81df47c255d8c015dc4b0eb139eab439edc",
       "tag": "compatibility-website-8feef179bed2bb48c81dd0bc8186d81df47c255d8c015dc4b0eb139eab439edc"
+    },
+    {
+      "archive_bytes": 45621891,
+      "archive_member_count": 163,
+      "archive_sha256": "d9c381a4d6092cc6932a51438e96383d21e1ba824bd82995ef0f592d14bbaeda",
+      "artifacts_sha256": "d44591e7486c0c8ae82af4f0152c291fb24f939050a26856095a0657f1bad853",
+      "asset": "compatibility-website-95b8e1d88bc919629032fc0bd70b8c80ebc3475021aaaafb94ca19534301e961.tar.gz",
+      "build_sha256": "127458d8767523788b202033375e7a6bc140d29070996dc97a8c4c77d21308ad",
+      "content_tree_sha256": "29f8179248b7afd077b77b4cc52bfb5cd9957c93f0b87f078ecdbf8999d5a4c6",
+      "counts": {
+        "current_validation_run_row_count": 111,
+        "green_cell_count": 805,
+        "in_manifest_cell_count": 5744,
+        "never_measured_cell_count": 4895,
+        "physical_row_count": 44779,
+        "red_cell_count": 30,
+        "represented_run_count": 51403,
+        "selected_by_full_custom_command_count": 3,
+        "test_count": 359,
+        "validation_history_row_count": 124
+      },
+      "directories": ["assets", "cells", "data", "runs", "tests"],
+      "file_bytes": 81056463,
+      "file_count": 157,
+      "identity": "95b8e1d88bc919629032fc0bd70b8c80ebc3475021aaaafb94ca19534301e961",
+      "manifest_tree_sha256": "8cbb43efe9d835594294ee5948768251f8994e1a19c2ade220824ad27359be72",
+      "mode_sha256": "d4eac0e1815277bda1a57e8eadc11c539814561d4777e673b7eca2ab245f6916",
+      "recursive_identity_sha256": "60a9715b40beb48b80cdfd9a912e742df6244b254ceca5ce31e661fdd62499c6",
+      "release_title": "Compatibility website snapshot 95b8e1d88bc919629032fc0bd70b8c80ebc3475021aaaafb94ca19534301e961",
+      "tag": "compatibility-website-95b8e1d88bc919629032fc0bd70b8c80ebc3475021aaaafb94ca19534301e961"
     },
     {
       "archive_bytes": 38139566,
