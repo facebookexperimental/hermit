@@ -1178,27 +1178,31 @@ impl ResultRow {
                     ));
                 }
             }
-            "ERROR" => {
-                if self.result.is_some() {
-                    return Err(format!(
-                        "ERROR row must not carry a product observation, got {:?}",
-                        self.result
-                    ));
-                }
-                if !matches!(
-                    self.failure_class,
+            // Keep the complete producer contract (runner::CellResult), not
+            // just the result-less ERROR shape used by older retained rows.
+            "ERROR" => match (self.result, self.failure_class) {
+                (
+                    Some(ObservedResult::SandboxDenied | ObservedResult::InfrastructureError),
+                    Some(FailureClass::UnderstoodInfrastructureFailure),
+                )
+                | (
+                    None,
                     Some(
                         FailureClass::UnderstoodInfrastructureFailure
-                            | FailureClass::UnderstoodPrerequisiteFailure
-                            | FailureClass::NoResult
-                    )
-                ) {
+                        | FailureClass::UnderstoodPrerequisiteFailure
+                        | FailureClass::NoResult,
+                    ),
+                )
+                | (
+                    Some(ObservedResult::Timeout | ObservedResult::Oom),
+                    Some(FailureClass::NoResult),
+                ) => {}
+                other => {
                     return Err(format!(
-                        "ERROR row must carry a non-product failure_class, got {:?}",
-                        self.failure_class
+                        "ERROR row must carry a non-product observation/classification, got {other:?}"
                     ));
                 }
-            }
+            },
             "HOST-INAPPLICABLE" => {
                 if self.result.is_some()
                     || self.failure_class != Some(FailureClass::UnderstoodPrerequisiteFailure)
@@ -1214,11 +1218,25 @@ impl ResultRow {
         Ok(())
     }
 
-    /// Return only a result proved by the typed outer disposition. A timeout is
-    /// observable even when no canonical comparison completed. Other
-    /// unavailable rows remain result-less until their producer supplies a
-    /// trustworthy class; an exit status alone is not enough to call a crash.
+    /// Preserve a producer-classified non-product diagnosis after validating
+    /// its tuple. This is not canonical comparison credit or an inference from
+    /// an exit signal. Older rows can still prove a timeout through an attempt.
     fn no_verdict_result(&self) -> Option<ObservedResult> {
+        match (self.outcome.as_str(), self.result, self.failure_class) {
+            (
+                "ERROR",
+                Some(result @ (ObservedResult::Timeout | ObservedResult::Oom)),
+                Some(FailureClass::NoResult),
+            )
+            | (
+                "ERROR",
+                Some(
+                    result @ (ObservedResult::SandboxDenied | ObservedResult::InfrastructureError),
+                ),
+                Some(FailureClass::UnderstoodInfrastructureFailure),
+            ) => return Some(result),
+            _ => {}
+        }
         self.attempts
             .iter()
             .any(|attempt| attempt.get("timed_out").and_then(JsonValue::as_bool) == Some(true))
@@ -4473,7 +4491,14 @@ fn apply_validate_results(
                 }
             };
             observation.hermit_shas.insert(hermit_sha.to_string());
-            if let Some(result) = result {
+            // Infrastructure diagnoses remain in the exact invocation below;
+            // the product-result set keeps its existing, checked vocabulary.
+            if let Some(result) = result.filter(|result| {
+                !matches!(
+                    result,
+                    ObservedResult::SandboxDenied | ObservedResult::InfrastructureError
+                )
+            }) {
                 observation.results.insert(result);
             }
             if let Some((left_info_messages, right_info_messages)) = comparison {
@@ -10155,6 +10180,168 @@ red/`measured-and-passed` count is **0**.",
         first_divergent_syscall: Some(9),
         attempts: vec![validate_attempt("FAIL")],
     };
+    // Compare the real producer and reader against a fixed tuple table. The
+    // report verdict is deliberately orthogonal to classification: accepting
+    // the tuple alone never grants a canonical comparison (fold controls below).
+    let allowed_current = [
+        ("PASS", Some(ObservedResult::Pass), None),
+        (
+            "FAIL",
+            Some(ObservedResult::DeterminismFailure),
+            Some(FailureClass::ProductFailure),
+        ),
+        (
+            "FAIL",
+            Some(ObservedResult::ParityFailure),
+            Some(FailureClass::ProductFailure),
+        ),
+        (
+            "FAIL",
+            Some(ObservedResult::ReplayFailure),
+            Some(FailureClass::ProductFailure),
+        ),
+        (
+            "FAIL",
+            Some(ObservedResult::CrashError),
+            Some(FailureClass::ProductFailure),
+        ),
+        (
+            "FAIL",
+            Some(ObservedResult::Timeout),
+            Some(FailureClass::NoResult),
+        ),
+        (
+            "FAIL",
+            Some(ObservedResult::Oom),
+            Some(FailureClass::NoResult),
+        ),
+        (
+            "FAIL",
+            Some(ObservedResult::SandboxDenied),
+            Some(FailureClass::UnderstoodInfrastructureFailure),
+        ),
+        (
+            "FAIL",
+            Some(ObservedResult::InfrastructureError),
+            Some(FailureClass::UnderstoodInfrastructureFailure),
+        ),
+        (
+            "ERROR",
+            None,
+            Some(FailureClass::UnderstoodInfrastructureFailure),
+        ),
+        (
+            "ERROR",
+            None,
+            Some(FailureClass::UnderstoodPrerequisiteFailure),
+        ),
+        ("ERROR", None, Some(FailureClass::NoResult)),
+        (
+            "ERROR",
+            Some(ObservedResult::Timeout),
+            Some(FailureClass::NoResult),
+        ),
+        (
+            "ERROR",
+            Some(ObservedResult::Oom),
+            Some(FailureClass::NoResult),
+        ),
+        (
+            "ERROR",
+            Some(ObservedResult::SandboxDenied),
+            Some(FailureClass::UnderstoodInfrastructureFailure),
+        ),
+        (
+            "ERROR",
+            Some(ObservedResult::InfrastructureError),
+            Some(FailureClass::UnderstoodInfrastructureFailure),
+        ),
+        (
+            "HOST-INAPPLICABLE",
+            None,
+            Some(FailureClass::UnderstoodPrerequisiteFailure),
+        ),
+    ];
+    let mut classification_cases = 0;
+    let mut accepted_cases = 0;
+    let mut legacy_reader_cases = 0;
+    for outcome in ["PASS", "FAIL", "ERROR", "HOST-INAPPLICABLE", "UNKNOWN"] {
+        for result in [
+            None,
+            Some(ObservedResult::Pass),
+            Some(ObservedResult::DeterminismFailure),
+            Some(ObservedResult::ParityFailure),
+            Some(ObservedResult::ReplayFailure),
+            Some(ObservedResult::CrashError),
+            Some(ObservedResult::Timeout),
+            Some(ObservedResult::Oom),
+            Some(ObservedResult::SandboxDenied),
+            Some(ObservedResult::InfrastructureError),
+        ] {
+            for class in [
+                None,
+                Some(FailureClass::ProductFailure),
+                Some(FailureClass::UnderstoodInfrastructureFailure),
+                Some(FailureClass::UnderstoodPrerequisiteFailure),
+                Some(FailureClass::NoResult),
+            ] {
+                for verdict in ["matched", "diverged", "no_result", "infrastructure_error"] {
+                    let mut value = serde_json::to_value(&validate_row).unwrap();
+                    value["outcome"] = serde_json::json!(outcome);
+                    value["result"] = serde_json::json!(result);
+                    value["failure_class"] = serde_json::json!(class);
+                    value["artifact_dir"] = serde_json::json!("fixture/retained-results");
+                    let mut report: JsonValue = serde_json::from_str(
+                        value["attempts"][0]["verification_report"]
+                            .as_str()
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    report["verdict"] = serde_json::json!(verdict);
+                    let report = serde_json::to_string(&report).unwrap();
+                    value["attempts"][0]["verification_report_sha256"] =
+                        serde_json::json!(format!("{:x}", Sha256::digest(report.as_bytes())));
+                    value["attempts"][0]["verification_report"] = serde_json::json!(report);
+                    let producer: hermit_manifest_plan::runner::CellResult =
+                        serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+                    let reader: ResultRow =
+                        serde_json::from_value(value).map_err(|e| e.to_string())?;
+                    let legacy_absence = result.is_none() && class.is_none();
+                    let expected =
+                        legacy_absence || allowed_current.contains(&(outcome, result, class));
+                    if producer.validate_recorded_classification().is_ok() != expected
+                        || reader.validate_recorded_classification().is_ok() != expected
+                    {
+                        return Err(format!(
+                            "producer/reader classification disagrees for {outcome}/{result:?}/{class:?}/{verdict}"
+                        ));
+                    }
+                    classification_cases += 1;
+                    accepted_cases += usize::from(expected);
+                    legacy_reader_cases +=
+                        usize::from(expected && !(outcome == "ERROR" && result.is_some()));
+                }
+            }
+        }
+    }
+    if (classification_cases, accepted_cases, legacy_reader_cases) != (1000, 88, 72) {
+        return Err(
+            "classification matrix omitted a variant or changed the accepted population".into(),
+        );
+    }
+    for field in ["result", "failure_class"] {
+        let mut value = serde_json::to_value(&validate_row).unwrap();
+        value["artifact_dir"] = serde_json::json!("fixture/retained-results");
+        value[field] = serde_json::json!("unknown-classification-value");
+        if serde_json::from_value::<ResultRow>(value.clone()).is_ok()
+            || serde_json::from_value::<hermit_manifest_plan::runner::CellResult>(value).is_ok()
+        {
+            return Err(format!(
+                "unknown {field} became a recognized producer/reader value"
+            ));
+        }
+    }
+
     let validate_candidate = |run_id: &str, coordinates: DivergenceCoordinates| {
         let mut row = validate_row.clone();
         row.run_id = run_id.into();
@@ -12906,6 +13093,182 @@ red/`measured-and-passed` count is **0**.",
         };
     let fold_fixture_row = |row: ResultRow| fold_fixture_rows(vec![row]);
 
+    // Current producer ERROR diagnoses survive the real fold and stored reader,
+    // without entering the canonical comparison or pass populations.
+    for (diagnosis, class, timed_out, status, signal) in [
+        (
+            ObservedResult::Timeout,
+            FailureClass::NoResult,
+            true,
+            None,
+            Some(15),
+        ),
+        (
+            ObservedResult::Oom,
+            FailureClass::NoResult,
+            false,
+            None,
+            Some(9),
+        ),
+        (
+            ObservedResult::SandboxDenied,
+            FailureClass::UnderstoodInfrastructureFailure,
+            false,
+            Some(1),
+            None,
+        ),
+        (
+            ObservedResult::InfrastructureError,
+            FailureClass::UnderstoodInfrastructureFailure,
+            false,
+            Some(1),
+            None,
+        ),
+    ] {
+        let mut row = validate_row.clone();
+        row.run_id = format!("fixture-error-{}", diagnosis.as_str());
+        row.outcome = "ERROR".into();
+        row.result = Some(diagnosis);
+        row.failure_class = Some(class);
+        row.error_kind = Some(diagnosis.as_str().into());
+        row.first_divergent_scheduler_turn = None;
+        row.first_divergent_virtual_nanoseconds = None;
+        row.first_divergent_record = None;
+        row.first_divergent_syscall = None;
+        row.attempts = vec![validate_attempt("ERROR")];
+        row.attempts[0]["timed_out"] = serde_json::json!(timed_out);
+        row.attempts[0]["status"] = serde_json::json!(status);
+        row.attempts[0]["signal"] = serde_json::json!(signal);
+        row.attempts[0]["error_kind"] = serde_json::json!(diagnosis.as_str());
+        // An outer ERROR cannot turn a matched report into a pass. Conversely,
+        // a real canonical divergence remains a divergence, not a no-result.
+        // Exercise all four report verdicts with the newly admitted tuples.
+        for verdict in ["matched", "diverged", "infrastructure_error"] {
+            let mut report_row = row.clone();
+            report_row.attempts = vec![validate_attempt(if verdict == "matched" {
+                "PASS"
+            } else if verdict == "diverged" {
+                "FAIL"
+            } else {
+                "ERROR"
+            })];
+            if verdict == "diverged" {
+                report_row.first_divergent_scheduler_turn = Some(7);
+                report_row.first_divergent_virtual_nanoseconds = Some(70);
+                report_row.first_divergent_record = Some(12);
+                report_row.first_divergent_syscall = Some(9);
+            } else if verdict == "infrastructure_error" {
+                let mut report = canonical_verdict::VerificationReport::no_result();
+                report.verdict = canonical_verdict::Verdict::InfrastructureError;
+                report.no_result_reason = None;
+                report.infrastructure_error =
+                    Some(canonical_verdict::InfrastructureError::SkidOvershoot { count: 1 });
+                let text = serde_json::to_string(&report).unwrap();
+                report_row.attempts[0]["verification_report_sha256"] =
+                    serde_json::json!(format!("{:x}", Sha256::digest(text.as_bytes())));
+                report_row.attempts[0]["verification_report"] = serde_json::json!(text);
+                report_row.attempts[0]["timed_out"] = serde_json::json!(false);
+                report_row.attempts[0]["status"] = serde_json::json!(1);
+                report_row.attempts[0]["signal"] = JsonValue::Null;
+            }
+            let (tracked, fold) = fold_fixture_row(report_row)?;
+            let observation = &tracked.cells[0].observations[0];
+            if fold.passed != 0 || fold.reads_all_green() {
+                return Err(format!(
+                    "outer ERROR {diagnosis:?}/{verdict} gained pass credit"
+                ));
+            }
+            if verdict == "diverged" {
+                if fold.located != 1
+                    || fold.unlocated != 0
+                    || !fold.errored.is_empty()
+                    || tracked.cells[0].measurement != MeasurementState::Diverged
+                    || observation.canonical_comparisons.len() != 1
+                {
+                    return Err(format!("ERROR {diagnosis:?} erased a canonical divergence"));
+                }
+            } else if fold.located != 0
+                || fold.unlocated != 0
+                || fold.errored.len() != 1
+                || tracked.cells[0].measurement != MeasurementState::MeasuredNoVerdict
+                || !observation.canonical_comparisons.is_empty()
+                || observation.invocations.iter().next().unwrap().result != Some(diagnosis)
+            {
+                return Err(format!(
+                    "ERROR {diagnosis:?}/{verdict} lost its diagnosis or fabricated a comparison"
+                ));
+            }
+        }
+        let original = serde_json::to_value(&row).unwrap();
+        let expected_identity = row.evidence_identity()?;
+        let (tracked, fold) = fold_fixture_row(row.clone())?;
+        let expected_results = if matches!(diagnosis, ObservedResult::Timeout | ObservedResult::Oom)
+        {
+            BTreeSet::from([diagnosis])
+        } else {
+            BTreeSet::new()
+        };
+        let observation = &tracked.cells[0].observations[0];
+        if fold.passed != 0
+            || fold.located != 0
+            || fold.unlocated != 0
+            || fold.errored.len() != 1
+            || fold.reads_all_green()
+            || tracked.cells[0].measurement != MeasurementState::MeasuredNoVerdict
+            || observation.results != expected_results
+            || !observation.canonical_comparisons.is_empty()
+            || observation.invocations.len() != 1
+        {
+            return Err(format!(
+                "ERROR {diagnosis:?} was lost or promoted by the fold"
+            ));
+        }
+        let invocation = observation.invocations.iter().next().unwrap();
+        if invocation.result != Some(diagnosis)
+            || invocation.evidence_sha256.as_deref() != Some(expected_identity.as_str())
+            || invocation.attempt != Some(row.attempt)
+            || invocation.attempts[0].status != status
+            || invocation.attempts[0].signal != signal
+            || invocation.attempts[0].timed_out != timed_out
+            || serde_json::to_value(&row).unwrap() != original
+        {
+            return Err(format!(
+                "ERROR {diagnosis:?} lost its original diagnosis or invocation"
+            ));
+        }
+        let encoded = encoded_cells(&tracked)?;
+        let reloaded: TrackedCells = serde_json::from_str(&encoded).map_err(|e| e.to_string())?;
+        if reloaded.cells != tracked.cells {
+            return Err(format!(
+                "ERROR {diagnosis:?} changed across stored readback"
+            ));
+        }
+        let mut repeated = tracked.clone();
+        let rows = BTreeMap::from([(
+            unlocated_id.clone(),
+            vec![ResultCandidate {
+                evidence_identity: expected_identity,
+                path: PathBuf::from("fixture/results.jsonl"),
+                row,
+            }],
+        )]);
+        let again = apply_validate_results(
+            &mut repeated,
+            &rows,
+            "sha-1",
+            "tree-1",
+            &depth_fixture,
+            true,
+            true,
+        )?;
+        refresh_measurement(&mut repeated);
+        if again.passed != 0 || again.errored.len() != 1 || encoded_cells(&repeated)? != encoded {
+            return Err(format!(
+                "ERROR {diagnosis:?} re-import changed stored evidence or credited a pass"
+            ));
+        }
+    }
+
     let mut not_run_row = validate_row.clone();
     not_run_row.run_id = "fixture-recovered-not-run".into();
     not_run_row.attempt = 1;
@@ -13514,7 +13877,7 @@ red/`measured-and-passed` count is **0**.",
     contradictory_outer_class.outcome = "ERROR".into();
     assert_recovered_refuses(
         contradictory_outer_class,
-        "ERROR row must not carry a product observation",
+        "ERROR row must carry a non-product observation/classification",
     );
 
     let mut not_run = no_result_row.clone();

@@ -432,6 +432,77 @@ mod tests {
             .unwrap()
     }
 
+    // Inspect absolute path references within field values, not substrings of
+    // relative paths such as hermit-cli/src/bin/hermit/run.rs. Delimiters also
+    // cover quoted prose/shell paths, flag assignments, linker comma arguments
+    // and file:line citations. Recognize the finite compiler path options below
+    // only when the option itself begins a token; a relative path containing
+    // -I/src is not one. This does not parse arbitrary shell/compiler syntax.
+    fn starts_path_token(before: &str) -> bool {
+        before.chars().next_back().is_none_or(|c| {
+            c.is_whitespace() || matches!(c, '\'' | '"' | '`' | '=' | ':' | ',' | '(' | '[' | '{')
+        })
+    }
+
+    fn contains_absolute_root_reference(value: &Value, root: &str) -> bool {
+        match value {
+            Value::String(text) => text.match_indices(root).any(|(offset, _)| {
+                let before = &text[..offset];
+                let after = text[offset + root.len()..].chars().next();
+                let starts_path = starts_path_token(before)
+                    || [
+                        "-I",
+                        "-L",
+                        "-B",
+                        "-isystem",
+                        "-iquote",
+                        "-idirafter",
+                        "-include",
+                        "-imacros",
+                        "-isysroot",
+                        "-iprefix",
+                        "-o",
+                        "-MF",
+                    ]
+                    .iter()
+                    .any(|&option| before.strip_suffix(option).is_some_and(starts_path_token));
+                let ends_component = after.is_none_or(|c| {
+                    c.is_whitespace()
+                        || matches!(
+                            c,
+                            '/' | '\'' | '"' | '`' | '=' | ':' | ',' | ';' | ')' | ']' | '}'
+                        )
+                });
+                starts_path && ends_component
+            }),
+            Value::Array(values) => values
+                .iter()
+                .any(|value| contains_absolute_root_reference(value, root)),
+            Value::Object(fields) => fields
+                .values()
+                .any(|value| contains_absolute_root_reference(value, root)),
+            _ => false,
+        }
+    }
+
+    fn require_root_independent_exports(exports: &[String], roots: &[&Path]) -> Result<(), String> {
+        let first = exports.first().ok_or("missing exported metadata")?;
+        if exports.iter().any(|export| export != first) {
+            return Err("exports differ across repository roots".into());
+        }
+        let value: Value = serde_json::from_str(first).unwrap();
+        for root in roots {
+            assert!(root.is_absolute());
+            if contains_absolute_root_reference(&value, root.to_str().unwrap()) {
+                return Err(format!(
+                    "absolute checkout-root reference: {}",
+                    root.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn identity(cell: &CellMetadata) -> (String, String, String, String, String) {
         (
             cell.lane.clone(),
@@ -540,6 +611,21 @@ mod tests {
     struct TemporaryManifestRoot(PathBuf);
 
     impl TemporaryManifestRoot {
+        fn alias_of(root: &Path, name: &str) -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let alias = std::env::temp_dir().join(format!(
+                "hermit-manifest-metadata-{name}-{}-{nonce}",
+                std::process::id()
+            ));
+            fs::create_dir(&alias).unwrap();
+            let alias = Self(alias);
+            std::os::unix::fs::symlink(root.join("tests"), alias.path().join("tests")).unwrap();
+            alias
+        }
+
         fn new(name: &str, manifest: &str) -> Self {
             let nonce = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -989,7 +1075,148 @@ test:
         assert_eq!(exported_identities, tracked_identities);
 
         let encoded = serde_json::to_string(&first).unwrap();
-        assert!(!encoded.contains(&root.to_string_lossy().to_string()));
+        // A relative authored citation can contain "/src", the pinned checkout
+        // root. Preserve it while refusing genuine absolute checkout paths.
+        let citation = "hermit-cli/src/bin/hermit/run.rs:2163";
+        assert!(first.cells.iter().any(|cell| {
+            cell.not_selected_by_full_reason
+                .as_ref()
+                .is_some_and(|reason| reason.evidence.as_deref() == Some(citation))
+        }));
+        let first_alias = TemporaryManifestRoot::alias_of(&root, "first-root");
+        let second_alias = TemporaryManifestRoot::alias_of(&root, "second-root");
+        let roots = [root.as_path(), first_alias.path(), second_alias.path()];
+        let mut exports = vec![encoded.clone()];
+        for alias in [&first_alias, &second_alias] {
+            let exported = build_export(alias.path()).unwrap();
+            exports.push(serde_json::to_string(&exported).unwrap());
+        }
+        require_root_independent_exports(&exports, &roots).unwrap();
+
+        // Run the same oracle against a leak shared by every variant: alias
+        // equality alone would miss a canonicalized or compile-time real root.
+        // /src is also checked without exempting the authored relative citation.
+        for leaked_root in roots.into_iter().chain([Path::new("/src")]) {
+            let checked_roots = [
+                root.as_path(),
+                first_alias.path(),
+                second_alias.path(),
+                leaked_root,
+            ];
+            require_root_independent_exports(&exports, &checked_roots).unwrap();
+
+            // Exercise each exported flag/argument surface through the same
+            // oracle, including uniform leaks that root equality cannot catch.
+            let mut option_fixture = serde_json::to_value(contract_fixture()).unwrap();
+            option_fixture["cells"][0]["not_selected_by_full_reason"]["evidence"] =
+                Value::String(citation.into());
+            for field in [
+                "/tests/1/build/cflags/0",
+                "/tests/1/build/rustflags/0",
+                "/tests/1/direct/argv/1",
+                "/cells/0/current_reproducer/argv/1",
+                "/cells/0/current_reproducer/shell_command",
+            ] {
+                for (option, suffix) in [
+                    ("-I", "include"),
+                    ("-L", "lib"),
+                    ("-B", "bin"),
+                    ("-isystem", "include"),
+                    ("-iquote", "include"),
+                    ("-idirafter", "include"),
+                    ("-include", "header"),
+                    ("-imacros", "header"),
+                    ("-isysroot", "root"),
+                    ("-iprefix", "include"),
+                    ("-o", "output"),
+                    ("-MF", "dependencies"),
+                    ("-Wl,-rpath,", "lib"),
+                ] {
+                    for relative in [
+                        format!("{option}hermit-cli/src/{suffix}"),
+                        format!("{option}relative-I/src/{suffix}"),
+                        format!("{option}/bin/{suffix}"),
+                    ] {
+                        let mut permitted = option_fixture.clone();
+                        *permitted.pointer_mut(field).unwrap() = Value::String(relative);
+                        let permitted = serde_json::to_string(&permitted).unwrap();
+                        require_root_independent_exports(
+                            &vec![permitted; exports.len()],
+                            &checked_roots,
+                        )
+                        .unwrap();
+                    }
+                    let mut leaked = option_fixture.clone();
+                    *leaked.pointer_mut(field).unwrap() =
+                        Value::String(format!("{option}{}/{suffix}", leaked_root.display()));
+                    let leaked = serde_json::to_string(&leaked).unwrap();
+                    let error = require_root_independent_exports(
+                        &vec![leaked; exports.len()],
+                        &checked_roots,
+                    )
+                    .unwrap_err();
+                    assert!(
+                        error.contains("absolute checkout-root reference"),
+                        "{field}: {option}: {error}"
+                    );
+                }
+                // A path mapping can end at '=' instead of a slash. Preserve
+                // relative operands and sibling paths sharing only the prefix.
+                for permitted in [
+                    "-fdebug-prefix-map=hermit-cli/src=/mapped".to_string(),
+                    format!(
+                        "-fdebug-prefix-map={}-sibling=/mapped",
+                        leaked_root.display()
+                    ),
+                ] {
+                    let mut mapped = option_fixture.clone();
+                    *mapped.pointer_mut(field).unwrap() = Value::String(permitted);
+                    let mapped = serde_json::to_string(&mapped).unwrap();
+                    require_root_independent_exports(&vec![mapped; exports.len()], &checked_roots)
+                        .unwrap();
+                }
+                let mut mapped = option_fixture.clone();
+                *mapped.pointer_mut(field).unwrap() = Value::String(format!(
+                    "-fdebug-prefix-map={}=/mapped",
+                    leaked_root.display()
+                ));
+                let mapped = serde_json::to_string(&mapped).unwrap();
+                let error =
+                    require_root_independent_exports(&vec![mapped; exports.len()], &checked_roots)
+                        .unwrap_err();
+                assert!(
+                    error.contains("absolute checkout-root reference"),
+                    "{field}: {error}"
+                );
+            }
+
+            let mut leaked: ManifestMetadata = serde_json::from_str(&encoded).unwrap();
+            let reproducer = leaked
+                .cells
+                .iter_mut()
+                .find_map(|cell| cell.current_reproducer.as_mut())
+                .unwrap();
+            reproducer.argv[0] = leaked_root
+                .join(&reproducer.argv[0])
+                .to_str()
+                .unwrap()
+                .to_string();
+            let leaked = serde_json::to_string(&leaked).unwrap();
+            let shared_leak = vec![leaked.clone(); exports.len()];
+            let error = require_root_independent_exports(&shared_leak, &checked_roots).unwrap_err();
+            assert!(
+                error.contains("absolute checkout-root reference"),
+                "{error}"
+            );
+            let mut one_root_leak = exports.clone();
+            one_root_leak[1] = leaked;
+            let error =
+                require_root_independent_exports(&one_root_leak, &checked_roots).unwrap_err();
+            assert!(
+                error.contains("exports differ across repository roots"),
+                "{error}"
+            );
+        }
         let encoded_value = serde_json::to_value(&first).unwrap();
         assert!(encoded_value.get("selected_custom_commands").is_none());
         assert!(
