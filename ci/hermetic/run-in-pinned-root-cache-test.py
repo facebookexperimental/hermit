@@ -9,6 +9,7 @@
 
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -362,6 +363,24 @@ class CargoCacheMounts(unittest.TestCase):
                     self.assertEqual((git(repo, "rev-parse", "HEAD"),
                                       git(repo, "ls-files", "--stage", "-z"),
                                       git(repo, "show", "HEAD:payload")), identities[str(repo)])
+
+
+class PinnedGuestPathContract(unittest.TestCase):
+    def test_declared_guest_paths_cover_existing_liteinst_and_portable_consumers(self):
+        here = Path(__file__).resolve().parent
+        paths = (here / "guest-paths.txt").read_text().splitlines()
+        self.assertEqual(len(paths), len(set(paths)), "duplicate guest paths")
+        self.assertTrue(paths)
+        for path in paths:
+            self.assertRegex(path, r"^/usr/bin/[A-Za-z0-9_-]+$")
+        source = (here.parents[1] / "hermit-cli/tests/liteinst_advanced.rs").read_text()
+        literals = set(re.findall(r'"(/usr/bin/[A-Za-z0-9_-]+)"', source))
+        self.assertTrue(literals, "the source population must not disappear")
+        self.assertEqual(literals - set(paths), set(), "missing existing LiteInst guest")
+        portable = {"/usr/bin/" + command for command in
+                    "bash date df du find git node nodejs nproc python3 sort stat tr".split()}
+        self.assertEqual(portable - set(paths), set(), "lost existing portable guest")
+        self.assertIn("/usr/bin/printf", paths, "DBT ptrace argument-forwarding reference")
 
 
 if __name__ == "__main__":

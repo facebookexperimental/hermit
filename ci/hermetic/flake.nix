@@ -102,6 +102,18 @@
         auditable = false;
       };
 
+      # Keep the existing coreutils output unchanged. Nixpkgs omits arch from
+      # that output; enable its real GNU implementation in a separate output
+      # and expose only arch below.
+      # coreutils-full uses the normal pinned stdenv; overriding coreutils
+      # directly would pull its earlier compiler-bootstrap inputs into this build.
+      archCoreutils = (pkgs.coreutils-full.override { minimal = true; }).overrideAttrs (previous: {
+        configureFlags = previous.configureFlags
+          ++ [ "--enable-install-program=arch,kill,uptime" ];
+      });
+      requiredGuestPaths = pkgs.lib.filter (path: path != "")
+        (pkgs.lib.splitString "\n" (builtins.readFile ./guest-paths.txt));
+
       # Executables that the selected portable population runs as hermit guests.
       # This was re-audited mechanically from ci/expected-e2e-plan.json, each
       # selected manifest entry's requirements/program, and commands invoked by
@@ -111,6 +123,8 @@
         bash coreutils diffutils findutils gnugrep gnused gawk
         openssl zstd gnutar gzip xz jq sqlite git perl python3 redis
         lua5_4 gnum4 nodejs openssh ruby tcl util-linux procps
+        # These outputs are not implied by their runtime libraries.
+        bzip2.bin glibc.bin hostname
       ];
 
       # The CLI replay tests run GDB outside Hermit and execute Python commands.
@@ -165,10 +179,13 @@
             # Selected portable cells name these FHS paths literally. Nix
             # places their providers in /bin, while usrBinEnv creates only
             # /usr/bin/env; add exactly the audited compatibility paths.
-            for command in bash date df du find git node nproc python3 sort stat tr; do
-              ln -s "/bin/$command" "usr/bin/$command"
+            mkdir -p bin
+            ln -s "${archCoreutils}/bin/arch" bin/arch
+            for path in ${pkgs.lib.escapeShellArgs requiredGuestPaths}; do
+              command="''${path##*/}"
+              if [ "$command" = nodejs ]; then command=node; fi
+              ln -s "/bin/$command" ".''${path}"
             done
-            ln -s /bin/node usr/bin/nodejs
           '';
           config = {
             Env = [

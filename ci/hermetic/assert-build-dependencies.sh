@@ -3,6 +3,8 @@
 # This is deliberately separate from run-split-validate.sh's guest-population
 # audit: a command can be required by both, but xxd is required only while
 # staging e9patch and must not be presented as a guest command.
+# This shared container preflight also checks absolute guest paths separately;
+# a present compiler does not prove that an integration guest can be executed.
 
 set -euo pipefail
 
@@ -103,6 +105,42 @@ check_native_libraries() {
     echo "assert-build-dependencies: OK -- ${#native_libraries[@]}/${#native_libraries[@]} native libraries and development headers are present." >&2
 }
 
+check_guest_paths() {
+    local root=${1:-}
+    local manifest
+    manifest=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/guest-paths.txt
+    local path count=0
+    local missing=()
+    local -A seen=()
+    [[ -f $manifest ]] || {
+        echo "assert-build-dependencies: missing guest-path manifest: $manifest" >&2
+        return 2
+    }
+    while IFS= read -r path || [[ -n $path ]]; do
+        if [[ ! $path =~ ^/usr/bin/[A-Za-z0-9_-]+$ || -v seen[$path] ]]; then
+            echo "assert-build-dependencies: invalid or duplicate guest path: $path" >&2
+            return 2
+        fi
+        seen[$path]=1
+        count=$((count + 1))
+        if [[ ! -f $root$path || ! -x $root$path ]]; then
+            missing+=("$path")
+        fi
+    done < "$manifest"
+    ((count > 0)) || {
+        echo "assert-build-dependencies: empty guest-path manifest" >&2
+        return 2
+    }
+    if ((${#missing[@]} > 0)); then
+        for path in "${missing[@]}"; do
+            echo "assert-build-dependencies: pinned root is missing required guest path: $path" >&2
+        done
+        echo "assert-build-dependencies: REFUSED -- ${#missing[@]} of $count absolute guest paths are missing or not executable files." >&2
+        return 2
+    fi
+    echo "assert-build-dependencies: OK -- $count/$count absolute guest paths are executable files." >&2
+}
+
 self_test() {
     local fixture stub output rc tool
     fixture=$(mktemp -d)
@@ -188,12 +226,50 @@ self_test() {
     }
 
     echo "PASS: assert-build-dependencies accepts 18/18 executables and 4/4 native libraries, and names xxd and libunwind when required files are absent"
+
+    local guest_root=$fixture/guest-root manifest path
+    manifest=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/guest-paths.txt
+    mkdir -p "$guest_root/usr/bin"
+    while IFS= read -r path; do
+        ln -s "$stub" "$guest_root$path"
+    done < "$manifest"
+    check_guest_paths "$guest_root"
+
+    # A PATH-resolvable printf is insufficient: the test executes /usr/bin/printf.
+    # Also reject a non-executable file, directory or broken symlink at that path.
+    local kind
+    for kind in absent non-executable directory broken-link; do
+        rm "$guest_root/usr/bin/printf"
+        case $kind in
+            absent) ;;
+            non-executable) printf 'fixture\n' > "$guest_root/usr/bin/printf" ;;
+            directory) mkdir "$guest_root/usr/bin/printf" ;;
+            broken-link) ln -s "$guest_root/absent" "$guest_root/usr/bin/printf" ;;
+        esac
+        set +e
+        output=$(check_guest_paths "$guest_root" 2>&1)
+        rc=$?
+        set -e
+        [[ $rc -eq 2 && $output == *"missing required guest path: /usr/bin/printf"* ]] || {
+            echo "assert-build-dependencies --self-test: $kind guest path was not refused ($rc): $output" >&2
+            return 1
+        }
+        if [[ $kind == directory ]]; then
+            rmdir "$guest_root/usr/bin/printf"
+        elif [[ $kind != absent ]]; then
+            rm "$guest_root/usr/bin/printf"
+        fi
+        ln -s "$stub" "$guest_root/usr/bin/printf"
+    done
+    check_guest_paths "$guest_root"
+    echo "PASS: absolute guest paths reject absent/non-executable/directory/broken-link printf and accept the restored executable"
 }
 
 case ${1:-} in
     "")
         check_build_dependencies
         check_native_libraries
+        check_guest_paths
         ;;
     --print)
         printf '%s\n' "${build_dependencies[@]}"
