@@ -367,7 +367,15 @@ mod tests {
     fn plan_publication_binds_compatibility_and_rechecks_source_before_execution() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("ci/dag")).unwrap();
-        let cfg = super::super::dag_from_json("{\"steps\":[]}").unwrap();
+        let cfg = super::super::dag_from_json(
+            &serde_json::json!({"steps":[{
+                "group":"check", "job":"fixture", "cmd":"true",
+                "result_manifests":[{"kind":"structured-test-results","schema":2,
+                    "path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"check.fixture"}]
+            }]})
+            .to_string(),
+        )
+        .unwrap();
         let dag = super::super::dag_to_json(&cfg);
         let path = root.path().join("ci/dag/validate.json");
         std::fs::write(&path, &dag).unwrap();
