@@ -586,6 +586,18 @@ print(hermit_bound_probe.VALUE + sum(range(1000)))
     });
     let report: serde_json::Value =
         serde_json::from_slice(&report_bytes).expect("Hermit verification report is valid JSON");
+    let typed =
+        hermit::canonical_verdict::VerificationReport::from_current_json_slice(&report_bytes)
+            .expect("real verification producer emitted a complete current report");
+    typed.require_exact_output_match().expect(
+        "real verification producer retained equal output hashes, lengths and dispositions",
+    );
+    let outputs = typed.compared_outputs.as_ref().unwrap();
+    assert!(
+        outputs.left.stdout_bytes > 0,
+        "Python arithmetic produced no retained stdout evidence"
+    );
+    assert_eq!(outputs.left.exit_code, Some(0));
     assert!(
         report["verdict"] == "matched"
             && report["verified"] == true

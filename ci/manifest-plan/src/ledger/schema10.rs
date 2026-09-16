@@ -710,6 +710,13 @@ impl ParityAttempt {
             || attempt.guest_argv.is_empty()
             || !prefix.iter().any(|arg| arg == "--verify")
             || !prefix.iter().any(|arg| arg == "--verify-strict")
+            || !prefix.iter().any(|arg| arg == "--strict")
+            || prefix.iter().any(|arg| {
+                matches!(
+                    arg.split('=').next(),
+                    Some("--no-rcb-time" | "--no-detlog-io-buffers")
+                )
+            })
         {
             return Err(
                 "schema 10 parity invocation contradicts its backend, guest, or strict verify role"
@@ -1593,7 +1600,8 @@ impl HistoryRow {
             .into_iter()
             .filter(|relation| !recorded.contains(&relation.candidate))
             .collect::<Vec<_>>();
-        let mut full_backend_parity = missing_backend_parity.is_empty();
+        let mut full_backend_parity =
+            !evidence.selected_backend_parity.is_empty() && missing_backend_parity.is_empty();
         let mut observations = Vec::new();
         for cell in &artifact_cells {
             match &cell.backend_parity {
@@ -1623,6 +1631,8 @@ impl HistoryRow {
             observations,
             missing_cells,
             missing_backend_parity,
+            // The independent V9 artifact verifier above requires every
+            // selected producer. Success therefore implies full coverage.
             missing_test_producers: Vec::new(),
             full_test_results: true,
             full_backend_parity,

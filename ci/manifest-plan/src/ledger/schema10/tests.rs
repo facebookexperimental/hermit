@@ -56,6 +56,7 @@ fn attempt(backend: &str, index: &str, report: &VerificationReport) -> ParityAtt
             "run".into(),
             "--backend".into(),
             backend.into(),
+            "--strict".into(),
             "--verify".into(),
             "--verify-strict".into(),
             "--".into(),
@@ -224,6 +225,82 @@ fn exact_artifacts_derive_compact_summaries_and_refuse_independent_mutations() {
     retain_fixture("matched", &row, &plan, &cells, &tests);
     assert_eq!(verified.observations.len(), 3);
     assert!(verified.missing_cells.is_empty() && verified.missing_backend_parity.is_empty());
+    for role in ["candidate_attempt", "reference_attempt"] {
+        for flag in ["--strict", "--no-rcb-time", "--no-detlog-io-buffers"] {
+            let mut cell: Value = serde_json::from_slice(&cells).unwrap();
+            let argv = cell["backend_parity"]["attempts"][0][role]["argv"]
+                .as_array_mut()
+                .unwrap();
+            if flag == "--strict" {
+                let before = argv.len();
+                argv.retain(|arg| arg.as_str() != Some(flag));
+                assert_eq!(before - argv.len(), 1);
+            } else {
+                let separator = argv
+                    .iter()
+                    .position(|arg| arg.as_str() == Some("--"))
+                    .unwrap();
+                argv.insert(separator, Value::String(flag.into()));
+            }
+            let mut changed_cells = serde_json::to_vec(&cell).unwrap();
+            changed_cells.push(b'\n');
+            let mut changed_row = serde_json::to_value(&row).unwrap();
+            changed_row["cell_results"]["artifact"]["sha256"] = hex_digest(&changed_cells).into();
+            let changed_row: HistoryRow = serde_json::from_value(changed_row).unwrap();
+            assert!(
+                changed_row
+                    .verify_schema10_artifact_bytes(&plan, &changed_cells, &tests)
+                    .unwrap_err()
+                    .contains("strict verify role"),
+                "{role} {flag}"
+            );
+        }
+    }
+    // Ordinary-only selection remains valid ordinary evidence, but it is not
+    // a measurement of parity over an empty denominator.
+    let mut ordinary_plan: ConstructedValidationPlanV10 = serde_json::from_slice(&plan).unwrap();
+    let mut cfg = ordinary_plan.constructed_dag().unwrap();
+    cfg.steps[0].cmd = crate::backend_parity_policy::HOSTED_ORDINARY_COMMAND.into();
+    ordinary_plan.dag_json = dag_to_json(&cfg);
+    let ordinary_plan = serde_json::to_vec(&ordinary_plan).unwrap();
+    let mut ordinary_cells: Value = serde_json::from_slice(&cells).unwrap();
+    ordinary_cells["backend_parity"] = Value::Null;
+    let mut ordinary_cells = serde_json::to_vec(&ordinary_cells).unwrap();
+    ordinary_cells.push(b'\n');
+    let mut ordinary_row = serde_json::to_value(&row).unwrap();
+    ordinary_row["cell_results"]["selected_backend_parity"] = serde_json::json!([]);
+    ordinary_row["cell_results"]["cells"][0]["backend_parity"] = Value::Null;
+    ordinary_row["cell_results"]["artifact"]["sha256"] = hex_digest(&ordinary_cells).into();
+    ordinary_row["constructed_plan"]["sha256"] = hex_digest(&ordinary_plan).into();
+    ordinary_row["constructed_plan"]["bytes"] = (ordinary_plan.len() as u64).into();
+    let ordinary_row: HistoryRow = serde_json::from_value(ordinary_row).unwrap();
+    let ordinary = ordinary_row
+        .verify_schema10_artifact_bytes(&ordinary_plan, &ordinary_cells, &tests)
+        .unwrap()
+        .unwrap();
+    assert!(ordinary.cell_results.selected_backend_parity.is_empty());
+    assert!(!ordinary.full_backend_parity);
+    assert!(
+        ordinary.full_test_results
+            && ordinary.missing_cells.is_empty()
+            && ordinary.missing_backend_parity.is_empty()
+    );
+    assert_eq!(ordinary.observations.len(), 1);
+    assert_eq!(
+        ordinary.observations[0].relation,
+        ComparisonRelationV10::Ordinary
+    );
+    assert_eq!(
+        ordinary.observations[0].verdict,
+        ComparisonObservationVerdictV10::Matched
+    );
+    retain_fixture(
+        "ordinary-only",
+        &ordinary_row,
+        &ordinary_plan,
+        &ordinary_cells,
+        &tests,
+    );
     let compact = serde_json::to_string(&verified.cell_results).unwrap();
     assert!(!compact.contains("/home/fixture"));
     assert!(
