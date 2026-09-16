@@ -126,6 +126,7 @@ EXPECTED_E2E_PLAN="$ROOT/ci/expected-e2e-plan.json"
 FETCH_MANIFESTS=(
     Cargo.toml
     liteinst-runtime-build/Cargo.toml
+    agent-utils/rs/Cargo.toml
 )
 [[ -f "$MAP" ]] || { echo "run-split-validate: missing $MAP" >&2; exit 2; }
 [[ -f "$EXPECTED_E2E_PLAN" ]] || {
@@ -279,7 +280,12 @@ if [[ $dry -eq 1 ]]; then
         echo
         echo "-- fetch phase would run, on the host:"
         for manifest in "${FETCH_MANIFESTS[@]}"; do
-            echo "   CARGO_HOME=$cargo_home cargo fetch --locked --manifest-path $manifest"
+            if [[ "$manifest" == agent-utils/rs/Cargo.toml ]]; then
+                echo "   # Agent Utils: neutral cwd=/; absolute Cargo home; no consumer target overrides"
+                echo "   CARGO_HOME=$cargo_home cargo fetch --locked --manifest-path $ROOT/$manifest"
+            else
+                echo "   CARGO_HOME=$cargo_home cargo fetch --locked --manifest-path $manifest"
+            fi
         done
         echo "   CARGO_HOME=$cargo_home ./ci/prepare-rust-scripts.sh --fetch-only"
     fi
@@ -325,13 +331,29 @@ if [[ $do_fetch -eq 1 ]]; then
     fi
 
     # --locked is the point of the phase: resolve to EXACTLY each workspace's
-    # Cargo.lock or fail. The LiteInst runtime is a separate Cargo workspace,
-    # so fetching only the repository root does not close the offline build's
-    # dependency set.
+    # Cargo.lock or fail. LiteInst and Agent Utils have separate workspaces;
+    # the root lock does not include every member of either workspace.
     (
         cd "$ROOT"
         for manifest in "${FETCH_MANIFESTS[@]}"; do
-            CARGO_HOME="$cargo_home" cargo fetch --locked --manifest-path "$manifest"
+            if [[ "$manifest" == agent-utils/rs/Cargo.toml ]]; then
+                # Match rs/bin/cargo-runner's Cargo configuration scope. Cargo
+                # discovers config from its process cwd, not --manifest-path;
+                # Hermit's target/toolchain config must not redirect this fetch.
+                # Resolve paths before leaving the repository, retaining cargo's
+                # executable name (it may be a rustup symlink).
+                (
+                    cargo_bin=$(command -v cargo)
+                    [[ "$cargo_bin" == /* ]] || cargo_bin="$PWD/$cargo_bin"
+                    absolute_cargo_home=$(realpath -- "$cargo_home")
+                    cd /
+                    env -u CARGO_BUILD_TARGET -u CARGO_TARGET_DIR \
+                        CARGO_HOME="$absolute_cargo_home" "$cargo_bin" fetch --locked \
+                        --manifest-path "$ROOT/$manifest"
+                )
+            else
+                CARGO_HOME="$cargo_home" cargo fetch --locked --manifest-path "$manifest"
+            fi
         done
         CARGO_HOME="$cargo_home" ./ci/prepare-rust-scripts.sh --fetch-only
     )

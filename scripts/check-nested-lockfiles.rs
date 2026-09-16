@@ -260,6 +260,9 @@ mod tests {
         OmitPreparation,
         OmitResolution,
         OmitLockedFetch,
+        OmitAgentUtils,
+        OmitAgentUtilsNeutralCwd,
+        OmitAgentUtilsLockedFetch,
     }
 
     struct ProductionFixture {
@@ -317,6 +320,8 @@ mod tests {
         fs::create_dir_all(root.join("ci/hermetic")).expect("create fixture repository");
         fs::create_dir_all(root.join("liteinst-runtime-build"))
             .expect("create nested workspace fixture");
+        fs::create_dir_all(root.join("agent-utils/rs"))
+            .expect("create Agent Utils workspace fixture");
         fs::create_dir_all(&fake_bin).expect("create fake binary directory");
 
         let mut split = fs::read_to_string(source_root.join("ci/hermetic/run-split-validate.sh"))
@@ -325,6 +330,23 @@ mod tests {
             .expect("read production rust-script producer");
         match mutation {
             FetchMutation::None => {}
+            FetchMutation::OmitAgentUtils => {
+                split = replace_exactly_once(&split, "    agent-utils/rs/Cargo.toml\n", "");
+            }
+            FetchMutation::OmitAgentUtilsNeutralCwd => {
+                split = replace_exactly_once(
+                    &split,
+                    "                    cd /\n",
+                    "                    : # mutation control: neutral Cargo cwd omitted\n",
+                );
+            }
+            FetchMutation::OmitAgentUtilsLockedFetch => {
+                split = replace_exactly_once(
+                    &split,
+                    "\"$cargo_bin\" fetch --locked \\\n",
+                    "\"$cargo_bin\" fetch \\\n",
+                );
+            }
             FetchMutation::OmitPreparation => {
                 split = replace_exactly_once(
                     &split,
@@ -388,6 +410,11 @@ mod tests {
         )
         .expect("write nested manifest fixture");
         fs::write(
+            root.join("agent-utils/rs/Cargo.toml"),
+            "[workspace]\nmembers = []\n",
+        )
+        .expect("write Agent Utils manifest fixture");
+        fs::write(
             root.join("fixture.rs"),
             "#!/usr/bin/env -S rust-script --force\nfn main() {}\n",
         )
@@ -419,6 +446,10 @@ done
 [[ -f $cargo_home/generated-workspace-fetched ]] || {
     printf 'offline-missing-generated-fetch\n' >>"${FIXTURE_JOURNAL:?}"
     exit 92
+}
+[[ -f $cargo_home/agent-utils-workspace-fetched ]] || {
+    printf 'offline-missing-agent-utils-fetch\n' >>"${FIXTURE_JOURNAL:?}"
+    exit 94
 }
 printf 'offline-consumer\n' >>"${FIXTURE_JOURNAL:?}"
 "#,
@@ -487,6 +518,13 @@ case $command_name in
             [[ -f $CARGO_HOME/generated-workspace-resolved ]]
             : >"$CARGO_HOME/generated-workspace-fetched"
             printf 'generated-locked-fetch\n' >>"${FIXTURE_JOURNAL:?}"
+        elif [[ $manifest == */agent-utils/rs/Cargo.toml ]]; then
+            [[ $PWD == / ]]
+            [[ $CARGO_HOME == /* ]]
+            [[ -z ${CARGO_BUILD_TARGET+x} && -z ${CARGO_TARGET_DIR+x} ]]
+            [[ -f $manifest ]]
+            : >"$CARGO_HOME/agent-utils-workspace-fetched"
+            printf 'agent-utils-neutral-locked-fetch\n' >>"${FIXTURE_JOURNAL:?}"
         else
             printf 'committed-locked-fetch:%s\n' "$manifest" >>"${FIXTURE_JOURNAL:?}"
         fi
@@ -551,6 +589,8 @@ esac
                 fixture.fake_bin.join("rust-script"),
             )
             .env("FIXTURE_JOURNAL", &fixture.journal)
+            .env("CARGO_BUILD_TARGET", "fixture-consumer-target")
+            .env("CARGO_TARGET_DIR", "fixture-consumer-output")
             .output()
             .expect("run production split validator fixture");
         let journal = fs::read_to_string(&fixture.journal).unwrap_or_default();
@@ -591,11 +631,17 @@ esac
 
         let marker = "cargo fetch --locked --manifest-path ";
         let stdout = String::from_utf8_lossy(&output.stdout);
+        let source_root = source_repo_root();
         let actual = stdout
             .lines()
             .filter_map(|line| {
-                line.split_once(marker)
-                    .map(|(_, manifest)| manifest.to_owned())
+                line.split_once(marker).map(|(_, manifest)| {
+                    Path::new(manifest)
+                        .strip_prefix(&source_root)
+                        .unwrap_or_else(|_| Path::new(manifest))
+                        .to_string_lossy()
+                        .into_owned()
+                })
             })
             .collect::<BTreeSet<_>>();
         let expected = std::iter::once("Cargo.toml".to_owned())
@@ -604,10 +650,11 @@ esac
                     .iter()
                     .map(|workspace| format!("{workspace}/Cargo.toml")),
             )
+            .chain(std::iter::once("agent-utils/rs/Cargo.toml".to_owned()))
             .collect::<BTreeSet<_>>();
         assert_eq!(
             expected, actual,
-            "the hermetic fetch phase must cover the root and every checked nested workspace"
+            "the hermetic fetch phase must cover root, checked nested workspaces and the Agent Utils launcher workspace"
         );
         assert!(stdout.contains("-- fetch phase would run"));
         assert!(stdout.contains("-- offline phase would run"));
@@ -686,6 +733,41 @@ esac
             assert!(
                 !journal.lines().any(|line| line == "offline-consumer"),
                 "{mutation:?} reached the offline consumer without complete generated-workspace preparation:\n{journal}"
+            );
+        }
+    }
+
+    #[test]
+    fn production_split_fetches_agent_utils_in_its_launcher_config_scope() {
+        let (output, journal) = run_production_fixture(FetchMutation::None);
+        assert!(output.status.success(), "{output:?}\n{journal}");
+        let root = journal_position(&journal, "committed-locked-fetch:Cargo.toml");
+        let liteinst = journal_position(
+            &journal,
+            "committed-locked-fetch:liteinst-runtime-build/Cargo.toml",
+        );
+        let agent_utils = journal_position(&journal, "agent-utils-neutral-locked-fetch");
+        let generated = journal_position(&journal, "generated-locked-fetch");
+        let offline = journal_position(&journal, "offline-consumer");
+        assert!(root < liteinst && liteinst < agent_utils && agent_utils < generated);
+        assert!(generated < offline);
+    }
+
+    #[test]
+    fn production_split_refuses_incomplete_or_misconfigured_agent_utils_fetch() {
+        for mutation in [
+            FetchMutation::OmitAgentUtils,
+            FetchMutation::OmitAgentUtilsNeutralCwd,
+            FetchMutation::OmitAgentUtilsLockedFetch,
+        ] {
+            let (output, journal) = run_production_fixture(mutation);
+            assert!(
+                !output.status.success(),
+                "{mutation:?}: {output:?}\n{journal}"
+            );
+            assert!(
+                !journal.lines().any(|line| line == "offline-consumer"),
+                "{mutation:?} reached offline consumption: {journal}"
             );
         }
     }
