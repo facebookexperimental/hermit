@@ -114,6 +114,27 @@
       requiredGuestPaths = pkgs.lib.filter (path: path != "")
         (pkgs.lib.splitString "\n" (builtins.readFile ./guest-paths.txt));
 
+      # These command fixtures are required by the existing strict test loops.
+      # Reference only their pinned executables, preserving every existing /bin
+      # provider while retaining the packages' runtime closures in the image.
+      commandFixtureTools = {
+        iostat = "${pkgs.sysstat}/bin/iostat";
+        lsmod = "${pkgs.kmod}/bin/lsmod";
+        mpstat = "${pkgs.sysstat}/bin/mpstat";
+        numactl = "${pkgs.numactl}/bin/numactl";
+        numastat = "${pkgs.numactl}/bin/numastat";
+        pidstat = "${pkgs.sysstat}/bin/pidstat";
+        ss = "${pkgs.iproute2}/bin/ss";
+      };
+      commandFixtureLinks = pkgs.lib.concatStringsSep "\n" (pkgs.lib.mapAttrsToList
+        (name: provider: ''
+          if [ ! -f ${pkgs.lib.escapeShellArg provider} ] || [ ! -x ${pkgs.lib.escapeShellArg provider} ]; then
+            echo ${pkgs.lib.escapeShellArg "missing executable pinned command fixture: ${name}"} >&2
+            exit 1
+          fi
+          ln -sT ${pkgs.lib.escapeShellArg provider} ${pkgs.lib.escapeShellArg "bin/${name}"}
+        '') commandFixtureTools);
+
       # Executables that the selected portable population runs as hermit guests.
       # This was re-audited mechanically from ci/expected-e2e-plan.json, each
       # selected manifest entry's requirements/program, and commands invoked by
@@ -181,6 +202,7 @@
             # /usr/bin/env; add exactly the audited compatibility paths.
             mkdir -p bin
             ln -s "${archCoreutils}/bin/arch" bin/arch
+            ${commandFixtureLinks}
             for path in ${pkgs.lib.escapeShellArgs requiredGuestPaths}; do
               command="''${path##*/}"
               if [ "$command" = nodejs ]; then command=node; fi
