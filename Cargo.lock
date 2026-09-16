@@ -440,6 +440,7 @@ name = "dagrun"
 version = "0.15.0"
 dependencies = [
  "libc",
+ "serde",
  "serde_json",
  "serde_norway",
  "signal-hook",
