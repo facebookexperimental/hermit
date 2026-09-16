@@ -270,7 +270,8 @@ Exact-cell options (run and plan):
                            --probe-disabled batch
   --probe-disabled         Probe disabled cells for one backend. With --test,
                            also requires --mode; without --test, --mode may
-                           narrow the disabled-backend population.
+                           narrow the disabled-backend population. With
+                           --cells-file, every identity must name that backend.
   --cell-timeout SECONDS   Maximum enclosing allowance for each selected cell;
                            refuses before launch if it cannot retain the current
                            preparation, execution, retry, and reporting bounds.
@@ -300,13 +301,14 @@ Selection and bounded-batch options (run and plan):
                            and every selected identity are retained in run.json.
   --cells-file PATH        Select exactly the canonical five-field cell JSON
                            identities of enabled executable red cells, listed
-                           one per line. This is a clean-
-                           commit repeated-batch selector: it requires
-                           --repetitions and cannot be combined with population
-                           filters. Duplicate, noncanonical, untracked,
-                           unsupported, disabled, or non-executable cells are
-                           rejected. run.json retains the source path, SHA-256,
-                           and exact selected identities.
+                           one per line. Add --probe-disabled --backend BACKEND
+                           to select only disabled executable cells for that
+                           backend instead. Requires --repetitions and a clean
+                           commit; other population filters are not accepted.
+                           Duplicate, noncanonical, untracked, non-executable,
+                           or wrong-population identities reject the whole file.
+                           run.json retains the source path, file SHA-256,
+                           selected-population SHA-256, and exact identities.
   --run-timeout SECONDS    Whole-run WALL-CLOCK bound (default 7200). This is
                            not a CPU budget and never weakens per-cell limits.
   --jobs COUNT             Fixed safe-ci scheduler pool (host-adaptive default).
@@ -658,15 +660,14 @@ fn validate_selection_shape(selection: &CellSelection) -> Result<(), String> {
         }
         if selection.test.is_some()
             || selection.mode.is_some()
-            || selection.backend.is_some()
+            || (selection.backend.is_some() && !selection.probe_disabled)
             || selection.sample.is_some()
             || selection.seed.is_some()
             || selection.green
-            || selection.probe_disabled
             || selection.run_id_prefix.is_some()
         {
             return Err(
-                "--cells-file cannot be combined with --test, --mode, --backend, --sample, --seed, --green, --probe-disabled, or --run-id-prefix"
+                "--cells-file cannot be combined with --test, --mode, --sample, --seed, --green, --run-id-prefix, or --backend without --probe-disabled"
                     .into(),
             );
         }
@@ -2821,6 +2822,17 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
     let requested_ids = requested_cells
         .as_ref()
         .map(|cells| cells.iter().cloned().collect::<BTreeSet<_>>());
+    if let Some(requested) = requested_ids.as_ref().filter(|_| selection.probe_disabled) {
+        for cell in requested {
+            if selection.backend.as_deref() != Some(cell.backend.as_str()) {
+                return Err(format!(
+                    "--cells-file identity {} does not match --probe-disabled --backend {}",
+                    display_id(cell),
+                    selection.backend.as_deref().unwrap_or_default()
+                ));
+            }
+        }
+    }
     let mut matched_requested = BTreeSet::new();
     let mut seen = BTreeSet::new();
     let mut selected_cells = Vec::new();
@@ -2858,6 +2870,16 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                     && selection.mode.is_none()
                     && !matches!(cell.id.mode.as_str(), "verify" | "replay" | "chaos"))
         };
+        if selected
+            && requested_ids.is_some()
+            && selection.probe_disabled
+            && (cell.status != "not-applicable" || cell.enabled)
+        {
+            return Err(format!(
+                "--cells-file identity {} is not in the disabled pressure population (status={}, enabled={})",
+                display_id(&cell.id), cell.status, cell.enabled
+            ));
+        }
         match cell.status.as_str() {
             "red"
                 if selected
@@ -2927,7 +2949,9 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                 selected_cells.push(cell);
             }
             "green" => {}
-            "not-applicable" if selected && requested_ids.is_some() => {
+            "not-applicable"
+                if selected && requested_ids.is_some() && !selection.probe_disabled =>
+            {
                 return Err(format!(
                     "--cells-file identity {} is unsupported: {}",
                     display_id(&cell.id),
@@ -2951,7 +2975,7 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                     })?;
                 if budget.attempts.is_some() {
                     selected_cells.push(cell);
-                } else if selection.is_exact() {
+                } else if selection.is_exact() || requested_ids.is_some() {
                     return Err(format!(
                         "{}/{}/{} is disabled and unavailable: its manifest declares no executable attempts",
                         cell.id.test, cell.id.mode, cell.id.backend
@@ -2983,6 +3007,10 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                 "--cells-file identity {} is not present in the tracked scorecard",
                 display_id(missing)
             ));
+        }
+        let selected: BTreeSet<_> = selected_cells.iter().map(|cell| cell.id.clone()).collect();
+        if &selected != requested {
+            return Err("--cells-file did not select every requested identity".into());
         }
     }
     selected_cells.sort_by(|left, right| left.id.cmp(&right.id));
@@ -8551,6 +8579,352 @@ fn pressure_sample_classification_self_test() -> Result<(), String> {
     Ok(())
 }
 
+fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), String> {
+    let tracked = load_tracked_cells(root)?;
+    let budgets = load_budgets(root)?;
+    let executable = |cell: &TrackedCell| {
+        budgets
+            .get(&(
+                cell.id.test.clone(),
+                cell.id.mode.clone(),
+                cell.id.backend.clone(),
+            ))
+            .is_some_and(|budget| budget.attempts.is_some())
+    };
+    let mut ids: Vec<_> = tracked
+        .cells
+        .iter()
+        .filter(|cell| {
+            !cell.enabled
+                && cell.status == "not-applicable"
+                && cell.id.backend == "liteinst"
+                && cell.id.mode == "verify"
+                && executable(cell)
+        })
+        .take(2)
+        .map(|cell| cell.id.clone())
+        .collect();
+    if ids.len() != 2 {
+        return Err(
+            "disabled cells-file self-test needs two executable LiteInst verify cells".into(),
+        );
+    }
+    ids.sort();
+    let path = scratch.join("disabled-cells.jsonl");
+    // File order is retained by its digest; selected identities are sorted independently.
+    let text = canonical_cells_jsonl(&ids.iter().rev().cloned().collect::<Vec<_>>())?;
+    fs::write(&path, &text).map_err(|error| error.to_string())?;
+    let results = scratch.join("disabled-cells-plan");
+    let mut args = vec![
+        "--results".into(),
+        results.to_string_lossy().into_owned(),
+        "--cells-file".into(),
+        path.to_string_lossy().into_owned(),
+        "--probe-disabled".into(),
+        "--backend".into(),
+        "liteinst".into(),
+        "--repetitions".into(),
+        "10".into(),
+        "--jobs".into(),
+        "2".into(),
+        "--manifest-guest-cap".into(),
+        "2".into(),
+        "--run-timeout".into(),
+        "21600".into(),
+    ]
+    .into_iter();
+    let (_, _, selection) = result_options(root, &mut args, false, true)?;
+    let selected = pressure_cells(root, &selection)?;
+    if selected
+        .selected
+        .iter()
+        .map(|cell| cell.id.clone())
+        .collect::<Vec<_>>()
+        != ids
+        || selected.eligible_cells != 2
+        || !selected.unavailable.is_empty()
+        || selected
+            .selected
+            .iter()
+            .any(|cell| cell.enabled || cell.status != "not-applicable")
+        || selection.is_exact()
+        || !selection.uses_shared_preparation()
+    {
+        return Err(
+            "disabled cells-file selection changed identities, population, or preparation".into(),
+        );
+    }
+    for (label, mutate) in [
+        ("missing backend", 0),
+        ("backend without probing", 1),
+        ("mode filter", 2),
+        ("test filter", 3),
+        ("sample", 4),
+        ("seed", 5),
+        ("green", 6),
+        ("run prefix", 7),
+        ("missing repetitions", 8),
+        ("zero repetitions", 9),
+    ] {
+        let mut invalid = selection.clone();
+        match mutate {
+            0 => invalid.backend = None,
+            1 => invalid.probe_disabled = false,
+            2 => invalid.mode = Some("verify".into()),
+            3 => invalid.test = Some(ids[0].test.clone()),
+            4 => invalid.sample = Some(1),
+            5 => invalid.seed = Some(1),
+            6 => invalid.green = true,
+            7 => invalid.run_id_prefix = Some("fixture".into()),
+            8 => invalid.repetitions = None,
+            9 => invalid.repetitions = Some(0),
+            _ => unreachable!(),
+        }
+        if validate_selection_shape(&invalid)
+            .and_then(|()| validate_repetition_selection(&invalid))
+            .is_ok()
+        {
+            return Err(format!("disabled cells-file accepted {label}"));
+        }
+    }
+    let fixture_id = |predicate: &dyn Fn(&TrackedCell) -> bool| {
+        tracked
+            .cells
+            .iter()
+            .find(|cell| predicate(cell))
+            .map(|cell| cell.id.clone())
+            .ok_or_else(|| "disabled cells-file self-test lacks its mixed-list fixture".to_string())
+    };
+    let wrong_backend = fixture_id(&|cell| {
+        cell.id.backend == "kvm"
+            && cell.status == "not-applicable"
+            && !cell.enabled
+            && executable(cell)
+    })?;
+    let red =
+        fixture_id(&|cell| cell.id.backend == "liteinst" && cell.status == "red" && cell.enabled)?;
+    let green = fixture_id(&|cell| {
+        cell.id.backend == "liteinst" && cell.status == "green" && cell.enabled
+    })?;
+    let unavailable = fixture_id(&|cell| {
+        cell.id.backend == "liteinst"
+            && cell.status == "not-applicable"
+            && !cell.enabled
+            && !executable(cell)
+    })?;
+    let mut unknown = ids[0].clone();
+    unknown.test.push_str("-not-in-scorecard");
+    for (label, extra, expected) in [
+        (
+            "wrong backend",
+            wrong_backend,
+            "does not match --probe-disabled --backend liteinst",
+        ),
+        (
+            "enabled red",
+            red,
+            "not in the disabled pressure population",
+        ),
+        (
+            "enabled green",
+            green,
+            "not in the disabled pressure population",
+        ),
+        ("unavailable", unavailable, "disabled and unavailable"),
+        (
+            "unknown",
+            unknown,
+            "is not present in the tracked scorecard",
+        ),
+        ("duplicate", ids[0].clone(), "duplicate"),
+    ] {
+        let mut mixed = ids.clone();
+        mixed.push(extra);
+        let mixed_path = scratch.join(format!("mixed-{}.jsonl", label.replace(' ', "-")));
+        fs::write(&mixed_path, canonical_cells_jsonl(&mixed)?)
+            .map_err(|error| error.to_string())?;
+        for retained in [false, true] {
+            let invalid = CellSelection {
+                cells_file: (!retained).then(|| mixed_path.clone()),
+                retained_cells_file_cells: retained.then(|| mixed.clone()),
+                ..selection.clone()
+            };
+            let error = pressure_cells(root, &invalid).err().ok_or_else(|| {
+                format!("disabled cells-file accepted mixed {label} list (retained={retained})")
+            })?;
+            let expected = if label == "duplicate" && !retained {
+                "repeats"
+            } else {
+                expected
+            };
+            if !error.contains(expected) {
+                return Err(format!(
+                    "disabled cells-file {label} refusal lost its cause: {error}"
+                ));
+            }
+        }
+    }
+    let ordinary = CellSelection {
+        probe_disabled: false,
+        backend: None,
+        ..selection.clone()
+    };
+    if pressure_cells(root, &ordinary)
+        .err()
+        .is_none_or(|error| !error.contains("is unsupported"))
+    {
+        return Err("ordinary cells-file no longer refuses disabled cells".into());
+    }
+    let checked = CheckedScorecard {
+        root,
+        enforce_host_capabilities: false,
+        memory_budget_override: Some(i64::MAX),
+    };
+    let (mut metadata, dag) = write_plan_after_scorecard_check(
+        &checked,
+        &results,
+        &results.join("dag.json"),
+        &selection,
+    )?;
+    let file_digest = format!("{:x}", Sha256::digest(text.as_bytes()));
+    let population_digest = selected_population_sha256(&ids)?;
+    let cell_steps: Vec<_> = dag
+        .steps
+        .iter()
+        .filter(|step| step.group == "cell")
+        .collect();
+    let producers: BTreeSet<_> = dag
+        .steps
+        .iter()
+        .filter(|step| matches!(step.group.as_str(), "pre" | "setup" | "gate" | "build"))
+        .map(|step| step.tag())
+        .collect();
+    let expected_producers: BTreeSet<_> = [
+        "pre.submodules",
+        "pre.reverie_pin",
+        "build.rust_scripts",
+        "setup.manifest_plan",
+        "gate.manifest",
+        "setup.nextest",
+        "build.workspace",
+        "build.runtime_release",
+        "build.e2e_artifact",
+        "build.liteinst_runtime_release",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    if metadata.cells != ids
+        || metadata.repetitions != Some(10)
+        || metadata.eligible_cells != 2
+        || metadata.unavailable_cells != 0
+        || !metadata.probe_disabled
+        || metadata.green
+        || metadata.backend.as_deref() != Some("liteinst")
+        || metadata.cells_file.as_deref() != Some(path.to_string_lossy().as_ref())
+        || metadata.cells_file_sha256.as_deref() != Some(file_digest.as_str())
+        || metadata.selected_population_sha256.as_deref() != Some(population_digest.as_str())
+        || metadata.jobs != 2
+        || metadata.manifest_guest_cap != 2
+        || cell_steps.len() != 20
+        || producers != expected_producers
+        || dag
+            .steps
+            .iter()
+            .filter(|step| step.group == "prepare")
+            .count()
+            != 2
+        || dag.resource_caps.get("manifest_guest") != Some(&2)
+        || cell_steps.iter().any(|step| {
+            !step.cmd.contains("--probe-disabled")
+                || !step.cmd.contains("--backend 'liteinst'")
+                || step.cmd.contains("--include-manual")
+                || !step.cmd.contains("--require-install")
+                || !step.cmd.contains("E2E_KEEP_VERIFY_LOGS=1")
+        })
+    {
+        return Err("disabled cells-file plan lost its exact population, repetitions, producers, or evidence contract".into());
+    }
+    let mut expected_timeouts = BTreeMap::new();
+    let keys = ids
+        .iter()
+        .map(|cell| (cell.test.clone(), cell.mode.clone(), cell.backend.clone()))
+        .collect();
+    let resolved = resolve_budgets(budgets, PressureTimeoutPolicy::from_env()?, &keys)?;
+    for cell in &ids {
+        let budget = &resolved[&(cell.test.clone(), cell.mode.clone(), cell.backend.clone())];
+        for repetition in 1..=10 {
+            expected_timeouts.insert(
+                format!("cell.{}", cell_run_slug(cell, Some(repetition))),
+                outer_timeout(budget)?,
+            );
+        }
+    }
+    if cell_steps
+        .iter()
+        .map(|step| (step.tag(), step.timeout))
+        .collect::<BTreeMap<_, _>>()
+        != expected_timeouts
+    {
+        return Err("disabled cells-file plan changed a repetition or enclosing timeout".into());
+    }
+    let mut missing_repetition = dag.clone();
+    missing_repetition
+        .steps
+        .retain(|step| step.tag() != cell_steps[0].tag());
+    if audit_dag(
+        &missing_repetition,
+        20,
+        metadata.run_timeout_seconds,
+        &expected_timeouts,
+    )
+    .is_ok()
+    {
+        return Err("disabled cells-file plan accepted an omitted repetition".into());
+    }
+    // This is a plan fixture, not an executed clean-source result. Keep the real
+    // command-boundary dirty-source checks; model retained committed metadata here.
+    metadata.source_tree_dirty = false;
+    let round_trip: RunMetadata =
+        serde_json::from_slice(&serde_json::to_vec(&metadata).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+    validate_run_contract(root, &results, &round_trip, false)?;
+    fs::remove_file(&path).map_err(|error| error.to_string())?;
+    validate_run_contract(root, &results, &round_trip, false)?;
+    for variant in 0..4 {
+        let mut invalid = round_trip.clone();
+        let expected = match variant {
+            0 => {
+                invalid.backend = Some("kvm".into());
+                "does not match --probe-disabled --backend kvm"
+            }
+            1 => {
+                invalid.probe_disabled = false;
+                "--backend without --probe-disabled"
+            }
+            2 => {
+                invalid.cells.pop();
+                invalid.eligible_cells = 1;
+                "selected-cell population SHA-256 mismatch"
+            }
+            3 => {
+                invalid.cells_file_sha256 = Some("A".repeat(64));
+                "SHA-256 is malformed"
+            }
+            _ => unreachable!(),
+        };
+        if validate_run_contract(root, &results, &invalid, false)
+            .err()
+            .is_none_or(|error| !error.contains(expected))
+        {
+            return Err(format!(
+                "disabled cells-file retained mutation {variant} was not refused for {expected}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn self_test(root: &Path) -> Result<(), String> {
     // Read the real checked-in scorecard before building synthetic fixtures.
     // A scorecard schema bump must take this consumer offline immediately and
@@ -9869,6 +10243,8 @@ fn self_test(root: &Path) -> Result<(), String> {
             "unsupported --cells-file identity reported the wrong error: {unsupported_error}"
         ));
     }
+
+    disabled_cells_file_self_test(root, &scratch)?;
 
     let cells_file_results = scratch.join("cells-file-plan");
     let cells_file_budget_keys = cells_file_ids.iter()
@@ -12963,6 +13339,28 @@ fn self_test(root: &Path) -> Result<(), String> {
         "compatibility pressure-test self-test: no-hardlinks exact checkout, scorecard/manifest refusal, direct scheduler, multi-failure continuation, red/green and cells-file selection, exact and batch repetitions, retry/attempt/JSON accounting, minimum shared build/preparation, sampling, timeout/OOM classification, generated-DAG mutation, cleanup, retained-runner/result identity, verify-log, and normalized-golden brackets pass"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod cells_file_selection_tests {
+    use super::*;
+
+    #[test]
+    fn disabled_cells_file_preserves_exact_selection_and_retained_evidence() {
+        let root = repo_root().unwrap();
+        let path = env::temp_dir().join(format!(
+            "hermit-pressure-disabled-cells-file-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        fs::create_dir(&path).unwrap();
+        let cleanup = SelfTestDirectory::new(path.clone());
+        disabled_cells_file_self_test(&root, &path).unwrap();
+        cleanup.remove().unwrap();
+    }
 }
 
 #[cfg(test)]
