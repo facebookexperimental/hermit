@@ -175,7 +175,9 @@ fn test_inputs(
             node: tag.clone(),
             outer_attempt: u64::try_from(latest.attempt)
                 .map_err(|_| format!("selected test producer {tag} has an invalid attempt"))?,
-            test_results: dagrun::TestResults::current(executed, filtered, results)?,
+            test_results: super::validate_test_results::terminal_results(
+                executed, filtered, results,
+            )?,
         });
     }
     let compatibility = if selected.compatibility_selected() {

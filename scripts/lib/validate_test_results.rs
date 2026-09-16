@@ -80,6 +80,20 @@ fn hex_digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// Validate terminal rows without discarding their in-memory classified attempts.
+/// The schema-9 artifact below retains the existing terminal summary only.
+pub fn terminal_results(
+    executed: u64,
+    filtered: u64,
+    rows: Vec<dagrun::TestResult>,
+) -> Result<dagrun::TestResults, String> {
+    if rows.iter().any(|row| row.attempt_results.is_some()) {
+        dagrun::TestResults::classified(executed, filtered, rows)
+    } else {
+        dagrun::TestResults::current(executed, filtered, rows)
+    }
+}
+
 fn checked_results(
     producer: TestResultProducer,
     results: &dagrun::TestResults,
@@ -88,6 +102,7 @@ fn checked_results(
         .results
         .as_ref()
         .ok_or_else(|| "structured test-result producer retained count-only schema".to_string())?;
+    terminal_results(results.executed_tests, results.filtered_tests, rows.clone())?;
     let row_count = u64::try_from(rows.len())
         .map_err(|_| "structured test-result row count does not fit u64".to_string())?;
     if row_count != results.executed_tests {
@@ -461,7 +476,7 @@ fn fixture_producer_steps(tags: &[&str]) -> Result<Vec<dagrun::model::Step>, Str
             .next()
             .ok_or("test-result fixture has no Step")?;
         step.result_manifests = Some(vec![ResultManifest::StructuredTestResults(
-            StructuredTestResultsManifest::current(*tag),
+            StructuredTestResultsManifest::classified(*tag),
         )]);
         steps.push(step);
     }
@@ -485,7 +500,7 @@ pub fn self_test() -> Result<String, String> {
     let inputs = vec![NodeTestResultsInput {
         node: "test.fixture".into(),
         outer_attempt: 2,
-        test_results: dagrun::TestResults::current(
+        test_results: terminal_results(
             2,
             3,
             vec![
@@ -636,22 +651,16 @@ mod tests {
             NodeTestResultsInput {
                 node: "test.beta".into(),
                 outer_attempt: 2,
-                test_results: dagrun::TestResults::current(1, 4, vec![result("same-id", true)])
-                    .unwrap(),
+                test_results: terminal_results(1, 4, vec![result("same-id", true)]).unwrap(),
             },
             NodeTestResultsInput {
                 node: "test.alpha".into(),
                 outer_attempt: 1,
-                test_results: dagrun::TestResults::current(
-                    2,
-                    3,
-                    vec![result("z", false), result("a", true)],
-                )
-                .unwrap(),
+                test_results: terminal_results(2, 3, vec![result("z", false), result("a", true)])
+                    .unwrap(),
             },
         ];
-        let compatibility =
-            dagrun::TestResults::current(1, 0, vec![result("same-id", true)]).unwrap();
+        let compatibility = terminal_results(1, 0, vec![result("same-id", true)]).unwrap();
         let retain_once = || {
             retain(
                 root.path(),
@@ -695,12 +704,30 @@ mod tests {
 
     #[test]
     fn cumulative_writer_refuses_incomplete_population_and_spoofed_totals() {
+        let classified = result("classified", true);
+        let ordinary = dagrun::TestResult::new("ordinary".into(), true, 1).unwrap();
+        assert_eq!(
+            terminal_results(1, 0, vec![classified.clone()])
+                .unwrap()
+                .results,
+            Some(vec![classified.clone()]),
+        );
+        assert_eq!(
+            terminal_results(1, 0, vec![ordinary.clone()])
+                .unwrap()
+                .results,
+            Some(vec![ordinary.clone()]),
+        );
+        assert!(terminal_results(2, 0, vec![classified.clone(), ordinary]).is_err());
+        let mut malformed = classified;
+        malformed.attempts += 1;
+        assert!(terminal_results(1, 0, vec![malformed]).is_err());
         let root = tempfile::tempdir().unwrap();
         let selected = fixture_selected_producers(&["test.alpha", "test.missing"], false).unwrap();
         let nodes = vec![NodeTestResultsInput {
             node: "test.alpha".into(),
             outer_attempt: 1,
-            test_results: dagrun::TestResults::current(1, 0, vec![result("a", true)]).unwrap(),
+            test_results: terminal_results(1, 0, vec![result("a", true)]).unwrap(),
         }];
         let invoke = |selected: &SelectedTestProducers, expected| {
             retain(
