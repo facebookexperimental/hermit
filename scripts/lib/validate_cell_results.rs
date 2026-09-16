@@ -993,8 +993,8 @@ mod tests {
         for (needle, replacement) in [
             ("\"status\":0", "\"status\":7,\"status\":0"),
             ("\"status\":0", "\"status\":0,\"status\":0"),
-            ("\"compared\":3", "\"compared\":0,\"compared\":3"),
-            ("\"compared\":3", "\"compared\":3,\"compared\":3"),
+            ("\"compared\":2", "\"compared\":0,\"compared\":2"),
+            ("\"compared\":2", "\"compared\":2,\"compared\":2"),
         ] {
             assert!(raw.contains(needle), "duplicate control omitted {needle}");
             let duplicate = raw.replacen(needle, replacement, 1);
