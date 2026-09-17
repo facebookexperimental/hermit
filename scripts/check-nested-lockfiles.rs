@@ -819,7 +819,8 @@ esac
     fn production_host_fetch_preserves_proxy_choices_and_offline_environment() {
         // Exercise the real split script and generated-workspace preparation,
         // observing their child environments rather than a copied selector.
-        let cases: &[(&[(&str, &str)], Option<&str>)] = &[
+        type ProxyVariables<'a> = &'a [(&'a str, &'a str)];
+        let cases: &[(ProxyVariables<'_>, Option<&str>)] = &[
             (&[], None),
             (
                 &[("https_proxy", "https://lower.invalid")],
