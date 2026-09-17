@@ -701,13 +701,13 @@ fn generated_plan_populations_preserve_command_policy() {
         .map(exact_identity)
         .collect::<Result<BTreeSet<_>, _>>()
         .unwrap();
-    assert_eq!(expected_cells.len(), 756);
+    assert_eq!(expected_cells.len(), 852);
     for (label, tag, cell_count) in [
-        ("full", "e2e.manifest_backend_parity_c", 756),
+        ("full", "e2e.manifest_backend_parity_c", 852),
         (
             "hosted-portable",
             "e2e.manifest_backend_parity_c_on_host",
-            753,
+            848,
         ),
     ] {
         let selected = dagrun::select_steps_by_labels(&generated, &[label.to_owned()]).unwrap();
@@ -755,13 +755,13 @@ fn generated_plan_populations_preserve_command_policy() {
                 .cloned()
                 .map(BackendParityRelation::ptrace)
                 .collect::<Vec<_>>();
-            assert_eq!(expected_relations.len(), if active { 97 } else { 0 });
+            assert_eq!(expected_relations.len(), if active { 173 } else { 0 });
             assert_eq!(
                 plan.planned_backend_parity_relations().unwrap(),
                 expected_relations
             );
             if active {
-                for (backend, count) in [("kvm", 75), ("liteinst", 21), ("sabre", 1)] {
+                for (backend, count) in [("kvm", 75), ("liteinst", 97), ("sabre", 1)] {
                     assert_eq!(
                         expected_relations
                             .iter()

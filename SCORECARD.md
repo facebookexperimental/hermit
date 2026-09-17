@@ -80,7 +80,7 @@ This is measured ptrace-reference parity, not CI plan membership and not same-ba
 | `dbt` | 341 | 281 | 0 | 0 | 341 |
 | `kvm` | 341 | 93 | 0 | 0 | 341 |
 | `sabre` | 341 | 197 | 0 | 0 | 341 |
-| `liteinst` | 341 | 290 | 0 | 0 | 341 |
+| `liteinst` | 341 | 194 | 0 | 0 | 341 |
 
 Measured pairs are listed individually so a failing backend/test coordinate is visible without interpreting the plan-colour tables. The raw-record column is the smaller of the two complete input record counts, before target and INFO selection. The Ptrace INFO and Candidate INFO columns count the selected Detcore messages used for comparison.
 

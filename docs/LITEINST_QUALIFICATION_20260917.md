@@ -7,7 +7,8 @@ strict canonical verification pairs, with 1,920 complete retained INFO logs.
 The measured source is Hermit `26bda94103ad20cf1d572bac5bc50217826eebed`,
 Detcore tree `779213274890cd37daafae32ea5a73c1f84090a6`. The imported
 observations preserve those historical identities, invocation metadata and
-comparison history. No new guest execution was performed by this change.
+comparison history. No guest execution was repeated to create these imported
+observations; the separate follow-up below does not replace them.
 
 The author base is `cc08c9b71a21643606636ab57a99e569ede416d7`, whose Detcore
 tree is `9f6359bab9d457808be23af6aa173ff74b1f8be6`. The shared physical-exit
@@ -52,6 +53,41 @@ owner. The privileged `cpuid-probe` identity has the existing full, privileged
 and hosted-privileged owners, making 193 added result entries in total. Existing
 timeouts, calibration census, prior 22-cell records and all unrelated validation
 commands, resources and ownership remain unchanged.
+
+The rebase onto main `2a4142371e74aebea3cbd8b4c8329fc819d324f9`
+preserves its separate backend-parity reporting and strengthens one selected
+recipe: LiteInst `backend-parity-c/readdir-order-identity` now receives
+`--require-small-determinized`, matching the ptrace and KVM arguments. This
+makes the existing small-directory determinization assertion fatal; the
+large-directory known gap remains reported separately. Its ten original
+comparisons and timing samples below used no guest argument and remain
+unchanged historical evidence. A separate follow-up used the retained
+`26bda94103ad20cf1d572bac5bc50217826eebed` Hermit executable, staged runtime
+and identical guest ELF with the stronger argument. Its preceding `/bin/true`
+comparison verified activation and matched 1,115 INFO records per side. All ten
+stronger first attempts then passed the fatal small-directory assertion and
+strict `BitwiseInfoV1` comparison, with 14,714 INFO records per side per pair and
+no relaxations. Every large-directory output still reports
+`order_identical=0`, `first_diff=0` and `words_equal=0`; whole-directory ordering
+remains a known defect.
+
+The separate follow-up's nearest-rank p90 is 7,820,673 microseconds of aggregate
+cgroup CPU and 8.328214490 seconds for the outer `safehermit` command. The
+existing formula requires 12 CPU / 34 wall seconds at p90, or 13 / 35 using the
+maximum samples. All runs used the unchanged 22 / 57 second bounds, actual
+3 GiB memory and zero swap. This command wall includes wrapper overhead but
+excludes historical build and official manifest preparation; it does not
+replace the preparation-inclusive historical samples below or in the ledger.
+The follow-up qualifies this stronger small-directory recipe on the historical
+host hybrid only, not current-main runtime or cross-backend parity.
+
+The full follow-up evidence is retained under the parent workspace's
+`ignored/liteinst-01a0a13c-review/queue-drain-20260916/` in
+`liteinst-readdir-stronger-argument` and
+`liteinst-readdir-stronger-argument-independent`. The independent `REPORT.md`
+SHA256 is `454843772e0f7988373202283631dd2db8a159d19edf7f95cb8b1a7202de3578`;
+its `FREEZE.json` SHA256 is
+`ca2775842c0fafb6665a6bb9d18a73a819bcc9755230e1e843eee9892d778c19`.
 
 ## Evidence and runtime identity
 
