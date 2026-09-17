@@ -2552,6 +2552,8 @@ test:
             - pipe-order
           kvm:
             - pipe-order
+          liteinst:
+            - "pipe-order"
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
@@ -2990,6 +2992,8 @@ test:
             - threads
           kvm:
             - threads
+          liteinst:
+            - "threads"
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
@@ -5215,6 +5219,8 @@ test:
             - "8192"
           sabre:
             - "8192"
+          liteinst:
+            - "8192"
         assert:
           bitwise_parity: true
         backends_disabled:
@@ -7026,6 +7032,8 @@ test:
             - README.md
           sabre:
             - README.md
+          liteinst:
+            - "README.md"
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
@@ -8062,6 +8070,8 @@ test:
             - itimer-delivery
           kvm:
             - itimer-delivery
+          liteinst:
+            - "itimer-delivery"
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
@@ -10024,6 +10034,8 @@ test:
             - cancellation
           kvm:
             - cancellation
+          liteinst:
+            - "cancellation"
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           sabre: Cancellation reaches one raw libc syscall site per execution; trusted shared-object native execution is not SaBRe support

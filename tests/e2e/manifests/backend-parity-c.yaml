@@ -5431,6 +5431,8 @@ test:
             - workdir
           kvm:
             - workdir
+          liteinst:
+            - "workdir"
         assert:
           bitwise_parity: true
         backends_disabled:
