@@ -510,7 +510,9 @@
    "argv": [
     "bash",
     "-c",
-    "bzip2 -c {{REAL_COMPAT_FIXTURES}}/README.md | sha256sum"
+    "set -euo pipefail; bzip2 -c \"$1\" | sha256sum",
+    "compat-bzip2",
+    "{{REAL_COMPAT_FIXTURES}}/README.md"
    ]
   },
   {
@@ -518,7 +520,9 @@
    "argv": [
     "bash",
     "-c",
-    "gzip -cn {{REAL_COMPAT_FIXTURES}}/README.md | sha256sum"
+    "set -euo pipefail; gzip -cn \"$1\" | sha256sum",
+    "compat-gzip",
+    "{{REAL_COMPAT_FIXTURES}}/README.md"
    ]
   },
   {
@@ -526,7 +530,9 @@
    "argv": [
     "bash",
     "-c",
-    "xz -c {{REAL_COMPAT_FIXTURES}}/README.md | sha256sum"
+    "set -euo pipefail; xz -c \"$1\" | sha256sum",
+    "compat-xz",
+    "{{REAL_COMPAT_FIXTURES}}/README.md"
    ]
   },
   {
@@ -534,7 +540,9 @@
    "argv": [
     "bash",
     "-c",
-    "zstd -q -c {{REAL_COMPAT_FIXTURES}}/README.md | sha256sum"
+    "set -euo pipefail; zstd -q -c \"$1\" | sha256sum",
+    "compat-zstd",
+    "{{REAL_COMPAT_FIXTURES}}/README.md"
    ]
   },
   {

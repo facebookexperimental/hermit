@@ -9187,6 +9187,207 @@ fn compat_fixture_operand_bracket(root: &Path, committed: &[&Step]) -> Result<St
     Ok("compat fixture operand: constructed + committed chown/install preserve clean guest environment, literal paths, owner/mode/size; old expansion and missing fixture fail".into())
 }
 
+/// A digest of empty input is a successful hash operation, not proof that its
+/// compressor succeeded. Run the actual generated guest argv under Minimal's
+/// cleared environment and compare against independently compressed real input.
+fn compat_compression_fixture_bracket(root: &Path, committed: &[&Step]) -> Result<String, String> {
+    use std::os::unix::process::CommandExt;
+
+    let fixture = tempfile::Builder::new()
+        .prefix("validate-compression-operand-")
+        .tempdir()
+        .map_err(|error| format!("compression fixture: create tempdir: {error}"))?;
+    let run_state = fixture.path().join("run state ' \" \\ $missing `false`");
+    let fixtures = run_state.join("strict-compat/real-compat-fixtures");
+    let failed_producers = fixture.path().join("failed-producers");
+    for path in [&fixtures, &failed_producers] {
+        std::fs::create_dir_all(path)
+            .map_err(|error| format!("compression fixture: create directory: {error}"))?;
+    }
+    let readme = fixtures.join("README.md");
+    let input = std::fs::read(root.join("README.md"))
+        .map_err(|error| format!("compression fixture: read real README: {error}"))?;
+    if input.is_empty() {
+        return Err("compression fixture: the positive input is empty".into());
+    }
+    std::fs::write(&readme, &input)
+        .map_err(|error| format!("compression fixture: write README: {error}"))?;
+    let root_text = root.to_string_lossy();
+    let fixtures_text = fixtures.to_string_lossy();
+    let tmp_text = fixture.path().to_string_lossy();
+    let paths = validate_corpus::CorpusPaths {
+        root_dir: &root_text,
+        real_compat_fixtures: &fixtures_text,
+        validation_tmp_dir: &tmp_text,
+        shell_build_dir: &tmp_text,
+    };
+    let compressors: [(&str, &[&str]); 4] = [
+        ("bzip2", &["-c"]),
+        ("gzip", &["-cn"]),
+        ("xz", &["-c"]),
+        ("zstd", &["-q", "-c"]),
+    ];
+    let only = compressors
+        .iter()
+        .map(|(label, _)| (*label).to_string())
+        .collect();
+    let constructed = validate_plan::compat_nodes_for(
+        root,
+        validate_plan::CompatMode::PortableStrict,
+        "fixture-hermit",
+        "unused",
+        &paths,
+        None,
+        Some(&only),
+        None,
+    )?;
+    let mut commands = Vec::new();
+    let empty_digest = format!("{:x}  -\n", Sha256::digest([]));
+    for (label, flags) in compressors {
+        let direct = Command::new(label)
+            .args(flags)
+            .arg(&readme)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .map_err(|error| format!("compression fixture: launch {label}: {error}"))?;
+        if !direct.status.success() || direct.stdout.is_empty() || !direct.stderr.is_empty() {
+            return Err(format!(
+                "compression fixture: real {label} control failed: {direct:?}"
+            ));
+        }
+        let expected = format!("{:x}  -\n", Sha256::digest(&direct.stdout));
+        // Retain the precise old false-pass mechanism as a negative control:
+        // the absent guest variable loses its prefix and sha256sum masks rc 1.
+        let old = Command::new("bash")
+            .args(["-c", &format!(
+                "{label} {} $VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures/README.md | sha256sum",
+                flags.join(" ")
+            )])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .map_err(|error| format!("compression fixture: old {label}: {error}"))?;
+        if !old.status.success() || old.stdout != empty_digest.as_bytes() || old.stderr.is_empty() {
+            return Err(format!(
+                "compression fixture: old {label} no longer reproduces the false pass: {old:?}"
+            ));
+        }
+        let stub = failed_producers.join(label);
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\nprintf 'partial producer output\\n'\nexit 23\n",
+        )
+        .and_then(|()| std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)))
+        .map_err(|error| format!("compression fixture: failing producer: {error}"))?;
+        for (kind, nodes) in [
+            ("constructed", constructed.iter().collect::<Vec<_>>()),
+            ("committed", committed.to_vec()),
+        ] {
+            let node = nodes
+                .iter()
+                .find(|node| node.job == label)
+                .ok_or_else(|| format!("compression fixture: missing {kind} {label}"))?;
+            let (_, guest) = node.cmd.split_once(" -- ").ok_or_else(|| {
+                format!("compression fixture: missing guest boundary: {}", node.cmd)
+            })?;
+            // Observe actual outer-shell expansion, not substring presence in
+            // the whole command. A literal/comment mentioning a variable is not
+            // an environment dependency; a path hidden inside bash -c is not an
+            // expanded operand. NUL framing preserves spaces and metacharacters.
+            let expanded = Command::new("bash")
+                .args(["-eu", "-c", &format!("printf '%s\\0' {guest}")])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("VALIDATE_RUN_STATE", &run_state)
+                .output()
+                .map_err(|error| format!("compression fixture: expand {kind} {label}: {error}"))?;
+            let argv = expanded
+                .stdout
+                .strip_suffix(&[0])
+                .ok_or_else(|| {
+                    format!("compression fixture: {kind} {label} has no final argv delimiter")
+                })?
+                .split(|byte| *byte == 0)
+                .map(|bytes| std::ffi::OsString::from(OsStr::from_bytes(bytes)))
+                .collect::<Vec<_>>();
+            if !expanded.status.success()
+                || !expanded.stderr.is_empty()
+                || argv.len() != 5
+                || argv[0] != "bash"
+                || argv[1] != "-c"
+                || argv[4] != readme.as_os_str()
+            {
+                return Err(format!(
+                    "compression fixture: {kind} {label} did not pass the actual fixture at the guest argv boundary: {expanded:?}"
+                ));
+            }
+            commands.push((kind, label, argv, expected.clone()));
+        }
+    }
+    let run = |argv: &[std::ffi::OsString], failed: bool, unreadable: bool| {
+        let path = if failed {
+            format!("{}:/usr/bin:/bin", failed_producers.display())
+        } else {
+            "/usr/bin:/bin".into()
+        };
+        let mut command = Command::new("/bin/bash");
+        command
+            .args(&argv[1..])
+            .env_clear()
+            .env("PATH", path)
+            .env("HOME", "/root")
+            .env("TMPDIR", fixture.path())
+            .current_dir("/");
+        // Root can read mode-000 files. A privileged self-test must exercise
+        // genuine denied access too, rather than skip or falsely pass this case.
+        if unreadable && unsafe { libc::geteuid() } == 0 {
+            command.gid(65534).uid(65534);
+        }
+        command
+            .output()
+            .map_err(|error| format!("compression fixture: launch guest: {error}"))
+    };
+    for (kind, label, argv, expected) in &commands {
+        let output = run(argv, false, false)?;
+        if !output.status.success()
+            || output.stdout != expected.as_bytes()
+            || !output.stderr.is_empty()
+        {
+            return Err(format!(
+                "compression fixture: {kind} {label} did not hash real compression: {output:?}, expected {expected:?}"
+            ));
+        }
+        let output = run(argv, true, false)?;
+        if output.status.code() != Some(23) {
+            return Err(format!(
+                "compression fixture: {kind} {label} hid a failed producer behind sha256sum: {output:?}"
+            ));
+        }
+    }
+    std::fs::set_permissions(&readme, std::fs::Permissions::from_mode(0o000))
+        .map_err(|error| format!("compression fixture: make unreadable: {error}"))?;
+    for (kind, label, argv, _) in &commands {
+        let output = run(argv, false, true)?;
+        if output.status.success() || output.stderr.is_empty() {
+            return Err(format!(
+                "compression fixture: {kind} {label} passed unreadable input: {output:?}"
+            ));
+        }
+    }
+    std::fs::remove_file(&readme)
+        .map_err(|error| format!("compression fixture: remove negative input: {error}"))?;
+    for (kind, label, argv, _) in &commands {
+        let output = run(argv, false, false)?;
+        if output.status.success() || output.stderr.is_empty() {
+            return Err(format!(
+                "compression fixture: {kind} {label} passed missing input: {output:?}"
+            ));
+        }
+    }
+    Ok("compression fixture: 4 old false passes reproduced; 8 constructed/committed argv preserve real input; 24 failed-producer/unreadable/missing cases fail".into())
+}
+
 /// Exercise committed strict-compatibility nodes through the real outer
 /// scheduler without running the corpus.
 ///
@@ -9273,6 +9474,7 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
         );
     }
     println!("  {}", compat_fixture_operand_bracket(root, &probes)?);
+    println!("  {}", compat_compression_fixture_bracket(root, &probes)?);
     let fixture_readme = "$VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures/README.md";
     let readme_labels = probes
         .iter()
