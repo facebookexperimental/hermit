@@ -10654,7 +10654,8 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
         .iter()
         .find(|bucket| bucket.lane == "privileged" && bucket.category == "backend-parity-c")
         .ok_or("node vacuity: required plan lost the privileged backend-parity-c bucket")?;
-    if privileged.selected != 2
+    // The checked-in bucket selects cpuid-probe for KVM, LiteInst and ptrace.
+    if privileged.selected != 3
         || !bucket_runs_nothing(privileged)
         || privileged.capabilities != vec!["cpuid-faulting".to_string()]
     {
@@ -12316,7 +12317,7 @@ mod nextest_timeout_tests {
                 })
                 .unwrap()
                 .len(),
-            756,
+            852,
             "timeout accounting must not change the shipped required-cell population"
         );
         let selection = Selection {

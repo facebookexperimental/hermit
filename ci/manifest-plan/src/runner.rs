@@ -74,6 +74,10 @@ use crate::timeouts::KVM_RUN_1709_CI_REMOVAL_COUNT;
 use crate::timeouts::LITEINST_2026_09_16_SELECTED_CI_CELL_COUNT;
 #[cfg(test)]
 use crate::timeouts::LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS;
+#[cfg(test)]
+use crate::timeouts::LITEINST_2026_09_17_SELECTED_CI_CELL_COUNT;
+#[cfg(test)]
+use crate::timeouts::LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS;
 use crate::timeouts::MANIFEST_SCHEMA;
 #[cfg(test)]
 use crate::timeouts::NON_CI_CELL_COUNT;
@@ -5626,6 +5630,7 @@ mod tests {
                 + KVM_2026_09_08_SELECTED_CI_CELL_COUNT
                 + IPC_DETERMINISM_CHAOS_SELECTED_CI_CELL_COUNT
                 + LITEINST_2026_09_16_SELECTED_CI_CELL_COUNT
+                + LITEINST_2026_09_17_SELECTED_CI_CELL_COUNT
         );
         assert_eq!(
             enabled.len() - required.len(),
@@ -5633,9 +5638,13 @@ mod tests {
             "the current manifest census records every enabled ci:false cell"
         );
 
-        // These were already enabled cells. Selection moves them from the
-        // non-CI population without rewriting the earlier retained census.
-        for calibration in LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS {
+        // The earlier group was already enabled; the later disabled group adds
+        // equally to enabled and required, preserving enabled-minus-required.
+        // Both groups retain their separate evidence and ordinary bounds.
+        for calibration in LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS
+            .iter()
+            .chain(&LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS)
+        {
             let cell = required
                 .iter()
                 .find(|cell| {

@@ -2,7 +2,7 @@
 
 This table is derived from the manifest, not from a separately maintained parent-workspace CSV. `./ci/compat-envelope/scorecard.rs check` verifies it.
 
-**Green** means this manifest cell is selected by full in `ci/expected-e2e-plan.json`; ordinary validation therefore requires it to pass. **Red** means the cell is in the manifest but is not selected by full. **Red does not mean failed:** a red cell may have passed, failed, produced no verdict, or never run. Manifest-disabled combinations are **Not applicable**; they are neither red nor omitted. The current generated data counts Green as **753** and Red as **154**. The generator classifies the current **4853** manifest-disabled combinations as **Not applicable**.
+**Green** means this manifest cell is selected by full in `ci/expected-e2e-plan.json`; ordinary validation therefore requires it to pass. **Red** means the cell is in the manifest but is not selected by full. **Red does not mean failed:** a red cell may have passed, failed, produced no verdict, or never run. Manifest-disabled combinations are **Not applicable**; they are neither red nor omitted. The current generated data counts Green as **849** and Red as **154**. The generator classifies the current **4757** manifest-disabled combinations as **Not applicable**.
 
 Every selected `verify` cell, and every seed in a selected `chaos` cell, runs the same backend twice. The manifest runner adds `--verify-strict` when the selected Hermit binary supports it, and accepts a result only when the typed report says `verified=true`, `verdict=matched`, `bitwise_parity=true`, `strictness=canonical`, `compare_logs=true`, a named canonical `record_envelope`, and both INFO-message counts are nonzero. Bare `--verify` remains a Stripped comparison when invoked directly and does not satisfy this regression plan. These same-backend results do not establish cross-backend parity.
 
@@ -12,20 +12,20 @@ Every selected `verify` cell, and every seed in a selected `chaos` cell, runs th
 | `dbt` | 0 | 61 | 1019 | 1080 |
 | `kvm` | 243 | 8 | 829 | 1080 |
 | `sabre` | 112 | 32 | 936 | 1080 |
-| `liteinst` | 50 | 3 | 1027 | 1080 |
+| `liteinst` | 146 | 3 | 931 | 1080 |
 | `native` | 0 | 33 | 327 | 360 |
-| **Total** | **753** | **154** | **4853** | **5760** |
+| **Total** | **849** | **154** | **4757** | **5760** |
 
 ## Denominator, and why the percentage is not comparable across changes to it
 
-Green is **753 of 5760**, which is **13.07%** — over THIS population and no other. The population is every combination the manifest declares, and it is composed of:
+Green is **849 of 5760**, which is **14.74%** — over THIS population and no other. The population is every combination the manifest declares, and it is composed of:
 
 - backends: `ptrace`, `dbt`, `kvm`, `sabre`, `liteinst`, `native`
 - modes: `chaos`, `naked`, `replay`, `verify`
 
-⚠️ **4853 of those 5760 cells are NOT APPLICABLE** — their backend is not enabled for their mode, so they were never asked to run and cannot pass or fail. Over the 907 cells that CAN run, green is **83.02%**.
+⚠️ **4757 of those 5760 cells are NOT APPLICABLE** — their backend is not enabled for their mode, so they were never asked to run and cannot pass or fail. Over the 1003 cells that CAN run, green is **84.65%**.
 
-⚠️ **DO NOT QUOTE THAT SECOND FIGURE AS PROGRESS.** It is the same 753 green cells measured against a smaller denominator. Nothing was fixed to produce it; it is what the first figure always meant once the cells that cannot run are excluded. Quote both or neither, and never compare one against the other as though something moved.
+⚠️ **DO NOT QUOTE THAT SECOND FIGURE AS PROGRESS.** It is the same 849 green cells measured against a smaller denominator. Nothing was fixed to produce it; it is what the first figure always meant once the cells that cannot run are excluded. Quote both or neither, and never compare one against the other as though something moved.
 
 ⚠️ **Adding or removing a backend or mode changes this denominator and therefore the percentage, without anything about the product changing.** Removing a backend whose cells are mostly red RAISES the reported figure; adding honest red cells LOWERS it. Neither is progress. Before comparing this percentage against an earlier one, diff the two lists above: if they differ, the numbers are not comparable and the difference is not a result.
 
@@ -33,11 +33,11 @@ The mode view makes the current order of work explicit: expand `verify` first, t
 
 | Mode | `ptrace` | `dbt` | `kvm` | `sabre` | `liteinst` | `native` | Green | Red | Not applicable | Total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `verify` | 341 / 360 | 0 / 360 | 243 / 360 | 112 / 360 | 50 / 360 | — | 746 | 120 | 934 | 1800 |
+| `verify` | 341 / 360 | 0 / 360 | 243 / 360 | 112 / 360 | 146 / 360 | — | 842 | 120 | 838 | 1800 |
 | `replay` | 1 / 360 | 0 / 360 | 0 / 360 | 0 / 360 | 0 / 360 | — | 1 | 0 | 1799 | 1800 |
 | `chaos` | 6 / 360 | 0 / 360 | 0 / 360 | 0 / 360 | 0 / 360 | — | 6 | 1 | 1793 | 1800 |
 | `naked` | — | — | — | — | — | 0 / 360 | 0 | 33 | 327 | 360 |
-| **Total** | | | | | | | **753** | **154** | **4853** | **5760** |
+| **Total** | | | | | | | **849** | **154** | **4757** | **5760** |
 
 ## Ptrace by manifest category
 
@@ -59,7 +59,7 @@ This view uses the same Basic Sanity Milestone 1 contracts as the tables above, 
 | `system-utils` | 33 / 34 | 1 / 34 | 0 / 34 | 34 | 102 |
 | `util-c` | 0 / 1 | 0 / 1 | 0 / 1 | 0 | 3 |
 
-Ordinary full validation executes 756 selected regression cells: the 753 green compatibility cells above (including 6 chaos-mode race-exposure checks), and 3 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.
+Ordinary full validation executes 852 selected regression cells: the 849 green compatibility cells above (including 6 chaos-mode race-exposure checks), and 3 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.
 
 ### Selected custom commands outside the comparable denominator
 
@@ -100,10 +100,10 @@ The cross-tab includes all **5760** tracked cells; no row is omitted. The curren
 
 | Status | `never-measured` | `measured-and-passed` | `measured-no-verdict` | `diverged-unlocated` | `diverged` | Total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `green` | 15 | 718 | 0 | 6 | 14 | 753 |
+| `green` | 15 | 814 | 0 | 6 | 14 | 849 |
 | `red` | 48 | 70 | 8 | 0 | 28 | 154 |
-| `not-applicable` | 4852 | 0 | 0 | 0 | 1 | 4853 |
-| **Total** | **4915** | **788** | **8** | **6** | **43** | **5760** |
+| `not-applicable` | 4756 | 0 | 0 | 0 | 1 | 4757 |
+| **Total** | **4819** | **884** | **8** | **6** | **43** | **5760** |
 
 Cells whose stored `measurement` is not `never-measured` are shown individually so status and measurement remain visible together.
 
@@ -120,29 +120,39 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `backend-parity-c/aio-refusal` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/aio-refusal` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/append-pwrite` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/append-pwrite` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/append-pwrite` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/bind-getsockname` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/bind-getsockname` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/bind-getsockname` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/cachestat-refusal` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/cachestat-refusal` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/cachestat-refusal` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/child-subreaper-refusal` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/child-subreaper-refusal` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/child-subreaper-refusal` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/close-range-fds` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/close-range-fds` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/close-range-fds` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/copy-file-range-refusal` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/copy-file-range-refusal` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/copy-file-range-refusal` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/cpu-virtualization` | `verify` | `dbt` | `red` | `measured-and-passed` |
 | `backend-parity-c/cpu-virtualization` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/cpu-virtualization` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/cpu-virtualization` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/cwd-roundtrip` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `backend-parity-c/cwd-roundtrip` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/cwd-roundtrip` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/dup-shared-offset` | `verify` | `dbt` | `red` | `diverged` |
 | `backend-parity-c/dup-shared-offset` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/dup-shared-offset` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/dup-shared-offset` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/environment-and-workdir` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `backend-parity-c/epoll-pwait2` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/epoll-pwait2` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/epoll-readiness` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/epoll-readiness` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/epoll-readiness` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/event-delivery-ordering` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/event-delivery-ordering` | `verify` | `ptrace` | `green` | `measured-and-passed` |
@@ -150,91 +160,124 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `backend-parity-c/eventfd-semantics` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/eventfd-semantics` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/faccessat2-flags` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/faccessat2-flags` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/faccessat2-flags` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/fadvise-hints` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/fadvise-hints` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/fadvise-hints` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/fallocate-extents` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/fallocate-extents` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/fallocate-extents` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/fchmod-bits` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/fchmod-bits` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/fchmod-bits` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `backend-parity-c/fchmodat2-flags` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/fchmodat2-flags` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/fcntl-owner` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/fcntl-owner` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/fd-duplication` | `verify` | `dbt` | `red` | `diverged` |
 | `backend-parity-c/fd-duplication` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/fd-duplication` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/fd-duplication` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/file-backed-mmap` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/file-backed-mmap` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/file-backed-mmap` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/file-io-roundtrip` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `backend-parity-c/file-io-roundtrip` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/file-io-roundtrip` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/flock-lifecycle` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/flock-lifecycle` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/flock-lifecycle` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/fork-exec-pipeline` | `verify` | `kvm` | `green` | `diverged` |
 | `backend-parity-c/fork-exec-pipeline` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `backend-parity-c/fsync-durability` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/fsync-durability` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/ftruncate-sparse` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/ftruncate-sparse` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/ftruncate-sparse` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/getcpu-identity` | `verify` | `dbt` | `red` | `measured-and-passed` |
 | `backend-parity-c/getcpu-identity` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/getcpu-identity` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/getcpu-identity` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/getpriority-identity` | `verify` | `dbt` | `red` | `measured-and-passed` |
 | `backend-parity-c/getpriority-identity` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/getpriority-identity` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/getpriority-identity` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/getrusage-self-accounting` | `verify` | `liteinst` | `red` | `measured-and-passed` |
 | `backend-parity-c/getrusage-self-accounting` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/hardware-trap-identity` | `verify` | `dbt` | `red` | `diverged` |
+| `backend-parity-c/hardware-trap-identity` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/hardware-trap-identity` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/host-identity` | `verify` | `dbt` | `red` | `measured-and-passed` |
+| `backend-parity-c/host-identity` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/host-identity` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/inline-syscall-sites` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/inline-syscall-sites` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/inline-syscall-sites` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `backend-parity-c/inotify-watch` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/inotify-watch` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `backend-parity-c/ioctl-fionread` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/ioctl-fionread` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/kcmp-refusal` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/kcmp-refusal` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/kcmp-refusal` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/linkat-flags` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/linkat-flags` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/linkat-flags` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/lseek-positioning` | `verify` | `dbt` | `red` | `measured-and-passed` |
 | `backend-parity-c/lseek-positioning` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/lseek-positioning` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/lseek-positioning` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/mce-kill-refusal` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/mce-kill-refusal` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/mce-kill-refusal` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/membarrier-query` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `backend-parity-c/membarrier-query` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/membarrier-query` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/memfd-create` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/memfd-create` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/memfd-create` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/mempolicy-default` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/mempolicy-default` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/mempolicy-default` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/mincore-residency` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/mincore-residency` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/mincore-residency` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/mixed-inline-and-libc-syscalls` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/mixed-inline-and-libc-syscalls` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/mixed-inline-and-libc-syscalls` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/mkdir-rmdir` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `backend-parity-c/mkdir-rmdir` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/mkdir-rmdir` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/mknod-special` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/mknod-special` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/mknod-special` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/mmap-layout-pointer-order` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `backend-parity-c/mmap-layout-pointer-order` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/mmap-layout-pointer-order` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `backend-parity-c/msync-writeback` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/msync-writeback` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/name-to-handle-refusal` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/name-to-handle-refusal` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/name-to-handle-refusal` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/no-new-privs-refusal` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/no-new-privs-refusal` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/no-new-privs-refusal` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/numa-node-identity` | `verify` | `dbt` | `red` | `measured-and-passed` |
 | `backend-parity-c/numa-node-identity` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/numa-node-identity` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/numa-node-identity` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/o-tmpfile-anon` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `backend-parity-c/o-tmpfile-anon` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/o-tmpfile-anon` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/openat-flags` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/openat-flags` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/openat-flags` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/openat2-refusal` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/openat2-refusal` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/openat2-refusal` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/path-file-ops` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/path-file-ops` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/path-file-ops` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/personality-domain` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/personality-domain` | `verify` | `ptrace` | `green` | `measured-and-passed` |
@@ -244,44 +287,61 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `backend-parity-c/pid-probe` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `backend-parity-c/pidfd-open-self` | `verify` | `dbt` | `red` | `measured-and-passed` |
 | `backend-parity-c/pidfd-open-self` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/pidfd-open-self` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/pidfd-open-self` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/pipe-capacity` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `backend-parity-c/pipe-capacity` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/pipe-capacity` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/pipe-capacity-pin` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/pipe-capacity-pin` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/pipe-capacity-pin` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/pipe-ipc` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/pipe-ipc` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/pipe-ipc` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/pipe-multiwriter-ordering` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/pipe2-flags` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/pipe2-flags` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/pipe2-flags` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `backend-parity-c/poll-readiness` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/poll-readiness` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/prctl-identity` | `verify` | `dbt` | `red` | `measured-and-passed` |
+| `backend-parity-c/prctl-identity` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/prctl-identity` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `backend-parity-c/prctl-pdeathsig` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/prctl-pdeathsig` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `backend-parity-c/preadv2-flags` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/preadv2-flags` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/pthread-lifecycle` | `verify` | `kvm` | `red` | `diverged` |
+| `backend-parity-c/pthread-lifecycle` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/pthread-lifecycle` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/pthread-lifecycle` | `verify` | `sabre` | `red` | `diverged` |
 | `backend-parity-c/readdir-entries` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/readdir-entries` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/readdir-entries` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/readdir-order-identity` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/readdir-order-identity` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/readdir-order-identity` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/record-lock` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/record-lock` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/rename-ops` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/rename-ops` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/rename-ops` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/renameat2-flags` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/renameat2-flags` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/renameat2-flags` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/rlimit-identity` | `verify` | `dbt` | `red` | `measured-and-passed` |
 | `backend-parity-c/rlimit-identity` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/rlimit-identity` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/rlimit-identity` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/robust-list` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/robust-list` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/robust-list` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/sched-getaffinity-identity` | `verify` | `dbt` | `red` | `measured-and-passed` |
 | `backend-parity-c/sched-getaffinity-identity` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/sched-getaffinity-identity` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/sched-getaffinity-identity` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/seccomp-refusal` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/seccomp-refusal` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/seccomp-refusal` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/sendfile-copy` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `backend-parity-c/sendfile-copy` | `verify` | `liteinst` | `green` | `measured-and-passed` |
@@ -290,44 +350,60 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `backend-parity-c/set-tid-address` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/set-tid-address` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/short-io-split-identity` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/short-io-split-identity` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/short-io-split-identity` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/shutdown-socketpair` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/shutdown-socketpair` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/shutdown-socketpair` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/signal-delivery-sequence` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/signal-delivery-sequence` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `backend-parity-c/signal-waitstatus-identity` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/signal-waitstatus-identity` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/signalfd-create` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/signalfd-create` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/signalfd-create` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/socket-epoll-ordering` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/socket-epoll-ordering` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/socket-epoll-ordering` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `backend-parity-c/socket-options` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/socket-options` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `backend-parity-c/socketpair-flags` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/socketpair-flags` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `backend-parity-c/sockname-unnamed` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/sockname-unnamed` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/stat-metadata-identity` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `backend-parity-c/stat-metadata-identity` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/stat-metadata-identity` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/statfs-free-determinism` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/statfs-free-determinism` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/statfs-free-determinism` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/static-nolibc-syscall-sites` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `backend-parity-c/static-nolibc-syscall-sites` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/statx-metadata` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/statx-metadata` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/statx-metadata` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/symlink-ops` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `backend-parity-c/symlink-ops` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/symlink-ops` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/sync-file-range` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/sync-file-range` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/sync-file-range` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/sysv-ipc-refusal` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/sysv-ipc-refusal` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/sysv-ipc-refusal` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `backend-parity-c/thp-disable` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/thp-disable` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/timer-family-identity` | `verify` | `ptrace` | `red` | `diverged` |
 | `backend-parity-c/umask-mode` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `backend-parity-c/umask-mode` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/umask-mode` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/uname-identity` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/uname-identity` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/uname-identity` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/utimensat-determinism` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/utimensat-determinism` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/utimensat-determinism` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `backend-parity-c/vectored-file-io` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/vectored-file-io` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/vectored-io` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `backend-parity-c/vectored-io` | `verify` | `liteinst` | `green` | `measured-and-passed` |
@@ -337,39 +413,49 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `bin-c/posix-timer-test` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/acct-refusal-probe` | `verify` | `dbt` | `red` | `measured-and-passed` |
 | `c-programs/acct-refusal-probe` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `c-programs/acct-refusal-probe` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `c-programs/acct-refusal-probe` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/acct-refusal-probe` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/add-key-enosys` | `verify` | `dbt` | `red` | `measured-and-passed` |
 | `c-programs/add-key-enosys` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `c-programs/add-key-enosys` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `c-programs/add-key-enosys` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/add-key-enosys` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/adjtimex-deterministic` | `verify` | `dbt` | `red` | `measured-and-passed` |
 | `c-programs/adjtimex-deterministic` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `c-programs/adjtimex-deterministic` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `c-programs/adjtimex-deterministic` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/adjtimex-deterministic` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/arch-prctl-determinism` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `c-programs/arch-prctl-determinism` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/bpf-enosys` | `verify` | `dbt` | `red` | `measured-and-passed` |
 | `c-programs/bpf-enosys` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `c-programs/bpf-enosys` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `c-programs/bpf-enosys` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/bpf-enosys` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/cachestat-enosys` | `verify` | `dbt` | `red` | `measured-and-passed` |
 | `c-programs/cachestat-enosys` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `c-programs/cachestat-enosys` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `c-programs/cachestat-enosys` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/cachestat-enosys` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/clock-adjtime-deterministic` | `verify` | `dbt` | `red` | `measured-and-passed` |
 | `c-programs/clock-adjtime-deterministic` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `c-programs/clock-adjtime-deterministic` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `c-programs/clock-adjtime-deterministic` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/clock-adjtime-deterministic` | `verify` | `sabre` | `green` | `measured-and-passed` |
+| `c-programs/clone` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `c-programs/clone` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/copy-file-range-refusal-probe` | `verify` | `dbt` | `red` | `measured-and-passed` |
 | `c-programs/copy-file-range-refusal-probe` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `c-programs/copy-file-range-refusal-probe` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `c-programs/copy-file-range-refusal-probe` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/copy-file-range-refusal-probe` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/dbt-copied-tiocgpgrp` | `verify` | `kvm` | `green` | `diverged` |
+| `c-programs/dbt-copied-tiocgpgrp` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `c-programs/dbt-copied-tiocgpgrp` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/dbt-copied-tiocgpgrp` | `verify` | `sabre` | `red` | `measured-and-passed` |
 | `c-programs/dbt-exec-failure` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `c-programs/dbt-exec-failure` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `c-programs/dbt-exec-failure` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/dbt-exec-failure` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/dbt-execveat-unsupported` | `verify` | `dbt` | `red` | `measured-and-passed` |
@@ -377,14 +463,18 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `c-programs/dbt-execveat-unsupported` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/dbt-execveat-unsupported` | `verify` | `sabre` | `red` | `measured-no-verdict` |
 | `c-programs/dbt-mmap-exec` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `c-programs/dbt-mmap-exec` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `c-programs/dbt-mmap-exec` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/dbt-mmap-exec` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/dbt-pid-virtualization` | `verify` | `ptrace` | `red` | `measured-and-passed` |
 | `c-programs/dbt-prlimit-self` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `c-programs/dbt-prlimit-self` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `c-programs/dbt-prlimit-self` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/dbt-prlimit-self` | `verify` | `sabre` | `green` | `measured-and-passed` |
+| `c-programs/dbt-self-sigqueue` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `c-programs/dbt-self-sigqueue` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/dbt-self-sigqueue` | `verify` | `sabre` | `green` | `measured-and-passed` |
+| `c-programs/dbt-wait-lifecycle` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `c-programs/dbt-wait-lifecycle` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/dbt-wait-lifecycle` | `verify` | `sabre` | `red` | `measured-and-passed` |
 | `c-programs/epoll-determinism` | `verify` | `kvm` | `green` | `measured-and-passed` |
@@ -392,20 +482,25 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `c-programs/epoll-determinism` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/epoll-determinism` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/fp-reduction-nondeterminism` | `chaos` | `ptrace` | `green` | `diverged-unlocated` |
+| `c-programs/fp-reduction-nondeterminism` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `c-programs/fp-reduction-nondeterminism` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/futex-requeue-enosys` | `verify` | `dbt` | `red` | `measured-and-passed` |
 | `c-programs/futex-requeue-enosys` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `c-programs/futex-requeue-enosys` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `c-programs/futex-requeue-enosys` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/futex-requeue-enosys` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/futex-waitv-enosys` | `verify` | `dbt` | `red` | `measured-and-passed` |
 | `c-programs/futex-waitv-enosys` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `c-programs/futex-waitv-enosys` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `c-programs/futex-waitv-enosys` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/futex-waitv-enosys` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/futex-wake-enosys` | `verify` | `dbt` | `red` | `measured-and-passed` |
 | `c-programs/futex-wake-enosys` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `c-programs/futex-wake-enosys` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `c-programs/futex-wake-enosys` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/futex-wake-enosys` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/get-robust-list-child` | `verify` | `kvm` | `green` | `diverged` |
+| `c-programs/get-robust-list-child` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `c-programs/get-robust-list-child` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/get-robust-list-child` | `verify` | `sabre` | `red` | `measured-and-passed` |
 | `c-programs/get-robust-list-self` | `verify` | `dbt` | `red` | `measured-and-passed` |
@@ -953,4 +1048,5 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `applications/kvm-python-examples` | `verify` | `kvm` | `red` | `diverged` |
 | `applications/kvm-shell-environment` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `backend-parity-c/cpuid-probe` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/cpuid-probe` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `backend-parity-c/cpuid-probe` | `verify` | `ptrace` | `green` | `measured-and-passed` |
