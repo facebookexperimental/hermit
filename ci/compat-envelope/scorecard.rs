@@ -11195,7 +11195,7 @@ red/`measured-and-passed` count is **0**.",
         .find(|cell| cell.id == parity_id)
         .expect("reference-failure parity cell remains tracked");
     if reference_failure_fold.errored.len() != 1
-        || reference_failure_cell.observations[0].results.len() != 0
+        || !reference_failure_cell.observations[0].results.is_empty()
         || !reference_failure_cell.observations[0]
             .backend_parity_comparisons
             .is_empty()
@@ -14940,7 +14940,7 @@ red/`measured-and-passed` count is **0**.",
         .map_err(|e| e.to_string())?;
         let current = read_current_pressure_evidence(
             &result_command_root,
-            &[current_summary.clone()],
+            std::slice::from_ref(&current_summary),
             &command_tracked,
         )?;
         if current.results.get(&import_parity_id).map(Vec::len) != Some(repeats as usize)
