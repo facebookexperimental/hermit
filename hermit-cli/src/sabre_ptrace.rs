@@ -55,6 +55,7 @@ struct MappingClassification {
 #[derive(Default)]
 struct TraceeState {
     pending_patch: Option<PendingPatch>,
+    pending_bootstrap: Option<i64>,
 }
 
 struct PendingPatch {
@@ -245,6 +246,8 @@ struct Supervisor {
     trusted_shared_objects: HashSet<PathBuf>,
     signal_diagnostics: HashMap<Pid, SignalDiagnostic>,
     physical_exit_observer: Arc<detcore::GlobalState>,
+    bootstrap_launch: Option<super::sabre_bootstrap::Launch>,
+    bootstrap: Option<super::sabre_bootstrap::Bootstrap>,
 }
 
 impl Supervisor {
@@ -254,6 +257,7 @@ impl Supervisor {
         plugin: PathBuf,
         readiness: Arc<AtomicBool>,
         physical_exit_observer: Arc<detcore::GlobalState>,
+        bootstrap_launch: super::sabre_bootstrap::Launch,
     ) -> Self {
         Self {
             root,
@@ -269,10 +273,59 @@ impl Supervisor {
             trusted_shared_objects: HashSet::new(),
             signal_diagnostics: HashMap::new(),
             physical_exit_observer,
+            bootstrap_launch: Some(bootstrap_launch),
+            bootstrap: None,
         }
     }
 
     fn run(mut self) -> Result<(ExitStatus, PathEvidence), Error> {
+        let result = self.run_inner();
+        if result.is_err() {
+            // Keep every child admitted at a kernel clone stop in the owned
+            // set before a bootstrap refusal. Only these traced generations
+            // are signalled; no process-name/fleet lookup is involved.
+            for pid in &self.tracees {
+                let _ = nix::sys::signal::kill(*pid, Signal::SIGKILL);
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !self.tracees.is_empty() && std::time::Instant::now() < deadline {
+                let owned: Vec<_> = self.tracees.iter().copied().collect();
+                for pid in owned {
+                    match waitpid(pid, Some(WaitPidFlag::__WALL | WaitPidFlag::WNOHANG)) {
+                        Ok(status) if final_physical_exit(&status).is_some() => {
+                            self.remove_tracee(pid);
+                            self.physical_exit_observer
+                                .complete_physical_process_exit(pid.as_raw());
+                        }
+                        Ok(
+                            WaitStatus::Stopped(..)
+                            | WaitStatus::PtraceEvent(..)
+                            | WaitStatus::PtraceSyscall(..),
+                        ) => {
+                            let _ = ptrace::cont(pid, Some(Signal::SIGKILL));
+                        }
+                        Ok(_) | Err(nix::errno::Errno::EINTR) => {}
+                        Err(error) => {
+                            return Err(anyhow!(
+                                "SaBRe owned-child cleanup refused after {result:?}: {error}"
+                            ));
+                        }
+                    }
+                }
+                if !self.tracees.is_empty() {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            if !self.tracees.is_empty() {
+                return Err(anyhow!(
+                    "SaBRe owned-child cleanup timed out after {result:?}"
+                ));
+            }
+        }
+        result
+    }
+
+    fn run_inner(&mut self) -> Result<(ExitStatus, PathEvidence), Error> {
         ptrace::attach(self.root).context("failed to attach SaBRe supervisor worker")?;
         match waitpid(self.root, Some(WaitPidFlag::__WALL))? {
             WaitStatus::Stopped(pid, Signal::SIGSTOP) if pid == self.root => {}
@@ -287,6 +340,12 @@ impl Supervisor {
             tid = self.root.as_raw(),
             "received supervisor attach stop",
         );
+        self.bootstrap = Some(super::sabre_bootstrap::Bootstrap::new(
+            self.root,
+            self.bootstrap_launch
+                .take()
+                .ok_or_else(|| anyhow!("bootstrap launch consumed twice"))?,
+        )?);
         self.set_options(self.root)
             .context("failed to set options on the initial SaBRe tracee")?;
         ptrace::syscall(self.root, None)
@@ -378,6 +437,10 @@ impl Supervisor {
                 WaitStatus::PtraceSyscall(pid) => self.handle_syscall_stop(pid)?,
                 WaitStatus::PtraceEvent(pid, _, event) => self.handle_ptrace_event(pid, event)?,
                 WaitStatus::Stopped(pid, signal) => {
+                    self.bootstrap
+                        .as_mut()
+                        .expect("attached bootstrap")
+                        .signal(pid, signal)?;
                     if signal == Signal::SIGSTOP && pid != self.root {
                         self.states.entry(pid).or_default();
                         self.tracees.insert(pid);
@@ -460,7 +523,7 @@ impl Supervisor {
         let status = root_status.ok_or_else(|| anyhow!("SaBRe root tracee disappeared"))?;
         let mut trusted_shared_objects = self
             .trusted_shared_objects
-            .into_iter()
+            .iter()
             .map(|path| path.display().to_string())
             .collect::<Vec<_>>();
         trusted_shared_objects.sort();
@@ -501,6 +564,21 @@ impl Supervisor {
         match syscall_info.op {
             libc::PTRACE_SYSCALL_INFO_ENTRY => {
                 let mut regs = ptrace::getregs(pid)?;
+                let state = self.states.entry(pid).or_default();
+                if state.pending_bootstrap.is_some() || state.pending_patch.is_some() {
+                    return Err(anyhow!("overlapping SaBRe syscall-entry state for {pid}"));
+                }
+                if let Some(response) = self
+                    .bootstrap
+                    .as_mut()
+                    .expect("attached bootstrap")
+                    .request(pid, &regs)?
+                {
+                    regs.orig_rax = u64::MAX;
+                    ptrace::setregs(pid, regs)?;
+                    self.states.entry(pid).or_default().pending_bootstrap = Some(response);
+                    return self.resume(pid, None);
+                }
                 let site = regs
                     .rip
                     .checked_sub(SYSCALL_INSN.len() as u64)
@@ -553,6 +631,18 @@ impl Supervisor {
                 // per-page would be an optimisation, not a correctness
                 // requirement.
                 let exit_regs = ptrace::getregs(pid)?;
+                if let Some(response) = self.states.entry(pid).or_default().pending_bootstrap.take()
+                {
+                    if exit_regs.orig_rax != u64::MAX
+                        || self.states.entry(pid).or_default().pending_patch.is_some()
+                    {
+                        return Err(anyhow!("mismatched bootstrap syscall exit for {pid}"));
+                    }
+                    let mut regs = exit_regs;
+                    regs.rax = response as u64;
+                    ptrace::setregs(pid, regs)?;
+                    return self.resume(pid, None);
+                }
                 if mutates_address_space(exit_regs.orig_rax) {
                     // Evict the whole ADDRESS SPACE, not just this thread's
                     // entries: CLONE_VM siblings share one mm, so a sibling
@@ -575,6 +665,9 @@ impl Supervisor {
     }
 
     fn handle_ptrace_event(&mut self, pid: Pid, event: libc::c_int) -> Result<(), Error> {
+        if !self.tracees.contains(&pid) {
+            return Err(anyhow!("ptrace event is not in the owned SaBRe lineage"));
+        }
         if matches!(
             event,
             libc::PTRACE_EVENT_CLONE | libc::PTRACE_EVENT_FORK | libc::PTRACE_EVENT_VFORK
@@ -594,6 +687,12 @@ impl Supervisor {
             self.states.insert(pid, TraceeState::default());
             self.signal_diagnostics.remove(&pid);
         }
+        // The kernel-reported child is already owned above before this can
+        // reject an unsupported pre-handoff transition.
+        self.bootstrap
+            .as_mut()
+            .expect("attached bootstrap")
+            .event(pid, event)?;
         self.resume(pid, None)
     }
 
@@ -635,6 +734,9 @@ impl Supervisor {
     }
 
     fn remove_tracee(&mut self, pid: Pid) {
+        if let Some(bootstrap) = self.bootstrap.as_mut() {
+            bootstrap.forget(pid);
+        }
         self.tracees.remove(&pid);
         self.states.remove(&pid);
         self.mapping_cache.forget(pid);
@@ -977,6 +1079,7 @@ pub async fn run(
     plugin: PathBuf,
     readiness: Arc<AtomicBool>,
     physical_exit_observer: Arc<detcore::GlobalState>,
+    bootstrap_launch: super::sabre_bootstrap::Launch,
     capture_output: bool,
 ) -> Result<Output, Error> {
     if capture_output {
@@ -997,7 +1100,14 @@ pub async fn run(
     ptrace::detach(root, Some(Signal::SIGSTOP))
         .context("failed to hand SaBRe tracee to supervisor worker")?;
     tokio::task::spawn_blocking(move || {
-        run_blocking(child, sabre, plugin, readiness, physical_exit_observer)
+        run_blocking(
+            child,
+            sabre,
+            plugin,
+            readiness,
+            physical_exit_observer,
+            bootstrap_launch,
+        )
     })
     .await
     .context("SaBRe ptrace supervisor task panicked")?
@@ -1033,6 +1143,7 @@ fn run_blocking(
     plugin: PathBuf,
     readiness: Arc<AtomicBool>,
     physical_exit_observer: Arc<detcore::GlobalState>,
+    bootstrap_launch: super::sabre_bootstrap::Launch,
 ) -> Result<Output, Error> {
     let root = Pid::from_raw(child.id() as i32);
     let stdout = child.stdout.take();
@@ -1041,10 +1152,17 @@ fn run_blocking(
 
     let stdout_thread = std::thread::spawn(move || read_pipe(stdout));
     let stderr_thread = std::thread::spawn(move || read_pipe(stderr));
-    let supervised = Supervisor::new(root, sabre, plugin, readiness, physical_exit_observer).run();
-    if supervised.is_err() {
-        let _ = nix::sys::signal::kill(root, Signal::SIGKILL);
-    }
+    let supervised = Supervisor::new(
+        root,
+        sabre,
+        plugin,
+        readiness,
+        physical_exit_observer,
+        bootstrap_launch,
+    )
+    .run();
+    // Supervisor owns error cleanup and reaping. Its former root PID may be
+    // reused after run returns, including when cleanup reports an error.
     let stdout = stdout_thread
         .join()
         .map_err(|_| anyhow!("SaBRe stdout reader panicked"))??;

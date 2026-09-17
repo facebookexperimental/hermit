@@ -1812,6 +1812,12 @@ pub struct ThreadState<T> {
     /// pseudo random number state
     pub prng: Pcg64Mcg,
 
+    /// One initial-image auxv write completed by an authenticated backend
+    /// before libc initialization. Consumed by the first post-exec callback;
+    /// normal construction and child derivation never manufacture this fact.
+    #[serde(default)]
+    pub(crate) initialized_random_auxv: Option<crate::random::InitialImage>,
+
     /// RNG to drive chaos scheduling decisions, separate from other (guest) RNG.
     pub chaos_prng: Pcg64Mcg,
 
@@ -2176,7 +2182,8 @@ impl<T> ThreadState<T> {
             clone_flags: None,
             pending_vfork: None,
             // For the root thread, we initialize from the seed in the config:
-            prng: Pcg64Mcg::seed_from_u64(cfg.rng_seed()),
+            prng: crate::random::root_prng(cfg.rng_seed()),
+            initialized_random_auxv: None,
             chaos_prng: Pcg64Mcg::seed_from_u64(cfg.sched_seed()),
             thread_logical_time,
             committed_clock_value: 0,
@@ -2200,6 +2207,42 @@ impl<T> ThreadState<T> {
             robust_list_head: None,
             robust_list_process: Arc::new(Mutex::new(RobustListProcessState::default())),
         }
+    }
+
+    /// Apply a required, authenticated initial-image random handoff to the
+    /// normal root. Errors are tool initialization failures, never guest errno.
+    pub fn apply_initial_random_state(
+        &mut self,
+        bytes: &[u8],
+        config: &Config,
+        image: crate::random::InitialImage,
+    ) -> Result<(), Errno> {
+        if self.initialized_random_auxv.is_some()
+            || self.past_global_first_execve
+            || self.dettid.as_raw() != image.pid
+            || self.clone_flags.is_some()
+            || self.pedigree.raw() != Pedigree::new().raw()
+        {
+            return Err(Errno::EPROTO);
+        }
+        let prng = crate::random::decode_initial_state(bytes, config, image)?;
+        self.prng = prng;
+        self.initialized_random_auxv = Some(image);
+        Ok(())
+    }
+
+    pub(crate) fn complete_initial_random_auxv(
+        &mut self,
+        pointer: Option<usize>,
+    ) -> Result<bool, Errno> {
+        let Some(image) = self.initialized_random_auxv else {
+            return Ok(false);
+        };
+        if pointer != Some(image.at_random) || self.dettid.as_raw() != image.pid {
+            return Err(Errno::EPROTO);
+        }
+        self.initialized_random_auxv = None;
+        Ok(true)
     }
 
     pub(crate) fn record_robust_list_head(&mut self, head: Option<usize>) {

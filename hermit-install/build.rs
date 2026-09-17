@@ -8,9 +8,6 @@
 
 use std::env;
 use std::fs;
-use std::hash::DefaultHasher;
-use std::hash::Hash;
-use std::hash::Hasher;
 use std::io;
 use std::os::unix::fs::symlink;
 use std::path::Path;
@@ -116,38 +113,34 @@ fn ensure_submodule(
     (source, expected)
 }
 
-fn build_sabre(repository: &Path, build_root: &Path, resources: &Path) {
-    let (source, revision) =
-        ensure_submodule(repository, "SaBRe", "third-party/sabre", "CMakeLists.txt");
-    // The target directory is restored by CI caches, while the installed
-    // package is a Cargo-external side effect. Include both the verified
-    // gitlink and the checkout path: the revision keeps stale SaBRe builds
-    // unreachable, while the path keeps CMakeCache.txt bound to its original
-    // absolute source directory.
-    let mut source_hash = DefaultHasher::new();
-    source.hash(&mut source_hash);
-    let build = build_root.join(format!("sabre-{revision}-{:016x}", source_hash.finish()));
-    run(
-        Command::new("cmake")
-            .arg("-S")
-            .arg(&source)
-            .arg("-B")
-            .arg(&build)
-            .arg("-DCMAKE_BUILD_TYPE=Release"),
-        "configure SaBRe",
+fn stage_sabre(resources: &Path, expected_reverie_revision: &str) {
+    // Reverie's vendor tree includes the frame/bootstrap repairs that are not
+    // in its original third-party/sabre gitlink. Use the loader built by that
+    // same Cargo dependency, including its verified source and build recipe.
+    let source = reverie_sabre::bundled_sabre_source_dir();
+    let revision = output(
+        Command::new("git")
+            .arg("-C")
+            .arg(source)
+            .args(["rev-parse", "HEAD"]),
+        "read the bundled SaBRe source's Reverie revision",
     );
-    let mut command = Command::new("cmake");
-    command
-        .arg("--build")
-        .arg(&build)
-        .args(["--config", "Release", "--parallel"]);
-    if let Some(jobs) = env::var_os("NUM_JOBS") {
-        command.arg(jobs);
-    }
-    run(&mut command, "build SaBRe");
-    copy_file(&build.join("sabre"), &resources.join("sabre"));
+    assert_eq!(
+        revision, expected_reverie_revision,
+        "bundled SaBRe does not match the selected Reverie revision"
+    );
+    copy_file(
+        reverie_sabre::bundled_sabre_path(),
+        &resources.join("sabre"),
+    );
+    // This remains a single revision line for existing diagnostic readers,
+    // but now identifies the Reverie commit carrying the vendor corrections.
     fs::write(resources.join("sabre.revision"), format!("{revision}\n"))
         .expect("failed to write SaBRe revision provenance");
+    copy_file(
+        &source.join("REVISION"),
+        &resources.join("sabre.upstream-revision"),
+    );
 }
 
 fn build_e9patch(repository: &Path, build_root: &Path, resources: &Path) {
@@ -188,8 +181,19 @@ fn copy_licenses(repository_root: &Path, reverie_root: &Path, install: &Path) {
         "LICENSE.MIT",
     ] {
         copy_file(
-            &reverie_root.join("third-party/sabre").join(name),
+            &reverie_sabre::bundled_sabre_source_dir().join(name),
             &licenses.join("sabre").join(name),
+        );
+    }
+    // The bundled loader also links Reverie's vendored libelf statically.
+    let libelf = reverie_sabre::bundled_sabre_source_dir()
+        .parent()
+        .expect("bundled SaBRe source has no vendor directory")
+        .join("libelf");
+    for name in ["COPYING", "COPYING-LGPLV3"] {
+        copy_file(
+            &libelf.join(name),
+            &licenses.join("sabre/libelf").join(name),
         );
     }
     copy_file(
@@ -405,7 +409,7 @@ fn main() {
         .parent()
         .and_then(Path::parent)
         .expect("reverie-dbt source is not inside the Reverie repository");
-    build_sabre(reverie_root, &build_root, &resources);
+    stage_sabre(&resources, &reverie_pin(repository));
     build_e9patch(reverie_root, &build_root, &resources);
     copy_licenses(repository, reverie_root, &install);
 

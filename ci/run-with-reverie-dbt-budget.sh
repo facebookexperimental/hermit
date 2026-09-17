@@ -228,6 +228,37 @@ fi
 # Keep the existing 1050 effective-job-second threshold and 16-job clamp.
 # Source comparison 89b2eb0abe05008a21974668602c288452108270c85132ea48f87bb325d91ca2 is a carry decision,
 # not a new timing sample or Hermit guest receipt.
+# CARRY TO 94d97270 (2026-09-17): all eight commits after b3049e54
+# (f918218c, 2fabda5b, 4866241e, 596b9ade, 545faab1, ca4e61a9,
+# 78e5d73a, 94d97270) preserve the complete reverie-dbt and third-party
+# trees and root Cargo.toml/rust-toolchain.toml Git objects. In particular:
+#   reverie-dbt: 6232257769144e8f63891a5efc8935abc3cd836b
+#   reverie-dbt/build.rs: 0ff8ae24b97464044735ba79ea74765ba4ac3ff0
+#   reverie-dbt/vendor/dynamorio: 42dd83f76cef3e730c39d2313c11fdc78d12ae35
+# CMAKE/CMAKE_GENERATOR selection and native build options are unchanged, so
+# recipe key 0aa6d84239b5a04b7cda124ebed4c7e3adc8b62f5b4c96011a9b971e90d6b0a4,
+# MAX_PARALLEL_JOBS=16 and 1050 effective-job-seconds carry unchanged. This is
+# recipe identity evidence, not a new timing measurement or runtime receipt.
+# The carried KVM, RPC/log-capture and SaBRe behavior is not claimed unchanged.
+# CARRY TO c164a085 (2026-09-17): the ninth commit after b3049e54
+# restores SaBRe's original PROT_* mapping protections and adds native controls.
+# Its five-path delta leaves all DBT inputs unchanged. Across all nine commits,
+# the complete reverie-dbt/third-party trees and root Cargo.toml/toolchain
+# retain the exact Git objects recorded above. The native recipe key remains
+# 0aa6d84239b5a04b7cda124ebed4c7e3adc8b62f5b4c96011a9b971e90d6b0a4;
+# CMAKE/CMAKE_GENERATOR, native options, 16-job clamp and 1050 effective-job-
+# second threshold are unchanged. This is a source-identity carry, not a new
+# timing sample or Hermit guest result; the SaBRe behavior intentionally changes.
+# CARRY TO 6ae69f57 (2026-09-17): the tenth commit after b3049e54
+# intentionally changes reverie-dbt/native/CMakeLists.txt: GNU builds of the
+# on-demand client now use -mtls-dialect=gnu, matching the installed client.
+# The complete reverie-dbt subtree and client compiler flags are NOT identical.
+# This is the sole DBT delta across the ten commits. DynamoRIO vendor source,
+# build.rs, root Cargo/toolchain and CMAKE/CMAKE_GENERATOR selection are unchanged;
+# native/CMakeLists.txt is not an input to the DynamoRIO SDK recipe key above.
+# That SDK key, MAX_PARALLEL_JOBS=16 and 1050 effective-job-seconds therefore carry.
+# Client preparation still reruns CMake and uses the new Cargo source directory.
+# This carry is source evidence, not a new timing sample or Hermit guest result.
 # CARRY TO 4db9ddb6 (2026-09-17): the host-hybrid LiteInst exec repair and
 # intervening runtime changes preserve the DynamoRIO cache recipe inputs:
 # vendor/dynamorio is 42dd83f76cef, and build.rs is 0ff8ae24b974.
@@ -236,6 +267,15 @@ fi
 # client at the new pin; this carry is not runtime validation.
 # Preserve CMAKE/CMAKE_GENERATOR selection, the 1050 effective-job-second
 # threshold and the 16-job clamp. No new calibration is claimed.
+# CARRY TO 226c3e31 (2026-09-17): the four commits after 6ae69f57
+# repair LiteInst exec reactivation/owned worker-exec waits, observe returned
+# native PKRU, and declare SaBRe's zlib dependency. The complete reverie-dbt
+# subtree, build.rs, DynamoRIO vendor, root Cargo/toolchain and CMake selection
+# are byte-identical to 6ae69f57. The earlier GNU client TLS flag is preserved;
+# it remains the sole DBT change across b3049e54..226c3e31, not an SDK key input.
+# Keep SDK key 0aa6d84239b5a04b7cda124ebed4c7e3adc8b62f5b4c96011a9b971e90d6b0a4,
+# the 16-job clamp and 1050 effective-job-seconds. No new timing or guest claim;
+# the carried LiteInst/ptrace/preload and SaBRe behavior intentionally changes.
 # CARRY TO 114b3094 (2026-09-17): the complete 4db9ddb6-to-landed
 # comparison preserves the entire reverie-dbt tree
 # df7f4e8c655698849f0356a2bb41121ddff15be8, build.rs blob
@@ -244,7 +284,7 @@ fi
 # Preserve CMAKE/CMAKE_GENERATOR selection, the 1050 effective-job-second
 # threshold and the 16-job clamp. This is a source-identity carry,
 # not a new timing calibration or Hermit guest result.
-expected_pin=114b309413612fafc2657c74e83811c71aac7b19
+expected_pin=30fee360d6359e38a429f6bf19d30cdfac9c1d0d
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

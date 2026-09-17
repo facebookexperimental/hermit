@@ -53,6 +53,7 @@ mod memory;
 pub mod netlink_route;
 mod procfs;
 mod procmaps;
+pub mod random;
 mod record_or_replay;
 mod resources;
 mod scheduler;
@@ -85,6 +86,7 @@ pub use config::config_wire_fingerprint;
 // TODO-HUMAN-REVIEW(PR-1120): Review the public canonical Detcore root identity.
 pub use consts::ROOT_DETPID;
 pub use digest::Digest;
+#[cfg(test)]
 use rand::RngExt as _;
 use raw_cpuid::CpuIdResult;
 use raw_cpuid::cpuid;
@@ -1504,6 +1506,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         ))
                     },
                     pedigree: child_pedigree.clone(),
+                    initialized_random_auxv: None,
                     stats: ThreadStats::new(),
                     file_metadata: {
                         debug!(
@@ -1708,17 +1711,25 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         tool_global::mark_past_first_execve(guest).await;
         self.pre_handler_hook(guest, false).await;
 
-        if let Some(ptr) = guest.auxv().at_random() {
+        let auxv = guest.auxv();
+        let initialized = guest
+            .thread_state_mut()
+            .complete_initial_random_auxv(auxv.at_random().map(|p| p.as_raw()))
+            .expect("authenticated initial random handoff no longer matches this image");
+        // The successful early write already emitted the ordinary auxv INFO
+        // record. Consume only its fact here: no second draw, write or event.
+        if !initialized && let Some(ptr) = auxv.at_random() {
             // It is safe to mutate this address since libc has not yet had a
             // chance to modify or copy the auxv table.
-            let bytes: [u8; 16] = guest.thread_state_mut().thread_prng().random();
-            detlog!(
-                "[post_exec, dtid {}] init auxv AT_RANDOM value to {:?}",
-                guest.thread_state().dettid,
-                bytes
-            );
+            let memory = guest.memory();
+            let dettid = guest.thread_state().dettid;
             let ptr = unsafe { ptr.into_mut() };
-            guest.memory().write_value(ptr, &bytes)?;
+            random::initialize_auxv(
+                guest.thread_state_mut().thread_prng(),
+                memory,
+                ptr.cast(),
+                dettid,
+            )?;
         }
 
         // Successful exec never returns through handle_syscall_event, so the

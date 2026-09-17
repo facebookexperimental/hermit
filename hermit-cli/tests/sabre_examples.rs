@@ -314,19 +314,21 @@ fn parity_run(example: &Path, args: &[&str], backend: Option<&Path>, label: &str
         .prefix("sabre-parity-")
         .tempfile_in(env!("CARGO_TARGET_TMPDIR"))
         .unwrap_or_else(|error| panic!("failed to create {label} diagnostic log: {error}"));
-    let output = run_bounded(
-        example_command(
-            example,
-            args,
-            backend,
-            false,
-            Some(diagnostic_log.path()),
-            None,
-        ),
-        label,
-        Some(diagnostic_log.path()),
+    // Keep the already-produced evidence through success and assertion failure.
+    // These host test artifacts never enter either compared guest stream.
+    let (_diagnostic_file, diagnostic_log) = diagnostic_log
+        .keep()
+        .unwrap_or_else(|error| panic!("failed to retain {label} diagnostic log: {error}"));
+    eprintln!(
+        "SaBRe parity controller log for {label}: {}",
+        diagnostic_log.display()
     );
-    let diagnostics = controller_diagnostics(Some(diagnostic_log.path()));
+    let output = run_bounded(
+        example_command(example, args, backend, false, Some(&diagnostic_log), None),
+        label,
+        Some(&diagnostic_log),
+    );
+    let diagnostics = controller_diagnostics(Some(&diagnostic_log));
     let guest_stderr = String::from_utf8_lossy(&output.stderr);
 
     // Positive control: every SaBRe run emits the structured backend fact into
@@ -410,7 +412,12 @@ fn assert_sabre_verify(program: &Path, args: &[&str], loader: &Path, label: &str
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .unwrap_or_else(|error| {
             panic!("failed to create canonical verification directory for {label}: {error}")
-        });
+        })
+        .keep();
+    eprintln!(
+        "SaBRe canonical verification artifacts for {label}: {}",
+        retained_logs.display()
+    );
     let verify = run_bounded(
         example_command(
             program,
@@ -418,7 +425,7 @@ fn assert_sabre_verify(program: &Path, args: &[&str], loader: &Path, label: &str
             Some(loader),
             true,
             None,
-            Some(retained_logs.path()),
+            Some(&retained_logs),
         ),
         &format!("SaBRe strict portable verification for {label}"),
         None,
@@ -438,7 +445,7 @@ fn assert_sabre_verify(program: &Path, args: &[&str], loader: &Path, label: &str
     );
 
     let report: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(retained_logs.path().join("verify.json")).unwrap_or_else(|error| {
+        &std::fs::read(retained_logs.join("verify.json")).unwrap_or_else(|error| {
             panic!("SaBRe verifier omitted its JSON report for {label}: {error}")
         }),
     )
@@ -530,7 +537,12 @@ fn sabre_scheduler_empty_info_precedes_fallback_completed_info() {
     let retained_logs = tempfile::Builder::new()
         .prefix("sabre-verify-logs-")
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
-        .expect("failed to create retained SaBRe verification log directory");
+        .expect("failed to create retained SaBRe verification log directory")
+        .keep();
+    eprintln!(
+        "SaBRe scheduler verification artifacts: {}",
+        retained_logs.display()
+    );
     let verify = run_bounded(
         example_command(
             Path::new("/bin/sh"),
@@ -538,7 +550,7 @@ fn sabre_scheduler_empty_info_precedes_fallback_completed_info() {
             Some(&loader),
             true,
             None,
-            Some(retained_logs.path()),
+            Some(&retained_logs),
         ),
         "SaBRe strict verification with retained logs",
         None,
@@ -554,7 +566,7 @@ fn sabre_scheduler_empty_info_precedes_fallback_completed_info() {
     );
 
     let report: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(retained_logs.path().join("verify.json"))
+        &std::fs::read(retained_logs.join("verify.json"))
             .expect("SaBRe strict verification did not publish its report"),
     )
     .expect("SaBRe strict verification report was not valid JSON");
@@ -567,7 +579,7 @@ fn sabre_scheduler_empty_info_precedes_fallback_completed_info() {
     );
 
     let retained_log = |prefix: &str| {
-        let mut matches = std::fs::read_dir(retained_logs.path())
+        let mut matches = std::fs::read_dir(&retained_logs)
             .expect("failed to read retained SaBRe verification log directory")
             .map(|entry| {
                 entry

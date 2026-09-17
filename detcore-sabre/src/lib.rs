@@ -8,11 +8,11 @@
 
 //! SaBRe plugin that executes Hermit's Detcore tool inside each guest process.
 
-use std::cell::Cell;
 use std::ffi::CString;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::io;
+use std::io::Read;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -45,22 +45,6 @@ pub const DETLOG_FORWARD_ENV: &str = "REVERIE_SABRE_HERMIT_FORWARD_DETLOG";
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-771): Review fork-inherited SaBRe coordinator discovery.
 static RPC_SOCKET: OnceLock<PathBuf> = OnceLock::new();
-
-thread_local! {
-    // Function detours are registered before the process-local tool is built.
-    // Adapter construction may itself call libc getrandom, so recursive calls
-    // must use the captured original while the first call initializes the
-    // process-local Plugin.
-    static LIBC_GETRANDOM_ACTIVE: Cell<bool> = const { Cell::new(false) };
-}
-
-struct DetourGuard<'a>(&'a Cell<bool>);
-
-impl Drop for DetourGuard<'_> {
-    fn drop(&mut self) {
-        self.0.set(false);
-    }
-}
 
 fn coordinator_socket() -> Option<PathBuf> {
     if let Some(socket) = RPC_SOCKET.get() {
@@ -192,12 +176,97 @@ pub fn runtime_library_path() -> io::Result<PathBuf> {
     })
 }
 
+/// Optional loader transport for a supervisor-authenticated later exec or
+/// initial static image. Absence of initial opt-in alone grants no authority.
+///
+/// # Safety
+/// Called once by the loader before plugin initialization with its own held
+/// callback. The callback itself must return an authenticated typed result.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reverie_sabre_install_loader_continuation_v1(
+    callback: sabre::bootstrap::TakeStateFn,
+) -> i32 {
+    match unsafe { sabre::bootstrap::install(callback) } {
+        Ok(()) => 0,
+        Err(error) => -error.into_raw(),
+    }
+}
+
 struct Plugin {
     adapter: RemoteReverieAdapter<Detcore>,
     // The SaBRe-injected runtime requests its hash seed on the first rewritten
     // syscall after post-load. Keep that tool-private draw out of Detcore's
     // guest-visible random stream.
     post_load_syscall_pending: AtomicBool,
+}
+
+fn initial_image_generation(pid: i32, bytes: &[u8]) -> io::Result<u64> {
+    // The kernel's comm field is raw bytes, including possible ") " bytes.
+    // Decode only the PID and start-time fields, outside the final delimiter.
+    let end = bytes
+        .windows(2)
+        .rposition(|pair| pair == b") ")
+        .ok_or_else(|| io::Error::other("invalid process stat"))?;
+    let prefix = &bytes[..end];
+    let owner_end = prefix
+        .windows(2)
+        .position(|pair| pair == b" (")
+        .ok_or_else(|| io::Error::other("invalid stat owner"))?;
+    let owner = std::str::from_utf8(&prefix[..owner_end]).map_err(io::Error::other)?;
+    if owner.parse::<i32>().map_err(io::Error::other)? != pid {
+        return Err(io::Error::other("initial random handoff owner mismatch"));
+    }
+    let start = bytes[end + 2..]
+        .split(u8::is_ascii_whitespace)
+        .filter(|field| !field.is_empty())
+        .nth(19)
+        .ok_or_else(|| io::Error::other("missing process generation"))?;
+    std::str::from_utf8(start)
+        .map_err(io::Error::other)?
+        .parse()
+        .map_err(io::Error::other)
+}
+
+fn own_initial_image(pid: i32) -> io::Result<detcore::random::InitialImage> {
+    fn bounded(path: &str) -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)?
+            .take(4097)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > 4096 {
+            return Err(io::Error::other("initial image identity exceeds bound"));
+        }
+        Ok(bytes)
+    }
+    let before = bounded("/proc/self/stat")?;
+    let start_time_ticks = initial_image_generation(pid, &before)?;
+    let auxv = bounded("/proc/self/auxv")?;
+    if auxv.len() % 16 != 0 {
+        return Err(io::Error::other("incomplete initial auxv"));
+    }
+    let mut at_random = None;
+    let mut terminated = false;
+    for row in auxv.as_chunks::<16>().0 {
+        let key = u64::from_ne_bytes(row[..8].try_into().unwrap());
+        let value = u64::from_ne_bytes(row[8..].try_into().unwrap());
+        if key == libc::AT_NULL {
+            terminated = value == 0;
+            break;
+        }
+        if key == libc::AT_RANDOM && at_random.replace(value as usize).is_some() {
+            return Err(io::Error::other("duplicate initial AT_RANDOM"));
+        }
+    }
+    if !terminated {
+        return Err(io::Error::other("unterminated initial auxv"));
+    }
+    Ok(detcore::random::InitialImage {
+        pid,
+        start_time_ticks,
+        at_random: at_random
+            .filter(|p| *p != 0)
+            .ok_or_else(|| io::Error::other("missing initial AT_RANDOM"))?,
+    })
 }
 
 impl Plugin {
@@ -246,8 +315,38 @@ impl Plugin {
         Self::check_coordinator_compatibility();
         let socket = coordinator_socket().unwrap_or_else(|| panic!("{RPC_SOCKET_ENV} is not set"));
 
-        let adapter = RemoteReverieAdapter::connect(socket)
-            .expect("failed to connect Detcore SaBRe plugin to coordinator");
+        let adapter = RemoteReverieAdapter::<Detcore>::connect_with_root_initializer(
+            socket,
+            |config, pid, state| {
+                // This runs only after the existing inherited-fork decision, on
+                // the normally constructed guest root. No clocks/metadata are
+                // imported and no coordinator readiness event is manufactured.
+                let image = own_initial_image(pid.as_raw())?;
+                let mut bytes = [0; detcore::random::MAX_INITIAL_STATE_BYTES];
+                let count = sabre::bootstrap::take_state(&mut bytes)
+                    .map_err(io::Error::other)?
+                    .ok_or_else(|| {
+                        io::Error::other("required initial random handoff was not negotiated")
+                    })?;
+                match detcore::random::decode_loader_state(&bytes[..count], config, image)
+                    .map_err(io::Error::other)?
+                {
+                    detcore::random::LoaderState::InitialRandom { .. } => {
+                        state
+                            .apply_initial_random_state(&bytes[..count], config, image)
+                            .map_err(io::Error::other)?;
+                    }
+                    detcore::random::LoaderState::ObservedExecContinuation
+                    | detcore::random::LoaderState::InitialStaticLegacy => {
+                        // The held loader and supervisor proved this legacy
+                        // image. Preserve every normal constructor field and
+                        // let the existing post-exec callback run unchanged.
+                    }
+                }
+                Ok(())
+            },
+        )
+        .expect("failed to connect Detcore SaBRe plugin to coordinator");
 
         Self {
             adapter,
@@ -289,36 +388,31 @@ impl reverie_sabre::Tool for Plugin {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1214): Review libc getrandom function interception.
-    // GNU patch calls glibc's getrandom wrapper from libc, whose raw syscall
-    // site SaBRe deliberately does not rewrite. Route that wrapper through the
-    // same Detcore syscall handler used by rewritten guest call sites.
+    // Guest calls retain libc's algorithm, return/errno and domain without
+    // constructing the tool. Plugin calls use Linux directly so their native
+    // entropy cannot seed libc/vDSO opaque state later shared with the guest.
+    // Rewritten libc and initial dynamic-bootstrap vDSO syscall sites still
+    // intercept guest entropy; static/later-exec vDSO coverage is unchanged.
+    // Serving a guest public request directly from Detcore would bypass libc's
+    // key-refill/ChaCha path and change ptrace-parity bytes.
     #[detour(lib = "libc", func = "getrandom")]
     fn libc_getrandom(
         buffer: *mut libc::c_void,
         length: libc::size_t,
         flags: libc::c_uint,
     ) -> libc::ssize_t {
-        LIBC_GETRANDOM_ACTIVE.with(|active| {
-            if active.replace(true) {
-                return Self::libc_getrandom_undetoured(buffer, length, flags);
-            }
-            let _guard = DetourGuard(active);
+        if unsafe { sabre::ffi::calling_from_plugin() } {
+            // libc::syscall preserves the C return/errno convention and leaves
+            // the caller's domain intact. The kernel validates the buffer.
+            return unsafe {
+                libc::syscall(libc::SYS_getrandom, buffer, length, flags) as libc::ssize_t
+            };
+        }
+        Self::libc_getrandom_undetoured(buffer, length, flags)
+    }
 
-            let syscall = Syscall::from_raw(
-                Sysno::getrandom,
-                SyscallArgs::new(buffer as usize, length, flags as usize, 0, 0, 0),
-            );
-            match <Self as reverie_sabre::ToolGlobal>::global()
-                .adapter
-                .handle_syscall(syscall)
-            {
-                Ok(result) => result as libc::ssize_t,
-                Err(error) => {
-                    unsafe { *libc::__errno_location() = error.into_raw() };
-                    -1
-                }
-            }
-        })
+    fn supports_loader_bootstrap() -> bool {
+        true
     }
 
     fn new(_client: Self::Client) -> Self {
@@ -442,6 +536,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn initial_generation_accepts_raw_worker_comm_and_rejects_invalid_identity() {
+        struct RestoreComm {
+            tid: i32,
+            name: [u8; 16],
+        }
+        impl Drop for RestoreComm {
+            fn drop(&mut self) {
+                assert_eq!(unsafe { libc::syscall(libc::SYS_gettid) } as i32, self.tid);
+                assert_eq!(
+                    unsafe { libc::prctl(libc::PR_SET_NAME, self.name.as_ptr()) },
+                    0
+                );
+            }
+        }
+        // /proc/self/stat names the leader. Use this owned libtest worker's
+        // actual stat to exercise the same production parser without renaming
+        // the leader or claiming that an injected SaBRe guest was executed.
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+        let path = format!("/proc/{tid}/stat");
+        let expected = initial_image_generation(tid, &std::fs::read(&path).unwrap()).unwrap();
+        let mut restore = RestoreComm { tid, name: [0; 16] };
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_GET_NAME, restore.name.as_mut_ptr()) },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_NAME, c"raw) \xff) task".as_ptr()) },
+            0
+        );
+        let bytes = std::fs::read(path).unwrap();
+        assert!(bytes.len() <= 4096);
+        assert!(std::str::from_utf8(&bytes).is_err());
+        assert!(bytes.windows(12).any(|row| row == b"raw) \xff) task"));
+        assert_eq!(initial_image_generation(tid, &bytes).unwrap(), expected);
+        assert!(
+            initial_image_generation(tid + 1, &bytes)
+                .unwrap_err()
+                .to_string()
+                .contains("owner mismatch")
+        );
+        assert!(initial_image_generation(tid, b"missing delimiter").is_err());
+        let end = bytes.windows(2).rposition(|row| row == b") ").unwrap();
+        let mut fields: Vec<&[u8]> = bytes[end + 2..]
+            .split(u8::is_ascii_whitespace)
+            .filter(|field| !field.is_empty())
+            .collect();
+        let mut malformed = bytes[..end + 2].to_vec();
+        fields[19] = b"not-a-number";
+        malformed.extend(fields.join(&b' '));
+        assert!(initial_image_generation(tid, &malformed).is_err());
+        assert!(initial_image_generation(tid, &bytes[..end + 2]).is_err());
+        let owner_end = bytes.windows(2).position(|row| row == b" (").unwrap();
+        let mut malformed_owner = b"not-a-pid".to_vec();
+        malformed_owner.extend_from_slice(&bytes[owner_end..]);
+        assert!(initial_image_generation(tid, &malformed_owner).is_err());
+        drop(restore);
+    }
+
+    #[test]
     fn guest_comm_uses_target_basename_and_linux_limit() {
         assert_eq!(
             guest_comm_from_args(
@@ -478,6 +631,168 @@ mod tests {
             unsafe { CStr::from_ptr(detour.lib_name) }.to_bytes(),
             b"libc"
         );
+
+        use std::cell::Cell;
+
+        type Original = fn(*mut libc::c_void, libc::size_t, libc::c_uint) -> libc::ssize_t;
+        type Detour =
+            unsafe extern "C" fn(*mut libc::c_void, libc::size_t, libc::c_uint) -> libc::ssize_t;
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        struct Observation {
+            buffer: usize,
+            length: usize,
+            flags: libc::c_uint,
+            from_plugin: bool,
+            errno: libc::c_int,
+        }
+
+        thread_local! {
+            static EXPECTED_BUFFER: Cell<*mut libc::c_void> = const { Cell::new(std::ptr::null_mut()) };
+            static OBSERVED: Cell<Option<Observation>> = const { Cell::new(None) };
+            static CALLS: Cell<usize> = const { Cell::new(0) };
+        }
+
+        fn controlled_original(
+            buffer: *mut libc::c_void,
+            length: libc::size_t,
+            flags: libc::c_uint,
+        ) -> libc::ssize_t {
+            OBSERVED.set(Some(Observation {
+                buffer: buffer as usize,
+                length,
+                flags,
+                from_plugin: unsafe { sabre::ffi::calling_from_plugin() },
+                errno: unsafe { *libc::__errno_location() },
+            }));
+            CALLS.set(CALLS.get() + 1);
+            if flags == 0x8000_0001 {
+                unsafe { *libc::__errno_location() = libc::EINVAL };
+                return -1;
+            }
+            if length == 0 {
+                return 0;
+            }
+            // Do not dereference a pointer or extent corrupted by the wrapper;
+            // the caller's exact observation and output assertions report it.
+            if !buffer.is_null() && buffer == EXPECTED_BUFFER.get() && length == 16 && flags == 0 {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(b"libc-vd".as_ptr(), buffer.cast::<u8>(), 7);
+                }
+            }
+            7
+        }
+
+        struct RestoreThreadState {
+            from_plugin: bool,
+            errno: libc::c_int,
+        }
+
+        impl Drop for RestoreThreadState {
+            fn drop(&mut self) {
+                EXPECTED_BUFFER.set(std::ptr::null_mut());
+                unsafe {
+                    if self.from_plugin {
+                        sabre::ffi::enter_plugin();
+                    } else {
+                        sabre::ffi::exit_plugin();
+                    }
+                    *libc::__errno_location() = self.errno;
+                }
+            }
+        }
+
+        let _restore = RestoreThreadState {
+            from_plugin: unsafe { sabre::ffi::calling_from_plugin() },
+            errno: unsafe { *libc::__errno_location() },
+        };
+        // The macro stores Original's Rust signature and returns its C-ABI
+        // stub through SaBRe's erased function-pointer ABI. Exercise those
+        // generated functions, not a direct call to the detour body.
+        // This test alone installs the original; all probe state is per-thread.
+        let original = unsafe {
+            std::mem::transmute::<Original, sabre::ffi::void_void_fn>(
+                controlled_original as Original,
+            )
+        };
+        let stub = unsafe {
+            std::mem::transmute::<sabre::ffi::void_void_fn, Detour>((detour.icept_callback)(
+                original,
+            ))
+        };
+        unsafe { sabre::ffi::exit_plugin() };
+        for (length, flags, expected_result, expected_errno) in [
+            (16, 0, 7, libc::E2BIG),
+            (16, 0x8000_0001, -1, libc::EINVAL),
+            (0, 0, 0, libc::E2BIG),
+        ] {
+            let mut bytes = [0xa5u8; 16];
+            let buffer = if length == 0 {
+                std::ptr::null_mut()
+            } else {
+                bytes.as_mut_ptr().cast::<libc::c_void>()
+            };
+            EXPECTED_BUFFER.set(buffer);
+            OBSERVED.set(None);
+            CALLS.set(0);
+            unsafe { *libc::__errno_location() = libc::E2BIG };
+            let result = unsafe { stub(buffer, length, flags) };
+            let errno = unsafe { *libc::__errno_location() };
+            let domain_after = unsafe { sabre::ffi::calling_from_plugin() };
+            assert_eq!(CALLS.get(), 1);
+            assert_eq!(
+                OBSERVED.get(),
+                Some(Observation {
+                    buffer: buffer as usize,
+                    length,
+                    flags,
+                    from_plugin: false,
+                    errno: libc::E2BIG,
+                })
+            );
+            assert_eq!(result, expected_result);
+            assert_eq!(errno, expected_errno);
+            assert!(!domain_after);
+            let mut expected_bytes = [0xa5; 16];
+            if expected_result == 7 {
+                expected_bytes[..7].copy_from_slice(b"libc-vd");
+            }
+            assert_eq!(bytes, expected_bytes);
+            EXPECTED_BUFFER.set(std::ptr::null_mut());
+        }
+
+        unsafe { sabre::ffi::enter_plugin() };
+        for (length, flags, null_buffer, expected_result, expected_errno) in [
+            (16, 0, false, 16, libc::E2BIG),
+            (16, 0x8000_0001, false, -1, libc::EINVAL),
+            (0, 0, true, 0, libc::E2BIG),
+            (1, 0, true, -1, libc::EFAULT),
+        ] {
+            let mut bytes = [0xa5u8; 24];
+            let buffer = if null_buffer {
+                std::ptr::null_mut()
+            } else {
+                bytes[4..20].as_mut_ptr().cast::<libc::c_void>()
+            };
+            EXPECTED_BUFFER.set(buffer);
+            OBSERVED.set(None);
+            CALLS.set(0);
+            unsafe { *libc::__errno_location() = libc::E2BIG };
+            let result = unsafe { stub(buffer, length, flags) };
+            let errno = unsafe { *libc::__errno_location() };
+            let domain_after = unsafe { sabre::ffi::calling_from_plugin() };
+            assert_eq!(CALLS.get(), 0, "plugin entropy must bypass libc state");
+            assert_eq!(OBSERVED.get(), None);
+            assert_eq!(result, expected_result);
+            assert_eq!(errno, expected_errno);
+            assert!(domain_after);
+            assert_eq!(&bytes[..4], &[0xa5; 4]);
+            assert_eq!(&bytes[20..], &[0xa5; 4]);
+            if expected_result <= 0 {
+                assert_eq!(bytes, [0xa5; 24]);
+            }
+            EXPECTED_BUFFER.set(std::ptr::null_mut());
+        }
     }
 
     #[test]

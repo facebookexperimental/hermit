@@ -322,6 +322,7 @@ mod record_replay_path;
 mod recorder;
 mod replay;
 mod replayer;
+mod sabre_bootstrap;
 mod sabre_ptrace;
 mod script;
 
@@ -1576,6 +1577,9 @@ async fn run_sabre(
         .as_ref()
         .map_or(program.as_path(), |staged| staged.path.as_path());
 
+    let bootstrap_launch =
+        sabre_bootstrap::Launch::new(Path::new(&sabre), launch_program, &config)?;
+
     // This runs after Hermit enters the guest mount namespace, where `/tmp`
     // names the container-visible temporary filesystem. Do not inherit a
     // host-side nested TMPDIR: validation commonly sets TMPDIR=/tmp/<run>/tmp,
@@ -1604,6 +1608,10 @@ async fn run_sabre(
     ]);
     command.program(&sabre);
     command.env(SABRE_RPC_SOCKET_ENV, &socket_path);
+    command.env_remove(sabre_bootstrap::ENVIRONMENT);
+    if bootstrap_launch.initializes_random() {
+        command.env(sabre_bootstrap::ENVIRONMENT, "1");
+    }
     // Publish the configuration and clock RPC fingerprint for this coordinator.
     // The plugin is a separate artifact in the same target directory, so it can
     // be stale without looking it. Its check before connecting names the mismatch
@@ -1666,6 +1674,7 @@ async fn run_sabre(
         plugin.clone(),
         fallback_ready,
         global.clone(),
+        bootstrap_launch,
         capture_output,
     )
     .await

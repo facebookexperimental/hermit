@@ -12,7 +12,6 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
 
-use rand::RngExt as _;
 use reverie::Error;
 use reverie::Guest;
 use reverie::syscalls;
@@ -23,6 +22,14 @@ use reverie::syscalls::MemoryAccess;
 
 use crate::consts::DEFAULT_HOSTNAME;
 use crate::detlog;
+#[cfg(test)]
+use crate::random::GETRANDOM_MAX_BYTES;
+use crate::random::RANDOM_FILL_CHUNK_BYTES;
+#[cfg(test)]
+use crate::random::getrandom_request_len;
+#[cfg(test)]
+use crate::random::validate_getrandom_flags;
+use crate::random::write_random_chunk;
 use crate::record_or_replay::RecordOrReplay;
 use crate::tool_global::create_session;
 use crate::tool_global::set_process_group;
@@ -180,61 +187,8 @@ fn from_str(s: &str) -> [i8; 65] {
     ret
 }
 
-const GETRANDOM_ALLOWED_FLAGS: u32 = libc::GRND_NONBLOCK | libc::GRND_RANDOM | libc::GRND_INSECURE;
-
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(#545): Confirm getrandom flag, stream, and fault semantics.
-fn validate_getrandom_flags(flags: usize) -> Result<(), Errno> {
-    let flags = flags as u32;
-    let random = flags & libc::GRND_RANDOM != 0;
-    let insecure = flags & libc::GRND_INSECURE != 0;
-
-    if flags & !GETRANDOM_ALLOWED_FLAGS != 0 || (random && insecure) {
-        Err(Errno::EINVAL)
-    } else {
-        Ok(())
-    }
-}
-
-const RANDOM_FILL_CHUNK_BYTES: usize = 4096;
 const RANDOM_DEVICE_BYTE_STRIDE: u8 = 73;
 const RANDOM_DEVICE_FIRST_BYTE: u8 = 41;
-// Linux's import_ubuf clamps getrandom requests to MAX_RW_COUNT on x86_64.
-const GETRANDOM_MAX_BYTES: usize = (i32::MAX as usize) & !4095;
-
-fn getrandom_request_len(requested: usize) -> usize {
-    requested.min(GETRANDOM_MAX_BYTES)
-}
-
-fn write_random_chunk(
-    mut memory: impl MemoryAccess,
-    remote_buf: AddrMut<u8>,
-    local_buf: &[u8],
-) -> Result<usize, Errno> {
-    const PTRACE_WORD_SPLIT: usize = std::mem::size_of::<u64>() / 2;
-
-    if local_buf.len() != std::mem::size_of::<u64>() {
-        return memory.write(remote_buf, local_buf);
-    }
-
-    // safeptrace uses PTRACE_POKEDATA for exactly eight bytes, which bypasses guest page
-    // protections. Split that case so getrandom observes the same EFAULT boundary as Linux.
-    let first = memory.write(remote_buf, &local_buf[..PTRACE_WORD_SPLIT])?;
-    if first < PTRACE_WORD_SPLIT {
-        return Ok(first);
-    }
-    let Some(second_buf) = remote_buf
-        .as_raw()
-        .checked_add(PTRACE_WORD_SPLIT)
-        .and_then(AddrMut::<u8>::from_raw)
-    else {
-        return Ok(first);
-    };
-    match memory.write(second_buf, &local_buf[PTRACE_WORD_SPLIT..]) {
-        Ok(second) => Ok(first + second),
-        Err(_) => Ok(first),
-    }
-}
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-1096): Review the backend-independent random-device stream.
@@ -461,66 +415,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
-    /// Fill guest memory from the deterministic PRNG owned by the current thread.
-    pub(super) fn fill_random_bytes<G: Guest<Self>>(
-        &self,
-        guest: &mut G,
-        remote_buf: AddrMut<u8>,
-        len: usize,
-        source: &str,
-    ) -> Result<usize, Error> {
-        let mut local_words = [0_u64; RANDOM_FILL_CHUNK_BYTES / std::mem::size_of::<u64>()];
-        let mut hasher = DefaultHasher::new();
-        let mut written = 0;
-
-        while written < len {
-            let remote_chunk = match remote_buf
-                .as_raw()
-                .checked_add(written)
-                .and_then(AddrMut::<u8>::from_raw)
-            {
-                Some(address) => address,
-                None if written == 0 => return Err(Errno::EFAULT.into()),
-                None => break,
-            };
-            let chunk_len = (len - written).min(RANDOM_FILL_CHUNK_BYTES);
-            // safeptrace's 8-byte write fast path currently requires an aligned source buffer.
-            let local_buf = unsafe {
-                std::slice::from_raw_parts_mut(local_words.as_mut_ptr().cast::<u8>(), chunk_len)
-            };
-            guest.thread_state_mut().thread_prng().fill(local_buf);
-            let n = match write_random_chunk(guest.memory(), remote_chunk, local_buf) {
-                Ok(n) => n,
-                Err(_) if written > 0 => break,
-                Err(error) => return Err(error.into()),
-            };
-            if n == 0 {
-                if written == 0 {
-                    return Err(Errno::EFAULT.into());
-                }
-                break;
-            }
-            if cfg!(debug_assertions) {
-                Hash::hash_slice(&local_buf[..n], &mut hasher);
-            }
-            written += n;
-            if n < chunk_len {
-                break;
-            }
-        }
-
-        if cfg!(debug_assertions) {
-            detlog!(
-                "[dtid {}] USER RAND [{}] Filled guest memory with {} random bytes, hash of bytes: {}",
-                guest.thread_state().dettid,
-                source,
-                written,
-                hasher.finish()
-            );
-        }
-        Ok(written)
-    }
-
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1096): Review the backend-independent random-device stream.
     /// Fill guest memory from the canonical stream used by every backend's
@@ -559,7 +453,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .saturating_add(index as u64),
                 );
             }
-            let n = match write_random_chunk(guest.memory(), remote_chunk, local_buf) {
+            let n = match write_random_chunk(&mut guest.memory(), remote_chunk, local_buf) {
                 Ok(n) => n,
                 Err(_) if written > 0 => break,
                 Err(error) => return Err(error.into()),
@@ -627,16 +521,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Getrandom,
     ) -> Result<i64, Error> {
-        validate_getrandom_flags(call.flags())?;
-        let len = getrandom_request_len(call.buflen());
-        if len == 0 {
-            return Ok(0);
-        }
-
-        let buf = call.buf().ok_or(Errno::EFAULT)?;
-
-        let n = self.fill_random_bytes(guest, buf, len, "getrandom")?;
-        Ok(n as i64)
+        let memory = guest.memory();
+        let dettid = guest.thread_state().dettid;
+        crate::random::getrandom(guest.thread_state_mut().thread_prng(), memory, dettid, call)
+            .map_err(Into::into)
     }
 
     /// setsid system call
