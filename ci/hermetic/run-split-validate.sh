@@ -335,27 +335,52 @@ if [[ $do_fetch -eq 1 ]]; then
     # the root lock does not include every member of either workspace.
     (
         cd "$ROOT"
+        # Keep Cargo's executable name (possibly a rustup symlink) while making
+        # a relative PATH entry independent of the neutral Agent Utils cwd.
+        cargo_bin=$(command -v cargo)
+        [[ "$cargo_bin" == /* ]] || cargo_bin="$PWD/$cargo_bin"
+        # Cargo falls back to Git's proxy before consulting the operational
+        # environment. A private Cargo home can expose a different Git route.
+        # Preserve explicit Cargo settings (including empty values), then use
+        # libcurl's HTTPS environment order. HTTP-only settings stay HTTP-only.
+        # Query in each child's actual cwd: Agent Utils intentionally uses /.
+        host_fetch() (
+            proxy=${https_proxy:-${HTTPS_PROXY:-}}
+            if [[ -z ${CARGO_HTTP_PROXY+x} && -n $proxy ]]; then
+                if ! configured=$("$cargo_bin" -Zunstable-options config get --format json 2>/dev/null |
+                    jq -r 'if type != "object" then error("invalid Cargo config")
+                           else (.http // {}) | if type != "object" then error("invalid http config")
+                           else has("proxy") end end'); then
+                    echo 'run-split-validate: cannot inspect Cargo proxy configuration; refusing host fetch.' >&2
+                    exit 2
+                fi
+                case $configured in
+                    true) ;; # Cargo's own setting takes precedence, even "".
+                    false) export CARGO_HTTP_PROXY="$proxy" ;;
+                    *) echo 'run-split-validate: invalid Cargo proxy configuration query result.' >&2; exit 2 ;;
+                esac
+            fi
+            "$@"
+        )
         for manifest in "${FETCH_MANIFESTS[@]}"; do
             if [[ "$manifest" == agent-utils/rs/Cargo.toml ]]; then
                 # Match rs/bin/cargo-runner's Cargo configuration scope. Cargo
                 # discovers config from its process cwd, not --manifest-path;
                 # Hermit's target/toolchain config must not redirect this fetch.
-                # Resolve paths before leaving the repository, retaining cargo's
-                # executable name (it may be a rustup symlink).
+                # Resolve the Cargo home before leaving the repository. The
+                # config query and fetch share both cwd and target environment.
                 (
-                    cargo_bin=$(command -v cargo)
-                    [[ "$cargo_bin" == /* ]] || cargo_bin="$PWD/$cargo_bin"
                     absolute_cargo_home=$(realpath -- "$cargo_home")
                     cd /
-                    env -u CARGO_BUILD_TARGET -u CARGO_TARGET_DIR \
-                        CARGO_HOME="$absolute_cargo_home" "$cargo_bin" fetch --locked \
+                    unset CARGO_BUILD_TARGET CARGO_TARGET_DIR
+                    CARGO_HOME="$absolute_cargo_home" host_fetch "$cargo_bin" fetch --locked \
                         --manifest-path "$ROOT/$manifest"
                 )
             else
-                CARGO_HOME="$cargo_home" cargo fetch --locked --manifest-path "$manifest"
+                CARGO_HOME="$cargo_home" host_fetch cargo fetch --locked --manifest-path "$manifest"
             fi
         done
-        CARGO_HOME="$cargo_home" ./ci/prepare-rust-scripts.sh --fetch-only
+        CARGO_HOME="$cargo_home" host_fetch ./ci/prepare-rust-scripts.sh --fetch-only
     )
     echo ":::: FETCH PHASE complete -- every byte checked against its Cargo.lock"
 fi
