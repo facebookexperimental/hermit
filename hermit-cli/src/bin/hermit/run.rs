@@ -4083,11 +4083,27 @@ impl RunOpts {
         capture_output: bool,
         guest_capture: Option<&GuestRunCaptureSession>,
     ) -> Result<(ExitStatus, Option<Output>), Error> {
+        // main has reserved startup stdin before this can allocate a descriptor.
+        // Keep the unlinked output open through the real container fork; its
+        // controller-local proc-fd spelling is constructed only inside it.
+        let summary_output = if guest_capture.is_some() && self.summary_json.is_some() {
+            Some(super::staged_summary::private_output(
+                &private_summary_dir()?,
+            )?)
+        } else {
+            None
+        };
         if self.no_namespace {
             let mut process = Container::new();
             apply_affinity(&mut process, self.pin_threads);
             return with_container(&mut process, || {
-                self.run_in_container(global, capture_output, guest_capture, None)
+                self.run_in_container(
+                    global,
+                    capture_output,
+                    guest_capture,
+                    summary_output.as_ref(),
+                    None,
+                )
             });
         }
 
@@ -4100,6 +4116,7 @@ impl RunOpts {
                 global,
                 capture_output,
                 guest_capture,
+                summary_output.as_ref(),
                 Some(&identity_sources),
             )
         })
@@ -4888,6 +4905,7 @@ impl RunOpts {
         global: &GlobalOpts,
         capture_output: bool,
         guest_capture: Option<&GuestRunCaptureSession>,
+        summary_output: Option<&File>,
         identity_sources: Option<&IdentityGuard>,
     ) -> Result<(ExitStatus, Option<Output>), Error> {
         let _guard = global.init_tracing();
@@ -4938,32 +4956,39 @@ impl RunOpts {
         self.save_config_to_disk()?;
 
         let timeout = self.run_timeout();
-        if capture_output || (guest_capture.is_some() && backend == Backend::Kvm) {
-            let out = hermit::run_with_output_backend_timeout(
-                command,
-                config,
-                self.summary,
-                &self.summary_json,
-                backend,
-                timeout,
-            )?;
-            if let Some(capture) = guest_capture {
-                capture.write_kvm_virtual_console(&out.stdout, &out.stderr)?;
-                Ok((out.status, None))
-            } else {
-                Ok((out.status, Some(out)))
-            }
-        } else {
-            let status = hermit::run_with_backend_timeout(
-                command,
-                config,
-                self.summary,
-                &self.summary_json,
-                backend,
-                timeout,
-            )?;
-            Ok((status, None))
-        }
+        super::staged_summary::with_published_summary(
+            summary_output,
+            self.summary_json.as_deref(),
+            guest_capture,
+            |summary_json| {
+                if capture_output || (guest_capture.is_some() && backend == Backend::Kvm) {
+                    let out = hermit::run_with_output_backend_timeout(
+                        command,
+                        config,
+                        self.summary,
+                        summary_json,
+                        backend,
+                        timeout,
+                    )?;
+                    if let Some(capture) = guest_capture {
+                        capture.write_kvm_virtual_console(&out.stdout, &out.stderr)?;
+                        Ok((out.status, None))
+                    } else {
+                        Ok((out.status, Some(out)))
+                    }
+                } else {
+                    let status = hermit::run_with_backend_timeout(
+                        command,
+                        config,
+                        self.summary,
+                        summary_json,
+                        backend,
+                        timeout,
+                    )?;
+                    Ok((status, None))
+                }
+            },
+        )
     }
 
     fn run_verify_in_container(

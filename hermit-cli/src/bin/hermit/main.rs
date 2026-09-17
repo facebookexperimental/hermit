@@ -39,6 +39,7 @@ mod replay;
 mod run;
 mod run_evidence;
 mod schedule_search;
+mod staged_summary;
 mod strace;
 mod tracing;
 mod verify;
