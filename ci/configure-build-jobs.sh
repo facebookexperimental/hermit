@@ -244,8 +244,19 @@ fi
 # The range also includes the paused-counter API change before the vFile fix.
 # This is source identity, not a new timing sample or Hermit test receipt;
 # fresh Rust build and unchanged selected CLI validation remain required.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != d87a03a312421d34dee81dae71aa395b40231e63 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie d87a03a312421d34dee81dae71aa395b40231e63 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO a2cc1868 (2026-09-17): the private-loader fallback changes
+# core/unix/loader.c; build.rs, CMake targets/options and MAX_PARALLEL_JOBS=16
+# remain unchanged. The default native recipe key therefore changes to
+# 0aa6d84239b5a04b7cda124ebed4c7e3adc8b62f5b4c96011a9b971e90d6b0a4.
+# A genuine local content-key MISS built in 27.71s at jobs=4 (110.84 job-seconds)
+# under 4 CPU / 8 GiB bounds. This supports retaining the existing 1050
+# effective-job-second threshold and 16-job clamp; it is not a replacement
+# hosted-runner calibration or a claim of unchanged recipe bytes.
+# The same pin also carries stricter RPC partial-header EOF classification;
+# it does not select the new mapped transport. Fresh Hermit build and original
+# unit assertions remain required; native loader fixtures are not guest evidence.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != a2cc1868795b19ae77e55242d614c43116e42609 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie a2cc1868795b19ae77e55242d614c43116e42609 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

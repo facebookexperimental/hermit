@@ -204,7 +204,18 @@ fi
 # c9c1ee55257cbb0635b56f494a75ee1dc6af839ca8e289231f533b0208340463.
 # This is source identity, not a new timing sample or a validation receipt;
 # fresh Hermit validation is required for the runtime and API changes.
-expected_pin=d87a03a312421d34dee81dae71aa395b40231e63
+# CARRY TO a2cc1868 (2026-09-17): the private-loader fallback changes
+# core/unix/loader.c; build.rs, CMake targets/options and MAX_PARALLEL_JOBS=16
+# remain unchanged. The default native recipe key therefore changes to
+# 0aa6d84239b5a04b7cda124ebed4c7e3adc8b62f5b4c96011a9b971e90d6b0a4.
+# A genuine local content-key MISS built in 27.71s at jobs=4 (110.84 job-seconds)
+# under 4 CPU / 8 GiB bounds. This supports retaining the existing 1050
+# effective-job-second threshold and 16-job clamp; it is not a replacement
+# hosted-runner calibration or a claim of unchanged recipe bytes.
+# The same pin also carries stricter RPC partial-header EOF classification;
+# it does not select the new mapped transport. Fresh Hermit build and original
+# unit assertions remain required; native loader fixtures are not guest evidence.
+expected_pin=a2cc1868795b19ae77e55242d614c43116e42609
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
@@ -269,6 +280,6 @@ export REVERIE_DBT_BUDGET_BOUND_PIN
 # shellcheck source=ci/configure-build-jobs.sh
 source "$ROOT_DIR/ci/configure-build-jobs.sh" reverie-dbt-budget-child
 
-echo "run-with-reverie-dbt-budget.sh: reverie-dbt-budget={pin:$REVERIE_DBT_BUDGET_BOUND_PIN,source:$REVERIE_DBT_BUILD_JOBS_SOURCE,raw-build-jobs:$REVERIE_DBT_RAW_BUILD_JOBS,effective-cpus-source:$REVERIE_DBT_EFFECTIVE_CPUS_SOURCE,effective-cpus:$REVERIE_DBT_EFFECTIVE_CPUS,reverie-max-jobs:$REVERIE_DBT_MAX_PARALLEL_JOBS,effective-native-jobs:$REVERIE_DBT_EFFECTIVE_BUILD_JOBS,effective-job-seconds:$REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBT_MAX_BUILD_SECONDS,basis:github-portable-cold-miss-n3-affinity4,carried-to-pin-on-dynamorio-recipe-key:c9c1ee55257cbb0635b56f494a75ee1dc6af839ca8e289231f533b0208340463}" >&2
+echo "run-with-reverie-dbt-budget.sh: reverie-dbt-budget={pin:$REVERIE_DBT_BUDGET_BOUND_PIN,source:$REVERIE_DBT_BUILD_JOBS_SOURCE,raw-build-jobs:$REVERIE_DBT_RAW_BUILD_JOBS,effective-cpus-source:$REVERIE_DBT_EFFECTIVE_CPUS_SOURCE,effective-cpus:$REVERIE_DBT_EFFECTIVE_CPUS,reverie-max-jobs:$REVERIE_DBT_MAX_PARALLEL_JOBS,effective-native-jobs:$REVERIE_DBT_EFFECTIVE_BUILD_JOBS,effective-job-seconds:$REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBT_MAX_BUILD_SECONDS,basis:github-portable-cold-miss-n3-affinity4,carried-to-pin-on-dynamorio-recipe-key:0aa6d84239b5a04b7cda124ebed4c7e3adc8b62f5b4c96011a9b971e90d6b0a4}" >&2
 
 exec "$@"
