@@ -2854,15 +2854,13 @@ fn repo_root() -> Result<PathBuf, String> {
 
 fn derive(root: &Path) -> Result<Derived, String> {
     let output = Command::new("cargo")
-        .args([
-            "run",
-            "--quiet",
-            "-p",
-            "hermit-manifest-plan",
-            "--",
-            "--format",
-            "matrix-json",
-        ])
+        .args(["run", "--quiet", "-p", "hermit-manifest-plan"])
+        // This helper embeds its source root. Keep each checkout's executable
+        // separate even when parallel audits inherit one CARGO_TARGET_DIR.
+        // This intentionally overrides external targets for this helper only.
+        .arg("--target-dir")
+        .arg(root.join("target"))
+        .args(["--", "--format", "matrix-json"])
         .current_dir(root)
         .output()
         .map_err(|e| format!("cannot run hermit-manifest-plan: {e}"))?;
@@ -12426,6 +12424,17 @@ red/`measured-and-passed` count is **0**.",
     }
 
     let command_root = repo_root()?;
+    // Establish the normal helper through its real producer before any clone
+    // invocation. The comparison below checks retained bytes, not the identity
+    // of every concurrently executing process.
+    derive(&command_root)?;
+    let command_helper = command_root.join("target/debug/hermit-manifest-plan");
+    let helper_sha256 = |path: &Path| -> Result<String, String> {
+        let bytes = fs::read(path)
+            .map_err(|error| format!("cannot read manifest helper {}: {error}", path.display()))?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    };
+    let command_helper_before = helper_sha256(&command_helper)?;
     let command_before = read_generated_files(&command_root)?;
     let empty_results = tempfile::tempdir()
         .map_err(|e| format!("cannot create empty result directory fixture: {e}"))?;
@@ -12601,11 +12610,26 @@ red/`measured-and-passed` count is **0**.",
         child
             .args([command, "--results"])
             .arg(&result_root)
+            // Reproduce the shared target inherited by the parallel audits.
+            // The common derive boundary must still select the clone's target.
+            .env("CARGO_TARGET_DIR", command_root.join("target"))
             .current_dir(&result_command_root);
         if let Some(summary) = summary {
             child.arg("--current-summary").arg(summary);
         }
         child.output().map_err(|e| e.to_string())
+    };
+    let require_separate_clone_helper = || -> Result<(), String> {
+        let clone_helper = result_command_root.join("target/debug/hermit-manifest-plan");
+        let clone_sha256 = helper_sha256(&clone_helper)?;
+        if helper_sha256(&command_helper)? != command_helper_before {
+            return Err("clone manifest generation changed the real checkout helper bytes".into());
+        }
+        eprintln!(
+            "scorecard clone manifest helper: {} sha256={clone_sha256}; real helper sha256={command_helper_before} unchanged",
+            clone_helper.display()
+        );
+        Ok(())
     };
     let has_current_replay = |cells: &TrackedCells| {
         cells.cells.iter().any(|cell| {
@@ -12642,6 +12666,7 @@ red/`measured-and-passed` count is **0**.",
             String::from_utf8_lossy(&observe_output.stderr)
         ));
     }
+    require_separate_clone_helper()?;
     let first_observe = read_generated_files(&result_command_root)?;
     fs::write(reverie_root.join("fixture"), "advanced\n").map_err(|e| e.to_string())?;
     commit("advance sibling")?;
@@ -12670,6 +12695,7 @@ red/`measured-and-passed` count is **0**.",
     combined_baseline_cells.projection = None;
     refresh_measurement(&mut combined_baseline_cells);
     let combined_derived = derive(&result_command_root)?;
+    require_separate_clone_helper()?;
     let combined_baseline = generated_files(&combined_derived, &combined_baseline_cells)?;
     fs::write(
         result_command_root.join(SCORECARD),
