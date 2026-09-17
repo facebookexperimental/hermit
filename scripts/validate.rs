@@ -1340,6 +1340,91 @@ fn strict_flag_missing_from(argv: &[String]) -> bool {
         .any(|arg| arg == STRICT_EXECUTION_FLAG)
 }
 
+fn assert_submodule_fixture_source(
+    root: &Path,
+    checkout: &Path,
+    expected_agent_utils: &str,
+) -> Result<(), String> {
+    // A prepared original-root driver must describe this clone's source and AU
+    // API. Compare actual tracked bytes and Git executable/symlink modes after
+    // the existing development overlay; do not equate a cache name with source.
+    let tracked = Command::new("git")
+        .args(["ls-files", "--stage", "-z"])
+        .current_dir(root)
+        .output()
+        .map_err(|error| {
+            format!("submodule service result: cannot list original source: {error}")
+        })?;
+    if !tracked.status.success() {
+        return Err("submodule service result: original source listing failed".into());
+    }
+    use std::os::unix::fs::PermissionsExt;
+    for entry in tracked
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let entry = std::str::from_utf8(entry)
+            .map_err(|error| format!("submodule service result: invalid source entry: {error}"))?;
+        let (metadata, relative) = entry
+            .split_once('\t')
+            .ok_or("submodule service result: malformed source entry")?;
+        if metadata.starts_with("160000 ") {
+            continue;
+        }
+        let original = root.join(relative);
+        let copied = checkout.join(relative);
+        let same = (|| -> std::io::Result<bool> {
+            let a = std::fs::symlink_metadata(&original)?;
+            let b = std::fs::symlink_metadata(&copied)?;
+            if a.file_type().is_symlink() || b.file_type().is_symlink() {
+                return Ok(a.file_type().is_symlink()
+                    && b.file_type().is_symlink()
+                    && std::fs::read_link(&original)? == std::fs::read_link(&copied)?);
+            }
+            Ok(a.is_file()
+                && b.is_file()
+                && a.permissions().mode() & 0o111 == b.permissions().mode() & 0o111
+                && std::fs::read(&original)? == std::fs::read(&copied)?)
+        })()
+        .map_err(|error| format!("submodule service result: cannot compare {relative}: {error}"))?;
+        if !same {
+            return Err(format!(
+                "submodule service result: original source differs from fixture: {relative}"
+            ));
+        }
+    }
+    let original_au = root.join("agent-utils");
+    let original_pin = Command::new("git")
+        .args(["rev-parse", "--verify", "HEAD^{commit}"])
+        .current_dir(&original_au)
+        .output()
+        .map_err(|error| {
+            format!("submodule service result: cannot inspect original AU pin: {error}")
+        })?;
+    let original_status = Command::new("git")
+        .args([
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ])
+        .current_dir(&original_au)
+        .output()
+        .map_err(|error| {
+            format!("submodule service result: cannot inspect original AU source: {error}")
+        })?;
+    if !original_pin.status.success()
+        || !original_status.status.success()
+        || String::from_utf8_lossy(&original_pin.stdout).trim() != expected_agent_utils
+        || !original_status.stdout.is_empty()
+    {
+        return Err("submodule service result: original AU source differs from the clean recorded fixture pin".into());
+    }
+
+    Ok(())
+}
+
 /// Exercise the real bootstrap boundary around the first DAG node.
 ///
 /// With agent-utils populated, the Rust driver can start and a missing rr
@@ -1350,6 +1435,7 @@ fn strict_flag_missing_from(argv: &[String]) -> bool {
 fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, String> {
     fn run_fixture(
         checkout: &Path,
+        prepared_source_root: Option<&Path>,
         result: &Path,
         ledger: &Path,
     ) -> Result<std::process::Output, String> {
@@ -1374,10 +1460,13 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
         }
         let mut command = Command::new("timeout");
         command
+            .args(["--signal=TERM", "300"])
+            .arg(
+                prepared_source_root
+                    .unwrap_or(checkout)
+                    .join("scripts/validate.rs"),
+            )
             .args([
-                "--signal=TERM",
-                "300",
-                "./scripts/validate.rs",
                 ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION,
                 SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_OPTION,
                 "--only",
@@ -1412,13 +1501,17 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
             .env_remove(TOOL_BOOTSTRAP_SHA256_ENV)
             .env_remove(validate_runtime::ACTIVE_ENV)
             .env_remove("CI_HUB_VALIDATE_LOCK_OWNER_PID")
-            .env_remove("CI_HUB_VALIDATE_LOCK_OWNER_FILE")
-            // This fixture deliberately exercises the pre-driver bootstrap in
-            // an independent checkout. It must compile that copied driver with
-            // the real rust-script so a missing path dependency remains visible
-            // instead of consuming this checkout's prepared executable.
-            .env_remove("HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED")
-            .env_remove("HERMIT_RUST_SCRIPT_ARTIFACT_ROOT");
+            .env_remove("CI_HUB_VALIDATE_LOCK_OWNER_FILE");
+        if prepared_source_root.is_none() {
+            // Only the missing-agent-utils case tests copied-source compilation.
+            // It must reach real rust-script, not a prepared executable.
+            command
+                .env_remove("HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED")
+                .env_remove("HERMIT_RUST_SCRIPT_ARTIFACT_ROOT");
+        }
+        // The missing-rr case retains normal producer selection for the
+        // original-root script. Its RUN entrypoint (never this process's
+        // potentially libtest current_exe) still discovers the fixture via cwd.
         let output = command
             .output()
             .map_err(|error| format!("submodule service result: cannot launch fixture: {error}"))?;
@@ -1551,7 +1644,7 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
     }
 
     let bootstrap_result = fixture.path().join("bootstrap-result.json");
-    let bootstrap = run_fixture(&checkout, &bootstrap_result, ledger.path())?;
+    let bootstrap = run_fixture(&checkout, None, &bootstrap_result, ledger.path())?;
     let bootstrap_output = format!(
         "{}{}",
         String::from_utf8_lossy(&bootstrap.stdout),
@@ -1596,8 +1689,10 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
         "checkout the recorded agent-utils pin",
     )?;
 
+    assert_submodule_fixture_source(root, &checkout, &expected_agent_utils)?;
+
     let result_path = fixture.path().join("service-result.json");
-    let output = run_fixture(&checkout, &result_path, ledger.path())?;
+    let output = run_fixture(&checkout, Some(root), &result_path, ledger.path())?;
     let rendered = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -23072,6 +23167,120 @@ mod shared_consumer_tests {
 #[cfg(test)]
 mod submodule_service_tests {
     use super::*;
+
+    #[test]
+    fn source_and_agent_utils_mismatches_refuse_prepared_reuse() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::symlink;
+
+        fn git(root: &Path, args: &[&str]) -> String {
+            let output = Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=validate fixture",
+                    "-c",
+                    "user.email=validate-fixture@example.invalid",
+                ])
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("source");
+        let copied = temp.path().join("copied");
+        std::fs::create_dir(&root).unwrap();
+        git(&root, &["init", "--quiet"]);
+        std::fs::write(root.join("payload"), b"same source\n").unwrap();
+        std::fs::set_permissions(root.join("payload"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        symlink("payload", root.join("link")).unwrap();
+        git(&root, &["add", "--", "payload", "link"]);
+        git(
+            &root,
+            &["commit", "--quiet", "-m", "source binding fixture"],
+        );
+        git(
+            temp.path(),
+            &["clone", "--quiet", "--no-local", "source", "copied"],
+        );
+
+        let au = root.join("agent-utils");
+        std::fs::create_dir(&au).unwrap();
+        git(&au, &["init", "--quiet"]);
+        std::fs::write(au.join("api"), b"recorded API\n").unwrap();
+        git(&au, &["add", "--", "api"]);
+        git(&au, &["commit", "--quiet", "-m", "recorded API fixture"]);
+        let pin = git(&au, &["rev-parse", "HEAD"]);
+        assert_submodule_fixture_source(&root, &copied, &pin).unwrap();
+
+        let source_refusal = "submodule service result: original source differs from fixture: ";
+        std::fs::write(copied.join("payload"), b"different source\n").unwrap();
+        assert_eq!(
+            assert_submodule_fixture_source(&root, &copied, &pin).unwrap_err(),
+            format!("{source_refusal}payload")
+        );
+        std::fs::write(copied.join("payload"), b"same source\n").unwrap();
+        std::fs::set_permissions(
+            copied.join("payload"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        assert_eq!(
+            assert_submodule_fixture_source(&root, &copied, &pin).unwrap_err(),
+            format!("{source_refusal}payload")
+        );
+        std::fs::set_permissions(
+            copied.join("payload"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        std::fs::remove_file(copied.join("link")).unwrap();
+        symlink("other-target", copied.join("link")).unwrap();
+        assert_eq!(
+            assert_submodule_fixture_source(&root, &copied, &pin).unwrap_err(),
+            format!("{source_refusal}link")
+        );
+        std::fs::remove_file(copied.join("link")).unwrap();
+        symlink("payload", copied.join("link")).unwrap();
+        assert_submodule_fixture_source(&root, &copied, &pin).unwrap();
+
+        let au_refusal =
+            "submodule service result: original AU source differs from the clean recorded fixture pin";
+        std::fs::write(au.join("api"), b"uncommitted API\n").unwrap();
+        assert_eq!(
+            assert_submodule_fixture_source(&root, &copied, &pin).unwrap_err(),
+            au_refusal
+        );
+        std::fs::write(au.join("api"), b"recorded API\n").unwrap();
+        std::fs::write(au.join("untracked-api"), b"untracked API\n").unwrap();
+        assert_eq!(
+            assert_submodule_fixture_source(&root, &copied, &pin).unwrap_err(),
+            au_refusal
+        );
+        std::fs::remove_file(au.join("untracked-api")).unwrap();
+        git(
+            &au,
+            &[
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "different recorded API revision",
+            ],
+        );
+        assert_eq!(
+            assert_submodule_fixture_source(&root, &copied, &pin).unwrap_err(),
+            au_refusal
+        );
+        let changed_pin = git(&au, &["rev-parse", "HEAD"]);
+        assert_submodule_fixture_source(&root, &copied, &changed_pin).unwrap();
+    }
 
     #[test]
     fn independent_fixture_keeps_missing_submodule_diagnosis_with_outer_run_state() {
