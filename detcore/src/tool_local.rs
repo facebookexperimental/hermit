@@ -1084,6 +1084,70 @@ mod file_metadata_tests {
                 .expect("discovered stdout should be tracked"),
             Some(ResourceID::Device(Device::ContainerStdout))
         );
+
+        // Observe real metadata transitions without closing the test process's
+        // stdio. The narrow repair preserves slot identities for inherited
+        // resources and leaves aliases above fd 2 in the ordinary inode pool.
+        use crate::syscalls::deterministic_stdio_inode_for_resource;
+
+        let inherited_stat = metadata
+            .with_detfd(libc::STDOUT_FILENO, |detfd| detfd.stat().unwrap())
+            .unwrap();
+        metadata.dup_fd(1, 7, OFlag::empty()).unwrap();
+        assert_eq!(
+            metadata.with_detfd(7, |detfd| detfd.resource()).unwrap(),
+            Some(ResourceID::Device(Device::ContainerStdout))
+        );
+        assert_eq!(
+            metadata
+                .with_detfd(7, |detfd| {
+                    deterministic_stdio_inode_for_resource(7, detfd.resource())
+                })
+                .unwrap(),
+            None
+        );
+        for fd in 0..=2 {
+            metadata.remove_fd(fd);
+            let mut ordinary = inherited_stat;
+            ordinary.inode = 123 + fd as u64;
+            metadata
+                .add_fd(owner, fd, OFlag::empty(), FdType::Regular, Some(ordinary))
+                .unwrap();
+            metadata.dup_fd(fd, 8, OFlag::empty()).unwrap();
+            for ordinary_fd in [fd, 8] {
+                assert_eq!(
+                    metadata
+                        .with_detfd(ordinary_fd, |detfd| {
+                            deterministic_stdio_inode_for_resource(ordinary_fd, detfd.resource())
+                        })
+                        .unwrap(),
+                    None
+                );
+            }
+            assert_eq!(
+                metadata
+                    .with_detfd(fd, |detfd| detfd.open_file_id())
+                    .unwrap(),
+                metadata
+                    .with_detfd(8, |detfd| detfd.open_file_id())
+                    .unwrap()
+            );
+            metadata.dup_fd(7, fd, OFlag::empty()).unwrap();
+            assert_eq!(
+                metadata
+                    .with_detfd(fd, |detfd| {
+                        deterministic_stdio_inode_for_resource(fd, detfd.resource())
+                    })
+                    .unwrap(),
+                Some(DetInode::mint(1000 + fd as u64)),
+                "inherited streams retain the existing numeric-slot outcome"
+            );
+        }
+        metadata.dup_fd(7, 9, OFlag::O_CLOEXEC).unwrap();
+        let child = metadata.fork_for(DetTid::from_raw(10));
+        let after_exec = child.for_exec(DetTid::from_raw(10));
+        assert!(!after_exec.file_handles.contains_key(&9));
+        assert!(after_exec.file_handles.contains_key(&7));
     }
 
     #[test]

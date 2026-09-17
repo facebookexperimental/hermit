@@ -44,7 +44,7 @@ use tracing::info;
 use tracing::trace;
 use tracing::warn;
 
-use super::deterministic_stdio_inode;
+use super::deterministic_stdio_inode_for_resource;
 use crate::config::SchedHeuristic;
 use crate::dirents::*;
 use crate::fd::*;
@@ -1245,13 +1245,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_target_fd())?;
         let fdinfo_identity = if let Some(target_fd) = target_fd {
-            let (cached_stat, logical_flags, open_file_id, fd_type) =
+            let (cached_stat, logical_flags, open_file_id, fd_type, inode_override) =
                 guest.thread_state().with_detfd(target_fd, |detfd| {
                     (
                         detfd.stat(),
                         detfd.status_flags(),
                         detfd.open_file_id(),
                         detfd.ty(),
+                        deterministic_stdio_inode_for_resource(target_fd, detfd.resource()),
                     )
                 })?;
             let raw_inode = match cached_stat {
@@ -1261,7 +1262,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     stat.st_ino
                 }
             };
-            let virtual_inode = match deterministic_stdio_inode(target_fd) {
+            let virtual_inode = match inode_override {
                 Some(inode) => inode,
                 None => determinize_inode(guest, raw_inode).await.0,
             };
@@ -1370,10 +1371,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             for fd in libc::STDIN_FILENO..=libc::STDERR_FILENO {
                 let cached = guest
                     .thread_state()
-                    .with_detfd(fd, |detfd| detfd.stat().map(|stat| stat.inode))
+                    .with_detfd(fd, |detfd| {
+                        let inode = deterministic_stdio_inode_for_resource(fd, detfd.resource())?;
+                        detfd.stat().map(|stat| (stat.inode, inode))
+                    })
                     .ok()
                     .flatten();
-                if let (Some(raw), Some(det)) = (cached, deterministic_stdio_inode(fd)) {
+                if let Some((raw, det)) = cached {
                     stdio_by_raw_inode.insert(raw, det);
                 }
             }
@@ -2662,7 +2666,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             guest.inject(Syscall::from(call)).await?;
             let statptr = call.stat().ok_or(Errno::EFAULT)?;
             let inode_override = match call {
-                StatFamily::Fstat(call) => deterministic_stdio_inode(call.fd()),
+                StatFamily::Fstat(call) => guest
+                    .thread_state()
+                    .with_detfd(call.fd(), |detfd| {
+                        deterministic_stdio_inode_for_resource(call.fd(), detfd.resource())
+                    })
+                    .ok()
+                    .flatten(),
                 _ => None,
             };
             let mut memory = guest.memory();

@@ -26,6 +26,7 @@ use reverie::syscalls::ReadAddr;
 use reverie::syscalls::Syscall;
 
 use super::deterministic_stdio_inode;
+use super::deterministic_stdio_inode_for_resource;
 use crate::record_or_replay::RecordOrReplay;
 use crate::tool_global::determinize_inode;
 use crate::tool_local::Detcore;
@@ -183,7 +184,8 @@ fn anonymous_proc_fd_identity(target: &[u8]) -> Option<AnonymousProcFdIdentity> 
     None
 }
 
-/// Match a raw identity against cached current-process stdio identities.
+/// Match a raw identity against cached current-process inherited-stdio identities.
+/// Callers exclude ordinary replacement objects before filling this array.
 ///
 /// Iterating in fd order deliberately matches the last-insert-wins behavior of
 /// the maps sanitizer's `stdio_by_raw_inode` table when stdio descriptors alias.
@@ -228,7 +230,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         for fd in libc::STDIN_FILENO..=libc::STDERR_FILENO {
             stdio_raw_inodes[fd as usize] = guest
                 .thread_state()
-                .with_detfd(fd, |detfd| detfd.stat().map(|stat| stat.inode))
+                .with_detfd(fd, |detfd| {
+                    deterministic_stdio_inode_for_resource(fd, detfd.resource())?;
+                    detfd.stat().map(|stat| stat.inode)
+                })
                 .ok()
                 .flatten();
         }
@@ -300,7 +305,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                 libc::S_IFSOCK => "socket",
                 _ => return Ok(result),
             };
-            let inode = match deterministic_stdio_inode(fd) {
+            let inode_override = guest
+                .thread_state()
+                .with_detfd(fd, |detfd| {
+                    deterministic_stdio_inode_for_resource(fd, detfd.resource())
+                })
+                .ok()
+                .flatten();
+            let inode = match inode_override {
                 Some(inode) => inode,
                 None => determinize_inode(guest, stat.st_ino).await.0,
             };

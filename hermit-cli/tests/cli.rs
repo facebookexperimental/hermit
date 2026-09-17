@@ -55,6 +55,7 @@ static DBT_LOG_ENV_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_INERT_RUNTIME: OnceLock<PathBuf> = OnceLock::new();
 static EXEC_CLOCK_CONTINUITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_LSEEK_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static STDIO_INODE_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FORK_CHILD_GETRANDOM_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
@@ -444,6 +445,31 @@ stdout:
 {}
 stderr:
 {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn stdio_inode_identity_guest() -> &'static Path {
+    STDIO_INODE_IDENTITY_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("stdio-inode-identity");
+        fs::create_dir_all(&build_root).expect("failed to create stdio-inode build directory");
+        let guest = build_root.join("stdio_inode_identity");
+        let output = Command::new("cc")
+            .args(["-O2", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/fixtures/stdio_inode_identity.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile stdio-inode fixture");
+        assert!(
+            output.status.success(),
+            "stdio-inode fixture compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -3416,6 +3442,45 @@ fn run_kvm_preserves_closed_standard_input() {
             .to_ascii_lowercase()
             .contains("bad file descriptor")
     );
+
+    // Keep the original loader/closed-stdin assertion above. These additional
+    // controls start with stdin open, then exercise object identity after the
+    // program's entry point, independently of that historical loader failure.
+    // The fixture's complete-stat-routes mode retains the separate followed
+    // proc-fd stat control; this test explicitly selects descriptor reuse.
+    let guest = stdio_inode_identity_guest();
+    let mode = "descriptor-reuse";
+    let expected = format!("stdio-inode-{mode}-ok\n");
+    let native_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create native stdio-inode workdir");
+    let native = Command::new(guest)
+        .arg(mode)
+        .current_dir(native_dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run native stdio-inode control");
+    assert!(native.status.success(), "native {mode} control: {native:?}");
+    assert_eq!(stdout(&native), expected);
+    assert_eq!(stderr(&native), "");
+    for backend in ["ptrace", "kvm"] {
+        let args = [
+            "run",
+            "--backend",
+            backend,
+            "--strict",
+            "--base-env=minimal",
+            "--",
+        ];
+        let output = hermit_command(&args)
+            .arg(guest)
+            .arg(mode)
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run stdio-inode identity fixture");
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{backend} {mode}");
+        assert_eq!(stderr(&output), "", "{backend} {mode}");
+    }
 }
 
 #[test]
