@@ -2109,7 +2109,7 @@ async fn run_kvm(
     let completion = backend
         .run_static_elf_with_tool_completion::<Detcore>(config, capture_output)
         .await
-        .context("KVM guest execution failed before global state recovery")?;
+        .map_err(|error| kvm_execution_error(error, None))?;
     let cleanup_started = Instant::now();
     let result =
         finish_kvm_tool_completion(completion, print_summary, print_summary_to_json_file).await;
@@ -2153,11 +2153,41 @@ async fn finish_kvm_tool_completion(
     print_summary: bool,
     print_summary_to_json_file: &Option<PathBuf>,
 ) -> Result<(i32, Vec<u8>, Vec<u8>), Error> {
-    completion
-        .global_state
-        .clean_up(print_summary, print_summary_to_json_file)
-        .await;
-    completion.result.context("KVM guest execution failed")
+    match completion.result {
+        Ok(output) => {
+            completion
+                .global_state
+                .clean_up(print_summary, print_summary_to_json_file)
+                .await;
+            Ok(output)
+        }
+        Err(error) => {
+            let cleanup = completion
+                .global_state
+                .clean_up_after_backend_failure()
+                .await;
+            Err(kvm_execution_error(error, Some(cleanup)))
+        }
+    }
+}
+
+fn kvm_execution_error(
+    primary: reverie_kvm::Error,
+    cleanup: Option<detcore::BackendFailureCleanup>,
+) -> Error {
+    // The manifest runner retains the first Error line. Keep the cause there,
+    // as well as the typed backend and optional scheduler errors in the chain.
+    let message = format!("KVM guest execution failed: {primary}");
+    let mut error = Error::new(primary);
+    if let Some(cleanup) = cleanup {
+        if let Err(recording) = cleanup.preemption_recording {
+            error = error.context(format!("partial preemption recording failed: {recording}"));
+        }
+        if let Err(scheduler) = cleanup.scheduler {
+            error = error.context(scheduler);
+        }
+    }
+    error.context(message)
 }
 
 #[cfg(test)]

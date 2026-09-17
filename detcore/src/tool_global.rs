@@ -145,6 +145,14 @@ struct PendingExecState {
     fd_blocking: ExecFdBlockingOverrides,
 }
 
+/// Separate terminal cleanup outcomes; neither replaces the backend failure.
+pub struct BackendFailureCleanup {
+    /// Natural scheduler completion, retaining a task panic or cancellation.
+    pub scheduler: Result<(), tokio::task::JoinError>,
+    /// The requested partial recording's write result; no destination is success.
+    pub preemption_recording: Result<(), String>,
+}
+
 #[derive(Clone, Copy)]
 struct RpcIncarnation {
     dettid: DetTid,
@@ -703,6 +711,39 @@ impl GlobalState {
         }
     }
 
+    /// Consume failed-run state after the scheduler has naturally finished.
+    ///
+    /// A failed run has no successful run summary. Preserve the scheduler's
+    /// join error and any requested partial preemption recording's write error
+    /// for the caller, without allowing either to replace the backend failure.
+    pub async fn clean_up_after_backend_failure(mut self) -> BackendFailureCleanup {
+        let scheduler = if let Some(handle) = self.sched_handle.take() {
+            handle.await
+        } else {
+            Ok(())
+        };
+        // A scheduler panic can poison this mutex. Its JoinError is returned
+        // below; recovering only to finish output must not replace that error.
+        let writer = self
+            .sched
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .preemption_writer
+            .take();
+        let preemption_recording = if self.cfg.record_preemptions_to.is_some() {
+            writer.map_or(Ok(()), |writer| writer.flush())
+        } else {
+            // The writer's destination is fixed from this same configuration.
+            // In-memory-only recordings have no Drop write to finish.
+            drop(writer);
+            Ok(())
+        };
+        BackendFailureCleanup {
+            scheduler,
+            preemption_recording,
+        }
+    }
+
     /// Shut down anything running, in particular wait on the scheduler.
     ///
     /// This is basically the destructor for the global state, but is here rather than in the
@@ -880,7 +921,9 @@ impl GlobalTool for GlobalState {
                     "deregistration must belong to its sender"
                 );
                 assert_eq!(owner.mm, request_mm, "deregistration must retain its MmId");
-                if !sched.thread_was_registered(dtid) {
+                // DBT can reject StartNewThread before parent registration.
+                // Its tombstone still needs the existing final accounting path.
+                if !sched.thread_was_registered(dtid) && !sched.thread_is_logically_killed(dtid) {
                     assert!(
                         sched.backend_failed() || !owner.thread_start_entered,
                         "a started thread must have a scheduler registration before deregistration"

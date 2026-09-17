@@ -37,6 +37,14 @@ async fn kvm_failed_completion_cleans_unstarted_scheduler_and_retains_typed_caus
     .await
     .expect("failure completion must naturally finish the daemon");
     let error = result.expect_err("failure is not a guest status");
+    assert!(
+        format!("Error: {error}")
+            .lines()
+            .next()
+            .unwrap()
+            .contains("KVM guest execution failed: invalid KVM root guest PID -17"),
+        "the manifest runner retains only the first Error line"
+    );
     let backend = error
         .downcast_ref::<reverie_kvm::Error>()
         .expect("typed backend cause");
@@ -70,6 +78,158 @@ async fn kvm_normal_completion_preserves_status_and_output() {
             .unwrap(),
         (37, b"stdout\n".to_vec(), b"stderr\n".to_vec()),
     );
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("summary.json");
+    let completion = reverie_kvm::ToolRunCompletion {
+        global_state: detcore::GlobalState::init_global_state(&config).await,
+        result: Ok((37, b"stdout\n".to_vec(), b"stderr\n".to_vec())),
+    };
+    assert_eq!(
+        finish_kvm_tool_completion(completion, false, &Some(path.clone()))
+            .await
+            .unwrap(),
+        (37, b"stdout\n".to_vec(), b"stderr\n".to_vec()),
+    );
+    let bytes = std::fs::read(path).unwrap();
+    let summary: detcore_model::summary::RunSummary = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        bytes,
+        (serde_json::to_string_pretty(&summary).unwrap() + "\n").as_bytes()
+    );
+}
+
+#[tokio::test]
+async fn kvm_failed_completion_never_publishes_a_success_summary() {
+    let directory = tempfile::tempdir().unwrap();
+    let absent = directory.path().join("absent.json");
+    let existing = directory.path().join("existing.json");
+    std::fs::write(&existing, b"existing summary\n").unwrap();
+    let unwritable = directory.path().join("directory");
+    std::fs::create_dir(&unwritable).unwrap();
+    for path in [&absent, &existing, &unwritable] {
+        let config = DetConfig {
+            sequentialize_threads: true,
+            ..DetConfig::default()
+        };
+        let global_state = detcore::GlobalState::init_global_state(&config).await;
+        global_state.report_backend_failure(reverie::BackendFailure {
+            pid: reverie::Pid::from_raw(17),
+            tid: reverie::Pid::from_raw(18),
+            phase: "failed summary publication control",
+        });
+        let completion = reverie_kvm::ToolRunCompletion {
+            global_state,
+            result: Err(reverie_kvm::Error::InvalidGuestPid(-17)),
+        };
+        let error = tokio::time::timeout(
+            Duration::from_millis(100),
+            finish_kvm_tool_completion(completion, true, &Some(path.clone())),
+        )
+        .await
+        .expect("failure cleanup must finish naturally")
+        .expect_err("an unwritable summary must not replace the backend failure");
+        assert!(matches!(
+            error.downcast_ref::<reverie_kvm::Error>(),
+            Some(reverie_kvm::Error::InvalidGuestPid(-17))
+        ));
+        assert_eq!(
+            error.to_string(),
+            "KVM guest execution failed: invalid KVM root guest PID -17"
+        );
+    }
+    assert!(!absent.exists());
+    assert_eq!(std::fs::read(existing).unwrap(), b"existing summary\n");
+    assert!(unwritable.is_dir());
+    assert_eq!(std::fs::read_dir(unwritable).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn kvm_failed_completion_preserves_requested_partial_preemption_recording() {
+    let directory = tempfile::tempdir().unwrap();
+    let writable = directory.path().join("preemptions.json");
+    let unwritable = directory.path().join("directory");
+    std::fs::create_dir(&unwritable).unwrap();
+    for path in [None, Some(writable.clone()), Some(unwritable.clone())] {
+        let config = DetConfig {
+            sequentialize_threads: true,
+            record_preemptions: true,
+            record_preemptions_to: path.clone(),
+            ..DetConfig::default()
+        };
+        let global_state = detcore::GlobalState::init_global_state(&config).await;
+        global_state.report_backend_failure(reverie::BackendFailure {
+            pid: reverie::Pid::from_raw(17),
+            tid: reverie::Pid::from_raw(18),
+            phase: "partial preemption recording control",
+        });
+        let completion = reverie_kvm::ToolRunCompletion {
+            global_state,
+            result: Err(reverie_kvm::Error::InvalidGuestPid(-17)),
+        };
+        let error = tokio::time::timeout(
+            Duration::from_millis(100),
+            finish_kvm_tool_completion(completion, false, &None),
+        )
+        .await
+        .expect("failure cleanup must finish naturally")
+        .expect_err("recording cleanup must retain the backend failure");
+        assert!(matches!(
+            error.downcast_ref::<reverie_kvm::Error>(),
+            Some(reverie_kvm::Error::InvalidGuestPid(-17))
+        ));
+        assert_eq!(
+            error.to_string(),
+            "KVM guest execution failed: invalid KVM root guest PID -17"
+        );
+        assert_eq!(
+            format!("{error:#}").contains("partial preemption recording failed:"),
+            path.as_ref() == Some(&unwritable)
+        );
+    }
+    let bytes = std::fs::read(writable).unwrap();
+    let _: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(unwritable.is_dir());
+}
+
+#[tokio::test]
+async fn kvm_failure_error_retains_scheduler_recording_and_primary_causes() {
+    let scheduler = tokio::spawn(async { panic!("scheduler cleanup control") })
+        .await
+        .expect_err("the control must supply a real JoinError");
+    let error = kvm_execution_error(
+        reverie_kvm::Error::InvalidGuestPid(-17),
+        Some(detcore::BackendFailureCleanup {
+            scheduler: Err(scheduler),
+            preemption_recording: Err("recording control".to_owned()),
+        }),
+    );
+    assert_eq!(
+        error.to_string(),
+        "KVM guest execution failed: invalid KVM root guest PID -17"
+    );
+    assert!(matches!(
+        error.downcast_ref::<reverie_kvm::Error>(),
+        Some(reverie_kvm::Error::InvalidGuestPid(-17))
+    ));
+    assert!(
+        error
+            .downcast_ref::<tokio::task::JoinError>()
+            .unwrap()
+            .is_panic()
+    );
+    assert!(
+        format!("{error:#}").contains("partial preemption recording failed: recording control")
+    );
+    let unrecovered = kvm_execution_error(reverie_kvm::Error::InvalidGuestPid(-19), None);
+    assert_eq!(
+        unrecovered.to_string(),
+        "KVM guest execution failed: invalid KVM root guest PID -19"
+    );
+    assert!(matches!(
+        unrecovered.downcast_ref::<reverie_kvm::Error>(),
+        Some(reverie_kvm::Error::InvalidGuestPid(-19))
+    ));
 }
 
 #[cfg(feature = "kvm-native-test-support")]

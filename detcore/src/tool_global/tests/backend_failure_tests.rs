@@ -10,6 +10,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
+use std::time::SystemTime;
 
 use futures::Future;
 use reverie::ExitStatus;
@@ -525,6 +526,155 @@ async fn unknown_deregistration(
 #[should_panic(expected = "a started thread must have a scheduler registration")]
 async fn ordinary_unknown_started_owner_is_not_acknowledged_as_unstarted() {
     unknown_deregistration(19, 19, 17, 17, true).await;
+}
+
+#[tokio::test]
+async fn dbt_missing_physical_id_start_preserves_tombstone_deregistration_accounting() {
+    let config = Config {
+        sequentialize_threads: true,
+        cancel_killed_thread_rpcs: true,
+        backend_requires_thread_directed_process_signals: true,
+        ..Config::default()
+    };
+    let state = GlobalState::initialize(&config, false);
+    let tid = DetTid::from_raw(19);
+    let process = DetPid::from_raw(17);
+    let mm = MmId::initial(process);
+    // Exercise the real DBT defensive refusal before CreateChildThread. Do
+    // not install a registration or fabricate a logical tombstone in the test.
+    let response = tokio::time::timeout(
+        Duration::from_millis(100),
+        state.receive_rpc(
+            Tid::from_raw(tid.as_raw()),
+            (
+                DetTime::new(&config),
+                mm,
+                GlobalRequest::StartNewThread(tid, process, None),
+            ),
+        ),
+    )
+    .await
+    .expect("a missing physical ID must not wait for parent registration");
+    assert_eq!(response, (None, GlobalResponse::ThreadExited));
+    {
+        let sched = state.sched.lock().unwrap();
+        assert!(!sched.backend_failed());
+        assert!(!sched.thread_was_registered(tid));
+        assert!(sched.thread_is_logically_killed(tid));
+    }
+    let before = serde_json::to_value(&*state.global_time.lock().unwrap()).unwrap();
+    let mut stats = TimesliceStats::default();
+    stats.record(7);
+    // Distinct final and duplicate payloads prove that the consuming RPC
+    // reaches existing accounting exactly once, rather than an early reply.
+    for count in [17, 99] {
+        let response = state
+            .receive_rpc(
+                Tid::from_raw(tid.as_raw()),
+                (
+                    DetTime::new(&config),
+                    mm,
+                    GlobalRequest::DeregisterThread(ThreadDeregistration {
+                        dettid: tid,
+                        detpid: process,
+                        mm,
+                        thread_start_entered: true,
+                        timeslice_stats: stats,
+                        syscall_count: count,
+                        chaos_epochs: Vec::new(),
+                    }),
+                ),
+            )
+            .await;
+        assert_eq!(response, (None, GlobalResponse::DeregisterThread(())));
+        let mut sched = state.sched.lock().unwrap();
+        assert!(!sched.note_deregistration_accounted(tid));
+        assert_eq!(sched.per_thread_timeslice.get(&tid), Some(&stats));
+        assert_eq!(sched.per_thread_syscalls.get(&tid), Some(&17));
+        assert!(!sched.next_turns.contains_key(&tid));
+        assert_eq!(sched.turn, 0);
+    }
+    assert_eq!(
+        serde_json::to_value(&*state.global_time.lock().unwrap()).unwrap(),
+        before
+    );
+}
+
+#[tokio::test]
+async fn backend_failure_cleanup_does_not_build_an_invalid_run_summary() {
+    let config = Config {
+        sequentialize_threads: true,
+        ..Config::default()
+    };
+    let future = SystemTime::now() + Duration::from_secs(60);
+    let mut premise = GlobalState::initialize(&config, false);
+    premise.realtime_start = future;
+    assert!(premise.into_run_summary().is_err());
+    let directory = tempfile::tempdir().unwrap();
+    let recording = directory.path().join("partial-preemptions.json");
+    let config = Config {
+        record_preemptions: true,
+        record_preemptions_to: Some(recording.clone()),
+        ..config
+    };
+    let mut state = GlobalState::initialize(&config, true);
+    state.realtime_start = future;
+    let tid = DetTid::from_raw(17);
+    let time = LogicalTime::from_nanos(37);
+    {
+        let mut sched = state.sched.lock().unwrap();
+        let writer = sched.preemption_writer.as_mut().unwrap();
+        writer.register_thread(tid, DEFAULT_PRIORITY);
+        writer.insert_reprioritization(tid, time, 23, DEFAULT_PRIORITY, DEFAULT_PRIORITY + 1);
+    }
+    assert!(!recording.exists());
+    state.report_backend_failure(failure(tid));
+    let cleanup = tokio::time::timeout(
+        Duration::from_millis(100),
+        state.clean_up_after_backend_failure(),
+    )
+    .await
+    .expect("the failed daemon must finish naturally");
+    assert!(cleanup.scheduler.is_ok());
+    assert!(cleanup.preemption_recording.is_ok());
+    let actual: crate::preemptions::PreemptionRecord =
+        serde_json::from_slice(&std::fs::read(recording).unwrap()).unwrap();
+    actual.validate().unwrap();
+    let mut expected = crate::preemptions::ThreadHistory::new()
+        .with_prio_changes(vec![(time, DEFAULT_PRIORITY)])
+        .with_preemption_rcbs(vec![23]);
+    expected.final_prio = DEFAULT_PRIORITY + 1;
+    assert_eq!(
+        actual.extract_all(),
+        std::collections::BTreeMap::from([(tid, expected)])
+    );
+    assert!(actual.schedevents().is_empty());
+}
+
+#[tokio::test]
+async fn backend_failure_cleanup_retains_panicked_scheduler_and_recording_error() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = Config {
+        sequentialize_threads: true,
+        record_preemptions: true,
+        record_preemptions_to: Some(directory.path().to_path_buf()),
+        ..Config::default()
+    };
+    let mut state = GlobalState::initialize(&config, false);
+    let sched = state.sched.clone();
+    state.sched_handle = Some(tokio::spawn(async move {
+        let _lock = sched.lock().unwrap();
+        panic!("scheduler cleanup control");
+    }));
+    let cleanup = tokio::time::timeout(
+        Duration::from_millis(100),
+        state.clean_up_after_backend_failure(),
+    )
+    .await
+    .expect("the owned task must finish without an abort");
+    assert!(cleanup.scheduler.unwrap_err().is_panic());
+    assert!(cleanup.preemption_recording.is_err());
+    assert!(directory.path().is_dir());
 }
 
 #[tokio::test]

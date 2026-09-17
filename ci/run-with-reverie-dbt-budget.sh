@@ -292,6 +292,15 @@ fi
 # Preserve CMAKE/CMAKE_GENERATOR selection, the 1050 effective-job-second
 # threshold and the 16-job clamp. This is a source-identity carry,
 # not a new timing calibration or Hermit guest result.
+# CARRY TO c8f4ca9d (2026-09-17): the landed KVM failure-notification repair
+# https://github.com/rrnewton/reverie/pull/577 preserves the SDK recipe from
+# 526c21cf: build.rs blob 0ff8ae24b97464044735ba79ea74765ba4ac3ff0 and
+# DynamoRIO vendor tree 42dd83f76cef3e730c39d2313c11fdc78d12ae35 are identical.
+# Root Cargo.toml, rust-toolchain.toml and the third-party gitlink also match.
+# CMAKE remains the default cmake and CMAKE_GENERATOR remains unset, retaining
+# SDK key 0aa6d84239b5a04b7cda124ebed4c7e3adc8b62f5b4c96011a9b971e90d6b0a4,
+# the 16-job clamp and 1050 effective-job-second threshold. This is source
+# evidence for carrying the build budget, not a new timing or runtime result.
 # CARRY TO 7d863ab3 (2026-09-17): the landed KVM cleanup correction
 # https://github.com/rrnewton/reverie/pull/578 changes only reverie-kvm/src/vm.rs.
 # The build.rs blob 0ff8ae24b97464044735ba79ea74765ba4ac3ff0, DynamoRIO

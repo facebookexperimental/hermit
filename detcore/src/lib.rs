@@ -118,6 +118,7 @@ pub use scheduler::Priority;
 pub use scheduler::runqueue::DEFAULT_PRIORITY;
 pub use scheduler::runqueue::FIRST_PRIORITY;
 pub use scheduler::runqueue::LAST_PRIORITY;
+pub use tool_global::BackendFailureCleanup;
 pub use tool_global::GlobalState;
 use tool_global::ThreadDeregistration;
 use tool_global::acknowledge_robust_list_exit_time;
