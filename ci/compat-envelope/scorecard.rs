@@ -3383,7 +3383,10 @@ fn encoded_cells(cells: &TrackedCells) -> Result<String, String> {
                 .collect();
         }
     }
-    let mut text = serde_json::to_string_pretty(&normalised)
+    // Retained observations must fit the repository's per-file size limit.
+    // Compact typed serialization preserves every field and its order while
+    // removing only JSON formatting whitespace.
+    let mut text = serde_json::to_string(&normalised)
         .map_err(|e| format!("cannot serialize tracked cells: {e}"))?;
     text.push('\n');
     Ok(text)
@@ -10984,6 +10987,15 @@ red/`measured-and-passed` count is **0**.",
             String::from_utf8_lossy(&clone.stderr).trim()
         ));
     }
+    // The clone contains committed data, while the executable may contain an
+    // uncommitted serialization change. Encode the fixture with this writer
+    // before recording its baseline; the command must still require exact bytes.
+    let fixture_cells: TrackedCells = read_json(&result_command_root.join(CELLS))?;
+    fs::write(
+        result_command_root.join(CELLS),
+        encoded_cells(&fixture_cells)?,
+    )
+    .map_err(|e| format!("cannot encode result-command fixture cells: {e}"))?;
     let git_ok = |repo: &Path, args: &[&str]| -> Result<(), String> {
         let status = Command::new("git")
             .args(args)
