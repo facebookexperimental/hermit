@@ -1558,6 +1558,7 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
     for relative in [
         ".config/nextest.toml",
         "Makefile",
+        "ci/compat/corpus-strict.json",
         "ci/dag/validate.json",
         "ci/manifest-plan/src/runner.rs",
         "ci/manifest-plan/src/service_result.rs",
@@ -1592,6 +1593,7 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
                 "--",
                 ".config/nextest.toml",
                 "Makefile",
+                "ci/compat/corpus-strict.json",
                 "ci/dag/validate.json",
                 "ci/manifest-plan/src/runner.rs",
                 "ci/manifest-plan/src/service_result.rs",
@@ -9058,6 +9060,133 @@ fn prepare_fixtures_node(_tag: &str, fixtures: &Path) -> dagrun::model::Step {
     prepare_fixtures_node_dep(_tag, fixtures, "compatprep.hermit_release")
 }
 
+/// Exercise both sides of the fixture-path boundary without a Hermit binary:
+/// the outer shell expands the run state, then env -i removes it before the
+/// unmodified guest argv executes. This is an argv/environment bracket, not a
+/// substitute for the real strict-verify comparator.
+fn compat_fixture_operand_bracket(root: &Path, committed: &[&Step]) -> Result<String, String> {
+    let fixture = tempfile::Builder::new()
+        .prefix("validate-compat-operand-")
+        .tempdir()
+        .map_err(|error| format!("compat fixture operand: cannot create fixture: {error}"))?;
+    let run_state = fixture.path().join("run state ' \" \\ $missing `false`");
+    let fixtures = run_state.join("strict-compat/real-compat-fixtures");
+    let guest_tmp = fixture.path().join("guest-tmp");
+    for path in [&fixtures, &guest_tmp] {
+        std::fs::create_dir_all(path)
+            .map_err(|error| format!("compat fixture operand: cannot create directory: {error}"))?;
+    }
+    let readme = fixtures.join("README.md");
+    std::fs::write(&readme, "the actual run-owned fixture\n")
+        .map_err(|error| format!("compat fixture operand: cannot write README: {error}"))?;
+    let metadata = std::fs::metadata(&readme)
+        .map_err(|error| format!("compat fixture operand: cannot stat README: {error}"))?;
+    let root_text = root.to_string_lossy();
+    let fixtures_text = fixtures.to_string_lossy();
+    let tmp_text = guest_tmp.to_string_lossy();
+    let paths = validate_corpus::CorpusPaths {
+        root_dir: &root_text,
+        real_compat_fixtures: &fixtures_text,
+        validation_tmp_dir: &tmp_text,
+        shell_build_dir: &tmp_text,
+    };
+    let only = BTreeSet::from(["chown".to_string(), "install".to_string()]);
+    let constructed = validate_plan::compat_nodes_for(
+        root,
+        validate_plan::CompatMode::PortableStrict,
+        "fixture-hermit",
+        "unused",
+        &paths,
+        None,
+        Some(&only),
+        None,
+    )?;
+    let mut commands = Vec::new();
+    for label in ["chown", "install"] {
+        for (kind, nodes) in [
+            ("constructed", constructed.iter().collect::<Vec<_>>()),
+            ("committed", committed.to_vec()),
+        ] {
+            let node = nodes
+                .iter()
+                .find(|node| node.job == label)
+                .ok_or_else(|| format!("compat fixture operand: missing {kind} {label}"))?;
+            let (_, guest) = node.cmd.split_once(" -- ").ok_or_else(|| {
+                format!(
+                    "compat fixture operand: missing guest boundary: {}",
+                    node.cmd
+                )
+            })?;
+            if !guest.contains("\"$1\"") || guest.contains("--env VALIDATE_RUN_STATE") {
+                return Err(format!(
+                    "compat fixture operand: {kind} {label} lost positional fixture"
+                ));
+            }
+            if kind == "committed"
+                && !guest.contains(
+                    "\"$VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures/README.md\"",
+                )
+            {
+                return Err(format!(
+                    "compat fixture operand: {label} lost outer path quoting: {guest}"
+                ));
+            }
+            commands.push((kind, label, guest.to_string()));
+        }
+    }
+    let run = |guest: &str| -> Result<std::process::Output, String> {
+        Command::new("bash").args(["-eu", "-c", &format!(
+            "exec env -i PATH=/usr/bin:/bin HOME=/root TMPDIR=\"$COMPAT_GUEST_TMP\" bash -c 'test \"${{VALIDATE_RUN_STATE+x}}\" != x || exit 91; exec \"$@\"' compat-env {guest}",
+        )])
+            .env_clear().env("PATH", "/usr/bin:/bin")
+            .env("VALIDATE_RUN_STATE", &run_state).env("COMPAT_GUEST_TMP", &guest_tmp)
+            .current_dir(fixture.path()).output()
+            .map_err(|error| format!("compat fixture operand: cannot run clean guest: {error}"))
+    };
+    for (kind, label, guest) in &commands {
+        let output = run(guest)?;
+        let expected = if *label == "chown" {
+            format!("{}:{}\n", metadata.uid(), metadata.gid())
+        } else {
+            format!("640 {}\n", metadata.len())
+        };
+        if !output.status.success() || output.stdout != expected.as_bytes() {
+            return Err(format!(
+                "compat fixture operand: {kind} {label} failed: status={} stdout={:?} stderr={:?}, expected={expected:?}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            ));
+        }
+        // Restore the old defect inside the single-quoted shell body. The
+        // parent still has the variable; only the guest is correctly stripped.
+        let old = guest.replace(
+            "\"$1\"",
+            "\"$VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures/README.md\"",
+        );
+        let output = run(&old)?;
+        if output.status.success()
+            || !String::from_utf8_lossy(&output.stderr)
+                .contains("VALIDATE_RUN_STATE: unbound variable")
+        {
+            return Err(format!(
+                "compat fixture operand: {kind} {label} did not reject the old guest expansion"
+            ));
+        }
+    }
+    std::fs::remove_file(&readme).map_err(|error| {
+        format!("compat fixture operand: cannot remove negative fixture: {error}")
+    })?;
+    for (kind, label, guest) in &commands {
+        if run(guest)?.status.success() {
+            return Err(format!(
+                "compat fixture operand: {kind} {label} passed with its actual fixture missing"
+            ));
+        }
+    }
+    Ok("compat fixture operand: constructed + committed chown/install preserve clean guest environment, literal paths, owner/mode/size; old expansion and missing fixture fail".into())
+}
+
 /// Exercise committed strict-compatibility nodes through the real outer
 /// scheduler without running the corpus.
 ///
@@ -9143,6 +9272,7 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
                 .into(),
         );
     }
+    println!("  {}", compat_fixture_operand_bracket(root, &probes)?);
     let fixture_readme = "$VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures/README.md";
     let readme_labels = probes
         .iter()

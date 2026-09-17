@@ -334,6 +334,44 @@ pub fn shell_join<I: IntoIterator<Item = S>, S: AsRef<str>>(argv: I) -> String {
         .join(" ")
 }
 
+/// A fixture passed as a positional argument to `bash -c` is expanded by the
+/// outer shell, before Hermit clears the guest environment. Keep it double-quoted
+/// so the generated DAG's later `$VALIDATE_RUN_STATE` substitution is expanded
+/// once without word splitting. Literal shell metacharacters in constructed paths
+/// must still survive unchanged; the placeholder is inserted after this quoting.
+fn shell_quote_fixture_operand(path: &str) -> String {
+    let mut quoted = String::from("\"");
+    for ch in path.chars() {
+        if matches!(ch, '\\' | '"' | '$' | '`') {
+            quoted.push('\\');
+        }
+        quoted.push(ch);
+    }
+    quoted.push('"');
+    quoted
+}
+
+fn compat_guest_command(row: &validate_corpus::CorpusRow, paths: &CorpusPaths) -> String {
+    row.argv
+        .iter()
+        .enumerate()
+        .map(|(index, arg)| {
+            // bash -c SCRIPT NAME ARG...: only explicit fixture operands get this
+            // treatment. Never interpolate the script body or alter ordinary argv.
+            if index >= 4
+                && row.argv[0] == "bash"
+                && row.argv[1] == "-c"
+                && Path::new(arg).starts_with(paths.real_compat_fixtures)
+            {
+                shell_quote_fixture_operand(arg)
+            } else {
+                shell_quote(arg)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The always-on preflight gates and the manifest-audit binary producer, as DAG nodes.
 ///
 /// Submodule verification is deliberately non-mutating and first. Initializing
@@ -639,13 +677,12 @@ pub fn compat_nodes_for(
         }
         let mut argv: Vec<String> = vec![hermit_bin.to_string()];
         argv.extend(mode.run_args(&row.label, nsswitch));
-        argv.extend(row.argv.iter().cloned());
         let wall = wall_override.unwrap_or_else(|| mode.timeout_for(&row.label));
         out.push(node(
             "compat",
             &sanitize_job(&row.label),
             &format!("{} compatibility: {}", mode.display_name(), row.label),
-            format!("{} </dev/null", shell_join(&argv)),
+            format!("{} {} </dev/null", shell_join(&argv), compat_guest_command(&row, paths)),
             gate_dep.map(|d| vec![d.to_string()]).unwrap_or_default(),
             wall,
             COMPAT_CPU_TIMEOUT_S.max(wall),

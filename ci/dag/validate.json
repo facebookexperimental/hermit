@@ -27588,7 +27588,7 @@
         "full",
         "portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/target/ci/hermit-strict run --strict --verify --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --mount=type=tmpfs,target=/test --workdir=/test --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; f=$(mktemp); printf \"owner\\n\" >\"$f\"; chown --reference=$VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures/README.md \"$f\"; stat -c \"%u:%g\" \"$f\"; rm -f \"$f\"' </dev/null",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/target/ci/hermit-strict run --strict --verify --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --mount=type=tmpfs,target=/test --workdir=/test --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; f=$(mktemp); printf \"owner\\n\" >\"$f\"; chown --reference=\"$1\" \"$f\"; stat -c \"%u:%g\" \"$f\"; rm -f \"$f\"' compat-chown \"$VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures/README.md\" </dev/null",
       "result_manifests": [],
       "deps": [
         "compatprep.fixtures",
@@ -28043,7 +28043,7 @@
         "full",
         "portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/target/ci/hermit-strict run --strict --verify --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --mount=type=tmpfs,target=/test --workdir=/test --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; d=$(mktemp -d); install -m 640 $VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures/README.md \"$d/copied\"; stat -c \"%a %s\" \"$d/copied\"; rm -rf \"$d\"' </dev/null",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/target/ci/hermit-strict run --strict --verify --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --mount=type=tmpfs,target=/test --workdir=/test --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; d=$(mktemp -d); install -m 640 \"$1\" \"$d/copied\"; stat -c \"%a %s\" \"$d/copied\"; rm -rf \"$d\"' compat-install \"$VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures/README.md\" </dev/null",
       "result_manifests": [],
       "deps": [
         "compatprep.fixtures",
@@ -34410,7 +34410,7 @@
       "labels": [
         "portable-strict-compat-only"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env NEXTEST_TEST_THREADS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/target/release/hermit run --strict --verify --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --mount=type=tmpfs,target=/test --workdir=/test --env TMPDIR=/tmp -- bash -c '\\''set -euo pipefail; f=$(mktemp); printf \"owner\\n\" >\"$f\"; chown --reference=$VALIDATE_RUN_STATE/portablecompat/real-compat-fixtures/README.md \"$f\"; stat -c \"%u:%g\" \"$f\"; rm -f \"$f\"'\\'' </dev/null'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env NEXTEST_TEST_THREADS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/target/release/hermit run --strict --verify --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --mount=type=tmpfs,target=/test --workdir=/test --env TMPDIR=/tmp -- bash -c '\\''set -euo pipefail; f=$(mktemp); printf \"owner\\n\" >\"$f\"; chown --reference=\"$1\" \"$f\"; stat -c \"%u:%g\" \"$f\"; rm -f \"$f\"'\\'' compat-chown \"$VALIDATE_RUN_STATE/portablecompat/real-compat-fixtures/README.md\" </dev/null'",
       "result_manifests": [],
       "deps": [
         "build.rust_scripts_in_pinned_root",
@@ -34878,7 +34878,7 @@
       "labels": [
         "portable-strict-compat-only"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env NEXTEST_TEST_THREADS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/target/release/hermit run --strict --verify --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --mount=type=tmpfs,target=/test --workdir=/test --env TMPDIR=/tmp -- bash -c '\\''set -euo pipefail; d=$(mktemp -d); install -m 640 $VALIDATE_RUN_STATE/portablecompat/real-compat-fixtures/README.md \"$d/copied\"; stat -c \"%a %s\" \"$d/copied\"; rm -rf \"$d\"'\\'' </dev/null'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env NEXTEST_TEST_THREADS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/target/release/hermit run --strict --verify --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --mount=type=tmpfs,target=/test --workdir=/test --env TMPDIR=/tmp -- bash -c '\\''set -euo pipefail; d=$(mktemp -d); install -m 640 \"$1\" \"$d/copied\"; stat -c \"%a %s\" \"$d/copied\"; rm -rf \"$d\"'\\'' compat-install \"$VALIDATE_RUN_STATE/portablecompat/real-compat-fixtures/README.md\" </dev/null'",
       "result_manifests": [],
       "deps": [
         "build.rust_scripts_in_pinned_root",
@@ -40686,7 +40686,7 @@
       "labels": [
         "strict-compat-only"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/target/release/hermit run --strict --verify --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; f=$(mktemp); printf \"owner\\n\" >\"$f\"; chown --reference=$VALIDATE_RUN_STATE/strictcompat/real-compat-fixtures/README.md \"$f\"; stat -c \"%u:%g\" \"$f\"; rm -f \"$f\"' </dev/null",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/target/release/hermit run --strict --verify --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; f=$(mktemp); printf \"owner\\n\" >\"$f\"; chown --reference=\"$1\" \"$f\"; stat -c \"%u:%g\" \"$f\"; rm -f \"$f\"' compat-chown \"$VALIDATE_RUN_STATE/strictcompat/real-compat-fixtures/README.md\" </dev/null",
       "result_manifests": [],
       "deps": [
         "strictcompatprep.fixtures"
@@ -41102,7 +41102,7 @@
       "labels": [
         "strict-compat-only"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/target/release/hermit run --strict --verify --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; d=$(mktemp -d); install -m 640 $VALIDATE_RUN_STATE/strictcompat/real-compat-fixtures/README.md \"$d/copied\"; stat -c \"%a %s\" \"$d/copied\"; rm -rf \"$d\"' </dev/null",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/target/release/hermit run --strict --verify --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; d=$(mktemp -d); install -m 640 \"$1\" \"$d/copied\"; stat -c \"%a %s\" \"$d/copied\"; rm -rf \"$d\"' compat-install \"$VALIDATE_RUN_STATE/strictcompat/real-compat-fixtures/README.md\" </dev/null",
       "result_manifests": [],
       "deps": [
         "strictcompatprep.fixtures"
@@ -68455,7 +68455,7 @@
       "labels": [
         "hosted-portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/target/ci/hermit-strict run --strict --verify --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --mount=type=tmpfs,target=/test --workdir=/test --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; f=$(mktemp); printf \"owner\\n\" >\"$f\"; chown --reference=$VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures/README.md \"$f\"; stat -c \"%u:%g\" \"$f\"; rm -f \"$f\"' </dev/null",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/target/ci/hermit-strict run --strict --verify --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --mount=type=tmpfs,target=/test --workdir=/test --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; f=$(mktemp); printf \"owner\\n\" >\"$f\"; chown --reference=\"$1\" \"$f\"; stat -c \"%u:%g\" \"$f\"; rm -f \"$f\"' compat-chown \"$VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures/README.md\" </dev/null",
       "result_manifests": [],
       "deps": [
         "compatprep.fixtures_on_host",
@@ -68897,7 +68897,7 @@
       "labels": [
         "hosted-portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/target/ci/hermit-strict run --strict --verify --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --mount=type=tmpfs,target=/test --workdir=/test --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; d=$(mktemp -d); install -m 640 $VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures/README.md \"$d/copied\"; stat -c \"%a %s\" \"$d/copied\"; rm -rf \"$d\"' </dev/null",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/target/ci/hermit-strict run --strict --verify --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --mount=type=tmpfs,target=/test --workdir=/test --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; d=$(mktemp -d); install -m 640 \"$1\" \"$d/copied\"; stat -c \"%a %s\" \"$d/copied\"; rm -rf \"$d\"' compat-install \"$VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures/README.md\" </dev/null",
       "result_manifests": [],
       "deps": [
         "compatprep.fixtures_on_host",

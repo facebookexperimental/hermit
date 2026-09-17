@@ -1534,7 +1534,9 @@
    "argv": [
     "bash",
     "-c",
-    "set -euo pipefail; f=$(mktemp); printf \"owner\\n\" >\"$f\"; chown --reference={{REAL_COMPAT_FIXTURES}}/README.md \"$f\"; stat -c \"%u:%g\" \"$f\"; rm -f \"$f\""
+    "set -euo pipefail; f=$(mktemp); printf \"owner\\n\" >\"$f\"; chown --reference=\"$1\" \"$f\"; stat -c \"%u:%g\" \"$f\"; rm -f \"$f\"",
+    "compat-chown",
+    "{{REAL_COMPAT_FIXTURES}}/README.md"
    ]
   },
   {
@@ -1640,7 +1642,9 @@
    "argv": [
     "bash",
     "-c",
-    "set -euo pipefail; d=$(mktemp -d); install -m 640 {{REAL_COMPAT_FIXTURES}}/README.md \"$d/copied\"; stat -c \"%a %s\" \"$d/copied\"; rm -rf \"$d\""
+    "set -euo pipefail; d=$(mktemp -d); install -m 640 \"$1\" \"$d/copied\"; stat -c \"%a %s\" \"$d/copied\"; rm -rf \"$d\"",
+    "compat-install",
+    "{{REAL_COMPAT_FIXTURES}}/README.md"
    ]
   },
   {
