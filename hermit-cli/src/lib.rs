@@ -4251,7 +4251,14 @@ mod tests {
             Backend::Liteinst,
         )
         .expect("run /bin/echo through the ptrace-hosted LiteInst hybrid");
-        assert_eq!(output.status, super::ExitStatus::Exited(0));
+        // Include captured output so a failed backend launch reports its diagnostics.
+        assert_eq!(
+            output.status,
+            super::ExitStatus::Exited(0),
+            "guest did not exit 0.\n--- guest stderr ---\n{}\n--- guest stdout ---\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout),
+        );
         assert_eq!(output.stdout, b"hello\n");
 
         let status = super::run_with_backend(
@@ -4579,7 +4586,14 @@ mod tests {
         let output = super::run_with_output_backend(command, config, true, &None, Backend::Dbt)
             .expect("run /bin/echo through DbtGuest<Detcore>");
 
-        assert_eq!(output.status, super::ExitStatus::Exited(0));
+        // Include captured output so a failed backend launch reports its diagnostics.
+        assert_eq!(
+            output.status,
+            super::ExitStatus::Exited(0),
+            "guest did not exit 0.\n--- guest stderr ---\n{}\n--- guest stdout ---\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout),
+        );
         assert_eq!(output.stdout, b"hello\n");
         assert!(
             String::from_utf8_lossy(&output.stderr)
@@ -4624,7 +4638,14 @@ mod tests {
         let output = super::run_with_output_backend(command, config, false, &None, Backend::Kvm)
             .expect("run dynamic /bin/echo through KvmGuest<Detcore>");
 
-        assert_eq!(output.status, super::ExitStatus::Exited(0));
+        // Include captured output so a failed backend launch reports its diagnostics.
+        assert_eq!(
+            output.status,
+            super::ExitStatus::Exited(0),
+            "guest did not exit 0.\n--- guest stderr ---\n{}\n--- guest stdout ---\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout),
+        );
         assert_eq!(output.stdout, b"hello\n");
         assert!(output.stderr.is_empty());
     }
