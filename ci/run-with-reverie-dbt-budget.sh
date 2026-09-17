@@ -204,7 +204,7 @@ fi
 # c9c1ee55257cbb0635b56f494a75ee1dc6af839ca8e289231f533b0208340463.
 # This is source identity, not a new timing sample or a validation receipt;
 # fresh Hermit validation is required for the runtime and API changes.
-expected_pin=a158914eceeca02a9ab4c7dd4e9916926d5e5c1e
+expected_pin=d87a03a312421d34dee81dae71aa395b40231e63
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

@@ -231,8 +231,21 @@ fi
 # c9c1ee55257cbb0635b56f494a75ee1dc6af839ca8e289231f533b0208340463.
 # This is source identity, not a new timing sample or a validation receipt;
 # fresh Hermit validation is required for the runtime and API changes.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != a158914eceeca02a9ab4c7dd4e9916926d5e5c1e ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie a158914eceeca02a9ab4c7dd4e9916926d5e5c1e (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO d87a03a3 (2026-09-16): the native-build inputs remain identical
+# to a158914e by Git object identity:
+#     reverie-dbt/vendor/dynamorio  a3c41e5d3630 -> a3c41e5d3630
+#     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
+#     reverie-dbt/Cargo.toml        8da5d73a60b9 -> 8da5d73a60b9
+# The unchanged recipe hashes the full vendored tree, build.rs, CMAKE, and
+# CMAKE_GENERATOR; this pin changes neither tool selection nor build options.
+# The 16-job clamp and 1050 effective-job-second threshold carry unchanged
+# at the existing default recipe key
+# c9c1ee55257cbb0635b56f494a75ee1dc6af839ca8e289231f533b0208340463.
+# The range also includes the paused-counter API change before the vFile fix.
+# This is source identity, not a new timing sample or Hermit test receipt;
+# fresh Rust build and unchanged selected CLI validation remain required.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != d87a03a312421d34dee81dae71aa395b40231e63 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie d87a03a312421d34dee81dae71aa395b40231e63 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
