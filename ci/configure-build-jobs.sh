@@ -268,8 +268,16 @@ fi
 # Keep the existing 1050 effective-job-second threshold and 16-job clamp.
 # Source comparison 89b2eb0abe05008a21974668602c288452108270c85132ea48f87bb325d91ca2 is a carry decision,
 # not a new timing sample or Hermit guest receipt.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 596b9adee8473dc0a7e62dce18580eead3d0c5c9 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 596b9adee8473dc0a7e62dce18580eead3d0c5c9 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 4db9ddb6 (2026-09-17): the host-hybrid LiteInst exec repair and
+# intervening runtime changes preserve the DynamoRIO cache recipe inputs:
+# vendor/dynamorio is 42dd83f76cef, and build.rs is 0ff8ae24b974.
+# The GNU-only -mtls-dialect=gnu addition changes native/CMakeLists.txt for
+# the on-demand client, not this DynamoRIO content-key miss. Rebuild that
+# client at the new pin; this carry is not runtime validation.
+# Preserve CMAKE/CMAKE_GENERATOR selection, the 1050 effective-job-second
+# threshold and the 16-job clamp. No new calibration is claimed.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 4db9ddb68126ce97ff929c7f30b61a633e48513e ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 4db9ddb68126ce97ff929c7f30b61a633e48513e (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
