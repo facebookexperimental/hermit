@@ -369,7 +369,20 @@ fn liteinst_strict_verify_virtual_identity_and_time() {
     let group_file = fs::read_to_string("/etc/group").expect("failed to read host group database");
     let root_group = group_name_by_gid(&group_file, "0").expect("GID 0 should have a name");
     let overflow_group = group_name_by_gid(&group_file, "65534").unwrap_or("nobody");
-    let expected_groups = format!("{root_group} {overflow_group}\n");
+    // Detcore reports both primary GIDs as zero. Container::map_root maps the
+    // caller's effective GID to zero; other inherited supplementary groups
+    // appear as the overflow GID. A group-file entry does not add membership.
+    // The groups utility prints each distinct GID only once.
+    let effective_gid = nix::unistd::getegid();
+    let has_overflow_group = nix::unistd::getgroups()
+        .expect("failed to read caller supplementary groups")
+        .iter()
+        .any(|gid| *gid != effective_gid);
+    let expected_groups = if has_overflow_group {
+        format!("{root_group} {overflow_group}\n")
+    } else {
+        format!("{root_group}\n")
+    };
     assert_liteinst_strict_verify(
         Path::new("/usr/bin/groups"),
         &[],
