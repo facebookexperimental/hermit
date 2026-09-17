@@ -583,8 +583,17 @@ fn run() -> Result<(), String> {
         }
     } {
         if report.executed_tests != expected {
+            // Carry the outcome the refusal already knows. The typed report is
+            // deliberately NOT written here -- publishing it would record a test
+            // population nobody sanctioned, which is the whole point of this
+            // ratchet -- so this message is the only place the run can say what
+            // actually happened. Without the breakdown a node where every test
+            // passed and a node that was failing produce the same line, and the
+            // consumer records both as an unexplained failure with no test ids.
             return Err(format!(
-                "nextest-test-results: expected {expected} tests to execute, saw {}; refusing because the selected set changed",
+                "nextest-test-results: expected {expected} tests to execute, saw {}, \
+                 of which {passed} passed and {failed} failed; refusing because the \
+                 selected set changed",
                 report.executed_tests
             ));
         }

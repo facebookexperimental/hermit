@@ -387,6 +387,11 @@ PYEOF
         "$scratch/launch-wrong-cpu.json" >"$scratch/launch-wrong.stdout" 2>"$scratch/launch-wrong.stderr" || status=$?
     [[ $status == 2 ]] || return 1
     grep -q 'expected 1 tests to execute, saw 0' "$scratch/launch-wrong.stderr" || return 1
+    # The refusal must carry the outcome it already knows. Withholding the typed
+    # report is deliberate and asserted on the next line, so this message is the
+    # only place the run can say whether the tests it DID run passed. Without it
+    # an all-green population drift and a failing one read identically.
+    grep -q 'of which 0 passed and 0 failed' "$scratch/launch-wrong.stderr" || return 1
     [[ ! -e $scratch/launch-wrong-count.json && ! -e $scratch/launch-wrong-cpu.json ]] || return 1
     status=0
     DAGRUN_TEST_COUNTS_PATH="$scratch/launch-stray-count.json" \
