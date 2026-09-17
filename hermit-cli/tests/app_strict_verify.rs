@@ -83,6 +83,9 @@ use std::process::Stdio;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test_binary;
+
 /// Serialize Hermit runs because the deterministic scheduler and runtime
 /// fixtures are process-global resources on the shared host.
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
@@ -331,7 +334,7 @@ fn assert_l2_under_strict_verify(program: &Path, args: &[&str]) {
     command
         .args(["--kill-after", HERMIT_VERIFY_KILL_AFTER])
         .arg(hermit_verify_timeout())
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test_binary::hermit_binary())
         .args([
             "--log=info",
             "run",
@@ -530,7 +533,7 @@ print(hermit_bound_probe.VALUE + sum(range(1000)))
         )
         .args(["--kill-after", HERMIT_VERIFY_KILL_AFTER])
         .arg(hermit_verify_timeout())
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test_binary::hermit_binary())
         .args([
             "--log=info",
             "run",
@@ -640,7 +643,7 @@ fn assert_l2_jvm_under_strict_verify(program: &Path, args: &[&str]) {
     command
         .args(["--kill-after", HERMIT_VERIFY_KILL_AFTER])
         .arg(hermit_verify_timeout())
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test_binary::hermit_binary())
         .args([
             "--log=info",
             "run",
@@ -913,7 +916,7 @@ fn run_once_under_strict(program: &Path, args: &[&str]) -> Output {
     command
         .args(["--kill-after", HERMIT_VERIFY_KILL_AFTER])
         .arg(hermit_verify_timeout())
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test_binary::hermit_binary())
         .args([
             "--log=off",
             "run",
@@ -1183,7 +1186,7 @@ fn make_command_with_execution_root(
     command
         .args(["--kill-after", HERMIT_VERIFY_KILL_AFTER])
         .arg(hermit_verify_timeout())
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test_binary::hermit_binary())
         .args([
             "--log=off",
             "run",
