@@ -622,6 +622,7 @@ fn parity_attempt_decoder_requires_every_nullable_key_and_binds_raw_reports() {
 
 #[test]
 fn retained_plan_refuses_changed_selection_policy_and_test_denominators() {
+    generated_plan_populations_preserve_command_policy();
     let (row, plan, cells, tests) =
         fixture(parity(vec![completed(1, BackendParityVerdict::Matched)]));
     let original: ConstructedValidationPlanV10 = serde_json::from_slice(&plan).unwrap();
@@ -680,5 +681,182 @@ fn retained_plan_refuses_changed_selection_policy_and_test_denominators() {
                 .is_err(),
             "{mutation} shrank the independently selected population"
         );
+    }
+}
+
+// Use the real generated graph and label selection, including the pinned-root
+// wrapper additions. The small report fixture above intentionally remains a
+// synthetic single-cell input; it does not cover generated command bytes.
+fn generated_plan_populations_preserve_command_policy() {
+    let root = crate::validation_dag::repo_root().unwrap();
+    let generated = crate::validation_dag::generate(&root).unwrap();
+    assert_eq!(
+        crate::validation_dag::canonical_text(&generated),
+        std::fs::read_to_string(root.join("ci/dag/validate.json")).unwrap()
+    );
+    let expected_json = std::fs::read_to_string(root.join("ci/expected-e2e-plan.json")).unwrap();
+    let expected_cells = crate::validation_dag::expected_cells_from_json(&expected_json)
+        .unwrap()
+        .iter()
+        .map(exact_identity)
+        .collect::<Result<BTreeSet<_>, _>>()
+        .unwrap();
+    assert_eq!(expected_cells.len(), 756);
+    for (label, tag, cell_count) in [
+        ("full", "e2e.manifest_backend_parity_c", 756),
+        (
+            "hosted-portable",
+            "e2e.manifest_backend_parity_c_on_host",
+            753,
+        ),
+    ] {
+        let selected = dagrun::select_steps_by_labels(&generated, &[label.to_owned()]).unwrap();
+        let expected_selected = expected_cells
+            .iter()
+            .filter(|cell| label == "full" || cell.lane == "portable")
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(expected_selected.len(), cell_count);
+        for active in [false, true] {
+            let mut cfg = selected.clone();
+            let index = cfg.steps.iter().position(|step| step.tag() == tag).unwrap();
+            let command = &mut cfg.steps[index].cmd;
+            assert!(command.matches("--parity-reference ptrace ").count() <= 1);
+            *command = command.replace("--parity-reference ptrace ", "");
+            assert_eq!(command.matches("--prebuilt --jobs 8").count(), 1);
+            if active {
+                *command = command.replace(
+                    "--prebuilt --jobs 8",
+                    "--prebuilt --parity-reference ptrace --jobs 8",
+                );
+            }
+            let plan = ConstructedValidationPlanV10 {
+                schema: 1,
+                run_id: format!(
+                    "generated-{label}-{}",
+                    if active { "parity" } else { "ordinary" }
+                ),
+                hermit_sha: "a".repeat(40),
+                path: ValidatePath::Full,
+                compatibility_selected: true,
+                dag_json: dag_to_json(&cfg),
+                expected_e2e_plan_json: expected_json.clone(),
+            };
+            assert_eq!(plan.planned_cells().unwrap(), expected_selected);
+            let expected_relations = expected_selected
+                .iter()
+                .filter(|cell| {
+                    active
+                        && cell.lane == "portable"
+                        && cell.category == "backend-parity-c"
+                        && cell.mode == "verify"
+                        && cell.backend != "ptrace"
+                })
+                .cloned()
+                .map(BackendParityRelation::ptrace)
+                .collect::<Vec<_>>();
+            assert_eq!(expected_relations.len(), if active { 97 } else { 0 });
+            assert_eq!(
+                plan.planned_backend_parity_relations().unwrap(),
+                expected_relations
+            );
+            if active {
+                for (backend, count) in [("kvm", 75), ("liteinst", 21), ("sabre", 1)] {
+                    assert_eq!(
+                        expected_relations
+                            .iter()
+                            .filter(|r| r.candidate.backend == backend)
+                            .count(),
+                        count
+                    );
+                }
+            }
+            if let Some(destination) = std::env::var_os("HERMIT_SCHEMA10_PLAN_FIXTURE_OUTPUT") {
+                use std::io::Write;
+                let destination = std::path::PathBuf::from(destination);
+                assert!(destination.is_absolute());
+                std::fs::create_dir_all(&destination).unwrap();
+                let state = if active { "parity" } else { "ordinary" };
+                for (suffix, bytes) in [
+                    ("plan.json", serde_json::to_vec(&plan).unwrap()),
+                    (
+                        "populations.json",
+                        serde_json::to_vec(&serde_json::json!({
+                            "cells":expected_selected, "backend_parity":expected_relations
+                        }))
+                        .unwrap(),
+                    ),
+                ] {
+                    let mut output = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(destination.join(format!("{label}-{state}-{suffix}")))
+                        .unwrap();
+                    output.write_all(&bytes).unwrap();
+                }
+            }
+            for mutation in [
+                "prefix",
+                "suffix",
+                "selector",
+                "unknown-node",
+                "raw-command",
+                "legacy-guard",
+                "missing-env",
+                "duplicate-env",
+            ] {
+                if (mutation == "unknown-node" && !active)
+                    || (label != "full"
+                        && matches!(
+                            mutation,
+                            "raw-command" | "legacy-guard" | "missing-env" | "duplicate-env"
+                        ))
+                {
+                    continue;
+                }
+                let mut changed = cfg.clone();
+                let step = &mut changed.steps[index];
+                match mutation {
+                    "prefix" => step.cmd.insert_str(0, "true; "),
+                    "suffix" => step.cmd.push_str(" --planted"),
+                    "selector" => step.manifest.as_mut().unwrap().backend = Some("kvm".into()),
+                    "unknown-node" => step.job.push_str("_unknown"),
+                    "raw-command" => {
+                        step.cmd = if active {
+                            crate::backend_parity_policy::PORTABLE_PARITY_COMMAND
+                        } else {
+                            crate::backend_parity_policy::PORTABLE_ORDINARY_COMMAND
+                        }
+                        .to_owned()
+                    }
+                    "legacy-guard" => {
+                        let quote = |value: &str| format!("'{}'", value.replace('\'', r"'\''"));
+                        let current = quote(crate::validation_dag::PINNED_ROOT_COMMAND_GUARD);
+                        let legacy = quote(crate::validation_dag::LEGACY_PINNED_ROOT_COMMAND_GUARD);
+                        assert_eq!(step.cmd.matches(&current).count(), 1);
+                        step.cmd = step.cmd.replace(&current, &legacy);
+                    }
+                    "missing-env" => {
+                        assert_eq!(step.cmd.matches(" --env CI ").count(), 1);
+                        step.cmd = step.cmd.replace(" --env CI ", " ");
+                    }
+                    "duplicate-env" => {
+                        assert_eq!(step.cmd.matches(" --env CI ").count(), 1);
+                        step.cmd = step.cmd.replace(" --env CI ", " --env CI --env CI ");
+                    }
+                    _ => unreachable!(),
+                }
+                let mut changed_plan = plan.clone();
+                changed_plan.dag_json = dag_to_json(&changed);
+                assert!(
+                    changed_plan.planned_cells().is_err(),
+                    "{label}/{active}/{mutation}"
+                );
+                assert!(
+                    changed_plan.planned_backend_parity_relations().is_err(),
+                    "{label}/{active}/{mutation}"
+                );
+            }
+        }
     }
 }

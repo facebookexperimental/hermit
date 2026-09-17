@@ -502,7 +502,7 @@ fn pinned_root_command(step: &Step) -> String {
 // The authored source already contains wrapped manifest commands. Keep their
 // command payload unchanged while carrying the current environment policy into
 // the outer wrapper; otherwise only newly cloned producers see added settings.
-fn refresh_pinned_root_environment(tag: &str, command: &str) -> Result<String, String> {
+pub(crate) fn refresh_pinned_root_environment(tag: &str, command: &str) -> Result<String, String> {
     let (header, payload) = command
         .split_once(" -- bash -c ")
         .ok_or_else(|| format!("{tag} has an unrecognized pinned-root command boundary"))?;

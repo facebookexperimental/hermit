@@ -13,11 +13,21 @@ pub(crate) const HOSTED_ORDINARY_COMMAND: &str = r########"export PATH="$PWD/ci/
 pub(crate) fn selects_ptrace_parity(step: &Step) -> Result<bool, String> {
     let expected = match step.tag().as_str() {
         "e2e.manifest_backend_parity_c" => {
-            Some((PORTABLE_PARITY_COMMAND, PORTABLE_ORDINARY_COMMAND))
+            // Generate trusted expected wrapper bytes with the same policy as
+            // the DAG producer. Never normalize the received command: doing so
+            // would silently restore a removed environment or argv guard.
+            let expected = |command| {
+                crate::validation_dag::refresh_pinned_root_environment(&step.tag(), command)
+            };
+            Some((
+                expected(PORTABLE_PARITY_COMMAND)?,
+                expected(PORTABLE_ORDINARY_COMMAND)?,
+            ))
         }
-        "e2e.manifest_backend_parity_c_on_host" => {
-            Some((HOSTED_PARITY_COMMAND, HOSTED_ORDINARY_COMMAND))
-        }
+        "e2e.manifest_backend_parity_c_on_host" => Some((
+            HOSTED_PARITY_COMMAND.to_owned(),
+            HOSTED_ORDINARY_COMMAND.to_owned(),
+        )),
         _ => None,
     };
     let Some((parity, ordinary)) = expected else {
