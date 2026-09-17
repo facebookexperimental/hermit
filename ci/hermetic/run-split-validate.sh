@@ -350,14 +350,6 @@ if [[ $do_fetch -eq 1 ]]; then
                 [[ "$cargo_bin" -ef "$rustup_bin" ]]; then
                 cargo_config_bin=$("$rustup_bin" which cargo 2>/dev/null) || cargo_config_bin=""
             fi
-            # Inspection is an optional enhancement for a stable-only host.
-            # Do not install or force a toolchain, or reinterpret a failed
-            # config query as absence: establish capability before querying.
-            if [[ -z $cargo_config_bin ]] ||
-                ! cargo_version=$("$cargo_config_bin" --version 2>/dev/null) ||
-                [[ $cargo_version != "cargo "*"-nightly "* && $cargo_version != "cargo "*"-dev "* ]]; then
-                cargo_config_bin=""
-            fi
         fi
         # Cargo falls back to Git's proxy before consulting the operational
         # environment. A private Cargo home can expose a different Git route.
@@ -367,7 +359,12 @@ if [[ $do_fetch -eq 1 ]]; then
         host_fetch() (
             proxy=${https_proxy:-${HTTPS_PROXY:-}}
             if [[ -z ${CARGO_HTTP_PROXY+x} && -n $proxy ]]; then
-                if [[ -z $cargo_config_bin ]]; then
+                # An unresolved proxy can select a different toolchain here.
+                # Establish capability at the query cwd, before inspecting
+                # config; unsupported inspection keeps the original fetch.
+                if [[ -z $cargo_config_bin ]] ||
+                    ! cargo_version=$("$cargo_config_bin" --version 2>/dev/null) ||
+                    [[ $cargo_version != "cargo "*"-nightly "* && $cargo_version != "cargo "*"-dev "* ]]; then
                     echo 'run-split-validate: nightly Cargo configuration inspection unavailable; applying no proxy default, using the original fetch configuration.' >&2
                     "$@"
                     exit $?
