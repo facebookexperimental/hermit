@@ -3474,6 +3474,7 @@ fn run_kvm_preserves_closed_standard_input() {
         let output = hermit_command(&args)
             .arg(guest)
             .arg(mode)
+            .current_dir(native_dir.path())
             .stdin(Stdio::null())
             .output()
             .expect("failed to run stdio-inode identity fixture");
