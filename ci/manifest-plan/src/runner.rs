@@ -8441,8 +8441,8 @@ esac
             .iter()
             .filter(|cell| cell.id.mode == "verify" && cell.id.backend.as_deref() != Some("ptrace"))
             .collect::<Vec<_>>();
-        // Main selected 18 additional LiteInst cells in this existing bucket.
-        // Retain its exact population and check every candidate's arguments.
+        // Pin the selected population and per-backend split, and check every
+        // candidate's arguments.
         assert_eq!(candidates.len(), 97);
         let mut by_backend = BTreeMap::new();
         for cell in &candidates {

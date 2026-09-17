@@ -89,7 +89,7 @@ fn completed(number: u64, verdict: BackendParityVerdict) -> BackendParityCellAtt
         attempt: number,
         candidate_attempt: attempt("kvm", "1", &report.candidate.verification),
         reference_attempt: attempt("ptrace", "parity-reference", &report.reference.verification),
-        report,
+        report: Box::new(report),
     }
 }
 

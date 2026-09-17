@@ -535,7 +535,7 @@ pub enum BackendParityCellAttempt {
         attempt: u64,
         candidate_attempt: ParityAttempt,
         reference_attempt: ParityAttempt,
-        report: BackendParityReport,
+        report: Box<BackendParityReport>,
     },
     UnavailableWithReason {
         attempt: u64,
@@ -1087,7 +1087,7 @@ impl CellBackendParity {
                     candidate_attempt,
                     reference_attempt: reference_attempt
                         .ok_or("completed parity omitted its reference attempt")?,
-                    report,
+                    report: Box::new(report),
                 }
             } else {
                 BackendParityCellAttempt::UnavailableWithReason {
