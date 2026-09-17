@@ -14228,12 +14228,16 @@ red/`measured-and-passed` count is **0**.",
             ));
         }
 
-        let mut wrong_attempt = current.clone();
-        wrong_attempt.attempt = 2;
+        // Keep the current sequence valid so this reaches the independent
+        // series-to-direct attempt binding guard, not missing-first refusal.
+        let mut wrong_attempt = source.clone();
+        wrong_attempt.series.attempt = Some(2);
+        wrong_attempt.series.run_index = 2;
+        wrong_attempt.validate_for_read()?;
         reconcile_control(
             &format!("parity-{verdict:?}-wrong-attempt"),
-            &wrong_attempt,
-            vec![source.clone()],
+            &current,
+            vec![wrong_attempt],
             None,
             true,
         )?;
