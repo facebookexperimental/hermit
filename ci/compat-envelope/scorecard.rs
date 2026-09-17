@@ -1021,6 +1021,10 @@ struct ResultRow {
     effective_args: Vec<String>,
     argv: Vec<String>,
     guest_argv: Vec<String>,
+    /// Older rows lack this redundant producer-owned path. They can still
+    /// prove literal command equality, but cannot authorize fixture relocation.
+    #[serde(default)]
+    artifact_dir: Option<String>,
     env: BTreeMap<String, String>,
     cwd: String,
     shell_command: String,
@@ -1081,6 +1085,65 @@ fn default_attempt() -> u64 {
 }
 
 impl ResultRow {
+    fn retry_fixture(&self) -> Result<Option<RetryFixture>, String> {
+        let Some(artifact_dir) = self.artifact_dir.as_deref() else {
+            return Ok(None);
+        };
+        if !artifact_dir.starts_with('/')
+            || !normal_path_suffix(&artifact_dir[1..])
+            || !normal_path_suffix(&self.run_id)
+            || self.run_id.contains('/')
+        {
+            return Err("retry artifact identity contains a non-normal path".into());
+        }
+        let result_root = Path::new(artifact_dir)
+            .ancestors()
+            .nth(3)
+            .ok_or("retry artifact identity has no result root")?;
+        let expected = hermit_manifest_plan::runner::cell_artifact_path(
+            result_root,
+            &self.run_id,
+            &hermit_manifest_plan::runner::CellId {
+                test: self.test.clone(),
+                mode: self.mode.clone(),
+                backend: self.backend.clone(),
+            },
+            self.attempt,
+        );
+        if expected.as_os_str() != artifact_dir {
+            return Err("retry artifact directory disagrees with its run/cell/attempt".into());
+        }
+        let fixture_root = format!("{artifact_dir}/fixtures");
+        if self.env.get("E2E_FIXTURE_DIR") != Some(&fixture_root)
+            || self.attempts.iter().any(|attempt| {
+                attempt
+                    .get("env")
+                    .and_then(|env| env.get("E2E_FIXTURE_DIR"))
+                    .and_then(JsonValue::as_str)
+                    != Some(fixture_root.as_str())
+            })
+        {
+            return Err("retry fixture environment disagrees with its artifact directory".into());
+        }
+        Ok(Some(RetryFixture {
+            result_root: result_root.to_path_buf(),
+            fixture_root,
+        }))
+    }
+
+    fn same_retry_guest_command(&self, other: &Self) -> Result<bool, String> {
+        if self.guest_argv == other.guest_argv {
+            return Ok(true);
+        }
+        let (Some(this), Some(other_fixture)) = (self.retry_fixture()?, other.retry_fixture()?)
+        else {
+            return Ok(false);
+        };
+        Ok(this.result_root == other_fixture.result_root
+            && retry_guest_arguments(&self.guest_argv, &this.fixture_root)
+                == retry_guest_arguments(&other.guest_argv, &other_fixture.fixture_root))
+    }
+
     fn has_parity_evidence(&self) -> bool {
         self.backend_parity.is_some()
             || self.error_kind.as_deref() == Some("incomplete-parity-evidence")
@@ -2301,6 +2364,48 @@ impl ResultRow {
     }
 }
 
+struct RetryFixture {
+    result_root: PathBuf,
+    fixture_root: String,
+}
+
+#[derive(Debug, PartialEq)]
+enum RetryGuestArgument<'a> {
+    Literal(&'a str),
+    FixtureRelative(&'a str),
+}
+
+fn normal_path_suffix(path: &str) -> bool {
+    !path.contains('\0')
+        && path
+            .split('/')
+            .all(|component| !matches!(component, "" | "." | ".."))
+}
+
+/// This key is only for comparing outer retries. Literal evidence and its
+/// digest remain unchanged; embedded shell strings and other paths stay literal.
+fn retry_guest_arguments<'a>(
+    argv: &'a [String],
+    fixture_root: &str,
+) -> Vec<RetryGuestArgument<'a>> {
+    argv.iter()
+        .map(|argument| {
+            if argument == fixture_root {
+                return RetryGuestArgument::FixtureRelative("");
+            }
+            match argument
+                .strip_prefix(fixture_root)
+                .and_then(|suffix| suffix.strip_prefix('/'))
+            {
+                Some(suffix) if normal_path_suffix(suffix) => {
+                    RetryGuestArgument::FixtureRelative(suffix)
+                }
+                _ => RetryGuestArgument::Literal(argument),
+            }
+        })
+        .collect()
+}
+
 struct Derived {
     population: BTreeSet<CellId>,
     enabled: BTreeSet<CellId>,
@@ -2362,8 +2467,19 @@ fn bind_parity_history(
     }
     let mut attempts = BTreeMap::<u64, ResultCandidate>::new();
     for candidate in candidates {
+        // Validate before duplicate collapse. This path is redundant with the
+        // already-digested fixture env, so no historical receipt hash changes.
+        candidate.row.retry_fixture().map_err(|error| {
+            format!(
+                "invalid retry artifact for {} at {}, outer attempt {}: {error}",
+                display_id(id),
+                candidate.path.display(),
+                candidate.row.attempt
+            )
+        })?;
         if let Some(previous) = attempts.get(&candidate.row.attempt) {
             if previous.evidence_identity != candidate.evidence_identity
+                || previous.row.artifact_dir != candidate.row.artifact_dir
                 || previous.row.result != candidate.row.result
                 || previous.row.failure_class != candidate.row.failure_class
                 || previous.row.error_kind != candidate.row.error_kind
@@ -2407,7 +2523,7 @@ fn bind_parity_history(
             || row.run_id != anchor.run_id
             || row.binary_sha256 != anchor.binary_sha256
             || row.test_sha256 != anchor.test_sha256
-            || row.guest_argv != anchor.guest_argv
+            || !row.same_retry_guest_command(anchor)?
             || row.relaxations != anchor.relaxations
             || row.log_level != anchor.log_level
         {
@@ -8924,10 +9040,11 @@ fn retained_coordinate_decision(
         .get(&retained.id)
         .cloned()
         .unwrap_or_default();
-    let mut current_by_run: BTreeMap<
+    type CurrentResultsByRun = BTreeMap<
         (String, String, Option<u64>, String),
         BTreeMap<(ObservedResult, DivergenceCoordinates), CurrentPressureResult>,
-    > = BTreeMap::new();
+    >;
+    let mut current_by_run: CurrentResultsByRun = BTreeMap::new();
     for result in offered_current_results {
         let row = &result.summary.rows[0];
         let invocation = row
@@ -9616,6 +9733,9 @@ fn normalise_recorded_root(row: &mut ResultRow) {
     if root.is_empty() || root == RECORDED_ROOT || !root.starts_with('/') {
         return;
     }
+    if let Some(artifact_dir) = &mut row.artifact_dir {
+        rewrite_recorded_root(artifact_dir, &root);
+    }
     for argument in row
         .argv
         .iter_mut()
@@ -9637,6 +9757,9 @@ fn normalise_recorded_root(row: &mut ResultRow) {
 fn normalise_recorded_prefix(row: &mut ResultRow, prefix: &str) {
     if prefix.is_empty() || prefix == RECORDED_ROOT || !prefix.starts_with('/') {
         return;
+    }
+    if let Some(artifact_dir) = &mut row.artifact_dir {
+        rewrite_recorded_root(artifact_dir, prefix);
     }
     for argument in row
         .argv
@@ -9854,6 +9977,7 @@ fn self_test() -> Result<(), String> {
             effective_args: vec!["run".into()],
             argv: vec!["hermit".into(), "run".into()],
             guest_argv: vec!["fixture".into()],
+            artifact_dir: None,
             env: BTreeMap::from([("LC_ALL".into(), "C".into())]),
             cwd: "/repo".into(),
             shell_command: "cd /repo && env LC_ALL=C hermit run".into(),
@@ -11650,6 +11774,7 @@ red/`measured-and-passed` count is **0**.",
         effective_args: vec!["run".into()],
         argv: vec!["hermit".into(), "run".into()],
         guest_argv: vec!["fixture".into()],
+        artifact_dir: None,
         env: BTreeMap::from([("LC_ALL".into(), "C".into())]),
         cwd: "/repo".into(),
         shell_command: "cd /repo && env LC_ALL=C hermit run".into(),
@@ -14728,13 +14853,66 @@ red/`measured-and-passed` count is **0**.",
             }
         }
     }
-    // A completed parity failure remains visible after either a matching retry
-    // or an incomplete retry. Exercise actual readers and both public writers.
-    for terminal in ["PASS", "ERROR"] {
+    // Keep the invocation internally exact when changing the test fixture's
+    // command. Reference and candidate retain their distinct backend flags.
+    let bind_retry_invocation = |row: &mut ResultRow| -> Result<(), String> {
+        for attempt in &mut row.attempts {
+            let mut argv: Vec<String> = serde_json::from_value(attempt["argv"].clone())
+                .map_err(|error| error.to_string())?;
+            if let Some(delimiter) = argv.iter().position(|arg| arg == "--") {
+                argv.truncate(delimiter);
+            }
+            argv.push("--".into());
+            argv.extend(row.guest_argv.clone());
+            attempt["argv"] = serde_json::to_value(&argv).unwrap();
+            attempt["guest_argv"] = serde_json::to_value(&row.guest_argv).unwrap();
+            attempt["env"] = serde_json::to_value(&row.env).unwrap();
+            attempt["cwd"] = row.cwd.clone().into();
+            attempt["shell_command"] = literal_shell_command(&row.cwd, &row.env, &argv).into();
+        }
+        row.argv = serde_json::from_value(row.attempts[0]["argv"].clone())
+            .map_err(|error| error.to_string())?;
+        row.effective_args = row.argv.iter().skip(1).cloned().collect();
+        row.shell_command = literal_shell_command(&row.cwd, &row.env, &row.argv);
+        Ok(())
+    };
+    let relocate_retry_fixture = |row: &mut ResultRow, result_root: &str| -> Result<(), String> {
+        let dir = hermit_manifest_plan::runner::cell_artifact_path(
+            Path::new(result_root),
+            &row.run_id,
+            &hermit_manifest_plan::runner::CellId {
+                test: row.test.clone(),
+                mode: row.mode.clone(),
+                backend: row.backend.clone(),
+            },
+            row.attempt,
+        );
+        row.artifact_dir = Some(dir.to_string_lossy().into_owned());
+        let fixture = dir.join("fixtures").to_string_lossy().into_owned();
+        row.env.insert("E2E_FIXTURE_DIR".into(), fixture.clone());
+        row.guest_argv = vec![
+            format!("{fixture}/program"),
+            "stable".into(),
+            "literal-attempt-2".into(),
+        ];
+        bind_retry_invocation(row)
+    };
+
+    // A completed parity failure remains visible after a matching, incomplete,
+    // or divergent retry, including the producer's real fixture relocation.
+    // Exercise actual readers and both public writers.
+    for terminal in ["PASS", "ERROR", "FAIL"] {
         let mut first = old_parity.clone();
         first.hermit_sha = fixture_head.clone();
         first.run_id = format!("parity-failure-then-{terminal}");
-        let mut second = parity_row(&import_parity_id, BackendParityVerdict::Matched)?;
+        let mut second = parity_row(
+            &import_parity_id,
+            if terminal == "FAIL" {
+                BackendParityVerdict::Diverged
+            } else {
+                BackendParityVerdict::Matched
+            },
+        )?;
         second.hermit_sha = fixture_head.clone();
         second.classification = "required".into();
         second.run_id = first.run_id.clone();
@@ -14751,10 +14929,36 @@ red/`measured-and-passed` count is **0**.",
             second.attempts[1]["status"] = 7.into();
             second.attempts[1]["error_kind"] = "incomplete-verification-evidence".into();
         }
+        if bind_parity_history(
+            &import_parity_id,
+            vec![
+                parity_candidate(first.clone())?,
+                parity_candidate(second.clone())?,
+            ],
+            ResultInput::Retained,
+        )?
+        .len()
+            != 2
+        {
+            return Err("literal retry history without artifact metadata was lost".into());
+        }
+        relocate_retry_fixture(&mut first, "/results")?;
+        relocate_retry_fixture(&mut second, "/results")?;
         first.comparison_evidence()?;
         second.comparison_evidence()?;
+        if first.guest_argv == second.guest_argv || !first.same_retry_guest_command(&second)? {
+            return Err(
+                "retry fixture did not exercise distinct authenticated physical paths".into(),
+            );
+        }
         let first_digest = first.evidence_identity()?;
         let second_digest = second.evidence_identity()?;
+        // Learning a redundant directory must not rewrite historical receipts.
+        let mut without_directory = first.clone();
+        without_directory.artifact_dir = None;
+        if without_directory.evidence_identity()? != first_digest {
+            return Err("retry directory changed the literal evidence digest".into());
+        }
         for command in ["import-results", "observe-results"] {
             restored_import_fixture()?;
             // File ordering and an identical repeated row must not change the
@@ -14768,7 +14972,7 @@ red/`measured-and-passed` count is **0**.",
             if retained.cells.len() != 1
                 || retained.cells[0].candidates.len() != 2
                 || retained.cells[0].hermit_sha != fixture_head
-                || retained.terminal_comparisons != if terminal == "PASS" { 2 } else { 1 }
+                || retained.terminal_comparisons != if terminal == "ERROR" { 1 } else { 2 }
                 || retained.cells[0]
                     .candidates
                     .iter()
@@ -14797,20 +15001,26 @@ red/`measured-and-passed` count is **0**.",
                     && !String::from_utf8_lossy(&output.stdout).contains(
                         "retained 1 incomplete parity attempt(s) without comparison credit",
                     ))
-                || receipts.len() != if terminal == "PASS" { 2 } else { 1 }
+                || receipts.len() != if terminal == "ERROR" { 1 } else { 2 }
                 || !receipts.iter().any(|receipt| {
                     receipt.evidence_sha256 == first_digest
                         && receipt.hermit_sha == fixture_head
                         && receipt.result == ObservedResult::ParityFailure
                 })
-                || (terminal == "PASS"
+                || (terminal != "ERROR"
                     && !receipts.iter().any(|receipt| {
                         receipt.evidence_sha256 == second_digest
                             && receipt.hermit_sha == fixture_head
-                            && receipt.result == ObservedResult::Pass
+                            && receipt.result
+                                == if terminal == "FAIL" {
+                                    ObservedResult::ParityFailure
+                                } else {
+                                    ObservedResult::Pass
+                                }
                     }))
                 || !latest_backend_parity(&cell).is_some_and(|receipt| {
-                    receipt.evidence_sha256 == first_digest
+                    (receipt.evidence_sha256 == first_digest
+                        || (terminal == "FAIL" && receipt.evidence_sha256 == second_digest))
                         && receipt.result == ObservedResult::ParityFailure
                 })
                 || cell
@@ -14849,24 +15059,205 @@ red/`measured-and-passed` count is **0**.",
             restored_import_fixture()?;
             let mut changed = second.clone();
             match invalid {
-                "missing-first" => write_import_rows(&[&changed])?,
-                "gap" => {
-                    changed.attempt = 3;
-                    write_import_rows(&[&first, &changed])?;
-                }
-                "conflicting-first" => {
-                    changed.attempt = 1;
-                    write_import_rows(&[&first, &changed])?;
-                }
+                "missing-first" => {}
+                "gap" => changed.attempt = 3,
+                "conflicting-first" => changed.attempt = 1,
                 _ => unreachable!(),
             }
+            // Reach the sequence/duplicate guard with valid producer metadata;
+            // a stale attempt-2 fixture must not mask the intended refusal.
+            relocate_retry_fixture(&mut changed, "/results")?;
+            if invalid == "conflicting-first" && terminal == "FAIL" {
+                // A second synthetic divergence at the same ordinal must be
+                // distinct evidence, not an identical replay of the first.
+                changed.first_divergent_record = Some(3);
+                changed
+                    .backend_parity
+                    .as_mut()
+                    .unwrap()
+                    .comparison
+                    .first_divergent_record = Some(3);
+            }
+            for row in [&first, &changed] {
+                row.require_literal_invocation()?;
+                row.comparison_evidence()?;
+                if row.retry_fixture()?.is_none() {
+                    return Err(format!("{invalid} fixture lacks retry metadata"));
+                }
+            }
+            if !first.same_retry_guest_command(&changed)? {
+                return Err(format!("{invalid} fixture changed the logical command"));
+            }
+            if invalid == "conflicting-first"
+                && first.evidence_identity()? == changed.evidence_identity()?
+            {
+                return Err("conflicting-first fixture has identical evidence".into());
+            }
+            if invalid == "missing-first" {
+                write_import_rows(&[&changed])?;
+            } else {
+                write_import_rows(&[&first, &changed])?;
+            }
             let refused = run_result_command("import-results", Some(&current_summary))?;
+            let expected_error = if invalid == "conflicting-first" {
+                "ambiguous parity evidence"
+            } else {
+                "invalid parity history"
+            };
             if refused.status.success()
+                || !String::from_utf8_lossy(&refused.stderr).contains(expected_error)
                 || read_generated_files(&result_command_root)? != result_command_before
             {
                 return Err(format!(
-                    "retained parity admitted invalid {invalid} sequence"
+                    "retained parity {terminal}/{invalid} did not refuse with {expected_error}: {refused:?}"
                 ));
+            }
+        }
+        if terminal == "FAIL" {
+            let mut normalized = first.clone();
+            normalized.cwd = "/original/checkout".into();
+            relocate_retry_fixture(&mut normalized, "/original/checkout/results")?;
+            normalise_recorded_root(&mut normalized);
+            normalized.require_literal_invocation()?;
+            normalized.retry_fixture()?;
+            let mut prefix_normalized = first.clone();
+            relocate_retry_fixture(&mut prefix_normalized, "/old-workspace/results")?;
+            normalise_recorded_prefix(&mut prefix_normalized, "/old-workspace");
+            prefix_normalized.require_literal_invocation()?;
+            prefix_normalized.retry_fixture()?;
+            for invalid in [
+                "missing-directory",
+                "wrong-run",
+                "wrong-cell",
+                "wrong-ordinal",
+                "wrong-root",
+                "wrong-env",
+                "relative-directory",
+                "traversing-directory",
+                "wrong-attempt-env",
+                "changed-program",
+                "added-argument",
+                "removed-argument",
+                "reordered-arguments",
+                "changed-literal",
+                "sibling-prefix",
+                "traversal",
+                "embedded-path",
+                "literal-placeholder",
+                "duplicate-directory",
+            ] {
+                restored_import_fixture()?;
+                let mut changed = second.clone();
+                match invalid {
+                    "missing-directory" => changed.artifact_dir = None,
+                    "wrong-run" | "wrong-cell" | "wrong-ordinal" => {
+                        let old = changed.artifact_dir.clone().unwrap();
+                        let wrong = match invalid {
+                            "wrong-run" => old.replace(&changed.run_id, "different-run"),
+                            "wrong-cell" => old.replace("-verify-", "-replay-"),
+                            _ => old.replace("-attempt-2", "-attempt-9"),
+                        };
+                        changed.artifact_dir = Some(wrong.clone());
+                        changed
+                            .env
+                            .insert("E2E_FIXTURE_DIR".into(), format!("{wrong}/fixtures"));
+                        changed.guest_argv[0] = format!("{wrong}/fixtures/program");
+                    }
+                    "wrong-root" => relocate_retry_fixture(&mut changed, "/different-results")?,
+                    "wrong-env" => {
+                        changed
+                            .env
+                            .insert("E2E_FIXTURE_DIR".into(), "/unrelated/fixtures".into());
+                    }
+                    "relative-directory" => {
+                        changed.artifact_dir = Some(
+                            changed
+                                .artifact_dir
+                                .as_ref()
+                                .unwrap()
+                                .trim_start_matches('/')
+                                .into(),
+                        );
+                    }
+                    "traversing-directory" => {
+                        changed.artifact_dir = Some(
+                            changed
+                                .artifact_dir
+                                .as_ref()
+                                .unwrap()
+                                .replace("/runs/", "/runs/../runs/"),
+                        );
+                    }
+                    "changed-program" => changed.guest_argv[0].push_str("-different"),
+                    "added-argument" => changed.guest_argv.push("extra".into()),
+                    "removed-argument" => {
+                        changed.guest_argv.pop();
+                    }
+                    "reordered-arguments" => changed.guest_argv.swap(1, 2),
+                    "changed-literal" => changed.guest_argv[1] = "different".into(),
+                    "sibling-prefix" => {
+                        changed.guest_argv[0] =
+                            changed.guest_argv[0].replace("/fixtures/", "/fixtures-other/")
+                    }
+                    "traversal" => {
+                        changed.guest_argv[0] =
+                            changed.guest_argv[0].replace("/fixtures/", "/fixtures/../fixtures/")
+                    }
+                    "embedded-path" => {
+                        changed.guest_argv[0] = format!("--file={}", changed.guest_argv[0])
+                    }
+                    "literal-placeholder" => changed.guest_argv[0] = "program".into(),
+                    "wrong-attempt-env" | "duplicate-directory" => {}
+                    _ => unreachable!(),
+                }
+                bind_retry_invocation(&mut changed)?;
+                if invalid == "wrong-attempt-env" {
+                    changed.attempts[1]["env"]["E2E_FIXTURE_DIR"] = "/other/fixtures".into();
+                    let env: BTreeMap<String, String> =
+                        serde_json::from_value(changed.attempts[1]["env"].clone()).unwrap();
+                    let argv: Vec<String> =
+                        serde_json::from_value(changed.attempts[1]["argv"].clone()).unwrap();
+                    changed.attempts[1]["shell_command"] =
+                        literal_shell_command(&changed.cwd, &env, &argv).into();
+                }
+                if invalid == "duplicate-directory" {
+                    changed.artifact_dir = None;
+                }
+                for reversed in [false, true] {
+                    let mut rows = vec![&first, &changed];
+                    if invalid == "duplicate-directory" {
+                        rows.push(&second);
+                    }
+                    if reversed {
+                        rows.reverse();
+                    }
+                    write_import_rows(&rows)?;
+                    if read_result_candidates(&result_root, &fixture_head).is_ok()
+                        || read_retained_results(
+                            &result_command_root,
+                            &result_root,
+                            &BTreeSet::from([import_parity_id.clone()]),
+                        )
+                        .is_ok()
+                    {
+                        return Err(format!(
+                            "retry identity admitted {invalid}, reversed={reversed}"
+                        ));
+                    }
+                }
+                for command in ["observe-results", "import-results"] {
+                    let refused = run_result_command(
+                        command,
+                        (command == "import-results").then_some(current_summary.as_path()),
+                    )?;
+                    if refused.status.success()
+                        || read_generated_files(&result_command_root)? != result_command_before
+                    {
+                        return Err(format!(
+                            "{command} admitted or wrote invalid retry identity {invalid}"
+                        ));
+                    }
+                }
             }
         }
     }
@@ -17174,6 +17565,7 @@ red/`measured-and-passed` count is **0**.",
         effective_args: Vec::new(),
         argv: vec!["fixture".into()],
         guest_argv: vec!["fixture".into()],
+        artifact_dir: None,
         env: BTreeMap::from([("LC_ALL".into(), "C".into())]),
         cwd: "/repo".into(),
         shell_command: "cd /repo && env LC_ALL=C fixture".into(),

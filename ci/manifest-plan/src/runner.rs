@@ -3039,22 +3039,35 @@ fn cell_timeout_attempt(
 /// directory that does not exist, so surfacing the path made collapsing them a
 /// prerequisite rather than a tidy-up.
 fn cell_artifact_dir(context: &RunContext, cell: &SelectedCell) -> PathBuf {
+    cell_artifact_path(
+        &context.result_root,
+        &context.run_id,
+        &cell.id,
+        context.attempt,
+    )
+}
+
+/// Construct the producer-owned path for one cell's outer attempt.
+/// Readers use this same definition to authenticate a retained fixture's
+/// relocation; they must still validate the recorded root and invocation.
+pub fn cell_artifact_path(
+    result_root: &Path,
+    run_id: &str,
+    cell: &CellId,
+    attempt: u64,
+) -> PathBuf {
     let base_slug = format!(
         "{}-{}-{}",
-        cell.id.test.replace('/', "-"),
-        cell.id.mode,
-        cell.id.backend.as_deref().unwrap_or("none")
+        cell.test.replace('/', "-"),
+        cell.mode,
+        cell.backend.as_deref().unwrap_or("none")
     );
-    let slug = if context.attempt == 1 {
+    let slug = if attempt == 1 {
         base_slug
     } else {
-        format!("{base_slug}-attempt-{}", context.attempt)
+        format!("{base_slug}-attempt-{attempt}")
     };
-    context
-        .result_root
-        .join("runs")
-        .join(&context.run_id)
-        .join(slug)
+    result_root.join("runs").join(run_id).join(slug)
 }
 
 fn verification_verdict(attempt: &AttemptResult) -> Option<Verdict> {
@@ -5330,6 +5343,15 @@ mod tests {
         let first_dir = cell_artifact_dir(&first, &cell);
         let second_dir = cell_artifact_dir(&second, &cell);
         assert_ne!(first_dir, second_dir);
+        assert_eq!(
+            first_dir,
+            cell_artifact_path(&first.result_root, &first.run_id, &cell.id, 1)
+        );
+        assert_eq!(first_dir.file_name().unwrap(), "fixture-test-verify-ptrace");
+        assert_eq!(
+            second_dir,
+            cell_artifact_path(&second.result_root, &second.run_id, &cell.id, 2)
+        );
         assert!(
             second_dir
                 .file_name()
