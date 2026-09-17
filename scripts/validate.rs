@@ -2433,8 +2433,13 @@ fn self_test() -> Result<(), String> {
         host: "fixture-host",
         toolchain: "fixture-toolchain",
     };
+    let current_cache_schema = if validate_evidence::ENABLED {
+        10
+    } else {
+        validate_cell_results::CELL_RESULTS_LEDGER_SCHEMA_VERSION
+    };
     let cache_row = serde_json::json!({
-        "schema_version": validate_cell_results::CELL_RESULTS_LEDGER_SCHEMA_VERSION,
+        "schema_version": current_cache_schema,
         "tree": cache_tree,
         "profile": "full",
         "host": "fixture-host",
@@ -2508,6 +2513,17 @@ fn self_test() -> Result<(), String> {
         })?;
         if !refusal.contains("cannot publish a current validation service result") {
             return Err(format!("summary: {label} cached count refusal was unclear: {refusal}"));
+        }
+    }
+    if validate_evidence::ENABLED {
+        let mut schema7_cache_row = cache_row.clone();
+        schema7_cache_row["schema_version"] =
+            serde_json::json!(7);
+        let refusal = cache_summary(&schema7_cache_row).err().ok_or_else(|| {
+            "summary: a schema-7 cache row produced a current service-result PASS".to_string()
+        })?;
+        if !refusal.contains("cannot publish a current validation service result") {
+            return Err(format!("summary: schema-7 cache refusal was unclear: {refusal}"));
         }
     }
     let mut legacy_cache_row = cache_row.clone();
@@ -12096,6 +12112,7 @@ fn manifest_command_policy(tag: &str, command: &str) -> Result<(Selection, bool)
     }
     let mut selection = Selection::default();
     let mut prebuilt = false;
+    let mut parity_reference = None;
     let mut seen = BTreeSet::new();
     let mut index = 2;
     while let Some(option) = argv.get(index) {
@@ -12109,7 +12126,7 @@ fn manifest_command_policy(tag: &str, command: &str) -> Result<(Selection, bool)
             "--prebuilt" => prebuilt = true,
             "--allow-empty" => {}
             "--lane" | "--category" | "--test" | "--mode" | "--backend" | "--results"
-            | "--junit" | "--jobs" => {
+            | "--junit" | "--jobs" | "--parity-reference" => {
                 index += 1;
                 let value = argv
                     .get(index)
@@ -12120,6 +12137,7 @@ fn manifest_command_policy(tag: &str, command: &str) -> Result<(Selection, bool)
                     "--test" => selection.test = Some(value.clone()),
                     "--mode" => selection.mode = Some(value.clone()),
                     "--backend" => selection.backend = Some(value.clone()),
+                    "--parity-reference" => parity_reference = Some(value.as_str()),
                     _ => {}
                 }
             }
@@ -12136,6 +12154,26 @@ fn manifest_command_policy(tag: &str, command: &str) -> Result<(Selection, bool)
             "retry bounds: {tag} must select a named lane with --ci-only"
         ));
     }
+    if let Some(reference) = parity_reference {
+        if reference != "ptrace" {
+            return Err(format!(
+                "retry bounds: {tag} --parity-reference currently requires ptrace"
+            ));
+        }
+        if selection.mode.as_deref().is_some_and(|mode| mode != "verify") {
+            return Err(format!(
+                "retry bounds: {tag} --parity-reference requires --mode verify when a mode is explicit"
+            ));
+        }
+        if selection.backend.as_deref() == Some(reference) {
+            return Err(format!(
+                "retry bounds: {tag} --parity-reference must differ from the explicit candidate --backend"
+            ));
+        }
+    }
+    // run_cell_inner shares one execution deadline and remaining CPU budget
+    // across candidate, reference, and comparison. Parity changes neither the
+    // selection nor the prebuilt/non-prebuilt timeout-window accounting.
     Ok((selection, prebuilt))
 }
 
@@ -13169,6 +13207,52 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         cpu: 1.25,
         wall: 1.5,
     };
+    let parity_command =
+        "target/debug/test-harness run --ci-only --lane portable --category c-programs";
+    for filters in ["", " --mode verify --backend liteinst"] {
+        for prebuilt_flag in ["", " --prebuilt"] {
+            let command = format!("{parity_command}{filters}{prebuilt_flag}");
+            let (ordinary, ordinary_prebuilt) = manifest_command_policy("parity-control", &command)?;
+            let (parity, parity_prebuilt) = manifest_command_policy(
+                "parity-control",
+                &format!("{command} --parity-reference ptrace"),
+            )?;
+            let ordinary_cells = manifests.select(&ordinary)?;
+            let parity_cells = manifests.select(&parity)?;
+            if ordinary_cells.is_empty()
+                || ordinary_prebuilt != parity_prebuilt
+                || ordinary_cells.iter().map(|cell| &cell.id).collect::<Vec<_>>()
+                    != parity_cells.iter().map(|cell| &cell.id).collect::<Vec<_>>()
+            {
+                return Err("retry bounds: parity changed the selected cells or prebuilt policy".into());
+            }
+            let headroom = |selection: &Selection, prebuilt| {
+                require_manifest_selection_headroom(
+                    &manifests, "parity-control", quick.timeout, selection,
+                    representative_multipliers, prebuilt, attempts,
+                    MANIFEST_TERMINATION_GRACE_S as u64,
+                )
+            };
+            if headroom(&ordinary, ordinary_prebuilt)? != headroom(&parity, parity_prebuilt)? {
+                return Err("retry bounds: parity changed shared execution-window headroom".into());
+            }
+        }
+    }
+    for (suffix, expected) in [
+        (" --parity-reference", "lacks a value for --parity-reference"),
+        (" --parity-reference ptrace --parity-reference ptrace", "supplies --parity-reference more than once"),
+        (" --parity-reference sabre", "currently requires ptrace"),
+        (" --parity-reference --prebuilt", "currently requires ptrace"),
+        (" --parity-reference ptrace --mode run", "requires --mode verify"),
+        (" --parity-reference ptrace --backend ptrace", "must differ from the explicit candidate"),
+        (" --parity-reference ptrace --unknown", "unmodeled harness argument"),
+    ] {
+        let refusal = manifest_command_policy("parity-control", &format!("{parity_command}{suffix}"))
+            .expect_err("invalid parity command must be refused");
+        if !refusal.contains(expected) {
+            return Err(format!("retry bounds: parity control failed for the wrong reason: {refusal}"));
+        }
+    }
     for step in committed.steps.iter()
         .filter(|step| step.cmd.contains("target/debug/test-harness run "))
     {
