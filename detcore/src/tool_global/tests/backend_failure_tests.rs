@@ -540,8 +540,22 @@ async fn dbt_missing_physical_id_start_preserves_tombstone_deregistration_accoun
     let tid = DetTid::from_raw(19);
     let process = DetPid::from_raw(17);
     let mm = MmId::initial(process);
+    // The parent process is already running while its new child's Start RPC
+    // races the parent's CreateChildThread. Only the child is unregistered.
+    state
+        .sched
+        .lock()
+        .unwrap()
+        .thread_tree
+        .add_child(process, process, true);
+    install_test_registration(&state, process, Ivar::new());
+    {
+        let sched = state.sched.lock().unwrap();
+        assert!(sched.thread_was_registered(process));
+        assert!(!sched.thread_was_registered(tid));
+    }
     // Exercise the real DBT defensive refusal before CreateChildThread. Do
-    // not install a registration or fabricate a logical tombstone in the test.
+    // not install the child registration or fabricate its logical tombstone.
     let response = tokio::time::timeout(
         Duration::from_millis(100),
         state.receive_rpc(
