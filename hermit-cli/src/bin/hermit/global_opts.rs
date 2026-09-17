@@ -7,6 +7,8 @@
  */
 
 use std::fs::File;
+use std::fs::OpenOptions;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -104,9 +106,15 @@ impl GlobalOpts {
     /// whose log was legitimately empty, and the person debugging cannot tell which.
     pub fn open_log_file(&mut self) -> Result<(), Error> {
         if let Some(path) = &self.log_file {
-            let file = File::create(path).with_context(|| {
-                format!("cannot open --log-file {} for writing", path.display())
-            })?;
+            let file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+                .open(path)
+                .with_context(|| {
+                    format!("cannot open --log-file {} for writing", path.display())
+                })?;
             self.log_file_handle = Some(Arc::new(file));
         }
         Ok(())
@@ -195,5 +203,89 @@ impl GlobalOpts {
             init_stderr_tracing(self.log);
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::*;
+
+    fn log_options(path: PathBuf) -> GlobalOpts {
+        GlobalOpts {
+            log: None,
+            log_file: Some(path),
+            log_file_handle: None,
+            run_evidence_log_handle: None,
+            run_evidence_write_error: None,
+            backend: None,
+        }
+    }
+
+    #[test]
+    fn host_log_open_refuses_a_symlink_without_changing_its_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.log");
+        let link = directory.path().join("requested.log");
+        std::fs::write(&target, b"do not truncate").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut options = log_options(link);
+
+        let error = options
+            .open_log_file()
+            .expect_err("--log-file must never follow a symlink");
+        assert!(error.to_string().contains("cannot open --log-file"));
+        assert_eq!(std::fs::read(target).unwrap(), b"do not truncate");
+    }
+
+    #[test]
+    fn host_log_open_creates_a_regular_file_and_keeps_the_opened_object() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("requested.log");
+        let opened_path = directory.path().join("opened.log");
+        let mut options = log_options(path.clone());
+
+        options.open_log_file().unwrap();
+        assert!(std::fs::metadata(&path).unwrap().is_file());
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+        let cloned_options = options.clone();
+        drop(options);
+        std::fs::rename(&path, &opened_path).unwrap();
+        std::fs::write(&path, b"replacement must not change").unwrap();
+        let mut held = cloned_options
+            .log_file_handle
+            .as_ref()
+            .unwrap()
+            .try_clone()
+            .unwrap();
+        drop(cloned_options);
+        held.write_all(b"written through the held descriptor")
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(opened_path).unwrap(),
+            b"written through the held descriptor"
+        );
+        assert_eq!(std::fs::read(path).unwrap(), b"replacement must not change");
+    }
+
+    #[test]
+    fn host_log_open_truncates_an_existing_regular_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("existing.log");
+        std::fs::write(&path, b"old log contents that must be truncated").unwrap();
+        let mut options = log_options(path.clone());
+
+        options.open_log_file().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+        let mut held = options
+            .log_file_handle
+            .as_ref()
+            .unwrap()
+            .try_clone()
+            .unwrap();
+        held.write_all(b"new log").unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"new log");
     }
 }
