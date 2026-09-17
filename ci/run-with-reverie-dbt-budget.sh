@@ -215,7 +215,12 @@ fi
 # The same pin also carries stricter RPC partial-header EOF classification;
 # it does not select the new mapped transport. Fresh Hermit build and original
 # unit assertions remain required; native loader fixtures are not guest evidence.
-expected_pin=a2cc1868795b19ae77e55242d614c43116e42609
+# CARRY TO b3049e54 (2026-09-17): the landed SaBRe frame ABI repair and
+# opt-in mapped-RPC ownership APIs leave the entire reverie-dbt subtree,
+# build.rs, vendor tree, native key, and CMAKE/CMAKE_GENERATOR selection unchanged.
+# Keep the existing 1050 effective-job-second threshold and 16-job clamp.
+# This source-identity carry supplies no new timing or Hermit guest evidence.
+expected_pin=b3049e54c644e28e2894402a36bb65664ab4508b
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
