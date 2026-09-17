@@ -496,6 +496,25 @@ impl Drop for GlobalState {
 }
 
 impl GlobalState {
+    /// Ordinary RPC mutation must linearize before terminal publication under
+    /// the same mutex as scheduler grants. A losing callback stays pending for
+    /// the backend's failure subscription to drop; no normal reply is invented.
+    /// Consuming exit RPCs retain their existing validation/accounting path.
+    async fn lock_rpc_scheduler(
+        &self,
+        consuming_cleanup: bool,
+    ) -> std::sync::MutexGuard<'_, Scheduler> {
+        std::future::poll_fn(|_| {
+            let sched = self.sched.lock().unwrap();
+            if !consuming_cleanup && sched.backend_failed() {
+                Poll::Pending
+            } else {
+                Poll::Ready(sched)
+            }
+        })
+        .await
+    }
+
     /// Return the producer-observed mount identity order after a run.
     ///
     /// The first vector is the exact mountinfo row/parent order. The second is
@@ -795,12 +814,29 @@ impl GlobalTool for GlobalState {
         GlobalState::initialize(cfg, true)
     }
 
+    fn report_backend_failure(&self, event: reverie::BackendFailure) {
+        let wake = self.sched.lock().unwrap().report_backend_failure(event);
+        if let Some(wake) = wake {
+            // No waiter can begin consuming cleanup until the scheduler has
+            // closed its selected transaction under the grant/commit mutex.
+            let _ = wake.send(());
+        }
+    }
+
+    async fn wait_for_backend_failure(&self) {
+        let wake = self.sched.lock().unwrap().backend_failure_waiter();
+        wake.await
+            .expect("GlobalState owns the failure sender until publication");
+    }
+
     async fn receive_rpc(&self, from: Tid, gr: Self::Request) -> Self::Response {
         type R = GlobalResponse;
         let dtid = DetTid::from_raw(from.into()); // TODO(T78538674): FIXME
         let (guest_time, request_mm, request) = gr;
         let time_from_guest = guest_time.as_nanos();
         let is_deregister = matches!(&request, GlobalRequest::DeregisterThread(_));
+        let consuming_cleanup =
+            is_deregister || matches!(&request, GlobalRequest::RobustListWakes(_));
 
         let (exec_reconnect, is_exec_caller_after_local_mm_swap) = {
             let pending = self.pending_exec_states.lock().unwrap();
@@ -823,7 +859,7 @@ impl GlobalTool for GlobalState {
         // clock accounting so logical teardown cannot linearize between the two.
         let mut tombstoned_deregistration = None;
         {
-            let sched = self.sched.lock().unwrap();
+            let sched = self.lock_rpc_scheduler(consuming_cleanup).await;
             if exec_reconnect.is_none()
                 && !is_exec_caller_after_local_mm_swap
                 && !sched.rpc_incarnation_matches(dtid, request_mm)
@@ -837,6 +873,23 @@ impl GlobalTool for GlobalState {
                 } else {
                     (None, R::ThreadExited)
                 };
+            }
+            if let GlobalRequest::DeregisterThread(owner) = &request {
+                assert_eq!(
+                    owner.dettid, dtid,
+                    "deregistration must belong to its sender"
+                );
+                assert_eq!(owner.mm, request_mm, "deregistration must retain its MmId");
+                if !sched.thread_was_registered(dtid) {
+                    assert!(
+                        sched.backend_failed() || !owner.thread_start_entered,
+                        "a started thread must have a scheduler registration before deregistration"
+                    );
+                    // The backend still consumes this constructed ThreadState,
+                    // but no guest start/registration happened. Acknowledge its
+                    // cleanup without creating a clock, tree entry or admission.
+                    return (None, R::DeregisterThread(()));
+                }
             }
             let child = match &request {
                 GlobalRequest::CreateChildThread(child, ..)
@@ -911,6 +964,7 @@ impl GlobalTool for GlobalState {
             }
             // TODO-HUMAN-REVIEW(PR-643): Review run-wide unsupported-syscall aggregation.
             GlobalRequest::ReportUnsupportedSyscall(name) => {
+                let _sched = self.lock_rpc_scheduler(false).await;
                 let inserted = self
                     .unsupported_syscalls
                     .lock()
@@ -925,6 +979,7 @@ impl GlobalTool for GlobalState {
                 R::ReportUnsupportedSyscall(())
             }
             GlobalRequest::PrepareExec(process, mm, fd_blocking) => {
+                let _sched = self.lock_rpc_scheduler(false).await;
                 if mm != request_mm {
                     return (None, R::ThreadExited);
                 }
@@ -944,6 +999,7 @@ impl GlobalTool for GlobalState {
                 R::PrepareExec(())
             }
             GlobalRequest::CancelExec(process) => {
+                let _sched = self.lock_rpc_scheduler(false).await;
                 let mut pending = self.pending_exec_states.lock().unwrap();
                 if pending
                     .get(&process)
@@ -954,6 +1010,7 @@ impl GlobalTool for GlobalState {
                 R::CancelExec(())
             }
             GlobalRequest::MarkPastFirstExecve => {
+                let _sched = self.lock_rpc_scheduler(false).await;
                 self.past_first_execve.store(true, SeqCst);
                 let overrides = self
                     .post_exec_fd_blocking
@@ -978,6 +1035,7 @@ impl GlobalTool for GlobalState {
                 priority,
             ) => {
                 if let Some(prepared) = &exec_reconnect {
+                    let mut sched = self.lock_rpc_scheduler(false).await;
                     let (pending, post_exec_mm) = {
                         let mut states = self.pending_exec_states.lock().unwrap();
                         let Some(pending) = states.remove(&parent_detpid) else {
@@ -988,7 +1046,6 @@ impl GlobalTool for GlobalState {
                         (pending, post_exec_mm)
                     };
                     assert_eq!(pending.process, parent_detpid);
-                    let mut sched = self.sched.lock().unwrap();
                     if let Some((physical_pid, physical_tid)) = physical_ids
                         && let Err(open_error) = sched.register_physical_thread(
                             dettid,
@@ -1012,7 +1069,6 @@ impl GlobalTool for GlobalState {
                         child_tid_addr: ctid,
                         reconnect_priority: priority,
                     });
-                    drop(sched);
                     if pending.caller != dettid {
                         self.global_time
                             .lock()
@@ -1099,9 +1155,8 @@ impl GlobalTool for GlobalState {
             }
             GlobalRequest::SetChildTidAddress(address) => {
                 let updated = self
-                    .sched
-                    .lock()
-                    .unwrap()
+                    .lock_rpc_scheduler(false)
+                    .await
                     .set_child_tid_address(dtid, address);
                 if updated {
                     R::SetChildTidAddress(())
@@ -1184,7 +1239,11 @@ impl GlobalTool for GlobalState {
             // TODO-HUMAN-REVIEW(PR-841): Review logical alarm query RPC.
             GlobalRequest::AlarmRemaining(dpid) => {
                 let now = self.global_time.lock().unwrap().as_nanos();
-                R::AlarmRemaining(self.sched.lock().unwrap().alarm_remaining(dpid, now))
+                R::AlarmRemaining(
+                    self.lock_rpc_scheduler(false)
+                        .await
+                        .alarm_remaining(dpid, now),
+                )
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#869)
@@ -1209,11 +1268,13 @@ impl GlobalTool for GlobalState {
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#663)
-            GlobalRequest::ResolveKillTargets(dpid) => {
-                R::ResolveKillTargets(self.sched.lock().unwrap().process_signal_targets(dpid))
-            }
+            GlobalRequest::ResolveKillTargets(dpid) => R::ResolveKillTargets(
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .process_signal_targets(dpid),
+            ),
             GlobalRequest::NotifySignalPending(dettid, SigWrapper(signal), target_process) => {
-                let mut scheduler = self.sched.lock().unwrap();
+                let mut scheduler = self.lock_rpc_scheduler(false).await;
                 scheduler.notify_signal_pending(dettid, SigWrapper(signal));
                 if signal == libc::SIGKILL
                     && let Some(detpid) = target_process
@@ -1223,42 +1284,40 @@ impl GlobalTool for GlobalState {
                 R::NotifySignalPending(())
             }
             GlobalRequest::ThreadIsLive(dtid) => {
-                R::ThreadIsLive(self.sched.lock().unwrap().thread_is_live(dtid))
+                R::ThreadIsLive(self.lock_rpc_scheduler(false).await.thread_is_live(dtid))
             }
             GlobalRequest::ExactChildWaitState(parent, child) => R::ExactChildWaitState(
-                self.sched
-                    .lock()
-                    .unwrap()
+                self.lock_rpc_scheduler(false)
+                    .await
                     .exact_child_wait_state(parent, child),
             ),
             GlobalRequest::ReadyChildWait(parent, selector) => {
-                let sched = self.sched.lock().unwrap();
+                let sched = self.lock_rpc_scheduler(false).await;
                 R::ReadyChildWait((
                     sched.ready_child_wait(parent, selector),
                     sched.has_child_wait_target(parent, selector),
                 ))
             }
-            GlobalRequest::ConsumeChildWait(parent, child) => {
-                R::ConsumeChildWait(self.sched.lock().unwrap().consume_child_wait(parent, child))
-            }
+            GlobalRequest::ConsumeChildWait(parent, child) => R::ConsumeChildWait(
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .consume_child_wait(parent, child),
+            ),
             GlobalRequest::ProcessGroup(process) => R::ProcessGroup(
-                self.sched
-                    .lock()
-                    .unwrap()
+                self.lock_rpc_scheduler(false)
+                    .await
                     .thread_tree
                     .process_group(process),
             ),
             GlobalRequest::SetProcessGroup(process, group) => R::SetProcessGroup(
-                self.sched
-                    .lock()
-                    .unwrap()
+                self.lock_rpc_scheduler(false)
+                    .await
                     .thread_tree
                     .set_process_group(process, group),
             ),
             GlobalRequest::CreateSession(process) => R::CreateSession(
-                self.sched
-                    .lock()
-                    .unwrap()
+                self.lock_rpc_scheduler(false)
+                    .await
                     .thread_tree
                     .create_session(process),
             ),
@@ -1267,6 +1326,7 @@ impl GlobalTool for GlobalState {
                 R::UnrecoverableShutdown(())
             }
             GlobalRequest::RequestPort(open_file_id) => {
+                let _sched = self.lock_rpc_scheduler(false).await;
                 let mut mut_used_ports = self.used_ports.lock().unwrap();
                 self.update_port_range();
                 let total_available =
@@ -1292,6 +1352,7 @@ impl GlobalTool for GlobalState {
                 }
             }
             GlobalRequest::AddUsedPort(port, open_file_id) => {
+                let _sched = self.lock_rpc_scheduler(false).await;
                 let mut used_ports = self.used_ports.lock().unwrap();
                 used_ports.insert(port);
                 let mut open_file_to_port = self.open_file_to_port.lock().unwrap();
@@ -1299,6 +1360,7 @@ impl GlobalTool for GlobalState {
                 R::AddUsedPort
             }
             GlobalRequest::ReleasePort(open_file_id) => {
+                let _sched = self.lock_rpc_scheduler(false).await;
                 let mut used_ports = self.used_ports.lock().unwrap();
                 let mut open_file_to_port = self.open_file_to_port.lock().unwrap();
                 let port = open_file_to_port.remove(&open_file_id);
@@ -1315,7 +1377,7 @@ impl GlobalTool for GlobalState {
             if is_deregister || exec_reconnect.is_some() || is_exec_caller_after_local_mm_swap {
                 false
             } else {
-                let sched = self.sched.lock().unwrap();
+                let sched = self.lock_rpc_scheduler(consuming_cleanup).await;
                 sched.thread_is_logically_killed(dtid)
                     || !sched.rpc_incarnation_matches(dtid, request_mm)
             };
@@ -1349,7 +1411,7 @@ impl GlobalState {
         let dettid = DetTid::from_raw(from.into()); // TODO(T78538674): FIXME
 
         let resp2 = {
-            let mut sched = self.sched.lock().unwrap();
+            let mut sched = self.lock_rpc_scheduler(false).await;
             if sched.thread_is_logically_killed(dettid)
                 || request_mm.is_some_and(|mm| !sched.rpc_incarnation_matches(dettid, mm))
             {
@@ -1374,7 +1436,7 @@ impl GlobalState {
         );
         let answer = resp2.get().await; // Block on the scheduler allowing our guest to proceed.
         let request_became_stale = {
-            let sched = self.sched.lock().unwrap();
+            let sched = self.lock_rpc_scheduler(false).await;
             sched.thread_is_logically_killed(dettid)
                 || request_mm.is_some_and(|mm| !sched.rpc_incarnation_matches(dettid, mm))
         };
@@ -1402,7 +1464,7 @@ impl GlobalState {
             // We trust the kernel to physically kill them irrespective of what they're
             // blocked on, including us having blocked them in the `futex_waiters` list.
             {
-                let mut sched = self.sched.lock().unwrap();
+                let mut sched = self.lock_rpc_scheduler(false).await;
                 if sched.thread_is_logically_killed(dettid)
                     || request_mm.is_some_and(|mm| !sched.rpc_incarnation_matches(dettid, mm))
                 {
@@ -1519,7 +1581,7 @@ impl GlobalState {
         };
 
         {
-            let mut sched = self.sched.lock().unwrap();
+            let mut sched = self.lock_rpc_scheduler(false).await;
             let sender = DetTid::from_raw(rpc_sender.into());
             if sched.thread_is_logically_killed(sender)
                 || !sched.rpc_incarnation_matches(sender, request_mm)
@@ -1678,7 +1740,7 @@ impl GlobalState {
         // TODO: eliminate this loop. Could instead signal with an ivar.
         let response_ivar = loop {
             yield_once().await;
-            let mut sched = self.sched.lock().unwrap();
+            let mut sched = self.lock_rpc_scheduler(false).await;
             if sched.thread_is_logically_killed(dettid)
                 || !sched.rpc_incarnation_matches(dettid, request_mm)
             {
@@ -1748,7 +1810,7 @@ impl GlobalState {
         );
         let _answer = response_ivar.get().await;
         let request_became_stale = {
-            let sched = self.sched.lock().unwrap();
+            let sched = self.lock_rpc_scheduler(false).await;
             sched.thread_is_logically_killed(dettid)
                 || !sched.rpc_incarnation_matches(dettid, request_mm)
         };
@@ -1760,21 +1822,22 @@ impl GlobalState {
             &dettid, &response_ivar
         );
         if let Some(pr) = &self.preemptions_to_replay {
-            let history = pr.extract_thread_record(&dettid).unwrap_or_else(|| {
-                warn!(
-                    "Replaying preemptions, but no record found for thread {}",
-                    dettid
-                );
-                ThreadHistory::new()
-            });
-            let old_prio = {
-                let mut sched = self.sched.lock().unwrap();
+            let (history, old_prio) = {
+                let mut sched = self.lock_rpc_scheduler(false).await;
                 if sched.thread_is_logically_killed(dettid)
                     || !sched.rpc_incarnation_matches(dettid, request_mm)
                 {
                     return SchedulerRpcResult::ThreadExited;
                 }
-                sched.priorities.insert(dettid, history.initial_priority())
+                let history = pr.extract_thread_record(&dettid).unwrap_or_else(|| {
+                    warn!(
+                        "Replaying preemptions, but no record found for thread {}",
+                        dettid
+                    );
+                    ThreadHistory::new()
+                });
+                let old_prio = sched.priorities.insert(dettid, history.initial_priority());
+                (history, old_prio)
             };
             debug!(
                 "[replay-preemption] Enqueing new thread at priority {:?} (changed from {:?})",
@@ -1794,6 +1857,7 @@ impl GlobalState {
             dettid,
             detpid,
             mm,
+            thread_start_entered: _,
             timeslice_stats,
             syscall_count,
             chaos_epochs,
@@ -1856,7 +1920,7 @@ impl GlobalState {
         let RpcIncarnation { dettid, mm } = caller;
         trace!("[detcore, dtid {}] Futex action: {:?}", &dettid, action);
         let response_iv = {
-            let mut sched = self.sched.lock().unwrap();
+            let mut sched = self.lock_rpc_scheduler(false).await;
             if sched.thread_is_logically_killed(dettid)
                 || !sched.rpc_incarnation_matches(dettid, mm)
             {
@@ -1921,6 +1985,7 @@ impl GlobalState {
     }
 
     async fn recv_determinize_inode(&self, from: Tid, ino: RawInode) -> (DetInode, LogicalTime) {
+        let _sched = self.lock_rpc_scheduler(false).await;
         // Here we establish a policy that when we first see a file its mtime is epoch.
         let nanos = self
             .cfg
@@ -1943,6 +2008,7 @@ impl GlobalState {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping RPC.
     async fn recv_determinize_device(&self, from: Tid, raw_device: u64) -> u64 {
+        let _sched = self.lock_rpc_scheduler(false).await;
         let det_device = self.devices.lock().unwrap().determinize(raw_device);
         trace!(
             "[detcore, dtid {}] resolved (raw) device {} to {}",
@@ -1957,6 +2023,7 @@ impl GlobalState {
         raw_mount_id: u64,
         mountinfo_order: Option<&[u64]>,
     ) -> Option<u64> {
+        let _sched = self.lock_rpc_scheduler(false).await;
         let virtual_mount_id = self
             .mount_ids
             .lock()
@@ -1970,6 +2037,7 @@ impl GlobalState {
     }
 
     async fn recv_validate_mount_id_order(&self, from: Tid, mountinfo_order: &[u64]) -> bool {
+        let _sched = self.lock_rpc_scheduler(false).await;
         let valid = self
             .mount_ids
             .lock()
@@ -1983,11 +2051,13 @@ impl GlobalState {
     }
 
     async fn recv_unlink_inode(&self, from: Tid, d_ino: DetInode) {
+        let _sched = self.lock_rpc_scheduler(false).await;
         trace!("[detcore, dtid {}] unlink (det) inode {:?}", from, d_ino);
         self.inodes.lock().unwrap().remove_inode(d_ino);
     }
 
     async fn recv_touch_file(&self, from: Tid, ino: RawInode) {
+        let _sched = self.lock_rpc_scheduler(false).await;
         let mtime = if self.cfg.virtualize_time {
             self.global_time.lock().unwrap().as_nanos()
         } else {
@@ -2031,36 +2101,35 @@ impl GlobalState {
         detpid: DetPid,
         request_mm: MmId,
     ) -> SchedulerRpcResult<TraceSchedEventResponse> {
-        if !self
-            .sched
-            .lock()
-            .unwrap()
-            .rpc_incarnation_matches(ev.dettid, request_mm)
-        {
-            return SchedulerRpcResult::ThreadExited;
-        }
-        // TODO(T124316762): debug address randomization in the tracer and get rid of this hack:
         let ev = {
-            if self.past_first_execve.load(SeqCst) {
-                ev
-            } else {
-                info!("Warning: erasing rip of pre-execve sched event! {:?}", ev);
-                SchedEvent {
-                    end_rip: None,
-                    start_rip: None,
-                    ..ev
-                }
+            let sched = self.lock_rpc_scheduler(false).await;
+            if !sched.rpc_incarnation_matches(ev.dettid, request_mm) {
+                return SchedulerRpcResult::ThreadExited;
             }
+            // TODO(T124316762): debug address randomization in the tracer and get rid of this hack:
+            let ev = {
+                if self.past_first_execve.load(SeqCst) {
+                    ev
+                } else {
+                    info!("Warning: erasing rip of pre-execve sched event! {:?}", ev);
+                    SchedEvent {
+                        end_rip: None,
+                        start_rip: None,
+                        ..ev
+                    }
+                }
+            };
+            // Future trace_schedevent calls will retain their rip values.
+            if ev.op == Op::Syscall(Sysno::execve, SyscallPhase::Prehook) {
+                self.past_first_execve.store(true, SeqCst);
+            }
+            ev
         };
-        // Future trace_schedevent calls will retain their rip values.
-        if ev.op == Op::Syscall(Sysno::execve, SyscallPhase::Prehook) {
-            self.past_first_execve.store(true, SeqCst);
-        }
 
         // Yield this guest thread if needed to follow schedule.
         let result = if self.cfg.replay_schedule_from.is_some() {
             let (consumed, print_stack2) = {
-                let mut sched = self.sched.lock().unwrap();
+                let mut sched = self.lock_rpc_scheduler(false).await;
                 if sched.thread_is_logically_killed(ev.dettid)
                     || !sched.rpc_incarnation_matches(ev.dettid, request_mm)
                 {
@@ -2112,7 +2181,7 @@ impl GlobalState {
             }
         } else {
             let print_stack_strace = {
-                let mut sched = self.sched.lock().unwrap();
+                let mut sched = self.lock_rpc_scheduler(false).await;
                 if sched.thread_is_logically_killed(ev.dettid)
                     || !sched.rpc_incarnation_matches(ev.dettid, request_mm)
                 {
@@ -2133,6 +2202,7 @@ impl GlobalState {
         if result.print_stack_strace.is_some()
             && let Some(sig) = &self.cfg.stacktrace_signal
         {
+            let _sched = self.lock_rpc_scheduler(false).await;
             trace!(
                 "[dtid {}] signaling thread with {} at the point of stack trace printing.",
                 ev.dettid, sig.0
@@ -2192,7 +2262,7 @@ impl GlobalState {
         sig: SigWrapper,
     ) -> SchedulerRpcResult<(LogicalTime, LogicalTime)> {
         let RpcIncarnation { dettid, mm } = caller;
-        let mut sched = self.sched.lock().unwrap();
+        let mut sched = self.lock_rpc_scheduler(false).await;
         if sched.thread_is_logically_killed(dettid) || !sched.rpc_incarnation_matches(dettid, mm) {
             return SchedulerRpcResult::ThreadExited;
         }
@@ -2219,7 +2289,7 @@ impl GlobalState {
         sig: SigWrapper,
     ) -> SchedulerRpcResult<()> {
         let RpcIncarnation { dettid, mm } = caller;
-        let mut sched = self.sched.lock().unwrap();
+        let mut sched = self.lock_rpc_scheduler(false).await;
         if sched.thread_is_logically_killed(dettid) || !sched.rpc_incarnation_matches(dettid, mm) {
             return SchedulerRpcResult::ThreadExited;
         }
@@ -2241,6 +2311,9 @@ pub struct ThreadDeregistration {
     pub(crate) dettid: DetTid,
     pub(crate) detpid: DetPid,
     pub(crate) mm: MmId,
+    /// Carried by the consuming ThreadState owner, independently of detpid's
+    /// delayed initialization and the parent's scheduler registration RPC.
+    pub(crate) thread_start_entered: bool,
     pub(crate) timeslice_stats: TimesliceStats,
     pub(crate) syscall_count: u64,
     pub(crate) chaos_epochs: Vec<ChaosEpochTransition>,
@@ -3513,6 +3586,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    mod backend_failure_tests;
     use std::collections::BTreeSet;
     use std::os::fd::AsRawFd;
     use std::os::fd::FromRawFd;
@@ -4759,6 +4833,7 @@ mod tests {
                     leader_clock.clone(),
                     old_mm,
                     GlobalRequest::DeregisterThread(ThreadDeregistration {
+                        thread_start_entered: true,
                         dettid: leader,
                         detpid,
                         mm: old_mm,
@@ -4953,6 +5028,7 @@ mod tests {
             .recv_deregister_thread(
                 reverie::Tid::from_raw(leader.as_raw()),
                 ThreadDeregistration {
+                    thread_start_entered: true,
                     dettid: leader,
                     detpid,
                     mm: MmId::initial(detpid),
@@ -4978,6 +5054,7 @@ mod tests {
             .recv_deregister_thread(
                 reverie::Tid::from_raw(leader.as_raw()),
                 ThreadDeregistration {
+                    thread_start_entered: true,
                     dettid: leader,
                     detpid,
                     mm: MmId::initial(detpid).for_exec(detpid),
@@ -5245,6 +5322,7 @@ mod tests {
                     late_time.clone(),
                     MmId::initial(dettid),
                     GlobalRequest::DeregisterThread(ThreadDeregistration {
+                        thread_start_entered: true,
                         dettid,
                         detpid,
                         mm: MmId::initial(detpid),
@@ -5278,6 +5356,7 @@ mod tests {
                     late_time,
                     MmId::initial(dettid),
                     GlobalRequest::DeregisterThread(ThreadDeregistration {
+                        thread_start_entered: true,
                         dettid,
                         detpid,
                         mm: MmId::initial(detpid),
@@ -6382,5 +6461,53 @@ mod robust_exit_clock_tests {
             later.inherited_nanos(),
         );
         f.exit(0, ExitStatus::Exited(0)).await;
+    }
+
+    #[tokio::test]
+    async fn backend_failure_preserves_consuming_robust_exit_clock_accounting() {
+        for order in [[0, 1], [1, 0]] {
+            let f = Fixture::new(RobustListExit::ExitGroup, false, None, false);
+            let selected = {
+                let mut sched = f.state.sched.lock().unwrap();
+                sched.next_turns.get_mut(&f.peer).unwrap().req = Ivar::new();
+                sched.select_test_turn().unwrap()
+            };
+            let responses = {
+                let sched = f.state.sched.lock().unwrap();
+                f.waiters.map(|tid| sched.next_turns[&tid].resp.clone())
+            };
+            let mut turn = std::pin::pin!(crate::scheduler::finish_selected_turn(
+                f.state.sched.clone(),
+                f.state.global_time.clone(),
+                selected.0,
+                selected.1,
+                selected.2,
+            ));
+            assert!(futures::poll!(turn.as_mut()).is_pending());
+            f.state.report_backend_failure(reverie::BackendFailure {
+                pid: Tid::from_raw(17),
+                tid: Tid::from_raw(18),
+                phase: "native robust cleanup control",
+            });
+            for index in order {
+                f.exit(index, ExitStatus::Exited(0)).await;
+            }
+            assert!(matches!(futures::poll!(turn.as_mut()), Poll::Ready(Err(_))));
+            f.assert_clocks(&[0, 1]);
+            let observations = f.observations.lock().unwrap();
+            assert_eq!(observations.len(), 1, "one complete batch");
+            assert_eq!(observations[0].counts, vec![1, 1]);
+            assert!(
+                responses
+                    .iter()
+                    .all(|response| response.try_read().is_none())
+            );
+            let mut sched = f.state.sched.lock().unwrap();
+            assert_eq!(sched.turn, 0);
+            for owner in &f.owners {
+                assert!(!sched.next_turns.contains_key(&owner.dettid));
+                assert!(!sched.note_deregistration_accounted(owner.dettid));
+            }
+        }
     }
 }

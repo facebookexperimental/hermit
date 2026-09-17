@@ -23,7 +23,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit",
             "--features",
-            "third-party-backends",
+            "third-party-backends,kvm-native-test-support",
             "--lib",
             "--bins",
         ]),
@@ -153,19 +153,27 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         "test.cli"
         | "test.isolated_dbt_workdir"
         | "test.cli_on_host"
-        | "privileged-test.cli_kvm"
         | "super.liteinst_python3_verify_diagnostics"
         | "super.dbt_pipe_backpressure_diagnostic"
         | "super.dbt_failed_exec_recovery_diagnostic"
         | "super.dbt_unsupported_syscall_aggregation_diagnostic"
         | "super.dbt_strict_blocked_stdin_teardown_diagnostic"
-        | "super.dbt_guest_stderr_isolation_diagnostic"
+        | "super.dbt_guest_stderr_isolation_diagnostic" => Some(&[
+            "-p",
+            "hermit",
+            "--features",
+            "third-party-backends",
+            "--test",
+            "cli",
+        ]),
+        "privileged-test.cli_kvm"
         | "privileged-only-test.cli_kvm"
         | "privileged-only-test.cli_kvm_on_host" => Some(&[
             "-p",
             "hermit",
             "--features",
-            "third-party-backends",
+            "third-party-backends,kvm-execution-tests",
+            "--lib",
             "--test",
             "cli",
         ]),
@@ -594,6 +602,49 @@ mod tests {
             .find(|step| step.tag() == "privileged-test.cli_kvm")
             .unwrap();
         assert_command_selection(original).unwrap();
+        let portable = crate::nextest_binaries::config_selections(&graph, "portable").unwrap();
+        let full = crate::nextest_binaries::config_selections(&graph, "full").unwrap();
+        let hardware: Vec<String> = serde_json::from_str(&original.env[SELECTION_ENV]).unwrap();
+        let hardware_key = crate::nextest_binaries::selection_key(&hardware);
+        assert_eq!(full.get(&hardware_key), Some(&hardware));
+        assert!(!portable.contains_key(&hardware_key));
+        assert_eq!(full.len(), portable.len() + 1);
+        for (key, selection) in &portable {
+            assert_eq!(full.get(key), Some(selection));
+        }
+        for tag in ["test.hermit_unit", "test.hermit_unit_on_host"] {
+            let step = graph.steps.iter().find(|step| step.tag() == tag).unwrap();
+            let selection: Vec<String> = serde_json::from_str(&step.env[SELECTION_ENV]).unwrap();
+            assert!(selection.contains(&"third-party-backends,kvm-native-test-support".into()));
+            assert!(
+                !selection
+                    .iter()
+                    .any(|arg| arg.contains("kvm-execution-tests"))
+            );
+        }
+        let mut missing_hardware = graph.clone();
+        let producer = missing_hardware
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "build.workspace_in_pinned_root")
+            .unwrap();
+        assert!(
+            execution_command(producer)
+                .unwrap()
+                .ends_with("./ci/nextest-binaries.rs prepare full")
+        );
+        producer.cmd = producer.cmd.replace(
+            "./ci/nextest-binaries.rs prepare full",
+            "./ci/nextest-binaries.rs prepare portable",
+        );
+        missing_hardware
+            .steps
+            .sort_by_key(|step| step.tag() != "privileged-test.cli_kvm");
+        let error = assert_preparation_dependencies(&missing_hardware).unwrap_err();
+        assert!(
+            error.starts_with("privileged-test.cli_kvm") && error.contains("same filesystem root"),
+            "{error}"
+        );
         let direct = graph
             .steps
             .iter()

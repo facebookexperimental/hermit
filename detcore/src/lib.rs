@@ -1487,6 +1487,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 ThreadState {
                     dettid,
                     detpid: None, // Initialized later.
+                    thread_start_entered: false,
                     physical_tid: None,
                     open_file_creator: None,
                     mm_id: MmId::for_clone(
@@ -1626,6 +1627,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     }
 
     async fn handle_thread_start<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Error> {
+        guest.thread_state_mut().thread_start_entered = true;
         let new_dettid = DetTid::from_raw(guest.tid().into()); // TODO(T78538674): virtualize pid/tid:
         assert_eq!(new_dettid, guest.thread_state().dettid);
         let detpid = select_thread_start_detpid(guest.thread_state().detpid, guest.pid());
@@ -2927,6 +2929,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 dettid,
                 detpid,
                 mm: mm_id,
+                thread_start_entered: thread_state.thread_start_entered,
                 timeslice_stats: thread_state.stats.timeslice_stats,
                 syscall_count: thread_state.stats.syscall_count,
                 chaos_epochs: pending_chaos_epochs,

@@ -33,6 +33,9 @@ use detcore_model::happens_before::Strength;
 use detcore_model::happens_before::ThreadRef;
 use detcore_model::summary::RunSummary;
 use detcore_model::summary::TimesliceStats;
+use futures::FutureExt;
+use futures::channel::oneshot;
+use futures::future::Shared;
 use nix::sys::signal;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
@@ -598,6 +601,13 @@ pub struct Scheduler {
     /// poison the scheduler mutex on the way out.
     terminal_deadlock: Option<String>,
 
+    // A fatal backend result ends this run; it is never a guest response.
+    // The event and run-queue transition share the grant/commit mutex. Every
+    // callback and daemon wait clones its own subscriber, unlike an Ivar.
+    backend_failure: Option<reverie::BackendFailure>,
+    backend_failure_sender: Option<oneshot::Sender<()>>,
+    backend_failure_wake: Shared<oneshot::Receiver<()>>,
+
     /// Whether exit-group teardown must explicitly cancel parked backend RPCs.
     cancel_killed_thread_rpcs: bool,
 
@@ -1130,7 +1140,9 @@ async fn sched_loop_inner(
         let sched = sched.lock().unwrap();
         (sched.started_up.clone(), sched.stop_after_iter)
     };
-    iv.get().await;
+    if until_backend_failure(&sched, iv.get()).await.is_err() {
+        return;
+    }
     info!("[scheduler] guest in queue, scheduler proceeding..",);
     if let Some(observer) = &observer {
         observer("guest registered; deterministic scheduler proceeding");
@@ -1142,6 +1154,9 @@ async fn sched_loop_inner(
     let mut observed_turn = false;
 
     loop {
+        if sched.lock().unwrap().backend_failed() {
+            return;
+        }
         // TODO (T137183027, T137184765): as part of the current strategy for blocking IO ops (see
         // SPINNING below), we need to make sure that other threads can progress so we don't
         // busy-wait too tightly.
@@ -1166,6 +1181,9 @@ async fn sched_loop_inner(
         // If there are NO threads left in the system, then we're truly done:
         {
             let sched = sched.lock().unwrap();
+            if sched.backend_failed() {
+                return;
+            }
             if sched.run_queue.is_empty()
                 && sched.blocked.is_empty()
                 && sched.pending_physical_process_exits.is_empty()
@@ -1218,6 +1236,29 @@ async fn sched_loop_inner(
 #[derive(Debug, Clone)]
 pub struct SkipTurn;
 
+/// Wait without manufacturing a normal scheduler request or response. The
+/// caller must check the terminal state again under the mutex before mutation.
+async fn until_backend_failure<T>(
+    sched: &Arc<Mutex<Scheduler>>,
+    wait: impl std::future::Future<Output = T>,
+) -> Result<T, SkipTurn> {
+    let failure = {
+        let sched = sched.lock().unwrap();
+        if sched.backend_failed() {
+            return Err(SkipTurn);
+        }
+        sched.backend_failure_waiter()
+    };
+    futures::pin_mut!(wait, failure);
+    match futures::future::select(failure, wait).await {
+        futures::future::Either::Left((notice, _)) => {
+            notice.expect("scheduler owns the failure sender until publication");
+            Err(SkipTurn)
+        }
+        futures::future::Either::Right((value, _)) => Ok(value),
+    }
+}
+
 /// Advance turn by 1 turn, blocking when necessary to make it happen.
 /// Return the outcome of the turn as well as which resources were used, if any.
 ///
@@ -1239,6 +1280,9 @@ pub async fn do_a_turn_blocking(
         // only the scheduler thread (us) actually rotates entries from the front to the back.
         let req_ivar = {
             let mut mg = sched.lock().unwrap();
+            if mg.backend_failed() {
+                return Err(SkipTurn);
+            }
             let arc = global_time.clone();
 
             let next_outstanding = mg.step1_check_quiescence(&arc, last_turn);
@@ -1251,23 +1295,39 @@ pub async fn do_a_turn_blocking(
             }
         };
         trace!("Scheduler wait for full quiescense, on {}...", req_ivar);
-        let _ = req_ivar.await;
+        let _ = until_backend_failure(&sched, req_ivar).await?;
     }
 
     // Here we copy some information while holding the sched lock, and then release it so
     // we can `.await` below:
     let (next_dtid, req, resp) = {
         let mut sched = sched.lock().unwrap();
+        if sched.backend_failed() {
+            return Err(SkipTurn);
+        }
         sched.step2_process_blocked(&global_time)?;
         sched.step3_peek().ok_or(SkipTurn)?
     };
 
+    finish_selected_turn(sched, global_time, next_dtid, req, resp).await
+}
+
+/// Complete the selected transaction. Keeping the await and post-await checks
+/// together also lets native controls hold the real request wait open while
+/// consuming cleanup races with the daemon.
+pub(crate) async fn finish_selected_turn(
+    sched: Arc<Mutex<Scheduler>>,
+    global_time: Arc<Mutex<GlobalTime>>,
+    next_dtid: DetTid,
+    req: Ivar<SchedRequest>,
+    resp: Ivar<SchedResponse>,
+) -> Result<Resources, SkipTurn> {
     // Step 1B: wait for the selected thread to make its request.
     trace!(
         "[sched-daemon] waiting for next thread (dtid {}) to park...",
         next_dtid
     );
-    let rsrcs: Resources = match req.get().await {
+    let rsrcs: Resources = match until_backend_failure(&sched, req.get()).await? {
         Err(ThreadExited) => {
             debug!(
                 "[sched-daemon] woke up on request {}, but fizzling because next thread, {}, exited.",
@@ -1283,7 +1343,10 @@ pub async fn do_a_turn_blocking(
             // pass" defect. The dead thread's buffered removal drains
             // deterministically on the next pass, once this undo has closed the
             // window.
-            sched.lock().unwrap().run_queue.undo_tentative_pop();
+            let mut sched = sched.lock().unwrap();
+            if !sched.backend_failed() {
+                sched.run_queue.undo_tentative_pop();
+            }
             return Err(SkipTurn);
         }
         Ok(r) => r,
@@ -1294,6 +1357,9 @@ pub async fn do_a_turn_blocking(
     // sufficient here because the thread cannot be racing with us to exit since we know
     // it is *already* parked.
     let mut mg = sched.lock().unwrap();
+    if mg.backend_failed() {
+        return Err(SkipTurn);
+    }
     mg.abort_turn_if_thread_vanished(next_dtid)?;
 
     // The logical COMMIT point for the turn is during step4:
@@ -1405,6 +1471,7 @@ impl Scheduler {
             v.into_iter().peekable()
         });
 
+        let (backend_failure_sender, backend_failure_wake) = oneshot::channel();
         Self {
             preemption_writer: if cfg.record_preemptions {
                 Some(PreemptionWriter::new(cfg.record_preemptions_to.clone()))
@@ -1434,6 +1501,9 @@ impl Scheduler {
             pending_cross_task_signals: Default::default(),
             cleared_child_tids: Default::default(),
             terminal_deadlock: None,
+            backend_failure: None,
+            backend_failure_sender: Some(backend_failure_sender),
+            backend_failure_wake: backend_failure_wake.shared(),
             cancel_killed_thread_rpcs: cfg.cancel_killed_thread_rpcs,
             backend_requires_thread_directed_process_signals: cfg
                 .backend_requires_thread_directed_process_signals,
@@ -1871,7 +1941,7 @@ impl Scheduler {
                 // down the exit scenarios and ensure that they happen when the guest is running and
                 // has NOT filled its request to the scheduler yet.
                 let request_was_pending = nextturn.req.try_put(Err(ThreadExited)).is_some();
-                if request_was_pending && self.cancel_killed_thread_rpcs {
+                if request_was_pending && self.cancel_killed_thread_rpcs && !self.backend_failed() {
                     // AUTONOMOUS-BOT-IMPLEMENTED
                     // TODO-HUMAN-REVIEW(PR-845): Review killed-thread RPC cancellation.
                     nextturn.resp.try_put(SchedResponse::Signaled(None));
@@ -2036,6 +2106,13 @@ impl Scheduler {
         self.exec_incarnations.insert(dettid, mm);
     }
 
+    #[cfg(test)]
+    pub(crate) fn select_test_turn(
+        &mut self,
+    ) -> Option<(DetTid, Ivar<SchedRequest>, Ivar<SchedResponse>)> {
+        self.step3_peek()
+    }
+
     // TODO-HUMAN-REVIEW(PR-1023): Review fail-closed SaBRe thread tombstones.
     pub(crate) fn thread_is_logically_killed(&self, dettid: DetTid) -> bool {
         self.cancel_killed_thread_rpcs && self.logically_killed_threads.contains(&dettid)
@@ -2047,10 +2124,45 @@ impl Scheduler {
             .is_none_or(|expected| *expected == mm)
     }
 
+    pub(crate) fn backend_failed(&self) -> bool {
+        self.backend_failure.is_some()
+    }
+
+    pub(crate) fn backend_failure_waiter(&self) -> Shared<oneshot::Receiver<()>> {
+        self.backend_failure_wake.clone()
+    }
+
+    /// Linearize failure with ordinary grants. Close the transaction here,
+    /// before any awakened Tool can run consuming clear-TID/futex cleanup.
+    /// The daemon observes the terminal state and must not undo it a second
+    /// time. The caller sends the notification after releasing this mutex.
+    pub(crate) fn report_backend_failure(
+        &mut self,
+        event: reverie::BackendFailure,
+    ) -> Option<oneshot::Sender<()>> {
+        if self.backend_failed() {
+            return None;
+        }
+        if self.run_queue.tentative_pop_in_progress() {
+            self.run_queue.undo_tentative_pop();
+        }
+        self.backend_failure = Some(event);
+        self.backend_failure_sender.take()
+    }
+
+    /// Construction does not imply scheduler registration: a backend may
+    /// consume a child before its parent has sent CreateChildThread.
+    pub(crate) fn thread_was_registered(&self, dettid: DetTid) -> bool {
+        self.thread_tree.thread_to_leader.contains_key(&dettid)
+    }
+
     /// Mark a physical exit cleanup as accounted. Non-cancelling backends preserve their existing
     /// behavior; SaBRe teardown may deliver the cleanup after an earlier logical tombstone.
     pub(crate) fn note_deregistration_accounted(&mut self, dettid: DetTid) -> bool {
-        !self.cancel_killed_thread_rpcs || self.deregistration_accounted.insert(dettid)
+        // Remember an owner accounted before a later peer failure as well.
+        // Ordinary non-cancelling behavior still accepts its prior callbacks.
+        let first = self.deregistration_accounted.insert(dettid);
+        (!self.cancel_killed_thread_rpcs && !self.backend_failed()) || first
     }
 
     /// Install a barrier between SaBRe's logical process-leader exit hook and the final ptrace

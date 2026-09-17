@@ -1714,6 +1714,10 @@ pub struct ThreadState<T> {
     /// The deterministic process ID of the this thread.
     pub detpid: Option<DetTid>,
 
+    /// Whether the backend entered the thread-start callback. Construction
+    /// alone does not imply that this thread was admitted to the scheduler.
+    pub(crate) thread_start_entered: bool,
+
     /// Host thread ID supplied by a backend whose scheduler identity is
     /// virtual. `None` keeps the existing direct-ID behavior for other
     /// backends.
@@ -2160,6 +2164,7 @@ impl<T> ThreadState<T> {
         ThreadState {
             dettid: pid,
             detpid: None, // Initialized later.
+            thread_start_entered: false,
             physical_tid: None,
             open_file_creator: None,
             mm_id: MmId::initial(pid),

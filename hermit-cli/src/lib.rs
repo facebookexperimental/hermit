@@ -2106,18 +2106,18 @@ async fn run_kvm(
     }
 
     let execution_started = Instant::now();
-    let (global_state, code, stdout, stderr) = backend
-        .run_static_elf_with_tool::<Detcore>(config, capture_output)
+    let completion = backend
+        .run_static_elf_with_tool_completion::<Detcore>(config, capture_output)
         .await
-        .map_err(|error| anyhow!("KVM guest execution failed: {error}"))?;
+        .context("KVM guest execution failed before global state recovery")?;
     let cleanup_started = Instant::now();
-    global_state
-        .clean_up(print_summary, print_summary_to_json_file)
-        .await;
+    let result =
+        finish_kvm_tool_completion(completion, print_summary, print_summary_to_json_file).await;
     let teardown_started = Instant::now();
     // Drop explicitly so the host's KVM VM teardown cost remains observable.
     drop(backend);
     let teardown_finished = Instant::now();
+    let (code, stdout, stderr) = result?;
 
     // Every field below is a host wall-clock duration. Keep this diagnostic at
     // DEBUG so it remains available for backend profiling without entering the
@@ -2145,6 +2145,26 @@ async fn run_kvm(
         stderr,
     })
 }
+
+// A runtime error still owns GlobalState. Finish its terminal daemon before
+// returning the typed cause to the CLI's error classifier.
+async fn finish_kvm_tool_completion(
+    completion: reverie_kvm::ToolRunCompletion<detcore::GlobalState>,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+) -> Result<(i32, Vec<u8>, Vec<u8>), Error> {
+    completion
+        .global_state
+        .clean_up(print_summary, print_summary_to_json_file)
+        .await;
+    completion.result.context("KVM guest execution failed")
+}
+
+#[cfg(test)]
+mod kvm_failure_tests;
+
+#[cfg(all(test, feature = "kvm-execution-tests"))]
+mod kvm_execution_tests;
 
 // TODO-HUMAN-REVIEW(PR-743): Review bounded relaunch before DBT guest execution.
 #[cfg(feature = "dbt")]

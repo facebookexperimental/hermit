@@ -332,8 +332,25 @@ fi
 # Preserve CMAKE/CMAKE_GENERATOR selection, the 1050 effective-job-second
 # threshold and the 16-job clamp. This is a source-identity carry,
 # not a new timing calibration or Hermit guest result.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 526c21cf06ef9e5098ec9002b93e40e2022e798f ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 526c21cf06ef9e5098ec9002b93e40e2022e798f (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO c8f4ca9d (2026-09-17): the landed KVM failure-notification repair
+# https://github.com/rrnewton/reverie/pull/577 preserves the SDK recipe from
+# 30fee360: build.rs blob 0ff8ae24b97464044735ba79ea74765ba4ac3ff0 and
+# DynamoRIO vendor tree 42dd83f76cef3e730c39d2313c11fdc78d12ae35 are identical.
+# Root Cargo.toml, rust-toolchain.toml and the third-party gitlink also match.
+# CMAKE remains the default cmake and CMAKE_GENERATOR remains unset, retaining
+# SDK key 0aa6d84239b5a04b7cda124ebed4c7e3adc8b62f5b4c96011a9b971e90d6b0a4,
+# the 16-job clamp and 1050 effective-job-second threshold. This is source
+# evidence for carrying the build budget, not a new timing or runtime result.
+# CARRY TO 7d863ab3 (2026-09-17): the landed KVM cleanup correction
+# https://github.com/rrnewton/reverie/pull/578 changes only reverie-kvm/src/vm.rs.
+# The build.rs blob 0ff8ae24b97464044735ba79ea74765ba4ac3ff0, DynamoRIO
+# vendor 42dd83f76cef3e730c39d2313c11fdc78d12ae35, root Cargo/toolchain and
+# third-party inputs match c8f4ca9d. Keep default cmake, unset CMAKE_GENERATOR,
+# SDK key 0aa6d84239b5a04b7cda124ebed4c7e3adc8b62f5b4c96011a9b971e90d6b0a4,
+# the 16-job clamp and 1050 effective-job-second threshold. This carries
+# the unchanged SDK recipe; it is not a new timing or Hermit guest measurement.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 7d863ab3f02639731713a01467b2548c41e3dbfb ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 7d863ab3f02639731713a01467b2548c41e3dbfb (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

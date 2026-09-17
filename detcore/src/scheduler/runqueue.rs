@@ -252,12 +252,12 @@ impl RunQueue {
 
     /// True while a `tentative_pop`/commit transaction is underway, i.e. the
     /// daemon has peeked a selection and may have released the scheduler lock
-    /// across an await. Test-only observability: production code never branches
-    /// on this. Run-queue admissions and removals are *always* buffered and
+    /// across an await. Fatal backend publication uses this read-only query to
+    /// close the transaction once before waking consuming cleanup. Ordinary
+    /// run-queue admissions and removals are always buffered and
     /// applied at the deterministic `step2` drain (window guaranteed closed), so
     /// a handler never needs to ask whether a window is live — see
     /// `Scheduler::admit_to_run_queue` / `deschedule_or_defer`. Read-only.
-    #[cfg(test)]
     pub fn tentative_pop_in_progress(&self) -> bool {
         self.tentative_selection.is_some()
     }
