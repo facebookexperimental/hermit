@@ -63,16 +63,22 @@ impl NodeClassification {
 /// Evidence of a failed condition remains authoritative alongside a diagnostic.
 ///
 /// Test results were parsed from the controlled runner's structured report.
-/// The refusal prefix is written by dagrun itself after rejecting that report
-/// (`scheduler.rs::run_step`), rather than copied from the child's output.
+/// Current dagrun retains a refused required report in `test_results_error`,
+/// separately from the exit reason. The legacy reason prefix is also retained.
+/// A refusal alone cannot turn an uncollected or aborted attempt into a result.
 pub(super) fn has_product_failure_evidence(attempt: &NodeAttempt) -> bool {
     attempt
         .test_results
         .as_ref()
         .is_some_and(|results| results.iter().any(|result| !result.passed))
-        || attempt
-            .reason
-            .starts_with("STRUCTURED TEST RESULTS REFUSED: ")
+        || (attempt.reported
+            && attempt.execution == AttemptExecution::Completed
+            && attempt.ok.is_some()
+            && !attempt.aborted
+            && (attempt.test_results_error.is_some()
+                || attempt
+                    .reason
+                    .starts_with("STRUCTURED TEST RESULTS REFUSED: ")))
 }
 
 pub(super) fn attempt_classification(attempt: &NodeAttempt) -> NodeClassification {
@@ -410,6 +416,39 @@ fn product_evidence_bracket() -> Result<(), String> {
                 .into(),
         );
     }
+    let mut typed_refusal = infra.clone();
+    typed_refusal.test_results_error = Some("required report contained a duplicate test ID".into());
+    if attempt_classification(&typed_refusal) != NodeClassification::ProductFailure
+        || typed_refusal.reason != infra.reason
+    {
+        return Err(
+            "classification: typed refusal lost precedence or changed the exit reason".into(),
+        );
+    }
+    // A declared report refused after completion is different from an attempt
+    // that never completed. Even a refusal diagnostic cannot fill that gap.
+    for bits in 1_u8..16 {
+        let mut incomplete = typed_refusal.clone();
+        incomplete.reported = bits & 1 == 0;
+        if bits & 2 != 0 {
+            incomplete.execution = AttemptExecution::Unknown;
+        }
+        incomplete.aborted = bits & 4 != 0;
+        if bits & 8 != 0 {
+            incomplete.ok = None;
+        }
+        if attempt_classification(&incomplete) != NodeClassification::NoResult {
+            return Err(format!(
+                "classification: incomplete attempt {bits} acquired a result from a refusal"
+            ));
+        }
+        incomplete.test_results = mixed.test_results.clone();
+        if attempt_classification(&incomplete) != NodeClassification::ProductFailure {
+            return Err(format!(
+                "classification: incomplete attempt {bits} erased an accepted failed test"
+            ));
+        }
+    }
     for bits in 1_u8..8 {
         let mut limited = infra.clone();
         limited.timed_out = Some(bits & 1 != 0);
@@ -698,11 +737,16 @@ mod tests {
                     &vec![dagrun::TestResult::new("fixture::fails".into(), false, 1).unwrap()]
                 );
             } else if name == "refused" {
+                let refusal = outcome.test_results_error.as_deref().unwrap();
                 assert!(
-                    outcome
-                        .reason
-                        .starts_with("STRUCTURED TEST RESULTS REFUSED: ")
+                    refusal.starts_with("malformed structured test results ")
+                        && refusal.ends_with(
+                            ": structured-test-results-results has 0 terminal row(s), expected exactly 1 executed test(s)"
+                        ),
+                    "{refusal}"
                 );
+                assert_eq!(outcome.reason, "exit 1");
+                assert_eq!(attempts[0].test_results_error, outcome.test_results_error);
                 assert!(outcome.test_results.is_none() && outcome.executed_tests.is_none());
             }
             let gate = super::super::ledger_gate_with_attempts(outcome, &attempts);

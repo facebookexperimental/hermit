@@ -95,6 +95,16 @@ def spec(strictness, compare_logs=True, **over):
 def record(verified=True, bitwise=False, left=239, right=239, strictness="stripped",
            verdict="matched", compare_logs=True):
     counts = None if left is None else {"left": left, "right": right}
+    # Synthetic empty guest outputs complete the current producer schema; these
+    # bytes are fixture data, not a new measurement of the historical examples.
+    output = {
+        "exit_code": 0,
+        "signal": None,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stdout_bytes": 0,
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stderr_bytes": 0,
+    }
     return {
         "verified": verified,
         "bitwise_parity": bitwise,
@@ -103,6 +113,7 @@ def record(verified=True, bitwise=False, left=239, right=239, strictness="stripp
         "infrastructure_error": None,
         "comparison": spec(strictness, compare_logs),
         "compared_log_messages": counts,
+        "compared_outputs": {"left": dict(output), "right": dict(output)},
         "dbt_counted_branches": None,
         "runtime": None,
         "guest_exit_code": 0,
@@ -118,7 +129,7 @@ def record(verified=True, bitwise=False, left=239, right=239, strictness="stripp
 
 # --------------------------------------------------------------------------
 print("case STRIPPED — the exact shape the scorecard producer emits today")
-# Verbatim from a live probe run: rc=0, banner ":: Success: deterministic.
+# The historical live probe had rc=0, banner ":: Success: deterministic.
 # Determinism verified.", and bitwise_parity false in the same record.
 got = tier_of(record(bitwise=False, strictness="stripped"))
 check("tier is 'stripped', NOT 'bitwise'", got and got["tier"] == "stripped", repr(got))

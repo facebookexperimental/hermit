@@ -984,7 +984,7 @@ mod tests {
             "classification":"deterministic", "outcome":"PASS", "result":"pass",
             "failure_class":null, "error_kind":null, "timeout_seconds":57,
             "execution_cpu_timeout_seconds":22, "execution_wall_timeout_seconds":57,
-            "argv":[], "guest_argv":[], "env":{}, "cwd":"/home/fixture/work",
+            "argv":[], "guest_argv":[], "env":{}, "cwd":"/synthetic/fixture/work",
             "shell_command":"synthetic retained writer input", "artifact_dir":"synthetic",
             "attempts":[completed["candidate_attempt"],completed["reference_attempt"]],
             "backend_parity":completed["report"]
@@ -1086,8 +1086,8 @@ mod tests {
             let artifact = result.evidence["artifact"]["path"].as_str().unwrap();
             let bytes = fs::read(parent.path().join(artifact)).unwrap();
             assert_eq!(result.evidence["artifact"]["sha256"], hex_digest(&bytes));
-            assert!(String::from_utf8(bytes).unwrap().contains("/home/fixture/"));
-            assert!(!serde_json::to_string(&result.evidence).unwrap().contains("/home/fixture/"));
+            assert!(String::from_utf8(bytes).unwrap().contains("/synthetic/fixture/"));
+            assert!(!serde_json::to_string(&result.evidence).unwrap().contains("/synthetic/fixture/"));
         }
     }
 

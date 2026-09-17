@@ -52,7 +52,7 @@ fn attempt(backend: &str, index: &str, report: &VerificationReport) -> ParityAtt
         cpu_usage_usec: Some(1),
         observation_sha256: None,
         argv: vec![
-            "/home/fixture/hermit".into(),
+            "/synthetic/fixture/hermit".into(),
             "run".into(),
             "--backend".into(),
             backend.into(),
@@ -60,12 +60,12 @@ fn attempt(backend: &str, index: &str, report: &VerificationReport) -> ParityAtt
             "--verify".into(),
             "--verify-strict".into(),
             "--".into(),
-            "/home/fixture/guest".into(),
+            "/synthetic/fixture/guest".into(),
         ],
-        guest_argv: vec!["/home/fixture/guest".into()],
+        guest_argv: vec!["/synthetic/fixture/guest".into()],
         env: BTreeMap::new(),
-        cwd: "/home/fixture/work".into(),
-        shell_command: "/home/fixture/hermit run a synthetic fixture".into(),
+        cwd: "/synthetic/fixture/work".into(),
+        shell_command: "/synthetic/fixture/hermit run a synthetic fixture".into(),
         stdout: "fixture output".into(),
         stderr: String::new(),
         verification_report_sha256: Some(hex_digest(raw.as_bytes())),
@@ -320,11 +320,11 @@ fn exact_artifacts_derive_compact_summaries_and_refuse_independent_mutations() {
         &tests,
     );
     let compact = serde_json::to_string(&verified.cell_results).unwrap();
-    assert!(!compact.contains("/home/fixture"));
+    assert!(!compact.contains("/synthetic/fixture"));
     assert!(
         String::from_utf8(cells.clone())
             .unwrap()
-            .contains("/home/fixture")
+            .contains("/synthetic/fixture")
     );
     for field in [
         "candidate_verification_report_sha256",
@@ -383,14 +383,14 @@ fn reference_refusal_and_cross_divergence_never_change_the_candidate_verdict() {
     reference.0.outcome = "ERROR".into();
     reference.0.status = Some(7);
     reference.0.error_kind = Some("incomplete-verification-evidence".into());
-    reference.0.reason = Some("/home/fixture/reference exited before JSON".into());
+    reference.0.reason = Some("/synthetic/fixture/reference exited before JSON".into());
     reference.0.verification_report = None;
     reference.0.verification_report_sha256 = None;
     let unavailable = BackendParityCellAttempt::UnavailableWithReason {
         attempt: 1,
         candidate_attempt: complete.candidate_attempt().clone(),
         reference_attempt: RequiredNullable::Value(reference.clone()),
-        reason: "/home/fixture/reference did not finish".into(),
+        reason: "/synthetic/fixture/reference did not finish".into(),
     };
     let (row, plan, cells, tests) = fixture(parity(vec![unavailable]));
     let verified = row
