@@ -8441,7 +8441,19 @@ esac
             .iter()
             .filter(|cell| cell.id.mode == "verify" && cell.id.backend.as_deref() != Some("ptrace"))
             .collect::<Vec<_>>();
-        assert_eq!(candidates.len(), 79);
+        // Main selected 18 additional LiteInst cells in this existing bucket.
+        // Retain its exact population and check every candidate's arguments.
+        assert_eq!(candidates.len(), 97);
+        let mut by_backend = BTreeMap::new();
+        for cell in &candidates {
+            *by_backend
+                .entry(cell.id.backend.as_deref().unwrap())
+                .or_insert(0) += 1;
+        }
+        assert_eq!(
+            by_backend,
+            BTreeMap::from([("kvm", 75), ("liteinst", 21), ("sabre", 1)])
+        );
         assert!(candidates.iter().any(|cell| cell.id.test
             == "backend-parity-c/readdir-order-identity"
             && cell.id.backend.as_deref() == Some("kvm")));
