@@ -2860,6 +2860,14 @@ impl RunOpts {
         }
     }
 
+    fn check_capture_companions(&self, paths: &GuestRunCapturePaths) -> Result<(), Error> {
+        paths.require_distinct_from(
+            self.backend_engagement_json.as_deref(),
+            "--backend-engagement-json",
+        )?;
+        paths.check_host_summary(self.summary_json.as_deref())
+    }
+
     fn selected_backend(&self) -> Backend {
         self.backend.unwrap_or_default()
     }
@@ -3001,6 +3009,12 @@ impl RunOpts {
         // value wins; otherwise fall back to the global one.
         self.backend = self.backend.or(global.backend);
         let guest_capture_paths = self.guest_run_capture_paths()?;
+        if let Some(paths) = &guest_capture_paths {
+            // Evidence is intentionally claimed by main before this preflight.
+            // Refuse capture collisions before clearing engagement or creating
+            // streams; summary also requires a check in its writer namespace.
+            self.check_capture_companions(paths)?;
+        }
         if let Some(path) = &self.backend_engagement_json {
             clear_machine_record(path, "backend engagement")?;
         }
@@ -3085,7 +3099,7 @@ impl RunOpts {
         if backend == Backend::E9patch {
             self.prepare_e9patch_program()?;
         }
-        let guest_capture = guest_capture_paths
+        let mut guest_capture = guest_capture_paths
             .map(|paths| {
                 let evidence = self.run_evidence_dir.as_deref().ok_or_else(|| {
                     Error::msg("harness guest capture requires --run-evidence-dir")
@@ -3163,7 +3177,7 @@ impl RunOpts {
             self.verify(global)
         } else {
             let (status, _) = self.run_with_guest_capture(global, false, guest_capture.as_ref())?;
-            if let Some(capture) = guest_capture {
+            if let Some(capture) = &mut guest_capture {
                 let config = hermit::prepare_backend_config(
                     self.effective_det_config(),
                     self.runtime_backend(),
@@ -3177,7 +3191,7 @@ impl RunOpts {
                     },
                 )?;
             }
-            self.write_backend_engagement_after_run()?;
+            self.write_backend_engagement_after_run(guest_capture.as_ref())?;
             drop(private_engagement_summary);
             Ok(status)
         }
@@ -3996,7 +4010,10 @@ impl RunOpts {
         Ok(())
     }
 
-    fn write_backend_engagement_after_run(&self) -> Result<(), Error> {
+    fn write_backend_engagement_after_run(
+        &self,
+        guest_capture: Option<&GuestRunCaptureSession>,
+    ) -> Result<(), Error> {
         let Some(path) = &self.backend_engagement_json else {
             return Ok(());
         };
@@ -4035,6 +4052,9 @@ impl RunOpts {
                 )));
             }
         };
+        if let Some(capture) = guest_capture {
+            capture.require_distinct_from(path, "--backend-engagement-json")?;
+        }
         write_backend_engagement(path, engagement)
     }
 
@@ -4875,6 +4895,11 @@ impl RunOpts {
         if capture_output && guest_capture.is_some() {
             anyhow::bail!("internal output capture cannot be combined with harness guest capture");
         }
+        if let (Some(capture), Some(summary)) = (guest_capture, self.summary_json.as_deref()) {
+            // Container mounts and chroot are complete here. Relative summary
+            // paths use this process's cwd, not the guest Command's --workdir.
+            capture.require_distinct_from(summary, "--summary-json")?;
+        }
         let backend = self.runtime_backend();
         let mut command = self.guest_command()?;
         if let Some(capture) = guest_capture.filter(|_| backend != Backend::Kvm) {
@@ -5090,7 +5115,7 @@ mod tests {
                 ..Default::default()
             };
             fs::write(summary_file.path(), serde_json::to_vec(&summary).unwrap()).unwrap();
-            options.write_backend_engagement_after_run().unwrap();
+            options.write_backend_engagement_after_run(None).unwrap();
             let report: BackendEngagementReport =
                 serde_json::from_slice(&fs::read(engagement_file.path()).unwrap()).unwrap();
             assert_eq!(
@@ -5112,7 +5137,7 @@ mod tests {
                 mapped_sites,
                 b0_sites,
             });
-            options.write_backend_engagement_after_run().unwrap();
+            options.write_backend_engagement_after_run(None).unwrap();
             let report: BackendEngagementReport =
                 serde_json::from_slice(&fs::read(engagement_file.path()).unwrap()).unwrap();
             assert_eq!(
@@ -5331,6 +5356,142 @@ mod tests {
                 );
             }
         }
+
+        let paths = GuestRunCapturePaths::new(
+            PathBuf::from("/result"),
+            PathBuf::from("/stdout"),
+            PathBuf::from("/stderr"),
+        );
+        assert!(
+            paths
+                .require_distinct_from(Some(Path::new("/stdout")), "--summary-json")
+                .unwrap_err()
+                .to_string()
+                .contains("must not reuse the --summary-json path")
+        );
+    }
+
+    #[test]
+    fn capture_preflight_preserves_summary_and_engagement_collisions() {
+        use std::os::unix::fs::MetadataExt as _;
+        use std::os::unix::fs::symlink;
+
+        let global = GlobalOpts::parse_from(["hermit"]);
+        for option in ["--summary-json", "--backend-engagement-json"] {
+            for capture_name in ["result.json", "stdout", "stderr"] {
+                for alias in [false, true] {
+                    let directory = tempfile::tempdir().unwrap();
+                    let root = directory.path();
+                    let target = root.join(capture_name);
+                    fs::write(&target, b"preserve captured artifact").unwrap();
+                    let before = fs::metadata(&target).unwrap();
+                    let companion = if alias {
+                        let alias = root.join("alias");
+                        symlink(&target, &alias).unwrap();
+                        alias
+                    } else {
+                        target.clone()
+                    };
+                    let engagement = root.join("engagement");
+                    fs::write(&engagement, b"preserve engagement").unwrap();
+                    let evidence = root.join("evidence");
+                    fs::create_dir(&evidence).unwrap();
+                    fs::write(evidence.join("already-claimed"), b"preserve evidence").unwrap();
+                    let mut options =
+                        RunOpts::parse_from(["run", "/nonexistent-capture-preflight-guest"]);
+                    assert!(!options.program.exists());
+                    options.run_evidence_dir = Some(evidence.clone());
+                    options.run_result_json = Some(root.join("result.json"));
+                    options.guest_stdout = Some(root.join("stdout"));
+                    options.guest_stderr = Some(root.join("stderr"));
+                    options.backend_engagement_json = Some(engagement.clone());
+                    if option == "--summary-json" {
+                        options.summary_json = Some(companion);
+                    } else {
+                        options.backend_engagement_json = Some(companion);
+                    }
+                    let error = options.main(&global).unwrap_err();
+                    assert!(
+                        error
+                            .to_string()
+                            .contains(&format!("must not reuse the {option} path")),
+                        "{error:#}"
+                    );
+                    let after = fs::metadata(&target).unwrap();
+                    assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+                    assert_eq!(fs::read(&target).unwrap(), b"preserve captured artifact");
+                    assert_eq!(fs::read(&engagement).unwrap(), b"preserve engagement");
+                    assert_eq!(
+                        fs::read(evidence.join("already-claimed")).unwrap(),
+                        b"preserve evidence"
+                    );
+                    for absent in ["result.json", "stdout", "stderr"]
+                        .into_iter()
+                        .filter(|name| *name != capture_name)
+                    {
+                        assert!(!root.join(absent).exists());
+                    }
+                }
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let evidence = root.join("evidence");
+        fs::create_dir(&evidence).unwrap();
+        let paths = GuestRunCapturePaths::new(
+            root.join("result"),
+            root.join("stdout"),
+            root.join("stderr"),
+        );
+        let mut options = RunOpts::parse_from(["run", "/nonexistent-capture-preflight-guest"]);
+        options.summary_json = Some(root.join("summary"));
+        options.backend_engagement_json = Some(root.join("engagement"));
+        options.check_capture_companions(&paths).unwrap();
+        let mut capture = GuestRunCaptureSession::create(&paths, &evidence).unwrap();
+        capture
+            .finish(
+                Backend::Ptrace,
+                ExitStatus::Exited(0),
+                GuestRunDeterminism {
+                    detlog_io_buffers: true,
+                    virtualize_time: true,
+                },
+            )
+            .unwrap();
+        fs::write(
+            options.summary_json.as_ref().unwrap(),
+            serde_json::to_vec(&RunSummary {
+                sched_turns: 12,
+                ..RunSummary::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        fs::hard_link(
+            &paths.result,
+            options.backend_engagement_json.as_ref().unwrap(),
+        )
+        .unwrap();
+        let result = fs::read(&paths.result).unwrap();
+        assert!(
+            options
+                .write_backend_engagement_after_run(Some(&capture))
+                .unwrap_err()
+                .to_string()
+                .contains("must not reuse the --backend-engagement-json path")
+        );
+        assert_eq!(fs::read(&paths.result).unwrap(), result);
+        fs::remove_file(options.backend_engagement_json.as_ref().unwrap()).unwrap();
+        options
+            .write_backend_engagement_after_run(Some(&capture))
+            .unwrap();
+        assert_eq!(fs::read(&paths.result).unwrap(), result);
+        assert!(
+            !fs::read(options.backend_engagement_json.as_ref().unwrap())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

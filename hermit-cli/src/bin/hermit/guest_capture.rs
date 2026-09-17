@@ -46,6 +46,145 @@ impl GuestRunCapturePaths {
             stderr,
         }
     }
+
+    fn require_different_spelling(&self, other: &Path, other_name: &str) -> Result<(), Error> {
+        if [&self.result, &self.stdout, &self.stderr]
+            .into_iter()
+            .any(|path| path == other)
+        {
+            return Err(collision_error(other, other_name));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn require_distinct_from(
+        &self,
+        other: Option<&Path>,
+        other_name: &str,
+    ) -> Result<(), Error> {
+        let Some(other) = other else {
+            return Ok(());
+        };
+        self.require_distinct_from_in(other, other_name, Path::new("."), false)
+    }
+
+    /// A summary is written inside the completed container. Refuse collisions
+    /// already visible on the host, but leave unresolved guest-only paths for
+    /// the mandatory check against inherited capture handles in that namespace.
+    pub(crate) fn check_host_summary(&self, other: Option<&Path>) -> Result<(), Error> {
+        let Some(other) = other else {
+            return Ok(());
+        };
+        self.require_distinct_from_in(other, "--summary-json", Path::new("."), true)
+    }
+
+    fn require_distinct_from_in(
+        &self,
+        other: &Path,
+        other_name: &str,
+        cwd: &Path,
+        defer_unresolved: bool,
+    ) -> Result<(), Error> {
+        self.require_different_spelling(other, other_name)?;
+        let destination = match OutputDestination::resolve(other, cwd) {
+            Ok(destination) => destination,
+            Err(_) if defer_unresolved => return Ok(()),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("resolving {other_name} path {}", other.display()));
+            }
+        };
+        for path in [&self.result, &self.stdout, &self.stderr] {
+            let capture = OutputDestination::resolve(path, cwd)
+                .with_context(|| format!("resolving guest capture path {}", path.display()))?;
+            if capture.aliases(&destination) {
+                return Err(collision_error(other, other_name));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Identify the destination that an ordinary followed-path writer would use,
+/// including a not-yet-created leaf. Parent traversal is left to the kernel:
+/// cancelling `..` lexically would be wrong when a preceding component is a
+/// symlink. Terminal symlinks also matter before their capture target exists.
+struct OutputDestination {
+    parent: RunEvidenceFileIdentity,
+    name: OsString,
+    file: Option<RunEvidenceFileIdentity>,
+}
+
+impl OutputDestination {
+    fn resolve(path: &Path, cwd: &Path) -> io::Result<Self> {
+        let mut path = cwd.join(path);
+        for followed in 0..=40 {
+            // Follow the actual complete path first. In particular, procfs
+            // descriptor links select an open object; read_link's displayed
+            // pathname may be deleted or shadowed in this namespace.
+            let followed_file = match std::fs::metadata(&path) {
+                Ok(metadata) => Some(metadata_identity(&metadata)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error),
+            };
+            let last = path
+                .as_os_str()
+                .as_bytes()
+                .rsplit(|byte| *byte == b'/')
+                .next()
+                .unwrap_or_default();
+            if last.is_empty() || last == b"." || last == b".." {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "output destination has no file basename",
+                ));
+            }
+            let parent_path = path.parent().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "output destination has no parent",
+                )
+            })?;
+            let parent = std::fs::metadata(parent_path)?;
+            if !parent.is_dir() {
+                return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+            }
+            let file = if followed_file.is_some() {
+                followed_file
+            } else {
+                match std::fs::symlink_metadata(&path) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        if followed == 40 {
+                            return Err(io::Error::from_raw_os_error(libc::ELOOP));
+                        }
+                        path = parent_path.join(std::fs::read_link(&path)?);
+                        continue;
+                    }
+                    Ok(metadata) => Some(metadata_identity(&metadata)),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(error),
+                }
+            };
+            return Ok(Self {
+                parent: metadata_identity(&parent),
+                name: OsStr::from_bytes(last).to_owned(),
+                file,
+            });
+        }
+        unreachable!("terminal symlink traversal is bounded")
+    }
+
+    fn aliases(&self, other: &Self) -> bool {
+        (self.parent == other.parent && self.name == other.name)
+            || self.file.is_some_and(|file| Some(file) == other.file)
+    }
+}
+
+fn collision_error(other: &Path, other_name: &str) -> Error {
+    Error::msg(format!(
+        "--run-result-json, --guest-stdout, and --guest-stderr must not reuse the {other_name} path {}",
+        other.display()
+    ))
 }
 
 /// Host-side owner of the exact guest output files for one ordinary run.
@@ -65,6 +204,7 @@ pub(crate) struct GuestRunCaptureSession {
     stderr: File,
     stdout_identity: RunEvidenceFileIdentity,
     stderr_identity: RunEvidenceFileIdentity,
+    result: Option<File>,
 }
 
 impl GuestRunCaptureSession {
@@ -140,6 +280,7 @@ impl GuestRunCaptureSession {
             stderr,
             stdout_identity,
             stderr_identity,
+            result: None,
         })
     }
 
@@ -151,6 +292,34 @@ impl GuestRunCaptureSession {
 
     pub(crate) fn stderr_fd_for_guest(&self) -> RawFd {
         self.stderr.as_raw_fd()
+    }
+
+    /// Use inherited identities, not host pathnames: the completed container
+    /// may hide those paths or expose the same directory at a different name.
+    pub(crate) fn require_distinct_from(
+        &self,
+        other: &Path,
+        other_name: &str,
+    ) -> Result<(), Error> {
+        let destination = OutputDestination::resolve(other, Path::new(".")).with_context(|| {
+            format!(
+                "resolving {other_name} path {} in the writer namespace",
+                other.display()
+            )
+        })?;
+        let same_child = destination.parent == self.parent_identity
+            && [&self.result_name, &self.stdout_name, &self.stderr_name]
+                .contains(&&destination.name);
+        let result_identity = self.result.as_ref().map(file_identity).transpose()?;
+        let same_file = destination.file.is_some_and(|file| {
+            file == self.stdout_identity
+                || file == self.stderr_identity
+                || Some(file) == result_identity
+        });
+        if same_child || same_file {
+            return Err(collision_error(other, other_name));
+        }
+        Ok(())
     }
 
     /// KVM exposes a virtual console rather than inheriting host descriptors.
@@ -168,7 +337,7 @@ impl GuestRunCaptureSession {
     }
 
     pub(crate) fn finish(
-        mut self,
+        &mut self,
         backend: Backend,
         status: ExitStatus,
         determinism: GuestRunDeterminism,
@@ -213,7 +382,11 @@ impl GuestRunCaptureSession {
                 "synchronizing guest-capture parent {}",
                 self.parent_path.display()
             )
-        })
+        })?;
+        // Keep the published result inode alongside both stream handles until
+        // the outer engagement writer has passed its final collision check.
+        self.result = Some(staged);
+        Ok(())
     }
 
     fn require_visible_identity(&self) -> Result<(), Error> {
@@ -444,12 +617,15 @@ fn link_unnamed_file_at(file: &File, directory: RawFd, destination: &OsStr) -> i
 }
 
 fn file_identity(file: &File) -> io::Result<RunEvidenceFileIdentity> {
-    let metadata = file.metadata()?;
+    Ok(metadata_identity(&file.metadata()?))
+}
+
+fn metadata_identity(metadata: &std::fs::Metadata) -> RunEvidenceFileIdentity {
     use std::os::unix::fs::MetadataExt as _;
-    Ok(RunEvidenceFileIdentity {
+    RunEvidenceFileIdentity {
         device: metadata.dev(),
         inode: metadata.ino(),
-    })
+    }
 }
 
 fn regular_file_identity(file: &File, description: &str) -> Result<RunEvidenceFileIdentity, Error> {
@@ -491,6 +667,204 @@ mod tests {
             directory.join("stdout"),
             directory.join("stderr"),
         )
+    }
+
+    #[test]
+    fn capture_collision_resolution_preserves_path_semantics() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let capture_dir = root.join("capture");
+        fs::create_dir_all(capture_dir.join("sub")).unwrap();
+        fs::create_dir(root.join("other")).unwrap();
+        let paths = capture_paths(&capture_dir);
+        symlink(&capture_dir, root.join("alias")).unwrap();
+        symlink(capture_dir.join("sub"), root.join("shortcut")).unwrap();
+        symlink("capture/stdout", root.join("dangling")).unwrap();
+        symlink("dangling", root.join("chain")).unwrap();
+        for path in [
+            "capture/stdout",
+            "capture/./stdout",
+            "capture/sub/../stdout",
+            "alias/stdout",
+            "shortcut/../stdout",
+            "dangling",
+            "chain",
+        ] {
+            let error = paths
+                .require_distinct_from_in(Path::new(path), "--summary-json", root, false)
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("must not reuse the --summary-json path"),
+                "{path}: {error:#}"
+            );
+        }
+        for path in ["capture/distinct", "other/stdout", "shortcut/../../stdout"] {
+            paths
+                .require_distinct_from_in(Path::new(path), "--summary-json", root, false)
+                .unwrap();
+        }
+        // The kernel must traverse `sub/..`: treating a missing component as
+        // lexical cancellation would certify a path that Linux cannot open.
+        assert!(
+            paths
+                .require_distinct_from_in(
+                    Path::new("missing/../distinct"),
+                    "--summary-json",
+                    root,
+                    false
+                )
+                .is_err()
+        );
+        symlink("loop", root.join("loop")).unwrap();
+        let error = paths
+            .require_distinct_from_in(Path::new("loop"), "--summary-json", root, false)
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().raw_os_error(),
+            Some(libc::ELOOP)
+        );
+        assert!(!paths.result.exists());
+        assert!(!paths.stdout.exists());
+        assert!(!paths.stderr.exists());
+    }
+
+    #[test]
+    fn capture_held_identity_refuses_summary_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        let capture_dir = directory.path().join("capture");
+        fs::create_dir(&capture_dir).unwrap();
+        let evidence = capture_dir.join("evidence");
+        fs::create_dir(&evidence).unwrap();
+        let paths = capture_paths(&capture_dir);
+        let mut capture = GuestRunCaptureSession::create(&paths, &evidence).unwrap();
+        capture
+            .stdout_for_guest()
+            .unwrap()
+            .write_all(b"out")
+            .unwrap();
+        (&capture.stderr).write_all(b"err").unwrap();
+        let distinct = directory.path().join("distinct");
+        fs::write(&distinct, b"independent").unwrap();
+        capture
+            .require_distinct_from(&distinct, "--summary-json")
+            .unwrap();
+        for (index, target) in [&paths.stdout, &paths.stderr].into_iter().enumerate() {
+            for symbolic in [false, true] {
+                let alias = directory.path().join(format!("alias-{index}-{symbolic}"));
+                if symbolic {
+                    symlink(target, &alias).unwrap();
+                } else {
+                    fs::hard_link(target, &alias).unwrap();
+                }
+                assert!(
+                    capture
+                        .require_distinct_from(&alias, "--summary-json")
+                        .unwrap_err()
+                        .to_string()
+                        .contains("must not reuse")
+                );
+            }
+        }
+        let result_alias = directory.path().join("future-result");
+        symlink(&paths.result, &result_alias).unwrap();
+        assert!(
+            capture
+                .require_distinct_from(&result_alias, "--summary-json")
+                .is_err()
+        );
+        let unavailable = directory.path().join("guest-only/summary");
+        paths.check_host_summary(Some(&unavailable)).unwrap();
+        assert!(
+            capture
+                .require_distinct_from(&unavailable, "--summary-json")
+                .is_err()
+        );
+
+        // Model an alternate visible name without a privileged mount: the
+        // admission helper must use inherited identities, not reopen host names.
+        let moved = directory.path().join("moved");
+        fs::rename(&capture_dir, &moved).unwrap();
+        assert!(!capture_dir.exists());
+        assert!(
+            capture
+                .require_distinct_from(&moved.join("stdout"), "--summary-json")
+                .unwrap_err()
+                .to_string()
+                .contains("must not reuse")
+        );
+        capture
+            .require_distinct_from(&distinct, "--summary-json")
+            .unwrap();
+        fs::rename(&moved, &capture_dir).unwrap();
+        capture
+            .finish(
+                Backend::Ptrace,
+                ExitStatus::Exited(0),
+                GuestRunDeterminism {
+                    detlog_io_buffers: true,
+                    virtualize_time: true,
+                },
+            )
+            .unwrap();
+        let published_alias = directory.path().join("published-result");
+        fs::hard_link(&paths.result, &published_alias).unwrap();
+        assert!(
+            capture
+                .require_distinct_from(&published_alias, "--backend-engagement-json")
+                .unwrap_err()
+                .to_string()
+                .contains("must not reuse")
+        );
+        assert_eq!(fs::read(&paths.stdout).unwrap(), b"out");
+        assert_eq!(fs::read(&paths.stderr).unwrap(), b"err");
+        assert_eq!(fs::read(&distinct).unwrap(), b"independent");
+        let result =
+            GuestRunResult::from_current_json_slice(&fs::read(&paths.result).unwrap()).unwrap();
+        assert_eq!(result.stdout.bytes, 3);
+        assert_eq!(result.stderr.bytes, 3);
+
+        for file in [
+            &capture.stdout,
+            &capture.stderr,
+            capture.result.as_ref().unwrap(),
+        ] {
+            let descriptor = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+            assert!(
+                capture
+                    .require_distinct_from(&descriptor, "--summary-json")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("must not reuse")
+            );
+        }
+        let independent = File::open(&distinct).unwrap();
+        let independent_descriptor =
+            PathBuf::from(format!("/proc/self/fd/{}", independent.as_raw_fd()));
+        capture
+            .require_distinct_from(&independent_descriptor, "--summary-json")
+            .unwrap();
+        // The held stdout still selects its original inode after its former
+        // name is replaced. Procfs's " (deleted)" display is not a new path.
+        fs::remove_file(&paths.stdout).unwrap();
+        fs::write(&paths.stdout, b"replacement").unwrap();
+        let descriptor = PathBuf::from(format!("/proc/self/fd/{}", capture.stdout.as_raw_fd()));
+        let displayed = fs::read_link(&descriptor).unwrap();
+        assert!(displayed.as_os_str().as_bytes().ends_with(b" (deleted)"));
+        assert_ne!(
+            fs::metadata(&descriptor).unwrap().ino(),
+            fs::metadata(&paths.stdout).unwrap().ino()
+        );
+        assert!(
+            capture
+                .require_distinct_from(&descriptor, "--summary-json")
+                .unwrap_err()
+                .to_string()
+                .contains("must not reuse")
+        );
+        assert_eq!(fs::read(&descriptor).unwrap(), b"out");
+        assert_eq!(fs::read(&paths.stdout).unwrap(), b"replacement");
     }
 
     #[test]
@@ -537,7 +911,7 @@ mod tests {
         let evidence = directory.path().join("evidence");
         fs::create_dir(&evidence).unwrap();
         let paths = capture_paths(directory.path());
-        let capture = GuestRunCaptureSession::create(&paths, &evidence).unwrap();
+        let mut capture = GuestRunCaptureSession::create(&paths, &evidence).unwrap();
         fs::remove_file(&paths.stderr).unwrap();
         fs::write(&paths.stderr, b"replacement").unwrap();
         let error = capture
@@ -561,7 +935,7 @@ mod tests {
         let evidence = directory.path().join("evidence");
         fs::create_dir(&evidence).unwrap();
         let paths = capture_paths(directory.path());
-        let capture = GuestRunCaptureSession::create(&paths, &evidence).unwrap();
+        let mut capture = GuestRunCaptureSession::create(&paths, &evidence).unwrap();
         capture
             .write_kvm_virtual_console(b"virtual stdout", b"virtual stderr")
             .unwrap();
@@ -604,7 +978,7 @@ mod tests {
             let evidence = directory.path().join("evidence");
             fs::create_dir(&evidence).unwrap();
             let paths = capture_paths(directory.path());
-            let capture = GuestRunCaptureSession::create(&paths, &evidence).unwrap();
+            let mut capture = GuestRunCaptureSession::create(&paths, &evidence).unwrap();
             capture
                 .stdout_for_guest()
                 .unwrap()
