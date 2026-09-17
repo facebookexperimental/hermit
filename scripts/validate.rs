@@ -19431,6 +19431,12 @@ fn validation_run_state_path(
     pid: u32,
     nonce: u128,
 ) -> Result<PathBuf, String> {
+    // A plan export is inert even when a running validator requests it. Its
+    // scratch state belongs beside the requested output, never to the outer
+    // execution whose state the exporter deliberately does not inherit.
+    if let Some(parent) = output_path.and_then(Path::parent) {
+        return Ok(parent.join("run-state"));
+    }
     if nested {
         let path = inherited
             .filter(|value| !value.is_empty())
@@ -19454,9 +19460,6 @@ fn validation_run_state_path(
             Path::new(value).display()
         ));
     }
-    if let Some(parent) = output_path.and_then(Path::parent) {
-        return Ok(parent.join("run-state"));
-    }
     if profile.is_empty()
         || !profile
             .bytes()
@@ -19471,6 +19474,28 @@ fn validation_run_state_path(
 
 fn run_state_path_bracket() -> Result<(), String> {
     let root = Path::new("/repo");
+    for nested in [false, true] {
+        for inherited in [None, Some(OsStr::new("/repo/target/validation/outer"))] {
+            let exported = validation_run_state_path(
+                root,
+                "full",
+                Some(Path::new("/export/generated.json")),
+                inherited,
+                nested,
+                41,
+                99,
+            )?;
+            if exported != Path::new("/export/run-state") {
+                return Err(
+                    "a plan export reused execution state instead of its own scratch directory"
+                        .into(),
+                );
+            }
+        }
+    }
+    if validation_run_state_path(root, "strict-compat-only", None, None, true, 41, 99).is_ok() {
+        return Err("a nested execution accepted missing outer run state".into());
+    }
     let profiles = ["full", "portable", "quick", "strict-compat-only"];
     let mut observed = BTreeSet::new();
     for (index, profile) in profiles.iter().enumerate() {
@@ -19535,6 +19560,12 @@ fn run_state_path_bracket() -> Result<(), String> {
         return Err("a nested run accepted state outside the checkout-owned run root".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn run_state_paths_keep_export_and_execution_ownership_separate() {
+    run_state_path_bracket().unwrap();
 }
 
 fn verified_run_state_scope_reexec(root: &Path, inherited: Option<&OsStr>) -> bool {

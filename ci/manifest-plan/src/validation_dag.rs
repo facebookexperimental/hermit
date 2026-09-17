@@ -279,8 +279,9 @@ fn generated_plan(root: &Path, scratch: &Path) -> Result<DagConfig, String> {
         .map_err(|error| format!("cannot run scripts/validate.rs for generated nodes: {error}"))?;
     if !output.status.success() {
         return Err(format!(
-            "generated-partition export failed with {}: {}",
+            "generated-partition export failed with {}:\nstdout:\n{}\nstderr:\n{}",
             output.status,
+            String::from_utf8_lossy(&output.stdout).trim(),
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
