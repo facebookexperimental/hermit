@@ -4208,7 +4208,9 @@ fn cell_divergence_position(attempts: &[AttemptResult]) -> DivergencePosition {
     }
 }
 
-pub(crate) fn summarize_sabre_path_evidence(attempts: &[AttemptResult]) -> Result<Option<JsonValue>, String> {
+pub(crate) fn summarize_sabre_path_evidence(
+    attempts: &[AttemptResult],
+) -> Result<Option<JsonValue>, String> {
     let is_sabre = attempts.iter().any(|attempt| {
         attempt
             .argv

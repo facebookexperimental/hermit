@@ -957,7 +957,10 @@ impl TestResultsSelectedPopulation {
     /// validation plan. Dependencies without a structured-result declaration
     /// are intentionally absent; every declared producer is included before
     /// any outcome or artifact row is observed.
-    pub fn from_constructed_plan_steps(steps: &[Step], compatibility: bool) -> Result<Self, String> {
+    pub fn from_constructed_plan_steps(
+        steps: &[Step],
+        compatibility: bool,
+    ) -> Result<Self, String> {
         let mut nodes = BTreeSet::new();
         for step in steps {
             if step.structured_test_results_manifest()?.is_some() {

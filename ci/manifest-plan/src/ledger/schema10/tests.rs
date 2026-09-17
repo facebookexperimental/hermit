@@ -226,7 +226,18 @@ fn exact_artifacts_derive_compact_summaries_and_refuse_independent_mutations() {
     assert_eq!(verified.observations.len(), 3);
     assert!(verified.missing_cells.is_empty() && verified.missing_backend_parity.is_empty());
     for role in ["candidate_attempt", "reference_attempt"] {
-        for flag in ["--strict", "--no-rcb-time", "--no-detlog-io-buffers"] {
+        for flag in [
+            "--strict",
+            "--no-rcb-time",
+            "--no-detlog-io-buffers",
+            "--no-virtualize-cpuid",
+            "--no-virtualize-metadata",
+            "--no-virtualize-time",
+            "--no-sequentialize-threads",
+            "--no-deterministic-io",
+            "--no-virtualize-cpuid=true",
+            "--no-unknown-future-policy",
+        ] {
             let mut cell: Value = serde_json::from_slice(&cells).unwrap();
             let argv = cell["backend_parity"]["attempts"][0][role]["argv"]
                 .as_array_mut()

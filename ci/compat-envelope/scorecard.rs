@@ -2339,6 +2339,111 @@ struct ResultCandidate {
     evidence_identity: String,
     path: PathBuf,
     row: ResultRow,
+    // Set only after checking the complete same-source/run attempt sequence.
+    // The candidate can fail before the producer starts a ptrace reference.
+    parity_history: bool,
+}
+
+fn bind_parity_history(
+    id: &CellId,
+    candidates: Vec<ResultCandidate>,
+    input: ResultInput,
+) -> Result<Vec<ResultCandidate>, String> {
+    if !candidates
+        .iter()
+        .any(|candidate| candidate.row.has_parity_evidence())
+    {
+        return Ok(candidates
+            .into_iter()
+            .filter(|candidate| {
+                candidate.row.is_ingestible_classification() && candidate.row.attempt > 0
+            })
+            .collect());
+    }
+    let mut attempts = BTreeMap::<u64, ResultCandidate>::new();
+    for candidate in candidates {
+        if let Some(previous) = attempts.get(&candidate.row.attempt) {
+            if previous.evidence_identity != candidate.evidence_identity
+                || previous.row.result != candidate.row.result
+                || previous.row.failure_class != candidate.row.failure_class
+                || previous.row.error_kind != candidate.row.error_kind
+            {
+                return Err(format!(
+                    "ambiguous parity evidence for {} at {}, source {}, run {}, outer attempt {}",
+                    display_id(id),
+                    candidate.path.display(),
+                    candidate.row.hermit_sha,
+                    candidate.row.run_id,
+                    candidate.row.attempt
+                ));
+            }
+        } else {
+            attempts.insert(candidate.row.attempt, candidate);
+        }
+    }
+    let anchor = &attempts
+        .values()
+        .next()
+        .expect("parity history is nonempty")
+        .row;
+    hermit_manifest_plan::runner::outcome_after_retries(
+        attempts
+            .iter()
+            .map(|(number, candidate)| (*number, candidate.row.outcome.as_str())),
+    )
+    .map_err(|error| {
+        format!(
+            "invalid parity history for {} at source {}, run {}: {error}",
+            display_id(id),
+            anchor.hermit_sha,
+            anchor.run_id
+        )
+    })?;
+    for candidate in attempts.values() {
+        let row = &candidate.row;
+        if !matches!(row.classification.as_str(), "required" | "disabled")
+            || row.classification != anchor.classification
+            || row.hermit_sha != anchor.hermit_sha
+            || row.run_id != anchor.run_id
+            || row.binary_sha256 != anchor.binary_sha256
+            || row.test_sha256 != anchor.test_sha256
+            || row.guest_argv != anchor.guest_argv
+            || row.relaxations != anchor.relaxations
+            || row.log_level != anchor.log_level
+        {
+            return Err(format!(
+                "parity history changes candidate identity for {} at {}, source {}, run {}, outer attempt {}",
+                display_id(id),
+                candidate.path.display(),
+                row.hermit_sha,
+                row.run_id,
+                row.attempt
+            ));
+        }
+        candidate.evidence(id, input)?;
+    }
+    Ok(attempts
+        .into_values()
+        .map(|mut candidate| {
+            candidate.parity_history = true;
+            candidate
+        })
+        .collect())
+}
+
+impl ResultCandidate {
+    fn evidence(&self, id: &CellId, input: ResultInput) -> Result<ValidateRowEvidence, String> {
+        self.row.comparison_evidence_from(input).map_err(|error| {
+            format!(
+                "malformed evidence for {} at {}, source {}, run {}, outer attempt {}: {error}",
+                display_id(id),
+                self.path.display(),
+                self.row.hermit_sha,
+                self.row.run_id,
+                self.row.attempt
+            )
+        })
+    }
 }
 
 struct RetainedCellResults {
@@ -3276,8 +3381,8 @@ fn render_backend_parity_section(tracked: &TrackedCells) -> String {
 
     let mut out = "\n## Cross-backend parity\n\n\
 This is measured ptrace-reference parity, not CI plan membership and not same-backend repeatability. \
-A cell is eligible when the corresponding ptrace `verify` coordinate is Green; this intentionally \
-includes manifest-disabled candidate cells selected through `--probe-disabled`. `Never measured` \
+A cell is eligible when the corresponding ptrace `verify` coordinate is Green. The CLI can explicitly \
+select eligible manifest-disabled candidates with `--probe-disabled`; the committed selectors do not include that option. `Never measured` \
 means no strict typed ptrace-vs-candidate report exists. \
 At the latest recorded Hermit source depth, any divergence outranks a match. The portable and hosted-portable `backend-parity-c` nodes currently perform ordinary same-backend verification. Ptrace-reference execution is prepared separately and is not active in this support stage. These selectors cover a subset of the eligible cells; eligibility does not mean every cell was selected or measured.\n\n\
 | Candidate backend | Eligible ptrace-green cells | Disabled probe candidates | Measured match | Parity failure | Never measured |\n\
@@ -4752,13 +4857,14 @@ fn apply_validate_results_from(
         let mut classified = candidates
             .iter()
             .map(|candidate| {
+                if !candidate.parity_history {
+                    candidate
+                        .row
+                        .require_ingestible_classification()
+                        .map_err(|error| format!("{} {error}", display_id(id)))?;
+                }
                 candidate
-                    .row
-                    .require_ingestible_classification()
-                    .map_err(|error| format!("{} {error}", display_id(id)))?;
-                candidate
-                    .row
-                    .comparison_evidence_from(reports)
+                    .evidence(id, reports)
                     .map(|evidence| (candidate, evidence))
                     .map_err(|error| format!("{} {error}", display_id(id)))
             })
@@ -8214,7 +8320,7 @@ fn read_result_candidates(
     if files.is_empty() {
         return Err(format!("no results.jsonl files under {}", root.display()));
     }
-    let mut out: BTreeMap<CellId, Vec<ResultCandidate>> = BTreeMap::new();
+    let mut grouped: BTreeMap<(CellId, String), Vec<ResultCandidate>> = BTreeMap::new();
     for path in files {
         let text = fs::read_to_string(&path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
@@ -8253,9 +8359,6 @@ fn read_result_candidates(
                     row.source_tree_dirty
                 ));
             }
-            if !row.is_ingestible_classification() {
-                continue;
-            }
             if row.attempt == 0 {
                 return Err(format!(
                     "{}:{} has non-positive attempt 0",
@@ -8269,11 +8372,22 @@ fn read_result_candidates(
             let id = row
                 .id()
                 .ok_or_else(|| format!("{}:{} has no backend", path.display(), index + 1))?;
-            out.entry(id).or_default().push(ResultCandidate {
-                evidence_identity,
-                path: path.clone(),
-                row,
-            });
+            grouped
+                .entry((id, row.run_id.clone()))
+                .or_default()
+                .push(ResultCandidate {
+                    parity_history: false,
+                    evidence_identity,
+                    path: path.clone(),
+                    row,
+                });
+        }
+    }
+    let mut out: BTreeMap<CellId, Vec<ResultCandidate>> = BTreeMap::new();
+    for ((id, _run), candidates) in grouped {
+        let candidates = bind_parity_history(&id, candidates, ResultInput::Current)?;
+        if !candidates.is_empty() {
+            out.entry(id).or_default().extend(candidates);
         }
     }
     Ok(out)
@@ -8363,7 +8477,7 @@ fn read_retained_results(
             if let Some(prefix) = retained_workspace.as_deref() {
                 normalise_recorded_prefix(&mut row, prefix);
             }
-            if !row.is_ingestible_classification() || row.source_tree_dirty || row.attempt == 0 {
+            if row.source_tree_dirty {
                 continue;
             }
             let Some(id) = row.id() else { continue };
@@ -8377,6 +8491,7 @@ fn read_retained_results(
                 .entry((id, row.hermit_sha.clone(), row.run_id.clone()))
                 .or_default()
                 .push(ResultCandidate {
+                    parity_history: false,
                     evidence_identity,
                     path: path.clone(),
                     row,
@@ -8389,59 +8504,47 @@ fn read_retained_results(
     let mut by_cell_and_rank: BTreeMap<(CellId, bool), BTreeMap<usize, Vec<ResultCandidate>>> =
         BTreeMap::new();
     for ((id, sha, _run_id), candidates) in grouped {
-        // A later match or missing reference cannot erase an earlier measured
-        // parity failure from the same run. Validate the complete sequence
-        // before choosing a latest source; ordinary-only runs retain their
-        // historical terminal-row projection below.
-        if candidates
-            .iter()
-            .any(|candidate| candidate.row.has_parity_evidence())
-        {
-            let mut attempts = BTreeMap::<u64, ResultCandidate>::new();
-            for candidate in candidates {
-                if let Some(previous) = attempts.get(&candidate.row.attempt) {
-                    if previous.evidence_identity != candidate.evidence_identity
-                        || previous.row.result != candidate.row.result
-                        || previous.row.failure_class != candidate.row.failure_class
-                        || previous.row.error_kind != candidate.row.error_kind
-                    {
-                        return Err(format!(
-                            "ambiguous retained parity evidence for {} at {sha}, outer attempt {}",
-                            display_id(&id),
-                            candidate.row.attempt
-                        ));
-                    }
-                } else {
-                    attempts.insert(candidate.row.attempt, candidate);
+        // Bind the complete sequence before classification or source-rank
+        // filtering. A failed candidate can precede the first parity report.
+        let candidates = bind_parity_history(&id, candidates, ResultInput::Retained)?;
+        let mut ordinary = Vec::new();
+        let mut parity = Vec::new();
+        let mut measured_parity = false;
+        for candidate in candidates {
+            if !candidate.parity_history {
+                // Preserve ordinary-only terminal-row admission: an earlier
+                // ordinary row is not newly required to carry a comparison.
+                ordinary.push(candidate);
+                continue;
+            }
+            match candidate.evidence(&id, ResultInput::Retained)? {
+                ValidateRowEvidence::Matched { .. } | ValidateRowEvidence::Diverged { .. } => {
+                    ordinary.push(candidate);
+                }
+                ValidateRowEvidence::ParityMatched { .. }
+                | ValidateRowEvidence::ParityDiverged { .. } => {
+                    measured_parity = true;
+                    parity.push(candidate);
+                }
+                ValidateRowEvidence::NotRun { .. } | ValidateRowEvidence::Unavailable { .. } => {
+                    parity.push(candidate);
                 }
             }
-            hermit_manifest_plan::runner::outcome_after_retries(
-                attempts
-                    .iter()
-                    .map(|(number, candidate)| (*number, candidate.row.outcome.as_str())),
-            )?;
-            let mut measured_parity = false;
-            for candidate in attempts.values() {
-                let evidence = candidate
-                    .row
-                    .comparison_evidence_from(ResultInput::Retained)?;
-                measured_parity |= matches!(
-                    evidence,
-                    ValidateRowEvidence::ParityMatched { .. }
-                        | ValidateRowEvidence::ParityDiverged { .. }
-                );
-            }
-            if measured_parity {
-                let rank = *history
-                    .get(&sha)
-                    .expect("history membership checked before grouping");
-                by_cell_and_rank
-                    .entry((id, true))
-                    .or_default()
-                    .entry(rank)
-                    .or_default()
-                    .extend(attempts.into_values());
-            }
+        }
+        if measured_parity {
+            let rank = *history.get(&sha).expect("history checked before grouping");
+            by_cell_and_rank
+                .entry((id.clone(), true))
+                .or_default()
+                .entry(rank)
+                .or_default()
+                .extend(parity);
+        }
+        // An ordinary candidate comparison from a parity run still belongs
+        // to the ordinary source ranking. A later ordinary measurement may
+        // supersede it without superseding the independent cross comparison.
+        let candidates = ordinary;
+        if candidates.is_empty() {
             continue;
         }
         let terminal_attempt = candidates
@@ -8574,9 +8677,7 @@ fn read_retained_results(
         };
         for candidate in &candidates {
             if matches!(
-                candidate
-                    .row
-                    .comparison_evidence_from(ResultInput::Retained)?,
+                candidate.evidence(&id, ResultInput::Retained)?,
                 ValidateRowEvidence::Matched { .. }
                     | ValidateRowEvidence::Diverged { .. }
                     | ValidateRowEvidence::ParityMatched { .. }
@@ -9829,6 +9930,7 @@ fn self_test() -> Result<(), String> {
         };
         let evidence_identity = row.evidence_identity().unwrap();
         ResultCandidate {
+            parity_history: false,
             evidence_identity,
             path: PathBuf::from("fixture/results.jsonl"),
             row,
@@ -10875,6 +10977,7 @@ red/`measured-and-passed` count is **0**.",
     };
     let parity_candidate = |row: ResultRow| -> Result<ResultCandidate, String> {
         Ok(ResultCandidate {
+            parity_history: false,
             evidence_identity: row.evidence_identity()?,
             path: PathBuf::from("fixture/parity-results.jsonl"),
             row,
@@ -10954,6 +11057,38 @@ red/`measured-and-passed` count is **0**.",
         .find(|cell| cell.id == parity_id)
         .expect("matching parity cell remains tracked");
     let matching_markdown = render_backend_parity_section(&matching_parity);
+    let plan = hermit_manifest_plan::validation_dag::generate(&repo_root()?)?;
+    let selectors = plan
+        .steps
+        .iter()
+        .filter(|step| {
+            matches!(
+                step.tag().as_str(),
+                "e2e.manifest_backend_parity_c" | "e2e.manifest_backend_parity_c_on_host"
+            )
+        })
+        .collect::<Vec<_>>();
+    if selectors.len() != 2
+        || selectors
+            .iter()
+            .any(|step| step.cmd.contains("--probe-disabled"))
+    {
+        return Err("scorecard selector description differs from the two actual commands".into());
+    }
+    let active = selectors
+        .iter()
+        .filter(|step| step.cmd.contains("--parity-reference ptrace"))
+        .count();
+    let expected = match active {
+        0 => "currently perform ordinary same-backend verification",
+        2 => "perform ptrace-reference parity comparisons",
+        _ => return Err("scorecard description requires both existing selectors to agree".into()),
+    };
+    if !matching_markdown.contains(expected) {
+        return Err(
+            "scorecard execution description is stale against the constructed selectors".into(),
+        );
+    }
     if matching_cell.measurement != MeasurementState::MeasuredAndPassed
         || matching_cell.observations[0].results != BTreeSet::from([ObservedResult::Pass])
         || matching_cell.observations[0]
@@ -11714,6 +11849,7 @@ red/`measured-and-passed` count is **0**.",
         row.attempts[0]["verification_report"] = JsonValue::String(report);
         let evidence_identity = row.evidence_identity().expect("fixture has identity");
         ResultCandidate {
+            parity_history: false,
             evidence_identity,
             path: PathBuf::from("fixture/results.jsonl"),
             row,
@@ -12200,6 +12336,7 @@ red/`measured-and-passed` count is **0**.",
     let rows = BTreeMap::from([(
         validate_id.clone(),
         vec![ResultCandidate {
+            parity_history: false,
             evidence_identity: "validate-bracket".into(),
             path: PathBuf::from("fixture/results.jsonl"),
             row: validate_row.clone(),
@@ -14036,6 +14173,7 @@ red/`measured-and-passed` count is **0**.",
         let current_rows = BTreeMap::from([(
             import_parity_id.clone(),
             vec![ResultCandidate {
+                parity_history: false,
                 evidence_identity: digest,
                 path: result_path.clone(),
                 row: current.clone(),
@@ -14391,6 +14529,170 @@ red/`measured-and-passed` count is **0**.",
                 {
                     return Err(format!(
                         "{command} admitted missing-reference contradiction {field}"
+                    ));
+                }
+            }
+        }
+    }
+    // A candidate may fail before the producer starts the ptrace reference.
+    // Validate the complete history before filtering disabled classifications;
+    // retain its ordinary failure/no-result without calling it cross parity.
+    for classification in ["required", "disabled"] {
+        let id = if classification == "disabled" {
+            &command_parity_id
+        } else {
+            &import_parity_id
+        };
+        for initial in ["ERROR", "FAIL"] {
+            let mut first = parity_row(id, BackendParityVerdict::Matched)?;
+            first.hermit_sha = fixture_head.clone();
+            first.classification = classification.into();
+            first.run_id = format!("candidate-{classification}-{initial}-before-parity");
+            first.backend_parity = None;
+            first.attempts.truncate(1);
+            first.outcome = initial.into();
+            first.attempts[0]["outcome"] = initial.into();
+            first.attempts[0]["status"] = 1.into();
+            if initial == "ERROR" {
+                first.result = None;
+                first.failure_class = Some(FailureClass::NoResult);
+                first.error_kind = Some("incomplete-verification-evidence".into());
+                first.attempts[0]["error_kind"] = "incomplete-verification-evidence".into();
+                let mut report = canonical_verdict::VerificationReport::no_result();
+                report.no_result_reason =
+                    Some(canonical_verdict::NoResultReason::ComparisonRefused {
+                        detail: "synthetic candidate comparison refusal before reference launch"
+                            .into(),
+                    });
+                set_report(
+                    &mut first.attempts[0],
+                    &serde_json::to_value(report).unwrap(),
+                )?;
+            } else {
+                first.result = Some(ObservedResult::DeterminismFailure);
+                first.failure_class = Some(FailureClass::ProductFailure);
+                first.error_kind = None;
+                let mut report: JsonValue = serde_json::from_str(
+                    first.attempts[0]["verification_report"].as_str().unwrap(),
+                )
+                .unwrap();
+                report["verdict"] = "diverged".into();
+                report["verified"] = false.into();
+                report["bitwise_parity"] = false.into();
+                set_report(&mut first.attempts[0], &report)?;
+            }
+            assert!(!first.has_parity_evidence());
+            first.comparison_evidence()?;
+            let mut second = parity_row(id, BackendParityVerdict::Matched)?;
+            second.hermit_sha = fixture_head.clone();
+            second.classification = classification.into();
+            second.run_id = first.run_id.clone();
+            second.attempt = 2;
+            let first_digest = first.evidence_identity()?;
+            for command in ["import-results", "observe-results"] {
+                restored_import_fixture()?;
+                write_import_rows(&[&second, &first])?;
+                let retained_bytes = fs::read(&result_path).map_err(|error| error.to_string())?;
+                let output = run_result_command(
+                    command,
+                    (command == "import-results").then_some(current_summary.as_path()),
+                )?;
+                let cells: TrackedCells = read_json(&result_command_root.join(CELLS))?;
+                let cell = cells.cells.iter().find(|cell| &cell.id == id).unwrap();
+                let ordinary = cell
+                    .observations
+                    .iter()
+                    .flat_map(|o| &o.canonical_comparisons)
+                    .filter(|r| r.run_id == first.run_id)
+                    .collect::<Vec<_>>();
+                let parity = cell
+                    .observations
+                    .iter()
+                    .flat_map(|o| &o.backend_parity_comparisons)
+                    .filter(|r| r.run_id == first.run_id)
+                    .collect::<Vec<_>>();
+                if !output.status.success()
+                    || fs::read(&result_path).map_err(|error| error.to_string())? != retained_bytes
+                    || parity.len() != 1
+                    || parity[0].result != ObservedResult::Pass
+                    || ordinary.len() != usize::from(initial == "FAIL")
+                    || (initial == "FAIL"
+                        && (ordinary[0].result != ObservedResult::DeterminismFailure
+                            || ordinary[0].evidence_sha256 != first_digest))
+                    || (initial == "ERROR"
+                        && !cell.observations.iter().flat_map(|o| &o.invocations).any(
+                            |invocation| {
+                                invocation.run_id == first.run_id
+                                    && invocation.attempt == Some(1)
+                                    && invocation.evidence_sha256.as_ref() == Some(&first_digest)
+                                    && invocation.result.is_none()
+                            },
+                        ))
+                {
+                    return Err(format!(
+                        "{command} lost pre-reference {classification} {initial}: {output:?}"
+                    ));
+                }
+            }
+            // A different candidate binary is not context for a disabled row.
+            restored_import_fixture()?;
+            let mut foreign = first.clone();
+            foreign.binary_sha256 = Some("f".repeat(64));
+            assert_ne!(foreign.binary_sha256, first.binary_sha256);
+            write_import_rows(&[&foreign, &second])?;
+            let refused = run_result_command("import-results", Some(&current_summary))?;
+            if refused.status.success()
+                || !String::from_utf8_lossy(&refused.stderr).contains("changes candidate identity")
+                || read_generated_files(&result_command_root)? != result_command_before
+            {
+                return Err("parity history admitted changed candidate identity".into());
+            }
+            if classification == "required" && initial == "FAIL" {
+                restored_import_fixture()?;
+                first.hermit_sha = older_sha.clone();
+                second.hermit_sha = older_sha.clone();
+                write_import_rows(&[&first, &second, &ordinary_pass])?;
+                let retained_bytes = fs::read(&result_path).map_err(|error| error.to_string())?;
+                let retained = read_retained_results(
+                    &result_command_root,
+                    &result_root,
+                    &BTreeSet::from([id.clone()]),
+                )?;
+                let rows = retained
+                    .cells
+                    .iter()
+                    .flat_map(|cell| &cell.candidates)
+                    .collect::<Vec<_>>();
+                if rows.len() != 2
+                    || !rows.iter().any(|candidate| {
+                        candidate.row.run_id == ordinary_pass.run_id
+                            && candidate.row.hermit_sha == fixture_head
+                    })
+                    || !rows.iter().any(|candidate| {
+                        candidate.row.run_id == second.run_id
+                            && candidate.row.attempt == 2
+                            && candidate.row.hermit_sha == older_sha
+                    })
+                    || rows.iter().any(|candidate| {
+                        candidate.row.run_id == first.run_id && candidate.row.attempt == 1
+                    })
+                {
+                    return Err(
+                        "parity grouping promoted an ordinary comparison at a stale source rank"
+                            .into(),
+                    );
+                }
+                let output = run_result_command("import-results", Some(&current_summary))?;
+                if !output.status.success()
+                    || fs::read(&result_path).map_err(|error| error.to_string())? != retained_bytes
+                    || imported_parity_cell()?
+                        .observations
+                        .iter()
+                        .flat_map(|o| &o.canonical_comparisons)
+                        .any(|receipt| receipt.run_id == first.run_id)
+                {
+                    return Err(format!(
+                        "stale ordinary comparison escaped parity source ranking: {output:?}"
                     ));
                 }
             }
@@ -15189,6 +15491,7 @@ red/`measured-and-passed` count is **0**.",
         BTreeMap::from([(
             id.clone(),
             vec![ResultCandidate {
+                parity_history: false,
                 evidence_identity: format!("coordinate-less-{outcome}"),
                 path: PathBuf::from("fixture/results.jsonl"),
                 row,
@@ -15338,11 +15641,13 @@ red/`measured-and-passed` count is **0**.",
         unlocated_id.clone(),
         vec![
             ResultCandidate {
+                parity_history: false,
                 evidence_identity: no_result_identity,
                 path: PathBuf::from("fixture/results.jsonl"),
                 row: no_result_row.clone(),
             },
             ResultCandidate {
+                parity_history: false,
                 evidence_identity: recovered_pass_identity,
                 path: PathBuf::from("fixture/results.jsonl"),
                 row: recovered_pass_row.clone(),
@@ -15389,6 +15694,7 @@ red/`measured-and-passed` count is **0**.",
                 .into_iter()
                 .map(|row| {
                     Ok(ResultCandidate {
+                        parity_history: false,
                         evidence_identity: row.evidence_identity()?,
                         path: PathBuf::from("fixture/results.jsonl"),
                         row,
@@ -15569,6 +15875,7 @@ red/`measured-and-passed` count is **0**.",
         let rows = BTreeMap::from([(
             unlocated_id.clone(),
             vec![ResultCandidate {
+                parity_history: false,
                 evidence_identity: expected_identity,
                 path: PathBuf::from("fixture/results.jsonl"),
                 row,
@@ -15820,6 +16127,7 @@ red/`measured-and-passed` count is **0**.",
         .into_iter()
         .map(|row| {
             Ok(ResultCandidate {
+                parity_history: false,
                 evidence_identity: row.evidence_identity()?,
                 path: PathBuf::from("fixture/results.jsonl"),
                 row,
@@ -15976,6 +16284,7 @@ red/`measured-and-passed` count is **0**.",
         (
             unlocated_id.clone(),
             vec![ResultCandidate {
+                parity_history: false,
                 evidence_identity: pass_neighbor.evidence_identity()?,
                 path: PathBuf::from("fixture/pass-results.jsonl"),
                 row: pass_neighbor,
@@ -15984,6 +16293,7 @@ red/`measured-and-passed` count is **0**.",
         (
             no_verdict_id.clone(),
             vec![ResultCandidate {
+                parity_history: false,
                 evidence_identity: no_verdict_neighbor.evidence_identity()?,
                 path: PathBuf::from("fixture/no-verdict-results.jsonl"),
                 row: no_verdict_neighbor,
@@ -16148,6 +16458,7 @@ red/`measured-and-passed` count is **0**.",
         let rows = BTreeMap::from([(
             unlocated_id.clone(),
             vec![ResultCandidate {
+                parity_history: false,
                 evidence_identity: identity,
                 path: PathBuf::from("fixture/results.jsonl"),
                 row,

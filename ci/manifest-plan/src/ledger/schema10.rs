@@ -711,12 +711,10 @@ impl ParityAttempt {
             || !prefix.iter().any(|arg| arg == "--verify")
             || !prefix.iter().any(|arg| arg == "--verify-strict")
             || !prefix.iter().any(|arg| arg == "--strict")
-            || prefix.iter().any(|arg| {
-                matches!(
-                    arg.split('=').next(),
-                    Some("--no-rcb-time" | "--no-detlog-io-buffers")
-                )
-            })
+            // The canonical producer emits no negated policy options. Refuse
+            // every such option independently, including future opt-outs that
+            // are not represented in the comparison report's policy fields.
+            || prefix.iter().any(|arg| arg.starts_with("--no-"))
         {
             return Err(
                 "schema 10 parity invocation contradicts its backend, guest, or strict verify role"
