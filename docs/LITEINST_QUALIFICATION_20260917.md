@@ -27,7 +27,7 @@ The historical executions use the activated **LiteInst host hybrid with the
 ptrace Detcore Tool**. They are same-backend strict repeat comparisons, not
 in-process LiteInst, ptrace-free execution, or comparisons against a ptrace
 golden run. The category name `backend-parity-c` is not evidence of
-cross-backend parity. The unchanged command policy uses `--log info`,
+cross-backend parity. The historical measurement command policy used `--log info`,
 `--strict --verify --verify-strict`, `BitwiseInfoV1`, positive compared INFO
 counts, exact exit/stdout/stderr comparison and no relaxations. The independent
 audits checked complete canonical log pairs, no truncation, one outer attempt,
@@ -35,6 +35,16 @@ one inner verification, and no retries, omitted failed attempts or no-result
 rows in this population. Staging and activation succeeded before the first
 measured cell in each batch. This qualification is not a measurement of a
 missing runtime.
+
+Main commit `e385d5f72a9b336bb121329790c6e9e3b61bdd34` subsequently enabled
+`--parity-reference ptrace` in the two existing portable `backend-parity-c`
+selectors and enabled cumulative validation evidence. This selection preserves
+that activation. Eligible selected cells now run the candidate repeat pair,
+the ptrace repeat pair, and the cross-backend comparison within the existing
+aggregate CPU budget and deadline. The historical candidate-only timings below
+do not measure that combined workload or its resource margins. All bounds stay
+unchanged, and the stored parity table still has zero measured comparisons;
+selection and activation do not establish a parity match.
 
 Comparable selection changes from 753 to 849 out of 5,760 cells, and enabled
 cells increase from 907 to 1,003. The 154 enabled-but-unselected cells remain
