@@ -24,9 +24,8 @@ use super::validate_test_results::NodeTestResultsInput;
 use super::validate_test_results::RetainedTestResults;
 use super::validate_test_results::SelectedTestProducers;
 
-// Reader and writer support lands before selector and producer activation.
-// The following activation commit changes this together with the two commands.
-pub const ENABLED: bool = false;
+// Retain cumulative evidence when the two existing selectors request parity.
+pub const ENABLED: bool = true;
 
 pub struct SelectedEvidence {
     dag_json: String,

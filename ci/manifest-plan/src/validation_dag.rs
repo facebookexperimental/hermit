@@ -2487,22 +2487,12 @@ sys.exit(37)
     }
 
     #[test]
-    fn parity_support_preserves_the_two_existing_mixed_bucket_selectors() {
+    fn parity_activation_preserves_the_two_existing_mixed_bucket_selectors() {
         let dag = generate(&repo_root().unwrap()).unwrap();
-        assert!(
-            dag.steps
-                .iter()
-                .all(|step| !step.cmd.contains("--parity-reference"))
-        );
         let parity = dag
             .steps
             .iter()
-            .filter(|step| {
-                matches!(
-                    step.tag().as_str(),
-                    "e2e.manifest_backend_parity_c" | "e2e.manifest_backend_parity_c_on_host"
-                )
-            })
+            .filter(|step| step.cmd.contains("--parity-reference"))
             .collect::<Vec<_>>();
         assert_eq!(
             parity
@@ -2515,10 +2505,8 @@ sys.exit(37)
             ]
         );
         for step in parity {
-            assert_eq!(step.cmd.matches("--parity-reference ptrace").count(), 0);
-            assert!(step.cmd.contains(
-                "--category backend-parity-c --ci-only --allow-empty --prebuilt --jobs 8"
-            ));
+            assert_eq!(step.cmd.matches("--parity-reference ptrace").count(), 1);
+            assert!(step.cmd.contains("--category backend-parity-c --ci-only --allow-empty --prebuilt --parity-reference ptrace --jobs 8"));
             let selector = step.manifest.as_ref().unwrap();
             assert_eq!(selector.lane, "portable");
             assert_eq!(selector.category, "backend-parity-c");

@@ -3382,7 +3382,7 @@ This is measured ptrace-reference parity, not CI plan membership and not same-ba
 A cell is eligible when the corresponding ptrace `verify` coordinate is Green. The CLI can explicitly \
 select eligible manifest-disabled candidates with `--probe-disabled`; the committed selectors do not include that option. `Never measured` \
 means no strict typed ptrace-vs-candidate report exists. \
-At the latest recorded Hermit source depth, any divergence outranks a match. The portable and hosted-portable `backend-parity-c` nodes currently perform ordinary same-backend verification. Ptrace-reference execution is prepared separately and is not active in this support stage. These selectors cover a subset of the eligible cells; eligibility does not mean every cell was selected or measured.\n\n\
+At the latest recorded Hermit source depth, any divergence outranks a match. The portable and hosted-portable `backend-parity-c` nodes perform ptrace-reference parity comparisons for eligible selected verify cells. These selectors cover a subset of the eligible cells; eligibility does not mean every cell was selected or measured.\n\n\
 | Candidate backend | Eligible ptrace-green cells | Disabled probe candidates | Measured match | Parity failure | Never measured |\n\
 | --- | ---: | ---: | ---: | ---: | ---: |\n"
         .to_owned();

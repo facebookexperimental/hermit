@@ -1387,7 +1387,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"Portable manifest bucket: backend-parity-c"########,
         description: r########"WORKER WIDTH measured 2026-08-23: recent 20-way validation runs rotated an identical empty early-Run1 no_result across unrelated ptrace cells, while each affected cell passed in another run. A focused run at eight workers completed all 79 selected strict rows in 175.9s with 79 canonical matches and no no_result, leaving a measured 424.1s margin to the unchanged 600s hang bound. This node reserves all 8 manifest_guest slots and passes the same width to the harness; ordinary Hermit gates may overlap now that their unsupported exclusive resource is removed. Tradeoff: blocking validation still does not exercise the former 20-way manifest pressure; every cell and the strict comparator remain enabled and unchanged. MEMORY measured 2026-08-25 at Hermit 16f70d9994 with the complete current-main artifact and width 8 under ambient load 49-64: three uncapped cgroup peaks were 2856333312, 3168403456, and 2857349120 bytes; three stricter 4-GiB-cap repetitions completed all 85 cells with peaks up to 3465289728 bytes and no cgroup kill. The 4-GiB baseline rounds above the observed high-water mark; the 6-GiB hard cap preserves another 2.5 GiB of runaway headroom without reserving the former unmeasured 32 GiB."########,
         labels: &[r########"full"########, r########"portable"########],
-        cmd: crate::backend_parity_policy::PORTABLE_ORDINARY_COMMAND,
+        cmd: crate::backend_parity_policy::PORTABLE_PARITY_COMMAND,
         cmdtype: CmdType::Unknown,
         manifest: Some(ManifestSpec {
             lane: r########"portable"########,
@@ -5241,7 +5241,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         desc: r########"Portable manifest bucket: backend-parity-c"########,
         description: r########"WORKER WIDTH measured 2026-08-23: recent 20-way validation runs rotated an identical empty early-Run1 no_result across unrelated ptrace cells, while each affected cell passed in another run. A focused run at eight workers completed all 79 selected strict rows in 175.9s with 79 canonical matches and no no_result, leaving a measured 424.1s margin to the unchanged 600s hang bound. This node reserves all 8 manifest_guest slots and passes the same width to the harness; ordinary Hermit gates may overlap now that their unsupported exclusive resource is removed. Tradeoff: blocking validation still does not exercise the former 20-way manifest pressure; every cell and the strict comparator remain enabled and unchanged. MEMORY measured 2026-08-25 at Hermit 16f70d9994 with the complete current-main artifact and width 8 under ambient load 49-64: three uncapped cgroup peaks were 2856333312, 3168403456, and 2857349120 bytes; three stricter 4-GiB-cap repetitions completed all 85 cells with peaks up to 3465289728 bytes and no cgroup kill. The 4-GiB baseline rounds above the observed high-water mark; the 6-GiB hard cap preserves another 2.5 GiB of runaway headroom without reserving the former unmeasured 32 GiB."########,
         labels: &[r########"hosted-portable"########],
-        cmd: crate::backend_parity_policy::HOSTED_ORDINARY_COMMAND,
+        cmd: crate::backend_parity_policy::HOSTED_PARITY_COMMAND,
         cmdtype: CmdType::Unknown,
         manifest: Some(ManifestSpec {
             lane: r########"portable"########,
