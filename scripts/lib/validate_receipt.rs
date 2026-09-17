@@ -234,6 +234,10 @@ pub fn self_test() -> Result<String, String> {
         ("envelope-only profile", eligible(0, 0, true, true, false, "envelope-only")),
         ("selective profile", eligible(0, 0, true, true, false, "selective")),
         ("focused compat profile", eligible(0, 0, true, true, false, "strict-compat-only")),
+        (
+            "cell requalification profile",
+            eligible(0, 0, true, true, false, "cell-requalification"),
+        ),
     ];
     let mut refused = 0usize;
     for (why, r) in &negatives {
@@ -249,6 +253,14 @@ pub fn self_test() -> Result<String, String> {
         if !e.contains("not the full suite") {
             return Err(format!("receipt: super must be refused BY THE PROFILE gate, got: {e}"));
         }
+    }
+    let focused_error = eligible(0, 0, true, true, false, "cell-requalification")
+        .err()
+        .ok_or("focused evidence must not authorize a full-suite receipt")?;
+    if focused_error != "profile is cell-requalification, not the full suite" {
+        return Err(format!(
+            "receipt: requalification must be refused BY THE PROFILE gate, got: {focused_error}"
+        ));
     }
     accepted += 0;
     Ok(format!(

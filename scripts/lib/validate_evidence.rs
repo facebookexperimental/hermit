@@ -366,52 +366,156 @@ mod tests {
 
     #[test]
     fn plan_publication_binds_compatibility_and_rechecks_source_before_execution() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(root.path().join("ci/dag")).unwrap();
-        let cfg = super::super::dag_from_json(
-            &serde_json::json!({"steps":[{
-                "group":"check", "job":"fixture", "cmd":"true",
-                "result_manifests":[{"kind":"structured-test-results","schema":2,
-                    "path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"check.fixture"}]
-            }]})
-            .to_string(),
-        )
-        .unwrap();
-        let dag = super::super::dag_to_json(&cfg);
-        let path = root.path().join("ci/dag/validate.json");
-        std::fs::write(&path, &dag).unwrap();
-        let expected = root.path().join("ci/expected-e2e-plan.json");
-        std::fs::write(&expected, "{\"schema\":1,\"cells\":[]}").unwrap();
-        let plan = super::super::finish_committed_selection(
-            Plan {
-                cfg,
-                profile: "full".into(),
-                ..Plan::default()
-            },
-            path,
-            dag.into_bytes(),
-        );
-        let selected = SelectedEvidence::capture(root.path(), &plan).unwrap();
-        let prepared = selected
-            .publish(root.path(), &plan, "synthetic-plan", &"a".repeat(40))
+        for profile in ["full", "cell-requalification"] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(root.path().join("ci/dag")).unwrap();
+            let cfg = super::super::dag_from_json(
+                &serde_json::json!({"steps":[{
+                    "group":"check", "job":"fixture", "cmd":"true",
+                    "result_manifests":[{"kind":"structured-test-results","schema":2,
+                        "path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"check.fixture"}]
+                }]})
+                .to_string(),
+            )
             .unwrap();
-        assert!(!prepared.plan.compatibility_selected);
+            let dag = super::super::dag_to_json(&cfg);
+            let path = root.path().join("ci/dag/validate.json");
+            std::fs::write(&path, &dag).unwrap();
+            let expected = root.path().join("ci/expected-e2e-plan.json");
+            std::fs::write(&expected, "{\"schema\":1,\"cells\":[]}").unwrap();
+            let mut plan = super::super::finish_committed_selection(
+                Plan {
+                    cfg,
+                    profile: profile.into(),
+                    ..Plan::default()
+                },
+                path,
+                dag.into_bytes(),
+            );
+            let selected = SelectedEvidence::capture(root.path(), &plan).unwrap();
+            let prepared = selected
+                .publish(root.path(), &plan, "synthetic-plan", &"a".repeat(40))
+                .unwrap();
+            assert!(!prepared.plan.compatibility_selected);
+            assert_eq!(prepared.plan.path.as_str(), profile);
+            assert_eq!(
+                std::fs::read(root.path().join(&prepared.reference.path)).unwrap(),
+                prepared.bytes
+            );
+            let changed = SelectedEvidence::capture(root.path(), &plan).unwrap();
+            std::fs::write(&expected, "{\"schema\":1,\"cells\":[]}\n").unwrap();
+            assert!(
+                changed
+                    .publish(root.path(), &plan, "changed-plan", &"a".repeat(40))
+                    .is_err()
+            );
+            assert!(
+                !root
+                    .path()
+                    .join("ignored/validate/artifacts/changed-plan/constructed-plan.json")
+                    .exists()
+            );
+            plan.profile = "cellrequalification".into();
+            let unknown = SelectedEvidence::capture(root.path(), &plan)
+                .err()
+                .expect("unknown profile must remain refused");
+            assert!(unknown.contains("unsupported cumulative evidence profile"));
+        }
+    }
+
+    #[test]
+    fn requalification_captures_and_publishes_the_committed_owner_without_full_authority() {
+        use super::super::DagManifest;
+        use super::super::build_plan;
+        use super::super::dag_to_json;
+        use super::super::parse_argv;
+
+        let root = Path::new(file!())
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let args = parse_argv(&[
+            "--requalify-cell".into(),
+            "backend-parity-c/pid-probe".into(),
+            "verify".into(),
+            "liteinst".into(),
+            "--no-label-pr".into(),
+        ])
+        .unwrap();
+        let plan = build_plan(root, &args, scratch.path()).unwrap();
+        assert_eq!(plan.profile, "cell-requalification");
+        assert_eq!(plan.selection_mode, "targeted");
+        assert!(!plan.suite_complete);
+        assert!(plan.second.is_none());
+
+        let requested = DagManifest {
+            lane: "portable".into(),
+            category: "backend-parity-c".into(),
+            test: Some("backend-parity-c/pid-probe".into()),
+            mode: Some("verify".into()),
+            backend: Some("liteinst".into()),
+        };
+        let committed = super::super::validate_plan::validation_config(root).unwrap();
+        let lane =
+            dagrun::select_steps_by_labels(&committed, std::slice::from_ref(&requested.lane))
+                .unwrap();
+        let owner = dagrun::result_manifest_owner(&lane.steps, &requested).unwrap();
+        let selected = dagrun::select_steps_by_tags(&lane, &[owner.tag()], false).unwrap();
+        // Exact bytes cover resource bounds, command argv and dependency order.
+        assert_eq!(dag_to_json(&plan.cfg), dag_to_json(&selected));
+        let prepared = SelectedEvidence::capture(root, &plan)
+            .unwrap()
+            .publish(
+                scratch.path(),
+                &plan,
+                "requalification-pid-probe",
+                &"a".repeat(40),
+            )
+            .unwrap();
+        assert_eq!(prepared.plan.path.as_str(), plan.profile);
+        assert_eq!(prepared.plan.dag_json, dag_to_json(&selected));
         assert_eq!(
-            std::fs::read(root.path().join(&prepared.reference.path)).unwrap(),
+            prepared.plan.expected_e2e_plan_json.as_bytes(),
+            std::fs::read(root.join("ci/expected-e2e-plan.json")).unwrap()
+        );
+        let mut expected: Vec<hermit_manifest_plan::ledger::CellIdentity> =
+            serde_json::from_value(serde_json::to_value(&plan.cell_evidence_expected).unwrap())
+                .unwrap();
+        expected.sort();
+        assert_eq!(prepared.plan.planned_cells().unwrap(), expected);
+        assert!(
+            prepared
+                .plan
+                .planned_backend_parity_relations()
+                .unwrap()
+                .iter()
+                .any(|relation| {
+                    relation.candidate.test == "backend-parity-c/pid-probe"
+                        && relation.candidate.mode == "verify"
+                        && relation.candidate.backend == "liteinst"
+                        && relation.reference_backend == "ptrace"
+                })
+        );
+        assert_eq!(
+            std::fs::read(scratch.path().join(&prepared.reference.path)).unwrap(),
             prepared.bytes
         );
-        let changed = SelectedEvidence::capture(root.path(), &plan).unwrap();
-        std::fs::write(&expected, "{\"schema\":1,\"cells\":[]}\n").unwrap();
-        assert!(
-            changed
-                .publish(root.path(), &plan, "changed-plan", &"a".repeat(40))
-                .is_err()
+        let refusal = super::super::validate_receipt::eligible(
+            0,
+            0,
+            true,
+            true,
+            false,
+            prepared.plan.path.as_str(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            refusal,
+            "profile is cell-requalification, not the full suite"
         );
-        assert!(
-            !root
-                .path()
-                .join("ignored/validate/artifacts/changed-plan/constructed-plan.json")
-                .exists()
-        );
+        // Preserve the existing ptrace selection and mutation controls as well.
+        super::super::requalification_plan_bracket(root).unwrap();
     }
 }

@@ -102,6 +102,13 @@ fn parity(attempts: Vec<BackendParityCellAttempt>) -> CellBackendParity {
 }
 
 fn fixture(parity: CellBackendParity) -> (HistoryRow, Vec<u8>, Vec<u8>, Vec<u8>) {
+    fixture_with_path(parity, ValidatePath::Full)
+}
+
+fn fixture_with_path(
+    parity: CellBackendParity,
+    path: ValidatePath,
+) -> (HistoryRow, Vec<u8>, Vec<u8>, Vec<u8>) {
     let id = identity();
     let tag = "e2e.manifest_backend_parity_c_on_host";
     let cfg = dag_from_json(&serde_json::json!({ "steps": [{
@@ -119,7 +126,7 @@ fn fixture(parity: CellBackendParity) -> (HistoryRow, Vec<u8>, Vec<u8>, Vec<u8>)
         schema: 1,
         run_id: run_id.clone(),
         hermit_sha: hermit_sha.clone(),
-        path: ValidatePath::Full,
+        path,
         compatibility_selected: false,
         dag_json: dag_to_json(&cfg),
         expected_e2e_plan_json: serde_json::json!({"schema":1,"cells":[id]}).to_string(),
@@ -143,7 +150,7 @@ fn fixture(parity: CellBackendParity) -> (HistoryRow, Vec<u8>, Vec<u8>, Vec<u8>)
     let selected = vec![id.clone()];
     let population = serde_json::to_vec(&serde_json::to_value(&selected).unwrap()).unwrap();
     let cells = CellResultsEvidenceV10 {
-        path: ValidatePath::Full,
+        path,
         run_id: run_id.clone(),
         hermit_sha: hermit_sha.clone(),
         source_tree_dirty: false,
@@ -162,7 +169,7 @@ fn fixture(parity: CellBackendParity) -> (HistoryRow, Vec<u8>, Vec<u8>, Vec<u8>)
     let test_row = TestResultArtifactRow {
         run_id: run_id.clone(),
         hermit_sha: hermit_sha.clone(),
-        path: ValidatePath::Full,
+        path,
         producer: TestResultProducer::Node {
             node: tag.into(),
             outer_attempt: 1,
@@ -184,7 +191,7 @@ fn fixture(parity: CellBackendParity) -> (HistoryRow, Vec<u8>, Vec<u8>, Vec<u8>)
         filtered_tests: 0,
     };
     let tests = TestResultsEvidenceV9 {
-        path: ValidatePath::Full,
+        path,
         run_id: run_id.clone(),
         hermit_sha: hermit_sha.clone(),
         source_tree_dirty: false,
@@ -206,7 +213,7 @@ fn fixture(parity: CellBackendParity) -> (HistoryRow, Vec<u8>, Vec<u8>, Vec<u8>)
             row_count: 1,
         },
     };
-    let row = serde_json::from_value(serde_json::json!({"schema_version":10,"run_id":run_id,"commit":hermit_sha,"profile":"full","tree_dirty":false,
+    let row = serde_json::from_value(serde_json::json!({"schema_version":10,"run_id":run_id,"commit":hermit_sha,"profile":path.as_str(),"tree_dirty":false,
         "executed_tests":1,"passed_tests":1,"filtered_tests":0,"cell_results":cells,"test_results":tests,
         "constructed_plan":ConstructedPlanArtifact {path:format!("ignored/validate/artifacts/{run_id}/constructed-plan.json"),sha256:hex_digest(&plan_bytes),bytes:plan_bytes.len() as u64}
     })).unwrap();
@@ -858,5 +865,85 @@ fn generated_plan_populations_preserve_command_policy() {
                 );
             }
         }
+    }
+}
+
+#[test]
+fn focused_profile_round_trips_without_accepting_unknown_spellings() {
+    for name in ["quick", "full", "super", "cell-requalification"] {
+        let encoded = serde_json::to_string(name).unwrap();
+        let path: ValidatePath = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(path.as_str(), name);
+        assert_eq!(serde_json::to_string(&path).unwrap(), encoded);
+    }
+    for unknown in ["cellrequalification", "targeted", "unknown-profile"] {
+        assert!(serde_json::from_value::<ValidatePath>(unknown.into()).is_err());
+    }
+}
+
+#[test]
+fn focused_artifacts_require_the_same_profile_at_every_identity_boundary() {
+    let path = serde_json::from_value::<ValidatePath>("cell-requalification".into()).unwrap();
+    let (mut row, plan, cells, tests) = fixture_with_path(
+        parity(vec![completed(1, BackendParityVerdict::Matched)]),
+        path,
+    );
+    row.selection_mode = Some("targeted".into());
+    let verified = row
+        .verify_schema10_artifact_bytes(&plan, &cells, &tests)
+        .unwrap()
+        .unwrap();
+    assert!(verified.full_backend_parity && verified.full_test_results);
+    assert_eq!(verified.observations.len(), 3);
+    assert!(verified.missing_cells.is_empty() && verified.missing_backend_parity.is_empty());
+    assert_eq!(row.profile.as_deref(), Some("cell-requalification"));
+    retain_fixture("matched-requalification", &row, &plan, &cells, &tests);
+
+    for boundary in [
+        "row",
+        "plan",
+        "cell-summary",
+        "test-summary",
+        "test-artifact",
+    ] {
+        let mut changed_row = serde_json::to_value(&row).unwrap();
+        let mut changed_plan = plan.clone();
+        let mut changed_tests = tests.clone();
+        match boundary {
+            "row" => changed_row["profile"] = "full".into(),
+            "plan" => {
+                let mut value: Value = serde_json::from_slice(&plan).unwrap();
+                value["path"] = "full".into();
+                changed_plan = serde_json::to_vec(&value).unwrap();
+                changed_row["constructed_plan"]["sha256"] = hex_digest(&changed_plan).into();
+                changed_row["constructed_plan"]["bytes"] = (changed_plan.len() as u64).into();
+            }
+            "cell-summary" => changed_row["cell_results"]["path"] = "full".into(),
+            "test-summary" => changed_row["test_results"]["path"] = "full".into(),
+            "test-artifact" => {
+                let mut value: TestResultArtifactRow = serde_json::from_slice(&tests).unwrap();
+                value.path = ValidatePath::Full;
+                changed_tests = serde_json::to_vec(&value).unwrap();
+                changed_tests.push(b'\n');
+                changed_row["test_results"]["artifact"]["sha256"] =
+                    hex_digest(&changed_tests).into();
+            }
+            _ => unreachable!(),
+        }
+        let changed_row: HistoryRow = serde_json::from_value(changed_row).unwrap();
+        let expected = match boundary {
+            "row" | "plan" => "schema 10 constructed plan differs from its row identity",
+            "cell-summary" => "schema 10 cell evidence differs from the exact clean row identity",
+            "test-summary" => "schema 9 test_results path differs from row profile",
+            "test-artifact" => "schema 9 test-results artifact row 1 has wrong validation path",
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            changed_row
+                .verify_schema10_artifact_bytes(&changed_plan, &cells, &changed_tests)
+                .expect_err("mismatched profile must be refused"),
+            expected,
+            "wrong refusal for {boundary} profile"
+        );
     }
 }

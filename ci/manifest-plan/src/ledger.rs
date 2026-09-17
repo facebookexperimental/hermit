@@ -589,6 +589,9 @@ pub enum ValidatePath {
     Quick,
     Full,
     Super,
+    /// Evidence for the selected cell owner and dependencies, not the full suite.
+    #[serde(rename = "cell-requalification")]
+    CellRequalification,
 }
 
 impl ValidatePath {
@@ -597,6 +600,7 @@ impl ValidatePath {
             Self::Quick => "quick",
             Self::Full => "full",
             Self::Super => "super",
+            Self::CellRequalification => "cell-requalification",
         }
     }
 }

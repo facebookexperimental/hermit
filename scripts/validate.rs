@@ -16998,6 +16998,16 @@ fn requalification_plan_bracket(root: &Path) -> Result<(), String> {
     }
     require_committed_scheduler_input(&plan)?;
 
+    let evidence_root = tempfile::tempdir().map_err(|error| {
+        format!("requalification plan: cannot create evidence fixture: {error}")
+    })?;
+    validate_evidence::SelectedEvidence::capture(root, &plan)?.publish(
+        evidence_root.path(),
+        &plan,
+        "requalification-plan-bracket",
+        &"a".repeat(40),
+    )?;
+
     let selected_owner = plan
         .cfg
         .steps
