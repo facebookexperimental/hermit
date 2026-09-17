@@ -1047,7 +1047,7 @@ esac
         assert_eq!(rows[6], "offline::");
     }
 
-    fn install_rustup_fixture(fixture: &ProductionFixture) {
+    fn install_rustup_fixture(fixture: &ProductionFixture, hardlink: bool) {
         let cargo = fs::read_to_string(fixture.fake_bin.join("cargo")).unwrap();
         for name in ["nightly", "stable"] {
             let marker = format!(
@@ -1086,19 +1086,29 @@ fi
 "#,
         );
         fs::remove_file(fixture.fake_bin.join("cargo")).unwrap();
-        std::os::unix::fs::symlink("rustup", fixture.fake_bin.join("cargo")).unwrap();
+        if hardlink {
+            fs::hard_link(
+                fixture.fake_bin.join("rustup"),
+                fixture.fake_bin.join("cargo"),
+            )
+            .unwrap();
+        } else {
+            std::os::unix::fs::symlink("rustup", fixture.fake_bin.join("cargo")).unwrap();
+        }
     }
 
     #[test]
     fn production_host_fetch_preserves_neutral_and_explicit_rustup_toolchains() {
-        for explicit_stable in [false, true] {
+        for (explicit_stable, hardlink) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
             for config in [
                 "{}",
                 r#"{"http":{"proxy":"https://configured.invalid"}}"#,
                 r#"{"http":{"proxy":""}}"#,
             ] {
                 let fixture = production_fixture(FetchMutation::None);
-                install_rustup_fixture(&fixture);
+                install_rustup_fixture(&fixture, hardlink);
                 let toolchains = fixture.base.join("toolchain-journal");
                 let proxies = fixture.base.join("proxy-journal");
                 let output = production_fixture_command(&fixture)

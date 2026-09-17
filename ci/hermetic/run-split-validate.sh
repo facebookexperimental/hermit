@@ -335,7 +335,7 @@ if [[ $do_fetch -eq 1 ]]; then
     # the root lock does not include every member of either workspace.
     (
         cd "$ROOT"
-        # Keep Cargo's executable name (possibly a rustup symlink) while making
+        # Keep Cargo's executable name (possibly a rustup proxy) while making
         # a relative PATH entry independent of the neutral Agent Utils cwd.
         cargo_bin=$(command -v cargo)
         [[ "$cargo_bin" == /* ]] || cargo_bin="$PWD/$cargo_bin"
@@ -347,7 +347,7 @@ if [[ $do_fetch -eq 1 ]]; then
         if [[ -z ${CARGO_HTTP_PROXY+x} && -n $proxy ]]; then
             cargo_config_bin=$cargo_bin
             if rustup_bin=$(command -v rustup) &&
-                [[ $(realpath -- "$cargo_bin") == $(realpath -- "$rustup_bin") ]]; then
+                [[ "$cargo_bin" -ef "$rustup_bin" ]]; then
                 cargo_config_bin=$("$rustup_bin" which cargo 2>/dev/null) || cargo_config_bin=""
             fi
             # Inspection is an optional enhancement for a stable-only host.
