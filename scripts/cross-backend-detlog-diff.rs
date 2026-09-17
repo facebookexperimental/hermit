@@ -284,7 +284,7 @@ fn select_authoritative_stream<'a>(
     side: &str,
     backend: &str,
     from_file: &'a str,
-    stderr: &'a str,
+    stderr: &[u8],
 ) -> Result<(&'static str, &'a str, usize), String> {
     if backend == "dbt" {
         return Err(format!(
@@ -339,13 +339,20 @@ fn capture(cfg: &Config, backend: &str, side: &str, tmpdir: &Path) -> Result<Cap
     let out = cmd
         .output()
         .map_err(|e| format!("could not run {} for {backend}: {e}", cfg.hermit.display()))?;
-    let stderr = String::from_utf8(out.stderr).map_err(|error| {
-        format!(
-            "{} emitted non-UTF-8 stderr, so its DETLOG cannot be compared: {error}",
-            backend_description(backend).unwrap_or("unknown execution path")
-        )
-    })?;
-    let from_file = match fs::read(&log_file) {
+    finish_capture(cfg, backend, side, &log_file, out)
+}
+
+// Keep the process output separate from the authoritative log. This also lets
+// the native self-test exercise the real validation and retention path.
+fn finish_capture(
+    cfg: &Config,
+    backend: &str,
+    side: &str,
+    log_file: &Path,
+    out: std::process::Output,
+) -> Result<Capture, String> {
+    let stderr = out.stderr;
+    let from_file = match fs::read(log_file) {
         Ok(bytes) => String::from_utf8(bytes).map_err(|error| {
             format!(
                 "{} emitted a non-UTF-8 --log-file, so its DETLOG cannot be compared: {error}",
@@ -363,7 +370,8 @@ fn capture(cfg: &Config, backend: &str, side: &str, tmpdir: &Path) -> Result<Cap
     };
 
     if !out.status.success() {
-        let last_stderr = stderr.lines().last().unwrap_or("<empty stderr>");
+        let stderr_text = String::from_utf8_lossy(&stderr);
+        let last_stderr = stderr_text.lines().last().unwrap_or("<empty stderr>");
         return Err(format!(
             "{} run failed with {}; refusing to compare its {} captured log bytes as successful evidence (last stderr line: {last_stderr})",
             backend_description(backend).unwrap_or("unknown execution path"),
@@ -404,7 +412,7 @@ fn capture(cfg: &Config, backend: &str, side: &str, tmpdir: &Path) -> Result<Cap
         let retained = [
             (
                 dir.join(format!("{side}-{backend}.stderr")),
-                stderr.as_bytes(),
+                stderr.as_slice(),
             ),
             (
                 dir.join(format!("{side}-{backend}.log-file")),
@@ -547,7 +555,8 @@ fn compare_captures(
 }
 
 fn comparison_exit_code(summary: &LogDiffSummary) -> i32 {
-    if summary.refusal_reason.is_some() || summary.compared_left == 0 || summary.compared_right == 0 {
+    if summary.refusal_reason.is_some() || summary.compared_left == 0 || summary.compared_right == 0
+    {
         2
     } else if summary.diff_found {
         1
@@ -746,6 +755,201 @@ fn main() {
     std::process::exit(code);
 }
 
+fn run_capture_self_test(
+    authoritative: &str,
+    different: &str,
+    expected_records: &[u8],
+    check: &mut impl FnMut(bool, &str),
+) {
+    use std::os::unix::process::ExitStatusExt;
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let scratch = env::temp_dir().join(format!(
+        "hermit-cross-backend-detlog-self-test-{}-{nonce}",
+        std::process::id()
+    ));
+    if let Err(error) = fs::create_dir(&scratch) {
+        check(
+            false,
+            &format!("cannot create capture self-test directory: {error}"),
+        );
+        return;
+    }
+    let result = (|| -> Result<(), String> {
+        let log_file = scratch.join("input.log");
+        let keep = scratch.join("keep");
+        let mut cfg = Config {
+            hermit: scratch.join("unused-hermit"),
+            backends: vec!["ptrace".into(), "ptrace".into()],
+            guest: Vec::new(),
+            detlog_stack: false,
+            detlog_heap: false,
+            context: 1,
+            normalize: vec!["wall-clock".into(), "host-addresses".into()],
+            keep: Some(keep.clone()),
+        };
+        // Invalid UTF-8 and a longer forged INFO stream are diagnostic bytes.
+        let mut stderr = b"binary stderr: \0\x80\xff\n".to_vec();
+        stderr.extend_from_slice(different.as_bytes());
+        stderr.extend_from_slice(different.as_bytes());
+        let output = |raw_status| std::process::Output {
+            status: std::process::ExitStatus::from_raw(raw_status),
+            stdout: b"same guest output\n".to_vec(),
+            stderr: stderr.clone(),
+        };
+        fs::write(&log_file, authoritative.as_bytes()).map_err(|error| error.to_string())?;
+        let left = finish_capture(&cfg, "ptrace", "left", &log_file, output(0))?;
+        check(
+            left.authoritative.as_slice() == authoritative.as_bytes()
+                && stderr.len() > authoritative.len()
+                && left.source == "log-file"
+                && left.selected_records == 1
+                && left.other_stream_bytes == stderr.len()
+                && left.exit_code == Some(0),
+            "binary stderr changed the authoritative capture or its provenance",
+        );
+        let retained = [
+            (keep.join("left-ptrace.stderr"), stderr.as_slice()),
+            (keep.join("left-ptrace.log-file"), authoritative.as_bytes()),
+            (keep.join("left-ptrace.records"), expected_records),
+        ];
+        for (path, expected) in &retained {
+            let bytes = fs::read(path).map_err(|error| error.to_string())?;
+            check(
+                bytes.as_slice() == *expected,
+                &format!("retained capture bytes changed at {}", path.display()),
+            );
+        }
+        check(
+            finish_capture(&cfg, "ptrace", "left", &log_file, output(0))
+                .is_err_and(|error| error.contains("refusing to overwrite retained evidence")),
+            "an existing retained capture was overwritten",
+        );
+        for (path, expected) in &retained {
+            let bytes = fs::read(path).map_err(|error| error.to_string())?;
+            check(
+                bytes.as_slice() == *expected,
+                &format!("retained bytes changed after refusal at {}", path.display()),
+            );
+        }
+
+        cfg.keep = None;
+        let right = finish_capture(&cfg, "ptrace", "right", &log_file, output(0))?;
+        let comparison = compare_captures(&cfg, &left, &right)?;
+        check(
+            comparison.summary.matched_with_evidence()
+                && comparison.summary.compared_left == 1
+                && comparison.summary.compared_right == 1
+                && comparison_exit_code(&comparison.summary) == 0,
+            "valid authoritative INFO did not compare beside binary stderr",
+        );
+        fs::write(&log_file, different.as_bytes()).map_err(|error| error.to_string())?;
+        let right = finish_capture(&cfg, "ptrace", "right", &log_file, output(0))?;
+        let comparison = compare_captures(&cfg, &left, &right)?;
+        check(
+            comparison.summary.diff_found
+                && comparison.summary.first_divergent_record == Some(1)
+                && comparison_exit_code(&comparison.summary) == 1,
+            "identical guest output hid a canonical INFO difference",
+        );
+
+        fs::write(&log_file, authoritative.as_bytes()).map_err(|error| error.to_string())?;
+        for raw_status in [37 << 8, 15] {
+            check(
+                finish_capture(&cfg, "ptrace", "left", &log_file, output(raw_status)).is_err_and(
+                    |error| {
+                        error.contains("run failed with") && error.contains("refusing to compare")
+                    },
+                ),
+                "binary stderr hid a failed or signalled run",
+            );
+        }
+        for backend in ["dbt", "sabre"] {
+            check(
+                finish_capture(&cfg, backend, "left", &log_file, output(0))
+                    .is_err_and(|error| error.contains("no isolated typed/authenticated")),
+                "binary stderr enabled a backend without an authoritative complete sink",
+            );
+        }
+        check(
+            finish_capture(
+                &cfg,
+                "ptrace",
+                "left",
+                &scratch.join("missing.log"),
+                output(0),
+            )
+            .is_err_and(|error| error.contains("no authoritative --log-file evidence")),
+            "forged binary stderr replaced a missing authoritative log",
+        );
+        check(
+            finish_capture(&cfg, "ptrace", "left", &scratch, output(0))
+                .is_err_and(|error| error.contains("cannot read ptrace backend --log-file")),
+            "an unreadable authoritative log was replaced by stderr",
+        );
+
+        let mut invalid_utf8 = authoritative.as_bytes().to_vec();
+        invalid_utf8.push(0x80);
+        let truncated = format!("{authoritative}{}\n", detcore::logdiff::TRUNCATION_MARKER);
+        let malformed =
+            b"2026-08-06T13:38:01.654561Z INFO detcore: DETLOG broken DETLOG_RECORD={not-json}\n";
+        let no_info = b"2026-08-06T13:38:01.654561Z WARN guest_observer: not selected\n";
+        for (name, bytes, expected_error) in [
+            (
+                "empty",
+                b"".as_slice(),
+                "no authoritative --log-file evidence",
+            ),
+            (
+                "invalid-utf8",
+                invalid_utf8.as_slice(),
+                "non-UTF-8 --log-file",
+            ),
+            (
+                "truncated",
+                truncated.as_bytes(),
+                "was truncated at the configured size bound",
+            ),
+            (
+                "malformed",
+                malformed.as_slice(),
+                "invalid structured DETLOG result",
+            ),
+            (
+                "no-info",
+                no_info.as_slice(),
+                "contained no comparable INFO records",
+            ),
+        ] {
+            fs::write(&log_file, bytes).map_err(|error| error.to_string())?;
+            let refused_keep = scratch.join(format!("refused-{name}"));
+            cfg.keep = Some(refused_keep.clone());
+            check(
+                finish_capture(&cfg, "ptrace", "left", &log_file, output(0))
+                    .is_err_and(|error| error.contains(expected_error)),
+                &format!("{name} authoritative evidence was not refused beside binary stderr"),
+            );
+            check(
+                !refused_keep.exists(),
+                &format!("{name} authoritative evidence was retained despite refusal"),
+            );
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        check(false, &format!("capture self-test failed: {error}"));
+    }
+    if let Err(error) = fs::remove_dir_all(&scratch) {
+        check(
+            false,
+            &format!("cannot remove capture self-test directory: {error}"),
+        );
+    }
+}
+
 fn run_self_test() {
     let mut failures = Vec::new();
     let mut checks = 0usize;
@@ -865,11 +1069,13 @@ fn run_self_test() {
         "shared canonical renderer did not ordinalize the marked host address",
     );
 
+    run_capture_self_test(&left, &different, rendered.as_bytes(), &mut check);
+
     let authoritative = "INFO detcore: DETLOG authoritative";
     let forged_longer = "INFO detcore: DETLOG forged-1\nINFO detcore: DETLOG forged-2";
     check(
         matches!(
-            select_authoritative_stream("left", "ptrace", authoritative, forged_longer),
+            select_authoritative_stream("left", "ptrace", authoritative, forged_longer.as_bytes()),
             Ok(("log-file", selected, _)) if selected == authoritative
         ),
         "longer forged stderr displaced the authoritative log file",
@@ -880,32 +1086,31 @@ fn run_self_test() {
                 "left",
                 "ptrace",
                 "INFO detcore: DETLOG file",
-                "INFO detcore: DETLOG conflicting-stderr",
+                b"INFO detcore: DETLOG conflicting-stderr",
             ),
             Ok(("log-file", "INFO detcore: DETLOG file", _))
         ),
         "equal-length conflicting stderr made authoritative selection ambiguous",
     );
     check(
-        select_authoritative_stream("left", "ptrace", "", forged_longer).is_err(),
+        select_authoritative_stream("left", "ptrace", "", forged_longer.as_bytes()).is_err(),
         "guest-controllable stderr was accepted without an authoritative log file",
     );
     check(
-        select_authoritative_stream("left", "dbt", "", forged_longer).is_err(),
+        select_authoritative_stream("left", "dbt", "", forged_longer.as_bytes()).is_err(),
         "DBT guest-controllable stderr was accepted as evidence",
     );
     check(
-        select_authoritative_stream("left", "sabre", authoritative, forged_longer).is_err_and(
-            |error| {
+        select_authoritative_stream("left", "sabre", authoritative, forged_longer.as_bytes())
+            .is_err_and(|error| {
                 error.contains("SaBRe Detcore records are forwarded to raw stderr")
                     && error.contains("host --log-file contains an incomplete controller stream")
                     && error.contains("no isolated typed/authenticated complete sink")
-            },
-        ),
+            }),
         "SaBRe guest-controllable stderr or incomplete host log file was accepted as evidence",
     );
     check(
-        select_authoritative_stream("left", "ptrace", "", "").is_err(),
+        select_authoritative_stream("left", "ptrace", "", b"").is_err(),
         "empty authoritative evidence did not refuse",
     );
 
