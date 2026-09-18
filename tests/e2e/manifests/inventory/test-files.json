@@ -3290,6 +3290,72 @@
     },
     {
       "disposition": "support-data",
+      "path": "tests/fixtures/ledger-schema10/legacy/PROVENANCE.md",
+      "runner": "Schema-10 legacy fixture maintainers",
+      "why": "Documents the immutable producer origin and byte-preservation contract for the legacy parser and artifact-verifier fixtures. It is provenance documentation, not an executable guest or a runtime-success receipt."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/fixtures/ledger-schema10/legacy/SHA256SUMS.json",
+      "runner": "Schema-10 legacy fixture provenance review",
+      "why": "Records original paths, Git blobs, byte counts and digests for the eight preserved legacy producer exports. This authentication metadata accompanies parser test inputs and is not an executable guest."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/fixtures/ledger-schema10/legacy/ordinary-only-cells.jsonl",
+      "runner": "hermit-manifest-plan ledger::schema10 tests",
+      "why": "Preserved ordinary-only legacy schema-10 cell-result artifact, included by parser and artifact-verifier regression controls. Tests authenticate and decode these bytes without inferring selected-attempt bindings or executing the embedded guest commands and paths."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/fixtures/ledger-schema10/legacy/ordinary-only-plan.json",
+      "runner": "hermit-manifest-plan ledger::schema10 tests and scripts/lib/validate_cell_results.rs tests",
+      "why": "Preserved ordinary-only legacy schema-10 plan artifact, included by parser and artifact-verifier regression controls. Tests authenticate and decode these bytes without inferring selected-attempt bindings or executing the embedded guest commands and paths."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/fixtures/ledger-schema10/legacy/ordinary-only-row.json",
+      "runner": "hermit-manifest-plan ledger::schema10 tests and scripts/lib/validate_cell_results.rs tests",
+      "why": "Preserved ordinary-only legacy schema-10 compact ledger row, included by parser and artifact-verifier regression controls. Tests authenticate and decode these bytes without inferring selected-attempt bindings or executing the embedded guest commands and paths."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/fixtures/ledger-schema10/legacy/ordinary-only-tests.jsonl",
+      "runner": "hermit-manifest-plan ledger::schema10 tests",
+      "why": "Preserved ordinary-only legacy schema-10 test-result artifact, included by parser and artifact-verifier regression controls. Tests authenticate and decode these bytes without inferring selected-attempt bindings or executing the embedded guest commands and paths."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/fixtures/ledger-schema10/legacy/reference-diverged-cells.jsonl",
+      "runner": "hermit-manifest-plan ledger::schema10 tests",
+      "why": "Preserved reference-diverged legacy schema-10 cell-result artifact, included by parser and artifact-verifier regression controls. Tests authenticate and decode these bytes without inferring selected-attempt bindings or executing the embedded guest commands and paths."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/fixtures/ledger-schema10/legacy/reference-diverged-plan.json",
+      "runner": "hermit-manifest-plan ledger::schema10 tests",
+      "why": "Preserved reference-diverged legacy schema-10 plan artifact, included by parser and artifact-verifier regression controls. Tests authenticate and decode these bytes without inferring selected-attempt bindings or executing the embedded guest commands and paths."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/fixtures/ledger-schema10/legacy/reference-diverged-row.json",
+      "runner": "hermit-manifest-plan ledger::schema10 tests",
+      "why": "Preserved reference-diverged legacy schema-10 compact ledger row, included by parser and artifact-verifier regression controls. Tests authenticate and decode these bytes without inferring selected-attempt bindings or executing the embedded guest commands and paths."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/fixtures/ledger-schema10/legacy/reference-diverged-tests.jsonl",
+      "runner": "hermit-manifest-plan ledger::schema10 tests",
+      "why": "Preserved reference-diverged legacy schema-10 test-result artifact, included by parser and artifact-verifier regression controls. Tests authenticate and decode these bytes without inferring selected-attempt bindings or executing the embedded guest commands and paths."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/fixtures/scorecard-writeback/refusal.txt",
+      "runner": "scripts/validate.rs refusal_detail_tests",
+      "why": "Included verbatim by the refusal-detail regression controls to verify that a real scorecard rejection retains its cell identity and cause. The diagnostic text is compared in memory; its recorded paths are never executed."
+    },
+    {
+      "disposition": "support-data",
       "path": "tests/helpers.bzl",
       "runner": "Meta Buck test targets",
       "why": "tests/helpers.bzl is owned by Meta Buck test targets: helpers.bzl defines Buck macros and target wiring for internal tests. Buck evaluates it during graph construction; it is build policy, not guest code runnable by the public manifest harness."

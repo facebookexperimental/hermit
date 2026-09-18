@@ -4885,9 +4885,10 @@ fn apply_pressure_summary(
     })
 }
 
-/// What a validate fold recorded, SPLIT BY WHETHER THE ROW LOCATED ANYTHING.
+/// What a validate fold recorded, separating comparison outcomes from rows
+/// without a canonical comparison.
 ///
-/// Two counts rather than one because the caller's summary line is the only
+/// Separate counts because the caller's summary line is the only
 /// thing most readers see. A single "merged N divergence position(s)" makes
 /// N=0 read as "the run was all green", which is wrong precisely when a cell
 /// diverged and the comparator could not say where -- the case that needs
@@ -4900,19 +4901,14 @@ struct ValidateFold {
     located: usize,
     /// Rows that diverged and carried none of them.
     unlocated: usize,
-    /// Rows that determined no product result: an infrastructure `ERROR`, a
-    /// completed FAIL/no_result before comparison, or another non-PASS/non-FAIL
-    /// outcome. Counted separately because no canonical product result was
-    /// established. Its exact invocation is still measured evidence and is
-    /// retained with no product result; counting it separately is what keeps
-    /// the run from reading all-green.
+    /// Rows without an admitted canonical comparison. These may retain a typed
+    /// crash-error/product failure, an infrastructure error, or another
+    /// pre-comparison outcome. The exact invocation and any established product
+    /// result remain measured evidence; missing comparison does not erase them.
+    /// Counting these rows separately keeps the run from reading all-green.
     ///
-    /// ⚠️ NAMED, NOT JUST COUNTED, following `apply_pressure_summary` -- the sibling
-    /// writer already prints every row it drops with its cell and reason, on the
-    /// grounds that "a fold that drops rows silently is worse than one that refuses
-    /// everything, because the caller cannot then tell a thin batch from a broken
-    /// one". A bare count says something did not run without saying WHAT, which
-    /// leaves the reader unable to re-run it -- a weaker version of the same defect.
+    /// Named, not just counted, so each missing comparison identifies the cell
+    /// and retained reason for follow-up.
     errored: Vec<String>,
 }
 
@@ -5402,22 +5398,22 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
     // position -- the one outcome that most needs to be read as a finding.
     //
     // ⚠️ AND `errored` MUST BE IN THE ALL-GREEN CONDITION BELOW. Without it a batch
-    // in which EVERY row was an infrastructure failure folds to zero located and
+    // in which EVERY row lacked a canonical comparison folds to zero located and
     // zero unlocated and prints the all-green sentence -- the identical collapse,
     // one outcome over, in the line a human actually acts on. An all-green summary
     // is what stops anyone looking, so this is the worst place for it to happen.
     if !fold.errored.is_empty() {
         println!(
-            "  ⚠️ {} row(s) DETERMINED NOTHING -- an infrastructure ERROR, a completed \
-             FAIL/no_result before comparison, or another non-PASS non-FAIL outcome. \
-             NO CANONICAL PRODUCT RESULT WAS ADMITTED for them, so this run is NOT \
-             all-green -- and it is NOT a product failure either. Their exact run and \
-             attempt were stored as measured no-verdict; no pass, divergence, or crash \
-             was invented. Re-run these cells; do not read this as a product result.",
+            "  ⚠️ {} row(s) DETERMINED NOTHING about canonical comparison. They may \
+             still retain a typed crash-error/product failure, an infrastructure \
+             error, or another pre-comparison outcome. This run is NOT all-green. \
+             Their exact run and attempt evidence and any established product result \
+             were retained; no pass or divergence was invented. Inspect the retained \
+             evidence before re-running these cells.",
             fold.errored.len()
         );
         for cell in &fold.errored {
-            println!("    determined nothing: {cell}");
+            println!("    no canonical comparison: {cell}");
         }
     }
     if fold.reads_all_green() {
@@ -5615,7 +5611,7 @@ fn import_results(
     }
     if !fold.errored.is_empty() {
         return Err(format!(
-            "retained import selected {} rows that determined nothing; first is {}",
+            "retained import selected {} rows without an admitted canonical comparison; first is {}",
             fold.errored.len(),
             fold.errored[0]
         ));
@@ -6167,11 +6163,11 @@ where
     );
     if !fold.errored.is_empty() {
         println!(
-            "  {} current result row(s) determined no canonical product result; their exact invocation evidence was retained",
+            "  {} current result row(s) lack an admitted canonical comparison; their exact invocation evidence and any established product result were retained",
             fold.errored.len()
         );
         for row in &fold.errored {
-            println!("    determined nothing: {row}");
+            println!("    no canonical comparison: {row}");
         }
     }
     for skipped in &projection.skipped {
@@ -7259,7 +7255,7 @@ fn apply_series_rows_inner(
 
     if !rows.is_empty() && prepared.is_empty() {
         return Err(format!(
-            "every one of the {} readable series row(s) determined nothing, so the projection was not written:\n{}",
+            "every one of the {} readable series row(s) determined nothing for the legacy projection, so the projection was not written:\n{}",
             rows.len(),
             skipped
                 .iter()
