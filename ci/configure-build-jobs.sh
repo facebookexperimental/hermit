@@ -354,8 +354,29 @@ fi
 # failed enclosing Cargo check, and conservative 1050 effective-job-second
 # threshold with a 16-job clamp. The single local sample does not replace
 # the original hosted calibration.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 99d1e4827cce2404442d7c27ab447886a5839326 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 99d1e4827cce2404442d7c27ab447886a5839326 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO f97b7be1 (2026-09-18): the budget carries UNCHANGED, on the
+# strongest form of the recipe-identity argument rather than an input-by-input
+# one: `git diff 99d1e482..f97b7be1 -- reverie-dbt` is EMPTY, and the whole
+# reverie-dbt subtree is one object, ad0ef5e0d8bd at both revisions. The two
+# repository inputs to the DynamoRIO content-key miss this wrapper bounds are
+# therefore identical by construction, and confirmed directly:
+#
+#   reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974  IDENTICAL
+#   reverie-dbt/vendor/dynamorio  117d54d744df -> 117d54d744df  IDENTICAL
+#
+# Both resolved at both revisions, so this is measured identity and not the
+# absent-reads-as-unchanged case the DBI->DBT path move can produce. The root
+# Cargo.toml 4168dea2771f, rust-toolchain.toml fdd319e308cd and the
+# third-party gitlink fb49c0ba7a9a are identical too. CMAKE and
+# CMAKE_GENERATOR are host inputs rather than pin contents, so the measured
+# SDK recipe, the 16-job clamp and the 1050 effective-job-second threshold all
+# carry. Reverie f97b7be1 "Add process-pending alarm publication for KVM"
+# touches only reverie-kvm/ and reverie/src/guest.rs; that runtime change is
+# build-relevant and still requires fresh validation. This carry is source
+# evidence for the build budget, not a new timing or Hermit guest measurement,
+# and it does not reuse an earlier pin's receipt.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != f97b7be1de4e2ef10ecc24cee5d8cc47f2fd254f ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie f97b7be1de4e2ef10ecc24cee5d8cc47f2fd254f (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

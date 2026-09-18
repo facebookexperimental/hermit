@@ -325,7 +325,7 @@ fi
 # That Cargo failure remains a failure; only its completed cold SDK work is
 # calibration evidence. The normal Hermit workspace/all-target check remains
 # independently required. No DBT guest correctness or new replay claim follows.
-expected_pin=99d1e4827cce2404442d7c27ab447886a5839326
+expected_pin=f97b7be1de4e2ef10ecc24cee5d8cc47f2fd254f
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
