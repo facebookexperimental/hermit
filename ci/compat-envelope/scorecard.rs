@@ -696,7 +696,7 @@ struct ObservedAttemptInvocation {
 /// instead of being read as evidence.
 ///
 /// This is recorded for EVERY tested cell, including passing ones, and names
-/// the latest admitted comparison directly rather than asking readers to infer
+/// the latest admitted result directly rather than asking readers to infer
 /// recency from an aggregate observation.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct LastTested {
@@ -710,6 +710,150 @@ struct LastTested {
     /// keyspaces and a bare number would be read against the wrong one.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     depth: BTreeMap<String, SourceDepth>,
+    /// WHICH CHECK produced this result, alongside WHEN it was produced.
+    ///
+    /// ⚠️ THIS EXISTS BECAUSE `hermit_sha` ANSWERS THE WRONG QUESTION. Measured
+    /// 2026-09-17: five `backend-parity-c` cells read green at shas that
+    /// PREDATE the backend-parity mechanism, one by five hours on the same
+    /// calendar day. Comparing today's red against that green says "regression"
+    /// when the truth is "this check has never run here" -- a BAR RAISE. The
+    /// consequence is not a wrong number, it is a wrong investigation: the next
+    /// lane bisects a ~99 commit window for a commit that does not exist.
+    ///
+    /// ⚠️ `None` MEANS THE ROW CANNOT SAY, AND MUST BE REPORTED THAT WAY.
+    /// It is never inferred, and specifically never inferred from a date --
+    /// dates are the thing already shown to be actively misleading here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    check: Option<CheckIdentity>,
+    /// Whether the cell was ENABLED when this stamp was written. A green from a
+    /// period when the cell was disabled is not a baseline, and `enabled` today
+    /// does not say what was true then. `None` means unrecorded, not `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    enabled_when_tested: Option<bool>,
+    /// Verdict of this exact stamp, not the cell's aggregate history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    comparison_verdict: Option<StampComparisonVerdict>,
+}
+
+/// The identity of the check that produced a result.
+///
+/// Recorded from what the producer actually applied, never reconstructed.
+/// Different complete policies are not interchangeable regression baselines.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+struct CheckIdentity {
+    /// The comparison policy's own name, e.g. `BitwiseInfoV1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    comparison: Option<String>,
+    /// The reference backend of a cross-backend parity comparison, e.g.
+    /// `ptrace`. Present EXACTLY when parity was applied, so `None` here is the
+    /// discriminator that catches the case this type exists for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parity_reference: Option<String>,
+    /// Actual admitted policies: one for ordinary comparison, reference then
+    /// candidate for parity. Counts, output hashes and verdicts are not policy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ordinary: Vec<canonical_verdict::ComparisonReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cross_backend: Option<LogDiffComparison>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum StampComparisonVerdict {
+    Matched,
+    Diverged,
+}
+
+impl CheckIdentity {
+    fn ordinary(policies: Vec<canonical_verdict::ComparisonReport>) -> Self {
+        Self {
+            comparison: Some("BitwiseInfoV1".into()),
+            parity_reference: None,
+            ordinary: policies,
+            cross_backend: None,
+        }
+    }
+
+    fn parity(report: &BackendParityReport) -> Self {
+        Self {
+            comparison: Some("BitwiseInfoV1".into()),
+            parity_reference: Some(report.reference.backend.clone()),
+            ordinary: [
+                report.reference.verification.comparison.clone(),
+                report.candidate.verification.comparison.clone(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+            cross_backend: Some(report.comparison.comparison.clone()),
+        }
+    }
+
+    fn complete(&self) -> bool {
+        let ordinary_complete = |policy: &canonical_verdict::ComparisonReport| {
+            policy.display_name.as_deref() == Some("BitwiseInfoV1")
+                && policy.strictness == canonical_verdict::LogCompareStrictness::Canonical
+                && policy.compare_logs
+                && policy.compare_io_buffers == Some(true)
+                && policy.log_scope == Some(canonical_verdict::ComparedLogScope::Info)
+                && policy.record_envelope.is_canonical()
+                && policy.virtualize_time.is_some()
+                && policy.strip_lines == Some(false)
+                && policy.canonicalize_addresses == Some(true)
+                && policy.full_trace == Some(true)
+                && policy.exact_remainder == Some(true)
+                && policy.ignore_lines == Some(false)
+                && policy.skip_commit == Some(false)
+                && policy.skip_detlog == Some(false)
+                && policy.stripped_prefixes.as_deref()
+                    == Some(&["real-wall-clock-prefix/v1".into()])
+                && policy.canonicalizations.as_deref()
+                    == Some(&["host-address-to-first-appearance-ordinal/v1".into()])
+        };
+        if self.comparison.as_deref() != Some("BitwiseInfoV1")
+            || !self.ordinary.iter().all(ordinary_complete)
+        {
+            return false;
+        }
+        match (&self.parity_reference, &self.cross_backend) {
+            (None, None) => self.ordinary.len() == 1,
+            (Some(reference), Some(policy)) => {
+                reference == "ptrace"
+                    && self.ordinary.len() == 2
+                    && policy.stream == "info"
+                    && policy.record_envelope == RecordEnvelopePolicy::CrossBackendDetcoreV1
+                    && !policy.unsafe_strip_lines
+                    && policy.canonicalize_host_addresses
+                    && policy.require_structured_events
+                    && policy.ignored_line_substrings.is_empty()
+                    && !policy.skip_commit
+                    && !policy.skip_detlog
+                    && !policy.git_diff
+                    && policy.included_detlog_kinds == ["syscall", "syscall_result", "other"]
+            }
+            _ => false,
+        }
+    }
+
+    fn adds_parity_to(&self, old: &Self) -> bool {
+        self.parity_reference.as_deref() == Some("ptrace")
+            && old.parity_reference.is_none()
+            && self.ordinary.get(1) == old.ordinary.first()
+    }
+
+    /// Whether two identities describe the same check. Deliberately exact: a
+    /// near-match is the failure mode being prevented.
+    fn matches(&self, other: &Self) -> bool {
+        self == other
+    }
+
+    fn describe(&self) -> String {
+        let comparison = self.comparison.as_deref().unwrap_or("unnamed comparison");
+        match &self.parity_reference {
+            Some(reference) => format!("{comparison} with parity against {reference}"),
+            None => format!("{comparison} without a parity comparison"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1059,10 +1203,12 @@ enum ValidateRowEvidence {
     Matched {
         left_info_messages: BTreeSet<u64>,
         right_info_messages: BTreeSet<u64>,
+        check: CheckIdentity,
     },
     Diverged {
         left_info_messages: BTreeSet<u64>,
         right_info_messages: BTreeSet<u64>,
+        check: CheckIdentity,
     },
     ParityMatched {
         report: BackendParityReport,
@@ -1078,6 +1224,25 @@ enum ValidateRowEvidence {
         reason: String,
         result: Option<ObservedResult>,
     },
+}
+
+impl ValidateRowEvidence {
+    fn stamp_comparison(&self) -> (Option<CheckIdentity>, Option<StampComparisonVerdict>) {
+        let (check, verdict) = match self {
+            Self::Matched { check, .. } => (check.clone(), StampComparisonVerdict::Matched),
+            Self::Diverged { check, .. } => (check.clone(), StampComparisonVerdict::Diverged),
+            Self::ParityMatched { report } => (
+                CheckIdentity::parity(report),
+                StampComparisonVerdict::Matched,
+            ),
+            Self::ParityDiverged { report } => (
+                CheckIdentity::parity(report),
+                StampComparisonVerdict::Diverged,
+            ),
+            Self::NotRun { .. } | Self::Unavailable { .. } => return (None, None),
+        };
+        (check.complete().then_some(check), Some(verdict))
+    }
 }
 
 fn default_attempt() -> u64 {
@@ -1868,6 +2033,7 @@ impl ResultRow {
         let mut saw_not_run = false;
         let mut unavailable = None;
         let mut operand_verifications = Vec::new();
+        let mut admitted_policies = Vec::new();
 
         for (index, attempt) in self.attempts.iter().enumerate() {
             let Some(report_text) = attempt
@@ -2078,6 +2244,11 @@ impl ResultRow {
                     single.first_divergent_syscall = report.first_divergent_syscall;
                     match single.bitwise_info_comparison_from(input) {
                         Ok((left, right)) => {
+                            if let Some(policy) = &report.comparison {
+                                if !admitted_policies.contains(policy) {
+                                    admitted_policies.push(policy.clone());
+                                }
+                            }
                             left_info_messages.extend(left);
                             right_info_messages.extend(right);
                             if report.verdict == canonical_verdict::Verdict::Matched {
@@ -2349,6 +2520,7 @@ impl ResultRow {
             return Ok(ValidateRowEvidence::Diverged {
                 left_info_messages,
                 right_info_messages,
+                check: CheckIdentity::ordinary(admitted_policies),
             });
         }
         if saw_no_result && !DivergenceCoordinates::from_row(self).is_empty() {
@@ -2389,6 +2561,7 @@ impl ResultRow {
         Ok(ValidateRowEvidence::Matched {
             left_info_messages,
             right_info_messages,
+            check: CheckIdentity::ordinary(admitted_policies),
         })
     }
 }
@@ -4802,6 +4975,11 @@ fn apply_pressure_summary(
             hermit_sha: summary.hermit_sha.clone(),
             detcore_tree: summary.detcore_tree.clone(),
             depth: depth.clone(),
+            // A summary does not authenticate its source-era configuration or
+            // comparison identity. Stamping it today cannot supply either.
+            check: None,
+            enabled_when_tested: None,
+            comparison_verdict: None,
         });
         let observations = &mut tracked.cells[index].observations;
         // Keyed by tree AND provenance. Keying by tree alone would let a
@@ -4955,6 +5133,7 @@ fn apply_validate_results(
         detcore_tree,
         depth,
         ValidateInput {
+            enablement: None,
             reports: ResultInput::Current,
             store_invocation,
             store_positions,
@@ -4968,7 +5147,13 @@ enum ResultInput {
     Retained,
 }
 
-struct ValidateInput {
+struct SourceEnablement<'a> {
+    hermit_sha: &'a str,
+    enabled: &'a BTreeSet<CellId>,
+}
+
+struct ValidateInput<'a> {
+    enablement: Option<SourceEnablement<'a>>,
     reports: ResultInput,
     store_invocation: bool,
     store_positions: bool,
@@ -4980,9 +5165,10 @@ fn apply_validate_results_from(
     hermit_sha: &str,
     detcore_tree: &str,
     depth: &BTreeMap<String, SourceDepth>,
-    input: ValidateInput,
+    input: ValidateInput<'_>,
 ) -> Result<ValidateFold, String> {
     let ValidateInput {
+        enablement,
         reports,
         store_invocation,
         store_positions,
@@ -5052,6 +5238,7 @@ fn apply_validate_results_from(
             distinct.push((candidate, evidence));
         }
         for (candidate, evidence) in distinct {
+            let (check, comparison_verdict) = evidence.stamp_comparison();
             let row = &candidate.row;
             let located_nothing = row.first_divergent_scheduler_turn.is_none()
                 && row.first_divergent_virtual_nanoseconds.is_none()
@@ -5061,6 +5248,7 @@ fn apply_validate_results_from(
                 ValidateRowEvidence::Matched {
                     left_info_messages,
                     right_info_messages,
+                    ..
                 } => (
                     Some(ObservedResult::Pass),
                     Some((left_info_messages, right_info_messages)),
@@ -5070,6 +5258,7 @@ fn apply_validate_results_from(
                 ValidateRowEvidence::Diverged {
                     left_info_messages,
                     right_info_messages,
+                    ..
                 } => (
                     Some(if row.mode == "replay" {
                         ObservedResult::ReplayFailure
@@ -5108,6 +5297,12 @@ fn apply_validate_results_from(
                 hermit_sha: hermit_sha.to_string(),
                 detcore_tree: detcore_tree.to_string(),
                 depth: depth.clone(),
+                check,
+                comparison_verdict,
+                enabled_when_tested: enablement
+                    .as_ref()
+                    .filter(|source| source.hermit_sha == hermit_sha)
+                    .map(|source| source.enabled.contains(id)),
             });
             if result == Some(ObservedResult::Pass) && !located_nothing {
                 return Err(format!(
@@ -5349,17 +5544,25 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
     let mut tracked: TrackedCells = serde_json::from_slice(&original.cells)
         .map_err(|e| format!("cannot parse tracked {CELLS}: {e}"))?;
     let before = tracked.clone();
-    let fold = apply_validate_results(
+    let fold = apply_validate_results_from(
         &mut tracked,
         &rows,
         &head,
         &detcore_tree,
         &depth,
-        true,
-        true,
+        ValidateInput {
+            reports: ResultInput::Current,
+            store_invocation: true,
+            store_positions: true,
+            enablement: Some(SourceEnablement {
+                hermit_sha: &head,
+                enabled: &derived.enabled,
+            }),
+        },
     )?;
     refresh_measurement(&mut tracked);
     enforce_writer_boundary(&before, &tracked, Writer::Observations)?;
+    let transitions = measurement_transitions(root, &before, &tracked, &head)?;
     let updated = generated_files(&derived, &tracked)?;
     let changed = replace_generated_files_with(
         root,
@@ -5392,6 +5595,9 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
         "compatibility scorecard: generated files {}",
         if changed { "changed" } else { "unchanged" }
     );
+    for transition in transitions {
+        println!("{transition}");
+    }
     // FOUR OUTCOMES, NOT TWO. This used to print the all-green sentence
     // whenever the located count was zero, which said "expected result for an
     // all-green run" over a batch whose cells had diverged without a locatable
@@ -5553,6 +5759,7 @@ fn import_results(
                 &retained.detcore_tree,
                 &retained.depth,
                 ValidateInput {
+                    enablement: None,
                     reports: ResultInput::Retained,
                     store_invocation: false,
                     store_positions: true,
@@ -5584,6 +5791,7 @@ fn import_results(
                     &retained.detcore_tree,
                     &retained.depth,
                     ValidateInput {
+                        enablement: None,
                         reports: ResultInput::Retained,
                         store_invocation: false,
                         store_positions,
@@ -5628,14 +5836,8 @@ fn import_results(
     };
     let before_counts = measurement_counts(&before);
     let after_counts = measurement_counts(&tracked);
-    let changed = before
-        .cells
-        .iter()
-        .filter_map(|old| {
-            let new = tracked.cells.iter().find(|cell| cell.id == old.id)?;
-            (old.measurement != new.measurement).then_some((old, new))
-        })
-        .collect::<Vec<_>>();
+    let resolution_head = git_head(root)?;
+    let transitions = measurement_transitions(root, &before, &tracked, &resolution_head)?;
 
     let scorecard = format!(
         "{}{}",
@@ -5720,19 +5922,76 @@ fn import_results(
         tracked.cells.len(),
         after_counts
     );
-    for (old, new) in changed {
-        println!(
-            "  {}: {} -> {} at {}",
-            display_id(&new.id),
-            old.measurement.as_str(),
-            new.measurement.as_str(),
-            new.last_tested
-                .as_ref()
-                .map(|last| last.hermit_sha.as_str())
-                .unwrap_or("no recorded SHA")
-        );
+    for transition in transitions {
+        println!("{transition}");
     }
     Ok(())
+}
+
+/// Prepare transition diagnostics before a writer publishes its generated pair.
+fn measurement_transitions(
+    root: &Path,
+    before: &TrackedCells,
+    after: &TrackedCells,
+    head: &str,
+) -> Result<Vec<String>, String> {
+    before
+        .cells
+        .iter()
+        .filter_map(|old| {
+            let new = after.cells.iter().find(|cell| cell.id == old.id)?;
+            (old.measurement != new.measurement).then_some((old, new))
+        })
+        .map(|(old, new)| measurement_transition(root, old, new, head))
+        .collect()
+}
+
+/// Render an admitted observation transition. An aggregate pass is not a claim
+/// that the latest stamp passed, and an improvement is not a regression.
+fn measurement_transition(
+    root: &Path,
+    old: &TrackedCell,
+    new: &TrackedCell,
+    head: &str,
+) -> Result<String, String> {
+    let prefix = format!(
+        "  {}: {} -> {}",
+        display_id(&new.id),
+        old.measurement.as_str(),
+        new.measurement.as_str()
+    );
+    if old.measurement != MeasurementState::MeasuredAndPassed
+        || !matches!(
+            new.measurement,
+            MeasurementState::Diverged | MeasurementState::DivergedUnlocated
+        )
+    {
+        return Ok(prefix);
+    }
+    let current = new.last_tested.as_ref();
+    let resolution = if current.is_none_or(|last| {
+        last.comparison_verdict != Some(StampComparisonVerdict::Diverged)
+            || last.enabled_when_tested != Some(true)
+    }) {
+        BaselineResolution::Refused {
+            reason: "the current stamp does not establish a canonical divergence with source-era enablement".into(),
+        }
+    } else {
+        resolve_last_tested_baseline(
+            root,
+            old.last_tested.as_ref(),
+            current.and_then(|last| last.check.as_ref()),
+            head,
+        )?
+    };
+    Ok(match resolution {
+        BaselineResolution::Regression { baseline_sha } => {
+            format!("{prefix} — REGRESSION since {baseline_sha}")
+        }
+        BaselineResolution::Refused { reason } => {
+            format!("{prefix} — NO USABLE BASELINE\n      {reason}")
+        }
+    })
 }
 
 fn git_is_ancestor(root: &Path, ancestor: &str, descendant: &str) -> Result<bool, String> {
@@ -5748,6 +6007,75 @@ fn git_is_ancestor(root: &Path, ancestor: &str, descendant: &str) -> Result<bool
             "git merge-base could not compare Hermit revisions {ancestor} and {descendant} (exit {code:?})"
         )),
     }
+}
+
+/// Whether a recorded green may be used as a baseline for today's failure.
+///
+/// ⚠️ THE POINT OF THIS TYPE IS THAT `Refused` IS A FIRST-CLASS ANSWER.
+/// Returning a sha that cannot serve as a baseline is worse than returning
+/// nothing, because the caller spends real time bisecting against it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BaselineResolution {
+    /// The recorded green was produced by the same check, with the cell
+    /// enabled, at a revision reachable from HEAD. A genuine REGRESSION window.
+    Regression { baseline_sha: String },
+    /// The recorded green exists but cannot bound today's failure. Carries the
+    /// reason so the caller reports it instead of guessing.
+    Refused { reason: String },
+}
+
+/// Require the exact old passing stamp, both complete policies, affirmative
+/// source-era enablement and real ancestry. Legacy absence stays unknown.
+fn resolve_last_tested_baseline(
+    root: &Path,
+    last_tested: Option<&LastTested>,
+    current_check: Option<&CheckIdentity>,
+    head: &str,
+) -> Result<BaselineResolution, String> {
+    let refuse = |reason| Ok(BaselineResolution::Refused { reason });
+    let Some(last) = last_tested else {
+        return refuse("no writer recorded a last_tested stamp for this cell".into());
+    };
+    let Some(recorded_check) = last.check.as_ref().filter(|check| check.complete()) else {
+        return refuse(format!(
+            "the stamp at {} does not record WHICH CHECK with complete policy; not inferred from dates or defaults",
+            last.hermit_sha
+        ));
+    };
+    let Some(current_check) = current_check.filter(|check| check.complete()) else {
+        return refuse("the CURRENT stamp does not record a complete comparison identity".into());
+    };
+    if last.comparison_verdict != Some(StampComparisonVerdict::Matched) {
+        return refuse("the recorded stamp does not establish a passing comparison; aggregate history is not a last-good stamp".into());
+    }
+    match last.enabled_when_tested {
+        Some(true) => {}
+        Some(false) => {
+            return refuse("the recorded comparison was made while the cell was DISABLED".into());
+        }
+        None => return refuse("the recorded stamp has UNKNOWN source-era enablement".into()),
+    }
+    if !recorded_check.matches(current_check) {
+        let relationship = if current_check.adds_parity_to(recorded_check) {
+            "BAR RAISE: the same ordinary policy now also requires cross-backend parity"
+        } else {
+            "DIFFERENT CHECK: no stricter/weaker relationship is established"
+        };
+        return refuse(format!(
+            "{relationship}; {} versus {}. This stamp does not establish a pass under today's check and cannot bound a regression",
+            recorded_check.describe(),
+            current_check.describe()
+        ));
+    }
+    if !git_is_ancestor(root, &last.hermit_sha, head)? {
+        return refuse(format!(
+            "the recorded baseline {} is NOT REACHABLE from HEAD {head} and cannot bound a bisect",
+            last.hermit_sha
+        ));
+    }
+    Ok(BaselineResolution::Regression {
+        baseline_sha: last.hermit_sha.clone(),
+    })
 }
 
 fn update_observations(
@@ -6036,14 +6364,21 @@ where
     // first; only exactly represented events may be suppressed. Existing
     // projected events still undergo their full-source ownership check.
     let mut preview = tracked.clone();
-    apply_validate_results(
+    apply_validate_results_from(
         &mut preview,
         &result_rows,
         &head,
         &detcore_tree,
         &depth,
-        true,
-        true,
+        ValidateInput {
+            reports: ResultInput::Current,
+            store_invocation: true,
+            store_positions: true,
+            enablement: Some(SourceEnablement {
+                hermit_sha: &head,
+                enabled: &derived.enabled,
+            }),
+        },
     )?;
     let current_attempts = current_result_attempts(&preview, &result_rows, &detcore_tree)?;
     let preview_representation =
@@ -6080,14 +6415,21 @@ where
         pre_series_corpus: true,
     });
     enforce_projection_preserves_evidence(&before, &tracked, rows_read)?;
-    let fold = apply_validate_results(
+    let fold = apply_validate_results_from(
         &mut tracked,
         &result_rows,
         &head,
         &detcore_tree,
         &depth,
-        true,
-        true,
+        ValidateInput {
+            reports: ResultInput::Current,
+            store_invocation: true,
+            store_positions: true,
+            enablement: Some(SourceEnablement {
+                hermit_sha: &head,
+                enabled: &derived.enabled,
+            }),
+        },
     )?;
     // A normal validate publishes its series row before this local write-back.
     // Match the final direct evidence to the complete snapshot before choosing
@@ -6126,6 +6468,7 @@ where
     enforce_projection_preserves_evidence(&before, &tracked, rows_read)?;
     refresh_measurement(&mut tracked);
     enforce_writer_boundary(&before, &tracked, Writer::Observations)?;
+    let transitions = measurement_transitions(root, &before, &tracked, &head)?;
     let updated = generated_files(&derived, &tracked)?;
     let partial_scorecard = updated.scorecard.clone();
 
@@ -6161,6 +6504,9 @@ where
         "compatibility scorecard: generated files {}",
         if changed { "changed" } else { "unchanged" }
     );
+    for transition in transitions {
+        println!("{transition}");
+    }
     if !fold.errored.is_empty() {
         println!(
             "  {} current result row(s) lack an admitted canonical comparison; their exact invocation evidence and any established product result were retained",
@@ -7448,6 +7794,13 @@ fn apply_series_rows_inner(
                 hermit_sha: row.hermit_sha.clone(),
                 detcore_tree: detcore_tree.to_string(),
                 depth: row.depth.clone(),
+                // Projected from historical series rows. Neither the check
+                // identity nor the enabled state AT THAT TIME survives in the
+                // row, and today's enabled flag is not evidence about then, so
+                // both stay unrecorded. This is the case the type exists for.
+                check: None,
+                enabled_when_tested: None,
+                comparison_verdict: None,
             });
         }
     }
@@ -9859,6 +10212,9 @@ fn self_test() -> Result<(), String> {
     let current_last_tested = LastTested {
         hermit_sha: "current-sha".into(),
         detcore_tree: "current-tree".into(),
+        check: None,
+        enabled_when_tested: None,
+        comparison_verdict: None,
         depth: BTreeMap::from([(
             "hermit".into(),
             SourceDepth {
@@ -11142,6 +11498,135 @@ red/`measured-and-passed` count is **0**.",
         })
     };
 
+    // Check provenance travels through the real admitted-report writer. The
+    // current source context is explicit; retained import never borrows today's
+    // enabled set. Resolve transitions against real Git objects, not fake SHAs.
+    let provenance_root = repo_root()?;
+    let provenance_head = git_head(&provenance_root)?;
+    let provenance_old = git_rev_parse(&provenance_root, "HEAD^")?;
+    let provenance_enabled = BTreeSet::from([id.clone()]);
+    let provenance_fold = |mut row: ResultRow, sha: &str, source_sha: Option<&str>, reports| {
+        row.hermit_sha = sha.into();
+        row.attempts[0]["index"] = "1".into();
+        row.attempts[0]["outcome"] = row.outcome.clone().into();
+        row.attempts[0]["status"] = serde_json::json!(if row.outcome == "PASS" { 0 } else { 1 });
+        row.attempts[0]["signal"] = JsonValue::Null;
+        row.attempts[0]["timed_out"] = false.into();
+        let rows = BTreeMap::from([(id.clone(), vec![parity_candidate(row)?])]);
+        let mut tracked = TrackedCells {
+            schema: SCHEMA,
+            projection: None,
+            cells: vec![empty_tracked_cell(id.clone(), CellStatus::Green)],
+        };
+        apply_validate_results_from(
+            &mut tracked,
+            &rows,
+            sha,
+            "provenance-tree",
+            &depth_fixture,
+            ValidateInput {
+                reports,
+                store_invocation: true,
+                store_positions: true,
+                enablement: source_sha.map(|hermit_sha| SourceEnablement {
+                    hermit_sha,
+                    enabled: &provenance_enabled,
+                }),
+            },
+        )?;
+        refresh_measurement(&mut tracked);
+        Ok::<_, String>(tracked.cells.remove(0))
+    };
+    let provenance_pass = provenance_fold(
+        candidate("PASS").row,
+        &provenance_old,
+        Some(&provenance_old),
+        ResultInput::Current,
+    )?;
+    let pass_stamp = provenance_pass.last_tested.as_ref().unwrap();
+    if pass_stamp.enabled_when_tested != Some(true)
+        || pass_stamp.comparison_verdict != Some(StampComparisonVerdict::Matched)
+        || pass_stamp.check.as_ref().is_none_or(|check| {
+            !check.complete() || check.ordinary.len() != 1 || check.cross_backend.is_some()
+        })
+    {
+        return Err("admitted ordinary match lost its source-qualified check identity".into());
+    }
+    let encoded_stamp = serde_json::to_string(pass_stamp).map_err(|e| e.to_string())?;
+    if serde_json::from_str::<LastTested>(&encoded_stamp).map_err(|e| e.to_string())? != *pass_stamp
+    {
+        return Err("comparison provenance changed during the scorecard JSON round trip".into());
+    }
+    for (source, reports) in [
+        (None, ResultInput::Retained),
+        (Some(provenance_head.as_str()), ResultInput::Current),
+    ] {
+        let historical = provenance_fold(candidate("PASS").row, &provenance_old, source, reports)?;
+        let last = historical.last_tested.as_ref().unwrap();
+        if last.enabled_when_tested.is_some()
+            || last.check != pass_stamp.check
+            || !matches!(
+                resolve_last_tested_baseline(
+                    &provenance_root,
+                    Some(last),
+                    pass_stamp.check.as_ref(),
+                    &provenance_head
+                )?,
+                BaselineResolution::Refused { .. }
+            )
+        {
+            return Err("historical comparison borrowed enablement from today's source".into());
+        }
+    }
+    for located in [false, true] {
+        let mut row = candidate("FAIL").row;
+        let position = located.then_some(2);
+        let report = pressure_verification("determinism-failure", None, None, position, None);
+        let raw = serde_json::to_string(&report).map_err(|e| e.to_string())?;
+        row.attempts[0]["verification_report_sha256"] =
+            format!("{:x}", Sha256::digest(raw.as_bytes())).into();
+        row.attempts[0]["verification_report"] = raw.into();
+        row.first_divergent_record = position;
+        let diverged = provenance_fold(
+            row,
+            &provenance_head,
+            Some(&provenance_head),
+            ResultInput::Current,
+        )?;
+        let last = diverged.last_tested.as_ref().unwrap();
+        if last.check != pass_stamp.check
+            || last.comparison_verdict != Some(StampComparisonVerdict::Diverged)
+        {
+            return Err("canonical divergence lost the actual ordinary policy or verdict".into());
+        }
+        let transition = measurement_transition(
+            &provenance_root,
+            &provenance_pass,
+            &diverged,
+            &provenance_head,
+        )?;
+        if !transition.contains(&format!("REGRESSION since {provenance_old}")) {
+            return Err(format!(
+                "real pass-to-divergence transition lost its comparable baseline: {transition}"
+            ));
+        }
+        let never = empty_tracked_cell(id.clone(), CellStatus::Green);
+        for (before, after) in [
+            (&diverged, &provenance_pass),
+            (&never, &provenance_pass),
+            (&diverged, &diverged),
+            (&never, &diverged),
+        ] {
+            let transition =
+                measurement_transition(&provenance_root, before, after, &provenance_head)?;
+            if transition.contains("REGRESSION") || transition.contains("NO USABLE BASELINE") {
+                return Err(format!(
+                    "non-regression transition invoked baseline resolution: {transition}"
+                ));
+            }
+        }
+    }
+
     let mut matching_parity = parity_tracked();
     let matching_row = parity_row(&parity_id, BackendParityVerdict::Matched)?;
     let mut unequal_raw_populations = matching_row.clone();
@@ -11214,6 +11699,30 @@ red/`measured-and-passed` count is **0**.",
         .iter()
         .find(|cell| cell.id == parity_id)
         .expect("matching parity cell remains tracked");
+    let matching_stamp = matching_cell.last_tested.as_ref().unwrap();
+    let matching_check = matching_stamp
+        .check
+        .as_ref()
+        .ok_or("parity match lost check identity")?;
+    if !matching_check.complete()
+        || matching_check.ordinary.len() != 2
+        || matching_check.cross_backend.is_none()
+        || matching_stamp.comparison_verdict != Some(StampComparisonVerdict::Matched)
+        || matching_stamp.enabled_when_tested.is_some()
+        || !matches!(
+            resolve_last_tested_baseline(
+                &provenance_root,
+                Some(pass_stamp),
+                Some(matching_check),
+                &provenance_head
+            )?,
+            BaselineResolution::Refused { .. }
+        )
+    {
+        return Err(
+            "parity stamp lost cross-backend policy or borrowed ordinary pass credit".into(),
+        );
+    }
     let matching_markdown = render_backend_parity_section(&matching_parity);
     let plan = hermit_manifest_plan::validation_dag::generate(&repo_root()?)?;
     let selectors = plan
@@ -11386,6 +11895,12 @@ red/`measured-and-passed` count is **0**.",
         .iter()
         .find(|cell| cell.id == parity_id)
         .expect("divergent parity cell remains tracked");
+    let divergent_stamp = divergent_cell.last_tested.as_ref().unwrap();
+    if divergent_stamp.check != matching_stamp.check
+        || divergent_stamp.comparison_verdict != Some(StampComparisonVerdict::Diverged)
+    {
+        return Err("parity divergence lost its admitted cross-backend policy or verdict".into());
+    }
     let divergent_markdown = render_backend_parity_section(&divergent_parity);
     if divergent_cell.measurement != MeasurementState::Diverged
         || divergent_cell.observations[0].results != BTreeSet::from([ObservedResult::ParityFailure])
@@ -15556,6 +16071,24 @@ red/`measured-and-passed` count is **0**.",
             String::from_utf8_lossy(&imported.stderr)
         ));
     }
+    let imported_cells: TrackedCells = read_json(&result_command_root.join(CELLS))?;
+    let imported_stamp = imported_cells
+        .cells
+        .iter()
+        .find(|cell| cell.id == replay_id)
+        .and_then(|cell| cell.last_tested.as_ref())
+        .ok_or("retained import lost its stamp")?;
+    if imported_stamp.enabled_when_tested.is_some()
+        || imported_stamp.comparison_verdict != Some(StampComparisonVerdict::Matched)
+        || imported_stamp
+            .check
+            .as_ref()
+            .is_none_or(|check| !check.complete())
+    {
+        return Err(
+            "import-results backfilled source-era enablement or lost admitted policy".into(),
+        );
+    }
     restore_generated()?;
 
     let mut malformed_retained = replay_row.clone();
@@ -15627,6 +16160,22 @@ red/`measured-and-passed` count is **0**.",
     {
         return Err("observe-results did not retain the seeded same-tree verify PASS".into());
     }
+    let seeded_stamp = seeded_cell
+        .last_tested
+        .as_ref()
+        .ok_or("observer omitted its current stamp")?;
+    if seeded_stamp.hermit_sha != fixture_head
+        || seeded_stamp.enabled_when_tested != Some(seeded_cell.enabled)
+        || seeded_stamp.comparison_verdict != Some(StampComparisonVerdict::Matched)
+        || seeded_stamp
+            .check
+            .as_ref()
+            .is_none_or(|check| !check.complete())
+    {
+        return Err(
+            "observe-results failed to stamp actual current source/check provenance".into(),
+        );
+    }
     let prior_results = seeded_observation.results.clone();
     let prior_comparisons = seeded_observation.canonical_comparisons.clone();
 
@@ -15652,6 +16201,12 @@ red/`measured-and-passed` count is **0**.",
         .cells
         .iter()
         .find(|cell| cell.id == verify_id);
+    let unavailable_stamp = observed_cell
+        .and_then(|cell| cell.last_tested.as_ref())
+        .ok_or("no-comparison observer lost recency")?;
+    if unavailable_stamp.check.is_some() || unavailable_stamp.comparison_verdict.is_some() {
+        return Err("current no-comparison observer borrowed an earlier passing policy".into());
+    }
     let final_observation = observed_cell.and_then(|cell| {
         cell.observations.iter().find(|observation| {
             observation.detcore_tree.as_deref() == Some(&fixture_detcore_tree)
@@ -15687,6 +16242,164 @@ red/`measured-and-passed` count is **0**.",
             "observe-results did not retain exact verify no-verdict evidence without changing the prior same-tree result".into(),
         );
     }
+    // Exercise BOTH real current-writer CLIs. Helper-only positive controls
+    // cannot establish that an authenticated comparison reaches its diagnostic.
+    let result_before_transitions = fs::read(&result_path).map_err(|e| e.to_string())?;
+    let transition_row = |label: &str, divergence: Option<Option<u64>>, unavailable: bool| {
+        let mut row = verify_row.clone();
+        row.run_id = label.into();
+        let mut report = canonical_verdict::VerificationReport::from_json_slice(
+            row.attempts[0]["verification_report"]
+                .as_str()
+                .unwrap()
+                .as_bytes(),
+        )?;
+        report.comparison.as_mut().unwrap().virtualize_time = Some(!unavailable);
+        if let Some(position) = divergence {
+            report.verified = false;
+            report.bitwise_parity = false;
+            report.verdict = canonical_verdict::Verdict::Diverged;
+            report.first_divergent_record = position;
+            row.first_divergent_record = position;
+            row.outcome = "FAIL".into();
+            row.result = Some(ObservedResult::DeterminismFailure);
+            row.failure_class = Some(FailureClass::ProductFailure);
+            row.attempts[0]["outcome"] = "FAIL".into();
+            row.attempts[0]["status"] = serde_json::json!(1);
+        }
+        let raw = serde_json::to_string(&report).map_err(|e| e.to_string())?;
+        row.attempts[0]["verification_report_sha256"] =
+            format!("{:x}", Sha256::digest(raw.as_bytes())).into();
+        row.attempts[0]["verification_report"] = raw.into();
+        Ok::<_, String>(row)
+    };
+    let read_transition_cell = || -> Result<TrackedCell, String> {
+        let cells: TrackedCells = read_json(&result_command_root.join(CELLS))?;
+        cells
+            .cells
+            .into_iter()
+            .find(|cell| cell.id == verify_id)
+            .ok_or_else(|| "current writer lost transition fixture cell".into())
+    };
+    for combined in [false, true] {
+        let command = if combined {
+            "project-and-observe-results"
+        } else {
+            "observe-results"
+        };
+        let invoke = || {
+            if combined {
+                run_snapshot_command(&empty_snapshot_path, &empty_snapshot_sha)
+            } else {
+                run_result_command("observe-results", None)
+            }
+        };
+        let require_output =
+            |output: std::process::Output, regression: bool, baseline_refusal: bool| {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if !output.status.success()
+                    || stdout.contains("REGRESSION since") != regression
+                    || stdout.contains("NO USABLE BASELINE") != baseline_refusal
+                    || (regression && !stdout.contains(&format!("REGRESSION since {fixture_head}")))
+                {
+                    return Err(format!(
+                        "{command} transition control: status={} stdout={stdout:?} stderr={:?}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
+                Ok::<_, String>(())
+            };
+        for position in [None, Some(2)] {
+            restore_combined_baseline()?;
+            write_result_row(&transition_row("cli-provenance-pass", None, false)?)?;
+            require_output(invoke()?, false, false)?;
+            let old = read_transition_cell()?;
+            let last = old.last_tested.as_ref().ok_or("CLI pass omitted stamp")?;
+            if old.measurement != MeasurementState::MeasuredAndPassed
+                || last.enabled_when_tested != Some(true)
+                || last.comparison_verdict != Some(StampComparisonVerdict::Matched)
+                || last.check.as_ref().is_none_or(|check| !check.complete())
+            {
+                return Err(format!(
+                    "{command} CLI positive did not establish an actual comparable pass"
+                ));
+            }
+            write_result_row(&transition_row(
+                "cli-provenance-divergence",
+                Some(position),
+                false,
+            )?)?;
+            require_output(invoke()?, true, false)?;
+            let diverged = read_transition_cell()?;
+            if diverged.measurement
+                != if position.is_some() {
+                    MeasurementState::Diverged
+                } else {
+                    MeasurementState::DivergedUnlocated
+                }
+            {
+                return Err(format!(
+                    "{command} CLI divergence lost its location semantics"
+                ));
+            }
+            // A later pass remains real evidence without erasing failure history
+            // or printing a new regression for the recovery attempt.
+            write_result_row(&transition_row("cli-provenance-recovery", None, false)?)?;
+            require_output(invoke()?, false, false)?;
+            let recovered = read_transition_cell()?;
+            if recovered.last_tested.as_ref().unwrap().comparison_verdict
+                != Some(StampComparisonVerdict::Matched)
+                || !recovered.observations.iter().any(|observation| {
+                    observation
+                        .results
+                        .contains(&ObservedResult::DeterminismFailure)
+                })
+            {
+                return Err(format!(
+                    "{command} recovery lost its pass or erased actual failure history"
+                ));
+            }
+            println!(
+                "scorecard self-test: {command} CLI comparable-pass -> divergence {position:?}, recovery opposing control passed"
+            );
+        }
+        restore_combined_baseline()?;
+        write_result_row(&transition_row("cli-history-pass", None, false)?)?;
+        require_output(invoke()?, false, false)?;
+        write_result_row(&transition_row("cli-history-no-comparison", None, true)?)?;
+        require_output(invoke()?, false, false)?;
+        let unknown = read_transition_cell()?;
+        if unknown.measurement != MeasurementState::MeasuredAndPassed
+            || unknown.last_tested.as_ref().unwrap().check.is_some()
+            || unknown
+                .last_tested
+                .as_ref()
+                .unwrap()
+                .comparison_verdict
+                .is_some()
+        {
+            return Err(format!(
+                "{command} latest no-comparison stamp borrowed the aggregate pass"
+            ));
+        }
+        write_result_row(&transition_row(
+            "cli-history-divergence",
+            Some(None),
+            false,
+        )?)?;
+        require_output(invoke()?, false, true)?;
+        write_result_row(&transition_row(
+            "cli-history-located",
+            Some(Some(2)),
+            false,
+        )?)?;
+        require_output(invoke()?, false, false)?;
+        println!(
+            "scorecard self-test: {command} CLI no-comparison baseline refused; location-only transition not a regression"
+        );
+    }
+    fs::write(&result_path, result_before_transitions).map_err(|e| e.to_string())?;
     restore_generated()?;
 
     for (staged_clean, unrelated_clean, allowed) in [
@@ -16576,6 +17289,28 @@ red/`measured-and-passed` count is **0**.",
     }) {
         let (tracked, fold) = fold_fixture_rows(rows)
             .map_err(|error| format!("{label} NotRun evidence was refused: {error}"))?;
+        if label == "after-match" {
+            let last = tracked.cells[0]
+                .last_tested
+                .as_ref()
+                .ok_or("latest NotRun lost its stamp")?;
+            if last.check.is_some()
+                || last.comparison_verdict.is_some()
+                || !matches!(
+                    resolve_last_tested_baseline(
+                        &provenance_root,
+                        Some(last),
+                        pass_stamp.check.as_ref(),
+                        &provenance_head
+                    )?,
+                    BaselineResolution::Refused { .. }
+                )
+            {
+                return Err(
+                    "latest no-comparison stamp borrowed the aggregate historical pass".into(),
+                );
+            }
+        }
         if fold.errored.len() != 1
             || !fold.errored[0]
                 .contains("NO_RESULT: attempt 1 retained its pre-run stamp after timeout")
@@ -18385,6 +19120,9 @@ red/`measured-and-passed` count is **0**.",
     let current_last_tested = LastTested {
         hermit_sha: fixture_hermit_tree.clone(),
         detcore_tree: fixture_detcore_tree.clone(),
+        check: None,
+        enabled_when_tested: None,
+        comparison_verdict: None,
         depth: BTreeMap::from([(
             "hermit".into(),
             SourceDepth {
@@ -20108,4 +20846,329 @@ red/`measured-and-passed` count is **0**.",
         "compatibility scorecard self-test: retained-comparison FRESH/DRIFTED/WRONG/UNCHECKABLE, provenance, distinct-evidence, result, selected-chaos, status-measurement-display, ratchet, observation-range, storage-round-trip, coordinate-less-divergence, recovered-no-result, determined-nothing-third-state, non-error-outcome-class, batch-equivalence, green-admission, validate-observation, disabled-parity-front-doors, empty-result command, source-identity, writer-boundary, projection, projection-schema, object-store-independence, path-independence, infrastructure-refusal, and divergence-without-a-comparison brackets pass"
     );
     Ok(())
+}
+
+/// Tests for baseline resolution.
+///
+/// ⚠️ THE POSITIVE CONTROL IS LOAD-BEARING. Three of these assert a REFUSAL, and
+/// a resolver that refuses everything would pass all three while being useless.
+/// `a_matching_check_at_a_reachable_revision_is_a_regression` is what makes the
+/// refusals mean something.
+#[cfg(test)]
+mod baseline_resolution_tests {
+    use super::*;
+
+    fn ordinary_policy() -> canonical_verdict::ComparisonReport {
+        canonical_verdict::ComparisonReport {
+            strictness: canonical_verdict::LogCompareStrictness::Canonical,
+            display_name: Some("BitwiseInfoV1".into()),
+            compare_logs: true,
+            compare_io_buffers: Some(true),
+            log_scope: Some(canonical_verdict::ComparedLogScope::Info),
+            record_envelope: canonical_verdict::RecordEnvelopeReport::AllRecordsV1,
+            virtualize_time: Some(true),
+            strip_lines: Some(false),
+            canonicalize_addresses: Some(true),
+            full_trace: Some(true),
+            exact_remainder: Some(true),
+            stripped_prefixes: Some(vec!["real-wall-clock-prefix/v1".into()]),
+            canonicalizations: Some(vec!["host-address-to-first-appearance-ordinal/v1".into()]),
+            ignore_lines: Some(false),
+            skip_commit: Some(false),
+            skip_detlog: Some(false),
+        }
+    }
+
+    fn cross_policy() -> LogDiffComparison {
+        LogDiffComparison {
+            stream: "info".into(),
+            record_envelope: RecordEnvelopePolicy::CrossBackendDetcoreV1,
+            unsafe_strip_lines: false,
+            canonicalize_host_addresses: true,
+            require_structured_events: true,
+            ignored_line_substrings: Vec::new(),
+            skip_commit: false,
+            skip_detlog: false,
+            included_detlog_kinds: vec!["syscall".into(), "syscall_result".into(), "other".into()],
+            git_diff: false,
+        }
+    }
+
+    fn identity(comparison: &str, parity: Option<&str>) -> CheckIdentity {
+        let policy = ordinary_policy();
+        CheckIdentity {
+            comparison: Some(comparison.to_string()),
+            parity_reference: parity.map(str::to_string),
+            ordinary: if parity.is_some() {
+                vec![policy.clone(), policy]
+            } else {
+                vec![policy]
+            },
+            cross_backend: parity.map(|_| cross_policy()),
+        }
+    }
+
+    fn stamp(sha: &str, check: Option<CheckIdentity>) -> LastTested {
+        LastTested {
+            hermit_sha: sha.to_string(),
+            detcore_tree: "tree".into(),
+            depth: BTreeMap::new(),
+            check,
+            enabled_when_tested: Some(true),
+            comparison_verdict: Some(StampComparisonVerdict::Matched),
+        }
+    }
+
+    /// A repository with two commits on `main` and one on an abandoned branch,
+    /// so a non-ancestor revision is a real object rather than a bad sha. That
+    /// distinction matters: the failure being prevented is a revision that
+    /// resolves perfectly and still cannot bound a bisect.
+    fn repository() -> (tempfile::TempDir, String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.name", "Fixture"]);
+        git(&["config", "user.email", "fixture@example.invalid"]);
+        fs::write(root.join("a"), "1").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "first"]);
+        let reachable = git(&["rev-parse", "HEAD"]);
+        // An abandoned line of development: committed, then left behind. This
+        // is what a rebased-away `last_tested` sha looks like on disk.
+        git(&["checkout", "-q", "-b", "abandoned"]);
+        fs::write(root.join("b"), "2").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "abandoned work"]);
+        let orphan = git(&["rev-parse", "HEAD"]);
+        git(&["checkout", "-q", "main"]);
+        fs::write(root.join("c"), "3").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "second"]);
+        (dir, reachable, orphan)
+    }
+
+    #[test]
+    fn a_matching_check_at_a_reachable_revision_is_a_regression() {
+        let (dir, reachable, _) = repository();
+        let head = "main";
+        let check = identity("BitwiseInfoV1", None);
+        let resolved = resolve_last_tested_baseline(
+            dir.path(),
+            Some(&stamp(&reachable, Some(check.clone()))),
+            Some(&check),
+            head,
+        )
+        .unwrap();
+        assert_eq!(
+            resolved,
+            BaselineResolution::Regression {
+                baseline_sha: reachable.clone()
+            },
+            "same check, cell enabled, revision reachable: this IS a regression and must resolve"
+        );
+        // The enum is the protection: a caller cannot reach a sha without
+        // having matched the Regression arm, so a refusal cannot be unwrapped
+        // into a revision by accident.
+        let BaselineResolution::Regression { baseline_sha } = &resolved else {
+            unreachable!()
+        };
+        assert_eq!(baseline_sha, &reachable);
+    }
+
+    /// The 2026-09-17 case: five backend-parity cells read green at revisions
+    /// that predate the parity mechanism by as little as five hours.
+    #[test]
+    fn a_green_predating_a_stricter_check_is_a_bar_raise_not_a_regression() {
+        let (dir, reachable, _) = repository();
+        // Green recorded before parity existed: no parity reference.
+        let recorded = identity("BitwiseInfoV1", None);
+        // Today's failure comes from the cross-backend parity comparison.
+        let today = identity("BitwiseInfoV1", Some("ptrace"));
+        let resolved = resolve_last_tested_baseline(
+            dir.path(),
+            Some(&stamp(&reachable, Some(recorded))),
+            Some(&today),
+            "main",
+        )
+        .unwrap();
+        let BaselineResolution::Refused { reason } = &resolved else {
+            panic!(
+                "a green produced by a different check must not bound today's failure: {resolved:?}"
+            );
+        };
+        assert!(reason.contains("BAR RAISE"), "{reason}");
+        assert!(
+            reason.contains("does not establish a pass under today's check"),
+            "the refusal must say why there is nothing to bisect: {reason}"
+        );
+        assert!(
+            !matches!(resolved, BaselineResolution::Regression { .. }),
+            "a bar raise must not hand back a revision; that is what sends a lane bisecting"
+        );
+    }
+
+    #[test]
+    fn a_baseline_that_is_not_reachable_from_head_is_refused() {
+        let (dir, _, orphan) = repository();
+        let check = identity("BitwiseInfoV1", None);
+        let resolved = resolve_last_tested_baseline(
+            dir.path(),
+            Some(&stamp(&orphan, Some(check.clone()))),
+            Some(&check),
+            "main",
+        )
+        .unwrap();
+        let BaselineResolution::Refused { reason } = &resolved else {
+            panic!("an unreachable revision must be refused, not returned: {resolved:?}");
+        };
+        assert!(reason.contains("NOT REACHABLE"), "{reason}");
+        // The revision is a real, resolvable object. Being resolvable is
+        // exactly why returning it would be believed.
+        let exists = Command::new("git")
+            .args(["cat-file", "-e", &format!("{orphan}^{{commit}}")])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(
+            exists.success(),
+            "the fixture's orphan revision must really exist"
+        );
+    }
+
+    #[test]
+    fn a_row_that_cannot_say_which_check_ran_is_refused_rather_than_inferred() {
+        let (dir, reachable, _) = repository();
+        let resolved = resolve_last_tested_baseline(
+            dir.path(),
+            Some(&stamp(&reachable, None)),
+            Some(&identity("BitwiseInfoV1", Some("ptrace"))),
+            "main",
+        )
+        .unwrap();
+        let BaselineResolution::Refused { reason } = &resolved else {
+            panic!("a historical row cannot be assumed comparable: {resolved:?}");
+        };
+        assert!(reason.contains("does not record WHICH CHECK"), "{reason}");
+        assert!(
+            reason.contains("not inferred"),
+            "the refusal must state that the identity was not reconstructed: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_green_recorded_while_the_cell_was_disabled_bounds_nothing() {
+        let (dir, reachable, _) = repository();
+        let check = identity("BitwiseInfoV1", None);
+        let mut last = stamp(&reachable, Some(check.clone()));
+        last.enabled_when_tested = Some(false);
+        let resolved =
+            resolve_last_tested_baseline(dir.path(), Some(&last), Some(&check), "main").unwrap();
+        assert!(
+            matches!(resolved, BaselineResolution::Refused { .. }),
+            "{resolved:?}"
+        );
+    }
+
+    #[test]
+    fn an_absent_stamp_is_refused_and_says_no_writer_recorded_one() {
+        let (dir, _, _) = repository();
+        let resolved = resolve_last_tested_baseline(
+            dir.path(),
+            None,
+            Some(&identity("BitwiseInfoV1", None)),
+            "main",
+        )
+        .unwrap();
+        let BaselineResolution::Refused { reason } = &resolved else {
+            panic!("absence is not a baseline: {resolved:?}");
+        };
+        assert!(reason.contains("no writer recorded"), "{reason}");
+    }
+    #[test]
+    fn both_stamp_identities_require_complete_admitted_policies() {
+        let check = identity("BitwiseInfoV1", None);
+        let mut incomplete = vec![
+            None,
+            Some(CheckIdentity::default()),
+            Some(identity("", None)),
+            Some(identity("BitwiseInfoV1", Some(""))),
+        ];
+        let mut missing_flag = check.clone();
+        missing_flag.ordinary[0].virtualize_time = None;
+        incomplete.push(Some(missing_flag));
+        let mut mixed_policy = check.clone();
+        mixed_policy.cross_backend = Some(cross_policy());
+        incomplete.push(Some(mixed_policy));
+        for partial in incomplete {
+            for (old, current) in [
+                (partial.as_ref(), Some(&check)),
+                (Some(&check), partial.as_ref()),
+            ] {
+                let last = stamp("does-not-exist", old.cloned());
+                // Refusal must precede ancestry: no Git repository is needed.
+                assert!(matches!(
+                    resolve_last_tested_baseline(Path::new("/"), Some(&last), current, "HEAD")
+                        .unwrap(),
+                    BaselineResolution::Refused { .. }
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_enablement_and_unproven_stamp_verdicts_remain_readable_and_refused() {
+        let check = identity("BitwiseInfoV1", None);
+        let full = serde_json::to_value(stamp("does-not-exist", Some(check.clone()))).unwrap();
+        for field in ["enabled_when_tested", "comparison_verdict"] {
+            for explicit_null in [false, true] {
+                let mut legacy = full.clone();
+                if explicit_null {
+                    legacy[field] = JsonValue::Null;
+                } else {
+                    legacy.as_object_mut().unwrap().remove(field);
+                }
+                let last: LastTested = serde_json::from_value(legacy).unwrap();
+                assert!(matches!(
+                    resolve_last_tested_baseline(Path::new("/"), Some(&last), Some(&check), "HEAD")
+                        .unwrap(),
+                    BaselineResolution::Refused { .. }
+                ));
+            }
+        }
+        let mut divergent = stamp("does-not-exist", Some(check.clone()));
+        divergent.comparison_verdict = Some(StampComparisonVerdict::Diverged);
+        assert!(matches!(
+            resolve_last_tested_baseline(Path::new("/"), Some(&divergent), Some(&check), "HEAD")
+                .unwrap(),
+            BaselineResolution::Refused { .. }
+        ));
+        let mut changed = check.clone();
+        changed.ordinary[0].virtualize_time = Some(false);
+        let refused = resolve_last_tested_baseline(
+            Path::new("/"),
+            Some(&stamp("old", Some(check))),
+            Some(&changed),
+            "HEAD",
+        )
+        .unwrap();
+        let BaselineResolution::Refused { reason } = refused else {
+            panic!("different policies were equated")
+        };
+        assert!(reason.contains("DIFFERENT CHECK"));
+        assert!(!reason.contains("BAR RAISE"));
+        assert!(!reason.contains("never passed"));
+    }
 }
