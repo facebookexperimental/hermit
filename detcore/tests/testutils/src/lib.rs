@@ -6,10 +6,13 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#![feature(internal_output_capture)]
+
 //! Testing utilities.
 
 use std::ffi::OsStr;
 use std::io;
+use std::io::Write;
 use std::num::NonZeroU64;
 use std::path::Path;
 use std::sync::Arc;
@@ -25,7 +28,11 @@ use reverie::Error;
 use reverie::ExitStatus;
 use reverie::GlobalTool;
 use reverie::Tool;
+use reverie::process::Container;
+use reverie::process::Mount;
+use reverie::process::Namespace;
 use reverie::process::Output;
+use reverie::process::RunError;
 use reverie_ptrace::spawn_fn_with_config;
 use reverie_ptrace::testing::print_tracee_output;
 use reverie_ptrace::testing::test_cmd_with_config;
@@ -634,7 +641,8 @@ where
 
 /// Like `det_test_fn`, but allows passing in a non-default configuration.  Takes a
 /// boolean flag indicating whether to expect a strictly deterministic behavior given the
-/// current test and current config.
+/// current test and current config. The oracle runs in the per-repetition
+/// process described by [`det_test_fn_with_config_repetitions`].
 pub fn det_test_fn_with_config<F, O>(isdet: bool, f: F, config: Config, oracle: O)
 where
     F: Fn() + Send + Sync,
@@ -644,6 +652,21 @@ where
 }
 
 /// Like [`det_test_fn_with_config`], but runs and compares exactly `repetitions` times.
+///
+/// Each repetition includes the tracer and guest in a fresh PID namespace with
+/// matching procfs. Container maps the caller's effective uid/gid to the same
+/// numeric values. A fresh user namespace still changes the capability/group
+/// context; this is not transparent isolation for arbitrary credential tests.
+/// The oracle consumes the actual global state in that child;
+/// only the original output and complete captured logs return to the repetition
+/// driver. The general [`test_fn_with_config`] state-returning API is unchanged.
+///
+/// The oracle therefore has a process boundary: mutations of captured Rust
+/// memory do not reach the caller or later repetitions. External side effects
+/// (files, inherited descriptors, diagnostics) remain real and require their own
+/// ownership/cleanup. Callbacks must not depend on parent-memory communication
+/// or locks held by other parent threads. This inherits `spawn_fn_with_config`'s
+/// best-effort Rust-after-fork limitation; it is not a general fork-safety promise.
 pub fn det_test_fn_with_config_repetitions<F, O>(
     repetitions: u64,
     isdet: bool,
@@ -655,7 +678,23 @@ pub fn det_test_fn_with_config_repetitions<F, O>(
     O: Fn(&Output, <Detcore as Tool>::GlobalState),
 {
     assert!(repetitions > 0, "at least one test repetition is required");
+    // Borrow the caller's values: only child-created configs/runtime/state are
+    // consumed in children, and the caller drops its originals after the wait.
+    run_function_test_driver(|| {
+        compare_function_repetitions(repetitions, isdet, &f, &config, &oracle);
+    });
+}
 
+fn compare_function_repetitions<F, O>(
+    repetitions: u64,
+    isdet: bool,
+    f: &F,
+    config: &Config,
+    oracle: &O,
+) where
+    F: Fn() + Send + Sync,
+    O: Fn(&Output, <Detcore as Tool>::GlobalState),
+{
     if isdet {
         println!("Expecting determinism:");
     } else {
@@ -664,10 +703,7 @@ pub fn det_test_fn_with_config_repetitions<F, O>(
     let mut dts = DetTestState::default();
     for ix in 1..repetitions {
         println!("Test Run {}:", ix);
-        let (output, state, logs) =
-            test_fn_with_logs::<Detcore, _>(&f, config.clone(), true).unwrap();
-        println!("({} log lines captured.)", logs.len());
-        oracle(&output, state);
+        let (output, logs) = isolated_function_repetition(f, config, oracle).unwrap();
         println!("Oracle passed.");
         if isdet {
             println!("Comparing against prior run, if any.");
@@ -675,9 +711,7 @@ pub fn det_test_fn_with_config_repetitions<F, O>(
         }
     }
     println!("Test Run {}:", repetitions);
-    let (output, state, logs) = test_fn_with_logs::<Detcore, _>(f, config, true).unwrap();
-    println!("({} log lines captured.)", logs.len());
-    oracle(&output, state);
+    let (output, logs) = isolated_function_repetition(f, config, oracle).unwrap();
     println!("Oracle passed. Full stderr:");
     println!("{}", String::from_utf8_lossy(&output.stderr));
     println!("Full stdout:");
@@ -686,6 +720,109 @@ pub fn det_test_fn_with_config_repetitions<F, O>(
         println!("Comparing against prior run, if any.");
         check_output(&output, logs, &mut dts);
     }
+}
+
+// Use libc's fork path, as spawn_fn_with_config does, before constructing a
+// Container or Tokio runtime. Libtest can have a waiting main thread even with
+// --test-threads=1; cloning a Container directly from its worker would bypass
+// libc's atfork handling. The forked driver has one surviving thread, and each
+// Container starts before that driver has created any runtime/workdir threads.
+// This does not repair arbitrary inherited Rust locks; see the public contract.
+fn run_function_test_driver(run: impl Fn()) {
+    // A concurrent generic function test may be initializing this LazyLock.
+    // Complete it in the original process, while that thread still exists;
+    // otherwise the child could inherit an in-progress Once and wait forever.
+    LazyLock::force(&GLOBAL_TEST_SUBSCRIBER);
+
+    // Match spawn_fn's handling of libtest's thread-local output capture. Child
+    // diagnostics go to the inherited streams, while the parent regains its
+    // original capture even when fork fails. Do not drop the parent's capture
+    // allocation in the child.
+    let output_capture = std::io::set_output_capture(None);
+    let pid = unsafe { libc::fork() };
+    let fork_error = (pid < 0).then(io::Error::last_os_error);
+    if pid == 0 {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&run));
+        let status = if result.is_ok() { 0 } else { 101 };
+        // Catching the panic keeps its original hook diagnostics and prevents
+        // unwinding into the inherited libtest stack. Flush diagnostics before
+        // _exit; flushing failures also make this driver fail.
+        for result in [std::io::stdout().flush(), std::io::stderr().flush()] {
+            if let Err(error) = result {
+                eprintln!("function-test driver could not flush diagnostics: {error}");
+                unsafe { libc::_exit(101) };
+            }
+        }
+        unsafe { libc::_exit(status) };
+    }
+    std::io::set_output_capture(output_capture);
+    if let Some(error) = fork_error {
+        panic!("cannot fork function-test driver: {error}");
+    }
+
+    let mut status = 0;
+    loop {
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if waited == pid {
+            break;
+        }
+        let error = io::Error::last_os_error();
+        if waited < 0 && error.raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        panic!("cannot wait for function-test driver {pid}: {error}");
+    }
+    let status = ExitStatus::from_raw(status);
+    assert_eq!(
+        status,
+        ExitStatus::Exited(0),
+        "isolated function-test driver failed; see its original diagnostics above",
+    );
+}
+
+// The fixed return type is the real Output and complete logs, never a stand-in
+// GlobalState. Keep the deferred result inseparable from its checked child exit,
+// even if serialization succeeds before child cleanup fails.
+fn in_function_pid_namespace<F, D>(run: F) -> Result<(Output, TracerLogs), RunError>
+where
+    F: FnMut() -> ((Output, TracerLogs), D),
+{
+    let uid = unsafe { libc::geteuid() };
+    let gid = unsafe { libc::getegid() };
+    Container::new()
+        .unshare(Namespace::PID)
+        .map_uid(uid, uid)
+        .map_gid(gid, gid)
+        .mount(Mount::proc())
+        .run_with_deferred_drop(run)?
+        .finalize()
+}
+
+fn isolated_function_repetition<F, O>(
+    f: &F,
+    config: &Config,
+    oracle: &O,
+) -> Result<(Output, TracerLogs), RunError>
+where
+    F: Fn() + Send + Sync,
+    O: Fn(&Output, <Detcore as Tool>::GlobalState),
+{
+    in_function_pid_namespace(|| {
+        // The Container clone callback is an extern-C boundary. Keep a Rust
+        // panic's diagnostics, then exit unsuccessfully instead of unwinding
+        // through that boundary or publishing a substitute successful value.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (output, state, logs) =
+                test_fn_with_logs::<Detcore, _>(f, config.clone(), true).unwrap();
+            println!("({} log lines captured.)", logs.len());
+            oracle(&output, state);
+            (output, logs)
+        }));
+        match result {
+            Ok(result) => (result, ()),
+            Err(_panic) => unsafe { libc::_exit(101) },
+        }
+    })
 }
 
 /// Runs a command multiple times and checks to see if the output was
@@ -823,6 +960,169 @@ mod tests {
     use super::install_global_test_subscriber;
     use super::requested_test_workdir;
     use super::test_fn_with_config;
+
+    fn oracle_receipts() -> (
+        std::os::unix::net::UnixDatagram,
+        std::os::unix::net::UnixDatagram,
+    ) {
+        let (reader, writer) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        reader
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        (reader, writer)
+    }
+
+    fn receive_oracle_receipt(reader: &std::os::unix::net::UnixDatagram, expected: &[u8]) {
+        let mut received = [0u8; 128];
+        let size = reader.recv(&mut received).expect("oracle was not reached");
+        std::assert_eq!(&received[..size], expected);
+    }
+
+    #[test]
+    fn function_driver_inherits_completed_subscriber_initialization() {
+        super::run_function_test_driver(|| {
+            // Inspect without forcing: child-side initialization or a force
+            // after the fork cannot repair the child's inherited Once state.
+            assert!(
+                std::sync::LazyLock::get(&super::GLOBAL_TEST_SUBSCRIBER).is_some(),
+                "driver inherited an uninitialized or in-progress subscriber",
+            );
+        });
+        assert!(
+            std::sync::LazyLock::get(&super::GLOBAL_TEST_SUBSCRIBER).is_some(),
+            "the original caller must complete subscriber initialization",
+        );
+    }
+
+    #[test]
+    fn isolated_function_repetitions_compare_real_pid_and_procfs_output() {
+        let (receipts, oracle) = oracle_receipts();
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        super::det_test_fn_with_config_repetitions(
+            2,
+            true,
+            || {
+                let pid = unsafe { libc::getpid() };
+                let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+                std::assert_eq!(
+                    std::fs::read_link("/proc/self").unwrap(),
+                    std::path::PathBuf::from(pid.to_string()),
+                );
+                let status =
+                    std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/status")).unwrap();
+                assert!(status.lines().any(|line| line == format!("Pid:\t{tid}")));
+                println!("pid={pid} tid={tid}");
+                eprintln!("real guest stderr");
+            },
+            detcore::Config {
+                max_timeslice: None,
+                ..Default::default()
+            },
+            |output, state| {
+                // These calls run in the untraced oracle, so they observe the
+                // actual container credentials rather than Detcore's persona.
+                std::assert_eq!(unsafe { libc::geteuid() }, uid);
+                std::assert_eq!(unsafe { libc::getegid() }, gid);
+                assert!(output.stdout.starts_with(b"pid="));
+                std::assert_eq!(output.stderr, b"real guest stderr\n");
+                super::expect_success(output, state);
+                oracle.send(b"real successful guest and state").unwrap();
+            },
+        );
+        for _ in 0..2 {
+            receive_oracle_receipt(&receipts, b"real successful guest and state");
+        }
+        receipts.set_nonblocking(true).unwrap();
+        std::assert_eq!(
+            receipts.recv(&mut [0; 128]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "exactly two physical repetitions must reach the oracle",
+        );
+    }
+
+    #[test]
+    fn isolated_function_repetitions_propagate_nonzero_guest_exit() {
+        let (receipts, oracle) = oracle_receipts();
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::det_test_fn_with_config_repetitions(
+                2,
+                true,
+                || unsafe { libc::_exit(23) },
+                detcore::Config {
+                    max_timeslice: None,
+                    ..Default::default()
+                },
+                |output, state| {
+                    std::assert_eq!(output.status, ExitStatus::Exited(23));
+                    oracle.send(b"real guest exited 23").unwrap();
+                    super::expect_success(output, state);
+                },
+            );
+        }));
+        assert!(failure.is_err(), "nonzero guest must fail the calling test");
+        // An unrelated setup/namespace/tracer failure cannot satisfy this test.
+        receive_oracle_receipt(&receipts, b"real guest exited 23");
+    }
+
+    #[test]
+    fn isolated_function_repetitions_propagate_reached_oracle_panic() {
+        let (receipts, oracle) = oracle_receipts();
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::det_test_fn_with_config_repetitions(
+                2,
+                true,
+                || {},
+                detcore::Config {
+                    max_timeslice: None,
+                    ..Default::default()
+                },
+                |output, state| {
+                    super::expect_success(output, state);
+                    oracle
+                        .send(b"successful guest before oracle panic")
+                        .unwrap();
+                    panic!("deliberate reached oracle failure");
+                },
+            );
+        }));
+        assert!(failure.is_err(), "oracle panic must fail the calling test");
+        receive_oracle_receipt(&receipts, b"successful guest before oracle panic");
+    }
+
+    #[test]
+    fn isolated_function_repetition_rejects_failure_after_publication() {
+        struct ExitAfterPublication;
+        impl Drop for ExitAfterPublication {
+            fn drop(&mut self) {
+                unsafe { libc::_exit(29) };
+            }
+        }
+        super::run_function_test_driver(|| {
+            let result = super::in_function_pid_namespace(|| {
+                (
+                    (
+                        reverie::process::Output {
+                            status: ExitStatus::Exited(0),
+                            stdout: b"provisional output".to_vec(),
+                            stderr: Vec::new(),
+                        },
+                        vec!["complete provisional log".to_owned()],
+                    ),
+                    ExitAfterPublication,
+                )
+            });
+            assert!(
+                matches!(
+                    result,
+                    Err(reverie::process::RunError::ExitStatus(ExitStatus::Exited(
+                        29
+                    )))
+                ),
+                "must reject the reached post-publication cleanup failure: {result:?}",
+            );
+        });
+    }
 
     #[test]
     fn isolated_workdir_request_is_exact_and_fail_closed() {

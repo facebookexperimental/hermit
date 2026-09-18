@@ -79,6 +79,7 @@ rust_library(
     srcs = ["tests/testutils/src/lib.rs"],
     autocargo = {"cargo_toml_dir": "tests/testutils/"},
     deps = [
+        "fbsource//third-party/rust:libc",
         "fbsource//third-party/rust:pretty_assertions",
         "fbsource//third-party/rust:tokio",
         "fbsource//third-party/rust:tracing",

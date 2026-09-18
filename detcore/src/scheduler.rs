@@ -4903,10 +4903,22 @@ impl Scheduler {
     /// does not have all the necessary information.
     ///
     /// Side Effects: This also flushes the in-memory PreemptionWriter to disk.
+    #[cfg(test)]
     pub fn generate_partial_run_summary(
         &mut self,
         preemptions_to: Option<&PathBuf>,
     ) -> anyhow::Result<RunSummary> {
+        self.generate_partial_run_summary_for_log(preemptions_to)
+            .map(|(summary, _)| summary)
+    }
+
+    /// Build the full report and the INFO preemption description together.
+    /// The latter retains counts/history but excludes the host output filename.
+    /// This performs one generation and flush.
+    pub(crate) fn generate_partial_run_summary_for_log(
+        &mut self,
+        preemptions_to: Option<&PathBuf>,
+    ) -> anyhow::Result<(RunSummary, Option<String>)> {
         let schedevent_replayed = self
             .replayer
             .as_ref()
@@ -4954,14 +4966,19 @@ impl Scheduler {
             None
         };
 
-        let reprio_descrip = if let Some(pw) = self.preemption_writer.take() {
+        let (reprio_descrip, info_reprio_descrip) = if let Some(pw) = self.preemption_writer.take()
+        {
             let mut buf = String::new();
             writeln!(
                 buf,
                 "Record of {} preemption and reprioritization events:",
                 pw.len()
             )?;
+            let info_description;
             if let Some(path) = preemptions_to {
+                // Preserve the full human/JSON description; build the INFO
+                // description before adding the host artifact destination.
+                info_description = buf.clone();
                 writeln!(buf, "  (Writing to file {:?})", path)?;
                 if let Err(str) = pw.flush() {
                     tracing::warn!("{}", str);
@@ -4969,10 +4986,11 @@ impl Scheduler {
             } else {
                 // Recording, but not outputting to file, so this is the only (partial) record of it:
                 writeln!(buf, "{}", truncated(200, pw.into_string()))?;
+                info_description = buf.clone();
             }
-            Some(buf)
+            (Some(buf), Some(info_description))
         } else {
-            None
+            (None, None)
         };
 
         let num_processes = self.thread_tree.thread_group_leaders.len() as u64;
@@ -4992,24 +5010,27 @@ impl Scheduler {
         }
         let syscalls = self.per_thread_syscalls.values().copied().sum();
 
-        Ok(RunSummary {
-            sched_turns: self.turn,
-            schedevent_replayed,
-            schedevent_recorded: self.recorded_event_count,
-            schedevent_desynced: total_desyncs,
-            // schedevent_desynced_at_context_switch: total_desyncs.at_context_switch,
-            desync_descrip,
-            reprio_descrip,
-            threads_descrip,
-            num_processes,
-            num_threads,
-            syscalls: Some(syscalls),
-            virttime_elapsed: 0, // Cannot fill.
-            virttime_final: 0,   // Cannot fill.
-            realtime_elapsed: None,
-            timeslice_stats,
-            per_thread_timeslice,
-        })
+        Ok((
+            RunSummary {
+                sched_turns: self.turn,
+                schedevent_replayed,
+                schedevent_recorded: self.recorded_event_count,
+                schedevent_desynced: total_desyncs,
+                // schedevent_desynced_at_context_switch: total_desyncs.at_context_switch,
+                desync_descrip,
+                reprio_descrip,
+                threads_descrip,
+                num_processes,
+                num_threads,
+                syscalls: Some(syscalls),
+                virttime_elapsed: 0, // Cannot fill.
+                virttime_final: 0,   // Cannot fill.
+                realtime_elapsed: None,
+                timeslice_stats,
+                per_thread_timeslice,
+            },
+            info_reprio_descrip,
+        ))
     }
 
     /// Summarize the state of the scheduler while executing (verbose).

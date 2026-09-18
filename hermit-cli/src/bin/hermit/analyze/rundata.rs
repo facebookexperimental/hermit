@@ -318,6 +318,25 @@ impl RunData {
         Ok(Self::new(aopts, runname, ro))
     }
 
+    /// Replay with the selected run's seeds and the original replay policy.
+    pub fn new_run1_replay(
+        aopts: &AnalyzeOpts,
+        runname: String,
+        selected: &RunOpts,
+    ) -> anyhow::Result<Self> {
+        let mut replay = Self::new_run1_target(aopts, runname)?;
+        let target = &selected.det_opts.det_config;
+        let config = &mut replay.runopts.det_opts.det_config;
+        // Search chooses an effective scheduler seed independently of the
+        // initial command line. Preserve all selected seed inputs, without
+        // copying search-only overrides such as --imprecise-search into replay.
+        config.seed = target.seed;
+        config.rng_seed = target.rng_seed;
+        config.fuzz_seed = target.fuzz_seed;
+        config.sched_seed = target.sched_seed;
+        Ok(replay)
+    }
+
     /// The baseline RunOpts based on user flags plus some sanitation/validation.
     fn get_base_runopts(aopts: &AnalyzeOpts) -> anyhow::Result<RunOpts> {
         let mut ro = Self::get_raw_runopts(aopts);
@@ -493,5 +512,57 @@ impl RunData {
 
     pub fn into_runopts(self) -> RunOpts {
         self.runopts
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preemption_replay_preserves_selected_seeds_and_original_timer_policy() {
+        for explicit_imprecise_timers in [false, true] {
+            let mut args = vec![
+                "analyze",
+                "--selfcheck",
+                "--search",
+                "--imprecise-search",
+                "--run1-seed=211",
+                "--",
+            ];
+            if explicit_imprecise_timers {
+                args.push("--imprecise-timers");
+            }
+            args.push("/bin/true");
+            let mut options = AnalyzeOpts::try_parse_from(args).unwrap();
+            let workspace = tempfile::tempdir().unwrap();
+            options.tmp_dir = Some(workspace.path().to_path_buf());
+            let mut selected = RunData::new_baseline(&options, "selected".to_owned()).unwrap();
+            let selected_config = &mut selected.runopts.det_opts.det_config;
+            selected_config.seed = 101;
+            selected_config.rng_seed = Some(102);
+            selected_config.fuzz_seed = Some(103);
+            selected_config.sched_seed = Some(104);
+            // This is the override launch_search applies, not a replay option.
+            selected_config.imprecise_timers = true;
+            let preempts = workspace.path().join("selected.preempts");
+            let replay = RunData::new_run1_replay(&options, "replay".to_owned(), &selected.runopts)
+                .unwrap()
+                .with_preempts_path_in(preempts.clone())
+                .with_preemption_recording();
+            let config = &replay.runopts.det_opts.det_config;
+            assert_eq!(config.seed, 101);
+            assert_eq!(config.rng_seed, Some(102));
+            assert_eq!(config.fuzz_seed, Some(103));
+            assert_eq!(config.sched_seed, Some(104));
+            assert_eq!(config.imprecise_timers, explicit_imprecise_timers);
+            assert_eq!(config.replay_preemptions_from.as_ref(), Some(&preempts));
+            assert_ne!(replay.runopts.save_config, selected.runopts.save_config);
+            assert_ne!(replay.runopts.summary_json, selected.runopts.summary_json);
+            assert_eq!(
+                config.record_preemptions_to.as_ref(),
+                Some(&workspace.path().join("replay_out.preempts")),
+            );
+        }
     }
 }

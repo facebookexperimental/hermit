@@ -349,8 +349,8 @@ fi
 # SDK key 0aa6d84239b5a04b7cda124ebed4c7e3adc8b62f5b4c96011a9b971e90d6b0a4,
 # the 16-job clamp and 1050 effective-job-second threshold. This carries
 # the unchanged SDK recipe; it is not a new timing or Hermit guest measurement.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 7d863ab3f02639731713a01467b2548c41e3dbfb ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 7d863ab3f02639731713a01467b2548c41e3dbfb (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 99d1e4827cce2404442d7c27ab447886a5839326 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 99d1e4827cce2404442d7c27ab447886a5839326 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
@@ -643,6 +643,22 @@ fi
 # outside the DynamoRIO content-key recipe. MAX_PARALLEL_JOBS=16 and the 1050
 # effective-job-second threshold carry unchanged. Fresh validation is still
 # required; this carry does not authorize receipt reuse.
+# BOUNDED COLD SDK OBSERVATION AT 99d1e482 (2026-09-18):
+# Incoming Reverie https://github.com/rrnewton/reverie/pull/467 changes the
+# vendored DynamoRIO drreg.c, so the old 7d863ab3 recipe identity does not carry.
+# At landed https://github.com/rrnewton/reverie/pull/579, the actual new build.rs
+# reported MISS, native completion in 49.64s at jobs=2, and PUBLISHED for
+#     key=sha256:b0247764df7fba083f90538e12d3afcc8ffad5150c65bd321e689da5e57b74ed
+# Actual child nproc=316; min(2,316,16)=2 yields a 525s elapsed ratchet.
+# The completed native sample is 99.28 effective-job-seconds, below 1050.
+# Retain the conservative 1050 effective-job-second threshold and 16-job clamp.
+# This one local sample does not replace the original n=3 hosted calibration
+# or satisfy the >=5-sample replacement rule. The encompassing explicit
+# external-package Cargo check returned 101 afterward: the counter2 example
+# requires prototype-runtime, absent in Hermit's default-features=false graph.
+# That Cargo failure remains a failure; only its completed cold SDK work is
+# calibration evidence. The normal Hermit workspace/all-target check remains
+# independently required. No DBT guest correctness or new replay claim follows.
 REVERIE_DBT_MAX_PARALLEL_JOBS=16
 REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS=1050
 REVERIE_DBT_EFFECTIVE_BUILD_JOBS=$REVERIE_DBT_RAW_BUILD_JOBS

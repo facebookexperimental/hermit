@@ -761,7 +761,8 @@ impl GlobalState {
         }
         let banner =
             "  ------------------------------ hermit run report ------------------------------";
-        let mut summary = self.into_run_summary().unwrap();
+        let recording_destination = self.cfg.record_preemptions_to.clone();
+        let (mut summary, info_reprio_descrip) = self.into_run_summary_for_log().unwrap();
 
         // Print machine-readable summary:
         if let Some(path) = print_summary_to_json_file {
@@ -785,18 +786,28 @@ impl GlobalState {
         } else {
             // Separate out the nondeterministic bits and print them at debug level:
             let rt = summary.realtime_elapsed.take();
-            info!("\n{}\n{}", banner, summary);
+            log_run_summary(
+                banner,
+                &summary,
+                info_reprio_descrip.as_deref(),
+                recording_destination.as_deref(),
+            );
             if let Some(x) = rt {
                 debug!("Nondeterministic realtime elapsed: {:?}", x);
             }
         }
     }
 
+    #[cfg(test)]
     fn into_run_summary(self) -> anyhow::Result<RunSummary> {
-        // First, the scheduler can generate part of the summary
-        let mut summary = {
+        self.into_run_summary_for_log().map(|(summary, _)| summary)
+    }
+
+    fn into_run_summary_for_log(self) -> anyhow::Result<(RunSummary, Option<String>)> {
+        // First, the scheduler can generate part of the summary (and flush once).
+        let (mut summary, info_reprio_descrip) = {
             let mut sched = self.sched.lock().unwrap();
-            sched.generate_partial_run_summary(self.cfg.record_preemptions_to.as_ref())?
+            sched.generate_partial_run_summary_for_log(self.cfg.record_preemptions_to.as_ref())?
         };
         // Second, we fill in the rest based on global state.
         //
@@ -826,8 +837,22 @@ impl GlobalState {
             }
         }
 
-        Ok(summary)
+        Ok((summary, info_reprio_descrip))
     }
+}
+
+fn log_run_summary(
+    banner: &str,
+    summary: &RunSummary,
+    info_reprio_descrip: Option<&str>,
+    recording_destination: Option<&std::path::Path>,
+) {
+    info!("\n{}\n{}", banner, summary.info(info_reprio_descrip));
+    debug!(
+        replayed_events = summary.schedevent_replayed,
+        ?recording_destination,
+        "Run recording/replay bookkeeping"
+    );
 }
 
 #[reverie::global_tool]
@@ -1249,8 +1274,11 @@ impl GlobalTool for GlobalState {
                 let ns = self.global_time.lock().unwrap().as_nanos();
                 R::GlobalTimeLowerBound(ns)
             }
-            GlobalRequest::TraceSchedEvent(ev, detpid) => {
-                match self.recv_trace_schedevent(ev, detpid, request_mm).await {
+            GlobalRequest::TraceSchedEvent(ev, detpid, command_bootstrap) => {
+                match self
+                    .recv_trace_schedevent(ev, detpid, request_mm, command_bootstrap)
+                    .await
+                {
                     SchedulerRpcResult::Continue(response) => R::TraceSchedEvent(response),
                     SchedulerRpcResult::ThreadExited => R::ThreadExited,
                 }
@@ -2143,6 +2171,7 @@ impl GlobalState {
         ev: SchedEvent,
         detpid: DetPid,
         request_mm: MmId,
+        command_bootstrap: bool,
     ) -> SchedulerRpcResult<TraceSchedEventResponse> {
         let ev = {
             let sched = self.lock_rpc_scheduler(false).await;
@@ -2154,7 +2183,13 @@ impl GlobalState {
                 if self.past_first_execve.load(SeqCst) {
                     ev
                 } else {
-                    info!("Warning: erasing rip of pre-execve sched event! {:?}", ev);
+                    info!(
+                        "Warning: erasing rip of pre-execve sched event! {:?}",
+                        SchedEventForLog {
+                            event: &ev,
+                            command_bootstrap
+                        }
+                    );
                     SchedEvent {
                         end_rip: None,
                         start_rip: None,
@@ -2466,7 +2501,8 @@ pub enum GlobalRequest {
     GlobalTimeLowerBound,
 
     /// Record scheduling event in a total order.
-    TraceSchedEvent(SchedEvent, DetPid),
+    // Logging provenance only; never serialized into a schedule artifact.
+    TraceSchedEvent(SchedEvent, DetPid, bool),
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
@@ -3232,6 +3268,41 @@ pub struct TraceSchedEventResponse {
     timeslice: Option<LogicalTime>,
 }
 
+struct SchedEventForLog<'a> {
+    event: &'a SchedEvent,
+    command_bootstrap: bool,
+}
+
+struct CommandBootstrapInstructionPointer(NonZeroUsize);
+
+impl std::fmt::Debug for CommandBootstrapInstructionPointer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", crate::logdiff::host_addr(self.0.get()))
+    }
+}
+
+impl std::fmt::Debug for SchedEventForLog<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if !self.command_bootstrap {
+            return std::fmt::Debug::fmt(self.event, f);
+        }
+        f.debug_struct("SchedEvent")
+            .field("dettid", &self.event.dettid)
+            .field("op", &self.event.op)
+            .field("count", &self.event.count)
+            .field(
+                "start_rip",
+                &self.event.start_rip.map(CommandBootstrapInstructionPointer),
+            )
+            .field(
+                "end_rip",
+                &self.event.end_rip.map(CommandBootstrapInstructionPointer),
+            )
+            .field("end_time", &self.event.end_time)
+            .finish()
+    }
+}
+
 /// Record an event in the schedule trace, OR check the event on replay.
 /// This also prints the backtrace of the schedevent, if indicated.
 ///
@@ -3274,7 +3345,12 @@ where
     }
 
     let detpid = guest.thread_state().detpid.expect("detpid unset");
-    let resp = send_and_update_time(guest, GlobalRequest::TraceSchedEvent(ev, detpid)).await;
+    let command_bootstrap = guest.is_command_bootstrap();
+    let resp = send_and_update_time(
+        guest,
+        GlobalRequest::TraceSchedEvent(ev, detpid, command_bootstrap),
+    )
+    .await;
 
     trace!("trace_schedevent result: {:?}", resp);
     match resp {
@@ -3629,6 +3705,180 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn schedule_event_host_markers_require_command_bootstrap_provenance() {
+        let event = SchedEvent::branches(DetTid::from_raw(3), 223)
+            .with_end_rip(std::num::NonZeroUsize::new(0x1234).unwrap())
+            .with_time(LogicalTime::from_nanos(2230));
+        let original = serde_json::to_string(&event).unwrap();
+        let plain = format!(
+            "{:?}",
+            super::SchedEventForLog {
+                event: &event,
+                command_bootstrap: false
+            }
+        );
+        assert_eq!(plain, format!("{event:?}"));
+        let marked = format!(
+            "{:?}",
+            super::SchedEventForLog {
+                event: &event,
+                command_bootstrap: true
+            }
+        );
+        assert_eq!(
+            marked,
+            "SchedEvent { dettid: DetPid(3), op: Branch, count: 223, start_rip: None, end_rip: Some(<hostaddr 0x1234>), end_time: Some(LogicalTime(2230)) }"
+        );
+        assert_eq!(serde_json::to_string(&event).unwrap(), original);
+    }
+
+    #[test]
+    fn summary_preemption_views_keep_counts_full_report_and_single_flush() {
+        let (_config, state, tid, _) = cancellation_test_state();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("recording");
+        let mut writer = crate::preemptions::PreemptionWriter::new(Some(path.clone()));
+        writer.register_thread(tid, DEFAULT_PRIORITY);
+        writer.insert_reprioritization(tid, LogicalTime::from_nanos(100), 10, DEFAULT_PRIORITY, 20);
+        let mut scheduler = state.sched.lock().unwrap();
+        scheduler.preemption_writer = Some(writer);
+        let (summary, info_description) = scheduler
+            .generate_partial_run_summary_for_log(Some(&path))
+            .unwrap();
+        assert!(scheduler.preemption_writer.is_none());
+        let recorded = std::fs::read(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&recorded).unwrap();
+        assert_eq!(
+            parsed["per_thread"][tid.to_string()]["prio_changes"],
+            serde_json::json!([[100, DEFAULT_PRIORITY]])
+        );
+        let count_line = "Record of 1 preemption and reprioritization events:\n";
+        assert_eq!(info_description.as_deref(), Some(count_line));
+        assert_eq!(
+            summary.reprio_descrip.as_deref(),
+            Some(format!("{count_line}  (Writing to file {path:?})\n").as_str())
+        );
+        let full = summary.to_string();
+        let json = serde_json::to_vec(&summary).unwrap();
+        let info = summary.info(info_description.as_deref()).to_string();
+        assert!(info.contains(count_line));
+        assert!(!info.contains("Writing to file"));
+        assert!(full.contains(&format!("Writing to file {path:?}")));
+        // Formatting and another empty summary do not flush the consumed writer again.
+        let _ = scheduler.generate_partial_run_summary(None).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), recorded);
+        assert_eq!(summary.to_string(), full);
+        assert_eq!(serde_json::to_vec(&summary).unwrap(), json);
+    }
+
+    #[test]
+    fn run_summary_info_keeps_semantics_and_debug_retains_bookkeeping() {
+        #[derive(Clone)]
+        struct Capture(std::sync::Arc<Mutex<Vec<(tracing::Level, String)>>>);
+        struct Visitor(String);
+        impl tracing::field::Visit for Visitor {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write;
+                write!(self.0, "{}={value:?};", field.name()).unwrap();
+            }
+        }
+        impl tracing::Subscriber for Capture {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                let mut visitor = Visitor(String::new());
+                event.record(&mut visitor);
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((*event.metadata().level(), visitor.0));
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+        let summary = super::RunSummary {
+            sched_turns: 4,
+            schedevent_recorded: 11,
+            schedevent_replayed: 11,
+            schedevent_desynced: 2,
+            desync_descrip: Some("two real desyncs\n".into()),
+            num_processes: 1,
+            num_threads: 1,
+            threads_descrip: "[3]".into(),
+            syscalls: Some(3),
+            virttime_elapsed: 2_512_380,
+            virttime_final: 2_512_380,
+            timeslice_stats: TimesliceStats {
+                count: 1,
+                sum_ns: 512_380,
+                min_ns: 512_380,
+                max_ns: 512_380,
+            },
+            ..Default::default()
+        };
+        let description = "Record of 7 preemption and reprioritization events:\n";
+        let captured = Capture(Default::default());
+        tracing::subscriber::with_default(captured.clone(), || {
+            super::log_run_summary(
+                "report",
+                &summary,
+                Some(description),
+                Some(std::path::Path::new("/host/recording")),
+            );
+        });
+        let events = captured.0.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].0, tracing::Level::INFO);
+        assert_eq!(events[1].0, tracing::Level::DEBUG);
+        let info = &events[0].1;
+        for text in [
+            "1 group leaders of 1 thread(s)",
+            "3 syscalls",
+            "4 turns, recorded 11 events (2 desynced)",
+            "two real desyncs",
+            "Record of 7 preemption",
+            "2_512_380ns",
+            "min=512380ns max=512380ns mean=512380ns count=1",
+        ] {
+            assert!(info.contains(text), "missing semantic field {text}: {info}");
+        }
+        assert!(!info.contains("/host/recording"));
+        assert!(!info.contains("replayed"));
+        assert!(events[1].1.contains("replayed_events=11"));
+        assert!(events[1].1.contains("/host/recording"));
+        let baseline = summary.info(Some(description)).to_string();
+        let mutations: [fn(&mut super::RunSummary); 8] = [
+            |s| s.sched_turns += 1,
+            |s| s.schedevent_recorded += 1,
+            |s| s.schedevent_desynced += 1,
+            |s| s.num_threads += 1,
+            |s| s.syscalls = Some(4),
+            |s| s.virttime_elapsed += 1,
+            |s| s.timeslice_stats.count += 1,
+            |s| s.threads_descrip.push_str(",4"),
+        ];
+        for mutate in mutations {
+            let mut changed = summary.clone();
+            mutate(&mut changed);
+            assert_ne!(changed.info(Some(description)).to_string(), baseline);
+        }
+        assert_ne!(
+            summary
+                .info(Some(
+                    "Record of 8 preemption and reprioritization events:\n"
+                ))
+                .to_string(),
+            baseline
+        );
+    }
+
     mod backend_failure_tests;
     use std::collections::BTreeSet;
     use std::os::fd::AsRawFd;
@@ -5560,7 +5810,7 @@ mod tests {
         install_test_registration(&state, dettid, request_seen.clone());
         install_test_registration(&state, next_tid, Ivar::new());
 
-        let replay = state.recv_trace_schedevent(event, detpid, MmId::initial(detpid));
+        let replay = state.recv_trace_schedevent(event, detpid, MmId::initial(detpid), false);
         let kill_after_replay_yield = async {
             while request_seen.try_read().is_none() {
                 tokio::task::yield_now().await;

@@ -143,16 +143,47 @@ pub struct RunSummary {
     pub per_thread_timeslice: Vec<(DetTid, TimesliceStats)>,
 }
 
-/// A human-readable, multi-line summary.
+/// A human-readable, multi-line summary. Serialized report fields are unchanged.
 impl fmt::Display for RunSummary {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt_summary(f, true, self.reprio_descrip.as_deref())
+    }
+}
+
+/// INFO view built with the producer's preemption description, before its host
+/// destination is appended. It does not alter the full report or serialized fields.
+pub struct RunSummaryInfo<'a> {
+    summary: &'a RunSummary,
+    reprio_description: Option<&'a str>,
+}
+
+impl fmt::Display for RunSummaryInfo<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.summary.fmt_summary(f, false, self.reprio_description)
+    }
+}
+
+impl RunSummary {
+    pub fn info<'a>(&'a self, reprio_description: Option<&'a str>) -> RunSummaryInfo<'a> {
+        RunSummaryInfo {
+            summary: self,
+            reprio_description,
+        }
+    }
+
+    fn fmt_summary(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+        include_replay_bookkeeping: bool,
+        reprio_description: Option<&str>,
+    ) -> fmt::Result {
         let RunSummary {
             sched_turns,
             schedevent_replayed,
             schedevent_recorded,
             schedevent_desynced,
             desync_descrip,
-            reprio_descrip,
+            reprio_descrip: _,
             num_processes,
             num_threads,
             syscalls,
@@ -172,16 +203,24 @@ impl fmt::Display for RunSummary {
         if let Some(syscalls) = syscalls {
             writeln!(f, "Guest threads completed {syscalls} syscalls.")?;
         }
-        writeln!(
-            f,
-            "Internally, the hermit scheduler ran {} turns, recorded {} events, replayed {} events ({} desynced)",
-            sched_turns, schedevent_recorded, schedevent_replayed, schedevent_desynced,
-        )?;
+        if include_replay_bookkeeping {
+            writeln!(
+                f,
+                "Internally, the hermit scheduler ran {} turns, recorded {} events, replayed {} events ({} desynced)",
+                sched_turns, schedevent_recorded, schedevent_replayed, schedevent_desynced,
+            )?;
+        } else {
+            writeln!(
+                f,
+                "Internally, the hermit scheduler ran {} turns, recorded {} events ({} desynced)",
+                sched_turns, schedevent_recorded, schedevent_desynced,
+            )?;
+        }
 
         if let Some(txt) = desync_descrip {
             write!(f, "{}", txt)?;
         }
-        if let Some(txt) = reprio_descrip {
+        if let Some(txt) = reprio_description {
             write!(f, "{}", txt)?;
         }
 

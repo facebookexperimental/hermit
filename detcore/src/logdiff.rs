@@ -427,11 +427,10 @@ pub fn strip_log_entry(log: &str) -> String {
 /// `0x...` literal. Only marked addresses are canonicalized, so reproducible hex
 /// (syscall arguments, guest memory ranges, digests) is compared exactly.
 ///
-/// Note: nothing in detcore's current DETLOG output prints a varying host
-/// pointer -- guest addresses are determinized and every logged `0x...` value is
-/// reproducible -- so this marker is presently unused in production and exists
-/// so a future host-pointer print opts into canonicalization deliberately rather
-/// than being swept up by a blanket regex.
+/// Command bootstrap logs use this marker for proven launcher-image pointers
+/// before the first successful exec. Guest pointers, syscall scalars, and
+/// addresses without that provenance remain exact. Marking an address preserves
+/// its identity and aliasing through the per-run ordinal mapping below.
 pub fn host_addr(addr: usize) -> String {
     format!("<hostaddr {addr:#x}>")
 }
