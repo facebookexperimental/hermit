@@ -1074,7 +1074,7 @@ mod tests {
         let c = &e.context;
         serde_json::json!({"schema_version":9,"result":"fail","commit":c.target_sha,
             "tree":c.target_tree,"host":c.host,"run_id":c.run_id,"started_at":c.started_at,
-            "log_file":"/home/producer/work/ignored/validate/exact-run.log",
+            "log_file":"/home/example/work/ignored/validate/exact-run.log",
             "log_identity":c.log_identity,"admission_floor_evidence":e})
     }
 
@@ -1171,14 +1171,14 @@ mod tests {
             "a\u{0085}run",
             "{{WORKSPACE_ROOT}}/run",
             "a/{{HOME}}/run",
-            "a/home/owner/run",
+            "a/home/example/run",
         ] {
             assert!(locator(path).validate().is_err(), "{path:?}");
         }
         let mut bad = locator("ignored/validate/run.log");
         bad.scope = "host".into();
         assert!(bad.validate().is_err());
-        for token in ["{{WORKSPACE_ROOT}}", "{{HOME}}", "/home/owner"] {
+        for token in ["{{WORKSPACE_ROOT}}", "{{HOME}}", "/home/example"] {
             let mut c = context_v2();
             c.run_id = token.into();
             assert!(admission_context_v2_bytes(&c).is_err());
@@ -1390,7 +1390,7 @@ mod tests {
         let mut serialized_rows = BTreeSet::new();
         for display in [
             "{{WORKSPACE_ROOT}}/ignored/validate/exact-run.log",
-            "/home/producer/work/ignored/validate/exact-run.log",
+            "/home/example/work/ignored/validate/exact-run.log",
             "/srv/reader/ignored/validate/exact-run.log",
         ] {
             let mut value = row_v2(&e);

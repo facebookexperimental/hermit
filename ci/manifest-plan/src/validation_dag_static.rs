@@ -207,7 +207,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Nine admission-context/nested-ID controls extend the measured 533-test set.
     // Six portable-context controls extend the measured 542-test set.
     ("test.regular_crates", 548),
-    ("test.hermit_unit", 707),
+    // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
+    ("test.hermit_unit", 710),
     ("test.detcore_unit", 704),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
@@ -236,7 +237,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.detcore_parallel_on_host", 5),
     ("test.detcore_unit_on_host", 704),
     ("test.hermit_integration_on_host", 158),
-    ("test.hermit_unit_on_host", 707),
+    ("test.hermit_unit_on_host", 710),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 24),
     // The host node carries the identical selection.

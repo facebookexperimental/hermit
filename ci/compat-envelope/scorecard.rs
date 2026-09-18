@@ -3518,7 +3518,9 @@ applicability facts as the table above.\n\n| Mode",
     for backend in &ordered {
         out.push_str(&format!(" | `{backend}`"));
     }
-    out.push_str(" | Selected by full | Not selected by full | Not applicable | In the manifest |\n| ---");
+    out.push_str(
+        " | Selected by full | Not selected by full | Not applicable | In the manifest |\n| ---",
+    );
     for _ in &ordered {
         out.push_str(" | ---:");
     }
@@ -10935,9 +10937,8 @@ fn self_test() -> Result<(), String> {
     measured_red.cells[0].measurement = MeasurementState::MeasuredAndPassed;
     let measured_section = render_measurement_section(&measured_red);
     if !measured_section.contains("Of the cells selected by full, **0** have `never-measured`")
-        || !measured_section.contains(
-            "of the cells not selected by full, **1** have `measured-and-passed`",
-        )
+        || !measured_section
+            .contains("of the cells not selected by full, **1** have `measured-and-passed`")
         || !measured_section.contains("| Not selected by full | 0 | 1 | 0 | 0 | 0 | 1 |")
     {
         return Err(
@@ -10959,9 +10960,8 @@ fn self_test() -> Result<(), String> {
         );
     }
     if !unmeasured_section.contains("Of the cells selected by full, **0** have `never-measured`")
-        || !unmeasured_section.contains(
-            "of the cells not selected by full, **0** have `measured-and-passed`",
-        )
+        || !unmeasured_section
+            .contains("of the cells not selected by full, **0** have `measured-and-passed`")
     {
         return Err("measurement prose kept a stale cross-combination count".into());
     }
@@ -10970,9 +10970,8 @@ fn self_test() -> Result<(), String> {
     let unmeasured_green_section = render_measurement_section(&unmeasured_green);
     if !unmeasured_green_section
         .contains("Of the cells selected by full, **1** have `never-measured`")
-        || !unmeasured_green_section.contains(
-            "of the cells not selected by full, **0** have `measured-and-passed`",
-        )
+        || !unmeasured_green_section
+            .contains("of the cells not selected by full, **0** have `measured-and-passed`")
     {
         return Err("measurement prose hard-coded the current selected count".into());
     }
@@ -11038,8 +11037,7 @@ fn self_test() -> Result<(), String> {
         selected_custom: BTreeSet::new(),
     };
     let status_section = render_scorecard(&not_applicable);
-    if !status_section
-        .contains("**1** are **Not applicable**")
+    if !status_section.contains("**1** are **Not applicable**")
         || !status_section.contains("| `ptrace` | 0 | 0 | 1 | 1 |")
         || !status_section.contains("| `verify` | 0 / 1 | 0 | 0 | 1 | 1 |")
     {
@@ -12981,7 +12979,9 @@ fn self_test() -> Result<(), String> {
         selected_custom: BTreeSet::new(),
     };
     if retained_import_cells(&red_import_fixture) != BTreeSet::from([validate_id.clone()]) {
-        return Err("an applicable cell not selected by full was excluded from retained import".into());
+        return Err(
+            "an applicable cell not selected by full was excluded from retained import".into(),
+        );
     }
 
     let rows = BTreeMap::from([(
@@ -14756,9 +14756,7 @@ fn self_test() -> Result<(), String> {
     if !command_tracked
         .cells
         .iter()
-        .any(|cell| {
-            cell.id == import_parity_id && cell.status != CellStatus::NotApplicable
-        })
+        .any(|cell| cell.id == import_parity_id && cell.status != CellStatus::NotApplicable)
     {
         return Err("parity retirement fixture requires the existing applicable KVM cell".into());
     }
@@ -21108,7 +21106,11 @@ mod baseline_resolution_tests {
     fn unknown_applicability_and_unproven_stamp_verdicts_remain_readable_and_refused() {
         let check = identity("BitwiseInfoV1", None);
         let full = serde_json::to_value(stamp("does-not-exist", Some(check.clone()))).unwrap();
-        for field in ["enabled_when_tested", "comparison_verdict"] {
+        for field in ["applicable_when_tested", "comparison_verdict"] {
+            assert!(
+                full.get(field).is_some(),
+                "serialized fixture is missing {field}"
+            );
             for explicit_null in [false, true] {
                 let mut legacy = full.clone();
                 if explicit_null {
