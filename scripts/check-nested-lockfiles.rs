@@ -655,6 +655,92 @@ esac
     }
 
     #[test]
+    fn production_prepare_reports_compiler_json_errors_without_publishing() {
+        for kind in ["rendered", "message", "malformed"] {
+            let fixture = production_fixture(FetchMutation::None);
+            write_executable(
+                &fixture.fake_bin.join("cargo"),
+                r#"#!/usr/bin/env bash
+set -euo pipefail
+command_name=${1:?}
+shift
+manifest=
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --manifest-path) manifest=$2; shift 2 ;;
+        *) shift ;;
+    esac
+done
+case $command_name in
+    metadata)
+        for package_manifest in "${manifest%/*}"/*/Cargo.toml; do
+            jq -n --arg manifest "$package_manifest" \
+                '{packages: [{manifest_path: $manifest, targets: [{kind: ["bin"], name: "fixture"}]}]}'
+        done
+        ;;
+    clippy|build) exit 0 ;;
+    test)
+        case ${FIXTURE_DIAGNOSTIC_KIND:?} in
+            rendered)
+                printf '%s\n' '{"reason":"compiler-message","message":{"level":"error","rendered":"error[E9999]: fixture compiler type mismatch\n","message":"fixture plain detail"}}'
+                ;;
+            message)
+                printf '%s\n' '{"reason":"compiler-message","message":{"level":"error","rendered":null,"message":"fixture plain detail"}}'
+                ;;
+            malformed) printf '%s\n' 'not compiler JSON' ;;
+            *) exit 99 ;;
+        esac
+        echo 'cargo fixture: could not compile test due to 1 previous error' >&2
+        exit 101
+        ;;
+    *) echo "unexpected fixture cargo command: $command_name" >&2; exit 99 ;;
+esac
+"#,
+            );
+            let published = fixture.root.join("target/ci/rust-scripts");
+            fs::create_dir_all(&published).unwrap();
+            fs::write(published.join("sentinel"), b"previous prepared artifacts").unwrap();
+            let path = env::join_paths(
+                std::iter::once(fixture.fake_bin.clone())
+                    .chain(env::split_paths(&env::var_os("PATH").unwrap())),
+            )
+            .unwrap();
+            let output = Command::new(fixture.root.join("ci/prepare-rust-scripts.sh"))
+                .current_dir(&fixture.root)
+                .env("PATH", path)
+                .env(
+                    "HERMIT_REAL_RUST_SCRIPT",
+                    fixture.fake_bin.join("rust-script"),
+                )
+                .env("FIXTURE_JOURNAL", &fixture.journal)
+                .env("FIXTURE_DIAGNOSTIC_KIND", kind)
+                .output()
+                .expect("run real producer with failed compiler fixture");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(1), "{kind}: {stderr}");
+            assert!(
+                stderr.contains("could not compile test due to 1 previous error"),
+                "{stderr}"
+            );
+            assert!(stderr.contains("prepare-rust-scripts: FAIL"), "{stderr}");
+            let cause = match kind {
+                "rendered" => "error[E9999]: fixture compiler type mismatch",
+                "message" => "fixture plain detail",
+                "malformed" => "could not decode compiler diagnostics",
+                _ => unreachable!(),
+            };
+            assert!(stderr.contains(cause), "{kind}: {stderr}");
+            assert_eq!(
+                fs::read(published.join("sentinel")).unwrap(),
+                b"previous prepared artifacts"
+            );
+            assert_eq!(fs::read_dir(&published).unwrap().count(), 1);
+            assert!(!published.join("stamp").exists());
+            assert!(!published.join("manifest.tsv").exists());
+        }
+    }
+
+    #[test]
     fn nested_workspace_list_is_non_empty() {
         assert!(
             !NESTED_WORKSPACES.is_empty(),

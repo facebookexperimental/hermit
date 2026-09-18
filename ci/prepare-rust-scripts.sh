@@ -362,6 +362,13 @@ test_json=$packages/tests.jsonl
 if ! cargo test --no-run --message-format=json \
     --manifest-path "$workspace_manifest" "${test_package_args[@]}" \
     --target-dir "$build_target" >"$test_json" 2>"$output"; then
+    # Cargo writes rendered compiler errors to JSON stdout in this mode, while
+    # stderr may contain only the final error count. Retain the actual cause
+    # before the generated package directory is removed by ordinary cleanup.
+    if ! jq -r 'select(.reason == "compiler-message" and .message.level == "error")
+        | (.message.rendered // .message.message)' "$test_json" >&2; then
+        printf 'prepare-rust-scripts: could not decode compiler diagnostics from %s\n' "$test_json" >&2
+    fi
     report_cargo_failure 'the generated rust-script workspace' "$workspace_manifest" "$output" \
         'build test harnesses for' || exit $?
 fi

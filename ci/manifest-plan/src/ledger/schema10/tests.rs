@@ -1090,16 +1090,32 @@ fn the_live_row_decode_refuses_a_compared_verdict_whose_binding_is_inconsistent(
 fn legacy_fixture(name: &str) -> (HistoryRow, Vec<u8>, Vec<u8>, Vec<u8>) {
     let (row, plan, cells, tests): (&str, &[u8], &[u8], &[u8]) = match name {
         "ordinary-only" => (
-            include_str!("fixtures/legacy/ordinary-only-row.json"),
-            include_bytes!("fixtures/legacy/ordinary-only-plan.json"),
-            include_bytes!("fixtures/legacy/ordinary-only-cells.jsonl"),
-            include_bytes!("fixtures/legacy/ordinary-only-tests.jsonl"),
+            include_str!(
+                "../../../../../tests/fixtures/ledger-schema10/legacy/ordinary-only-row.json"
+            ),
+            include_bytes!(
+                "../../../../../tests/fixtures/ledger-schema10/legacy/ordinary-only-plan.json"
+            ),
+            include_bytes!(
+                "../../../../../tests/fixtures/ledger-schema10/legacy/ordinary-only-cells.jsonl"
+            ),
+            include_bytes!(
+                "../../../../../tests/fixtures/ledger-schema10/legacy/ordinary-only-tests.jsonl"
+            ),
         ),
         "reference-diverged" => (
-            include_str!("fixtures/legacy/reference-diverged-row.json"),
-            include_bytes!("fixtures/legacy/reference-diverged-plan.json"),
-            include_bytes!("fixtures/legacy/reference-diverged-cells.jsonl"),
-            include_bytes!("fixtures/legacy/reference-diverged-tests.jsonl"),
+            include_str!(
+                "../../../../../tests/fixtures/ledger-schema10/legacy/reference-diverged-row.json"
+            ),
+            include_bytes!(
+                "../../../../../tests/fixtures/ledger-schema10/legacy/reference-diverged-plan.json"
+            ),
+            include_bytes!(
+                "../../../../../tests/fixtures/ledger-schema10/legacy/reference-diverged-cells.jsonl"
+            ),
+            include_bytes!(
+                "../../../../../tests/fixtures/ledger-schema10/legacy/reference-diverged-tests.jsonl"
+            ),
         ),
         _ => panic!("unknown preserved legacy fixture: {name}"),
     };

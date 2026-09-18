@@ -23856,7 +23856,7 @@ mod refusal_detail_tests {
     /// The real refusal that stranded seven hours of validation on 2026-09-17,
     /// taken verbatim from run 1838's log rather than invented, so the bound
     /// and the shape are sized against the thing they exist for.
-    const REAL: &str = "compatibility scorecard: parity history changes candidate identity for portable/backend-parity-c/backend-parity-c/aio-refusal/verify@kvm at /home/newton/work/dev-hermit/ignored/validate/artifacts/validate-ops-tick-158a89f6217b-088d91951315/e2e/portable/manifest_backend_parity_c/results.jsonl, source 158a89f6217b25db9540237f9c1e256cdbaf785c, run validate-ops-tick-158a89f6217b-088d91951315, outer attempt 2";
+    const REAL: &str = include_str!("../tests/fixtures/scorecard-writeback/refusal.txt");
 
     #[test]
     fn the_real_refusal_survives_into_the_record_and_names_its_cell() {

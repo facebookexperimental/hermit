@@ -1104,7 +1104,7 @@ mod tests {
         let retained: Value =
             serde_json::from_str(include_str!("fixtures/schema10-matched-cell.json")).unwrap();
         let legacy_fixture: Value = serde_json::from_str(include_str!(
-            "../../ci/manifest-plan/src/ledger/schema10/fixtures/legacy/ordinary-only-row.json"
+            "../../tests/fixtures/ledger-schema10/legacy/ordinary-only-row.json"
         ))
         .unwrap();
         let completed = &retained["backend_parity"]["attempts"][0];
@@ -1379,7 +1379,7 @@ mod tests {
         // The ordinary writer has its own selected-row branch. The schema-7
         // retry tests below do not prove that V1 binds the row it selected.
         let ordinary_plan: ConstructedValidationPlanV10 = serde_json::from_str(include_str!(
-            "../../ci/manifest-plan/src/ledger/schema10/fixtures/legacy/ordinary-only-plan.json"
+            "../../tests/fixtures/ledger-schema10/legacy/ordinary-only-plan.json"
         ))
         .unwrap();
         let selected = ordinary_plan.planned_cells().unwrap();
