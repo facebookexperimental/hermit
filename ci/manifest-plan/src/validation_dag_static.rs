@@ -205,7 +205,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Prepared inventories retain all prior identities and add four reporting
     // tests to regular crates and nine to Hermit's library/binary selection.
     // Nine admission-context/nested-ID controls extend the measured 533-test set.
-    ("test.regular_crates", 542),
+    // Six portable-context controls extend the measured 542-test set.
+    ("test.regular_crates", 548),
     ("test.hermit_unit", 707),
     ("test.detcore_unit", 704),
     ("test.detcore_misc", 27),
@@ -239,7 +240,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 24),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 542),
+    ("test.regular_crates_on_host", 548),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];

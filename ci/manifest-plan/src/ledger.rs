@@ -155,8 +155,8 @@ pub struct HistoryRow {
     /// order followed by this `BTreeMap`'s key order. Moving `tree` into an
     /// ordinary struct field would change existing receipt digests without
     /// changing their meaning.
-    #[serde(flatten, deserialize_with = "admission::deserialize_extensions")]
-    pub extra: BTreeMap<String, Value>,
+    #[serde(flatten)]
+    pub extra: HistoryExtensions,
 }
 
 impl HistoryRow {
