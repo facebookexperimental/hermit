@@ -13505,6 +13505,7 @@ exec env -u HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER -u HERMIT_TEST_WALL_TIMEOUT_MULTI
         std::fs::create_dir_all(&copied_scripts).unwrap();
         for name in [
             "run-split-validate.sh",
+            "retry-fetch.sh",
             "run-in-pinned-root.sh",
             "image.digest",
         ] {
@@ -22549,6 +22550,7 @@ mod committed_selection_preservation_tests {
         let fixture = scratch.path();
         for path in [
             "ci/hermetic/run-split-validate.sh",
+            "ci/hermetic/retry-fetch.sh",
             "ci/check-shard-coverage.sh",
             "ci/expected-e2e-plan.json",
             ".github/workflows/ci-portable.yml",
