@@ -555,6 +555,242 @@ pub struct CellResult {
     pub mode: String,
     pub backend: String,
     pub cell_verdict: CellVerdict,
+    /// The exact series event this verdict's evidence was selected from.
+    ///
+    /// FORWARD-ONLY AND DELIBERATELY ABSENT ON OLD ROWS. Every row written
+    /// before this field existed is UNBOUND, and `None` is how it says so --
+    /// there is no inference from timestamps, ordering, result equality or a
+    /// guessed retry that could recover the identity, and every one of those
+    /// would manufacture a foreign key rather than record one. A reader must
+    /// render "unbound" and must not count such a row as resolved.
+    ///
+    /// A NEW row omitting it would read exactly like an old one, so absence is
+    /// fail-open by itself; `require_bound_compared_cells` is the guard that
+    /// closes it, and the producer is required to pass that guard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_binding: Option<CellEvidenceBinding>,
+}
+
+impl CellResult {
+    pub fn identity(&self) -> CellIdentity {
+        CellIdentity {
+            lane: self.lane.clone(),
+            category: self.category.clone(),
+            test: self.test.clone(),
+            mode: self.mode.clone(),
+            backend: self.backend.clone(),
+        }
+    }
+
+    /// Whether this verdict states a comparison, which is the population the
+    /// binding must cover. A cell that performs no comparison by design, or
+    /// that was unavailable, read no attempt and has nothing to bind.
+    pub fn is_compared(&self) -> bool {
+        matches!(
+            self.cell_verdict,
+            CellVerdict::ComparedAndMatched { .. } | CellVerdict::ComparedAndDiverged { .. }
+        )
+    }
+}
+
+/// The exact source ATTEMPT a terminal cell verdict was computed from.
+///
+/// ⚠️ THIS DELIBERATELY DOES NOT CARRY A PUBLISHED `event_id`, AND AN EARLIER
+/// VERSION OF IT DID. That version predicted the identity by digesting these
+/// coordinates the way the series producer does. The prediction is unsound for
+/// exactly the population this type covers, and the correction is worth stating
+/// rather than quietly dropping:
+///
+/// * the series producer derives `event_id` AFTER collapsing equal rows;
+/// * collapse folds a row if and only if its payload carries no `attempt` key;
+/// * a validate row gets that key if and only if it has no-verdict evidence.
+///
+/// A COMPARED verdict has a verdict, so it never carries the key, so it is
+/// always collapsible. Two attempts with equal payloads publish ONE event at
+/// `run_index: 1, last_run_index: 2` and there is no attempt-2 event. MEASURED
+/// over the tracked shards: 170 published validate events fold attempts 1 and
+/// 2, 152 of them compared, and **152 of 152 of the predicted `run_index: 2`
+/// identities are absent from the corpus**. The earlier design named a
+/// nonexistent event for every retried compared cell, self-consistently, which
+/// is why self-consistency was not the safety property it looked like.
+///
+/// So this records what the producer actually knows -- which attempt it read --
+/// and leaves resolution to a reader that holds the published rows. THE
+/// RESOLUTION RULE, because it is not obvious and getting it wrong reintroduces
+/// the same defect: a published event carries the half-open-free interval
+/// `[run_index, last_run_index]` of the attempts it represents, so the bound
+/// attempt resolves to the event whose interval CONTAINS it, not to the event
+/// whose `run_index` equals it.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CellEvidenceBinding {
+    pub run_id: String,
+    pub producer: String,
+    /// `test/mode/backend`. The series cell key deliberately omits lane and
+    /// category, so this is NOT the enclosing `CellIdentity` rendered.
+    pub series_cell: String,
+    /// The Hermit tree the bound attempt executed at.
+    pub tree: String,
+    /// The attempt ordinal the verdict was computed from. For the validation
+    /// driver this is also the pre-collapse `run_index` the series producer
+    /// would assign, but it is NOT the published `run_index` when the row was
+    /// folded -- see the resolution rule above.
+    pub selected_attempt: u64,
+}
+
+/// The series producer name the validation driver emits under.
+pub const VALIDATE_SERIES_PRODUCER: &str = "validate";
+
+impl CellEvidenceBinding {
+    /// The series cell key for a five-part cell identity.
+    ///
+    /// `naked` cells with no backend are published as `native`, matching the
+    /// series producer. Every other mode requires the backend it was given.
+    pub fn series_cell_key(identity: &CellIdentity) -> String {
+        let backend = if identity.backend.is_empty() && identity.mode == "naked" {
+            "native"
+        } else {
+            identity.backend.as_str()
+        };
+        format!("{}/{}/{}", identity.test, identity.mode, backend)
+    }
+
+    /// Bind a COMPARED terminal verdict produced by the validation driver to
+    /// the attempt it read.
+    pub fn for_validate_compared(
+        run_id: &str,
+        identity: &CellIdentity,
+        tree: &str,
+        selected_attempt: u64,
+    ) -> Self {
+        Self {
+            run_id: run_id.to_string(),
+            producer: VALIDATE_SERIES_PRODUCER.to_string(),
+            series_cell: Self::series_cell_key(identity),
+            tree: tree.to_string(),
+            selected_attempt,
+        }
+    }
+
+    /// Reproduce the series producer's event identity for one PUBLISHED row's
+    /// coordinates.
+    ///
+    /// ⚠️ READER-SIDE ONLY. Verified against the whole published corpus --
+    /// 71,607 of 71,607 rows recompute from their own payload, 0 differ -- so
+    /// this is exact for coordinates taken FROM a published row. It is NOT a
+    /// way to predict the identity a future row will get: `run_index` after
+    /// collapse is the fold's FIRST attempt, which a producer holding one
+    /// attempt cannot know. Callers resolving a binding must select the
+    /// published row by interval and may then digest THAT row's coordinates.
+    pub fn derive_event_id(
+        run_id: &str,
+        producer: &str,
+        series_cell: &str,
+        tree: &str,
+        run_index: u64,
+        attempt: Option<u64>,
+    ) -> String {
+        // Built as an ordered list rather than a serde struct so the key order
+        // is the sorted order the producer emits and stays visible here.
+        let mut fields: Vec<(&str, String)> = Vec::with_capacity(6);
+        if let Some(attempt) = attempt {
+            fields.push(("attempt", attempt.to_string()));
+        }
+        fields.push(("cell", json_string(series_cell)));
+        fields.push(("producer", json_string(producer)));
+        fields.push(("run_id", json_string(run_id)));
+        fields.push(("run_index", run_index.to_string()));
+        fields.push(("tree", json_string(tree)));
+        let body = fields
+            .iter()
+            .map(|(key, value)| format!("{}:{value}", json_string(key)))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "series-{:x}",
+            Sha256::digest(format!("{{{body}}}").as_bytes())
+        )
+    }
+
+    /// Whether a published row's fold interval represents this bound attempt.
+    ///
+    /// `last_run_index` is absent on an unfolded row, where the interval is the
+    /// single `run_index`.
+    pub fn is_represented_by(&self, run_index: u64, last_run_index: Option<u64>) -> bool {
+        let last = last_run_index.unwrap_or(run_index);
+        run_index <= self.selected_attempt && self.selected_attempt <= last
+    }
+
+    /// Refuse a binding that does not belong to the run, tree and cell the
+    /// enclosing evidence claims.
+    ///
+    /// ⚠️ THE ATTEMPT AXIS IS NOT CHECKED HERE AND MUST NOT BE CLAIMED HERE.
+    /// An earlier version took the expected attempt as a parameter and every
+    /// live caller passed the binding's own value, so the comparison was
+    /// between one expression and itself and could never fail -- five distinct
+    /// ordinals were all accepted. The attempt is checked by
+    /// `CellResultV10`'s own `selected_attempt` at decode, and independently
+    /// re-derived from the attempt history for parity cells only. Ordinary
+    /// cells carry a producer assertion that nothing in the ledger can refute;
+    /// the end-to-end resolution against published rows is what would.
+    pub fn verify_against(
+        &self,
+        run_id: &str,
+        tree: &str,
+        identity: &CellIdentity,
+    ) -> Result<(), String> {
+        if self.producer != VALIDATE_SERIES_PRODUCER {
+            return Err(format!(
+                "cell evidence binding names producer {}, not {VALIDATE_SERIES_PRODUCER}",
+                self.producer
+            ));
+        }
+        if self.run_id != run_id {
+            return Err(format!(
+                "cell evidence binding is for run {}, not {run_id}",
+                self.run_id
+            ));
+        }
+        if self.tree != tree {
+            return Err(format!(
+                "cell evidence binding is for tree {}, not {tree}",
+                self.tree
+            ));
+        }
+        let expected_cell = Self::series_cell_key(identity);
+        if self.series_cell != expected_cell {
+            return Err(format!(
+                "cell evidence binding is for cell {}, not {expected_cell}",
+                self.series_cell
+            ));
+        }
+        if self.selected_attempt == 0 {
+            return Err("cell evidence binding names attempt 0; attempts are one-based".into());
+        }
+        Ok(())
+    }
+}
+
+/// Match the series producer's Python `json.dumps` default `ensure_ascii=True`.
+/// Serde supplies JSON quote and control escapes; Python additionally escapes
+/// DEL and every non-ASCII scalar as lowercase UTF-16 code units. Supplementary
+/// scalars therefore need two surrogate escapes, not literal UTF-8 bytes.
+fn json_string(value: &str) -> String {
+    use std::fmt::Write;
+
+    let encoded = serde_json::to_string(value).expect("a string always encodes as JSON");
+    let mut ascii = String::with_capacity(encoded.len());
+    for scalar in encoded.chars() {
+        if scalar < '\u{7f}' {
+            ascii.push(scalar);
+        } else {
+            let mut units = [0; 2];
+            for unit in scalar.encode_utf16(&mut units) {
+                write!(ascii, "\\u{unit:04x}").expect("writing into a String cannot fail");
+            }
+        }
+    }
+    ascii
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -760,6 +996,11 @@ impl From<CellResultV8> for CellResult {
             mode: value.mode,
             backend: value.backend,
             cell_verdict: value.cell_verdict.into(),
+            // Schema 8 predates the binding. Lifting an old row leaves it
+            // UNBOUND rather than reconstructing an identity from the
+            // coordinates around it, which is the historical inference the
+            // requirement forbids.
+            evidence_binding: None,
         }
     }
 }
@@ -820,11 +1061,86 @@ impl CellResultsEvidenceV8 {
 /// this reader does not understand yet. Exact versioned shapes precede the raw
 /// fallback so supported rows retain typed access while unknown extensions stay
 /// readable.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum CellResultsValue {
     Typed(CellResultsEvidence),
     Other(Value),
+}
+
+impl<'de> Deserialize<'de> for CellResultsValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // V10 dispatch happens after this value is retained in HistoryRow.
+        // Refuse duplicate contract markers here, before Value can erase them.
+        // Other unknown shapes keep the same raw fallback as the old untagged
+        // enum; this is not a second artifact or historical-schema decoder.
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Value;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("cell evidence with at most one binding_contract marker")
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Value, E> {
+                Ok(Value::Null)
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Value, E> {
+                Ok(Value::Bool(value))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Value, E> {
+                Ok(Value::from(value))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Value, E> {
+                Ok(Value::from(value))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Value, E> {
+                serde_json::Number::from_f64(value)
+                    .map(Value::Number)
+                    .ok_or_else(|| E::custom("non-finite cell evidence number"))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Value, E> {
+                Ok(Value::String(value.into()))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Value, A::Error> {
+                let mut values = Vec::new();
+                while let Some(value) = seq.next_element::<Value>()? {
+                    values.push(value);
+                }
+                Ok(Value::Array(values))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Value, A::Error> {
+                let mut values = serde_json::Map::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "binding_contract" && values.contains_key(&key) {
+                        return Err(serde::de::Error::custom(
+                            "duplicate field `binding_contract` in cell evidence",
+                        ));
+                    }
+                    values.insert(key, map.next_value()?);
+                }
+                Ok(Value::Object(values))
+            }
+        }
+        let raw = deserializer.deserialize_any(Visitor)?;
+        Ok(match serde_json::from_value(raw.clone()) {
+            Ok(value) => Self::Typed(value),
+            Err(_) => Self::Other(raw),
+        })
+    }
 }
 
 impl CellResultsValue {
@@ -2797,5 +3113,289 @@ mod tests {
         let mut extra = row;
         extra["extra"] = serde_json::json!(true);
         assert!(serde_json::from_value::<TestResultArtifactRow>(extra).is_err());
+    }
+}
+
+#[cfg(test)]
+mod cell_evidence_binding_tests {
+    use super::*;
+
+    fn identity(test: &str, mode: &str, backend: &str) -> CellIdentity {
+        CellIdentity {
+            lane: "portable".into(),
+            category: "c-programs".into(),
+            test: test.into(),
+            mode: mode.into(),
+            backend: backend.into(),
+        }
+    }
+
+    /// The derivation must be the series producer's, not merely a digest of its
+    /// own. These vectors are REAL published rows taken verbatim from the
+    /// tracked shards, three carrying an attempt and three not, so both
+    /// encodings are pinned against data rather than against this code.
+    #[test]
+    fn the_derivation_reproduces_real_published_event_identities() {
+        /// (run_id, producer, cell, tree, run_index, attempt, event_id).
+        type Vector = (
+            &'static str,
+            &'static str,
+            &'static str,
+            &'static str,
+            u64,
+            Option<u64>,
+            &'static str,
+        );
+        let vectors: [Vector; 6] = [
+            (
+                "pressure-e12c472d22d2-red-verify-3x-20260830T151049Z",
+                "pressure-test",
+                "shared-futex-c/qemu-init/verify/ptrace",
+                "e12c472d22d2725aa1e58b7169c4a44bf82fc890",
+                3,
+                Some(1),
+                "series-00b21d40ff83452b02f8c4f7e12d26f08b45a9e95d34f1748f570004f99b5092",
+            ),
+            (
+                "pressure-e12c472d22d2-red-verify-3x-20260830T151049Z",
+                "pressure-test",
+                "backend-parity-c/fd-duplication/verify/dbt",
+                "e12c472d22d2725aa1e58b7169c4a44bf82fc890",
+                1,
+                Some(2),
+                "series-00b28bf1cb59532e6a6729b6e3e26844b5d28e92dfb28ecdab28ef5553a87c64",
+            ),
+            (
+                "pressure-e12c472d22d2-red-verify-3x-20260830T151049Z",
+                "pressure-test",
+                "chaos-c/lock-granularity/verify/sabre",
+                "e12c472d22d2725aa1e58b7169c4a44bf82fc890",
+                1,
+                Some(1),
+                "series-00c667343cb4402d4e4009c4cd2e6b0322c0f3d282af6171e07d6cf5023a9a19",
+            ),
+            (
+                "git-pipe-baseline-cycle-v2",
+                "pressure-test",
+                "applications/git-repository-workflow/verify/ptrace",
+                "dee8cf49ce6a7e3e9e2c87c930f3aa55ae83da18",
+                18,
+                None,
+                "series-34f5c99e64c04f2efd989350d48d254915492ea805da537a8bd156078be9ce1c",
+            ),
+            (
+                "git-pipe-baseline-cycle-v2",
+                "pressure-test",
+                "applications/git-repository-workflow/verify/ptrace",
+                "dee8cf49ce6a7e3e9e2c87c930f3aa55ae83da18",
+                8,
+                None,
+                "series-4dd18413e91e3570edc563e1ccb66be9638257002fe1bbdd946dde119c71838d",
+            ),
+            (
+                "git-pipe-baseline-cycle-v2",
+                "pressure-test",
+                "applications/git-repository-workflow/verify/ptrace",
+                "dee8cf49ce6a7e3e9e2c87c930f3aa55ae83da18",
+                16,
+                None,
+                "series-5fb123dddfab57d4a5a87c90df843bb72cfa991a2447cad3ff17ca7d8e6242ff",
+            ),
+        ];
+        for (run_id, producer, cell, tree, run_index, attempt, expected) in vectors {
+            assert_eq!(
+                CellEvidenceBinding::derive_event_id(
+                    run_id, producer, cell, tree, run_index, attempt
+                ),
+                expected,
+                "derivation drifted from the published identity for {cell} run_index {run_index}"
+            );
+        }
+
+        // Synthetic golden controls from the actual Python identity expression
+        // at parent 45fa84a89d773af4816afc02354adbb62952553f,
+        // ci-hub/series/series.py:3653. They are separate from the six published
+        // ASCII events above. Cover BMP, supplementary surrogate pairs (at both
+        // range endpoints), DEL, and JSON quote/backslash/control escaping.
+        let unicode_vectors: [Vector; 3] = [
+            (
+                "validate-caf\u{e9}-\u{4e2d}",
+                "validate",
+                "backend-parity-c/identity/verify/kvm",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                1,
+                Some(1),
+                "series-f3f6ebb451fc0b5ee6feb8fcea9749c7598133b12f430b77b90654abe1396d78",
+            ),
+            (
+                "validate-\u{1f680}-\u{10000}-\u{10ffff}",
+                "validate",
+                "backend-parity-c/identity/verify/kvm",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                2,
+                None,
+                "series-79fe7f02b6fe0b917fa1ee883ba616593e6e652b445c7b672e0361e46288d1ad",
+            ),
+            (
+                "validate-\u{7f}-\u{0}\u{8}\u{c}\u{a}\u{d}\u{9}\"\\",
+                "validate",
+                "backend-parity-c/identity/verify/kvm",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                3,
+                Some(3),
+                "series-1e748ca8c190012ee45a76e973760feeb4054a2e047d1b2550217c814238bed1",
+            ),
+        ];
+        for (run_id, producer, cell, tree, run_index, attempt, expected) in unicode_vectors {
+            assert_eq!(
+                CellEvidenceBinding::derive_event_id(
+                    run_id, producer, cell, tree, run_index, attempt
+                ),
+                expected,
+                "derivation differs from the Python producer's Unicode encoding"
+            );
+        }
+    }
+
+    /// THE REGRESSION FOR THE COLLAPSE DEFECT, on a real folded row.
+    ///
+    /// `validate-hermit-147-green-bar-baseline-26f5bc2de3d3` published ONE
+    /// event for attempts 1 and 2 of this cell, at `run_index: 1,
+    /// last_run_index: 2`. An earlier version of this type predicted the
+    /// identity from the SELECTED attempt, so a verdict computed from attempt 2
+    /// named `run_index: 2` -- an identity that is absent from the corpus, and
+    /// absent for 152 of 152 such rows.
+    #[test]
+    fn a_folded_row_is_resolved_by_interval_and_not_by_the_selected_attempt() {
+        const RUN: &str = "validate-hermit-147-green-bar-baseline-26f5bc2de3d3";
+        const CELL: &str = "system-utils/clock-determinism/custom/ptrace";
+        const TREE: &str = "26f5bc2de3d328b64c41c42ef093ecb9d89e98ab";
+        const PUBLISHED: &str =
+            "series-041bf9284137fb073e8d0e154a4b6ce64e8a32cf889dc33c9db3ddf4e1b8e9d5";
+
+        // The published event is the FOLD, at run_index 1.
+        assert_eq!(
+            CellEvidenceBinding::derive_event_id(RUN, "validate", CELL, TREE, 1, None),
+            PUBLISHED
+        );
+        // Predicting from the selected attempt 2 yields a DIFFERENT identity,
+        // and that identity is the one measured absent from the corpus. This
+        // assertion is the defect, pinned so it cannot come back.
+        assert_ne!(
+            CellEvidenceBinding::derive_event_id(RUN, "validate", CELL, TREE, 2, None),
+            PUBLISHED
+        );
+
+        // What the binding records instead, and how it resolves.
+        let binding = CellEvidenceBinding::for_validate_compared(
+            RUN,
+            &identity("system-utils/clock-determinism", "custom", "ptrace"),
+            TREE,
+            2,
+        );
+        assert_eq!(binding.series_cell, CELL);
+        assert!(
+            binding.is_represented_by(1, Some(2)),
+            "the fold [1,2] represents attempt 2"
+        );
+        // Controls, so the interval is not accepting everything: a fold that
+        // stops short, and an unfolded row at the wrong index.
+        assert!(!binding.is_represented_by(1, Some(1)));
+        assert!(!binding.is_represented_by(3, Some(4)));
+        assert!(!binding.is_represented_by(1, None));
+        assert!(
+            CellEvidenceBinding::for_validate_compared(
+                RUN,
+                &identity("system-utils/clock-determinism", "custom", "ptrace"),
+                TREE,
+                1,
+            )
+            .is_represented_by(1, None),
+            "an unfolded attempt-1 row represents attempt 1"
+        );
+    }
+
+    #[test]
+    fn a_naked_cell_without_a_backend_takes_the_published_native_key() {
+        assert_eq!(
+            CellEvidenceBinding::series_cell_key(&identity("prog", "naked", "")),
+            "prog/naked/native"
+        );
+        assert_eq!(
+            CellEvidenceBinding::series_cell_key(&identity("prog", "verify", "ptrace")),
+            "prog/verify/ptrace"
+        );
+    }
+
+    fn bound() -> CellEvidenceBinding {
+        CellEvidenceBinding::for_validate_compared(
+            "run-1",
+            &identity("prog", "verify", "ptrace"),
+            "a".repeat(40).as_str(),
+            3,
+        )
+    }
+
+    #[test]
+    fn verify_against_refuses_each_axis_it_claims_and_accepts_a_correct_binding() {
+        let tree = "a".repeat(40);
+        let cell = identity("prog", "verify", "ptrace");
+
+        bound()
+            .verify_against("run-1", &tree, &cell)
+            .expect("a correct binding is accepted");
+
+        let error = bound().verify_against("run-2", &tree, &cell).unwrap_err();
+        assert!(error.contains("is for run run-1"), "{error}");
+
+        let error = bound()
+            .verify_against("run-1", &"b".repeat(40), &cell)
+            .unwrap_err();
+        assert!(error.contains("is for tree"), "{error}");
+
+        let error = bound()
+            .verify_against("run-1", &tree, &identity("prog", "verify", "dbt"))
+            .unwrap_err();
+        assert!(error.contains("is for cell prog/verify/ptrace"), "{error}");
+
+        let mut foreign_producer = bound();
+        foreign_producer.producer = "pressure-test".into();
+        let error = foreign_producer
+            .verify_against("run-1", &tree, &cell)
+            .unwrap_err();
+        assert!(error.contains("names producer pressure-test"), "{error}");
+
+        let mut zero = bound();
+        zero.selected_attempt = 0;
+        let error = zero.verify_against("run-1", &tree, &cell).unwrap_err();
+        assert!(error.contains("attempts are one-based"), "{error}");
+
+        // The control in the other direction: a correctly rebuilt binding for
+        // each perturbed axis is ACCEPTED, so the refusals above are not
+        // passing because everything is refused.
+        for (run_id, cell, attempt) in [
+            ("run-2", identity("prog", "verify", "ptrace"), 3),
+            ("run-1", identity("prog", "verify", "dbt"), 3),
+            ("run-1", identity("prog", "verify", "ptrace"), 1),
+        ] {
+            CellEvidenceBinding::for_validate_compared(run_id, &cell, &tree, attempt)
+                .verify_against(run_id, &tree, &cell)
+                .expect("a correctly built binding must be accepted");
+        }
+    }
+
+    #[test]
+    fn the_binding_round_trips_and_rejects_an_unknown_field() {
+        let binding = bound();
+        let encoded = serde_json::to_value(&binding).unwrap();
+        // It must not carry a predicted published identity at all.
+        assert!(encoded.get("event_id").is_none(), "{encoded}");
+        assert_eq!(
+            serde_json::from_value::<CellEvidenceBinding>(encoded.clone()).unwrap(),
+            binding
+        );
+        let mut extra = encoded;
+        extra["surprise"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<CellEvidenceBinding>(extra).is_err());
     }
 }

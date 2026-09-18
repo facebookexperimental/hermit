@@ -1,0 +1,62 @@
+{
+  "files": {
+    "ordinary-only-cells.jsonl": {
+      "bytes": 860,
+      "parent_blob": "5a27267ad7920e2bbf00789de8e394651a918836",
+      "parent_path": "ci-hub/validate/tests/fixtures/schema10/ordinary-only-cells.jsonl",
+      "sha256": "5947d3a8601fbba9aef9358023f97fe7ef08e1090502c9ed8beed537729a1f4b"
+    },
+    "ordinary-only-plan.json": {
+      "bytes": 2353,
+      "parent_blob": "e93b430a65aaa7131ddf164eb8b9719074bbecf6",
+      "parent_path": "ci-hub/validate/tests/fixtures/schema10/ordinary-only-plan.json",
+      "sha256": "0d06b7720589e999cbeb49f42ade9a52a106737fe44b706453b0d479d970e6d7"
+    },
+    "ordinary-only-row.json": {
+      "bytes": 2983,
+      "parent_blob": "dea75f6cd57abd01d49c244beeaa4bb758777fb3",
+      "parent_path": "ci-hub/validate/tests/fixtures/schema10/ordinary-only-row.json",
+      "sha256": "3edb4e199ea7b8d4e5668874cf2932739621312d96257e4fce7a955496041cc0"
+    },
+    "ordinary-only-tests.jsonl": {
+      "bytes": 243,
+      "parent_blob": "223119a68297726b663c04cccdf7043eaeaabf36",
+      "parent_path": "ci-hub/validate/tests/fixtures/schema10/ordinary-only-tests.jsonl",
+      "sha256": "6c65aad8be1f3c8a74cc4955e1c3e2a69b27497f42a8066659b714861ce77a7d"
+    },
+    "reference-diverged-cells.jsonl": {
+      "bytes": 5887,
+      "parent_blob": "5fa2918549ad9e158ac14a131391022d55028780",
+      "parent_path": "ci-hub/validate/tests/fixtures/schema10/reference-diverged-cells.jsonl",
+      "sha256": "2e44e899a1c585fafa0eb8ccf39b551390523b3852ff6ab64a734213f0e75423"
+    },
+    "reference-diverged-plan.json": {
+      "bytes": 2379,
+      "parent_blob": "9f977a76897a5ecd3663634c35c29c0d7898ec31",
+      "parent_path": "ci-hub/validate/tests/fixtures/schema10/reference-diverged-plan.json",
+      "sha256": "5d58608415594b226023ada6ec57222672a89197bf93c38c615e83b0e9f2b9f4"
+    },
+    "reference-diverged-row.json": {
+      "bytes": 4865,
+      "parent_blob": "a742b12ec87e69e55e609a56d90c08a87280d97e",
+      "parent_path": "ci-hub/validate/tests/fixtures/schema10/reference-diverged-row.json",
+      "sha256": "f55562b08ec04604bb50f8fdc917462459aea97997c12e66edcdc0d3d565a6ec"
+    },
+    "reference-diverged-tests.jsonl": {
+      "bytes": 243,
+      "parent_blob": "223119a68297726b663c04cccdf7043eaeaabf36",
+      "parent_path": "ci-hub/validate/tests/fixtures/schema10/reference-diverged-tests.jsonl",
+      "sha256": "6c65aad8be1f3c8a74cc4955e1c3e2a69b27497f42a8066659b714861ce77a7d"
+    }
+  },
+  "format": "hermit-legacy-schema10-fixture-copy/v1",
+  "parent_commit": "45fa84a89d773af4816afc02354adbb62952553f",
+  "parent_fixture_directory": "ci-hub/validate/tests/fixtures/schema10",
+  "parent_manifest_path": "ci-hub/validate/tests/fixtures/schema10/SHA256SUMS.json",
+  "parent_manifest_sha256": "4821718ba4d479b09ea99cee7e5a20ec8750f289b2b047dcc11a43000118a7f7",
+  "producer_native_record_sha256": "873a5441fa49e9cb0d10b8ead7b215b5cf3ed7246f8a6b9a2cd8c5bda2ab362d",
+  "purpose": "Exact prebinding schema10 parser and artifact-verifier regression inputs; not guest measurements or backend coverage.",
+  "source_head": "73146a90f8f1dd468471ffab448b6b7d71f33bf6",
+  "source_tree": "0dff6f5354eabd11f8b539161f0d5b40c9ce0467",
+  "synthetic": true
+}

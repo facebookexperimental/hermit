@@ -12,6 +12,7 @@ use hermit_manifest_plan::canonical_verdict::InfrastructureError;
 use hermit_manifest_plan::canonical_verdict::Verdict as VerificationVerdict;
 use hermit_manifest_plan::canonical_verdict::VerificationReport;
 use hermit_manifest_plan::ledger::CellIdentity;
+use hermit_manifest_plan::ledger::CellBindingContract;
 use hermit_manifest_plan::ledger::CellResult as LedgerCellResult;
 use hermit_manifest_plan::ledger::CellResultsArtifact;
 use hermit_manifest_plan::ledger::CellResultsEvidence;
@@ -692,6 +693,12 @@ pub fn retain(
                 mode: identity.mode,
                 backend: identity.backend,
                 cell_verdict: cell_verdict(row)?,
+                // The schema-7 shape predates the evidence binding and stays
+                // UNBOUND. Binding is forward-only: `retain_v10` writes it on
+                // the current cumulative evidence, and adding it here would
+                // put a new field in an old schema without the artifact-side
+                // attempt that makes it independently checkable.
+                evidence_binding: None,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -796,6 +803,28 @@ pub fn retain_v10(
     result_root: &Path,
     plan: &hermit_manifest_plan::ledger::ConstructedValidationPlanV10,
 ) -> Result<RetainedCellResults, String> {
+    // Reader support lands first. Production must keep the exact legacy wire
+    // contract until the installed parent readers understand marked bindings.
+    retain_v10_with_contract(parent, result_root, plan, CellBindingContract::LegacyUnbound)
+}
+
+/// Exercise the future writer through its real serializer and publication
+/// checks. Activation requires a later source change, never an environment flag.
+#[cfg(test)]
+pub fn retain_v10_bound(
+    parent: &Path,
+    result_root: &Path,
+    plan: &hermit_manifest_plan::ledger::ConstructedValidationPlanV10,
+) -> Result<RetainedCellResults, String> {
+    retain_v10_with_contract(parent, result_root, plan, CellBindingContract::SelectedAttemptV1)
+}
+
+fn retain_v10_with_contract(
+    parent: &Path,
+    result_root: &Path,
+    plan: &hermit_manifest_plan::ledger::ConstructedValidationPlanV10,
+    binding_contract: CellBindingContract,
+) -> Result<RetainedCellResults, String> {
     use hermit_manifest_plan::ledger::{CellArtifactResultV10, CellBackendParity, CellResultsEvidenceV10};
     let selected = plan.planned_cells()?;
     let selected_set = selected.iter().cloned().collect::<BTreeSet<_>>();
@@ -822,9 +851,14 @@ pub fn retain_v10(
     let mut full_cells = Vec::new();
     for (id, mut rows) in rows {
         rows.sort_by_key(|(attempt, _)| *attempt);
-        let (cell_verdict, backend_parity) = if parity_candidates.contains(&id) {
+        let (cell_verdict, backend_parity, selected_attempt) = if parity_candidates.contains(&id) {
             let parity = CellBackendParity::from_result_rows(&id, &rows)?;
-            (parity.candidate_verdict(&id)?, RequiredNullable::Value(parity))
+            let selected_attempt = parity.candidate_attempt_number(&id)?;
+            (
+                parity.candidate_verdict(&id)?,
+                RequiredNullable::Value(parity),
+                selected_attempt,
+            )
         } else {
             if rows.iter().any(|(_, row)| row.get("backend_parity").is_some_and(|value| !value.is_null())
                 || row.get("attempts").and_then(Value::as_array).is_some_and(|attempts| {
@@ -835,17 +869,27 @@ pub fn retain_v10(
             }
             let outcome = outcome_after_retries(rows.iter().map(|(attempt, row)| Ok((*attempt, string(row, "outcome")?)))
                 .collect::<Result<Vec<_>, String>>()?)?;
-            let row = rows.iter().rev().find(|(_, row)| row.get("outcome").and_then(Value::as_str) == Some(outcome))
-                .map(|(_, row)| row).ok_or("ordinary cell has no selected terminal result")?;
-            (cell_verdict(row)?, RequiredNullable::Null)
+            // The attempt comes from the SAME row the verdict does. Taking it
+            // from anywhere else -- the last attempt, the highest ordinal, the
+            // count -- would name a real published event that is not the one
+            // this verdict was computed from, which is the failure the binding
+            // exists to make impossible.
+            let (selected_attempt, row) = rows
+                .iter()
+                .rev()
+                .find(|(_, row)| row.get("outcome").and_then(Value::as_str) == Some(outcome))
+                .map(|(attempt, row)| (*attempt, row))
+                .ok_or("ordinary cell has no selected terminal result")?;
+            (cell_verdict(row)?, RequiredNullable::Null, selected_attempt)
         };
         full_cells.push(CellArtifactResultV10 { lane: id.lane, category: id.category, test: id.test,
-            mode: id.mode, backend: id.backend, cell_verdict, backend_parity });
+            mode: id.mode, backend: id.backend, cell_verdict, backend_parity,
+            selected_attempt: (binding_contract == CellBindingContract::SelectedAttemptV1).then_some(selected_attempt) });
     }
     let mut bytes = Vec::new();
     let mut cells = Vec::new();
     for cell in &full_cells {
-        cells.push(cell.summary()?);
+        cells.push(cell.summary_for_contract(binding_contract, &plan.run_id, &plan.hermit_sha)?);
         let mut row = serde_json::to_value(cell).map_err(|error| error.to_string())?;
         let object = row.as_object_mut().ok_or("schema 10 full cell is not an object")?;
         object.insert("run_id".into(), Value::String(plan.run_id.clone()));
@@ -859,12 +903,16 @@ pub fn retain_v10(
     let artifact_path = super::validate_artifacts::publish_run_artifact_noclobber(
         parent, &plan.run_id, "cell-results.jsonl", &bytes, "retained full cell results")?;
     let evidence = CellResultsEvidenceV10 {
+        binding_contract,
         path: plan.path, run_id: plan.run_id.clone(), hermit_sha: plan.hermit_sha.clone(), source_tree_dirty: false,
         selected_count: selected.len() as u64, recorded_count: cells.len() as u64,
         population_sha256: hex_digest(&population), artifact: CellResultsArtifact {
             path: artifact_path, sha256: hex_digest(&bytes), row_count: cells.len() as u64 },
         selected, selected_backend_parity, cells,
     };
+    if binding_contract == CellBindingContract::SelectedAttemptV1 {
+        evidence.require_bound_compared_cells()?;
+    }
     evidence.verify_cell_artifact_bytes(&bytes)?;
     Ok(RetainedCellResults { schema_version: 10, run_id: plan.run_id.clone(),
         evidence: serde_json::to_value(evidence).map_err(|error| error.to_string())? })
@@ -975,6 +1023,9 @@ mod tests {
             include_str!("fixtures/schema10-matched-plan.json")).unwrap();
         let retained: Value = serde_json::from_str(
             include_str!("fixtures/schema10-matched-cell.json")).unwrap();
+        let legacy_fixture: Value = serde_json::from_str(include_str!(
+            "../../ci/manifest-plan/src/ledger/schema10/fixtures/legacy/ordinary-only-row.json"
+        )).unwrap();
         let completed = &retained["backend_parity"]["attempts"][0];
         let base = serde_json::json!({
             "schema":4, "run_id":plan.run_id, "hermit_sha":plan.hermit_sha,
@@ -1004,6 +1055,8 @@ mod tests {
             fs::create_dir(&results).unwrap();
             fs::write(results.join("results.jsonl"), format!("{duplicate}\n")).unwrap();
             let error = retain_v10(parent.path(), &results, &plan).unwrap_err();
+            assert!(error.contains("duplicate field"), "{error}");
+            let error = retain_v10_bound(parent.path(), &results, &plan).unwrap_err();
             assert!(error.contains("duplicate field"), "{error}");
             assert!(!parent.path().join("ignored/validate/artifacts").exists());
         }
@@ -1059,15 +1112,80 @@ mod tests {
                 row["reason"] = Value::String("synthetic reference did not provide a matching strict comparison".into());
             }
             fs::write(results.join("results.jsonl"), format!("{}\n", serde_json::to_string(&row).unwrap())).unwrap();
-            let result = retain_v10(parent.path(), &results, &plan);
+            let legacy_parent = tempfile::tempdir().unwrap();
+            let legacy = retain_v10(legacy_parent.path(), &results, &plan);
+            let result = retain_v10_bound(parent.path(), &results, &plan);
             if matches!(case, "pass-without-report" | "missing-digest") {
+                assert!(legacy.is_err(), "legacy {case} was admitted");
                 assert!(result.is_err(), "{case} was admitted");
                 continue;
             }
             let result = result.unwrap_or_else(|error| panic!("{case}: {error}"));
+            let legacy = legacy.unwrap_or_else(|error| panic!("legacy {case}: {error}"));
+            assert_eq!(legacy.schema_version, 10);
+            assert!(legacy.evidence.get("binding_contract").is_none());
+            assert_eq!(legacy.evidence.as_object().unwrap().keys().collect::<Vec<_>>(),
+                legacy_fixture["cell_results"].as_object().unwrap().keys().collect::<Vec<_>>());
+            let legacy_cell = &legacy.evidence["cells"][0];
+            assert_eq!(legacy_cell.as_object().unwrap().keys().collect::<Vec<_>>(),
+                legacy_fixture["cell_results"]["cells"][0].as_object().unwrap().keys().collect::<Vec<_>>());
+            assert!(legacy_cell.get("selected_attempt").is_none());
+            assert!(legacy_cell.get("evidence_binding").is_none());
+            assert_eq!(legacy_cell["cell_verdict"], result.evidence["cells"][0]["cell_verdict"]);
+            assert_eq!(legacy_cell["backend_parity"], result.evidence["cells"][0]["backend_parity"]);
+            let legacy_evidence: hermit_manifest_plan::ledger::CellResultsEvidenceV10 =
+                serde_json::from_value(legacy.evidence.clone()).unwrap();
+            assert_eq!(legacy_evidence.binding_contract, CellBindingContract::LegacyUnbound);
+            assert!(legacy_evidence.bound_attempts().unwrap_err().contains("legacy-unbound"));
+            let legacy_bytes = fs::read(legacy_parent.path().join(
+                legacy.evidence["artifact"]["path"].as_str().unwrap())).unwrap();
+            legacy_evidence.verify_cell_artifact_bytes(&legacy_bytes).unwrap();
+            let legacy_artifact: Value = serde_json::from_slice(&legacy_bytes).unwrap();
+            assert_eq!(legacy_artifact.as_object().unwrap().keys().collect::<Vec<_>>(),
+                retained.as_object().unwrap().keys().collect::<Vec<_>>(),
+                "production must retain the exact published legacy artifact shape");
             assert_eq!(result.schema_version, 10);
+            assert_eq!(result.evidence["binding_contract"], 1);
             let cell = &result.evidence["cells"][0];
             assert_eq!(cell["cell_verdict"]["state"], "compared-and-matched", "{case}");
+            // THE VERDICT NAMES THE ATTEMPT IT WAS COMPUTED FROM. Without this
+            // the row states a comparison and nothing records which of the
+            // run's events produced it, which is the whole defect: a verdict
+            // that can be counted and never resolved.
+            let binding = &cell["evidence_binding"];
+            assert!(!binding.is_null(), "{case}: compared verdict left unbound");
+            assert_eq!(binding["run_id"], Value::String(plan.run_id.clone()), "{case}");
+            assert_eq!(binding["tree"], Value::String(plan.hermit_sha.clone()), "{case}");
+            assert_eq!(binding["producer"], "validate", "{case}");
+            assert_eq!(
+                binding["series_cell"],
+                Value::String(format!("{}/verify/kvm", retained["test"].as_str().unwrap())),
+                "{case}"
+            );
+            // The bound ordinal, and the row's own independent copy of it.
+            // Recording it twice is what gives the decode-time guard a second
+            // operand; without it the guard compared the binding against
+            // itself and accepted every ordinal.
+            assert_eq!(binding["selected_attempt"], Value::from(1), "{case}");
+            assert_eq!(cell["selected_attempt"], Value::from(1), "{case}");
+            // It must NOT carry a predicted published identity. Predicting one
+            // is unsound for a compared verdict, which is always collapsible.
+            assert!(binding.get("event_id").is_none(), "{case}: {binding}");
+            let typed: hermit_manifest_plan::ledger::CellEvidenceBinding =
+                serde_json::from_value(binding.clone()).unwrap();
+            typed
+                .verify_against(
+                    &plan.run_id,
+                    &plan.hermit_sha,
+                    &CellIdentity {
+                        lane: cell["lane"].as_str().unwrap().into(),
+                        category: cell["category"].as_str().unwrap().into(),
+                        test: cell["test"].as_str().unwrap().into(),
+                        mode: cell["mode"].as_str().unwrap().into(),
+                        backend: cell["backend"].as_str().unwrap().into(),
+                    },
+                )
+                .unwrap_or_else(|error| panic!("{case}: {error}"));
             let attempt = &cell["backend_parity"]["attempts"][0];
             assert_eq!(attempt["candidate"]["state"], "compared-and-matched");
             match case {

@@ -207,7 +207,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // #[test], audit_inventory_refuses_an_unregistered_test_file, in the
     // selected package hermit-manifest-plan, and did not update this table.
     // 508 + 1 = 509, and the run that caught it reported 509 passed 0 failed.
-    ("test.regular_crates", 509),
+    ("test.regular_crates", 523),
     ("test.hermit_unit", 697),
     ("test.detcore_unit", 701),
     ("test.detcore_misc", 27),
@@ -241,7 +241,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 24),
     // Same +1, same cause: this row carries the identical selection.
-    ("test.regular_crates_on_host", 509),
+    ("test.regular_crates_on_host", 523),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];
