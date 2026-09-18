@@ -102,6 +102,7 @@ function nextest_inventory_args {
 function emit_libtest_count {
     local events=$1 status=${2:-0} path=${DAGRUN_TEST_COUNTS_PATH:--}
     local attempts=${3-} binary_map=${4-} cpu_report=${5-}
+    local writer_status=0
     local -a cpu_args=()
     if [[ ! -s $events ]]; then
         printf 'run-nextest-counted: typed nextest event stream is empty\n' >&2
@@ -114,9 +115,10 @@ function emit_libtest_count {
         fi
         cpu_args=("$attempts" "$binary_map" "$cpu_report")
     fi
-    if ! "$RESULT_WRITER" "$events" "$status" "$path" "${cpu_args[@]}"; then
+    "$RESULT_WRITER" "$events" "$status" "$path" "${cpu_args[@]}" || writer_status=$?
+    if ((writer_status != 0)); then
         printf 'run-nextest-counted: cannot derive typed test results from %s\n' "$events" >&2
-        return 2
+        return "$writer_status"
     fi
 }
 
@@ -133,7 +135,7 @@ function run_nextest {
     fi
 
     cleanup_nextest_config
-    nextest_config=$(mktemp "${TMPDIR:-/tmp}/hermit-nextest-config.XXXXXX.toml")
+    nextest_config=$(mktemp "${TMPDIR:-/tmp}/hermit-nextest-config.XXXXXX.toml") || return $?
     if ! HERMIT_NEXTEST_CPU_WRAPPER_BIN="$cpu_wrapper" "$TIMEOUT_CONFIG_WRITER" \
         "$SCRIPT_DIR/../.config/nextest.toml" "$wall_multiplier" "$nextest_config"; then
         cleanup_nextest_config
@@ -168,13 +170,11 @@ function run_nextest {
 
     emit_libtest_count "$events_log" "$status" "$attempts" "$binary_map" \
         "$cpu_report" || count_status=$?
-    if ((count_status != 0)); then
-        return "$count_status"
-    fi
+    # Publication cannot erase a failure that the actual test runner observed.
     if ((status != 0)); then
         return "$status"
     fi
-    return 0
+    return "$count_status"
 }
 
 function self_test {
@@ -394,6 +394,14 @@ PYEOF
     grep -q 'of which 0 passed and 0 failed' "$scratch/launch-wrong.stderr" || return 1
     [[ ! -e $scratch/launch-wrong-count.json && ! -e $scratch/launch-wrong-cpu.json ]] || return 1
     status=0
+    DAGRUN_TEST_COUNTS_PATH="$scratch/failed-wrong-count.json" NEXTEST_EXPECTED_EXECUTED=2 \
+        emit_libtest_count "$scratch/wrapper-events" 100 "$ordinary_attempts" "$binary_map" \
+        "$scratch/failed-wrong-cpu.json" >"$scratch/failed-wrong.stdout" 2>"$scratch/failed-wrong.stderr" || status=$?
+    [[ $status == 2 ]] || return 1
+    grep -q 'expected 2 tests to execute, saw 1' "$scratch/failed-wrong.stderr" || return 1
+    grep -q 'of which 0 passed and 1 failed' "$scratch/failed-wrong.stderr" || return 1
+    [[ ! -e $scratch/failed-wrong-count.json && ! -e $scratch/failed-wrong-cpu.json ]] || return 1
+    status=0
     DAGRUN_TEST_COUNTS_PATH="$scratch/launch-stray-count.json" \
         emit_libtest_count "$scratch/launch-events" 100 "$ordinary_attempts" "$binary_map" \
         "$scratch/launch-stray-cpu.json" >"$scratch/launch-stray.stdout" 2>"$scratch/launch-stray.stderr" || status=$?
@@ -421,12 +429,12 @@ if [[ ${1:-} == --self-test ]]; then
     exit
 fi
 
-events_log=$(mktemp)
-cpu_measurement_dir=$(mktemp -d "${TMPDIR:-/tmp}/hermit-nextest-cpu.XXXXXX")
+events_log=$(mktemp) || exit $?
+cpu_measurement_dir=$(mktemp -d "${TMPDIR:-/tmp}/hermit-nextest-cpu.XXXXXX") || exit $?
 cpu_attempt_records="$cpu_measurement_dir/attempts"
 cpu_inventory="$cpu_measurement_dir/inventory.json"
 cpu_binary_map="$cpu_measurement_dir/binary-map.json"
-mkdir "$cpu_attempt_records"
+mkdir "$cpu_attempt_records" || exit $?
 trap 'cleanup_nextest_config; cleanup_cpu_measurement_dir; rm -f "$events_log"' EXIT
 cpu_wrapper=$(build_cpu_wrapper) || exit $?
 cpu_report=$(configured_cpu_report_path) || exit $?

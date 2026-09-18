@@ -309,6 +309,7 @@ mod tests {
                 dagrun::TestResult::new("failed-case".into(), false, 2).unwrap(),
             ]),
             test_results_error: None,
+            test_results_error_kind: None,
             returncode: Some(1),
             oomed: false,
             oom_kills: 0,

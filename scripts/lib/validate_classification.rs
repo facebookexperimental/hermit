@@ -96,12 +96,36 @@ fn refused_without_writing_any_report(attempt: &NodeAttempt) -> bool {
 /// it existing. Collected wall/CPU/OOM breaches are likewise real failed
 /// conditions and are excluded for the same reason.
 fn absent_report_is_the_only_failure(attempt: &NodeAttempt) -> bool {
-    attempt.returncode == Some(0)
+    attempt.ok == Some(false)
+        && attempt.returncode == Some(0)
+        // An authoritative invalid/read-I/O kind must not be excused by a
+        // contradictory legacy string that happens to begin with this phrase.
+        && matches!(
+            attempt.test_results_error_kind,
+            None | Some(dagrun::TestResultsErrorKind::Missing)
+        )
         && attempt.timed_out != Some(true)
         && attempt.cpu_timed_out != Some(true)
         && attempt.oomed != Some(true)
         && !attempt.oom_kills.is_some_and(|kills| kills > 0)
         && refused_without_writing_any_report(attempt)
+}
+
+/// A controlled producer uses the existing temporary-failure status only after
+/// valid test evidence could not be written/published. The runner independently
+/// observed absence/read I/O; prose and a generic exit 2 cannot grant this class.
+fn publication_report_is_unavailable(attempt: &NodeAttempt) -> bool {
+    attempt.ok == Some(false)
+        && attempt.returncode == Some(super::NO_RESULT_EXIT_CODE)
+        && attempt.test_results_error.is_some()
+        && matches!(
+            attempt.test_results_error_kind,
+            Some(dagrun::TestResultsErrorKind::Missing | dagrun::TestResultsErrorKind::ReadIo)
+        )
+        && attempt.timed_out != Some(true)
+        && attempt.cpu_timed_out != Some(true)
+        && attempt.oomed != Some(true)
+        && !attempt.oom_kills.is_some_and(|kills| kills > 0)
 }
 
 /// Evidence of a failed condition remains authoritative alongside a diagnostic.
@@ -122,8 +146,9 @@ pub(super) fn has_product_failure_evidence(attempt: &NodeAttempt) -> bool {
         && attempt.execution == AttemptExecution::Completed
         && attempt.ok.is_some()
         && !attempt.aborted
-        && refusal_cause(attempt).is_some()
+        && (refusal_cause(attempt).is_some() || attempt.test_results_error_kind.is_some())
         && !absent_report_is_the_only_failure(attempt)
+        && !publication_report_is_unavailable(attempt)
 }
 
 pub(super) fn attempt_classification(attempt: &NodeAttempt) -> NodeClassification {
@@ -941,12 +966,19 @@ mod tests {
                 );
             } else if name == "refused" {
                 let refusal = outcome.test_results_error.as_deref().unwrap();
+                let (cause, diagnostic_tail) = refusal
+                    .split_once("; last output: ")
+                    .expect("refusal must retain the step's diagnostic");
                 assert!(
-                    refusal.starts_with("malformed structured test results ")
-                        && refusal.ends_with(
+                    cause.starts_with("malformed structured test results ")
+                        && cause.ends_with(
                             ": structured-test-results-results has 0 terminal row(s), expected exactly 1 executed test(s)"
                         ),
                     "{refusal}"
+                );
+                assert_eq!(
+                    diagnostic_tail,
+                    "An action was blocked on this server based on a security policy! | Enforcer: FS, Reason: FILE_OPEN"
                 );
                 assert_eq!(outcome.reason, "exit 1");
                 assert_eq!(attempts[0].test_results_error, outcome.test_results_error);
@@ -1498,5 +1530,231 @@ mod timeout_tests {
                 assert_eq!(result.skipped, vec![format!("classification.{name}")]);
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[path = "validate_nextest_fixture.rs"]
+mod real_nextest_tests;
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+
+    fn refused(kind: Option<dagrun::TestResultsErrorKind>) -> NodeAttempt {
+        let mut attempt = reported_attempt(&fixture_outcome("test.publication", 75), 1);
+        attempt.test_results_error = Some("real import refusal; prose is not authority".into());
+        attempt.test_results_error_kind = kind;
+        attempt
+    }
+
+    #[test]
+    fn typed_publication_inability_stays_unknown_but_never_hides_failed_evidence() {
+        use dagrun::TestResultsErrorKind::InvalidReport;
+        use dagrun::TestResultsErrorKind::Missing;
+        use dagrun::TestResultsErrorKind::ReadIo;
+        for kind in [Missing, ReadIo] {
+            let attempt = refused(Some(kind));
+            assert_eq!(
+                attempt_classification(&attempt),
+                NodeClassification::NoResult
+            );
+            for exit in [-15, 0, 1, 2, 101] {
+                let mut command_failure = attempt.clone();
+                command_failure.returncode = Some(exit);
+                assert_eq!(
+                    attempt_classification(&command_failure),
+                    NodeClassification::ProductFailure
+                );
+            }
+            for mask in 1..16 {
+                let mut limited = attempt.clone();
+                limited.timed_out = Some(mask & 1 != 0);
+                limited.cpu_timed_out = Some(mask & 2 != 0);
+                limited.oomed = Some(mask & 4 != 0);
+                limited.oom_kills = Some(if mask & 8 != 0 { 1 } else { 0 });
+                assert_eq!(
+                    attempt_classification(&limited),
+                    NodeClassification::ProductFailure
+                );
+            }
+            let mut measured_failure = attempt.clone();
+            measured_failure.test_results = Some(vec![
+                dagrun::TestResult::new("real::failed".into(), false, 1).unwrap(),
+            ]);
+            assert_eq!(
+                attempt_classification(&measured_failure),
+                NodeClassification::ProductFailure
+            );
+            let outcome = fixture_outcome("test.publication", 75);
+            let earlier = reported_attempt(&fixture_outcome("test.publication", 1), 1);
+            let mut later = attempt.clone();
+            later.attempt = 2;
+            assert_eq!(
+                node_classification(&outcome, &[earlier, later]),
+                NodeClassification::ProductFailure
+            );
+
+            // A publication exit collected while cancellation drains is not a
+            // completed child result or a measured child-budget breach. Keep
+            // the scheduler's first cause separate from the import diagnostic.
+            for (cut_by_run_budget, cause) in [
+                (false, dagrun::model::ABORTED_BY_PEER_FAILURE_REASON),
+                (true, dagrun::model::ABORTED_BY_RUN_BUDGET_REASON),
+                (
+                    false,
+                    "ABORTED (required whole-run CPU accounting was lost; CPU budget exhaustion was not established)",
+                ),
+            ] {
+                let mut aborted = StepOutcome::aborted_outcome(
+                    "test.publication".into(),
+                    0.25,
+                    String::new(),
+                    Some(super::super::NO_RESULT_EXIT_CODE),
+                    None,
+                    None,
+                    cut_by_run_budget,
+                );
+                // The scheduler records accounting loss after constructing the
+                // cancellation outcome; its public constructor takes the two
+                // ordinary peer/run-budget causes directly.
+                if cut_by_run_budget || cause == dagrun::model::ABORTED_BY_PEER_FAILURE_REASON {
+                    assert_eq!(aborted.reason, cause);
+                } else {
+                    aborted.reason = cause.into();
+                }
+                aborted.test_results_error = Some("publication import unavailable".into());
+                aborted.test_results_error_kind = Some(kind);
+                let unknown = reported_attempt(&aborted, 1);
+                assert!(unknown.reported && unknown.aborted);
+                assert_eq!(unknown.ok, Some(false));
+                assert_eq!(unknown.execution, AttemptExecution::Unknown);
+                assert_eq!(unknown.returncode, Some(super::super::NO_RESULT_EXIT_CODE));
+                assert_eq!(unknown.reason, cause);
+                assert_eq!(unknown.test_results_error, aborted.test_results_error);
+                assert_eq!(unknown.test_results_error_kind, Some(kind));
+                assert_eq!(unknown.timed_out, Some(false));
+                assert_eq!(unknown.cpu_timed_out, Some(false));
+                assert_eq!(unknown.oomed, Some(false));
+                assert_eq!(unknown.oom_kills, Some(0));
+                assert!(!attempt_is_no_result(&unknown));
+                assert_eq!(super::super::attempt_result(&unknown), None);
+                assert_eq!(
+                    super::super::completed_node_count(
+                        std::slice::from_ref(&aborted),
+                        std::slice::from_ref(&unknown),
+                    ),
+                    0
+                );
+                assert_eq!(attempt_classification(&unknown), NodeClassification::NoResult);
+
+                let mut with_failed_row = unknown.clone();
+                with_failed_row.test_results = Some(vec![
+                    dagrun::TestResult::new("real::failed".into(), false, 1).unwrap(),
+                ]);
+                let mut latest = unknown.clone();
+                latest.attempt = 2;
+                for (name, attempts, wanted) in [
+                    ("aborted_import", vec![unknown], NodeClassification::NoResult),
+                    (
+                        "retained_failed_row",
+                        vec![with_failed_row],
+                        NodeClassification::ProductFailure,
+                    ),
+                    (
+                        "earlier_failure",
+                        vec![
+                            reported_attempt(&fixture_outcome("test.publication", 1), 1),
+                            latest,
+                        ],
+                        NodeClassification::ProductFailure,
+                    ),
+                ] {
+                    assert_eq!(node_classification(&aborted, &attempts), wanted, "{name}");
+                    let gate = super::super::ledger_gate_with_attempts(&aborted, &attempts);
+                    assert_eq!(gate["result"], wanted.result(), "{name}");
+                    assert_eq!(gate["failure_class"], wanted.as_str(), "{name}");
+                    assert_eq!(gate["aborted"], wanted == NodeClassification::NoResult);
+                    assert_eq!(gate["raw_aborted"], true);
+                    assert!(gate["raw_result"].is_null());
+                    if wanted == NodeClassification::ProductFailure {
+                        assert_eq!(gate["failure_origin"], "outer_gate");
+                    }
+                    let raw = gate["attempts"].as_array().unwrap().last().unwrap();
+                    assert!(raw["result"].is_null());
+                    assert_eq!(raw["aborted"], true);
+                    for observation in [&gate, raw] {
+                        assert_eq!(observation["reported"], true);
+                        assert_eq!(observation["execution"], "unknown");
+                        assert_eq!(observation["exit_code"], super::super::NO_RESULT_EXIT_CODE);
+                        assert_eq!(observation["reason"], cause);
+                        assert_eq!(
+                            observation["test_results_error"],
+                            "publication import unavailable"
+                        );
+                        assert_eq!(observation["test_results_error_kind"], kind.value());
+                        for field in ["timed_out", "cpu_timed_out", "oomed"] {
+                            assert_eq!(observation[field], false, "{name}: {field}");
+                        }
+                        assert_eq!(observation["oom_kills"], 0);
+                    }
+                    let typed: hermit_manifest_plan::ledger::GateHistoryRow =
+                        serde_json::from_value(gate.clone()).unwrap();
+                    let read_back = serde_json::to_value(typed).unwrap();
+                    for (field, expected) in gate.as_object().unwrap() {
+                        assert_eq!(&read_back[field], expected, "{name}: reader lost {field}");
+                    }
+                    println!("ABORTED_PUBLICATION_FIXTURE {name} {read_back}");
+                }
+            }
+        }
+        for kind in [None, Some(InvalidReport)] {
+            let attempt = refused(kind);
+            assert_eq!(
+                attempt_classification(&attempt),
+                NodeClassification::ProductFailure
+            );
+        }
+        assert_eq!(
+            dagrun::TestResultsErrorKind::from_value("future_kind"),
+            None
+        );
+        let mut invalid_without_text = refused(Some(InvalidReport));
+        invalid_without_text.test_results_error = None;
+        assert_eq!(
+            attempt_classification(&invalid_without_text),
+            NodeClassification::ProductFailure
+        );
+        for kind in [ReadIo, InvalidReport] {
+            let mut contradictory = refused(Some(kind));
+            contradictory.returncode = Some(0);
+            contradictory.test_results_error =
+                Some("required structured test results were not written to fixture".into());
+            assert_eq!(
+                attempt_classification(&contradictory),
+                NodeClassification::ProductFailure,
+                "legacy prose must not override {kind:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn contradictory_success_never_excuses_a_required_result_refusal() {
+        let mut attempt = refused(Some(dagrun::TestResultsErrorKind::Missing));
+        attempt.ok = Some(true);
+        attempt.returncode = Some(0);
+        attempt.test_results_error =
+            Some("required structured test results were not written to fixture".into());
+        assert_eq!(
+            attempt_classification(&attempt),
+            NodeClassification::ProductFailure
+        );
+        attempt.test_results_error = None;
+        attempt.test_results_error_kind = None;
+        attempt.reason = "STRUCTURED TEST RESULTS REFUSED: required structured test results were not written to fixture".into();
+        assert_eq!(
+            attempt_classification(&attempt),
+            NodeClassification::ProductFailure
+        );
     }
 }

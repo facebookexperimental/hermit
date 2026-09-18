@@ -17,10 +17,16 @@ use std::process::ExitCode;
 
 use dagrun::TestResult;
 use dagrun::TestResults;
-use nextest_cpu::{
-    read_attempt_records, read_binary_map, write_binary_map_atomic, write_report_atomic,
-    AttemptIdentity, AttemptRecord, BinaryMap, CpuReport,
-};
+use dagrun::TestResultsWriteError;
+use dagrun::structured_test_results_recovery_path;
+use nextest_cpu::AttemptIdentity;
+use nextest_cpu::AttemptRecord;
+use nextest_cpu::BinaryMap;
+use nextest_cpu::CpuReport;
+use nextest_cpu::read_attempt_records;
+use nextest_cpu::read_binary_map;
+use nextest_cpu::write_binary_map_atomic;
+use nextest_cpu::write_report_atomic;
 use serde_json::Value;
 
 #[path = "../scripts/lib/rust_script_prelude.rs"]
@@ -417,10 +423,16 @@ fn reconcile_cpu_attempts(
         }
     }
     let records = read_attempt_records(directory)?;
-    let required = parsed.expected_attempts.iter().try_fold(0u64, |total, test| total.checked_add(test.attempts))
+    let required = parsed
+        .expected_attempts
+        .iter()
+        .try_fold(0u64, |total, test| total.checked_add(test.attempts))
         .ok_or("missing=typed retry population overflows the available attempt count")?;
     if required > records.len() as u64 {
-        return Err(format!("missing=typed events require {required} attempt records, supplied {}", records.len()));
+        return Err(format!(
+            "missing=typed events require {required} attempt records, supplied {}",
+            records.len()
+        ));
     }
     // Any expansion is now bounded by records that were actually supplied.
     // Exact identity and success comparisons below remain mandatory.
@@ -438,7 +450,13 @@ fn reconcile_cpu_attempts(
                 test: attempt.test.clone(),
                 attempt: number,
             };
-            if expected.insert(identity.clone(), attempt.passed && number == attempt.attempts).is_some() {
+            if expected
+                .insert(
+                    identity.clone(),
+                    attempt.passed && number == attempt.attempts,
+                )
+                .is_some()
+            {
                 return Err(format!(
                     "typed nextest events contain duplicate CPU attempt identity {identity:?}"
                 ));
@@ -505,7 +523,74 @@ fn parse_u64(value: String, name: &str) -> Result<u64, String> {
         .map_err(|error| format!("nextest-test-results {name}: {error}"))
 }
 
-fn run() -> Result<(), String> {
+/// Only the atomic structured-result publication boundary may use the existing
+/// no-result status. Parse/schema/count/CPU errors remain ordinary refusals.
+#[derive(Debug)]
+enum ProducerError {
+    Invalid(String),
+    Publication(TestResultsWriteError),
+    PublicationRecovery {
+        primary: TestResultsWriteError,
+        recovery: TestResultsWriteError,
+    },
+}
+
+impl ProducerError {
+    fn exit_code(&self) -> u8 {
+        match self {
+            Self::Invalid(_) | Self::Publication(TestResultsWriteError::Invalid(_)) => 2,
+            Self::Publication(
+                TestResultsWriteError::Write { .. } | TestResultsWriteError::Publish { .. },
+            ) => 75,
+            Self::PublicationRecovery { .. } => 75,
+        }
+    }
+}
+
+impl From<String> for ProducerError {
+    fn from(message: String) -> Self {
+        Self::Invalid(message)
+    }
+}
+
+impl From<&str> for ProducerError {
+    fn from(message: &str) -> Self {
+        Self::Invalid(message.into())
+    }
+}
+
+impl std::fmt::Display for ProducerError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(message) => formatter.write_str(message),
+            Self::Publication(error) => std::fmt::Display::fmt(error, formatter),
+            Self::PublicationRecovery { primary, recovery } => write!(
+                formatter,
+                "{primary}; structured-test-results-recovery also failed: {recovery}"
+            ),
+        }
+    }
+}
+
+fn publish_with_recovery(report: &TestResults, path: &Path) -> Result<(), ProducerError> {
+    match report.write_current_typed(path) {
+        Ok(()) => Ok(()),
+        Err(primary @ TestResultsWriteError::Invalid(_)) => {
+            Err(ProducerError::Publication(primary))
+        }
+        Err(
+            primary @ (TestResultsWriteError::Write { .. } | TestResultsWriteError::Publish { .. }),
+        ) => {
+            let recovery = structured_test_results_recovery_path(path);
+            match report.write_current_typed(&recovery) {
+                Ok(()) => Err(ProducerError::Publication(primary)),
+                Err(recovery) => Err(ProducerError::PublicationRecovery { primary, recovery }),
+            }
+        }
+    }
+}
+
+fn run() -> Result<(), ProducerError> {
     let mut args = env::args().skip(1);
     let Some(first) = args.next() else {
         usage();
@@ -528,7 +613,7 @@ fn run() -> Result<(), String> {
         let bytes = fs::read(&inventory)
             .map_err(|error| format!("cannot read nextest inventory {inventory}: {error}"))?;
         let map = BinaryMap::from_nextest_inventory(&bytes)?;
-        return write_binary_map_atomic(Path::new(&output), &map);
+        return write_binary_map_atomic(Path::new(&output), &map).map_err(ProducerError::from);
     }
     let events = first;
     let status = parse_u64(
@@ -562,7 +647,7 @@ fn run() -> Result<(), String> {
     if status == 0 && failed != 0 {
         return Err(format!(
             "nextest-test-results: successful nextest status disagrees with {failed} failed typed result(s)"
-        ));
+        ).into());
     }
     let cpu_report = match (attempt_records, binary_map, cpu_report) {
         (Some(records), Some(binary_map), Some(output)) => {
@@ -595,11 +680,12 @@ fn run() -> Result<(), String> {
                  of which {passed} passed and {failed} failed; refusing because the \
                  selected set changed",
                 report.executed_tests
-            ));
+            )
+            .into());
         }
     }
     if output != "-" {
-        report.write_current(Path::new(&output))?;
+        publish_with_recovery(&report, Path::new(&output))?;
     }
     if let Some((cpu_report, output)) = cpu_report {
         if output != "-" {
@@ -627,19 +713,131 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("nextest-test-results: {error}");
-            ExitCode::from(2)
+            ExitCode::from(error.exit_code())
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use nextest_cpu::{write_attempt_atomic, AttemptCompletion, BinaryMapEntry};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
+
+    use nextest_cpu::AttemptCompletion;
+    use nextest_cpu::BinaryMapEntry;
+    use nextest_cpu::write_attempt_atomic;
+
+    use super::*;
 
     static NEXT_SCRATCH: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn only_typed_publication_io_uses_no_result_status() {
+        use std::io;
+        let invalid = ProducerError::Publication(TestResultsWriteError::Invalid(
+            "permission denied is only text in an invalid report".into(),
+        ));
+        assert_eq!(invalid.exit_code(), 2);
+        assert_eq!(
+            ProducerError::from("structured-test-results-write fake: denied").exit_code(),
+            2
+        );
+        for error in [
+            TestResultsWriteError::Write {
+                path: PathBuf::from("temporary"),
+                source: io::Error::from(io::ErrorKind::PermissionDenied),
+            },
+            TestResultsWriteError::Publish {
+                path: PathBuf::from("destination"),
+                source: io::Error::from(io::ErrorKind::IsADirectory),
+            },
+        ] {
+            let message = error.to_string();
+            let mapped = ProducerError::Publication(error);
+            assert_eq!(mapped.exit_code(), 75);
+            assert_eq!(mapped.to_string(), message);
+        }
+    }
+
+    #[test]
+    fn publication_failure_preserves_validated_schema_two_rows_in_recovery() {
+        let scratch = Scratch::new();
+        let report = TestResults::current(
+            2,
+            3,
+            vec![
+                TestResult::new("suite$passes".into(), true, 1).unwrap(),
+                TestResult::new("suite$fails".into(), false, 1).unwrap(),
+            ],
+        )
+        .unwrap();
+        let expected = scratch.0.join("expected.json");
+        publish_with_recovery(&report, &expected).unwrap();
+        assert!(!structured_test_results_recovery_path(&expected).exists());
+
+        let primary = scratch.0.join("primary.json");
+        fs::create_dir(&primary).unwrap();
+        let error = publish_with_recovery(&report, &primary).unwrap_err();
+        assert_eq!(error.exit_code(), 75);
+        match error {
+            ProducerError::Publication(TestResultsWriteError::Publish { path, .. }) => {
+                assert_eq!(path, primary)
+            }
+            other => panic!("expected the original publish error, got {other:?}"),
+        }
+        let recovery = structured_test_results_recovery_path(&primary);
+        assert_eq!(fs::read(&recovery).unwrap(), fs::read(&expected).unwrap());
+        assert_eq!(
+            TestResults::from_json_slice(&fs::read(recovery).unwrap()).unwrap(),
+            report
+        );
+    }
+
+    #[test]
+    fn recovery_failure_reports_both_errors_without_weakening_status() {
+        let scratch = Scratch::new();
+        let report = TestResults::current(
+            1,
+            0,
+            vec![TestResult::new("suite$case".into(), true, 1).unwrap()],
+        )
+        .unwrap();
+        let primary = scratch.0.join("primary.json");
+        fs::create_dir(&primary).unwrap();
+        fs::create_dir(structured_test_results_recovery_path(&primary)).unwrap();
+        let error = publish_with_recovery(&report, &primary).unwrap_err();
+        assert_eq!(error.exit_code(), 75);
+        assert!(matches!(error, ProducerError::PublicationRecovery { .. }));
+        let message = error.to_string();
+        assert!(
+            message.contains("structured-test-results-publish"),
+            "{message}"
+        );
+        assert!(
+            message.contains("structured-test-results-recovery also failed"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn invalid_report_never_writes_recovery() {
+        let scratch = Scratch::new();
+        let primary = scratch.0.join("primary.json");
+        let invalid = TestResults {
+            executed_tests: 2,
+            filtered_tests: 0,
+            results: Some(vec![TestResult::new("suite$case".into(), true, 1).unwrap()]),
+        };
+        let error = publish_with_recovery(&invalid, &primary).unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+        assert!(matches!(
+            error,
+            ProducerError::Publication(TestResultsWriteError::Invalid(_))
+        ));
+        assert!(!primary.exists());
+        assert!(!structured_test_results_recovery_path(&primary).exists());
+    }
 
     struct Scratch(PathBuf);
 
@@ -1046,13 +1244,23 @@ mod tests {
 
     #[test]
     fn historical_stress_events_remain_distinct_and_refuse_unscoped_cpu_records() {
-        let events = sample_events().replace("\"kind\":\"lib\"", "\"kind\":\"lib\",\"stress_index\":1").replace("suite::suite$", "suite::suite@stress-1$");
+        let events = sample_events()
+            .replace("\"kind\":\"lib\"", "\"kind\":\"lib\",\"stress_index\":1")
+            .replace("suite::suite$", "suite::suite@stress-1$");
         let parsed = parse_event_text(&events).unwrap();
         assert_eq!(parsed.executed_tests, 2);
-        assert!(parsed.results.iter().all(|row| row.id.contains("@stress-1")));
+        assert!(
+            parsed
+                .results
+                .iter()
+                .all(|row| row.id.contains("@stress-1"))
+        );
         let scratch = Scratch::new();
         let error = reconcile_cpu_attempts(&parsed, &scratch.0, &sample_binary_map()).unwrap_err();
-        assert!(error.contains("does not support stress_index identities"), "{error}");
+        assert!(
+            error.contains("does not support stress_index identities"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1060,14 +1268,26 @@ mod tests {
         let events = sample_events().replace("recovers#2", "recovers#18446744073709551615");
         let parsed = parse_event_text(&events).unwrap();
         assert_eq!(parsed.executed_tests, 2);
-        assert_eq!(parsed.results.iter().find(|r| r.id.ends_with("$recovers")).unwrap().attempts, u64::MAX);
+        assert_eq!(
+            parsed
+                .results
+                .iter()
+                .find(|r| r.id.ends_with("$recovers"))
+                .unwrap()
+                .attempts,
+            u64::MAX
+        );
         assert_eq!(parsed.expected_attempts.len(), 2);
         let scratch = Scratch::new();
         let error = reconcile_cpu_attempts(&parsed, &scratch.0, &sample_binary_map()).unwrap_err();
         assert!(error.contains("retry population overflows"), "{error}");
-        let parsed = parse_event_text(&sample_events().replace("recovers#2", "recovers#999999999")).unwrap();
+        let parsed =
+            parse_event_text(&sample_events().replace("recovers#2", "recovers#999999999")).unwrap();
         let error = reconcile_cpu_attempts(&parsed, &scratch.0, &sample_binary_map()).unwrap_err();
-        assert!(error.contains("require 1000000000 attempt records, supplied 0"), "{error}");
+        assert!(
+            error.contains("require 1000000000 attempt records, supplied 0"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1268,7 +1488,10 @@ mod tests {
             },
         );
         let error = zero_budget.validate().unwrap_err();
-        assert!(error.contains("budget must be greater than zero"), "{error}");
+        assert!(
+            error.contains("budget must be greater than zero"),
+            "{error}"
+        );
 
         zero_budget.completion = AttemptCompletion::CpuTimeout {
             cpu_budget_usec: 12_000,
