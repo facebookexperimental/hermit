@@ -349,6 +349,11 @@ fi
 # SDK key 0aa6d84239b5a04b7cda124ebed4c7e3adc8b62f5b4c96011a9b971e90d6b0a4,
 # the 16-job clamp and 1050 effective-job-second threshold. This carries
 # the unchanged SDK recipe; it is not a new timing or Hermit guest measurement.
+# BOUND TO 99d1e482 (2026-09-18): the SDK recipe changed to b0247764df7f.
+# See "BOUNDED COLD SDK OBSERVATION AT 99d1e482" below for the native sample,
+# failed enclosing Cargo check, and conservative 1050 effective-job-second
+# threshold with a 16-job clamp. The single local sample does not replace
+# the original hosted calibration.
 if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 99d1e4827cce2404442d7c27ab447886a5839326 ]]; then
     echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 99d1e4827cce2404442d7c27ab447886a5839326 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
