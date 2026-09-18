@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
+use hermit::Backend;
 use hermit::liteinst_bootstrap::EffectiveFilter;
 use tracing::Subscriber;
 use tracing::metadata::LevelFilter;
@@ -337,10 +338,11 @@ fn sync_file_subscriber<W: Write + Send + 'static>(level: LevelFilter, f: W) -> 
 pub fn init_sync_file_tracing<W: Write + Send + 'static>(
     level: Option<LevelFilter>,
     f: W,
+    backend: Backend,
 ) -> TracingGuard {
-    // Match the PID/TID slot consumed by file tracing's worker and by the
-    // stderr logger, while keeping verification evidence synchronous.
-    equalize_tracing_thread_number();
+    // Match the PID/TID slot consumed by file tracing's worker while keeping
+    // verification evidence synchronous and the namespace single-threaded.
+    align_tracing_pid_baseline(backend);
     let level = level.unwrap_or(DEFAULT_TRACE_LEVEL);
     let subscriber = sync_file_subscriber(level, f);
     subscriber
@@ -401,20 +403,82 @@ where
     }
 }
 
-fn equalize_tracing_thread_number() {
-    // Create an extra, pointless thread just so that our thread number starts at the same DetTid
-    // "3" that the `init_file_tracing` option does.
-    std::thread::spawn(|| {}).join().unwrap();
+/// Make the next guest task use the same identity as the asynchronous logger.
+///
+/// `init_file_tracing` starts a nonblocking writer thread inside the fresh PID
+/// namespace. The namespace init is PID 1, that worker consumes PID 2, and the
+/// root guest consequently starts at [`detcore::ROOT_DETPID`] (PID 3). The
+/// synchronous and stderr subscribers have no worker, but their guests still
+/// need the same identity baseline.
+///
+/// Creating and joining a dummy host thread to consume PID 2 is not equivalent:
+/// the thread participates in the parent's signal/timer state and made KVM's
+/// `setitimer` determinism case die from SIGALRM. A forked process has separate
+/// signal and interval-timer state, and it exits before any backend starts.
+/// Outside a PID-namespace init (notably `--no-namespace`) this is a deliberate
+/// no-op; Hermit must not create a process merely to alter the host namespace.
+fn align_tracing_pid_baseline(backend: Backend) {
+    // KVM supplies the deterministic root identity explicitly rather than
+    // deriving it from a Linux task in this namespace. Allocating PID 2 for
+    // that backend is both unnecessary and harmful: it makes the setitimer
+    // sandbox die from SIGALRM before a comparison can run.
+    if backend == Backend::Kvm {
+        return;
+    }
+
+    // SAFETY: getpid has no preconditions and cannot fail.
+    if unsafe { libc::getpid() } != 1 {
+        return;
+    }
+
+    // SAFETY: the child returns through `_exit` immediately and touches no Rust
+    // allocation, lock, or destructor inherited across fork. POSIX specifies
+    // that interval timers are not inherited by a fork child.
+    let child = unsafe { libc::fork() };
+    assert!(
+        child >= 0,
+        "failed to reserve the tracing PID slot: {}",
+        io::Error::last_os_error()
+    );
+    if child == 0 {
+        unsafe { libc::_exit(0) };
+    }
+
+    let mut status = 0;
+    loop {
+        let waited = unsafe { libc::waitpid(child, &mut status, 0) };
+        if waited == child {
+            break;
+        }
+        let error = io::Error::last_os_error();
+        if waited < 0 && error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        panic!("failed to reap tracing PID-slot process {child}: {error}");
+    }
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "tracing PID-slot process {child} exited unexpectedly: {status:#x}"
+    );
+    assert_eq!(
+        child,
+        detcore::ROOT_DETPID.as_raw() - 1,
+        "fresh PID namespace did not reserve the expected tracing slot"
+    );
 }
 
 /// Preserve the public stderr logger while synchronously duplicating INFO-and-
-/// higher events into a private evidence descriptor. The only spawned thread
-/// is the same joined PID/TID equalization thread used without evidence.
-pub fn init_stderr_tracing_with_evidence<E>(level: Option<LevelFilter>, evidence: E) -> TracingGuard
+/// higher events into a private evidence descriptor. PID alignment uses the
+/// short-lived process reservation above and does not create a host thread.
+pub fn init_stderr_tracing_with_evidence<E>(
+    level: Option<LevelFilter>,
+    evidence: E,
+    backend: Backend,
+) -> TracingGuard
 where
     E: Write + Send + 'static,
 {
-    equalize_tracing_thread_number();
+    align_tracing_pid_baseline(backend);
     let public_layer = tracing_subscriber::fmt::layer()
         .with_writer(|| detcore::util::RetryingStderr)
         .with_ansi(stderr().is_terminal())
@@ -453,8 +517,8 @@ pub fn stderr_subscriber(level: Option<LevelFilter>) -> impl Subscriber {
 /// Initializes tracing to `stderr`.
 ///
 /// NOTE: Writes to stderr are unbuffered, so this may be slow.
-pub fn init_stderr_tracing(level: Option<LevelFilter>) {
-    equalize_tracing_thread_number();
+pub fn init_stderr_tracing(level: Option<LevelFilter>, backend: Backend) {
+    align_tracing_pid_baseline(backend);
 
     stderr_subscriber(level)
         .try_init()
@@ -465,11 +529,179 @@ pub fn init_stderr_tracing(level: Option<LevelFilter>) {
 mod tests {
     use std::sync::Mutex;
 
+    use reverie::process::Container;
+    use reverie::process::Mount;
+    use reverie::process::Namespace;
+
     use super::*;
 
     /// `log_max_bytes` reads the process environment, which libtest's threads
     /// share.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn pid_namespace() -> Container {
+        let mut container = Container::new();
+        container
+            .unshare(Namespace::PID)
+            .map_root()
+            .mount(Mount::proc());
+        container
+    }
+
+    fn fork_and_observe_child_pid() -> i32 {
+        // SAFETY: the child makes only getpid and _exit calls. The parent waits
+        // synchronously, so no child is left behind in the test namespace.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed: {}", io::Error::last_os_error());
+        if child == 0 {
+            let observed = unsafe { libc::getpid() };
+            unsafe {
+                libc::_exit(if observed == detcore::ROOT_DETPID.as_raw() {
+                    0
+                } else {
+                    1
+                })
+            };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0, "child observed the wrong PID");
+        child
+    }
+
+    fn deny_host_thread_creation() -> io::Result<()> {
+        let denied = 0x0005_0000 | libc::EPERM as u32; // SECCOMP_RET_ERRNO
+        let mut filter = [
+            libc::sock_filter {
+                code: 0x20, // BPF_LD | BPF_W | BPF_ABS
+                jt: 0,
+                jf: 0,
+                k: 0, // offsetof(seccomp_data, nr)
+            },
+            libc::sock_filter {
+                code: 0x15, // BPF_JMP | BPF_JEQ | BPF_K
+                jt: 4,
+                jf: 0,
+                k: libc::SYS_clone3 as u32,
+            },
+            libc::sock_filter {
+                code: 0x15,
+                jt: 0,
+                jf: 2,
+                k: libc::SYS_clone as u32,
+            },
+            libc::sock_filter {
+                code: 0x20, // BPF_LD | BPF_W | BPF_ABS
+                jt: 0,
+                jf: 0,
+                k: 16, // offsetof(seccomp_data, args[0])
+            },
+            libc::sock_filter {
+                code: 0x45, // BPF_JMP | BPF_JSET | BPF_K
+                jt: 1,
+                jf: 0,
+                k: libc::CLONE_THREAD as u32,
+            },
+            libc::sock_filter {
+                code: 0x06, // BPF_RET | BPF_K
+                jt: 0,
+                jf: 0,
+                k: 0x7fff_0000, // SECCOMP_RET_ALLOW
+            },
+            libc::sock_filter {
+                code: 0x06, // BPF_RET | BPF_K
+                jt: 0,
+                jf: 0,
+                k: denied,
+            },
+        ];
+        let program = libc::sock_fprog {
+            len: filter.len() as u16,
+            filter: filter.as_mut_ptr(),
+        };
+        // SAFETY: `program` describes the live filter array above. The filter
+        // allows process creation but rejects clone3 and clone(CLONE_THREAD),
+        // the two paths std::thread uses. It is installed only in the
+        // disposable namespace child used by the test.
+        unsafe {
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::prctl(
+                libc::PR_SET_SECCOMP,
+                libc::SECCOMP_MODE_FILTER,
+                &program as *const libc::sock_fprog,
+            ) == -1
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn synchronous_pid_alignment_matches_the_file_appender_baseline() {
+        let synchronous_pid = pid_namespace()
+            .run(|| {
+                assert_eq!(unsafe { libc::getpid() }, 1);
+                align_tracing_pid_baseline(Backend::Ptrace);
+                fork_and_observe_child_pid()
+            })
+            .expect("synchronous baseline namespace failed");
+
+        let appender_pid = pid_namespace()
+            .run(|| {
+                assert_eq!(unsafe { libc::getpid() }, 1);
+                let (_subscriber, guard) = file_subscriber(DEFAULT_TRACE_LEVEL, io::sink());
+                let child = fork_and_observe_child_pid();
+                drop(guard);
+                child
+            })
+            .expect("file-appender baseline namespace failed");
+
+        assert_eq!(synchronous_pid, detcore::ROOT_DETPID.as_raw());
+        assert_eq!(synchronous_pid, appender_pid);
+    }
+
+    #[test]
+    fn pid_alignment_succeeds_when_host_thread_creation_is_denied() {
+        let guest_pid = pid_namespace()
+            .run(|| {
+                assert_eq!(unsafe { libc::getpid() }, 1);
+                deny_host_thread_creation().expect("cannot install host-thread deny filter");
+                align_tracing_pid_baseline(Backend::Ptrace);
+                fork_and_observe_child_pid()
+            })
+            .expect("thread-free alignment namespace failed");
+
+        assert_eq!(guest_pid, detcore::ROOT_DETPID.as_raw());
+    }
+
+    #[test]
+    fn kvm_pid_alignment_allocates_no_host_task() {
+        let next_pid = pid_namespace()
+            .run(|| {
+                assert_eq!(unsafe { libc::getpid() }, 1);
+                align_tracing_pid_baseline(Backend::Kvm);
+                // No task was allocated by alignment, so this first actual
+                // child must receive PID 2 rather than PID 3.
+                let child = unsafe { libc::fork() };
+                assert!(child >= 0, "fork failed: {}", io::Error::last_os_error());
+                if child == 0 {
+                    unsafe { libc::_exit(0) };
+                }
+                let mut status = 0;
+                assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+                assert!(libc::WIFEXITED(status));
+                assert_eq!(libc::WEXITSTATUS(status), 0);
+                child
+            })
+            .expect("KVM no-allocation namespace failed");
+
+        assert_eq!(next_pid, 2);
+    }
+
     struct FailingWriter {
         fail_write: bool,
     }

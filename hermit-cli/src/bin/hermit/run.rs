@@ -4136,7 +4136,7 @@ impl RunOpts {
     fn run_with_namespace_only(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         // TODO: Make this use detcore instead after detcore is capable of being
         // "lightweight".
-        let _guard = global.init_tracing();
+        let _guard = global.init_tracing_for_backend(self.runtime_backend());
 
         let tmpfs = self.tmpfs()?;
         let PreparedMounts {
@@ -4930,7 +4930,7 @@ impl RunOpts {
         summary_output: Option<&File>,
         identity_sources: Option<&IdentityGuard>,
     ) -> Result<(ExitStatus, Option<Output>), Error> {
-        let _guard = global.init_tracing();
+        let _guard = global.init_tracing_for_backend(self.runtime_backend());
 
         if capture_output && guest_capture.is_some() {
             anyhow::bail!("internal output capture cannot be combined with harness guest capture");
@@ -5038,7 +5038,11 @@ impl RunOpts {
         // when a fail-closed guest dies, which is precisely the line naming the
         // cause -- measured 0 of 18 runs versus 4 of 4. See
         // `init_sync_file_tracing`.
-        let _guard = init_sync_file_tracing(Some(level), BoundedWriter::new(log_file, limit));
+        let _guard = init_sync_file_tracing(
+            Some(level),
+            BoundedWriter::new(log_file, limit),
+            self.runtime_backend(),
+        );
 
         let command = self.guest_command()?;
 

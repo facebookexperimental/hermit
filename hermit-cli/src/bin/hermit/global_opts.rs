@@ -152,6 +152,17 @@ impl GlobalOpts {
     /// guest namespace and silently loses it.
     #[must_use = "This function returns a guard that should not be immediately dropped"]
     pub fn init_tracing(&self) -> Option<TracingGuard> {
+        self.init_tracing_for_backend(self.backend.unwrap_or_default())
+    }
+
+    /// Initialize tracing with the backend selected by the owning subcommand.
+    ///
+    /// `run --backend ...` remains a supported compatibility spelling, so the
+    /// backend is not necessarily present in the global option. Callers that
+    /// own a subcommand selection must pass it here rather than silently using
+    /// the global default when deciding whether a Linux PID slot is needed.
+    #[must_use = "This function returns a guard that should not be immediately dropped"]
+    pub fn init_tracing_for_backend(&self, backend: Backend) -> Option<TracingGuard> {
         if let Some(handle) = &self.log_file_handle {
             // Each subscriber needs an owned File; `try_clone` dups the descriptor,
             // so every run writes through the same host-side open file.
@@ -198,9 +209,11 @@ impl GlobalOpts {
             let evidence = self
                 .run_evidence_writer(limit)
                 .expect("run-evidence handle was present");
-            Some(init_stderr_tracing_with_evidence(self.log, evidence))
+            Some(init_stderr_tracing_with_evidence(
+                self.log, evidence, backend,
+            ))
         } else {
-            init_stderr_tracing(self.log);
+            init_stderr_tracing(self.log, backend);
             None
         }
     }
