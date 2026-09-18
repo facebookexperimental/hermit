@@ -11,8 +11,8 @@ use std::path::PathBuf;
 use hermit_manifest_plan::canonical_verdict::InfrastructureError;
 use hermit_manifest_plan::canonical_verdict::Verdict as VerificationVerdict;
 use hermit_manifest_plan::canonical_verdict::VerificationReport;
-use hermit_manifest_plan::ledger::CellIdentity;
 use hermit_manifest_plan::ledger::CellBindingContract;
+use hermit_manifest_plan::ledger::CellIdentity;
 use hermit_manifest_plan::ledger::CellResult as LedgerCellResult;
 use hermit_manifest_plan::ledger::CellResultsArtifact;
 use hermit_manifest_plan::ledger::CellResultsEvidence;
@@ -80,7 +80,10 @@ fn read_result_rows(path: &Path) -> Result<Vec<(PathBuf, usize, Value)>, String>
     read_result_rows_with(path, false)
 }
 
-fn read_result_rows_with(path: &Path, schema10: bool) -> Result<Vec<(PathBuf, usize, Value)>, String> {
+fn read_result_rows_with(
+    path: &Path,
+    schema10: bool,
+) -> Result<Vec<(PathBuf, usize, Value)>, String> {
     let mut files = Vec::new();
     collect_results_files(path, &mut files)?;
     files.sort();
@@ -185,9 +188,9 @@ fn canonical_report(
     let report = VerificationReport::from_current_json_slice(bytes)?;
     if report.verdict == VerificationVerdict::InfrastructureError {
         return Err(match report.infrastructure_error.as_ref() {
-            Some(InfrastructureError::SkidOvershoot { count }) => format!(
-                "recorded infrastructure_error: {count} HERMIT_SKID_OVERSHOOT report(s)"
-            ),
+            Some(InfrastructureError::SkidOvershoot { count }) => {
+                format!("recorded infrastructure_error: {count} HERMIT_SKID_OVERSHOOT report(s)")
+            }
             None => unreachable!("typed report parser requires an infrastructure error"),
         });
     }
@@ -251,10 +254,7 @@ fn cell_verdict(row: &Value) -> Result<CellVerdict, String> {
         let preserved_reason = preserved_reason(row, Some(attempt)).map(str::to_owned);
         let Some(raw) = attempt.get("verification_report").and_then(Value::as_str) else {
             unavailable_reason = Some(preserved_reason.clone().unwrap_or_else(|| {
-                format!(
-                    "attempt {} emitted no typed verification report",
-                    index + 1
-                )
+                format!("attempt {} emitted no typed verification report", index + 1)
             }));
             continue;
         };
@@ -387,7 +387,13 @@ fn enabled_cell_scope(cell: &Value) -> Result<Value, String> {
         .as_object()
         .cloned()
         .ok_or("cell identity was not an object")?;
-    for key in ["status", "measurement", "reason", "last_tested", "observations"] {
+    for key in [
+        "status",
+        "measurement",
+        "reason",
+        "last_tested",
+        "observations",
+    ] {
         if let Some(value) = cell.get(key) {
             scoped.insert(key.into(), value.clone());
         }
@@ -441,7 +447,10 @@ fn coverage_document(
             Ok((id, enabled_cell_scope(cell)?))
         })
         .collect::<Result<_, String>>()?;
-    let selected_and_enabled = selected.keys().filter(|key| enabled.contains_key(*key)).count();
+    let selected_and_enabled = selected
+        .keys()
+        .filter(|key| enabled.contains_key(*key))
+        .count();
     let enabled_not_selected: Vec<Value> = enabled
         .iter()
         .filter(|(key, _)| !selected.contains_key(*key))
@@ -546,7 +555,10 @@ pub fn retain_coverage_evidence(
         return Err(format!(
             "{} --json exited {}; {}",
             audit.display(),
-            output.status.code().map_or_else(|| "by signal".into(), |code| code.to_string()),
+            output
+                .status
+                .code()
+                .map_or_else(|| "by signal".into(), |code| code.to_string()),
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
@@ -562,9 +574,16 @@ pub fn retain_coverage_evidence(
         &cells_document,
         &registration,
     )?;
-    let artifact_dir = parent.join("ignored").join("validate").join("artifacts").join(run_id);
+    let artifact_dir = parent
+        .join("ignored")
+        .join("validate")
+        .join("artifacts")
+        .join(run_id);
     fs::create_dir_all(&artifact_dir).map_err(|error| {
-        format!("cannot create retained coverage directory {}: {error}", artifact_dir.display())
+        format!(
+            "cannot create retained coverage directory {}: {error}",
+            artifact_dir.display()
+        )
     })?;
     let artifact = artifact_dir.join("coverage.json");
     let mut bytes = serde_json::to_vec_pretty(&document)
@@ -617,7 +636,9 @@ pub fn retain_coverage_evidence(
             "sha256": hex_digest(&bytes),
         }),
     );
-    Ok(RetainedCoverageEvidence { evidence: Value::Object(evidence) })
+    Ok(RetainedCoverageEvidence {
+        evidence: Value::Object(evidence),
+    })
 }
 
 /// Transform all result rows for one validate invocation into the closed
@@ -634,40 +655,40 @@ pub fn retain(
     let mut observations = BTreeSet::new();
     let mut attempt_rows: BTreeMap<CellIdentity, Vec<(u64, Value)>> = BTreeMap::new();
     for (file, line_number, row) in read_result_rows(result_root)? {
-            if row.get("schema").and_then(Value::as_u64) != Some(4)
-                || string(&row, "hermit_sha")? != commit
-                || row.get("source_tree_dirty").and_then(Value::as_bool) != Some(false)
-            {
+        if row.get("schema").and_then(Value::as_u64) != Some(4)
+            || string(&row, "hermit_sha")? != commit
+            || row.get("source_tree_dirty").and_then(Value::as_bool) != Some(false)
+        {
+            return Err(format!(
+                "{}:{line_number} is not an exact clean schema-4 cell result for {commit}",
+                file.display()
+            ));
+        }
+        require_current_timeout_policy(&row)
+            .map_err(|error| format!("{}:{line_number} {error}", file.display()))?;
+        let row_run_id = string(&row, "run_id")?;
+        match run_id.as_deref() {
+            None => run_id = Some(row_run_id.into()),
+            Some(existing) if existing == row_run_id => {}
+            Some(existing) => {
                 return Err(format!(
-                    "{}:{line_number} is not an exact clean schema-4 cell result for {commit}",
-                    file.display()
+                    "per-cell results mix run_id {existing} with {row_run_id}"
                 ));
             }
-            require_current_timeout_policy(&row)
-                .map_err(|error| format!("{}:{line_number} {error}", file.display()))?;
-            let row_run_id = string(&row, "run_id")?;
-            match run_id.as_deref() {
-                None => run_id = Some(row_run_id.into()),
-                Some(existing) if existing == row_run_id => {}
-                Some(existing) => {
-                    return Err(format!(
-                        "per-cell results mix run_id {existing} with {row_run_id}"
-                    ));
-                }
-            }
-            let id = identity(&row)?;
-            let key = id.clone();
-            let attempt = row.get("attempt").and_then(Value::as_u64).unwrap_or(1);
-            if attempt == 0 {
-                return Err("per-cell result attempt must be positive".into());
-            }
-            if !observations.insert((key.clone(), attempt)) {
-                return Err("per-cell results contain a duplicate identity and attempt".into());
-            }
-            if identities.insert(key.clone()) {
-                selected.push(id);
-            }
-            attempt_rows.entry(key).or_default().push((attempt, row));
+        }
+        let id = identity(&row)?;
+        let key = id.clone();
+        let attempt = row.get("attempt").and_then(Value::as_u64).unwrap_or(1);
+        if attempt == 0 {
+            return Err("per-cell result attempt must be positive".into());
+        }
+        if !observations.insert((key.clone(), attempt)) {
+            return Err("per-cell results contain a duplicate identity and attempt".into());
+        }
+        if identities.insert(key.clone()) {
+            selected.push(id);
+        }
+        attempt_rows.entry(key).or_default().push((attempt, row));
     }
     let mut cells = attempt_rows
         .into_iter()
@@ -803,20 +824,28 @@ pub fn retain_v10(
     result_root: &Path,
     plan: &hermit_manifest_plan::ledger::ConstructedValidationPlanV10,
 ) -> Result<RetainedCellResults, String> {
-    // Reader support lands first. Production must keep the exact legacy wire
-    // contract until the installed parent readers understand marked bindings.
-    retain_v10_with_contract(parent, result_root, plan, CellBindingContract::LegacyUnbound)
+    // Deploy only after the published parent readers have been activated.
+    retain_v10_with_contract(
+        parent,
+        result_root,
+        plan,
+        CellBindingContract::SelectedAttemptV1,
+    )
 }
 
-/// Exercise the future writer through its real serializer and publication
-/// checks. Activation requires a later source change, never an environment flag.
+/// Preserve the exact published legacy wire contract as a historical control.
 #[cfg(test)]
-pub fn retain_v10_bound(
+pub fn retain_v10_legacy(
     parent: &Path,
     result_root: &Path,
     plan: &hermit_manifest_plan::ledger::ConstructedValidationPlanV10,
 ) -> Result<RetainedCellResults, String> {
-    retain_v10_with_contract(parent, result_root, plan, CellBindingContract::SelectedAttemptV1)
+    retain_v10_with_contract(
+        parent,
+        result_root,
+        plan,
+        CellBindingContract::LegacyUnbound,
+    )
 }
 
 fn retain_v10_with_contract(
@@ -825,11 +854,16 @@ fn retain_v10_with_contract(
     plan: &hermit_manifest_plan::ledger::ConstructedValidationPlanV10,
     binding_contract: CellBindingContract,
 ) -> Result<RetainedCellResults, String> {
-    use hermit_manifest_plan::ledger::{CellArtifactResultV10, CellBackendParity, CellResultsEvidenceV10};
+    use hermit_manifest_plan::ledger::CellArtifactResultV10;
+    use hermit_manifest_plan::ledger::CellBackendParity;
+    use hermit_manifest_plan::ledger::CellResultsEvidenceV10;
     let selected = plan.planned_cells()?;
     let selected_set = selected.iter().cloned().collect::<BTreeSet<_>>();
     let selected_backend_parity = plan.planned_backend_parity_relations()?;
-    let parity_candidates = selected_backend_parity.iter().map(|relation| relation.candidate.clone()).collect::<BTreeSet<_>>();
+    let parity_candidates = selected_backend_parity
+        .iter()
+        .map(|relation| relation.candidate.clone())
+        .collect::<BTreeSet<_>>();
     let mut rows = BTreeMap::<CellIdentity, Vec<(u64, Value)>>::new();
     let mut seen = BTreeSet::new();
     for (file, line, row) in read_result_rows_with(result_root, true)? {
@@ -838,11 +872,17 @@ fn retain_v10_with_contract(
             || string(&row, "run_id")? != plan.run_id
             || row.get("source_tree_dirty").and_then(Value::as_bool) != Some(false)
         {
-            return Err(format!("{}:{line} is not a clean current result for the retained plan", file.display()));
+            return Err(format!(
+                "{}:{line} is not a clean current result for the retained plan",
+                file.display()
+            ));
         }
         require_current_timeout_policy(&row)?;
         let id = identity(&row)?;
-        let attempt = row.get("attempt").and_then(Value::as_u64).ok_or("current cell result omitted attempt")?;
+        let attempt = row
+            .get("attempt")
+            .and_then(Value::as_u64)
+            .ok_or("current cell result omitted attempt")?;
         if !selected_set.contains(&id) || !seen.insert((id.clone(), attempt)) {
             return Err("schema 10 results contain an unselected cell or repeated attempt".into());
         }
@@ -860,15 +900,26 @@ fn retain_v10_with_contract(
                 selected_attempt,
             )
         } else {
-            if rows.iter().any(|(_, row)| row.get("backend_parity").is_some_and(|value| !value.is_null())
-                || row.get("attempts").and_then(Value::as_array).is_some_and(|attempts| {
-                    attempts.iter().any(|attempt| attempt.get("index").and_then(Value::as_str) == Some("parity-reference"))
-                }))
-            {
+            if rows.iter().any(|(_, row)| {
+                row.get("backend_parity")
+                    .is_some_and(|value| !value.is_null())
+                    || row
+                        .get("attempts")
+                        .and_then(Value::as_array)
+                        .is_some_and(|attempts| {
+                            attempts.iter().any(|attempt| {
+                                attempt.get("index").and_then(Value::as_str)
+                                    == Some("parity-reference")
+                            })
+                        })
+            }) {
                 return Err("ordinary selected cell emitted an unplanned parity comparison".into());
             }
-            let outcome = outcome_after_retries(rows.iter().map(|(attempt, row)| Ok((*attempt, string(row, "outcome")?)))
-                .collect::<Result<Vec<_>, String>>()?)?;
+            let outcome = outcome_after_retries(
+                rows.iter()
+                    .map(|(attempt, row)| Ok((*attempt, string(row, "outcome")?)))
+                    .collect::<Result<Vec<_>, String>>()?,
+            )?;
             // The attempt comes from the SAME row the verdict does. Taking it
             // from anywhere else -- the last attempt, the highest ordinal, the
             // count -- would name a real published event that is not the one
@@ -882,40 +933,69 @@ fn retain_v10_with_contract(
                 .ok_or("ordinary cell has no selected terminal result")?;
             (cell_verdict(row)?, RequiredNullable::Null, selected_attempt)
         };
-        full_cells.push(CellArtifactResultV10 { lane: id.lane, category: id.category, test: id.test,
-            mode: id.mode, backend: id.backend, cell_verdict, backend_parity,
-            selected_attempt: (binding_contract == CellBindingContract::SelectedAttemptV1).then_some(selected_attempt) });
+        full_cells.push(CellArtifactResultV10 {
+            lane: id.lane,
+            category: id.category,
+            test: id.test,
+            mode: id.mode,
+            backend: id.backend,
+            cell_verdict,
+            backend_parity,
+            selected_attempt: (binding_contract == CellBindingContract::SelectedAttemptV1)
+                .then_some(selected_attempt),
+        });
     }
     let mut bytes = Vec::new();
     let mut cells = Vec::new();
     for cell in &full_cells {
         cells.push(cell.summary_for_contract(binding_contract, &plan.run_id, &plan.hermit_sha)?);
         let mut row = serde_json::to_value(cell).map_err(|error| error.to_string())?;
-        let object = row.as_object_mut().ok_or("schema 10 full cell is not an object")?;
+        let object = row
+            .as_object_mut()
+            .ok_or("schema 10 full cell is not an object")?;
         object.insert("run_id".into(), Value::String(plan.run_id.clone()));
         object.insert("hermit_sha".into(), Value::String(plan.hermit_sha.clone()));
         object.insert("source_tree_dirty".into(), Value::Bool(false));
         serde_json::to_writer(&mut bytes, &row).map_err(|error| error.to_string())?;
         bytes.push(b'\n');
     }
-    let population = serde_json::to_vec(&serde_json::to_value(&selected).map_err(|error| error.to_string())?)
-        .map_err(|error| error.to_string())?;
+    let population =
+        serde_json::to_vec(&serde_json::to_value(&selected).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
     let artifact_path = super::validate_artifacts::publish_run_artifact_noclobber(
-        parent, &plan.run_id, "cell-results.jsonl", &bytes, "retained full cell results")?;
+        parent,
+        &plan.run_id,
+        "cell-results.jsonl",
+        &bytes,
+        "retained full cell results",
+    )?;
     let evidence = CellResultsEvidenceV10 {
         binding_contract,
-        path: plan.path, run_id: plan.run_id.clone(), hermit_sha: plan.hermit_sha.clone(), source_tree_dirty: false,
-        selected_count: selected.len() as u64, recorded_count: cells.len() as u64,
-        population_sha256: hex_digest(&population), artifact: CellResultsArtifact {
-            path: artifact_path, sha256: hex_digest(&bytes), row_count: cells.len() as u64 },
-        selected, selected_backend_parity, cells,
+        path: plan.path,
+        run_id: plan.run_id.clone(),
+        hermit_sha: plan.hermit_sha.clone(),
+        source_tree_dirty: false,
+        selected_count: selected.len() as u64,
+        recorded_count: cells.len() as u64,
+        population_sha256: hex_digest(&population),
+        artifact: CellResultsArtifact {
+            path: artifact_path,
+            sha256: hex_digest(&bytes),
+            row_count: cells.len() as u64,
+        },
+        selected,
+        selected_backend_parity,
+        cells,
     };
     if binding_contract == CellBindingContract::SelectedAttemptV1 {
         evidence.require_bound_compared_cells()?;
     }
     evidence.verify_cell_artifact_bytes(&bytes)?;
-    Ok(RetainedCellResults { schema_version: 10, run_id: plan.run_id.clone(),
-        evidence: serde_json::to_value(evidence).map_err(|error| error.to_string())? })
+    Ok(RetainedCellResults {
+        schema_version: 10,
+        run_id: plan.run_id.clone(),
+        evidence: serde_json::to_value(evidence).map_err(|error| error.to_string())?,
+    })
 }
 
 #[cfg(test)]
@@ -1019,13 +1099,14 @@ mod tests {
     #[test]
     fn cumulative_writer_preserves_reference_and_cross_failures_separately() {
         use hermit_manifest_plan::ledger::ConstructedValidationPlanV10;
-        let plan: ConstructedValidationPlanV10 = serde_json::from_str(
-            include_str!("fixtures/schema10-matched-plan.json")).unwrap();
-        let retained: Value = serde_json::from_str(
-            include_str!("fixtures/schema10-matched-cell.json")).unwrap();
+        let plan: ConstructedValidationPlanV10 =
+            serde_json::from_str(include_str!("fixtures/schema10-matched-plan.json")).unwrap();
+        let retained: Value =
+            serde_json::from_str(include_str!("fixtures/schema10-matched-cell.json")).unwrap();
         let legacy_fixture: Value = serde_json::from_str(include_str!(
             "../../ci/manifest-plan/src/ledger/schema10/fixtures/legacy/ordinary-only-row.json"
-        )).unwrap();
+        ))
+        .unwrap();
         let completed = &retained["backend_parity"]["attempts"][0];
         let base = serde_json::json!({
             "schema":4, "run_id":plan.run_id, "hermit_sha":plan.hermit_sha,
@@ -1056,65 +1137,90 @@ mod tests {
             fs::write(results.join("results.jsonl"), format!("{duplicate}\n")).unwrap();
             let error = retain_v10(parent.path(), &results, &plan).unwrap_err();
             assert!(error.contains("duplicate field"), "{error}");
-            let error = retain_v10_bound(parent.path(), &results, &plan).unwrap_err();
+            let error = retain_v10_legacy(parent.path(), &results, &plan).unwrap_err();
             assert!(error.contains("duplicate field"), "{error}");
             assert!(!parent.path().join("ignored/validate/artifacts").exists());
         }
-        for case in ["matched", "cross-diverged", "reference-diverged", "reference-no-report", "pass-without-report", "missing-digest"] {
+        for case in [
+            "matched",
+            "cross-diverged",
+            "reference-diverged",
+            "reference-no-report",
+            "pass-without-report",
+            "missing-digest",
+        ] {
             let parent = tempfile::tempdir().unwrap();
             let results = parent.path().join("input");
             fs::create_dir(&results).unwrap();
             let mut row = base.clone();
             match case {
-                "matched" => {},
+                "matched" => {}
                 "cross-diverged" => {
                     row["outcome"] = Value::String("FAIL".into());
                     row["result"] = Value::String("parity-failure".into());
                     row["failure_class"] = Value::String("product_failure".into());
                     row["reason"] = Value::String("synthetic cross divergence".into());
                     row["backend_parity"]["verdict"] = Value::String("diverged".into());
-                    row["backend_parity"]["comparison"]["verdict"] = Value::String("diverged".into());
+                    row["backend_parity"]["comparison"]["verdict"] =
+                        Value::String("diverged".into());
                     row["backend_parity"]["comparison"]["first_divergent_record"] = Value::from(2);
-                },
+                }
                 "reference-diverged" => {
                     let mut report: VerificationReport = serde_json::from_str(
-                        row["attempts"][1]["verification_report"].as_str().unwrap()).unwrap();
+                        row["attempts"][1]["verification_report"].as_str().unwrap(),
+                    )
+                    .unwrap();
                     report.verdict = VerificationVerdict::Diverged;
                     report.verified = false;
                     report.bitwise_parity = false;
                     report.first_divergent_record = Some(1);
                     let raw = serde_json::to_string(&report).unwrap();
-                    row["attempts"][1]["verification_report_sha256"] = Value::String(hex_digest(raw.as_bytes()));
+                    row["attempts"][1]["verification_report_sha256"] =
+                        Value::String(hex_digest(raw.as_bytes()));
                     row["attempts"][1]["verification_report"] = Value::String(raw);
                     row["attempts"][1]["first_divergent_record"] = Value::from(1);
                     row["attempts"][1]["outcome"] = Value::String("FAIL".into());
                     row["attempts"][1]["status"] = Value::from(1);
-                    row["attempts"][1]["reason"] = Value::String("synthetic reference divergence".into());
-                },
+                    row["attempts"][1]["reason"] =
+                        Value::String("synthetic reference divergence".into());
+                }
                 "reference-no-report" | "pass-without-report" => {
                     row["attempts"][1]["verification_report"] = Value::Null;
                     row["attempts"][1]["verification_report_sha256"] = Value::Null;
                     if case == "reference-no-report" {
                         row["attempts"][1]["outcome"] = Value::String("ERROR".into());
                         row["attempts"][1]["status"] = Value::from(7);
-                        row["attempts"][1]["error_kind"] = Value::String("incomplete-verification-evidence".into());
+                        row["attempts"][1]["error_kind"] =
+                            Value::String("incomplete-verification-evidence".into());
                     }
-                },
+                }
                 "missing-digest" => row["attempts"][1]["verification_report_sha256"] = Value::Null,
                 _ => unreachable!(),
             }
-            if matches!(case, "reference-diverged" | "reference-no-report" | "pass-without-report" | "missing-digest") {
+            if matches!(
+                case,
+                "reference-diverged"
+                    | "reference-no-report"
+                    | "pass-without-report"
+                    | "missing-digest"
+            ) {
                 row["backend_parity"] = Value::Null;
                 row["outcome"] = Value::String("ERROR".into());
                 row["result"] = Value::Null;
                 row["failure_class"] = Value::String("no_result".into());
                 row["error_kind"] = Value::String("incomplete-parity-evidence".into());
-                row["reason"] = Value::String("synthetic reference did not provide a matching strict comparison".into());
+                row["reason"] = Value::String(
+                    "synthetic reference did not provide a matching strict comparison".into(),
+                );
             }
-            fs::write(results.join("results.jsonl"), format!("{}\n", serde_json::to_string(&row).unwrap())).unwrap();
+            fs::write(
+                results.join("results.jsonl"),
+                format!("{}\n", serde_json::to_string(&row).unwrap()),
+            )
+            .unwrap();
             let legacy_parent = tempfile::tempdir().unwrap();
-            let legacy = retain_v10(legacy_parent.path(), &results, &plan);
-            let result = retain_v10_bound(parent.path(), &results, &plan);
+            let legacy = retain_v10_legacy(legacy_parent.path(), &results, &plan);
+            let result = retain_v10(parent.path(), &results, &plan);
             if matches!(case, "pass-without-report" | "missing-digest") {
                 assert!(legacy.is_err(), "legacy {case} was admitted");
                 assert!(result.is_err(), "{case} was admitted");
@@ -1124,38 +1230,92 @@ mod tests {
             let legacy = legacy.unwrap_or_else(|error| panic!("legacy {case}: {error}"));
             assert_eq!(legacy.schema_version, 10);
             assert!(legacy.evidence.get("binding_contract").is_none());
-            assert_eq!(legacy.evidence.as_object().unwrap().keys().collect::<Vec<_>>(),
-                legacy_fixture["cell_results"].as_object().unwrap().keys().collect::<Vec<_>>());
+            assert_eq!(
+                legacy
+                    .evidence
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .collect::<Vec<_>>(),
+                legacy_fixture["cell_results"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .collect::<Vec<_>>()
+            );
             let legacy_cell = &legacy.evidence["cells"][0];
-            assert_eq!(legacy_cell.as_object().unwrap().keys().collect::<Vec<_>>(),
-                legacy_fixture["cell_results"]["cells"][0].as_object().unwrap().keys().collect::<Vec<_>>());
+            assert_eq!(
+                legacy_cell.as_object().unwrap().keys().collect::<Vec<_>>(),
+                legacy_fixture["cell_results"]["cells"][0]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .collect::<Vec<_>>()
+            );
             assert!(legacy_cell.get("selected_attempt").is_none());
             assert!(legacy_cell.get("evidence_binding").is_none());
-            assert_eq!(legacy_cell["cell_verdict"], result.evidence["cells"][0]["cell_verdict"]);
-            assert_eq!(legacy_cell["backend_parity"], result.evidence["cells"][0]["backend_parity"]);
+            assert_eq!(
+                legacy_cell["cell_verdict"],
+                result.evidence["cells"][0]["cell_verdict"]
+            );
+            assert_eq!(
+                legacy_cell["backend_parity"],
+                result.evidence["cells"][0]["backend_parity"]
+            );
             let legacy_evidence: hermit_manifest_plan::ledger::CellResultsEvidenceV10 =
                 serde_json::from_value(legacy.evidence.clone()).unwrap();
-            assert_eq!(legacy_evidence.binding_contract, CellBindingContract::LegacyUnbound);
-            assert!(legacy_evidence.bound_attempts().unwrap_err().contains("legacy-unbound"));
-            let legacy_bytes = fs::read(legacy_parent.path().join(
-                legacy.evidence["artifact"]["path"].as_str().unwrap())).unwrap();
-            legacy_evidence.verify_cell_artifact_bytes(&legacy_bytes).unwrap();
+            assert_eq!(
+                legacy_evidence.binding_contract,
+                CellBindingContract::LegacyUnbound
+            );
+            assert!(
+                legacy_evidence
+                    .bound_attempts()
+                    .unwrap_err()
+                    .contains("legacy-unbound")
+            );
+            let legacy_bytes = fs::read(
+                legacy_parent
+                    .path()
+                    .join(legacy.evidence["artifact"]["path"].as_str().unwrap()),
+            )
+            .unwrap();
+            legacy_evidence
+                .verify_cell_artifact_bytes(&legacy_bytes)
+                .unwrap();
             let legacy_artifact: Value = serde_json::from_slice(&legacy_bytes).unwrap();
-            assert_eq!(legacy_artifact.as_object().unwrap().keys().collect::<Vec<_>>(),
+            assert_eq!(
+                legacy_artifact
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .collect::<Vec<_>>(),
                 retained.as_object().unwrap().keys().collect::<Vec<_>>(),
-                "production must retain the exact published legacy artifact shape");
+                "legacy control must retain the exact published artifact shape"
+            );
             assert_eq!(result.schema_version, 10);
             assert_eq!(result.evidence["binding_contract"], 1);
             let cell = &result.evidence["cells"][0];
-            assert_eq!(cell["cell_verdict"]["state"], "compared-and-matched", "{case}");
+            assert_eq!(
+                cell["cell_verdict"]["state"], "compared-and-matched",
+                "{case}"
+            );
             // THE VERDICT NAMES THE ATTEMPT IT WAS COMPUTED FROM. Without this
             // the row states a comparison and nothing records which of the
             // run's events produced it, which is the whole defect: a verdict
             // that can be counted and never resolved.
             let binding = &cell["evidence_binding"];
             assert!(!binding.is_null(), "{case}: compared verdict left unbound");
-            assert_eq!(binding["run_id"], Value::String(plan.run_id.clone()), "{case}");
-            assert_eq!(binding["tree"], Value::String(plan.hermit_sha.clone()), "{case}");
+            assert_eq!(
+                binding["run_id"],
+                Value::String(plan.run_id.clone()),
+                "{case}"
+            );
+            assert_eq!(
+                binding["tree"],
+                Value::String(plan.hermit_sha.clone()),
+                "{case}"
+            );
             assert_eq!(binding["producer"], "validate", "{case}");
             assert_eq!(
                 binding["series_cell"],
@@ -1194,18 +1354,156 @@ mod tests {
                 "reference-diverged" => {
                     assert_eq!(attempt["reference"]["state"], "compared-and-diverged");
                     assert_eq!(attempt["cross"]["state"], "unavailable-with-reason");
-                },
+                }
                 "reference-no-report" => {
                     assert_eq!(attempt["reference"]["state"], "unavailable-with-reason");
                     assert!(attempt["reference_verification_report_sha256"].is_null());
-                },
+                }
                 _ => unreachable!(),
             }
             let artifact = result.evidence["artifact"]["path"].as_str().unwrap();
             let bytes = fs::read(parent.path().join(artifact)).unwrap();
             assert_eq!(result.evidence["artifact"]["sha256"], hex_digest(&bytes));
-            assert!(String::from_utf8(bytes).unwrap().contains("/synthetic/fixture/"));
-            assert!(!serde_json::to_string(&result.evidence).unwrap().contains("/synthetic/fixture/"));
+            assert!(
+                String::from_utf8(bytes)
+                    .unwrap()
+                    .contains("/synthetic/fixture/")
+            );
+            assert!(
+                !serde_json::to_string(&result.evidence)
+                    .unwrap()
+                    .contains("/synthetic/fixture/")
+            );
+        }
+
+        // The ordinary writer has its own selected-row branch. The schema-7
+        // retry tests below do not prove that V1 binds the row it selected.
+        let ordinary_plan: ConstructedValidationPlanV10 = serde_json::from_str(include_str!(
+            "../../ci/manifest-plan/src/ledger/schema10/fixtures/legacy/ordinary-only-plan.json"
+        ))
+        .unwrap();
+        let selected = ordinary_plan.planned_cells().unwrap();
+        assert_eq!(selected.len(), 1);
+        assert!(
+            ordinary_plan
+                .planned_backend_parity_relations()
+                .unwrap()
+                .is_empty()
+        );
+        let id = &selected[0];
+        let unavailable = |row: &mut Value| {
+            row["outcome"] = Value::String("ERROR".into());
+            row["reason"] = Value::String("runner produced no comparison report".into());
+            row["attempts"] = serde_json::json!([{
+                "verification_report": null, "verification_report_sha256": null
+            }]);
+        };
+        for (case, retry, selected_attempt, state) in [
+            (
+                "fail-then-error",
+                Some("ERROR"),
+                1u64,
+                "compared-and-diverged",
+            ),
+            ("fail-then-pass", Some("PASS"), 2u64, "compared-and-matched"),
+            ("unavailable", None, 1u64, "unavailable-with-reason"),
+        ] {
+            let parent = tempfile::tempdir().unwrap();
+            let results = parent.path().join("input");
+            let mut first = result_row(&ordinary_plan.run_id, &ordinary_plan.hermit_sha);
+            first["attempt"] = Value::from(1);
+            for (field, value) in [
+                ("lane", &id.lane),
+                ("category", &id.category),
+                ("test", &id.test),
+                ("mode", &id.mode),
+                ("backend", &id.backend),
+            ] {
+                first[field] = Value::String(value.clone());
+            }
+            if retry.is_some() {
+                first["outcome"] = Value::String("FAIL".into());
+                first["reason"] = Value::String("first comparison diverged".into());
+                replace_report(
+                    &mut first,
+                    &serde_json::from_str(&report("diverged", "info")).unwrap(),
+                );
+            } else {
+                unavailable(&mut first);
+            }
+            let mut written = vec![first.clone()];
+            append_result_row(&results, &first);
+            if let Some(outcome) = retry {
+                let mut second = first;
+                second["attempt"] = Value::from(2);
+                if outcome == "PASS" {
+                    second["outcome"] = Value::String("PASS".into());
+                    second["reason"] = Value::Null;
+                    replace_report(
+                        &mut second,
+                        &serde_json::from_str(&report("matched", "info")).unwrap(),
+                    );
+                } else {
+                    unavailable(&mut second);
+                }
+                assert_eq!(identity(&second).unwrap(), *id, "{case}");
+                append_result_row(&results, &second);
+                written.push(second);
+            }
+            assert_eq!(identity(&written[0]).unwrap(), *id, "{case}");
+            assert_eq!(written.len(), if retry.is_some() { 2 } else { 1 }, "{case}");
+            let result = retain_v10(parent.path(), &results, &ordinary_plan).unwrap();
+            assert_eq!(result.schema_version, 10);
+            assert_eq!(result.evidence["binding_contract"], 1);
+            assert_eq!(result.evidence["selected_count"], 1);
+            assert_eq!(result.evidence["recorded_count"], 1);
+            assert_eq!(result.evidence["artifact"]["row_count"], 1);
+            assert_eq!(result.evidence["cells"].as_array().unwrap().len(), 1);
+            let cell = &result.evidence["cells"][0];
+            assert_eq!(cell["cell_verdict"]["state"], state, "{case}");
+            assert!(cell["backend_parity"].is_null(), "{case}");
+            let evidence: hermit_manifest_plan::ledger::CellResultsEvidenceV10 =
+                serde_json::from_value(result.evidence.clone()).unwrap();
+            let bindings = evidence.bound_attempts().unwrap();
+            if retry.is_some() {
+                assert_eq!(bindings.len(), 1, "{case}");
+                assert_eq!(cell["selected_attempt"], selected_attempt, "{case}");
+                assert_eq!(
+                    cell["evidence_binding"]["selected_attempt"], selected_attempt,
+                    "{case}"
+                );
+                let binding: hermit_manifest_plan::ledger::CellEvidenceBinding =
+                    serde_json::from_value(cell["evidence_binding"].clone()).unwrap();
+                binding
+                    .verify_against(&ordinary_plan.run_id, &ordinary_plan.hermit_sha, id)
+                    .unwrap();
+            } else {
+                assert!(bindings.is_empty(), "{case}");
+                assert!(cell.get("selected_attempt").is_none(), "{case}");
+                assert!(cell.get("evidence_binding").is_none(), "{case}");
+            }
+            let bytes = fs::read(
+                parent
+                    .path()
+                    .join(result.evidence["artifact"]["path"].as_str().unwrap()),
+            )
+            .unwrap();
+            assert_eq!(result.evidence["artifact"]["sha256"], hex_digest(&bytes));
+            evidence.verify_cell_artifact_bytes(&bytes).unwrap();
+            let artifact: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(artifact["selected_attempt"], selected_attempt, "{case}");
+            assert_eq!(artifact["cell_verdict"]["state"], state, "{case}");
+            if retry.is_some() {
+                assert_eq!(artifact["cell_verdict"], cell["cell_verdict"], "{case}");
+            } else {
+                assert_eq!(
+                    artifact["cell_verdict"]["reason"],
+                    "runner produced no comparison report"
+                );
+            }
+            // A recovered match selects attempt 2, but the failed first row is
+            // still retained; a later ERROR must not select over that failure.
+            assert_eq!(all_result_rows(&results).unwrap(), written, "{case}");
         }
     }
 
@@ -1389,10 +1687,8 @@ mod tests {
             "none_recorded":["unknown"],
             "undeclared":[]
         });
-        let planned_nodes = BTreeSet::from([
-            "check.example".to_string(),
-            "test.example".to_string(),
-        ]);
+        let planned_nodes =
+            BTreeSet::from(["check.example".to_string(), "test.example".to_string()]);
         let planned_test_nodes = BTreeSet::from(["test.example".to_string()]);
         let test_node_coverage = serde_json::json!({
             "planned_test_nodes": 1,
@@ -1423,14 +1719,26 @@ mod tests {
         assert_eq!(scope["e2e"]["selected_and_enabled_count"], 1);
         assert_eq!(scope["e2e"]["enabled_not_selected_count"], 1);
         assert_eq!(scope["e2e"]["selected_not_enabled_count"], 1);
-        assert_eq!(scope["e2e"]["enabled_not_selected"][0]["observed_pass_count"], 1);
-        assert_eq!(scope["e2e"]["enabled_not_selected"][0]["observed_fail_count"], 2);
+        assert_eq!(
+            scope["e2e"]["enabled_not_selected"][0]["observed_pass_count"],
+            1
+        );
+        assert_eq!(
+            scope["e2e"]["enabled_not_selected"][0]["observed_fail_count"],
+            2
+        );
         assert_eq!(
             scope["e2e"]["enabled_not_selected"][0]["reason"],
             "excluded after the recorded observations"
         );
-        assert_eq!(scope["integration_test_binaries"]["ci_registered"][0], "covered");
-        assert_eq!(scope["integration_test_binaries"]["none_recorded"][0], "unknown");
+        assert_eq!(
+            scope["integration_test_binaries"]["ci_registered"][0],
+            "covered"
+        );
+        assert_eq!(
+            scope["integration_test_binaries"]["none_recorded"][0],
+            "unknown"
+        );
     }
 
     fn append_result_row(root: &Path, row: &Value) {
@@ -1466,9 +1774,9 @@ mod tests {
             retained.evidence["cells"][0]["cell_verdict"]["state"],
             "compared-and-matched"
         );
-        let expected_comparison: Value =
-            serde_json::from_str::<Value>(&report("matched", "info")).unwrap()["comparison"]
-                .clone();
+        let expected_comparison: Value = serde_json::from_str::<Value>(&report("matched", "info"))
+            .unwrap()["comparison"]
+            .clone();
         assert_eq!(
             retained.evidence["cells"][0]["cell_verdict"]["comparison"],
             expected_comparison
@@ -1496,7 +1804,10 @@ mod tests {
         });
         let mut expected_bytes = serde_json::to_vec(&artifact_row).unwrap();
         expected_bytes.push(b'\n');
-        assert_eq!(bytes, expected_bytes, "the shared type must preserve artifact bytes");
+        assert_eq!(
+            bytes, expected_bytes,
+            "the shared type must preserve artifact bytes"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1588,7 +1899,10 @@ mod tests {
 
             let error = retain(&root, &results, commit, &expected).unwrap_err();
             if case == "unknown" {
-                assert!(error.contains("unsupported cell mode `future-mode`"), "{error}");
+                assert!(
+                    error.contains("unsupported cell mode `future-mode`"),
+                    "{error}"
+                );
             } else {
                 assert!(error.contains("no nonempty mode"), "{error}");
             }
@@ -1611,17 +1925,22 @@ mod tests {
         let commit = "1515151515151515151515151515151515151515";
         let mut row = result_row("validate-missing-report-field", commit);
         let mut report: Value = serde_json::from_str(&report("matched", "info")).unwrap();
-        report.as_object_mut().unwrap().remove("first_divergent_record");
+        report
+            .as_object_mut()
+            .unwrap()
+            .remove("first_divergent_record");
         replace_report(&mut row, &report);
         write_result(&results, &row);
 
         let retained = retain(&root, &results, commit, &expected(&row)).unwrap();
         let verdict = &retained.evidence["cells"][0]["cell_verdict"];
         assert_eq!(verdict["state"], "unavailable-with-reason");
-        assert!(verdict["reason"]
-            .as_str()
-            .unwrap()
-            .contains("missing current producer field `first_divergent_record`"));
+        assert!(
+            verdict["reason"]
+                .as_str()
+                .unwrap()
+                .contains("missing current producer field `first_divergent_record`")
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1811,9 +2130,8 @@ mod tests {
                 "3434343434343434343434343434343434343434",
             );
             row["outcome"] = Value::String("ERROR".into());
-            row["reason"] = Value::String(
-                "verification recorded 2 HERMIT_SKID_OVERSHOOT report(s)".into(),
-            );
+            row["reason"] =
+                Value::String("verification recorded 2 HERMIT_SKID_OVERSHOOT report(s)".into());
             let mut infrastructure: Value =
                 serde_json::from_str(&report("matched", "info")).unwrap();
             infrastructure["verified"] = Value::Bool(false);

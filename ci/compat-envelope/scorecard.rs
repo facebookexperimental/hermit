@@ -18821,7 +18821,7 @@ red/`measured-and-passed` count is **0**.",
             series.validate_for_write()?;
             let encoded = serde_json::to_vec(&series).map_err(|e| e.to_string())?;
             let series: SeriesRow = serde_json::from_slice(&encoded).map_err(|e| e.to_string())?;
-            let (projected, projection) = project_series_fixture(&[series.clone()])?;
+            let (projected, projection) = project_series_fixture(std::slice::from_ref(&series))?;
             let (direct, fold) = fold_fixture_row(direct)?;
             let expected = if timed_out {
                 ObservedResult::Timeout
