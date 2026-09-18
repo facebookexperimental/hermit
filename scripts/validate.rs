@@ -1862,12 +1862,16 @@ fn self_test_runner_log_probe(logs: &Path, outer: &Path) -> Result<(), String> {
         10, 10, 64 * 1024 * 1024,
     );
     // Real production labels deliberately collide with the seeded outer files.
+    let mut skipped = step("post", "must_not_run", "exit 99");
+    skipped.deps = vec!["setup.manifest_plan".into()];
     let cfg = validate_plan::config_from(vec![
         step("pre", "submodules", "printf 'fixture pass\\n'"),
         step("setup", "manifest_plan", "printf 'fixture failure\\n'; exit 23"),
+        skipped,
     ], "runner log isolation fixture");
     let result = run_lane_once(&cfg, 1, true, 0, None, &logs.join("driver.log"), None, false);
-    if !result.complete || result.ok || result.run_timed_out || !result.skipped.is_empty()
+    if result.complete || result.ok || result.run_timed_out
+        || result.skipped != ["post.must_not_run".to_string()]
         || result.outcomes.len() != 2 || result.attempts.len() != 2
     {
         return Err(format!("runner log isolation: terminal result changed: complete={} ok={} outcomes={:?} skipped={:?}",
@@ -1891,14 +1895,46 @@ fn self_test_runner_log_probe(logs: &Path, outer: &Path) -> Result<(), String> {
         .map(serde_json::from_slice::<serde_json::Value>)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("runner log isolation: malformed private journal: {error}"))?;
-    for (tag, ok) in [("pre.submodules", "true"), ("setup.manifest_plan", "false")] {
+    if dagrun::require_step_end_ok(&serde_json::json!({
+        "event": "step_end",
+        "ok": "false",
+    }))
+    .is_ok()
+    {
+        return Err("runner log isolation: string `false` journal verdict was accepted".into());
+    }
+    let ends = rows.iter().filter(|row| row["event"] == "step_end").collect::<Vec<_>>();
+    let skips = rows.iter().filter(|row| row["event"] == "step_skip").collect::<Vec<_>>();
+    let terminal_steps = ends.iter().chain(&skips)
+        .filter_map(|row| row["step"].as_str())
+        .collect::<BTreeSet<_>>();
+    let expected_terminal_steps = [
+        "pre.submodules",
+        "setup.manifest_plan",
+        "post.must_not_run",
+    ].into_iter().collect::<BTreeSet<_>>();
+    if ends.len() + skips.len() != expected_terminal_steps.len()
+        || terminal_steps != expected_terminal_steps
+    {
+        return Err(format!("runner log isolation: incomplete terminal accounting: {terminal_steps:?}"));
+    }
+    for (tag, ok) in [("pre.submodules", true), ("setup.manifest_plan", false)] {
         let starts = rows.iter().filter(|row| row["event"] == "step_start" && row["step"] == tag).count();
-        let ends = rows.iter().filter(|row| row["event"] == "step_end" && row["step"] == tag).collect::<Vec<_>>();
-        if starts != 1 || ends.len() != 1 || ends[0]["ok"] != ok
-            || ends[0]["timed_out"] != "false" || ends[0]["cpu_timed_out"] != "false"
+        let matching_ends = ends.iter().filter(|row| row["step"] == tag).collect::<Vec<_>>();
+        let observed_ok = matching_ends.first()
+            .ok_or_else(|| format!("runner log isolation: no terminal journal record for {tag}"))
+            .and_then(|row| dagrun::require_step_end_ok(row)
+                .map_err(|error| format!("runner log isolation: {tag}: {error}")))?;
+        if starts != 1 || matching_ends.len() != 1 || observed_ok != ok
+            || matching_ends[0]["timed_out"] != "false" || matching_ends[0]["cpu_timed_out"] != "false"
         {
             return Err(format!("runner log isolation: missing or changed start/end record for {tag}"));
         }
+    }
+    if skips.len() != 1 || skips[0]["step"] != "post.must_not_run"
+        || skips[0]["reason"] != "dependency_failed"
+    {
+        return Err(format!("runner log isolation: missing or changed skip record: {skips:?}"));
     }
     for name in ["journal.jsonl", "pre.submodules.log", "setup.manifest_plan.log"] {
         if read(&outer.join(name))? != RUNNER_LOG_SENTINEL {
@@ -2124,6 +2160,7 @@ fn self_test() -> Result<(), String> {
             filtered_tests: None,
             test_results: None,
             test_results_error: None,
+            test_results_error_kind: None,
             returncode: Some(if ok { 0 } else { 1 }),
             oomed: false,
             oom_kills: 0,
@@ -10290,6 +10327,7 @@ fn summary_listing_bracket() -> Result<String, String> {
         filtered_tests: None,
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
         returncode: Some(if ok { 0 } else { 1 }),
         oomed: false,
         oom_kills: 0,
@@ -16565,6 +16603,7 @@ fn test_node_coverage_bracket() -> Result<(), String> {
         filtered_tests: Some(0),
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
         returncode: Some(if ok { 0 } else { 100 }),
         oomed: false,
         oom_kills: 0,
@@ -16619,6 +16658,7 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
         filtered_tests,
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
         returncode: Some(if ok { 0 } else { 100 }),
         oomed: false,
         oom_kills: 0,
@@ -17137,6 +17177,7 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
         filtered_tests: Some(0),
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
         returncode: Some(1),
         oomed: false,
         oom_kills: 0,
@@ -18091,6 +18132,7 @@ fn possible_missing_artifact_bracket() -> Result<(), String> {
         filtered_tests: None,
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
         returncode,
         oomed: false,
         oom_kills: 0,
@@ -18131,6 +18173,7 @@ fn no_result_propagation_bracket() -> Result<(), String> {
         filtered_tests: None,
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
         returncode: Some(returncode),
         oomed: false,
         oom_kills: 0,
@@ -22220,6 +22263,7 @@ fn stop_test_seam(
         filtered_tests: None,
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
         returncode: Some(if ok { 0 } else { 1 }),
         oomed: false,
         oom_kills: 0,

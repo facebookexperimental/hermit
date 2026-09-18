@@ -3,6 +3,7 @@
 set -euo pipefail
 SOURCE_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 python3 - "$SOURCE_DIR" <<'PY'
+import json
 import os
 from pathlib import Path
 import shutil
@@ -42,7 +43,8 @@ set -euo pipefail
 printf '%s\\0' "$@" > "$DAGRUN_LOG_DIR/received.argv"
 printf '%s\\n' '{"event":"step_start","step":"test.cli"}' > "$DAGRUN_LOG_DIR/journal.jsonl"
 printf 'fixture failure retained\\n' > "$DAGRUN_LOG_DIR/test.cli.log"
-printf '%s\\n' '{"event":"step_end","step":"test.cli","ok":"false","returncode":"23"}' >> "$DAGRUN_LOG_DIR/journal.jsonl"
+printf '%s\\n' '{"event":"step_end","step":"test.cli","ok":false,"returncode":"23"}' >> "$DAGRUN_LOG_DIR/journal.jsonl"
+printf '%s\\n' '{"event":"step_skip","step":"test.dependent","reason":"dependency_failed"}' >> "$DAGRUN_LOG_DIR/journal.jsonl"
 printf 'fixture stdout\\n'
 if [[ ${FIXTURE_SIGNAL:-0} == 1 ]]; then kill -TERM "$$"; fi
 if [[ ${1:-} == --test && ${2:-} == scripts/alpha.rs ]]; then exit 23; fi
@@ -88,8 +90,24 @@ exit 17
         assert path != outer and path.is_dir()
         assert stat.S_IMODE(path.stat().st_mode) == 0o700
         assert (path / "test.cli.log").read_bytes() == b"fixture failure retained\n"
-        rows = (path / "journal.jsonl").read_text().splitlines()
-        assert len(rows) == 2 and '"ok":"false"' in rows[1]
+        rows = [json.loads(line) for line in (path / "journal.jsonl").read_text().splitlines()]
+        ends = [row for row in rows if row.get("event") == "step_end"]
+        skips = [row for row in rows if row.get("event") == "step_skip"]
+
+        def step_end_ok(row):
+            if row.get("event") != "step_end" or type(row.get("ok")) is not bool:
+                raise ValueError("journal step_end ok must be a boolean")
+            return row["ok"]
+
+        assert len(ends) == 1 and step_end_ok(ends[0]) is False
+        try:
+            step_end_ok({"event": "step_end", "ok": "false"})
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("string false journal verdict was accepted")
+        assert skips == [{"event": "step_skip", "step": "test.dependent",
+                          "reason": "dependency_failed"}]
         for name in ("source.path", "command.argv"):
             assert stat.S_IMODE((path / name).stat().st_mode) == 0o600
 

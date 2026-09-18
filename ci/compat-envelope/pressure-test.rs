@@ -7424,6 +7424,9 @@ fn display_id(cell: &CellId) -> String {
 }
 
 fn prerequisite_scheduler_self_test(canonical: &DagConfig, scratch: &Path) -> Result<(), String> {
+    if dagrun::require_step_end_ok(&json!({"event": "step_end", "ok": "false"})).is_ok() {
+        return Err("prerequisite journal reader accepted string `false` as a verdict".into());
+    }
     let required = required_build_tags(None, true);
     let original: BTreeMap<_, _> = canonical.steps.iter()
         .filter(|step| required.contains(step.tag().as_str()))
@@ -7533,14 +7536,33 @@ fn prerequisite_scheduler_self_test(canonical: &DagConfig, scratch: &Path) -> Re
             .map_err(|e| format!("invalid isolated prerequisite journal: {e}"))?;
         let ends: Vec<_> = rows.iter().filter(|row| row["event"] == "step_end").collect();
         let ended: BTreeSet<_> = ends.iter().filter_map(|row| row["step"].as_str()).collect();
-        if ends.len() != expected.len()
-            || ended != expected.iter().map(String::as_str).collect()
-            || ends.iter().any(|row| {
-                row["ok"] != if row["step"].as_str() == failed { "false" } else { "true" }
-                    || row["cpu_limit_s"] != "5" || row["wall_limit_s"] != "5"
-            })
-        {
+        if ends.len() != expected.len() || ended != expected.iter().map(String::as_str).collect() {
             return Err(format!("isolated prerequisite fixture {failed:?} lost its exact terminal evidence"));
+        }
+        for row in &ends {
+            let step = row["step"].as_str().ok_or("prerequisite step_end has no string step")?;
+            let ok = dagrun::require_step_end_ok(row)
+                .map_err(|error| format!("prerequisite {step}: {error}"))?;
+            if ok != (Some(step) != failed)
+                || row["cpu_limit_s"] != "5" || row["wall_limit_s"] != "5"
+            {
+                return Err(format!("isolated prerequisite fixture {failed:?} lost its exact terminal evidence"));
+            }
+        }
+        let skips = rows.iter().filter(|row| row["event"] == "step_skip").collect::<Vec<_>>();
+        let skipped: BTreeSet<_> = skips.iter().filter_map(|row| row["step"].as_str()).collect();
+        let expected_skipped: BTreeSet<_> = original.keys()
+            .map(String::as_str)
+            .filter(|step| !expected.iter().any(|ended| ended == step))
+            .collect();
+        let accounted: BTreeSet<_> = ended.union(&skipped).copied().collect();
+        if ends.len() + skips.len() != original.len()
+            || skips.len() != expected_skipped.len()
+            || skipped != expected_skipped
+            || accounted != original.keys().map(String::as_str).collect()
+            || skips.iter().any(|row| row["reason"] != "dependency_failed")
+        {
+            return Err(format!("isolated prerequisite fixture {failed:?} lost its skip accounting"));
         }
     }
     println!("  prerequisite scheduler: ten-node positive and four failed-preflight controls retain exact execution identities");
