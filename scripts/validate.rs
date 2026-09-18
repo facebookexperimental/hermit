@@ -190,7 +190,15 @@ const INTEGRATION_ARTIFACT_WRAPPER: &str =
 /// placeholder tag. The committed DAG contains the real `compat.*` population;
 /// this name is never a node and never triggers runtime graph generation.
 const STRICT_COMPAT_SELECTION_ALIAS: &str = "test.strict_compat";
-const NEXTEST_PORTABLE_PREPARE_COMMAND: &str = "./ci/nextest-binaries.rs prepare portable";
+// The FULL plan's workspace producer prepares the FULL profile. Each build
+// producer prepares the profile of the plan it serves -- full/full,
+// privileged/privileged, liteinst/liteinst, quick/quick, super/super -- and
+// ci/manifest-plan/src/validation_dag_static.rs, which generates the graph,
+// emits "prepare portable" for no step at all. The earlier spelling here named
+// a profile this producer had stopped preparing, so the bracket refused a graph
+// that was correct. Renamed as well as retargeted: a constant whose name says
+// portable while its value says full is the same defect one layer down.
+const NEXTEST_FULL_PREPARE_COMMAND: &str = "./ci/nextest-binaries.rs prepare full";
 const NEXTEST_PRIVILEGED_ASSERT_COMMAND: &str = "./ci/nextest-binaries.rs assert privileged";
 const TESTS_MISC_EXECUTABLE_READ_COMMAND: &str = r#"tests_misc="$(./ci/nextest-binaries.rs executable hermit-detcore tests_misc)" || exit 1"#;
 
@@ -329,7 +337,7 @@ fn prepared_nextest_commands_bracket(workspace: &Step, privileged: &Step) -> Res
         || !privileged_command.contains(NEXTEST_PRIVILEGED_ASSERT_COMMAND)
         || !privileged_command.contains(TESTS_MISC_EXECUTABLE_READ_COMMAND)
         || privileged_command.contains("cargo ")
-        || !workspace_command.ends_with(NEXTEST_PORTABLE_PREPARE_COMMAND)
+        || !workspace_command.ends_with(NEXTEST_FULL_PREPARE_COMMAND)
     {
         return Err("full-plan bracket: prepared Nextest population must come from the workspace producer and the privileged barrier must verify it without Cargo compilation".into());
     }
@@ -3442,15 +3450,15 @@ cleared-caps refusal names {} starved step(s)",
                     .into(),
             );
         }
-        let portable_build = full
+        let workspace_build = full
             .cfg
             .steps
             .iter()
             .find(|s| s.tag() == "build.workspace")
-            .ok_or("full-plan bracket: portable fat build disappeared")?;
-        if !portable_build.cmd.contains("cargo build --workspace --all-targets")
-            || !portable_build.cmd.contains("cargo build -p hermit")
-            || !portable_build.cmd.contains("--bin hermit")
+            .ok_or("full-plan bracket: workspace fat build disappeared")?;
+        if !workspace_build.cmd.contains("cargo build --workspace --all-targets")
+            || !workspace_build.cmd.contains("cargo build -p hermit")
+            || !workspace_build.cmd.contains("--bin hermit")
         {
             return Err("full-plan bracket: fat build does not finish the debug Hermit producer".into());
         }
@@ -3594,11 +3602,23 @@ cleared-caps refusal names {} starved step(s)",
             .find(|s| s.tag() == "privileged-build.privileged_tests")
             .ok_or("full-plan bracket: privileged focused build disappeared")?;
         privileged_artifact_barriers(privileged_build)?;
-        prepared_nextest_commands_bracket(portable_build, privileged_build)?;
-        let prepared = hermit_manifest_plan::nextest_binaries::profile_selections(&root, "portable")?;
+        prepared_nextest_commands_bracket(workspace_build, privileged_build)?;
+        // Ask about the profile the producer ACTUALLY prepares. build.workspace
+        // prepares "full" (see NEXTEST_FULL_PREPARE_COMMAND), so asking whether
+        // "portable" covers the privileged selections tested a set nobody
+        // prepares. MEASURED on the committed graph: portable holds 15
+        // selections, full 16, privileged 3; portable omits exactly one
+        // privileged selection and full omits none. The one it omits is
+        // privileged-only-test.cli_kvm's
+        // ["-p","hermit","--features","third-party-backends,kvm-execution-tests","--lib","--test","cli"],
+        // which the same commit created when it gave that node the
+        // kvm-execution-tests feature. The requirement is unchanged -- every
+        // privileged selection must already be prepared -- only the set it is
+        // asked of is now the one that exists.
+        let prepared = hermit_manifest_plan::nextest_binaries::profile_selections(&root, "full")?;
         for required in hermit_manifest_plan::nextest_binaries::profile_selections(&root, "privileged")?.keys() {
             if !prepared.contains_key(required) {
-                return Err(format!("full-plan bracket: portable preparation omits privileged Cargo selection {required}"));
+                return Err(format!("full-plan bracket: full preparation omits privileged Cargo selection {required}"));
             }
         }
         if ["test.cli", "test.hermit_modes"]
@@ -13587,7 +13607,14 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         .ok_or("retry bounds: privileged lane is absent")?;
     for (tag, expected) in [
         ("privileged-only-test.pmu_buck_chaos_cases", 6usize),
-        ("privileged-only-test.cli_kvm", 24usize),
+        // 25, not 24, since hermit de6a9910e "Align KVM validation selections with
+        // measured inventories" added the kvm-native-test-support feature. That
+        // commit measured 694/698/25 and retained all 689/681/24 prior identities,
+        // so this is one ADDED selection rather than a changed one. It bumped
+        // ci/dag/validate.json and left this table behind, which is what made
+        // gate.manifest fail deterministically -- the guard was right and the
+        // copy was stale.
+        ("privileged-only-test.cli_kvm", 25usize),
     ] {
         let step = privileged
             .steps
@@ -22738,8 +22765,8 @@ mod fused_privileged_build_tests {
         let repository = Path::new(file!()).parent().and_then(Path::parent).unwrap();
         let committed = validate_plan::validation_config(repository).unwrap();
         let workspace = committed.steps.iter().find(|step| step.tag() == "build.workspace").unwrap();
-        assert!(workspace.cmd.ends_with(NEXTEST_PORTABLE_PREPARE_COMMAND));
-        let preparation = &workspace.cmd[workspace.cmd.len() - NEXTEST_PORTABLE_PREPARE_COMMAND.len()..];
+        assert!(workspace.cmd.ends_with(NEXTEST_FULL_PREPARE_COMMAND));
+        let preparation = &workspace.cmd[workspace.cmd.len() - NEXTEST_FULL_PREPARE_COMMAND.len()..];
         let mut consumer = committed.steps.iter().find(|step| step.tag() == "privileged-build.privileged_tests").unwrap().clone();
         // This fixture supplies a fake Cargo executable and an empty target.
         // Preserve its full cold/prepared contract against the exact authored
@@ -22774,7 +22801,14 @@ mod fused_privileged_build_tests {
         let prepared = run_build(preparation, root.path(), &bin, &log, "current");
         assert!(prepared.status.success(), "{}", String::from_utf8_lossy(&prepared.stderr));
         let before = std::fs::read_to_string(&log).unwrap();
-        let expected = hermit_manifest_plan::nextest_binaries::profile_selections(repository, "portable").unwrap();
+        // The FULL profile, because `preparation` above is the full plan's own
+        // producer (NEXTEST_FULL_PREPARE_COMMAND) run against a fixture holding
+        // the real ci/dag/validate.json. Asking for "portable" compared this
+        // producer's output against a set it does not prepare: 16 observed
+        // builds against 15 expected. That is not a widening -- the loop below
+        // requires every expected selection to appear exactly once, so this
+        // now checks 16 selections where it checked 15.
+        let expected = hermit_manifest_plan::nextest_binaries::profile_selections(repository, "full").unwrap();
         let calls = before.lines().map(|line| serde_json::from_str::<Vec<String>>(line).unwrap()).collect::<Vec<_>>();
         let builds = calls.iter().filter(|args| args.first().map(String::as_str) == Some("nextest") && !args.iter().any(|arg| arg == "--binaries-metadata")).collect::<Vec<_>>();
         assert_eq!(builds.len(), expected.len(), "each distinct selection is prepared once");
@@ -23361,8 +23395,8 @@ mod prepared_command_tests {
         let payload = guarded_command_source(&pinned.tag(), &pinned.cmd).unwrap();
         let changed = outer_decoy(
             pinned,
-            &payload.replacen(NEXTEST_PORTABLE_PREPARE_COMMAND, "missing-preparation", 1),
-            NEXTEST_PORTABLE_PREPARE_COMMAND,
+            &payload.replacen(NEXTEST_FULL_PREPARE_COMMAND, "missing-preparation", 1),
+            NEXTEST_FULL_PREPARE_COMMAND,
         );
         assert!(prepared_nextest_commands_bracket(&changed, barrier).is_err());
 
