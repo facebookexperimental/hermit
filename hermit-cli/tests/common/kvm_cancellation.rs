@@ -461,7 +461,9 @@ pub(super) fn run(loops: usize, expected: i32) {
         .keep();
     eprintln!("KVM cancellation artifacts retained at {}", root.display());
     let guest = root.join("program");
-    let fixture = repository.join(format!("tests/c/kvm_cancellation_{loops}.S"));
+    let fixture = repository.join(format!(
+        "hermit-cli/tests/fixtures/kvm_cancellation_{loops}.S"
+    ));
     fs::copy(&fixture, root.join("guest.S")).expect("retain exact assembly");
     let status = bounded_command(
         Command::new("cc")
