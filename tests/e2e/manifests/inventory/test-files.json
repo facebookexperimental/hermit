@@ -1220,6 +1220,24 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/kvm_cancellation_256.S",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/kvm_cancellation_256.S is owned by hermit-cli/tests/cli.rs: This freestanding KVM cancellation guest has an exact nonzero exit contract, a fixed clone3/futex/RDTSC protocol, two strict canonical verification runs and driver-owned cancellation trace assertions; it is not a generic expected-zero E2E cell."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/kvm_cancellation_512.S",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/kvm_cancellation_512.S is owned by hermit-cli/tests/cli.rs: This freestanding KVM cancellation guest has an exact nonzero exit contract, a fixed clone3/futex/RDTSC protocol, two strict canonical verification runs and driver-owned cancellation trace assertions; it is not a generic expected-zero E2E cell."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/kvm_cancellation_64.S",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/kvm_cancellation_64.S is owned by hermit-cli/tests/cli.rs: This freestanding KVM cancellation guest has an exact nonzero exit contract, a fixed clone3/futex/RDTSC protocol, two strict canonical verification runs and driver-owned cancellation trace assertions; it is not a generic expected-zero E2E cell."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/kvm_exact_child_waits.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/kvm_exact_child_waits.c is owned by hermit-cli/tests/cli.rs: The CLI integration suite compiles this child-wait workload and exercises the KVM-specific completion contract with exact process ordering; it remains coupled to that dedicated driver rather than a generic manifest cell."

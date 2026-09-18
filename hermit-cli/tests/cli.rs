@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/kvm_cancellation.rs"]
+mod kvm_cancellation;
+
 #[path = "common/liteinst.rs"]
 mod liteinst_runtime;
 
@@ -6959,4 +6962,20 @@ fn the_stderr_deadline_is_spent_once_across_writes_not_restarted_by_each() {
         Some(127),
         "giving up on undeliverable diagnostics must not change the exit status"
     );
+}
+
+// The run_kvm_ prefix is selected by all three existing KVM validation lanes.
+#[test]
+fn run_kvm_exit_group_cancels_queued_leader_exit() {
+    kvm_cancellation::run(64, 95);
+}
+
+#[test]
+fn run_kvm_exit_group_cancels_queued_worker_exit() {
+    kvm_cancellation::run(256, 17);
+}
+
+#[test]
+fn run_kvm_exit_group_cancels_rdtsc_posthook_wait() {
+    kvm_cancellation::run(512, 17);
 }

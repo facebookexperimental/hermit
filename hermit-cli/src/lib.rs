@@ -2402,7 +2402,11 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     config.use_thread_local_clock_reads = false;
     config.detect_host_clock_futex_timeouts = backend == Backend::Sabre;
     config.syscall_clobbers_virtualized_by_backend = backend == Backend::Sabre;
-    config.cancel_killed_thread_rpcs = matches!(backend, Backend::Sabre | Backend::Dbt);
+    // Wake pending RPCs on logical removal, reject stale requests, and account
+    // the eventual deregistration exactly once. KVM has no native task exit
+    // that can resolve a removed thread's pending Tool future.
+    config.cancel_killed_thread_rpcs =
+        matches!(backend, Backend::Sabre | Backend::Dbt | Backend::Kvm);
     config.backend_reports_physical_process_exits = backend == Backend::Sabre;
     // TODO-HUMAN-REVIEW(PR-1122): Review concurrent KVM process-child scheduling.
     config.backend_serializes_fork_children = false;
@@ -4257,6 +4261,7 @@ mod tests {
     fn kvm_backend_config_marks_concurrent_process_children() {
         let config = super::DetConfig::default();
         let kvm = prepare_backend_config(config, Backend::Kvm);
+        assert!(kvm.cancel_killed_thread_rpcs);
         assert!(!kvm.backend_serializes_fork_children);
         assert!(kvm.backend_dispatches_thread_tools);
         assert!(kvm.backend_tracks_process_children);

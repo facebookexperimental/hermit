@@ -325,7 +325,21 @@ fi
 # That Cargo failure remains a failure; only its completed cold SDK work is
 # calibration evidence. The normal Hermit workspace/all-target check remains
 # independently required. No DBT guest correctness or new replay claim follows.
-expected_pin=f97b7be1de4e2ef10ecc24cee5d8cc47f2fd254f
+# CARRY TO b5e2ab49 (2026-09-18): the KVM repairs through
+# https://github.com/rrnewton/reverie/pull/587 preserve the entire reverie-dbt
+# subtree from f97b7be1, including build.rs and the DynamoRIO gitlink. Root
+# Cargo.toml, rust-toolchain.toml, third-party and .gitmodules also match.
+# No CMAKE or CMAKE_GENERATOR selection changes here. Carry the existing
+# b0247764df7f recipe, 1050 effective-job-second threshold and 16-job clamp.
+# This is source identity evidence, not a new timing or Hermit guest result;
+# the original single-sample and failed-enclosing-check limitations remain.
+# CARRY TO e21e13c7 (2026-09-18): the ptrace clock-origin repair changes
+# only reverie-ptrace source/tests. The complete reverie-dbt tree, build.rs,
+# DynamoRIO Gitlink and root recipe/toolchain inputs are identical to b5e2ab49.
+# Retain the 1050 effective-job-second budget and 16-job clamp with the same
+# CMAKE selection. This source-identity carry is not a new timing measurement
+# and does not transfer an earlier pin's runtime validation.
+expected_pin=e21e13c76482918d73e90f49eba04a28bdb054bd
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
