@@ -127,9 +127,9 @@ Commands:
   --help
       Show this text.
 
-Green means that the cell is selected by full in ci/expected-e2e-plan.json.
-Red means that the cell is in the manifest but is not selected by full; red
-does not mean failed. Manifest-disabled combinations are Not applicable.
+Selected by full means that the cell appears in ci/expected-e2e-plan.json.
+Not selected by full means that the cell is in the manifest but absent from
+that plan; selection is not a test result. Other combinations are Not applicable.
 Cross-backend parity is reported separately and only from strict measured
 ptrace-vs-candidate evidence.
 "#;
@@ -159,11 +159,10 @@ struct ManifestRow {
     ci: bool,
     #[serde(default)]
     ci_disabled_reason: Option<CiDisabledReasonData>,
-    enabled: bool,
     lane: String,
     mode: String,
-    /// Why this backend is not enabled for this mode, verbatim from the
-    /// manifest. Present exactly when `enabled` is false. See
+    /// Why this backend is not applicable for this mode, verbatim from the
+    /// manifest. Its presence is the explicit applicability boundary. See
     /// [`CellStatus::NotApplicable`].
     #[serde(default)]
     not_applicable_reason: Option<String>,
@@ -256,10 +255,9 @@ struct ObservationProjection {
 struct TrackedCell {
     #[serde(flatten)]
     id: CellId,
-    #[serde(default)]
-    enabled: bool,
     status: CellStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "not_selected_by_full_reason", alias = "ci_disabled_reason")]
     ci_disabled_reason: Option<CiDisabledReasonData>,
     /// Why the green-removal ratchet was OVERRIDDEN for this cell, verbatim from
     /// `update --allow-green-removal <reason>`.
@@ -333,16 +331,17 @@ struct CiDisabledReasonData {
 enum CellStatus {
     Green,
     Red,
-    /// The backend is not enabled for this test and mode, so the cell was never
+    /// The backend is not applicable to this test and mode, so the cell was never
     /// asked to do anything and cannot have failed.
     ///
     /// ⚠️ THIS EXISTS BECAUSE `Red` WAS CARRYING THREE MEANINGS AT ONCE: it
     /// failed, it was never measured, and it does not apply. Measured
     /// 2026-08-25: of 5,317 red cells, exactly TWO carried any observation, and
-    /// 4,940 were cells whose backend is not enabled for their mode. A reader
+    /// 4,940 were cells whose backend is not applicable to their mode. A reader
     /// seeing 5,317 reds was reading 93% not-applicable as failure.
     ///
-    /// It is DERIVED FROM `enabled`, never asserted independently, and it always
+    /// It is derived from the manifest's applicability reason, never asserted
+    /// independently, and it always
     /// carries the manifest's own reason string -- so it cannot drift from the
     /// manifest and it cannot be set without saying why.
     #[serde(rename = "not-applicable")]
@@ -350,11 +349,11 @@ enum CellStatus {
 }
 
 impl CellStatus {
-    fn as_str(self) -> &'static str {
+    fn selection_label(self) -> &'static str {
         match self {
-            Self::Green => "green",
-            Self::Red => "red",
-            Self::NotApplicable => "not-applicable",
+            Self::Green => "Selected by full",
+            Self::Red => "Not selected by full",
+            Self::NotApplicable => "Not applicable",
         }
     }
 }
@@ -725,11 +724,12 @@ struct LastTested {
     /// dates are the thing already shown to be actively misleading here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     check: Option<CheckIdentity>,
-    /// Whether the cell was ENABLED when this stamp was written. A green from a
-    /// period when the cell was disabled is not a baseline, and `enabled` today
+    /// Whether the cell was applicable when this stamp was written. A result from a
+    /// period when the cell was not applicable is not a baseline, and applicability today
     /// does not say what was true then. `None` means unrecorded, not `false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    enabled_when_tested: Option<bool>,
+    #[serde(alias = "enabled_when_tested")]
+    applicable_when_tested: Option<bool>,
     /// Verdict of this exact stamp, not the cell's aggregate history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     comparison_verdict: Option<StampComparisonVerdict>,
@@ -2610,7 +2610,7 @@ fn retry_guest_arguments<'a>(
 
 struct Derived {
     population: BTreeSet<CellId>,
-    enabled: BTreeSet<CellId>,
+    applicable: BTreeSet<CellId>,
     ci_disabled_reasons: BTreeMap<CellId, CiDisabledReasonData>,
     not_applicable_reasons: BTreeMap<CellId, String>,
     selected: BTreeSet<CellId>,
@@ -2619,7 +2619,7 @@ struct Derived {
 }
 
 fn retained_import_cells(derived: &Derived) -> BTreeSet<CellId> {
-    let mut eligible = derived.enabled.clone();
+    let mut eligible = derived.applicable.clone();
     eligible.extend(
         derived
             .population
@@ -3194,7 +3194,7 @@ fn derive(root: &Path) -> Result<Derived, String> {
 
     let mut manifest_cells = BTreeSet::new();
     let mut population = BTreeSet::new();
-    let mut enabled = BTreeSet::new();
+    let mut applicable = BTreeSet::new();
     let mut ci_enabled = BTreeSet::new();
     let mut ci_disabled_reasons = BTreeMap::new();
     let mut not_applicable_reasons = BTreeMap::new();
@@ -3220,14 +3220,14 @@ fn derive(root: &Path) -> Result<Derived, String> {
         if comparable {
             population.insert(id.clone());
         }
-        if row.enabled {
+        if row.not_applicable_reason.is_none() {
             if comparable {
-                enabled.insert(id.clone());
+                applicable.insert(id.clone());
             }
             if row.ci {
                 if row.ci_disabled_reason.is_some() {
                     return Err(format!(
-                        "CI-enabled cell carries ci_disabled_reason: {}",
+                        "cell selected by full carries a not-selected reason: {}",
                         display_id(&id)
                     ));
                 }
@@ -3235,14 +3235,14 @@ fn derive(root: &Path) -> Result<Derived, String> {
             } else {
                 let reason = row.ci_disabled_reason.ok_or_else(|| {
                     format!(
-                        "enabled cell omitted from ordinary CI has no reason: {}",
+                        "applicable cell not selected by full has no reason: {}",
                         display_id(&id)
                     )
                 })?;
                 ci_disabled_reasons.insert(id, reason);
             }
         } else {
-            // A cell whose backend is not enabled for this mode is NOT
+            // A cell whose backend is not applicable for this mode is NOT
             // APPLICABLE, not failing. It must say why, and the manifest already
             // requires a reason for every disabled backend -- so an absent one
             // here means the plan emitter dropped it, which is worth refusing
@@ -3275,7 +3275,7 @@ fn derive(root: &Path) -> Result<Derived, String> {
         }
         if !ci_enabled.contains(id) {
             return Err(format!(
-                "expected plan names a cell not enabled for ordinary CI: {}",
+                "expected plan names a cell that is not applicable: {}",
                 display_id(id)
             ));
         }
@@ -3283,7 +3283,7 @@ fn derive(root: &Path) -> Result<Derived, String> {
     let (green, selected_custom) = selected_partition(&selected, &population)?;
     Ok(Derived {
         population,
-        enabled,
+        applicable,
         ci_disabled_reasons,
         not_applicable_reasons,
         selected,
@@ -3383,27 +3383,27 @@ fn render_scorecard(derived: &Derived) -> String {
 
     // This is the same derived count printed in the summary table below. Keep
     // the prose on the value rather than restating a hand-maintained snapshot:
-    // the old literal still said manifest-disabled cells were red after
+    // the old literal still counted not-applicable cells as not selected after
     // `NotApplicable` became a separate status.
     let na_total = derived
         .population
         .iter()
-        .filter(|id| !derived.enabled.contains(*id))
+        .filter(|id| !derived.applicable.contains(*id))
         .count();
-    let status_green_total = derived.green.len();
-    let status_red_total = derived.enabled.difference(&derived.green).count();
+    let selected_by_full_total = derived.green.len();
+    let not_selected_by_full_total = derived.applicable.difference(&derived.green).count();
 
     let mut out = format!(
         "# Compatibility scorecard\n\n\
 This table is derived from the manifest, not from a separately maintained parent-workspace CSV. \
 `./ci/compat-envelope/scorecard.rs check` verifies it.\n\n\
-**Green** means this manifest cell is selected by full in `ci/expected-e2e-plan.json`; ordinary \
-validation therefore requires it to pass. **Red** means the cell is in the manifest but is not \
-selected by full. **Red does not mean failed:** a red cell may have passed, failed, produced no \
-verdict, or never run. Manifest-disabled combinations are **Not applicable**; they are neither red \
-nor omitted. The current generated data counts Green as **{status_green_total}** and Red as \
-**{status_red_total}**. The generator classifies the current **{na_total}** manifest-disabled \
-combinations as **Not applicable**.\n\n\
+The count table includes all **{}** cells in the manifest; no row is omitted. A cell is \
+**Selected by full** exactly when it appears in `ci/expected-e2e-plan.json`. A cell is \
+**Not selected by full** when it is in the manifest but absent from that plan. Selection is not a \
+test result: a cell not selected by full may have passed, failed, produced no verdict, or never run. \
+Of these cells, **{selected_by_full_total}** are selected by full, \
+**{not_selected_by_full_total}** are not selected by full, and **{na_total}** are \
+**Not applicable**.\n\n\
 Every selected `verify` cell, and every seed in a selected `chaos` cell, runs the same backend \
 twice. The manifest runner adds `--verify-strict` when the selected Hermit binary supports it, and \
 accepts a result only when the typed report says `verified=true`, `verdict=matched`, \
@@ -3411,10 +3411,11 @@ accepts a result only when the typed report says `verified=true`, `verdict=match
 `record_envelope`, and both INFO-message counts are nonzero. Bare `--verify` remains a Stripped \
 comparison when invoked directly and does not satisfy \
 this regression plan. These same-backend results do not establish cross-backend parity.\n\n\
-| Backend | Green | Red | Not applicable | Total |\n\
+| Backend | Selected by full | Not selected by full | Not applicable | In the manifest |\n\
 | --- | ---: | ---: | ---: | ---: |\n",
+        derived.population.len()
     );
-    let mut green_total = 0usize;
+    let mut selected_total = 0usize;
     let mut total = 0usize;
     for backend in &ordered {
         let backend_total = derived
@@ -3422,29 +3423,29 @@ this regression plan. These same-backend results do not establish cross-backend 
             .iter()
             .filter(|id| id.backend == *backend)
             .count();
-        let backend_green = derived
+        let backend_selected = derived
             .green
             .iter()
             .filter(|id| id.backend == *backend)
             .count();
-        // NOT APPLICABLE IS SUBTRACTED FROM RED, NOT ADDED TO THE TOTAL. The
+        // NOT APPLICABLE IS SUBTRACTED FROM NOT SELECTED, NOT ADDED TO THE TOTAL. The
         // population is unchanged; what changes is that a cell whose backend is
-        // not enabled for this mode stops being counted as a failure.
+        // not applicable for this mode stops being counted as not selected.
         let backend_na = derived
             .population
             .iter()
-            .filter(|id| id.backend == *backend && !derived.enabled.contains(*id))
+            .filter(|id| id.backend == *backend && !derived.applicable.contains(*id))
             .count();
-        green_total += backend_green;
+        selected_total += backend_selected;
         total += backend_total;
         out.push_str(&format!(
-            "| `{backend}` | {backend_green} | {} | {backend_na} | {backend_total} |\n",
-            backend_total - backend_green - backend_na
+            "| `{backend}` | {backend_selected} | {} | {backend_na} | {backend_total} |\n",
+            backend_total - backend_selected - backend_na
         ));
     }
     out.push_str(&format!(
-        "| **Total** | **{green_total}** | **{}** | **{na_total}** | **{total}** |\n\n",
-        total - green_total - na_total
+        "| **Total** | **{selected_total}** | **{}** | **{na_total}** | **{total}** |\n\n",
+        total - selected_total - na_total
     ));
     // DENOMINATOR PROVENANCE. Emitted from the derived population, never
     // hand-written, so it cannot go stale and cannot be forgotten.
@@ -3454,8 +3455,8 @@ this regression plan. These same-backend results do not establish cross-backend 
     // a mode to the manifest grows it, removing one shrinks it. Both move the
     // percentage while nothing about the product moves. Worked example with
     // real numbers at the time of writing: dropping `dbt` would remove 1035
-    // cells, ALL OF THEM RED, taking the total from 5520 to 4485 and RAISING
-    // reported green from 5.07% to 6.24% -- a 23% relative improvement with
+    // cells, ALL OF THEM NOT SELECTED, taking the total from 5520 to 4485 and RAISING
+    // the reported selection from 5.07% to 6.24% -- a 23% relative improvement with
     // nothing improved. Restoring it later would move the number back DOWN,
     // which reads as a regression when it is a restoration of honesty.
     //
@@ -3465,7 +3466,7 @@ this regression plan. These same-backend results do not establish cross-backend 
     let percent = if total == 0 {
         0.0
     } else {
-        100.0 * green_total as f64 / total as f64
+        100.0 * selected_total as f64 / total as f64
     };
     let modes: BTreeSet<&str> = derived
         .population
@@ -3474,20 +3475,20 @@ this regression plan. These same-backend results do not establish cross-backend 
         .collect();
     out.push_str(&format!(
         "## Denominator, and why the percentage is not comparable across changes to it\n\n\
-Green is **{green_total} of {total}**, which is **{percent:.2}%** — over THIS population and no \
+Selected by full is **{selected_total} of {total}**, which is **{percent:.2}%** — over THIS population and no \
 other. The population is every combination the manifest declares, and it is composed of:\n\n\
 - backends: {}\n\
 - modes: {}\n\n\
-⚠️ **{na} of those {total} cells are NOT APPLICABLE** — their backend is not enabled for their \
+⚠️ **{na} of those {total} cells are NOT APPLICABLE** — their backend is not applicable for their \
 mode, so they were never asked to run and cannot pass or fail. Over the {applicable} cells that \
-CAN run, green is **{applicable_percent:.2}%**.\n\n\
-⚠️ **DO NOT QUOTE THAT SECOND FIGURE AS PROGRESS.** It is the same {green_total} green cells \
+CAN run, selected by full is **{applicable_percent:.2}%**.\n\n\
+⚠️ **DO NOT QUOTE THAT SECOND FIGURE AS PROGRESS.** It is the same {selected_total} cells selected by full \
 measured against a smaller denominator. Nothing was fixed to produce it; it is what the first \
 figure always meant once the cells that cannot run are excluded. Quote both or neither, and never \
 compare one against the other as though something moved.\n\n\
 ⚠️ **Adding or removing a backend or mode changes this denominator and therefore the percentage, \
-without anything about the product changing.** Removing a backend whose cells are mostly red \
-RAISES the reported figure; adding honest red cells LOWERS it. Neither is progress. Before \
+without anything about the product changing.** Removing a backend whose cells are mostly not selected \
+RAISES the reported figure; adding manifest cells that are not selected LOWERS it. Neither is progress. Before \
 comparing this percentage against an earlier one, diff the two lists above: if they differ, the \
 numbers are not comparable and the difference is not a result.\n\n",
         ordered
@@ -3505,19 +3506,19 @@ numbers are not comparable and the difference is not a result.\n\n",
         applicable_percent = if total == na_total {
             0.0
         } else {
-            100.0 * green_total as f64 / (total - na_total) as f64
+            100.0 * selected_total as f64 / (total - na_total) as f64
         },
     ));
     out.push_str(
         "The mode view makes the current order of work explicit: expand `verify` first, then \
-`replay`, then `chaos`. Each backend cell is `green / total`; an em dash means that mode does \
-not exist for that backend. The summary columns use the same Green, Red, and Not applicable \
-statuses as the table above.\n\n| Mode",
+`replay`, then `chaos`. Each backend cell is `selected by full / in the manifest`; an em dash means \
+that mode does not exist for that backend. The summary columns use the same selection and \
+applicability facts as the table above.\n\n| Mode",
     );
     for backend in &ordered {
         out.push_str(&format!(" | `{backend}`"));
     }
-    out.push_str(" | Green | Red | Not applicable | Total |\n| ---");
+    out.push_str(" | Selected by full | Not selected by full | Not applicable | In the manifest |\n| ---");
     for _ in &ordered {
         out.push_str(" | ---:");
     }
@@ -3532,7 +3533,7 @@ statuses as the table above.\n\n| Mode",
         let mode_na = derived
             .population
             .iter()
-            .filter(|id| id.mode == mode && !derived.enabled.contains(*id))
+            .filter(|id| id.mode == mode && !derived.applicable.contains(*id))
             .count();
         out.push_str(&format!("| `{mode}`"));
         for backend in &ordered {
@@ -3558,15 +3559,15 @@ statuses as the table above.\n\n| Mode",
         ));
     }
     out.push_str(&format!(
-        "| **Total** | | | | | | | **{green_total}** | **{}** | **{na_total}** | **{total}** |\n\n",
-        total - green_total - na_total
+        "| **Total** | | | | | | | **{selected_total}** | **{}** | **{na_total}** | **{total}** |\n\n",
+        total - selected_total - na_total
     ));
     out.push_str(
         "## Ptrace by manifest category\n\n\
 This view uses the same Basic Sanity Milestone 1 contracts as the tables above, but makes the ptrace \
-workload mix visible. Each entry is `green / total`; `custom` commands are not part of this \
+workload mix visible. Each entry is `selected by full / in the manifest`; `custom` commands are not part of this \
 denominator.\n\n\
-| Manifest category | Verify | Replay | Chaos | Green | Total |\n\
+| Manifest category | Verify | Replay | Chaos | Selected by full | In the manifest |\n\
 | --- | ---: | ---: | ---: | ---: | ---: |\n",
     );
     let categories: BTreeSet<&str> = derived
@@ -3607,10 +3608,10 @@ denominator.\n\n\
         .count();
     let custom = derived.selected_custom.len();
     out.push_str(&format!(
-        "Ordinary full validation executes {} selected regression cells: the {green_total} green \
-compatibility cells above (including {chaos} chaos-mode race-exposure checks), and {custom} \
+        "Ordinary full validation executes {} cells: the {selected_total} comparable compatibility \
+cells selected by full above (including {chaos} chaos-mode race-exposure checks), and {custom} \
 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for \
-all of them; a failing green cell is a regression, not permission to move it to red.\n",
+all of them; a failing selected cell is a regression, not permission to remove it from the plan.\n",
         derived.selected.len()
     ));
     if !derived.selected_custom.is_empty() {
@@ -3658,14 +3659,13 @@ fn latest_backend_parity(cell: &TrackedCell) -> Option<&RecordedBackendParityCom
 }
 
 fn render_backend_parity_section(tracked: &TrackedCells) -> String {
-    let ptrace_is_green = |candidate: &TrackedCell| {
+    let ptrace_is_selected_by_full = |candidate: &TrackedCell| {
         tracked.cells.iter().any(|reference| {
             reference.id.lane == candidate.id.lane
                 && reference.id.category == candidate.id.category
                 && reference.id.test == candidate.id.test
                 && reference.id.mode == candidate.id.mode
                 && reference.id.backend == "ptrace"
-                && reference.enabled
                 && reference.status == CellStatus::Green
         })
     };
@@ -3676,7 +3676,7 @@ fn render_backend_parity_section(tracked: &TrackedCells) -> String {
             cell.id.mode == "verify"
                 && cell.id.backend != "ptrace"
                 && cell.id.backend != "native"
-                && ptrace_is_green(cell)
+                && ptrace_is_selected_by_full(cell)
         })
         .collect::<Vec<_>>();
     let mut backends = tracked
@@ -3697,11 +3697,11 @@ fn render_backend_parity_section(tracked: &TrackedCells) -> String {
 
     let mut out = "\n## Cross-backend parity\n\n\
 This is measured ptrace-reference parity, not CI plan membership and not same-backend repeatability. \
-A cell is eligible when the corresponding ptrace `verify` coordinate is Green. The CLI can explicitly \
-select eligible manifest-disabled candidates with `--probe-disabled`; the committed selectors do not include that option. `Never measured` \
+A cell is eligible when the corresponding ptrace `verify` coordinate is selected by full. The CLI can explicitly \
+select eligible not-applicable candidates with `--probe-disabled`; the committed selectors do not include that option. `Never measured` \
 means no strict typed ptrace-vs-candidate report exists. \
 At the latest recorded Hermit source depth, any divergence outranks a match. The portable and hosted-portable `backend-parity-c` nodes perform ptrace-reference parity comparisons for eligible selected verify cells. These selectors cover a subset of the eligible cells; eligibility does not mean every cell was selected or measured.\n\n\
-| Candidate backend | Eligible ptrace-green cells | Disabled probe candidates | Measured match | Parity failure | Never measured |\n\
+| Candidate backend | Ptrace cells selected by full | Not-applicable probe candidates | Measured match | Parity failure | Never measured |\n\
 | --- | ---: | ---: | ---: | ---: | ---: |\n"
         .to_owned();
     for backend in ordered {
@@ -3724,7 +3724,10 @@ At the latest recorded Hermit source depth, any divergence outranks a match. The
                     .is_some_and(|evidence| evidence.result == ObservedResult::ParityFailure)
             })
             .count();
-        let disabled = cells.iter().filter(|cell| !cell.enabled).count();
+        let disabled = cells
+            .iter()
+            .filter(|cell| cell.status == CellStatus::NotApplicable)
+            .count();
         out.push_str(&format!(
             "| `{backend}` | {} | {disabled} | {matched} | {diverged} | {} |\n",
             cells.len(),
@@ -3784,44 +3787,33 @@ fn render_measurement_section(tracked: &TrackedCells) -> String {
     // table. An import changed one count to zero while leaving the prose saying
     // both combinations were present. Derive the claims through the table's
     // own count so another import changes both together.
-    let green_never_measured = count(CellStatus::Green, MeasurementState::NeverMeasured);
-    let red_measured_and_passed = count(CellStatus::Red, MeasurementState::MeasuredAndPassed);
-    let green_never_measured_claim = match green_never_measured {
-        0 => "zero Green cells are `never-measured`".to_owned(),
-        1 => "1 Green cell is `never-measured`".to_owned(),
-        count => format!("{count} Green cells are `never-measured`"),
-    };
-    let red_measured_and_passed_claim = match red_measured_and_passed {
-        1 => "1 Red cell that is `measured-and-passed`".to_owned(),
-        count => format!("{count} Red cells that are `measured-and-passed`"),
-    };
+    let selected_never_measured = count(CellStatus::Green, MeasurementState::NeverMeasured);
+    let not_selected_measured_and_passed =
+        count(CellStatus::Red, MeasurementState::MeasuredAndPassed);
 
     let mut out = render_backend_parity_section(tracked);
     out.push_str(&format!(
-        "\n## Status and measurement\n\n\
-Selection and observation answer different questions. The Green/Red table says what full validation \
-selects. The per-cell `measurement` value says what retained evidence observed: `never-measured`, \
-`measured-and-passed`, `measured-no-verdict`, `diverged-unlocated`, or `diverged`. In the current \
-generated data, **{green_never_measured_claim}**. Read the generated Status and measurement section \
-for the complete current cross-tab; do not use Red as a failed-test count.\n\n\
-The current green/`never-measured` count is **{green_never_measured}**, and the current \
-red/`measured-and-passed` count is **{red_measured_and_passed}**.\n\n\
+        "\n## Selection and measurement\n\n\
+Selection and observation answer different questions. The first column says whether full validation \
+selects a cell. The per-cell `measurement` value says what retained evidence observed: \
+`never-measured`, `measured-and-passed`, `measured-no-verdict`, `diverged-unlocated`, or `diverged`. \
+Of the cells selected by full, **{selected_never_measured}** have `never-measured`; of the cells not \
+selected by full, **{not_selected_measured_and_passed}** have `measured-and-passed`.\n\n\
 Retained history that has not been imported is not counted here. A stored measurement does not \
 establish that it describes current code; `show` reports whether the recorded last test still \
 matches `HEAD:detcore`.\n\n",
     ));
     out.push_str(&format!(
-        "The cross-tab includes all **{}** tracked cells; no row is omitted. The current generated \
-data contains **{red_measured_and_passed_claim}**. These claims \
+        "The count table includes all **{}** cells in the manifest; no row is omitted. These claims \
 use the same counts printed in the table below.\n\n",
         tracked.cells.len(),
     ));
     out.push_str(
-        "| Status | `never-measured` | `measured-and-passed` | `measured-no-verdict` | `diverged-unlocated` | `diverged` | Total |\n\
+        "| Selection by full | `never-measured` | `measured-and-passed` | `measured-no-verdict` | `diverged-unlocated` | `diverged` | In the manifest |\n\
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |\n",
     );
     for status in statuses {
-        out.push_str(&format!("| `{}`", status.as_str()));
+        out.push_str(&format!("| {}", status.selection_label()));
         for measurement in measurements {
             out.push_str(&format!(" | {}", count(status, measurement)));
         }
@@ -3844,9 +3836,9 @@ use the same counts printed in the table below.\n\n",
     out.push_str(&format!(" | **{}** |\n\n", tracked.cells.len()));
 
     out.push_str(
-        "Cells whose stored `measurement` is not `never-measured` are shown individually so status \
+        "Cells whose stored `measurement` is not `never-measured` are shown individually so selection \
 and measurement remain visible together.\n\n\
-| Test | Mode | Backend | Status | Measurement |\n\
+| Test | Mode | Backend | Selection by full | Measurement |\n\
 | --- | --- | --- | --- | --- |\n",
     );
     let mut displayed = 0usize;
@@ -3860,7 +3852,7 @@ and measurement remain visible together.\n\n\
             cell.id.test,
             cell.id.mode,
             cell.id.backend,
-            cell.status.as_str(),
+            cell.status.selection_label(),
             cell.measurement.as_str()
         ));
     }
@@ -3943,8 +3935,8 @@ fn tracked_from(
             // derivation recomputes STATUS from the manifest and the plan, and
             // must not discard measured evidence while doing so.
             let last_tested = previous.get(&id).and_then(|cell| cell.last_tested.clone());
-            let enabled = derived.enabled.contains(&id);
-            let status = if !enabled {
+            let applicable = derived.applicable.contains(&id);
+            let status = if !applicable {
                 CellStatus::NotApplicable
             } else if derived.green.contains(&id) {
                 CellStatus::Green
@@ -3968,7 +3960,6 @@ fn tracked_from(
             };
             let mut cell = TrackedCell {
                 id,
-                enabled,
                 status,
                 ci_disabled_reason,
                 not_applicable_reason,
@@ -4121,9 +4112,6 @@ fn enforce_writer_boundary(
                         id.test, id.mode, id.backend
                     )
                 };
-                if old_cell.enabled != new_cell.enabled {
-                    return Err(changed("enabled"));
-                }
                 if old_cell.status != new_cell.status {
                     return Err(changed("status"));
                 }
@@ -4403,7 +4391,7 @@ fn update_tracked(
     let not_applicable = derived
         .population
         .iter()
-        .filter(|id| !derived.enabled.contains(*id))
+        .filter(|id| !derived.applicable.contains(*id))
         .count();
     println!(
         "compatibility scorecard: wrote {} green / {} red / {} not-applicable / {} total",
@@ -4978,7 +4966,7 @@ fn apply_pressure_summary(
             // A summary does not authenticate its source-era configuration or
             // comparison identity. Stamping it today cannot supply either.
             check: None,
-            enabled_when_tested: None,
+            applicable_when_tested: None,
             comparison_verdict: None,
         });
         let observations = &mut tracked.cells[index].observations;
@@ -5133,7 +5121,7 @@ fn apply_validate_results(
         detcore_tree,
         depth,
         ValidateInput {
-            enablement: None,
+            applicability: None,
             reports: ResultInput::Current,
             store_invocation,
             store_positions,
@@ -5147,13 +5135,13 @@ enum ResultInput {
     Retained,
 }
 
-struct SourceEnablement<'a> {
+struct SourceApplicability<'a> {
     hermit_sha: &'a str,
-    enabled: &'a BTreeSet<CellId>,
+    applicable: &'a BTreeSet<CellId>,
 }
 
 struct ValidateInput<'a> {
-    enablement: Option<SourceEnablement<'a>>,
+    applicability: Option<SourceApplicability<'a>>,
     reports: ResultInput,
     store_invocation: bool,
     store_positions: bool,
@@ -5168,7 +5156,7 @@ fn apply_validate_results_from(
     input: ValidateInput<'_>,
 ) -> Result<ValidateFold, String> {
     let ValidateInput {
-        enablement,
+        applicability,
         reports,
         store_invocation,
         store_positions,
@@ -5299,10 +5287,10 @@ fn apply_validate_results_from(
                 depth: depth.clone(),
                 check,
                 comparison_verdict,
-                enabled_when_tested: enablement
+                applicable_when_tested: applicability
                     .as_ref()
                     .filter(|source| source.hermit_sha == hermit_sha)
-                    .map(|source| source.enabled.contains(id)),
+                    .map(|source| source.applicable.contains(id)),
             });
             if result == Some(ObservedResult::Pass) && !located_nothing {
                 return Err(format!(
@@ -5554,9 +5542,9 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
             reports: ResultInput::Current,
             store_invocation: true,
             store_positions: true,
-            enablement: Some(SourceEnablement {
+            applicability: Some(SourceApplicability {
                 hermit_sha: &head,
-                enabled: &derived.enabled,
+                applicable: &derived.applicable,
             }),
         },
     )?;
@@ -5759,7 +5747,7 @@ fn import_results(
                 &retained.detcore_tree,
                 &retained.depth,
                 ValidateInput {
-                    enablement: None,
+                    applicability: None,
                     reports: ResultInput::Retained,
                     store_invocation: false,
                     store_positions: true,
@@ -5791,7 +5779,7 @@ fn import_results(
                     &retained.detcore_tree,
                     &retained.depth,
                     ValidateInput {
-                        enablement: None,
+                        applicability: None,
                         reports: ResultInput::Retained,
                         store_invocation: false,
                         store_positions,
@@ -5971,10 +5959,10 @@ fn measurement_transition(
     let current = new.last_tested.as_ref();
     let resolution = if current.is_none_or(|last| {
         last.comparison_verdict != Some(StampComparisonVerdict::Diverged)
-            || last.enabled_when_tested != Some(true)
+            || last.applicable_when_tested != Some(true)
     }) {
         BaselineResolution::Refused {
-            reason: "the current stamp does not establish a canonical divergence with source-era enablement".into(),
+            reason: "the current stamp does not establish a canonical divergence with source-era applicability".into(),
         }
     } else {
         resolve_last_tested_baseline(
@@ -6017,7 +6005,7 @@ fn git_is_ancestor(root: &Path, ancestor: &str, descendant: &str) -> Result<bool
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum BaselineResolution {
     /// The recorded green was produced by the same check, with the cell
-    /// enabled, at a revision reachable from HEAD. A genuine REGRESSION window.
+    /// applicable, at a revision reachable from HEAD. A genuine REGRESSION window.
     Regression { baseline_sha: String },
     /// The recorded green exists but cannot bound today's failure. Carries the
     /// reason so the caller reports it instead of guessing.
@@ -6025,7 +6013,7 @@ enum BaselineResolution {
 }
 
 /// Require the exact old passing stamp, both complete policies, affirmative
-/// source-era enablement and real ancestry. Legacy absence stays unknown.
+/// source-era applicability and real ancestry. Legacy absence stays unknown.
 fn resolve_last_tested_baseline(
     root: &Path,
     last_tested: Option<&LastTested>,
@@ -6048,12 +6036,12 @@ fn resolve_last_tested_baseline(
     if last.comparison_verdict != Some(StampComparisonVerdict::Matched) {
         return refuse("the recorded stamp does not establish a passing comparison; aggregate history is not a last-good stamp".into());
     }
-    match last.enabled_when_tested {
+    match last.applicable_when_tested {
         Some(true) => {}
         Some(false) => {
             return refuse("the recorded comparison was made while the cell was DISABLED".into());
         }
-        None => return refuse("the recorded stamp has UNKNOWN source-era enablement".into()),
+        None => return refuse("the recorded stamp has UNKNOWN source-era applicability".into()),
     }
     if !recorded_check.matches(current_check) {
         let relationship = if current_check.adds_parity_to(recorded_check) {
@@ -6374,9 +6362,9 @@ where
             reports: ResultInput::Current,
             store_invocation: true,
             store_positions: true,
-            enablement: Some(SourceEnablement {
+            applicability: Some(SourceApplicability {
                 hermit_sha: &head,
-                enabled: &derived.enabled,
+                applicable: &derived.applicable,
             }),
         },
     )?;
@@ -6425,9 +6413,9 @@ where
             reports: ResultInput::Current,
             store_invocation: true,
             store_positions: true,
-            enablement: Some(SourceEnablement {
+            applicability: Some(SourceApplicability {
                 hermit_sha: &head,
-                enabled: &derived.enabled,
+                applicable: &derived.applicable,
             }),
         },
     )?;
@@ -7795,11 +7783,11 @@ fn apply_series_rows_inner(
                 detcore_tree: detcore_tree.to_string(),
                 depth: row.depth.clone(),
                 // Projected from historical series rows. Neither the check
-                // identity nor the enabled state AT THAT TIME survives in the
-                // row, and today's enabled flag is not evidence about then, so
+                // identity nor the applicability AT THAT TIME survives in the
+                // row, and today's applicability is not evidence about then, so
                 // both stay unrecorded. This is the case the type exists for.
                 check: None,
-                enabled_when_tested: None,
+                applicable_when_tested: None,
                 comparison_verdict: None,
             });
         }
@@ -8909,7 +8897,7 @@ struct RetainedImport {
 
 /// Read retained validate rows without pretending they belong to the current
 /// checkout. Each row keeps its own Hermit SHA, and only clean canonical
-/// comparisons on HEAD's history are eligible. For each enabled cell or
+/// comparisons on HEAD's history are eligible. For each applicable cell or
 /// disabled ptrace-referenced parity candidate, import ordinary terminal
 /// comparisons and complete measured parity attempt histories at the newest
 /// eligible SHA independently for each comparison relation, so disagreement at one revision remains visible instead of being
@@ -10213,7 +10201,7 @@ fn self_test() -> Result<(), String> {
         hermit_sha: "current-sha".into(),
         detcore_tree: "current-tree".into(),
         check: None,
-        enabled_when_tested: None,
+        applicable_when_tested: None,
         comparison_verdict: None,
         depth: BTreeMap::from([(
             "hermit".into(),
@@ -10841,7 +10829,7 @@ fn self_test() -> Result<(), String> {
     }
     let selected_fixture = Derived {
         population: population.clone(),
-        enabled: population.clone(),
+        applicable: population.clone(),
         ci_disabled_reasons: BTreeMap::new(),
         not_applicable_reasons: BTreeMap::new(),
         selected,
@@ -10854,10 +10842,11 @@ fn self_test() -> Result<(), String> {
         .next()
         .ok_or("scorecard omitted its status explanation")?;
     for required in [
-        "**Green** means this manifest cell is selected by full in `ci/expected-e2e-plan.json`; ordinary validation therefore requires it to pass.",
-        "**Red** means the cell is in the manifest but is not selected by full.",
-        "**Red does not mean failed:**",
-        "Manifest-disabled combinations are **Not applicable**; they are neither red nor omitted.",
+        "cells in the manifest; no row is omitted.",
+        "**Selected by full** exactly when it appears in `ci/expected-e2e-plan.json`.",
+        "**Not selected by full** when it is in the manifest but absent from that plan.",
+        "Selection is not a test result:",
+        "**Not applicable**",
     ] {
         if !status_prose.contains(required) {
             return Err(format!(
@@ -10872,15 +10861,15 @@ fn self_test() -> Result<(), String> {
             ));
         }
     }
-    if !status_prose.contains("counts Green as **1** and Red as **0**")
-        || !status_prose
-            .contains("the current **0** manifest-disabled combinations as **Not applicable**")
+    if !status_prose.contains("are selected by full")
+        || !status_prose.contains("are not selected by full")
+        || !status_prose.contains("are **Not applicable**")
     {
         return Err("scorecard status prose did not derive its three status counts".into());
     }
-    if !USAGE.contains("selected by full in ci/expected-e2e-plan.json")
+    if !USAGE.contains("Selected by full means that the cell appears in ci/expected-e2e-plan.json")
         || !USAGE.contains(
-            "Red means that the cell is in the manifest but is not selected by full; red\ndoes not mean failed",
+            "Not selected by full means that the cell is in the manifest but absent from\nthat plan; selection is not a test result",
         )
         || USAGE.contains("until it is measured, promoted")
     {
@@ -10926,45 +10915,42 @@ fn self_test() -> Result<(), String> {
     };
     let visible_red = Derived {
         population: BTreeSet::from([id.clone()]),
-        enabled: BTreeSet::from([id.clone()]),
+        applicable: BTreeSet::from([id.clone()]),
         ci_disabled_reasons: BTreeMap::from([(id.clone(), visible_reason.clone())]),
         not_applicable_reasons: BTreeMap::new(),
         selected: BTreeSet::new(),
         green: BTreeSet::new(),
         selected_custom: BTreeSet::new(),
     };
-    if !render_scorecard(&visible_red).contains("counts Green as **0** and Red as **1**") {
-        return Err("scorecard status prose did not derive its Red count".into());
+    if !render_scorecard(&visible_red).contains("**1** are not selected by full") {
+        return Err("scorecard prose did not derive its not-selected-by-full count".into());
     }
     let visible_tracked = tracked_from(&visible_red, None, Some("self-test"), false)?;
     if visible_tracked.cells[0].ci_disabled_reason.as_ref() != Some(&visible_reason)
-        || !encoded_cells(&visible_tracked)?.contains("ci_disabled_reason")
+        || !encoded_cells(&visible_tracked)?.contains("not_selected_by_full_reason")
     {
         return Err("per-backend CI reason was not emitted into tracked scorecard data".into());
     }
     let mut measured_red = visible_tracked.clone();
     measured_red.cells[0].measurement = MeasurementState::MeasuredAndPassed;
     let measured_section = render_measurement_section(&measured_red);
-    let current_counts = "In the current generated data, **zero Green cells are \
-`never-measured`**.";
-    let parser_counts = "The current green/`never-measured` count is **0**, and the current \
-red/`measured-and-passed` count is **1**.";
-    if !measured_section.contains(current_counts)
-        || !measured_section.contains(parser_counts)
-        || !measured_section.contains("**1 Red cell that is `measured-and-passed`**")
-        || !measured_section.contains("| `red` | 0 | 1 | 0 | 0 | 0 | 1 |")
+    if !measured_section.contains("Of the cells selected by full, **0** have `never-measured`")
+        || !measured_section.contains(
+            "of the cells not selected by full, **1** have `measured-and-passed`",
+        )
+        || !measured_section.contains("| Not selected by full | 0 | 1 | 0 | 0 | 0 | 1 |")
     {
         return Err(
-            "measurement prose did not use the same green/never-measured and red/measured-and-passed counts as its table"
+            "measurement prose did not use the same selection and measurement counts as its table"
                 .into(),
         );
     }
     let measured_row = format!(
-        "| `{}` | `{}` | `{}` | `red` | `measured-and-passed` |",
+        "| `{}` | `{}` | `{}` | `Not selected by full` | `measured-and-passed` |",
         id.test, id.mode, id.backend
     );
     if !measured_section.contains(&measured_row) {
-        return Err("measurement display did not show red and measured-and-passed together".into());
+        return Err("measurement display did not show selection and measurement together".into());
     }
     let unmeasured_section = render_measurement_section(&visible_tracked);
     if unmeasured_section.contains(&measured_row) {
@@ -10972,25 +10958,23 @@ red/`measured-and-passed` count is **1**.";
             "measurement display showed measured-and-passed without that measurement".into(),
         );
     }
-    if !unmeasured_section.contains("**zero Green cells are `never-measured`**")
+    if !unmeasured_section.contains("Of the cells selected by full, **0** have `never-measured`")
         || !unmeasured_section.contains(
-            "The current green/`never-measured` count is **0**, and the current \
-red/`measured-and-passed` count is **0**.",
+            "of the cells not selected by full, **0** have `measured-and-passed`",
         )
-        || !unmeasured_section.contains("**0 Red cells that are `measured-and-passed`**")
     {
         return Err("measurement prose kept a stale cross-combination count".into());
     }
     let mut unmeasured_green = visible_tracked.clone();
     unmeasured_green.cells[0].status = CellStatus::Green;
     let unmeasured_green_section = render_measurement_section(&unmeasured_green);
-    if !unmeasured_green_section.contains("**1 Green cell is `never-measured`**")
+    if !unmeasured_green_section
+        .contains("Of the cells selected by full, **1** have `never-measured`")
         || !unmeasured_green_section.contains(
-            "The current green/`never-measured` count is **1**, and the current \
-red/`measured-and-passed` count is **0**.",
+            "of the cells not selected by full, **0** have `measured-and-passed`",
         )
     {
-        return Err("measurement prose hard-coded the current zero Green count".into());
+        return Err("measurement prose hard-coded the current selected count".into());
     }
 
     let cross_tab_cells = [
@@ -11030,9 +11014,9 @@ red/`measured-and-passed` count is **0**.",
         }
     }
     for row in [
-        "| `green` | 0 | 0 | 1 | 1 | 0 | 2 |",
-        "| `red` | 1 | 1 | 0 | 0 | 0 | 2 |",
-        "| `not-applicable` | 0 | 0 | 0 | 0 | 1 | 1 |",
+        "| Selected by full | 0 | 0 | 1 | 1 | 0 | 2 |",
+        "| Not selected by full | 1 | 1 | 0 | 0 | 0 | 2 |",
+        "| Not applicable | 0 | 0 | 0 | 0 | 1 | 1 |",
         "| **Total** | **1** | **1** | **1** | **1** | **1** | **5** |",
     ] {
         if !cross_tab.contains(row) {
@@ -11043,7 +11027,7 @@ red/`measured-and-passed` count is **0**.",
     }
     let not_applicable = Derived {
         population: BTreeSet::from([id.clone()]),
-        enabled: BTreeSet::new(),
+        applicable: BTreeSet::new(),
         ci_disabled_reasons: BTreeMap::new(),
         not_applicable_reasons: BTreeMap::from([(
             id.clone(),
@@ -11055,18 +11039,17 @@ red/`measured-and-passed` count is **0**.",
     };
     let status_section = render_scorecard(&not_applicable);
     if !status_section
-        .contains("the current **1** manifest-disabled combinations as **Not applicable**")
+        .contains("**1** are **Not applicable**")
         || !status_section.contains("| `ptrace` | 0 | 0 | 1 | 1 |")
         || !status_section.contains("| `verify` | 0 / 1 | 0 | 0 | 1 | 1 |")
     {
-        return Err("status prose and tables did not use the same manifest-disabled count".into());
+        return Err("selection prose and tables did not use the same not-applicable count".into());
     }
     let old_green = TrackedCells {
         schema: SCHEMA,
         projection: None,
         cells: vec![TrackedCell {
             id: id.clone(),
-            enabled: true,
             status: CellStatus::Green,
             ci_disabled_reason: None,
             not_applicable_reason: None,
@@ -11078,7 +11061,7 @@ red/`measured-and-passed` count is **0**.",
     };
     let regressed = Derived {
         population: BTreeSet::from([id.clone()]),
-        enabled: BTreeSet::from([id.clone()]),
+        applicable: BTreeSet::from([id.clone()]),
         ci_disabled_reasons: BTreeMap::new(),
         not_applicable_reasons: BTreeMap::new(),
         selected: BTreeSet::new(),
@@ -11093,7 +11076,6 @@ red/`measured-and-passed` count is **0**.",
         projection: None,
         cells: vec![TrackedCell {
             id: id.clone(),
-            enabled: true,
             status: CellStatus::Green,
             ci_disabled_reason: None,
             not_applicable_reason: None,
@@ -11129,7 +11111,7 @@ red/`measured-and-passed` count is **0**.",
     // stale justifications that read as live ones.
     let back_to_green = Derived {
         population: BTreeSet::from([id.clone()]),
-        enabled: BTreeSet::from([id.clone()]),
+        applicable: BTreeSet::from([id.clone()]),
         ci_disabled_reasons: BTreeMap::new(),
         not_applicable_reasons: BTreeMap::new(),
         selected: BTreeSet::new(),
@@ -11152,7 +11134,6 @@ red/`measured-and-passed` count is **0**.",
         projection: None,
         cells: vec![TrackedCell {
             id: id.clone(),
-            enabled: false,
             status: CellStatus::Red,
             ci_disabled_reason: None,
             not_applicable_reason: None,
@@ -11292,13 +11273,13 @@ red/`measured-and-passed` count is **0**.",
         ..parity_id.clone()
     };
     let empty_tracked_cell = |id: CellId, status: CellStatus| {
-        let enabled = status != CellStatus::NotApplicable;
+        let applicable = status != CellStatus::NotApplicable;
         TrackedCell {
             id,
-            enabled,
             status,
             ci_disabled_reason: None,
-            not_applicable_reason: (!enabled).then(|| "fixture candidate disabled".into()),
+            not_applicable_reason: (!applicable)
+                .then(|| "fixture candidate is not applicable".into()),
             last_tested: None,
             observations: Vec::new(),
             measurement: MeasurementState::NeverMeasured,
@@ -11315,7 +11296,7 @@ red/`measured-and-passed` count is **0**.",
     };
     let retained_fixture = Derived {
         population: BTreeSet::from([ptrace_id.clone(), parity_id.clone()]),
-        enabled: BTreeSet::from([ptrace_id.clone()]),
+        applicable: BTreeSet::from([ptrace_id.clone()]),
         ci_disabled_reasons: BTreeMap::new(),
         not_applicable_reasons: BTreeMap::from([(
             parity_id.clone(),
@@ -11500,7 +11481,7 @@ red/`measured-and-passed` count is **0**.",
 
     // Check provenance travels through the real admitted-report writer. The
     // current source context is explicit; retained import never borrows today's
-    // enabled set. Resolve transitions against real Git objects, not fake SHAs.
+    // applicable set. Resolve transitions against real Git objects, not fake SHAs.
     let provenance_root = repo_root()?;
     let provenance_head = git_head(&provenance_root)?;
     let provenance_old = git_rev_parse(&provenance_root, "HEAD^")?;
@@ -11528,9 +11509,9 @@ red/`measured-and-passed` count is **0**.",
                 reports,
                 store_invocation: true,
                 store_positions: true,
-                enablement: source_sha.map(|hermit_sha| SourceEnablement {
+                applicability: source_sha.map(|hermit_sha| SourceApplicability {
                     hermit_sha,
-                    enabled: &provenance_enabled,
+                    applicable: &provenance_enabled,
                 }),
             },
         )?;
@@ -11544,7 +11525,7 @@ red/`measured-and-passed` count is **0**.",
         ResultInput::Current,
     )?;
     let pass_stamp = provenance_pass.last_tested.as_ref().unwrap();
-    if pass_stamp.enabled_when_tested != Some(true)
+    if pass_stamp.applicable_when_tested != Some(true)
         || pass_stamp.comparison_verdict != Some(StampComparisonVerdict::Matched)
         || pass_stamp.check.as_ref().is_none_or(|check| {
             !check.complete() || check.ordinary.len() != 1 || check.cross_backend.is_some()
@@ -11563,7 +11544,7 @@ red/`measured-and-passed` count is **0**.",
     ] {
         let historical = provenance_fold(candidate("PASS").row, &provenance_old, source, reports)?;
         let last = historical.last_tested.as_ref().unwrap();
-        if last.enabled_when_tested.is_some()
+        if last.applicable_when_tested.is_some()
             || last.check != pass_stamp.check
             || !matches!(
                 resolve_last_tested_baseline(
@@ -11575,7 +11556,7 @@ red/`measured-and-passed` count is **0**.",
                 BaselineResolution::Refused { .. }
             )
         {
-            return Err("historical comparison borrowed enablement from today's source".into());
+            return Err("historical comparison borrowed applicability from today's source".into());
         }
     }
     for located in [false, true] {
@@ -11708,7 +11689,7 @@ red/`measured-and-passed` count is **0**.",
         || matching_check.ordinary.len() != 2
         || matching_check.cross_backend.is_none()
         || matching_stamp.comparison_verdict != Some(StampComparisonVerdict::Matched)
-        || matching_stamp.enabled_when_tested.is_some()
+        || matching_stamp.applicable_when_tested.is_some()
         || !matches!(
             resolve_last_tested_baseline(
                 &provenance_root,
@@ -12806,7 +12787,6 @@ red/`measured-and-passed` count is **0**.",
             projection: None,
             cells: vec![TrackedCell {
                 id: validate_id.clone(),
-                enabled: true,
                 status: CellStatus::Red,
                 ci_disabled_reason: None,
                 not_applicable_reason: None,
@@ -12834,7 +12814,6 @@ red/`measured-and-passed` count is **0**.",
         projection: None,
         cells: vec![TrackedCell {
             id: dbt_id.clone(),
-            enabled: true,
             status: CellStatus::Red,
             ci_disabled_reason: None,
             not_applicable_reason: None,
@@ -12921,7 +12900,6 @@ red/`measured-and-passed` count is **0**.",
         projection: None,
         cells: vec![TrackedCell {
             id: validate_id.clone(),
-            enabled: true,
             status: CellStatus::Red,
             ci_disabled_reason: None,
             not_applicable_reason: None,
@@ -12976,7 +12954,6 @@ red/`measured-and-passed` count is **0**.",
             projection: None,
             cells: vec![TrackedCell {
                 id: validate_id.clone(),
-                enabled: true,
                 status: CellStatus::Red,
                 ci_disabled_reason: None,
                 not_applicable_reason: None,
@@ -12996,7 +12973,7 @@ red/`measured-and-passed` count is **0**.",
 
     let red_import_fixture = Derived {
         population: BTreeSet::from([validate_id.clone()]),
-        enabled: BTreeSet::from([validate_id.clone()]),
+        applicable: BTreeSet::from([validate_id.clone()]),
         ci_disabled_reasons: BTreeMap::new(),
         not_applicable_reasons: BTreeMap::new(),
         selected: BTreeSet::new(),
@@ -13004,7 +12981,7 @@ red/`measured-and-passed` count is **0**.",
         selected_custom: BTreeSet::new(),
     };
     if retained_import_cells(&red_import_fixture) != BTreeSet::from([validate_id.clone()]) {
-        return Err("an enabled red cell was excluded from retained import".into());
+        return Err("an applicable cell not selected by full was excluded from retained import".into());
     }
 
     let rows = BTreeMap::from([(
@@ -14673,7 +14650,7 @@ red/`measured-and-passed` count is **0**.",
         .cells
         .iter()
         .find(|candidate| {
-            !candidate.enabled
+            candidate.status == CellStatus::NotApplicable
                 && candidate.id.mode == "verify"
                 && candidate.id.backend == "kvm"
                 && command_tracked.cells.iter().any(|reference| {
@@ -14682,7 +14659,6 @@ red/`measured-and-passed` count is **0**.",
                         && reference.id.test == candidate.id.test
                         && reference.id.mode == candidate.id.mode
                         && reference.id.backend == "ptrace"
-                        && reference.enabled
                         && reference.status == CellStatus::Green
                 })
         })
@@ -14780,9 +14756,11 @@ red/`measured-and-passed` count is **0**.",
     if !command_tracked
         .cells
         .iter()
-        .any(|cell| cell.id == import_parity_id && cell.enabled)
+        .any(|cell| {
+            cell.id == import_parity_id && cell.status != CellStatus::NotApplicable
+        })
     {
-        return Err("parity retirement fixture requires the existing enabled KVM cell".into());
+        return Err("parity retirement fixture requires the existing applicable KVM cell".into());
     }
 
     // The combined writer must bind each parity receipt to its current result
@@ -16078,7 +16056,7 @@ red/`measured-and-passed` count is **0**.",
         .find(|cell| cell.id == replay_id)
         .and_then(|cell| cell.last_tested.as_ref())
         .ok_or("retained import lost its stamp")?;
-    if imported_stamp.enabled_when_tested.is_some()
+    if imported_stamp.applicable_when_tested.is_some()
         || imported_stamp.comparison_verdict != Some(StampComparisonVerdict::Matched)
         || imported_stamp
             .check
@@ -16086,7 +16064,7 @@ red/`measured-and-passed` count is **0**.",
             .is_none_or(|check| !check.complete())
     {
         return Err(
-            "import-results backfilled source-era enablement or lost admitted policy".into(),
+            "import-results backfilled source-era applicability or lost admitted policy".into(),
         );
     }
     restore_generated()?;
@@ -16165,7 +16143,8 @@ red/`measured-and-passed` count is **0**.",
         .as_ref()
         .ok_or("observer omitted its current stamp")?;
     if seeded_stamp.hermit_sha != fixture_head
-        || seeded_stamp.enabled_when_tested != Some(seeded_cell.enabled)
+        || seeded_stamp.applicable_when_tested
+            != Some(seeded_cell.status != CellStatus::NotApplicable)
         || seeded_stamp.comparison_verdict != Some(StampComparisonVerdict::Matched)
         || seeded_stamp
             .check
@@ -16317,7 +16296,7 @@ red/`measured-and-passed` count is **0**.",
             let old = read_transition_cell()?;
             let last = old.last_tested.as_ref().ok_or("CLI pass omitted stamp")?;
             if old.measurement != MeasurementState::MeasuredAndPassed
-                || last.enabled_when_tested != Some(true)
+                || last.applicable_when_tested != Some(true)
                 || last.comparison_verdict != Some(StampComparisonVerdict::Matched)
                 || last.check.as_ref().is_none_or(|check| !check.complete())
             {
@@ -16586,7 +16565,6 @@ red/`measured-and-passed` count is **0**.",
     };
     let bare_cell = |id: &CellId| TrackedCell {
         id: id.clone(),
-        enabled: true,
         status: CellStatus::Red,
         ci_disabled_reason: None,
         not_applicable_reason: None,
@@ -18456,7 +18434,6 @@ red/`measured-and-passed` count is **0**.",
                 mode: "verify".into(),
                 backend: "ptrace".into(),
             },
-            enabled: true,
             status,
             ci_disabled_reason: None,
             not_applicable_reason: None,
@@ -18749,7 +18726,6 @@ red/`measured-and-passed` count is **0**.",
                     mode: "verify".into(),
                     backend: "ptrace".into(),
                 },
-                enabled: true,
                 status: CellStatus::Red,
                 ci_disabled_reason: None,
                 not_applicable_reason: None,
@@ -19121,7 +19097,7 @@ red/`measured-and-passed` count is **0**.",
         hermit_sha: fixture_hermit_tree.clone(),
         detcore_tree: fixture_detcore_tree.clone(),
         check: None,
-        enabled_when_tested: None,
+        applicable_when_tested: None,
         comparison_verdict: None,
         depth: BTreeMap::from([(
             "hermit".into(),
@@ -20198,7 +20174,7 @@ red/`measured-and-passed` count is **0**.",
     let boundary_id = stamped.cells[0].id.clone();
     let derived_fixture = Derived {
         population: BTreeSet::from([boundary_id.clone()]),
-        enabled: BTreeSet::from([boundary_id.clone()]),
+        applicable: BTreeSet::from([boundary_id.clone()]),
         ci_disabled_reasons: BTreeMap::new(),
         not_applicable_reasons: BTreeMap::new(),
         selected: BTreeSet::from([boundary_id.clone()]),
@@ -20914,7 +20890,7 @@ mod baseline_resolution_tests {
             detcore_tree: "tree".into(),
             depth: BTreeMap::new(),
             check,
-            enabled_when_tested: Some(true),
+            applicable_when_tested: Some(true),
             comparison_verdict: Some(StampComparisonVerdict::Matched),
         }
     }
@@ -20977,7 +20953,7 @@ mod baseline_resolution_tests {
             BaselineResolution::Regression {
                 baseline_sha: reachable.clone()
             },
-            "same check, cell enabled, revision reachable: this IS a regression and must resolve"
+            "same check, cell applicable, revision reachable: this IS a regression and must resolve"
         );
         // The enum is the protection: a caller cannot reach a sha without
         // having matched the Regression arm, so a refusal cannot be unwrapped
@@ -21073,7 +21049,7 @@ mod baseline_resolution_tests {
         let (dir, reachable, _) = repository();
         let check = identity("BitwiseInfoV1", None);
         let mut last = stamp(&reachable, Some(check.clone()));
-        last.enabled_when_tested = Some(false);
+        last.applicable_when_tested = Some(false);
         let resolved =
             resolve_last_tested_baseline(dir.path(), Some(&last), Some(&check), "main").unwrap();
         assert!(
@@ -21129,7 +21105,7 @@ mod baseline_resolution_tests {
     }
 
     #[test]
-    fn unknown_enablement_and_unproven_stamp_verdicts_remain_readable_and_refused() {
+    fn unknown_applicability_and_unproven_stamp_verdicts_remain_readable_and_refused() {
         let check = identity("BitwiseInfoV1", None);
         let full = serde_json::to_value(stamp("does-not-exist", Some(check.clone()))).unwrap();
         for field in ["enabled_when_tested", "comparison_verdict"] {

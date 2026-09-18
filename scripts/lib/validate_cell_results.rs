@@ -382,7 +382,7 @@ fn string_set(value: &Value, key: &str) -> Result<BTreeSet<String>, String> {
         .collect()
 }
 
-fn enabled_cell_scope(cell: &Value) -> Result<Value, String> {
+fn manifest_cell_scope(cell: &Value) -> Result<Value, String> {
     let mut scoped = identity_value(&identity(cell)?)?
         .as_object()
         .cloned()
@@ -436,29 +436,28 @@ fn coverage_document(
         .iter()
         .map(|cell| Ok((sort_key(cell)?, cell.clone())))
         .collect::<Result<_, String>>()?;
-    let enabled: BTreeMap<_, _> = cells_document
+    let in_manifest: BTreeMap<_, _> = cells_document
         .get("cells")
         .and_then(Value::as_array)
         .ok_or("ci/compat-envelope/cells.json has no cells array")?
         .iter()
-        .filter(|cell| cell.get("enabled").and_then(Value::as_bool) == Some(true))
         .map(|cell| {
             let id = identity(cell)?;
-            Ok((id, enabled_cell_scope(cell)?))
+            Ok((id, manifest_cell_scope(cell)?))
         })
         .collect::<Result<_, String>>()?;
-    let selected_and_enabled = selected
+    let selected_and_in_manifest = selected
         .keys()
-        .filter(|key| enabled.contains_key(*key))
+        .filter(|key| in_manifest.contains_key(*key))
         .count();
-    let enabled_not_selected: Vec<Value> = enabled
+    let in_manifest_not_selected_by_path: Vec<Value> = in_manifest
         .iter()
         .filter(|(key, _)| !selected.contains_key(*key))
         .map(|(_, value)| value.clone())
         .collect();
-    let selected_not_enabled: Vec<Value> = selected
+    let selected_not_in_manifest: Vec<Value> = selected
         .iter()
-        .filter(|(key, _)| !enabled.contains_key(*key))
+        .filter(|(key, _)| !in_manifest.contains_key(*key))
         .map(|(_, value)| value.clone())
         .collect();
 
@@ -509,13 +508,14 @@ fn coverage_document(
         },
         "e2e": {
             "selected_count": selected.len(),
-            "enabled_count": enabled.len(),
-            "selected_and_enabled_count": selected_and_enabled,
-            "enabled_not_selected_count": enabled_not_selected.len(),
-            "selected_not_enabled_count": selected_not_enabled.len(),
+            "selected_by": plan_name,
+            "in_manifest_count": in_manifest.len(),
+            "selected_and_in_manifest_count": selected_and_in_manifest,
+            "in_manifest_not_selected_by_path_count": in_manifest_not_selected_by_path.len(),
+            "selected_not_in_manifest_count": selected_not_in_manifest.len(),
             "selected": selected.into_values().collect::<Vec<_>>(),
-            "enabled_not_selected": enabled_not_selected,
-            "selected_not_enabled": selected_not_enabled,
+            "in_manifest_not_selected_by_path": in_manifest_not_selected_by_path,
+            "selected_not_in_manifest": selected_not_in_manifest,
         },
         "integration_test_binaries": registration,
     }))
@@ -523,7 +523,7 @@ fn coverage_document(
 
 /// Retain the exact test population around a full run, including work outside
 /// the selected set. This is reporting, not an exemption: a reader can tell a
-/// selected cell from an enabled cell that ordinary validation never selected,
+/// selected cell from a cell in the manifest that this validate path never selected,
 /// and can see every integration-test binary outside the CI DAG.
 pub fn retain_coverage_evidence(
     parent: &Path,
@@ -613,10 +613,11 @@ pub fn retain_coverage_evidence(
         "e2e".into(),
         serde_json::json!({
             "selected_count": e2e["selected_count"],
-            "enabled_count": e2e["enabled_count"],
-            "selected_and_enabled_count": e2e["selected_and_enabled_count"],
-            "enabled_not_selected_count": e2e["enabled_not_selected_count"],
-            "selected_not_enabled_count": e2e["selected_not_enabled_count"],
+            "selected_by": e2e["selected_by"],
+            "in_manifest_count": e2e["in_manifest_count"],
+            "selected_and_in_manifest_count": e2e["selected_and_in_manifest_count"],
+            "in_manifest_not_selected_by_path_count": e2e["in_manifest_not_selected_by_path_count"],
+            "selected_not_in_manifest_count": e2e["selected_not_in_manifest_count"],
         }),
     );
     evidence.insert(
@@ -1651,7 +1652,7 @@ mod tests {
     }
 
     #[test]
-    fn coverage_separates_selected_from_enabled_but_not_selected() {
+    fn coverage_separates_cells_in_manifest_from_cells_selected_by_path() {
         let selected = vec![
             serde_json::json!({
                 "lane":"portable", "category":"c-programs", "test":"c-programs/a",
@@ -1665,18 +1666,18 @@ mod tests {
         let cells = serde_json::json!({"cells":[
             {
                 "lane":"portable", "category":"c-programs", "test":"c-programs/a",
-                "mode":"verify", "backend":"ptrace", "enabled":true
+                "mode":"verify", "backend":"ptrace"
             },
             {
                 "lane":"portable", "category":"c-programs", "test":"c-programs/b",
-                "mode":"verify", "backend":"ptrace", "enabled":true,
+                "mode":"verify", "backend":"ptrace",
                 "status":"red", "measurement":"measured-and-failed",
                 "reason":"excluded after the recorded observations",
                 "observations":[{"results":["pass", "fail", "fail"]}]
             },
             {
                 "lane":"portable", "category":"c-programs", "test":"c-programs/custom",
-                "mode":"custom", "backend":"ptrace", "enabled":false
+                "mode":"custom", "backend":"ptrace", "status":"not-applicable"
             }
         ]});
         let registration = serde_json::json!({
@@ -1715,20 +1716,21 @@ mod tests {
         assert_eq!(scope["test_nodes"]["planned"][0], "test.example");
         assert_eq!(scope["test_nodes"]["coverage"], test_node_coverage);
         assert_eq!(scope["e2e"]["selected_count"], 2);
-        assert_eq!(scope["e2e"]["enabled_count"], 2);
-        assert_eq!(scope["e2e"]["selected_and_enabled_count"], 1);
-        assert_eq!(scope["e2e"]["enabled_not_selected_count"], 1);
-        assert_eq!(scope["e2e"]["selected_not_enabled_count"], 1);
+        assert_eq!(scope["e2e"]["selected_by"], "full");
+        assert_eq!(scope["e2e"]["in_manifest_count"], 3);
+        assert_eq!(scope["e2e"]["selected_and_in_manifest_count"], 2);
+        assert_eq!(scope["e2e"]["in_manifest_not_selected_by_path_count"], 1);
+        assert_eq!(scope["e2e"]["selected_not_in_manifest_count"], 0);
         assert_eq!(
-            scope["e2e"]["enabled_not_selected"][0]["observed_pass_count"],
+            scope["e2e"]["in_manifest_not_selected_by_path"][0]["observed_pass_count"],
             1
         );
         assert_eq!(
-            scope["e2e"]["enabled_not_selected"][0]["observed_fail_count"],
+            scope["e2e"]["in_manifest_not_selected_by_path"][0]["observed_fail_count"],
             2
         );
         assert_eq!(
-            scope["e2e"]["enabled_not_selected"][0]["reason"],
+            scope["e2e"]["in_manifest_not_selected_by_path"][0]["reason"],
             "excluded after the recorded observations"
         );
         assert_eq!(

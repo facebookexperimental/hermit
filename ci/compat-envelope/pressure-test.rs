@@ -240,7 +240,7 @@ Commands:
       refuse it, while batches report and omit it rather than inventing a run.
       Add --repetitions N to repeat every selected red cell in independent boxed
       checks against the same clean committed source. Use --green with
-      --repetitions to select enabled green cells instead; an exact cell, --mode,
+      --repetitions to select cells selected by full instead; an exact cell, --mode,
       and --sample may narrow either population. Existing resource
       caps allow four manifest guests at once by default, including KVM guests.
       This reports per-cell flakiness; it never edits or demotes the scorecard.
@@ -290,8 +290,8 @@ Selection and bounded-batch options (run and plan):
                            samples verify, replay, and chaos; custom and naked
                            are omitted. Sampling draws only from cells whose
                            manifests provide executable commands. With --green
-                           and --repetitions, sample the enabled green cells.
-  --green                  With --repetitions, select enabled green cells instead
+                           and --repetitions, sample cells selected by full.
+  --green                  With --repetitions, select cells selected by full instead
                            of red cells. Exact --test/--mode/--backend, --mode,
                            and --sample filters are retained in run.json. A sample
                            records selected/eligible counts and its seed in
@@ -300,7 +300,7 @@ Selection and bounded-batch options (run and plan):
   --seed SEED              Reproduce one sample. If omitted, a generated seed
                            and every selected identity are retained in run.json.
   --cells-file PATH        Select exactly the canonical five-field cell JSON
-                           identities of enabled executable red cells, listed
+                           identities of executable cells not selected by full, listed
                            one per line. Add --probe-disabled --backend BACKEND
                            to select only disabled executable cells for that
                            backend instead. Requires --repetitions and a clean
@@ -344,7 +344,7 @@ Examples:
     --mode verify --backend ptrace --green \
     --repetitions 100 --cell-timeout 600
 
-  # Check every enabled green cell once with one shared build.
+  # Check every cell selected by full once with one shared build.
   ./ci/compat-envelope/pressure-test.rs run \
     --green --repetitions 1 --run-timeout 14400
 
@@ -528,12 +528,17 @@ fn load_cells_file(path: &Path) -> Result<(Vec<CellId>, String), String> {
 struct TrackedCell {
     #[serde(flatten)]
     id: CellId,
-    enabled: bool,
     status: String,
     /// Why a `not-applicable` cell is not applicable, verbatim from the
     /// manifest. Absent for `green` and `red`.
     #[serde(default)]
     not_applicable_reason: Option<String>,
+}
+
+impl TrackedCell {
+    fn is_applicable(&self) -> bool {
+        self.status != "not-applicable"
+    }
 }
 
 struct PressureCells {
@@ -2837,13 +2842,13 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
     let mut seen = BTreeSet::new();
     let mut selected_cells = Vec::new();
     let mut unavailable = Vec::new();
-    let mut enabled_by_test = BTreeMap::new();
+    let mut applicable_by_test = BTreeMap::new();
     for cell in tracked.cells {
         if !seen.insert(cell.id.clone()) {
             return Err("tracked cells contain a duplicate identity".into());
         }
-        if cell.enabled {
-            enabled_by_test
+        if cell.is_applicable() {
+            applicable_by_test
                 .entry(cell.id.test.clone())
                 .or_insert_with(|| cell.id.clone());
         }
@@ -2873,11 +2878,11 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
         if selected
             && requested_ids.is_some()
             && selection.probe_disabled
-            && (cell.status != "not-applicable" || cell.enabled)
+            && cell.is_applicable()
         {
             return Err(format!(
-                "--cells-file identity {} is not in the disabled pressure population (status={}, enabled={})",
-                display_id(&cell.id), cell.status, cell.enabled
+                "--cells-file identity {} is not in the not-applicable pressure population (status={})",
+                display_id(&cell.id), cell.status
             ));
         }
         match cell.status.as_str() {
@@ -2886,9 +2891,9 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                     && !selection.selects_green_population()
                     && !selection.probe_disabled =>
             {
-                if requested_ids.is_some() && !cell.enabled {
+                if requested_ids.is_some() && !cell.is_applicable() {
                     return Err(format!(
-                        "--cells-file identity {} is tracked but disabled",
+                        "--cells-file identity {} is tracked but not applicable",
                         display_id(&cell.id)
                     ));
                 }
@@ -2927,7 +2932,7 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                     display_id(&cell.id)
                 ));
             }
-            "green" if selected && selection.selects_green_population() && cell.enabled => {
+            "green" if selected && selection.selects_green_population() && cell.is_applicable() => {
                 let budget = budgets
                     .get(&(
                         cell.id.test.clone(),
@@ -2956,7 +2961,7 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                     "--cells-file identity {} is unsupported: {}",
                     display_id(&cell.id),
                     cell.not_applicable_reason.as_deref().unwrap_or(
-                        "its backend is not enabled for this mode, so it has no guest command"
+                        "its backend is not applicable to this mode, so it has no guest command"
                     )
                 ));
             }
@@ -2977,14 +2982,14 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                     selected_cells.push(cell);
                 } else if selection.is_exact() || requested_ids.is_some() {
                     return Err(format!(
-                        "{}/{}/{} is disabled and unavailable: its manifest declares no executable attempts",
+                        "{}/{}/{} is not applicable and unavailable: its manifest declares no executable attempts",
                         cell.id.test, cell.id.mode, cell.id.backend
                     ));
                 } else {
                     unavailable.push(cell);
                 }
             }
-            // Without explicit probing, a disabled cell stays out of the
+            // Without explicit probing, a not-applicable cell stays out of the
             // executable population and an exact request explains why.
             "not-applicable" if selected && selection.is_exact() => {
                 return Err(format!(
@@ -2993,7 +2998,7 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                     cell.id.mode,
                     cell.id.backend,
                     cell.not_applicable_reason.as_deref().unwrap_or(
-                        "its backend is not enabled for this mode, so it has no guest command"
+                        "its backend is not applicable to this mode, so it has no guest command"
                     )
                 ));
             }
@@ -3030,11 +3035,11 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
             ) {
                 if selection.selects_green_population() {
                     format!(
-                        "{test}/{mode}/{backend} is not an enabled green tracked cell; use the scorecard or manifest CLI to inspect it"
+                        "{test}/{mode}/{backend} is not selected by full; use the scorecard or manifest CLI to inspect it"
                     )
                 } else if selection.probe_disabled {
                     format!(
-                        "{test}/{mode}/{backend} is not a disabled tracked cell; use the scorecard or manifest CLI to inspect it"
+                        "{test}/{mode}/{backend} is not a not-applicable tracked cell; use the scorecard or manifest CLI to inspect it"
                     )
                 } else {
                     format!(
@@ -3043,16 +3048,16 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                 }
             } else if let Some(mode) = selection.mode.as_deref() {
                 if selection.selects_green_population() {
-                    format!("tracked scorecard has no enabled green cells for mode `{mode}`")
+                    format!("tracked scorecard has no cells selected by full for mode `{mode}`")
                 } else if selection.probe_disabled {
-                    format!("tracked scorecard has no disabled cells for mode `{mode}`")
+                    format!("tracked scorecard has no not-applicable cells for mode `{mode}`")
                 } else {
                     format!("tracked scorecard has no red cells for mode `{mode}`")
                 }
             } else if selection.selects_green_population() {
-                "tracked scorecard has no enabled green cells".into()
+                "tracked scorecard has no cells selected by full".into()
             } else if selection.probe_disabled {
-                "tracked scorecard has no disabled cells".into()
+                "tracked scorecard has no not-applicable cells".into()
             } else {
                 "tracked scorecard has no red cells".into()
             },
@@ -3063,7 +3068,7 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
         if count > selected_cells.len() {
             return Err(if selection.selects_green_population() {
                 format!(
-                    "--sample {count} exceeds the {} enabled green cells in the selected population",
+                    "--sample {count} exceeds the {} cells selected by full in the requested population",
                     selected_cells.len()
                 )
             } else {
@@ -3088,9 +3093,9 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
     }
     let mut preparation_by_test = BTreeMap::new();
     for cell in &selected_cells {
-        let prepared_with = enabled_by_test.get(&cell.id.test).ok_or_else(|| {
+        let prepared_with = applicable_by_test.get(&cell.id.test).ok_or_else(|| {
             format!(
-                "{} has no manifest-enabled mode available to build its fixture",
+                "{} has no applicable manifest mode available to build its fixture",
                 cell.id.test
             )
         })?;
@@ -4136,7 +4141,7 @@ fn write_plan_after_scorecard_check(
             let junit = cell_dir.join("junit.xml");
             let junit_in_progress = cell_dir.join("junit.in-progress.xml");
             let status_file = cell_dir.join("harness-status");
-            let (selector, backend) = if tracked.enabled {
+            let (selector, backend) = if tracked.is_applicable() {
                 let backend = if cell.backend == "native" {
                     String::new()
                 } else {
@@ -4720,7 +4725,8 @@ fn validate_run_contract(
     let expected_cells = pressure_cells.selected;
     let mut expected = BTreeMap::new();
     for tracked in expected_cells {
-        if expected.insert(tracked.id, tracked.enabled).is_some() {
+        let applicable = tracked.is_applicable();
+        if expected.insert(tracked.id, applicable).is_some() {
             return Err(format!(
                 "tracked scorecard contains a duplicate {}-cell identity",
                 population_label(metadata.green, metadata.probe_disabled)
@@ -8631,7 +8637,7 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
         .cells
         .iter()
         .filter(|cell| {
-            !cell.enabled
+            !cell.is_applicable()
                 && cell.status == "not-applicable"
                 && cell.id.backend == "liteinst"
                 && cell.id.mode == "verify"
@@ -8682,7 +8688,7 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
         || selected
             .selected
             .iter()
-            .any(|cell| cell.enabled || cell.status != "not-applicable")
+            .any(|cell| cell.is_applicable() || cell.status != "not-applicable")
         || selection.is_exact()
         || !selection.uses_shared_preparation()
     {
@@ -8734,18 +8740,19 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
     let wrong_backend = fixture_id(&|cell| {
         cell.id.backend == "kvm"
             && cell.status == "not-applicable"
-            && !cell.enabled
+            && !cell.is_applicable()
             && executable(cell)
     })?;
-    let red =
-        fixture_id(&|cell| cell.id.backend == "liteinst" && cell.status == "red" && cell.enabled)?;
+    let red = fixture_id(&|cell| {
+        cell.id.backend == "liteinst" && cell.status == "red" && cell.is_applicable()
+    })?;
     let green = fixture_id(&|cell| {
-        cell.id.backend == "liteinst" && cell.status == "green" && cell.enabled
+        cell.id.backend == "liteinst" && cell.status == "green" && cell.is_applicable()
     })?;
     let unavailable = fixture_id(&|cell| {
         cell.id.backend == "liteinst"
             && cell.status == "not-applicable"
-            && !cell.enabled
+            && !cell.is_applicable()
             && !executable(cell)
     })?;
     let mut unknown = ids[0].clone();
@@ -8757,16 +8764,16 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
             "does not match --probe-disabled --backend liteinst",
         ),
         (
-            "enabled red",
+            "not selected by full",
             red,
-            "not in the disabled pressure population",
+            "not in the not-applicable pressure population",
         ),
         (
-            "enabled green",
+            "selected by full",
             green,
-            "not in the disabled pressure population",
+            "not in the not-applicable pressure population",
         ),
-        ("unavailable", unavailable, "disabled and unavailable"),
+        ("unavailable", unavailable, "not applicable and unavailable"),
         (
             "unknown",
             unknown,
@@ -9835,7 +9842,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     // A NOT-APPLICABLE CELL MUST NEITHER RUN NOR BE SILENTLY IGNORED. This
     // bracket previously keyed on "a red chaos cell without seeds", which was
     // the same population under its old name: before the scorecard could say
-    // `not-applicable`, a cell whose backend is not enabled for its mode was
+    // `not-applicable`, a cell whose backend was not applicable to its mode was
     // recorded as red. The invariant is unchanged -- such a cell must stay out
     // of the executable population, and an exact request for it must be refused
     // WITH THE MANIFEST'S OWN REASON rather than a bare "not red".
@@ -9884,7 +9891,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     let disabled_exact = pressure_cells(root, &disabled_exact_selection)?;
     if disabled_exact.selected.len() != 1
         || disabled_exact.selected[0].id != not_applicable.id
-        || disabled_exact.selected[0].enabled
+        || disabled_exact.selected[0].is_applicable()
     {
         return Err("explicit disabled-cell probing lost its exact requested cell".into());
     }
@@ -9892,7 +9899,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         .cells
         .iter()
         .find(|cell| {
-            cell.enabled
+            cell.is_applicable()
                 && cell.status == "red"
                 && cell.id.mode == "verify"
                 && cell.id.backend == "kvm"
@@ -9908,10 +9915,10 @@ fn self_test(root: &Path) -> Result<(), String> {
     };
     let red_as_disabled_error = pressure_cells(root, &red_as_disabled)
         .err()
-        .ok_or("disabled-cell probe accepted an enabled red cell")?;
-    if !red_as_disabled_error.contains("is not a disabled tracked cell") {
+        .ok_or("not-applicable-cell probe accepted a cell not selected by full")?;
+    if !red_as_disabled_error.contains("is not a not-applicable tracked cell") {
         return Err(format!(
-            "disabled-cell probe of an enabled red cell reported the wrong error: {red_as_disabled_error}"
+            "not-applicable-cell probe reported the wrong error: {red_as_disabled_error}"
         ));
     }
     let absent_kvm = CapabilityVerdict {
@@ -9940,13 +9947,13 @@ fn self_test(root: &Path) -> Result<(), String> {
     let disabled_batch = pressure_cells(root, &disabled_batch_selection)?;
     if disabled_batch.selected.is_empty()
         || disabled_batch.selected.iter().any(|cell| {
-            cell.enabled
+            cell.is_applicable()
                 || cell.status != "not-applicable"
                 || cell.id.mode != "verify"
                 || cell.id.backend != "kvm"
         })
     {
-        return Err("disabled-backend batch selected an enabled or mismatched cell".into());
+        return Err("not-applicable-backend batch selected an applicable or mismatched cell".into());
     }
     let oversized_disabled_sample = CellSelection {
         sample: Some(disabled_batch.eligible_cells + 1),
@@ -10563,12 +10570,12 @@ fn self_test(root: &Path) -> Result<(), String> {
         .cells
         .iter()
         .find(|tracked| {
-            tracked.enabled
+            tracked.is_applicable()
                 && tracked.status == "green"
                 && tracked.id.mode == "verify"
                 && tracked.id.backend == "ptrace"
         })
-        .ok_or("self-test needs one enabled green ptrace/verify cell")?
+        .ok_or("self-test needs one ptrace/verify cell selected by full")?
         .id
         .clone();
     let repeated_selection = CellSelection {
@@ -11005,7 +11012,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     let expected_green_ids: BTreeSet<_> = tracked
         .cells
         .iter()
-        .filter(|tracked| tracked.enabled && tracked.status == "green")
+        .filter(|tracked| tracked.is_applicable() && tracked.status == "green")
         .map(|tracked| tracked.id.clone())
         .collect();
     let selected_green_batch = pressure_cells(root, &green_batch_selection)?;
@@ -11015,7 +11022,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         .map(|tracked| tracked.id.clone())
         .collect();
     if selected_green_ids != expected_green_ids || !selected_green_batch.unavailable.is_empty() {
-        return Err("--green did not select the complete enabled green population".into());
+        return Err("--green did not select the complete population selected by full".into());
     }
     let green_sample_selection = CellSelection {
         green: true,
@@ -12496,7 +12503,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     summarize_first.lane = summarize_retry.id.lane.clone();
     summarize_first.mode = summarize_retry.id.mode.clone();
     summarize_first.backend = Some(summarize_retry.id.backend.clone());
-    summarize_first.classification = if summarize_retry.enabled {
+    summarize_first.classification = if summarize_retry.is_applicable() {
         "required".into()
     } else {
         "disabled".into()
@@ -14565,7 +14572,7 @@ mod pressure_sample_tests {
             row.test = selected.id.test.clone();
             row.category = selected.id.category.clone();
             row.lane = selected.id.lane.clone();
-            row.classification = if selected.enabled {
+            row.classification = if selected.is_applicable() {
                 "required"
             } else {
                 "disabled"
@@ -14923,7 +14930,7 @@ mod pressure_planning_tests {
         let cell: TrackedCell = serde_json::from_value(json!({
             "backend": "ptrace", "category": "applications", "lane": "portable",
             "mode": "verify", "test": "applications/example-timed-progress-bar",
-            "enabled": true, "status": "red",
+            "status": "red",
         })).unwrap();
         let mut selection = CellSelection {
             repetitions: Some(1), jobs: Some(4), kvm_guest_cap: Some(1),
@@ -14936,6 +14943,6 @@ mod pressure_planning_tests {
         selection.kvm_guest_cap = None;
         validate_selection_shape(&selection).unwrap();
         validate_guest_caps_against_selected_demand(std::slice::from_ref(&cell), &selection).unwrap();
-        assert!(USAGE.contains("identities of enabled executable red cells"));
+        assert!(USAGE.contains("identities of executable cells not selected by full"));
     }
 }

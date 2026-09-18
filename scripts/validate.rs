@@ -22056,15 +22056,17 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
                     let binaries = &scope.evidence["integration_test_binaries"];
                     let plan_name = retained_plan["name"].as_str().unwrap_or("unknown");
                     let selected = e2e["selected_count"].as_u64().unwrap_or(0);
-                    let enabled_not_selected =
-                        e2e["enabled_not_selected_count"].as_u64().unwrap_or(0);
+                    let in_manifest = e2e["in_manifest_count"].as_u64().unwrap_or(0);
+                    let in_manifest_not_selected = e2e
+                        ["in_manifest_not_selected_by_path_count"]
+                        .as_u64()
+                        .unwrap_or(0);
                     println!(
-                        "Coverage: plan {} selected {} outer nodes; E2E selected {selected} of {} selected-or-enabled cells; \
-                         {enabled_not_selected} enabled cells were not selected; integration \
+                        "Coverage: plan {} selected {} outer nodes; E2E selected {selected} of {in_manifest} cells in the manifest; \
+                         {in_manifest_not_selected} cells in the manifest were not selected by {plan_name}; integration \
                          binaries CI-registered {} of {} ({} reason-recorded, {} none-recorded).",
                         plan_name,
                         retained_plan["outer_node_count"],
-                        selected + enabled_not_selected,
                         binaries["ci_registered_count"],
                         binaries["present_count"],
                         binaries["reason_recorded_count"],

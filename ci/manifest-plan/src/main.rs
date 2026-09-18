@@ -97,8 +97,8 @@ struct PlanRow {
     backend: String,
     ci: bool,
     ci_disabled_reason: Option<CiDisabledReasonData>,
-    enabled: bool,
-    /// Why this backend is not enabled for this mode, verbatim from the
+    applicable: bool,
+    /// Why this backend is not applicable for this mode, verbatim from the
     /// manifest's `modes.<mode>.backends_disabled.<backend>`.
     ///
     /// ⚠️ THIS IS A DIFFERENT FACT FROM `ci_disabled_reason` AND THE TWO MUST NOT
@@ -108,7 +108,7 @@ struct PlanRow {
     /// carried the scorecard had nowhere to put that distinction, so it rendered
     /// 4,940 never-applicable cells as red.
     ///
-    /// `Some` exactly when `enabled` is false; the manifest already requires a
+    /// `Some` exactly when `applicable` is false; the manifest already requires a
     /// non-empty reason for every disabled backend, so this is never invented.
     not_applicable_reason: Option<String>,
     timeout_seconds: i64,
@@ -359,7 +359,7 @@ fn main() {
         Format::Json => {
             let output: Vec<_> = rows
                 .iter()
-                .filter(|row| row.enabled)
+                .filter(|row| row.applicable)
                 .map(|row| {
                     json!({
                         "bucket": row.bucket,
@@ -390,7 +390,6 @@ fn main() {
                         "backend": row.backend,
                         "ci": row.ci,
                         "ci_disabled_reason": row.ci_disabled_reason,
-                        "enabled": row.enabled,
                         "not_applicable_reason": row.not_applicable_reason,
                         "timeout_seconds": row.timeout_seconds,
                         "cpu_timeout_seconds": row.cpu_timeout_seconds,
@@ -409,17 +408,17 @@ fn main() {
                 "{:<10}\t{:<38}\t{:<10}\t{:<8}\t{:<5}\tBUCKET",
                 "LANE", "TEST", "MODE", "BACKEND", "CI"
             );
-            for row in rows.iter().filter(|row| row.enabled) {
+            for row in rows.iter().filter(|row| row.applicable) {
                 println!(
                     "{:<10}\t{:<38}\t{:<10}\t{:<8}\t{:<5}\t{}",
                     row.lane, row.id, row.mode, row.backend, row.ci, row.bucket
                 );
             }
             eprintln!(
-                "\nPASS: {} manifest(s), {} test(s), {} enabled plan cells validated",
+                "\nPASS: {} manifest(s), {} test(s), {} applicable manifest cells validated",
                 manifests.len(),
                 seen_ids.len(),
-                rows.iter().filter(|row| row.enabled).count()
+                rows.iter().filter(|row| row.applicable).count()
             );
         }
     }
@@ -1130,11 +1129,11 @@ fn validate_and_expand(
             rows,
         );
     }
-    if rows[row_start..].iter().any(|row| row.enabled && row.ci)
+    if rows[row_start..].iter().any(|row| row.applicable && row.ci)
         && program_path.as_ref().is_some_and(|path| !path.is_file())
     {
         die(format!(
-            "{id}: CI-enabled program symlink target is unavailable: {}",
+            "{id}: program selected by full has an unavailable symlink target: {}",
             program.unwrap()
         ));
     }
@@ -1594,7 +1593,7 @@ fn validate_mode_with_cpu(
             backend,
             ci: selected,
             ci_disabled_reason,
-            enabled: true,
+            applicable: true,
             not_applicable_reason: None,
             timeout_seconds,
             cpu_timeout_seconds,
@@ -1613,7 +1612,7 @@ fn validate_mode_with_cpu(
             backend: backend.to_string(),
             ci: false,
             ci_disabled_reason: None,
-            enabled: false,
+            applicable: false,
             not_applicable_reason,
             timeout_seconds: inherited_timeout_seconds,
             cpu_timeout_seconds: inherited_cpu_timeout_seconds,
@@ -1980,17 +1979,17 @@ liteinst = "unsupported"
             &mut rows,
         );
         assert_eq!(rows.len(), 5);
-        let enabled: Vec<_> = rows.iter().filter(|row| row.enabled).collect();
-        assert_eq!(enabled.len(), 1);
-        assert_eq!(enabled[0].backend, "ptrace");
-        assert!(enabled[0].ci);
-        assert_eq!(enabled[0].timeout_seconds, 90);
-        assert_eq!(enabled[0].attempts, Some(1));
+        let applicable: Vec<_> = rows.iter().filter(|row| row.applicable).collect();
+        assert_eq!(applicable.len(), 1);
+        assert_eq!(applicable[0].backend, "ptrace");
+        assert!(applicable[0].ci);
+        assert_eq!(applicable[0].timeout_seconds, 90);
+        assert_eq!(applicable[0].attempts, Some(1));
         assert!(
             rows.iter()
                 .all(|row| row.timeout_seconds == 90 && row.attempts == Some(1))
         );
-        assert_eq!(rows.iter().filter(|row| !row.enabled).count(), 4);
+        assert_eq!(rows.iter().filter(|row| !row.applicable).count(), 4);
     }
 
     #[test]
@@ -2149,7 +2148,7 @@ sabre = "unsupported"
         );
         assert!(
             rows.iter()
-                .filter(|row| !row.enabled)
+                .filter(|row| !row.applicable)
                 .all(|row| !row.ci && row.ci_disabled_reason.is_none())
         );
     }
@@ -2490,7 +2489,7 @@ liteinst = "unsupported"
         let mut rows = Vec::new();
         validate_chaos(&spec, &mut rows);
         assert_eq!(rows.len(), 5);
-        assert_eq!(rows.iter().filter(|row| row.enabled).count(), 1);
+        assert_eq!(rows.iter().filter(|row| row.applicable).count(), 1);
         assert!(rows.iter().all(|row| row.mode == "chaos"));
     }
 
@@ -2503,7 +2502,7 @@ liteinst = "unsupported"
         let mut rows = Vec::new();
         validate_chaos(&spec, &mut rows);
         assert_eq!(rows.len(), 5);
-        assert_eq!(rows.iter().filter(|row| row.enabled).count(), 1);
+        assert_eq!(rows.iter().filter(|row| row.applicable).count(), 1);
     }
 
     // NEGATIVE side: an undeclared ceiling is what makes a saturated oracle

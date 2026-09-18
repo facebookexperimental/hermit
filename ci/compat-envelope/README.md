@@ -10,7 +10,7 @@ versioned table. The stable per-cell identities behind the totals live in
 data are not versioned; each validate run retains those under `ignored/`.
 
 The denominator is the complete comparable manifest matrix, not just the
-combinations that happen to be enabled today. For `N` manifest tests, verify,
+combinations selected by one validate path. For `N` manifest tests, verify,
 replay, and chaos span five Hermit backends, while native contributes one
 naked-execution control: `N × (5 × 3 + 1)` cells. Native is shown as a sixth
 backend in the table, but it does not have replay or chaos cells, so the formula
@@ -23,14 +23,14 @@ For one dated example only: on 2026-08-13, `N = 336`, so the comparable matrix
 has `336 × (5 × 3 + 1) = 5,376` cells. The checked-in table is generated from
 the live manifest and changes automatically when a manifest test is added.
 
-`hermit-manifest-plan --format
-matrix-json` emits both sides of each manifest's required enabled/disabled
-partition. It also emits the validated per-test timeout and the number of
+`hermit-manifest-plan --format matrix-json` emits every cell in the manifest,
+including applicable and not-applicable combinations. It also emits the
+validated per-test timeout and the number of
 `execute_attempt` calls the existing harness makes for each mode. A seedless
 chaos mode has `attempts: null`: it remains red but has no command to run. The
 pressure-test entry point consumes this output instead of parsing the manifest
 a second way. A disabled combination is not applicable. The existing `--format
-json` and text views remain enabled-only because
+json` and text views remain execution-only because
 they are execution plans rather than scorecards.
 
 ## Ordinary validation
@@ -43,8 +43,8 @@ Run:
 
 The path is deliberately direct:
 
-1. `hermit-manifest-plan` validates the complete matrix and emits the enabled
-   execution plan.
+1. `hermit-manifest-plan` validates the complete matrix and emits the execution
+   plan selected by the requested path.
 2. `ci/expected-e2e-plan.json` identifies the cells ordinary validation runs.
 3. Each manifest bucket appends schema-4 `results.jsonl` rows to a unique
    durable result directory. Every row includes the validate attempt number,
@@ -71,7 +71,8 @@ The path is deliberately direct:
    and decides whether to commit it; validation never commits it automatically.
 6. A top-level full run retains `ignored/validate/artifacts/<run-id>/coverage.json`.
    It names the exact plan and outer nodes, every selected E2E cell, every
-   enabled-but-unselected E2E cell with its recorded reason and observed
+   cell in the manifest not selected by that path, with its recorded reason
+   and observed
    pass/fail counts, and the complete integration-test-binary registration
    partition. The ledger row carries the same counts and binds the artifact by
    SHA-256.
@@ -94,7 +95,7 @@ do not establish strict INFO-log determinism or cross-backend parity. The
 scorecard says this directly and reports no cross-backend parity count until
 the manifest has cells that really compare fresh ptrace and non-ptrace logs.
 
-Scorecard colour records whether an enabled cell is in the selected plan.
+Scorecard selection records whether a cell in the manifest is selected by full.
 Measurement is separate: importing a pass or divergence records what happened
 without changing which cells validation selects. Moving a cell out of the
 selected plan is not a fix, and `scorecard.rs update` refuses that plan removal
@@ -121,14 +122,15 @@ run a test and cannot change measurement by itself. The following validate
 automatically records any canonical per-cell results after its ledger and
 receipt work; selection alone is not evidence.
 
-## Red cells and the periodic full-matrix run
+## Cells not selected by full and the periodic full-matrix run
 
-Every enabled manifest cell outside the selected plan is red. Manifest-disabled
-cells are not applicable. A red cell can have a passing measurement, and a green
-cell can have a divergence; the two fields answer different questions.
+Every applicable manifest cell outside the full plan is not selected by full.
+Other cells are not applicable. A cell not selected by full can have a passing
+measurement, and a selected cell can have a divergence; selection and
+measurement answer different questions.
 
-To measure a disabled backend population before changing its manifest
-eligibility, name the backend explicitly. The backend requirement prevents an
+To measure a not-applicable backend population before changing its manifest
+applicability, name the backend explicitly. The backend requirement prevents an
 unfiltered probe from attempting every unsupported combination:
 
 ```console
@@ -139,7 +141,7 @@ unfiltered probe from attempting every unsupported combination:
 
 These probes use the harness's existing `--probe-disabled` execution path and
 retain the backend filter in `run.json`. They do not change cell status or
-manifest selection; a later reviewed change may enable only cells supported by
+manifest selection; a later reviewed change may select only cells supported by
 the measured evidence.
 
 ## Divergence positions: where a cell diverged, and how well you know it
@@ -230,7 +232,7 @@ observations. Those observations cannot qualify a receipt, and the scorecard
 writer cannot change which cells are selected or move their green/red state.
 `import-results` walks retained history without executing a guest, keeps only
 clean schema-4 `BitwiseInfoV1` terminal comparisons from commits on `HEAD`'s
-history, and selects the newest such commit independently for every enabled
+history, and selects the newest such commit independently for every applicable
 cell. If several retained runs at that commit disagree, it imports every result
 instead of resolving the conflict by file order.
 
@@ -331,8 +333,9 @@ LiteInst cell retains the complete canonical LiteInst build chain.
 so ignored Cargo output in the primary checkout cannot change the experiment
 and no shared worktree registry is touched. The generated clone is removed
 afterward while the run directory remains retained.
-Enabled red cells use the ordinary exact-cell selector; disabled red cells use
-the harness's explicit `--probe-disabled` selector. Each cell gets at most the
+Applicable cells not selected by full use the ordinary exact-cell selector;
+not-applicable cells use the harness's explicit `--probe-disabled` selector.
+Each cell gets at most the
 shipped portable DAG's existing 600-second bucket allowance; the manifest's
 smaller per-cell timeout still applies inside it. Expected nonzero exits,
 timeouts, OOMs, and no-result outcomes stay red but do not stop later cells. If the
