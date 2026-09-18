@@ -350,7 +350,7 @@ mod tests {
             FetchMutation::OmitPreparation => {
                 split = replace_exactly_once(
                     &split,
-                    "        CARGO_HOME=\"$cargo_home\" host_fetch ./ci/prepare-rust-scripts.sh --fetch-only\n",
+                    "        CARGO_HOME=\"$cargo_home\" retry_fetch \"prepare-rust-scripts --fetch-only\" \\\n            host_fetch ./ci/prepare-rust-scripts.sh --fetch-only\n",
                     "        : # mutation control: generated workspace preparation omitted\n",
                 );
             }
@@ -382,6 +382,9 @@ mod tests {
             }
         }
         write_executable(&root.join("ci/hermetic/run-split-validate.sh"), &split);
+        let retry = fs::read_to_string(source_root.join("ci/hermetic/retry-fetch.sh"))
+            .expect("read production fetch retry helper");
+        write_executable(&root.join("ci/hermetic/retry-fetch.sh"), &retry);
         write_executable(&root.join("ci/prepare-rust-scripts.sh"), &prepare);
 
         fs::write(
