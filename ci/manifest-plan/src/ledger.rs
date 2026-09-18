@@ -18,6 +18,9 @@ use crate::runner::FailureClass;
 mod schema10;
 pub use schema10::*;
 
+mod admission;
+pub use admission::*;
+
 /// The stable fields emitted by `validate/aggregate.py --json` and JSONL stores.
 /// Optional fields reflect honest reconstructed rows where a measurement was not
 /// available; unrecognized fields are retained for forward compatibility.
@@ -152,7 +155,7 @@ pub struct HistoryRow {
     /// order followed by this `BTreeMap`'s key order. Moving `tree` into an
     /// ordinary struct field would change existing receipt digests without
     /// changing their meaning.
-    #[serde(flatten)]
+    #[serde(flatten, deserialize_with = "admission::deserialize_extensions")]
     pub extra: BTreeMap<String, Value>,
 }
 
@@ -293,8 +296,15 @@ impl HistoryRow {
 /// This is the per-node replacement for the blunt aggregate `filtered_tests == 0`
 /// predicate, which could not distinguish a full run's legitimate cross-shard
 /// filtering (~693 tests) from a narrowed-subset masquerade.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct CoverageRow {
+    /// Decode-only identity retained for admission row binding. Historical
+    /// receipt serialization intentionally omitted this newer extension;
+    /// keeping it out of serialization preserves those exact canonical bytes.
+    /// Duplicate occurrences are retained as a non-string array so admission
+    /// validation refuses them, while historical rows remain readable.
+    #[serde(skip_serializing)]
+    pub admission_run_id: Option<Value>,
     /// Test-bearing DAG nodes the run PLANNED (manifest `test.*` steps for the
     /// lanes actually run). `0` = the producer could not determine a planned set;
     /// never treated as a satisfied obligation.
@@ -1061,85 +1071,147 @@ impl CellResultsEvidenceV8 {
 /// this reader does not understand yet. Exact versioned shapes precede the raw
 /// fallback so supported rows retain typed access while unknown extensions stay
 /// readable.
-#[derive(Clone, Debug, Serialize, PartialEq)]
-#[serde(untagged)]
+#[derive(Clone, Debug)]
 pub enum CellResultsValue {
     Typed(CellResultsEvidence),
     Other(Value),
+    /// Decode-only duplicate identity state. Historical serialization and typed
+    /// access delegate to `value`; admission checks must inspect the original IDs.
+    #[doc(hidden)]
+    WithDuplicateRunIds {
+        value: Box<Self>,
+        run_ids: Value,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct RetainedResultValue {
+    value: Value,
+    duplicate_run_ids: Option<Value>,
+}
+
+impl RetainedResultValue {
+    fn plain(value: Value) -> Self {
+        Self {
+            value,
+            duplicate_run_ids: None,
+        }
+    }
+}
+
+// Retain top-level nested run-ID occurrences before Value overwrites duplicate
+// keys. Only CellResultsValue had the existing binding_contract refusal; keep
+// that policy separate from the newly retained, decode-only identity metadata.
+fn deserialize_result_value<'de, D: Deserializer<'de>>(
+    deserializer: D,
+    cell_contract: bool,
+) -> Result<RetainedResultValue, D::Error> {
+    struct Visitor {
+        cell_contract: bool,
+    }
+    impl<'de> serde::de::Visitor<'de> for Visitor {
+        type Value = RetainedResultValue;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("result evidence retaining original run-ID occurrences")
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(RetainedResultValue::plain(Value::Null))
+        }
+        fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+            Ok(RetainedResultValue::plain(Value::Bool(value)))
+        }
+        fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+            Ok(RetainedResultValue::plain(Value::from(value)))
+        }
+        fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+            Ok(RetainedResultValue::plain(Value::from(value)))
+        }
+        fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
+            serde_json::Number::from_f64(value)
+                .map(Value::Number)
+                .map(RetainedResultValue::plain)
+                .ok_or_else(|| E::custom("non-finite result evidence number"))
+        }
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+            Ok(RetainedResultValue::plain(Value::String(value.into())))
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut values = Vec::new();
+            while let Some(value) = seq.next_element::<Value>()? {
+                values.push(value);
+            }
+            Ok(RetainedResultValue::plain(Value::Array(values)))
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut values = serde_json::Map::new();
+            let mut ids = Vec::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if self.cell_contract && key == "binding_contract" && values.contains_key(&key) {
+                    return Err(serde::de::Error::custom(
+                        "duplicate field `binding_contract` in cell evidence",
+                    ));
+                }
+                let value = map.next_value::<Value>()?;
+                if key == "run_id" {
+                    ids.push(value.clone());
+                }
+                values.insert(key, value);
+            }
+            Ok(RetainedResultValue {
+                value: Value::Object(values),
+                duplicate_run_ids: (ids.len() > 1).then_some(Value::Array(ids)),
+            })
+        }
+    }
+    deserializer.deserialize_any(Visitor { cell_contract })
 }
 
 impl<'de> Deserialize<'de> for CellResultsValue {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        // V10 dispatch happens after this value is retained in HistoryRow.
-        // Refuse duplicate contract markers here, before Value can erase them.
-        // Other unknown shapes keep the same raw fallback as the old untagged
-        // enum; this is not a second artifact or historical-schema decoder.
-        struct Visitor;
-        impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = Value;
-
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("cell evidence with at most one binding_contract marker")
-            }
-
-            fn visit_unit<E: serde::de::Error>(self) -> Result<Value, E> {
-                Ok(Value::Null)
-            }
-
-            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Value, E> {
-                Ok(Value::Bool(value))
-            }
-
-            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Value, E> {
-                Ok(Value::from(value))
-            }
-
-            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Value, E> {
-                Ok(Value::from(value))
-            }
-
-            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Value, E> {
-                serde_json::Number::from_f64(value)
-                    .map(Value::Number)
-                    .ok_or_else(|| E::custom("non-finite cell evidence number"))
-            }
-
-            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Value, E> {
-                Ok(Value::String(value.into()))
-            }
-
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(
-                self,
-                mut seq: A,
-            ) -> Result<Value, A::Error> {
-                let mut values = Vec::new();
-                while let Some(value) = seq.next_element::<Value>()? {
-                    values.push(value);
-                }
-                Ok(Value::Array(values))
-            }
-
-            fn visit_map<A: serde::de::MapAccess<'de>>(
-                self,
-                mut map: A,
-            ) -> Result<Value, A::Error> {
-                let mut values = serde_json::Map::new();
-                while let Some(key) = map.next_key::<String>()? {
-                    if key == "binding_contract" && values.contains_key(&key) {
-                        return Err(serde::de::Error::custom(
-                            "duplicate field `binding_contract` in cell evidence",
-                        ));
-                    }
-                    values.insert(key, map.next_value()?);
-                }
-                Ok(Value::Object(values))
-            }
-        }
-        let raw = deserializer.deserialize_any(Visitor)?;
-        Ok(match serde_json::from_value(raw.clone()) {
+        let raw = deserialize_result_value(deserializer, true)?;
+        let value = match serde_json::from_value(raw.value.clone()) {
             Ok(value) => Self::Typed(value),
-            Err(_) => Self::Other(raw),
+            Err(_) => Self::Other(raw.value),
+        };
+        Ok(match raw.duplicate_run_ids {
+            Some(run_ids) => Self::WithDuplicateRunIds {
+                value: Box::new(value),
+                run_ids,
+            },
+            None => value,
         })
+    }
+}
+
+impl Serialize for CellResultsValue {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Typed(value) => value.serialize(serializer),
+            Self::Other(value) => value.serialize(serializer),
+            Self::WithDuplicateRunIds { value, .. } => value.serialize(serializer),
+        }
+    }
+}
+
+// Equality retains the historical typed/raw value semantics. Optional admission
+// integrity is a separate check on the original row, never inferred from equality.
+impl PartialEq for CellResultsValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::WithDuplicateRunIds { value, .. }, other) => value.as_ref() == other,
+            (value, Self::WithDuplicateRunIds { value: other, .. }) => value == other.as_ref(),
+            (Self::Typed(value), Self::Typed(other)) => value == other,
+            (Self::Other(value), Self::Other(other)) => value == other,
+            _ => false,
+        }
     }
 }
 
@@ -1148,6 +1220,7 @@ impl CellResultsValue {
         match self {
             Self::Typed(evidence) => Some(evidence),
             Self::Other(_) => None,
+            Self::WithDuplicateRunIds { value, .. } => value.typed(),
         }
     }
 
@@ -1155,6 +1228,7 @@ impl CellResultsValue {
         match self {
             Self::Typed(evidence) => Some(evidence),
             Self::Other(_) => None,
+            Self::WithDuplicateRunIds { value, .. } => value.typed_mut(),
         }
     }
 
@@ -1162,20 +1236,58 @@ impl CellResultsValue {
         match self {
             Self::Other(value) => serde_json::from_value(value.clone()).ok(),
             Self::Typed(_) => None,
+            Self::WithDuplicateRunIds { value, .. } => value.schema8(),
+        }
+    }
+
+    /// Original nested identity for admission checks and transient delegation.
+    /// Duplicate occurrences remain an invalid array even when every ID matches.
+    /// This metadata is deliberately excluded from historical serialization.
+    pub fn admission_run_id(&self) -> Option<Value> {
+        match self {
+            Self::Typed(value) => Some(Value::String(value.run_id.clone())),
+            Self::Other(value) => value.get("run_id").cloned(),
+            Self::WithDuplicateRunIds { run_ids, .. } => Some(run_ids.clone()),
         }
     }
 }
 
 /// Raw test-results evidence. The enclosing [`HistoryRow::schema_version`]
 /// decides whether these bytes have a supported typed interpretation.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-#[serde(transparent)]
-pub struct TestResultsValue(Value);
+#[derive(Clone, Debug)]
+pub struct TestResultsValue(RetainedResultValue);
+
+impl<'de> Deserialize<'de> for TestResultsValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserialize_result_value(deserializer, false).map(Self)
+    }
+}
+
+impl Serialize for TestResultsValue {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.value.serialize(serializer)
+    }
+}
+
+impl PartialEq for TestResultsValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.value == other.0.value
+    }
+}
 
 impl TestResultsValue {
     fn schema9(&self) -> Result<TestResultsEvidenceV9, String> {
-        serde_json::from_value(self.0.clone())
+        serde_json::from_value(self.0.value.clone())
             .map_err(|error| format!("schema 9 test_results is malformed: {error}"))
+    }
+
+    /// Original nested identity, including duplicate/non-string refusal state.
+    /// Callers may restore this only in a transient verifier request, not history.
+    pub fn admission_run_id(&self) -> Option<Value> {
+        self.0
+            .duplicate_run_ids
+            .clone()
+            .or_else(|| self.0.value.get("run_id").cloned())
     }
 }
 
