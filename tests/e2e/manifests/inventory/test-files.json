@@ -1,6 +1,12 @@
 {
   "files": [
     {
+      "disposition": "buck-fixture",
+      "path": "tests/BUCK",
+      "runner": "Meta Buck test targets",
+      "why": "tests/BUCK is owned by Meta Buck test targets: It declares the internal test target graph for the tests tree. The public Cargo and E2E manifest paths do not execute this build metadata as a guest, but Meta's Buck build consumes it directly."
+    },
+    {
       "disposition": "support-data",
       "path": "tests/Cargo.toml",
       "runner": "Cargo and Hermit Rust integration tests",
@@ -218,15 +224,15 @@
     },
     {
       "disposition": "manifest-test",
-      "path": "tests/backend-parity/fixtures/environment_and_workdir.c",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (portable CI)",
-      "why": "tests/backend-parity/fixtures/environment_and_workdir.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (portable CI): the ptrace verify and custom cells assert the exact guest environment name set and prove each guest starts in an empty writable tmpfs at /test"
-    },
-    {
-      "disposition": "manifest-test",
       "path": "tests/backend-parity/fixtures/dup_shared_offset.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false)",
       "why": "tests/backend-parity/fixtures/dup_shared_offset.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/backend-parity/fixtures/environment_and_workdir.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (portable CI)",
+      "why": "tests/backend-parity/fixtures/environment_and_workdir.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (portable CI): the ptrace verify and custom cells assert the exact guest environment name set and prove each guest starts in an empty writable tmpfs at /test"
     },
     {
       "disposition": "manifest-test",
@@ -439,6 +445,12 @@
       "why": "tests/backend-parity/fixtures/mmap_layout_pointer_order.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/backend-parity/fixtures/mountinfo_device_identity.c",
+      "runner": "hermit-cli/tests/kvm_harder.rs",
+      "why": "tests/backend-parity/fixtures/mountinfo_device_identity.c is owned by hermit-cli/tests/kvm_harder.rs: The KVM integration suite compiles this focused guest and checks deterministic mountinfo device identities through its backend-specific execution contract; it is not a standalone manifest program."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/backend-parity/fixtures/msync_writeback.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false)",
@@ -473,6 +485,12 @@
       "path": "tests/backend-parity/fixtures/openat_flags.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false)",
       "why": "tests/backend-parity/fixtures/openat_flags.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/backend-parity/fixtures/parity_probe.h",
+      "runner": "tests/backend-parity/parity_mutation.py",
+      "why": "tests/backend-parity/fixtures/parity_probe.h is owned by tests/backend-parity/parity_mutation.py: This header gives every identity fixture in the family one contract -- check accumulation, a single canonical stdout line, nonzero exit on any failed check, and the parity_mutate_*() seam the harness perturbs. It is compiled into each fixture rather than run, so it is build input to the harness and never an executable guest in its own right."
     },
     {
       "disposition": "manifest-test",
@@ -583,10 +601,22 @@
       "why": "tests/backend-parity/fixtures/renameat2_flags.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "suite-helper",
+      "path": "tests/backend-parity/fixtures/rlimit_identity.c",
+      "runner": "tests/backend-parity/parity_mutation.py",
+      "why": "tests/backend-parity/fixtures/rlimit_identity.c is owned by tests/backend-parity/parity_mutation.py: This is a family member guest exercised only through the shared mutation harness, which compiles it with the family flags and supplies its declared mutation field. It carries no bespoke verification logic of its own and is not a manifest test, so the generic manifest must not schedule it independently of the harness that gives it meaning."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/backend-parity/fixtures/robust_list.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false)",
       "why": "tests/backend-parity/fixtures/robust_list.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/backend-parity/fixtures/sched_getaffinity_identity.c",
+      "runner": "tests/backend-parity/parity_mutation.py",
+      "why": "tests/backend-parity/fixtures/sched_getaffinity_identity.c is owned by tests/backend-parity/parity_mutation.py: This is the second family member guest, registered to demonstrate that a new member inherits the shared verification with zero bespoke code. Like its sibling it is compiled and driven exclusively by the mutation harness and is not an independently scheduled manifest test, so the generic manifest must not claim it."
     },
     {
       "disposition": "manifest-test",
@@ -643,16 +673,16 @@
       "why": "tests/backend-parity/fixtures/signalfd_create.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
-      "disposition": "manifest-test",
-      "path": "tests/backend-parity/fixtures/socket_epoll_ordering.c",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false)",
-      "why": "tests/backend-parity/fixtures/socket_epoll_ordering.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI because no backend has ever been measured for this cell -- the registration it was ported from disabled the non-ptrace backends with a host-toolchain excuse rather than a measurement"
-    },
-    {
       "disposition": "guest-fixture",
       "path": "tests/backend-parity/fixtures/sigprocmask_state.c",
       "runner": "tests/backend-parity/run_matrix.py",
       "why": "tests/backend-parity/fixtures/sigprocmask_state.c is owned by tests/backend-parity/run_matrix.py: Probes deterministic sigprocmask(2) signal-mask block/unblock/query round-tripping as a direct C guest exercised only by the standalone backend-parity matrix harness, which drives ptrace/DBT/KVM strict and --verify probes against matrix.tsv; not registered in a CI manifest bucket, so it stays a driver-owned guest fixture."
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/backend-parity/fixtures/socket_epoll_ordering.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false)",
+      "why": "tests/backend-parity/fixtures/socket_epoll_ordering.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI because no backend has ever been measured for this cell -- the registration it was ported from disabled the non-ptrace backends with a host-toolchain excuse rather than a measurement"
     },
     {
       "disposition": "manifest-test",
@@ -722,6 +752,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/backend-parity/fixtures/timer_family_identity.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml",
+      "why": "tests/backend-parity/fixtures/timer_family_identity.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml: The centralized manifest declares its build, backend selection, timeout, and strict verification observation contract."
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/backend-parity/fixtures/umask_mode.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false)",
       "why": "tests/backend-parity/fixtures/umask_mode.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
@@ -751,6 +787,24 @@
       "why": "tests/backend-parity/fixtures/vectored_io.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "support-data",
+      "path": "tests/backend-parity/measurements/README.md",
+      "runner": "maintainers of tests/e2e/manifests/backend-parity-c.yaml",
+      "why": "tests/backend-parity/measurements/README.md is owned by maintainers of tests/e2e/manifests/backend-parity-c.yaml: This note records the method and the traps behind the measured verify sweeps that justify each ci flag in the backend-parity-c manifest, so a later flip cites recorded evidence instead of re-deriving it. It is documentation consumed by humans; no runner reads it and the generic manifest must not treat it as guest input."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/backend-parity/measurements/verify-sweep-6e1b59af0.tsv",
+      "runner": "maintainers of tests/e2e/manifests/backend-parity-c.yaml",
+      "why": "tests/backend-parity/measurements/verify-sweep-6e1b59af0.tsv is owned by maintainers of tests/e2e/manifests/backend-parity-c.yaml: This table is the recorded per-cell verify evidence, one row per declared test and backend pair with both sweep verdicts, that every ci = true flag in the backend-parity-c manifest rests on. It is inert recorded data read by reviewers rather than by any runner, and the generic manifest must not schedule it as an executable guest."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/backend-parity/parity_mutation.py",
+      "runner": "ci/dag/validate.json e2e.parity_mutation",
+      "why": "tests/backend-parity/parity_mutation.py is owned by ci/dag/validate.json e2e.parity_mutation: This is the shared mutation harness for the backend-parity identity family: it proves each declared field is load-bearing and compares every candidate backend against the golden ptrace reference at a recorded strictness tier. It is a driver invoked directly by CI, not a guest, and the generic manifest must not schedule it as one."
+    },
+    {
       "disposition": "special-driver",
       "path": "tests/backend-parity/retarget_to_manifest.py",
       "runner": "backend-parity matrix.tsv -> schema-v3 manifest migration tool (manual)",
@@ -767,6 +821,12 @@
       "path": "tests/backend-parity/split_asymmetric_pr.py",
       "runner": "matrix-symmetry backlog split tool (manual; self-test runs in target/debug/test-harness validate)",
       "why": "tests/backend-parity/split_asymmetric_pr.py is owned by matrix-symmetry backlog split tool (manual; self-test runs in target/debug/test-harness validate): Mechanical PR surgery driver that partitions legacy backend-private test hunks from landable code, proves byte-for-byte source-tree losslessness, preserves source authorship, and publishes cross-linked code and deferred-test PRs without executing guest behavior itself."
+    },
+    {
+      "disposition": "special-driver",
+      "path": "tests/backend-parity/test_parallel_validate_paths.py",
+      "runner": "check.backend_parity_suites",
+      "why": "tests/backend-parity/test_parallel_validate_paths.py is owned by check.backend_parity_suites: This driver-side unittest suite proves concurrent backend-parity runs use isolated host temporary paths and fixed guest workdirs. It tests orchestration rather than serving as a guest program."
     },
     {
       "disposition": "special-driver",
@@ -788,6 +848,12 @@
     },
     {
       "disposition": "buck-fixture",
+      "path": "tests/bin/BUCK",
+      "runner": "Meta Buck test targets",
+      "why": "tests/bin/BUCK is owned by Meta Buck test targets: It declares internal targets for the C fixtures in tests/bin. Buck consumes this metadata directly; the file is neither a guest executable nor an input selected by the public manifest runner."
+    },
+    {
+      "disposition": "buck-fixture",
       "path": "tests/bin/README.md",
       "runner": "Meta Buck test targets",
       "why": "tests/bin/README.md is owned by Meta Buck test targets: This README documents Buck-owned C fixture targets under tests/bin. Those internal targets have no standalone public build/run contract, so the file and its documented fixtures remain under Buck rather than the public manifest builder."
@@ -805,16 +871,22 @@
       "why": "tests/bin/robust_futex_test.c is owned by target/debug/test-harness via tests/e2e/manifests/bin-c.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "buck-fixture",
+      "path": "tests/c/BUCK",
+      "runner": "Meta Buck test targets",
+      "why": "tests/c/BUCK is owned by Meta Buck test targets: It declares the internal build and test targets for the C guest corpus. Buck consumes this metadata directly while the public test harness obtains its program selection from the centralized manifests."
+    },
+    {
+      "disposition": "buck-fixture",
+      "path": "tests/c/PACKAGE",
+      "runner": "Meta Buck test targets",
+      "why": "tests/c/PACKAGE is owned by Meta Buck test targets: It supplies package-level Buck policy for the C guest corpus. The file configures the internal build graph and is not itself a guest program or public manifest input."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/acct_refusal_probe.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/acct_refusal_probe.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
-      "disposition": "manifest-test",
-      "path": "tests/c/procfs_identity_agreement.c",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace; ci=true)",
-      "why": "tests/c/procfs_identity_agreement.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace; ci=true): regression guest for the /proc/<pid>/maps identity class, asserting that stat, maps and fdinfo report ONE inode for the same mapped file so a second determinization route cannot present a second stable-but-wrong identity"
     },
     {
       "disposition": "manifest-test",
@@ -851,6 +923,12 @@
       "path": "tests/c/chown_virtual_root_identity.c",
       "runner": "hermit-cli/tests/chown_virtual_root_identity.rs",
       "why": "tests/c/chown_virtual_root_identity.c is owned by hermit-cli/tests/chown_virtual_root_identity.rs: Guest asserting all three parts of the determinized chown-family contract -- a virtual root's ownership change succeeds for any uid, errors unrelated to identity (ENOENT, ordinary and O_PATH EBADF, ENOTDIR, and the fchownat flag EINVAL) still reach the guest, and validation does not mutate ownership, mode bits, or raw ctime. It is the behavioural bracket the syscall_classification unit tests cannot be: those pin set membership, and stay green when the dispatch arm's result regresses. The Rust integration test disables metadata virtualization and runs the guest under hermit in both namespace configurations. Driven only by its own integration test, so it is a test-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/chroot_mountinfo_fdinfo.c",
+      "runner": "hermit-cli/tests/procfs_determinism.rs",
+      "why": "tests/c/chroot_mountinfo_fdinfo.c is owned by hermit-cli/tests/procfs_determinism.rs: The Rust integration suite compiles and runs this chroot-specific procfs guest while asserting its mountinfo and fdinfo identity contract; the dedicated caller owns behavior that a generic manifest cell does not express."
     },
     {
       "disposition": "manifest-test",
@@ -955,10 +1033,22 @@
       "why": "tests/c/errno_path_identity.c is owned by target/debug/test-harness via tests/e2e/manifests/system-utils.yaml: exercises syscall failure cases chosen to fail for argument-intrinsic reasons and prints each errno, so verify's double run asserts that failure is as deterministic as success"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/exec_clock_continuity.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/exec_clock_continuity.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test compiles this self-re-execing guest and asserts that guest virtual time is strictly monotonic ACROSS the execve boundary, comparing pre-exec and post-exec CLOCK_REALTIME samples handed through argv; it remains a guest fixture because a generic manifest cannot express the exec-boundary hand-off contract or the cross-image ordering assertion."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/file_timestamp_identity.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/system-utils.yaml",
       "why": "tests/c/file_timestamp_identity.c is owned by target/debug/test-harness via tests/e2e/manifests/system-utils.yaml: creates files and directories, prints their stat and statx metadata including atime/mtime/ctime/btime and the mtime ORDERING between them, and exercises utimensat fixed and UTIME_NOW, so verify's double run asserts guest-created file timestamps are reproducible without freezing them"
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/fixtures/stdio_inode_identity.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/fixtures/stdio_inode_identity.c is owned by hermit-cli/tests/cli.rs: The CLI integration suite compiles this fixture and controls descriptor replacement so it can assert ordinary inode identity on inherited standard streams; that setup is owned by the dedicated integration test."
     },
     {
       "disposition": "cargo-integration-test-fixture",
@@ -967,10 +1057,22 @@
       "why": "tests/c/flock_exclusion.c is compiled and exercised by hermit-cli/tests/flock_exclusion.rs: it proves flock exclusion between distinct open file descriptions in one process and across processes, release and reacquire, safe refusal for blocking upgrades of known and SCM_RIGHTS-received lock state, safe cross-process inherited-lock state, replayed lock side effects for materialized files, and fail-closed replay for non-materialized files"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/fork_child_getrandom.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/fork_child_getrandom.c is owned by hermit-cli/tests/cli.rs: The no-namespace integration test forks two sequential child processes, requires their getrandom streams to be distinct, and verifies the complete invocation twice so changing host TIDs cannot change either child's bytes. It remains a fixture because the generic manifest has no no-namespace execution mode."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/fp_reduction_nondeterminism.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/fp_reduction_nondeterminism.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/ftruncate_ignore_output_error.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/ftruncate_ignore_output_error.c is owned by hermit-cli/tests/record_replay.rs: The record/replay integration suite compiles this workload and injects an output-side failure to verify that replay aborts instead of silently ignoring the failed ftruncate side effect."
     },
     {
       "disposition": "manifest-test",
@@ -1117,6 +1219,12 @@
       "why": "tests/c/keyctl_passthrough.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/kvm_exact_child_waits.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/kvm_exact_child_waits.c is owned by hermit-cli/tests/cli.rs: The CLI integration suite compiles this child-wait workload and exercises the KVM-specific completion contract with exact process ordering; it remains coupled to that dedicated driver rather than a generic manifest cell."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/listmount_enosys.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
@@ -1211,6 +1319,12 @@
       "path": "tests/c/mmap_stress_determinism.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/mmap_stress_determinism.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/mount_nscd_order.c",
+      "runner": "hermit-cli/tests/procfs_determinism.rs and hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/mount_nscd_order.c is owned by hermit-cli/tests/procfs_determinism.rs and hermit-cli/tests/record_replay.rs: Those integration suites compile the guest and assert stable mount and nscd ordering across both procfs observation and recording-stream lifecycles."
     },
     {
       "disposition": "manifest-test",
@@ -1382,6 +1496,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/prctl_option_policy.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
+      "why": "tests/c/prctl_option_policy.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: The centralized manifest declares its program build and complete per-mode and per-backend execution policy."
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/print_memaddrs.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/print_memaddrs.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
@@ -1403,6 +1523,12 @@
       "path": "tests/c/proc_fdinfo.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/proc_fdinfo.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/proc_fdinfo_mount_classes.c",
+      "runner": "hermit-cli/tests/procfs_determinism.rs",
+      "why": "tests/c/proc_fdinfo_mount_classes.c is owned by hermit-cli/tests/procfs_determinism.rs: The dedicated procfs integration suite compiles the guest and asserts mount-class identities in fdinfo under its controlled filesystem setup, which is outside the generic manifest contract."
     },
     {
       "disposition": "manifest-test",
@@ -1427,6 +1553,12 @@
       "path": "tests/c/process_vm_writev_refusal_probe.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/process_vm_writev_refusal_probe.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/procfs_identity_agreement.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace; ci=true)",
+      "why": "tests/c/procfs_identity_agreement.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace; ci=true): regression guest for the /proc/<pid>/maps identity class, asserting that stat, maps and fdinfo report ONE inode for the same mapped file so a second determinization route cannot present a second stable-but-wrong identity"
     },
     {
       "disposition": "manifest-test",
@@ -1477,6 +1609,12 @@
       "why": "tests/c/pty_nr_count.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/public_record_mount_stdio.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/public_record_mount_stdio.c is owned by hermit-cli/tests/record_replay.rs: The record/replay integration suite compiles this workload and controls mount and standard-stream state to verify public recording behavior across the complete dedicated transaction."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/random_sources.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
@@ -1487,6 +1625,18 @@
       "path": "tests/c/rcx_canonicalization.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/rcx_canonicalization.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/record_replay_deep_fork_chain.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/record_replay_deep_fork_chain.c is owned by hermit-cli/tests/record_replay.rs: The dedicated integration suite compiles this process-tree workload and asserts recording-stream behavior across a deep fork chain, including lifecycle setup not represented by a generic manifest row."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/record_replay_execveat_paths.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/record_replay_execveat_paths.c is owned by hermit-cli/tests/record_replay.rs: The record/replay integration suite compiles this workload and asserts path handling across execveat image changes under caller-controlled recording and replay phases."
     },
     {
       "disposition": "manifest-test",
@@ -1502,9 +1652,33 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/record_replay_file_state_regular_sink.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
+      "why": "Separate regular-file sendfile variant preserves unlinked-source and FICLONE byte checks; the original stdout-destination fixture remains independently declared."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/record_replay_forked_streams.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/record_replay_forked_streams.c is owned by hermit-cli/tests/record_replay.rs: The dedicated integration suite compiles this process-tree workload and checks stable recording streams across forked children using caller-owned setup and assertions."
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/record_replay_lseek_seek_cur.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/record_replay_lseek_seek_cur.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/record_replay_mkdir_eexist.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/record_replay_mkdir_eexist.c is owned by hermit-cli/tests/record_replay.rs: The record/replay integration suite compiles this workload and arranges the filesystem state needed to assert deterministic EEXIST behavior across the two phases."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/record_replay_poll_partial_copyout.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/record_replay_poll_partial_copyout.c is owned by hermit-cli/tests/record_replay.rs: The dedicated integration suite compiles this workload and checks partial poll copyout behavior at multiple controlled record/replay boundaries."
     },
     {
       "disposition": "manifest-test",
@@ -1579,6 +1753,12 @@
       "why": "tests/c/sched_getaffinity_identity.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/sched_setattr_abi.c",
+      "runner": "hermit-cli/tests/sched_setattr_abi.rs",
+      "why": "tests/c/sched_setattr_abi.c is owned by hermit-cli/tests/sched_setattr_abi.rs: The Rust integration suite compiles the guest and interprets its per-case ABI output to assert malformed and supported sched_setattr semantics under a dedicated contract."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/sched_setattr_batch.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
@@ -1616,15 +1796,15 @@
     },
     {
       "disposition": "manifest-test",
-      "path": "tests/c/setitimer_determinism.c",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
-      "why": "tests/c/setitimer_determinism.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
-      "disposition": "manifest-test",
       "path": "tests/c/session_identity.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
       "why": "tests/c/session_identity.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: pins the container's observed session and process-group identity under ptrace verification"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/setitimer_determinism.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
+      "why": "tests/c/setitimer_determinism.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "disposition": "manifest-test",
@@ -1679,6 +1859,12 @@
       "path": "tests/c/sigtimedwait-timeout-1s.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/sigtimedwait-timeout-1s.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "buck-fixture",
+      "path": "tests/c/simple/BUCK",
+      "runner": "Meta Buck test targets",
+      "why": "tests/c/simple/BUCK is owned by Meta Buck test targets: It declares internal targets for the small C guest fixtures in this directory. Buck consumes this metadata directly; it is not an executable guest or public manifest input."
     },
     {
       "disposition": "manifest-test",
@@ -1784,21 +1970,27 @@
     },
     {
       "disposition": "manifest-test",
-      "path": "tests/c/startup_tls_guards.c",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/system-utils.yaml (explicit mode selection; ci=false)",
-      "why": "tests/c/startup_tls_guards.c is owned by target/debug/test-harness via tests/e2e/manifests/system-utils.yaml (explicit mode selection; ci=false): prints the x86-64 glibc TLS stack canary, pointer guard, and AT_RANDOM bytes so canonical verification detects a backend that replaces startup randomness only after glibc has consumed it"
-    },
-    {
-      "disposition": "manifest-test",
       "path": "tests/c/startup_surface_identity.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/system-utils.yaml",
       "why": "tests/c/startup_surface_identity.c is owned by target/debug/test-harness via tests/e2e/manifests/system-utils.yaml: prints argv, environ in order, the full auxv vector including the AT_RANDOM bytes and the raw vDSO base, and the initial stack layout, and branches on those values so verify's double run asserts identity of both the inputs and the decisions made from them"
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/startup_tls_guards.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/system-utils.yaml (explicit mode selection; ci=false)",
+      "why": "tests/c/startup_tls_guards.c is owned by target/debug/test-harness via tests/e2e/manifests/system-utils.yaml (explicit mode selection; ci=false): prints the x86-64 glibc TLS stack canary, pointer guard, and AT_RANDOM bytes so canonical verification detects a backend that replaces startup randomness only after glibc has consumed it"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/statmount_enosys.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/statmount_enosys.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/stdio_lseek_identity.c",
+      "runner": "hermit-cli/tests/cli.rs and hermit-cli/tests/run_evidence.rs",
+      "why": "tests/c/stdio_lseek_identity.c is owned by hermit-cli/tests/cli.rs and hermit-cli/tests/run_evidence.rs: The dedicated suites compile the guest and control inherited output descriptors to assert unseekable standard-stream identity and its recorded execution evidence."
     },
     {
       "disposition": "manifest-test",
@@ -1877,6 +2069,12 @@
       "path": "tests/c/tee_enosys.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/tee_enosys.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/terminal_child_selectors.c",
+      "runner": "hermit-cli/tests/terminal_child_selectors.rs",
+      "why": "tests/c/terminal_child_selectors.c is owned by hermit-cli/tests/terminal_child_selectors.rs: The Rust integration suite compiles this terminal-process fixture and asserts wait selector semantics under caller-controlled session and process-group setup."
     },
     {
       "disposition": "manifest-test",
@@ -1969,6 +2167,18 @@
       "why": "tests/c/wait_on_child.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/waitid_signal_interrupt.c",
+      "runner": "hermit-cli/tests/waitid_signal_interrupt.rs",
+      "why": "tests/c/waitid_signal_interrupt.c is owned by hermit-cli/tests/waitid_signal_interrupt.rs: The dedicated integration suite compiles this signal fixture and controls delivery timing to assert the legacy waitid interruption context."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/write_ignore_output_error.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/write_ignore_output_error.c is owned by hermit-cli/tests/record_replay.rs: The record/replay integration suite compiles this workload and injects an output-side write failure to verify replay aborts instead of silently discarding the failed side effect."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/writev_determinism.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
@@ -2011,10 +2221,22 @@
       "why": "tests/chaos/order_violation.c is owned by target/debug/test-harness via tests/e2e/manifests/*.yaml: Direct schema-v2 program; all modes and backend policy are centralized in the YAML bucket manifests"
     },
     {
+      "disposition": "manifest-test",
+      "path": "tests/chaos/thread_interleaving.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/*.yaml",
+      "why": "tests/chaos/thread_interleaving.c is owned by target/debug/test-harness via tests/e2e/manifests/*.yaml: Direct schema-v2 program; all modes and backend policy are centralized in the YAML bucket manifests"
+    },
+    {
       "disposition": "special-driver",
       "path": "tests/compat/complex_shell_workload.sh",
       "runner": "scripts/validate.rs compatibility partitions",
       "why": "tests/compat/complex_shell_workload.sh is owned by scripts/validate.rs compatibility partitions: The `complex_shell_workload` compatibility driver prepares or executes a heterogeneous command workload used by strict, DBT, SaBRe, LiteInst, or record/replay ratchets. scripts/validate.rs owns tool discovery and per-command expectations, so this is orchestration rather than one guest program."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/compat/localhost_http_server.c",
+      "runner": "tests/compat/prepare_real_compat_fixtures.sh",
+      "why": "tests/compat/localhost_http_server.c is owned by tests/compat/prepare_real_compat_fixtures.sh: The compatibility fixture builder compiles this loopback server into an immutable input for networked application probes; the surrounding driver owns its lifecycle and observations."
     },
     {
       "disposition": "guest-fixture",
@@ -2041,10 +2263,22 @@
       "why": "tests/debugger/.gitignore is owned by tests/debugger/run_debugger_tests.sh: The debugger asset `.gitignore` is support metadata for generated debugger sessions. The driver owns ports, process cleanup, and replay assertions that a standalone manifest program cannot supply."
     },
     {
+      "disposition": "buck-fixture",
+      "path": "tests/debugger/BUCK",
+      "runner": "Meta Buck test targets",
+      "why": "tests/debugger/BUCK is owned by Meta Buck test targets: It declares internal debugger test targets and their dependencies. Buck consumes this metadata directly; it is not a guest program or public manifest input."
+    },
+    {
       "disposition": "guest-fixture",
       "path": "tests/debugger/README.md",
       "runner": "tests/debugger/run_debugger_tests.sh",
       "why": "tests/debugger/README.md is owned by tests/debugger/run_debugger_tests.sh: The debugger asset `README.md` is support metadata for generated debugger sessions. The driver owns ports, process cleanup, and replay assertions that a standalone manifest program cannot supply."
+    },
+    {
+      "disposition": "buck-fixture",
+      "path": "tests/debugger/guests/BUCK",
+      "runner": "Meta Buck test targets",
+      "why": "tests/debugger/guests/BUCK is owned by Meta Buck test targets: It declares internal build targets for debugger guest fixtures. Buck consumes this metadata directly, while the file itself has no runtime observation contract."
     },
     {
       "disposition": "manifest-test",
@@ -2701,6 +2935,204 @@
       "why": "tests/e2e/manifests/util-c.yaml is owned by target/debug/test-harness via ci/manifest-plan: The `util-c` YAML file is policy for the `util-c` manifest bucket: it declares program identities, modes, backend partitions, and WHY reasons. It configures the common system and is not itself executable test input."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/barrier-rounds.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/barrier-rounds.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the barrier-rounds workload from steady_state_common.c and is compiled as the performance/barrier-rounds cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/barrier-yield-rounds.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/barrier-yield-rounds.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the barrier-yield-rounds workload from steady_state_third.c and is compiled as the performance/barrier-yield-rounds cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/clock-query-churn.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/clock-query-churn.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the clock-query-churn workload from steady_state_third.c and is compiled as the performance/clock-query-churn cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/condvar-baton.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/condvar-baton.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the condvar-baton workload from steady_state_common.c and is compiled as the performance/condvar-baton cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/condvar-signal-baton.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/condvar-signal-baton.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the condvar-signal-baton workload from steady_state_third.c and is compiled as the performance/condvar-signal-baton cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/dup-close-churn.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/dup-close-churn.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the dup-close-churn workload from steady_state_third.c and is compiled as the performance/dup-close-churn cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/epoll-eventfd-ring.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/epoll-eventfd-ring.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the epoll-eventfd-ring workload from steady_state_extra.c and is compiled as the performance/epoll-eventfd-ring cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/eventfd-roundtrip.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/eventfd-roundtrip.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the eventfd-roundtrip workload from steady_state_extra.c and is compiled as the performance/eventfd-roundtrip cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/fork-wait-churn.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/fork-wait-churn.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the fork-wait-churn workload from steady_state_extra.c and is compiled as the performance/fork-wait-churn cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/futex-baton.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/futex-baton.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the futex-baton workload from steady_state_extra.c and is compiled as the performance/futex-baton cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/getrandom-churn.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/getrandom-churn.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the getrandom-churn workload from steady_state_third.c and is compiled as the performance/getrandom-churn cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/mmap-churn.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/mmap-churn.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the mmap-churn workload from steady_state_common.c and is compiled as the performance/mmap-churn cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/mutex-contention.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/mutex-contention.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the mutex-contention workload from steady_state_common.c and is compiled as the performance/mutex-contention cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/nanosleep-yield.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/nanosleep-yield.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the nanosleep-yield workload from steady_state_extra.c and is compiled as the performance/nanosleep-yield cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/open-read-close-churn.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/open-read-close-churn.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the open-read-close-churn workload from steady_state_third.c and is compiled as the performance/open-read-close-churn cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/pipe-fd-churn.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/pipe-fd-churn.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the pipe-fd-churn workload from steady_state_extra.c and is compiled as the performance/pipe-fd-churn cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/pipe-nonblock-churn.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/pipe-nonblock-churn.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the pipe-nonblock-churn workload from steady_state_third.c and is compiled as the performance/pipe-nonblock-churn cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/pipe-roundtrip.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/pipe-roundtrip.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the pipe-roundtrip workload from steady_state_common.c and is compiled as the performance/pipe-roundtrip cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/poll-pipe-ring.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/poll-pipe-ring.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the poll-pipe-ring workload from steady_state_extra.c and is compiled as the performance/poll-pipe-ring cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/rwlock-contention.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/rwlock-contention.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the rwlock-contention workload from steady_state_common.c and is compiled as the performance/rwlock-contention cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/rwlock-mixed-contention.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/rwlock-mixed-contention.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the rwlock-mixed-contention workload from steady_state_third.c and is compiled as the performance/rwlock-mixed-contention cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/semaphore-baton.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/semaphore-baton.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the semaphore-baton workload from steady_state_extra.c and is compiled as the performance/semaphore-baton cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/sigmask-toggle.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/sigmask-toggle.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the sigmask-toggle workload from steady_state_common.c and is compiled as the performance/sigmask-toggle cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/socketpair-dgram-churn.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/socketpair-dgram-churn.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the socketpair-dgram-churn workload from steady_state_third.c and is compiled as the performance/socketpair-dgram-churn cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/socketpair-roundtrip.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/socketpair-roundtrip.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the socketpair-roundtrip workload from steady_state_common.c and is compiled as the performance/socketpair-roundtrip cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/spin-trylock-contention.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/spin-trylock-contention.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the spin-trylock-contention workload from steady_state_third.c and is compiled as the performance/spin-trylock-contention cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/steady_state_common.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/steady_state_common.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: it supplies shared bounded performance workloads selected by the wrapper sources in this directory and is not an independently executable test."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/steady_state_extra.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/steady_state_extra.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: it supplies shared bounded performance workloads selected by the wrapper sources in this directory and is not an independently executable test."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/steady_state_third.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/steady_state_third.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: it supplies shared bounded performance workloads selected by the wrapper sources in this directory and is not an independently executable test."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/syscall-mix.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/syscall-mix.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the syscall-mix workload from steady_state_common.c and is compiled as the performance/syscall-mix cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/thread-churn.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/thread-churn.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the thread-churn workload from steady_state_extra.c and is compiled as the performance/thread-churn cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/trylock-contention.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/trylock-contention.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the trylock-contention workload from steady_state_extra.c and is compiled as the performance/trylock-contention cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/performance/yield-storm.c",
+      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
+      "why": "tests/e2e/performance/yield-storm.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the yield-storm workload from steady_state_common.c and is compiled as the performance/yield-storm cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
       "disposition": "support-data",
       "path": "tests/e2e/system-utils/README.md",
       "runner": "maintainers of tests/e2e/system-utils",
@@ -2738,6 +3170,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/e2e/system-utils/nscd-neutralised.sh",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/system-utils.yaml",
+      "why": "tests/e2e/system-utils/nscd-neutralised.sh is owned by target/debug/test-harness via tests/e2e/manifests/system-utils.yaml: The centralized manifest declares its program invocation, portable lane, backend policy, and deterministic observation contract."
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/e2e/system-utils/openssl-enc.sh",
       "runner": "target/debug/test-harness via tests/e2e/manifests/*.yaml",
       "why": "tests/e2e/system-utils/openssl-enc.sh is owned by target/debug/test-harness via tests/e2e/manifests/*.yaml: Direct schema-v2 program; all modes and backend policy are centralized in the YAML bucket manifests"
@@ -2768,6 +3206,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/e2e/system-utils/overflow-gid-resolves.sh",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/system-utils.yaml",
+      "why": "tests/e2e/system-utils/overflow-gid-resolves.sh is owned by target/debug/test-harness via tests/e2e/manifests/system-utils.yaml: The centralized manifest declares its program invocation and verifies resolution of the frozen overflow-GID fixture through the portable ptrace reference path."
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/e2e/system-utils/proc-random-uuid.sh",
       "runner": "target/debug/test-harness via tests/e2e/manifests/*.yaml",
       "why": "tests/e2e/system-utils/proc-random-uuid.sh is owned by target/debug/test-harness via tests/e2e/manifests/*.yaml: Direct schema-v2 program; all modes and backend policy are centralized in the YAML bucket manifests"
@@ -2779,16 +3223,16 @@
       "why": "tests/e2e/system-utils/proc-uptime.sh is owned by target/debug/test-harness via tests/e2e/manifests/*.yaml: Direct schema-v2 program; all modes and backend policy are centralized in the YAML bucket manifests"
     },
     {
-      "disposition": "guest-fixture",
-      "path": "tests/e2e/system-utils/procfs_sanitized_paths.c",
-      "runner": "tests/e2e/system-utils/procfs-sanitized-paths.sh",
-      "why": "tests/e2e/system-utils/procfs_sanitized_paths.c is owned by tests/e2e/system-utils/procfs-sanitized-paths.sh: The C guest reads all eighteen procfs paths in one process and asserts sanitizer-specific invariants; the manifest-compatible shell wrapper compiles and owns its lifecycle."
-    },
-    {
       "disposition": "manifest-test",
       "path": "tests/e2e/system-utils/procfs-sanitized-paths.sh",
       "runner": "target/debug/test-harness via tests/e2e/manifests/*.yaml",
       "why": "tests/e2e/system-utils/procfs-sanitized-paths.sh is owned by target/debug/test-harness via tests/e2e/manifests/*.yaml: Direct schema-v2 program; all modes and backend policy are centralized in the YAML bucket manifests"
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/system-utils/procfs_sanitized_paths.c",
+      "runner": "tests/e2e/system-utils/procfs-sanitized-paths.sh",
+      "why": "tests/e2e/system-utils/procfs_sanitized_paths.c is owned by tests/e2e/system-utils/procfs-sanitized-paths.sh: The C guest reads all eighteen procfs paths in one process and asserts sanitizer-specific invariants; the manifest-compatible shell wrapper compiles and owns its lifecycle."
     },
     {
       "disposition": "manifest-test",
@@ -2935,6 +3379,12 @@
       "why": "tests/reproducible-builds/run.sh is owned by reproducible-build E2E suite: run.sh performs two isolated Cargo builds of the pinned fixture and compares their artifacts. That paired-build assertion is a build-system experiment, not a single Hermit guest observation."
     },
     {
+      "disposition": "buck-fixture",
+      "path": "tests/runtime/BUCK",
+      "runner": "Meta Buck test targets",
+      "why": "tests/runtime/BUCK is owned by Meta Buck test targets: It declares internal targets for runtime integration fixtures. Buck consumes this metadata directly; the file is build policy and has no standalone guest behavior."
+    },
+    {
       "disposition": "support-data",
       "path": "tests/runtime/RuntimeRandom.java",
       "runner": "Hermit managed-runtime integration targets",
@@ -3041,6 +3491,12 @@
       "path": "tests/rust/mem_race.rs",
       "runner": "tests/Cargo.toml and Hermit integration targets",
       "why": "tests/rust/mem_race.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `mem_race` is built from `tests/rust/mem_race.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/rust/multi_futex_block.rs",
+      "runner": "tests/Cargo.toml and hermit-cli/tests/full_summary_futex_order.rs",
+      "why": "tests/rust/multi_futex_block.rs is owned by tests/Cargo.toml and hermit-cli/tests/full_summary_futex_order.rs: Cargo builds target rustbin_multi_futex_block, then the integration test stops it at selected scheduler turns and compares repeated futex-summary ordering."
     },
     {
       "disposition": "cargo-binary",
@@ -3349,6 +3805,12 @@
       "why": "tests/stress/scheduling_fairness.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `scheduling_fairness` is built from `tests/stress/scheduling_fairness.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
+      "disposition": "buck-fixture",
+      "path": "tests/util/BUCK",
+      "runner": "Meta Buck test targets",
+      "why": "tests/util/BUCK is owned by Meta Buck test targets: It declares internal targets for shared test utilities. Buck consumes this metadata directly; the file configures the test graph rather than acting as an executable test input."
+    },
+    {
       "disposition": "support-data",
       "path": "tests/util/README.md",
       "runner": "developers invoking tests/util probes",
@@ -3407,264 +3869,6 @@
       "path": "tests/util/ssl_server.py",
       "runner": "scripts/validate.rs or Hermit integration targets",
       "why": "tests/util/ssl_server.py is owned by scripts/validate.rs or Hermit integration targets: The `ssl_server` utility provides a caller-facing probe or server helper; its caller owns process coordination, hardware preflight, arguments, and assertions. Running this helper as an independent manifest cell would test setup machinery without the behavior it supports."
-    },
-    {
-      "disposition": "support-data",
-      "path": "tests/backend-parity/measurements/README.md",
-      "runner": "maintainers of tests/e2e/manifests/backend-parity-c.yaml",
-      "why": "tests/backend-parity/measurements/README.md is owned by maintainers of tests/e2e/manifests/backend-parity-c.yaml: This note records the method and the traps behind the measured verify sweeps that justify each ci flag in the backend-parity-c manifest, so a later flip cites recorded evidence instead of re-deriving it. It is documentation consumed by humans; no runner reads it and the generic manifest must not treat it as guest input."
-    },
-    {
-      "disposition": "support-data",
-      "path": "tests/backend-parity/measurements/verify-sweep-6e1b59af0.tsv",
-      "runner": "maintainers of tests/e2e/manifests/backend-parity-c.yaml",
-      "why": "tests/backend-parity/measurements/verify-sweep-6e1b59af0.tsv is owned by maintainers of tests/e2e/manifests/backend-parity-c.yaml: This table is the recorded per-cell verify evidence, one row per declared test and backend pair with both sweep verdicts, that every ci = true flag in the backend-parity-c manifest rests on. It is inert recorded data read by reviewers rather than by any runner, and the generic manifest must not schedule it as an executable guest."
-    },
-    {
-      "disposition": "suite-helper",
-      "path": "tests/backend-parity/fixtures/parity_probe.h",
-      "runner": "tests/backend-parity/parity_mutation.py",
-      "why": "tests/backend-parity/fixtures/parity_probe.h is owned by tests/backend-parity/parity_mutation.py: This header gives every identity fixture in the family one contract -- check accumulation, a single canonical stdout line, nonzero exit on any failed check, and the parity_mutate_*() seam the harness perturbs. It is compiled into each fixture rather than run, so it is build input to the harness and never an executable guest in its own right."
-    },
-    {
-      "disposition": "suite-helper",
-      "path": "tests/backend-parity/fixtures/rlimit_identity.c",
-      "runner": "tests/backend-parity/parity_mutation.py",
-      "why": "tests/backend-parity/fixtures/rlimit_identity.c is owned by tests/backend-parity/parity_mutation.py: This is a family member guest exercised only through the shared mutation harness, which compiles it with the family flags and supplies its declared mutation field. It carries no bespoke verification logic of its own and is not a manifest test, so the generic manifest must not schedule it independently of the harness that gives it meaning."
-    },
-    {
-      "disposition": "suite-helper",
-      "path": "tests/backend-parity/fixtures/sched_getaffinity_identity.c",
-      "runner": "tests/backend-parity/parity_mutation.py",
-      "why": "tests/backend-parity/fixtures/sched_getaffinity_identity.c is owned by tests/backend-parity/parity_mutation.py: This is the second family member guest, registered to demonstrate that a new member inherits the shared verification with zero bespoke code. Like its sibling it is compiled and driven exclusively by the mutation harness and is not an independently scheduled manifest test, so the generic manifest must not claim it."
-    },
-    {
-      "disposition": "suite-helper",
-      "path": "tests/backend-parity/parity_mutation.py",
-      "runner": "ci/dag/validate.json e2e.parity_mutation",
-      "why": "tests/backend-parity/parity_mutation.py is owned by ci/dag/validate.json e2e.parity_mutation: This is the shared mutation harness for the backend-parity identity family: it proves each declared field is load-bearing and compares every candidate backend against the golden ptrace reference at a recorded strictness tier. It is a driver invoked directly by CI, not a guest, and the generic manifest must not schedule it as one."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/c/exec_clock_continuity.c",
-      "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/exec_clock_continuity.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test compiles this self-re-execing guest and asserts that guest virtual time is strictly monotonic ACROSS the execve boundary, comparing pre-exec and post-exec CLOCK_REALTIME samples handed through argv; it remains a guest fixture because a generic manifest cannot express the exec-boundary hand-off contract or the cross-image ordering assertion."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/c/fork_child_getrandom.c",
-      "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/fork_child_getrandom.c is owned by hermit-cli/tests/cli.rs: The no-namespace integration test forks two sequential child processes, requires their getrandom streams to be distinct, and verifies the complete invocation twice so changing host TIDs cannot change either child's bytes. It remains a fixture because the generic manifest has no no-namespace execution mode."
-    },
-    {
-      "disposition": "manifest-test",
-      "path": "tests/chaos/thread_interleaving.c",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/*.yaml",
-      "why": "tests/chaos/thread_interleaving.c is owned by target/debug/test-harness via tests/e2e/manifests/*.yaml: Direct schema-v2 program; all modes and backend policy are centralized in the YAML bucket manifests"
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/e2e/performance/barrier-rounds.c",
-      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
-      "why": "tests/e2e/performance/barrier-rounds.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the barrier-rounds workload from steady_state_common.c and is compiled as the performance/barrier-rounds cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/e2e/performance/barrier-yield-rounds.c",
-      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
-      "why": "tests/e2e/performance/barrier-yield-rounds.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the barrier-yield-rounds workload from steady_state_third.c and is compiled as the performance/barrier-yield-rounds cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/e2e/performance/clock-query-churn.c",
-      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
-      "why": "tests/e2e/performance/clock-query-churn.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the clock-query-churn workload from steady_state_third.c and is compiled as the performance/clock-query-churn cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/e2e/performance/condvar-baton.c",
-      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
-      "why": "tests/e2e/performance/condvar-baton.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the condvar-baton workload from steady_state_common.c and is compiled as the performance/condvar-baton cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/e2e/performance/condvar-signal-baton.c",
-      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
-      "why": "tests/e2e/performance/condvar-signal-baton.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the condvar-signal-baton workload from steady_state_third.c and is compiled as the performance/condvar-signal-baton cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/e2e/performance/dup-close-churn.c",
-      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
-      "why": "tests/e2e/performance/dup-close-churn.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the dup-close-churn workload from steady_state_third.c and is compiled as the performance/dup-close-churn cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/e2e/performance/epoll-eventfd-ring.c",
-      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
-      "why": "tests/e2e/performance/epoll-eventfd-ring.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the epoll-eventfd-ring workload from steady_state_extra.c and is compiled as the performance/epoll-eventfd-ring cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/e2e/performance/eventfd-roundtrip.c",
-      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
-      "why": "tests/e2e/performance/eventfd-roundtrip.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the eventfd-roundtrip workload from steady_state_extra.c and is compiled as the performance/eventfd-roundtrip cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/e2e/performance/fork-wait-churn.c",
-      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
-      "why": "tests/e2e/performance/fork-wait-churn.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the fork-wait-churn workload from steady_state_extra.c and is compiled as the performance/fork-wait-churn cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/e2e/performance/futex-baton.c",
-      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
-      "why": "tests/e2e/performance/futex-baton.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the futex-baton workload from steady_state_extra.c and is compiled as the performance/futex-baton cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/e2e/performance/getrandom-churn.c",
-      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
-      "why": "tests/e2e/performance/getrandom-churn.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the getrandom-churn workload from steady_state_third.c and is compiled as the performance/getrandom-churn cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/e2e/performance/mmap-churn.c",
-      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
-      "why": "tests/e2e/performance/mmap-churn.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the mmap-churn workload from steady_state_common.c and is compiled as the performance/mmap-churn cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/e2e/performance/mutex-contention.c",
-      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
-      "why": "tests/e2e/performance/mutex-contention.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the mutex-contention workload from steady_state_common.c and is compiled as the performance/mutex-contention cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/e2e/performance/nanosleep-yield.c",
-      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
-      "why": "tests/e2e/performance/nanosleep-yield.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the nanosleep-yield workload from steady_state_extra.c and is compiled as the performance/nanosleep-yield cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/e2e/performance/open-read-close-churn.c",
-      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
-      "why": "tests/e2e/performance/open-read-close-churn.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the open-read-close-churn workload from steady_state_third.c and is compiled as the performance/open-read-close-churn cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/e2e/performance/pipe-fd-churn.c",
-      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
-      "why": "tests/e2e/performance/pipe-fd-churn.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the pipe-fd-churn workload from steady_state_extra.c and is compiled as the performance/pipe-fd-churn cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/e2e/performance/pipe-nonblock-churn.c",
-      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
-      "why": "tests/e2e/performance/pipe-nonblock-churn.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the pipe-nonblock-churn workload from steady_state_third.c and is compiled as the performance/pipe-nonblock-churn cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/e2e/performance/pipe-roundtrip.c",
-      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
-      "why": "tests/e2e/performance/pipe-roundtrip.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the pipe-roundtrip workload from steady_state_common.c and is compiled as the performance/pipe-roundtrip cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/e2e/performance/poll-pipe-ring.c",
-      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
-      "why": "tests/e2e/performance/poll-pipe-ring.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the poll-pipe-ring workload from steady_state_extra.c and is compiled as the performance/poll-pipe-ring cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/e2e/performance/rwlock-contention.c",
-      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
-      "why": "tests/e2e/performance/rwlock-contention.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the rwlock-contention workload from steady_state_common.c and is compiled as the performance/rwlock-contention cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/e2e/performance/rwlock-mixed-contention.c",
-      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
-      "why": "tests/e2e/performance/rwlock-mixed-contention.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the rwlock-mixed-contention workload from steady_state_third.c and is compiled as the performance/rwlock-mixed-contention cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/e2e/performance/semaphore-baton.c",
-      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
-      "why": "tests/e2e/performance/semaphore-baton.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the semaphore-baton workload from steady_state_extra.c and is compiled as the performance/semaphore-baton cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/e2e/performance/sigmask-toggle.c",
-      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
-      "why": "tests/e2e/performance/sigmask-toggle.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the sigmask-toggle workload from steady_state_common.c and is compiled as the performance/sigmask-toggle cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/e2e/performance/socketpair-dgram-churn.c",
-      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
-      "why": "tests/e2e/performance/socketpair-dgram-churn.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the socketpair-dgram-churn workload from steady_state_third.c and is compiled as the performance/socketpair-dgram-churn cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/e2e/performance/socketpair-roundtrip.c",
-      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
-      "why": "tests/e2e/performance/socketpair-roundtrip.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the socketpair-roundtrip workload from steady_state_common.c and is compiled as the performance/socketpair-roundtrip cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/e2e/performance/spin-trylock-contention.c",
-      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
-      "why": "tests/e2e/performance/spin-trylock-contention.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the spin-trylock-contention workload from steady_state_third.c and is compiled as the performance/spin-trylock-contention cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/e2e/performance/steady_state_common.c",
-      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
-      "why": "tests/e2e/performance/steady_state_common.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: it supplies shared bounded performance workloads selected by the wrapper sources in this directory and is not an independently executable test."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/e2e/performance/steady_state_extra.c",
-      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
-      "why": "tests/e2e/performance/steady_state_extra.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: it supplies shared bounded performance workloads selected by the wrapper sources in this directory and is not an independently executable test."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/e2e/performance/steady_state_third.c",
-      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
-      "why": "tests/e2e/performance/steady_state_third.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: it supplies shared bounded performance workloads selected by the wrapper sources in this directory and is not an independently executable test."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/e2e/performance/syscall-mix.c",
-      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
-      "why": "tests/e2e/performance/syscall-mix.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the syscall-mix workload from steady_state_common.c and is compiled as the performance/syscall-mix cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/e2e/performance/thread-churn.c",
-      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
-      "why": "tests/e2e/performance/thread-churn.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the thread-churn workload from steady_state_extra.c and is compiled as the performance/thread-churn cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/e2e/performance/trylock-contention.c",
-      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
-      "why": "tests/e2e/performance/trylock-contention.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the trylock-contention workload from steady_state_extra.c and is compiled as the performance/trylock-contention cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/e2e/performance/yield-storm.c",
-      "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
-      "why": "tests/e2e/performance/yield-storm.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the yield-storm workload from steady_state_common.c and is compiled as the performance/yield-storm cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
-    },
-    {
-      "disposition": "manifest-test",
-      "path": "tests/c/record_replay_file_state_regular_sink.c",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
-      "why": "Separate regular-file sendfile variant preserves unlinked-source and FICLONE byte checks; the original stdout-destination fixture remains independently declared."
     }
   ],
   "schema": 2

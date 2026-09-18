@@ -15,6 +15,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
 #[cfg(not(test))]
 use std::process::exit;
 
@@ -326,7 +327,9 @@ fn main() {
         documents.push(document);
     }
 
-    validate_front_door(&repo_root, &documents);
+    let inventory = load_test_inventory(&repo_root);
+    validate_test_inventory(&repo_root, &inventory, &seen_programs);
+    validate_front_door(&repo_root, &documents, &inventory);
     validate_ci_reason_baseline(&repo_root, &documents);
 
     rows.sort_by(|left, right| {
@@ -648,7 +651,156 @@ fn validate_ci_reason_baseline(repo_root: &Path, documents: &[Value]) {
     }
 }
 
-fn validate_front_door(repo_root: &Path, documents: &[Value]) {
+fn load_test_inventory(repo_root: &Path) -> JsonValue {
+    let inventory_path = repo_root.join(TEST_INVENTORY);
+    let inventory_text = std::fs::read_to_string(&inventory_path)
+        .unwrap_or_else(|error| die(format!("cannot read {}: {error}", inventory_path.display())));
+    serde_json::from_str(&inventory_text).unwrap_or_else(|error| {
+        die(format!(
+            "{}: invalid JSON: {error}",
+            inventory_path.display()
+        ))
+    })
+}
+
+fn inventory_string<'a>(entry: &'a JsonValue, key: &str, location: &str) -> &'a str {
+    entry
+        .get(key)
+        .and_then(JsonValue::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| die(format!("{location}: `{key}` must be a non-empty string")))
+}
+
+/// Require the inventory to be an exact partition of the test tree.
+///
+/// Git is the population authority on purpose: tracked files and genuinely new
+/// untracked files qualify, while ignored compiler/test output does not. This is
+/// the same population used by `ci/merge-test-inventory.py` when it prunes stale
+/// entries, so the writer and checker cannot disagree about what must be owned.
+fn validate_test_inventory(
+    repo_root: &Path,
+    inventory: &JsonValue,
+    manifest_programs: &BTreeSet<String>,
+) {
+    let object = inventory
+        .as_object()
+        .unwrap_or_else(|| die(format!("{TEST_INVENTORY}: expected an object")));
+    let actual_keys: BTreeSet<_> = object.keys().map(String::as_str).collect();
+    let expected_keys: BTreeSet<_> = ["files", "schema"].into_iter().collect();
+    if actual_keys != expected_keys {
+        die(format!(
+            "{TEST_INVENTORY}: keys must be exactly {expected_keys:?}, got {actual_keys:?}"
+        ));
+    }
+    if inventory.get("schema").and_then(JsonValue::as_u64) != Some(2) {
+        die(format!("{TEST_INVENTORY}: schema must be 2"));
+    }
+    let files = inventory
+        .get("files")
+        .and_then(JsonValue::as_array)
+        .filter(|files| !files.is_empty())
+        .unwrap_or_else(|| {
+            die(format!(
+                "{TEST_INVENTORY}: `files` must be a non-empty array"
+            ))
+        });
+
+    let mut paths = Vec::with_capacity(files.len());
+    let mut inventory_manifest_tests = BTreeSet::new();
+    for (index, entry) in files.iter().enumerate() {
+        let location = format!("{TEST_INVENTORY}: files[{index}]");
+        let entry_object = entry
+            .as_object()
+            .unwrap_or_else(|| die(format!("{location}: expected an object")));
+        let actual_keys: BTreeSet<_> = entry_object.keys().map(String::as_str).collect();
+        let expected_keys: BTreeSet<_> = ["disposition", "path", "runner", "why"]
+            .into_iter()
+            .collect();
+        if actual_keys != expected_keys {
+            die(format!(
+                "{location}: keys must be exactly {expected_keys:?}, got {actual_keys:?}"
+            ));
+        }
+        let path = inventory_string(entry, "path", &location);
+        let disposition = inventory_string(entry, "disposition", &location);
+        let _runner = inventory_string(entry, "runner", &location);
+        let _why = inventory_string(entry, "why", &location);
+        if !path.starts_with("tests/") || path.contains("..") {
+            die(format!(
+                "{location}: `path` must stay below tests/ without `..`: {path}"
+            ));
+        }
+        if disposition == "manifest-test" {
+            inventory_manifest_tests.insert(path.to_string());
+        }
+        paths.push(path.to_string());
+    }
+
+    if paths.windows(2).any(|pair| pair[0] > pair[1]) {
+        die(format!(
+            "{TEST_INVENTORY}: files must be sorted by path; run ci/merge-test-inventory.py to canonicalize"
+        ));
+    }
+    let registered: BTreeSet<_> = paths.iter().cloned().collect();
+    if registered.len() != paths.len() {
+        let mut seen = BTreeSet::new();
+        let duplicates: Vec<_> = paths
+            .iter()
+            .filter(|path| !seen.insert((*path).clone()))
+            .cloned()
+            .collect();
+        die(format!(
+            "{TEST_INVENTORY}: duplicate paths: {}",
+            duplicates.join(", ")
+        ));
+    }
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args([
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            "tests",
+        ])
+        .output()
+        .unwrap_or_else(|error| die(format!("cannot enumerate tests/ with git: {error}")));
+    if !output.status.success() {
+        die(format!(
+            "cannot enumerate tests/ with git: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let present_text = String::from_utf8(output.stdout)
+        .unwrap_or_else(|_| die("git ls-files returned a non-UTF-8 test path"));
+    let present: BTreeSet<_> = present_text.lines().map(str::to_string).collect();
+    let unregistered: Vec<_> = present.difference(&registered).cloned().collect();
+    let phantoms: Vec<_> = registered.difference(&present).cloned().collect();
+    if !unregistered.is_empty() || !phantoms.is_empty() {
+        die(format!(
+            "test inventory is stale; every file in tests/ must have an explicit disposition; unregistered={unregistered:?}, phantom={phantoms:?}"
+        ));
+    }
+
+    if &inventory_manifest_tests != manifest_programs {
+        let missing: Vec<_> = manifest_programs
+            .difference(&inventory_manifest_tests)
+            .cloned()
+            .collect();
+        let stale: Vec<_> = inventory_manifest_tests
+            .difference(manifest_programs)
+            .cloned()
+            .collect();
+        die(format!(
+            "manifest programs and disposition=manifest-test inventory entries differ; missing={missing:?}, stale={stale:?}"
+        ));
+    }
+}
+
+fn validate_front_door(repo_root: &Path, documents: &[Value], inventory: &JsonValue) {
     let baseline_path = repo_root.join(MATRIX_SYMMETRY_BASELINE);
     let baseline_text = std::fs::read_to_string(&baseline_path)
         .unwrap_or_else(|error| die(format!("cannot read {}: {error}", baseline_path.display())));
@@ -690,16 +842,6 @@ fn validate_front_door(repo_root: &Path, documents: &[Value]) {
         MATRIX_SYMMETRY_BASELINE,
     );
 
-    let inventory_path = repo_root.join(TEST_INVENTORY);
-    let inventory_text = std::fs::read_to_string(&inventory_path)
-        .unwrap_or_else(|error| die(format!("cannot read {}: {error}", inventory_path.display())));
-    let inventory: JsonValue = serde_json::from_str(&inventory_text).unwrap_or_else(|error| {
-        die(format!(
-            "{}: invalid JSON: {error}",
-            inventory_path.display()
-        ))
-    });
-
     enforce_exact_ratchet(
         "manifest ptrace-front-door debt",
         &asymmetric_manifest_tests(documents),
@@ -707,7 +849,7 @@ fn validate_front_door(repo_root: &Path, documents: &[Value]) {
     );
     enforce_exact_ratchet(
         "backend-private guest debt",
-        &backend_private_guest_files(&inventory),
+        &backend_private_guest_files(inventory),
         &expected_private,
     );
 }
