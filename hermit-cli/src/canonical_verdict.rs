@@ -56,6 +56,55 @@ pub enum NoResultReason {
     },
     /// The log comparator refused to claim either agreement or divergence.
     ComparisonRefused { detail: String },
+    /// A sandbox exited before returning its guest Output. This is an
+    /// attempted execution failure, with no guest disposition or comparison.
+    ContainerFailed(ContainerFailure),
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationRun {
+    Run1,
+    Run2,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
+pub enum ContainerDisposition {
+    /// Zero is possible when the child exits without returning its result.
+    Exited {
+        code: i32,
+    },
+    Signaled {
+        signal: i32,
+        core_dumped: bool,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerFailure {
+    pub run: VerificationRun,
+    pub disposition: ContainerDisposition,
+}
+
+impl ContainerFailure {
+    /// `main` returns 125 for ContainerChildExit. This is the enclosing Hermit
+    /// process's status, distinct from the container disposition above.
+    pub fn require_reporter_exit(
+        &self,
+        status: Option<i32>,
+        signal: Option<i32>,
+        timed_out: bool,
+    ) -> Result<(), String> {
+        if status == Some(125) && signal.is_none() && !timed_out {
+            Ok(())
+        } else {
+            Err(format!(
+                "container_failed contradicts Hermit process disposition: status={status:?} signal={signal:?} timed_out={timed_out} (expected exit 125 without timeout)"
+            ))
+        }
+    }
 }
 
 /// The understood infrastructure failure recorded by verification.
@@ -361,6 +410,49 @@ impl VerificationReport {
     /// compare. A null comparison beside a product verdict is contradictory
     /// and stays refused at parse.
     fn require_consistent_outcome_fields(self) -> Result<Self, String> {
+        if let Some(NoResultReason::ContainerFailed(failure)) = &self.no_result_reason {
+            let valid_status = match failure.disposition {
+                // classify_container_result reserves these normal exit codes
+                // for policy refusal, deadline, and mapped signal stops.
+                ContainerDisposition::Exited { code } => {
+                    // The deadline constant currently lives in hermit-cli,
+                    // which this shared schema's manifest reader cannot import.
+                    const DEADLINE_EXIT: i32 = 124;
+                    (0..=255).contains(&code)
+                        && code != detcore_model::HERMIT_POLICY_REFUSAL_EXIT
+                        && code != DEADLINE_EXIT
+                        && detcore_model::signal_from_exit_status(code).is_none()
+                }
+                ContainerDisposition::Signaled { signal, .. } => (1..=64).contains(&signal),
+            };
+            if !valid_status {
+                return Err("invalid container_failed disposition".into());
+            }
+            // No Output returned from the failed run. In particular, run 1's
+            // status must not be relabelled as the failed run 2's guest status.
+            if self.verdict != Verdict::NoResult
+                || self.verified
+                || self.bitwise_parity
+                || self.infrastructure_error.is_some()
+                || self.comparison.is_some()
+                || self.compared_log_messages.is_some()
+                || self.compared_outputs.is_some()
+                || self.dbt_counted_branches.is_some()
+                || self.runtime.is_some()
+                || self.guest_exit_code.is_some()
+                || self.guest_signal.is_some()
+                || self.first_divergent_scheduler_turn.is_some()
+                || self.first_divergent_virtual_nanoseconds.is_some()
+                || self.first_divergent_record.is_some()
+                || self.first_divergent_syscall.is_some()
+                || self.first_divergent_left_message.is_some()
+                || self.first_divergent_right_message.is_some()
+            {
+                return Err(
+                    "container_failed contradicts its no-comparison, unknown-guest outcome".into(),
+                );
+            }
+        }
         if self.comparison.is_none()
             && !matches!(
                 self.verdict,
@@ -634,6 +726,156 @@ impl VerificationReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn failed_container_report(
+        run: VerificationRun,
+        disposition: ContainerDisposition,
+    ) -> VerificationReport {
+        let mut report = VerificationReport::no_result();
+        report.no_result_reason = Some(NoResultReason::ContainerFailed(ContainerFailure {
+            run,
+            disposition,
+        }));
+        report
+    }
+
+    #[test]
+    fn container_failure_requires_exact_actor_and_absent_comparison_fields() {
+        for run in [VerificationRun::Run1, VerificationRun::Run2] {
+            for disposition in [
+                ContainerDisposition::Exited { code: 0 },
+                ContainerDisposition::Exited { code: 101 },
+                ContainerDisposition::Signaled {
+                    signal: 14,
+                    core_dumped: false,
+                },
+                ContainerDisposition::Signaled {
+                    signal: 11,
+                    core_dumped: true,
+                },
+            ] {
+                let report = failed_container_report(run, disposition);
+                let bytes = serde_json::to_vec(&report).unwrap();
+                assert_eq!(
+                    VerificationReport::from_current_json_slice(&bytes).unwrap(),
+                    report
+                );
+                assert!(report.require_canonical_comparison().is_err());
+                assert!(report.require_canonical_match().is_err());
+                let NoResultReason::ContainerFailed(failure) =
+                    report.no_result_reason.as_ref().unwrap()
+                else {
+                    unreachable!()
+                };
+                failure
+                    .require_reporter_exit(Some(125), None, false)
+                    .unwrap();
+                for (status, signal, timeout) in [
+                    (Some(0), None, false),
+                    (Some(122), None, false),
+                    (None, Some(14), false),
+                    (Some(125), None, true),
+                ] {
+                    assert!(
+                        failure
+                            .require_reporter_exit(status, signal, timeout)
+                            .is_err()
+                    );
+                }
+                let value = serde_json::to_value(&report).unwrap();
+                for (field, invented) in [
+                    ("verified", serde_json::json!(true)),
+                    ("bitwise_parity", serde_json::json!(true)),
+                    ("verdict", serde_json::json!("matched")),
+                    ("guest_exit_code", serde_json::json!(0)),
+                    ("guest_signal", serde_json::json!(14)),
+                    (
+                        "runtime",
+                        serde_json::json!({"run1":{"scheduler_turns":1,"virtual_nanoseconds":2}}),
+                    ),
+                    (
+                        "compared_log_messages",
+                        serde_json::json!({"left":1,"right":1}),
+                    ),
+                    ("first_divergent_record", serde_json::json!(1)),
+                    ("first_divergent_syscall", serde_json::json!(1)),
+                    ("first_divergent_scheduler_turn", serde_json::json!(1)),
+                    ("first_divergent_virtual_nanoseconds", serde_json::json!(1)),
+                    (
+                        "first_divergent_left_message",
+                        serde_json::json!("invented"),
+                    ),
+                    (
+                        "first_divergent_right_message",
+                        serde_json::json!("invented"),
+                    ),
+                    (
+                        "dbt_counted_branches",
+                        serde_json::json!({"left":1,"right":1}),
+                    ),
+                    (
+                        "infrastructure_error",
+                        serde_json::json!({"kind":"skid_overshoot","count":1}),
+                    ),
+                ] {
+                    let mut bad = value.clone();
+                    bad[field] = invented;
+                    let bytes = serde_json::to_vec(&bad).unwrap();
+                    assert!(
+                        VerificationReport::from_current_json_slice(&bytes).is_err(),
+                        "{field}"
+                    );
+                    assert!(
+                        VerificationReport::from_retained_cell_json_slice(&bytes).is_err(),
+                        "{field}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn container_failure_rejects_malformed_duplicate_and_reserved_dispositions() {
+        let report = failed_container_report(
+            VerificationRun::Run1,
+            ContainerDisposition::Exited { code: 0 },
+        );
+        let value = serde_json::to_value(report).unwrap();
+        for code in [-1, 122, 124, 129, 142, 192, 256] {
+            let mut bad = value.clone();
+            bad["no_result_reason"]["disposition"]["code"] = code.into();
+            assert!(
+                VerificationReport::from_current_json_value(bad).is_err(),
+                "{code}"
+            );
+        }
+        for replacement in [
+            serde_json::json!({"kind":"container_failed","disposition":{"kind":"exited","code":1}}),
+            serde_json::json!({"kind":"container_failed","run":"run3","disposition":{"kind":"exited","code":1}}),
+            serde_json::json!({"kind":"container_failed","run":"run1","disposition":{"kind":"exited","code":1,"signal":14}}),
+            serde_json::json!({"kind":"container_failed","run":"run1","disposition":{"kind":"signaled","signal":14}}),
+            serde_json::json!({"kind":"container_failed","run":"run1","disposition":{"kind":"signaled","signal":0,"core_dumped":false}}),
+            serde_json::json!({"kind":"container_failed","run":"run1","disposition":{"kind":"signaled","signal":65,"core_dumped":false}}),
+            serde_json::json!({"kind":"container_failed","run":"run1","extra":true,"disposition":{"kind":"exited","code":1}}),
+        ] {
+            let mut bad = value.clone();
+            bad["no_result_reason"] = replacement;
+            assert!(VerificationReport::from_current_json_value(bad).is_err());
+        }
+        let raw = serde_json::to_string(&value).unwrap();
+        for (needle, replacement) in [
+            (r#""run":"run1""#, r#""run":"run1","run":"run2""#),
+            (r#""code":0"#, r#""code":0,"code":0"#),
+        ] {
+            assert!(raw.contains(needle));
+            let bad = raw.replacen(needle, replacement, 1);
+            assert!(
+                VerificationReport::from_current_json_slice(bad.as_bytes())
+                    .unwrap_err()
+                    .contains("duplicate field")
+            );
+        }
+    }
 
     /// The divergence position must survive the parse. It was already being
     /// emitted by hermit and already present in the retained report string, but

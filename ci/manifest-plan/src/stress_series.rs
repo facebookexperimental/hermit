@@ -172,6 +172,7 @@ pub enum SeriesNoVerdictKind {
     ComparisonRefused,
     NotRun,
     FirstRunRejected,
+    ContainerFailed,
     InfrastructureError,
     MissingReportTimeout,
     NoncanonicalMatch,
@@ -357,6 +358,13 @@ impl SeriesPressureAttempt {
                         && !self.timed_out
                         && self.error_kind.is_none()
                         && self.status.is_some_and(|status| status > 0)
+                        && self.signal.is_none()
+                }
+                Some(SeriesNoVerdictKind::ContainerFailed) => {
+                    self.outcome == "FAIL"
+                        && !self.timed_out
+                        && self.error_kind.is_none()
+                        && self.status == Some(125)
                         && self.signal.is_none()
                 }
                 _ => false,
@@ -703,7 +711,8 @@ impl SeriesRow {
                     (kind, Some(comparison)) => {
                         let (verdict, no_result_kind) = match kind {
                             SeriesNoVerdictKind::Unspecified | SeriesNoVerdictKind::ComparisonRefused
-                            | SeriesNoVerdictKind::NotRun | SeriesNoVerdictKind::FirstRunRejected =>
+                            | SeriesNoVerdictKind::NotRun | SeriesNoVerdictKind::FirstRunRejected
+                            | SeriesNoVerdictKind::ContainerFailed =>
                                 (Verdict::NoResult, Some(kind)),
                             SeriesNoVerdictKind::InfrastructureError => (Verdict::InfrastructureError, None),
                             SeriesNoVerdictKind::NoncanonicalMatch => (Verdict::Matched, None),
@@ -902,6 +911,18 @@ impl SeriesRow {
                             "first_run_rejected evidence must carry attempt outcome FAIL, no error_kind, a nonzero status without signal, timed_out=false, a verification report, and no_result disposition"
                                 .into(),
                         );
+                    }
+                }
+                SeriesNoVerdictKind::ContainerFailed => {
+                    if disposition.attempt_outcome != "FAIL"
+                        || disposition.disposition != SeriesOutcome::NoResult
+                        || disposition.timed_out
+                        || disposition.error_kind.is_some()
+                        || disposition.status != Some(125)
+                        || disposition.signal.is_some()
+                        || disposition.verification_report_sha256.is_none()
+                    {
+                        return Err("container_failed evidence must carry FAIL, exit 125 without signal or timeout, no error_kind, a report, and no_result comparison disposition".into());
                     }
                 }
                 SeriesNoVerdictKind::NoncanonicalMatch => {
@@ -1384,6 +1405,48 @@ mod tests {
             retained_v2.validate_for_write().unwrap_err(),
             "new rows must use stress-series/v3, got stress-series/v2"
         );
+    }
+
+    #[test]
+    fn container_failure_series_retains_crash_and_no_comparison_separately() {
+        let mut fixture = no_verdict_row();
+        fixture.series.outcome = SeriesOutcome::Errored;
+        fixture.series.result = Some(ObservedResult::CrashError);
+        fixture.series.failure_class = Some(FailureClass::ProductFailure);
+        let disposition = &mut fixture
+            .series
+            .no_verdict_evidence
+            .as_mut()
+            .unwrap()
+            .attempts[0];
+        disposition.kind = SeriesNoVerdictKind::ContainerFailed;
+        disposition.attempt_outcome = "FAIL".into();
+        disposition.disposition = SeriesOutcome::NoResult;
+        disposition.error_kind = None;
+        disposition.status = Some(125);
+        disposition.signal = None;
+        disposition.timed_out = false;
+        fixture.validate_for_write().unwrap();
+        let encoded = serde_json::to_vec(&fixture).unwrap();
+        let decoded: SeriesRow = serde_json::from_slice(&encoded).unwrap();
+        decoded.validate_for_read().unwrap();
+        assert_eq!(decoded.series.result, Some(ObservedResult::CrashError));
+        for mutation in ["zero", "timeout", "signal", "pass", "canonical-credit"] {
+            let mut bad = fixture.clone();
+            let disposition = &mut bad.series.no_verdict_evidence.as_mut().unwrap().attempts[0];
+            match mutation {
+                "zero" => disposition.status = Some(0),
+                "timeout" => disposition.timed_out = true,
+                "signal" => {
+                    disposition.status = None;
+                    disposition.signal = Some(14);
+                }
+                "pass" => disposition.attempt_outcome = "PASS".into(),
+                "canonical-credit" => disposition.disposition = SeriesOutcome::Diverged,
+                _ => unreachable!(),
+            }
+            assert!(bad.validate_for_write().is_err(), "{mutation}");
+        }
     }
 
     #[test]

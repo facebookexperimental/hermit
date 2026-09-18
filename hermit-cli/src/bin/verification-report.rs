@@ -42,7 +42,11 @@ fn read_current_report(path: &Path) -> Result<VerificationReport, String> {
 }
 fn no_result_detail(report: &VerificationReport) -> String {
     match report.no_result_reason.as_ref() {
-        Some(NoResultReason::NotRun) => "the invocation did not run".into(),
+        Some(NoResultReason::NotRun) => "the invocation did not replace its pre-run stamp".into(),
+        Some(NoResultReason::ContainerFailed(failure)) => format!(
+            "the sandbox failed during {:?}: {:?}; guest disposition and comparison are unavailable",
+            failure.run, failure.disposition
+        ),
         Some(NoResultReason::FirstRunRejected {
             exit_code,
             signal,
@@ -135,5 +139,36 @@ fn main() -> ExitCode {
         other => refuse(format!(
             "unknown requirement {other:?}; expected matched or canonical-match"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn container_failure_reader_refuses_match_without_claiming_guest_failure() {
+        let mut report = VerificationReport::no_result();
+        report.no_result_reason = Some(NoResultReason::ContainerFailed(
+            hermit::canonical_verdict::ContainerFailure {
+                run: hermit::canonical_verdict::VerificationRun::Run2,
+                disposition: hermit::canonical_verdict::ContainerDisposition::Signaled {
+                    signal: 14,
+                    core_dumped: false,
+                },
+            },
+        ));
+        assert!(
+            require_match(&report)
+                .unwrap_err()
+                .contains("sandbox failed")
+        );
+        assert!(
+            no_result_detail(&report).contains("guest disposition and comparison are unavailable")
+        );
+        assert!(
+            no_result_detail(&VerificationReport::no_result())
+                .contains("did not replace its pre-run stamp")
+        );
     }
 }

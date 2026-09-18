@@ -30,6 +30,8 @@ use hermit::canonical_verdict::ComparedLogScope;
 use hermit::canonical_verdict::ComparedOutput;
 use hermit::canonical_verdict::ComparedOutputs;
 use hermit::canonical_verdict::ComparisonReport;
+use hermit::canonical_verdict::ContainerDisposition;
+use hermit::canonical_verdict::ContainerFailure;
 pub(crate) use hermit::canonical_verdict::DbtCountedBranchComparison;
 use hermit::canonical_verdict::InfrastructureError;
 pub(crate) use hermit::canonical_verdict::LogCompareStrictness;
@@ -38,6 +40,7 @@ use hermit::canonical_verdict::RecordEnvelopeReport;
 use hermit::canonical_verdict::RuntimeStats;
 pub(crate) use hermit::canonical_verdict::Verdict;
 pub(crate) use hermit::canonical_verdict::VerificationReport;
+pub(crate) use hermit::canonical_verdict::VerificationRun;
 pub(crate) use hermit::canonical_verdict::VerificationRuntime;
 use pretty_assertions::Comparison;
 use reverie::process::ExitStatus;
@@ -751,6 +754,90 @@ pub fn write_pending_verification_json(path: &Path) -> Result<(), Error> {
     write_report_json(path, &VerificationReport::no_result())
 }
 
+/// Execute one real verification run and replace the pending stamp only when
+/// the container classifier established an unexpected child exit. Neither a
+/// returned guest Output nor an unclassified error is that observation.
+pub(crate) fn run_verification_execution<T>(
+    path: Option<&Path>,
+    run: VerificationRun,
+    execute: impl FnOnce() -> Result<T, Error>,
+) -> Result<T, Error> {
+    execute().map_err(|error| {
+        let Some(super::container::ContainerChildExit(status)) =
+            error.downcast_ref::<super::container::ContainerChildExit>()
+        else {
+            return error;
+        };
+        let Some(path) = path else { return error };
+        let disposition = match *status {
+            ExitStatus::Exited(code) => ContainerDisposition::Exited { code },
+            ExitStatus::Signaled(signal, core_dumped) => ContainerDisposition::Signaled {
+                signal: signal as i32,
+                core_dumped,
+            },
+        };
+        let mut report = VerificationReport::no_result();
+        report.no_result_reason = Some(NoResultReason::ContainerFailed(ContainerFailure {
+            run,
+            disposition,
+        }));
+        match write_report_json(path, &report) {
+            Ok(()) => error,
+            Err(secondary) => {
+                retain_verification_error(error, "publishing container failure", secondary)
+            }
+        }
+    })
+}
+
+/// Keep the original typed error as anyhow's cause and the actual secondary
+/// error as context. Classification/downcasts must still find the first cause.
+#[derive(Debug)]
+pub(crate) struct VerificationFailureContext {
+    errors: Vec<(&'static str, Error)>,
+}
+
+impl std::fmt::Display for VerificationFailureContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, (operation, error)) in self.errors.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str("; ")?;
+            }
+            write!(formatter, "{operation} also failed: {error:#}")?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn retain_verification_error(
+    mut primary: Error,
+    operation: &'static str,
+    error: Error,
+) -> Error {
+    if let Some(context) = primary.downcast_mut::<VerificationFailureContext>() {
+        context.errors.push((operation, error));
+        primary
+    } else {
+        primary.context(VerificationFailureContext {
+            errors: vec![(operation, error)],
+        })
+    }
+}
+
+pub(crate) fn retain_logs_after_verification_error<const N: usize>(
+    mut primary: Error,
+    logs: [(&str, TempPath); N],
+) -> Error {
+    // Attempt every requested retention, even if an earlier one fails.
+    eprintln!(":: Verification logs retained:");
+    for (label, log) in logs {
+        if let Err(secondary) = retain_verification_log(label, log) {
+            primary = retain_verification_error(primary, "retaining verification log", secondary);
+        }
+    }
+    primary
+}
+
 /// Write `report` to `path` atomically: a reader concurrent with the write sees
 /// either the old contents or the complete new record, never a truncated one.
 /// The directory to stage the temporary record in: always the one the target
@@ -903,11 +990,15 @@ pub(crate) fn retain_verification_logs<const N: usize>(
     let mut retained = Vec::with_capacity(N);
     eprintln!(":: Verification logs retained:");
     for (label, log) in logs {
-        let path = log.keep()?;
-        eprintln!("::   {label}: {}", path.display());
-        retained.push(path);
+        retained.push(retain_verification_log(label, log)?);
     }
     Ok(retained)
+}
+
+fn retain_verification_log(label: &str, log: TempPath) -> Result<PathBuf, Error> {
+    let path = log.keep()?;
+    eprintln!("::   {label}: {}", path.display());
+    Ok(path)
 }
 
 fn flock(file: &File, operation: i32) -> io::Result<()> {
@@ -1564,6 +1655,278 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    fn classified_container<T: serde::Serialize + serde::de::DeserializeOwned>(
+        mut child: impl FnMut() -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        // Exercise the real result/exit transport and production classifier.
+        // These controls do not need the CLI's child panic-hook installation.
+        super::super::container::classify_container_result(
+            reverie::process::Container::new()
+                .run(|| child().map_err(hermit::SerializableError::from)),
+        )
+    }
+
+    fn real_container_exit(path: &Path, run: VerificationRun, code: Option<i32>) -> Error {
+        run_verification_execution::<()>(Some(path), run, || {
+            classified_container(|| {
+                // Only the freshly created container child changes disposition
+                // or exits. The fallback code makes a blocked/failed signal a
+                // different result, so setup failure cannot satisfy the test.
+                unsafe {
+                    if let Some(code) = code {
+                        libc::_exit(code);
+                    }
+                    let mut mask = std::mem::zeroed();
+                    assert_eq!(libc::sigemptyset(&mut mask), 0);
+                    assert_eq!(libc::sigaddset(&mut mask, libc::SIGALRM), 0);
+                    assert_eq!(
+                        libc::sigprocmask(libc::SIG_UNBLOCK, &mask, std::ptr::null_mut()),
+                        0
+                    );
+                    assert_ne!(libc::signal(libc::SIGALRM, libc::SIG_DFL), libc::SIG_ERR);
+                    libc::raise(libc::SIGALRM);
+                    libc::_exit(99);
+                }
+            })
+        })
+        .unwrap_err()
+    }
+
+    fn check_real_container_failure(run: VerificationRun) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("verify.json");
+        write_pending_verification_json(&path).unwrap();
+        if run == VerificationRun::Run2 {
+            let first = run_verification_execution(Some(&path), VerificationRun::Run1, || {
+                classified_container(|| Ok(output(0, b"first run", b"")))
+            })
+            .unwrap();
+            assert_eq!(first.stdout, b"first run");
+            assert_eq!(first.status, ExitStatus::Exited(0));
+            assert_eq!(
+                VerificationReport::from_current_json_slice(&fs::read(&path).unwrap()).unwrap(),
+                VerificationReport::no_result()
+            );
+        }
+        let error = real_container_exit(&path, run, None);
+        let actual = error
+            .downcast_ref::<super::super::container::ContainerChildExit>()
+            .expect("real child must die by SIGALRM, not refuse setup");
+        assert_eq!(
+            actual.0,
+            ExitStatus::Signaled(reverie::process::Signal::SIGALRM, false)
+        );
+        assert_eq!(super::super::failure_exit_code(&error), 125);
+        let report = VerificationReport::from_current_json_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(
+            report.no_result_reason,
+            Some(NoResultReason::ContainerFailed(ContainerFailure {
+                run,
+                disposition: ContainerDisposition::Signaled {
+                    signal: libc::SIGALRM,
+                    core_dumped: false
+                }
+            }))
+        );
+        assert!(report.guest_exit_code.is_none() && report.guest_signal.is_none());
+        assert!(report.comparison.is_none() && report.compared_outputs.is_none());
+        assert!(report.require_canonical_comparison().is_err());
+    }
+
+    #[test]
+    fn real_container_failure_replaces_run1_stamp() {
+        check_real_container_failure(VerificationRun::Run1);
+    }
+
+    #[test]
+    fn real_container_failure_replaces_run2_stamp_without_claiming_run1_status() {
+        check_real_container_failure(VerificationRun::Run2);
+    }
+
+    #[test]
+    fn real_container_zero_exit_and_deliberate_stops_remain_distinct() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("verify.json");
+        for code in [
+            0,
+            101,
+            detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
+            hermit::HERMIT_DEADLINE_EXIT,
+            detcore_model::signal_exit_status(libc::SIGTERM),
+        ] {
+            write_pending_verification_json(&path).unwrap();
+            let error = real_container_exit(&path, VerificationRun::Run1, Some(code));
+            let report =
+                VerificationReport::from_current_json_slice(&fs::read(&path).unwrap()).unwrap();
+            match code {
+                0 | 101 => {
+                    assert!(
+                        error
+                            .downcast_ref::<super::super::container::ContainerChildExit>()
+                            .is_some()
+                    );
+                    assert_eq!(
+                        report.no_result_reason,
+                        Some(NoResultReason::ContainerFailed(ContainerFailure {
+                            run: VerificationRun::Run1,
+                            disposition: ContainerDisposition::Exited { code }
+                        }))
+                    );
+                    assert_eq!(super::super::failure_exit_code(&error), 125);
+                }
+                122 => {
+                    assert!(
+                        error
+                            .downcast_ref::<super::super::container::PolicyRefusal>()
+                            .is_some()
+                    );
+                    assert_eq!(report, VerificationReport::no_result());
+                }
+                124 => {
+                    assert!(
+                        error
+                            .downcast_ref::<super::super::container::RunTimeoutMarker>()
+                            .is_some()
+                    );
+                    assert_eq!(report, VerificationReport::no_result());
+                }
+                _ => {
+                    assert!(
+                        error
+                            .downcast_ref::<super::super::container::SignalDeath>()
+                            .is_some()
+                    );
+                    assert_eq!(report, VerificationReport::no_result());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn returned_guest_signal_and_unknown_error_do_not_become_container_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("verify.json");
+        write_pending_verification_json(&path).unwrap();
+        let expected = Output {
+            status: ExitStatus::Signaled(reverie::process::Signal::SIGALRM, false),
+            stdout: Vec::new(),
+            stderr: b"guest".to_vec(),
+        };
+        let returned = run_verification_execution(Some(&path), VerificationRun::Run1, || {
+            classified_container(|| Ok(expected.clone()))
+        })
+        .unwrap();
+        assert_eq!(returned.status, expected.status);
+        assert_eq!(returned.stderr, expected.stderr);
+        let error = run_verification_execution::<()>(Some(&path), VerificationRun::Run1, || {
+            classified_container(|| Err(Error::msg("ordinary unknown error")))
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "ordinary unknown error");
+        let panic = run_verification_execution::<()>(Some(&path), VerificationRun::Run1, || {
+            super::super::container::classify_container_result(Ok(Err(
+                hermit::SerializableError::from(Error::msg("caught panic control")).into_panic(),
+            )))
+        })
+        .unwrap_err();
+        assert!(
+            panic
+                .downcast_ref::<super::super::container::ContainerChildPanic>()
+                .is_some()
+        );
+        assert_eq!(
+            VerificationReport::from_current_json_slice(&fs::read(path).unwrap()).unwrap(),
+            VerificationReport::no_result()
+        );
+    }
+
+    #[test]
+    fn container_failure_keeps_primary_type_and_secondary_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = real_container_exit(
+            &dir.path().join("absent/verify.json"),
+            VerificationRun::Run1,
+            Some(101),
+        );
+        assert!(
+            error
+                .downcast_ref::<super::super::container::ContainerChildExit>()
+                .is_some()
+        );
+        let context = error.downcast_ref::<VerificationFailureContext>().unwrap();
+        assert_eq!(context.errors.len(), 1);
+        assert_eq!(context.errors[0].0, "publishing container failure");
+        assert!(
+            context.errors[0]
+                .1
+                .chain()
+                .any(|cause| cause.downcast_ref::<std::io::Error>().is_some())
+        );
+        let log = tempfile::NamedTempFile::new_in(dir.path())
+            .unwrap()
+            .into_temp_path();
+        fs::write(&log, b"retained failure log").unwrap();
+        let retained = log.to_path_buf();
+        let error = retain_logs_after_verification_error(error, [("run 1", log)]);
+        assert_eq!(fs::read(retained).unwrap(), b"retained failure log");
+        // Exercise the error-composition boundary separately: retaining a
+        // TempPath can fail only on platform-specific filesystem operations.
+        // This control does not claim an actual retention I/O failure occurred.
+        let secondary = Error::new(std::io::Error::from_raw_os_error(libc::EACCES));
+        let error = retain_verification_error(error, "retaining verification log", secondary);
+        assert!(
+            error
+                .downcast_ref::<super::super::container::ContainerChildExit>()
+                .is_some()
+        );
+        assert_eq!(super::super::failure_exit_code(&error), 125);
+        assert!(format!("{error:#}").contains("publishing container failure"));
+        let context = error.downcast_ref::<VerificationFailureContext>().unwrap();
+        assert_eq!(context.errors.len(), 2);
+        assert_eq!(context.errors[0].0, "publishing container failure");
+        assert_eq!(context.errors[1].0, "retaining verification log");
+        assert_eq!(
+            context.errors[1]
+                .1
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::EACCES)
+        );
+
+        // A secondary retention error must not replace a deliberate stop's
+        // original exit class. This exercises error composition, not a failed
+        // filesystem retention operation.
+        for (primary, expected_exit) in [
+            (
+                Error::new(super::super::container::PolicyRefusal),
+                detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
+            ),
+            (
+                Error::new(super::super::container::RunTimeoutMarker),
+                hermit::HERMIT_DEADLINE_EXIT,
+            ),
+        ] {
+            let error = retain_verification_error(
+                primary,
+                "retaining verification log",
+                Error::new(std::io::Error::from_raw_os_error(libc::EACCES)),
+            );
+            assert_eq!(super::super::failure_exit_code(&error), expected_exit);
+            let context = error.downcast_ref::<VerificationFailureContext>().unwrap();
+            assert_eq!(context.errors.len(), 1);
+            assert_eq!(context.errors[0].0, "retaining verification log");
+            assert_eq!(
+                context.errors[0]
+                    .1
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(libc::EACCES)
+            );
+        }
+    }
 
     fn output(status: i32, stdout: &[u8], stderr: &[u8]) -> Output {
         Output {

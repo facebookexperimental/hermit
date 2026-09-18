@@ -1393,10 +1393,8 @@ impl ResultRow {
             .then_some(ObservedResult::Timeout)
     }
 
-    /// Return the typed reason when this FAIL records only completed first
-    /// runs rejected before comparison. Such a row is execution evidence, but
-    /// not product-behavior evidence: it must be named and retained as a
-    /// measured no-verdict rather than forced through the comparison path.
+    /// Retain a rejected guest or a typed container failure without crediting
+    /// either as a completed comparison.
     fn typed_no_result_reason(&self) -> Result<Option<String>, String> {
         if self.outcome != "FAIL" || !matches!(self.mode.as_str(), "verify" | "replay" | "chaos") {
             return Ok(None);
@@ -1551,9 +1549,23 @@ impl ResultRow {
                     }
                     report.no_result_reason.as_ref().unwrap()
                 }
+                Some(canonical_verdict::NoResultReason::ContainerFailed(failure)) => {
+                    failure.require_reporter_exit(
+                        attempt
+                            .get("status")
+                            .and_then(JsonValue::as_i64)
+                            .and_then(|value| i32::try_from(value).ok()),
+                        attempt
+                            .get("signal")
+                            .and_then(JsonValue::as_i64)
+                            .and_then(|value| i32::try_from(value).ok()),
+                        attempt.get("timed_out").and_then(JsonValue::as_bool) != Some(false),
+                    )?;
+                    report.no_result_reason.as_ref().unwrap()
+                }
                 Some(canonical_verdict::NoResultReason::NotRun) => {
                     return Err(format!(
-                        "attempt {} did not complete its first run",
+                        "attempt {} did not replace its pre-run stamp",
                         index + 1
                     ));
                 }
@@ -1847,7 +1859,7 @@ impl ResultRow {
     fn comparison_evidence_from(&self, input: ResultInput) -> Result<ValidateRowEvidence, String> {
         self.require_provenance()?;
         self.validate_recorded_classification()?;
-        let no_verdict_result = self.no_verdict_result();
+        let mut no_verdict_result = self.no_verdict_result();
         let mut left_info_messages = BTreeSet::new();
         let mut right_info_messages = BTreeSet::new();
         let mut divergence_positions = Vec::new();
@@ -2145,7 +2157,7 @@ impl ResultRow {
                             saw_not_run = true;
                             unavailable.get_or_insert_with(|| {
                                 format!(
-                                    "NO_RESULT: attempt {} did not complete its first run",
+                                    "NO_RESULT: attempt {} retained its pre-run stamp after timeout",
                                     index + 1
                                 )
                             });
@@ -2170,6 +2182,23 @@ impl ResultRow {
                         let reason = single
                             .typed_no_result_reason()?
                             .ok_or("FirstRunRejected did not classify as no_result")?;
+                        unavailable.get_or_insert(format!("NO_RESULT: {reason}"));
+                    }
+                    Some(canonical_verdict::NoResultReason::ContainerFailed(_)) => {
+                        saw_no_result = true;
+                        let mut single = self.clone();
+                        single.outcome = "FAIL".into();
+                        single.first_divergent_scheduler_turn = None;
+                        single.first_divergent_virtual_nanoseconds = None;
+                        single.first_divergent_record = None;
+                        single.first_divergent_syscall = None;
+                        single.attempts = vec![attempt.clone()];
+                        let reason = single
+                            .typed_no_result_reason()?
+                            .ok_or("ContainerFailed did not classify as no_result")?;
+                        // Preserve an already classified timeout/infrastructure
+                        // result from another attempt in this retained history.
+                        no_verdict_result.get_or_insert(ObservedResult::CrashError);
                         unavailable.get_or_insert(format!("NO_RESULT: {reason}"));
                     }
                     Some(canonical_verdict::NoResultReason::ComparisonRefused { detail }) => {
@@ -6937,12 +6966,23 @@ fn series_evidence(row: &SeriesRow, id: &CellId) -> Option<SeriesEvidence> {
         return None;
     }
     if let Some(evidence) = &row.series.no_verdict_evidence {
-        return Some(SeriesEvidence {
-            result: evidence
+        // Callers validate the exact disposition/classification tuple before
+        // projection. Retain this typed product crash without treating any
+        // other no-result kind as a crash or granting comparison credit.
+        let result = if evidence.attempts.iter().any(|attempt| attempt.timed_out) {
+            Some(ObservedResult::Timeout)
+        } else if row.series.result == Some(ObservedResult::CrashError)
+            && evidence
                 .attempts
                 .iter()
-                .any(|attempt| attempt.timed_out)
-                .then_some(ObservedResult::Timeout),
+                .any(|attempt| attempt.kind == SeriesNoVerdictKind::ContainerFailed)
+        {
+            Some(ObservedResult::CrashError)
+        } else {
+            None
+        };
+        return Some(SeriesEvidence {
+            result,
             no_verdict: true,
         });
     }
@@ -16022,6 +16062,70 @@ red/`measured-and-passed` count is **0**.",
     no_result_row.first_divergent_record = None;
     no_result_row.first_divergent_syscall = None;
     no_result_row.attempts = vec![no_result_attempt];
+
+    // A typed sandbox failure is a product crash, while the comparison
+    // denominator remains unchanged. No guest Output was returned.
+    for run in ["run1", "run2"] {
+        let mut container_row = no_result_row.clone();
+        let mut report =
+            serde_json::to_value(canonical_verdict::VerificationReport::no_result()).unwrap();
+        report["no_result_reason"] = serde_json::json!({"kind":"container_failed","run":run,"disposition":{"kind":"signaled","signal":14,"core_dumped":false}});
+        let raw = serde_json::to_string(&report).unwrap();
+        container_row.attempts[0]["verification_report_sha256"] =
+            format!("{:x}", Sha256::digest(raw.as_bytes())).into();
+        container_row.attempts[0]["verification_report"] = raw.into();
+        if !matches!(
+            container_row.comparison_evidence()?,
+            ValidateRowEvidence::Unavailable {
+                result: Some(ObservedResult::CrashError),
+                ..
+            }
+        ) {
+            return Err("container failure lost crash evidence or gained comparison credit".into());
+        }
+        let mut mixed = container_row.clone();
+        mixed.outcome = "ERROR".into();
+        mixed.result = Some(ObservedResult::Timeout);
+        mixed.failure_class = Some(FailureClass::NoResult);
+        mixed.error_kind = Some("wall-timeout".into());
+        let mut timeout_attempt = mixed.attempts[0].clone();
+        timeout_attempt["index"] = "2".into();
+        timeout_attempt["outcome"] = "ERROR".into();
+        timeout_attempt["status"] = JsonValue::Null;
+        timeout_attempt["signal"] = serde_json::json!(9);
+        timeout_attempt["timed_out"] = serde_json::json!(true);
+        timeout_attempt["error_kind"] = "wall-timeout".into();
+        let timeout_report =
+            serde_json::to_string(&canonical_verdict::VerificationReport::no_result()).unwrap();
+        timeout_attempt["verification_report_sha256"] =
+            format!("{:x}", Sha256::digest(timeout_report.as_bytes())).into();
+        timeout_attempt["verification_report"] = timeout_report.into();
+        mixed.attempts.push(timeout_attempt);
+        if !matches!(
+            mixed.comparison_evidence()?,
+            ValidateRowEvidence::NotRun {
+                result: Some(ObservedResult::Timeout),
+                ..
+            }
+        ) {
+            return Err("container failure erased a timeout from another retained attempt".into());
+        }
+        let mut zero = container_row.clone();
+        zero.attempts[0]["status"] = serde_json::json!(0);
+        if zero.comparison_evidence().is_ok() {
+            return Err("container failure accepted a zero-exit wrapper".into());
+        }
+        let mut contradiction = container_row;
+        report["guest_signal"] = serde_json::json!(14);
+        let raw = serde_json::to_string(&report).unwrap();
+        contradiction.attempts[0]["verification_report_sha256"] =
+            format!("{:x}", Sha256::digest(raw.as_bytes())).into();
+        contradiction.attempts[0]["verification_report"] = raw.into();
+        if contradiction.comparison_evidence().is_ok() {
+            return Err("container failure accepted an invented guest disposition".into());
+        }
+    }
+
     let no_result_identity = no_result_row.evidence_identity().unwrap();
 
     let mut unspecified_no_result = no_result_row.clone();
@@ -16042,6 +16146,18 @@ red/`measured-and-passed` count is **0**.",
         return Err(
             "an explicitly null no_result_reason was not retained as explicit absence".into(),
         );
+    }
+
+    let mut typed_not_run = unspecified_no_result.clone();
+    let report = serde_json::to_string(&canonical_verdict::VerificationReport::no_result())
+        .map_err(|error| error.to_string())?;
+    typed_not_run.attempts[0]["verification_report_sha256"] =
+        format!("{:x}", Sha256::digest(report.as_bytes())).into();
+    typed_not_run.attempts[0]["verification_report"] = report.into();
+    if typed_not_run.typed_no_result_reason()
+        != Err("attempt 1 did not replace its pre-run stamp".into())
+    {
+        return Err("typed NotRun did not retain its precise pre-run-stamp refusal".into());
     }
 
     let mut recovered_pass_row = validate_row.clone();
@@ -16348,7 +16464,8 @@ red/`measured-and-passed` count is **0**.",
             .map_err(|error| format!("recovered NotRun {label} was refused: {error}"))?;
         if fold.passed != 1
             || fold.errored.len() != 1
-            || !fold.errored[0].contains("did not complete its first run")
+            || !fold.errored[0]
+                .contains("NO_RESULT: attempt 1 retained its pre-run stamp after timeout")
             || fold.reads_all_green()
             || tracked.cells[0].measurement != MeasurementState::MeasuredAndPassed
             || tracked.cells[0].last_tested.is_none()
@@ -16384,7 +16501,8 @@ red/`measured-and-passed` count is **0**.",
         .map_err(|error| format!("recovered pre-launch NotRun was refused: {error}"))?;
     if fold.passed != 1
         || fold.errored.len() != 1
-        || !fold.errored[0].contains("did not complete its first run")
+        || !fold.errored[0]
+            .contains("NO_RESULT: attempt 1 retained its pre-run stamp after timeout")
         || fold.reads_all_green()
         || tracked.cells[0].measurement != MeasurementState::MeasuredAndPassed
         || tracked.cells[0].observations.len() != 1
@@ -16463,7 +16581,8 @@ red/`measured-and-passed` count is **0**.",
         let (tracked, fold) = fold_fixture_rows(rows)
             .map_err(|error| format!("{label} NotRun evidence was refused: {error}"))?;
         if fold.errored.len() != 1
-            || !fold.errored[0].contains("did not complete its first run")
+            || !fold.errored[0]
+                .contains("NO_RESULT: attempt 1 retained its pre-run stamp after timeout")
             || tracked.cells[0].measurement != expected_measurement
             || tracked.cells[0].last_tested.is_none()
             || tracked.cells[0].observations.len() != 1
@@ -16482,7 +16601,8 @@ red/`measured-and-passed` count is **0**.",
         .push(no_result_row.attempts[0].clone());
     let (tracked, fold) = fold_fixture_rows(vec![mixed_terminal])?;
     if fold.errored.len() != 1
-        || !fold.errored[0].contains("did not complete its first run")
+        || !fold.errored[0]
+            .contains("NO_RESULT: attempt 1 retained its pre-run stamp after timeout")
         || tracked.cells[0].measurement != MeasurementState::MeasuredNoVerdict
         || tracked.cells[0].observations[0].results != BTreeSet::from([ObservedResult::Timeout])
     {
@@ -16656,7 +16776,8 @@ red/`measured-and-passed` count is **0**.",
     bind_row_to_first_attempt(&mut all_not_run);
     let (tracked, fold) = fold_fixture_row(all_not_run)?;
     if fold.errored.len() != 1
-        || !fold.errored[0].contains("did not complete its first run")
+        || !fold.errored[0]
+            .contains("NO_RESULT: attempt 1 retained its pre-run stamp after timeout")
         || tracked.cells[0].measurement != MeasurementState::MeasuredNoVerdict
         || tracked.cells[0].observations[0].results != BTreeSet::from([ObservedResult::Timeout])
     {
@@ -18551,14 +18672,57 @@ red/`measured-and-passed` count is **0**.",
     series_unavailable.series.run_index = 2;
     series_unavailable.series.attempt = Some(2);
     series_unavailable.series.no_verdict_evidence = Some(no_verdict_evidence(false));
+    // Stored projected observations need the same complete source identity as
+    // the production writer. Commit the actual fixture rows and read them back
+    // through its immutable snapshot path before applying and encoding them.
+    let projection_source_fixture =
+        tempfile::tempdir().map_err(|e| format!("cannot create no-verdict series fixture: {e}"))?;
+    let projection_source_repo = projection_source_fixture.path();
+    git_ok(projection_source_repo, &["init", "--quiet"])?;
+    let projection_source_dir = projection_source_repo.join("series");
+    fs::create_dir(&projection_source_dir)
+        .map_err(|e| format!("cannot create no-verdict series directory: {e}"))?;
     let project_series_fixture =
         |rows: &[SeriesRow]| -> Result<(TrackedCells, ProjectObservationsOutcome), String> {
+            let mut shard = String::new();
+            for row in rows {
+                shard.push_str(&serde_json::to_string(row).map_err(|e| e.to_string())?);
+                shard.push('\n');
+            }
+            fs::write(projection_source_dir.join("fixture.jsonl"), shard)
+                .map_err(|e| format!("cannot write no-verdict series fixture: {e}"))?;
+            git_ok(projection_source_repo, &["add", "series"])?;
+            git_ok(
+                projection_source_repo,
+                &[
+                    "-c",
+                    "user.name=scorecard fixture",
+                    "-c",
+                    "user.email=scorecard@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "--allow-empty",
+                    "-m",
+                    "no-verdict series fixture",
+                ],
+            )?;
+            let snapshot = snapshot_series_source(&projection_source_dir)?;
+            let captured_rows = read_series_rows(&snapshot)?;
             let mut tracked = TrackedCells {
                 schema: SCHEMA,
                 projection: None,
                 cells: vec![boundary_cell(Vec::new(), CellStatus::Green)],
             };
-            let outcome = apply_series_rows(&root, &mut tracked, rows, None)?;
+            let outcome =
+                apply_series_rows(&root, &mut tracked, &captured_rows, Some(&snapshot.source))?;
+            tracked.projection = Some(ObservationProjection {
+                source: snapshot.source,
+                source_commit: Some(snapshot.source_commit),
+                source_tree: Some(snapshot.source_tree),
+                refreshed_at: "fixture-no-verdict".into(),
+                rows_read: captured_rows.len() as u64,
+                pre_series_corpus: outcome.pre_series_corpus,
+            });
             refresh_measurement(&mut tracked);
             Ok((tracked, outcome))
         };
@@ -18582,6 +18746,204 @@ red/`measured-and-passed` count is **0**.",
             != direct_unavailable.cells[0].observations[0].results
     {
         return Err("RUN1573-style KVM unavailable changed between direct and series paths".into());
+    }
+
+    // Exercise the actual direct and series folds for both typed run labels.
+    // The series retains report/attempt identities, not an invented guest exit
+    // or comparison. A later timed-out attempt must still take precedence.
+    for run in ["run1", "run2"] {
+        let mut direct_container = no_result_row.clone();
+        direct_container.run_id = format!("fixture-container-{run}");
+        let mut report =
+            serde_json::to_value(canonical_verdict::VerificationReport::no_result()).unwrap();
+        report["no_result_reason"] = serde_json::json!({
+            "kind": "container_failed", "run": run,
+            "disposition": {"kind": "signaled", "signal": 14, "core_dumped": false}
+        });
+        replace_embedded_report(&mut direct_container, report);
+        let mut container_series = series_row(
+            "fixture/boundary/verify/ptrace",
+            SeriesOutcome::Errored,
+            SeriesProducer::Validate,
+            1,
+            Some(fixture_detcore_tree.clone()),
+            None,
+        );
+        container_series.event_id = format!("fixture-container-{run}-attempt-1");
+        container_series.run_id = direct_container.run_id.clone();
+        container_series.series.attempt = Some(1);
+        container_series.series.no_verdict_evidence = Some(SeriesNoVerdictEvidence {
+            evidence_sha256: direct_container.evidence_identity()?,
+            attempts: vec![SeriesAttemptDisposition {
+                index: "1".into(),
+                kind: SeriesNoVerdictKind::ContainerFailed,
+                detail: None,
+                attempt_outcome: "FAIL".into(),
+                disposition: SeriesOutcome::NoResult,
+                error_kind: None,
+                status: Some(125),
+                signal: None,
+                timed_out: false,
+                verification_report_sha256: Some(
+                    direct_container.attempts[0]["verification_report_sha256"]
+                        .as_str()
+                        .unwrap()
+                        .into(),
+                ),
+            }],
+        });
+        for timed_out in [false, true] {
+            let mut direct = direct_container.clone();
+            let mut series = container_series.clone();
+            if timed_out {
+                direct.outcome = "ERROR".into();
+                direct.result = Some(ObservedResult::Timeout);
+                direct.failure_class = Some(FailureClass::NoResult);
+                direct.error_kind = Some("wall-timeout".into());
+                let mut timeout_attempt = not_run_row.attempts[0].clone();
+                timeout_attempt["index"] = "2".into();
+                direct.attempts.push(timeout_attempt);
+                series.series.outcome = SeriesOutcome::Timeout;
+                series.series.result = Some(ObservedResult::Timeout);
+                series.series.failure_class = Some(FailureClass::NoResult);
+                let evidence = series.series.no_verdict_evidence.as_mut().unwrap();
+                let mut timeout = no_verdict_evidence(true).attempts.remove(0);
+                timeout.index = "2".into();
+                timeout.verification_report_sha256 = Some(
+                    direct.attempts[1]["verification_report_sha256"]
+                        .as_str()
+                        .unwrap()
+                        .into(),
+                );
+                evidence.attempts.push(timeout);
+                evidence.evidence_sha256 = direct.evidence_identity()?;
+            }
+            series.validate_for_write()?;
+            let encoded = serde_json::to_vec(&series).map_err(|e| e.to_string())?;
+            let series: SeriesRow = serde_json::from_slice(&encoded).map_err(|e| e.to_string())?;
+            let (projected, projection) = project_series_fixture(&[series.clone()])?;
+            let (direct, fold) = fold_fixture_row(direct)?;
+            let expected = if timed_out {
+                ObservedResult::Timeout
+            } else {
+                ObservedResult::CrashError
+            };
+            if series_evidence(&series, &projected.cells[0].id)
+                != Some(SeriesEvidence {
+                    result: Some(expected),
+                    no_verdict: true,
+                })
+                || projected.cells[0].measurement != MeasurementState::MeasuredNoVerdict
+                || direct.cells[0].measurement != projected.cells[0].measurement
+                || direct.cells[0].observations[0].results != BTreeSet::from([expected])
+                || projected.cells[0].observations[0].results
+                    != direct.cells[0].observations[0].results
+                || projection.rows != 1
+                || projection.no_verdict_rows != 1
+                || projection.runs != 1
+                || !projection.skipped.is_empty()
+                || fold.passed != 0
+                || fold.located != 0
+                || fold.unlocated != 0
+                || fold.errored.len() != 1
+                || fold.reads_all_green()
+            {
+                return Err(format!(
+                    "{run} container failure changed between direct and series folds (timeout={timed_out})"
+                ));
+            }
+            let mut missing_projection = projected.clone();
+            missing_projection.projection = None;
+            if !encoded_cells(&missing_projection)
+                .expect_err("projected container failure without source identity was stored")
+                .contains("uses projected identity without scorecard schema 7 and complete source identity")
+            {
+                return Err("missing container projection metadata lost its exact refusal".into());
+            }
+            for tracked in [&direct, &projected] {
+                let observation = &tracked.cells[0].observations[0];
+                if !observation.canonical_comparisons.is_empty()
+                    || !observation.backend_parity_comparisons.is_empty()
+                {
+                    return Err("container failure manufactured comparison/count credit".into());
+                }
+                let encoded = encoded_cells(tracked)?;
+                let reloaded: TrackedCells =
+                    serde_json::from_str(&encoded).map_err(|e| e.to_string())?;
+                if reloaded.schema != tracked.schema
+                    || reloaded.projection != tracked.projection
+                    || reloaded.cells != tracked.cells
+                {
+                    return Err("container failure changed across stored scorecard readback".into());
+                }
+            }
+            if projected.cells[0].observations[0].event_ids
+                != BTreeSet::from([series.event_id.clone()])
+                || direct.cells[0].observations[0].invocations.len() != 1
+            {
+                return Err(
+                    "container failure lost its exact projection/invocation identity".into(),
+                );
+            }
+        }
+        // Do not promote another well-formed historical no-result kind just
+        // because its enclosing series has the same product-failure tuple.
+        let mut historical = container_series.clone();
+        historical
+            .series
+            .no_verdict_evidence
+            .as_mut()
+            .unwrap()
+            .attempts[0]
+            .kind = SeriesNoVerdictKind::FirstRunRejected;
+        let (projected, outcome) = project_series_fixture(&[historical])?;
+        if !projected.cells[0].observations[0].results.is_empty() || outcome.no_verdict_rows != 1 {
+            return Err("container projection broadened unrelated no-result observations".into());
+        }
+        // The real series admission gate must still reject malformed or
+        // contradictory tuples atomically, including alongside a valid row.
+        for mutation in [
+            "zero",
+            "signal",
+            "timeout",
+            "pass",
+            "comparison",
+            "missing-report",
+            "classification",
+            "duplicate-index",
+        ] {
+            let mut bad = container_series.clone();
+            bad.event_id = format!("fixture-bad-{run}-{mutation}");
+            let evidence = bad.series.no_verdict_evidence.as_mut().unwrap();
+            let disposition = &mut evidence.attempts[0];
+            match mutation {
+                "zero" => disposition.status = Some(0),
+                "signal" => {
+                    disposition.status = None;
+                    disposition.signal = Some(14);
+                }
+                "timeout" => disposition.timed_out = true,
+                "pass" => disposition.attempt_outcome = "PASS".into(),
+                "comparison" => disposition.disposition = SeriesOutcome::Diverged,
+                "missing-report" => disposition.verification_report_sha256 = None,
+                "classification" => bad.series.failure_class = Some(FailureClass::NoResult),
+                "duplicate-index" => evidence.attempts.push(evidence.attempts[0].clone()),
+                _ => unreachable!(),
+            }
+            let mut atomic = TrackedCells {
+                schema: SCHEMA,
+                projection: None,
+                cells: vec![boundary_cell(Vec::new(), CellStatus::Green)],
+            };
+            let before = serde_json::to_vec(&atomic).map_err(|e| e.to_string())?;
+            if apply_series_rows(&root, &mut atomic, &[container_series.clone(), bad], None).is_ok()
+                || serde_json::to_vec(&atomic).map_err(|e| e.to_string())? != before
+            {
+                return Err(format!(
+                    "{run} container series accepted {mutation} or changed state on refusal"
+                ));
+            }
+        }
     }
 
     let mut series_noncanonical = series_unavailable.clone();

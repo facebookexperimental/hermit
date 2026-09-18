@@ -2520,6 +2520,29 @@ fn execute_spec_until(
                             // The producer's classified failure, or a
                             // contradiction in that evidence, cannot be
                             // superseded by a pre-stamped or unrelated report.
+                        } else if let Some(
+                            crate::canonical_verdict::NoResultReason::ContainerFailed(failure),
+                        ) = &report.no_result_reason
+                        {
+                            match failure.require_reporter_exit(
+                                output.status.code(),
+                                std::os::unix::process::ExitStatusExt::signal(&output.status),
+                                output.timeout.is_some(),
+                            ) {
+                                Ok(()) => {
+                                    outcome = "FAIL".into();
+                                    error_kind = None;
+                                    reason = Some(format!(
+                                        "sandbox failed during {:?}: {:?}; no guest disposition or comparison was returned",
+                                        failure.run, failure.disposition
+                                    ));
+                                }
+                                Err(error) => {
+                                    outcome = "ERROR".into();
+                                    error_kind = Some("incomplete-verification-evidence".into());
+                                    reason = Some(error);
+                                }
+                            }
                         } else if report.verdict == Verdict::InfrastructureError {
                             let comparison_error = report
                                 .comparison
@@ -9103,12 +9126,20 @@ esac
         status: i32,
         reason: crate::canonical_verdict::NoResultReason,
     ) -> AttemptResult {
-        let dir = std::env::temp_dir().join(format!(
-            "hermit-runner-no-result-bracket-{}-{status}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        static NEXT_DIRECTORY: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let dir = loop {
+            let sequence = NEXT_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let candidate = std::env::temp_dir().join(format!(
+                "hermit-runner-no-result-bracket-{}-{status}-{sequence}",
+                std::process::id()
+            ));
+            match fs::create_dir(&candidate) {
+                Ok(()) => break candidate,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("creating no-result fixture directory: {error}"),
+            }
+        };
         let verdict = dir.join("verdict.json");
         let mut report = VerificationReport::no_result();
         report.no_result_reason = Some(reason);
@@ -9144,6 +9175,65 @@ esac
         let result = execute_spec(&spec).unwrap();
         fs::remove_dir_all(dir).unwrap();
         result
+    }
+
+    #[test]
+    fn container_failure_is_a_product_crash_without_comparison_credit() {
+        use crate::canonical_verdict::ContainerDisposition;
+        use crate::canonical_verdict::ContainerFailure;
+        use crate::canonical_verdict::NoResultReason;
+        use crate::canonical_verdict::VerificationRun;
+        for run in [VerificationRun::Run1, VerificationRun::Run2] {
+            for disposition in [
+                ContainerDisposition::Exited { code: 0 },
+                ContainerDisposition::Signaled {
+                    signal: 14,
+                    core_dumped: false,
+                },
+            ] {
+                let reason = NoResultReason::ContainerFailed(ContainerFailure { run, disposition });
+                let failed = no_result_with_exit_status(125, reason.clone());
+                assert_eq!(failed.outcome, "FAIL");
+                assert_eq!(failed.error_kind, None);
+                assert_eq!(failed.status, Some(125));
+                assert_eq!(
+                    observed_result(
+                        "verify",
+                        &failed.outcome,
+                        std::slice::from_ref(&failed),
+                        failed.error_kind.as_deref(),
+                        None
+                    ),
+                    Some(ObservedResult::CrashError)
+                );
+                assert_eq!(
+                    failure_class(
+                        &failed.outcome,
+                        Some(ObservedResult::CrashError),
+                        failed.error_kind.as_deref()
+                    ),
+                    Some(FailureClass::ProductFailure)
+                );
+                let report = VerificationReport::from_current_json_slice(
+                    failed.verification_report.as_ref().unwrap().as_bytes(),
+                )
+                .unwrap();
+                assert!(report.require_canonical_comparison().is_err());
+                assert!(report.guest_exit_code.is_none() && report.guest_signal.is_none());
+                let contradicted = no_result_with_exit_status(0, reason);
+                assert_eq!(contradicted.outcome, "ERROR");
+                assert_eq!(
+                    contradicted.error_kind.as_deref(),
+                    Some("incomplete-verification-evidence")
+                );
+                assert!(
+                    contradicted
+                        .reason
+                        .unwrap()
+                        .contains("contradicts Hermit process")
+                );
+            }
+        }
     }
 
     #[test]
