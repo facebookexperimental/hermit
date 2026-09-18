@@ -210,6 +210,7 @@ erasing the host; this table is where the erased identities go back.
 | pinned authority outage, validation DAG node `check.lint_checks` | `devbig014` | On 2026-09-04, an HTTP 504 fetching the check-status authority made `make lint-checks` exit 2 and the node report FAILED; an unreachable review-label contract raised `RuntimeError` and made `make lint-checks` exit 1. Two gates went red on four consecutive hourly runs of a tree that had passed 267/267 earlier that day. |
 | pre-push submodule diagnosis | `devbig014` | On 2026-09-04, a fresh detached worktree with unpopulated submodules made Cargo fail before linting a Python-and-Makefile-only change; the hook incorrectly described that as a compile failure until the diagnosis was made explicit. |
 | `portable` lane, node `test.hermit_unit` | `devbig030` | Warm repeats at `a6b0c37648df`: nextest `-j1` 27.0s and 27.3s; `-j16` 14.4s and 13.7s; `CARGO_BUILD_JOBS=8` unchanged |
+| `refusal_detail_tests::REAL` in `scripts/validate.rs`, run 1838 | `devbig014` | On 2026-09-17, validation of `158a89f6217b25db9540237f9c1e256cdbaf785c` recorded `parity history changes candidate identity` for `portable/backend-parity-c/backend-parity-c/aio-refusal/verify@kvm`, run `validate-ops-tick-158a89f6217b-088d91951315`, outer attempt 2. The original 407-byte diagnostic is preserved unchanged in `tests/fixtures/scorecard-writeback/refusal.txt` and included as test data; its historical artifact path is evidence, not a runtime filesystem dependency. |
 
 ## Hardware-sensitive Cargo tests
 
