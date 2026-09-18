@@ -1,5 +1,5 @@
 {
-  "latest_identity": "95b8e1d88bc919629032fc0bd70b8c80ebc3475021aaaafb94ca19534301e961",
+  "latest_identity": "68112f48ce07501e03dafad5ccd2039c62e3d9d8a35f287e37badacc18f45ca2",
   "release_repository": "rrnewton/hermit",
   "releases": [
     {
@@ -31,6 +31,36 @@
       "recursive_identity_sha256": "6548c51b9b5ab62d0f49f22b0fcc1c75020443edc8e568acf8bb6dafa80e465d",
       "release_title": "Compatibility website snapshot 65493813dc95c708611e42918d09210f78c4aecca0e564909f7e1be12d441045",
       "tag": "compatibility-website-65493813dc95c708611e42918d09210f78c4aecca0e564909f7e1be12d441045"
+    },
+    {
+      "archive_bytes": 44969906,
+      "archive_member_count": 163,
+      "archive_sha256": "71166fbc9b13e0f5917d29c2dffe40174e96ee00eb08b44307ca22944a831cac",
+      "artifacts_sha256": "219da46f2503ecaad1b0917fdcb3dab911283c6e38454cec515a97c8ed90db14",
+      "asset": "compatibility-website-68112f48ce07501e03dafad5ccd2039c62e3d9d8a35f287e37badacc18f45ca2.tar.gz",
+      "build_sha256": "6984e7d917cd1730fe564d1e931264e684d43da684ae901dbf17583bf977db08",
+      "content_tree_sha256": "48fce8cad28fd1c2bceb314130011621d9519301ae647b758ba046ec7ec08645",
+      "counts": {
+        "current_validation_run_row_count": 111,
+        "green_cell_count": 805,
+        "in_manifest_cell_count": 5744,
+        "never_measured_cell_count": 4895,
+        "physical_row_count": 44779,
+        "red_cell_count": 30,
+        "represented_run_count": 51403,
+        "selected_by_full_custom_command_count": 3,
+        "test_count": 359,
+        "validation_history_row_count": 124
+      },
+      "directories": ["assets", "cells", "data", "runs", "tests"],
+      "file_bytes": 80261987,
+      "file_count": 157,
+      "identity": "68112f48ce07501e03dafad5ccd2039c62e3d9d8a35f287e37badacc18f45ca2",
+      "manifest_tree_sha256": "e5b8ba66eac1ce2ca94862c120e18ed2e27b9e977426301d54d0f5d9deebc966",
+      "mode_sha256": "d4eac0e1815277bda1a57e8eadc11c539814561d4777e673b7eca2ab245f6916",
+      "recursive_identity_sha256": "26eefd5ac022963129bb5fad2dfd5e4ceb876bff5007adaf2a54581d2280d3a5",
+      "release_title": "Compatibility website snapshot 68112f48ce07501e03dafad5ccd2039c62e3d9d8a35f287e37badacc18f45ca2",
+      "tag": "compatibility-website-68112f48ce07501e03dafad5ccd2039c62e3d9d8a35f287e37badacc18f45ca2"
     },
     {
       "archive_bytes": 45621287,
