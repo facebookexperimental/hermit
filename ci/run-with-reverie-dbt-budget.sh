@@ -356,7 +356,12 @@ fi
 # manifest/toolchain recipe inputs. Keep the same CMAKE/CMAKE_GENERATOR selection,
 # 1050 effective-job-seconds and 16-job clamp. Source identity carry only;
 # no new calibration.
-expected_pin=429962666ad7e9ef05877b74b585a571f57ef0c4
+# CARRY TO 91110d249ffd8957267d71fab8c83d9636105efe: the landed KVM memory and process
+# startup changes preserve the exact DynamoRIO SDK build.rs/vendor and root
+# manifest/toolchain recipe inputs. Keep the same CMAKE/CMAKE_GENERATOR selection,
+# 1050 effective-job-seconds and 16-job clamp. Source identity carry only;
+# no new calibration.
+expected_pin=91110d249ffd8957267d71fab8c83d9636105efe
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
