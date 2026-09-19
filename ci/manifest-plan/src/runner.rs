@@ -11,6 +11,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Child;
 use std::process::Command;
 use std::process::ExitStatus;
 use std::process::Stdio;
@@ -2848,26 +2849,15 @@ fn wait4_process(pid: u32, options: libc::c_int) -> Result<Option<(ExitStatus, u
     }
 }
 
-/// Live user-plus-system CPU consumed by one process group, including CPU from
-/// children already reaped by a still-live member.
-///
-/// `wait4` is the authoritative final measurement, but it becomes available
-/// only after the process exits and therefore cannot enforce a budget. Reuse
-/// dagrun's process-group reader: its one short-lived snapshot is shared by all
-/// concurrent cells, rather than making every cell enumerate the host's entire
-/// `/proc` tree on every poll.
-fn process_group_cpu_usage_usec(pgid: u32) -> Result<Option<u64>, String> {
-    dagrun::proccpu::subtree_cpu_seconds(pgid)
-        .map(|seconds| {
-            let usec = seconds * 1_000_000.0;
-            if !usec.is_finite() || usec.is_sign_negative() || usec > u64::MAX as f64 {
-                return Err(format!(
-                    "process group {pgid} returned invalid live CPU seconds {seconds}"
-                ));
-            }
-            Ok(usec as u64)
-        })
-        .transpose()
+fn live_cpu_usage_usec(pgid: u32, seconds: f64) -> Result<u64, String> {
+    let usec = seconds * 1_000_000.0;
+    // u64::MAX rounds up to 2^64 as f64, so that boundary is exclusive.
+    if !usec.is_finite() || usec.is_sign_negative() || usec >= u64::MAX as f64 {
+        return Err(format!(
+            "process group {pgid} returned invalid live CPU seconds {seconds}"
+        ));
+    }
+    Ok(usec as u64)
 }
 
 fn stop_process_group(pid: u32) -> Result<(ExitStatus, u64), String> {
@@ -2923,11 +2913,23 @@ fn execute_process_with_cpu_poll_interval(
     stderr: &Path,
     limits: ProcessLimits,
 ) -> Result<ProcessOutput, String> {
-    let ProcessLimits {
-        deadline,
-        cpu_budget_usec,
-        cpu_poll_interval,
-    } = limits;
+    let child = spawn_process(cwd, program, args, env, stdout, stderr)?;
+    monitor_process(
+        child,
+        limits,
+        |pid| dagrun::proccpu::ProcessGroupCpu::new(pid).map_err(|error| error.to_string()),
+        |reader| reader.seconds().map_err(|error| error.to_string()),
+    )
+}
+
+fn spawn_process(
+    cwd: &Path,
+    program: &str,
+    args: &[String],
+    env: &BTreeMap<String, String>,
+    stdout: &Path,
+    stderr: &Path,
+) -> Result<Child, String> {
     let stdout_file = File::create(stdout).map_err(|e| format!("{}: {e}", stdout.display()))?;
     let stderr_file = File::create(stderr).map_err(|e| format!("{}: {e}", stderr.display()))?;
     let mut command = Command::new(program);
@@ -2946,10 +2948,27 @@ fn execute_process_with_cpu_poll_interval(
             Ok(())
         });
     }
-    let child = command
+    command
         .spawn()
-        .map_err(|e| format!("cannot execute {program}: {e}"))?;
+        .map_err(|e| format!("cannot execute {program}: {e}"))
+}
+
+fn monitor_process<R>(
+    child: Child,
+    limits: ProcessLimits,
+    register: impl FnOnce(u32) -> Result<R, String>,
+    mut sample: impl FnMut(&R) -> Result<f64, String>,
+) -> Result<ProcessOutput, String> {
+    let ProcessLimits {
+        deadline,
+        cpu_budget_usec,
+        cpu_poll_interval,
+    } = limits;
     let pid = child.id();
+    // Authenticate once at spawn and retain the invocation owner through the
+    // final wait/stop. Do not retry a failed registration using a numeric PID.
+    // Disabled CPU accounting neither registers nor samples a reader.
+    let cpu_reader = cpu_budget_usec.map(|_| register(pid));
     let mut next_cpu_poll = Instant::now() + cpu_poll_interval;
     let mut cpu_accounting_missing_since = None;
     loop {
@@ -2968,18 +2987,29 @@ fn execute_process_with_cpu_poll_interval(
             (Some(ProcessTimeout::Wall), None)
         } else if let Some(limit) = cpu_budget_usec.filter(|_| now >= next_cpu_poll) {
             next_cpu_poll = now + cpu_poll_interval;
-            match process_group_cpu_usage_usec(pid)? {
-                Some(used) => {
+            let observation = match &cpu_reader {
+                Some(Ok(reader)) => sample(reader)
+                    .map_err(|error| format!("sampling: {error}"))
+                    .and_then(|seconds| live_cpu_usage_usec(pid, seconds)),
+                Some(Err(error)) => Err(format!("registration: {error}")),
+                None => Err("CPU budget has no invocation reader".into()),
+            };
+            match observation {
+                Ok(used) => {
                     cpu_accounting_missing_since = None;
                     ((used >= limit).then_some(ProcessTimeout::Cpu), Some(used))
                 }
-                None => {
+                Err(reason) => {
                     let missing_since = cpu_accounting_missing_since.get_or_insert(now);
                     if now.duration_since(*missing_since) >= CELL_CPU_ACCOUNTING_GRACE {
-                        let _ = stop_process_group(pid);
-                        return Err(format!(
-                            "cannot measure live CPU for process group {pid}; stopped it rather than silently disabling its CPU budget"
-                        ));
+                        return match stop_process_group(pid) {
+                            Ok(_) => Err(format!(
+                                "cannot measure live CPU for process group {pid}: {reason}; stopped and reaped its leader rather than silently disabling its CPU budget"
+                            )),
+                            Err(error) => Err(format!(
+                                "cannot measure live CPU for process group {pid}: {reason}; could not confirm leader stop/reap: {error}"
+                            )),
+                        };
                     }
                     (None, None)
                 }
@@ -5962,6 +5992,7 @@ mod tests {
         }
         let child = command.spawn().unwrap();
         let pid = child.id();
+        let reader = dagrun::proccpu::ProcessGroupCpu::new(pid).unwrap();
         // `stop_process_group` below owns the matching wait4; discard only the
         // std handle so the test exercises the production reaper.
         drop(child);
@@ -5973,15 +6004,293 @@ mod tests {
             5_000_000,
         );
         assert_eq!(unrelated.timeout, Some(ProcessTimeout::Wall));
-        let used = process_group_cpu_usage_usec(pid)
-            .unwrap()
-            .expect("the launched sleeper must remain measurable");
+        let used = live_cpu_usage_usec(
+            pid,
+            reader
+                .seconds()
+                .expect("the launched sleeper must remain measurable"),
+        )
+        .unwrap();
         assert!(
             used < 100_000,
             "an idle process group unexpectedly included unrelated CPU: {used} usec"
         );
         stop_process_group(pid).unwrap();
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn cpu_reader_test_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        root
+    }
+
+    fn spawn_cpu_reader_fixture(root: &Path, label: &str, script: &str) -> Child {
+        spawn_process(
+            root,
+            "/bin/sh",
+            &["-c".into(), script.into()],
+            &BTreeMap::new(),
+            &root.join(format!("{label}.stdout")),
+            &root.join(format!("{label}.stderr")),
+        )
+        .unwrap()
+    }
+
+    fn owned_child_is_reaped(pid: u32) -> bool {
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+        let error = std::io::Error::last_os_error();
+        waited == -1 && error.raw_os_error() == Some(libc::ECHILD)
+    }
+
+    #[test]
+    fn owned_cpu_reader_lives_until_each_invocation_is_reaped() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct ObservedReader {
+            reader: dagrun::proccpu::ProcessGroupCpu,
+            pid: u32,
+            registered: Instant,
+            dropped_after_reap: Rc<Cell<bool>>,
+        }
+        impl Drop for ObservedReader {
+            fn drop(&mut self) {
+                self.dropped_after_reap.set(owned_child_is_reaped(self.pid));
+            }
+        }
+
+        let root = cpu_reader_test_root("owned-reader-lifetime");
+        let registered_invocations = Cell::new(0);
+        for label in ["first", "second"] {
+            let done = root.join(format!("{label}.done"));
+            let child = spawn_cpu_reader_fixture(
+                &root,
+                label,
+                &format!("while [ ! -f {label}.done ]; do sleep 0.02; done"),
+            );
+            let pid = child.id();
+            let registrations = Cell::new(0);
+            let samples = Cell::new(0);
+            let dropped_after_reap = Rc::new(Cell::new(false));
+            let output = monitor_process(
+                child,
+                ProcessLimits {
+                    deadline: Instant::now() + Duration::from_secs(5),
+                    cpu_budget_usec: Some(5_000_000),
+                    cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
+                },
+                |registered_pid| {
+                    assert_eq!(registered_pid, pid);
+                    registrations.set(registrations.get() + 1);
+                    registered_invocations.set(registered_invocations.get() + 1);
+                    dagrun::proccpu::ProcessGroupCpu::new(pid)
+                        .map(|reader| ObservedReader {
+                            reader,
+                            pid,
+                            registered: Instant::now(),
+                            dropped_after_reap: Rc::clone(&dropped_after_reap),
+                        })
+                        .map_err(|error| error.to_string())
+                },
+                |reader| {
+                    assert!(!dropped_after_reap.get());
+                    let seconds = reader.reader.seconds().map_err(|error| error.to_string())?;
+                    samples.set(samples.get() + 1);
+                    if samples.get() >= 3
+                        && reader.registered.elapsed() >= Duration::from_millis(700)
+                    {
+                        fs::write(&done, b"complete").map_err(|error| error.to_string())?;
+                    }
+                    Ok(seconds)
+                },
+            )
+            .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.timeout, None);
+            assert_eq!(registrations.get(), 1);
+            assert!(samples.get() >= 3);
+            assert!(done.is_file(), "reader must outlive the shared cache TTL");
+            assert!(dropped_after_reap.get());
+            assert!(owned_child_is_reaped(pid));
+        }
+        // Reaped invocations may legitimately reuse a numeric PID. Each still
+        // constructs and drops its own reader through the factory above.
+        assert_eq!(registered_invocations.get(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unavailable_cpu_registration_sampling_and_conversion_reap_the_owned_child() {
+        use std::cell::Cell;
+
+        let root = cpu_reader_test_root("unavailable-reader");
+        for failure in ["registration", "sampling", "conversion"] {
+            let child = spawn_cpu_reader_fixture(&root, failure, "exec sleep 20");
+            let pid = child.id();
+            let registrations = Cell::new(0);
+            let samples = Cell::new(0);
+            let started = Instant::now();
+            let error = monitor_process(
+                child,
+                ProcessLimits {
+                    deadline: started + Duration::from_secs(5),
+                    cpu_budget_usec: Some(5_000_000),
+                    cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
+                },
+                |registered_pid| {
+                    assert_eq!(registered_pid, pid);
+                    registrations.set(registrations.get() + 1);
+                    if failure == "registration" {
+                        Err("fixture registration unavailable".into())
+                    } else {
+                        dagrun::proccpu::ProcessGroupCpu::new(pid)
+                            .map_err(|error| error.to_string())
+                    }
+                },
+                |_| {
+                    samples.set(samples.get() + 1);
+                    if failure == "sampling" {
+                        Err("fixture sample unavailable".into())
+                    } else {
+                        Ok(f64::NAN)
+                    }
+                },
+            )
+            .map(|_| ())
+            .expect_err("unavailable accounting must refuse the command");
+            assert!(started.elapsed() >= CELL_CPU_ACCOUNTING_GRACE);
+            assert_eq!(
+                registrations.get(),
+                1,
+                "never retry numeric-PID registration"
+            );
+            if failure == "registration" {
+                assert_eq!(samples.get(), 0);
+                assert!(error.contains("registration: fixture registration unavailable"));
+            } else {
+                assert!(samples.get() > 1);
+                if failure == "sampling" {
+                    assert!(error.contains("sampling: fixture sample unavailable"));
+                } else {
+                    assert!(error.contains("invalid live CPU seconds NaN"));
+                }
+            }
+            assert!(error.contains("stopped and reaped its leader"), "{error}");
+            assert!(owned_child_is_reaped(pid), "{failure}: {error}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn completed_or_cpu_disabled_commands_do_not_require_live_cpu_samples() {
+        use std::cell::Cell;
+
+        let root = cpu_reader_test_root("optional-reader");
+        for cpu_budget_usec in [None, Some(5_000_000)] {
+            let child = spawn_cpu_reader_fixture(&root, "complete", "exit 0");
+            let pid = child.id();
+            let registrations = Cell::new(0);
+            let output = monitor_process(
+                child,
+                ProcessLimits {
+                    deadline: Instant::now() + Duration::from_secs(5),
+                    cpu_budget_usec,
+                    cpu_poll_interval: Duration::from_secs(5),
+                },
+                |_| -> Result<(), String> {
+                    assert!(
+                        cpu_budget_usec.is_some(),
+                        "disabled accounting must not register"
+                    );
+                    registrations.set(registrations.get() + 1);
+                    Err("fixture registration unavailable".into())
+                },
+                |_| panic!("wait4 completion must precede live sampling"),
+            )
+            .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.timeout, None);
+            assert_eq!(registrations.get(), usize::from(cpu_budget_usec.is_some()));
+            assert!(owned_child_is_reaped(pid));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_valid_cpu_sample_resets_the_unavailable_grace() {
+        let root = cpu_reader_test_root("reader-grace-reset");
+        let done = root.join("done");
+        let child =
+            spawn_cpu_reader_fixture(&root, "reset", "while [ ! -f done ]; do sleep 0.02; done");
+        let pid = child.id();
+        let mut first_missing = None;
+        let mut valid_samples = 0;
+        let mut missing_after_valid = 0;
+        let output = monitor_process(
+            child,
+            ProcessLimits {
+                deadline: Instant::now() + Duration::from_secs(5),
+                cpu_budget_usec: Some(5_000_000),
+                cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
+            },
+            |pid| dagrun::proccpu::ProcessGroupCpu::new(pid).map_err(|error| error.to_string()),
+            |reader| {
+                let first = *first_missing.get_or_insert_with(Instant::now);
+                if valid_samples == 0 && first.elapsed() >= Duration::from_millis(500) {
+                    let seconds = reader.seconds().map_err(|error| error.to_string())?;
+                    valid_samples += 1;
+                    return Ok(seconds);
+                }
+                if valid_samples > 0 {
+                    missing_after_valid += 1;
+                    if first.elapsed() >= CELL_CPU_ACCOUNTING_GRACE + Duration::from_millis(200) {
+                        fs::write(&done, b"complete").map_err(|error| error.to_string())?;
+                    }
+                }
+                Err("fixture transient sample unavailable".into())
+            },
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.timeout, None);
+        assert_eq!(valid_samples, 1);
+        assert!(missing_after_valid > 0);
+        assert!(
+            done.is_file(),
+            "must survive beyond the original missing grace"
+        );
+        assert!(owned_child_is_reaped(pid));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn live_cpu_conversion_refuses_unrepresentable_values() {
+        assert_eq!(live_cpu_usage_usec(42, 0.0), Ok(0));
+        assert_eq!(live_cpu_usage_usec(42, 0.125), Ok(125_000));
+        for seconds in [
+            -0.0,
+            -1.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            u64::MAX as f64 / 1_000_000.0,
+        ] {
+            assert!(live_cpu_usage_usec(42, seconds).is_err(), "{seconds}");
+        }
+        // Converting the adjacent float to seconds and back rounds up to 2^64.
+        let adjacent_usec = f64::from_bits((u64::MAX as f64).to_bits() - 1);
+        assert!(live_cpu_usage_usec(42, adjacent_usec / 1_000_000.0).is_err());
+        let representable_usec = f64::from_bits((u64::MAX as f64).to_bits() - 2);
+        assert!(live_cpu_usage_usec(42, representable_usec / 1_000_000.0).is_ok());
     }
 
     fn bounded_spec(root: &Path, label: &str, script: &str) -> CellRunSpec {

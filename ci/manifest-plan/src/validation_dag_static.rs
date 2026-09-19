@@ -206,7 +206,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tests to regular crates and nine to Hermit's library/binary selection.
     // Nine admission-context/nested-ID controls extend the measured 533-test set.
     // Six portable-context controls extend the measured 542-test set.
-    ("test.regular_crates", 548),
+    // Five owned CPU-reader controls retain all 548 prior selected identities.
+    ("test.regular_crates", 553),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     ("test.hermit_unit", 710),
     ("test.detcore_unit", 728),
@@ -241,7 +242,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 24),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 548),
+    ("test.regular_crates_on_host", 553),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];
