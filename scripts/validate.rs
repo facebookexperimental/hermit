@@ -13721,14 +13721,9 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         .ok_or("retry bounds: privileged lane is absent")?;
     for (tag, expected) in [
         ("privileged-only-test.pmu_buck_chaos_cases", 6usize),
-        // 25, not 24, since hermit de6a9910e "Align KVM validation selections with
-        // measured inventories" added the kvm-native-test-support feature. That
-        // commit measured 694/698/25 and retained all 689/681/24 prior identities,
-        // so this is one ADDED selection rather than a changed one. It bumped
-        // ci/dag/validate.json and left this table behind, which is what made
-        // gate.manifest fail deterministically -- the guard was right and the
-        // copy was stale.
-        ("privileged-only-test.cli_kvm", 25usize),
+        // All 27 run_kvm_ CLI controls plus the initialized-VM setup control.
+        // Keep this guard aligned with the counted selection in the canonical DAG.
+        ("privileged-only-test.cli_kvm", 28usize),
     ] {
         let step = privileged
             .steps
