@@ -21,7 +21,7 @@ fn inherited_time_survives_complete_detcore_rpc_encoding() {
     // intentionally private to Detcore. Both actual startup request shapes must
     // retain the nonzero baseline and the fields that follow the clock.
     for request in [
-        serde_json::json!({"StartNewThread": [child, child, null]}),
+        serde_json::json!({"StartNewThread": [child, child, null, null]}),
         serde_json::json!({"CreateVforkChildThread": [
             parent, parent, child, 0,
             CloneFlags::CLONE_VFORK | CloneFlags::CLONE_VM,
