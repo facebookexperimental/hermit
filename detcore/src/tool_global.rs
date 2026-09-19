@@ -9,6 +9,7 @@
 //! Detcore tool global state, and centralized methods corresponding to the centralized portion of
 //! the Detcore tool.
 
+mod parked;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -39,6 +40,9 @@ use detcore_model::summary::TimesliceStats;
 use nix::sys::signal;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
+pub(crate) use parked::parked_wait_request;
+pub(crate) use parked::polled_read_request;
+pub(crate) use parked::signal_dequeued;
 use reverie::GlobalRPC;
 use reverie::GlobalTool;
 use reverie::Guest;
@@ -77,6 +81,10 @@ use crate::scheduler::SchedValue;
 use crate::scheduler::Scheduler;
 use crate::scheduler::ThreadNextTurn;
 use crate::scheduler::entropy_to_priority;
+use crate::scheduler::parked::*;
+use crate::scheduler::real_timer::DequeueAck;
+use crate::scheduler::real_timer::ItimerSnapshot;
+use crate::scheduler::real_timer::TimerFailure;
 use crate::scheduler::runqueue::FIRST_PRIORITY;
 use crate::scheduler::runqueue::LAST_PRIORITY;
 use crate::scheduler::runqueue::REPLAY_DEFERRED_PRIORITY;
@@ -880,8 +888,38 @@ impl GlobalTool for GlobalState {
         GlobalState::initialize(cfg, true)
     }
 
+    fn install_backend_signal_control(
+        &self,
+        control: Option<reverie::BackendSignalControl>,
+    ) -> Result<reverie::BackendSignalControlMode, reverie::Error> {
+        self.sched.lock().unwrap().install_signal_control(control)
+    }
+
+    fn authorize_backend_signal_boundary(
+        &self,
+        task: reverie::SignalTaskIdentity,
+    ) -> Result<Option<reverie::SignalDeliveryPermit>, reverie::Error> {
+        self.sched.lock().unwrap().authorize_signal_boundary(task)
+    }
+
+    async fn on_backend_signal_boundary(
+        &self,
+        receipt: reverie::SignalBoundaryReceipt,
+    ) -> Result<(), reverie::Error> {
+        self.sched.lock().unwrap().consume_signal_boundary(receipt)
+    }
+
     fn report_backend_failure(&self, event: reverie::BackendFailure) {
-        let wake = self.sched.lock().unwrap().report_backend_failure(event);
+        let (wake, deferred) = {
+            let mut sched = self.sched.lock().unwrap();
+            (
+                sched.report_backend_failure(event),
+                sched.take_signal_failure_wakes(),
+            )
+        };
+        for wake in deferred {
+            let _ = wake.send(());
+        }
         if let Some(wake) = wake {
             // No waiter can begin consuming cleanup until the scheduler has
             // closed its selected transaction under the grant/commit mutex.
@@ -900,6 +938,17 @@ impl GlobalTool for GlobalState {
         let dtid = DetTid::from_raw(from.into()); // TODO(T78538674): FIXME
         let (guest_time, request_mm, request) = gr;
         let time_from_guest = guest_time.as_nanos();
+        if let GlobalRequest::SignalDequeued {
+            detpid,
+            identity,
+            dequeue,
+        } = &request
+        {
+            return self
+                .recv_signal_dequeued(dtid, request_mm, guest_time, *detpid, *identity, *dequeue)
+                .await;
+        }
+
         let is_deregister = matches!(&request, GlobalRequest::DeregisterThread(_));
         let consuming_cleanup =
             is_deregister || matches!(&request, GlobalRequest::RobustListWakes(_));
@@ -1015,6 +1064,62 @@ impl GlobalTool for GlobalState {
         // threads' own clock happens through shared memory.)
         #[allow(clippy::unit_arg)]
         let resp = match request {
+            GlobalRequest::SignalDequeued { .. } => {
+                unreachable!("consuming path handled before ordinary cancellation")
+            }
+            GlobalRequest::ParkedRequest(rs, pid, capability) => {
+                let (response, _) = self
+                    .recv_resources_with_origin(
+                        from,
+                        pid,
+                        rs,
+                        Some(request_mm),
+                        RpcOrigin::DirectRequestResources,
+                        capability,
+                    )
+                    .await;
+                match response {
+                    SchedulerRpcResult::Continue(r) => R::ParkedRequest(r),
+                    SchedulerRpcResult::ThreadExited => R::ThreadExited,
+                }
+            }
+            GlobalRequest::ResumeParkedRequest {
+                ticket,
+                current_site,
+            } => {
+                self.recv_resume_parked(from, request_mm, ticket, current_site)
+                    .await
+            }
+            GlobalRequest::FinishParkedObservation {
+                wait,
+                lease,
+                site,
+                finish,
+            } => {
+                let ack = Ivar::new();
+                let intent = ControlIntent::Finish {
+                    wait,
+                    lease,
+                    site,
+                    finish,
+                    ack: ack.clone(),
+                };
+                let posted = self
+                    .sched
+                    .lock()
+                    .unwrap()
+                    .post_control(dtid, request_mm, intent);
+                if let Err(error) = posted {
+                    self.sched.lock().unwrap().fail_parked(dtid, error);
+                    return (None, R::ThreadExited);
+                }
+                R::FinishParkedObservation(ack.await)
+            }
+            GlobalRequest::ParkedProtocolFailure(error) => {
+                self.sched.lock().unwrap().fail_parked(dtid, error);
+                return (None, R::ThreadExited);
+            }
+
             GlobalRequest::RequestResources(rs, pid) => {
                 let (response, _endtime) = self
                     .recv_request_resources(from, pid, rs, Some(request_mm))
@@ -1077,8 +1182,42 @@ impl GlobalTool for GlobalState {
                 }
                 R::CancelExec(())
             }
-            GlobalRequest::MarkPastFirstExecve => {
-                let _sched = self.lock_rpc_scheduler(false).await;
+            GlobalRequest::MarkPastFirstExecve(signal_identity) => {
+                let mut sched = self.lock_rpc_scheduler(false).await;
+                if self.cfg.kvm_shared_dequeue_timers {
+                    let result = (|| {
+                        let identity = signal_identity.ok_or(ProtocolFailure::Identity)?;
+                        let pid = sched
+                            .registered_process(dtid)
+                            .ok_or(ProtocolFailure::Identity)?;
+                        let mut pending = self.pending_exec_states.lock().unwrap();
+                        if let Some(prepared) = pending.get(&pid) {
+                            if prepared.caller != dtid || prepared.process != pid {
+                                return Err(ProtocolFailure::Identity);
+                            }
+                            sched.complete_signal_exec(
+                                pid,
+                                dtid,
+                                prepared.mm,
+                                request_mm,
+                                identity,
+                            )?;
+                            pending.remove(&pid);
+                        } else {
+                            // A backend that re-enters thread-start already bound
+                            // the new image. A lifecycle notification alone cannot
+                            // authorize a new address space or backend generation.
+                            sched
+                                .real_timers
+                                .validate_task(pid, dtid, request_mm, identity)?;
+                        }
+                        Ok(())
+                    })();
+                    if let Err(error) = result {
+                        sched.fail_parked(dtid, error);
+                        return (None, R::ThreadExited);
+                    }
+                }
                 self.past_first_execve.store(true, SeqCst);
                 let overrides = self
                     .post_exec_fd_blocking
@@ -1209,9 +1348,16 @@ impl GlobalTool for GlobalState {
                 SchedulerRpcResult::ThreadExited => R::ThreadExited,
             },
             // Requested by the child thread itself:
-            GlobalRequest::StartNewThread(dettid, detpid, physical_ids) => {
+            GlobalRequest::StartNewThread(dettid, detpid, physical_ids, signal_identity) => {
                 match self
-                    .recv_start_new_thread(from, dettid, detpid, request_mm, physical_ids)
+                    .recv_start_new_thread(
+                        from,
+                        dettid,
+                        detpid,
+                        request_mm,
+                        physical_ids,
+                        signal_identity,
+                    )
                     .await
                 {
                     SchedulerRpcResult::Continue(history) => R::StartNewThread(history),
@@ -1310,11 +1456,14 @@ impl GlobalTool for GlobalState {
             // TODO-HUMAN-REVIEW(PR-841): Review logical alarm query RPC.
             GlobalRequest::AlarmRemaining(dpid) => {
                 let now = self.global_time.lock().unwrap().as_nanos();
-                R::AlarmRemaining(
-                    self.lock_rpc_scheduler(false)
-                        .await
-                        .alarm_remaining(dpid, now),
-                )
+                let mut sched = self.lock_rpc_scheduler(false).await;
+                match sched.itimer_snapshot(dpid, now) {
+                    Ok(snapshot) => R::AlarmRemaining(snapshot),
+                    Err(error) => {
+                        sched.fail_parked(dtid, ProtocolFailure::Timer(error));
+                        R::ThreadExited
+                    }
+                }
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#869)
@@ -1472,13 +1621,15 @@ impl GlobalTool for GlobalState {
 }
 
 impl GlobalState {
-    async fn recv_request_resources(
+    async fn recv_resources_with_origin(
         &self,
         from: Tid,
         detpid: DetPid,
         rs: Resources,
         request_mm: Option<MmId>,
-    ) -> (SchedulerRpcResult<ResumeStatus>, Option<LogicalTime>) {
+        rpc: RpcOrigin,
+        capability: ControlCapability,
+    ) -> (SchedulerRpcResult<ResourceReply>, Option<LogicalTime>) {
         let dettid = DetTid::from_raw(from.into()); // TODO(T78538674): FIXME
 
         let resp2 = {
@@ -1498,6 +1649,19 @@ impl GlobalState {
                 "[detcore, dtid {}] ResourceRequest, filling request into {}",
                 &dettid, &nextturn.req
             );
+            if let Some(mm) = request_mm
+                && let Err(error) = sched.install_resource_origin(
+                    dettid,
+                    ResourceOrigin {
+                        rpc,
+                        mm,
+                        control: capability,
+                    },
+                )
+            {
+                sched.fail_parked(dettid, error);
+                return (SchedulerRpcResult::ThreadExited, None);
+            }
             sched.request_put(&nextturn.req, rs.clone(), &self.global_time);
             nextturn.resp
         };
@@ -1506,6 +1670,19 @@ impl GlobalState {
             dettid, &resp2, rs
         );
         let answer = resp2.get().await; // Block on the scheduler allowing our guest to proceed.
+        self.finish_resource_response(from, detpid, rs, request_mm, answer)
+            .await
+    }
+
+    async fn finish_resource_response(
+        &self,
+        from: Tid,
+        detpid: DetPid,
+        rs: Resources,
+        request_mm: Option<MmId>,
+        answer: SchedResponse,
+    ) -> (SchedulerRpcResult<ResourceReply>, Option<LogicalTime>) {
+        let dettid = DetTid::from_raw(from.as_raw());
         let request_became_stale = {
             let sched = self.lock_rpc_scheduler(false).await;
             sched.thread_is_logically_killed(dettid)
@@ -1522,6 +1699,14 @@ impl GlobalState {
                 dettid
             );
             return (SchedulerRpcResult::ThreadExited, None);
+        }
+        // A control spends only this response transport, not the resource
+        // operation. It must precede exit-group or normal grant side effects.
+        if let SchedResponse::ObserveSignal(control) = answer {
+            return (
+                SchedulerRpcResult::Continue(ResourceReply::ObserveSignal(control)),
+                None,
+            );
         }
         if let Some((true, process, mm)) = rs.exit_identity() {
             info!(
@@ -1552,6 +1737,13 @@ impl GlobalState {
         }
 
         match answer {
+            SchedResponse::ObserveSignal(_) => {
+                self.sched
+                    .lock()
+                    .unwrap()
+                    .fail_parked(dettid, ProtocolFailure::UnexpectedControl);
+                (SchedulerRpcResult::ThreadExited, None)
+            }
             // In this context, SchedValue
             SchedResponse::Go(Some(schedval)) => {
                 trace!(
@@ -1565,7 +1757,7 @@ impl GlobalState {
                     SchedValue::Value(timeslice) => Some(LogicalTime::from_nanos(timeslice)),
                 };
                 (
-                    SchedulerRpcResult::Continue(ResumeStatus::Normal),
+                    SchedulerRpcResult::Continue(ResourceReply::Grant(ResumeStatus::Normal)),
                     endtime_update,
                 )
             }
@@ -1574,7 +1766,10 @@ impl GlobalState {
                     "[dtid {}] resources granted but no timeslice specified",
                     dettid,
                 );
-                (SchedulerRpcResult::Continue(ResumeStatus::Normal), None)
+                (
+                    SchedulerRpcResult::Continue(ResourceReply::Grant(ResumeStatus::Normal)),
+                    None,
+                )
             }
             SchedResponse::Signaled(signal) => {
                 trace!(
@@ -1582,7 +1777,9 @@ impl GlobalState {
                     dettid,
                 );
                 (
-                    SchedulerRpcResult::Continue(ResumeStatus::Signaled(signal)),
+                    SchedulerRpcResult::Continue(ResourceReply::Grant(ResumeStatus::Signaled(
+                        signal,
+                    ))),
                     None,
                 )
             }
@@ -1674,6 +1871,7 @@ impl GlobalState {
                     child_tid_addr: ctid,
                     req: Ivar::new(),
                     resp: Ivar::new(),
+                    protocol: Default::default(),
                 });
 
             {
@@ -1785,9 +1983,15 @@ impl GlobalState {
                 Permission::W,
             );
             if matches!(
-                self.recv_request_resources(rpc_sender, parent_detpid, rs, Some(request_mm))
-                    .await
-                    .0,
+                self.recv_grant_resources(
+                    rpc_sender,
+                    parent_detpid,
+                    rs,
+                    Some(request_mm),
+                    RpcOrigin::ParentContinue
+                )
+                .await
+                .0,
                 SchedulerRpcResult::ThreadExited
             ) {
                 return SchedulerRpcResult::ThreadExited;
@@ -1806,6 +2010,7 @@ impl GlobalState {
         detpid: DetPid,
         request_mm: MmId,
         physical_ids: Option<(i32, i32)>,
+        signal_identity: Option<reverie::SignalTaskIdentity>,
     ) -> SchedulerRpcResult<Option<ThreadHistory>> {
         let mut tries: u64 = 0;
         // TODO: eliminate this loop. Could instead signal with an ivar.
@@ -1872,6 +2077,33 @@ impl GlobalState {
                 sched.logically_kill_thread(&dettid, &detpid, request_mm);
                 return SchedulerRpcResult::ThreadExited;
             }
+            if self.cfg.kvm_shared_dequeue_timers {
+                let binding = signal_identity
+                    .ok_or(TimerFailure::Identity)
+                    .and_then(|identity| {
+                        if from.as_raw() != dettid.as_raw()
+                            || sched.registered_process(dettid) != Some(detpid)
+                        {
+                            return Err(TimerFailure::Identity);
+                        }
+                        sched.real_timers.bind(detpid, dettid, request_mm, identity)
+                    });
+                if let Err(error) = binding {
+                    sched.fail_parked(dettid, ProtocolFailure::Timer(error));
+                    return SchedulerRpcResult::ThreadExited;
+                }
+            }
+            if let Err(error) = sched.install_resource_origin(
+                dettid,
+                ResourceOrigin {
+                    rpc: RpcOrigin::ThreadStart,
+                    mm: request_mm,
+                    control: ControlCapability::None,
+                },
+            ) {
+                sched.fail_parked(dettid, error);
+                return SchedulerRpcResult::ThreadExited;
+            }
             sched.request_put(&nextturn.req, rsrcs, &self.global_time);
             break nextturn.resp;
         };
@@ -1879,7 +2111,14 @@ impl GlobalState {
             "[detcore, dtid {}] New thread will now wait for response on {}...",
             &dettid, &response_ivar
         );
-        let _answer = response_ivar.get().await;
+        let answer = response_ivar.get().await;
+        if matches!(answer, SchedResponse::ObserveSignal(_)) {
+            self.sched
+                .lock()
+                .unwrap()
+                .fail_parked(dettid, ProtocolFailure::UnexpectedControl);
+            return SchedulerRpcResult::ThreadExited;
+        }
         let request_became_stale = {
             let sched = self.lock_rpc_scheduler(false).await;
             sched.thread_is_logically_killed(dettid)
@@ -2019,6 +2258,17 @@ impl GlobalState {
                         );
                         return Some(SchedValue::Value(0));
                     }
+                    if let Err(error) = sched.install_resource_origin(
+                        dettid,
+                        ResourceOrigin {
+                            rpc: RpcOrigin::FutexAction,
+                            mm,
+                            control: ControlCapability::None,
+                        },
+                    ) {
+                        sched.fail_parked(dettid, error);
+                        return Some(SchedValue::Value(nix::errno::Errno::EINTR as u64));
+                    }
                     sched.sleep_futex_waiter(&dettid, futexid, maybe_timeout, mask);
                     // block on ivar, below
                 }
@@ -2047,6 +2297,14 @@ impl GlobalState {
                 answer
             }
             SchedResponse::Signaled(_) => Some(SchedValue::Value(nix::errno::Errno::EINTR as u64)),
+            SchedResponse::ObserveSignal(_) => {
+                self.sched
+                    .lock()
+                    .unwrap()
+                    .fail_parked(dettid, ProtocolFailure::UnexpectedControl);
+                self.wait_for_backend_failure().await;
+                futures::future::pending().await
+            }
         }
     }
 
@@ -2241,7 +2499,13 @@ impl GlobalState {
                 let mut rsrcs = Resources::new(ev.dettid);
                 rsrcs.insert(ResourceID::TraceReplay, Permission::RW);
                 let (response, timeslice) = self
-                    .recv_request_resources(tid, detpid, rsrcs, Some(request_mm))
+                    .recv_grant_resources(
+                        tid,
+                        detpid,
+                        rsrcs,
+                        Some(request_mm),
+                        RpcOrigin::TraceSchedEvent,
+                    )
                     .await;
                 if response == SchedulerRpcResult::ThreadExited {
                     return SchedulerRpcResult::ThreadExited;
@@ -2344,14 +2608,13 @@ impl GlobalState {
         if sched.thread_is_logically_killed(dettid) || !sched.rpc_incarnation_matches(dettid, mm) {
             return SchedulerRpcResult::ThreadExited;
         }
-        SchedulerRpcResult::Continue(sched.register_alarm(
-            detpid,
-            dettid,
-            now,
-            duration,
-            interval,
-            alarm_signal(sig),
-        ))
+        match sched.replace_real_timer(detpid, dettid, now, duration, interval, alarm_signal(sig)) {
+            Ok(old) => SchedulerRpcResult::Continue(old),
+            Err(error) => {
+                sched.fail_parked(dettid, ProtocolFailure::Timer(error));
+                SchedulerRpcResult::ThreadExited
+            }
+        }
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -2407,6 +2670,23 @@ pub enum GlobalRequest {
     /// Lock the resources
     /// Also contains the `DetPid` of the process containing the thread requesting resources.
     RequestResources(Resources, DetPid),
+    ParkedRequest(Resources, DetPid, ControlCapability),
+    ResumeParkedRequest {
+        ticket: ResumeTicket,
+        current_site: reverie::CallbackSignalSite,
+    },
+    FinishParkedObservation {
+        wait: ContinuationId,
+        lease: reverie::ParkedObservationLease,
+        site: reverie::CallbackSignalSite,
+        finish: ObservationFinish,
+    },
+    ParkedProtocolFailure(ProtocolFailure),
+    SignalDequeued {
+        detpid: DetPid,
+        identity: reverie::SignalTaskIdentity,
+        dequeue: reverie::SignalDequeue,
+    },
     /// Release the locks
     ReleaseResources(Resources),
     /// For convenience, release all the resources held by the current TID.
@@ -2426,7 +2706,7 @@ pub enum GlobalRequest {
     CancelExec(DetPid),
 
     /// Mark the initial image transition complete for backends that begin post-exec.
-    MarkPastFirstExecve,
+    MarkPastFirstExecve(Option<reverie::SignalTaskIdentity>),
 
     /// The parent is adding a child-thread to the round-robin pool.  Contains the dettid
     /// of the new child and it's starting scheduler priority IF it is available to the caller.
@@ -2459,7 +2739,12 @@ pub enum GlobalRequest {
 
     /// New thread is alive and waiting to run its first instruction.  Contains the dettid
     /// and detpid of the new child.
-    StartNewThread(DetTid, DetPid, Option<(i32, i32)>),
+    StartNewThread(
+        DetTid,
+        DetPid,
+        Option<(i32, i32)>,
+        Option<reverie::SignalTaskIdentity>,
+    ),
 
     /// Remove a thread from scheduler data structures, guaranteeing that it will
     /// consume no further turns. Carries its final timeslice distribution and any
@@ -2569,10 +2854,17 @@ pub enum GlobalRequest {
 #[allow(missing_docs, clippy::unit_arg)]
 #[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
 pub enum GlobalResponse {
-    /// The scheduler permanently removed this raw TID. Guest-side RPC handling consumes this by
-    /// tail-injecting a thread exit before any per-operation caller can resume.
+    /// The scheduler permanently removed this raw TID. Guest-side RPC handling retires
+    /// this task without cancelling a live group-exit issuer or resuming the operation.
     ThreadExited,
     RequestResources(ResumeStatus),
+    ParkedRequest(ResourceReply),
+    ResumeParkedRequest(ResourceReply),
+    FinishParkedObservation(Result<FinishAck, ProtocolFailure>),
+    SignalDequeued {
+        ack: Result<DequeueAck, TimerFailure>,
+        terminal: bool,
+    },
     ReleaseResources(()),
     ReleaseAllResources(()),
     // TODO-HUMAN-REVIEW(PR-643): Review this new Detcore global RPC response.
@@ -2611,7 +2903,7 @@ pub enum GlobalResponse {
     ProcessGroup(Option<DetPid>),
     SetProcessGroup(bool),
     CreateSession(bool),
-    AlarmRemaining(LogicalTime),
+    AlarmRemaining(ItimerSnapshot),
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     ResolveKillTargets(Vec<DetTid>),
@@ -2675,11 +2967,20 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    let (_, response) = send_and_update_time(guest, GlobalRequest::MarkPastFirstExecve).await;
+    let signal_identity = guest
+        .config()
+        .kvm_shared_dequeue_timers
+        .then(|| guest.signal_task_identity())
+        .flatten();
+    let (_, response) =
+        send_and_update_time(guest, GlobalRequest::MarkPastFirstExecve(signal_identity)).await;
     let overrides = match response {
         GlobalResponse::MarkPastFirstExecve(overrides) => overrides,
         _ => unreachable!(),
     };
+    if guest.config().kvm_shared_dequeue_timers {
+        guest.thread_state_mut().signal_task_identity = signal_identity;
+    }
     if !overrides.is_empty() {
         let dettid = guest.thread_state().dettid;
         let metadata = Arc::clone(&guest.thread_state().file_metadata);
@@ -2732,10 +3033,10 @@ where
             "[detcore, dtid {}] exiting after terminal scheduler cancellation",
             dettid
         );
-        // The terminal response must never return to an operation-specific RPC caller. Reverie
-        // SaBRe runs exactly-once Tool cleanup for this non-original thread exit, then executes the
-        // raw exit without restoring the callback's guest frame.
-        guest.tail_inject(reverie::syscalls::Exit::default()).await
+        // This exact task must never resume, but a sibling may still own the
+        // winning exit-group commit. Retire only this task; explicit backend
+        // cancellation could cancel that issuer or lose its later status.
+        guest.retire_current_thread().await
     }
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-845): Review applying the coordinator clock after exec reload.
@@ -2774,6 +3075,17 @@ where
     T: RecordOrReplay,
 {
     if guest.config().sequentialize_threads {
+        if let Some(lease) = guest.signal_observation_lease() {
+            if let Some(site) = guest.parked_signal_site() {
+                return parked::capable_resource_request(
+                    guest,
+                    r,
+                    ControlCapability::PublishOnly { lease, site },
+                )
+                .await;
+            }
+            parked::terminate_protocol(guest, ProtocolFailure::Identity).await;
+        }
         let dettid = guest.thread_state().dettid;
         let detpid = guest.thread_state().detpid.expect("detpid unset");
         trace!(
@@ -2837,9 +3149,11 @@ where
             .thread_state()
             .physical_tid
             .map(|tid| (guest.pid().as_raw(), tid));
+        let signal_identity = guest.signal_task_identity();
+        guest.thread_state_mut().signal_task_identity = signal_identity;
         let resp = send_and_update_time(
             guest,
-            GlobalRequest::StartNewThread(dettid, detpid, physical_ids),
+            GlobalRequest::StartNewThread(dettid, detpid, physical_ids, signal_identity),
         )
         .await;
         match resp.1 {
@@ -3419,7 +3733,7 @@ where
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-841): Review logical alarm query API.
 /// Return the logical duration remaining on the process's one-shot alarm.
-pub async fn alarm_remaining<G, T>(guest: &mut G) -> LogicalTime
+pub async fn alarm_remaining<G, T>(guest: &mut G) -> ItimerSnapshot
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -4050,6 +4364,7 @@ mod tests {
                 child_tid_addr: 0,
                 req: request,
                 resp: Ivar::new(),
+                protocol: Default::default(),
             },
         );
         scheduler.priorities.insert(dettid, DEFAULT_PRIORITY);
@@ -4181,6 +4496,190 @@ mod tests {
 
         fn read_clock(&mut self) -> Result<u64, reverie::Error> {
             panic!("external registration must not read a host clock")
+        }
+    }
+
+    struct RetirementGuest<'a> {
+        global: &'a GlobalState,
+        config: &'a Config,
+        thread: crate::ThreadState<()>,
+        requests: Mutex<Vec<GlobalRequest>>,
+        retired: std::sync::atomic::AtomicBool,
+    }
+
+    #[reverie::tool]
+    impl GlobalRPC<GlobalState> for RetirementGuest<'_> {
+        async fn send_rpc(
+            &self,
+            message: <GlobalState as GlobalTool>::Request,
+        ) -> <GlobalState as GlobalTool>::Response {
+            self.requests.lock().unwrap().push(message.2.clone());
+            self.global
+                .receive_rpc(Tid::from_raw(self.thread.dettid.as_raw()), message)
+                .await
+        }
+
+        fn config(&self) -> &Config {
+            self.config
+        }
+    }
+
+    #[reverie::tool]
+    impl Guest<Detcore> for RetirementGuest<'_> {
+        type Memory = reverie::syscalls::LocalMemory;
+        type Stack = ExternalRegistrationStack;
+
+        fn tid(&self) -> reverie::Pid {
+            reverie::Pid::from_raw(self.thread.dettid.as_raw())
+        }
+
+        fn pid(&self) -> reverie::Pid {
+            reverie::Pid::from_raw(self.thread.detpid.unwrap().as_raw())
+        }
+
+        fn ppid(&self) -> Option<reverie::Pid> {
+            None
+        }
+
+        fn memory(&self) -> Self::Memory {
+            panic!("external registration must not access guest memory")
+        }
+
+        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<()> {
+            &mut self.thread
+        }
+
+        fn thread_state(&self) -> &crate::ThreadState<()> {
+            &self.thread
+        }
+
+        async fn regs(&mut self) -> libc::user_regs_struct {
+            panic!("external registration must not read guest registers")
+        }
+
+        async fn stack(&mut self) -> Self::Stack {
+            panic!("external registration must not use a guest stack")
+        }
+
+        async fn daemonize(&mut self) {
+            panic!("external registration must not daemonize")
+        }
+
+        async fn inject<S: reverie::syscalls::SyscallInfo>(
+            &mut self,
+            _syscall: S,
+        ) -> Result<i64, reverie::syscalls::Errno> {
+            panic!("external registration must not inject a syscall")
+        }
+
+        async fn retire_current_thread(&mut self) -> reverie::Never {
+            self.retired
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            futures::future::pending().await
+        }
+
+        async fn cancel_current_thread(&mut self) -> reverie::Never {
+            panic!("scheduler retirement must not request group cancellation")
+        }
+
+        async fn tail_inject<S: reverie::syscalls::SyscallInfo>(
+            &mut self,
+            _syscall: S,
+        ) -> reverie::Never {
+            panic!("external registration unexpectedly retired its live parent")
+        }
+
+        fn set_timer(&mut self, _schedule: reverie::TimerSchedule) -> Result<(), reverie::Error> {
+            panic!("external registration must not set a timer")
+        }
+
+        fn set_timer_precise(
+            &mut self,
+            _schedule: reverie::TimerSchedule,
+        ) -> Result<(), reverie::Error> {
+            panic!("external registration must not set a timer")
+        }
+
+        fn read_clock(&mut self) -> Result<u64, reverie::Error> {
+            panic!("external registration must not read a host clock")
+        }
+    }
+
+    #[tokio::test]
+    async fn thread_exited_uses_natural_retirement_for_killed_stale_and_failed_rpcs() {
+        use std::sync::atomic::Ordering;
+
+        use reverie::Tool;
+
+        for cause in ["killed", "stale image", "backend failure", "live"] {
+            let (config, state, tid, pid) = cancellation_test_state();
+            install_test_registration(&state, tid, Ivar::new());
+            let tool: Detcore = Detcore::new(Tid::from_raw(tid.as_raw()), &config);
+            let mut thread = tool.init_thread_state(Tid::from_raw(tid.as_raw()), None);
+            thread.detpid = Some(pid);
+            thread.thread_logical_time.add_syscall_with_cost(37);
+            match cause {
+                "killed" => {
+                    state
+                        .sched
+                        .lock()
+                        .unwrap()
+                        .logically_kill_thread(&tid, &pid, thread.mm_id)
+                }
+                "stale image" => {
+                    state
+                        .sched
+                        .lock()
+                        .unwrap()
+                        .install_test_exec_incarnation(tid, thread.mm_id);
+                    thread.mm_id = thread.mm_id.for_exec(pid);
+                }
+                "backend failure" => state.report_backend_failure(reverie::BackendFailure {
+                    pid: Tid::from_raw(pid.as_raw()),
+                    tid: Tid::from_raw(tid.as_raw()),
+                    phase: "natural retirement control",
+                }),
+                "live" => {}
+                _ => unreachable!(),
+            }
+            let mut guest = RetirementGuest {
+                global: &state,
+                config: &config,
+                thread,
+                requests: Mutex::new(Vec::new()),
+                retired: std::sync::atomic::AtomicBool::new(false),
+            };
+            let before = guest.thread.thread_logical_time.as_nanos();
+            {
+                let mut call = std::pin::pin!(super::send_and_update_time(
+                    &mut guest,
+                    GlobalRequest::GlobalTimeLowerBound
+                ));
+                if cause == "live" {
+                    assert!(matches!(
+                        futures::poll!(call.as_mut()),
+                        std::task::Poll::Ready((_, GlobalResponse::GlobalTimeLowerBound(_)))
+                    ));
+                } else {
+                    assert!(futures::poll!(call.as_mut()).is_pending(), "{cause}");
+                }
+            }
+            // A terminal backend failure closes ordinary RPC admission before
+            // any ThreadExited response. The backend failure subscription owns
+            // cancellation of that pending callback; it must not retire as success.
+            assert_eq!(
+                guest.retired.load(Ordering::SeqCst),
+                matches!(cause, "killed" | "stale image"),
+                "{cause}"
+            );
+            assert_eq!(guest.requests.lock().unwrap().len(), 1);
+            assert_eq!(guest.thread.thread_logical_time.as_nanos(), before);
+            if cause == "backend failure" {
+                assert!(state.sched.lock().unwrap().backend_failed());
+                assert!(
+                    futures::poll!(std::pin::pin!(state.wait_for_backend_failure())).is_ready()
+                );
+            }
         }
     }
 
@@ -4429,7 +4928,7 @@ mod tests {
             (
                 child_clock.clone(),
                 child_mm,
-                GlobalRequest::StartNewThread(child, child, None),
+                GlobalRequest::StartNewThread(child, child, None, None),
             ),
         ));
         if start_before_selection {
@@ -4626,7 +5125,7 @@ mod tests {
             (
                 child_clock,
                 mm,
-                GlobalRequest::StartNewThread(child, child, None),
+                GlobalRequest::StartNewThread(child, child, None, None),
             ),
         ));
         assert!(futures::poll!(&mut startup).is_pending());
@@ -4813,7 +5312,7 @@ mod tests {
             (
                 fresh.clone(),
                 old_mm.for_exec(detpid),
-                GlobalRequest::StartNewThread(leader, detpid, None),
+                GlobalRequest::StartNewThread(leader, detpid, None, None),
             ),
         ));
         assert!(futures::poll!(&mut startup).is_pending());
@@ -4988,7 +5487,7 @@ mod tests {
                 (
                     fresh_local_time,
                     old_mm.for_exec(detpid),
-                    GlobalRequest::StartNewThread(dettid, detpid, physical_ids),
+                    GlobalRequest::StartNewThread(dettid, detpid, physical_ids, None),
                 ),
             )
             .await;
@@ -5197,7 +5696,7 @@ mod tests {
                 (
                     fresh_local_time,
                     old_mm.for_exec(detpid),
-                    GlobalRequest::StartNewThread(leader, detpid, None),
+                    GlobalRequest::StartNewThread(leader, detpid, None, None),
                 ),
             )
             .await;
@@ -5240,7 +5739,7 @@ mod tests {
                 (
                     worker_clock,
                     old_mm.for_exec(detpid),
-                    GlobalRequest::MarkPastFirstExecve,
+                    GlobalRequest::MarkPastFirstExecve(None),
                 ),
             )
             .await;
@@ -5503,6 +6002,7 @@ mod tests {
                 child_tid_addr: 0,
                 req: Ivar::new(),
                 resp: Ivar::new(),
+                protocol: Default::default(),
             },
         );
         state
@@ -5840,7 +6340,7 @@ mod tests {
             (
                 DetTime::new(&config),
                 MmId::initial(dettid),
-                GlobalRequest::StartNewThread(dettid, detpid, None),
+                GlobalRequest::StartNewThread(dettid, detpid, None, None),
             ),
         );
         let kill_after_request = async {
@@ -5884,7 +6384,7 @@ mod tests {
                 (
                     DetTime::new(&config),
                     MmId::initial(detpid),
-                    GlobalRequest::StartNewThread(dettid, detpid, None),
+                    GlobalRequest::StartNewThread(dettid, detpid, None, None),
                 ),
             )
             .await;
@@ -6073,6 +6573,7 @@ mod tests {
                     child_tid_addr: 0,
                     req: Ivar::new(),
                     resp: Ivar::new(),
+                    protocol: Default::default(),
                 },
             );
             scheduler.runqueue_push_back(dettid);
@@ -6327,6 +6828,7 @@ mod robust_exit_clock_tests {
                             child_tid_addr: 0,
                             req: Ivar::new(),
                             resp: Ivar::new(),
+                            protocol: Default::default(),
                         },
                     );
                     sched.install_test_exec_incarnation(
@@ -6438,6 +6940,7 @@ mod robust_exit_clock_tests {
                         child_tid_addr: 0,
                         req: Ivar::new(),
                         resp: Ivar::new(),
+                        protocol: Default::default(),
                     },
                 );
                 sched.install_test_exec_incarnation(tid, thread.mm_id);
@@ -6683,6 +7186,7 @@ mod robust_exit_clock_tests {
                         child_tid_addr: 0,
                         req: replacement_request.clone(),
                         resp: Ivar::new(),
+                        protocol: Default::default(),
                     },
                 );
                 let mut replacement_time = f.owners[0].thread_logical_time.clone();

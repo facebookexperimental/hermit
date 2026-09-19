@@ -347,7 +347,11 @@ fi
 # Keep default CMAKE, unset CMAKE_GENERATOR, the 1050 effective-job-second
 # budget and 16-job clamp. This source-identity carry is not a new timing or
 # guest measurement; all prior calibration and validation limitations remain.
-expected_pin=bd398149c1f0fc8231dcde8820e7e90c87c7e798
+# CARRY TO d3ababc9c1ac5704322c0feca3658fee11f20155: reviewed timer source preserves the exact
+# DynamoRIO SDK build.rs/vendor and root manifest/toolchain recipe inputs.
+# Keep the same CMAKE/CMAKE_GENERATOR selection, 1050 effective-job-seconds
+# and 16-job clamp. This is source identity carry, not new calibration.
+expected_pin=d3ababc9c1ac5704322c0feca3658fee11f20155
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

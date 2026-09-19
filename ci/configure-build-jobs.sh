@@ -397,8 +397,8 @@ fi
 # Keep default CMAKE, unset CMAKE_GENERATOR, the 1050 effective-job-second
 # budget and 16-job clamp. This source-identity carry is not a new timing or
 # guest measurement; all prior calibration and validation limitations remain.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != bd398149c1f0fc8231dcde8820e7e90c87c7e798 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie bd398149c1f0fc8231dcde8820e7e90c87c7e798 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != d3ababc9c1ac5704322c0feca3658fee11f20155 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie d3ababc9c1ac5704322c0feca3658fee11f20155 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

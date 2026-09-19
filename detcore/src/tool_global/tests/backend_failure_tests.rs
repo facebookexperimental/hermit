@@ -132,6 +132,7 @@ async fn selected_cleanup(daemon_first: bool) {
                 child_tid_addr: 0,
                 req: Ivar::new(),
                 resp: Ivar::new(),
+                protocol: Default::default(),
             },
         );
         sched.priorities.insert(waiter, DEFAULT_PRIORITY);
@@ -563,7 +564,7 @@ async fn dbt_missing_physical_id_start_preserves_tombstone_deregistration_accoun
             (
                 DetTime::new(&config),
                 mm,
-                GlobalRequest::StartNewThread(tid, process, None),
+                GlobalRequest::StartNewThread(tid, process, None, None),
             ),
         ),
     )

@@ -34,7 +34,6 @@ use crate::scheduler::Priority;
 use crate::scheduler::entropy_to_priority;
 use crate::tool_global::ResumeStatus;
 use crate::tool_global::register_posix_timer;
-use crate::tool_global::resource_request;
 use crate::tool_global::thread_observe_time;
 use crate::tool_local::Detcore;
 use crate::types::LogicalTime;
@@ -298,12 +297,26 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: NanosleepFamily,
     ) -> Result<i64, Error> {
         let target_time = time_from_resources(&request).expect("a sleepuntil resource request");
-        match resource_request(guest, request).await {
+        match crate::tool_global::parked_wait_request(
+            guest,
+            request,
+            crate::scheduler::parked::ParkedWaitPolicy::NanosleepNoHandlerRestart {
+                absolute_deadline: target_time,
+            },
+        )
+        .await
+        {
             ResumeStatus::Normal => Ok(0),
             ResumeStatus::Signaled(_) => {
                 let now = thread_observe_time(guest).await;
                 let delta = remaining_sleep_duration(target_time, now);
-                let addr2 = call.rem();
+                // Linux never touches remain for TIMER_ABSTIME, even when
+                // a caught signal interrupts the absolute sleep.
+                let addr2 = if call.flags() & libc::TIMER_ABSTIME == 0 {
+                    call.rem()
+                } else {
+                    None
+                };
                 if let Some(addr2) = addr2 {
                     info!(
                         "[interrupted] sleep till (until {}), woke up {:?} early, writing into nanosleep rem argument.",
@@ -333,13 +346,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(guest.inject(Syscall::from(call)).await?);
         }
 
-        // TODO: use 2nd, `rem` argument when providing a way for a signal to interrupt the
-        // logical sleep.
         let addr = call.req().ok_or(Errno::EFAULT)?;
-        let t: Timespec = guest
-            .memory()
-            .read_value(addr)
-            .expect("should be able to read from memory");
+        let t: Timespec = guest.memory().read_value(addr)?;
 
         // Linux validates the requested interval BEFORE sleeping: nanosleep(2)
         // and clock_nanosleep(2) both fail EINVAL when tv_nsec is outside

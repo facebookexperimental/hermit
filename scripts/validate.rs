@@ -13791,9 +13791,10 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         .ok_or("retry bounds: privileged lane is absent")?;
     for (tag, expected) in [
         ("privileged-only-test.pmu_buck_chaos_cases", 6usize),
-        // All 27 run_kvm_ CLI controls plus the initialized-VM setup control.
-        // Keep this guard aligned with the counted selection in the canonical DAG.
-        ("privileged-only-test.cli_kvm", 28usize),
+        // The shipped KVM selection contains 29 run_kvm_ declarations and
+        // the unchanged initialized-VM setup control. The eight-mode timer
+        // and two-role retirement tests each count as one selected test.
+        ("privileged-only-test.cli_kvm", 30usize),
     ] {
         let step = privileged
             .steps

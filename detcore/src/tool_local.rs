@@ -1724,6 +1724,10 @@ pub struct ThreadState<T> {
     #[serde(default)]
     pub physical_tid: Option<i32>,
 
+    /// Backend lifetime retained for consuming signal effects after retirement.
+    #[serde(default)]
+    pub(crate) signal_task_identity: Option<reverie::SignalTaskIdentity>,
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1063): Review backend-supplied open-file creator identity.
     /// Stable identity used when allocating deterministic open-file descriptions.
@@ -2166,6 +2170,7 @@ impl<T> ThreadState<T> {
             detpid: None, // Initialized later.
             thread_start_entered: false,
             physical_tid: None,
+            signal_task_identity: None,
             open_file_creator: None,
             mm_id: MmId::initial(pid),
             memory_metadata: Arc::new(Mutex::new(MemoryMetadata::new())),

@@ -113,7 +113,7 @@ impl<R: Read + AsRawFd> CapturedStream<R> {
     }
 }
 
-fn bounded_read(path: &Path, limit: u64) -> Vec<u8> {
+pub(super) fn bounded_read(path: &Path, limit: u64) -> Vec<u8> {
     let mut bytes = Vec::new();
     fs::File::open(path)
         .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
@@ -146,6 +146,14 @@ fn check_outputs(directory: &Path) {
 }
 
 fn bounded_command(command: &mut Command, directory: &Path) -> ExitStatus {
+    bounded_command_with_timeout(command, directory, Duration::from_secs(57))
+}
+
+pub(super) fn bounded_command_with_timeout(
+    command: &mut Command,
+    directory: &Path,
+    wall_limit: Duration,
+) -> ExitStatus {
     fs::create_dir_all(directory).expect("create retained command directory");
     fs::write(directory.join("command.txt"), format!("{command:?}\n"))
         .expect("retain actual command");
@@ -189,15 +197,16 @@ fn bounded_command(command: &mut Command, directory: &Path) -> ExitStatus {
             break status;
         }
         assert!(
-            start.elapsed() < Duration::from_secs(57),
-            "57-second wall limit exceeded; evidence at {}",
+            start.elapsed() < wall_limit,
+            "{}-second wall limit exceeded; evidence at {}",
+            wall_limit.as_secs(),
             directory.display()
         );
         std::thread::sleep(Duration::from_millis(10));
     };
     // Fast exit must still pass size and wall checks.
     check_outputs(directory);
-    assert!(start.elapsed() < Duration::from_secs(57));
+    assert!(start.elapsed() < wall_limit);
     fs::write(directory.join("status.txt"), format!("{status}\n")).expect("retain actual status");
     status
 }

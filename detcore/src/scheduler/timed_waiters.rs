@@ -27,6 +27,8 @@ pub struct TimedEvents {
 
     // Keep one alarm(2)/setitimer(2) event per process and one event per POSIX timer id.
     signal_timers: BTreeMap<SignalTimerId, SignalTimerState>,
+    // KVM real timers recur only after an actual shared SIGALRM dequeue.
+    kvm_real_deadlines: BTreeMap<DetPid, LogicalTime>,
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -143,6 +145,48 @@ impl TimedEvents {
             .map(|state| (state.deadline, state.interval))
     }
 
+    /// Replace a process-owned KVM deadline without entering legacy recurrence.
+    /// Publication is process-owned, and receiver selection is a separate phase;
+    /// the task that armed the timer does not own its later delivery.
+    pub fn insert_kvm_real_deadline(&mut self, deadline: LogicalTime, pid: DetPid) {
+        assert!(!self.signal_timers.contains_key(&SignalTimerId::Alarm(pid)));
+        self.remove_kvm_real_deadline(pid);
+        self.kvm_real_deadlines.insert(pid, deadline);
+        self.map
+            .entry(deadline)
+            .or_default()
+            .insert(TimedEvent::SignalEvt(
+                SignalTimerId::Alarm(pid),
+                pid,
+                Signal::SIGALRM,
+            ));
+    }
+
+    pub fn remove_kvm_real_deadline(&mut self, pid: DetPid) {
+        let old = self
+            .kvm_real_deadlines
+            .remove(&pid)
+            .map(|deadline| SignalTimerState {
+                deadline,
+                interval: LogicalTime::ZERO,
+            });
+        self.clear_old_signal_timer(SignalTimerId::Alarm(pid), old);
+    }
+
+    pub fn alarm_state(&self, pid: DetPid) -> Option<(LogicalTime, LogicalTime)> {
+        self.signal_timers
+            .get(&SignalTimerId::Alarm(pid))
+            .map(|s| (s.deadline, s.interval))
+    }
+
+    pub fn thread_deadline(&self, tid: DetTid) -> Option<LogicalTime> {
+        self.map.iter().find_map(|(deadline, events)| {
+            events
+                .contains(&TimedEvent::ThreadEvt(tid))
+                .then_some(*deadline)
+        })
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#869)
     fn clear_old_signal_timer(&mut self, id: SignalTimerId, old: Option<SignalTimerState>) {
@@ -246,6 +290,7 @@ impl TimedEvents {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#869)
     pub fn remove_process_timers(&mut self, dp: DetPid) {
+        self.remove_kvm_real_deadline(dp);
         let ids: Vec<_> = self
             .signal_timers
             .keys()
@@ -290,6 +335,12 @@ impl TimedEvents {
             None
         }?;
 
+        if let TimedEvent::SignalEvt(SignalTimerId::Alarm(pid), _, _) = evt
+            && self.kvm_real_deadlines.get(&pid) == Some(&time_ns)
+        {
+            self.kvm_real_deadlines.remove(&pid);
+            return Some((time_ns, evt));
+        }
         if let TimedEvent::SignalEvt(id, _, _) = evt
             && self
                 .signal_timers

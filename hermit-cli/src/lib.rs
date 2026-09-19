@@ -2418,6 +2418,8 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     // none of those backends can safely defer Detcore's modeled transition.
     config.backend_runs_exit_robust_list = backend == Backend::Ptrace;
     config.backend_requires_thread_directed_process_signals = backend == Backend::Dbt;
+    config.backend_is_kvm = backend == Backend::Kvm;
+    config.kvm_shared_dequeue_timers = config.backend_is_kvm && config.sequentialize_threads;
     // E9patch preprocesses the guest and then uses the ptrace builder. LiteInst,
     // DBT, KVM, and SaBRe re-invoke the Tool callback on ERESTARTSYS instead of
     // resuming through the kernel's ptrace syscall-restart frame.
@@ -4259,9 +4261,19 @@ mod tests {
 
     #[test]
     fn kvm_backend_config_marks_concurrent_process_children() {
-        let config = super::DetConfig::default();
+        let defaults = super::DetConfig::default();
+        assert!(!defaults.sequentialize_threads);
+        let nonsequential = prepare_backend_config(defaults, Backend::Kvm);
+        assert!(nonsequential.backend_is_kvm);
+        assert!(!nonsequential.kvm_shared_dequeue_timers);
+
+        let config = super::DetConfig {
+            sequentialize_threads: true,
+            ..super::DetConfig::default()
+        };
         let kvm = prepare_backend_config(config, Backend::Kvm);
         assert!(kvm.cancel_killed_thread_rpcs);
+        assert!(kvm.kvm_shared_dequeue_timers);
         assert!(!kvm.backend_serializes_fork_children);
         assert!(kvm.backend_dispatches_thread_tools);
         assert!(kvm.backend_tracks_process_children);

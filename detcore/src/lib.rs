@@ -1051,6 +1051,18 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     type GlobalState = GlobalState;
     type ThreadState = ThreadState<T::ThreadState>;
 
+    fn observe_signal_dequeues(config: &Config) -> bool {
+        config.kvm_shared_dequeue_timers && config.sequentialize_threads && config.backend_is_kvm
+    }
+
+    async fn handle_signal_dequeue<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        dequeue: reverie::SignalDequeue,
+    ) -> Result<(), Errno> {
+        tool_global::signal_dequeued(guest, dequeue).await
+    }
+
     /// Constructor for Detcore process-local state.
     fn new(pid: Pid, cfg: &Config) -> Self {
         let detpid = DetPid::from_raw(pid.into()); // TODO(T78538674): virtualize pid.
@@ -1490,6 +1502,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     detpid: None, // Initialized later.
                     thread_start_entered: false,
                     physical_tid: None,
+                    signal_task_identity: None,
                     open_file_creator: None,
                     mm_id: MmId::for_clone(
                         pts.1.mm_id,

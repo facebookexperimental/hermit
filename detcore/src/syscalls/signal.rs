@@ -37,7 +37,6 @@ use crate::tool_global::alarm_remaining;
 use crate::tool_global::notify_signal_pending;
 use crate::tool_global::register_alarm;
 use crate::tool_global::resolve_kill_targets;
-use crate::tool_global::resource_request;
 use crate::tool_global::thread_observe_time;
 use crate::types::DetPid;
 use crate::types::DetTid;
@@ -317,15 +316,17 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(guest.inject(call).await?);
         }
 
-        let remaining = match call.which() {
+        let snapshot = match call.which() {
             libc::ITIMER_REAL => alarm_remaining(guest).await,
-            libc::ITIMER_VIRTUAL | libc::ITIMER_PROF => LogicalTime::ZERO,
+            libc::ITIMER_VIRTUAL | libc::ITIMER_PROF => {
+                crate::scheduler::real_timer::ItimerSnapshot::default()
+            }
             _ => return Err(Errno::EINVAL.into()),
         };
         let value = call.value().ok_or(Errno::EFAULT)?;
         let timer = libc::itimerval {
-            it_interval: logical_time_to_timeval(LogicalTime::ZERO),
-            it_value: logical_time_to_timeval(remaining),
+            it_interval: logical_time_to_timeval(snapshot.interval),
+            it_value: logical_time_to_timeval(snapshot.remaining),
         };
         guest.memory().write_value(value, &timer)?;
         Ok(0)
@@ -343,7 +344,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             // fast-forward virtual time onto it (see `step2d_handle_empty_queue`),
             // so the `Normal` arm below stays unreachable.
             let req = Self::sleep_request_abs(guest, LogicalTime::INDEFINITE).await;
-            match resource_request(guest, req).await {
+            match crate::tool_global::parked_wait_request(
+                guest,
+                req,
+                crate::scheduler::parked::ParkedWaitPolicy::PauseNoHandlerRestart,
+            )
+            .await
+            {
                 ResumeStatus::Normal => {
                     panic!(
                         "Internal violation: pause should never return from the scheduler except by interruption!"

@@ -8,8 +8,13 @@
 
 //! Deterministic scheduling algorithm.
 
+pub(crate) mod parked;
+#[cfg(test)]
+mod parked_tests;
+pub(crate) mod real_timer;
 mod replayer;
 pub mod runqueue;
+mod signal_control;
 pub mod timed_waiters;
 
 use std::collections::BTreeMap;
@@ -138,6 +143,7 @@ pub enum SchedResponse {
     /// The guest was interupted by a signal while waiting on the scheduler, and will now execute
     /// the handler.
     Signaled(Option<Vec<SigWrapper>>),
+    ObserveSignal(Box<parked::AlarmControl>),
     // TODO: Time to exit, or an exit is already under way
     // Exit,
 }
@@ -168,6 +174,7 @@ pub struct ThreadNextTurn {
     pub req: Ivar<SchedRequest>,
     /// A place for the response when that request is fulfilled.
     pub resp: Ivar<SchedResponse>,
+    pub(crate) protocol: parked::TurnProtocol,
 }
 
 /// State needed to replace a process's scheduler identity after successful exec.
@@ -604,7 +611,7 @@ pub struct Scheduler {
     // A fatal backend result ends this run; it is never a guest response.
     // The event and run-queue transition share the grant/commit mutex. Every
     // callback and daemon wait clones its own subscriber, unlike an Ivar.
-    backend_failure: Option<reverie::BackendFailure>,
+    backend_failure: Option<BackendFailureLocation>,
     backend_failure_sender: Option<oneshot::Sender<()>>,
     backend_failure_wake: Shared<oneshot::Receiver<()>>,
 
@@ -614,6 +621,12 @@ pub struct Scheduler {
     /// Whether scheduler identities must be resolved through a host thread
     /// pidfd before sending process-directed signals.
     backend_requires_thread_directed_process_signals: bool,
+    backend_is_kvm: bool,
+    #[cfg(test)]
+    host_signal_attempts: u64,
+    kvm_shared_dequeue_timers: bool,
+    pub(crate) real_timers: real_timer::RealTimers,
+    parked: parked::ParkedRequests,
 
     /// Whether this backend can preserve Linux signal semantics when a
     /// scheduler-managed pipe write is woken by a cross-task signal.
@@ -1236,6 +1249,15 @@ async fn sched_loop_inner(
 #[derive(Debug, Clone)]
 pub struct SkipTurn;
 
+/// Scheduler-local attribution also represents process operations that have no
+/// selected task. The public backend callback still supplies its actual task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BackendFailureLocation {
+    pid: reverie::Pid,
+    tid: Option<reverie::Tid>,
+    phase: &'static str,
+}
+
 /// Wait without manufacturing a normal scheduler request or response. The
 /// caller must check the terminal state again under the mutex before mutation.
 async fn until_backend_failure<T>(
@@ -1264,7 +1286,7 @@ async fn until_backend_failure<T>(
 ///
 /// WARNING: this is duplicated with the non-blocking `step` function below.
 /// TODO: this duplication is temporary and they should be either combined or one removed soon.
-pub async fn do_a_turn_blocking(
+async fn do_ordinary_turn_blocking(
     sched: Arc<Mutex<Scheduler>>,
     global_time: Arc<Mutex<GlobalTime>>,
     last_turn: &Result<Resources, SkipTurn>,
@@ -1310,6 +1332,163 @@ pub async fn do_a_turn_blocking(
     };
 
     finish_selected_turn(sched, global_time, next_dtid, req, resp).await
+}
+
+pub async fn do_a_turn_blocking(
+    sched: Arc<Mutex<Scheduler>>,
+    global_time: Arc<Mutex<GlobalTime>>,
+    last_turn: &Result<Resources, SkipTurn>,
+) -> Result<Resources, SkipTurn> {
+    let controlled = sched.lock().unwrap().kvm_shared_dequeue_timers;
+    if !controlled {
+        return do_ordinary_turn_blocking(sched, global_time, last_turn).await;
+    }
+    let result = async {
+        // A control pause retains both its maintenance position and the unpaid
+        // obligation of the preceding real turn. Transport messages never pay it.
+        enum Action {
+            Wait {
+                request: Option<Ivar<SchedRequest>>,
+                control: Ivar<()>,
+                barrier: bool,
+            },
+            Select(DetTid, Ivar<SchedRequest>, Ivar<SchedResponse>),
+        }
+        let mut charged = false;
+        let mut refresh = false;
+        let mut maintenance = 0;
+        // The reference admits one due event before a selection. Control
+        // callbacks may refresh observed time, but must not spend that event
+        // budget again and reverse ordinary sleepers' queue-front order.
+        let mut timed_event_processed = false;
+        let mut empty_queue_skip = false;
+        loop {
+            signal_control::flush_signal_failures(&sched);
+            let action = {
+                let mut state = sched.lock().unwrap();
+                state.drain_control_intents();
+                if state.backend_failed() {
+                    return Err(SkipTurn);
+                }
+                let barrier = state.control_barrier();
+                if empty_queue_skip && !barrier {
+                    return Err(SkipTurn);
+                }
+                let request = state.are_all_quiesced();
+                if !barrier && request.is_none() {
+                    if !charged {
+                        state.bump_global_time(&global_time, last_turn);
+                        charged = true;
+                    } else if refresh {
+                        // A hook can advance real observed logical time. Refresh
+                        // eligibility without charging again. An earlier empty
+                        // due check leaves the one-event budget available; an
+                        // actual pop consumes it until this turn returns.
+                        state.bump_global_time(&global_time, &Err(SkipTurn));
+                        if !timed_event_processed {
+                            timed_event_processed = state.step2b_process_timed();
+                        }
+                        if let Err(error) = state.select_parked_alarm() {
+                            state.fail_parked_selection(error);
+                            continue;
+                        }
+                    }
+                    refresh = false;
+                    if state.are_all_quiesced().is_some() {
+                        continue;
+                    }
+                    match maintenance {
+                        0 => {
+                            state.step2_drain_prefix()?;
+                            maintenance = 1;
+                            continue;
+                        }
+                        1 => {
+                            if !timed_event_processed {
+                                timed_event_processed = state.step2b_process_timed();
+                            }
+                            if let Err(error) = state.select_parked_alarm() {
+                                state.fail_parked_selection(error);
+                            }
+                            maintenance = 2;
+                            continue;
+                        }
+                        2 => {
+                            state.step2c_process_io_blockers()?;
+                            maintenance = 3;
+                            continue;
+                        }
+                        3 => {
+                            state.step2e_process_signal_deferred();
+                            maintenance = 4;
+                            continue;
+                        }
+                        4 => {
+                            empty_queue_skip =
+                                state.step2d_handle_empty_queue(&global_time).is_err();
+                            // Select at the time to which the empty queue just
+                            // advanced, before a later pass can advance again.
+                            if let Err(error) = state.select_parked_alarm() {
+                                state.fail_parked_selection(error);
+                            }
+                            maintenance = 5;
+                            continue;
+                        }
+                        _ => {
+                            if let Err(error) = state.select_parked_alarm() {
+                                state.fail_parked_selection(error);
+                                continue;
+                            }
+                            // Installing an observation creates an empty callback
+                            // gate. Await its hook/finish before any tentative pop.
+                            if state.are_all_quiesced().is_some() {
+                                continue;
+                            }
+                            let (tid, req, resp) = state.step3_peek().ok_or(SkipTurn)?;
+                            Action::Select(tid, req, resp)
+                        }
+                    }
+                } else {
+                    Action::Wait {
+                        request,
+                        control: state.control_waiter(),
+                        barrier,
+                    }
+                }
+            };
+            match action {
+                Action::Select(tid, req, resp) => {
+                    return finish_selected_turn(
+                        sched.clone(),
+                        global_time.clone(),
+                        tid,
+                        req,
+                        resp,
+                    )
+                    .await;
+                }
+                Action::Wait {
+                    request,
+                    control,
+                    barrier,
+                } => {
+                    if barrier {
+                        until_backend_failure(&sched, control).await?;
+                    } else if let Some(request) = request {
+                        let wait = async {
+                            futures::pin_mut!(request, control);
+                            let _ = futures::future::select(request, control).await;
+                        };
+                        until_backend_failure(&sched, wait).await?;
+                    }
+                    refresh = true;
+                }
+            }
+        }
+    }
+    .await;
+    signal_control::flush_signal_failures(&sched);
+    result
 }
 
 /// Complete the selected transaction. Keeping the await and post-await checks
@@ -1505,6 +1684,12 @@ impl Scheduler {
             backend_failure_sender: Some(backend_failure_sender),
             backend_failure_wake: backend_failure_wake.shared(),
             cancel_killed_thread_rpcs: cfg.cancel_killed_thread_rpcs,
+            backend_is_kvm: cfg.backend_is_kvm,
+            #[cfg(test)]
+            host_signal_attempts: 0,
+            kvm_shared_dequeue_timers: cfg.kvm_shared_dequeue_timers,
+            real_timers: Default::default(),
+            parked: Default::default(),
             backend_requires_thread_directed_process_signals: cfg
                 .backend_requires_thread_directed_process_signals,
             backend_supports_parked_write_signal_interruption: cfg
@@ -1920,6 +2105,8 @@ impl Scheduler {
         // Remove from all non-runnable pools:
         self.remove_blocking_entries(dtid);
         self.remove_physical_thread(dtid, mm);
+        self.real_timers.retire_task(*detpid, *dtid);
+        self.retire_parked_requests(*dtid);
 
         let _ = self.priorities.remove(dtid);
         match self.next_turns.remove(dtid) {
@@ -1969,6 +2156,7 @@ impl Scheduler {
                 self.wake_child_waiters(parent, *detpid);
             }
             self.blocked.timed_waiters.remove_process_timers(*detpid);
+            self.real_timers.retire_process(*detpid);
         }
     }
 
@@ -2039,6 +2227,7 @@ impl Scheduler {
                         child_tid_addr,
                         req: Ivar::new(),
                         resp: Ivar::new(),
+                        protocol: Default::default(),
                     },
                 )
                 .is_none(),
@@ -2140,12 +2329,29 @@ impl Scheduler {
         &mut self,
         event: reverie::BackendFailure,
     ) -> Option<oneshot::Sender<()>> {
+        self.report_backend_failure_location(BackendFailureLocation {
+            pid: event.pid,
+            tid: Some(event.tid),
+            phase: event.phase,
+        })
+    }
+
+    fn report_backend_failure_location(
+        &mut self,
+        event: BackendFailureLocation,
+    ) -> Option<oneshot::Sender<()>> {
         if self.backend_failed() {
             return None;
         }
         if self.run_queue.tentative_pop_in_progress() {
             self.run_queue.undo_tentative_pop();
         }
+        tracing::error!(
+            "backend failure for process {}, task {:?}, phase {}",
+            event.pid,
+            event.tid,
+            event.phase
+        );
         self.backend_failure = Some(event);
         self.backend_failure_sender.take()
     }
@@ -2431,10 +2637,7 @@ impl Scheduler {
     /// Step: Before we select which thread to run, first we check if some internal data
     /// structure maintenance is necessary, i.e. moving timed events from the waiting pool
     /// to the run queue. It manipulates scheduler data structures accordingly.
-    fn step2_process_blocked(
-        &mut self,
-        global_time: &Arc<Mutex<GlobalTime>>,
-    ) -> Result<(), SkipTurn> {
+    fn step2_drain_prefix(&mut self) -> Result<(), SkipTurn> {
         // Apply run-queue mutations deferred by asynchronous global-request
         // handlers first, at this fixed deterministic point, before any early
         // return below and before step3 opens a tentative-pop window. Removals
@@ -2457,11 +2660,21 @@ impl Scheduler {
             return Err(SkipTurn);
         }
         self.step2a_wait_for_vfork_barrier()?;
-        self.step2b_process_timed(); // May populate run_queue.
-        self.step2c_process_io_blockers()?;
-        self.step2e_process_signal_deferred(); // May populate run_queue.
-        self.step2d_handle_empty_queue(global_time)?;
         Ok(())
+    }
+
+    fn step2_process_blocked(
+        &mut self,
+        global_time: &Arc<Mutex<GlobalTime>>,
+    ) -> Result<(), SkipTurn> {
+        self.step2_drain_prefix()?;
+        self.step2b_process_timed();
+        if self.backend_failed() || self.control_barrier() {
+            return Err(SkipTurn);
+        }
+        self.step2c_process_io_blockers()?;
+        self.step2e_process_signal_deferred();
+        self.step2d_handle_empty_queue(global_time)
     }
 
     /// Re-admit parents whose host-async `SIGCHLD` was parked in
@@ -2559,46 +2772,33 @@ impl Scheduler {
     /// Check whether it is time for the *earliest* time-based event to execute INSTEAD of
     /// dispatching from the normal run queue.  Manipulates scheduler data structures
     /// accordingly.
-    fn step2b_process_timed(&mut self) {
+    /// Return whether an event was actually consumed, so a control refresh
+    /// can distinguish an empty check from a spent maintenance budget.
+    fn step2b_process_timed(&mut self) -> bool {
         if let Some((time_ns, evt)) = self
             .blocked
             .timed_waiters
             .pop_if_before(self.committed_time)
         {
             match evt {
-                TimedEvent::ThreadEvt(dtid) => self.wake_timed_event(time_ns, dtid),
-                TimedEvent::SignalEvt(
-                    timed_waiters::SignalTimerId::ChildExit { parent, .. },
-                    dtid,
-                    sig,
-                ) => {
-                    // Deterministic child-exit SIGCHLD. If the host-async signal
-                    // already arrived and was parked by the InboundSignal deferral
-                    // gate, release it now at this logical time — that real signal
-                    // is sufficient, so do not also synthesize one (avoids a
-                    // duplicate delivery). Otherwise synthesize the delivery so the
-                    // parent is notified deterministically regardless of host
-                    // signal latency. Either way mark the parent `sigchld_ready` so
-                    // its InboundSignal turn is granted here rather than deferred a
-                    // second time. Releasing the deferred signal at a logical
-                    // deadline (rather than only at run-queue quiescence, as
-                    // step2e does) is what breaks the redis_deep starvation
-                    // deadlock: a busy sibling can no longer starve the reaper.
-                    self.blocked.sigchld_ready.insert(parent);
-                    if self.blocked.sigchld_deferred.remove(&parent) {
-                        self.run_queue.push_eager_io_repoll(parent);
-                    } else {
-                        self.fire_alarm(parent, dtid, sig);
-                    }
+                TimedEvent::ThreadEvt(tid) => self.wake_timed_event(time_ns, tid),
+                TimedEvent::SignalEvt(id, tid, sig) => {
+                    self.dispatch_timed_signal(time_ns, id, tid, sig, true)
                 }
-                TimedEvent::SignalEvt(id, dtid, sig) => self.fire_alarm(id.process(), dtid, sig),
             }
+            true
+        } else {
+            false
         }
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     fn fire_alarm(&mut self, dpid: DetPid, dtid: DetTid, sig: Signal) {
+        #[cfg(test)]
+        {
+            self.host_signal_attempts += 1;
+        }
         let Some(target) = self.select_signal_target(dpid, Some(dtid)) else {
             info!(
                 "[dpid {}] Alarm expired after its target exited; ignoring.",
@@ -3618,23 +3818,33 @@ impl Scheduler {
                     .pop()
                     .expect("internal error: no timed events found");
                 debug_assert_eq!(event_ns, next_deadline);
-                info!("[scheduler] Skipping global time ahead to {}.", event_ns);
                 {
                     let mut gt = global_time.lock().unwrap();
                     let gt_now_ns = gt.as_nanos();
-                    let delta = event_ns.duration_since(gt_now_ns);
-                    detlog_debug!(
-                        "[sched] add extra global time for deadlock avoidance {:?} on current time {}",
-                        delta,
-                        gt_now_ns,
-                    );
-                    gt.add_extra_time(delta);
+                    if event_ns > gt_now_ns {
+                        info!("[scheduler] Skipping global time ahead to {}.", event_ns);
+                        let delta = event_ns.duration_since(gt_now_ns);
+                        detlog_debug!(
+                            "[sched] add extra global time for deadlock avoidance {:?} on current time {}",
+                            delta,
+                            gt_now_ns,
+                        );
+                        gt.add_extra_time(delta);
+                    } else {
+                        // A control hook may have crossed this deadline after
+                        // maintenance consumed its one event. Keep the separate
+                        // empty-queue wake/SkipTurn, without rewinding the clock.
+                        info!(
+                            "[scheduler] Waking elapsed timed event at {} with global time {} unchanged.",
+                            event_ns, gt_now_ns,
+                        );
+                    }
                 }
 
                 match evt {
                     TimedEvent::ThreadEvt(dtid) => self.wake_timed_event(event_ns, dtid),
                     TimedEvent::SignalEvt(id, dtid, sig) => {
-                        self.fire_alarm(id.process(), dtid, sig)
+                        self.dispatch_timed_signal(event_ns, id, dtid, sig, false)
                     }
                 }
                 return Err(SkipTurn);
@@ -3815,7 +4025,7 @@ impl Scheduler {
     fn upgrade_polled_to_runnable(&mut self, dettid: DetTid, rs: &Resources) {
         let mut retry_rs = rs.clone();
         retry_rs.poll_attempt = 0;
-        let runnable_req = Ivar::full(Ok(retry_rs));
+        let runnable_req = Ivar::full(Ok(retry_rs.clone()));
         let req = &mut self
             .next_turns
             .get_mut(&dettid)
@@ -3826,7 +4036,10 @@ impl Scheduler {
             "[dtid {}] Upgrading polled resource request in {} to runnable non-polled in {}",
             dettid, req, runnable_req
         );
-        *req = runnable_req;
+        let previous = std::mem::replace(req, runnable_req.clone());
+        // This is the same logical operation with a fresh scheduler request.
+        // Keep parked ownership attached while the daemon holds exclusive access.
+        self.rebind_parked_request(dettid, &previous, &runnable_req, rs, &retry_rs);
     }
 
     /// Helper function. Same postcondition as step4_resource_block
@@ -3896,7 +4109,7 @@ impl Scheduler {
                 // non-interference, or on interference *only* affecting the external
                 // actions that will be recorded anyway.
                 self.run_queue.consume_yield_exclusion();
-                self.unblock_guest(dettid, resp);
+                self.unblock_guest(dettid, resp)?;
 
                 // Only once the ivars are cleared and the guest is ready to issue
                 // BlockedExternalContinue do we record which blocked pool owns it.
@@ -4133,12 +4346,6 @@ impl Scheduler {
         self.skip_turn() // The thread shouldn't run.
     }
 
-    /// Step1: Wait till threads park. Also tick global logical time due to the scheduler itself.
-    ///
-    /// N.B. Currently, as an overapproximation, we check for full quiescence!
-    ///
-    /// N.B. This was formerly "step 3" and has been temporarily moved earlier to make
-    /// things easier for the time being.
     fn step1_check_quiescence(
         &mut self,
         global_time: &Mutex<GlobalTime>,
@@ -4306,6 +4513,12 @@ impl Scheduler {
             }
             Some(nxt) => {
                 assert_eq!(resp, &nxt.resp);
+                // Refuse an exhausted transport identity before recording a
+                // COMMIT or consuming any response state.
+                if nxt.protocol.epoch.checked_add(1).is_none() {
+                    self.fail_parked(next_dtid, parked::ProtocolFailure::Overflow);
+                    return Err(SkipTurn);
+                }
                 // N.B.: these prints themselves should be deterministic between
                 // runs.  They are part of the "detlog".
                 let normalization_marker = if self.is_sabre_internal_pipe_io_turn(rsrcs) {
@@ -4343,7 +4556,7 @@ impl Scheduler {
                         record_suffix,
                     );
                 }
-                self.unblock_guest(next_dtid, resp);
+                self.unblock_guest(next_dtid, resp)?;
                 Ok(())
             }
         }
@@ -4353,15 +4566,18 @@ impl Scheduler {
     ///
     /// Precondition: guest is stopped.
     /// Postcondition: guest is running concurrently with this scheduler/tracer thread.
-    fn unblock_guest(&mut self, dtid: DetTid, resp: &Ivar<SchedResponse>) {
-        self.turn += 1;
+    fn unblock_guest(&mut self, dtid: DetTid, resp: &Ivar<SchedResponse>) -> Result<(), SkipTurn> {
         trace!(
             "[sched-step5] Guest unblocking (via {}); clear ivars for the next turn on dettid {}",
             &resp, &dtid
         );
         let signals = self.inbound_signals(dtid); // Peek before we clear the ivars.
         let futex_timed_out = self.blocked.timed_out_futex_waiters.remove(&dtid);
-        self.clear_nextturn(dtid);
+        if let Err(error) = self.clear_nextturn(dtid) {
+            self.fail_parked(dtid, error);
+            return Err(SkipTurn);
+        }
+        self.turn += 1;
         let answer = if !signals.is_empty() {
             SchedResponse::Signaled(Some(signals))
         } else if futex_timed_out {
@@ -4376,7 +4592,9 @@ impl Scheduler {
                 .map(SchedValue::Value);
             SchedResponse::Go(as_schedvalue)
         };
+        self.parked.running = Some(dtid);
         resp.put(answer);
+        Ok(())
     }
 
     fn inbound_signals(&self, dettid: DetTid) -> Vec<SigWrapper> {
@@ -4404,13 +4622,26 @@ impl Scheduler {
     ///
     /// Precondition: guest is stopped so that there is no chance the ivars are being used
     /// concurrently while they are being cleared.
-    fn clear_nextturn(&mut self, dtid: DetTid) {
+    fn clear_nextturn(&mut self, dtid: DetTid) -> Result<(), parked::ProtocolFailure> {
+        let epoch = self
+            .next_turns
+            .get(&dtid)
+            .ok_or(parked::ProtocolFailure::Identity)?
+            .protocol
+            .epoch
+            .checked_add(1)
+            .ok_or(parked::ProtocolFailure::Overflow)?;
+        self.settle_parked_grant(dtid);
+        self.clear_ready_polled_read(dtid);
         let nextturn = self
             .next_turns
             .get_mut(&dtid)
             .expect("clear_nextturn: Thread should be available in next_turns");
         nextturn.req = Ivar::new();
         nextturn.resp = Ivar::new();
+        nextturn.protocol.epoch = epoch;
+        nextturn.protocol.origin = None;
+        Ok(())
     }
 
     /// Step: reenqueue the thread that just had a turn.
@@ -4506,7 +4737,7 @@ impl Scheduler {
     }
 
     /// Record an intent to admit `dtid` to the run queue, applied by the daemon
-    /// at the next deterministic drain point ([`step2`](Self::step2_process_blocked)).
+    /// at the next deterministic drain point ([`step2`](Self::step2_drain_prefix)).
     ///
     /// Global-request handlers (`recv_create_child_thread`,
     /// `reconnect_after_exec`) hold the scheduler lock but run on whichever
@@ -4627,7 +4858,7 @@ impl Scheduler {
     }
 
     /// Record an intent to remove `dtid` from the run queue, applied by the
-    /// daemon at the next deterministic drain point ([`step2`](Self::step2_process_blocked)).
+    /// daemon at the next deterministic drain point ([`step2`](Self::step2_drain_prefix)).
     ///
     /// The mirror of [`Scheduler::admit_to_run_queue`] for the removal side, and
     /// deferred for the same reason: a global-request handler
@@ -5172,7 +5403,7 @@ impl Scheduler {
                 .insert_alarm(target_time, detpid, dettid, sig, interval)
         };
         if let Some((old_target_time, old_interval)) = old {
-            let remain_ns: u64 = old_target_time.as_nanos().saturating_sub(now.as_nanos());
+            let remain_ns = old_target_time.as_nanos().saturating_sub(now.as_nanos());
             (LogicalTime::from_nanos(remain_ns), old_interval)
         } else {
             // Return 0 if no previous alarm, as per https://man7.org/linux/man-pages/man2/alarm.2.html
@@ -5329,6 +5560,7 @@ mod test {
                 child_tid_addr: 0,
                 req: Ivar::new(),
                 resp: Ivar::new(),
+                protocol: Default::default(),
             },
         );
     }
@@ -6157,6 +6389,7 @@ mod test {
                     // observe the thread died the moment it awaits `req.get()`.
                     req: Ivar::full(Err(ThreadExited)),
                     resp: Ivar::new(),
+                    protocol: Default::default(),
                 },
             );
             s.runqueue_push_back(dead);
@@ -6260,7 +6493,7 @@ mod test {
     /// Deliberately NOT an end-to-end test of that arm. Reaching it requires
     /// teardown to clear `next_turns` inside the host-scheduling gap between the
     /// await resolving and the re-lock, and that gap is not constructible from a
-    /// test: `step1_check_quiescence` only proceeds once every thread's request
+    /// test: the daemon quiescence check only proceeds once every thread's request
     /// is already filled, so `req.get()` never suspends and there is no window a
     /// test can hold open. An attempt to win the lock in that gap is a genuine
     /// race that would usually lose (and deadlocks outright on a current-thread
@@ -6422,6 +6655,7 @@ mod test {
                 child_tid_addr: 0,
                 req: Ivar::full(Ok(continuation)),
                 resp: Ivar::new(),
+                protocol: Default::default(),
             },
         );
 
@@ -6455,6 +6689,7 @@ mod test {
                 child_tid_addr: 0,
                 req: Ivar::full(Ok(continuation)),
                 resp: Ivar::new(),
+                protocol: Default::default(),
             },
         );
 
@@ -6491,6 +6726,7 @@ mod test {
                 child_tid_addr: 0,
                 req: Ivar::full(Ok(failure)),
                 resp: Ivar::new(),
+                protocol: Default::default(),
             },
         );
 
@@ -6527,6 +6763,7 @@ mod test {
                 child_tid_addr: 0,
                 req: Ivar::full(Ok(continuation)),
                 resp: Ivar::new(),
+                protocol: Default::default(),
             },
         );
 
@@ -6562,6 +6799,7 @@ mod test {
                 child_tid_addr: 0,
                 req: Ivar::full(Ok(signal)),
                 resp: Ivar::new(),
+                protocol: Default::default(),
             },
         );
 
@@ -6588,6 +6826,7 @@ mod test {
                 child_tid_addr: 0,
                 req: Ivar::full(Ok(signal)),
                 resp: Ivar::new(),
+                protocol: Default::default(),
             },
         );
 
@@ -7082,6 +7321,7 @@ mod test {
                 child_tid_addr: 0,
                 req: Ivar::full(Ok(Resources::new(dettid))),
                 resp: response.clone(),
+                protocol: Default::default(),
             },
         );
 
@@ -7112,6 +7352,7 @@ mod test {
                 child_tid_addr: 0,
                 req: request.clone(),
                 resp: response.clone(),
+                protocol: Default::default(),
             },
         );
 
@@ -7135,6 +7376,7 @@ mod test {
                 child_tid_addr: 0,
                 req: Ivar::full(Ok(Resources::new(dettid))),
                 resp: response.clone(),
+                protocol: Default::default(),
             },
         );
 
@@ -7159,6 +7401,7 @@ mod test {
                 child_tid_addr: 0x1000,
                 req: Ivar::new(),
                 resp: Ivar::new(),
+                protocol: Default::default(),
             },
         );
 
@@ -7185,6 +7428,7 @@ mod test {
                 child_tid_addr: 0x1000,
                 req: Ivar::new(),
                 resp: Ivar::new(),
+                protocol: Default::default(),
             },
         );
 
@@ -7269,6 +7513,7 @@ mod test {
                 child_tid_addr: 0,
                 req: Ivar::new(),
                 resp: Ivar::new(),
+                protocol: Default::default(),
             },
         );
 
@@ -7582,6 +7827,7 @@ mod test {
                     // host pointers, which is exactly what must not reach stderr.
                     req: Ivar::full(Ok(resources)),
                     resp: Ivar::new(),
+                    protocol: Default::default(),
                 },
             );
             scheduler.blocked.timed_out_futex_waiters.insert(dettid);
@@ -7736,6 +7982,7 @@ mod test {
                 child_tid_addr: 0,
                 req: Ivar::new(),
                 resp: Ivar::new(),
+                protocol: Default::default(),
             },
         );
 
@@ -7774,6 +8021,7 @@ mod test {
                     child_tid_addr: 0,
                     req: Ivar::new(),
                     resp: Ivar::new(),
+                    protocol: Default::default(),
                 },
             );
         }
@@ -7995,6 +8243,7 @@ mod test {
                     child_tid_addr: 0,
                     req: Ivar::new(),
                     resp: Ivar::new(),
+                    protocol: Default::default(),
                 },
             );
         }
@@ -8028,6 +8277,7 @@ mod test {
                     child_tid_addr: 0,
                     req: Ivar::new(),
                     resp: Ivar::new(),
+                    protocol: Default::default(),
                 },
             );
         }
@@ -8071,6 +8321,7 @@ mod test {
                 child_tid_addr: 0,
                 req: Ivar::new(),
                 resp: Ivar::new(),
+                protocol: Default::default(),
             },
         );
         scheduler.priorities.insert(parent, DEFAULT_PRIORITY);

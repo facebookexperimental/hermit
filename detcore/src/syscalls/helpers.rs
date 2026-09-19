@@ -1467,10 +1467,13 @@ where
     let mut rsrc = rsrc.clone();
 
     loop {
-        if matches!(
-            resource_request(guest, rsrc.clone()).await,
-            ResumeStatus::Signaled(_)
-        ) {
+        let resumed = match call.into() {
+            Syscall::Read(read) if maybe_timeout.is_none() && _maybe_stackguard.is_none() => {
+                crate::tool_global::polled_read_request(guest, read, rsrc.clone()).await
+            }
+            _ => resource_request(guest, rsrc.clone()).await,
+        };
+        if matches!(resumed, ResumeStatus::Signaled(_)) {
             let errno = call.signal_interrupt_errno();
             tracing::trace!(
                 "retry_nonblocking_syscall: interrupted by signal before retrying {}: {:?}",

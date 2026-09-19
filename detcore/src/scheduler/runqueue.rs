@@ -145,6 +145,14 @@ struct QueueValue {
     poll_upgrade: Option<Priority>,
 }
 
+/// One suspended queue entry. Global yield/random-selection state stays live.
+#[derive(Debug, Clone)]
+pub(super) struct SuspendedRunQueueEntry {
+    key: PrioritizedOrder,
+    value: QueueValue,
+    persistent_priority: Priority,
+}
+
 #[derive(Debug, Clone)]
 pub struct RunQueue {
     /// We use a "flattened" queue (rather than a Priority -> Vec<DetTid> map)
@@ -389,6 +397,37 @@ impl RunQueue {
         self.tids().any(|t| t == &tid)
     }
 
+    pub(super) fn suspend(
+        &mut self,
+        tid: DetTid,
+        persistent_priority: Priority,
+    ) -> Option<SuspendedRunQueueEntry> {
+        assert!(self.tentative_selection.is_none());
+        let key = *self.queue.iter().find(|(_, v)| v.tid == tid)?.0;
+        let value = self.queue.remove(&key).expect("located queue entry");
+        Some(SuspendedRunQueueEntry {
+            key,
+            value,
+            persistent_priority,
+        })
+    }
+
+    pub(super) fn restore(
+        &mut self,
+        mut entry: SuspendedRunQueueEntry,
+        current_priority: Priority,
+    ) {
+        assert!(self.tentative_selection.is_none());
+        assert!(!self.contains_tid(entry.value.tid));
+        if entry.persistent_priority != current_priority {
+            entry.key.priority = current_priority;
+            if entry.value.poll_upgrade.is_some() {
+                entry.value.poll_upgrade = Some(current_priority);
+            }
+        }
+        assert!(self.queue.insert(entry.key, entry.value).is_none());
+    }
+
     /// Remove `tid` from the queue, returning true if removal ocurred.
     /// Mutating operation: this will error if a tentative_pop/commit transaction is underway.
     pub fn remove_tid(&mut self, tid: DetTid) -> bool {
@@ -621,6 +660,81 @@ impl Default for RunQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_suspend_restore_preserves_all_queue_state() {
+        for strategy in [
+            SchedHeuristic::None,
+            SchedHeuristic::Random,
+            SchedHeuristic::StickyRandom,
+        ] {
+            let tid = DetTid::from_raw(1);
+            let peer = DetTid::from_raw(2);
+            let mut queue = RunQueue::new(strategy, 391, 0.5);
+            queue.push_yielded(tid, DEFAULT_PRIORITY);
+            queue.push_back(peer, DEFAULT_PRIORITY);
+            let key = *queue
+                .queue
+                .iter()
+                .find(|(_, value)| value.tid == tid)
+                .unwrap()
+                .0;
+            queue.queue.get_mut(&key).unwrap().poll_upgrade = Some(DEFAULT_PRIORITY);
+            queue.sticky_random_selection = Some(tid);
+            let before = format!("{queue:?}");
+            let saved = queue.suspend(tid, DEFAULT_PRIORITY).unwrap();
+            assert_eq!(queue.yielded_skip, Some(tid));
+            assert_eq!(queue.sticky_random_selection, Some(tid));
+            queue.restore(saved, DEFAULT_PRIORITY);
+            assert_eq!(format!("{queue:?}"), before, "{strategy:?}");
+        }
+    }
+
+    #[test]
+    fn observation_restore_keeps_real_selection_progress_and_new_priority() {
+        for strategy in [
+            SchedHeuristic::None,
+            SchedHeuristic::Random,
+            SchedHeuristic::StickyRandom,
+        ] {
+            let tid = DetTid::from_raw(1);
+            let peer = DetTid::from_raw(2);
+            let mut queue = RunQueue::new(strategy, 391, 0.5);
+            queue.push_yielded(tid, DEFAULT_PRIORITY);
+            queue.push_back(peer, DEFAULT_PRIORITY);
+            let key = *queue
+                .queue
+                .iter()
+                .find(|(_, value)| value.tid == tid)
+                .unwrap()
+                .0;
+            queue.queue.get_mut(&key).unwrap().poll_upgrade = Some(DEFAULT_PRIORITY);
+            let saved = queue.suspend(tid, DEFAULT_PRIORITY).unwrap();
+            assert_eq!(queue.tentative_pop_next(), Some(peer));
+            assert_eq!(queue.commit_tentative_pop_completed_turn(), peer);
+            assert_eq!(queue.yielded_skip, None);
+            queue.push_back(peer, DEFAULT_PRIORITY);
+            let random_after_turn = format!("{:?}", queue.prng);
+            let sticky_after_turn = queue.sticky_random_selection;
+            let turns_after_turn = (queue.last_back_turn, queue.last_front_turn);
+            queue.restore(saved, DEFAULT_PRIORITY + 3);
+            let (restored, value) = queue
+                .queue
+                .iter()
+                .find(|(_, value)| value.tid == tid)
+                .unwrap();
+            assert_eq!(restored.turn, key.turn);
+            assert_eq!(restored.priority, DEFAULT_PRIORITY + 3);
+            assert_eq!(value.poll_upgrade, Some(DEFAULT_PRIORITY + 3));
+            assert_eq!(queue.yielded_skip, None);
+            assert_eq!(queue.sticky_random_selection, sticky_after_turn);
+            assert_eq!(
+                (queue.last_back_turn, queue.last_front_turn),
+                turns_after_turn
+            );
+            assert_eq!(format!("{:?}", queue.prng), random_after_turn);
+        }
+    }
 
     #[test]
     fn yielded_thread_cedes_exactly_one_turn_under_every_heuristic() {

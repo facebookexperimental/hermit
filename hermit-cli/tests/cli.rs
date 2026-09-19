@@ -9,6 +9,12 @@
 #[path = "common/kvm_cancellation.rs"]
 mod kvm_cancellation;
 
+#[path = "common/kvm_itimer.rs"]
+mod kvm_itimer;
+
+#[path = "common/kvm_signal_retirement.rs"]
+mod kvm_signal_retirement;
+
 #[path = "common/liteinst.rs"]
 mod liteinst_runtime;
 
@@ -6978,4 +6984,14 @@ fn run_kvm_exit_group_cancels_queued_worker_exit() {
 #[test]
 fn run_kvm_exit_group_cancels_rdtsc_posthook_wait() {
     kvm_cancellation::run(512, 17);
+}
+
+#[test]
+fn run_kvm_itimer_real_interrupts_sleep_in_all_eight_modes() {
+    kvm_itimer::run();
+}
+
+#[test]
+fn run_kvm_process_timer_signal_and_sibling_group_exit_retire_both_roles() {
+    kvm_signal_retirement::run();
 }
