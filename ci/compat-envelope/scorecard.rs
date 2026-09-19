@@ -4016,13 +4016,9 @@ fn enforce_writer_boundary(
     after: &TrackedCells,
     writer: Writer,
 ) -> Result<(), String> {
-    let index = |cells: &TrackedCells| -> BTreeMap<CellId, TrackedCell> {
-        cells
-            .cells
-            .iter()
-            .map(|cell| (cell.id.clone(), cell.clone()))
-            .collect()
-    };
+    fn index(cells: &TrackedCells) -> BTreeMap<&CellId, &TrackedCell> {
+        cells.cells.iter().map(|cell| (&cell.id, cell)).collect()
+    }
     let (old, new) = (index(before), index(after));
 
     // ⚠️ THE PROJECTION BLOCK IS OBSERVATION-AUTHORITY STATE, so `update` may
