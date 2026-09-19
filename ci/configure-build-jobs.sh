@@ -406,8 +406,17 @@ fi
 # Keep default CMAKE, unset CMAKE_GENERATOR, the 1050 effective-job-second
 # budget and 16-job clamp. This is source-identity carry, not new calibration
 # or transferred runtime evidence; prior calibration limitations remain.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 502bc21f897065766f1ef4c940ede1efe4743acd ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 502bc21f897065766f1ef4c940ede1efe4743acd (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO f7bd85e11dd258112148ed2cba6531501a1a00d9 (2026-09-19): relative to
+# 502bc21f897065766f1ef4c940ede1efe4743acd, the complete reverie-dbt tree
+# remains d12ba78b0f844791815db06eb41f07a818f99967, including build.rs blob
+# 0ff8ae24b97464044735ba79ea74765ba4ac3ff0 and DynamoRIO vendor tree
+# 117d54d744df23921c531d0fe08537249f5a510a. Root Cargo/toolchain/.gitmodules
+# and third-party inputs are unchanged. Preserve CMAKE/CMAKE_GENERATOR
+# selection, the 16-job clamp and 1050 effective-job-second threshold.
+# This source-identity carry adds no timing sample or runtime evidence;
+# prior calibration limitations remain.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != f7bd85e11dd258112148ed2cba6531501a1a00d9 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie f7bd85e11dd258112148ed2cba6531501a1a00d9 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

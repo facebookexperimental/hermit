@@ -368,7 +368,7 @@ fi
 # threshold and 16-job clamp. The native KVM repair requires its own
 # qualification; this is source-identity carry, not a new timing sample,
 # SDK cache-key measurement, guest result or earlier receipt reuse.
-expected_pin=502bc21f897065766f1ef4c940ede1efe4743acd
+expected_pin=f7bd85e11dd258112148ed2cba6531501a1a00d9
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
