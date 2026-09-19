@@ -1275,6 +1275,13 @@ pub struct CellResult {
     /// obtain a complete measurement. A measured zero remains a real value.
     #[serde(default)]
     pub cpu_usage_usec: Option<u64>,
+    /// Per-invocation observations, independent of the charged aggregate.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::cpu_evidence::deserialize_present"
+    )]
+    pub cpu_observations: Option<crate::cpu_evidence::CellCpuObservationsV1>,
     /// Runtime totals from the first attempt that produced them.
     pub runtime: Option<VerificationRuntime>,
     pub log_level: Option<String>,
@@ -1332,6 +1339,50 @@ pub struct CellResult {
 }
 
 impl CellResult {
+    /// Bind supplied CPU evidence to this row; historical absence adds no requirements.
+    pub fn require_cpu_observations(&self) -> Result<(), String> {
+        let Some(observations) = &self.cpu_observations else {
+            return Ok(());
+        };
+        use crate::ledger::RequiredNullable;
+        let binding = crate::cpu_evidence::CellCpuBinding {
+            run_id: self.run_id.clone(),
+            hermit_sha: self.hermit_sha.clone(),
+            lane: self.lane.clone(),
+            category: self.category.clone(),
+            test: self.test.clone(),
+            mode: self.mode.clone(),
+            backend: self
+                .backend
+                .clone()
+                .map_or(RequiredNullable::Null, RequiredNullable::Value),
+            outer_attempt: self.attempt,
+            run_index: self
+                .run_index
+                .map_or(RequiredNullable::Null, RequiredNullable::Value),
+        };
+        observations.validate_binding(&binding)?;
+        for attempt in &self.attempts {
+            observations.validate_attempt(
+                &attempt.index,
+                &attempt.argv,
+                &attempt.cwd,
+                &attempt.env,
+            )?;
+        }
+        observations.require_passing_prerequisites(self.attempts.iter().map(|attempt| {
+            (
+                attempt.index.as_str(),
+                attempt.outcome == "PASS"
+                    && attempt.status == Some(0)
+                    && attempt.signal.is_none()
+                    && !attempt.timed_out,
+                Some(attempt.timed_out),
+            )
+        }))?;
+        Ok(())
+    }
+
     /// Human-facing explanation without manufacturing a cause the producer did
     /// not record.
     pub fn reason_for_display(&self) -> &str {
@@ -4016,6 +4067,7 @@ fn run_cell_inner(
         })
         .and_then(|total| checked_add_cpu_usage(Some(total), parity_comparison_cpu_usage_usec));
     Ok(CellResult {
+        cpu_observations: None,
         artifact_dir: dir.display().to_string(),
         schema: CELL_RESULT_SCHEMA,
         run_id: context.run_id.clone(),
@@ -4097,6 +4149,7 @@ pub fn infrastructure_error_result(
     let dir = cell_artifact_dir(context, cell);
     let timeouts = cell_timeouts(context, cell).ok();
     CellResult {
+        cpu_observations: None,
         artifact_dir: dir.display().to_string(),
         schema: CELL_RESULT_SCHEMA,
         run_id: context.run_id.clone(),
@@ -4172,6 +4225,7 @@ pub fn host_inapplicable_result(
     let dir = cell_artifact_dir(context, cell);
     let timeouts = cell_timeouts(context, cell).ok();
     CellResult {
+        cpu_observations: None,
         artifact_dir: dir.display().to_string(),
         schema: CELL_RESULT_SCHEMA,
         run_id: context.run_id.clone(),
@@ -4460,6 +4514,7 @@ pub fn prepare_result_path(path: &Path) -> Result<(), String> {
 pub fn append_result(path: &Path, result: &CellResult) -> Result<(), String> {
     result.require_current_classification()?;
     result.require_current_timeout_policy()?;
+    result.require_cpu_observations()?;
     // A missing prerequisite means the cell did not execute. Keep the typed
     // value for the harness summary and JUnit skip, but do not publish a cell
     // row that downstream readers could count as an observation. The validate
@@ -7850,6 +7905,7 @@ backends_disabled:
     /// names is open is the failure this file is full of warnings about.
     fn cell_result_that_located_nothing() -> CellResult {
         CellResult {
+            cpu_observations: None,
             schema: CELL_RESULT_SCHEMA,
             run_id: "fixture".into(),
             machine_shortname: "fixture-host".into(),

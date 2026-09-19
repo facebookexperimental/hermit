@@ -934,6 +934,12 @@ fn retain_v10_with_contract(
                 .ok_or("ordinary cell has no selected terminal result")?;
             (cell_verdict(row)?, RequiredNullable::Null, selected_attempt)
         };
+        let cpu_observation_history =
+            hermit_manifest_plan::cpu_evidence::CellCpuHistoryV1::from_source_rows(&rows)?;
+        if binding_contract == CellBindingContract::LegacyUnbound && cpu_observation_history.is_some()
+        {
+            return Err("legacy cell artifact cannot retain present CPU observations".into());
+        }
         full_cells.push(CellArtifactResultV10 {
             lane: id.lane,
             category: id.category,
@@ -942,6 +948,7 @@ fn retain_v10_with_contract(
             backend: id.backend,
             cell_verdict,
             backend_parity,
+            cpu_observation_history,
             selected_attempt: (binding_contract == CellBindingContract::SelectedAttemptV1)
                 .then_some(selected_attempt),
         });
@@ -2224,5 +2231,241 @@ mod tests {
         let error = retain(&root, &results, commit, &plan).unwrap_err();
         assert!(error.contains("1 missing, 0 extra"));
         fs::remove_dir_all(root).unwrap();
+    }
+    // Synthetic reader controls: these values are not native CPU measurements.
+    fn cpu_fixture_envelope(row: &Value) -> Value {
+        let invocations: Vec<Value> = row["attempts"].as_array().unwrap().iter().enumerate().map(|(i, attempt)| serde_json::json!({
+            "ordinal":i+1,"role":{"kind":"execution","attempt_index":attempt["index"],"backend":if attempt["index"] == "parity-reference" {serde_json::json!("ptrace")} else {row["backend"].clone()}},
+            "command":{"argv":attempt["argv"],"cwd":attempt["cwd"],"env_overrides":attempt["env"]},
+            "launch":{"state":"spawned","pid":17},"live":{"state":"disabled"},
+            "final_wait":{"state":"reaped","source":"wait4","pid":17,"raw_status":0,"at":{"seconds":1,"nanoseconds":0},"cpu":{"state":"measured","user_usec":3,"system_usec":2,"total_usec":5}},
+            "termination":"completed_wait4","returned_cpu_charge":{"state":"value","cpu_usec":5,"basis":"final_wait4"}
+        })).collect();
+        serde_json::json!({"version":1,"binding":{"run_id":row["run_id"],"hermit_sha":row["hermit_sha"],"lane":row["lane"],"category":row["category"],"test":row["test"],"mode":row["mode"],"backend":row["backend"],"outer_attempt":row["attempt"],"run_index":null},"invocations":invocations})
+    }
+
+    #[test]
+    fn cpu_projection_preserves_every_ordinary_retry_and_refuses_hidden_malformed_rows() {
+        use hermit_manifest_plan::ledger::ConstructedValidationPlanV10;
+        let plan: ConstructedValidationPlanV10 = serde_json::from_str(include_str!(
+            "../../tests/fixtures/ledger-schema10/legacy/ordinary-only-plan.json"
+        ))
+        .unwrap();
+        let id = plan.planned_cells().unwrap().remove(0);
+        let mut first = result_row(&plan.run_id, &plan.hermit_sha);
+        for (key, value) in [
+            ("lane", &id.lane),
+            ("category", &id.category),
+            ("test", &id.test),
+            ("mode", &id.mode),
+            ("backend", &id.backend),
+        ] {
+            first[key] = Value::String(value.clone());
+        }
+        first["attempt"] = Value::from(1);
+        first["outcome"] = Value::String("FAIL".into());
+        replace_report(
+            &mut first,
+            &serde_json::from_str(&report("diverged", "info")).unwrap(),
+        );
+        let mut second = first.clone();
+        second["attempt"] = Value::from(2);
+        second["outcome"] = Value::String("PASS".into());
+        replace_report(
+            &mut second,
+            &serde_json::from_str(&report("matched", "info")).unwrap(),
+        );
+        for row in [&mut first, &mut second] {
+            row["attempts"][0]["index"] = Value::String("verify-1".into());
+            row["attempts"][0]["argv"] = serde_json::json!(["synthetic-command"]);
+            row["attempts"][0]["cwd"] = Value::String("/synthetic".into());
+            row["attempts"][0]["env"] = serde_json::json!({});
+        }
+        let mut old_bytes = None;
+        for mask in 0..4 {
+            let parent = tempfile::tempdir().unwrap();
+            let results = parent.path().join("results");
+            let mut rows = [first.clone(), second.clone()];
+            for (i, row) in rows.iter_mut().enumerate() {
+                if mask & (1 << i) != 0 {
+                    row["cpu_observations"] = cpu_fixture_envelope(row);
+                }
+                append_result_row(&results, row);
+            }
+            let retained = retain_v10(parent.path(), &results, &plan).unwrap();
+            let bytes = fs::read(
+                parent
+                    .path()
+                    .join(retained.evidence["artifact"]["path"].as_str().unwrap()),
+            )
+            .unwrap();
+            let artifact: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(artifact["selected_attempt"], 2);
+            assert_eq!(artifact["cell_verdict"]["state"], "compared-and-matched");
+            let evidence: hermit_manifest_plan::ledger::CellResultsEvidenceV10 =
+                serde_json::from_value(retained.evidence.clone()).unwrap();
+            evidence.verify_cell_artifact_bytes(&bytes).unwrap();
+            if mask == 0 {
+                assert!(artifact.get("cpu_observation_history").is_none());
+                old_bytes = Some(bytes);
+            } else {
+                let history = &artifact["cpu_observation_history"];
+                assert_eq!(history["attempts"].as_array().unwrap().len(), 2);
+                for i in 0..2 {
+                    assert_eq!(history["attempts"][i]["outer_attempt"], i + 1);
+                    assert_eq!(
+                        history["attempts"][i]["state"],
+                        if mask & (1 << i) != 0 {
+                            "recorded"
+                        } else {
+                            "unrecorded"
+                        }
+                    );
+                    if mask & (1 << i) != 0 {
+                        assert_eq!(
+                            history["attempts"][i]["observations"],
+                            rows[i]["cpu_observations"]
+                        );
+                    }
+                }
+                let mut without = artifact.clone();
+                without
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("cpu_observation_history");
+                let mut historical = serde_json::to_vec(&without).unwrap();
+                historical.push(b'\n');
+                assert_eq!(historical, old_bytes.as_ref().unwrap().as_slice());
+            }
+        }
+        for bad in [Value::Null, serde_json::json!({"version":99}), {
+            let mut value = cpu_fixture_envelope(&first);
+            value["binding"]["test"] = Value::String("foreign".into());
+            value
+        }] {
+            let parent = tempfile::tempdir().unwrap();
+            let results = parent.path().join("results");
+            let mut row = first.clone();
+            row["cpu_observations"] = bad;
+            append_result_row(&results, &row);
+            append_result_row(&results, &second);
+            assert!(retain_v10(parent.path(), &results, &plan).is_err());
+            assert!(
+                !parent
+                    .path()
+                    .join("ignored/validate/artifacts")
+                    .join(&plan.run_id)
+                    .join("cell-results.jsonl")
+                    .exists()
+            );
+        }
+        let parent = tempfile::tempdir().unwrap();
+        let results = parent.path().join("results");
+        first["cpu_observations"] = cpu_fixture_envelope(&first);
+        append_result_row(&results, &first);
+        append_result_row(&results, &second);
+        assert!(
+            retain_v10_legacy(parent.path(), &results, &plan)
+                .unwrap_err()
+                .contains("CPU observations")
+        );
+    }
+
+    #[test]
+    fn cpu_projection_preserves_parity_invocations_and_validates_their_operands() {
+        use hermit_manifest_plan::ledger::ConstructedValidationPlanV10;
+        let plan: ConstructedValidationPlanV10 =
+            serde_json::from_str(include_str!("fixtures/schema10-matched-plan.json")).unwrap();
+        let retained: Value =
+            serde_json::from_str(include_str!("fixtures/schema10-matched-cell.json")).unwrap();
+        let completed = &retained["backend_parity"]["attempts"][0];
+        let base = serde_json::json!({
+            "schema":4,"run_id":plan.run_id,"hermit_sha":plan.hermit_sha,
+            "source_tree_dirty":false,"attempt":1,"test":retained["test"],
+            "category":retained["category"],"lane":retained["lane"],"mode":"verify","backend":"kvm",
+            "classification":"deterministic","outcome":"PASS","result":"pass",
+            "failure_class":null,"error_kind":null,"timeout_seconds":57,
+            "execution_cpu_timeout_seconds":22,"execution_wall_timeout_seconds":57,
+            "argv":[],"guest_argv":[],"env":{},"cwd":"/synthetic/fixture/work",
+            "shell_command":"synthetic retained writer input","artifact_dir":"synthetic",
+            "attempts":[completed["candidate_attempt"],completed["reference_attempt"]],
+            "backend_parity":completed["report"]
+        });
+        let mut supplied = base.clone();
+        supplied["cpu_observations"] = cpu_fixture_envelope(&supplied);
+        let mut normalization = supplied["cpu_observations"]["invocations"][1].clone();
+        normalization["ordinal"] = Value::from(3);
+        normalization["role"] =
+            serde_json::json!({"kind":"ptrace_normalization","execution_ordinal":2});
+        let mut comparison = normalization.clone();
+        comparison["ordinal"] = Value::from(4);
+        comparison["role"] = serde_json::json!({"kind":"parity_comparison","candidate_execution":1,"reference_execution":2});
+        supplied["cpu_observations"]["invocations"]
+            .as_array_mut()
+            .unwrap()
+            .extend([normalization, comparison]);
+        let mut historical = None;
+        for row in [&base, &supplied] {
+            let parent = tempfile::tempdir().unwrap();
+            let results = parent.path().join("results");
+            append_result_row(&results, row);
+            let retained = retain_v10(parent.path(), &results, &plan).unwrap();
+            let bytes = fs::read(
+                parent
+                    .path()
+                    .join(retained.evidence["artifact"]["path"].as_str().unwrap()),
+            )
+            .unwrap();
+            let evidence: hermit_manifest_plan::ledger::CellResultsEvidenceV10 =
+                serde_json::from_value(retained.evidence).unwrap();
+            evidence.verify_cell_artifact_bytes(&bytes).unwrap();
+            let mut artifact: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(artifact["selected_attempt"], 1);
+            assert_eq!(artifact["cell_verdict"]["state"], "compared-and-matched");
+            if row.get("cpu_observations").is_none() {
+                assert!(artifact.get("cpu_observation_history").is_none());
+                historical = Some(artifact);
+            } else {
+                assert_eq!(
+                    artifact["cpu_observation_history"]["attempts"][0]["observations"],
+                    supplied["cpu_observations"]
+                );
+                artifact
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("cpu_observation_history");
+                assert_eq!(Some(artifact), historical);
+            }
+        }
+        for (pointer, value) in [
+            (
+                "/cpu_observations/invocations/1/role/backend",
+                serde_json::json!("kvm"),
+            ),
+            (
+                "/cpu_observations/invocations/1/command/argv",
+                serde_json::json!(["foreign"]),
+            ),
+            (
+                "/cpu_observations/invocations/2/role/execution_ordinal",
+                serde_json::json!(1),
+            ),
+            (
+                "/cpu_observations/invocations/3/role/reference_execution",
+                serde_json::json!(1),
+            ),
+            ("/attempts/0/outcome", serde_json::json!("FAIL")),
+            ("/attempts/1/outcome", serde_json::json!("ERROR")),
+        ] {
+            let mut bad = supplied.clone();
+            *bad.pointer_mut(pointer).unwrap() = value;
+            let parent = tempfile::tempdir().unwrap();
+            let results = parent.path().join("results");
+            append_result_row(&results, &bad);
+            assert!(
+                retain_v10(parent.path(), &results, &plan).is_err(),
+                "{pointer}"
+            );
+        }
     }
 }

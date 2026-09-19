@@ -4,6 +4,7 @@ mod backend_parity_policy;
 pub mod canonical_verdict;
 pub mod ci_selection;
 pub mod cli_help;
+pub mod cpu_evidence;
 pub mod environmental_block;
 pub mod host_capability;
 pub mod ledger;

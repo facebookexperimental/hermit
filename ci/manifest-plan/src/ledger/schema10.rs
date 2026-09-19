@@ -145,6 +145,7 @@ pub fn read_schema10_source_result(bytes: &[u8]) -> Result<Value, String> {
             exact_duration(attempt)?;
         }
     }
+    crate::cpu_evidence::validate_cpu_observations_in_source_row(&value)?;
     Ok(value)
 }
 
@@ -359,6 +360,8 @@ pub struct CellArtifactResultV10 {
     /// would compare the binding against itself and pass for any value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selected_attempt: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_observation_history: Option<crate::cpu_evidence::CellCpuHistoryV1>,
 }
 
 #[derive(Deserialize)]
@@ -372,6 +375,8 @@ struct CellArtifactResultV10Wire {
     cell_verdict: CellVerdictV8,
     backend_parity: RequiredNullable<CellBackendParity>,
     selected_attempt: u64,
+    #[serde(default, deserialize_with = "crate::cpu_evidence::deserialize_present")]
+    cpu_observation_history: Option<crate::cpu_evidence::CellCpuHistoryV1>,
 }
 
 impl<'de> Deserialize<'de> for CellArtifactResultV10 {
@@ -386,6 +391,7 @@ impl<'de> Deserialize<'de> for CellArtifactResultV10 {
             cell_verdict: value.cell_verdict.into(),
             backend_parity: value.backend_parity,
             selected_attempt: Some(value.selected_attempt),
+            cpu_observation_history: value.cpu_observation_history,
         })
     }
 }
@@ -415,6 +421,7 @@ impl From<LegacyCellArtifactResultV10Wire> for CellArtifactResultV10 {
             cell_verdict: value.cell_verdict.into(),
             backend_parity: value.backend_parity,
             selected_attempt: None,
+            cpu_observation_history: None,
         }
     }
 }
@@ -1294,6 +1301,7 @@ impl CellBackendParity {
                 .map_err(|error| format!("schema 10 source result is malformed: {error}"))?;
             typed.require_current_classification()?;
             typed.require_current_timeout_policy()?;
+            typed.require_cpu_observations()?;
             let actual = CellIdentity {
                 lane: typed.lane.clone(),
                 category: typed.category.clone(),
@@ -2022,6 +2030,52 @@ impl CellResultsEvidenceV10 {
             }
             .map_err(|error| format!("invalid schema 10 full cell evidence: {error}"))?;
             validate_ordinary_verdict(&cell.identity(), &cell.cell_verdict)?;
+            if let Some(history) = &cell.cpu_observation_history {
+                history.validate_for_artifact(
+                    &self.run_id,
+                    &self.hermit_sha,
+                    &cell.identity(),
+                    cell.selected_attempt
+                        .ok_or("CPU history lacks selected-attempt binding")?,
+                )?;
+                if let RequiredNullable::Value(parity) = &cell.backend_parity {
+                    for attempt in &parity.attempts {
+                        let record = history
+                            .attempts
+                            .iter()
+                            .find(|item| item.outer_attempt() == attempt.attempt())
+                            .ok_or("CPU history omits a parity outer attempt")?;
+                        if let Some(observations) = record.observations() {
+                            for operand in std::iter::once(attempt.candidate_attempt())
+                                .chain(attempt.reference_attempt())
+                            {
+                                let operand = &operand.0;
+                                observations.validate_attempt(
+                                    &operand.index,
+                                    &operand.argv,
+                                    &operand.cwd,
+                                    &operand.env,
+                                )?;
+                            }
+                            observations.require_passing_prerequisites(
+                                std::iter::once(attempt.candidate_attempt())
+                                    .chain(attempt.reference_attempt())
+                                    .map(|operand| {
+                                        let operand = &operand.0;
+                                        (
+                                            operand.index.as_str(),
+                                            operand.outcome == "PASS"
+                                                && operand.status == Some(0)
+                                                && operand.signal.is_none()
+                                                && !operand.timed_out,
+                                            Some(operand.timed_out),
+                                        )
+                                    }),
+                            )?;
+                        }
+                    }
+                }
+            }
             cells.push(cell);
         }
         let summaries = cells

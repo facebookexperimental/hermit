@@ -133,6 +133,7 @@ fn fixture_with_path(
     };
     let plan_bytes = serde_json::to_vec(&plan).unwrap();
     let cell = CellArtifactResultV10 {
+        cpu_observation_history: None,
         lane: id.lane.clone(),
         category: id.category.clone(),
         test: id.test.clone(),
@@ -1525,5 +1526,123 @@ fn raw_history_rows_refuse_duplicate_binding_contract_markers() {
                 .contains("duplicate field `binding_contract`"),
             "{first}/{second}: {error}"
         );
+    }
+}
+
+#[test]
+fn cpu_history_is_authenticated_without_changing_compact_verdicts() {
+    let (row, plan, original, tests) =
+        fixture(parity(vec![completed(1, BackendParityVerdict::Matched)]));
+    row.verify_schema10_artifact_bytes(&plan, &original, &tests)
+        .unwrap()
+        .unwrap();
+    let original_value: Value = serde_json::from_slice(&original).unwrap();
+    let verified = row
+        .verify_schema10_artifact_bytes(&plan, &original, &tests)
+        .unwrap()
+        .unwrap();
+    let decoded = verified
+        .cell_results
+        .verify_cell_artifact_bytes(&original)
+        .unwrap();
+    assert!(decoded[0].cpu_observation_history.is_none());
+    let mut historical = serde_json::to_value(&decoded[0]).unwrap();
+    for key in ["run_id", "hermit_sha", "source_tree_dirty"] {
+        historical[key] = original_value[key].clone();
+    }
+    let mut historical_bytes = serde_json::to_vec(&historical).unwrap();
+    historical_bytes.push(b'\n');
+    assert_eq!(historical_bytes, original);
+    let mut source = crate::cpu_evidence::tests::source_row();
+    for key in [
+        "run_id",
+        "hermit_sha",
+        "lane",
+        "category",
+        "test",
+        "mode",
+        "backend",
+    ] {
+        source[key] = original_value[key].clone();
+    }
+    let operands = &original_value["backend_parity"]["attempts"][0];
+    source["attempts"] =
+        serde_json::json!([operands["candidate_attempt"], operands["reference_attempt"]]);
+    let observations = crate::cpu_evidence::tests::envelope(&source);
+    let history = serde_json::json!({"version":1,"attempts":[{"state":"recorded","outer_attempt":1,"observations":observations}]});
+    let check = |value: &Value| {
+        let mut bytes = serde_json::to_vec(value).unwrap();
+        bytes.push(b'\n');
+        let mut parent = serde_json::to_value(&row).unwrap();
+        parent["cell_results"]["artifact"]["sha256"] = hex_digest(&bytes).into();
+        let parent: HistoryRow = serde_json::from_value(parent).unwrap();
+        parent.verify_schema10_artifact_bytes(&plan, &bytes, &tests)
+    };
+    let mut supplied = original_value.clone();
+    supplied["cpu_observation_history"] = history;
+    let admitted = check(&supplied).unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value(admitted.cell_results.cells).unwrap(),
+        serde_json::to_value(verified.cell_results.cells).unwrap()
+    );
+    for (pointer, value) in [
+        ("/cpu_observation_history", Value::Null),
+        ("/cpu_observation_history/version", serde_json::json!(2)),
+        (
+            "/cpu_observation_history/attempts/0/observations/binding/run_id",
+            serde_json::json!("foreign"),
+        ),
+        (
+            "/cpu_observation_history/attempts/0/outer_attempt",
+            serde_json::json!(2),
+        ),
+        (
+            "/cpu_observation_history/attempts/0/observations/invocations/0/command/argv",
+            serde_json::json!(["foreign"]),
+        ),
+    ] {
+        let mut bad = supplied.clone();
+        *bad.pointer_mut(pointer).unwrap() = value;
+        assert!(check(&bad).is_err(), "{pointer}");
+    }
+    let mut missing = supplied.clone();
+    missing["cpu_observation_history"]["attempts"][0]["observations"]["invocations"] =
+        serde_json::json!([]);
+    assert!(check(&missing).is_err());
+    let mut unknown = supplied.clone();
+    unknown["cpu_observation_history"]["future"] = Value::Bool(true);
+    assert!(check(&unknown).is_err());
+    // The authenticated artifact retains typed parity attempts. Intrinsically
+    // valid CPU evidence must still agree with their actual timeout flags.
+    let mut contradicted = supplied.clone();
+    let reference = &mut contradicted["cpu_observation_history"]["attempts"][0]["observations"]["invocations"]
+        [1];
+    reference["termination"] = serde_json::json!("final_wait_cpu_budget_return");
+    reference["live"] = serde_json::json!({"state":"enabled","source":"agent_utils_paired_pidfd_stat_v1","registration":{"state":"unavailable","reason":"synthetic refusal"},"polls":0,"source_sample_calls":0,"valid_polls":0,"unavailable_polls":0,"first":null,"last":null,"high_water":null,"timeout_trigger":null,"last_error":null});
+    let intrinsic: crate::cpu_evidence::CellCpuObservationsV1 = serde_json::from_value(
+        contradicted["cpu_observation_history"]["attempts"][0]["observations"].clone(),
+    )
+    .unwrap();
+    intrinsic.validate().unwrap();
+    assert!(
+        check(&contradicted)
+            .unwrap_err()
+            .contains("retained timed_out")
+    );
+    contradicted
+        .as_object_mut()
+        .unwrap()
+        .remove("cpu_observation_history");
+    assert!(check(&contradicted).is_ok());
+    // Legacy absence stays exact; removing its binding contract cannot admit a new field.
+    let mut legacy = original_value.clone();
+    legacy.as_object_mut().unwrap().remove("selected_attempt");
+    for key in ["run_id", "hermit_sha", "source_tree_dirty"] {
+        legacy.as_object_mut().unwrap().remove(key);
+    }
+    assert!(serde_json::from_value::<LegacyCellArtifactResultV10Wire>(legacy.clone()).is_ok());
+    for extension in [Value::Null, supplied["cpu_observation_history"].clone()] {
+        legacy["cpu_observation_history"] = extension;
+        assert!(serde_json::from_value::<LegacyCellArtifactResultV10Wire>(legacy.clone()).is_err());
     }
 }
