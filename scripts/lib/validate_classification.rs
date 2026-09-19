@@ -1199,6 +1199,12 @@ mod ledger_tests {
             ),
         ] {
             let ctx = super::super::LedgerCtx {
+                run_id: std::env::var("E2E_RUN_ID").ok(),
+                admission_floor_evidence: None,
+                admission_provenance_error: None,
+                log_identity: None,
+                base_observation: serde_json::Value::Null,
+                main_observation: serde_json::Value::Null,
                 started_at: "2026-09-13T00:00:00Z".into(),
                 host: "classification-fixture".into(),
                 toolchain: "fixture".into(),
@@ -1210,8 +1216,8 @@ mod ledger_tests {
                 commit: "535b48a113390f0084eac204b54de67dacc24f29".into(),
                 tree: "d0fc13f45eb671585d1aa26c7fcf3fdb4ca480c7".into(),
                 git_depth: 1,
-                git_ahead: 0,
-                git_behind: 0,
+                git_ahead: Some(0),
+                git_behind: Some(0),
                 commit_anchored: false,
                 tree_dirty: false,
                 dag_jobs: 1,

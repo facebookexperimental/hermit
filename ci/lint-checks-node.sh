@@ -136,8 +136,27 @@ make: *** [lint-checks] Error 1"
 }
 
 if [ "${1:-}" = '--self-test' ]; then
+    if [ "$#" -ne 1 ]; then
+        echo 'lint-checks-node: --self-test accepts no other argument' >&2
+        exit 2
+    fi
     self_test
     exit $?
+fi
+
+# This parameter carries only a SHA already selected by the driver. It neither
+# grants admission nor changes the ordinary standalone checker policy.
+pin_args=()
+if [ "$#" -ne 0 ]; then
+    if [ "$#" -ne 2 ] || [ "$1" != '--reverie-pin-base-ref' ] || ! [[ "$2" =~ ^[0-9a-f]{40}$ ]]; then
+        echo 'usage: ci/lint-checks-node.sh [--reverie-pin-base-ref FULL_SHA]' >&2
+        exit 2
+    fi
+    pin_args=("VALIDATE_REVERIE_PIN_BASE_REF=$2")
+fi
+if [[ ${VALIDATE_REVERIE_PIN_BASE_REF+x} || ${MAKEFLAGS:-}${MFLAGS:-}${MAKEOVERRIDES:-} == *VALIDATE_REVERIE_PIN_BASE_REF* ]]; then
+    echo 'lint-checks-node: an ambient admission floor is not authority' >&2
+    exit 2
 fi
 
 cd "$(dirname "$0")/.."
@@ -187,7 +206,7 @@ esac
 node_out=$(mktemp) || exit 1
 trap 'rm -f "$node_out"' EXIT
 set +e
-make lint-checks 2>&1 | tee "$node_out"
+make lint-checks "${pin_args[@]}" 2>&1 | tee "$node_out"
 pipeline_status=("${PIPESTATUS[@]}")
 set -e
 make_rc=${pipeline_status[0]}

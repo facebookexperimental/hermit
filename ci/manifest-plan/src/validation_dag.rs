@@ -36,6 +36,27 @@ const SUPER_REPETITIONS: &str = "20";
 const PINNED_ROOT_FETCH_TAG: &str = "setup.pinned_root_fetch";
 const PINNED_ROOT_FETCH_COMMAND: &str = "seed=(); if [ -n \"${CARGO_HOME:-}\" ]; then seed=(--seed-cargo \"$CARGO_HOME\"); fi; ./ci/hermetic/run-split-validate.sh --fetch-only \"${seed[@]}\"";
 const PIN_GATE_COMMAND: &str = r#"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; with-proxy ./ci/run-reverie-pin-check.sh --repo "$PWD""#;
+const LINT_CHECKS_COMMAND: &str = r#"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/lint-checks-node.sh"#;
+
+/// Literal argv rendering only, not admission authority. The driver retains its
+/// private authenticated slot proof and checks the complete derived graph.
+pub fn admitted_pin_command(tag: &str, floor: Option<&str>) -> Result<Option<String>, String> {
+    let (base, flag) = match tag {
+        "pre.reverie_pin" | "pre.reverie_pin_on_host" => (PIN_GATE_COMMAND, "--base-ref"),
+        "check.lint_checks" => (LINT_CHECKS_COMMAND, "--reverie-pin-base-ref"),
+        other if other.starts_with("pre.reverie_pin") => {
+            return Err(format!("unknown pin node {other}"));
+        }
+        _ => return Ok(None),
+    };
+    match floor {
+        Some(sha) if crate::ledger::admission_hex(sha, 40) => {
+            Ok(Some(format!("{base} {flag} '{sha}'")))
+        }
+        Some(_) => Err("pin command requires one literal full lowercase SHA".into()),
+        None => Ok(Some(base.into())),
+    }
+}
 const OUTCOME_CONSUMERS_COMMAND: &str = r#"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/check-outcome-consumers-node.sh"#;
 const PINNED_ROOT_TWIN_SUFFIX: &str = "_in_pinned_root";
 pub const HOSTED_PORTABLE_LABEL: &str = "hosted-portable";

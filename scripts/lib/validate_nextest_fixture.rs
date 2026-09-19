@@ -162,7 +162,7 @@ fn ensure_prepared_helpers(source: &Path, root: &Path, deadline: u64) {
     assert_eq!(outcome.oom_kills, 0);
 }
 
-fn context(source: &Path, outcomes: &[StepOutcome]) -> LedgerCtx {
+fn context(source: &Path, outcomes: &[StepOutcome], run_id: &str) -> LedgerCtx {
     let (executed_tests, passed_tests, filtered_tests) = libtest_counts(outcomes);
     // An exact clean source is required for cumulative artifact binding. The
     // fixture remains nonqualifying even when its sole passing control passes.
@@ -174,6 +174,12 @@ fn context(source: &Path, outcomes: &[StepOutcome]) -> LedgerCtx {
         .is_empty()
     );
     LedgerCtx {
+        run_id: Some(run_id.to_string()),
+        admission_floor_evidence: None,
+        admission_provenance_error: None,
+        log_identity: None,
+        base_observation: serde_json::Value::Null,
+        main_observation: serde_json::Value::Null,
         started_at: utc_now(),
         host: "real-nextest-fixture".into(),
         toolchain: "fixture; actual tool versions retained separately".into(),
@@ -185,8 +191,8 @@ fn context(source: &Path, outcomes: &[StepOutcome]) -> LedgerCtx {
         commit: git_text(source, &["rev-parse", "HEAD"]),
         tree: git_text(source, &["rev-parse", "HEAD^{tree}"]),
         git_depth: 0,
-        git_ahead: 0,
-        git_behind: 0,
+        git_ahead: Some(0),
+        git_behind: Some(0),
         commit_anchored: false,
         tree_dirty: false,
         dag_jobs: 1,
@@ -521,7 +527,7 @@ fn actual_nextest_results_and_publication_failures() {
                 names.len()
             );
         }
-        let ctx = context(&source, &result.outcomes);
+        let ctx = context(&source, &result.outcomes, &run_id);
         let retained =
             prepared.retain(&case, &case, &ctx, &result.outcomes, &result.attempts, None);
         let retained = if mismatch {
@@ -569,6 +575,7 @@ fn actual_nextest_results_and_publication_failures() {
         let text = fs::read_to_string(&ledger).unwrap();
         assert_eq!(text.lines().count(), 1);
         let row: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(row["run_id"], run_id);
         assert_eq!(row["result"], expected_class.result());
         assert_eq!(row["selection_mode"], "only");
         assert_eq!(row["commit_anchored"], false);

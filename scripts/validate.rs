@@ -85,6 +85,9 @@ mod validate_evidence;
 #[path = "lib/validate_plan.rs"]
 mod validate_plan;
 
+#[path = "lib/validate_admission.rs"]
+mod validate_admission;
+
 #[path = "lib/validate_receipt.rs"]
 mod validate_receipt;
 
@@ -374,7 +377,7 @@ mod artifact_plan_tests {
 
     #[test]
     fn actual_host_and_pinned_consumers_require_their_artifact_and_resource_producers() {
-        let cfg = validate_plan::validation_config(&repo_root()).unwrap();
+        let cfg = validate_plan::validation_config(&test_source_root()).unwrap();
         for tag in ["test.hermit_integration", "test.hermit_integration_on_host"] {
             let step = cfg.steps.iter().find(|step| step.tag() == tag).unwrap();
             integration_artifact_bracket(step).unwrap();
@@ -4304,11 +4307,13 @@ fn checkout_attribution_bracket() -> Result<(), String> {
         std::env::set_var("HERMIT_VALIDATE_STOP_TEST_MODE", "1");
         std::env::set_var("VALIDATE_STOP_TEST_AUTHORITY_STATUS_JSON", &authority);
     }
-    let admitted = checkout_admission(&disposable, Some(&parent), None, commit, host);
+    let admitted = checkout_admission(&disposable, Some(&parent), None, commit, host, None);
     let lookalike = parent.join("worktrees/slots/validate-fresh-lookalike");
-    let lookalike_admitted = checkout_admission(&lookalike, Some(&parent), None, commit, host);
+    let lookalike_admitted =
+        checkout_admission(&lookalike, Some(&parent), None, commit, host, None);
     unsafe { std::env::set_var("VALIDATE_STOP_TEST_AUTHORITY_STATUS_JSON", "{}") };
-    let missing_authority = checkout_admission(&disposable, Some(&parent), None, commit, host);
+    let missing_authority =
+        checkout_admission(&disposable, Some(&parent), None, commit, host, None);
     unsafe {
         match prior_stop_mode {
             Some(value) => std::env::set_var("HERMIT_VALIDATE_STOP_TEST_MODE", value),
@@ -4849,7 +4854,7 @@ mod focused_only_tests {
 
     #[test]
     fn actual_focused_selection_keeps_exact_producers_and_all_refusals() {
-        only_plan_bracket(&repo_root()).unwrap();
+        only_plan_bracket(&test_source_root()).unwrap();
     }
 }
 
@@ -5384,6 +5389,8 @@ struct DurableLog {
     tee: std::process::Child,
     orig_stdout: i32,
     orig_stderr: i32,
+    _file: std::fs::File,
+    retained: Option<validate_admission::RetainedFile>,
 }
 
 impl DurableLog {
@@ -5839,35 +5846,60 @@ fn record_scorecard_writeback(
     summary.detail.push(detail);
 }
 
+/// The descriptor stays owned by DurableLog until tee has terminated. The
+/// kernel fd reference names the opened object even if its display path moves.
+fn spawn_durable_tee(file: &std::fs::File) -> std::io::Result<std::process::Child> {
+    use std::os::fd::AsRawFd;
+    Command::new("tee")
+        .arg("-a")
+        .arg(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            file.as_raw_fd()
+        ))
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+}
+
 /// Establish the self-tee. FAIL-CLOSED: any failure exits loudly rather than
 /// running without a durable receipt. Must be called AFTER `resolve_cgroups`
 /// (which re-execs), so the tee is set up once, in the final boxed process.
-fn setup_durable_log(root: &Path, profile: &str, sha: &str) -> Result<DurableLog, u8> {
+fn setup_durable_log(
+    root: &Path,
+    profile: &str,
+    sha: &str,
+    state: Option<&validate_admission::VerifiedStateRoot>,
+) -> Result<DurableLog, u8> {
     use std::os::unix::io::AsRawFd;
     let path = durable_log_path(root, profile, sha);
-    if let Some(dir) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(dir) {
+    let reserved = (|| -> Result<_, String> {
+        if let Some(state) = state {
+            let retained = state.create(&state.locator(&path)?)?;
+            let file = retained.file.try_clone().map_err(|e| e.to_string())?;
+            Ok((file, Some(retained)))
+        } else {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            }
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map_err(|e| e.to_string())?;
+            Ok((file, None))
+        }
+    })();
+    let (file, retained) = match reserved {
+        Ok(value) => value,
+        Err(error) => {
             eprintln!(
-                "validate: ERROR: cannot create durable-log dir {}: {e}. A run with no durable \
-                 receipt is a silent no-result; refusing to proceed.",
-                dir.display()
+                "validate: ERROR: cannot reserve actual durable log {}: {error}",
+                path.display()
             );
             return Err(4);
         }
-    }
-    if let Err(e) = std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-        eprintln!(
-            "validate: ERROR: cannot reserve durable log {}: {e}. Refusing to append two runs to one path.",
-            path.display()
-        );
-        return Err(4);
-    }
-    let mut tee = match Command::new("tee")
-        .arg("-a")
-        .arg(&path)
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-    {
+    };
+    let mut tee = match spawn_durable_tee(&file) {
         Ok(c) => c,
         Err(e) => {
             eprintln!(
@@ -5896,7 +5928,14 @@ fn setup_durable_log(root: &Path, profile: &str, sha: &str) -> Result<DurableLog
     }
     drop(tee.stdin.take());
     eprintln!("validate: durable log: {}", path.display());
-    Ok(DurableLog { path, tee, orig_stdout, orig_stderr })
+    Ok(DurableLog {
+        path,
+        tee,
+        orig_stdout,
+        orig_stderr,
+        _file: file,
+        retained,
+    })
 }
 
 // --------------------------------------------------------------------------- git / host
@@ -5953,6 +5992,18 @@ fn measure_git_depth(commit: &str) -> Result<u64, String> {
 /// yields the SAME tree. This, not the commit SHA, is the result-cache key.
 fn git_tree() -> String {
     sh("git", &["rev-parse", "HEAD^{tree}"]).unwrap_or_else(|| "unknown".into())
+}
+
+#[cfg(test)]
+fn test_source_root() -> PathBuf {
+    let source = Path::new(file!());
+    assert!(
+        source.is_absolute(),
+        "rust-script must bind the source path"
+    );
+    let root = source.parent().unwrap().parent().unwrap().to_path_buf();
+    assert!(root.join("ci/dag/validate.json").is_file());
+    root
 }
 
 fn repo_root() -> PathBuf {
@@ -6130,8 +6181,13 @@ fn checkout_admission(
     tool_root: Option<&Path>,
     commit: &str,
     host: &str,
+    original: Option<&validate_admission::AuthenticatedValidationAdmission>,
 ) -> CheckoutAdmission {
-    let lock_admitted = validate_lock_admission(tool_root, commit, host).is_ok();
+    let lock_admitted = match original {
+        Some(proof) => validate_lock_admission(root, tool_root, commit, host)
+            .is_ok_and(|current| current.witness() == proof.witness()),
+        None => validate_lock_fixture_admission(tool_root, commit, host).is_ok(),
+    };
     CheckoutAdmission {
         lock_admitted,
         disposable: lock_admitted && is_disposable_validate_checkout(root, parent),
@@ -6686,7 +6742,7 @@ fn immutable_tool_content_sha256(root: &Path) -> Result<String, String> {
 fn configured_authority_tool_root(
     supplied: &Path,
     state_root: &Path,
-) -> Result<PathBuf, String> {
+) -> Result<(PathBuf, validate_admission::VerifiedStateRoot), String> {
     let authority_value = std::env::var_os(TOOL_AUTHORITY_ENV)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| format!("immutable tool authority is incomplete: {TOOL_AUTHORITY_ENV} is absent"))?;
@@ -6722,7 +6778,8 @@ fn configured_authority_tool_root(
             authority.content_sha256
         ));
     }
-    Ok(supplied.to_path_buf())
+    let state = validate_admission::VerifiedStateRoot::from_tool_authority(&authority)?;
+    Ok((supplied.to_path_buf(), state))
 }
 
 struct SelfTestToolAuthority {
@@ -6910,9 +6967,17 @@ fn install_self_test_tool_authority(authority: &SelfTestToolAuthority) {
 /// must be an absolute, existing dev-hermit checkout; silently falling back to
 /// the state root would execute whatever code happens to be in the primary
 /// checkout instead of the code that admitted this run.
-fn configured_tool_root(parent: Option<&Path>) -> Result<Option<PathBuf>, String> {
+fn configured_tool_selection(
+    parent: Option<&Path>,
+) -> Result<
+    (
+        Option<PathBuf>,
+        Option<validate_admission::VerifiedStateRoot>,
+    ),
+    String,
+> {
     let Some(value) = std::env::var_os(TOOL_ROOT_ENV) else {
-        return Ok(parent.map(Path::to_path_buf));
+        return Ok((parent.map(Path::to_path_buf), None));
     };
     if value.is_empty() {
         return Err(format!("{TOOL_ROOT_ENV} is explicitly empty"));
@@ -6930,7 +6995,8 @@ fn configured_tool_root(parent: Option<&Path>) -> Result<Option<PathBuf>, String
         let state_root = parent.ok_or_else(|| {
             format!("explicit {TOOL_ROOT_ENV} has no canonical {PARENT_ENV} to bind to")
         })?;
-        return configured_authority_tool_root(&supplied, state_root).map(Some);
+        return configured_authority_tool_root(&supplied, state_root)
+            .map(|(tool, state)| (Some(tool), Some(state)));
     }
     let resolved = std::fs::canonicalize(&supplied).map_err(|error| {
         format!(
@@ -7020,7 +7086,11 @@ fn configured_tool_root(parent: Option<&Path>) -> Result<Option<PathBuf>, String
             dirty.lines().next().unwrap_or("unknown change")
         ));
     }
-    Ok(Some(resolved))
+    Ok((Some(resolved), None))
+}
+
+fn configured_tool_root(parent: Option<&Path>) -> Result<Option<PathBuf>, String> {
+    configured_tool_selection(parent).map(|(tool, _state)| tool)
 }
 
 /// Whether this invocation is real product work in a dev-hermit workspace and
@@ -15555,6 +15625,12 @@ fn timed_out_nodes(outcomes: &[StepOutcome]) -> Vec<String> {
 // --------------------------------------------------------------------------- ledger
 
 struct LedgerCtx {
+    run_id: Option<String>,
+    admission_floor_evidence: Option<hermit_manifest_plan::ledger::AdmissionEvidence>,
+    admission_provenance_error: Option<String>,
+    log_identity: Option<hermit_manifest_plan::ledger::WorkspaceLocatorV2>,
+    base_observation: serde_json::Value,
+    main_observation: serde_json::Value,
     started_at: String,
     host: String,
     toolchain: String,
@@ -15566,8 +15642,8 @@ struct LedgerCtx {
     commit: String,
     tree: String,
     git_depth: u64,
-    git_ahead: i64,
-    git_behind: i64,
+    git_ahead: Option<i64>,
+    git_behind: Option<i64>,
     commit_anchored: bool,
     /// Dirt present in the source at admission, plus final dirt for an in-place
     /// run. A clean admitted disposable checkout's later state is diagnostic.
@@ -15609,6 +15685,7 @@ struct LedgerCtx {
 }
 
 struct ReceiptEvidence {
+    base_observation: serde_json::Value,
     base_sha: serde_json::Value,
     base_tree: serde_json::Value,
     reverie_base_sha: serde_json::Value,
@@ -15618,6 +15695,7 @@ struct ReceiptEvidence {
 impl Default for ReceiptEvidence {
     fn default() -> Self {
         Self {
+            base_observation: serde_json::Value::Null,
             base_sha: serde_json::Value::Null,
             base_tree: serde_json::Value::Null,
             reverie_base_sha: serde_json::Value::Null,
@@ -15635,12 +15713,27 @@ fn receipt_evidence(
     log: &Path,
     commit: &str,
 ) -> ReceiptEvidence {
-    let Some(tool_root) = tool_root else { return ReceiptEvidence::default() };
+    admitted_receipt_evidence(tool_root, root, log, commit, None).unwrap_or_default()
+}
+
+fn admitted_receipt_evidence(
+    tool_root: Option<&Path>,
+    root: &Path,
+    log: &Path,
+    commit: &str,
+    admission: Option<(
+        &validate_admission::RetainedAdmission,
+        &validate_admission::VerifiedStateRoot,
+        &validate_admission::RetainedFile,
+    )>,
+) -> Result<ReceiptEvidence, String> {
+    let tool_root = tool_root.ok_or("parent receipt helper unavailable")?;
     let helper = tool_root.join("ci-hub/validate/finalize_receipt.py");
     if !helper.is_file() || log.as_os_str().is_empty() || commit.is_empty() {
-        return ReceiptEvidence::default();
+        return Err("parent receipt helper or original log/commit unavailable".into());
     }
-    let Ok(out) = Command::new("python3")
+    let mut command = Command::new("python3");
+    command
         .arg(&helper)
         .arg("--log")
         .arg(log)
@@ -15648,24 +15741,62 @@ fn receipt_evidence(
         .arg(commit)
         .arg("--hermit-checkout")
         .arg(root)
-        .arg("--emit-only")
-        .output()
-    else {
-        return ReceiptEvidence::default();
-    };
-    if !out.status.success() {
-        return ReceiptEvidence::default();
+        .arg("--emit-only");
+    if let Some((retained, state, file)) = admission {
+        retained.verify(state, file)?;
+        if state.locator(log)? != file.locator {
+            return Err("receipt invocation does not name actual driver log".into());
+        }
+        command
+            .arg("--admission-context")
+            .arg(retained.artifact_path(state))
+            .arg("--admission-context-sha256")
+            .arg(retained.evidence.artifact_sha256())
+            .arg("--admission-state-root")
+            .arg(state.path());
     }
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
-        return ReceiptEvidence::default();
-    };
+    let out = command
+        .output()
+        .map_err(|e| format!("receipt helper could not start: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "receipt helper failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .map_err(|e| format!("invalid receipt helper output: {e}"))?;
+    if let Some((retained, state, file)) = admission {
+        retained.verify(state, file)?;
+        let original = &retained.evidence;
+        // Decode this claim directly from raw output so duplicate fields cannot
+        // disappear in the generic JSON map used for legacy receipt fields.
+        let echoed = hermit_manifest_plan::ledger::admission_evidence_receipt_echo(&out.stdout)
+            .map_err(|e| format!("invalid echoed admission context: {e}"))?;
+        echoed.validate()?;
+        if &echoed != original {
+            return Err(
+                "parent receipt context differs from original in-memory admission proof".into(),
+            );
+        }
+        if value
+            .get("base_observation")
+            .and_then(|v| v.get("contract"))
+            .and_then(serde_json::Value::as_str)
+            != Some("post-run-local-main-merge-base/v1")
+        {
+            return Err("parent helper did not distinguish post-run base observation".into());
+        }
+    }
     let field = |name: &str| value.get(name).cloned().unwrap_or(serde_json::Value::Null);
-    ReceiptEvidence {
+    Ok(ReceiptEvidence {
+        base_observation: field("base_observation"),
         base_sha: field("base_sha"),
         base_tree: field("base_tree"),
         reverie_base_sha: field("reverie_base_sha"),
         reverie_base_tree: field("reverie_base_tree"),
-    }
+    })
 }
 
 /// Ask the parent lock authority whether this exact run is admitted. Ordinary
@@ -15673,11 +15804,7 @@ fn receipt_evidence(
 /// requires a fully checked lock holder that remains explicitly noncanonical.
 /// Production never trusts caller-supplied owner PIDs or sidecar paths. The
 /// stop-test JSON seam is confined to an intrinsically non-qualifying fixture.
-fn validate_lock_admission(
-    tool_root: Option<&Path>,
-    commit: &str,
-    host: &str,
-) -> Result<(), String> {
+fn validate_lock_status(tool_root: Option<&Path>) -> Result<Vec<u8>, String> {
     let status = if env_flag("HERMIT_VALIDATE_STOP_TEST_MODE", "1") {
         let Ok(fixture) = std::env::var("VALIDATE_STOP_TEST_AUTHORITY_STATUS_JSON") else {
             return Err("stop-test mode is on but no planted authority status was supplied".into());
@@ -15711,14 +15838,46 @@ fn validate_lock_admission(
         }
         output.stdout
     };
-    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-        .ok()
-        .map(|id| id.trim().to_string());
+    Ok(status)
+}
+
+fn validate_lock_admission(
+    root: &Path,
+    tool_root: Option<&Path>,
+    commit: &str,
+    host: &str,
+) -> Result<validate_admission::AuthenticatedValidationAdmission, String> {
+    let status = validate_lock_status(tool_root)?;
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map_err(|e| format!("cannot observe admission boot identity: {e}"))?;
+    validate_admission::AuthenticatedValidationAdmission::from_status(
+        root,
+        &status,
+        commit,
+        host,
+        Some(boot.trim()),
+        &mut validate_runtime::identity_in_ancestry,
+    )
+}
+
+// Only the intrinsically nonqualifying stop/attribution fixture uses the old
+// boolean seam. Real front-door work must obtain the typed floor above.
+fn validate_lock_fixture_admission(
+    tool_root: Option<&Path>,
+    commit: &str,
+    host: &str,
+) -> Result<(), String> {
+    if !env_flag("HERMIT_VALIDATE_STOP_TEST_MODE", "1") {
+        return Err("fixture admission is unavailable outside stop-test mode".into());
+    }
+    let status = validate_lock_status(tool_root)?;
+    let boot =
+        std::fs::read_to_string("/proc/sys/kernel/random/boot_id").map_err(|e| e.to_string())?;
     validate_lock_status_reason(
         &status,
         commit,
         host,
-        boot_id.as_deref(),
+        Some(boot.trim()),
         &mut validate_runtime::identity_in_ancestry,
     )
 }
@@ -18064,8 +18223,12 @@ fn tool_root_split_bracket() -> Result<(), String> {
         return Err("tool-root split: ledger adapter resolved through the state root".into());
     }
     let tool_authority_marker = state_root.join("authority-called");
-    let authority =
-        validate_lock_admission(Some(effective_tool_root), "fixture", "fixture-host");
+    let authority = validate_lock_admission(
+        &checkout,
+        Some(effective_tool_root),
+        "fixture",
+        "fixture-host",
+    );
     if authority.is_ok() || !tool_authority_marker.is_file() {
         return Err(
             "tool-root split: authority did not execute exclusively from the tool root".into(),
@@ -18500,13 +18663,13 @@ fn write_ledger(
         .map(String::as_str)
         .filter(|tag| !accounted.contains(tag))
         .collect();
-    let environment_run_id = std::env::var("E2E_RUN_ID")
-        .ok()
-        .filter(|value| !value.trim().is_empty());
-    let run_id = cell_results
-        .map(|results| results.run_id.as_str())
-        .or_else(|| coverage.get("run_id").and_then(serde_json::Value::as_str))
-        .or(environment_run_id.as_deref());
+    // Failed/no-cell rows retain the configured invocation's ID too.
+    let run_id = ctx.run_id.as_deref();
+    let result = if ctx.admission_provenance_error.is_some() && result == "pass" {
+        "no_result"
+    } else {
+        result
+    };
     let mut record = serde_json::json!({
         "schema_version": ledger_schema,
         "repo": "hermit",
@@ -18533,6 +18696,9 @@ fn write_ledger(
         "git_behind": ctx.git_behind,
         "commit_anchored": ctx.commit_anchored,
         "tree_dirty": ctx.tree_dirty,
+        "base_observation": ctx.base_observation,
+        "main_observation": ctx.main_observation,
+        "admission_provenance_error": ctx.admission_provenance_error,
         "base_sha": ctx.base_sha,
         "base_tree": ctx.base_tree,
         "reverie_base_sha": ctx.reverie_base_sha,
@@ -18635,6 +18801,14 @@ fn write_ledger(
         eprintln!("validate: ERROR: schema 10 requires all cumulative evidence components");
         return;
     }
+    if let Some(identity) = &ctx.log_identity {
+        record["log_identity"] =
+            serde_json::to_value(identity).expect("typed original log identity");
+    }
+    if let Some(evidence) = &ctx.admission_floor_evidence {
+        record["admission_floor_evidence"] =
+            serde_json::to_value(evidence).expect("typed admission evidence");
+    }
     let typed = match serde_json::from_value::<HistoryRow>(record.clone()) {
         Ok(typed) => typed,
         Err(error) => {
@@ -18649,6 +18823,10 @@ fn write_ledger(
             eprintln!("validate: ERROR: refusing unbound cumulative ledger row: {error}");
             return;
         }
+    }
+    if let Err(error) = typed.admission_evidence() {
+        eprintln!("validate: ERROR: refusing mismatched admission ledger row: {error}");
+        return;
     }
     if typed.retry_rounds() != Ok(Some(ctx.retry_rounds)) {
         eprintln!(
@@ -20390,8 +20568,8 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
             std::env::set_var(PARENT_ENV, parent);
         }
     }
-    let tool_root = match configured_tool_root(parent.as_deref()) {
-        Ok(tool_root) => tool_root,
+    let (tool_root, verified_state_root) = match configured_tool_selection(parent.as_deref()) {
+        Ok(selection) => selection,
         Err(error) => {
             return RunSummary::refused(
                 2,
@@ -20508,8 +20686,10 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     // their caller-supplied nesting marker.
     // Help, self-test and the stop-test seam returned above; `--show-plan` is
     // explicitly inert here.
-    let ci_hub_dir_present =
-        tool_root.as_ref().is_some_and(|candidate| candidate.join("ci-hub").is_dir());
+    let mut admitted_context = None;
+    let ci_hub_dir_present = tool_root
+        .as_ref()
+        .is_some_and(|candidate| candidate.join("ci-hub").is_dir());
     if !args.allow_local_off_the_record_run
         && product_front_door_applies(
         parent.is_some(),
@@ -20524,14 +20704,20 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
         let commit = git_sha();
         let host = short_hostname();
         let ci_hub_launcher_available = tool_root.join("ci-hub/ci-hub").is_file();
-        let admission = validate_lock_admission(Some(tool_root), &commit, &host);
+        let admission = validate_lock_admission(&root, Some(tool_root), &commit, &host);
         // NAME THE CONJUNCT THAT FAILED. The decision is unchanged -- it is still
         // exactly `admission.is_ok()` -- but a refusal that lists three
         // possibilities and identifies none is undiagnosable from outside, and
         // that is what left the owner unable to see that his checkout simply was
         // not at the commit his lock was taken for.
         let admitted = admission.is_ok();
-        let why = admission.err();
+        let why = match admission {
+            Ok(proof) => {
+                admitted_context = Some(proof);
+                None
+            }
+            Err(error) => Some(error),
+        };
         if let Some(refusal) = product_front_door_refusal(
             tool_root,
             &root,
@@ -20564,6 +20750,25 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
                 "the dev-hermit product front door",
                 detail,
             );
+        }
+    }
+
+    if let Some(proof) = admitted_context.as_ref() {
+        let inherited = std::env::var_os("VALIDATE_RUN_STATE");
+        if nesting.nested || verified_run_state_scope_reexec(&root, inherited.as_deref()) {
+            let check = inherited
+                .as_deref()
+                .map(Path::new)
+                .ok_or_else(|| "admitted nested run has no inherited run state".to_string())
+                .and_then(|state| proof.check_witness(&root, state));
+            if let Err(error) = check {
+                return RunSummary::refused(
+                    4,
+                    &profile_name,
+                    "admission re-exec/nesting binding",
+                    vec![error],
+                );
+            }
         }
     }
 
@@ -20683,12 +20888,22 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     // Rebase-freshness gate. Mechanically enforced, not advisory. A nested
     // payload inherits the outer run's verdict on the very same checkout; it also
     // must not spend a network round trip inside a budgeted DAG node.
-    match rebase_freshness(
-        args.skip_inner_dirty_working_tree_and_rebase_freshness_checks
-            || nesting.nested
-            || args.write_constructed_dag.is_some()
-            || args.write_generated_plan.is_some(),
-    ) {
+    let freshness = match admitted_context.as_ref() {
+        Some(proof) => proof.verify_source(&root).map(|()| {
+            format!(
+                "base: immutable admitted floor {} tree {} (later main observations are separate)",
+                proof.floor().sha,
+                proof.floor().tree
+            )
+        }),
+        None => rebase_freshness(
+            args.skip_inner_dirty_working_tree_and_rebase_freshness_checks
+                || nesting.nested
+                || args.write_constructed_dag.is_some()
+                || args.write_generated_plan.is_some(),
+        ),
+    };
+    match freshness {
         Ok(msg) => eprintln!("validate: {msg}"),
         Err(msg) => {
             eprintln!("validate: refusing to validate a stale base.\n  {msg}");
@@ -20785,6 +21000,21 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
         );
     }
     std::env::set_var("VALIDATE_RUN_STATE", &tmp);
+    if let Some(proof) = admitted_context.as_ref() {
+        let result = if nesting.nested || verified_scope_reexec {
+            proof.check_witness(&root, &tmp)
+        } else {
+            proof.write_witness(&root, &tmp)
+        };
+        if let Err(error) = result {
+            return RunSummary::refused(
+                4,
+                &profile_name,
+                "admission run-state binding",
+                vec![error],
+            );
+        }
+    }
     if !nesting.nested {
         for (variable, name) in [
             ("TMPDIR", "tmp"),
@@ -20933,6 +21163,22 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
             vec![error],
         );
     }
+
+    let execution_plan = match validate_admission::BoundExecutionPlan::bind(
+        &plan.cfg,
+        plan.second.as_ref(),
+        admitted_context.as_ref(),
+    ) {
+        Ok(bound) => bound,
+        Err(error) => {
+            return RunSummary::refused(
+                4,
+                &plan.profile,
+                "admitted execution derivation",
+                vec![error],
+            );
+        }
+    };
 
     let cumulative_selection = if validate_evidence::ENABLED
         && !nesting.nested && !args.allow_local_off_the_record_run
@@ -21185,7 +21431,15 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
         && !dirty_at_admission
         && plan.selection_mode == "full"
     {
-        if let Some(hit) = validate_history::cache_lookup(&ledger_rows, "pass", &cache_key) {
+        if let Some(hit) =
+            validate_history::cache_lookup(&ledger_rows, "pass", &cache_key).filter(|hit| {
+                admitted_context.as_ref().is_none_or(|proof| {
+                    hit.admission_floor_evidence
+                        .as_ref()
+                        .is_some_and(|evidence| execution_plan.cache_matches(proof, evidence))
+                })
+            })
+        {
             match cache_hit_run_summary(
                 &hit,
                 &plan.profile,
@@ -21306,7 +21560,15 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
             )
         }
     };
-    match setup_durable_log(&root, &plan.profile, &commit) {
+    if admitted_context.is_some() && verified_state_root.is_none() {
+        return RunSummary::refused(
+            4,
+            &plan.profile,
+            "authenticated state root",
+            vec!["admitted validation requires the launcher's held state-root authority".into()],
+        );
+    }
+    match setup_durable_log(&root, &plan.profile, &commit, verified_state_root.as_ref()) {
         Ok(d) => *durable_slot = Some(d),
         Err(code) => {
             return RunSummary::refused(
@@ -21430,8 +21692,63 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     let jobs = args.jobs.unwrap_or_else(default_jobs);
     let started_at = utc_now();
     let started_epoch = epoch_now();
-    let host_cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-    let node_count = plan.cfg.steps.len() + plan.second.as_ref().map(|c| c.steps.len()).unwrap_or(0);
+    let run_id = match std::env::var("E2E_RUN_ID") {
+        Ok(id) if !id.trim().is_empty() && !id.contains('\0') => id,
+        _ => {
+            return RunSummary::refused(
+                4,
+                &plan.profile,
+                "retained run identity",
+                vec!["E2E_RUN_ID is unavailable after result setup".into()],
+            );
+        }
+    };
+    // Recheck the committed graph and the full derived graph at dispatch.
+    let dispatch_check = require_committed_scheduler_input(&plan)
+        .and_then(|_| {
+            admitted_context
+                .as_ref()
+                .map_or(Ok(()), |proof| proof.verify_source(&root))
+        })
+        .and_then(|_| {
+            execution_plan.verify(&plan.cfg, plan.second.as_ref(), admitted_context.as_ref())
+        });
+    if let Err(error) = dispatch_check {
+        return RunSummary::refused(4, &plan.profile, "admitted execution plan", vec![error]);
+    }
+    let retained_admission = if !nesting.nested {
+        match admitted_context
+            .as_ref()
+            .map(|proof| {
+                let state = verified_state_root
+                    .as_ref()
+                    .ok_or("authenticated state root missing")?;
+                let log = durable_slot
+                    .as_ref()
+                    .and_then(|d| d.retained.as_ref())
+                    .ok_or("actual retained log descriptor missing")?;
+                execution_plan.retain(proof, &root, state, &run_id, &started_at, log)
+            })
+            .transpose()
+        {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                return RunSummary::refused(
+                    4,
+                    &plan.profile,
+                    "retained admission context",
+                    vec![error],
+                );
+            }
+        }
+    } else {
+        None
+    };
+    let host_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let node_count =
+        plan.cfg.steps.len() + plan.second.as_ref().map(|c| c.steps.len()).unwrap_or(0);
     // Every node the profile PLANNED, including the ones withheld as
     // host-inapplicable. The ledger's `unaccounted_nodes` is computed against
     // this set, so a node that neither ran nor carries a recorded reason is
@@ -21516,7 +21833,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     };
     let mut run_timed_out = false;
 
-    let r = lane(&plan.cfg);
+    let r = lane(&execution_plan.cfg);
     outcomes.extend(r.outcomes.iter().cloned());
     skipped.extend(r.skipped.iter().cloned());
     attempts.extend(r.attempts.iter().cloned());
@@ -21524,7 +21841,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     execution_complete = execution_complete && r.complete;
     run_timed_out = run_timed_out || r.run_timed_out;
 
-    if let Some(second) = &plan.second {
+    if let Some(second) = &execution_plan.second {
         // Sequential lanes are separate fail-fast families. A failure in the first lane must not
         // suppress the second: the lane runner still cancels failed-family peers and skips true
         // dependents, while the second lane records its own real outcomes.
@@ -21618,24 +21935,78 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     // The parent still supplies exact base and pin evidence, but its historical
     // per-node coverage parser reads printable banners. Rebuild coverage from
     // dagrun's structured producer results so stdout cannot qualify a node.
-    let receipt = receipt_evidence(tool_root.as_deref(), &root, &log_path, &commit);
+    let (receipt, mut admission_provenance_error) =
+        if let Some(retained) = retained_admission.as_ref() {
+            let result = (|| {
+                let state = verified_state_root
+                    .as_ref()
+                    .ok_or("authenticated state root missing")?;
+                let durable = durable_slot.as_mut().ok_or("actual log writer missing")?;
+                if durable.tee.try_wait().map_err(|e| e.to_string())?.is_some() {
+                    return Err("durable log writer exited before receipt finalization".into());
+                }
+                let log = durable
+                    .retained
+                    .as_ref()
+                    .ok_or("actual retained log descriptor missing")?;
+                admitted_receipt_evidence(
+                    tool_root.as_deref(),
+                    &root,
+                    &log_path,
+                    &commit,
+                    Some((retained, state, log)),
+                )
+            })();
+            match result {
+                Ok(receipt) => (receipt, None),
+                Err(error) => (ReceiptEvidence::default(), Some(error)),
+            }
+        } else {
+            (
+                receipt_evidence(tool_root.as_deref(), &root, &log_path, &commit),
+                None,
+            )
+        };
+    let log_identity = durable_slot
+        .as_ref()
+        .and_then(|d| d.retained.as_ref())
+        .map(|log| log.locator.clone());
+    let admission_floor_evidence = retained_admission.as_ref().map(|r| r.evidence.clone());
     let coverage = typed_test_node_coverage(&plan.planned_test_nodes, &outcomes);
 
-    let behind_ahead = sh("git", &["rev-list", "--left-right", "--count", "origin/main...HEAD"])
-        .unwrap_or_else(|| "0 0".into());
-    let mut ba = behind_ahead.split_whitespace();
-    let git_behind: i64 = ba.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-    let git_ahead: i64 = ba.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    // Later local-ref observations are not admission proof. Unknown remains
+    // explicit instead of a failed Git command inventing a measured zero.
+    let main_observation = validate_admission::post_run_main_observation(&root);
+    let (git_behind, git_ahead) = match &main_observation {
+        Ok(value) => (value["behind"].as_i64(), value["ahead"].as_i64()),
+        Err(error) => {
+            if admitted_context.is_some() {
+                admission_provenance_error.get_or_insert(error.clone());
+            }
+            (None, None)
+        }
+    };
+    let main_observation = match main_observation {
+        Ok(value) => value,
+        Err(error) => {
+            serde_json::json!({"contract":"post-run-local-main-distance/v1", "error":error})
+        }
+    };
     // Observed, not inferred: did the pin gate actually run and pass in THIS run?
-    let pin_gate_passed = outcomes.iter().any(|o| o.tag == PIN_GATE_TAG && o.ok);
+    let pin_gate_passed = validate_admission::pin_gate_passed(&planned_tags, &outcomes);
     let checkout_admission = checkout_admission(
         &root,
         parent.as_deref(),
         tool_root.as_deref(),
         &commit,
         &host,
+        admitted_context.as_ref(),
     );
     let lock_admitted = checkout_admission.lock_admitted;
+    if admitted_context.is_some() && !lock_admitted {
+        admission_provenance_error
+            .get_or_insert("original live admission no longer verifies after the run".into());
+    }
     let dirty_after_run = tree_dirty();
     let admitted_disposable_checkout = checkout_admission.disposable;
     let attribution = source_attribution(
@@ -21654,6 +22025,12 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
         );
     }
     let ctx = LedgerCtx {
+        run_id: Some(run_id),
+        admission_floor_evidence,
+        admission_provenance_error,
+        log_identity,
+        base_observation: receipt.base_observation,
+        main_observation,
         started_at,
         host: host.clone(),
         toolchain: toolchain.clone(),
@@ -21663,7 +22040,10 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
         selection_mode: plan.selection_mode.into(),
         cache_state: cache.into(),
         commit: commit.clone(),
-        tree: git_tree(),
+        tree: admitted_context
+            .as_ref()
+            .map(|admission| admission.target_tree().to_string())
+            .unwrap_or_else(git_tree),
         git_depth,
         git_ahead,
         git_behind,
@@ -21960,6 +22340,10 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     // rows before appending the ledger entry so schema 7 is emitted only when
     // the artifact has actually been published and bound by checksum.
     let mut evidence_refusal_details = Vec::new();
+    if let Some(error) = &ctx.admission_provenance_error {
+        evidence_refusal_details.push(format!("admission provenance unavailable: {error}"));
+        exit_code = exit_code_with_evidence_refusal(exit_code);
+    }
     let should_retain_cells = plan.suite_complete || plan.cell_evidence_expected.is_some();
     let cumulative_expected = prepared_evidence.is_some();
     let retained_evidence = if execution_complete {
@@ -22420,8 +22804,14 @@ fn stop_test_seam(
     let wall = started.elapsed().as_secs_f64();
     let ledger = ledger_path(root);
     let host = short_hostname();
-    let lock_admitted = validate_lock_admission(tool_root, &commit, &host).is_ok();
+    let lock_admitted = validate_lock_fixture_admission(tool_root, &commit, &host).is_ok();
     let ctx = LedgerCtx {
+        run_id: std::env::var("E2E_RUN_ID").ok(),
+        admission_floor_evidence: None,
+        admission_provenance_error: None,
+        log_identity: None,
+        base_observation: serde_json::Value::Null,
+        main_observation: serde_json::Value::Null,
         started_at,
         host,
         toolchain: sh("rustc", &["--version"]).unwrap_or_else(|| "unknown".into()),
@@ -22433,8 +22823,8 @@ fn stop_test_seam(
         commit,
         tree: git_tree(),
         git_depth,
-        git_ahead: 0,
-        git_behind: 0,
+        git_ahead: Some(0),
+        git_behind: Some(0),
         commit_anchored: false,
         tree_dirty: tree_dirty(),
         dag_jobs: 0,
@@ -23503,7 +23893,7 @@ mod prepared_command_tests {
 
     #[test]
     fn actual_prepared_commands_preserve_no_compilation_and_refuse_outer_decoys() {
-        let root = repo_root();
+        let root = test_source_root();
         let cfg = validate_plan::validation_config(&root).unwrap();
         let find = |tag: &str| cfg.steps.iter().find(|step| step.tag() == tag).unwrap();
         let host = find("build.workspace");
@@ -23598,7 +23988,7 @@ mod shared_consumer_tests {
 
     #[test]
     fn actual_shared_cli_population_requires_the_workdir_consumer_and_every_resource() {
-        let cfg = validate_plan::validation_config(&repo_root()).unwrap();
+        let cfg = validate_plan::validation_config(&test_source_root()).unwrap();
         let full = dagrun::select_steps_by_labels(&cfg, &["full".into()]).unwrap();
         assert_committed_shared_integration_test_serialization(&full.steps, &full.resource_caps)
             .unwrap();
@@ -23815,7 +24205,7 @@ mod submodule_service_tests {
                 Some(outer.as_os_str())
             );
             assert_eq!(std::fs::read(outer.join("sentinel")).unwrap(), SENTINEL);
-            let detail = submodule_failure_service_result_bracket(&repo_root()).unwrap();
+            let detail = submodule_failure_service_result_bracket(&test_source_root()).unwrap();
             println!("{COMPLETED}: {detail}");
             return;
         }
@@ -23832,7 +24222,7 @@ mod submodule_service_tests {
                 "submodule_service_tests::independent_fixture_keeps_missing_submodule_diagnosis_with_outer_run_state",
                 "--nocapture",
             ])
-            .current_dir(repo_root())
+            .current_dir(test_source_root())
             .env(CHILD, "1")
             .env("VALIDATE_RUN_STATE", &outer)
             .env(RUN_STATE_SCOPE_REEXEC_ENV, &outer)

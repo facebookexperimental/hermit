@@ -2,6 +2,33 @@ SUBMODULE_PROXY ?= $(shell command -v with-proxy 2>/dev/null)
 SUBMODULE_GIT = $(SUBMODULE_PROXY) git
 CARGO_PROXY ?= $(SUBMODULE_PROXY)
 CARGO = $(CARGO_PROXY) cargo
+
+# Data-only transport from validate's authenticated execution graph. A bare
+# invocation retains the ordinary current-main check. Never expand the raw
+# value as Make code, and do not export it to recursive fixture invocations.
+override _VALIDATE_PIN_ARG :=
+ifneq ($(origin VALIDATE_REVERIE_PIN_BASE_REF),undefined)
+ifneq ($(origin VALIDATE_REVERIE_PIN_BASE_REF),command line)
+$(error VALIDATE_REVERIE_PIN_BASE_REF requires an explicit command-line argument)
+endif
+override _VALIDATE_PIN_SHA := $(value VALIDATE_REVERIE_PIN_BASE_REF)
+override _VALIDATE_PIN_NONHEX := $(subst 0,,$(subst 1,,$(subst 2,,$(subst 3,,$(subst 4,,$(subst 5,,$(subst 6,,$(subst 7,,$(subst 8,,$(subst 9,,$(subst a,,$(subst b,,$(subst c,,$(subst d,,$(subst e,,$(subst f,,$(_VALIDATE_PIN_SHA)))))))))))))))))
+ifneq ($(_VALIDATE_PIN_NONHEX),)
+$(error VALIDATE_REVERIE_PIN_BASE_REF requires a literal lowercase SHA)
+endif
+ifneq ($(shell printf '%s' '$(_VALIDATE_PIN_SHA)' | wc -c),40)
+$(error VALIDATE_REVERIE_PIN_BASE_REF requires exactly 40 characters)
+endif
+override _VALIDATE_PIN_ARG := --base-ref '$(_VALIDATE_PIN_SHA)'
+# undefine alone leaves GNU Make's command-line forwarding record intact.
+# Remove only our validated exact assignment; keep all unrelated overrides.
+ifneq ($(words $(filter VALIDATE_REVERIE_PIN_BASE_REF=$(_VALIDATE_PIN_SHA),$(MAKEOVERRIDES))),1)
+$(error ambiguous VALIDATE_REVERIE_PIN_BASE_REF forwarding record)
+endif
+override MAKEOVERRIDES := $(filter-out VALIDATE_REVERIE_PIN_BASE_REF=$(_VALIDATE_PIN_SHA),$(MAKEOVERRIDES))
+override undefine VALIDATE_REVERIE_PIN_BASE_REF
+unexport _VALIDATE_PIN_SHA _VALIDATE_PIN_ARG _VALIDATE_PIN_NONHEX
+endif
 # Keep Cargo and nested native builds wide enough for high-core CI hosts without
 # immediately saturating every hardware thread. Override on smaller shared hosts.
 THIRD_PARTY_BUILD_JOBS ?= 64
@@ -172,7 +199,7 @@ lint-checks: ## The lint checkers CI schedules as one node (everything in `lint`
 	@git diff --check
 	./ci/verify-submodules.sh --self-test
 	./ci/verify-submodules.sh
-	$(SUBMODULE_PROXY) ./ci/run-reverie-pin-check.sh
+	$(SUBMODULE_PROXY) ./ci/run-reverie-pin-check.sh $(_VALIDATE_PIN_ARG)
 	$(SUBMODULE_PROXY) ./scripts/check-nested-lockfiles.rs
 	./scripts/check-record-version-floor.rs
 	./scripts/core-review-protocol-lint-test.sh

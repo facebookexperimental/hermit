@@ -772,7 +772,7 @@ fn base_pin(root: &Path, base_ref: &str) -> Option<String> {
     // is a fail-OPEN hole, and it is what the regression bracket caught before
     // this shipped. List the flat tree and filter by basename instead, the same
     // way the parent's primary_checkout.py does for the same reason.
-    let listed = git_in(root, &["ls-tree", "-r", "-z", "--name-only", base_ref]).ok()?;
+    let listed = authority_git_in(root, &["ls-tree", "-r", "-z", "--name-only", base_ref]).ok()?;
     if !listed.status.success() {
         return None;
     }
@@ -781,7 +781,8 @@ fn base_pin(root: &Path, base_ref: &str) -> Option<String> {
         .split('\0')
         .filter(|name| !name.is_empty() && name.ends_with("Cargo.toml"))
     {
-        let blob = git_in(root, &["cat-file", "blob", &format!("{base_ref}:{name}")]).ok()?;
+        let blob =
+            authority_git_in(root, &["cat-file", "blob", &format!("{base_ref}:{name}")]).ok()?;
         if !blob.status.success() {
             continue;
         }
@@ -1012,10 +1013,10 @@ fn isolated_git_command() -> Result<Command, String> {
 ///   off-history pin certified as on-history -- and reports 1 again under
 ///   `--no-replace-objects`. That is the whole verdict of this checker,
 ///   inverted by a ref an attacker can write into the cache.
-/// * GRAFTS. The older `info/grafts` / `core.graftFile` mechanism rewrites
-///   parentage the same way. It is deprecated and, measured on the same git,
-///   did not flip the answer; `--no-replace-objects` does not cover it either,
-///   so it gets its own explicit block rather than being assumed dead.
+/// * GRAFTS. The older `info/grafts` mechanism also rewrites parentage.
+///   A real opposing control demonstrated that `core.graftFile=/dev/null`
+///   does not disable it on the installed Git. Use Git's supported per-child
+///   `GIT_GRAFT_FILE` override; `--no-replace-objects` alone does not cover it.
 ///
 /// `GIT_NO_REPLACE_OBJECTS` is set as well as the flag passed. The flag governs
 /// this process; the variable governs any Git the command re-enters, and the
@@ -1025,11 +1026,23 @@ fn authority_git_command() -> Result<Command, String> {
     // Both spellings, for the reason in the doc comment above.
     command.arg("--no-replace-objects");
     command.env("GIT_NO_REPLACE_OBJECTS", "1");
-    // Grafts are a separate mechanism that `--no-replace-objects` does not
-    // disable. Point the graft file at an empty one; `-c` beats a config file,
-    // and an inherited `GIT_GRAFT_FILE` is already cleared as a local variable.
-    command.args(["-c", "core.graftFile=/dev/null"]);
+    // Set after environment isolation so the effective override cannot be
+    // cleared or inherited from a caller. No repository/global config changes.
+    command.env("GIT_GRAFT_FILE", "/dev/null");
     Ok(command)
+}
+
+/// Base manifest bytes decide monotonicity just as graph ancestry does. Keep
+/// setup/mutation commands on git_in, but read the recorded base immutably.
+fn authority_git_in(dir: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+    under_git_env(|| {
+        authority_git_command()?
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .map_err(|error| format!("could not read immutable Git base: {error}"))
+    })
 }
 
 /// Every `url.<base>.insteadOf` rewrite visible in the environment, as
@@ -3414,6 +3427,182 @@ mod tests {
             "a pin that REGRESSES below its base must be REFUSED"
         );
         fs::remove_dir_all(root).expect("remove Hermit fixture repository");
+    }
+
+    #[test]
+    fn immutable_admission_base_survives_real_remote_advance_without_weakening_landing_floor() {
+        let (reverie, old, latest, _off) = shared_reverie();
+        let origin = hermit_fixture("admitted-origin", &old, &old);
+        let head = || {
+            String::from_utf8(git_in(&origin, &["rev-parse", "HEAD"]).unwrap().stdout)
+                .unwrap()
+                .trim()
+                .to_string()
+        };
+        let floor = head();
+        let checkout = temp_path("admitted-checkout");
+        let cloned = Command::new("git")
+            .args(["clone", "--quiet"])
+            .arg(&origin)
+            .arg(&checkout)
+            .output()
+            .unwrap();
+        assert!(
+            cloned.status.success(),
+            "{}",
+            String::from_utf8_lossy(&cloned.stderr)
+        );
+        let run = |base: &str| {
+            run_with_config(Config {
+                repo: Some(checkout.clone()),
+                remote: Some(reverie.to_string_lossy().into_owned()),
+                base_ref: base.into(),
+                ..Config::default()
+            })
+            .expect("real checker result")
+        };
+        assert_eq!(run(&floor), 0, "early admitted invocation");
+        fs::write(origin.join("Cargo.toml"), format!(
+            "[dependencies]\nreverie = {{ git = \"https://github.com/rrnewton/reverie.git\", rev = \"{latest}\" }}\n"
+        )).unwrap();
+        assert!(
+            git_in(&origin, &["add", "Cargo.toml"])
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(
+            git_in(&origin, &["commit", "-qm", "advance main pin"])
+                .unwrap()
+                .status
+                .success()
+        );
+        let advanced = head();
+        assert_ne!(advanced, floor);
+        assert!(
+            git_in(
+                &checkout,
+                &[
+                    "fetch",
+                    "--quiet",
+                    "origin",
+                    "HEAD:refs/remotes/origin/main"
+                ]
+            )
+            .unwrap()
+            .status
+            .success()
+        );
+        assert_eq!(run(&floor), 0, "late invocation of the same admitted floor");
+        assert_eq!(
+            run("origin/main"),
+            1,
+            "ordinary landing still checks newer main and refuses regression"
+        );
+        assert_eq!(
+            run(&advanced),
+            1,
+            "a literal newer floor also refuses the genuinely older pin"
+        );
+        fs::remove_dir_all(checkout).unwrap();
+        fs::remove_dir_all(origin).unwrap();
+    }
+
+    #[test]
+    fn admission_immutable_base_ignores_replacement_tree() {
+        let (_remote, old, latest, _off) = shared_reverie();
+        let root = hermit_fixture("admission-base-replacement", &latest, &old);
+        assert!(
+            git_in(&root, &["commit", "-qm", "candidate tree"])
+                .unwrap()
+                .status
+                .success()
+        );
+        let floor = String::from_utf8(git_in(&root, &["rev-parse", "basefixture"]).unwrap().stdout)
+            .unwrap();
+        let floor = floor.trim();
+        assert_eq!(base_pin(&root, floor).as_deref(), Some(latest.as_str()));
+        let tree = |rev: &str| {
+            String::from_utf8(
+                git_in(&root, &["rev-parse", &format!("{rev}^{{tree}}")])
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap()
+            .trim()
+            .to_string()
+        };
+        let floor_tree = tree(floor);
+        let current_tree = tree("HEAD");
+        assert_ne!(floor_tree, current_tree);
+        assert!(
+            git_in(&root, &["replace", &floor_tree, &current_tree])
+                .unwrap()
+                .status
+                .success()
+        );
+        let raw = git_in(&root, &["show", &format!("{floor}:Cargo.toml")]).unwrap();
+        assert!(raw.status.success());
+        assert!(
+            String::from_utf8_lossy(&raw.stdout).contains(old.as_str()),
+            "replacement must actually reinterpret the base tree"
+        );
+        let protected = base_pin(&root, floor);
+        fs::remove_dir_all(&root).unwrap();
+        assert_eq!(
+            protected.as_deref(),
+            Some(latest.as_str()),
+            "the literal admitted base must keep its original tree"
+        );
+    }
+
+    #[test]
+    fn admission_immutable_authority_ignores_real_info_grafts() {
+        let root = temp_path("admission-graft-authority");
+        init_fixture_repo(&root);
+        let a = commit_file(&root, "a", "a\n");
+        let b = commit_file(&root, "b", "b\n");
+        let tree = String::from_utf8(git_in(&root, &["rev-parse", "HEAD^{tree}"]).unwrap().stdout)
+            .unwrap();
+        let off = String::from_utf8(
+            git_in(&root, &["commit-tree", tree.trim(), "-m", "unrelated"])
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let off = off.trim();
+        fs::write(root.join(".git/info/grafts"), format!("{b} {off}\n{off}\n")).unwrap();
+        assert!(
+            git_in(&root, &["merge-base", "--is-ancestor", off, &b])
+                .unwrap()
+                .status
+                .success(),
+            "actual graft must change the unguarded ancestry answer"
+        );
+        let query = |ancestor: &str| {
+            under_git_env(|| {
+                authority_git_command()
+                    .unwrap()
+                    .arg("-C")
+                    .arg(&root)
+                    .args(["merge-base", "--is-ancestor", ancestor, &b])
+                    .output()
+                    .unwrap()
+            })
+        };
+        let false_ancestry = query(off);
+        let real_ancestry = query(&a);
+        fs::remove_dir_all(&root).unwrap();
+        assert_eq!(
+            false_ancestry.status.code(),
+            Some(1),
+            "graft must not manufacture ancestry: {}",
+            String::from_utf8_lossy(&false_ancestry.stderr)
+        );
+        assert!(
+            real_ancestry.status.success(),
+            "real original ancestry must remain accepted"
+        );
     }
 
     #[test]

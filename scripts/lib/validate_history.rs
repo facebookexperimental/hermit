@@ -38,6 +38,7 @@ use std::process::Command;
 /// misdescribe what was reused.
 #[derive(Clone, Debug)]
 pub struct CacheHit {
+    pub admission_floor_evidence: Option<hermit_manifest_plan::ledger::AdmissionEvidence>,
     pub finished_at: String,
     pub real_seconds: f64,
     pub cpu_seconds: f64,
@@ -93,6 +94,15 @@ pub fn canonical_ledger_adapter(ledger: &Path, tool_root: Option<&Path>) -> Opti
     )
 }
 
+pub(crate) fn canonical_ledger_reader(adapter: &Path) -> Command {
+    let mut command = Command::new("python3");
+    // Preserve original claims through the event union and corrections, before
+    // admission_cache_row checks them. The legacy adapter view is deliberately
+    // lossy and can hide a contradictory duplicate behind its last value.
+    command.arg(adapter).args(["rows", "--preserve-admission"]);
+    command
+}
+
 /// Read the one logical ledger into rows, skipping unparseable lines.
 ///
 /// In an admitted dev-hermit run, `ledger` is the parent's logical `ledger/`
@@ -112,7 +122,7 @@ pub fn read_rows(ledger: &Path) -> Vec<serde_json::Value> {
         let Some(adapter) = canonical_ledger_adapter(ledger, configured_tool_root.as_deref()) else {
             return Vec::new();
         };
-        let Ok(output) = Command::new("python3").arg(&adapter).arg("rows").output() else {
+        let Ok(output) = canonical_ledger_reader(&adapter).output() else {
             eprintln!(
                 "validate: warning: cannot launch canonical ledger reader {}",
                 adapter.display()
@@ -138,8 +148,24 @@ pub fn read_rows(ledger: &Path) -> Vec<serde_json::Value> {
     };
     text.lines()
         .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(admission_cache_row)
         .collect()
+}
+
+/// Preserve original duplicate evidence before the generic history view can
+/// collapse it. A malformed apparent pass cannot become a reuse candidate;
+/// recorded failure rows remain in the view and retain their blocking role.
+/// This is a read-only cache/estimate view, never a canonical row serializer.
+pub(crate) fn admission_cache_row(raw: &str) -> Option<serde_json::Value> {
+    let row: serde_json::Value = serde_json::from_str(raw).ok()?;
+    if row.get("admission_floor_evidence").is_some() && s(&row, "result") == "pass" {
+        // The raw echo decoder refuses duplicate outer claim/context fields.
+        // HistoryRow separately retains original nested run/locator duplicates.
+        hermit_manifest_plan::ledger::admission_evidence_receipt_echo(raw.as_bytes()).ok()?;
+        let original: hermit_manifest_plan::ledger::HistoryRow = serde_json::from_str(raw).ok()?;
+        original.admission_evidence().ok()??;
+    }
+    Some(row)
 }
 
 fn s<'a>(row: &'a serde_json::Value, k: &str) -> &'a str {
@@ -312,6 +338,12 @@ fn has_blocking_failure(rows: &[serde_json::Value], key: &CacheKey<'_>) -> bool 
 /// guessed at, so a future third writer cannot be silently cached under
 /// whichever field name happens to be present.
 fn pass_row_qualifies(row: &serde_json::Value) -> bool {
+    if row.get("admission_floor_evidence").is_some()
+        && !serde_json::from_value::<hermit_manifest_plan::ledger::HistoryRow>(row.clone())
+            .is_ok_and(|original| original.admission_evidence().is_ok_and(|e| e.is_some()))
+    {
+        return false;
+    }
     if i(row, "failures") != Some(0) {
         return false;
     }
@@ -388,6 +420,10 @@ pub fn cache_lookup(
         (i(row, "executed_tests").unwrap_or(0), "test(s)")
     };
     Some(CacheHit {
+        admission_floor_evidence:
+            serde_json::from_value::<hermit_manifest_plan::ledger::HistoryRow>(row.clone())
+                .ok()
+                .and_then(|row| row.admission_evidence().ok().flatten()),
         finished_at: s(row, "finished_at").to_string(),
         real_seconds: f(row, "real_seconds"),
         cpu_seconds: f(row, "user_seconds") + f(row, "sys_seconds"),
