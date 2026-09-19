@@ -361,7 +361,14 @@ fi
 # manifest/toolchain recipe inputs. Keep the same CMAKE/CMAKE_GENERATOR selection,
 # 1050 effective-job-seconds and 16-job clamp. Source identity carry only;
 # no new calibration.
-expected_pin=91110d249ffd8957267d71fab8c83d9636105efe
+# CARRY TO 502bc21f897065766f1ef4c940ede1efe4743acd: all repository inputs
+# to the DynamoRIO SDK recipe, including the complete reverie-dbt subtree,
+# remain byte-identical to 91110d249ffd8957267d71fab8c83d9636105efe.
+# Keep default CMAKE, unset CMAKE_GENERATOR, the 1050 effective-job-second
+# threshold and 16-job clamp. The native KVM repair requires its own
+# qualification; this is source-identity carry, not a new timing sample,
+# SDK cache-key measurement, guest result or earlier receipt reuse.
+expected_pin=502bc21f897065766f1ef4c940ede1efe4743acd
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

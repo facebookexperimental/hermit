@@ -55,12 +55,12 @@ rand_pcg = { version = "0.10.2", features = ["serde"] }
 regex = "1.13.1"
 # Reverie is pinned to a specific commit for reproducibility. Keep this rev in
 # sync across all crates and bump it via docs/updating-reverie.md.
-reverie = { package = "reverie-core", version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "91110d249ffd8957267d71fab8c83d9636105efe" }
-reverie-dbt = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "91110d249ffd8957267d71fab8c83d9636105efe", default-features = false, optional = true }
-reverie-kvm = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "91110d249ffd8957267d71fab8c83d9636105efe" }
-reverie-ptrace = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "91110d249ffd8957267d71fab8c83d9636105efe" }
-reverie-liteinst = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "91110d249ffd8957267d71fab8c83d9636105efe", default-features = false }
-reverie-rpc-transport = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "91110d249ffd8957267d71fab8c83d9636105efe" }
+reverie = { package = "reverie-core", version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "502bc21f897065766f1ef4c940ede1efe4743acd" }
+reverie-dbt = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "502bc21f897065766f1ef4c940ede1efe4743acd", default-features = false, optional = true }
+reverie-kvm = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "502bc21f897065766f1ef4c940ede1efe4743acd" }
+reverie-ptrace = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "502bc21f897065766f1ef4c940ede1efe4743acd" }
+reverie-liteinst = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "502bc21f897065766f1ef4c940ede1efe4743acd", default-features = false }
+reverie-rpc-transport = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "502bc21f897065766f1ef4c940ede1efe4743acd" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 shell-words = "1.1.1"
