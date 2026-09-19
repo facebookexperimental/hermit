@@ -351,7 +351,12 @@ fi
 # DynamoRIO SDK build.rs/vendor and root manifest/toolchain recipe inputs.
 # Keep the same CMAKE/CMAKE_GENERATOR selection, 1050 effective-job-seconds
 # and 16-job clamp. This is source identity carry, not new calibration.
-expected_pin=d3ababc9c1ac5704322c0feca3658fee11f20155
+# CARRY TO 429962666ad7e9ef05877b74b585a571f57ef0c4: the landed capture/startup and memory
+# ownership changes preserve the exact DynamoRIO SDK build.rs/vendor and root
+# manifest/toolchain recipe inputs. Keep the same CMAKE/CMAKE_GENERATOR selection,
+# 1050 effective-job-seconds and 16-job clamp. Source identity carry only;
+# no new calibration.
+expected_pin=429962666ad7e9ef05877b74b585a571f57ef0c4
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
