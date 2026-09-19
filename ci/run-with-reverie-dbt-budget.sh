@@ -339,7 +339,15 @@ fi
 # Retain the 1050 effective-job-second budget and 16-job clamp with the same
 # CMAKE selection. This source-identity carry is not a new timing measurement
 # and does not transfer an earlier pin's runtime validation.
-expected_pin=e21e13c76482918d73e90f49eba04a28bdb054bd
+# CARRY TO bd398149 (2026-09-19): the landed native feature-build repair
+# https://github.com/rrnewton/reverie/pull/590 changes only a KVM constructor
+# call and equivalent test byte-array syntax. The complete reverie-dbt tree
+# ad0ef5e0d8bd, build.rs, DynamoRIO tree, root Cargo.toml, toolchain,
+# .gitmodules and third-party inputs are identical to e21e13c7.
+# Keep default CMAKE, unset CMAKE_GENERATOR, the 1050 effective-job-second
+# budget and 16-job clamp. This source-identity carry is not a new timing or
+# guest measurement; all prior calibration and validation limitations remain.
+expected_pin=bd398149c1f0fc8231dcde8820e7e90c87c7e798
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
