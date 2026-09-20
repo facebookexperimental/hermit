@@ -16,6 +16,10 @@
 #
 #   usage: run-in-pinned-root.sh --src DIR --out DIR [--digest NAME@SHA]
 #                                [--src-rw] [--cargo-home DIR] [--proc-locks-runtime] [--env NAME]... -- CMD...
+#          run-in-pinned-root.sh --check-image [--digest NAME@SHA]
+#
+# --check-image only reads the exact local image reference. It shares the late
+# execution guard, uses the caller's Podman store, and creates no output paths.
 #
 # --src-rw mounts the source WRITABLE. The default is read-only and stays that
 # way, but a test phase legitimately writes into its own tree (target/ci,
@@ -43,12 +47,14 @@ DIGEST_FILE="$HERE/image.digest"
 
 src=""; out=""; digest=""; src_mode="ro=true"; cargo_home=""
 proc_locks_runtime=false
+check_image=false
 pass_env=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --src) src=$2; shift 2 ;;
         --out) out=$2; shift 2 ;;
         --digest) digest=$2; shift 2 ;;
+        --check-image) check_image=true; shift ;;
         --src-rw) src_mode="ro=false"; shift ;;
         --cargo-home) cargo_home=$2; shift 2 ;;
         --proc-locks-runtime) proc_locks_runtime=true; shift ;;
@@ -57,6 +63,53 @@ while [[ $# -gt 0 ]]; do
         *) echo "run-in-pinned-root: unexpected argument '$1'" >&2; exit 2 ;;
     esac
 done
+
+check_pinned_image() {
+    if [[ -z "$digest" ]]; then
+        [[ -f "$DIGEST_FILE" ]] || {
+            echo "run-in-pinned-root: no --digest and no $DIGEST_FILE." >&2
+            echo "  Build the image first: ci/hermetic/build-image.sh" >&2
+            return 2
+        }
+        if ! digest=$(cat -- "$DIGEST_FILE"); then
+            echo "run-in-pinned-root: cannot read exact image reference from $DIGEST_FILE." >&2
+            return 2
+        fi
+    fi
+    if [[ ! "$digest" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]]; then
+        echo "run-in-pinned-root: invalid exact image reference '$digest'; expected NAME@sha256:64-lowercase-hex." >&2
+        return 2
+    fi
+
+    # Admission runs before any DAG node, so store inspection needs its own
+    # bound. Keep stderr and the actual status (including timeout/tool failure)
+    # instead of converting every nonzero result into 'image missing'. GNU
+    # timeout also signals its command group; the forced-stop grace is finite.
+    local status
+    if timeout --verbose --signal=TERM --kill-after=2s 10s podman image exists "$digest"; then
+        return 0
+    else
+        status=$?
+    fi
+    if [[ "$status" == 1 ]]; then
+        echo "run-in-pinned-root: image $digest is not present locally (Podman status 1)." >&2
+        echo "  This path does not fall back to a tag or to the host." >&2
+        echo "  Rebuild it from the committed lock: ci/hermetic/build-image.sh" >&2
+    else
+        echo "run-in-pinned-root: inspection unavailable for $digest (probe status $status; 10s query bound, 2s forced-stop grace)." >&2
+    fi
+    return "$status"
+}
+
+if "$check_image"; then
+    [[ -z "$src" && -z "$out" && -z "$cargo_home" && "$src_mode" == ro=true && "$proc_locks_runtime" == false && ${#pass_env[@]} == 0 && $# == 0 ]] || {
+        echo "run-in-pinned-root: --check-image accepts only optional --digest." >&2
+        exit 2
+    }
+    status=0
+    check_pinned_image || status=$?
+    exit "$status"
+fi
 
 [[ -n "$src" ]] || { echo "run-in-pinned-root: --src is required" >&2; exit 2; }
 [[ -n "$out" ]] || { echo "run-in-pinned-root: --out is required" >&2; exit 2; }
@@ -72,26 +125,11 @@ if [[ -n "$cargo_home" ]]; then
     cargo_home=$(realpath -m -- "$cargo_home")
 fi
 
-if [[ -z "$digest" ]]; then
-    [[ -f "$DIGEST_FILE" ]] || {
-        echo "run-in-pinned-root: no --digest and no $DIGEST_FILE." >&2
-        echo "  Build the image first: ci/hermetic/build-image.sh" >&2
-        exit 2
-    }
-    digest=$(tr -d '[:space:]' < "$DIGEST_FILE")
-fi
-
 # FAIL CLOSED ON A MISSING IMAGE. Falling back to a tag, or to the host, would
 # silently produce a run that is not hermetic while still reporting success --
 # which is worse than not running at all, because the receipt would claim a
 # pinned root it did not use.
-if ! podman image exists "$digest"; then
-    echo "run-in-pinned-root: image $digest is not present locally." >&2
-    echo "  This path does not fall back to a tag or to the host: a run that is" >&2
-    echo "  not in the pinned root must not be recorded as if it were." >&2
-    echo "  Rebuild it from the committed lock: ci/hermetic/build-image.sh" >&2
-    exit 1
-fi
+check_pinned_image || exit $?
 
 pinned_home="$out/home"
 mkdir -p "$out/target" "$pinned_home"

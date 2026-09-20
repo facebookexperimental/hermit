@@ -88,6 +88,9 @@ mod validate_plan;
 #[path = "lib/validate_admission.rs"]
 mod validate_admission;
 
+#[path = "lib/validate_pinned_image.rs"]
+mod validate_pinned_image;
+
 #[path = "lib/validate_receipt.rs"]
 mod validate_receipt;
 
@@ -21497,6 +21500,13 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
                 prev.finished_at
             );
         }
+    }
+
+    // This is the actual bound executable selection, after plan-only/cache
+    // returns and before any graph execution. A failed read-only image probe is
+    // an admission refusal, not a completed-node failure or a passing receipt.
+    if let Err(summary) = validate_pinned_image::admit(&root, &execution_plan, &plan.profile) {
+        return *summary;
     }
 
     match run_timeout {
