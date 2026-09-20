@@ -735,14 +735,15 @@ fn generated_plan_populations_preserve_command_policy() {
         for active in [false, true] {
             let mut cfg = selected.clone();
             let index = cfg.steps.iter().position(|step| step.tag() == tag).unwrap();
+            assert_eq!(cfg.steps[index].jobs_flag.as_deref(), Some("--jobs"));
             let command = &mut cfg.steps[index].cmd;
             assert!(command.matches("--parity-reference ptrace ").count() <= 1);
             *command = command.replace("--parity-reference ptrace ", "");
-            assert_eq!(command.matches("--prebuilt --jobs 8").count(), 1);
+            assert_eq!(command.matches("--prebuilt --results").count(), 1);
             if active {
                 *command = command.replace(
-                    "--prebuilt --jobs 8",
-                    "--prebuilt --parity-reference ptrace --jobs 8",
+                    "--prebuilt --results",
+                    "--prebuilt --parity-reference ptrace --results",
                 );
             }
             let plan = ConstructedValidationPlanV10 {

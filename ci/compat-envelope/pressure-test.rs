@@ -13397,7 +13397,15 @@ mod cells_file_selection_tests {
 
     #[test]
     fn disabled_cells_file_preserves_exact_selection_and_retained_evidence() {
-        let root = repo_root().unwrap();
+        // Rust's test harness runs cases concurrently, and sibling fixtures
+        // temporarily change the process-wide current directory. Anchor this
+        // repository fixture to the source path instead of racing on cwd.
+        let root = Path::new(file!())
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .unwrap()
+            .to_path_buf();
         let path = env::temp_dir().join(format!(
             "hermit-pressure-disabled-cells-file-{}-{}",
             std::process::id(),

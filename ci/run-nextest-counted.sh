@@ -6,9 +6,28 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 readonly RESULT_WRITER="$SCRIPT_DIR/nextest-test-results.rs"
 readonly TIMEOUT_CONFIG_WRITER="$SCRIPT_DIR/nextest-timeout-config.rs"
+readonly PREBUILT_RUST_SCRIPT="$SCRIPT_DIR/rust-script-bin/rust-script"
 
 nextest_config=
 cpu_measurement_dir=
+
+# Do not rely on a nested `/usr/bin/env rust-script` shebang resolving the
+# repository wrapper after validation has entered its hosted namespace.  The
+# top-level driver was already resolved before that boundary, but these helper
+# invocations happen inside it; run 35335623037 resolved the installed compiler
+# instead, tried to rebuild nextest-binaries.rs without network access, and all
+# prepared Nextest shards refused before executing a test.  Official consumers
+# name the prepared runner directly.  Standalone use retains the normal shebang
+# path and may compile as before.
+function run_rust_script {
+    local source=$1
+    shift
+    if [[ ${HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED:-0} == 1 ]]; then
+        "$PREBUILT_RUST_SCRIPT" --force "$source" "$@"
+    else
+        "$source" "$@"
+    fi
+}
 
 function cleanup_nextest_config {
     if [[ -n $nextest_config ]]; then
@@ -28,9 +47,9 @@ function cleanup_cpu_measurement_dir {
 # normal binary, independently of the Nextest test-harness binary of this name.
 function build_cpu_wrapper {
     if [[ ${HERMIT_PREPARED_NEXTEST_REQUIRED:-0} == 1 ]]; then
-        "$SCRIPT_DIR/nextest-binaries.rs" cpu-wrapper
+        run_rust_script "$SCRIPT_DIR/nextest-binaries.rs" cpu-wrapper
     else
-        "$SCRIPT_DIR/nextest-binaries.rs" build-cpu-wrapper
+        run_rust_script "$SCRIPT_DIR/nextest-binaries.rs" build-cpu-wrapper
     fi
 }
 
@@ -38,7 +57,7 @@ function invoke_nextest {
     local operation=$1
     shift
     if [[ ${HERMIT_PREPARED_NEXTEST_REQUIRED:-0} == 1 ]]; then
-        "$SCRIPT_DIR/nextest-binaries.rs" "$operation" --config-file "$nextest_config" "$@"
+        run_rust_script "$SCRIPT_DIR/nextest-binaries.rs" "$operation" --config-file "$nextest_config" "$@"
     else
         cargo nextest --config-file "$nextest_config" "$operation" "$@"
     fi
@@ -115,7 +134,7 @@ function emit_libtest_count {
         fi
         cpu_args=("$attempts" "$binary_map" "$cpu_report")
     fi
-    "$RESULT_WRITER" "$events" "$status" "$path" "${cpu_args[@]}" || writer_status=$?
+    run_rust_script "$RESULT_WRITER" "$events" "$status" "$path" "${cpu_args[@]}" || writer_status=$?
     if ((writer_status != 0)); then
         printf 'run-nextest-counted: cannot derive typed test results from %s\n' "$events" >&2
         return "$writer_status"
@@ -136,7 +155,7 @@ function run_nextest {
 
     cleanup_nextest_config
     nextest_config=$(mktemp "${TMPDIR:-/tmp}/hermit-nextest-config.XXXXXX.toml") || return $?
-    if ! HERMIT_NEXTEST_CPU_WRAPPER_BIN="$cpu_wrapper" "$TIMEOUT_CONFIG_WRITER" \
+    if ! HERMIT_NEXTEST_CPU_WRAPPER_BIN="$cpu_wrapper" run_rust_script "$TIMEOUT_CONFIG_WRITER" \
         "$SCRIPT_DIR/../.config/nextest.toml" "$wall_multiplier" "$nextest_config"; then
         cleanup_nextest_config
         return 2
@@ -149,7 +168,7 @@ function run_nextest {
         cleanup_nextest_config
         return 2
     fi
-    if ! "$RESULT_WRITER" --write-binary-map "$inventory" "$binary_map"; then
+    if ! run_rust_script "$RESULT_WRITER" --write-binary-map "$inventory" "$binary_map"; then
         printf 'run-nextest-counted: cannot validate typed nextest binary inventory\n' >&2
         cleanup_nextest_config
         return 2

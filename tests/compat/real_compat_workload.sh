@@ -16,6 +16,16 @@ fi
 
 readonly PROGRAM=$1
 readonly FIXTURE_ROOT=${REAL_COMPAT_FIXTURES:-/tmp/hermit-real-compat-fixtures}
+# Hosted strict verification mounts a fresh tmpfs at /test for each physical
+# run and executes this script there. Allocate below that per-run filesystem so
+# inode-bearing getdents64 buffers and /proc/self/maps observations start from
+# the same baseline even while a -j2 peer is active. Other callers retain /tmp.
+if [[ $PWD == /test ]]; then
+    WORK_ROOT=$PWD
+else
+    WORK_ROOT=/tmp
+fi
+readonly WORK_ROOT
 # A real allocation, not a name derived from the program. The old
 # "/tmp/hermit-real-compat-$PROGRAM" was the same directory for every concurrent
 # run of one program, and the two lines below made that MUTUALLY DESTRUCTIVE
@@ -25,7 +35,7 @@ readonly FIXTURE_ROOT=${REAL_COMPAT_FIXTURES:-/tmp/hermit-real-compat-fixtures}
 # at least one side fail. `mktemp -d` creates the directory itself, so the
 # `rm -rf`/`mkdir` that opened the window are gone with it, and the trap now
 # only ever removes this run's own tree.
-WORK_DIR="$(mktemp -d "/tmp/hermit-real-compat-$PROGRAM.XXXXXXXX")"
+WORK_DIR="$(mktemp -d "$WORK_ROOT/hermit-real-compat-$PROGRAM.XXXXXXXX")"
 readonly WORK_DIR
 export LC_ALL=C
 export TZ=UTC
@@ -379,7 +389,8 @@ EOF
         # Coreutils df reads /proc/self/mountinfo before statfs(2). Feed that
         # read from the immutable fixture through an inherited descriptor so
         # Hermit's per-attempt private mount roots cannot contaminate the
-        # strict comparison. The redirect marker proves the fixture was used.
+        # strict comparison. The marker belongs to this invocation's private
+        # work directory, so concurrent df probes cannot truncate each other.
         output=$(HERMIT_LSOF_MOUNTS_FD=0 \
             HERMIT_LSOF_REDIRECT_MARKER="$WORK_DIR/df.redirected" \
             LD_PRELOAD="$FIXTURE_ROOT/lsof/libmount_redirect.so" \

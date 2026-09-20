@@ -209,9 +209,11 @@ const NEXTEST_PRIVILEGED_ASSERT_COMMAND: &str = "./ci/nextest-binaries.rs assert
 const TESTS_MISC_EXECUTABLE_READ_COMMAND: &str = r#"tests_misc="$(./ci/nextest-binaries.rs executable hermit-detcore tests_misc)" || exit 1"#;
 
 
-fn integration_artifact_producer(command: &str) -> &'static str {
-    if command.starts_with("./ci/hermetic/run-in-pinned-root.sh ") {
+fn integration_artifact_producer(step: &Step) -> &'static str {
+    if step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh ") {
         "build.e2e_artifact_in_pinned_root"
+    } else if step.tag() == "test.hermit_integration_on_host" {
+        "build.e2e_artifact_on_host"
     } else {
         "build.e2e_artifact"
     }
@@ -227,7 +229,7 @@ fn hermit_integration_uses_published_artifact(step: &Step) -> bool {
         && step
             .deps
             .iter()
-            .any(|dependency| dependency == integration_artifact_producer(&step.cmd))
+            .any(|dependency| dependency == integration_artifact_producer(step))
 }
 
 // Only the self-test mutations use this reconstruction. Decode the same exact
@@ -278,7 +280,7 @@ fn integration_artifact_bracket(integration: &Step) -> Result<(), String> {
             "full-plan bracket: removing the integration artifact wrapper was accepted".into(),
         );
     }
-    let producer = integration_artifact_producer(&integration.cmd);
+    let producer = integration_artifact_producer(integration);
     let mut missing_dependency = integration.clone();
     missing_dependency
         .deps
@@ -288,16 +290,21 @@ fn integration_artifact_bracket(integration: &Step) -> Result<(), String> {
             "full-plan bracket: removing the integration artifact dependency was accepted".into(),
         );
     }
-    let other_producer = if producer == "build.e2e_artifact" {
-        "build.e2e_artifact_in_pinned_root"
-    } else {
-        "build.e2e_artifact"
-    };
-    missing_dependency.deps.push(other_producer.into());
-    if hermit_integration_uses_published_artifact(&missing_dependency) {
-        return Err(
-            "full-plan bracket: the other execution root's artifact producer was accepted".into(),
-        );
+    for other_producer in [
+        "build.e2e_artifact",
+        "build.e2e_artifact_in_pinned_root",
+        "build.e2e_artifact_on_host",
+    ] {
+        if other_producer == producer {
+            continue;
+        }
+        let mut wrong_dependency = missing_dependency.clone();
+        wrong_dependency.deps.push(other_producer.into());
+        if hermit_integration_uses_published_artifact(&wrong_dependency) {
+            return Err(
+                "full-plan bracket: the other execution root's artifact producer was accepted".into(),
+            );
+        }
     }
     if integration
         .cmd
@@ -22950,6 +22957,7 @@ mod committed_selection_preservation_tests {
             "ci/hermetic/run-split-validate.sh",
             "ci/hermetic/retry-fetch.sh",
             "ci/check-shard-coverage.sh",
+            "ci/run-hosted-node.sh",
             "ci/expected-e2e-plan.json",
             ".github/workflows/ci-portable.yml",
         ] {

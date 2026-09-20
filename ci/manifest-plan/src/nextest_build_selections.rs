@@ -411,7 +411,8 @@ pub(super) fn assert_command_selection(step: &dagrun::model::Step) -> Result<(),
         if !command.contains(marker) {
             continue;
         }
-        let parsed = split_arguments(&command_arguments(&command, marker)?)?;
+        let parsed = split_arguments(&command_arguments(&command, marker)?)
+            .map_err(|error| format!("{tag}: {error}"))?;
         if parsed.build != expected {
             return Err(format!(
                 "{tag} command has Cargo selection {:?}, declared {expected:?}",
@@ -564,6 +565,11 @@ mod tests {
             .iter()
             .find(|step| step.tag() == "build.workspace")
             .unwrap();
+        let hosted = graph
+            .steps
+            .iter()
+            .find(|step| step.tag() == "build.workspace_on_host")
+            .unwrap();
         let image = graph
             .steps
             .iter()
@@ -572,7 +578,11 @@ mod tests {
         assert_eq!(execution_command(image).unwrap(), host.cmd);
         for (consumer, producer, wrong_command) in [
             ("test.regular_crates", image.tag(), host.cmd.clone()),
-            ("test.regular_crates_on_host", host.tag(), image.cmd.clone()),
+            (
+                "test.regular_crates_on_host",
+                hosted.tag(),
+                image.cmd.clone(),
+            ),
         ] {
             let mut wrong_root = graph.clone();
             wrong_root
@@ -622,6 +632,38 @@ mod tests {
                     .any(|arg| arg.contains("kvm-execution-tests"))
             );
         }
+        let hosted_producer = graph
+            .steps
+            .iter()
+            .find(|step| step.tag() == "build.workspace_on_host")
+            .unwrap();
+        assert!(
+            hosted_producer
+                .cmd
+                .ends_with("./ci/nextest-binaries.rs prepare hosted-portable")
+        );
+        let hosted_artifact = graph
+            .steps
+            .iter()
+            .find(|step| step.tag() == "build.e2e_artifact_on_host")
+            .unwrap();
+        let hosted_unit = graph
+            .steps
+            .iter()
+            .find(|step| step.tag() == "test.hermit_unit_on_host")
+            .unwrap();
+        assert!(
+            hosted_unit
+                .deps
+                .iter()
+                .any(|dependency| dependency == "build.e2e_artifact_on_host")
+        );
+        assert!(
+            hosted_artifact
+                .deps
+                .iter()
+                .any(|dependency| dependency == "build.workspace_on_host")
+        );
         let mut missing_hardware = graph.clone();
         let producer = missing_hardware
             .steps

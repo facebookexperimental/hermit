@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Load the content-pinned ci-hub review-label contract without copying it."""
+"""Load the content-pinned ci-hub review-label contract."""
 
 from __future__ import annotations
 
@@ -28,7 +28,12 @@ def _candidate_authorities() -> list[Path]:
     if parent := os.environ.get("DEV_HERMIT_PARENT"):
         return [Path(parent) / AUTHORITY_RELATIVE_PATH]
 
-    candidates: list[Path] = []
+    # Hosted runners cannot read the private parent repository. Keep the exact
+    # pinned bytes locally and continue to authenticate them by digest below.
+    candidates = [
+        Path(__file__).resolve().parents[1]
+        / "ci/vendor/dev-hermit/ci-hub/review_contract.py"
+    ]
     for start in (Path(__file__).resolve(), Path.cwd().resolve()):
         candidates.extend(parent / AUTHORITY_RELATIVE_PATH for parent in start.parents)
     return candidates

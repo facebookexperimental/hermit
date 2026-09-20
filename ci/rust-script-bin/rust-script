@@ -41,6 +41,14 @@ for argument in "$@"; do
         real_rust_script=$(find_real_rust_script)
         exec "$real_rust_script" "$@"
     fi
+    # Stop at the source operand. Everything after it belongs to the prepared
+    # program, where flags such as Nextest's `-p PACKAGE` must not be mistaken
+    # for rust-script's own package-generation mode. Run 35342226342 made that
+    # mistake after entering hosted network isolation and delegated the already
+    # prepared nextest-binaries.rs back to the compiler.
+    if [[ $argument != -* ]]; then
+        break
+    fi
 done
 
 case ${1:-} in

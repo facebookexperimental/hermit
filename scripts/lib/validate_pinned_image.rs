@@ -617,8 +617,7 @@ exit 91
                     calls += 1;
                     Ok(ExitStatus::from_raw(1 << 8))
                 })
-                .err()
-                .expect("absent image must stop this selected plan");
+                .expect_err("absent image must stop this selected plan");
                 assert_eq!(calls, 1);
                 assert_eq!(refused.nodes_executed, 0);
                 assert_eq!(refused.executed_tests, Some(0));
@@ -633,8 +632,7 @@ exit 91
         let plan = BoundExecutionPlan::bind(&cfg, None, None).unwrap();
         for code in [1, 124, 125, 127, 137] {
             let mut summary = admit_with(&plan, "full", |_| Ok(ExitStatus::from_raw(code << 8)))
-                .err()
-                .expect("nonzero probe must refuse");
+                .expect_err("nonzero probe must refuse");
             assert_eq!(summary.verdict, crate::Verdict::Refused);
             assert_eq!(summary.exit_code, COULD_NOT_RUN_EXIT_CODE);
             assert_eq!(summary.nodes_executed, 0);
@@ -663,8 +661,7 @@ exit 91
         }
         std::fs::remove_file(f.dir.path().join(WRAPPER)).unwrap();
         let unavailable = admit(f.dir.path(), &plan, "full")
-            .err()
-            .expect("an unstartable probe must refuse before graph execution");
+            .expect_err("an unstartable probe must refuse before graph execution");
         assert_eq!(unavailable.nodes_executed, 0);
         assert_eq!(unavailable.executed_tests, Some(0));
         assert!(

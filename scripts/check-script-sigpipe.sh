@@ -113,6 +113,27 @@ delegated=$(HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1 \
     exit 1
 }
 
+# A prepared script's arguments are not rust-script options. In particular,
+# every package-selecting Nextest command carries `-p` after the source path;
+# the wrapper must pass it to the prepared binary instead of delegating the
+# whole invocation to the compiler. Use nextest-binaries' strict executable
+# query to prove which program parsed the deliberately extra arguments.
+nested_status=0
+HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1 \
+    HERMIT_REAL_RUST_SCRIPT="$fake_rust_script" \
+    ./ci/rust-script-bin/rust-script --force ci/nextest-binaries.rs \
+        --print-executable -p fixture >"$tmp/nested.out" 2>"$tmp/nested.err" || nested_status=$?
+[[ $nested_status == 2 ]] || {
+    echo "check-script-sigpipe.sh: nested -p selected the wrong runner (exit $nested_status)" >&2
+    cat "$tmp/nested.out" "$tmp/nested.err" >&2
+    exit 1
+}
+grep -q 'unexpected executable query argument' "$tmp/nested.err" || {
+    echo "check-script-sigpipe.sh: nested -p did not reach the prepared program" >&2
+    cat "$tmp/nested.out" "$tmp/nested.err" >&2
+    exit 1
+}
+
 unlisted_source="$ROOT_DIR/target/ci/rust-script-unlisted-$$.rs"
 trap 'rm -rf "$tmp" "$external_tmp"; rm -f "$unlisted_source"' EXIT
 printf '%s\n' 'fn main() {}' >"$unlisted_source"
@@ -127,7 +148,7 @@ grep -q 'producer manifest has no unique entry' "$tmp/unlisted.err" || {
     cat "$tmp/unlisted.err" >&2
     exit 1
 }
-echo "check-script-sigpipe.sh: OK — external tooling delegates; unlisted repository scripts refuse"
+echo "check-script-sigpipe.sh: OK — external tooling delegates; prepared payload flags stay nested; unlisted repository scripts refuse"
 
 ./ci/rust-script-bin/test-ownership.sh
 ./ci/rust-script-bin/test-log-isolation.sh

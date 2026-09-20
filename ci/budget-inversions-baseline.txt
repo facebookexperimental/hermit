@@ -18,21 +18,8 @@
 # Both are CI policy calls. The guard deliberately does not choose.
 #
 # Format: <node> <declared>s >= <bound>s (<what bounds it>)
-doc.doctests 900s >= 900s (job test-debug timeout-minutes)
-doc.rustdoc 900s >= 900s (job test-debug timeout-minutes)
-lint.clippy 1200s >= 900s (job test-debug timeout-minutes)
-test.app_strict_verify 900s >= 900s (job test-debug timeout-minutes)
-test.arbitrary_binaries 900s >= 900s (job test-debug timeout-minutes)
-test.cli_on_host 900s >= 900s (job test-debug timeout-minutes)
-test.command_strict_verify 900s >= 900s (job test-debug timeout-minutes)
 test.dbt_parity 900s >= 900s (job test-release timeout-minutes)
-test.detcore_unit 900s >= 900s (job test-debug timeout-minutes)
-test.envelope_levels 900s >= 900s (job test-debug timeout-minutes)
-test.hermit_integration 1200s >= 900s (job test-debug timeout-minutes)
-test.hermit_modes_on_host 900s >= 900s (job test-debug timeout-minutes)
-test.hermit_unit 900s >= 900s (job test-debug timeout-minutes)
 test.liteinst_strict 900s >= 900s (job test-release timeout-minutes)
-test.regular_crates 900s >= 900s (job test-debug timeout-minutes)
 test.sabre_examples 900s >= 900s (job test-release timeout-minutes)
 #
 # REMOVED 2026-08-10, and this is what a shrink looks like:

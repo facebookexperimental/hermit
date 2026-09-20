@@ -153,6 +153,29 @@ FILE *fopen(const char *path, const char *mode) {
     return stream;
 }
 
+int open(const char *path, int flags, ...) {
+    static int (*next_open)(const char *, int, ...);
+    mode_t mode = 0;
+    if (next_open == NULL) {
+        next_open = dlsym(RTLD_NEXT, "open");
+    }
+    if (is_proc_mount_table(path)) {
+        int fd = duplicate_mount_fd();
+        if (fd >= 0) {
+            mark_redirect();
+        }
+        return fd;
+    }
+    if ((flags & O_CREAT) != 0 || (flags & O_TMPFILE) == O_TMPFILE) {
+        va_list args;
+        va_start(args, flags);
+        mode = va_arg(args, mode_t);
+        va_end(args);
+        return next_open(path, flags, mode);
+    }
+    return next_open(path, flags);
+}
+
 int open64(const char *path, int flags, ...) {
     static int (*next_open64)(const char *, int, ...);
     mode_t mode = 0;

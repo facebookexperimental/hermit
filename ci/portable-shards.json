@@ -58,9 +58,7 @@
     "e2e.manifest_determinism_stress_c_on_host",
     "e2e.manifest_determinism_stress_on_host",
     "e2e.manifest_language_runtimes_on_host",
-    "e2e.manifest_shared_futex_c_on_host",
-    "e2e.manifest_system_utils_on_host",
-    "e2e.manifest_util_c_on_host"
+    "e2e.manifest_system_utils_on_host"
   ],
   "final_nodes": [
     "scorecard.compatibility_on_host"
@@ -91,7 +89,9 @@
         "test.hermit_integration",
         "test.cli_on_host",
         "test.arbitrary_binaries",
-        "test.applications_e2e"
+        "test.applications_e2e",
+        "e2e.manifest_shared_futex_c_on_host",
+        "e2e.manifest_util_c_on_host"
       ]
     },
     {

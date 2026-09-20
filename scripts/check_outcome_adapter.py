@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Load the content-pinned ci-hub check-outcome authority without copying it."""
+"""Load the content-pinned ci-hub check-outcome authority."""
 
 from __future__ import annotations
 
@@ -116,7 +116,15 @@ def _candidate_authorities() -> list[Path]:
     if parent := os.environ.get("DEV_HERMIT_PARENT"):
         return [Path(parent) / AUTHORITY_RELATIVE_PATH]
 
-    candidates: list[Path] = []
+    # GitHub's repository token cannot read the private dev-hermit repository.
+    # Keep the exact content-pinned authority in this public checkout so hosted
+    # validation can evaluate the contract without broader credentials.  The
+    # digest check below remains the authority boundary; this copy is not
+    # trusted merely because it is local.
+    candidates = [
+        Path(__file__).resolve().parents[1]
+        / "ci/vendor/dev-hermit/ci-hub/check_outcome.py"
+    ]
     for start in (Path(__file__).resolve(), Path.cwd().resolve()):
         candidates.extend(parent / AUTHORITY_RELATIVE_PATH for parent in start.parents)
     return candidates

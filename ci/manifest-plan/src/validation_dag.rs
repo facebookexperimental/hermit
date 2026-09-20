@@ -35,7 +35,7 @@ const EXPECTED_PLAN: &str = "ci/expected-e2e-plan.json";
 const SUPER_REPETITIONS: &str = "20";
 const PINNED_ROOT_FETCH_TAG: &str = "setup.pinned_root_fetch";
 const PINNED_ROOT_FETCH_COMMAND: &str = "seed=(); if [ -n \"${CARGO_HOME:-}\" ]; then seed=(--seed-cargo \"$CARGO_HOME\"); fi; ./ci/hermetic/run-split-validate.sh --fetch-only \"${seed[@]}\"";
-const PIN_GATE_COMMAND: &str = r#"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; with-proxy ./ci/run-reverie-pin-check.sh --repo "$PWD""#;
+pub(super) const PIN_GATE_COMMAND: &str = r#"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; hermit_run_pin_check() { if command -v with-proxy >/dev/null 2>&1; then with-proxy "$@"; else "$@"; fi; }; hermit_run_pin_check ./ci/run-reverie-pin-check.sh --repo "$PWD""#;
 const LINT_CHECKS_COMMAND: &str = r#"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/lint-checks-node.sh"#;
 
 /// Literal argv rendering only, not admission authority. The driver retains its
@@ -623,6 +623,13 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
             split.len()
         ));
     }
+    // The hosted test consumers need a producer whose prepared population and
+    // metadata belong to their committed profile. Keep the shared test cases
+    // and features, including kvm-native-test-support, while separating the
+    // hosted artifact identity from the pinned local producer.
+    // Split the producer before closing over its shared downstream consumers,
+    // so no hosted path retains a dependency on the local full producer.
+    split.insert("build.workspace".into());
     loop {
         let previous = split.len();
         for step in &cfg.steps {
@@ -646,9 +653,9 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
             break;
         }
     }
-    if split.len() != 206 {
+    if split.len() != 213 {
         return Err(format!(
-            "hosted test dependency closure has {} nodes, expected 206",
+            "hosted test dependency closure has {} nodes, expected 213",
             split.len()
         ));
     }
@@ -679,16 +686,22 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
             }
         }
     }
+    let hosted_workspace = cfg
+        .steps
+        .iter_mut()
+        .find(|step| step.tag() == "build.workspace_on_host")
+        .ok_or("hosted workspace producer is absent")?;
+    let local_prepare = "./ci/nextest-binaries.rs prepare full";
+    if hosted_workspace.cmd.matches(local_prepare).count() != 1 {
+        return Err("hosted workspace producer lost the exact local preparation command".into());
+    }
+    hosted_workspace.cmd = hosted_workspace.cmd.replace(
+        local_prepare,
+        "./ci/nextest-binaries.rs prepare hosted-portable",
+    );
     Ok(())
 }
 
-/// Materialize the pinned-root execution split as ordinary committed nodes.
-///
-/// This transform belongs to maintenance-time generation. Runtime validation
-/// sends the selected committed graph to dagrun without cloning producers or
-/// rewriting commands/dependencies. Existing twins are replaced from their
-/// host-side producers. Already-wrapped manifest commands retain their authored
-/// inner commands while their outer environment forwarding follows this policy.
 fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
     cfg.steps.retain(|step| {
         step.tag() != PINNED_ROOT_FETCH_TAG && !step.job.ends_with(PINNED_ROOT_TWIN_SUFFIX)
@@ -1476,9 +1489,9 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
     assert_structured_result_producers(cfg)?;
     crate::nextest_build_selections::assert_preparation_dependencies(cfg)?;
     assert_rust_script_producer_contract(cfg)?;
-    if cfg.steps.len() != 1598 {
+    if cfg.steps.len() != 1605 {
         return Err(format!(
-            "superset has {} steps, expected 1598",
+            "superset has {} steps, expected 1605",
             cfg.steps.len()
         ));
     }
@@ -1501,6 +1514,39 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
             .find(|step| step.tag() == tag)
             .ok_or_else(|| format!("committed DAG lost {tag}"))
     };
+    for tag in ["build.workspace", "build.runtime_release"] {
+        let producer = step(tag)?;
+        if producer.hint.preferred_inner_jobs != Some(32)
+            || producer.jobs_env.as_deref() != Some("CARGO_BUILD_JOBS")
+            || producer.jobs_flag.as_deref() != Some("")
+        {
+            return Err(format!(
+                "{tag} must expose CARGO_BUILD_JOBS so a smaller admitted CPU cap can lower its 32-worker preference"
+            ));
+        }
+    }
+    for hosted in cfg.steps.iter().filter(|step| {
+        step.labels
+            .iter()
+            .any(|label| label == HOSTED_PORTABLE_LABEL)
+            && step.hint.preferred_inner_jobs.unwrap_or(1) > 1
+    }) {
+        let has_width_channel = hosted
+            .jobs_env
+            .as_deref()
+            .is_some_and(|name| !name.is_empty())
+            || hosted
+                .jobs_flag
+                .as_deref()
+                .is_some_and(|flag| !flag.is_empty());
+        if !has_width_channel {
+            return Err(format!(
+                "{} has preferred_inner_jobs={} but no non-empty jobs_env or jobs_flag through which a smaller hosted runner can enforce its admitted width",
+                hosted.tag(),
+                hosted.hint.preferred_inner_jobs.unwrap()
+            ));
+        }
+    }
     for tag in crate::validation_dag_static::PMU_MEMORY_FAILURE_FAMILY_MEMBERS {
         if step(tag)?.fail_fast_family.as_deref()
             != Some(crate::validation_dag_static::PMU_MEMORY_FAILURE_FAMILY)
@@ -1682,7 +1728,7 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
         .ok_or("committed DAG lost pre.reverie_pin")?;
     if pin.cmd != PIN_GATE_COMMAND {
         return Err(format!(
-            "pre.reverie_pin must use the unconditional with-proxy command; got {:?}",
+            "pre.reverie_pin must use the portable proxy-when-present command; got {:?}",
             pin.cmd
         ));
     }
@@ -2003,6 +2049,72 @@ pub fn require_fresh(committed: &str, generated: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pin_gate_uses_proxy_only_when_the_runner_provides_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = Scratch::create().unwrap();
+        let root = scratch.0.join("pin checkout with 'quotes'");
+        let bin = root.join("ci/rust-script-bin");
+        fs::create_dir_all(&bin).unwrap();
+        let checker = root.join("ci/run-reverie-pin-check.sh");
+        fs::write(
+            &checker,
+            "#!/bin/bash\nprintf 'checker\\0' >>\"$CAPTURE\"\nprintf '%s\\0' \"$@\" >>\"$CAPTURE\"\nexit \"$CHECKER_STATUS\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&checker, fs::Permissions::from_mode(0o755)).unwrap();
+        let capture = root.join("capture");
+        let floor = "0123456789abcdef0123456789abcdef01234567";
+        for proxied in [false, true] {
+            if proxied {
+                let proxy = bin.join("with-proxy");
+                fs::write(&proxy, "#!/bin/bash\nprintf 'proxy\\0' >>\"$CAPTURE\"\nprintf '%s\\0' \"$@\" >>\"$CAPTURE\"\nexec \"$@\"\n").unwrap();
+                fs::set_permissions(proxy, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            for tag in ["pre.reverie_pin", "pre.reverie_pin_on_host"] {
+                for admitted_floor in [None, Some(floor)] {
+                    let command = admitted_pin_command(tag, admitted_floor).unwrap().unwrap();
+                    for status in [0, 23] {
+                        fs::write(&capture, "").unwrap();
+                        let output = Command::new("bash")
+                            .args(["-c", &command])
+                            .current_dir(&root)
+                            .env("PATH", "/usr/bin:/bin")
+                            .env("CAPTURE", &capture)
+                            .env("CHECKER_STATUS", status.to_string())
+                            .output()
+                            .unwrap();
+                        assert_eq!(output.status.code(), Some(status), "{output:?}");
+                        let root_text = root.to_str().unwrap();
+                        let mut args = vec!["--repo", root_text];
+                        if let Some(floor) = admitted_floor {
+                            args.extend(["--base-ref", floor]);
+                        }
+                        let mut expected = Vec::new();
+                        if proxied {
+                            expected.extend(["proxy", "./ci/run-reverie-pin-check.sh"]);
+                            expected.extend(args.iter().copied());
+                        }
+                        expected.push("checker");
+                        expected.extend(args);
+                        assert_eq!(
+                            fs::read(&capture).unwrap(),
+                            format!("{}\0", expected.join("\0")).as_bytes()
+                        );
+                    }
+                }
+            }
+        }
+        for bad_floor in [
+            "short",
+            "BAD0123456789abcdef0123456789abcdef0123456",
+            "'; exit 0 #",
+        ] {
+            assert!(admitted_pin_command("pre.reverie_pin", Some(bad_floor)).is_err());
+        }
+    }
 
     #[test]
     fn manifest_setup_prepares_tracked_dagrun_before_cargo_with_admitted_width() {
@@ -2535,7 +2647,9 @@ sys.exit(37)
         );
         for step in parity {
             assert_eq!(step.cmd.matches("--parity-reference ptrace").count(), 1);
-            assert!(step.cmd.contains("--category backend-parity-c --ci-only --allow-empty --prebuilt --parity-reference ptrace --jobs 8"));
+            assert!(step.cmd.contains("--category backend-parity-c --ci-only --allow-empty --prebuilt --parity-reference ptrace --results"));
+            assert_eq!(step.jobs_flag.as_deref(), Some("--jobs"));
+            assert_eq!(step.hint.preferred_inner_jobs, Some(8));
             let selector = step.manifest.as_ref().unwrap();
             assert_eq!(selector.lane, "portable");
             assert_eq!(selector.category, "backend-parity-c");
@@ -2543,7 +2657,6 @@ sys.exit(37)
             assert_eq!(selector.mode, None);
             assert_eq!(selector.backend, None);
             assert_eq!(step.hint.resources.get("manifest_guest"), Some(&8));
-            assert_eq!(step.hint.preferred_inner_jobs, Some(8));
             assert!(!step.cmd.contains("--probe-disabled"));
         }
     }
@@ -2602,8 +2715,17 @@ sys.exit(37)
             .collect::<BTreeSet<_>>();
         assert_eq!(new_variants.len(), 189);
         new_variants.extend(shared_tests.map(|job| format!("test.{job}_on_host")));
-        new_variants.insert("compatprep.fixtures_on_host".into());
-        assert_eq!(new_variants.len(), 206);
+        new_variants.extend([
+            "build.e2e_artifact_on_host".into(),
+            "build.liteinst_runtime_release_on_host".into(),
+            "build.workspace_on_host".into(),
+            "check.backend_parity_suites_on_host".into(),
+            "compatprep.fixtures_on_host".into(),
+            "doc.doctests_on_host".into(),
+            "doc.rustdoc_on_host".into(),
+            "lint.clippy_on_host".into(),
+        ]);
+        assert_eq!(new_variants.len(), 213);
         let mut expected = legacy_variants
             .map(str::to_string)
             .into_iter()
@@ -2664,15 +2786,15 @@ sys.exit(37)
             "{error}"
         );
 
-        let mut planted_pin_fallback = committed.clone();
-        planted_pin_fallback
+        let mut planted_unconditional_proxy = committed.clone();
+        planted_unconditional_proxy
             .steps
             .iter_mut()
             .find(|step| step.tag() == "pre.reverie_pin")
             .unwrap()
-            .cmd = "if command -v with-proxy; then with-proxy true; else true; fi".into();
-        let error = assert_invariants(&planted_pin_fallback, &cells).unwrap_err();
-        assert!(error.contains("unconditional with-proxy"), "{error}");
+            .cmd = "with-proxy ./ci/run-reverie-pin-check.sh --repo \"$PWD\"".into();
+        let error = assert_invariants(&planted_unconditional_proxy, &cells).unwrap_err();
+        assert!(error.contains("portable proxy-when-present"), "{error}");
 
         let mut planted_missing_rust_script_dep = committed.clone();
         planted_missing_rust_script_dep
@@ -2701,6 +2823,105 @@ sys.exit(37)
             error.contains("hosted-portable label has 250 direct steps"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn hosted_nextest_selections_keep_local_cases_and_failure_limits() {
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let mut checked = BTreeSet::new();
+        for hosted in committed.steps.iter().filter(|step| {
+            step.group == "test"
+                && step.job.ends_with(HOSTED_VARIANT_SUFFIX)
+                && step.env.contains_key("NEXTEST_EXPECTED_EXECUTED")
+        }) {
+            let local_tag = hosted
+                .tag()
+                .strip_suffix(HOSTED_VARIANT_SUFFIX)
+                .unwrap()
+                .to_owned();
+            checked.insert(local_tag.clone());
+            let local = committed
+                .steps
+                .iter()
+                .find(|step| step.tag() == local_tag)
+                .unwrap();
+            let local_payload = if local
+                .cmd
+                .starts_with("./ci/hermetic/run-in-pinned-root.sh ")
+            {
+                let argv = shell_words::split(&local.cmd).unwrap();
+                let boundary = argv.iter().position(|arg| arg == "--").unwrap();
+                assert_eq!(argv[boundary + 3], PINNED_ROOT_COMMAND_GUARD);
+                argv[boundary + 5].clone()
+            } else {
+                local.cmd.clone()
+            };
+            assert_eq!(
+                hosted.cmd,
+                local_payload,
+                "{} changed its test selection",
+                hosted.tag()
+            );
+            assert_eq!(
+                hosted.timeout,
+                local.timeout,
+                "{} changed its timeout",
+                hosted.tag()
+            );
+            assert_eq!(
+                hosted.cpu_timeout,
+                local.cpu_timeout,
+                "{} changed its CPU timeout",
+                hosted.tag()
+            );
+            for key in [
+                "NEXTEST_EXPECTED_EXECUTED",
+                crate::nextest_binaries::SELECTION_ENV,
+            ] {
+                assert_eq!(
+                    hosted.env.get(key),
+                    local.env.get(key),
+                    "{} changed {key}",
+                    hosted.tag()
+                );
+            }
+        }
+        assert_eq!(
+            checked,
+            BTreeSet::from(
+                [
+                    "test.app_strict_verify",
+                    "test.arbitrary_binaries",
+                    "test.cli",
+                    "test.command_strict_verify",
+                    "test.detcore_misc",
+                    "test.detcore_parallel",
+                    "test.detcore_unit",
+                    "test.hermit_integration",
+                    "test.hermit_modes",
+                    "test.hermit_unit",
+                    "test.ignored_syscall_regressions",
+                    "test.liteinst_strict",
+                    "test.regular_crates",
+                    "test.rr_suite_contract",
+                    "test.sabre_examples",
+                ]
+                .map(str::to_owned)
+            ),
+            "every hosted Nextest selection must be compared to its local selection"
+        );
+        let local = committed
+            .steps
+            .iter()
+            .find(|step| step.tag() == "e2e.manifest_backend_parity_c")
+            .unwrap();
+        let hosted = committed
+            .steps
+            .iter()
+            .find(|step| step.tag() == "e2e.manifest_backend_parity_c_on_host")
+            .unwrap();
+        assert_eq!(local.timeout, 600);
+        assert_eq!(hosted.timeout, local.timeout);
     }
 
     #[test]

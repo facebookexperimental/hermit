@@ -503,6 +503,37 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn nested_alias_sibling_remains_an_absolute_checkout_root_reference() {
+        // Model TMPDIR inside the checkout regardless of this test process's
+        // environment. A component-boundary sibling of one alias still lies
+        // inside the checkout and must fail the complete-root oracle.
+        let checkout = Path::new("/checkout");
+        let first_alias = Path::new("/checkout/run-state/tmp/first-root");
+        let second_alias = Path::new("/checkout/run-state/tmp/second-root");
+        let checked_roots = [checkout, first_alias, second_alias];
+        for field in [
+            "/tests/1/build/cflags/0",
+            "/tests/1/build/rustflags/0",
+            "/tests/1/direct/argv/1",
+            "/cells/0/current_reproducer/argv/1",
+            "/cells/0/current_reproducer/shell_command",
+        ] {
+            let mut mapped = serde_json::to_value(contract_fixture()).unwrap();
+            *mapped.pointer_mut(field).unwrap() = Value::String(format!(
+                "-fdebug-prefix-map={}-sibling=/mapped",
+                first_alias.display()
+            ));
+            let exports = vec![serde_json::to_string(&mapped).unwrap(); checked_roots.len()];
+            require_root_independent_exports(&exports, &[first_alias]).unwrap();
+            let error = require_root_independent_exports(&exports, &checked_roots).unwrap_err();
+            assert_eq!(
+                error, "absolute checkout-root reference: /checkout",
+                "{field}"
+            );
+        }
+    }
+
     fn identity(cell: &CellMetadata) -> (String, String, String, String, String) {
         (
             cell.lane.clone(),
@@ -1169,11 +1200,22 @@ test:
                         leaked_root.display()
                     ),
                 ] {
+                    let relative_only = permitted.starts_with("-fdebug-prefix-map=hermit-cli/");
                     let mut mapped = option_fixture.clone();
                     *mapped.pointer_mut(field).unwrap() = Value::String(permitted);
                     let mapped = serde_json::to_string(&mapped).unwrap();
-                    require_root_independent_exports(&vec![mapped; exports.len()], &checked_roots)
-                        .unwrap();
+                    // The sibling spelling is relative only to leaked_root.
+                    // Hosted validation deliberately puts TMPDIR below the
+                    // checkout, so an alias sibling there still is an absolute
+                    // descendant of the checkout root and must remain refused
+                    // by that separate root. Test the component boundary
+                    // against the root whose textual prefix this case varies.
+                    let roots = if relative_only {
+                        checked_roots.as_slice()
+                    } else {
+                        std::slice::from_ref(&leaked_root)
+                    };
+                    require_root_independent_exports(&vec![mapped; exports.len()], roots).unwrap();
                 }
                 let mut mapped = option_fixture.clone();
                 *mapped.pointer_mut(field).unwrap() = Value::String(format!(

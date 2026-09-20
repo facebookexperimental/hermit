@@ -18,6 +18,10 @@ is_build_or_run_file() {
 
 is_excluded() {
     [[ $1 == ci/compat-envelope/cells.json ]] && return 0
+    # These are byte-authenticated historical parser inputs copied from the
+    # private parent, not commands or live configuration. Their synthetic paths
+    # must remain unchanged or their companion hashes stop authenticating them.
+    [[ $1 == ci/manifest-plan/src/ledger/schema10/fixtures/legacy/* ]] && return 0
     case "/$1/" in
         */.git/* | */ignored/* | */experiments/* | */scratch/* | */target/* \
             | */third-party/* | */vendor/* | */scripts/check-portable-paths.sh/)
@@ -101,6 +105,21 @@ self_test() {
         rm -f "$fixture"
         return 1
     }
+    is_excluded ci/manifest-plan/src/ledger/schema10/fixtures/legacy/reference-diverged-cells.jsonl || {
+        echo "portability self-test failed to exclude authenticated legacy evidence" >&2
+        rm -f "$fixture"
+        return 1
+    }
+    if is_excluded ci/manifest-plan/src/ledger/schema10/tests.rs; then
+        echo "portability self-test widened the legacy-evidence exclusion to live parser code" >&2
+        rm -f "$fixture"
+        return 1
+    fi
+    if is_excluded ci/manifest-plan/src/ledger/schema10/fixtures/current/probe.jsonl; then
+        echo "portability self-test widened the legacy-evidence exclusion to current fixtures" >&2
+        rm -f "$fixture"
+        return 1
+    fi
     if is_excluded ci/compat-envelope/scorecard.rs; then
         echo "portability self-test excluded live compatibility code" >&2
         rm -f "$fixture"

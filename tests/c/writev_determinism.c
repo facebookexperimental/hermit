@@ -217,7 +217,8 @@ static void receive_writev_signal(int signal) {
   writev_signal_received = 1;
   if (writev_signal_ack_fd >= 0) {
     char acknowledged = 'A';
-    (void)write(writev_signal_ack_fd, &acknowledged, sizeof(acknowledged));
+    ssize_t written = write(writev_signal_ack_fd, &acknowledged, sizeof(acknowledged));
+    (void)written;
   }
   errno = saved_errno;
 }

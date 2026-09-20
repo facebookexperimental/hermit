@@ -2,8 +2,8 @@ name: CI (GitHub-managed portable)
 
 # Diagnostic fan-out of the constructed portable plan. It runs automatically
 # only after a commit reaches the integration branch, and may also be dispatched
-# manually. Local exact-head full validation remains the landing authority; this
-# workflow reports additional evidence and a hosted red never gates a landing.
+# manually. Follow AGENTS.md for landing: local or GitHub evidence is acceptable,
+# and reported failures require investigation.
 #
 # WHY: the former serial `regular` job ran the entire 46-node
 # portable DAG on ONE ubuntu-latest runner with outer concurrency 1 (serial
@@ -77,6 +77,8 @@ env:
   MANIFEST_PLAN_TARBALL: hermit-manifest-plan.tgz
   DEBUG_ARTIFACT: hermit-debug-${{ github.run_id }}
   DEBUG_TARBALL: hermit-portable-debug.tzst
+  NEXTEST_ARTIFACT: hermit-nextest-${{ github.run_id }}
+  NEXTEST_TARBALL: hermit-portable-nextest.tzst
   RELEASE_DBT_ARTIFACT: hermit-release-dbt-${{ github.run_id }}
   RELEASE_ARTIFACT: hermit-release-${{ github.run_id }}
   RELEASE_TARBALL: hermit-portable-release.tzst
@@ -343,7 +345,12 @@ jobs:
     needs: [select, preflight]
     if: needs.select.outputs.decision != 'skip'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # check.lint_checks alone has a committed 2400s bound: its historical
+    # loaded run reached 8m54s, and it now owns every lint-checks script test.
+    # Run 35354614446 proved the old 10-minute outer job bound contradictory:
+    # it canceled the healthy node after 390s of visible progress. Preserve the
+    # inner 40-minute hang detector plus ten minutes for setup and artifacts.
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
         with:
@@ -360,10 +367,26 @@ jobs:
           sudo apt-get install -y liblzma-dev
       - name: Rust components
         run: rustup component add clippy rustfmt
+      # check.lint_checks runs the real structured-Nextest fixture.  Installing
+      # rust-script alone made that fixture fail with "no such command:
+      # nextest" on run 35335623037; the fixture is a test of the production
+      # adapter, not a reason to replace it with a mock in hosted CI.
+      - name: Install cargo-nextest (checks)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
       - name: Install rust-script (checks)
         env:
           RUSTFLAGS: ""
         run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
+      # The real structured-Nextest fixture deliberately enters its execution
+      # namespace with CARGO_NET_OFFLINE=true.  Its standalone CPU-wrapper
+      # preparation still asks Cargo for locked workspace metadata, so a fresh
+      # runner must populate those sources before crossing that boundary.  Run
+      # 35342226342 reached the prepared runner and pinned Nextest correctly,
+      # then refused because addr2line was not yet present in Cargo's cache.
+      - name: Fetch locked workspace dependencies for offline checks
+        run: cargo fetch --locked
       - name: Download rust-script binaries
         uses: actions/download-artifact@v4
         with:
@@ -534,15 +557,19 @@ jobs:
           install -Dm755 target/debug/deps/libdetcore_dbt.so \
             target/install_pkg/rsrcs/libdetcore_dbt.so
           test -x target/debug/verification-report
+          test -x target/debug/nextest-cpu-wrapper
           test -x target/ci/bin/cargo-nextest
+          test -f target/ci/nextest-binaries/current.json
           tar --zstd -cf "$DEBUG_TARBALL" \
             target/debug/hermit \
             target/debug/test-harness \
             target/debug/hermit-manifest-plan \
             target/debug/verification-report \
+            target/debug/nextest-cpu-wrapper \
             target/debug/deps/libdetcore_dbt.so \
             target/install_pkg/rsrcs/libdetcore_dbt.so \
             target/ci/bin/cargo-nextest \
+            target/ci/nextest-binaries \
             target/ci/rust-scripts \
             ignored/e2e/build
           ls -lh "$DEBUG_TARBALL"
@@ -551,6 +578,41 @@ jobs:
         with:
           name: ${{ env.DEBUG_ARTIFACT }}
           path: ${{ env.DEBUG_TARBALL }}
+          if-no-files-found: error
+          retention-days: 1
+      - name: Pack prepared Nextest inputs
+        run: |
+          set -euo pipefail
+          nextest_inputs=$(mktemp)
+          trap 'rm -f "$nextest_inputs"' EXIT
+          jq -er --arg root "$PWD/" '
+            [
+              .selections[].binaries[].executable.path,
+              .selections[].runtime_files[].path,
+              .guests[].path
+            ]
+            | unique
+            | if length == 0 then error("prepared Nextest input set is empty")
+              elif all(.[]; startswith($root)) then .[] | ltrimstr($root)
+              else error("prepared Nextest input is outside the repository")
+              end
+          ' target/ci/nextest-binaries/current.json > "$nextest_inputs"
+          while IFS= read -r input; do
+            [[ -f $input && ! -L $input ]] || {
+              echo "prepared Nextest input is absent or a symlink: $input" >&2
+              exit 1
+            }
+          done < "$nextest_inputs"
+          tar --zstd -cf "$NEXTEST_TARBALL" \
+            -T "$nextest_inputs" \
+            target/debug/nextest-cpu-wrapper \
+            target/ci/nextest-binaries
+          ls -lh "$NEXTEST_TARBALL"
+      - name: Upload prepared Nextest inputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NEXTEST_ARTIFACT }}
+          path: ${{ env.NEXTEST_TARBALL }}
           if-no-files-found: error
           retention-days: 1
 
@@ -729,7 +791,10 @@ jobs:
       && needs.build-release.result == 'success'
       && needs.build-complete.result == 'success'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Run 35390137055 spent the entire inherited 15-minute job bound downloading
+    # the immutable 2 GiB prepared-Nextest artifact and was cancelled before
+    # unpacking or executing integration. Preserve ten minutes for real work.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.select.outputs.debug_matrix) }}
@@ -744,7 +809,7 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal ncat netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
+          sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk gdb git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal ncat netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
       - name: Rust components
         run: rustup component add clippy rustfmt
       - name: Install cargo-nextest (unit-parallel shard)
@@ -791,6 +856,11 @@ jobs:
         with:
           name: ${{ env.DEBUG_ARTIFACT }}
           path: .
+      - name: Download prepared Nextest inputs
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.NEXTEST_ARTIFACT }}
+          path: .
       # The completed release tree carries the DBT and LiteInst runtimes plus
       # the constructed E2E artifact. A selective run may skip it only when the
       # selector proved the chosen debug shard needs none of those outputs.
@@ -805,11 +875,15 @@ jobs:
           set -euo pipefail
           tar --zstd -xf "$DEBUG_TARBALL"
           rm -f "$DEBUG_TARBALL"
+          tar --zstd -xf "$NEXTEST_TARBALL"
+          rm -f "$NEXTEST_TARBALL"
           test -x target/debug/hermit
           test -x target/debug/verification-report
+          test -x target/debug/nextest-cpu-wrapper
           test -f target/debug/deps/libdetcore_dbt.so
           test -f target/install_pkg/rsrcs/libdetcore_dbt.so
           test -x target/ci/bin/cargo-nextest
+          test -f target/ci/nextest-binaries/current.json
       # Install into CARGO_HOME/bin rather than adding target/ci/bin to PATH:
       # cargo searches $CARGO_HOME/bin BEFORE PATH when resolving
       # `cargo-<subcommand>`, so a PATH entry loses to whatever the rust-cache
@@ -839,7 +913,7 @@ jobs:
       - name: Run shard nodes (${{ matrix.slug }})
         env:
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
-        run: ./ci/run-node.sh portable "${{ matrix.nodes }}"
+        run: ./ci/run-hosted-node.sh portable "${{ matrix.nodes }}"
       - name: Upload debug shard node performance report
         if: always()
         uses: actions/upload-artifact@v4
@@ -886,6 +960,11 @@ jobs:
         with:
           name: ${{ env.DEBUG_ARTIFACT }}
           path: .
+      - name: Download prepared Nextest inputs
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.NEXTEST_ARTIFACT }}
+          path: .
       - name: Download full release prebuilt tree
         uses: actions/download-artifact@v4
         with:
@@ -895,14 +974,18 @@ jobs:
         run: |
           set -euo pipefail
           tar --zstd -xf "$DEBUG_TARBALL"; rm -f "$DEBUG_TARBALL"
+          tar --zstd -xf "$NEXTEST_TARBALL"
+          rm -f "$NEXTEST_TARBALL"
           tar --zstd -xf "$RELEASE_TARBALL"; rm -f "$RELEASE_TARBALL"
           test -x target/debug/test-harness
+          test -x target/debug/nextest-cpu-wrapper
+          test -f target/ci/nextest-binaries/current.json
           test -x target/ci/hermit-strict
           ./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null
       - name: Run strict compatibility node
         env:
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
-        run: ./ci/run-node.sh portable "$(jq -r '.strict_compat_nodes|join(",")' ci/portable-shards.json)"
+        run: ./ci/run-hosted-node.sh portable "$(jq -r '.strict_compat_nodes|join(",")' ci/portable-shards.json)"
       - name: Upload strict-compat node performance report
         if: always()
         uses: actions/upload-artifact@v4
@@ -933,7 +1016,7 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc binutils bzip2 clang cmake file g++ gcc git jq libc6-dbg libelf-dev libunwind-dev liblzma-dev make pkg-config procps python3-full time zlib1g-dev zstd
+          sudo apt-get install -y bc binutils bzip2 clang cmake file g++ gcc git iproute2 jq libc6-dbg libelf-dev libunwind-dev liblzma-dev make pkg-config procps python3-full time zlib1g-dev zstd
       # Release shards now execute individual tests through the same pinned
       # nextest timeout policy as debug shards. The release artifact contains
       # product binaries, not Cargo subcommand tooling, so provision it here.
@@ -973,17 +1056,26 @@ jobs:
         with:
           name: ${{ env.RELEASE_ARTIFACT }}
           path: .
+      - name: Download prepared Nextest inputs
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.NEXTEST_ARTIFACT }}
+          path: .
       - name: Unpack full release prebuilt tree
         run: |
           set -euo pipefail
           tar --zstd -xf "$RELEASE_TARBALL"
           rm -f "$RELEASE_TARBALL"
+          tar --zstd -xf "$NEXTEST_TARBALL"
+          rm -f "$NEXTEST_TARBALL"
           test -x target/release/hermit
+          test -x target/debug/nextest-cpu-wrapper
+          test -f target/ci/nextest-binaries/current.json
           ./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null
       - name: Run shard nodes (${{ matrix.slug }})
         env:
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
-        run: ./ci/run-node.sh portable "${{ matrix.nodes }}"
+        run: ./ci/run-hosted-node.sh portable "${{ matrix.nodes }}"
       - name: Upload release shard node performance report
         if: always()
         uses: actions/upload-artifact@v4
@@ -994,12 +1086,16 @@ jobs:
           retention-days: 14
 
   # ------------------------------------------------------------- e2e steps
+  # Every selected E2E product verdict remains part of this workflow's result.
+  # Failure does not prevent the retained evidence from reaching the reducer.
   e2e:
-    name: "e2e step: ${{ matrix.slug }}"
+    name: "e2e: ${{ matrix.slug }}"
     needs: [select, build-debug, build-complete]
     if: needs.select.outputs.run_e2e != 'false'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Preserve the existing constructed-node limits with setup and evidence
+    # packing outside each node's execution budget.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.build-debug.outputs.e2e_matrix) }}
@@ -1025,6 +1121,14 @@ jobs:
         run: |
           if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          # GitHub exposes nested virtualization but leaves /dev/kvm readable
+          # only by root. These shards contain declared KVM cells, so make the
+          # device usable instead of misclassifying permission denial as a
+          # product no-result.
+          if [[ -e /dev/kvm ]]; then
+            sudo chmod a+rw /dev/kvm
+            sudo sysctl -w kernel.perf_event_paranoid=-1
           fi
           sudo install -d -o "$(id -u)" -g "$(id -g)" /test
           sudo install -d -o "$(id -u)" -g "$(id -g)" /results
@@ -1055,10 +1159,10 @@ jobs:
           test -x target/debug/hermit
           test -x target/release/hermit
           ./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null
-      - name: Run constructed step (${{ matrix.node }})
+      - name: Run constructed E2E node (${{ matrix.node }})
         env:
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
-        run: ./ci/run-node.sh portable "${{ matrix.node }}"
+        run: ./ci/run-hosted-node.sh portable "${{ matrix.node }}"
       - name: Pack deterministic parity transport archive
         if: always()
         env:
@@ -1220,6 +1324,25 @@ jobs:
         env:
           RUSTFLAGS: ""
         run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
+      # The folded reducer executes scorecard.compatibility_on_host through
+      # run-node.sh. That committed node requires the same immutable prepared
+      # rust-script manifest as every other consumer; installing the interpreter
+      # alone cannot supply those binaries (run 35354614446).
+      - name: Download reducer manifest plan tools and rust-script binaries
+        if: needs.select.outputs.run_e2e != 'false'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.MANIFEST_PLAN_ARTIFACT }}
+          path: .
+      - name: Unpack reducer manifest plan tools and rust-script binaries
+        if: needs.select.outputs.run_e2e != 'false'
+        run: |
+          set -euo pipefail
+          tar -xzf "$MANIFEST_PLAN_TARBALL"
+          rm -f "$MANIFEST_PLAN_TARBALL"
+          test -x target/debug/test-harness
+          test -x target/debug/hermit-manifest-plan
+          ./ci/prepare-rust-scripts.sh --check
       # Folded in from the former standalone `reduce-e2e` job so the portable
       # gate critical path is one queued stage shorter (select -> build -> e2e
       # -> reduce-e2e -> regular  becomes  select -> build -> e2e -> regular).
@@ -1239,6 +1362,7 @@ jobs:
         if: needs.select.outputs.run_e2e != 'false'
         env:
           EXPECTED: ${{ needs.build-debug.outputs.e2e_count }}
+          EXPECTED_CELLS: ${{ needs.plan.outputs.selected_cell_count }}
         run: |
           set -euo pipefail
           actual=$(find ignored/transport -maxdepth 1 -name '*.tar.zst' -type f | wc -l)
@@ -1260,7 +1384,12 @@ jobs:
             tar --zstd -xf "$archive" -C "ignored/reduced/expanded/$slug"
             stage="ignored/reduced/expanded/$slug/parity-v1"
             test -f "$stage/complete"
-            step=$(jq -er '.step | select(startswith("e2e.manifest_"))' "$stage/index.json")
+            step=$(jq -er \
+              --arg sha "$GITHUB_SHA" \
+              --arg run_key "${{ github.run_id }}-${{ github.run_attempt }}" \
+              'select(.schema == 1 and .repository_sha == $sha and .run_key == $run_key
+                and .lane == "portable") | .step | select(startswith("e2e.manifest_"))' \
+              "$stage/index.json")
             job=${step#e2e.}
             mkdir -p "ignored/reduced/results/portable/$job"
             cp "$stage/results.jsonl" "ignored/reduced/results/portable/$job/results.jsonl"
@@ -1269,6 +1398,25 @@ jobs:
 
           find ignored/reduced/expanded -path '*/parity-v1/results.jsonl' -type f -print0 |
             sort -z | xargs -0 cat > ignored/reduced/results.jsonl
+          [[ "$EXPECTED_CELLS" =~ ^[0-9]+$ ]]
+          jq -se --arg sha "$GITHUB_SHA" '
+            all(.[];
+              .schema == 4
+              and .hermit_sha == $sha
+              and .lane == "portable"
+              and .source_tree_dirty == false)
+          ' ignored/reduced/results.jsonl >/dev/null
+          jq -S --argjson expected "$EXPECTED_CELLS" '
+            [.cells[] | select(.lane == "portable")
+              | [.lane, .category, .test, .mode, .backend]]
+            | select(length == $expected) | sort
+          ' ci/expected-e2e-plan.json > ignored/reduced/expected-identities.json
+          jq -sS '[.[] | [.lane, .category, .test, .mode, .backend]] | unique | sort' \
+            ignored/reduced/results.jsonl > ignored/reduced/actual-identities.json
+          cmp -s ignored/reduced/expected-identities.json ignored/reduced/actual-identities.json || {
+            diff -u ignored/reduced/expected-identities.json ignored/reduced/actual-identities.json
+            exit 1
+          }
           jq -s '{schema:1, cells:length,
             passed:(map(select(.outcome=="PASS"))|length),
             failed:(map(select(.outcome=="FAIL"))|length),
@@ -1279,7 +1427,7 @@ jobs:
             cp "$junit" "ignored/reduced/$slug.junit.xml"
           done < <(find ignored/reduced/expanded -path '*/parity-v1/junit.xml' \
             -type f -print0 | sort -z)
-      - name: Run constructed final result step
+      - name: Run constructed E2E verdict
         if: needs.select.outputs.run_e2e != 'false'
         env:
           E2E_RESULT_ROOT: ${{ github.workspace }}/ignored/reduced/results
@@ -1305,11 +1453,9 @@ jobs:
           set -euo pipefail
           jq . <<< "$RESULTS"
           # A job is acceptable only if it SUCCEEDED or was intentionally
-          # deselected (skipped) by affected-test selection. A `failure` or
-          # `cancelled` in ANY selected job still fails closed — selection can
-          # remove a job from the run, never mask a real failure. `select` itself
-          # is in this set: if it dies it reports `failure`, not `skipped`, so a
-          # broken selection job reds the diagnostic instead of silently skipping tests.
+          # deselected (skipped) by affected-test selection. Product failures,
+          # evidence failures and cancellation all remain failures. `select`
+          # itself is in this set, so broken selection cannot silently skip tests.
           jq -e 'all(.[]; .result == "success" or .result == "skipped")' <<< "$RESULTS"
 
   # ------------------------------------------------------------- cleanup

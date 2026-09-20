@@ -58,7 +58,7 @@
         "quick",
         "super"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; with-proxy ./ci/run-reverie-pin-check.sh --repo \"$PWD\"",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; hermit_run_pin_check() { if command -v with-proxy >/dev/null 2>&1; then with-proxy \"$@\"; else \"$@\"; fi; }; hermit_run_pin_check ./ci/run-reverie-pin-check.sh --repo \"$PWD\"",
       "result_manifests": [],
       "deps": [
         "pre.submodules"
@@ -371,7 +371,6 @@
       "description": "EXECUTION GAP CLOSED 2026-08-25 (task three_backend_parity_suites). These three self-contained Python suites were inventoried as driver-owned but had no DAG node: inventory established ownership, not execution, and neither the backend-parity mutation node nor running run_matrix.py as the DBT parity program imports them. Before wiring, all three were run directly at bc9d1782acf0 and passed: verify-tier evidence (50 runtime checks), scorecard-header compatibility (73), and atomic run-matrix output (19). The suite guards typed-verdict-only L2 claims, non-vacuous compared-log counts, operand-derived parity and schema compatibility, and whole-or-nothing result artifacts. It consumes the verification-report binary produced by build.workspace, but has no guest or backend prerequisite.",
       "labels": [
         "full",
-        "hosted-portable",
         "portable"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; python3 tests/backend-parity/test_verify_tier_evidence.py && python3 tests/backend-parity/test_scorecard_header_compat.py && python3 tests/backend-parity/test_run_matrix_output_skew.py",
@@ -731,7 +730,6 @@
       "description": "CLEAN-TARGET PREPARATION 2026-08-28: hermit-install reads the DynamoRIO installation produced by reverie-dbt, but Cargo may run their unrelated build scripts concurrently inside the combined workspace build. A clean hosted target therefore reached hermit-install before drrun existed while warm local targets passed. The first detcore-dbt build establishes that resource through the same pinned budget wrapper; the following combined build still owns the complete debug workspace graph, including test targets and the flaky harness. The explicit bin build completes target/debug/hermit for the later verified E2E artifact publisher. preferred_inner_jobs=32 is measured on a cold empty target at hermit@846baeca: 130.35s, cgroup-recorded peak=11663998976 bytes. The generous 64GiB cap deliberately prioritizes throughput over cap tightness. Release artifacts remain a separate profile because Cargo cannot emit dev and release profiles in one invocation; the privileged lane is a separate DAG and is unchanged.",
       "labels": [
         "full",
-        "hosted-portable",
         "portable"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh cargo build --locked -p detcore-dbt && ./ci/run-with-reverie-dbt-budget.sh cargo build --workspace --all-targets --features third-party-backends && CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && ./ci/nextest-binaries.rs prepare full",
@@ -747,7 +745,7 @@
       "timeout": 1200,
       "cpu_timeout": 7200,
       "jobs_flag": "",
-      "jobs_env": null,
+      "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
         "resources": {},
         "est_duration_s": 130.0,
@@ -782,7 +780,7 @@
       "timeout": 1200,
       "cpu_timeout": 7200,
       "jobs_flag": "",
-      "jobs_env": null,
+      "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
         "resources": {},
         "est_duration_s": 185.0,
@@ -802,7 +800,6 @@
       "description": "This is the publication barrier between the two initial Cargo producers and every later shared-target writer. It hashes target/debug/hermit before and after copying, snapshots target/install_pkg with symlinks dereferenced, verifies required DBT/SaBRe/LiteInst/e9patch resources and the complete resource hash manifest, then atomically publishes a unique content-addressed directory plus pointer. Manifest consumers and all later Cargo writers depend on this node, so the publisher never reads either mutable tree while a sibling writer can relink or recreate it.",
       "labels": [
         "full",
-        "hosted-portable",
         "portable"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path target/install_pkg",
@@ -839,7 +836,6 @@
       "description": "MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 308543488 bytes; the larger 4147245056-byte historical completed peak governs. A 4-GiB scheduling baseline rounds above that floor and the 6-GiB hard cap adds 2 GiB of runaway headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md.",
       "labels": [
         "full",
-        "hosted-portable",
         "portable"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./scripts/stage-liteinst-runtime.sh release $PWD/target/release/libreverie_liteinst.so $PWD/target/liteinst-runtime-build",
@@ -996,7 +992,7 @@
         "full",
         "portable"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY --env CI --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env NEXTEST_TEST_THREADS --env VALIDATE_RUN_STATE -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category backend-parity-c --ci-only --allow-empty --prebuilt --parity-reference ptrace --jobs 8 --results \"$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/junit.xml\"'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY --env CI --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env NEXTEST_TEST_THREADS --env VALIDATE_RUN_STATE -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category backend-parity-c --ci-only --allow-empty --prebuilt --parity-reference ptrace --results \"$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/junit.xml\"'",
       "manifest": {
         "lane": "portable",
         "category": "backend-parity-c"
@@ -2958,7 +2954,7 @@
       "engine_only": false,
       "timeout": 600,
       "cpu_timeout": 7200,
-      "jobs_flag": "",
+      "jobs_flag": "--jobs",
       "jobs_env": null,
       "hint": {
         "resources": {
@@ -3094,7 +3090,7 @@
         "full",
         "portable"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY --env CI --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env NEXTEST_TEST_THREADS --env VALIDATE_RUN_STATE -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category c-programs --ci-only --allow-empty --prebuilt --jobs 8 --results \"$E2E_RESULT_ROOT/portable/manifest_c_programs/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_c_programs/junit.xml\"'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY --env CI --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env NEXTEST_TEST_THREADS --env VALIDATE_RUN_STATE -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category c-programs --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/portable/manifest_c_programs/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_c_programs/junit.xml\"'",
       "manifest": {
         "lane": "portable",
         "category": "c-programs"
@@ -6148,7 +6144,7 @@
       "engine_only": false,
       "timeout": 600,
       "cpu_timeout": 7200,
-      "jobs_flag": "",
+      "jobs_flag": "--jobs",
       "jobs_env": null,
       "hint": {
         "resources": {
@@ -7643,10 +7639,9 @@
       "description": "FEATURE SCOPE 2026-08-25 (task workspace-clippy-gate-never-sees-the-dbt-feature): --all-features added. Without it this gate ran hermit-cli's default feature set, so the DBT, SaBRe, e9patch and third-party-backends paths were never linted. --all-features deliberately picks up future features without another manual widening. MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 279248896 bytes after the feature widening; the larger width-8 historical calibration of 4.0 GiB governs. The 4-GiB baseline preserves that floor and the 6-GiB hard cap adds 2 GiB of headroom. CPU WIDTH remains pinned at 8 by CARGO_BUILD_JOBS and preferred_inner_jobs; jobs_flag stays empty because appending '-j 8' would reach rustc. See ai_docs/dag-memory-caps-recalibration-20260825.md.",
       "labels": [
         "full",
-        "hosted-portable",
         "portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh cargo clippy --workspace --all-targets --all-features -- -D warnings",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh cargo clippy --workspace --all-targets --all-features -- -D warnings",
       "result_manifests": [],
       "deps": [
         "build.e2e_artifact",
@@ -7659,7 +7654,7 @@
       "timeout": 1200,
       "cpu_timeout": 7200,
       "jobs_flag": "",
-      "jobs_env": null,
+      "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
         "resources": {},
         "est_duration_s": 300.0,
@@ -7676,13 +7671,12 @@
       "group": "doc",
       "job": "doctests",
       "desc": "Test workspace documentation (cargo test --workspace --features third-party-backends --doc)",
-      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> cargo defaulted the build phase to nproc). rss_baseline=measured_peak@j8=208MiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.5GiB additive -> hard_mem_max_bytes=2.0GiB (was 5GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv. CPU-WIDTH DERIVATION 2026-08-10 (task p0_dynamorio_build_cache): preferred_inner_jobs=8 mirrors the leading CARGO_BUILD_JOBS=8 prefix. See doc.rustdoc for the shared derivation; jobs_flag is empty so the declaration sizes the cgroup box only and never edits argv.",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 via the scheduler-controlled CARGO_BUILD_JOBS channel (was unset -> cargo defaulted the build phase to nproc). rss_baseline=measured_peak@j8=208MiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.5GiB additive -> hard_mem_max_bytes=2.0GiB (was 5GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv. CPU-WIDTH DERIVATION 2026-08-10 (task p0_dynamorio_build_cache): preferred_inner_jobs=8 is delivered through the CARGO_BUILD_JOBS jobs_env channel. See doc.rustdoc for the shared derivation; jobs_flag is empty so the declaration sizes the cgroup box only and never edits argv.",
       "labels": [
         "full",
-        "hosted-portable",
         "portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh cargo test --workspace --features third-party-backends --doc",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh cargo test --workspace --features third-party-backends --doc",
       "result_manifests": [],
       "deps": [
         "build.e2e_artifact",
@@ -7695,7 +7689,7 @@
       "timeout": 900,
       "cpu_timeout": 7200,
       "jobs_flag": "",
-      "jobs_env": null,
+      "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
         "resources": {},
         "est_duration_s": 180.0,
@@ -7712,13 +7706,12 @@
       "group": "doc",
       "job": "rustdoc",
       "desc": "Documentation (RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --all-features)",
-      "description": "MEM RE-DERIVATION 2026-08-25 (task re_derive_doc_rustdoc): rss_baseline 1181116006 -> 1505439744. The previous figure PREDATED the --all-features/-D warnings change and I flagged it stale when I made that change; this replaces it rather than leaving the caveat standing. method=cgroup-RECORDED (systemd-run --user -p MemoryAccounting=yes, MemoryPeak == cgroup memory.peak), pinned_jobs=8 via the CARGO_BUILD_JOBS=8 prefix, target_state=warm with `rm -rf target/doc` first so rustdoc actually reruns. n=2 complete runs, both result=success: 1505439744 and 1491546112 bytes (1.402 and 1.389 GiB); the larger is recorded. A THIRD, COLDER, INCOMPLETE run peaked HIGHER at 1913589760 (1.78 GiB) before it was killed, so a cold-cache run costs more than this warm figure and 1.78 GiB is a lower bound for that case -- the existing 3 GiB hard cap still clears it, which is why hard_mem_max_bytes is UNCHANGED. ⚠️ est_duration_s DELIBERATELY NOT UPDATED. Warm wall clock here was 12s against the recorded 150, but this box reports 316 effective CPUs (see the run-with-reverie-dbt-budget.sh banner), so its wall clock is not transferable to a CI runner. CPU time consumed was 33.4s, which is the portable number if anyone wants to re-derive duration properly. Memory peak transfers; wall clock on a 316-CPU host does not. ENFORCEMENT 2026-08-25 (task doc_rustdoc_cannot_fail): RUSTDOCFLAGS=-D warnings added. Until now this node ran cargo doc with no RUSTDOCFLAGS, so it EXITED 0 WHILE EMITTING WARNINGS -- it rendered documentation and could not fail on documentation defects. Measured against the real pre-fix source at 89288ed6ad^: the old command exits 0 with 3 warnings; with -D warnings it exits 101 and names both offending items and lines. --all-features added alongside, and HONESTLY IT IS PRECAUTIONARY RATHER THAN A FIX: measured today it changes nothing for rustdoc -- 13 crates and 920 HTML pages either way, zero delta -- because the feature-gated items in hermit-cli are #[doc(hidden)] re-exports and detcore-dbt is a workspace member documented regardless. It is here so that a DOCUMENTED item placed behind a feature gate later cannot become invisible, which is the mechanism that hid clippy findings until e602aaa991. Do not read it as closing a live gap. .github/workflows/docs.yml deliberately NOT changed: it PUBLISHES to gh-pages rather than gating, and a publisher that refuses to publish over a doc warning is a worse trade. MEM/CPU DERIVATION 2026-08-10 (tasks memory-caps-must-scale-with-job-count, fix_doc_rustdoc_dynamorio and p0_dynamorio_build_cache): pinned_jobs=8 via both CARGO_BUILD_JOBS=8 and preferred_inner_jobs=8. THIS NODE CARRIES THE SHARED DERIVATION for every step whose command starts with a CARGO_BUILD_JOBS=<N> prefix; target/debug/test-harness enforces the pairing as a rule over all such steps. The explicit preferred width is load-bearing: safe-ci's declarations-first default (agent-utils DEFAULT_SMALL_CPU_COUNT=1) otherwise boxes this eight-worker cold DynamoRIO build to cpu.max=1 core while the DBT ratchet derives 132s from eight effective workers. ROOT CAUSE, measured: hermit ab4a8c08 advanced the agent-utils gitlink a6f4232 ('make the SMALL default cap OPT-IN, default OFF') -> 1d893fbc, which contains ada564d ('activate small undeclared-step caps'); every head that failed pins the activated runner and both heads that passed pin a6f4232. LIVE CGROUP READ with the runner built at the pinned SHA, each step reporting its own /proc/self/cgroup -> cpu.max: an undeclared step gets '100000 100000' (1 core) and a preferred_inner_jobs=8 step gets '800000 100000' (8 cores). A/B ON THE IDENTICAL DynamoRIO cmake build --parallel 8 (316-core validation host, load avg 46): unboxed 15.37s wall / 102.51 CPU-s at 666% CPU, versus CPUQuota=100% 112.23s wall / 112.01 CPU-s at 99% CPU; cmake configure is a further 3.65s serial. 112s at one core is already 85% of the 132s budget for the build alone, and sharing that core with the node's concurrent rustdoc/cargo work produced the observed 185.51/187.79/188.06/286.70s. CONTROL: build.workspace and build.runtime_release were the only steps that already declared a width (32) and were the only cpu-bound steps that did not regress (91s -> 88s), while undeclared test.detcore_unit went 34s -> 103s. The 132s ratchet is UNCHANGED and stays fully live: 15.4s observed against 132s once eight cores are actually delivered. jobs_flag is empty so the declaration sizes the cgroup box only; CARGO_BUILD_JOBS already conveys the width to Cargo, and appending '-j 8' would edit argv (harmless here, but it would reach libtest or rustc on three sibling steps). rss_baseline=measured_peak@j8=1.1GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm Rust artifacts but a distinct cargo-doc reverie-dbt build-script OUT_DIR can still cold-build DynamoRIO; hermit@21b22c2b. headroom=+1.9GiB additive -> hard_mem_max_bytes=3.0GiB. Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
+      "description": "MEM RE-DERIVATION 2026-08-25 (task re_derive_doc_rustdoc): rss_baseline 1181116006 -> 1505439744. The previous figure PREDATED the --all-features/-D warnings change and I flagged it stale when I made that change; this replaces it rather than leaving the caveat standing. method=cgroup-RECORDED (systemd-run --user -p MemoryAccounting=yes, MemoryPeak == cgroup memory.peak), pinned_jobs=8 via the CARGO_BUILD_JOBS=8 prefix, target_state=warm with `rm -rf target/doc` first so rustdoc actually reruns. n=2 complete runs, both result=success: 1505439744 and 1491546112 bytes (1.402 and 1.389 GiB); the larger is recorded. A THIRD, COLDER, INCOMPLETE run peaked HIGHER at 1913589760 (1.78 GiB) before it was killed, so a cold-cache run costs more than this warm figure and 1.78 GiB is a lower bound for that case -- the existing 3 GiB hard cap still clears it, which is why hard_mem_max_bytes is UNCHANGED. ⚠️ est_duration_s DELIBERATELY NOT UPDATED. Warm wall clock here was 12s against the recorded 150, but this box reports 316 effective CPUs (see the run-with-reverie-dbt-budget.sh banner), so its wall clock is not transferable to a CI runner. CPU time consumed was 33.4s, which is the portable number if anyone wants to re-derive duration properly. Memory peak transfers; wall clock on a 316-CPU host does not. ENFORCEMENT 2026-08-25 (task doc_rustdoc_cannot_fail): RUSTDOCFLAGS=-D warnings added. Until now this node ran cargo doc with no RUSTDOCFLAGS, so it EXITED 0 WHILE EMITTING WARNINGS -- it rendered documentation and could not fail on documentation defects. Measured against the real pre-fix source at 89288ed6ad^: the old command exits 0 with 3 warnings; with -D warnings it exits 101 and names both offending items and lines. --all-features added alongside, and HONESTLY IT IS PRECAUTIONARY RATHER THAN A FIX: measured today it changes nothing for rustdoc -- 13 crates and 920 HTML pages either way, zero delta -- because the feature-gated items in hermit-cli are #[doc(hidden)] re-exports and detcore-dbt is a workspace member documented regardless. It is here so that a DOCUMENTED item placed behind a feature gate later cannot become invisible, which is the mechanism that hid clippy findings until e602aaa991. Do not read it as closing a live gap. .github/workflows/docs.yml deliberately NOT changed: it PUBLISHES to gh-pages rather than gating, and a publisher that refuses to publish over a doc warning is a worse trade. MEM/CPU DERIVATION 2026-08-10 (tasks memory-caps-must-scale-with-job-count, fix_doc_rustdoc_dynamorio and p0_dynamorio_build_cache): pinned_jobs=8 via both CARGO_BUILD_JOBS=8 and preferred_inner_jobs=8. THIS NODE CARRIES THE SHARED DERIVATION for every step whose preferred width is delivered through the CARGO_BUILD_JOBS jobs_env channel; target/debug/test-harness enforces the pairing as a rule over all such steps. The explicit preferred width is load-bearing: safe-ci's declarations-first default (agent-utils DEFAULT_SMALL_CPU_COUNT=1) otherwise boxes this eight-worker cold DynamoRIO build to cpu.max=1 core while the DBT ratchet derives 132s from eight effective workers. ROOT CAUSE, measured: hermit ab4a8c08 advanced the agent-utils gitlink a6f4232 ('make the SMALL default cap OPT-IN, default OFF') -> 1d893fbc, which contains ada564d ('activate small undeclared-step caps'); every head that failed pins the activated runner and both heads that passed pin a6f4232. LIVE CGROUP READ with the runner built at the pinned SHA, each step reporting its own /proc/self/cgroup -> cpu.max: an undeclared step gets '100000 100000' (1 core) and a preferred_inner_jobs=8 step gets '800000 100000' (8 cores). A/B ON THE IDENTICAL DynamoRIO cmake build --parallel 8 (316-core validation host, load avg 46): unboxed 15.37s wall / 102.51 CPU-s at 666% CPU, versus CPUQuota=100% 112.23s wall / 112.01 CPU-s at 99% CPU; cmake configure is a further 3.65s serial. 112s at one core is already 85% of the 132s budget for the build alone, and sharing that core with the node's concurrent rustdoc/cargo work produced the observed 185.51/187.79/188.06/286.70s. CONTROL: build.workspace and build.runtime_release were the only steps that already declared a width (32) and were the only cpu-bound steps that did not regress (91s -> 88s), while undeclared test.detcore_unit went 34s -> 103s. The 132s ratchet is UNCHANGED and stays fully live: 15.4s observed against 132s once eight cores are actually delivered. jobs_flag is empty so the declaration sizes the cgroup box only; CARGO_BUILD_JOBS already conveys the width to Cargo, and appending '-j 8' would edit argv (harmless here, but it would reach libtest or rustc on three sibling steps). rss_baseline=measured_peak@j8=1.1GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm Rust artifacts but a distinct cargo-doc reverie-dbt build-script OUT_DIR can still cold-build DynamoRIO; hermit@21b22c2b. headroom=+1.9GiB additive -> hard_mem_max_bytes=3.0GiB. Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
       "labels": [
         "full",
-        "hosted-portable",
         "portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; CARGO_BUILD_JOBS=8 RUSTDOCFLAGS='-D warnings' ./ci/run-with-reverie-dbt-budget.sh cargo doc --workspace --no-deps --all-features",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; RUSTDOCFLAGS='-D warnings' ./ci/run-with-reverie-dbt-budget.sh cargo doc --workspace --no-deps --all-features",
       "result_manifests": [],
       "deps": [
         "build.e2e_artifact",
@@ -7731,7 +7724,7 @@
       "timeout": 900,
       "cpu_timeout": 7200,
       "jobs_flag": "",
-      "jobs_env": null,
+      "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
         "resources": {},
         "est_duration_s": 150.0,
@@ -7748,7 +7741,7 @@
       "group": "test",
       "job": "regular_crates",
       "desc": "Test regular workspace crates (nextest, excludes hermit-detcore/hermit/flaky)",
-      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (build phase). rss_baseline=measured_peak@j8=2.0GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.5GiB additive -> hard_mem_max_bytes=3.5GiB (was 6GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv. CPU-WIDTH DERIVATION 2026-08-31 (task remove-the-hermit-guest-serialisation-and-expose-what-actually-breaks): preferred_inner_jobs=8 is the enforced cgroup width and jobs_flag=-j passes the same admitted width to nextest. Without the flag, nextest used all 316 visible CPUs inside an 8-core cgroup; after removing hermit_guest serialization, three hard-wall-clock runner fixtures launched together and stretched from their 1-2s contracts to 8.427-8.460s. Solo and three-way reruns of the already-built test binary passed in 1.03/2.21/1.05s. Coupling nextest to the admitted width removes the oversubscription without widening any timeout or changing the selected tests.",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 via the scheduler-controlled CARGO_BUILD_JOBS channel (build phase). rss_baseline=measured_peak@j8=2.0GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.5GiB additive -> hard_mem_max_bytes=3.5GiB (was 6GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv. CPU-WIDTH DERIVATION 2026-08-31 (task remove-the-hermit-guest-serialisation-and-expose-what-actually-breaks): preferred_inner_jobs=8 is the enforced cgroup width and jobs_flag=-j passes the same admitted width to nextest. Without the flag, nextest used all 316 visible CPUs inside an 8-core cgroup; after removing hermit_guest serialization, three hard-wall-clock runner fixtures launched together and stretched from their 1-2s contracts to 8.427-8.460s. Solo and three-way reruns of the already-built test binary passed in 1.03/2.21/1.05s. Coupling nextest to the admitted width removes the oversubscription without widening any timeout or changing the selected tests.",
       "labels": [
         "full",
         "portable"
@@ -7772,7 +7765,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "559",
+        "NEXTEST_EXPECTED_EXECUTED": "562",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -7802,7 +7795,7 @@
         "full",
         "portable"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_PREPARED_NEXTEST_REQUIRED --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env NEXTEST_EXPECTED_EXECUTED --env NEXTEST_PREPARED_BUILD_SELECTION --env NEXTEST_TEST_THREADS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends,kvm-native-test-support --lib --bins -j 1'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_PREPARED_NEXTEST_REQUIRED --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env NEXTEST_EXPECTED_EXECUTED --env NEXTEST_PREPARED_BUILD_SELECTION --env NEXTEST_TEST_THREADS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends,kvm-native-test-support --lib --bins -j 1'",
       "result_manifests": [
         {
           "kind": "structured-test-results",
@@ -7829,7 +7822,7 @@
       "timeout": 900,
       "cpu_timeout": 7200,
       "jobs_flag": "",
-      "jobs_env": null,
+      "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
         "resources": {},
         "est_duration_s": 120.0,
@@ -7846,12 +7839,12 @@
       "group": "test",
       "job": "detcore_unit",
       "desc": "Test Detcore unit and binary targets (-p hermit-detcore --lib --bins)",
-      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> build phase defaulted to nproc). rss_baseline=measured_peak@j8=1.8GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.7GiB additive -> hard_mem_max_bytes=3.5GiB (was 5GiB). NOTE: cpu_timeout intentionally NOT set here or on the sibling test.detcore_misc node -- detcore_misc currently livelocks under load (reverie#355 is the established fix; a cpu_timeout derived from pre-355 hang behaviour would be wrong). cpu_timeout derivation is out of scope for this memory-cap change. Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv. CPU-WIDTH DERIVATION 2026-08-10 (task p0_dynamorio_build_cache): preferred_inner_jobs=8 mirrors the leading CARGO_BUILD_JOBS=8 prefix. This node is the cleanest measured case of the one-core default: 34s at agent-utils a6f4232 (caps OFF) versus 103s at d2fdfc83 (caps ON), a 3.0x regression against a flat build.runtime_release control that already declared its width. See doc.rustdoc for the shared derivation; jobs_flag is empty so the declaration sizes the cgroup box only and never edits argv.",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 via the scheduler-controlled CARGO_BUILD_JOBS channel (was unset -> build phase defaulted to nproc). rss_baseline=measured_peak@j8=1.8GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.7GiB additive -> hard_mem_max_bytes=3.5GiB (was 5GiB). NOTE: cpu_timeout intentionally NOT set here or on the sibling test.detcore_misc node -- detcore_misc currently livelocks under load (reverie#355 is the established fix; a cpu_timeout derived from pre-355 hang behaviour would be wrong). cpu_timeout derivation is out of scope for this memory-cap change. Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv. CPU-WIDTH DERIVATION 2026-08-10 (task p0_dynamorio_build_cache): preferred_inner_jobs=8 is delivered through the CARGO_BUILD_JOBS jobs_env channel. This node is the cleanest measured case of the one-core default: 34s at agent-utils a6f4232 (caps OFF) versus 103s at d2fdfc83 (caps ON), a 3.0x regression against a flat build.runtime_release control that already declared its width. See doc.rustdoc for the shared derivation; jobs_flag is empty so the declaration sizes the cgroup box only and never edits argv.",
       "labels": [
         "full",
         "portable"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_PREPARED_NEXTEST_REQUIRED --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env NEXTEST_EXPECTED_EXECUTED --env NEXTEST_PREPARED_BUILD_SELECTION --env NEXTEST_TEST_THREADS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; CARGO_BUILD_JOBS=8 ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-detcore --lib --bins'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_PREPARED_NEXTEST_REQUIRED --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env NEXTEST_EXPECTED_EXECUTED --env NEXTEST_PREPARED_BUILD_SELECTION --env NEXTEST_TEST_THREADS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-detcore --lib --bins'",
       "result_manifests": [
         {
           "kind": "structured-test-results",
@@ -7878,7 +7871,7 @@
       "timeout": 900,
       "cpu_timeout": 7200,
       "jobs_flag": "",
-      "jobs_env": null,
+      "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
         "resources": {},
         "est_duration_s": 120.0,
@@ -8214,8 +8207,8 @@
         "cli"
       ],
       "deps": [
-        "build.e2e_artifact",
-        "build.liteinst_runtime_release",
+        "build.e2e_artifact_on_host",
+        "build.liteinst_runtime_release_on_host",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.nextest"
@@ -8423,7 +8416,7 @@
         "hermit_modes"
       ],
       "deps": [
-        "build.e2e_artifact",
+        "build.e2e_artifact_on_host",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.nextest"
@@ -8612,12 +8605,12 @@
       "group": "test",
       "job": "rr_suite_contract",
       "desc": "rr suite source contract (scratch dirs fresh and cleaned)",
-      "description": "MEM-CAP DERIVATION 2026-08-04 (follow-on to task memory-caps-must-scale-with-job-count / #1583, which capped the OTHER compile-bearing nodes but MISSED this one): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> the test binary's build phase defaulted to nproc, and under the full portable profile that cc1plus fan-out blew the old 2.0GiB cap -> OOM; the job-pin is the actual fix). rss_baseline=measured_peak@j8=3.5GiB; method=cgroup-RECORDED (dagrun step_profiles peak_bytes == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@b384187e. CAVEAT: peak_bytes is cap-influenced because compile page-cache is reclaimable (a negative-control run at a 512MiB cap PASSED via reclaim, oom_kills=0) -> the true non-reclaimable working set at j8 is well under this figure; the cap is conservative headroom, the pin is the fix. headroom=+1.5GiB additive -> hard_mem_max_bytes=5.0GiB (was 2.0GiB, which was too tight once the node was left unpinned). classification light->cpu-bound (compile-bearing). CPU-WIDTH DERIVATION 2026-08-10 (task p0_dynamorio_build_cache): preferred_inner_jobs=8 mirrors the leading CARGO_BUILD_JOBS=8 prefix. See doc.rustdoc for the shared derivation; jobs_flag is empty because appending '-j 8' here would land after '--' and reach libtest, which rejects it.",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (follow-on to task memory-caps-must-scale-with-job-count / #1583, which capped the OTHER compile-bearing nodes but MISSED this one): pinned_jobs=8 via the scheduler-controlled CARGO_BUILD_JOBS channel (was unset -> the test binary's build phase defaulted to nproc, and under the full portable profile that cc1plus fan-out blew the old 2.0GiB cap -> OOM; the job-pin is the actual fix). rss_baseline=measured_peak@j8=3.5GiB; method=cgroup-RECORDED (dagrun step_profiles peak_bytes == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@b384187e. CAVEAT: peak_bytes is cap-influenced because compile page-cache is reclaimable (a negative-control run at a 512MiB cap PASSED via reclaim, oom_kills=0) -> the true non-reclaimable working set at j8 is well under this figure; the cap is conservative headroom, the pin is the fix. headroom=+1.5GiB additive -> hard_mem_max_bytes=5.0GiB (was 2.0GiB, which was too tight once the node was left unpinned). classification light->cpu-bound (compile-bearing). CPU-WIDTH DERIVATION 2026-08-10 (task p0_dynamorio_build_cache): preferred_inner_jobs=8 is delivered through the CARGO_BUILD_JOBS jobs_env channel. See doc.rustdoc for the shared derivation; jobs_flag is empty because appending '-j 8' here would land after '--' and reach libtest, which rejects it.",
       "labels": [
         "full",
         "portable"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_PREPARED_NEXTEST_REQUIRED --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env NEXTEST_EXPECTED_EXECUTED --env NEXTEST_PREPARED_BUILD_SELECTION --env NEXTEST_TEST_THREADS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test rr_suite -j 1 rr_scratch_directories_are_fresh_and_cleaned -- --exact'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_PREPARED_NEXTEST_REQUIRED --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env NEXTEST_EXPECTED_EXECUTED --env NEXTEST_PREPARED_BUILD_SELECTION --env NEXTEST_TEST_THREADS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test rr_suite -j 1 rr_scratch_directories_are_fresh_and_cleaned -- --exact'",
       "result_manifests": [
         {
           "kind": "structured-test-results",
@@ -8647,7 +8640,7 @@
       "timeout": 720,
       "cpu_timeout": 7200,
       "jobs_flag": "",
-      "jobs_env": null,
+      "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
         "resources": {},
         "est_duration_s": 30.0,
@@ -14362,7 +14355,7 @@
         }
       ],
       "deps": [
-        "build.e2e_artifact",
+        "build.e2e_artifact_on_host",
         "build.manifest_guests",
         "gate.manifest",
         "pre.reverie_pin",
@@ -14397,7 +14390,7 @@
       "labels": [
         "hosted-portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category backend-parity-c --ci-only --allow-empty --prebuilt --parity-reference ptrace --jobs 8 --results \"$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/junit.xml\"",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category backend-parity-c --ci-only --allow-empty --prebuilt --parity-reference ptrace --results \"$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/junit.xml\"",
       "manifest": {
         "lane": "portable",
         "category": "backend-parity-c"
@@ -16343,7 +16336,7 @@
         }
       ],
       "deps": [
-        "build.e2e_artifact",
+        "build.e2e_artifact_on_host",
         "build.manifest_guests",
         "gate.manifest",
         "pre.reverie_pin",
@@ -16354,7 +16347,7 @@
       "engine_only": false,
       "timeout": 600,
       "cpu_timeout": 7200,
-      "jobs_flag": "",
+      "jobs_flag": "--jobs",
       "jobs_env": null,
       "hint": {
         "resources": {
@@ -16413,7 +16406,7 @@
         }
       ],
       "deps": [
-        "build.e2e_artifact",
+        "build.e2e_artifact_on_host",
         "build.manifest_guests",
         "gate.manifest",
         "pre.reverie_pin",
@@ -16448,7 +16441,7 @@
       "labels": [
         "hosted-portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category c-programs --ci-only --allow-empty --prebuilt --jobs 8 --results \"$E2E_RESULT_ROOT/portable/manifest_c_programs/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_c_programs/junit.xml\"",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category c-programs --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/portable/manifest_c_programs/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_c_programs/junit.xml\"",
       "manifest": {
         "lane": "portable",
         "category": "c-programs"
@@ -19486,7 +19479,7 @@
         }
       ],
       "deps": [
-        "build.e2e_artifact",
+        "build.e2e_artifact_on_host",
         "build.manifest_guests",
         "gate.manifest",
         "pre.reverie_pin",
@@ -19497,7 +19490,7 @@
       "engine_only": false,
       "timeout": 600,
       "cpu_timeout": 7200,
-      "jobs_flag": "",
+      "jobs_flag": "--jobs",
       "jobs_env": null,
       "hint": {
         "resources": {
@@ -19549,7 +19542,7 @@
         }
       ],
       "deps": [
-        "build.e2e_artifact",
+        "build.e2e_artifact_on_host",
         "build.manifest_guests",
         "gate.manifest",
         "pre.reverie_pin",
@@ -19647,7 +19640,7 @@
         }
       ],
       "deps": [
-        "build.e2e_artifact",
+        "build.e2e_artifact_on_host",
         "build.manifest_guests",
         "gate.manifest",
         "pre.reverie_pin",
@@ -19724,7 +19717,7 @@
         }
       ],
       "deps": [
-        "build.e2e_artifact",
+        "build.e2e_artifact_on_host",
         "build.manifest_guests",
         "gate.manifest",
         "pre.reverie_pin",
@@ -19871,7 +19864,7 @@
         }
       ],
       "deps": [
-        "build.e2e_artifact",
+        "build.e2e_artifact_on_host",
         "build.manifest_guests",
         "gate.manifest",
         "pre.reverie_pin",
@@ -19976,7 +19969,7 @@
         }
       ],
       "deps": [
-        "build.e2e_artifact",
+        "build.e2e_artifact_on_host",
         "build.manifest_guests",
         "gate.manifest",
         "pre.reverie_pin",
@@ -20256,7 +20249,7 @@
         }
       ],
       "deps": [
-        "build.e2e_artifact",
+        "build.e2e_artifact_on_host",
         "build.manifest_guests",
         "gate.manifest",
         "pre.reverie_pin",
@@ -20305,7 +20298,7 @@
         }
       ],
       "deps": [
-        "build.e2e_artifact",
+        "build.e2e_artifact_on_host",
         "build.manifest_guests",
         "gate.manifest",
         "pre.reverie_pin",
@@ -20809,7 +20802,7 @@
         }
       ],
       "deps": [
-        "build.e2e_artifact",
+        "build.e2e_artifact_on_host",
         "build.manifest_guests",
         "gate.manifest",
         "pre.reverie_pin",
@@ -20858,7 +20851,7 @@
         }
       ],
       "deps": [
-        "build.e2e_artifact",
+        "build.e2e_artifact_on_host",
         "build.manifest_guests",
         "gate.manifest",
         "pre.reverie_pin",
@@ -20939,7 +20932,7 @@
       "labels": [
         "hosted-privileged"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; with-proxy ./ci/run-reverie-pin-check.sh --repo \"$PWD\"",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; hermit_run_pin_check() { if command -v with-proxy >/dev/null 2>&1; then with-proxy \"$@\"; else \"$@\"; fi; }; hermit_run_pin_check ./ci/run-reverie-pin-check.sh --repo \"$PWD\"",
       "result_manifests": [],
       "deps": [],
       "env": {},
@@ -61766,6 +61759,143 @@
       "fail_fast_family": "superstress.dbt_verify_20"
     },
     {
+      "group": "check",
+      "job": "backend_parity_suites_on_host",
+      "desc": "Backend-parity driver contracts, including the L2 evidence-tier gate",
+      "description": "EXECUTION GAP CLOSED 2026-08-25 (task three_backend_parity_suites). These three self-contained Python suites were inventoried as driver-owned but had no DAG node: inventory established ownership, not execution, and neither the backend-parity mutation node nor running run_matrix.py as the DBT parity program imports them. Before wiring, all three were run directly at bc9d1782acf0 and passed: verify-tier evidence (50 runtime checks), scorecard-header compatibility (73), and atomic run-matrix output (19). The suite guards typed-verdict-only L2 claims, non-vacuous compared-log counts, operand-derived parity and schema compatibility, and whole-or-nothing result artifacts. It consumes the verification-report binary produced by build.workspace, but has no guest or backend prerequisite.",
+      "labels": [
+        "hosted-portable"
+      ],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; python3 tests/backend-parity/test_verify_tier_evidence.py && python3 tests/backend-parity/test_scorecard_header_compat.py && python3 tests/backend-parity/test_run_matrix_output_skew.py",
+      "result_manifests": [],
+      "deps": [
+        "build.workspace_on_host",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ],
+      "env": {},
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 60,
+      "cpu_timeout": 7200,
+      "jobs_flag": null,
+      "jobs_env": null,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 8.0,
+        "rss_baseline_bytes": 134217728,
+        "hard_mem_max_bytes": 536870912,
+        "classification": "light",
+        "preferred_inner_jobs": null,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "check.backend_parity_suites_on_host"
+    },
+    {
+      "group": "build",
+      "job": "workspace_on_host",
+      "desc": "Prepare DBT native resources, then build all debug workspace targets",
+      "description": "CLEAN-TARGET PREPARATION 2026-08-28: hermit-install reads the DynamoRIO installation produced by reverie-dbt, but Cargo may run their unrelated build scripts concurrently inside the combined workspace build. A clean hosted target therefore reached hermit-install before drrun existed while warm local targets passed. The first detcore-dbt build establishes that resource through the same pinned budget wrapper; the following combined build still owns the complete debug workspace graph, including test targets and the flaky harness. The explicit bin build completes target/debug/hermit for the later verified E2E artifact publisher. preferred_inner_jobs=32 is measured on a cold empty target at hermit@846baeca: 130.35s, cgroup-recorded peak=11663998976 bytes. The generous 64GiB cap deliberately prioritizes throughput over cap tightness. Release artifacts remain a separate profile because Cargo cannot emit dev and release profiles in one invocation; the privileged lane is a separate DAG and is unchanged.",
+      "labels": [
+        "hosted-portable"
+      ],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh cargo build --locked -p detcore-dbt && ./ci/run-with-reverie-dbt-budget.sh cargo build --workspace --all-targets --features third-party-backends && CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && ./ci/nextest-binaries.rs prepare hosted-portable",
+      "result_manifests": [],
+      "deps": [
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.nextest"
+      ],
+      "env": {},
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 1200,
+      "cpu_timeout": 7200,
+      "jobs_flag": "",
+      "jobs_env": "CARGO_BUILD_JOBS",
+      "hint": {
+        "resources": {},
+        "est_duration_s": 130.0,
+        "rss_baseline_bytes": 11663998976,
+        "hard_mem_max_bytes": 68719476736,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 32,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "build.workspace_on_host"
+    },
+    {
+      "group": "build",
+      "job": "e2e_artifact_on_host",
+      "desc": "Publish a verified content-addressed Hermit binary and complete backend-resource bundle",
+      "description": "This is the publication barrier between the two initial Cargo producers and every later shared-target writer. It hashes target/debug/hermit before and after copying, snapshots target/install_pkg with symlinks dereferenced, verifies required DBT/SaBRe/LiteInst/e9patch resources and the complete resource hash manifest, then atomically publishes a unique content-addressed directory plus pointer. Manifest consumers and all later Cargo writers depend on this node, so the publisher never reads either mutable tree while a sibling writer can relink or recreate it.",
+      "labels": [
+        "hosted-portable"
+      ],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path target/install_pkg",
+      "result_manifests": [],
+      "deps": [
+        "build.runtime_release",
+        "build.workspace_on_host",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ],
+      "env": {},
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 120,
+      "cpu_timeout": 7200,
+      "jobs_flag": null,
+      "jobs_env": null,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 20.0,
+        "rss_baseline_bytes": 536870912,
+        "hard_mem_max_bytes": 2147483648,
+        "classification": "light",
+        "preferred_inner_jobs": null,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "build.e2e_artifact_on_host"
+    },
+    {
+      "group": "build",
+      "job": "liteinst_runtime_release_on_host",
+      "desc": "Build and stage the release LiteInst runtime",
+      "description": "MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 308543488 bytes; the larger 4147245056-byte historical completed peak governs. A 4-GiB scheduling baseline rounds above that floor and the 6-GiB hard cap adds 2 GiB of runaway headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md.",
+      "labels": [
+        "hosted-portable"
+      ],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./scripts/stage-liteinst-runtime.sh release $PWD/target/release/libreverie_liteinst.so $PWD/target/liteinst-runtime-build",
+      "result_manifests": [],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ],
+      "env": {},
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 900,
+      "cpu_timeout": 7200,
+      "jobs_flag": null,
+      "jobs_env": null,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 120.0,
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 6442450944,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": null,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "build.liteinst_runtime_release_on_host"
+    },
+    {
       "group": "test",
       "job": "applications_e2e_on_host",
       "desc": "Run application end-to-end strict verification",
@@ -61783,7 +61913,7 @@
         }
       ],
       "deps": [
-        "build.e2e_artifact",
+        "build.e2e_artifact_on_host",
         "gate.manifest",
         "pre.reverie_pin"
       ],
@@ -61807,10 +61937,112 @@
       "fail_fast_family": "test.applications_e2e_on_host"
     },
     {
+      "group": "lint",
+      "job": "clippy_on_host",
+      "desc": "Clippy (cargo clippy --workspace --all-targets --all-features -D warnings)",
+      "description": "FEATURE SCOPE 2026-08-25 (task workspace-clippy-gate-never-sees-the-dbt-feature): --all-features added. Without it this gate ran hermit-cli's default feature set, so the DBT, SaBRe, e9patch and third-party-backends paths were never linted. --all-features deliberately picks up future features without another manual widening. MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 279248896 bytes after the feature widening; the larger width-8 historical calibration of 4.0 GiB governs. The 4-GiB baseline preserves that floor and the 6-GiB hard cap adds 2 GiB of headroom. CPU WIDTH remains pinned at 8 by CARGO_BUILD_JOBS and preferred_inner_jobs; jobs_flag stays empty because appending '-j 8' would reach rustc. See ai_docs/dag-memory-caps-recalibration-20260825.md.",
+      "labels": [
+        "hosted-portable"
+      ],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh cargo clippy --workspace --all-targets --all-features -- -D warnings",
+      "result_manifests": [],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ],
+      "env": {},
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 1200,
+      "cpu_timeout": 7200,
+      "jobs_flag": "",
+      "jobs_env": "CARGO_BUILD_JOBS",
+      "hint": {
+        "resources": {},
+        "est_duration_s": 300.0,
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 6442450944,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 8,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "lint.clippy_on_host"
+    },
+    {
+      "group": "doc",
+      "job": "doctests_on_host",
+      "desc": "Test workspace documentation (cargo test --workspace --features third-party-backends --doc)",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 via the scheduler-controlled CARGO_BUILD_JOBS channel (was unset -> cargo defaulted the build phase to nproc). rss_baseline=measured_peak@j8=208MiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.5GiB additive -> hard_mem_max_bytes=2.0GiB (was 5GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv. CPU-WIDTH DERIVATION 2026-08-10 (task p0_dynamorio_build_cache): preferred_inner_jobs=8 is delivered through the CARGO_BUILD_JOBS jobs_env channel. See doc.rustdoc for the shared derivation; jobs_flag is empty so the declaration sizes the cgroup box only and never edits argv.",
+      "labels": [
+        "hosted-portable"
+      ],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh cargo test --workspace --features third-party-backends --doc",
+      "result_manifests": [],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ],
+      "env": {},
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 900,
+      "cpu_timeout": 7200,
+      "jobs_flag": "",
+      "jobs_env": "CARGO_BUILD_JOBS",
+      "hint": {
+        "resources": {},
+        "est_duration_s": 180.0,
+        "rss_baseline_bytes": 218103808,
+        "hard_mem_max_bytes": 2147483648,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 8,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "doc.doctests_on_host"
+    },
+    {
+      "group": "doc",
+      "job": "rustdoc_on_host",
+      "desc": "Documentation (RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --all-features)",
+      "description": "MEM RE-DERIVATION 2026-08-25 (task re_derive_doc_rustdoc): rss_baseline 1181116006 -> 1505439744. The previous figure PREDATED the --all-features/-D warnings change and I flagged it stale when I made that change; this replaces it rather than leaving the caveat standing. method=cgroup-RECORDED (systemd-run --user -p MemoryAccounting=yes, MemoryPeak == cgroup memory.peak), pinned_jobs=8 via the CARGO_BUILD_JOBS=8 prefix, target_state=warm with `rm -rf target/doc` first so rustdoc actually reruns. n=2 complete runs, both result=success: 1505439744 and 1491546112 bytes (1.402 and 1.389 GiB); the larger is recorded. A THIRD, COLDER, INCOMPLETE run peaked HIGHER at 1913589760 (1.78 GiB) before it was killed, so a cold-cache run costs more than this warm figure and 1.78 GiB is a lower bound for that case -- the existing 3 GiB hard cap still clears it, which is why hard_mem_max_bytes is UNCHANGED. ⚠️ est_duration_s DELIBERATELY NOT UPDATED. Warm wall clock here was 12s against the recorded 150, but this box reports 316 effective CPUs (see the run-with-reverie-dbt-budget.sh banner), so its wall clock is not transferable to a CI runner. CPU time consumed was 33.4s, which is the portable number if anyone wants to re-derive duration properly. Memory peak transfers; wall clock on a 316-CPU host does not. ENFORCEMENT 2026-08-25 (task doc_rustdoc_cannot_fail): RUSTDOCFLAGS=-D warnings added. Until now this node ran cargo doc with no RUSTDOCFLAGS, so it EXITED 0 WHILE EMITTING WARNINGS -- it rendered documentation and could not fail on documentation defects. Measured against the real pre-fix source at 89288ed6ad^: the old command exits 0 with 3 warnings; with -D warnings it exits 101 and names both offending items and lines. --all-features added alongside, and HONESTLY IT IS PRECAUTIONARY RATHER THAN A FIX: measured today it changes nothing for rustdoc -- 13 crates and 920 HTML pages either way, zero delta -- because the feature-gated items in hermit-cli are #[doc(hidden)] re-exports and detcore-dbt is a workspace member documented regardless. It is here so that a DOCUMENTED item placed behind a feature gate later cannot become invisible, which is the mechanism that hid clippy findings until e602aaa991. Do not read it as closing a live gap. .github/workflows/docs.yml deliberately NOT changed: it PUBLISHES to gh-pages rather than gating, and a publisher that refuses to publish over a doc warning is a worse trade. MEM/CPU DERIVATION 2026-08-10 (tasks memory-caps-must-scale-with-job-count, fix_doc_rustdoc_dynamorio and p0_dynamorio_build_cache): pinned_jobs=8 via both CARGO_BUILD_JOBS=8 and preferred_inner_jobs=8. THIS NODE CARRIES THE SHARED DERIVATION for every step whose preferred width is delivered through the CARGO_BUILD_JOBS jobs_env channel; target/debug/test-harness enforces the pairing as a rule over all such steps. The explicit preferred width is load-bearing: safe-ci's declarations-first default (agent-utils DEFAULT_SMALL_CPU_COUNT=1) otherwise boxes this eight-worker cold DynamoRIO build to cpu.max=1 core while the DBT ratchet derives 132s from eight effective workers. ROOT CAUSE, measured: hermit ab4a8c08 advanced the agent-utils gitlink a6f4232 ('make the SMALL default cap OPT-IN, default OFF') -> 1d893fbc, which contains ada564d ('activate small undeclared-step caps'); every head that failed pins the activated runner and both heads that passed pin a6f4232. LIVE CGROUP READ with the runner built at the pinned SHA, each step reporting its own /proc/self/cgroup -> cpu.max: an undeclared step gets '100000 100000' (1 core) and a preferred_inner_jobs=8 step gets '800000 100000' (8 cores). A/B ON THE IDENTICAL DynamoRIO cmake build --parallel 8 (316-core validation host, load avg 46): unboxed 15.37s wall / 102.51 CPU-s at 666% CPU, versus CPUQuota=100% 112.23s wall / 112.01 CPU-s at 99% CPU; cmake configure is a further 3.65s serial. 112s at one core is already 85% of the 132s budget for the build alone, and sharing that core with the node's concurrent rustdoc/cargo work produced the observed 185.51/187.79/188.06/286.70s. CONTROL: build.workspace and build.runtime_release were the only steps that already declared a width (32) and were the only cpu-bound steps that did not regress (91s -> 88s), while undeclared test.detcore_unit went 34s -> 103s. The 132s ratchet is UNCHANGED and stays fully live: 15.4s observed against 132s once eight cores are actually delivered. jobs_flag is empty so the declaration sizes the cgroup box only; CARGO_BUILD_JOBS already conveys the width to Cargo, and appending '-j 8' would edit argv (harmless here, but it would reach libtest or rustc on three sibling steps). rss_baseline=measured_peak@j8=1.1GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm Rust artifacts but a distinct cargo-doc reverie-dbt build-script OUT_DIR can still cold-build DynamoRIO; hermit@21b22c2b. headroom=+1.9GiB additive -> hard_mem_max_bytes=3.0GiB. Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
+      "labels": [
+        "hosted-portable"
+      ],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; RUSTDOCFLAGS='-D warnings' ./ci/run-with-reverie-dbt-budget.sh cargo doc --workspace --no-deps --all-features",
+      "result_manifests": [],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ],
+      "env": {},
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 900,
+      "cpu_timeout": 7200,
+      "jobs_flag": "",
+      "jobs_env": "CARGO_BUILD_JOBS",
+      "hint": {
+        "resources": {},
+        "est_duration_s": 150.0,
+        "rss_baseline_bytes": 1505439744,
+        "hard_mem_max_bytes": 3221225472,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 8,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "doc.rustdoc_on_host"
+    },
+    {
       "group": "test",
       "job": "regular_crates_on_host",
       "desc": "Test regular workspace crates (nextest, excludes hermit-detcore/hermit/flaky)",
-      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (build phase). rss_baseline=measured_peak@j8=2.0GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.5GiB additive -> hard_mem_max_bytes=3.5GiB (was 6GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv. CPU-WIDTH DERIVATION 2026-08-31 (task remove-the-hermit-guest-serialisation-and-expose-what-actually-breaks): preferred_inner_jobs=8 is the enforced cgroup width and jobs_flag=-j passes the same admitted width to nextest. Without the flag, nextest used all 316 visible CPUs inside an 8-core cgroup; after removing hermit_guest serialization, three hard-wall-clock runner fixtures launched together and stretched from their 1-2s contracts to 8.427-8.460s. Solo and three-way reruns of the already-built test binary passed in 1.03/2.21/1.05s. Coupling nextest to the admitted width removes the oversubscription without widening any timeout or changing the selected tests.",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 via the scheduler-controlled CARGO_BUILD_JOBS channel (build phase). rss_baseline=measured_peak@j8=2.0GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.5GiB additive -> hard_mem_max_bytes=3.5GiB (was 6GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv. CPU-WIDTH DERIVATION 2026-08-31 (task remove-the-hermit-guest-serialisation-and-expose-what-actually-breaks): preferred_inner_jobs=8 is the enforced cgroup width and jobs_flag=-j passes the same admitted width to nextest. Without the flag, nextest used all 316 visible CPUs inside an 8-core cgroup; after removing hermit_guest serialization, three hard-wall-clock runner fixtures launched together and stretched from their 1-2s contracts to 8.427-8.460s. Solo and three-way reruns of the already-built test binary passed in 1.03/2.21/1.05s. Coupling nextest to the admitted width removes the oversubscription without widening any timeout or changing the selected tests.",
       "labels": [
         "hosted-portable"
       ],
@@ -61824,14 +62056,14 @@
         }
       ],
       "deps": [
-        "build.e2e_artifact",
+        "build.e2e_artifact_on_host",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.nextest"
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "559",
+        "NEXTEST_EXPECTED_EXECUTED": "562",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -61860,7 +62092,7 @@
       "labels": [
         "hosted-portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends,kvm-native-test-support --lib --bins -j 1",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends,kvm-native-test-support --lib --bins -j 1",
       "result_manifests": [
         {
           "kind": "structured-test-results",
@@ -61870,7 +62102,7 @@
         }
       ],
       "deps": [
-        "build.e2e_artifact",
+        "build.e2e_artifact_on_host",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.nextest"
@@ -61885,7 +62117,7 @@
       "timeout": 900,
       "cpu_timeout": 7200,
       "jobs_flag": "",
-      "jobs_env": null,
+      "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
         "resources": {},
         "est_duration_s": 120.0,
@@ -61902,11 +62134,11 @@
       "group": "test",
       "job": "detcore_unit_on_host",
       "desc": "Test Detcore unit and binary targets (-p hermit-detcore --lib --bins)",
-      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> build phase defaulted to nproc). rss_baseline=measured_peak@j8=1.8GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.7GiB additive -> hard_mem_max_bytes=3.5GiB (was 5GiB). NOTE: cpu_timeout intentionally NOT set here or on the sibling test.detcore_misc node -- detcore_misc currently livelocks under load (reverie#355 is the established fix; a cpu_timeout derived from pre-355 hang behaviour would be wrong). cpu_timeout derivation is out of scope for this memory-cap change. Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv. CPU-WIDTH DERIVATION 2026-08-10 (task p0_dynamorio_build_cache): preferred_inner_jobs=8 mirrors the leading CARGO_BUILD_JOBS=8 prefix. This node is the cleanest measured case of the one-core default: 34s at agent-utils a6f4232 (caps OFF) versus 103s at d2fdfc83 (caps ON), a 3.0x regression against a flat build.runtime_release control that already declared its width. See doc.rustdoc for the shared derivation; jobs_flag is empty so the declaration sizes the cgroup box only and never edits argv.",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 via the scheduler-controlled CARGO_BUILD_JOBS channel (was unset -> build phase defaulted to nproc). rss_baseline=measured_peak@j8=1.8GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.7GiB additive -> hard_mem_max_bytes=3.5GiB (was 5GiB). NOTE: cpu_timeout intentionally NOT set here or on the sibling test.detcore_misc node -- detcore_misc currently livelocks under load (reverie#355 is the established fix; a cpu_timeout derived from pre-355 hang behaviour would be wrong). cpu_timeout derivation is out of scope for this memory-cap change. Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv. CPU-WIDTH DERIVATION 2026-08-10 (task p0_dynamorio_build_cache): preferred_inner_jobs=8 is delivered through the CARGO_BUILD_JOBS jobs_env channel. This node is the cleanest measured case of the one-core default: 34s at agent-utils a6f4232 (caps OFF) versus 103s at d2fdfc83 (caps ON), a 3.0x regression against a flat build.runtime_release control that already declared its width. See doc.rustdoc for the shared derivation; jobs_flag is empty so the declaration sizes the cgroup box only and never edits argv.",
       "labels": [
         "hosted-portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; CARGO_BUILD_JOBS=8 ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-detcore --lib --bins",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-detcore --lib --bins",
       "result_manifests": [
         {
           "kind": "structured-test-results",
@@ -61916,7 +62148,7 @@
         }
       ],
       "deps": [
-        "build.e2e_artifact",
+        "build.e2e_artifact_on_host",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.nextest"
@@ -61931,7 +62163,7 @@
       "timeout": 900,
       "cpu_timeout": 7200,
       "jobs_flag": "",
-      "jobs_env": null,
+      "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
         "resources": {},
         "est_duration_s": 120.0,
@@ -61962,7 +62194,7 @@
         }
       ],
       "deps": [
-        "build.e2e_artifact",
+        "build.e2e_artifact_on_host",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.nextest"
@@ -62008,7 +62240,7 @@
         }
       ],
       "deps": [
-        "build.e2e_artifact",
+        "build.e2e_artifact_on_host",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.nextest"
@@ -62102,7 +62334,7 @@
         "zero_copy_pipe_fallback"
       ],
       "deps": [
-        "build.e2e_artifact",
+        "build.e2e_artifact_on_host",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.nextest"
@@ -62151,7 +62383,7 @@
         "arbitrary_binaries"
       ],
       "deps": [
-        "build.e2e_artifact",
+        "build.e2e_artifact_on_host",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.nextest"
@@ -62200,8 +62432,8 @@
         "liteinst_advanced"
       ],
       "deps": [
-        "build.e2e_artifact",
-        "build.liteinst_runtime_release",
+        "build.e2e_artifact_on_host",
+        "build.liteinst_runtime_release_on_host",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.nextest"
@@ -62250,7 +62482,7 @@
         "sabre_examples"
       ],
       "deps": [
-        "build.e2e_artifact",
+        "build.e2e_artifact_on_host",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.nextest"
@@ -62299,7 +62531,7 @@
         "app_strict_verify"
       ],
       "deps": [
-        "build.e2e_artifact",
+        "build.e2e_artifact_on_host",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.nextest"
@@ -62348,7 +62580,7 @@
         "command_strict_verify"
       ],
       "deps": [
-        "build.e2e_artifact",
+        "build.e2e_artifact_on_host",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.nextest"
@@ -62398,7 +62630,7 @@
         "rcx_canonicalization"
       ],
       "deps": [
-        "build.e2e_artifact",
+        "build.e2e_artifact_on_host",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.nextest"
@@ -62430,11 +62662,11 @@
       "group": "test",
       "job": "rr_suite_contract_on_host",
       "desc": "rr suite source contract (scratch dirs fresh and cleaned)",
-      "description": "MEM-CAP DERIVATION 2026-08-04 (follow-on to task memory-caps-must-scale-with-job-count / #1583, which capped the OTHER compile-bearing nodes but MISSED this one): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> the test binary's build phase defaulted to nproc, and under the full portable profile that cc1plus fan-out blew the old 2.0GiB cap -> OOM; the job-pin is the actual fix). rss_baseline=measured_peak@j8=3.5GiB; method=cgroup-RECORDED (dagrun step_profiles peak_bytes == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@b384187e. CAVEAT: peak_bytes is cap-influenced because compile page-cache is reclaimable (a negative-control run at a 512MiB cap PASSED via reclaim, oom_kills=0) -> the true non-reclaimable working set at j8 is well under this figure; the cap is conservative headroom, the pin is the fix. headroom=+1.5GiB additive -> hard_mem_max_bytes=5.0GiB (was 2.0GiB, which was too tight once the node was left unpinned). classification light->cpu-bound (compile-bearing). CPU-WIDTH DERIVATION 2026-08-10 (task p0_dynamorio_build_cache): preferred_inner_jobs=8 mirrors the leading CARGO_BUILD_JOBS=8 prefix. See doc.rustdoc for the shared derivation; jobs_flag is empty because appending '-j 8' here would land after '--' and reach libtest, which rejects it.",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (follow-on to task memory-caps-must-scale-with-job-count / #1583, which capped the OTHER compile-bearing nodes but MISSED this one): pinned_jobs=8 via the scheduler-controlled CARGO_BUILD_JOBS channel (was unset -> the test binary's build phase defaulted to nproc, and under the full portable profile that cc1plus fan-out blew the old 2.0GiB cap -> OOM; the job-pin is the actual fix). rss_baseline=measured_peak@j8=3.5GiB; method=cgroup-RECORDED (dagrun step_profiles peak_bytes == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@b384187e. CAVEAT: peak_bytes is cap-influenced because compile page-cache is reclaimable (a negative-control run at a 512MiB cap PASSED via reclaim, oom_kills=0) -> the true non-reclaimable working set at j8 is well under this figure; the cap is conservative headroom, the pin is the fix. headroom=+1.5GiB additive -> hard_mem_max_bytes=5.0GiB (was 2.0GiB, which was too tight once the node was left unpinned). classification light->cpu-bound (compile-bearing). CPU-WIDTH DERIVATION 2026-08-10 (task p0_dynamorio_build_cache): preferred_inner_jobs=8 is delivered through the CARGO_BUILD_JOBS jobs_env channel. See doc.rustdoc for the shared derivation; jobs_flag is empty because appending '-j 8' here would land after '--' and reach libtest, which rejects it.",
       "labels": [
         "hosted-portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test rr_suite -j 1 rr_scratch_directories_are_fresh_and_cleaned -- --exact",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test rr_suite -j 1 rr_scratch_directories_are_fresh_and_cleaned -- --exact",
       "result_manifests": [
         {
           "kind": "structured-test-results",
@@ -62447,7 +62679,7 @@
         "rr_suite"
       ],
       "deps": [
-        "build.e2e_artifact",
+        "build.e2e_artifact_on_host",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.nextest"
@@ -62462,7 +62694,7 @@
       "timeout": 720,
       "cpu_timeout": 7200,
       "jobs_flag": "",
-      "jobs_env": null,
+      "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
         "resources": {},
         "est_duration_s": 30.0,
@@ -62535,7 +62767,7 @@
         }
       ],
       "deps": [
-        "build.workspace",
+        "build.workspace_on_host",
         "gate.manifest",
         "pre.reverie_pin"
       ],
@@ -62570,10 +62802,10 @@
       "result_manifests": [],
       "deps": [
         "build.runtime_release",
-        "doc.doctests",
-        "doc.rustdoc",
+        "doc.doctests_on_host",
+        "doc.rustdoc_on_host",
         "gate.manifest",
-        "lint.clippy",
+        "lint.clippy_on_host",
         "pre.reverie_pin",
         "test.detcore_unit_on_host",
         "test.hermit_unit_on_host",
@@ -69151,7 +69383,7 @@
       "timeout": 1200,
       "cpu_timeout": 7200,
       "jobs_flag": "",
-      "jobs_env": null,
+      "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
         "resources": {},
         "est_duration_s": 130.0,
@@ -69188,7 +69420,7 @@
       "timeout": 1200,
       "cpu_timeout": 7200,
       "jobs_flag": "",
-      "jobs_env": null,
+      "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
         "resources": {},
         "est_duration_s": 185.0,
