@@ -17,7 +17,10 @@
 byteorder
 bytes
 derive_more
+kvm-bindings
+kvm-ioctls
 linked-hash-map
+liteinst2
 memmap2
 never-say-never
 num-traits

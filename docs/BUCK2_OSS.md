@@ -1,10 +1,10 @@
 # Reproducing the OSS Buck2 build
 
 The OSS Buck2 project is generated from Hermit's authoritative root
-`Cargo.toml` and tracked `Cargo.lock`. Reverie remains a separate Buck cell and
-generates its dependencies from its own root manifest and tracked lockfile.
-Generated Rust `BUCK` files and vendored crate sources remain ignored because
-they can be regenerated.
+`Cargo.toml` and tracked `Cargo.lock`. Reverie remains a separately pinned
+source cell, but both cells resolve third-party Rust crates through Hermit's
+single generated graph. Generated Rust `BUCK` files and vendored crate sources
+remain ignored because they can be regenerated.
 
 ## Prerequisites
 
@@ -21,16 +21,15 @@ they can be regenerated.
 
 ## Steps
 
-This work lives on the `revive/buck2-oss-901` branch, not on `main`. `main` has
-no `BUCK` files at all, so cloning the default branch leaves nothing for the
-procedure to act on and produces no error explaining why.
-
 ```sh
-git clone --recursive --branch revive/buck2-oss-901 \
-    https://github.com/rrnewton/hermit.git
+git clone --recursive https://github.com/rrnewton/hermit.git
 cd hermit
 ./bootstrap/regenerate-rust-deps
-./bootstrap/buck2 build reverie//:reverie-ptrace
+./bootstrap/buck2 build \
+    reverie//:reverie-ptrace \
+    reverie//:reverie-rpc-transport \
+    reverie//:reverie-liteinst \
+    reverie//:reverie-kvm
 ./bootstrap/buck2 build --keep-going shim//third-party/rust/...
 ./bootstrap/buck2 build //hermit-cli:hermit
 ```
@@ -38,13 +37,9 @@ cd hermit
 If you already have a checkout, `git submodule update --init --recursive`
 replaces the `--recursive` in the clone.
 
-`reverie//:reverie-ptrace` is the green gate. The complete generated
-third-party target pattern is a **diagnostic, not a gate**: it is expected to
-report the Windows-only `winapi-0.3-build-script-run` analysis exception plus
-`reverie-dbt-0.2` and `reverie-sabre-0.2`, whose Cargo build-script outputs are
-not yet represented in Reindeer fixups. Neither optional package is on the
-default `//hermit-cli:hermit` dependency path. `//hermit-cli:hermit` itself
-stops at a known architecture boundary described at the end of this document.
+`//hermit-cli:hermit` is the green gate. The complete generated third-party
+target pattern is a diagnostic rather than a gate: it includes optional and
+non-host platform targets that the default Hermit binary does not use.
 
 ## On a Meta host
 
@@ -115,10 +110,9 @@ that resolves through `rust-toolchain.toml`. While that file said `nightly`, a
 reviewer building on a different day got a different compiler, which left every
 other pin here without effect.
 
-Note that `reverie/rust-toolchain.toml` pins a different nightly
-(`nightly-2026-07-29`) for its own reasons. Under Buck2 this is inert — actions
-run from the outer project root, so the Hermit pin governs the whole build —
-but a `cargo` command run from inside `reverie/` will use the Reverie pin.
+Note that `reverie/rust-toolchain.toml` may select a different compiler for
+standalone Cargo work. Under Buck2 this is inert — actions run from the outer
+project root, so the Hermit pin governs the whole build.
 
 The first Reindeer invocation downloads the pinned source revision, installs the
 pinned Rust toolchain if needed, and compiles Reindeer into the user cache
@@ -127,101 +121,29 @@ elsewhere. DotSlash downloads and verifies the platform-specific Buck2 release
 binary; `DOTSLASH_CACHE` relocates its cache.
 
 `regenerate-rust-deps` starts without generated dependency output, vendors the
-versions in each tracked `Cargo.lock`, generates each `shim/third-party/rust/BUCK`
-twice, and refuses the result if two consecutive outputs differ. It also refuses
-changes to either tracked lockfile. The repository-root `.gitignore` files
-exclude generated paths. Those patterns must not move into `shim/.gitignore`:
-pinned Reindeer reads ignore files through the shim cell root and would
-otherwise generate empty crates.
+versions in the tracked root `Cargo.lock`, generates
+`shim/third-party/rust/BUCK` twice, and refuses the result if two consecutive
+outputs differ. It also refuses changes to the lockfile. Both Hermit and
+Reverie consume this graph. The repository-root `.gitignore` excludes generated
+paths. Those patterns must not move into `shim/.gitignore`: pinned Reindeer
+reads ignore files through the shim cell root and would otherwise generate
+empty crates.
 
 ## What a reproduction should produce
 
-Measured 2026-08-21 from a fresh recursive clone at `e95ab8c9`, reverie
-`868d46cf`, on x86_64 Linux with cold DotSlash and tool caches:
+Measured 2026-09-20 on x86_64 Linux with warm tool and crate caches:
 
 | Step | Result |
 |---|---|
-| `regenerate-rust-deps` | Hermit `Cargo.lock` `bf71543c…`, `BUCK` `493aa548…`; Reverie `Cargo.lock` `69960ec2…`, `BUCK` `fba4eb29…`; working tree clean |
-| `build reverie//:reverie-ptrace` | exit 0, 24.8s, `libreverie_ptrace-0229eb76.rmeta` |
-| `build --keep-going shim//third-party/rust/...` | exit 3, 1m31s; red on `reverie-dbt-0.2` and `reverie-sabre-0.2` plus the `winapi-0.3-build-script-run` analysis exception; 14 incompatible targets skipped |
+| `regenerate-rust-deps` | exit 0, 300 crates; `Cargo.lock` SHA-256 `fa94382c50130b061e0e4ed057485c83bdc8cc018fe057be35363e72d90a74f9`; generated `BUCK` SHA-256 `3607f57c700803956e60e25147b982e8e15cb5e91ec08fe3cf679941bcc383c4` |
+| build Reverie's ptrace, RPC transport, LiteInst, and KVM libraries together | exit 0 |
+| `build //hermit-cli:hermit` | exit 0 |
 
-Those four generation hashes were produced independently in three different
-checkouts, so generation is deterministic across clones and not merely
-repeatable in one worktree.
-
-**`14 incompatible targets skipped` is the number the pinned Buck2 reports. A
-different Buck2 binary running the identical command reports 23, and both are
-correct.** Meta-internal Buck2 `083174567c29` says 23 where the pinned public
-release 2026-08-01 says 14; the earlier validation of this branch used the
-internal binary, because the internal DotSlash could not run the pinned
-descriptor. Nothing else about the build differs between the two: same two
-failing compilation targets, same `winapi-0.3-build-script-run` analysis error,
-same nine `dep_only_incompatible_version_two` soft errors, `BUILD ERRORS (2)`
-either way. The two binaries bundle different preludes — `prelude` is a bundled
-external cell — so `prelude//platforms:default` configures differently and the
-two runs share no configuration hash at all.
-
-The difference of nine is accounted for by the nine per-platform
-`winapi-0.3-build-script-build-{linux-arm64, linux-riscv64, linux-x86_64,
-macos-arm64, macos-x86_64, wasi, wasm32, windows-gnu, windows-msvc}` targets,
-each of which is incompatible only because a transitive dep is, and each of
-which both binaries report identically as a soft error saying "will be error in
-future". The internal binary appears to count them in the skipped total; the
-pinned release appears to leave them to the soft-error channel.
-
-That account rests on arithmetic (23 − 14 = 9), on those nine soft-error names
-being identical in both logs, and on the printed list's first three and last
-three entries being unchanged between the two runs — `winapi` sorts before
-`windows`, so nine extra entries would land in the hidden middle. **It does not
-rest on an enumerated diff of the two lists**, because Buck2 truncates the
-printed list to first-three-and-last-three and `ctargets` fails on the same
-`winapi-0.3-build-script-run` analysis error. Nobody has read Buck2's source to
-confirm the counting change between the two versions. Quote 14 when following
-this document, since the pinned release is what it tells you to run.
-
-**The first `shim//third-party/rust/...` build in a cold checkout can report a
-third failure that is not real.** Once in five runs of that command, a freshly
-cloned tree additionally failed
-`gh_facebook_buck2_shims_meta//third-party/rust:serde_core-1-build-script-build`
-with a missing intermediate input:
-
-```
-transitive_dependency_symlinks.py: error: argument --artifacts: can't open
-  '...__serde_core-1-build-script-build__/.../XIPL-depslink-symlinked_dirs.json'
-```
-
-That is an action-graph symptom rather than a compile error, and it cleared on
-both immediate re-runs of the identical command in the same checkout. If you
-see three failures instead of two, re-run before drawing a conclusion; the red
-set in the table above is what the branch actually reproduces.
-
-## Known stopping point
-
-**The two cells no longer compile separate copies of third-party crates.**
+The two cells do not compile separate copies of third-party crates.
 `.buckconfig` maps the `reverie_shim` cell onto the Hermit shim cell, so
-Reverie's BUCK files resolve their third-party crates there and each crate is
-compiled once. The trait mismatch that used to stop `detcore-model` —
-Reverie's `Sysno` carrying `serde::Serialize` from one `serde_core-1.0.229`
-while `detcore-model` required the other — is gone. `reverie//:reverie-ptrace`
-still builds, and to the same artifact hash as before the change.
-
-Two things made this cheaper than expected. The two cells were never on
-different versions: both vendored byte-identical `serde_core-1.0.229`, so
-nothing needed rolling forward. And the only obstacle to sharing one cell was
-that Reverie's BUCK names crates without a version suffix (`thiserror`, the
-spelling Meta's internal build uses) while Reindeer emits such an alias only
-for the manifest's own direct dependencies. `shared-cell-aliases.txt` closes
-that gap; see the comment in that file.
-
-`//hermit-cli:hermit` now stops further along, on missing first-party BUCK
-targets rather than on any dependency-graph conflict. `hermit-cli:libhermit`
-needs `detcore_model`, `hermit_resources`, `addr2line`, `nix`, `object`,
-`reverie_kvm`, `reverie_liteinst` and `reverie_rpc_transport`. The first five
-are edges absent from `hermit-cli/BUCK`. The last three have no Buck target at
-all: `reverie/BUCK` defines seven targets and none of them is a KVM, LiteInst
-or RPC-transport library. `hermit-resources/` likewise has a `Cargo.toml` and
-`src/` but no `BUCK` file. Supplying those targets is the unfinished
-backend-target work, in both repositories, not a design question.
+Reverie's BUCK files resolve their third-party crates through the same generated
+targets as Hermit. `shared-cell-aliases.txt` provides the unversioned names used
+by Reverie's hand-written BUCK targets.
 
 No shared action-cache performance measurement has yet been made. A local
 successful build proves target compatibility only, not the vision's claimed

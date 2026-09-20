@@ -41,3 +41,10 @@ envelope.json
 # records absolute cwd/log_file paths -- so a tracked shard can never satisfy
 # scripts/check-portable-paths.sh. Kept in-tree for locality, never committed.
 ci/validate-ledger/
+
+# Buck2 and Reindeer output. The generated Rust graph is reproducible from the
+# tracked Cargo lockfile and bootstrap pins.
+buck-out/
+/shim/third-party/rust/.cargo/
+/shim/third-party/rust/BUCK
+/shim/third-party/rust/vendor/

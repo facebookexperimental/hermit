@@ -1,0 +1,4 @@
+# `ci/manifest-plan` is coordinator tooling and has no Buck target. Cargo still
+# exposes its local `dagrun` dependency while resolving the workspace, so keep
+# Reindeer from trying to emit a third-party rule for sources outside this cell.
+omit_targets = ["dagrun"]

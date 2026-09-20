@@ -13,7 +13,7 @@ if [[ ! -f Cargo.lock ]] || ! git ls-files --error-unmatch Cargo.lock >/dev/null
   exit 1
 fi
 
-if [[ ! -f reverie/bootstrap/regenerate-rust-deps ]]; then
+if [[ ! -f reverie/BUCK ]]; then
   echo "initialize the pinned reverie submodule before generating Buck dependencies" >&2
   exit 1
 fi
@@ -105,12 +105,6 @@ EOT
 }
 append_shared_cell_aliases
 
-# Hermit's BUCK files consume Reverie as a separate cell. Generate its own
-# authoritative dependency graph rather than synthesizing or sharing one.
-"$repo_root/reverie/bootstrap/regenerate-rust-deps"
-
 sha256sum \
   Cargo.lock \
-  "$third_party_dir/BUCK" \
-  reverie/Cargo.lock \
-  reverie/shim/third-party/rust/BUCK
+  "$third_party_dir/BUCK"

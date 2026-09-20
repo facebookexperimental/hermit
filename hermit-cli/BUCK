@@ -11,6 +11,13 @@ load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
 
 oncall("hermit")
 
+hermit_build_env = {
+    "CARGO_PKG_VERSION": "0.2.0",
+    "HERMIT_BUILD_DATE": "unknown",
+    "HERMIT_BUILD_GIT_SHA": "unknown",
+    "HERMIT_REVERIE_PIN": "f7bd85e11dd258112148ed2cba6531501a1a00d9",
+}
+
 rust_library(
     name = "libhermit",
     srcs = glob(
@@ -22,9 +29,11 @@ rust_library(
         ],
     ),
     crate = "hermit",
+    env = hermit_build_env,
     # iced-x86 decoder tables are process-lifetime globals.
     test_env = {"LSAN_OPTIONS": "detect_leaks=0"},
     deps = [
+        "fbsource//third-party/rust:addr2line",
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:bincode",
         "fbsource//third-party/rust:clap",
@@ -32,6 +41,9 @@ rust_library(
         "fbsource//third-party/rust:goblin",
         "fbsource//third-party/rust:iced-x86",
         "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:nix",
+        "fbsource//third-party/rust:object",
+        "fbsource//third-party/rust:rand_pcg",
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:serde_json",
         "fbsource//third-party/rust:tempfile",
@@ -41,14 +53,20 @@ rust_library(
         "fbsource//third-party/rust:tracing-subscriber",
         "fbsource//third-party/rust:uuid",
         "//hermetic_infra/hermit/detcore:detcore",
+        "//hermetic_infra/hermit/detcore-model:detcore-model",
+        "//hermetic_infra/hermit/hermit-resources:hermit-resources",
         "//hermetic_infra/reverie:reverie",
+        "//hermetic_infra/reverie:reverie-kvm",
+        "//hermetic_infra/reverie:reverie-liteinst",
         "//hermetic_infra/reverie:reverie-ptrace",
+        "//hermetic_infra/reverie:reverie-rpc-transport",
     ],
 )
 
 rust_binary(
     name = "hermit",
     srcs = glob(["src/bin/**/*.rs"]),
+    env = hermit_build_env,
     # Signal-handler messages intentionally live for the process lifetime.
     test_env = {"LSAN_OPTIONS": "detect_leaks=0"},
     test_srcs = glob([
@@ -60,6 +78,7 @@ rust_binary(
         "fbsource//third-party/rust:clap",
         "fbsource//third-party/rust:colored",
         "fbsource//third-party/rust:diff",
+        "fbsource//third-party/rust:dirs",
         "fbsource//third-party/rust:libc",
         "fbsource//third-party/rust:nix",
         "fbsource//third-party/rust:num_cpus",
@@ -75,11 +94,13 @@ rust_binary(
         "fbsource//third-party/rust:tracing",
         "fbsource//third-party/rust:tracing-appender",
         "fbsource//third-party/rust:tracing-subscriber",
+        "fbsource//third-party/rust:uuid",
         ":libhermit",
         "//common/rust/build_info:build_info",
         "//common/rust/shed/fbinit:fbinit",
         "//hermetic_infra/hermit/common/test-workdir:hermit-test-workdir",
         "//hermetic_infra/hermit/detcore:detcore",
+        "//hermetic_infra/hermit/detcore-model:detcore-model",
         "//hermetic_infra/reverie:reverie",
         "//hermetic_infra/reverie:reverie-ptrace",
     ],
