@@ -2103,7 +2103,7 @@ mod tests {
         );
         fs::write(
             root.join("ci/hermetic/image.digest"),
-            "fixture@sha256:unused\n",
+            "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000\n",
         )
         .unwrap();
         for name in ["assert-no-network.sh", "assert-build-dependencies.sh"] {
@@ -2123,10 +2123,10 @@ root = pathlib.Path(os.environ['WRAPPER_TEST_ROOT'])
 args = sys.argv[1:]
 with (root / 'podman.jsonl').open('a') as out:
     out.write(json.dumps(args) + '\n')
-if args == ['image', 'exists', 'fixture@sha256:unused']:
+if args == ['image', 'exists', 'fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000']:
     sys.exit(0)
 assert args[0] == 'run', args
-boundary = args.index('fixture@sha256:unused')
+boundary = args.index('fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000')
 command = args[boundary + 1:]
 assert command[:2] == ['bash', '-c'] and command[3] == 'bash', command
 assert command[2] in json.loads((root / 'guards.json').read_text()), command
@@ -2208,10 +2208,17 @@ sys.exit(37)
                 .map(|line| serde_json::from_str::<Vec<String>>(line).unwrap())
                 .collect::<Vec<_>>();
             assert_eq!(calls.len(), 2);
-            assert_eq!(calls[0], ["image", "exists", "fixture@sha256:unused"]);
+            assert_eq!(
+                calls[0],
+                [
+                    "image",
+                    "exists",
+                    "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                ]
+            );
             let boundary = calls[1]
                 .iter()
-                .position(|arg| arg == "fixture@sha256:unused")
+                .position(|arg| arg == "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000")
                 .unwrap();
             assert_eq!(calls[1][boundary + 5], unwrapped);
             if step.jobs_env.as_deref() == Some("NEXTEST_TEST_THREADS") {

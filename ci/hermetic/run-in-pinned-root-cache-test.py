@@ -55,7 +55,7 @@ class CargoCacheMounts(unittest.TestCase):
         result = subprocess.run(
             [
                 "bash", str(WRAPPER), "--src", str(source), "--out", output,
-                "--cargo-home", cargo_home, "--digest", "fixture@sha256:unused",
+                "--cargo-home", cargo_home, "--digest", "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000",
                 *forwarded,
                 "--", "/not-executed/command", "literal argument",
             ],
@@ -68,7 +68,7 @@ class CargoCacheMounts(unittest.TestCase):
         result, calls = self.invoke()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[0], ["image", "exists", "fixture@sha256:unused"])
+        self.assertEqual(calls[0], ["image", "exists", "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000"])
         argv = calls[1]
         mounts = [argv[index + 1] for index, arg in enumerate(argv) if arg == "--mount"]
         imports = [mount for mount in mounts if f"source={self.root}/cargo" in mount]
@@ -86,7 +86,7 @@ class CargoCacheMounts(unittest.TestCase):
         self.assertFalse(any(arg.startswith(("--cgroup-parent", "--cgroupns")) for arg in argv))
         self.assertIn("--network=none", argv)
         self.assertIn("--http-proxy=false", argv)
-        self.assertEqual(argv[-3:], ["fixture@sha256:unused", "/not-executed/command", "literal argument"])
+        self.assertEqual(argv[-3:], ["fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000", "/not-executed/command", "literal argument"])
 
     def test_proc_locks_mount_reuses_the_native_host_inode(self):
         runtime = self.root / "runtime with spaces"
@@ -144,7 +144,7 @@ class CargoCacheMounts(unittest.TestCase):
                 self.capture.unlink(missing_ok=True)
                 result, calls = self.invoke(proc_locks_runtime=runtime)
                 self.assertNotEqual(result.returncode, 0)
-                self.assertEqual(calls, [["image", "exists", "fixture@sha256:unused"]])
+                self.assertEqual(calls, [["image", "exists", "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000"]])
 
     def test_normalized_output_with_spaces_keeps_the_exact_private_home(self):
         result, calls = self.invoke(output="unused directory/../output with spaces")
@@ -167,7 +167,7 @@ class CargoCacheMounts(unittest.TestCase):
         self.assertIn("CARGO_HOME=/build/.cargo", argv)
         self.assertIn("--network=none", argv)
         self.assertIn("--http-proxy=false", argv)
-        self.assertEqual(argv[-3:], ["fixture@sha256:unused", "/not-executed/command", "literal argument"])
+        self.assertEqual(argv[-3:], ["fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000", "/not-executed/command", "literal argument"])
 
     def test_absent_dependency_cache_is_not_replaced_by_a_whole_home_mount(self):
         (self.root / "cargo/registry").rmdir()
@@ -184,7 +184,7 @@ class CargoCacheMounts(unittest.TestCase):
         result, calls = self.invoke("missing")
         self.assertEqual(result.returncode, 2)
         self.assertIn("is not a directory", result.stderr)
-        self.assertEqual(calls, [["image", "exists", "fixture@sha256:unused"]])
+        self.assertEqual(calls, [["image", "exists", "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000"]])
 
     def test_run_state_uses_the_same_host_directory_for_each_pinned_command(self):
         run_state = self.root / "run state"
@@ -203,7 +203,7 @@ class CargoCacheMounts(unittest.TestCase):
         result, calls = self.invoke(run_state="relative-state")
         self.assertEqual(result.returncode, 2)
         self.assertIn("VALIDATE_RUN_STATE must be absolute", result.stderr)
-        self.assertEqual(calls, [["image", "exists", "fixture@sha256:unused"]])
+        self.assertEqual(calls, [["image", "exists", "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000"]])
 
     def test_relocates_real_nested_submodule_configs_without_changing_host_metadata(self):
         git_bin = shutil.which("git")
@@ -415,7 +415,7 @@ class CargoCacheMounts(unittest.TestCase):
                 self.assertEqual(nested_copy["ro"], "true")
                 self.assertEqual(git(source, "config", "--file", nested_copy["source"],
                                      "--get", "core.worktree").decode().strip(), "/src/nested module")
-                self.assertEqual(argv[-3:], ["fixture@sha256:unused", "/not-executed/command", "literal argument"])
+                self.assertEqual(argv[-3:], ["fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000", "/not-executed/command", "literal argument"])
                 self.assertFalse(any(value.startswith(("GIT_DIR=", "GIT_WORK_TREE=", "GIT_CONFIG_COUNT="))
                                      for value in argv), "root Git overrides must not leak to nested Git")
                 for filename, data in before.items():
