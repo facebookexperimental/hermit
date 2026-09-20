@@ -1,10 +1,11 @@
 //! Optional per-invocation CPU observations, independent of charged CPU and verdicts.
 //!
-//! Readers validate supplied evidence; current producers do not emit it yet.
+//! The runner records actual launch, sampling and wait boundaries in this envelope.
 //! A missing envelope is historical absence, never a measured zero.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde::Deserializer;
@@ -27,6 +28,15 @@ where
 pub struct Elapsed {
     pub seconds: u64,
     pub nanoseconds: u32,
+}
+
+impl From<Duration> for Elapsed {
+    fn from(value: Duration) -> Self {
+        Self {
+            seconds: value.as_secs(),
+            nanoseconds: value.subsec_nanos(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -215,6 +225,47 @@ pub enum WaitCpuObservation {
         reason: String,
     },
 }
+
+impl WaitCpuObservation {
+    pub(crate) fn from_rusage(usage: &libc::rusage) -> Self {
+        let user = RawTimeval {
+            seconds: usage.ru_utime.tv_sec,
+            microseconds: usage.ru_utime.tv_usec,
+        };
+        let system = RawTimeval {
+            seconds: usage.ru_stime.tv_sec,
+            microseconds: usage.ru_stime.tv_usec,
+        };
+        let measured = (|| {
+            let user_usec = raw_usec(&user).ok_or("wait4 returned an invalid user CPU duration")?;
+            let system_usec =
+                raw_usec(&system).ok_or("wait4 returned an invalid system CPU duration")?;
+            let total_usec = user_usec
+                .checked_add(system_usec)
+                .ok_or("wait4 CPU usage overflowed u64")?;
+            Ok::<_, &str>((user_usec, system_usec, total_usec))
+        })();
+        match measured {
+            Ok((user_usec, system_usec, total_usec)) => Self::Measured {
+                user_usec,
+                system_usec,
+                total_usec,
+            },
+            Err(reason) => Self::Invalid {
+                user,
+                system,
+                reason: reason.into(),
+            },
+        }
+    }
+
+    pub(crate) fn total(&self) -> Result<u64, String> {
+        match self {
+            Self::Measured { total_usec, .. } => Ok(*total_usec),
+            Self::Invalid { reason, .. } => Err(reason.clone()),
+        }
+    }
+}
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FinalWaitObservation {
@@ -311,6 +362,58 @@ fn raw_usec(value: &RawTimeval) -> Option<u64> {
 }
 
 impl LiveCpuEnabled {
+    pub(crate) fn new() -> Self {
+        Self {
+            source: LiveCpuSource::AgentUtilsPairedPidfdStatV1,
+            registration: RegistrationObservation::NotAttempted,
+            polls: 0,
+            source_sample_calls: 0,
+            valid_polls: 0,
+            unavailable_polls: 0,
+            first: RequiredNullable::Null,
+            last: RequiredNullable::Null,
+            high_water: RequiredNullable::Null,
+            timeout_trigger: RequiredNullable::Null,
+            last_error: RequiredNullable::Null,
+        }
+    }
+
+    /// Summarize an existing monitor poll. This does not call the CPU source.
+    pub(crate) fn record_poll(
+        &mut self,
+        at: Duration,
+        source_called: bool,
+        observation: &Result<u64, CpuError>,
+        triggered: bool,
+    ) {
+        self.polls += 1;
+        self.source_sample_calls += u64::from(source_called);
+        match observation {
+            Ok(cpu_usec) => {
+                self.valid_polls += 1;
+                let point = CpuPoint {
+                    poll: self.polls,
+                    at: at.into(),
+                    cpu_usec: *cpu_usec,
+                };
+                if matches!(self.first, RequiredNullable::Null) {
+                    self.first = RequiredNullable::Value(point.clone());
+                }
+                if nullable(&self.high_water).is_none_or(|high| point.cpu_usec > high.cpu_usec) {
+                    self.high_water = RequiredNullable::Value(point.clone());
+                }
+                self.last = RequiredNullable::Value(point.clone());
+                if triggered {
+                    self.timeout_trigger = RequiredNullable::Value(point);
+                }
+            }
+            Err(error) => {
+                self.unavailable_polls += 1;
+                self.last_error = RequiredNullable::Value(error.clone());
+            }
+        }
+    }
+
     fn validate(&self, launched: bool, final_at: Option<&Elapsed>) -> Result<(), String> {
         require(
             self.valid_polls.checked_add(self.unavailable_polls) == Some(self.polls),
@@ -424,6 +527,30 @@ impl LiveCpuEnabled {
 }
 
 impl InvocationCpuObservation {
+    pub(crate) fn pending(
+        ordinal: u64,
+        role: InvocationRole,
+        command: CommandIdentity,
+        cpu_enabled: bool,
+    ) -> Self {
+        Self {
+            ordinal,
+            role,
+            command,
+            launch: LaunchObservation::NotStarted {
+                reason: NotStartedReason::WallBudgetAlreadyExhausted,
+            },
+            live: if cpu_enabled {
+                LiveCpuObservation::Enabled(Box::new(LiveCpuEnabled::new()))
+            } else {
+                LiveCpuObservation::Disabled
+            },
+            final_wait: FinalWaitObservation::NotApplicable,
+            termination: TerminationPath::NotStarted,
+            returned_cpu_charge: ReturnedCpuCharge::Unavailable,
+        }
+    }
+
     fn returned_without_timeout(&self) -> bool {
         matches!(
             self.termination,

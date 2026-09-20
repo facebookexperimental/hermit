@@ -29,7 +29,6 @@ use hermit_manifest_plan::runner::cell_result_after_retries;
 use hermit_manifest_plan::runner::cell_result_and_attempts_after_retries;
 use hermit_manifest_plan::runner::checked_add_cpu_usage;
 use hermit_manifest_plan::runner::host_inapplicable_result;
-use hermit_manifest_plan::runner::infrastructure_error_result;
 use hermit_manifest_plan::runner::prepare_result_path;
 use hermit_manifest_plan::runner::requires_capability;
 use hermit_manifest_plan::runner::run_cell;
@@ -2126,7 +2125,7 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                     };
                     match result {
                         Ok(result) => result,
-                        Err(error) => infrastructure_error_result(&attempt_context, cell, error),
+                        Err(error) => error.into_result(&attempt_context, cell),
                     }
                 },
                 |result| cell_result_is_retryable(result.outcome.as_str(), result.failure_class),

@@ -39,9 +39,29 @@ pub use crate::canonical_verdict::VerificationRuntime;
 use crate::ci_selection::CiDisabledReasonSpec;
 use crate::ci_selection::CiSelection;
 use crate::ci_selection::CiSelectionSpec;
+use crate::cpu_evidence::CellCpuBinding;
+use crate::cpu_evidence::CellCpuObservationsV1;
+use crate::cpu_evidence::ChargeBasis;
+use crate::cpu_evidence::CommandIdentity;
+use crate::cpu_evidence::CpuError;
+use crate::cpu_evidence::CpuErrorStage;
+use crate::cpu_evidence::FinalCpuSource;
+use crate::cpu_evidence::FinalWaitObservation;
+use crate::cpu_evidence::InvocationCpuObservation;
+use crate::cpu_evidence::InvocationRole;
+use crate::cpu_evidence::LaunchObservation;
+use crate::cpu_evidence::LiveCpuObservation;
+use crate::cpu_evidence::NotStartedReason;
+use crate::cpu_evidence::RegistrationObservation;
+use crate::cpu_evidence::ReturnedCpuCharge;
+use crate::cpu_evidence::SpawnStage;
+use crate::cpu_evidence::TerminationPath;
+use crate::cpu_evidence::WaitCpuObservation;
+use crate::cpu_evidence::WaitOperation;
 use crate::environmental_block::EnvBlockClass;
 use crate::environmental_block::environmental_block_observation;
 use crate::host_capability::probe_host_capabilities;
+use crate::ledger::RequiredNullable;
 use crate::logdiff_report::LogDiffReport;
 use crate::logdiff_report::LogDiffVerdict;
 use crate::stress_series::HostCapabilities;
@@ -1815,6 +1835,7 @@ pub fn prepare_test(
         dir,
         execution_deadline_after_preparation(Instant::now(), timeouts.wall_seconds)?,
         timeouts.wall_seconds,
+        &mut Vec::new(),
     )
     .map(|(guest, _cpu_usage_usec)| guest)
 }
@@ -1825,6 +1846,7 @@ fn prepare_test_until(
     dir: &Path,
     deadline: Instant,
     wall_timeout_seconds: u64,
+    observations: &mut Vec<InvocationCpuObservation>,
 ) -> Result<(Vec<String>, u64), String> {
     prepare_dirs(&context.root, dir)?;
     let mut cpu_usage_usec = 0u64;
@@ -1873,6 +1895,7 @@ fn prepare_test_until(
                         &args,
                         deadline,
                         wall_timeout_seconds,
+                        observations,
                     )?)
                     .ok_or_else(|| "cell CPU usage overflowed u64".to_string())?;
             }
@@ -1902,6 +1925,7 @@ fn prepare_test_until(
                         &args,
                         deadline,
                         wall_timeout_seconds,
+                        observations,
                     )?)
                     .ok_or_else(|| "cell CPU usage overflowed u64".to_string())?;
             }
@@ -1919,6 +1943,7 @@ fn prepare_test_until(
                         &["--prepare".into()],
                         deadline,
                         wall_timeout_seconds,
+                        observations,
                     )?)
                     .ok_or_else(|| "cell CPU usage overflowed u64".to_string())?;
             }
@@ -2067,23 +2092,31 @@ fn run_preparation(
     args: &[String],
     deadline: Instant,
     cell_timeout_seconds: u64,
+    observations: &mut Vec<InvocationCpuObservation>,
 ) -> Result<u64, String> {
     let captures = dir.join("captures");
-    if remaining_cell_time(deadline).is_zero() {
-        return Err(with_diagnostic(
-            format!("cell exceeded {cell_timeout_seconds} s during fixture preparation"),
-            &captures,
-        ));
-    }
-    let output = execute_process(
+    let request = ProcessRequest::new(
+        InvocationRole::Preparation,
         &context.root,
         program,
         args,
         &preparation_env(dir),
         &captures.join("prepare.stdout"),
         &captures.join("prepare.stderr"),
-        (deadline, None),
-    )?;
+    );
+    if remaining_cell_time(deadline).is_zero() {
+        record_not_started(
+            request,
+            false,
+            NotStartedReason::WallBudgetAlreadyExhausted,
+            observations,
+        );
+        return Err(with_diagnostic(
+            format!("cell exceeded {cell_timeout_seconds} s during fixture preparation"),
+            &captures,
+        ));
+    }
+    let output = execute_process(request, (deadline, None), observations)?;
     if output.timeout.is_some() || !output.status.success() {
         // Carry the child's own words back. This used to return the bare sentence
         // and drop `prepare.stderr` on the floor, which turned every denied or
@@ -2330,6 +2363,7 @@ pub fn execute_spec(spec: &CellRunSpec) -> Result<AttemptResult, String> {
         spec.timeout_seconds,
         spec.timeout_seconds,
         None,
+        &mut Vec::new(),
     )
 }
 
@@ -2339,6 +2373,7 @@ fn execute_spec_until(
     cpu_timeout_seconds: u64,
     wall_timeout_seconds: u64,
     remaining_cpu_usec: Option<u64>,
+    observations: &mut Vec<InvocationCpuObservation>,
 ) -> Result<AttemptResult, String> {
     // The attempt label comes from the spec rather than a parallel parameter.
     // `build_spec` already stored it, and every caller passed the same value to
@@ -2370,6 +2405,22 @@ fn execute_spec_until(
     fs::create_dir_all(&captures).map_err(|e| e.to_string())?;
     let stdout_path = captures.join(format!("{}-{index}.stdout", spec.id.mode));
     let stderr_path = captures.join(format!("{}-{index}.stderr", spec.id.mode));
+    let request = ProcessRequest::new(
+        InvocationRole::Execution {
+            attempt_index: spec.attempt.clone(),
+            backend: spec
+                .id
+                .backend
+                .clone()
+                .map_or(RequiredNullable::Null, RequiredNullable::Value),
+        },
+        &spec.cwd,
+        &spec.argv[0],
+        &spec.argv[1..],
+        &spec.env,
+        &stdout_path,
+        &stderr_path,
+    );
     let started = Instant::now();
     let remaining = remaining_cell_time(deadline);
     let exhausted = if remaining.is_zero() {
@@ -2380,6 +2431,15 @@ fn execute_spec_until(
         None
     };
     if let Some(timeout) = exhausted {
+        record_not_started(
+            request,
+            remaining_cpu_usec.is_some(),
+            match timeout {
+                ProcessTimeout::Cpu => NotStartedReason::CpuBudgetAlreadyExhausted,
+                ProcessTimeout::Wall => NotStartedReason::WallBudgetAlreadyExhausted,
+            },
+            observations,
+        );
         fs::write(&stdout_path, b"").map_err(|e| e.to_string())?;
         fs::write(&stderr_path, b"").map_err(|e| e.to_string())?;
         return Ok(cell_timeout_attempt(
@@ -2390,15 +2450,8 @@ fn execute_spec_until(
             timeout,
         ));
     }
-    let output = execute_process(
-        &spec.cwd,
-        &spec.argv[0],
-        &spec.argv[1..],
-        &spec.env,
-        &stdout_path,
-        &stderr_path,
-        (deadline, remaining_cpu_usec),
-    )?;
+    let execution_ordinal = observations.len() as u64 + 1;
+    let output = execute_process(request, (deadline, remaining_cpu_usec), observations)?;
     let mut accounted_cpu_usage_usec = Some(output.cpu_usage_usec);
     let mut normalization_error = None;
     if output.timeout.is_none()
@@ -2412,8 +2465,11 @@ fn execute_spec_until(
                 &spec.cwd,
                 deadline,
                 remaining_cpu_usec.map(|budget| budget.saturating_sub(output.cpu_usage_usec)),
-                cpu_timeout_seconds,
-                wall_timeout_seconds,
+                (cpu_timeout_seconds, wall_timeout_seconds),
+                (
+                    observations,
+                    InvocationRole::PtraceNormalization { execution_ordinal },
+                ),
             );
             accounted_cpu_usage_usec =
                 checked_add_cpu_usage(accounted_cpu_usage_usec, normalized.cpu_usage_usec);
@@ -2748,8 +2804,8 @@ fn normalize_ptrace_golden(
     cwd: &Path,
     deadline: Instant,
     remaining_cpu_usec: Option<u64>,
-    cpu_timeout_seconds: u64,
-    wall_timeout_seconds: u64,
+    timeout_seconds: (u64, u64),
+    record: (&mut Vec<InvocationCpuObservation>, InvocationRole),
 ) -> AccountedStep<()> {
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
@@ -2784,13 +2840,17 @@ fn normalize_ptrace_golden(
     let stderr = directory.join("normalized-ptrace-golden.stderr");
     let args = vec!["log-diff".into(), run1[0].to_string_lossy().into_owned()];
     let output = match execute_process(
-        cwd,
-        hermit,
-        &args,
-        &BTreeMap::new(),
-        &normalized,
-        &stderr,
+        ProcessRequest::new(
+            record.1,
+            cwd,
+            hermit,
+            &args,
+            &BTreeMap::new(),
+            &normalized,
+            &stderr,
+        ),
         (deadline, remaining_cpu_usec),
+        record.0,
     ) {
         Ok(output) => output,
         Err(error) => {
@@ -2810,7 +2870,7 @@ fn normalize_ptrace_golden(
         if let Some(timeout) = output.timeout {
             return Err(format!(
                 "ptrace golden normalization {}",
-                timeout.reason(cpu_timeout_seconds, wall_timeout_seconds)
+                timeout.reason(timeout_seconds.0, timeout_seconds.1)
             ));
         }
         Ok(())
@@ -2857,28 +2917,45 @@ struct ProcessLimits {
     cpu_poll_interval: Duration,
 }
 
+struct ExecutionBudget {
+    deadline: Instant,
+    cpu_timeout_seconds: u64,
+    wall_timeout_seconds: u64,
+    remaining_cpu_usec: Option<u64>,
+}
+
+fn record_not_started(
+    request: ProcessRequest,
+    cpu_enabled: bool,
+    reason: NotStartedReason,
+    observations: &mut Vec<InvocationCpuObservation>,
+) {
+    let mut observation = InvocationCpuObservation::pending(
+        observations.len() as u64 + 1,
+        request.role,
+        request.command,
+        cpu_enabled,
+    );
+    observation.launch = LaunchObservation::NotStarted { reason };
+    observations.push(observation);
+}
+
 /// Add two complete CPU measurements, refusing missing or overflowing input.
 pub fn checked_add_cpu_usage(total: Option<u64>, usage: Option<u64>) -> Option<u64> {
     total.and_then(|total| usage.and_then(|usage| total.checked_add(usage)))
 }
 
 fn rusage_cpu_usage_usec(usage: &libc::rusage) -> Result<u64, String> {
-    fn timeval_usec(value: libc::timeval) -> Option<u64> {
-        let seconds = u64::try_from(value.tv_sec).ok()?;
-        let microseconds = u64::try_from(value.tv_usec).ok()?;
-        (microseconds < 1_000_000)
-            .then_some(seconds.checked_mul(1_000_000)?.checked_add(microseconds)?)
-    }
-
-    let user = timeval_usec(usage.ru_utime)
-        .ok_or_else(|| "wait4 returned an invalid user CPU duration".to_string())?;
-    let system = timeval_usec(usage.ru_stime)
-        .ok_or_else(|| "wait4 returned an invalid system CPU duration".to_string())?;
-    user.checked_add(system)
-        .ok_or_else(|| "wait4 CPU usage overflowed u64".to_string())
+    WaitCpuObservation::from_rusage(usage).total()
 }
 
-fn wait4_process(pid: u32, options: libc::c_int) -> Result<Option<(ExitStatus, u64)>, String> {
+fn wait4_process(
+    pid: u32,
+    options: libc::c_int,
+    operation: WaitOperation,
+    started: Instant,
+    final_wait: &mut FinalWaitObservation,
+) -> Result<Option<(ExitStatus, u64)>, String> {
     loop {
         let mut status = 0;
         let mut usage = unsafe { std::mem::zeroed::<libc::rusage>() };
@@ -2887,16 +2964,40 @@ fn wait4_process(pid: u32, options: libc::c_int) -> Result<Option<(ExitStatus, u
             return Ok(None);
         }
         if waited == pid as libc::pid_t {
-            return Ok(Some((
-                ExitStatus::from_raw(status),
-                rusage_cpu_usage_usec(&usage)?,
-            )));
+            let cpu = WaitCpuObservation::from_rusage(&usage);
+            let total = rusage_cpu_usage_usec(&usage);
+            *final_wait = if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+                FinalWaitObservation::Reaped {
+                    source: FinalCpuSource::Wait4,
+                    pid,
+                    raw_status: status,
+                    at: started.elapsed().into(),
+                    cpu,
+                }
+            } else {
+                FinalWaitObservation::NonterminalReturn {
+                    source: FinalCpuSource::Wait4,
+                    pid,
+                    raw_status: status,
+                    at: started.elapsed().into(),
+                    cpu,
+                }
+            };
+            return Ok(Some((ExitStatus::from_raw(status), total?)));
         }
         let error = std::io::Error::last_os_error();
         if error.kind() == std::io::ErrorKind::Interrupted {
             continue;
         }
-        return Err(format!("wait4({pid}) failed: {error}"));
+        let reason = format!("wait4({pid}) failed: {error}");
+        *final_wait = FinalWaitObservation::Unavailable {
+            operation,
+            errno: error
+                .raw_os_error()
+                .map_or(RequiredNullable::Null, RequiredNullable::Value),
+            reason: reason.clone(),
+        };
+        return Err(reason);
     }
 }
 
@@ -2911,13 +3012,23 @@ fn live_cpu_usage_usec(pgid: u32, seconds: f64) -> Result<u64, String> {
     Ok(usec as u64)
 }
 
-fn stop_process_group(pid: u32) -> Result<(ExitStatus, u64), String> {
+fn stop_process_group(
+    pid: u32,
+    started: Instant,
+    final_wait: &mut FinalWaitObservation,
+) -> Result<(ExitStatus, u64), String> {
     unsafe {
         libc::kill(-(pid as i32), libc::SIGTERM);
     }
     let grace = Instant::now() + Duration::from_secs(10);
     loop {
-        if let Some(result) = wait4_process(pid, libc::WNOHANG)? {
+        if let Some(result) = wait4_process(
+            pid,
+            libc::WNOHANG,
+            WaitOperation::StopGrace,
+            started,
+            final_wait,
+        )? {
             return Ok(result);
         }
         if Instant::now() >= grace {
@@ -2928,69 +3039,130 @@ fn stop_process_group(pid: u32) -> Result<(ExitStatus, u64), String> {
     unsafe {
         libc::kill(-(pid as i32), libc::SIGKILL);
     }
-    wait4_process(pid, 0)?.ok_or_else(|| format!("blocking wait4({pid}) returned no child"))
+    wait4_process(pid, 0, WaitOperation::BlockingStop, started, final_wait)?.ok_or_else(|| {
+        let reason = format!("blocking wait4({pid}) returned no child");
+        *final_wait = FinalWaitObservation::Unavailable {
+            operation: WaitOperation::BlockingStop,
+            errno: RequiredNullable::Null,
+            reason: reason.clone(),
+        };
+        reason
+    })
+}
+
+struct ProcessRequest {
+    role: InvocationRole,
+    command: CommandIdentity,
+    cwd: PathBuf,
+    stdout: PathBuf,
+    stderr: PathBuf,
+}
+
+impl ProcessRequest {
+    fn new(
+        role: InvocationRole,
+        cwd: &Path,
+        program: &str,
+        args: &[String],
+        env: &BTreeMap<String, String>,
+        stdout: &Path,
+        stderr: &Path,
+    ) -> Self {
+        Self {
+            role,
+            cwd: cwd.to_owned(),
+            command: CommandIdentity {
+                argv: std::iter::once(program.to_string())
+                    .chain(args.iter().cloned())
+                    .collect(),
+                cwd: cwd.to_string_lossy().into_owned(),
+                env_overrides: env.clone(),
+            },
+            stdout: stdout.to_owned(),
+            stderr: stderr.to_owned(),
+        }
+    }
 }
 
 fn execute_process(
-    cwd: &Path,
-    program: &str,
-    args: &[String],
-    env: &BTreeMap<String, String>,
-    stdout: &Path,
-    stderr: &Path,
+    request: ProcessRequest,
     limits: (Instant, Option<u64>),
+    observations: &mut Vec<InvocationCpuObservation>,
 ) -> Result<ProcessOutput, String> {
     execute_process_with_cpu_poll_interval(
-        cwd,
-        program,
-        args,
-        env,
-        stdout,
-        stderr,
+        request,
         ProcessLimits {
             deadline: limits.0,
             cpu_budget_usec: limits.1,
             cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
         },
+        observations,
     )
 }
 
 fn execute_process_with_cpu_poll_interval(
-    cwd: &Path,
-    program: &str,
-    args: &[String],
-    env: &BTreeMap<String, String>,
-    stdout: &Path,
-    stderr: &Path,
+    request: ProcessRequest,
     limits: ProcessLimits,
+    observations: &mut Vec<InvocationCpuObservation>,
 ) -> Result<ProcessOutput, String> {
-    let child = spawn_process(cwd, program, args, env, stdout, stderr)?;
-    monitor_process(
-        child,
-        limits,
-        |pid| dagrun::proccpu::ProcessGroupCpu::new(pid).map_err(|error| error.to_string()),
-        |reader| reader.seconds().map_err(|error| error.to_string()),
+    let started = Instant::now();
+    let mut observation = InvocationCpuObservation::pending(
+        observations.len() as u64 + 1,
+        request.role,
+        request.command,
+        limits.cpu_budget_usec.is_some(),
+    );
+    let result = spawn_process(
+        &request.cwd,
+        &request.stdout,
+        &request.stderr,
+        &mut observation,
     )
+    .and_then(|child| {
+        monitor_process(
+            child,
+            limits,
+            started,
+            &mut observation,
+            |pid| dagrun::proccpu::ProcessGroupCpu::new(pid).map_err(|error| error.to_string()),
+            |reader| reader.seconds().map_err(|error| error.to_string()),
+        )
+    });
+    // Retain the same observation on every error path, including successful
+    // reap after accounting became unavailable. An error never fabricates zero.
+    observations.push(observation);
+    result
 }
 
 fn spawn_process(
     cwd: &Path,
-    program: &str,
-    args: &[String],
-    env: &BTreeMap<String, String>,
     stdout: &Path,
     stderr: &Path,
+    observation: &mut InvocationCpuObservation,
 ) -> Result<Child, String> {
-    let stdout_file = File::create(stdout).map_err(|e| format!("{}: {e}", stdout.display()))?;
-    let stderr_file = File::create(stderr).map_err(|e| format!("{}: {e}", stderr.display()))?;
+    let mut open_capture = |path: &Path, stage| {
+        File::create(path).map_err(|error| {
+            let reason = format!("{}: {error}", path.display());
+            observation.launch = LaunchObservation::SpawnFailed {
+                stage,
+                reason: reason.clone(),
+            };
+            observation.termination = TerminationPath::SpawnFailed;
+            reason
+        })
+    };
+    let stdout_file = open_capture(stdout, SpawnStage::StdoutCapture)?;
+    let stderr_file = open_capture(stderr, SpawnStage::StderrCapture)?;
+    let identity = &observation.command;
+    let program = &identity.argv[0];
     let mut command = Command::new(program);
     command
-        .args(args)
+        .args(&identity.argv[1..])
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(stdout_file)
         .stderr(stderr_file);
-    command.envs(env.iter());
+    command.envs(identity.env_overrides.iter());
     unsafe {
         command.pre_exec(|| {
             if libc::setpgid(0, 0) == -1 {
@@ -2999,14 +3171,28 @@ fn spawn_process(
             Ok(())
         });
     }
-    command
-        .spawn()
-        .map_err(|e| format!("cannot execute {program}: {e}"))
+    match command.spawn() {
+        Ok(child) => {
+            observation.launch = LaunchObservation::Spawned { pid: child.id() };
+            Ok(child)
+        }
+        Err(error) => {
+            let reason = format!("cannot execute {program}: {error}");
+            observation.launch = LaunchObservation::SpawnFailed {
+                stage: SpawnStage::Spawn,
+                reason: reason.clone(),
+            };
+            observation.termination = TerminationPath::SpawnFailed;
+            Err(reason)
+        }
+    }
 }
 
 fn monitor_process<R>(
     child: Child,
     limits: ProcessLimits,
+    started: Instant,
+    observation: &mut InvocationCpuObservation,
     register: impl FnOnce(u32) -> Result<R, String>,
     mut sample: impl FnMut(&R) -> Result<f64, String>,
 ) -> Result<ProcessOutput, String> {
@@ -3016,17 +3202,43 @@ fn monitor_process<R>(
         cpu_poll_interval,
     } = limits;
     let pid = child.id();
-    // Authenticate once at spawn and retain the invocation owner through the
-    // final wait/stop. Do not retry a failed registration using a numeric PID.
-    // Disabled CPU accounting neither registers nor samples a reader.
+    // Authenticate once at spawn and retain this generation's owner through
+    // final wait/stop. Disabled accounting never registers or samples a reader.
     let cpu_reader = cpu_budget_usec.map(|_| register(pid));
+    if let LiveCpuObservation::Enabled(live) = &mut observation.live {
+        live.registration = match &cpu_reader {
+            Some(Ok(_)) => RegistrationObservation::BoundOnce,
+            Some(Err(reason)) => RegistrationObservation::Unavailable {
+                reason: reason.clone(),
+            },
+            None => unreachable!("enabled CPU observation requires the existing CPU budget"),
+        };
+    }
     let mut next_cpu_poll = Instant::now() + cpu_poll_interval;
     let mut cpu_accounting_missing_since = None;
     loop {
-        if let Some((status, cpu_usage_usec)) = wait4_process(pid, libc::WNOHANG)? {
+        observation.termination = TerminationPath::WaitError;
+        if let Some((status, cpu_usage_usec)) = wait4_process(
+            pid,
+            libc::WNOHANG,
+            WaitOperation::Poll,
+            started,
+            &mut observation.final_wait,
+        )? {
             let timeout = cpu_budget_usec
                 .filter(|limit| cpu_usage_usec >= *limit)
                 .map(|_| ProcessTimeout::Cpu);
+            observation.termination = if timeout.is_some() {
+                TerminationPath::FinalWaitCpuBudgetReturn
+            } else if matches!(observation.final_wait, FinalWaitObservation::Reaped { .. }) {
+                TerminationPath::CompletedWait4
+            } else {
+                TerminationPath::NonterminalWait4Return
+            };
+            observation.returned_cpu_charge = ReturnedCpuCharge::Value {
+                cpu_usec: cpu_usage_usec,
+                basis: ChargeBasis::FinalWait4,
+            };
             return Ok(ProcessOutput {
                 status,
                 timeout,
@@ -3038,22 +3250,44 @@ fn monitor_process<R>(
             (Some(ProcessTimeout::Wall), None)
         } else if let Some(limit) = cpu_budget_usec.filter(|_| now >= next_cpu_poll) {
             next_cpu_poll = now + cpu_poll_interval;
-            let observation = match &cpu_reader {
+            let sample_result = match &cpu_reader {
                 Some(Ok(reader)) => sample(reader)
-                    .map_err(|error| format!("sampling: {error}"))
-                    .and_then(|seconds| live_cpu_usage_usec(pid, seconds)),
-                Some(Err(error)) => Err(format!("registration: {error}")),
-                None => Err("CPU budget has no invocation reader".into()),
+                    .map_err(|error| CpuError {
+                        stage: CpuErrorStage::Sampling,
+                        reason: format!("sampling: {error}"),
+                    })
+                    .and_then(|seconds| {
+                        live_cpu_usage_usec(pid, seconds).map_err(|reason| CpuError {
+                            stage: CpuErrorStage::Conversion,
+                            reason,
+                        })
+                    }),
+                Some(Err(error)) => Err(CpuError {
+                    stage: CpuErrorStage::Registration,
+                    reason: format!("registration: {error}"),
+                }),
+                None => unreachable!("CPU budget has no invocation reader"),
             };
-            match observation {
+            let triggered = sample_result.as_ref().is_ok_and(|used| *used >= limit);
+            if let LiveCpuObservation::Enabled(live) = &mut observation.live {
+                live.record_poll(
+                    now.duration_since(started),
+                    matches!(&cpu_reader, Some(Ok(_))),
+                    &sample_result,
+                    triggered,
+                );
+            }
+            match sample_result {
                 Ok(used) => {
                     cpu_accounting_missing_since = None;
-                    ((used >= limit).then_some(ProcessTimeout::Cpu), Some(used))
+                    (triggered.then_some(ProcessTimeout::Cpu), Some(used))
                 }
-                Err(reason) => {
+                Err(error) => {
+                    let reason = error.reason;
                     let missing_since = cpu_accounting_missing_since.get_or_insert(now);
                     if now.duration_since(*missing_since) >= CELL_CPU_ACCOUNTING_GRACE {
-                        return match stop_process_group(pid) {
+                        observation.termination = TerminationPath::AccountingUnavailableStop;
+                        return match stop_process_group(pid, started, &mut observation.final_wait) {
                             Ok(_) => Err(format!(
                                 "cannot measure live CPU for process group {pid}: {reason}; stopped and reaped its leader rather than silently disabling its CPU budget"
                             )),
@@ -3069,10 +3303,23 @@ fn monitor_process<R>(
             (None, None)
         };
         if let Some(timeout) = timeout {
-            let (status, final_cpu_usage_usec) = stop_process_group(pid)?;
+            observation.termination = match timeout {
+                ProcessTimeout::Cpu => TerminationPath::CpuBudgetStop,
+                ProcessTimeout::Wall => TerminationPath::WallBudgetStop,
+            };
+            let (status, final_cpu_usage_usec) =
+                stop_process_group(pid, started, &mut observation.final_wait)?;
             let cpu_usage_usec = observed_cpu_usec.map_or(final_cpu_usage_usec, |observed| {
                 observed.max(final_cpu_usage_usec)
             });
+            observation.returned_cpu_charge = ReturnedCpuCharge::Value {
+                cpu_usec: cpu_usage_usec,
+                basis: if observed_cpu_usec.is_some() {
+                    ChargeBasis::MaxTriggerAndFinalWait4
+                } else {
+                    ChargeBasis::FinalWait4
+                },
+            };
             return Ok(ProcessOutput {
                 status,
                 timeout: Some(timeout),
@@ -3280,6 +3527,7 @@ fn produce_backend_parity_report(
     reference_spec: &CellRunSpec,
     reference_attempt: &AttemptResult,
     budget: ParityComparatorBudget,
+    record: (&mut Vec<InvocationCpuObservation>, InvocationRole),
 ) -> AccountedStep<BackendParityReport> {
     let inputs = (|| {
         let candidate_backend = candidate_spec
@@ -3324,13 +3572,17 @@ fn produce_backend_parity_report(
     let comparator_program = context.hermit_bin.to_string_lossy().into_owned();
     let captures = candidate_spec.cell_dir.join("captures");
     let output = match execute_process(
-        &context.root,
-        &comparator_program,
-        &comparator_args,
-        &BTreeMap::new(),
-        &captures.join("backend-parity-logdiff.stdout"),
-        &captures.join("backend-parity-logdiff.stderr"),
+        ProcessRequest::new(
+            record.1,
+            &context.root,
+            &comparator_program,
+            &comparator_args,
+            &BTreeMap::new(),
+            &captures.join("backend-parity-logdiff.stdout"),
+            &captures.join("backend-parity-logdiff.stderr"),
+        ),
         (budget.deadline, Some(budget.remaining_cpu_usec)),
+        record.0,
     ) {
         Ok(output) => output,
         Err(error) => {
@@ -3550,8 +3802,110 @@ fn apply_failed_chaos_assertion(
     }
 }
 
-pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult, String> {
-    run_cell_inner(context, cell, None)
+#[derive(Default)]
+struct CellRunProgress {
+    observations: Vec<InvocationCpuObservation>,
+    attempts: Vec<AttemptResult>,
+}
+
+/// A failed cell still owns every invocation and completed semantic attempt.
+/// The harness consumes this once when it publishes the infrastructure row.
+#[derive(Debug)]
+pub struct CellRunFailure {
+    reason: String,
+    observations: Box<CellCpuObservationsV1>,
+    attempts: Vec<AttemptResult>,
+}
+
+impl std::fmt::Display for CellRunFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.reason.fmt(f)
+    }
+}
+
+impl std::error::Error for CellRunFailure {}
+
+impl CellRunFailure {
+    pub fn into_result(self, context: &RunContext, cell: &SelectedCell) -> CellResult {
+        let mut result = infrastructure_error_result(context, cell, self.reason);
+        result.cpu_observations = Some(*self.observations);
+        result.attempts = self.attempts;
+        result
+    }
+}
+
+fn empty_cpu_observations(context: &RunContext, cell: &SelectedCell) -> CellCpuObservationsV1 {
+    CellCpuObservationsV1 {
+        version: 1,
+        binding: CellCpuBinding {
+            run_id: context.run_id.clone(),
+            hermit_sha: context.source_sha.clone(),
+            lane: cell.test.lane.clone(),
+            category: cell.category.clone(),
+            test: cell.id.test.clone(),
+            mode: cell.id.mode.clone(),
+            backend: cell
+                .id
+                .backend
+                .clone()
+                .map_or(RequiredNullable::Null, RequiredNullable::Value),
+            outer_attempt: context.attempt,
+            run_index: context
+                .run_index
+                .map_or(RequiredNullable::Null, RequiredNullable::Value),
+        },
+        invocations: Vec::new(),
+    }
+}
+
+fn record_cell(
+    context: &RunContext,
+    cell: &SelectedCell,
+    run: impl FnOnce(&mut CellRunProgress) -> Result<CellResult, String>,
+) -> Result<CellResult, CellRunFailure> {
+    let mut progress = CellRunProgress::default();
+    let outcome = run(&mut progress);
+    let mut observations = empty_cpu_observations(context, cell);
+    observations.invocations = progress.observations;
+    match outcome {
+        Ok(mut result) => {
+            result.cpu_observations = Some(observations);
+            if let Err(reason) = result.require_cpu_observations() {
+                return Err(CellRunFailure {
+                    reason: format!("invalid generated CPU observations: {reason}"),
+                    observations: Box::new(result.cpu_observations.take().expect("attached above")),
+                    attempts: result.attempts,
+                });
+            }
+            Ok(result)
+        }
+        Err(reason) => Err(CellRunFailure {
+            reason,
+            observations: Box::new(observations),
+            attempts: progress.attempts,
+        }),
+    }
+}
+
+fn execution_ordinal(
+    observations: &[InvocationCpuObservation],
+    index: &str,
+) -> Result<u64, String> {
+    observations
+        .iter()
+        .find_map(|observation| match &observation.role {
+            InvocationRole::Execution { attempt_index, .. } if attempt_index == index => {
+                Some(observation.ordinal)
+            }
+            _ => None,
+        })
+        .ok_or_else(|| format!("missing actual execution ordinal for {index}"))
+}
+
+pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult, CellRunFailure> {
+    record_cell(context, cell, |progress| {
+        run_cell_inner(context, cell, None, progress)
+    })
 }
 
 /// Run the ordinary cell plus a ptrace reference and compare one retained run
@@ -3562,69 +3916,76 @@ pub fn run_cell_with_parity(
     context: &RunContext,
     cell: &SelectedCell,
     reference_backend: &str,
-) -> Result<CellResult, String> {
-    if reference_backend != "ptrace" {
-        return Err(format!(
-            "backend parity currently requires the ptrace reference, got {reference_backend:?}"
-        ));
-    }
-    if cell.id.mode != "verify" {
-        return Err(format!(
-            "backend parity requires verify mode, got {:?}",
-            cell.id.mode
-        ));
-    }
-    let candidate_backend = cell
-        .id
-        .backend
-        .as_deref()
-        .ok_or_else(|| "backend parity requires a candidate backend".to_string())?;
-    if candidate_backend == reference_backend {
-        return Err("backend parity candidate and reference must differ".into());
-    }
-    let mode = &cell.test.modes[&cell.id.mode];
-    if !mode
-        .backends_enabled
-        .iter()
-        .any(|backend| backend == reference_backend)
-    {
-        return Err(format!(
-            "{} verify has no enabled ptrace reference",
-            cell.id.test
-        ));
-    }
-    if mode.compare_io_buffers == Some(false) || mode.rcb_time == Some(false) {
-        return Err(format!(
-            "{} verify relaxes I/O-buffer or RCB-time comparison and cannot produce strict backend parity",
-            cell.id.test
-        ));
-    }
-    let candidate_args = mode
-        .guest_args
-        .get(candidate_backend)
-        .cloned()
-        .unwrap_or_default();
-    let reference_args = mode
-        .guest_args
-        .get(reference_backend)
-        .cloned()
-        .unwrap_or_default();
-    if candidate_args != reference_args {
-        return Err(format!(
-            "{} verify changes guest arguments between {candidate_backend} and ptrace; refusing to compare different workloads",
-            cell.id.test
-        ));
-    }
-    let mut retained_context = context.clone();
-    retained_context.keep_logs = true;
-    run_cell_inner(&retained_context, cell, Some(reference_backend))
+) -> Result<CellResult, CellRunFailure> {
+    record_cell(context, cell, |progress| {
+        if reference_backend != "ptrace" {
+            return Err(format!(
+                "backend parity currently requires the ptrace reference, got {reference_backend:?}"
+            ));
+        }
+        if cell.id.mode != "verify" {
+            return Err(format!(
+                "backend parity requires verify mode, got {:?}",
+                cell.id.mode
+            ));
+        }
+        let candidate_backend = cell
+            .id
+            .backend
+            .as_deref()
+            .ok_or_else(|| "backend parity requires a candidate backend".to_string())?;
+        if candidate_backend == reference_backend {
+            return Err("backend parity candidate and reference must differ".into());
+        }
+        let mode = &cell.test.modes[&cell.id.mode];
+        if !mode
+            .backends_enabled
+            .iter()
+            .any(|backend| backend == reference_backend)
+        {
+            return Err(format!(
+                "{} verify has no enabled ptrace reference",
+                cell.id.test
+            ));
+        }
+        if mode.compare_io_buffers == Some(false) || mode.rcb_time == Some(false) {
+            return Err(format!(
+                "{} verify relaxes I/O-buffer or RCB-time comparison and cannot produce strict backend parity",
+                cell.id.test
+            ));
+        }
+        let candidate_args = mode
+            .guest_args
+            .get(candidate_backend)
+            .cloned()
+            .unwrap_or_default();
+        let reference_args = mode
+            .guest_args
+            .get(reference_backend)
+            .cloned()
+            .unwrap_or_default();
+        if candidate_args != reference_args {
+            return Err(format!(
+                "{} verify changes guest arguments between {candidate_backend} and ptrace; refusing to compare different workloads",
+                cell.id.test
+            ));
+        }
+        let mut retained_context = context.clone();
+        retained_context.keep_logs = true;
+        run_cell_inner(&retained_context, cell, Some(reference_backend), progress)
+    })
 }
 
 fn run_cell_inner(
     context: &RunContext,
     cell: &SelectedCell,
     parity_reference: Option<&str>,
+    progress: &mut CellRunProgress,
 ) -> Result<CellResult, String> {
+    let CellRunProgress {
+        observations,
+        attempts,
+    } = progress;
     let dir = cell_artifact_dir(context, cell);
     let started = Instant::now();
     let timeouts = cell_timeouts(context, cell)?;
@@ -3639,6 +4000,7 @@ fn run_cell_inner(
         &dir,
         preparation_deadline,
         timeouts.wall_seconds,
+        observations,
     )?;
     // Fixture preparation keeps its scaled wall-clock guard above. Post-preparation
     // execution uses its separately measured bound as an aggregate CPU-second budget
@@ -3650,7 +4012,6 @@ fn run_cell_inner(
     let execution_cpu_budget_usec = timeouts.cpu_seconds.saturating_mul(1_000_000);
     let mut execution_cpu_usage_usec = 0u64;
     let mode = cell.test.modes.get(&cell.id.mode).unwrap();
-    let mut attempts = Vec::new();
     let mut backend_parity = None;
     let mut parity_error: Option<(&'static str, String)> = None;
     let mut parity_comparison_cpu_usage_usec = Some(0);
@@ -3670,10 +4031,16 @@ fn run_cell_inner(
                     &spec,
                     &cell.test.observation,
                     &dir,
-                    deadline,
-                    timeouts.cpu_seconds,
-                    timeouts.wall_seconds,
-                    Some(execution_cpu_budget_usec.saturating_sub(execution_cpu_usage_usec)),
+                    ExecutionBudget {
+                        deadline,
+                        cpu_timeout_seconds: timeouts.cpu_seconds,
+                        wall_timeout_seconds: timeouts.wall_seconds,
+
+                        remaining_cpu_usec: Some(
+                            execution_cpu_budget_usec.saturating_sub(execution_cpu_usage_usec),
+                        ),
+                    },
+                    observations,
                 )?);
                 execution_cpu_usage_usec = execution_cpu_usage_usec
                     .checked_add(
@@ -3711,10 +4078,16 @@ fn run_cell_inner(
                     &spec,
                     &cell.test.observation,
                     &dir,
-                    deadline,
-                    timeouts.cpu_seconds,
-                    timeouts.wall_seconds,
-                    Some(execution_cpu_budget_usec.saturating_sub(execution_cpu_usage_usec)),
+                    ExecutionBudget {
+                        deadline,
+                        cpu_timeout_seconds: timeouts.cpu_seconds,
+                        wall_timeout_seconds: timeouts.wall_seconds,
+
+                        remaining_cpu_usec: Some(
+                            execution_cpu_budget_usec.saturating_sub(execution_cpu_usage_usec),
+                        ),
+                    },
+                    observations,
                 )?);
                 execution_cpu_usage_usec = execution_cpu_usage_usec
                     .checked_add(
@@ -3744,10 +4117,16 @@ fn run_cell_inner(
                     &spec,
                     &cell.test.observation,
                     &dir,
-                    deadline,
-                    timeouts.cpu_seconds,
-                    timeouts.wall_seconds,
-                    Some(execution_cpu_budget_usec.saturating_sub(execution_cpu_usage_usec)),
+                    ExecutionBudget {
+                        deadline,
+                        cpu_timeout_seconds: timeouts.cpu_seconds,
+                        wall_timeout_seconds: timeouts.wall_seconds,
+
+                        remaining_cpu_usec: Some(
+                            execution_cpu_budget_usec.saturating_sub(execution_cpu_usage_usec),
+                        ),
+                    },
+                    observations,
                 )?);
                 execution_cpu_usage_usec = execution_cpu_usage_usec
                     .checked_add(
@@ -3776,10 +4155,14 @@ fn run_cell_inner(
                 &candidate_spec,
                 &cell.test.observation,
                 &dir,
-                deadline,
-                timeouts.cpu_seconds,
-                timeouts.wall_seconds,
-                Some(execution_cpu_budget_usec),
+                ExecutionBudget {
+                    deadline,
+                    cpu_timeout_seconds: timeouts.cpu_seconds,
+                    wall_timeout_seconds: timeouts.wall_seconds,
+
+                    remaining_cpu_usec: Some(execution_cpu_budget_usec),
+                },
+                observations,
             )?);
             execution_cpu_usage_usec = attempts
                 .last()
@@ -3792,7 +4175,7 @@ fn run_cell_inner(
                 // a candidate product result. It must also prevent the ptrace
                 // reference from running, because that work cannot turn the
                 // ineligible candidate into parity evidence.
-                parity_error = parity_candidate_path_error(&attempts);
+                parity_error = parity_candidate_path_error(attempts);
                 if parity_error.is_none()
                     && attempts
                         .last()
@@ -3814,10 +4197,16 @@ fn run_cell_inner(
                         &reference_spec,
                         &cell.test.observation,
                         &dir,
-                        deadline,
-                        timeouts.cpu_seconds,
-                        timeouts.wall_seconds,
-                        Some(execution_cpu_budget_usec.saturating_sub(execution_cpu_usage_usec)),
+                        ExecutionBudget {
+                            deadline,
+                            cpu_timeout_seconds: timeouts.cpu_seconds,
+                            wall_timeout_seconds: timeouts.wall_seconds,
+
+                            remaining_cpu_usec: Some(
+                                execution_cpu_budget_usec.saturating_sub(execution_cpu_usage_usec),
+                            ),
+                        },
+                        observations,
                     );
                     match reference_attempt {
                         Err(error) => {
@@ -3845,6 +4234,16 @@ fn run_cell_inner(
                                             "parity operand CPU usage overflowed u64".to_string()
                                         })
                                     })?;
+                                let comparison_role = InvocationRole::ParityComparison {
+                                    candidate_execution: execution_ordinal(
+                                        observations,
+                                        &candidate_spec.attempt,
+                                    )?,
+                                    reference_execution: execution_ordinal(
+                                        observations,
+                                        &reference_spec.attempt,
+                                    )?,
+                                };
                                 let comparison = produce_backend_parity_report(
                                     context,
                                     &candidate_spec,
@@ -3858,6 +4257,7 @@ fn run_cell_inner(
                                         cpu_timeout_seconds: timeouts.cpu_seconds,
                                         wall_timeout_seconds: timeouts.wall_seconds,
                                     },
+                                    (observations, comparison_role),
                                 );
                                 parity_comparison_cpu_usage_usec = comparison.cpu_usage_usec;
                                 match comparison.result {
@@ -3889,7 +4289,7 @@ fn run_cell_inner(
     }
     .to_string();
     let mut reason = attempts.iter().find_map(|attempt| attempt.reason.clone());
-    let position = cell_divergence_position(&attempts);
+    let position = cell_divergence_position(attempts);
     let mut first_divergent_scheduler_turn = position.scheduler_turn;
     let mut first_divergent_virtual_nanoseconds = position.virtual_nanoseconds;
     let mut first_divergent_record = position.record;
@@ -3999,7 +4399,7 @@ fn run_cell_inner(
             );
         }
     }
-    let execution_path = match summarize_sabre_path_evidence(&attempts) {
+    let execution_path = match summarize_sabre_path_evidence(attempts) {
         Ok(value) => value,
         Err(error) => {
             outcome = "ERROR".into();
@@ -4055,7 +4455,7 @@ fn run_cell_inner(
     let result = observed_result(
         &cell.id.mode,
         &outcome,
-        &attempts,
+        attempts,
         error_kind.as_deref(),
         backend_parity.as_ref(),
     );
@@ -4123,7 +4523,7 @@ fn run_cell_inner(
                     .and_then(|assert| assert.min_normalized_entropy),
             )
         }),
-        attempts,
+        attempts: std::mem::take(attempts),
         backend_parity,
         first_divergent_scheduler_turn,
         first_divergent_virtual_nanoseconds,
@@ -4149,7 +4549,7 @@ pub fn infrastructure_error_result(
     let dir = cell_artifact_dir(context, cell);
     let timeouts = cell_timeouts(context, cell).ok();
     CellResult {
-        cpu_observations: None,
+        cpu_observations: Some(empty_cpu_observations(context, cell)),
         artifact_dir: dir.display().to_string(),
         schema: CELL_RESULT_SCHEMA,
         run_id: context.run_id.clone(),
@@ -4225,7 +4625,7 @@ pub fn host_inapplicable_result(
     let dir = cell_artifact_dir(context, cell);
     let timeouts = cell_timeouts(context, cell).ok();
     CellResult {
-        cpu_observations: None,
+        cpu_observations: Some(empty_cpu_observations(context, cell)),
         artifact_dir: dir.display().to_string(),
         schema: CELL_RESULT_SCHEMA,
         run_id: context.run_id.clone(),
@@ -4967,17 +5367,16 @@ fn execute_observed_until(
     spec: &CellRunSpec,
     observation: &Observation,
     dir: &Path,
-    deadline: Instant,
-    cpu_timeout_seconds: u64,
-    wall_timeout_seconds: u64,
-    remaining_cpu_usec: Option<u64>,
+    budget: ExecutionBudget,
+    observations: &mut Vec<InvocationCpuObservation>,
 ) -> Result<AttemptResult, String> {
     let mut attempt = execute_spec_until(
         spec,
-        deadline,
-        cpu_timeout_seconds,
-        wall_timeout_seconds,
-        remaining_cpu_usec,
+        budget.deadline,
+        budget.cpu_timeout_seconds,
+        budget.wall_timeout_seconds,
+        budget.remaining_cpu_usec,
+        observations,
     )?;
     attempt.observation_sha256 = Some(observation_hash(observation, &attempt, dir));
     Ok(attempt)
@@ -5914,7 +6313,8 @@ mod tests {
         // This is the exact boundary reached when the aggregate execution
         // backstop is gone before a later attempt starts: no child process can
         // exist or have an exit status.
-        let attempt = execute_spec_until(&spec, Instant::now(), 15, 57, None).unwrap();
+        let attempt =
+            execute_spec_until(&spec, Instant::now(), 15, 57, None, &mut Vec::new()).unwrap();
         assert_eq!(attempt.outcome, "ERROR");
         assert_eq!(attempt.error_kind.as_deref(), Some("wall-timeout"));
         assert!(attempt.timed_out);
@@ -5966,6 +6366,7 @@ mod tests {
             1,
             5,
             Some(0),
+            &mut Vec::new(),
         )
         .unwrap();
         assert_eq!(attempt.outcome, "ERROR");
@@ -5985,13 +6386,20 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let measure = |label: &str, script: &str| {
             execute_process(
-                &root,
-                "/bin/sh",
-                &["-c".into(), script.into()],
-                &BTreeMap::new(),
-                &root.join(format!("{label}.stdout")),
-                &root.join(format!("{label}.stderr")),
+                ProcessRequest::new(
+                    InvocationRole::Execution {
+                        attempt_index: "1".into(),
+                        backend: RequiredNullable::Null,
+                    },
+                    &root,
+                    "/bin/sh",
+                    &["-c".into(), script.into()],
+                    &BTreeMap::new(),
+                    &root.join(format!("{label}.stdout")),
+                    &root.join(format!("{label}.stderr")),
+                ),
                 (Instant::now() + Duration::from_secs(10), None),
+                &mut Vec::new(),
             )
             .unwrap()
         };
@@ -6015,16 +6423,26 @@ mod tests {
         wall: Duration,
         cpu_budget_usec: u64,
     ) -> ProcessOutput {
-        execute_process(
-            root,
-            "/bin/sh",
-            &["-c".into(), script.into()],
-            &BTreeMap::new(),
-            &root.join(format!("{label}.stdout")),
-            &root.join(format!("{label}.stderr")),
+        let mut observations = Vec::new();
+        let output = execute_process(
+            ProcessRequest::new(
+                InvocationRole::Execution {
+                    attempt_index: "1".into(),
+                    backend: RequiredNullable::Null,
+                },
+                root,
+                "/bin/sh",
+                &["-c".into(), script.into()],
+                &BTreeMap::new(),
+                &root.join(format!("{label}.stdout")),
+                &root.join(format!("{label}.stderr")),
+            ),
             (Instant::now() + wall, Some(cpu_budget_usec)),
+            &mut observations,
         )
-        .unwrap()
+        .unwrap();
+        assert_process_observation(&observations[0], &output);
+        output
     }
 
     #[test]
@@ -6070,7 +6488,12 @@ mod tests {
             used < 100_000,
             "an idle process group unexpectedly included unrelated CPU: {used} usec"
         );
-        stop_process_group(pid).unwrap();
+        stop_process_group(
+            pid,
+            Instant::now(),
+            &mut FinalWaitObservation::NotApplicable,
+        )
+        .unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -6087,16 +6510,35 @@ mod tests {
         root
     }
 
-    fn spawn_cpu_reader_fixture(root: &Path, label: &str, script: &str) -> Child {
-        spawn_process(
+    fn spawn_cpu_reader_fixture(
+        root: &Path,
+        label: &str,
+        script: &str,
+        cpu_enabled: bool,
+    ) -> (Child, Instant, InvocationCpuObservation) {
+        let started = Instant::now();
+        let request = ProcessRequest::new(
+            InvocationRole::Execution {
+                attempt_index: label.into(),
+                backend: RequiredNullable::Null,
+            },
             root,
             "/bin/sh",
             &["-c".into(), script.into()],
             &BTreeMap::new(),
             &root.join(format!("{label}.stdout")),
             &root.join(format!("{label}.stderr")),
+        );
+        let mut observation =
+            InvocationCpuObservation::pending(1, request.role, request.command, cpu_enabled);
+        let child = spawn_process(
+            &request.cwd,
+            &request.stdout,
+            &request.stderr,
+            &mut observation,
         )
-        .unwrap()
+        .unwrap();
+        (child, started, observation)
     }
 
     fn owned_child_is_reaped(pid: u32) -> bool {
@@ -6104,6 +6546,112 @@ mod tests {
         let waited = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
         let error = std::io::Error::last_os_error();
         waited == -1 && error.raw_os_error() == Some(libc::ECHILD)
+    }
+
+    fn enabled_cpu(observation: &InvocationCpuObservation) -> &crate::cpu_evidence::LiveCpuEnabled {
+        let LiveCpuObservation::Enabled(live) = &observation.live else {
+            panic!("expected enabled live CPU observation: {observation:?}");
+        };
+        live
+    }
+
+    fn measured_final_cpu(observation: &InvocationCpuObservation) -> u64 {
+        let LaunchObservation::Spawned { pid } = observation.launch else {
+            panic!("expected a real launched process: {observation:?}");
+        };
+        let FinalWaitObservation::Reaped {
+            pid: waited,
+            cpu:
+                WaitCpuObservation::Measured {
+                    user_usec,
+                    system_usec,
+                    total_usec,
+                },
+            ..
+        } = &observation.final_wait
+        else {
+            panic!("expected actual wait4 CPU and reap: {observation:?}");
+        };
+        assert_eq!(*waited, pid);
+        assert_eq!(user_usec.checked_add(*system_usec), Some(*total_usec));
+        assert!(owned_child_is_reaped(pid));
+        *total_usec
+    }
+
+    fn validate_native_observation(observation: &InvocationCpuObservation) {
+        CellCpuObservationsV1 {
+            version: 1,
+            binding: CellCpuBinding {
+                run_id: "native-cpu-fixture".into(),
+                hermit_sha: "0".repeat(40),
+                lane: "portable".into(),
+                category: "fixture".into(),
+                test: "fixture/native-cpu".into(),
+                mode: "naked".into(),
+                backend: RequiredNullable::Null,
+                outer_attempt: 1,
+                run_index: RequiredNullable::Null,
+            },
+            invocations: vec![observation.clone()],
+        }
+        .validate()
+        .unwrap();
+    }
+
+    fn assert_process_observation(observation: &InvocationCpuObservation, output: &ProcessOutput) {
+        let final_cpu = measured_final_cpu(observation);
+        let (cpu_usec, basis) = match &observation.returned_cpu_charge {
+            ReturnedCpuCharge::Value { cpu_usec, basis } => (*cpu_usec, basis),
+            ReturnedCpuCharge::Unavailable => panic!("successful monitor return lost CPU charge"),
+        };
+        assert_eq!(cpu_usec, output.cpu_usage_usec);
+        match observation.termination {
+            TerminationPath::CpuBudgetStop => {
+                let live = enabled_cpu(observation);
+                let RequiredNullable::Value(trigger) = &live.timeout_trigger else {
+                    panic!("CPU stop must retain its actual triggering sample");
+                };
+                assert_eq!(basis, &ChargeBasis::MaxTriggerAndFinalWait4);
+                assert_eq!(cpu_usec, final_cpu.max(trigger.cpu_usec));
+                assert_eq!(output.timeout, Some(ProcessTimeout::Cpu));
+            }
+            TerminationPath::CompletedWait4
+            | TerminationPath::FinalWaitCpuBudgetReturn
+            | TerminationPath::WallBudgetStop => {
+                assert_eq!(basis, &ChargeBasis::FinalWait4);
+                assert_eq!(cpu_usec, final_cpu);
+            }
+            _ => panic!("unexpected successful monitor termination: {observation:?}"),
+        }
+        validate_native_observation(observation);
+    }
+
+    fn assert_cpu_source_roundtrip(row: &CellResult) {
+        use crate::cpu_evidence::CellCpuHistoryV1;
+        use crate::ledger::read_schema10_source_result;
+
+        let source = read_schema10_source_result(&serde_json::to_vec(row).unwrap()).unwrap();
+        let history = CellCpuHistoryV1::from_source_rows(&[(row.attempt, source.clone())])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            history.attempts[0].observations(),
+            row.cpu_observations.as_ref()
+        );
+        for pointer in [
+            "/cpu_observations/binding/run_id",
+            "/cpu_observations/invocations/0/live/polls",
+            "/cpu_observations/invocations/0/final_wait/cpu/user_usec",
+        ] {
+            let mut invalid = source.clone();
+            if let Some(value) = invalid.pointer_mut(pointer) {
+                *value = JsonValue::String("tampered".into());
+                assert!(
+                    read_schema10_source_result(&serde_json::to_vec(&invalid).unwrap()).is_err(),
+                    "{pointer}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -6127,10 +6675,11 @@ mod tests {
         let registered_invocations = Cell::new(0);
         for label in ["first", "second"] {
             let done = root.join(format!("{label}.done"));
-            let child = spawn_cpu_reader_fixture(
+            let (child, started, mut observation) = spawn_cpu_reader_fixture(
                 &root,
                 label,
                 &format!("while [ ! -f {label}.done ]; do sleep 0.02; done"),
+                true,
             );
             let pid = child.id();
             let registrations = Cell::new(0);
@@ -6143,6 +6692,8 @@ mod tests {
                     cpu_budget_usec: Some(5_000_000),
                     cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
                 },
+                started,
+                &mut observation,
                 |registered_pid| {
                     assert_eq!(registered_pid, pid);
                     registrations.set(registrations.get() + 1);
@@ -6176,6 +6727,12 @@ mod tests {
             assert!(done.is_file(), "reader must outlive the shared cache TTL");
             assert!(dropped_after_reap.get());
             assert!(owned_child_is_reaped(pid));
+            assert_process_observation(&observation, &output);
+            let live = enabled_cpu(&observation);
+            assert_eq!(live.registration, RegistrationObservation::BoundOnce);
+            assert_eq!(live.source_sample_calls, samples.get());
+            assert_eq!(live.valid_polls, samples.get());
+            assert_eq!(live.unavailable_polls, 0);
         }
         // Reaped invocations may legitimately reuse a numeric PID. Each still
         // constructs and drops its own reader through the factory above.
@@ -6189,11 +6746,11 @@ mod tests {
 
         let root = cpu_reader_test_root("unavailable-reader");
         for failure in ["registration", "sampling", "conversion"] {
-            let child = spawn_cpu_reader_fixture(&root, failure, "exec sleep 20");
+            let (child, started, mut observation) =
+                spawn_cpu_reader_fixture(&root, failure, "exec sleep 20", true);
             let pid = child.id();
             let registrations = Cell::new(0);
             let samples = Cell::new(0);
-            let started = Instant::now();
             let error = monitor_process(
                 child,
                 ProcessLimits {
@@ -6201,6 +6758,8 @@ mod tests {
                     cpu_budget_usec: Some(5_000_000),
                     cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
                 },
+                started,
+                &mut observation,
                 |registered_pid| {
                     assert_eq!(registered_pid, pid);
                     registrations.set(registrations.get() + 1);
@@ -6241,6 +6800,31 @@ mod tests {
             }
             assert!(error.contains("stopped and reaped its leader"), "{error}");
             assert!(owned_child_is_reaped(pid), "{failure}: {error}");
+            measured_final_cpu(&observation);
+            assert_eq!(
+                observation.termination,
+                TerminationPath::AccountingUnavailableStop
+            );
+            assert_eq!(
+                observation.returned_cpu_charge,
+                ReturnedCpuCharge::Unavailable
+            );
+            let live = enabled_cpu(&observation);
+            assert_eq!(live.source_sample_calls, samples.get());
+            assert_eq!(live.valid_polls, 0);
+            assert!(live.unavailable_polls >= 2);
+            let RequiredNullable::Value(last_error) = &live.last_error else {
+                panic!("unavailability must retain its typed error");
+            };
+            assert_eq!(
+                last_error.stage,
+                match failure {
+                    "registration" => CpuErrorStage::Registration,
+                    "sampling" => CpuErrorStage::Sampling,
+                    _ => CpuErrorStage::Conversion,
+                }
+            );
+            validate_native_observation(&observation);
         }
         fs::remove_dir_all(root).unwrap();
     }
@@ -6251,7 +6835,8 @@ mod tests {
 
         let root = cpu_reader_test_root("optional-reader");
         for cpu_budget_usec in [None, Some(5_000_000)] {
-            let child = spawn_cpu_reader_fixture(&root, "complete", "exit 0");
+            let (child, started, mut observation) =
+                spawn_cpu_reader_fixture(&root, "complete", "exit 0", cpu_budget_usec.is_some());
             let pid = child.id();
             let registrations = Cell::new(0);
             let output = monitor_process(
@@ -6261,6 +6846,8 @@ mod tests {
                     cpu_budget_usec,
                     cpu_poll_interval: Duration::from_secs(5),
                 },
+                started,
+                &mut observation,
                 |_| -> Result<(), String> {
                     assert!(
                         cpu_budget_usec.is_some(),
@@ -6276,6 +6863,18 @@ mod tests {
             assert_eq!(output.timeout, None);
             assert_eq!(registrations.get(), usize::from(cpu_budget_usec.is_some()));
             assert!(owned_child_is_reaped(pid));
+            assert_process_observation(&observation, &output);
+            if cpu_budget_usec.is_some() {
+                let live = enabled_cpu(&observation);
+                assert_eq!(live.polls, 0);
+                assert_eq!(live.source_sample_calls, 0);
+                assert!(matches!(
+                    live.registration,
+                    RegistrationObservation::Unavailable { .. }
+                ));
+            } else {
+                assert_eq!(observation.live, LiveCpuObservation::Disabled);
+            }
         }
         fs::remove_dir_all(root).unwrap();
     }
@@ -6284,8 +6883,12 @@ mod tests {
     fn a_valid_cpu_sample_resets_the_unavailable_grace() {
         let root = cpu_reader_test_root("reader-grace-reset");
         let done = root.join("done");
-        let child =
-            spawn_cpu_reader_fixture(&root, "reset", "while [ ! -f done ]; do sleep 0.02; done");
+        let (child, started, mut observation) = spawn_cpu_reader_fixture(
+            &root,
+            "reset",
+            "while [ ! -f done ]; do sleep 0.02; done",
+            true,
+        );
         let pid = child.id();
         let mut first_missing = None;
         let mut valid_samples = 0;
@@ -6297,6 +6900,8 @@ mod tests {
                 cpu_budget_usec: Some(5_000_000),
                 cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
             },
+            started,
+            &mut observation,
             |pid| dagrun::proccpu::ProcessGroupCpu::new(pid).map_err(|error| error.to_string()),
             |reader| {
                 let first = *first_missing.get_or_insert_with(Instant::now);
@@ -6324,6 +6929,11 @@ mod tests {
             "must survive beyond the original missing grace"
         );
         assert!(owned_child_is_reaped(pid));
+        assert_process_observation(&observation, &output);
+        let live = enabled_cpu(&observation);
+        assert_eq!(live.valid_polls, 1);
+        assert!(live.unavailable_polls > 1);
+        assert!(matches!(live.last_error, RequiredNullable::Value(_)));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -6371,6 +6981,365 @@ mod tests {
         }
     }
 
+    fn native_cpu_cell(script: &str, runs: u64) -> SelectedCell {
+        let mut cell = ptrace_cell("naked");
+        cell.id.backend = None;
+        cell.test.direct = Some(DirectCommand::Argv(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            script.into(),
+        ]));
+        cell.test.modes.get_mut("naked").unwrap().runs = Some(runs);
+        cell.timeout_seconds = 5;
+        cell.cpu_timeout_seconds = 4;
+        cell
+    }
+
+    #[test]
+    fn actual_fd_reserve_refusal_preserves_unavailable_cpu_and_reap() {
+        const CHILD: &str = "HERMIT_TEST_CPU_FD_RESERVE_CHILD";
+        const CASE: &str =
+            "runner::tests::actual_fd_reserve_refusal_preserves_unavailable_cpu_and_reap";
+        if std::env::var_os(CHILD).is_none() {
+            // setrlimit is process-wide: keep it out of the parallel libtest
+            // process, and select only this case in the isolated child.
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", CASE, "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
+        let root = cpu_reader_test_root("actual-fd-reserve");
+        let context = run_context(&root);
+        let cell = native_cpu_cell("exec sleep 20", 1);
+        let mut limit = unsafe { std::mem::zeroed::<libc::rlimit>() };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        assert!(limit.rlim_cur >= 32);
+        limit.rlim_cur = 32;
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        let started = Instant::now();
+        let failure =
+            run_cell(&context, &cell).expect_err("real descriptor reserve refusal must fail");
+        assert!(started.elapsed() >= CELL_CPU_ACCOUNTING_GRACE, "{failure}");
+        assert!(
+            failure
+                .to_string()
+                .contains("registration: descriptor reserve"),
+            "{failure}"
+        );
+        let row = failure.into_result(&context, &cell);
+        assert_eq!(row.outcome, "ERROR");
+        assert_eq!(row.cpu_usage_usec, None);
+        assert!(row.attempts.is_empty());
+        row.require_cpu_observations().unwrap();
+        let observations = row.cpu_observations.as_ref().unwrap();
+        assert_eq!(observations.invocations.len(), 1);
+        let invocation = &observations.invocations[0];
+        assert_eq!(
+            invocation.termination,
+            TerminationPath::AccountingUnavailableStop
+        );
+        assert_eq!(
+            invocation.returned_cpu_charge,
+            ReturnedCpuCharge::Unavailable
+        );
+        measured_final_cpu(invocation);
+        let live = enabled_cpu(invocation);
+        assert_eq!(
+            live.registration,
+            RegistrationObservation::Unavailable {
+                reason: "descriptor reserve".into()
+            }
+        );
+        assert_eq!(live.source_sample_calls, 0);
+        assert_eq!(live.valid_polls, 0);
+        assert!(live.unavailable_polls >= 2);
+        assert_eq!(live.first, RequiredNullable::Null);
+        assert_eq!(live.high_water, RequiredNullable::Null);
+        assert_eq!(live.timeout_trigger, RequiredNullable::Null);
+        let ledger = root.join("results.jsonl");
+        append_result(&ledger, &row).unwrap();
+        let bytes = fs::read(&ledger).unwrap();
+        let decoded: CellResult = serde_json::from_slice(&bytes).unwrap();
+        decoded.require_cpu_observations().unwrap();
+        assert_cpu_source_roundtrip(&decoded);
+        println!(
+            "CPU_FD_REFUSAL_ROW {}",
+            String::from_utf8(bytes).unwrap().trim()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_later_launch_retains_prior_attempt_and_cpu_observations() {
+        let root = cpu_reader_test_root("prior-work-before-spawn-failure");
+        let context = run_context(&root);
+        let program = root.join("remove-self");
+        fs::write(&program, "#!/bin/sh\nrm -- \"$0\"\nprintf measured\n").unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut cell = native_cpu_cell("unused", 2);
+        cell.test.direct = Some(DirectCommand::Argv(vec![program.display().to_string()]));
+        let failure = run_cell(&context, &cell).expect_err("second launch must fail after unlink");
+        let row = failure.into_result(&context, &cell);
+        assert_eq!(row.outcome, "ERROR");
+        assert_eq!(row.cpu_usage_usec, None);
+        assert_eq!(row.attempts.len(), 1, "{row:?}");
+        assert_eq!(row.attempts[0].stdout, "measured");
+        let invocations = &row.cpu_observations.as_ref().unwrap().invocations;
+        assert_eq!(invocations.len(), 2);
+        assert_eq!(invocations[0].termination, TerminationPath::CompletedWait4);
+        assert_eq!(
+            row.attempts[0].cpu_usage_usec,
+            Some(measured_final_cpu(&invocations[0]))
+        );
+        assert_eq!(invocations[1].ordinal, 2);
+        assert!(matches!(
+            invocations[1].launch,
+            LaunchObservation::SpawnFailed {
+                stage: SpawnStage::Spawn,
+                ..
+            }
+        ));
+        assert_eq!(
+            invocations[1].final_wait,
+            FinalWaitObservation::NotApplicable
+        );
+        assert_eq!(
+            invocations[1].returned_cpu_charge,
+            ReturnedCpuCharge::Unavailable
+        );
+        row.require_cpu_observations().unwrap();
+        assert_cpu_source_roundtrip(&row);
+        append_result(&root.join("results.jsonl"), &row).unwrap();
+        println!(
+            "CPU_PARTIAL_WORK_ROW {}",
+            serde_json::to_string(&row).unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_zombie_then_reaped_child_has_no_double_cpu_charge() {
+        use std::io::Read;
+        use std::os::unix::net::UnixListener;
+
+        let root = cpu_reader_test_root("zombie-reap-cpu");
+        let source = root.join("work.c");
+        let program = root.join("work");
+        // The parent holds the real zombie until the monitor releases it,
+        // then holds the reaped state until a second real source sample.
+        fs::write(&source, r#"
+#define _GNU_SOURCE
+#include <assert.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/resource.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+static uint64_t cpu_ns(void) {
+    struct timespec t;
+    assert(clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &t) == 0);
+    return (uint64_t)t.tv_sec * 1000000000 + t.tv_nsec;
+}
+static void phase(int fd, char mark) {
+    assert(write(fd, &mark, 1) == 1);
+    char ack;
+    assert(read(fd, &ack, 1) == 1 && ack == mark);
+}
+int main(int argc, char **argv) {
+    assert(argc == 2);
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    assert(fd >= 0);
+    struct sockaddr_un address = { .sun_family = AF_UNIX };
+    assert(strlen(argv[1]) < sizeof(address.sun_path));
+    strcpy(address.sun_path, argv[1]);
+    assert(connect(fd, (struct sockaddr *)&address, sizeof(address)) == 0);
+    int child_clock[2];
+    assert(pipe(child_clock) == 0);
+    pid_t child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        close(child_clock[0]);
+        uint64_t started = cpu_ns();
+        while (cpu_ns() - started < 250000000) {}
+        uint64_t used = cpu_ns();
+        assert(write(child_clock[1], &used, sizeof(used)) == sizeof(used));
+        _exit(0);
+    }
+    close(child_clock[1]);
+    uint64_t child_ns;
+    assert(read(child_clock[0], &child_ns, sizeof(child_ns)) == sizeof(child_ns));
+    siginfo_t info;
+    assert(waitid(P_PID, child, &info, WEXITED | WNOWAIT) == 0);
+    assert(info.si_pid == child && info.si_code == CLD_EXITED && info.si_status == 0);
+    phase(fd, 'Z');
+    int status;
+    struct rusage used;
+    assert(wait4(child, &status, 0, &used) == child);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    phase(fd, 'R');
+    printf("{\"child_clock_ns\":%llu,\"child_user_usec\":%llu,\"child_system_usec\":%llu,\"parent_clock_ns\":%llu}\n",
+        (unsigned long long)child_ns,
+        (unsigned long long)used.ru_utime.tv_sec * 1000000 + used.ru_utime.tv_usec,
+        (unsigned long long)used.ru_stime.tv_sec * 1000000 + used.ru_stime.tv_usec,
+        (unsigned long long)cpu_ns());
+    return 0;
+}
+"#).unwrap();
+        assert!(
+            Command::new("cc")
+                .args(["-O2", "-Wall", "-Werror"])
+                .arg(&source)
+                .arg("-o")
+                .arg(&program)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let socket = root.join("phase.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let request = ProcessRequest::new(
+            InvocationRole::Execution {
+                attempt_index: "1".into(),
+                backend: RequiredNullable::Null,
+            },
+            &root,
+            program.to_str().unwrap(),
+            &[socket.display().to_string()],
+            &BTreeMap::new(),
+            &root.join("work.stdout"),
+            &root.join("work.stderr"),
+        );
+        let started = Instant::now();
+        let mut observation =
+            InvocationCpuObservation::pending(1, request.role, request.command, true);
+        let child = spawn_process(
+            &request.cwd,
+            &request.stdout,
+            &request.stderr,
+            &mut observation,
+        )
+        .unwrap();
+        let mut connection = None;
+        let mut phase = None;
+        let mut phase_samples = Vec::new();
+        let output = monitor_process(
+            child,
+            ProcessLimits {
+                deadline: started + Duration::from_secs(5),
+                cpu_budget_usec: Some(2_000_000),
+                cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
+            },
+            started,
+            &mut observation,
+            |pid| dagrun::proccpu::ProcessGroupCpu::new(pid).map_err(|error| error.to_string()),
+            |reader| {
+                // Always call the actual generation-bound source first. The
+                // handshake never substitutes a measured value or adds polls.
+                let seconds = reader.seconds().map_err(|error| error.to_string())?;
+                if connection.is_none() {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            stream.set_nonblocking(true).map_err(|e| e.to_string())?;
+                            connection = Some(stream);
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(error) => return Err(error.to_string()),
+                    }
+                }
+                if let Some(stream) = &mut connection {
+                    if phase.is_none() {
+                        let mut mark = [0];
+                        match stream.read(&mut mark) {
+                            Ok(1) => phase = Some((mark[0], Instant::now())),
+                            Ok(_) => return Err("native phase peer closed early".into()),
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(error) => return Err(error.to_string()),
+                        }
+                    }
+                    // AU's existing shared snapshot TTL is 500ms. Hold each
+                    // state longer so its accepted sample cannot predate it.
+                    if let Some((mark, _)) = phase.filter(|(_, since): &(u8, Instant)| {
+                        since.elapsed() >= Duration::from_millis(600)
+                    }) {
+                        phase_samples.push((mark, live_cpu_usage_usec(0, seconds)?));
+                        stream.write_all(&[mark]).map_err(|e| e.to_string())?;
+                        phase = None;
+                    }
+                }
+                Ok(seconds)
+            },
+        )
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            fs::read_to_string(&request.stderr).unwrap()
+        );
+        assert_eq!(output.timeout, None);
+        assert_process_observation(&observation, &output);
+        assert_eq!(
+            phase_samples
+                .iter()
+                .map(|(mark, _)| *mark)
+                .collect::<Vec<_>>(),
+            b"ZR"
+        );
+        let clocks: JsonValue =
+            serde_json::from_slice(&fs::read(&request.stdout).unwrap()).unwrap();
+        assert!(clocks["child_clock_ns"].as_u64().unwrap() >= 250_000_000);
+        let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        assert!(ticks > 0);
+        // Two processes, each with at most user/system tick quantization;
+        // wait4's two microsecond components contribute at most 2us rounding.
+        // This bound derives from the measurement units, not observed runs.
+        let quantization_usec = 4 * 1_000_000u64.div_ceil(ticks as u64) + 2;
+        let final_cpu = measured_final_cpu(&observation);
+        let child_cpu = clocks["child_user_usec"].as_u64().unwrap()
+            + clocks["child_system_usec"].as_u64().unwrap();
+        assert!(child_cpu > quantization_usec * 2);
+        assert!(final_cpu >= child_cpu);
+        let RequiredNullable::Value(high) = &enabled_cpu(&observation).high_water else {
+            panic!("native control must retain real live CPU samples");
+        };
+        assert!(
+            high.cpu_usec <= final_cpu + quantization_usec,
+            "live high-water duplicated waited CPU: {observation:?}"
+        );
+        for (_, sample) in &phase_samples {
+            assert!(
+                *sample + quantization_usec >= child_cpu,
+                "child CPU disappeared across reap"
+            );
+        }
+        println!(
+            "CPU_NATIVE_ZOMBIE_REAP {}",
+            serde_json::json!({
+                "observation": observation, "clocks": clocks,
+                "phase_samples": phase_samples, "clock_ticks_per_second": ticks,
+                "quantization_bound_usec": quantization_usec,
+            })
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn cpu_burner_is_stopped_by_the_cpu_budget() {
         let root = std::env::temp_dir().join(format!(
@@ -6380,12 +7349,14 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let spec = bounded_spec(&root, "burner", "while :; do :; done");
+        let mut observations = Vec::new();
         let attempt = execute_spec_until(
             &spec,
             Instant::now() + Duration::from_secs(5),
             1,
             5,
             Some(1_000_000),
+            &mut observations,
         )
         .unwrap();
         assert!(attempt.timed_out);
@@ -6396,6 +7367,19 @@ mod tests {
             serde_json::to_value(&attempt).unwrap()["error_kind"],
             "cpu-timeout",
             "the retained evidence must distinguish a CPU timeout from wall timeout"
+        );
+        let observation = &observations[0];
+        assert_eq!(observation.termination, TerminationPath::CpuBudgetStop);
+        assert_process_observation(
+            observation,
+            &ProcessOutput {
+                status: ExitStatus::from_raw(match observation.final_wait {
+                    FinalWaitObservation::Reaped { raw_status, .. } => raw_status,
+                    _ => panic!("missing reap"),
+                }),
+                timeout: Some(ProcessTimeout::Cpu),
+                cpu_usage_usec: attempt.cpu_usage_usec.unwrap(),
+            },
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -6408,26 +7392,44 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
+        let mut observations = Vec::new();
         let output = execute_process_with_cpu_poll_interval(
-            &root,
-            "/bin/sh",
-            &[
-                "-c".into(),
-                "head -c 8388608 /dev/zero | sha256sum >/dev/null".into(),
-            ],
-            &BTreeMap::new(),
-            &root.join("completed.stdout"),
-            &root.join("completed.stderr"),
+            ProcessRequest::new(
+                InvocationRole::Execution {
+                    attempt_index: "1".into(),
+                    backend: RequiredNullable::Null,
+                },
+                &root,
+                "/bin/sh",
+                &[
+                    "-c".into(),
+                    "head -c 8388608 /dev/zero | sha256sum >/dev/null".into(),
+                ],
+                &BTreeMap::new(),
+                &root.join("completed.stdout"),
+                &root.join("completed.stderr"),
+            ),
             ProcessLimits {
                 deadline: Instant::now() + Duration::from_secs(5),
                 cpu_budget_usec: Some(1),
                 cpu_poll_interval: Duration::from_secs(5),
             },
+            &mut observations,
         )
         .unwrap();
         assert!(output.status.success());
         assert_eq!(output.timeout, Some(ProcessTimeout::Cpu));
         assert!(output.cpu_usage_usec >= 1);
+        assert_process_observation(&observations[0], &output);
+        assert_eq!(
+            observations[0].termination,
+            TerminationPath::FinalWaitCpuBudgetReturn
+        );
+        assert_eq!(enabled_cpu(&observations[0]).polls, 0);
+        assert_eq!(
+            enabled_cpu(&observations[0]).timeout_trigger,
+            RequiredNullable::Null
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -6440,12 +7442,14 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let spec = bounded_spec(&root, "sleeper", "sleep 5");
+        let mut observations = Vec::new();
         let attempt = execute_spec_until(
             &spec,
             Instant::now() + Duration::from_secs(1),
             1,
             1,
             Some(5_000_000),
+            &mut observations,
         )
         .unwrap();
         assert!(attempt.timed_out);
@@ -6459,6 +7463,19 @@ mod tests {
             serde_json::to_value(&attempt).unwrap()["error_kind"],
             "wall-timeout",
             "the retained evidence must distinguish a wall timeout from CPU timeout"
+        );
+        let observation = &observations[0];
+        assert_eq!(observation.termination, TerminationPath::WallBudgetStop);
+        assert_process_observation(
+            observation,
+            &ProcessOutput {
+                status: ExitStatus::from_raw(match observation.final_wait {
+                    FinalWaitObservation::Reaped { raw_status, .. } => raw_status,
+                    _ => panic!("missing reap"),
+                }),
+                timeout: Some(ProcessTimeout::Wall),
+                cpu_usage_usec: attempt.cpu_usage_usec.unwrap(),
+            },
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -6569,8 +7586,13 @@ mod tests {
             &root,
             Instant::now() + Duration::from_secs(5),
             Some(200_000),
-            1,
-            5,
+            (1, 5),
+            (
+                &mut Vec::new(),
+                InvocationRole::PtraceNormalization {
+                    execution_ordinal: 1,
+                },
+            ),
         );
         let error = normalized
             .result
@@ -6641,6 +7663,13 @@ mod tests {
                 cpu_timeout_seconds: 1,
                 wall_timeout_seconds: 5,
             },
+            (
+                &mut Vec::new(),
+                InvocationRole::ParityComparison {
+                    candidate_execution: 1,
+                    reference_execution: 2,
+                },
+            ),
         );
         let error = compared
             .result
@@ -6716,6 +7745,12 @@ mod tests {
 
         let result = run_cell(&context, &cell).unwrap();
         assert_eq!(result.attempts.len(), 3);
+        let observations = result
+            .cpu_observations
+            .as_ref()
+            .expect("real cell invocations must retain their CPU observations");
+        assert_eq!(observations.invocations.len(), 3);
+        result.require_cpu_observations().unwrap();
         assert!(result.attempts.iter().all(|attempt| !attempt.timed_out));
         assert_eq!(result.result, Some(ObservedResult::Pass));
         assert_eq!(result.failure_class, None);
@@ -8839,6 +9874,7 @@ esac
         context.run_verify_strict = true;
 
         let result = run_cell_with_parity(&context, &cell, "ptrace").unwrap();
+        assert_cpu_source_roundtrip(&result);
         let invocations = fs::read_to_string(root.join("invocations")).unwrap_or_default();
         fs::remove_dir_all(root).unwrap();
         (result, invocations)
@@ -8903,6 +9939,30 @@ esac
         assert_eq!(matched.outcome, "PASS", "{matched:#?}");
         assert_eq!(matched.result, Some(ObservedResult::Pass));
         assert_eq!(matched.attempts.len(), 2);
+        let observations = &matched.cpu_observations.as_ref().unwrap().invocations;
+        assert_eq!(observations.len(), 4);
+        assert_eq!(
+            observations[2].role,
+            InvocationRole::PtraceNormalization {
+                execution_ordinal: 2
+            }
+        );
+        assert_eq!(
+            observations[3].role,
+            InvocationRole::ParityComparison {
+                candidate_execution: 1,
+                reference_execution: 2,
+            }
+        );
+        assert_eq!(
+            matched.cpu_usage_usec,
+            observations.iter().try_fold(0u64, |total, observation| {
+                match observation.returned_cpu_charge {
+                    ReturnedCpuCharge::Value { cpu_usec, .. } => total.checked_add(cpu_usec),
+                    ReturnedCpuCharge::Unavailable => None,
+                }
+            })
+        );
         assert_eq!(
             matched.backend_parity.as_ref().map(|report| report.verdict),
             Some(BackendParityVerdict::Matched)
@@ -9709,6 +10769,7 @@ esac
             ],
             Instant::now() + Duration::from_secs(5),
             5,
+            &mut Vec::new(),
         )
         .unwrap_err();
         assert!(error.contains("fixture preparation failed for /bin/sh: exited 17"));
@@ -9776,6 +10837,7 @@ esac
             &["-c".into(), "sleep 60".into()],
             Instant::now() + Duration::from_secs(1),
             cell.timeout_seconds,
+            &mut Vec::new(),
         )
         .unwrap_err();
         assert!(
@@ -9800,6 +10862,7 @@ esac
             &["-c".into(), "true".into()],
             Instant::now() + Duration::from_secs(1),
             cell.timeout_seconds,
+            &mut Vec::new(),
         )
         .expect("healthy fixture preparation must finish silently under the same bound");
         fs::remove_dir_all(root).unwrap();
@@ -9852,6 +10915,16 @@ esac
         assert_eq!(result.outcome, "PASS", "unexpected result: {result:?}");
         assert_eq!(result.result, Some(ObservedResult::Pass));
         assert_eq!(result.attempts.len(), 1);
+        let observations = &result.cpu_observations.as_ref().unwrap().invocations;
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].role, InvocationRole::Preparation);
+        assert_eq!(observations[0].live, LiveCpuObservation::Disabled);
+        assert_eq!(observations[1].ordinal, 2);
+        assert_eq!(
+            result.cpu_usage_usec,
+            Some(measured_final_cpu(&observations[0]) + measured_final_cpu(&observations[1]))
+        );
+        assert_cpu_source_roundtrip(&result);
         assert!(!result.attempts[0].timed_out);
         assert_eq!(result.attempts[0].stdout, "complete\n");
         assert!(
