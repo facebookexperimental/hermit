@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+repo_root=$(cd -- "$script_dir/.." && pwd)
+third_party_dir=$repo_root/shim/third-party/rust
+
+cd "$repo_root"
+
+if [[ ! -f Cargo.lock ]] || ! git ls-files --error-unmatch Cargo.lock >/dev/null 2>&1; then
+  echo "Cargo.lock must exist and be tracked before Buck dependencies are generated" >&2
+  exit 1
+fi
+
+if [[ ! -f reverie/BUCK ]]; then
+  echo "initialize the pinned reverie submodule before generating Buck dependencies" >&2
+  exit 1
+fi
+
+cargo metadata --locked --format-version 1 --no-deps >/dev/null
+
+# A fresh checkout has none of these generated paths. Removing only paths that
+# Git confirms are excluded makes repeated local use take the same path.
+for generated in \
+  "$third_party_dir/.cargo" \
+  "$third_party_dir/BUCK" \
+  "$third_party_dir/vendor"
+do
+  relative=${generated#"$repo_root/"}
+  if [[ -e $generated ]] && ! git check-ignore -q "$relative"; then
+    echo "refusing to remove non-ignored path: $relative" >&2
+    exit 1
+  fi
+done
+rm -rf -- \
+  "$third_party_dir/.cargo" \
+  "$third_party_dir/BUCK" \
+  "$third_party_dir/vendor"
+
+reindeer_args=(
+  --third-party-dir "$third_party_dir"
+  --manifest-path "$repo_root/Cargo.toml"
+)
+
+"$script_dir/reindeer" "${reindeer_args[@]}" vendor
+
+first_output=$(mktemp)
+trap 'rm -f -- "$first_output"' EXIT
+"$script_dir/reindeer" "${reindeer_args[@]}" buckify --stdout >"$first_output"
+"$script_dir/reindeer" "${reindeer_args[@]}" buckify
+cmp --silent "$first_output" "$third_party_dir/BUCK" || {
+  echo "Reindeer produced different BUCK output across consecutive invocations" >&2
+  exit 1
+}
+
+git diff --exit-code -- Cargo.lock
+
+# One third-party cell serves both Hermit and Reverie: .buckconfig maps the
+# `reverie_shim` cell onto this one, so Reverie's BUCK files resolve their
+# third-party crates here and only one copy of each crate is compiled. Reverie
+# names those crates without a version suffix, and Reindeer only emits such an
+# alias for the manifest's own direct dependencies, so the aliases Reverie
+# needs are appended here. Each is resolved against the BUCK just generated, so
+# a version bump cannot silently strand one.
+append_shared_cell_aliases() {
+  local list=$third_party_dir/shared-cell-aliases.txt
+  local buck=$third_party_dir/BUCK
+  [[ -f $list ]] || { echo "missing $list" >&2; exit 1; }
+  {
+    echo
+    echo "# Aliases for crates the Reverie cell names without a version suffix."
+    echo "# Appended by bootstrap/regenerate-rust-deps from shared-cell-aliases.txt."
+  } >>"$buck"
+  local crate actual
+  while read -r crate; do
+    [[ -n $crate && ${crate:0:1} != "#" ]] || continue
+    if grep -qE "^    name = \"$crate\",$" "$buck"; then
+      echo "shared-cell alias '$crate' already exists in the generated BUCK" >&2
+      exit 1
+    fi
+    actual=$(grep -oE "^    name = \"$crate-[0-9][0-9a-zA-Z.]*\",$" "$buck" \
+      | sed -E 's/^    name = "(.*)",$/\1/' | sort -V | tail -1)
+    if [[ -z $actual ]]; then
+      echo "no versioned target for shared-cell alias '$crate' in $buck" >&2
+      exit 1
+    fi
+    cat >>"$buck" <<EOT
+
+third_party_rust_alias(
+    name = "$crate",
+    actual = ":$actual",
+    platforms = [
+        "linux-arm64",
+        "linux-x86_64",
+        "macos-arm64",
+        "macos-x86_64",
+        "windows-gnu",
+        "windows-msvc",
+    ],
+    visibility = ["PUBLIC"],
+)
+EOT
+  done <"$list"
+}
+append_shared_cell_aliases
+
+sha256sum \
+  Cargo.lock \
+  "$third_party_dir/BUCK"

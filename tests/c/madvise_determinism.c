@@ -6,9 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
-#endif
 
 #include <errno.h>
 #include <fcntl.h>
@@ -26,22 +24,17 @@
 #define MADV_POPULATE_READ 22
 #endif
 
-static int
-expect_errno(void* address, size_t length, int advice, int expected) {
+static int expect_errno(void *address, size_t length, int advice, int expected) {
   errno = 0;
   if (madvise(address, length, advice) != -1 || errno != expected) {
-    fprintf(
-        stderr,
-        "madvise(%d) expected errno %d, got %d\n",
-        advice,
-        expected,
-        errno);
+    fprintf(stderr, "madvise(%d) expected errno %d, got %d\n", advice,
+            expected, errno);
     return 1;
   }
   return 0;
 }
 
-int main(int argc, char** argv) {
+int main(int argc, char **argv) {
   const bool kvm = argc == 2 && strcmp(argv[1], "--kvm") == 0;
   const long page_size_raw = sysconf(_SC_PAGESIZE);
   const bool recording = argc == 2 && strcmp(argv[1], "--record") == 0;
@@ -50,20 +43,17 @@ int main(int argc, char** argv) {
   }
   const size_t page_size = (size_t)page_size_raw;
 
-  unsigned char* anonymous = mmap(
-      NULL,
-      page_size,
-      PROT_READ | PROT_WRITE,
-      MAP_PRIVATE | MAP_ANONYMOUS,
-      -1,
-      0);
+  unsigned char *anonymous =
+      mmap(NULL, page_size, PROT_READ | PROT_WRITE,
+           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (anonymous == MAP_FAILED) {
     return 11;
   }
   anonymous[0] = 0x5a;
 
   if (madvise(anonymous, page_size, MADV_WILLNEED) != 0 ||
-      madvise(anonymous, page_size, MADV_FREE) != 0 || anonymous[0] != 0x5a) {
+      madvise(anonymous, page_size, MADV_FREE) != 0 ||
+      anonymous[0] != 0x5a) {
     return 12;
   }
   if (expect_errno(anonymous, page_size, MADV_POPULATE_READ, EINVAL) ||
@@ -81,7 +71,7 @@ int main(int argc, char** argv) {
     if (fd < 0) {
       return 15;
     }
-    unsigned char* file_mapping =
+    unsigned char *file_mapping =
         mmap(NULL, page_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
     if (file_mapping == MAP_FAILED) {
       return 16;
@@ -97,9 +87,8 @@ int main(int argc, char** argv) {
           file_mapping[0] != modified) {
         return 17;
       }
-    } else if (
-        madvise(file_mapping, page_size, MADV_DONTNEED) != 0 ||
-        file_mapping[0] != original) {
+    } else if (madvise(file_mapping, page_size, MADV_DONTNEED) != 0 ||
+               file_mapping[0] != original) {
       return 17;
     }
     if (munmap(file_mapping, page_size) != 0 || close(fd) != 0) {

@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# Execute only rust-script binaries prepared by ci/prepare-rust-scripts.sh.
+
+set -euo pipefail
+
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+PUBLISHED="${HERMIT_RUST_SCRIPT_ARTIFACT_ROOT:-$ROOT_DIR/target/ci/rust-scripts}"
+MANIFEST="$PUBLISHED/manifest.tsv"
+original_args=("$@")
+
+die() {
+    printf 'prebuilt rust-script: %s\n' "$*" >&2
+    exit 2
+}
+
+find_real_rust_script() {
+    local candidate dir
+    if [[ -n ${HERMIT_REAL_RUST_SCRIPT:-} ]]; then
+        [[ -x $HERMIT_REAL_RUST_SCRIPT ]] || die "HERMIT_REAL_RUST_SCRIPT is not executable: $HERMIT_REAL_RUST_SCRIPT"
+        printf '%s\n' "$HERMIT_REAL_RUST_SCRIPT"
+        return
+    fi
+    IFS=: read -ra path_entries <<<"${PATH:-}"
+    for dir in "${path_entries[@]}"; do
+        [[ -n $dir ]] || dir=.
+        candidate=$dir/rust-script
+        [[ -x $candidate ]] || continue
+        if [[ $(realpath -- "$candidate") != "$ROOT_DIR/ci/rust-script-bin/rust-script" ]]; then
+            realpath -- "$candidate"
+            return
+        fi
+    done
+    die "real rust-script executable not found outside ci/rust-script-bin"
+}
+
+for argument in "$@"; do
+    if [[ $argument == --package || $argument == -p ]]; then
+        # Package generation writes Rust and Cargo metadata but performs no
+        # compilation. validate's cache self-test needs this mode to inspect
+        # rust-script's package placement before the DAG begins.
+        real_rust_script=$(find_real_rust_script)
+        exec "$real_rust_script" "$@"
+    fi
+    # Stop at the source operand. Everything after it belongs to the prepared
+    # program, where flags such as Nextest's `-p PACKAGE` must not be mistaken
+    # for rust-script's own package-generation mode. Run 35342226342 made that
+    # mistake after entering hosted network isolation and delegated the already
+    # prepared nextest-binaries.rs back to the compiler.
+    if [[ $argument != -* ]]; then
+        break
+    fi
+done
+
+case ${1:-} in
+    --version|-V|--help|-h)
+        # These queries do not compile anything. Keep tooling probes compatible
+        # without pretending that they consumed a prepared repository script.
+        real_rust_script=$(find_real_rust_script)
+        exec "$real_rust_script" "$@"
+        ;;
+esac
+
+mode=run
+while (($#)); do
+    case $1 in
+        --force|--cargo-output)
+            shift
+            ;;
+        --test)
+            mode='test'
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            die "unsupported option $1; the validation graph may only run prepared scripts"
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+(($#)) || die "missing script path"
+source=$1
+shift
+
+execute_script() {
+    if [[ $mode == test ]]; then
+        exec "$ROOT_DIR/ci/rust-script-bin/run-test-harness" "$source" -- "$@"
+    fi
+    exec "$@"
+}
+
+[[ -f $MANIFEST ]] || die "missing producer output $MANIFEST; require build.rust_scripts before this node"
+source_abs=$(realpath -- "$source") || die "cannot resolve script path $source"
+case $source_abs in
+    "$ROOT_DIR"/*)
+        if ! source_root=$(git -C "$(dirname -- "$source_abs")" rev-parse --show-toplevel 2>/dev/null); then
+            die "cannot establish Git ownership for repository script $source_abs"
+        fi
+        [[ -n $source_root && -d $source_root ]] ||
+            die "cannot establish Git ownership for repository script $source_abs: invalid root $source_root"
+        source_root=$(realpath -- "$source_root") ||
+            die "cannot establish Git ownership for repository script $source_abs: cannot resolve root"
+        case $source_abs in
+            "$source_root"/*) ;;
+            *) die "cannot establish Git ownership for repository script $source_abs: root does not contain source" ;;
+        esac
+        if [[ $source_root != "$ROOT_DIR" ]]; then
+            case $source_root in
+                "$ROOT_DIR"/*) ;;
+                *) die "cannot establish Git ownership for repository script $source_abs: root is outside checkout" ;;
+            esac
+            # A separate fixture checkout below target owns its own scripts.
+            # Failed ownership lookup must never authorize a compiler fallback.
+            real_rust_script=$(find_real_rust_script)
+            execute_script "$real_rust_script" "${original_args[@]}"
+        fi
+        source_rel=${source_abs#"$ROOT_DIR"/}
+        ;;
+    *)
+        # The validation environment also launches rust-script programs owned
+        # by its external operational tooling. This repository cannot prepare
+        # those sources, so leave that separate checkout to its own runner.
+        real_rust_script=$(find_real_rust_script)
+        execute_script "$real_rust_script" "${original_args[@]}"
+        ;;
+esac
+
+row=$(awk -F '\t' -v source="$source_rel" '$1 == source { print; found++ } END { if (found != 1) exit 1 }' "$MANIFEST") ||
+    die "producer manifest has no unique entry for $source_rel"
+IFS=$'\t' read -r recorded run_path test_path <<<"$row"
+[[ $recorded == "$source_rel" ]] || die "producer manifest returned the wrong script: $recorded"
+
+case $mode in
+    run) selected=$run_path ;;
+    test)
+        [[ $test_path != - ]] || die "$source_rel has no test harness in the producer manifest"
+        selected=$test_path
+        ;;
+esac
+case $selected in
+    /*) die "producer manifest contains an absolute artifact path for $source_rel" ;;
+    ../*|*/../*|*/..|..) die "producer manifest path escapes its directory for $source_rel" ;;
+esac
+binary="$PUBLISHED/$selected"
+[[ -f $binary && -x $binary ]] || die "prepared $mode binary is missing or not executable: $binary"
+binary_abs=$(realpath -- "$binary") || die "cannot resolve prepared $mode binary: $binary"
+case $binary_abs in
+    "$PUBLISHED"/*) ;;
+    *) die "prepared $mode binary escapes producer output: $binary_abs" ;;
+esac
+
+execute_script "$binary_abs" "$@"

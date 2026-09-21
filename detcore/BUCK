@@ -1,0 +1,230 @@
+load("@fbcode_macros//build_defs:export_files.bzl", "export_file")
+load("@fbcode_macros//build_defs:native_rules.bzl", "buck_sh_test")
+load("@fbcode_macros//build_defs:sanitizers.bzl", "sanitizers")
+load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
+load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
+load("@fbsource//tools/build_defs:rust_unittest.bzl", "rust_unittest")
+load("@fbsource//tools/build_defs:selects.bzl", "selects")
+load("@fbsource//tools/build_defs:testpilot_defs.bzl", "tpx_labels")
+
+oncall("hermit")
+
+# Some tests don't work when a sanitizer is in use (i.e., with @mode/dev). This
+# makes it easy to conditionally compile them with `#[cfg(not(sanitized))]`.
+sanitized_feature = selects.apply(
+    sanitizers.get_sanitizer_v2(),
+    lambda san: ["--cfg=sanitized"] if san else [],
+)
+
+rust_library(
+    name = "detcore",
+    srcs = glob(["src/**/*.rs"]),
+    autocargo = {
+        "cargo_toml_config": {
+            "dependencies_override": {
+                "dependencies": {
+                    "bitflags": {
+                        "features": [
+                            "serde",
+                        ]
+                    },
+                },
+            },
+        },
+    },
+    test_deps = [
+        "fbsource//third-party/rust:serde_json",
+        "fbsource//third-party/rust:tempfile",
+        "fbsource//third-party/rust:test-case",
+    ],
+    test_env = {
+        "ASAN_OPTIONS": "detect_leaks=0",
+    },
+    test_rustc_flags = sanitized_feature,
+    deps = [
+        "fbsource//third-party/rust:anyhow",
+        "fbsource//third-party/rust:async-trait",
+        "fbsource//third-party/rust:bitflags",
+        "fbsource//third-party/rust:chrono",
+        "fbsource//third-party/rust:futures",
+        "fbsource//third-party/rust:hex",
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:nix",
+        "fbsource//third-party/rust:pretty",
+        "fbsource//third-party/rust:pretty_assertions",
+        "fbsource//third-party/rust:rand",
+        "fbsource//third-party/rust:rand_distr",
+        "fbsource//third-party/rust:rand_pcg",
+        "fbsource//third-party/rust:raw-cpuid",
+        "fbsource//third-party/rust:regex",
+        "fbsource//third-party/rust:serde",
+        "fbsource//third-party/rust:serde_json",
+        "fbsource//third-party/rust:sha2",
+        "fbsource//third-party/rust:clap",
+        "fbsource//third-party/rust:tempfile",
+        "fbsource//third-party/rust:tokio",
+        "fbsource//third-party/rust:tracing",
+        "fbsource//third-party/rust:procfs",
+        # Do NOT add a dependency on reverie-ptrace here! The implementation of
+        # detcore should be backend agnostic. However, it's okay to depend on
+        # reverie-ptrace in tests.
+        "//hermetic_infra/reverie:reverie",
+        "//hermetic_infra/hermit/detcore-model:detcore-model",
+    ],
+)
+
+# Utilities shared by integration tests.
+rust_library(
+    name = "detcore-testutils",
+    srcs = ["tests/testutils/src/lib.rs"],
+    autocargo = {"cargo_toml_dir": "tests/testutils/"},
+    deps = [
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:pretty_assertions",
+        "fbsource//third-party/rust:tokio",
+        "fbsource//third-party/rust:tracing",
+        "fbsource//third-party/rust:tracing-subscriber",
+        ":detcore",
+        "//hermetic_infra/hermit/common/test-allocator:test-allocator",
+        "//hermetic_infra/hermit/common/test-workdir:hermit-test-workdir",
+        "//hermetic_infra/reverie:reverie",
+        "//hermetic_infra/reverie:reverie-ptrace",
+    ],
+)
+
+# Integration tests:
+# Here we compile several single rust files into separate binary targets.
+# This is because they are SLOW to compile/link and it speeds.
+
+test_env = {
+    "ASAN_OPTIONS": "detect_leaks=0",
+    "RUST_BACKTRACE": "full",
+    # N.B. flip on for debugging:
+    # "RUST_LOG": "detcore=trace",
+    # "RUST_LOG_FILE": "/tmp/detcore_tests.log",
+}
+
+rust_unittest(
+    name = "tests_misc",
+    srcs = glob(["tests/misc/**/*.rs"]),
+    crate_root = "tests/misc/mod.rs",
+    env = test_env,
+    link_style = "static_pic",  # T196869422: [global_allocator] requires static linkage to function
+    rustc_flags = sanitized_feature,
+    deps = [
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:nix",
+        "fbsource//third-party/rust:raw-cpuid",
+        "fbsource//third-party/rust:tempfile",
+        ":detcore",
+        ":detcore-testutils",
+        "//hermetic_infra/hermit/common/test-allocator:test-allocator",
+        "//hermetic_infra/reverie:reverie",
+        "//hermetic_infra/reverie:reverie-ptrace",
+    ],
+)
+
+rust_unittest(
+    name = "tests_parallelism",
+    srcs = ["tests/parallelism/mod.rs"],
+    crate_root = "tests/parallelism/mod.rs",
+    env = test_env,
+    link_style = "static_pic",  # T196869422: [global_allocator] requires static linkage to function
+    rustc_flags = sanitized_feature,
+    deps = [
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:pretty_assertions",
+        ":detcore",
+        ":detcore-testutils",
+        "//hermetic_infra/hermit/common/test-allocator:test-allocator",
+        "//hermetic_infra/reverie:reverie",
+        "//hermetic_infra/reverie:reverie-ptrace",
+    ],
+)
+
+# FIXME: Disabled because these tests are too brittle to run and maintain.
+# rust_unittest(
+#    name = "tests_stats",
+#    srcs = ["tests/stats/mod.rs"],
+#    crate_root = "tests/stats/mod.rs",
+#    env = test_env,
+#    link_style = "static_pic",  # [global_allocator] requires static linkage to function
+#    rustc_flags = sanitized_feature,
+#    deps = [
+#        "fbsource//third-party/rust:libc",
+#        "fbsource//third-party/rust:nix",
+#        "fbsource//third-party/rust:rand",
+#        "fbsource//third-party/rust:tempfile",
+#        ":detcore",
+#        ":detcore-testutils",
+#        "//hermetic_infra/hermit/common/test-allocator:test-allocator",
+#        "//hermetic_infra/reverie:reverie",
+#        "//hermetic_infra/reverie:reverie-ptrace",
+#    ],
+# )
+
+rust_unittest(
+    name = "tests_time",
+    srcs = ["tests/time/mod.rs"],
+    crate_root = "tests/time/mod.rs",
+    env = test_env,
+    link_style = "static_pic",  # [global_allocator] requires static linkage to function
+    rustc_flags = sanitized_feature,
+    deps = [
+        "fbsource//third-party/rust:chrono",
+        "fbsource//third-party/rust:libc",
+        ":detcore",
+        ":detcore-testutils",
+        "//hermetic_infra/hermit/common/test-allocator:test-allocator",
+        "//hermetic_infra/reverie:reverie",
+        "//hermetic_infra/reverie:reverie-ptrace",
+    ],
+)
+
+export_file(
+    name = "musl_srcs",
+    src = "tests/testdata/musl-1.2.1.tar.gz",
+)
+
+buck_sh_test(
+    name = "test_build_musl_detcore",
+    args = [
+        "$(location :musl_srcs)",
+        "$(location //hermetic_infra/hermit/hermit-cli:hermit)",
+        "run",
+    ],
+    test = "tests/scripts/test_build_musl.sh",
+    deps = [
+        ":musl_srcs",
+    ],
+)
+
+rust_binary(
+    name = "syscaller",
+    srcs = ["scripts/syscaller.rs"],
+    deps = [
+        "fbsource//third-party/rust:libc",
+    ],
+)
+
+# This target is meant to be executed with `buck run` and
+# be used a reporting script that automatically find all
+# required targets and setup conditions.
+# buck_sh_binary(), buck_python_binary() cannot expand
+# `location` macros and they cannot pass args.
+# buck_python_test() is also coming with the limitation that
+# doesn't support args.
+buck_sh_test(
+    name = "get-syscall-support",
+    args = [
+        "$(location //hermetic_infra/hermit/hermit-cli:hermit)",
+        "$(location :syscaller)",
+    ],
+    # This is for buck test to ignore this target
+    # as this target is meant for `buck run` only.
+    labels = [tpx_labels.test_is_invisible_to_testpilot],
+    test = "scripts/get_syscall_support.py",
+    deps = [
+        ":syscaller",
+    ],
+)

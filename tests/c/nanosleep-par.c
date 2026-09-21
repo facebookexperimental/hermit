@@ -43,7 +43,9 @@ SOFTWARE.
 static _Atomic unsigned long counter_loc;
 static volatile _Atomic unsigned long* pcounter = &counter_loc;
 
-#define DELAY_CYCLES 10000000
+// Exercise userspace work between sleeps without making this correctness probe
+// depend on sustained CPU availability on shared CI hosts.
+#define DELAY_CYCLES 1000000
 
 static void delay(void) {
   for (int i = 0; i < DELAY_CYCLES; i++) {

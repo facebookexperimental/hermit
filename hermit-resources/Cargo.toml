@@ -1,0 +1,10 @@
+[package]
+name = "hermit-resources"
+description = "Resource accounting and limit types for the Hermit deterministic execution engine."
+version = "0.2.0"
+edition = "2024"
+license = "BSD-3-Clause"
+repository = "https://github.com/facebookexperimental/hermit"
+
+[lib]
+path = "src/lib.rs"

@@ -1,0 +1,40 @@
+{
+  "schema_version": 5,
+  "fields": [
+    "schema_version",
+    "commit",
+    "profile",
+    "selection_mode",
+    "final_validate_status",
+    "detail",
+    "exit_code",
+    "executed_nodes",
+    "executed_tests",
+    "passed_tests",
+    "scorecard_writeback"
+  ],
+  "outcomes": {
+    "PASSED": {
+      "validation_exit_code": 0,
+      "state": "completed",
+      "result": "success"
+    },
+    "FAILED": {
+      "validation_exit_code": 1,
+      "state": "completed",
+      "result": "failure"
+    },
+    "COULD_NOT_RUN": {
+      "validation_exit_code": 75,
+      "state": "completed",
+      "result": "no-result"
+    }
+  },
+  "scorecard_writeback": {
+    "nullable": true,
+    "variants": {
+      "completed": ["status"],
+      "failed": ["status", "error"]
+    }
+  }
+}

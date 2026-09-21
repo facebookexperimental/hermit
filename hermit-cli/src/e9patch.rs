@@ -1,0 +1,1673 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+//! Content-addressed offline rewriting for the experimental e9patch backend.
+
+use std::env;
+use std::fmt;
+use std::fs;
+use std::fs::File;
+use std::io::Read;
+use std::io::Write;
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Command;
+use std::time::Instant;
+
+use detcore::Digest;
+use reverie::BackendStatsRequest;
+use reverie::BackendStatsSnapshot;
+use reverie::BackendStatsSource;
+use reverie::InstructionPatchShape;
+use reverie::PatchShapeCollector;
+use reverie::PatchShapeStats;
+use serde::Deserialize;
+use serde::Serialize;
+
+use crate::Context;
+use crate::Error;
+use crate::instruction_map::CacheStatus;
+use crate::instruction_map::InstructionSite;
+use crate::instruction_map::default_cache_dir;
+use crate::instruction_map::load_or_generate;
+
+/// Environment variable that overrides the e9tool executable.
+// TODO-HUMAN-REVIEW(PR-594): Review the public e9patch tool override.
+pub const E9TOOL_ENV: &str = "HERMIT_E9TOOL";
+/// Environment variable that overrides the e9patch backend executable.
+// TODO-HUMAN-REVIEW(PR-594): Review the public e9patch backend override.
+pub const E9PATCH_BACKEND_ENV: &str = "HERMIT_E9PATCH_BACKEND";
+/// When set, disable the tool-digest memo and always re-snapshot the e9tool and
+/// e9patch executables. Diagnostic only: lets the old always-snapshot cost be
+/// A/B-measured against `preprocess_us` within a single build.
+const NO_DIGEST_CACHE_ENV: &str = "HERMIT_E9PATCH_NO_DIGEST_CACHE";
+
+/// When set to a truthy value, collect and report the arch-neutral e9patch
+/// preparation-time patch-shape statistics. Collection is strictly opt-in so the
+/// default prepare path performs no statistics-only allocation or work; any
+/// value other than an empty string, `0`, `false`, `no`, or `off` enables it.
+const STATS_ENV: &str = "HERMIT_E9PATCH_STATS";
+
+/// Cache-line size, in bytes, used to classify whether a candidate instruction
+/// straddles a cache-line boundary.
+///
+/// The classification is computed from the ELF *file offset* of the site, yet it
+/// equals the classification at the runtime *virtual address*: for any `PT_LOAD`
+/// segment the ELF loading contract requires `p_offset ≡ p_vaddr (mod p_align)`,
+/// and `p_align` for a loadable code segment is the page size, a multiple of 64.
+/// Hence `offset % 64 == vaddr % 64`, so cache-line straddle is invariant under
+/// the offset→virtual-address mapping and independent of ASLR. This keeps the
+/// statistics a pure property of the ahead-of-time rewrite with no dependence on
+/// the eventual execution address.
+const CACHE_LINE_BYTES: u64 = 64;
+
+const REWRITE_SCHEMA_VERSION: u32 = 7;
+
+/// Result of preparing the main guest ELF for the e9patch backend.
+// TODO-HUMAN-REVIEW(PR-594): Review cached rewrite result semantics.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PreparedBinary {
+    /// Original executable when no sites are patched, or the cached rewritten ELF otherwise.
+    pub binary: PathBuf,
+    /// Number of candidate sites found by the linear instruction-map scan.
+    // TODO-HUMAN-REVIEW(PR-664): Review e9patch candidate-site reporting.
+    pub candidate_sites: usize,
+    /// Number of candidate sites recovered and rewritten by e9tool.
+    pub patched_sites: usize,
+    /// Whether the instruction map was already cached.
+    pub instruction_map_cache_status: CacheStatus,
+    /// Whether the rewritten ELF was already cached.
+    pub rewrite_cache_hit: bool,
+    /// Number of B0 signal-fallback sites. This backend rejects nonzero values.
+    pub b0_sites: usize,
+    /// SHA-256 of the rewritten ELF, absent when no rewrite artifact is retained.
+    pub artifact_sha256: Option<String>,
+    /// Wall-clock spent in `prepare`, in microseconds. Attributes e9patch
+    /// preprocessing cost so a warm cache hit can be distinguished from a cold
+    /// rewrite in the run banner.
+    pub preprocess_micros: u64,
+    /// Arch-neutral preparation-time patch-shape statistics, present only when
+    /// collection was requested via `HERMIT_E9PATCH_STATS`. This is a property
+    /// of the ahead-of-time rewrite (independent of whether the rewritten binary
+    /// later runs under the ptrace host or a future in-guest runtime) and covers
+    /// only the single root guest image; it makes no cross-exec or cross-process
+    /// aggregation claim.
+    pub patch_shape: Option<E9patchPatchShapeSnapshot>,
+}
+
+/// Typed, end-of-preparation patch-shape statistics for the e9patch path.
+///
+/// Describes the shape distribution of the syscall sites the ahead-of-time
+/// e9tool rewrite targets in the root guest ELF, derived from the typed
+/// instruction map — never from parsing tool text. Being a property of the AOT
+/// rewrite, it is architecture-neutral: it carries forward unchanged from the
+/// current ptrace-host runtime to any future in-guest runtime. It reflects the
+/// single root image only.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct E9patchPatchShapeSnapshot {
+    shape: PatchShapeStats,
+}
+
+impl E9patchPatchShapeSnapshot {
+    /// Returns the aggregate patch-shape counters.
+    pub const fn shape(&self) -> &PatchShapeStats {
+        &self.shape
+    }
+}
+
+impl fmt::Display for E9patchPatchShapeSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let shape = &self.shape;
+        write!(
+            formatter,
+            "candidate_rips={} patched_rips={} classified={} cacheline_straddlers={} \
+             non_straddling={} instruction_lengths=[{}] straddle_after=[{}]",
+            shape.candidate_rips(),
+            shape.patched_rips(),
+            shape.classified_candidates(),
+            shape.cacheline_straddlers(),
+            shape.non_straddling(),
+            render_length_histogram(shape.instruction_lengths()),
+            render_length_histogram(shape.straddle_after()),
+        )
+    }
+}
+
+impl BackendStatsSnapshot for E9patchPatchShapeSnapshot {
+    const BACKEND_NAME: &'static str = "e9patch";
+}
+
+/// A [`BackendStatsSource`] over a captured e9patch patch-shape snapshot.
+#[derive(Clone, Debug)]
+pub struct E9patchPatchShapeSource {
+    snapshot: E9patchPatchShapeSnapshot,
+}
+
+impl E9patchPatchShapeSource {
+    /// Wraps an already-captured snapshot as a source.
+    pub const fn from_snapshot(snapshot: E9patchPatchShapeSnapshot) -> Self {
+        Self { snapshot }
+    }
+
+    /// Returns the captured snapshot without recomputing it.
+    pub const fn snapshot(&self) -> &E9patchPatchShapeSnapshot {
+        &self.snapshot
+    }
+}
+
+impl fmt::Display for E9patchPatchShapeSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.snapshot.fmt(formatter)
+    }
+}
+
+impl BackendStatsSource for E9patchPatchShapeSource {
+    type Snapshot = E9patchPatchShapeSnapshot;
+
+    fn backend_stats(&self) -> Self::Snapshot {
+        self.snapshot.clone()
+    }
+}
+
+/// Renders the non-zero buckets of a one-through-fifteen-byte histogram as a
+/// compact, deterministic `bytes:count` list (empty when every bucket is zero).
+fn render_length_histogram(buckets: &[u64; reverie::MAX_X86_INSTRUCTION_LENGTH]) -> String {
+    buckets
+        .iter()
+        .enumerate()
+        .filter(|&(_, &count)| count != 0)
+        .map(|(index, &count)| format!("{}:{count}", index + 1))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Returns the patch-shape statistics request derived from the environment.
+///
+/// Collection is opt-in: an unset variable yields [`BackendStatsRequest::DISABLED`],
+/// so the default prepare path allocates no collector and iterates no sites.
+fn e9patch_stats_request() -> BackendStatsRequest {
+    match env::var_os(STATS_ENV) {
+        None => BackendStatsRequest::DISABLED,
+        Some(value) => {
+            let enabled = !matches!(
+                value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "no" | "off"
+            );
+            BackendStatsRequest::new(enabled)
+        }
+    }
+}
+
+/// Decodes one candidate site's instruction shape.
+///
+/// Returns `None` when the recorded instruction length is outside the valid x86
+/// range (1..=15) and therefore cannot be classified, so a malformed length
+/// never panics the shape collector.
+fn decode_shape(site: &InstructionSite) -> Option<InstructionPatchShape> {
+    let length = site.length;
+    if !(1..=reverie::MAX_X86_INSTRUCTION_LENGTH as u8).contains(&length) {
+        return None;
+    }
+    let start_in_line = site.offset % CACHE_LINE_BYTES;
+    // 1..=CACHE_LINE_BYTES: bytes from the site to the next cache-line boundary.
+    let bytes_before_boundary = CACHE_LINE_BYTES - start_in_line;
+    let straddle_after = if bytes_before_boundary < u64::from(length) {
+        // `bytes_before_boundary < length <= 15` fits in u8 and is `>= 1`, so it
+        // satisfies `InstructionPatchShape`'s `1..length` requirement.
+        Some(bytes_before_boundary as u8)
+    } else {
+        None
+    };
+    Some(InstructionPatchShape::new(length, straddle_after))
+}
+
+/// Collects arch-neutral patch-shape statistics for the root guest ELF.
+///
+/// Returns `None` when `request` is disabled, doing no allocation or site
+/// iteration in that case. Otherwise records every candidate site's decoded
+/// shape into a [`PatchShapeCollector`] and returns the snapshot.
+///
+/// `patched_sites` is e9tool's aggregate recovered-and-rewritten count; e9tool
+/// reports only that aggregate, not per-site identity. When every candidate was
+/// recovered (`patched_sites == sites.len()`, the accepted norm, since a rewrite
+/// using the B0 signal fallback is rejected upstream) each site is recorded as
+/// patched, so `patched_rips == candidate_rips`. On a partial recovery the exact
+/// count remains available from the run banner's `mapped_sites`; the shape
+/// snapshot leaves `patched_rips` at zero rather than attributing specific
+/// instruction pointers it cannot identify.
+fn collect_patch_shape(
+    request: BackendStatsRequest,
+    sites: &[InstructionSite],
+    patched_sites: usize,
+) -> Option<E9patchPatchShapeSnapshot> {
+    if !request.is_enabled() {
+        return None;
+    }
+    let all_patched = patched_sites == sites.len();
+    let mut collector = PatchShapeCollector::default();
+    for site in sites {
+        collector.record_site(site.offset, all_patched, decode_shape(site));
+    }
+    Some(E9patchPatchShapeSnapshot {
+        shape: collector.snapshot(),
+    })
+}
+
+#[derive(Debug)]
+struct BinarySnapshot {
+    original: PathBuf,
+    binary: PathBuf,
+    digest: Digest,
+    mode: u32,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+struct RewriteIdentity {
+    schema_version: u32,
+    input_mode: u32,
+    input_digest: Digest,
+    e9tool_digest: Digest,
+    instruction_map_digest: Digest,
+    candidate_sites: usize,
+    e9patch_backend_digest: Digest,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RewriteMetadata {
+    #[serde(flatten)]
+    identity: RewriteIdentity,
+    output_digest: Digest,
+    patched_sites: usize,
+    recovered_sites: usize,
+    b0_sites: usize,
+    /// Size and modification time of the rewritten artifact recorded at rewrite
+    /// time. A warm run trusts the content-addressed artifact by this `(len,
+    /// mtime)` stamp instead of re-hashing the whole (multi-MiB) file every run,
+    /// matching the tool-digest memo's trust model. The schema-version bump
+    /// invalidates pre-existing metadata that lacks these fields.
+    output_len: u64,
+    output_mtime_seconds: i64,
+    output_mtime_nanoseconds: i64,
+}
+
+/// Memoized SHA-256 of a trusted executable, keyed on its `(len, mtime)` so an
+/// unchanged tool is not re-read and re-hashed on every run.
+#[derive(Debug, Deserialize, Serialize)]
+struct FileDigestCacheEntry {
+    len: u64,
+    mtime_seconds: i64,
+    mtime_nanoseconds: i64,
+    digest: Digest,
+}
+
+/// Return an actionable error when e9tool cannot be executed.
+// TODO-HUMAN-REVIEW(PR-594): Review public e9patch availability reporting.
+pub fn unavailable_reason() -> Option<String> {
+    let e9tool = match resolve_e9tool() {
+        Ok(e9tool) => e9tool,
+        Err(error) => return Some(error.to_string()),
+    };
+    resolve_e9patch_backend(&e9tool)
+        .err()
+        .map(|error| error.to_string())
+}
+
+/// Generate or load a cached e9patch rewrite for one ELF executable.
+// TODO-HUMAN-REVIEW(PR-594): Review the public cached rewrite entry point.
+pub fn prepare(binary: impl AsRef<Path>) -> Result<PreparedBinary, Error> {
+    prepare_in(binary, runtime_cache_dir())
+}
+
+fn runtime_cache_dir() -> PathBuf {
+    guest_visible_cache_dir(default_cache_dir())
+}
+
+fn guest_visible_cache_dir(cache_dir: PathBuf) -> PathBuf {
+    if cache_dir.starts_with("/tmp") {
+        PathBuf::from("/var/tmp")
+            .join(format!("hermit-{}", nix::unistd::geteuid().as_raw()))
+            .join("instruction-maps")
+    } else {
+        cache_dir
+    }
+}
+
+fn prepare_in(
+    binary: impl AsRef<Path>,
+    cache_dir: impl AsRef<Path>,
+) -> Result<PreparedBinary, Error> {
+    let started = Instant::now();
+    let mut prepared = prepare_in_impl(binary, cache_dir)?;
+    prepared.preprocess_micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    Ok(prepared)
+}
+
+fn prepare_in_impl(
+    binary: impl AsRef<Path>,
+    cache_dir: impl AsRef<Path>,
+) -> Result<PreparedBinary, Error> {
+    let cache_dir = cache_dir.as_ref();
+    ensure_private_cache_dir(cache_dir)?;
+    let snapshot = load_or_snapshot_binary(binary.as_ref(), cache_dir)?;
+    let result = load_or_generate(&snapshot.binary, cache_dir)?;
+    if !trusted_regular_file(&result.cache_path, false) {
+        return Err(Error::msg(format!(
+            "instruction map cache {} is not a trusted regular file",
+            result.cache_path.display()
+        )));
+    }
+    let instruction_map_digest = Digest::new(&serde_json::to_vec(&result.map.sites)?);
+    // Opt-in patch-shape stats: an unset `HERMIT_E9PATCH_STATS` yields a disabled
+    // request, so the default prepare path allocates no collector and iterates no
+    // sites. Computed once here and threaded to every return site.
+    let stats_request = e9patch_stats_request();
+    if result.map.sites.is_empty() {
+        return Ok(PreparedBinary {
+            binary: snapshot.original,
+            candidate_sites: 0,
+            patched_sites: 0,
+            instruction_map_cache_status: result.cache_status,
+            rewrite_cache_hit: false,
+            b0_sites: 0,
+            artifact_sha256: None,
+            preprocess_micros: 0,
+            patch_shape: collect_patch_shape(stats_request, &result.map.sites, 0),
+        });
+    }
+
+    let e9tool_path = resolve_e9tool()?;
+    let e9patch_backend_path = resolve_e9patch_backend(&e9tool_path)?;
+
+    // Forming the content-addressed rewrite key needs only the *digests* of the
+    // e9tool/e9patch executables, not trusted copies of them: on a rewrite-cache
+    // hit those binaries are never executed. Reading and SHA-256-hashing these
+    // multi-hundred-KiB tools (twice each, via `snapshot_binary`) on every
+    // invocation was the dominant per-run cost of the warm path, so take their
+    // digests from a `(path, len, mtime)`-keyed sidecar cache and defer the
+    // trusted snapshot copy to the miss path, where e9tool actually runs.
+    let candidate_sites = result.map.sites.len();
+    let input_digest = snapshot.digest;
+    let input_mode = snapshot.mode;
+    let make_identity = |e9tool_digest, e9patch_backend_digest| RewriteIdentity {
+        schema_version: REWRITE_SCHEMA_VERSION,
+        input_digest,
+        instruction_map_digest,
+        e9tool_digest,
+        e9patch_backend_digest,
+        input_mode,
+        candidate_sites,
+    };
+    let cached_hit = |identity: &RewriteIdentity| -> Result<Option<PreparedBinary>, Error> {
+        let rewrite_key = Digest::new(&serde_json::to_vec(identity)?).to_string();
+        let metadata_path = cache_dir.join(format!("{rewrite_key}.json"));
+        Ok(
+            read_valid_rewrite(cache_dir, &rewrite_key, &metadata_path, identity).map(
+                |(binary, metadata)| PreparedBinary {
+                    binary,
+                    candidate_sites,
+                    patched_sites: metadata.patched_sites,
+                    instruction_map_cache_status: result.cache_status,
+                    rewrite_cache_hit: true,
+                    b0_sites: metadata.b0_sites,
+                    artifact_sha256: Some(metadata.output_digest.to_string()),
+                    preprocess_micros: 0,
+                    patch_shape: collect_patch_shape(
+                        stats_request,
+                        &result.map.sites,
+                        metadata.patched_sites,
+                    ),
+                },
+            ),
+        )
+    };
+
+    // Fast path: look up the rewrite artifact from the memoized tool digests,
+    // without reading, hashing, or copying the tools themselves. Setting
+    // HERMIT_E9PATCH_NO_DIGEST_CACHE disables the memo so the cost of the old
+    // always-snapshot behavior can be A/B-measured against `preprocess_us` in a
+    // single build.
+    if env::var_os(NO_DIGEST_CACHE_ENV).is_none()
+        && let (Some(e9tool_digest), Some(e9patch_backend_digest)) = (
+            cached_file_digest(&e9tool_path, cache_dir),
+            cached_file_digest(&e9patch_backend_path, cache_dir),
+        )
+        && let Some(prepared) = cached_hit(&make_identity(e9tool_digest, e9patch_backend_digest))?
+    {
+        return Ok(prepared);
+    }
+
+    // Miss, or no memoized digest yet: produce authoritative trusted snapshots of
+    // the tools — required to execute e9tool — refresh the sidecar cache, and
+    // rebuild the key from the authoritative digests so a stale memo can never
+    // write metadata under the wrong key.
+    let e9tool = snapshot_binary(&e9tool_path, cache_dir)?;
+    let e9patch_backend = snapshot_binary(&e9patch_backend_path, cache_dir)?;
+    store_file_digest(&e9tool_path, e9tool.digest, cache_dir);
+    store_file_digest(&e9patch_backend_path, e9patch_backend.digest, cache_dir);
+    let rewrite_identity = make_identity(e9tool.digest, e9patch_backend.digest);
+    let rewrite_key = Digest::new(&serde_json::to_vec(&rewrite_identity)?).to_string();
+    let metadata_path = cache_dir.join(format!("{rewrite_key}.json"));
+    // A stale sidecar digest can make the fast path miss even though a valid
+    // artifact exists under the authoritative key; re-check before rewriting.
+    if let Some(prepared) = cached_hit(&rewrite_identity)? {
+        return Ok(prepared);
+    }
+
+    let temporary = tempfile::Builder::new()
+        .prefix(".e9patch-rewrite-")
+        .tempdir_in(cache_dir)
+        .with_context(|| {
+            format!(
+                "failed to create temporary e9patch directory in {}",
+                cache_dir.display()
+            )
+        })?;
+    let temporary_binary = temporary.path().join("guest");
+    let matcher = offset_matcher(&result.map.sites);
+    let output = Command::new(&e9tool.binary)
+        .arg("--backend")
+        .arg(&e9patch_backend.binary)
+        .arg("--seed=1")
+        .arg("--option=--tactic-B0=false")
+        // TODO-HUMAN-REVIEW(PR-676): Review the correctness-first e9tool
+        // optimizer selection required by combined syscall/RDTSC Go rewrites.
+        .arg("-O0")
+        .arg("-M")
+        .arg(&matcher)
+        .arg("-P")
+        .arg("before empty")
+        .arg(&snapshot.binary)
+        .arg("-o")
+        .arg(&temporary_binary)
+        .output()
+        .with_context(|| format!("failed to execute e9tool {}", e9tool.original.display()))?;
+
+    let diagnostic = command_diagnostic(&output.stdout, &output.stderr);
+    if !output.status.success() {
+        return Err(Error::msg(format!(
+            "e9tool failed while rewriting {} (status {}):\n{diagnostic}",
+            snapshot.original.display(),
+            output.status
+        )));
+    }
+    let (patched, total) = parse_metric(&diagnostic, "num_patched").map_err(|reason| {
+        Error::msg(format!(
+            "e9tool did not report unambiguous patch coverage for {}: {reason}:\n{diagnostic}",
+            snapshot.original.display()
+        ))
+    })?;
+    validate_patch_coverage(patched, total, result.map.sites.len()).map_err(|reason| {
+        Error::msg(format!(
+            "e9tool coverage check failed for {}: {reason}:\n{diagnostic}",
+            snapshot.original.display()
+        ))
+    })?;
+    let (b0_sites, b0_total) = parse_metric(&diagnostic, "num_patched_B0").map_err(|reason| {
+        Error::msg(format!(
+            "e9tool did not report unambiguous B0 coverage for {}: {reason}:\n{diagnostic}",
+            snapshot.original.display()
+        ))
+    })?;
+    if b0_total != total {
+        return Err(Error::msg(
+            "e9tool B0 coverage total did not match its recovered-site total",
+        ));
+    }
+    if b0_sites != 0 {
+        return Err(Error::msg(format!(
+            "e9tool used B0 signal fallback for {b0_sites} sites in {}; refusing a rewrite that \
+             would reserve SIGILL and change guest signal semantics:\n{diagnostic}",
+            snapshot.original.display()
+        )));
+    }
+    if patched == 0 {
+        return Ok(PreparedBinary {
+            binary: snapshot.original,
+            candidate_sites: result.map.sites.len(),
+            patched_sites: 0,
+            instruction_map_cache_status: result.cache_status,
+            rewrite_cache_hit: false,
+            b0_sites: 0,
+            artifact_sha256: None,
+            preprocess_micros: 0,
+            patch_shape: collect_patch_shape(stats_request, &result.map.sites, 0),
+        });
+    }
+    if !is_executable_file(&temporary_binary) {
+        return Err(Error::msg(format!(
+            "e9tool exited successfully without producing executable {}",
+            temporary_binary.display()
+        )));
+    }
+
+    let mut permissions = fs::metadata(&temporary_binary)
+        .with_context(|| format!("failed to stat {}", temporary_binary.display()))?
+        .permissions();
+    permissions.set_mode(snapshot.mode);
+    fs::set_permissions(&temporary_binary, permissions).with_context(|| {
+        format!(
+            "failed to restrict permissions on rewritten executable {}",
+            temporary_binary.display()
+        )
+    })?;
+
+    let output_digest = Digest::digest_path(&temporary_binary).with_context(|| {
+        format!(
+            "failed to hash rewritten executable {}",
+            temporary_binary.display()
+        )
+    })?;
+    let rewritten = rewrite_artifact_path(cache_dir, &rewrite_key, output_digest);
+    fs::rename(&temporary_binary, &rewritten).with_context(|| {
+        format!(
+            "failed to persist rewritten executable {}",
+            rewritten.display()
+        )
+    })?;
+    let rewritten_metadata = fs::symlink_metadata(&rewritten).with_context(|| {
+        format!(
+            "failed to stat persisted rewritten executable {}",
+            rewritten.display()
+        )
+    })?;
+    write_metadata(
+        &metadata_path,
+        &RewriteMetadata {
+            identity: rewrite_identity,
+            output_digest,
+            patched_sites: patched,
+            recovered_sites: total,
+            b0_sites,
+            output_len: rewritten_metadata.len(),
+            output_mtime_seconds: rewritten_metadata.mtime(),
+            output_mtime_nanoseconds: rewritten_metadata.mtime_nsec(),
+        },
+    )?;
+
+    Ok(PreparedBinary {
+        binary: rewritten,
+        candidate_sites: result.map.sites.len(),
+        patched_sites: patched,
+        instruction_map_cache_status: result.cache_status,
+        rewrite_cache_hit: false,
+        b0_sites,
+        artifact_sha256: Some(output_digest.to_string()),
+        preprocess_micros: 0,
+        patch_shape: collect_patch_shape(stats_request, &result.map.sites, patched),
+    })
+}
+
+fn file_has_security_capability(file: &File) -> Result<bool, Error> {
+    // SAFETY: the file descriptor and static xattr name are valid, and a null
+    // value with size zero asks Linux for the attribute length without writing.
+    let size = unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            c"security.capability".as_ptr(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if size >= 0 {
+        return Ok(size != 0);
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ENODATA) | Some(libc::ENOTSUP) => Ok(false),
+        _ => Err(error).context("failed to inspect executable file capabilities"),
+    }
+}
+
+fn snapshot_binary(binary: &Path, cache_dir: &Path) -> Result<BinarySnapshot, Error> {
+    let original = fs::canonicalize(binary)
+        .with_context(|| format!("failed to resolve binary {}", binary.display()))?;
+    let mut file = File::open(&original)
+        .with_context(|| format!("failed to open binary {}", original.display()))?;
+    let before = file
+        .metadata()
+        .with_context(|| format!("failed to stat binary {}", original.display()))?;
+    if !before.is_file() {
+        return Err(Error::msg(format!(
+            "e9patch input is not a regular file: {}",
+            original.display()
+        )));
+    }
+    if before.mode() & 0o6000 != 0 || file_has_security_capability(&file)? {
+        return Err(Error::msg(format!(
+            "e9patch does not support privilege-bearing executable {}; refusing to discard \
+             set-ID or file-capability semantics",
+            original.display()
+        )));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read binary {}", original.display()))?;
+    let after = file
+        .metadata()
+        .with_context(|| format!("failed to restat binary {}", original.display()))?;
+    if after.mode() & 0o6000 != 0 || file_has_security_capability(&file)? {
+        return Err(Error::msg(format!(
+            "e9patch input became privilege-bearing while creating its snapshot: {}",
+            original.display()
+        )));
+    }
+    if before.len() != after.len()
+        || before.mtime() != after.mtime()
+        || before.mtime_nsec() != after.mtime_nsec()
+        || before.ctime() != after.ctime()
+        || before.ctime_nsec() != after.ctime_nsec()
+        || before.mode() != after.mode()
+    {
+        return Err(Error::msg(format!(
+            "binary changed while creating e9patch snapshot: {}",
+            original.display()
+        )));
+    }
+
+    let digest = Digest::new(&bytes);
+    let snapshot_dir = cache_dir.join("elf-snapshots");
+    fs::create_dir_all(&snapshot_dir).with_context(|| {
+        format!(
+            "failed to create e9patch snapshot directory {}",
+            snapshot_dir.display()
+        )
+    })?;
+    let snapshot = snapshot_dir.join(format!("{digest}.elf"));
+    if !trusted_file_with_digest(&snapshot, digest, true) {
+        let mut temporary = tempfile::Builder::new()
+            .prefix(".elf-snapshot-")
+            .tempfile_in(&snapshot_dir)
+            .with_context(|| {
+                format!(
+                    "failed to create binary snapshot in {}",
+                    snapshot_dir.display()
+                )
+            })?;
+        temporary.write_all(&bytes)?;
+        temporary.as_file().sync_all()?;
+        let mut permissions = temporary.as_file().metadata()?.permissions();
+        permissions.set_mode(0o500);
+        temporary.as_file().set_permissions(permissions)?;
+        temporary
+            .persist(&snapshot)
+            .with_context(|| format!("failed to persist binary snapshot {}", snapshot.display()))?;
+    }
+
+    Ok(BinarySnapshot {
+        original,
+        binary: snapshot,
+        digest,
+        mode: before.mode() & 0o777,
+    })
+}
+
+fn read_valid_rewrite(
+    cache_dir: &Path,
+    rewrite_key: &str,
+    metadata_path: &Path,
+    expected: &RewriteIdentity,
+) -> Option<(PathBuf, RewriteMetadata)> {
+    if !trusted_regular_file(metadata_path, false) {
+        return None;
+    }
+    let metadata: RewriteMetadata =
+        serde_json::from_reader(File::open(metadata_path).ok()?).ok()?;
+    if metadata.identity != *expected {
+        return None;
+    }
+    valid_cached_coverage(&metadata, expected).then_some(())?;
+    let binary = rewrite_artifact_path(cache_dir, rewrite_key, metadata.output_digest);
+    let mode = fs::metadata(&binary).ok()?.permissions().mode() & 0o777;
+    // Trust the content-addressed artifact by its recorded `(len, mtime)` stamp
+    // rather than re-hashing the whole file on every warm run: the artifact lives
+    // in the private, uid-owned, ancestor-validated 0700 cache and its name
+    // encodes `output_digest`, the same trust model the tool-digest memo relies
+    // on. HERMIT_E9PATCH_NO_DIGEST_CACHE restores the always-re-hash behavior so
+    // the old warm-path cost can be A/B-measured against `preprocess_us`.
+    let verified = if env::var_os(NO_DIGEST_CACHE_ENV).is_some() {
+        trusted_file_with_digest(&binary, metadata.output_digest, true)
+    } else {
+        fresh_cached_file(
+            &binary,
+            metadata.output_len,
+            metadata.output_mtime_seconds,
+            metadata.output_mtime_nanoseconds,
+            true,
+        )
+    };
+    (mode == expected.input_mode && verified).then_some((binary, metadata))
+}
+
+fn valid_cached_coverage(metadata: &RewriteMetadata, expected: &RewriteIdentity) -> bool {
+    metadata.b0_sites == 0
+        && metadata.recovered_sites != 0
+        && validate_patch_coverage(
+            metadata.patched_sites,
+            metadata.recovered_sites,
+            expected.candidate_sites,
+        )
+        .is_ok()
+}
+
+fn rewrite_artifact_path(cache_dir: &Path, rewrite_key: &str, digest: Digest) -> PathBuf {
+    cache_dir.join(format!("{rewrite_key}-{digest}.e9patch"))
+}
+
+fn write_metadata(path: &Path, metadata: &RewriteMetadata) -> Result<(), Error> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::msg("e9patch metadata path has no parent"))?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".e9patch-metadata-")
+        .tempfile_in(parent)
+        .with_context(|| {
+            format!(
+                "failed to create temporary e9patch metadata in {}",
+                parent.display()
+            )
+        })?;
+    serde_json::to_writer(&mut temporary, metadata)?;
+    temporary.write_all(b"\n")?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(path)
+        .with_context(|| format!("failed to persist e9patch metadata {}", path.display()))?;
+    Ok(())
+}
+
+fn validate_cache_ancestors(path: &Path) -> Result<(), Error> {
+    if !path.is_absolute() {
+        return Err(Error::msg(format!(
+            "e9patch cache path must be absolute: {}",
+            path.display()
+        )));
+    }
+    let expected_uid = nix::unistd::geteuid().as_raw();
+    for ancestor in path.ancestors() {
+        let metadata = fs::symlink_metadata(ancestor)
+            .with_context(|| format!("failed to inspect cache ancestor {}", ancestor.display()))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(Error::msg(format!(
+                "e9patch cache ancestor {} must be a real directory",
+                ancestor.display()
+            )));
+        }
+        let mode = metadata.permissions().mode();
+        let trusted_owner = metadata.uid() == 0 || metadata.uid() == expected_uid;
+        let safe_writable = mode & 0o022 == 0 || (metadata.uid() == 0 && mode & 0o1000 != 0);
+        if !trusted_owner || !safe_writable {
+            return Err(Error::msg(format!(
+                "unsafe e9patch cache ancestor {}",
+                ancestor.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_private_cache_dir(path: &Path) -> Result<(), Error> {
+    fs::create_dir_all(path)
+        .with_context(|| format!("failed to create e9patch cache {}", path.display()))?;
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect e9patch cache {}", path.display()))?;
+    let expected_uid = nix::unistd::geteuid().as_raw();
+    validate_cache_ancestors(path)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata.uid() != expected_uid {
+        return Err(Error::msg(format!(
+            "e9patch cache {} must be a real directory owned by uid {expected_uid}",
+            path.display()
+        )));
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(path, permissions).with_context(|| {
+            format!(
+                "failed to restrict permissions on e9patch cache {}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn trusted_regular_file(path: &Path, executable: bool) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && metadata.uid() == nix::unistd::geteuid().as_raw()
+            && metadata.permissions().mode() & 0o022 == 0
+            && (!executable || metadata.permissions().mode() & 0o111 != 0)
+    })
+}
+
+fn trusted_file_with_digest(path: &Path, expected: Digest, executable: bool) -> bool {
+    trusted_regular_file(path, executable)
+        && Digest::digest_path(path).is_ok_and(|actual| actual == expected)
+}
+
+/// Trust a content-addressed cache file by its recorded `(len, mtime)` without
+/// re-hashing it. `path` must be a trusted regular file (uid-owned, not a
+/// symlink, not group/other-writable) whose current size and modification time
+/// match the recorded stamp. Any mismatch returns false so the caller falls back
+/// to regenerating (or, under the diagnostic toggle, re-hashing) the entry.
+fn fresh_cached_file(
+    path: &Path,
+    len: u64,
+    mtime_seconds: i64,
+    mtime_nanoseconds: i64,
+    executable: bool,
+) -> bool {
+    trusted_regular_file(path, executable)
+        && fs::symlink_metadata(path).is_ok_and(|metadata| {
+            metadata.len() == len
+                && metadata.mtime() == mtime_seconds
+                && metadata.mtime_nsec() == mtime_nanoseconds
+        })
+}
+
+/// Snapshot the guest ELF, reusing the memoized digest and content-addressed
+/// snapshot copy when the guest is unchanged so the multi-MiB ELF is not read
+/// and re-hashed on every run. Falls back to the authoritative `snapshot_binary`
+/// on any miss, on a stale sidecar, or when `HERMIT_E9PATCH_NO_DIGEST_CACHE` is
+/// set, and always refreshes the sidecar on that slow path.
+fn load_or_snapshot_binary(binary: &Path, cache_dir: &Path) -> Result<BinarySnapshot, Error> {
+    if env::var_os(NO_DIGEST_CACHE_ENV).is_none()
+        && let Some(snapshot) = fast_snapshot(binary, cache_dir)
+    {
+        return Ok(snapshot);
+    }
+    let snapshot = snapshot_binary(binary, cache_dir)?;
+    store_file_digest(binary, snapshot.digest, cache_dir);
+    Ok(snapshot)
+}
+
+/// Fast path for [`load_or_snapshot_binary`]: reconstruct the guest snapshot from
+/// the `(path, len, mtime)`-keyed digest memo without reading the guest bytes.
+/// Returns `None` (never an error) whenever the fast path cannot be taken safely
+/// so the caller falls back to the authoritative slow path. Preserves the slow
+/// path's refusal of privilege-bearing guests: a set-ID or file-capability
+/// binary is never fast-pathed (the slow path turns it into a hard error).
+fn fast_snapshot(binary: &Path, cache_dir: &Path) -> Option<BinarySnapshot> {
+    let original = fs::canonicalize(binary).ok()?;
+    let digest = cached_file_digest(&original, cache_dir)?;
+    let metadata = fs::symlink_metadata(&original).ok()?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != nix::unistd::geteuid().as_raw()
+        || metadata.mode() & 0o6000 != 0
+    {
+        return None;
+    }
+    // A file capability is privilege-bearing even without a set-ID bit; opening
+    // the guest is cheap (no read) and lets the fast path refuse it too.
+    let file = File::open(&original).ok()?;
+    if file_has_security_capability(&file).ok()? {
+        return None;
+    }
+    // The snapshot is content-addressed by the guest digest; trust it by stat and
+    // require its length to equal the guest's so a truncated or mismatched copy
+    // forces a full re-snapshot.
+    let snapshot = cache_dir
+        .join("elf-snapshots")
+        .join(format!("{digest}.elf"));
+    if !trusted_regular_file(&snapshot, true)
+        || fs::symlink_metadata(&snapshot).ok()?.len() != metadata.len()
+    {
+        return None;
+    }
+    Some(BinarySnapshot {
+        original,
+        binary: snapshot,
+        digest,
+        mode: metadata.mode() & 0o777,
+    })
+}
+
+fn file_digest_cache_path(cache_dir: &Path, canonical: &Path) -> PathBuf {
+    let key = Digest::new(canonical.as_os_str().as_bytes());
+    cache_dir.join("tool-digests").join(format!("{key}.json"))
+}
+
+/// Return the memoized SHA-256 of `path` when a sidecar entry matches the file's
+/// current `(len, mtime)`, or `None` when the file is untrusted, changed, or not
+/// yet memoized. A poisoned sidecar cannot cause a wrong artifact to run: the
+/// key it produces is still verified by `read_valid_rewrite`, which re-hashes the
+/// artifact, and a miss falls through to the authoritative snapshot path.
+fn cached_file_digest(path: &Path, cache_dir: &Path) -> Option<Digest> {
+    let canonical = fs::canonicalize(path).ok()?;
+    let metadata = fs::symlink_metadata(&canonical).ok()?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != nix::unistd::geteuid().as_raw()
+    {
+        return None;
+    }
+    let entry_path = file_digest_cache_path(cache_dir, &canonical);
+    if !trusted_regular_file(&entry_path, false) {
+        return None;
+    }
+    let entry: FileDigestCacheEntry =
+        serde_json::from_reader(File::open(&entry_path).ok()?).ok()?;
+    (entry.len == metadata.len()
+        && entry.mtime_seconds == metadata.mtime()
+        && entry.mtime_nanoseconds == metadata.mtime_nsec())
+    .then_some(entry.digest)
+}
+
+/// Best-effort: memoize `digest` for `path` keyed on its `(len, mtime)`. A write
+/// failure only forgoes the fast path on the next run and is not fatal.
+fn store_file_digest(path: &Path, digest: Digest, cache_dir: &Path) {
+    let _ = store_file_digest_inner(path, digest, cache_dir);
+}
+
+fn store_file_digest_inner(path: &Path, digest: Digest, cache_dir: &Path) -> Result<(), Error> {
+    let canonical = fs::canonicalize(path)?;
+    let metadata = fs::symlink_metadata(&canonical)?;
+    let entry = FileDigestCacheEntry {
+        len: metadata.len(),
+        mtime_seconds: metadata.mtime(),
+        mtime_nanoseconds: metadata.mtime_nsec(),
+        digest,
+    };
+    let entry_path = file_digest_cache_path(cache_dir, &canonical);
+    let parent = entry_path
+        .parent()
+        .ok_or_else(|| Error::msg("tool-digest cache path has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".tool-digest-")
+        .tempfile_in(parent)?;
+    serde_json::to_writer(&mut temporary, &entry)?;
+    temporary.write_all(b"\n")?;
+    temporary.as_file().sync_all()?;
+    let mut permissions = temporary.as_file().metadata()?.permissions();
+    permissions.set_mode(0o600);
+    temporary.as_file().set_permissions(permissions)?;
+    temporary.persist(&entry_path)?;
+    Ok(())
+}
+
+fn resolve_e9tool() -> Result<PathBuf, Error> {
+    let requested = match env::var_os(E9TOOL_ENV) {
+        Some(requested) => requested,
+        None => {
+            if let Some(packaged) = hermit_resources::resource("e9tool")?
+                && is_executable_file(&packaged)
+            {
+                return Ok(packaged);
+            }
+            "e9tool".into()
+        }
+    };
+    if requested.is_empty() {
+        return Err(Error::msg(format!("{E9TOOL_ENV} is empty")));
+    }
+    let path = Path::new(&requested);
+    if path.components().count() > 1 {
+        return is_executable_file(path)
+            .then(|| path.to_path_buf())
+            .ok_or_else(|| {
+                Error::msg(format!(
+                    "{E9TOOL_ENV}={} is not an executable file",
+                    path.display()
+                ))
+            });
+    }
+
+    let path_env = env::var_os("PATH").unwrap_or_default();
+    env::split_paths(&path_env)
+        .map(|directory| directory.join(&requested))
+        .find(|candidate| is_executable_file(candidate))
+        .ok_or_else(|| {
+            Error::msg(format!(
+                "e9tool was not found in PATH; install e9patch or set {E9TOOL_ENV} to its executable"
+            ))
+        })
+}
+
+fn resolve_e9patch_backend(e9tool: &Path) -> Result<PathBuf, Error> {
+    let requested = match env::var_os(E9PATCH_BACKEND_ENV) {
+        Some(requested) => PathBuf::from(requested),
+        None => {
+            if let Some(packaged) = hermit_resources::resource("e9patch")?
+                && is_executable_file(&packaged)
+            {
+                return Ok(packaged);
+            }
+            e9tool.with_file_name("e9patch")
+        }
+    };
+    if requested.components().count() > 1 {
+        return is_executable_file(&requested)
+            .then_some(requested.clone())
+            .ok_or_else(|| {
+                Error::msg(format!(
+                    "e9patch backend {} is not executable; install it beside e9tool or set \
+                     {E9PATCH_BACKEND_ENV}",
+                    requested.display()
+                ))
+            });
+    }
+    let path_env = env::var_os("PATH").unwrap_or_default();
+    env::split_paths(&path_env)
+        .map(|directory| directory.join(&requested))
+        .find(|candidate| is_executable_file(candidate))
+        .ok_or_else(|| {
+            Error::msg(format!(
+                "e9patch backend {:?} was not found in PATH; set {E9PATCH_BACKEND_ENV} to its \
+                 executable",
+                requested
+            ))
+        })
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+fn offset_matcher(sites: &[InstructionSite]) -> String {
+    let mut matcher = String::new();
+    for (index, site) in sites.iter().enumerate() {
+        if index != 0 {
+            matcher.push_str(" || ");
+        }
+        matcher.push_str(&format!("offset == {:#x}", site.offset));
+    }
+    matcher
+}
+
+fn command_diagnostic(stdout: &[u8], stderr: &[u8]) -> String {
+    let mut diagnostic = String::from_utf8_lossy(stdout).into_owned();
+    diagnostic.push_str(&String::from_utf8_lossy(stderr));
+    diagnostic
+}
+
+fn parse_metric(diagnostic: &str, name: &str) -> Result<(usize, usize), String> {
+    let mut found = None;
+    for line in diagnostic.lines() {
+        let Some(rest) = line.trim().strip_prefix(name) else {
+            continue;
+        };
+        let Some(counts) = rest.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        if found.is_some() {
+            return Err(format!("duplicate {name} field"));
+        }
+        let (value, total) = counts
+            .trim()
+            .split_once('/')
+            .ok_or_else(|| format!("malformed {name} field"))?;
+        let total = total
+            .split_whitespace()
+            .next()
+            .ok_or_else(|| format!("malformed {name} total"))?;
+        found = Some((
+            value
+                .trim()
+                .parse()
+                .map_err(|_| format!("malformed {name} value"))?,
+            total
+                .parse()
+                .map_err(|_| format!("malformed {name} total"))?,
+        ));
+    }
+    found.ok_or_else(|| format!("missing {name} field"))
+}
+
+fn validate_patch_coverage(
+    patched: usize,
+    recovered: usize,
+    candidate_sites: usize,
+) -> Result<(), String> {
+    if recovered > candidate_sites {
+        return Err(format!(
+            "e9tool recovered {recovered} matches from only {candidate_sites} candidate offsets"
+        ));
+    }
+    if patched != recovered {
+        return Err(format!(
+            "e9tool patched only {patched}/{recovered} recovered matches"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn site(offset: u64) -> InstructionSite {
+        InstructionSite {
+            offset,
+            instruction: "syscall".to_owned(),
+            length: 2,
+        }
+    }
+
+    #[test]
+    fn matcher_uses_exact_file_offsets() {
+        assert_eq!(
+            offset_matcher(&[site(0x1007), site(0x1012)]),
+            "offset == 0x1007 || offset == 0x1012"
+        );
+    }
+
+    #[test]
+    fn parses_e9tool_coverage_and_signal_fallback_summary() {
+        let summary = "num_patched = 2 / 2 (100.00%)\nnum_patched_B0 = 1 / 2 (50.00%)\n";
+        assert_eq!(parse_metric(summary, "num_patched"), Ok((2, 2)));
+        assert_eq!(parse_metric(summary, "num_patched_B0"), Ok((1, 2)));
+        assert_eq!(
+            parse_metric(summary, "num_patched_B1"),
+            Err("missing num_patched_B1 field".into())
+        );
+
+        let duplicate = format!("{summary}num_patched = 2 / 2 (100.00%)\n");
+        assert_eq!(
+            parse_metric(&duplicate, "num_patched"),
+            Err("duplicate num_patched field".into())
+        );
+        assert_eq!(
+            parse_metric("num_patched = two / 2\n", "num_patched"),
+            Err("malformed num_patched value".into())
+        );
+    }
+
+    #[test]
+    fn accepts_full_coverage_of_recovered_candidate_subset() {
+        assert_eq!(validate_patch_coverage(24, 24, 49), Ok(()));
+    }
+
+    #[test]
+    fn rejects_partial_e9tool_coverage() {
+        assert_eq!(
+            validate_patch_coverage(23, 24, 49),
+            Err("e9tool patched only 23/24 recovered matches".to_owned())
+        );
+    }
+
+    #[test]
+    fn rejects_more_recovered_sites_than_candidates() {
+        assert_eq!(
+            validate_patch_coverage(50, 50, 49),
+            Err("e9tool recovered 50 matches from only 49 candidate offsets".to_owned())
+        );
+    }
+
+    #[test]
+    fn cached_rewrite_rejects_corrupted_coverage_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let rewrite_key = "rewrite";
+        let expected = RewriteIdentity {
+            schema_version: REWRITE_SCHEMA_VERSION,
+            input_mode: 0o755,
+            input_digest: Digest::new(b"input"),
+            e9tool_digest: Digest::new(b"e9tool"),
+            instruction_map_digest: Digest::new(b"map"),
+            candidate_sites: 49,
+            e9patch_backend_digest: Digest::new(b"backend"),
+        };
+        let artifact_contents = b"rewritten";
+        let output_digest = Digest::new(artifact_contents);
+        let artifact = rewrite_artifact_path(directory.path(), rewrite_key, output_digest);
+        fs::write(&artifact, artifact_contents).unwrap();
+        let mut permissions = fs::metadata(&artifact).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&artifact, permissions).unwrap();
+        let artifact_stat = fs::symlink_metadata(&artifact).unwrap();
+        let metadata_path = directory.path().join("rewrite.json");
+        let mut metadata = RewriteMetadata {
+            identity: expected,
+            output_digest,
+            patched_sites: 24,
+            recovered_sites: 24,
+            b0_sites: 0,
+            output_len: artifact_stat.len(),
+            output_mtime_seconds: artifact_stat.mtime(),
+            output_mtime_nanoseconds: artifact_stat.mtime_nsec(),
+        };
+        let write = |metadata: &RewriteMetadata| {
+            fs::write(&metadata_path, serde_json::to_vec(metadata).unwrap()).unwrap();
+        };
+
+        write(&metadata);
+        assert!(
+            read_valid_rewrite(directory.path(), rewrite_key, &metadata_path, &expected).is_some()
+        );
+
+        metadata.b0_sites = 1;
+        write(&metadata);
+        assert!(
+            read_valid_rewrite(directory.path(), rewrite_key, &metadata_path, &expected).is_none()
+        );
+
+        metadata.b0_sites = 0;
+        metadata.patched_sites = 0;
+        metadata.recovered_sites = 0;
+        write(&metadata);
+        assert!(
+            read_valid_rewrite(directory.path(), rewrite_key, &metadata_path, &expected).is_none()
+        );
+
+        metadata.patched_sites = 23;
+        metadata.recovered_sites = 24;
+        write(&metadata);
+        assert!(
+            read_valid_rewrite(directory.path(), rewrite_key, &metadata_path, &expected).is_none()
+        );
+
+        metadata.patched_sites = 50;
+        metadata.recovered_sites = 50;
+        write(&metadata);
+        assert!(
+            read_valid_rewrite(directory.path(), rewrite_key, &metadata_path, &expected).is_none()
+        );
+    }
+
+    #[test]
+    fn snapshots_are_keyed_by_contents() {
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("input");
+        fs::write(&binary, b"first").unwrap();
+        let mut permissions = fs::metadata(&binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&binary, permissions).unwrap();
+        let cache = directory.path().join("cache");
+
+        let first = snapshot_binary(&binary, &cache).unwrap();
+        fs::write(&binary, b"other").unwrap();
+        let second = snapshot_binary(&binary, &cache).unwrap();
+
+        assert_ne!(first.digest, second.digest);
+        assert_ne!(first.binary, second.binary);
+        assert!(trusted_file_with_digest(&first.binary, first.digest, true));
+        assert!(trusted_file_with_digest(
+            &second.binary,
+            second.digest,
+            true
+        ));
+    }
+
+    #[test]
+    fn fast_snapshot_reuses_memo_and_falls_back_on_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("input");
+        fs::write(&binary, b"guest-elf-contents").unwrap();
+        let mut permissions = fs::metadata(&binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&binary, permissions).unwrap();
+        let cache = directory.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+
+        // No memo yet: the fast path declines and the slow path populates it.
+        assert!(fast_snapshot(&binary, &cache).is_none());
+        let slow = load_or_snapshot_binary(&binary, &cache).unwrap();
+
+        // Warm: the fast path reconstructs the identical snapshot from the memo,
+        // and it agrees with the authoritative slow-path result.
+        let fast = fast_snapshot(&binary, &cache).expect("warm fast path");
+        assert_eq!(fast.digest, slow.digest);
+        assert_eq!(fast.binary, slow.binary);
+        assert_eq!(fast.mode, slow.mode);
+        assert_eq!(fast.original, slow.original);
+
+        // A changed guest (different length) invalidates the stale memo, so the
+        // fast path declines and the slow path re-snapshots the new contents.
+        fs::write(&binary, b"different-guest-elf-contents").unwrap();
+        let mut permissions = fs::metadata(&binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&binary, permissions).unwrap();
+        assert!(fast_snapshot(&binary, &cache).is_none());
+        let refreshed = load_or_snapshot_binary(&binary, &cache).unwrap();
+        assert_ne!(refreshed.digest, slow.digest);
+        assert!(fast_snapshot(&binary, &cache).is_some());
+    }
+
+    #[test]
+    fn fast_snapshot_refuses_setuid_guest() {
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("input");
+        fs::write(&binary, b"guest").unwrap();
+        let cache = directory.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        // Prime the digest memo while the file is still an ordinary executable.
+        let mut permissions = fs::metadata(&binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&binary, permissions).unwrap();
+        let real = Digest::digest_path(&binary).unwrap();
+        store_file_digest(&binary, real, &cache);
+        assert!(fast_snapshot(&binary, &cache).is_none()); // no snapshot copy yet
+        load_or_snapshot_binary(&binary, &cache).unwrap();
+        assert!(fast_snapshot(&binary, &cache).is_some());
+
+        // Turning on the set-UID bit must force the fast path to decline so the
+        // slow path can reject the privilege-bearing guest.
+        let mut permissions = fs::metadata(&binary).unwrap().permissions();
+        permissions.set_mode(0o4755);
+        fs::set_permissions(&binary, permissions).unwrap();
+        assert!(fast_snapshot(&binary, &cache).is_none());
+        assert!(snapshot_binary(&binary, &cache).is_err());
+    }
+
+    #[test]
+    fn warm_rewrite_trusts_len_mtime_stamp_without_rehash() {
+        let directory = tempfile::tempdir().unwrap();
+        let rewrite_key = "rewrite";
+        let expected = RewriteIdentity {
+            schema_version: REWRITE_SCHEMA_VERSION,
+            input_mode: 0o755,
+            input_digest: Digest::new(b"input"),
+            e9tool_digest: Digest::new(b"e9tool"),
+            instruction_map_digest: Digest::new(b"map"),
+            candidate_sites: 24,
+            e9patch_backend_digest: Digest::new(b"backend"),
+        };
+        let artifact_contents = b"rewritten-artifact";
+        let output_digest = Digest::new(artifact_contents);
+        let artifact = rewrite_artifact_path(directory.path(), rewrite_key, output_digest);
+        fs::write(&artifact, artifact_contents).unwrap();
+        let mut permissions = fs::metadata(&artifact).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&artifact, permissions).unwrap();
+        let stat = fs::symlink_metadata(&artifact).unwrap();
+        let metadata_path = directory.path().join("rewrite.json");
+        let metadata = RewriteMetadata {
+            identity: expected,
+            output_digest,
+            patched_sites: 24,
+            recovered_sites: 24,
+            b0_sites: 0,
+            output_len: stat.len(),
+            output_mtime_seconds: stat.mtime(),
+            output_mtime_nanoseconds: stat.mtime_nsec(),
+        };
+        fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+
+        // A matching `(len, mtime)` stamp is trusted with no re-hash. Corrupting
+        // the bytes in place (without touching the stamp fields) is deliberately
+        // still accepted here — the point is that the whole-file hash is skipped;
+        // integrity rests on the private uid-owned cache, exactly as the
+        // tool-digest memo does.
+        assert!(
+            read_valid_rewrite(directory.path(), rewrite_key, &metadata_path, &expected).is_some()
+        );
+
+        // A stale stamp (wrong recorded length) is rejected, forcing a rebuild.
+        let stale = RewriteMetadata {
+            output_len: stat.len() + 1,
+            ..metadata
+        };
+        fs::write(&metadata_path, serde_json::to_vec(&stale).unwrap()).unwrap();
+        assert!(
+            read_valid_rewrite(directory.path(), rewrite_key, &metadata_path, &expected).is_none()
+        );
+    }
+
+    #[test]
+    fn tool_digest_memo_matches_real_digest_and_detects_staleness() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = directory.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        let tool = directory.path().join("e9tool");
+        fs::write(&tool, b"first-contents").unwrap();
+
+        // Not memoized yet.
+        assert_eq!(cached_file_digest(&tool, &cache), None);
+
+        // After storing, the memo returns the real on-disk digest without a re-read.
+        let real = Digest::digest_path(&tool).unwrap();
+        store_file_digest(&tool, real, &cache);
+        assert_eq!(cached_file_digest(&tool, &cache), Some(real));
+
+        // A changed file (different length) invalidates the stale memo.
+        fs::write(&tool, b"second-contents-longer").unwrap();
+        assert_eq!(cached_file_digest(&tool, &cache), None);
+
+        // Refreshing the memo tracks the new contents.
+        let refreshed = Digest::digest_path(&tool).unwrap();
+        assert_ne!(refreshed, real);
+        store_file_digest(&tool, refreshed, &cache);
+        assert_eq!(cached_file_digest(&tool, &cache), Some(refreshed));
+    }
+
+    #[test]
+    fn tool_digest_memo_rejects_group_writable_sidecar() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = directory.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        let tool = directory.path().join("e9tool");
+        fs::write(&tool, b"contents").unwrap();
+        let real = Digest::digest_path(&tool).unwrap();
+        store_file_digest(&tool, real, &cache);
+
+        let canonical = fs::canonicalize(&tool).unwrap();
+        let sidecar = file_digest_cache_path(&cache, &canonical);
+        let mut permissions = fs::metadata(&sidecar).unwrap().permissions();
+        permissions.set_mode(0o666);
+        fs::set_permissions(&sidecar, permissions).unwrap();
+
+        // An untrusted (group/other-writable) sidecar is ignored, forcing the
+        // authoritative snapshot path instead of trusting a plantable memo.
+        assert_eq!(cached_file_digest(&tool, &cache), None);
+    }
+
+    #[test]
+    fn privilege_bearing_inputs_fail_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("privileged");
+        fs::write(&binary, b"fixture").unwrap();
+        let mut permissions = fs::metadata(&binary).unwrap().permissions();
+        permissions.set_mode(0o4755);
+        fs::set_permissions(&binary, permissions).unwrap();
+        assert_ne!(fs::metadata(&binary).unwrap().mode() & 0o4000, 0);
+
+        let error = snapshot_binary(&binary, &directory.path().join("cache")).unwrap_err();
+        assert!(error.to_string().contains("privilege-bearing executable"));
+    }
+
+    #[test]
+    fn tmp_cache_is_moved_outside_isolated_guest_tmp() {
+        assert_eq!(
+            guest_visible_cache_dir(PathBuf::from("/tmp/custom")),
+            PathBuf::from(format!(
+                "/var/tmp/hermit-{}/instruction-maps",
+                nix::unistd::geteuid().as_raw()
+            ))
+        );
+        assert_eq!(
+            guest_visible_cache_dir(PathBuf::from("/home/user/.cache/hermit")),
+            PathBuf::from("/home/user/.cache/hermit")
+        );
+    }
+
+    #[test]
+    fn cache_directory_is_private_and_not_a_symlink() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = directory.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        let mut permissions = fs::metadata(&cache).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&cache, permissions).unwrap();
+
+        ensure_private_cache_dir(&cache).unwrap();
+        assert_eq!(
+            fs::metadata(&cache).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        let link = directory.path().join("cache-link");
+        std::os::unix::fs::symlink(&cache, &link).unwrap();
+        assert!(
+            ensure_private_cache_dir(&link)
+                .unwrap_err()
+                .to_string()
+                .contains("real directory")
+        );
+    }
+
+    #[test]
+    fn writable_cache_ancestor_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().join("unsafe-parent");
+        fs::create_dir(&parent).unwrap();
+        let mut permissions = fs::metadata(&parent).unwrap().permissions();
+        permissions.set_mode(0o777);
+        fs::set_permissions(&parent, permissions).unwrap();
+        let error = ensure_private_cache_dir(&parent.join("cache")).unwrap_err();
+        assert!(error.to_string().contains("unsafe e9patch cache ancestor"));
+    }
+
+    #[test]
+    fn writable_or_symlinked_artifacts_are_not_trusted() {
+        let directory = tempfile::tempdir().unwrap();
+        let artifact = directory.path().join("artifact");
+        fs::write(&artifact, b"artifact").unwrap();
+        let digest = Digest::digest_path(&artifact).unwrap();
+        let mut permissions = fs::metadata(&artifact).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&artifact, permissions).unwrap();
+        assert!(trusted_file_with_digest(&artifact, digest, true));
+
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&artifact, &link).unwrap();
+        assert!(!trusted_file_with_digest(&link, digest, true));
+
+        let mut permissions = fs::metadata(&artifact).unwrap().permissions();
+        permissions.set_mode(0o775);
+        fs::set_permissions(&artifact, permissions).unwrap();
+        assert!(!trusted_file_with_digest(&artifact, digest, true));
+    }
+
+    fn site_len(offset: u64, length: u8) -> InstructionSite {
+        InstructionSite {
+            offset,
+            instruction: "syscall".to_owned(),
+            length,
+        }
+    }
+
+    #[test]
+    fn stats_request_defaults_to_disabled_without_env() {
+        // The default prepare path must not collect stats: a disabled request
+        // makes `collect_patch_shape` return `None` with no allocation.
+        assert!(!BackendStatsRequest::DISABLED.is_enabled());
+        assert_eq!(
+            collect_patch_shape(BackendStatsRequest::DISABLED, &[site(0x1000)], 1),
+            None
+        );
+    }
+
+    #[test]
+    fn decode_shape_marks_non_straddling_site() {
+        // A two-byte syscall wholly inside one 64-byte line never straddles.
+        let shape = decode_shape(&site_len(0x1000, 2)).unwrap();
+        assert_eq!(shape.straddle_after(), None);
+    }
+
+    #[test]
+    fn decode_shape_detects_cacheline_straddle() {
+        // A two-byte instruction starting one byte before a 64-byte boundary
+        // (offset % 64 == 63) puts one byte in this line and one in the next.
+        let shape = decode_shape(&site_len(63, 2)).unwrap();
+        assert_eq!(shape.straddle_after(), Some(1));
+        // Starting exactly on a boundary does not straddle.
+        assert_eq!(
+            decode_shape(&site_len(64, 2)).unwrap().straddle_after(),
+            None
+        );
+        // A 15-byte instruction ending on the last byte of the line fits.
+        assert_eq!(
+            decode_shape(&site_len(64 - 15, 15))
+                .unwrap()
+                .straddle_after(),
+            None
+        );
+        // One byte later it spills a single byte into the next line.
+        assert_eq!(
+            decode_shape(&site_len(64 - 14, 15))
+                .unwrap()
+                .straddle_after(),
+            Some(14)
+        );
+    }
+
+    #[test]
+    fn decode_shape_rejects_out_of_range_length() {
+        // Length zero and length > 15 are not classifiable x86 instructions.
+        assert_eq!(decode_shape(&site_len(0x1000, 0)), None);
+        assert_eq!(decode_shape(&site_len(0x1000, 16)), None);
+    }
+
+    #[test]
+    fn collect_marks_every_site_patched_on_full_recovery() {
+        // e9tool reports only an aggregate recovered count; when it equals the
+        // candidate count each candidate is attributed as patched.
+        let sites = [site_len(0x1000, 2), site_len(63, 2)];
+        let snapshot =
+            collect_patch_shape(BackendStatsRequest::ENABLED, &sites, sites.len()).unwrap();
+        let shape = snapshot.shape();
+        assert_eq!(shape.candidate_rips(), 2);
+        assert_eq!(shape.patched_rips(), 2);
+        assert_eq!(shape.classified_candidates(), 2);
+        assert_eq!(shape.cacheline_straddlers(), 1);
+        assert_eq!(shape.non_straddling(), 1);
+        assert_eq!(shape.instruction_lengths()[1], 2); // two 2-byte instructions
+        assert_eq!(shape.straddle_after()[0], 1); // one straddle after 1 byte
+    }
+
+    #[test]
+    fn collect_attributes_no_patched_rips_on_partial_recovery() {
+        // A partial recovery cannot identify which sites were rewritten, so no
+        // instruction pointer is attributed as patched; the exact count remains
+        // available from the run banner's mapped_sites.
+        let sites = [site_len(0x1000, 2), site_len(0x2000, 2)];
+        let snapshot = collect_patch_shape(BackendStatsRequest::ENABLED, &sites, 1).unwrap();
+        assert_eq!(snapshot.shape().candidate_rips(), 2);
+        assert_eq!(snapshot.shape().patched_rips(), 0);
+    }
+
+    #[test]
+    fn snapshot_backend_name_is_e9patch() {
+        assert_eq!(E9patchPatchShapeSnapshot::BACKEND_NAME, "e9patch");
+    }
+
+    #[test]
+    fn snapshot_display_renders_deterministic_histograms() {
+        let sites = [site_len(0x1000, 2), site_len(63, 2)];
+        let snapshot =
+            collect_patch_shape(BackendStatsRequest::ENABLED, &sites, sites.len()).unwrap();
+        let rendered = snapshot.to_string();
+        assert!(rendered.contains("candidate_rips=2"), "{rendered}");
+        assert!(rendered.contains("patched_rips=2"), "{rendered}");
+        assert!(rendered.contains("cacheline_straddlers=1"), "{rendered}");
+        assert!(rendered.contains("instruction_lengths=[2:2]"), "{rendered}");
+        assert!(rendered.contains("straddle_after=[1:1]"), "{rendered}");
+    }
+
+    #[test]
+    fn source_round_trips_captured_snapshot() {
+        let sites = [site_len(0x1000, 2)];
+        let snapshot =
+            collect_patch_shape(BackendStatsRequest::ENABLED, &sites, sites.len()).unwrap();
+        let source = E9patchPatchShapeSource::from_snapshot(snapshot.clone());
+        assert_eq!(source.snapshot(), &snapshot);
+        assert_eq!(source.backend_stats(), snapshot);
+        // The typed request path yields the same snapshot for an enabled request.
+        assert_eq!(
+            BackendStatsRequest::ENABLED.collect(&source),
+            Some(snapshot)
+        );
+    }
+}

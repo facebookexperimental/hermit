@@ -12,7 +12,7 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
-static void check(int condition, const char* message) {
+static void check(int condition, const char *message) {
   if (!condition) {
     perror(message);
     exit(EXIT_FAILURE);

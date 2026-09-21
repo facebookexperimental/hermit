@@ -7,24 +7,25 @@ default). Sections 3p-3q add the overnight expansion evidence from batches 3-41 
 real-application matrix. It is meant to be copy-pasteable so you can reproduce the results
 yourself.
 
-> **TL;DR:** On the default ptrace backend, Hermit runs a broad range of real programs
-> bit-for-bit deterministically under `--strict --verify` — all of coreutils, crypto/hashing,
+> **TL;DR:** On the default ptrace backend, a broad range of real programs pass
+> Stripped `--strict --verify` comparison — all of coreutils, crypto/hashing,
 > compression, SQLite, floating-point math, filesystem tools, process trees, and
 > multithreaded C/OpenMP programs whose threads do **not** read wall-clock time.
 > **75 distinct program invocations were exercised in the baseline pass.** The overnight
-> expansion produced **134 clean L2 results as written, or 135 valid L2 results after replacing
+> expansion produced **134 clean Stripped results as written, or 135 valid
+> Stripped results after replacing
 > one malformed socket command with its corrected AF_UNIX form**. A **second expansion (batches
-> 30-41)** added **56 more clean L2 passes** across networking/sockets, signals, time/clock,
+> 30-41)** added **56 more clean Stripped passes** across networking/sockets, signals, time/clock,
 > environment/argv, mmap/memory, epoll/poll, larger CPython, C data-structure apps, Perl, C++,
 > and compiled Rust, plus **five real userland apps** (`bc`, `awk`, `sort`, `sed`, `sqlite3`)
-> verified at L2 (§3q). These batch rows overlap
+> passing Stripped verification (§3q). These batch rows overlap
 > the baseline and each other, so they are not added to 75 as a distinct-program total.
 > Recurring engine gaps include **multithreaded wall-clock reads**, heavy compiler process
 > trees, and blocking FIFO rendezvous. The clock gap is strongly **load-sensitive** (see the
 > box in §3); NSS and `/proc` mismatches additionally expose non-hermetic host state.
 > **New this session:** Hermit wraps a full **QEMU** VMM and boots Linux to userspace with
 > **byte-identical** serial output across two runs under relaxed flags (§3r), and a
-> consolidated **9-language L2 matrix** (C, C++, Rust, Go, Perl, Lua, Node.js, Java, gawk)
+> consolidated **9-language Stripped matrix** (C, C++, Rust, Go, Perl, Lua, Node.js, Java, gawk)
 > verifies clean (§3s).
 
 > ⚠️ **Run conditions matter.** This matrix was captured on a **heavily loaded** host
@@ -66,7 +67,9 @@ $HERMIT run --strict --verify -- <program> [args...]
 
 - `--strict` — full deterministic mode (virtual time, virtualized PIDs/ports, deterministic
   scheduling). It is currently the default; the flag is kept for clarity.
-- `--verify` — run the program twice and confirm the two runs are bit-for-bit identical.
+- `--verify` — run the program twice and compare status, stdout, stderr, and
+  Stripped Detcore logs. Selected numeric, address, path, and time fields are
+  removed before the log comparison, so this is not bit-for-bit parity and not L2.
   On success you get: `:: Success: deterministic. Determinism verified.`
   On failure: `:: Failure: nondeterministic.`
 
@@ -78,7 +81,7 @@ Two useful notes about the sandbox:
 
 ---
 
-## 3. Verified pass/fail matrix (`--strict --verify`, backend = ptrace)
+## 3. Stripped pass/fail matrix (`--strict --verify`, backend = ptrace)
 
 Legend: **PASS** = `Determinism verified` observed. **FLAKY (n/m)** = passed n of m repeat
 runs (load-sensitive). **FAIL** = reproducible `--verify` mismatch. **native rc=1** = the
@@ -210,16 +213,16 @@ are exclusively **wall-clock reads from worker threads**, not scheduling.
 | nested subshell tree `(echo a; (echo b; echo c))` | PASS |
 | pipeline `seq 1 100 | grep 5 | wc -l` | PASS |
 
-### 3l. Language runtimes — mixed (CPython is the load-sensitive outlier)
+### 3l. Language runtimes — pure-compute witnesses verify
 
 | Runtime | Command | Result |
 |---------|---------|--------|
-| perl | `perl -e 'print 6*7'` | PASS |
+| perl | `perl -e 'print 42'` | **PASS Stripped (20/20)** at `96f9953a`; host load averages remained 146–176 during the run. Repetition does not make this L4. |
 | lua | `lua -e 'print(6*7)'` | PASS |
 | node | `node -e 'console.log(6*7)'` | PASS |
 | java | `java -version` | PASS (OpenJDK 1.8.0_492 Temurin, 5/5 runs) — **requires PR #223** (`saturating_add` fix for `LogicalTime` overflow, #219) |
 | gawk | `gawk 'BEGIN{print 6*7}'` | PASS |
-| python3 (pure compute) | `python3 -c 'print(sum(range(100)))'` | **FLAKY (2/10 PASS under load)** — worker-thread `clock_gettime(CLOCK_MONOTONIC_COARSE)` sub-second divergence (dtid 3). Passes on a lightly-loaded host. |
+| python3 (pure compute) | `python3 -c 'print(sum(range(100)))'` | **PASS Stripped (20/20)** at `96f9953a`; host load averages remained 146–181 during the run. Repetition does not make this L4. |
 | python3 threading | see §3j | **FAIL** — same clock divergence |
 | php | `php -r 'echo 6*7;'` | TIMEOUT (>120 s under load; heavy interpreter startup) |
 | ruby | `ruby -e 'puts 6*7'` | **native broken** — host RubyGems load error (fails outside Hermit too) |
@@ -266,27 +269,29 @@ cmp hello1 hello2 && echo IDENTICAL   # -> IDENTICAL
 ```
 
 Note: this is the build *artifact* being reproducible across independent runs. `gcc` still
-fails `--strict --verify` (that checks internal syscall-trace determinism across a multi-process
-`cc1`/`as`/`ld` pipeline, see §6) — both facts are true and not contradictory: the emitted
-binary is deterministic even though the internal syscall interleaving is not.
+fails `--strict --verify` (that checks Stripped internal syscall-trace equality across a
+multi-process `cc1`/`as`/`ld` pipeline, see §6) — both facts are true and not contradictory:
+the emitted binary is deterministic even though the compared internal syscall observations
+do not match.
 
-### 3p. Overnight expansion batches 3-29 — 135 valid L2 checks
+### 3p. Overnight expansion batches 3-29 — 135 valid Stripped checks
 
 The following results come from the closed batch task notes, not from a single fresh run at
 the current HEAD. The notes explicitly bind several batches to `c88bc0f` and the later batches
 to `21a6813`; other batches identify `main` and `target/debug/hermit` but omit an exact SHA.
 Every row used the default **ptrace** backend, default log level, and no determinism
 relaxations. Batches 19-20 and 27-28 used `--tmp=/tmp` only to expose their host-compiled
-fixture binaries to the guest. `PASS L2` means `hermit run --strict --verify` completed
-with bitwise-identical repeat output.
+fixture binaries to the guest. `PASS Stripped` means `hermit run --strict --verify`
+completed after selected numeric, address, path, and time fields were stripped
+from the compared logs. It is not an L2 result.
 
 The 27 numbered batches contain 141 as-written checks, and the separate interpreter expansion
 contains 6. Of those 147 checks, 134 passed cleanly as written. Batch 13 contained a malformed
 Python socket command; replacing it with the intended AF_UNIX abstract-socket bind passed at
-L2, yielding the 135 valid passing checks catalogued below. Counts are invocation rows, not a
-deduplicated program count.
+Stripped verification, yielding the 135 valid passing checks catalogued below.
+Counts are invocation rows, not a deduplicated program count.
 
-| Category | Batch | Passing commands / workloads | L2 passes |
+| Category | Batch | Passing commands / workloads | Stripped passes |
 |---|---:|---|---:|
 | Shell and text processing | 3 | `echo\|sort`; `sort\|uniq`; `echo\|wc`; `head`; `sed`; `awk`; `bc`; `date +%s`; `env\|head` | 9 |
 | Language interpreters | interpreter expansion | CPython JSON, numeric loop, and PID/PPID probes; Perl hello; Node hello | 5 |
@@ -329,31 +334,33 @@ These results are deliberately excluded from the 135-pass table:
 | Batch | Command / workload | Observed result | Classification |
 |---:|---|---|---|
 | 3 | `id` | 9/10 passed; one verify mismatch | Flaky NSS lookup through the live host `nscd` socket |
-| interpreter expansion | Ruby hello | Default invocation fails natively because RubyGems is broken; `--disable-gems` passes L2 | Host runtime failure; corrected control passes |
+| interpreter expansion | Ruby hello | Default invocation fails natively because RubyGems is broken; `--disable-gems` passes Stripped verification | Host runtime failure; corrected control passes |
 | 4 | `gcc hello.c -o ...` | 2/8 passed; six detlog mismatches | Heavy compiler process-tree/InternalIOPolling divergence |
 | 5 | default-format `stat /etc/passwd` | Intermittent failure, about 1/5 | UID/GID name lookup through `nscd`; numeric format passes 5/5 |
 | 8 | blocking FIFO writer+reader | Hangs in plain strict mode and verify | FIFO-open rendezvous livelock |
 | 10 | `tar` with owner names | 7/8 passed | NSS/`nscd` owner-name lookup flake |
 | 11 | `ps aux\|head` | Stdout mismatch with matching detlogs | Live `%CPU`/VSZ/RSS values for the supervisor from `/proc` |
 | 13 | Python `AF_INET` bind with a NUL hostname | Fails natively with `TypeError` | Malformed test; corrected AF_UNIX form is counted above |
-| 15 | Meta `git --version`; `git log -1` | Both hang even in one strict run | Site-specific telemetry subprocess interaction |
+| 15 | Site-wrapped `git --version`; `git log -1` | Both hang even in one strict run | Site-specific wrapper subprocess interaction |
 | 18 | Python `getfqdn()` | 4/5 passed; one resolver error | Flaky host NSS/DNS resolution, not a repeat-output mismatch |
 | 18 | `ss -tlnp` | 0/5; detlog mismatch | Reads changing live netlink socket state and `/proc/<pid>/fd` |
 | 21 | `meminfo\|head` | 0/3; stdout mismatch with identical detlogs | Dynamic host memory counters are passed through, not snapshotted |
 
-These classifications matter: a host-state mismatch or invalid command is not a clean L2 pass,
+These classifications matter: a host-state mismatch or invalid command is not
+a clean Stripped pass,
 but it is also not evidence of a missing syscall handler. The reproducible product gaps remain
 the compiler process-tree divergence and FIFO rendezvous livelock; NSS and `/proc` rows require
 additional isolation or virtualization to become deterministic.
 
-### 3q. Second expansion batches 30-41 — 56 clean L2 passes + real-app matrix
+### 3q. Second expansion batches 30-41 — 56 clean Stripped passes + real-app matrix
 
 A second overnight expansion (batches 30-41) probed twelve program families under
 `hermit run --strict --verify` (backend **ptrace**, default log level, **no** determinism
 relaxations). Results come from the closed batch task notes; batches bind to `main` at
 `163333c` / `859970c` / `21a6813` (each note records its SHA). Every row was confirmed both
-deterministic across the two `--verify` sub-runs **and** byte-identical to native stdout under
-a separate `--strict` run. `PASS L2` = `:: Success: deterministic. Determinism verified.`
+successful under the Stripped comparison across the two `--verify` sub-runs
+**and** byte-identical to native stdout under a separate `--strict` run.
+`PASS Stripped` = `:: Success: deterministic. Determinism verified.` and is not L2.
 
 > **Setup note (recurring across these batches):** current `main` **refuses a guest program
 > located under host `/tmp`** (`--strict` errors "Program /tmp/… is under host /tmp … Pass
@@ -377,23 +384,24 @@ a separate `--strict` run. `PASS L2` = `:: Success: deterministic. Determinism v
 | 41 | Compiled Rust | 3/3 | integer compute, 4× `std::thread` join, `HashMap` (seed virtualized) |
 | **Total** |  | **56** |  |
 
-**Real userland applications** (`hermit run --strict --verify -- bash -c '<cmd>'`) — **5/5 PASS L2**:
+**Real userland applications** (`hermit run --strict --verify -- bash -c '<cmd>'`) — **5/5 PASS Stripped**:
 
 | App | Command | Result | Output |
 |-----|---------|--------|--------|
-| bc | `bc -l` pi via `4*a(1)`, scale=20 | PASS L2 | `3.14159265358979323844` |
-| awk | `echo '1 2 3 4 5' \| awk` field sum | PASS L2 | `15` |
-| sort | `printf '3\n1\n4\n1\n5\n' \| sort -n` | PASS L2 | `1 1 3 4 5` |
-| sed | `echo 'hello world' \| sed 's/world/hermit/'` | PASS L2 | `hello hermit` |
-| sqlite3 | CSV `CREATE`/`INSERT 42`/`SELECT` via pipe | PASS L2 | `42` |
+| bc | `bc -l` pi via `4*a(1)`, scale=20 | PASS Stripped | `3.14159265358979323844` |
+| awk | `echo '1 2 3 4 5' \| awk` field sum | PASS Stripped | `15` |
+| sort | `printf '3\n1\n4\n1\n5\n' \| sort -n` | PASS Stripped | `1 1 3 4 5` |
+| sed | `echo 'hello world' \| sed 's/world/hermit/'` | PASS Stripped | `hello hermit` |
+| sqlite3 | CSV `CREATE`/`INSERT 42`/`SELECT` via pipe | PASS Stripped | `42` |
 
 Notable results and honest caveats:
 
 - **Virtual time makes clock-reading programs verify.** C `std::chrono::steady_clock` diff is
   byte-identical across two independent `--strict` runs (`diff_ns=1010030`) though it varies
-  natively; batch 32 pins all clocks to the virtual epoch `1640995199` (2021-12-31 23:59:59 UTC).
+  natively; batch 32 pins all clocks to the virtual epoch `1767225600` (2026-01-01 00:00:00 UTC).
 - **Synchronous fault + signal paths are deterministic:** `mprotect(PROT_READ)`→SIGSEGV caught
-  via `sigsetjmp`/`siglongjmp` (batch 34) and `SA_SIGINFO` delivery (batch 31) both verify at L2.
+  via `sigsetjmp`/`siglongjmp` (batch 34) and `SA_SIGINFO` delivery (batch 31)
+  both pass Stripped verification.
 - **Raw-futex and lock-heavy multithreading verify** (batch 39: 3-state Drepper `futex` mutex
   ×40000, `rwlock`, condvars) — deterministic scheduling, no livelock; single-process threads
   are the class Hermit determinizes reliably.
@@ -415,7 +423,7 @@ initramfs (`rdinit=/init`).
 
 | Mode | Command flags | Result |
 |---|---|---|
-| **Relaxed (working)** | `--no-sequentialize-threads --preemption-timeout disabled --no-virtualize-cpuid` + QEMU `-accel tcg,thread=single -smp 1 -icount shift=0,sleep=off` | **BOOTS TO USERSPACE** — kernel comes up (e820/ACPI/`smpboot CPU0`/clocksource tsc/btrfs/ima) → `Run /init` → busybox shell; `exit 0` with an auto-`poweroff` init |
+| **Relaxed (working)** | `--no-sequentialize-threads --max-timeslice disabled --no-virtualize-cpuid` + QEMU `-accel tcg,thread=single -smp 1 -icount shift=0,sleep=off` | **BOOTS TO USERSPACE** — kernel comes up (e820/ACPI/`smpboot CPU0`/clocksource tsc/btrfs/ima) → `Run /init` → busybox shell; `exit 0` with an auto-`poweroff` init |
 | Relaxed, **repeated ×2** | same, `hermit_autotest` on cmdline (auto-poweroff) | **BYTE-IDENTICAL** — two independent boots produced identical 22908-byte serial logs, `sha256 564e1ba4…` (kernel printk timestamps included). Determinism confirmed by direct 2-run comparison |
 | `--strict` / `--strict --verify` | strict re-enables sequentialize-threads + PMU-preemption single-stepping + cpuid virtualization | **DOES NOT COMPLETE** — QEMU launches but the guest kernel emits **zero** serial output within 240s (no `[0.000000] Linux version`); timeout SIGKILL. Not a crash/syscall gap — precise-preemption single-stepping is catastrophically slow for a CPU-bound emulator |
 
@@ -423,39 +431,41 @@ Notes:
 - Determinism here is established by a **manual two-run byte comparison**, not by `--strict
   --verify` (which cannot complete in-window). The relaxations are documented **requirements**,
   not conveniences — see [`docs/QEMU_BOOT.md`](docs/QEMU_BOOT.md): `--no-sequentialize-threads`
-  (QEMU needs concurrent host threads), `--preemption-timeout disabled` (no PMU single-step),
+  (QEMU needs concurrent host threads), `--max-timeslice disabled` (no PMU single-step),
   `--no-virtualize-cpuid` (CPUID faulting on this host), `-icount shift=0,sleep=off` (single
   instruction-derived guest clock; the alternative is Hermit-side `--no-virtualize-time
   --no-virtualize-metadata`).
-- Corroborated by the preserved experiment `experiments/qemu-boot-debug/results.csv`, row
+- Corroborated by the [preserved parent-workspace experiment](https://github.com/rrnewton/dev-hermit/blob/main/experiments/hermit-experiments-migration_20260727/qemu-boot-debug/results.csv), row
   `virtual_minimal_fixed_icount` → `complete_boot`, `exit 0`, coherent `1000.031MHz` clock.
 - Under strict, Hermit prints an explicit VMM warning (mutually-inconsistent RDTSC vs
   virtualized `clock_gettime` can corrupt guest clock calibration).
 
-### 3s. Language-runtime summary — 9 languages verify at L2
+### 3s. Language-runtime summary — 9 languages pass Stripped verification
 
-Consolidated from §3l and batches 36/37/38/40/41, plus a Go check added 2026-07-23. `PASS L2`
+Consolidated from §3l and batches 36/37/38/40/41, plus a Go check added 2026-07-23. `PASS Stripped`
 = `hermit run --strict --verify` reports `:: Success: deterministic. Determinism verified.`
+after Stripped comparison; it is not an L2 claim.
 Sources/binaries kept outside the Hermit-isolated `/tmp`.
 
 | Language | Witness command | Result |
 |---|---|---|
-| C | `gcc hello.c` build + run; batch 37 mini-apps | **PASS L2** |
-| C++ | batch 40: `g++ -std=c++17` vector/map/`std::thread`+atomic ×400000/regex/`chrono` | **PASS L2** (5/5) |
-| Rust | batch 41 + `rustc -O` integer-sum binary | **PASS L2** (3/3 this session) |
-| Go | `go build` integer-sum binary (`go sum: 4950`) | **PASS L2** (3/3 this session) — Go's multithreaded runtime verifies for this compute workload |
-| Perl | `perl -e 'print 6*7'`; batch 38 (strftime/hash/map/line-count) | **PASS L2** |
-| Lua | `lua -e 'print(6*7)'` | **PASS L2** |
-| Node.js | `node -e 'console.log(6*7)'` | **PASS L2** |
-| Java | `java -version` (OpenJDK 1.8.0_492 Temurin, 5/5) — **requires PR #223** (`saturating_add` `LogicalTime` overflow fix) | **PASS L2** |
-| gawk | `gawk 'BEGIN{print 6*7}'` | **PASS L2** |
-| Python 3 | `python3 -c 'print(sum(range(100)))'` | **CONDITIONAL** — PASS on a lightly-loaded host; **flaky under load** (multi-thread `clock_gettime` sub-second divergence, §6.1) |
+| C | `gcc hello.c` build + run; batch 37 mini-apps | **PASS Stripped** |
+| C++ | batch 40: `g++ -std=c++17` vector/map/`std::thread`+atomic ×400000/regex/`chrono` | **PASS Stripped** (5/5) |
+| Rust | batch 41 + `rustc -O` integer-sum binary | **PASS Stripped** (3/3 this session) |
+| Go | `go build` integer-sum binary (`go sum: 4950`) | **PASS Stripped** (3/3 this session) — Go's multithreaded runtime passes for this compute workload |
+| Perl | `perl -e 'print 42'`; batch 38 (strftime/hash/map/line-count) | **PASS Stripped (20/20)** at `96f9953a` under host load averages 146–176; not L4. |
+| Lua | `lua -e 'print(6*7)'` | **PASS Stripped** |
+| Node.js | `node -e 'console.log(6*7)'` | **PASS Stripped** |
+| Java | `java -version` (OpenJDK 1.8.0_492 Temurin, 5/5) — **requires PR #223** (`saturating_add` `LogicalTime` overflow fix) | **PASS Stripped** |
+| gawk | `gawk 'BEGIN{print 6*7}'` | **PASS Stripped** |
+| Python 3 | `python3 -c 'print(sum(range(100)))'` | **PASS Stripped (20/20)** at `96f9953a` under host load averages 146–181; not L4. Threaded Python remains a separate gap (§3j). |
 | Ruby | `ruby -e 'puts 6*7'` | **N/A** — host RubyGems broken (fails outside Hermit too), not a determinism result |
 | PHP | `php -r 'echo 6*7;'` | **N/A** — HHVM JIT, too slow to finish twice under load (timeout), not a determinism result |
 
-The 9 solidly-verifying languages are **C, C++, Rust, Go, Perl, Lua, Node.js, Java (with PR
-#223), and gawk**. Python verifies only on an idle host; Ruby and PHP are excluded for
-host/runtime reasons that are not Hermit determinism failures.
+The nine broad runtime witnesses remain **C, C++, Rust, Go, Perl, Lua, Node.js, Java (with PR
+#223), and gawk**. Python's pure-compute witness passed 20 repeated Stripped comparisons;
+that repetition is not L4. Threaded Python remains a separate gap. Ruby and PHP are excluded
+for host/runtime reasons.
 
 ---
 
@@ -464,12 +474,12 @@ host/runtime reasons that are not Hermit determinism failures.
 | Backend | Flag | Status |
 |---------|------|--------|
 | **ptrace** | `--backend ptrace` (default) | **Working.** Every result in this doc uses it. |
-| **DBI** (DynamoRIO) | `--backend dbi` | **SDK-gated.** Now *ungated when a DynamoRIO SDK is present* (PR #213). With no SDK it fail-closes: `backend 'dbi' is unavailable: the DynamoRIO SDK was not found; set DYNAMORIO_HOME or DynamoRIO_DIR to a valid SDK`. No SDK is installed on this host, so the DBI E2E path is untested here. |
+| **DBT** (DynamoRIO) | `--backend dbt` | **SDK-gated.** Now *ungated when a DynamoRIO SDK is present* (PR #213). With no SDK it fail-closes: `backend 'dbt' is unavailable: the DynamoRIO SDK was not found; set DYNAMORIO_HOME or DynamoRIO_DIR to a valid SDK`. No SDK is installed on this host, so the DBT E2E path is untested here. |
 | **KVM** | `--backend kvm` | **Wiring in progress.** Fail-closed; no Tool/Guest adapter for executing Linux programs yet. |
 
 ```bash
 $HERMIT run --strict --verify -- /bin/echo hi   # ptrace: works
-$HERMIT run --backend dbi -- /bin/echo hi        # needs DYNAMORIO_HOME/DynamoRIO_DIR
+$HERMIT run --backend dbt -- /bin/echo hi        # needs DYNAMORIO_HOME/DynamoRIO_DIR
 $HERMIT run --backend kvm -- /bin/echo hi        # fail-closed
 ```
 
@@ -528,9 +538,9 @@ pipeline-hangs boundary:
 Two reproducible R/R-record gaps were pinned:
 
 1. **Concurrent shell pipelines deadlock `hermit record`** (2 processes + a live pipe). The
-   *identical* pipeline is deterministic under plain `run --verify`, and the same apps record
-   cleanly when fed a **file argument** instead of a pipe — so the deadlock is record-engine
-   specific, not an app or determinism defect.
+   *identical* pipeline passes Stripped `run --verify`, and the same apps record cleanly when
+   fed a **file argument** instead of a pipe — so the deadlock is record-engine specific, not
+   an app execution defect.
 2. **A parent `write()` immediately followed by a cross-process `kill()` of a child blocked in
    `pause()` deadlocks the scheduler** (a `BlockingExternalIO` turn-race). A non-I/O syscall
    before the `kill` does not trigger it; single-process signal delivery and in-guest
@@ -578,20 +588,20 @@ that path.
   | Repo | PR | Title |
   |---|---:|---|
   | hermit | [#211](https://github.com/rrnewton/hermit/pull/211) | validate: auto-apply `locally-validated` PR label on a green run |
-  | hermit | [#225](https://github.com/rrnewton/hermit/pull/225) | DBI M2a: add `reverie-dbi` dependency to `hermit-cli` |
+  | hermit | [#225](https://github.com/rrnewton/hermit/pull/225) | DBT M2a: add `reverie-dbt` dependency to `hermit-cli` |
   | hermit | [#229](https://github.com/rrnewton/hermit/pull/229) | KVM M3: prove Detcore drives `KvmGuest` via `run_with_tool` |
   | hermit | [#230](https://github.com/rrnewton/hermit/pull/230) | detcore: classify internal pipes as `InternalIOPolling` (fix R/R pipe record deadlock) |
   | hermit | [#233](https://github.com/rrnewton/hermit/pull/233) | Fix KVM backend dispatch and private-flag futex timeout classification |
-  | hermit | [#234](https://github.com/rrnewton/hermit/pull/234) | DBI M2b: route DBI backend through `reverie_dbi::DbiRunner` |
+  | hermit | [#234](https://github.com/rrnewton/hermit/pull/234) | DBT M2b: route DBT backend through `reverie_dbt::DbtRunner` |
   | hermit | [#235](https://github.com/rrnewton/hermit/pull/235) | detcore: record internal-pipe read data on the `InternalIOPolling` path (R/R replay ordering) |
   | reverie | [#23](https://github.com/rrnewton/reverie/pull/23) | Document and formalize the Reverie backend contract |
-  | reverie | [#32](https://github.com/rrnewton/reverie/pull/32) | reverie-dbi: Guest stack + `tail_inject` (M2); simple observation tools |
+  | reverie | [#32](https://github.com/rrnewton/reverie/pull/32) | reverie-dbt: Guest stack + `tail_inject` (M2); simple observation tools |
   | reverie | [#39](https://github.com/rrnewton/reverie/pull/39) | reverie-kvm: `StraceTool` over `KvmGuest` (KVM M2) |
-  | reverie | [#40](https://github.com/rrnewton/reverie/pull/40) | reverie-dbi: park/unpark executor so DBI handlers can suspend (async FFI bridge) |
+  | reverie | [#40](https://github.com/rrnewton/reverie/pull/40) | reverie-dbt: park/unpark executor so DBT handlers can suspend (async FFI bridge) |
 
-  These advance the DBI (DynamoRIO) and KVM backends behind the still-default ptrace backend
+  These advance the DBT (DynamoRIO) and KVM backends behind the still-default ptrace backend
   (#225/#233/#234 + reverie #23/#32/#39/#40) and the record/replay pipe path (#230/#235); the
-  DBI/KVM E2E paths remain gated/in-progress as described in §4, and pipe R/R is not yet
+  DBT/KVM E2E paths remain gated/in-progress as described in §4, and pipe R/R is not yet
   `--verify`-clean (see §5).
 
 **Not Hermit issues (documented so they aren't mis-filed):**
@@ -616,7 +626,7 @@ HERMIT=$(pwd)/target/debug/hermit
 # Any single program:
 $HERMIT run --strict --verify -- /bin/echo hello
 
-# A load-sensitive case (pass on idle host, flaky under heavy load):
+# A historically load-sensitive case (20/20 at 96f9953a under load averages 146–181):
 $HERMIT run --strict --verify -- python3 -c 'print(sum(range(100)))'
 
 # Record/replay suite:
@@ -625,6 +635,6 @@ cargo test -p hermit --test record_replay -- --test-threads=1
 
 Multithreaded / network programs are compiled natively and run *under* Hermit, so these
 measure **runtime** determinism (thread scheduling, syscalls, virtual time). Keep sources and
-binaries outside the Hermit-isolated `/tmp` when reproducing. Because the multithreaded-clock
-gap is load-sensitive, quantify flaky cases with repeat runs (e.g. 10×) rather than a single
-trial, and record the host `load average` alongside the result.
+binaries outside the Hermit-isolated `/tmp` when reproducing. Because clock-related failures can
+be load-sensitive, quantify suspected flaky cases with repeat runs rather than a single trial,
+bind results to a commit, and record the host `load average` alongside the result.

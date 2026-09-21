@@ -4,9 +4,9 @@ Last tested: 2026-07-21
 
 This report measures how unmodified host binaries behave under Hermit. It
 separates a cheap launch/version matrix from functional workloads that exercise
-subprocesses, files, sockets, and threads. The launch matrix is also represented
-by a public Cargo integration test so regressions in the passing subset are
-caught on the self-hosted CI runner.
+subprocesses, files, sockets, and threads. The semantic run matrix is also
+represented by a public Cargo integration test so regressions in the passing
+subset are caught in portable CI.
 
 ## Test environment
 
@@ -23,7 +23,7 @@ Hermit was built with `cargo build -p hermit`. Run-mode probes used:
 target/debug/hermit run \
   --base-env=minimal \
   --no-virtualize-cpuid \
-  --preemption-timeout=disabled \
+  --max-timeslice=disabled \
   -- PROGRAM ARGS...
 ```
 
@@ -47,14 +47,14 @@ to replay. `N/A` means the package was not installed.
 | Dynamic ELF | GNU `ls --version` | PASS | PASS | PASS | Dynamically linked baseline. |
 | Shell | `sh -c printf` | PASS | PASS | PASS | Shell built-in, no child process. |
 | Python | System Python `print` | PASS | PASS | PASS | `/usr/bin/python3`; complex imports differ below. |
-| Python | Meta Python `print` | HANG | HANG | BLOCKED | Uses unsupported `CLONE_VFORK`; issue #15. |
+| Python | Site-wrapped Python `print` | HANG | HANG | BLOCKED | Uses unsupported `CLONE_VFORK`; issue #15. |
 | Node | Node 16 `console.log` | PASS | HANG | HANG | Recording is incomplete; replay also leaks stopped processes; issue #19. |
 | Java | OpenJDK 8 `java -version` | PASS | PASS | HANG | Replay outlives `timeout -k`; issue #19. |
 | Go | Go 1.26 `go version` | PASS | PASS | FAIL | Unexpected `Return(3)` event; issue #31. |
 | HTTP client | `curl --version` | PASS | PASS | PASS | No network in this probe. |
 | HTTP client | `wget --version` | PASS | PASS | PASS | No network in this probe. |
 | VCS | System Git `--version` | PASS | PASS | PASS | `/usr/bin/git`; functional Git differs below. |
-| VCS | Meta Git `--version` | HANG | HANG | BLOCKED | Uses unsupported `CLONE_VFORK`; issue #15. |
+| VCS | Site-wrapped Git `--version` | HANG | HANG | BLOCKED | Uses unsupported `CLONE_VFORK`; issue #15. |
 | C compiler | GCC `--version` | PASS | PASS | PASS | Functional compilation differs below. |
 | Build tool | Make `--version` | PASS | PASS | PASS | Functional builds invoke `CLONE_VFORK`. |
 | Build tool | CMake `--version` | N/A | N/A | N/A | CMake was not installed on the test host. |
@@ -106,7 +106,7 @@ The matrix maps to one issue per distinct failure category on the approved
 - [#19](https://github.com/rrnewton/hermit/issues/19): record/replay syscall desynchronization and leaked stopped children. Java and Node hang results were added to this issue rather than filed as a duplicate.
 - [#31](https://github.com/rrnewton/hermit/issues/31): Go and SQLite replay consume unexpected filesystem events.
 
-The tested base does not contain the open `CLONE_VFORK` implementation in [PR #27](https://github.com/rrnewton/hermit/pull/27). Make, Cargo builds, Meta Python, and Meta Git should be retested after that change lands.
+The tested base does not contain the open `CLONE_VFORK` implementation in [PR #27](https://github.com/rrnewton/hermit/pull/27). Make, Cargo builds, and the site-wrapped Python and Git launchers should be retested after that change lands.
 
 ## CI coverage
 
@@ -115,6 +115,9 @@ The tested base does not contain the open `CLONE_VFORK` implementation in [PR #2
 - `run_arbitrary_binary_matrix` discovers installed tools and runs static and dynamic ELF, shell, Python, Node, Java, Go, curl, wget, Git, GCC, Make, CMake, SQLite, and a direct Cargo binary. Missing optional packages are skipped; `ls` and `sh` are required baselines.
 - `record_replay_stable_arbitrary_binaries` runs `record start --verify` for the locally proven subset: BusyBox, `ls`, `sh`, system Python, curl, wget, system Git, GCC, Make, and direct Cargo.
 
-The existing self-hosted CI job runs `cargo test -p hermit`, so Cargo discovers these integration tests without a workflow change. On this host the run test covered 15 installed categories in 1.9 seconds, and the stable record/replay test covered 10 categories in 16.4 seconds.
+Portable CI runs the curated semantic command matrix. The stable record/replay
+matrix remains part of explicit full or scheduled validation. On the measured
+host, the original run test covered 15 installed categories in 1.9 seconds and
+the stable record/replay test covered 10 categories in 16.4 seconds.
 
 Keep failing cases out of the green CI matrix until their linked issues are fixed. When a fix lands, move the smallest corresponding probe into the stable record/replay set and retain the functional workload as regression coverage.

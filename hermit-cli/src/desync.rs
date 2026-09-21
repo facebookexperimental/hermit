@@ -19,6 +19,7 @@ use reverie::syscalls::SyscallInfo;
 use crate::error::Error;
 use crate::event_stream::DebugEvent;
 use crate::event_stream::EventReader;
+use crate::event_stream::EventStreamId;
 
 /// An error that is raised when the replayer receives an unexpected event. This
 /// error should help give us enough context to debug the desynchronization
@@ -26,6 +27,8 @@ use crate::event_stream::EventReader;
 pub struct DesyncError {
     // The thread ID.
     pub thread: Pid,
+    // The recording-local identity used to locate this thread's event stream.
+    pub stream_id: EventStreamId,
     // The event count and also the point of desynchronization in the stream of
     // syscalls for this thread.
     pub count: u64,
@@ -42,8 +45,8 @@ impl fmt::Display for DesyncError {
 
         writeln!(
             f,
-            "On thread {}, got unexpected syscall (count = {}):",
-            self.thread, self.count
+            "On physical thread {} (recording stream {}), got unexpected syscall (count = {}):",
+            self.thread, self.stream_id, self.count
         )?;
         writeln!(
             f,
@@ -69,7 +72,7 @@ pub struct DesyncSummary<'a> {
 
 impl<'a> fmt::Display for DesyncSummary<'a> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let mut events = match EventReader::open(self.data_dir, self.error.thread) {
+        let mut events = match EventReader::open(self.data_dir, &self.error.stream_id) {
             Ok(events) => events,
             Err(err) => return write!(f, "Failed to read events: {}", err),
         };
@@ -157,7 +160,7 @@ impl DesyncError {
 
         let mut file = io::BufWriter::new(file);
 
-        let mut events = EventReader::open(data_dir, self.thread)?;
+        let mut events = EventReader::open(data_dir, &self.stream_id)?;
 
         // Since we have previously recorded the complete event stream and we
         // have the index of the current mismatch, we can use that information
@@ -187,5 +190,69 @@ impl DesyncError {
         }
 
         Ok(temp_path.keep()?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use reverie::Pid;
+    use reverie::syscalls::Sysno;
+
+    use super::DesyncError;
+    use crate::event_stream::DebugEvent;
+    use crate::event_stream::EventStreamId;
+    use crate::event_stream::EventWriter;
+
+    fn assert_report_uses_stream(stream_id: EventStreamId, physical_tid: i32) {
+        let data = tempfile::tempdir().expect("create recording directory");
+        let mut writer = EventWriter::create(data.path(), &stream_id).expect("create event stream");
+        writer
+            .push_debug_event(DebugEvent::for_test(Sysno::getpid, "getpid()"))
+            .expect("write first debug event");
+        writer
+            .push_debug_event(DebugEvent::for_test(Sysno::getppid, "getppid()"))
+            .expect("write second debug event");
+        drop(writer);
+
+        let error = DesyncError {
+            thread: Pid::from_raw(physical_tid),
+            stream_id,
+            count: 2,
+            actual: DebugEvent::for_test(Sysno::gettid, "gettid()"),
+            expected: DebugEvent::for_test(Sysno::getppid, "getppid()"),
+        };
+        let summary = error.summary(data.path(), 1, 1).to_string();
+        assert!(summary.contains(&format!("physical thread {physical_tid}")));
+        assert!(summary.contains(&format!("recording stream {}", error.stream_id)));
+        assert!(
+            summary.contains("getpid()"),
+            "missing preceding context: {summary}"
+        );
+        assert!(
+            summary.contains("gettid()"),
+            "missing actual event: {summary}"
+        );
+        assert!(
+            !summary.contains("Failed to read events"),
+            "physical tid was incorrectly used as an event filename: {summary}"
+        );
+
+        let report = error.generate_report(data.path()).expect("generate report");
+        let contents = fs::read_to_string(&report).expect("read report");
+        assert!(contents.contains("getpid()"));
+        assert!(contents.contains("gettid()"));
+        fs::remove_file(report).expect("remove report");
+    }
+
+    #[test]
+    fn root_desync_report_uses_recording_stream_identity() {
+        assert_report_uses_stream(EventStreamId::root(), 91_001);
+    }
+
+    #[test]
+    fn child_desync_report_uses_recording_stream_identity() {
+        assert_report_uses_stream(EventStreamId::root().child(1), 91_002);
     }
 }

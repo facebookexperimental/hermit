@@ -29,17 +29,14 @@ int main(void) {
   };
   struct ifreq request = {0};
   memcpy(request.ifr_name, "lo", sizeof("lo"));
-  request.ifr_data = (void*)&value;
+  request.ifr_data = (void *)&value;
 
   errno = 0;
   int result = ioctl(fd, SIOCETHTOOL, &request);
   int error = errno;
   if (result != -1 || error != ENODEV) {
-    fprintf(
-        stderr,
-        "SIOCETHTOOL returned %d with errno %d, expected ENODEV\n",
-        result,
-        error);
+    fprintf(stderr, "SIOCETHTOOL returned %d with errno %d, expected ENODEV\n",
+            result, error);
     return EXIT_FAILURE;
   }
   if (close(fd) != 0) {

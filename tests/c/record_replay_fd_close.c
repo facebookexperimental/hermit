@@ -6,9 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
-#endif
 
 #include <errno.h>
 #include <fcntl.h>
@@ -87,8 +85,7 @@ int main(int argc, char** argv) {
     return fail("memfd_create(displaced)");
   }
   if (displaced_memfd == file_fd) {
-    fprintf(
-        stderr, "simultaneous descriptors unexpectedly match: %d\n", file_fd);
+    fprintf(stderr, "simultaneous descriptors unexpectedly match: %d\n", file_fd);
     return 1;
   }
   if (close(file_fd) != 0) {

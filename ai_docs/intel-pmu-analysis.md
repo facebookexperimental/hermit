@@ -221,8 +221,8 @@ Reverie's generic PMU checks are useful but incomplete:
 - None enumerates or validates every hybrid PMU/core type.
 - Validation errors are warning-only at the builder hook.
 
-GitHub-hosted regular jobs commonly lack PMU permission, and PMU tests return
-early when the generic instruction counter cannot be opened. Self-hosted jobs
+GitHub-managed portable regular jobs commonly lack PMU permission, and PMU tests return
+early when the generic instruction counter cannot be opened. Privileged jobs
 run host-dependent tests, but workflow labels do not specify CPU vendor/model
 and the workflows do not print or assert it. The available host for this investigation is AMD EPYC 9D85, and there is no
 enforceable Intel coverage lane.

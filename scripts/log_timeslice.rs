@@ -1,4 +1,4 @@
-#!/usr/bin/env rust-script
+#!/usr/bin/env -S rust-script --force
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  * All rights reserved.
@@ -6,7 +6,6 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
-
 //! Analyze Hermit/Detcore scheduler *timeslice* structure from a hermit log.
 //!
 //! Feed it the stderr/log of a `hermit run --log info` (or debug/trace) run:
@@ -32,6 +31,9 @@
 //!   * ` COMMIT turn N, dettid D ... on previously committed <VT>s`
 //!   * `[dtid D] inbound rdtsc, new logical time: DetTime { ... rcbs: R, ... }`
 //!   * `DETLOG [syscall]... inbound syscall:`
+
+#[path = "lib/rust_script_prelude.rs"]
+mod rust_script_prelude;
 
 use std::io::Read;
 use std::io::{self};
@@ -118,7 +120,20 @@ fn label(s: &Slice) -> String {
     }
 }
 
+const USAGE: &str = "\
+Usage: hermit --log info run -- <prog> 2>&1 | log_timeslice.rs
+
+Summarize per-timeslice scheduling from a Hermit log on stdin. Reads
+`ending timeslice T..` and ` COMMIT turn ..` lines (present at --log info or
+higher) and prints one row per timeslice with commit counts and virtual/RCB/wall
+advance. Give it a log stream on stdin; -h/--help prints this message.";
+
 fn main() {
+    rust_script_prelude::init();
+    if std::env::args().skip(1).any(|a| a == "-h" || a == "--help") {
+        println!("{USAGE}");
+        return;
+    }
     let mut input = String::new();
     io::stdin().read_to_string(&mut input).expect("read stdin");
 

@@ -21,7 +21,7 @@ the median. This is repeated L1 execution, not L2 verification or L4 stress.
 
 ## Medians
 
-| Workload | Native | Ptrace | DBI | KVM |
+| Workload | Native | Ptrace | DBT | KVM |
 | --- | ---: | ---: | ---: | ---: |
 | CPU: 1M arithmetic iterations | 4.022 ms | 15.829 ms (3.94x) | 164.177 ms (40.82x) | 64.264 ms (15.98x) |
 | Syscall: 100K raw calls | 16.187 ms | 3720.259 ms (229.83x) | 1466.236 ms (90.58x) | 1566.686 ms (96.79x) |
@@ -36,10 +36,10 @@ adds about 39.9 microseconds per call. Increasing executable text from about
 0.4 KiB to 4 MiB leaves the ptrace median effectively unchanged (15.83 versus
 15.97 ms).
 
-**DBI matches translated-code startup cost and lowers syscall interception
+**DBT matches translated-code startup cost and lowers syscall interception
 cost.** Its small CPU workload establishes a roughly 164 ms fixed startup.
 Traversing 4 MiB of text raises the median to 3.519 seconds while native remains
-about 4 ms, directly exposing DynamoRIO translation cost. DBI is 2.54x faster
+about 4 ms, directly exposing DynamoRIO translation cost. DBT is 2.54x faster
 than ptrace on the 100K-syscall median and 1.93x faster on mixed work. It is not
 the fastest choice for tiny or code-wide short-lived programs because startup
 dominates.
@@ -52,8 +52,8 @@ add about 15 microseconds per call: 1.502 seconds for 100K calls and 150 ms for
 ## Caveats
 
 This is a busy shared host. Load averages recorded at completion were
-40.55/83.95/90.41 across 316 logical CPUs. Most rows were tight, but DBI's
-100K-syscall samples ranged from 264.7 ms to 2.768 seconds and one DBI CPU sample
+40.55/83.95/90.41 across 316 logical CPUs. Most rows were tight, but DBT's
+100K-syscall samples ranged from 264.7 ms to 2.768 seconds and one DBT CPU sample
 was 2.367 seconds; the required median includes that variance. These results
 compare end-to-end process wall time, including each backend's setup and
 teardown. Raw samples, exact commands, host metadata, and fixture sizes are in

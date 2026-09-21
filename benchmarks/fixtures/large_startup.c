@@ -1,12 +1,4 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
-/* Execute 4 MiB of text so DBI must translate the full code path. */
+/* Execute 4 MiB of text so DBT must translate the full code path. */
 __asm__(
     ".pushsection .text.benchmark_padding,\"ax\",@progbits\n"
     ".balign 16\n"
@@ -23,6 +15,6 @@ __asm__(
 extern void benchmark_padding(void);
 
 int main(void) {
-  benchmark_padding();
-  return 0;
+    benchmark_padding();
+    return 0;
 }

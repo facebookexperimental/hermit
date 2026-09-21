@@ -33,6 +33,7 @@ SOFTWARE.
 
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/utsname.h>
 
@@ -41,6 +42,25 @@ int main() {
   int ret = uname(&buf);
   if (ret == -1) {
     printf("Uname failed\nReason: %s\n", strerror(errno));
+    /* buf is uninitialized on failure; reading it below would be undefined. */
+    return EXIT_FAILURE;
+  }
+
+  /* Hermit's documented virtual container identity, as asserted by the
+     sibling backend-parity fixture host_identity. */
+  enum { EXPECTED_CHECKS = 4 };
+  int ok = 0;
+  if (strcmp(buf.sysname, "Linux") == 0) {
+    ok++;
+  }
+  if (strcmp(buf.nodename, "hermetic-container.local") == 0) {
+    ok++;
+  }
+  if (strcmp(buf.release, "5.2.0") == 0) {
+    ok++;
+  }
+  if (strcmp(buf.machine, "x86_64") == 0) {
+    ok++;
   }
 
   printf("Operating name: %s\n", buf.sysname);
@@ -48,4 +68,6 @@ int main() {
   printf("Operating system release: %s\n", buf.release);
   printf("Operating system version: %s\n", buf.version);
   printf("Hardware identifier: %s\n", buf.machine);
+
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

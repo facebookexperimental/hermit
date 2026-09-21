@@ -2,10 +2,12 @@
 
 [package]
 name = "hermetic_infra_hermit_flaky-tests"
-version = "0.0.0"
+description = "Intentionally racy guest programs for Hermit deterministic scheduling and race-search tests."
+version = "0.2.0"
 edition = "2024"
 repository = "https://github.com/facebookexperimental/hermit"
 license = "BSD-3-Clause"
+publish = false
 
 [[bin]]
 name = "cas_sequence_easy_bin"

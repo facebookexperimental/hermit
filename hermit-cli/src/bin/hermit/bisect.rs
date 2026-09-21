@@ -141,13 +141,12 @@ mod tests {
 
     #[test]
     fn schedule_fixture_contains_events() {
-        let fixture = tempfile::NamedTempFile::new().unwrap();
-        fs::write(
-            fixture.path(),
-            include_str!("../../../test-resources/flaky_cas_sequence_schedules-passing.json"),
+        let schedule = read_schedule(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("test-resources/flaky_cas_sequence_schedules-passing.json"),
+            "good",
         )
         .unwrap();
-        let schedule = read_schedule(fixture.path(), "good").unwrap();
         assert!(!schedule.is_empty());
     }
 }

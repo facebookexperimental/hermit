@@ -4,21 +4,21 @@ This file is the developer guide for the Hermit project. It covers what Hermit
 is, how to build and test it, its architecture, how to debug determinism
 problems, and how changes reach the repository.
 
+Codex coordinator discipline: coordinate only; delegate nontrivial tool work to workers. Never paste raw tool
+output into the user transcript; provide concise synthesized results to avoid the cybersecurity false-positive
+filter. If a worker hits that filter, rephrase or replace the worker without stalling the coordinator.
+
 ## Autonomous Bot Audit Tags
 
-Bot-authored syscall and API changes must leave an explicit audit trail:
+New syscall support authored by a bot must leave two narrowly scoped
+determinization breadcrumbs:
 
-- Add the exact marker `// AUTONOMOUS-BOT-IMPLEMENTED` at every syscall
-  match entry added by an autonomous bot. Only a human reviewer removes this
-  marker, and only after reviewing that entry.
-- Add `// TODO-HUMAN-REVIEW(PR-id)` to every bot-added syscall implementation
-  and API change, replacing `PR-id` with the pull request that introduced the
-  change (for example, `// TODO-HUMAN-REVIEW(PR-123)`). Place it on the changed
-  declaration or at the smallest code region it covers; do not use an unscoped
-  file-level marker.
-- A new syscall requires both markers: `// AUTONOMOUS-BOT-IMPLEMENTED` at its
-  dispatch match entry and `// TODO-HUMAN-REVIEW(PR-id)` at its implementation
-  or API surface. Do not remove or rename either marker autonomously.
+- Add `// AUTONOMOUS-BOT-IMPLEMENTED` at the new dispatch/classification entry.
+- Add `// TODO-HUMAN-REVIEW(PR-id)` at the implementation or determinization
+  block, replacing `PR-id` with the introducing pull request.
+- Both markers are required for new syscall support. They are not blanket
+  markers for API changes, backend work, or routine parity fixes. Do not remove
+  or rename either marker autonomously.
 
 ## Project Overview
 
@@ -83,8 +83,8 @@ cargo test --workspace
 During iteration, prefer the narrowest relevant target, for example:
 
 ```bash
-cargo test -p detcore
-cargo test -p detcore --test tests_time
+cargo test -p hermit-detcore
+cargo test -p hermit-detcore --test tests_time
 cargo test -p hermit
 ```
 
@@ -116,27 +116,37 @@ and the reason is documented.
 ## Script Convention
 
 - Project scripts use rust-script as `.rs` files with the shebang
-  `#!/usr/bin/env rust-script`.
+  `#!/usr/bin/env -S rust-script --force`. The `--force` flag delegates included-module
+  and local-path dependency freshness to Cargo instead of rust-script's main-file-only
+  executable cache. This convention requires an `env` implementation with `-S` support
+  (GNU coreutils 8.30 or newer on supported Linux hosts).
 - Prefer rust-script over Python for all new scripts.
-- Scripts are usually single files, but may be split into subdirectories when
-  useful.
+- `scripts/` is reserved for repository-wide utilities. Co-locate actions over
+  a directory's data with that directory; see `docs/DIRECTORY_ACTIONS.md`.
+- Standalone CLI scripts must call `scripts/lib/rust_script_prelude.rs::init`
+  before producing output so Unix pipelines terminate cleanly on `SIGPIPE`.
+- Scripts are usually single files, but shared support may live under
+  `scripts/lib/`.
 - Install rust-script with `cargo install rust-script` if it is not already
   available.
 
 ## Workspace Map
 
-The root Cargo workspace has ten members:
+The root Cargo workspace has thirteen members:
 
 | Path | Role |
 | --- | --- |
 | `hermit-cli` | Main `hermit` CLI and `libhermit`; run, record, replay, log-diff, analyze, and container orchestration. |
-| `detcore` | Core determinism engine and Reverie tool; scheduler, virtual time, syscall handling, CPUID handling, and record/replay behavior. |
+| `detcore` | Core determinism engine and Reverie tool; scheduler, virtual time, syscall handling, content digests, CPUID handling, and record/replay behavior. |
 | `detcore-model` | Shared deterministic state and model types, including PIDs, file descriptors, futexes, schedules, and logical time. |
+| `detcore-dbt` | Feature-gated DynamoRIO backend glue; private while the public DBT package boundary and name remain undecided. |
+| `detcore-sabre` | Feature-gated SaBRe backend glue; private while third-party backend packaging remains provisional. |
 | `detcore/tests/testutils` | Helpers used by Detcore integration tests. |
 | `hermit-verify` | Verification executable for stress, trace, schedule, and replay checks. |
-| `common/digest` | Digest utility shared by the workspace. |
-| `common/edit-distance` | Edit-distance utility used when comparing executions and logs. |
 | `common/test-allocator` | Test allocator and supporting test binary. |
+| `ci/manifest-plan` | Private generator and validator for the E2E manifest, test inventory, and test-selection artifacts. |
+| `hermit-install` | Private build helper that stages feature-gated third-party backend resources for tests and development. |
+| `hermit-resources` | Resource accounting and limit types shared by Hermit and Detcore. |
 | `tests` | Guest programs used by integration scenarios, including time, futex, network, pipe, scheduling, and RDTSC cases. |
 | `flaky-tests` | Intentionally racy guest programs used to demonstrate and test deterministic scheduling and chaos mode. |
 
@@ -154,11 +164,40 @@ preemption. Its implementation is split between `tool_local`, which handles
 events near each guest task, and `tool_global`, which owns shared deterministic
 state; the two communicate through RPC.
 
-Hermit can drive the guest through more than one instrumentation backend. The
-`ptrace` backend is the default and best-tested path. Alternative backends
-(dynamic binary instrumentation and KVM) exist at varying maturity; always state
-which backend a result came from, because behavior and coverage differ between
-them.
+## Backend Definition
+
+In this repository, a **backend** is a complete execution path that loads the
+shared Detcore tool through Reverie as `Detcore<XxxGuest>`, where `XxxGuest` is
+the backend-specific guest implementation. Every real backend runs the same
+copy of the Detcore determinism code; a separate reimplementation or a command
+that merely launches a program is not a backend.
+
+The `ptrace` backend is the default and best-tested path. DBT and KVM are real
+backends only where they execute this full Detcore tool path. Use these terms
+precisely:
+
+- e9patch is **not** a backend. It is binary-rewriting preprocessing used with
+  the ptrace backend. A CLI spelling such as `--backend=e9patch` does not change
+  this architectural classification.
+- A prototype, stub, launch adapter, preprocessing tool, or compatibility shim
+  is **not** a backend. Report it by its actual category and state explicitly
+  whether it ever loads Detcore as a Reverie tool.
+- There is one shared copy of Detcore behavior. Do not describe backend-local
+  syscall emulation or a second determinism engine as Detcore parity.
+
+Never make an unqualified "pass", "deterministic", or "L2" claim. Every result
+must name the exact backend and exact test or guest command, including relevant
+flags. For preprocessing and prototype results, say what executed underneath;
+for example, "e9patch preprocessing with the ptrace backend" rather than
+"e9patch backend".
+
+A feature is **done** only when the exact test meets its declared assurance
+level across **all in-scope backends**. A pass on one backend is evidence for
+that backend only, not a project-wide completion claim. KVM `--verify` compares
+the retained internal logs as well as exit status/stdout/stderr. Claim L2 for a
+KVM cell only when its strict typed report says `bitwise_parity: true` (which
+requires syscall output-buffer hashes) and names nonzero compared INFO-message counts; backend capability is not evidence that a
+particular guest passed.
 
 Start investigations in these locations:
 
@@ -184,19 +223,30 @@ presupposes the ones below it:
 | --- | --- | --- |
 | L0 | Builds and unit/integration tests pass | `cargo test` exits 0 |
 | L1 | Runs deterministically under strict mode | `hermit run --strict` |
-| L2 | Bitwise-identical repeat run | `hermit run --strict --verify` |
-| L3 | Memory determinism | `hermit run --strict --verify --detlog-heap --detlog-stack` |
+| L2 | Canonical full-observation repeat parity | `hermit run --strict --verify --verify-strict --verify-json <path> -- ...` and require JSON `bitwise_parity: true` with nonzero compared INFO-message counts |
+| L3 | Memory determinism | Add `--detlog-heap --detlog-stack` to the L2 command |
 | L4 | Stress-hardened | L2/L3 repeated 20x with no divergence |
 
 A claim that a run "passes" is meaningless without a level. Write, for example,
 "passes at L2 (ptrace backend)". When reporting a run, also state:
 
-- **Backend**: `ptrace`, `DBI`, or `KVM`.
+- **Backend**: `ptrace`, `DBT`, or `KVM`.
 - **Log level**: the `--log`/`RUST_LOG` level, or "default" when unset.
 - **Relaxations**: any flag that weakens determinism, for example
   `--no-strict` or `--no-sequentialize-threads`. State "none" when there are
   none. A non-strict result is not a determinism guarantee; label the relaxation
   and do not present it as one.
+
+Default `--verify` uses the lossy `Stripped` comparator and cannot establish
+L2. `--verify-strict` compares exit status/stdout/stderr byte-for-byte and INFO
+events under the repository's `BitwiseInfoV1` policy: it removes only the real
+wall-clock prefix, ordinalizes host addresses while preserving identity/order/
+aliasing, and compares the full remainder exactly. Virtual time,
+retired-branch counts, syscall values, sizes, flags, and other numeric payloads
+must not be stripped. State this canonical envelope rather than calling the raw
+log files literally byte-identical. KVM uses this same retained-log comparison;
+an unreadable or truncated comparison must refuse with `verdict: no_result`
+rather than report a match.
 
 ## Debugging
 
@@ -206,9 +256,17 @@ before reading source:
 - Raise the log level to see the event stream and Detcore's decisions:
   `hermit --log info run -- <program>` (or `debug` / `trace` for more detail).
   The `DETLOG` lines record syscalls, scheduling, and virtualized time.
-- Reproduce nondeterminism with `hermit run --strict --verify`, which runs the
-  guest twice and reports the first divergence.
-- For record/replay problems use `hermit record start --verify -- <program>`,
+- Reproduce nondeterminism with `hermit run --strict --verify --verify-strict`,
+  which runs the guest twice under the L2 comparison policy and reports the
+  first divergence. **Before triaging what it reports, read
+  [docs/DIVERGENCE_CLASSES.md](docs/DIVERGENCE_CLASSES.md).** There are three
+  classes, they need different fixes, and identical DETLOG counts does NOT mean
+  the difference is a clock — the third class has identical counts and no clock
+  involvement. Classify on what differs AT the divergent record: a time field, a
+  control-flow difference visible in the counts, or payload bytes with
+  everything else identical.
+- For record/replay problems use
+  `hermit record start --verify --verify-strict -- <program>`,
   which records then replays and diffs the two logs; a divergence names the
   thread and syscall event where the runs parted.
 - Use `hermit-verify` for stress, trace, schedule, and replay checks, and the
@@ -216,6 +274,10 @@ before reading source:
 - Prefer the smallest guest that reproduces the issue; the `tests` and
   `flaky-tests` members already contain minimal time, futex, pipe, signal, and
   scheduling programs to start from.
+- Several nested mechanisms can stop a run, and they do not bound the same
+  quantity; [docs/TIMEOUT_LADDER.md](docs/TIMEOUT_LADDER.md) describes each rung,
+  why an exit code cannot say which one fired, and how the stderr class line
+  distinguishes them.
 
 When a symptom depends on PMU access, CPUID interception, or specific CPU
 features, capture the host environment in the report; those are host
@@ -235,8 +297,59 @@ limitations, not necessarily product bugs.
   Clippy checks before finishing. Clearly document checks that the current
   hardware cannot execute.
 - Keep unrelated changes and generated artifacts out of the patch.
+- Don't break the demos: if a change touches a demo, an adversarial reviewer must
+  confirm the demo still runs GREEN (not just code-review) before it lands — see
+  the demo-touching-commit adversarial-review policy.
+
+## Pre-Commit Cleanliness Protocol
+
+`hermit/` is a clean, focused implementation repository: product source, tests,
+build config, and minimal curated documentation only. Experiments, bulk AI
+research notes, binaries, and vendored clones do **not** belong here — they live
+in the `dev-hermit` parent workspace. The `repo-cleanliness` skill
+(`.claude/skills/repo-cleanliness/SKILL.md`, also surfaced to Claude via
+`.llms/skills` and to stock Codex via
+`.agents/skills/repo-cleanliness/SKILL.md`) is the full standing rule; this
+section is the mandatory pre-commit gate.
+
+Before every commit, audit exactly what you are about to stage and fix any
+misplaced file *before* committing — never "commit now, clean up later":
+
+```bash
+git status --short
+git diff --cached --name-only    # exact staged paths
+git diff --cached --numstat      # line counts; a '-' column means a binary file
+```
+
+Verify all of the following; a failure is a defect to fix before committing:
+
+- **Right repo, right path.** Every staged file belongs in *this* repo at a
+  sensible path — product code, tests, build config, or curated docs.
+- **No experiments.** Do not add `hermit/experiments/`; experiments live at
+  `~/work/dev-hermit/experiments/`. Reference external code by URL + commit SHA,
+  never by vendoring a checkout.
+- **No `ai_docs` slop.** Any `ai_docs/` change must be minimal, curated, durable
+  reference, not a scratch dump; bulk research goes in the parent `ai_docs/`.
+- **No binaries or large blobs.** No `.o`/`.a`/`.so`, archives, images, VM
+  images, kernels, core dumps, or `*.perf.data`; no text file over 2 MiB without
+  coordinator approval. Inspect anything suspicious with `file` and `du`.
+- **No nested git repos.** `git diff --cached --name-only | grep -E '/\.git(/|$)'`
+  must be empty.
+- **Only your task's paths.** If the tree is dirty with another agent's work,
+  stage your own paths explicitly; never `git add -A` past your ownership.
+
+To unstage a misplaced file: `git restore --staged <path>`, move it to its
+correct home, then commit.
 
 ## Contributing And Pull Requests
+
+**Before sweeping the open-pull-request queue to decide what is already landed,
+read [docs/PR_SWEEP_VERDICTS.md](docs/PR_SWEEP_VERDICTS.md).** Merge commits are
+disabled here, so EVERY LANDING REWRITES THE SHA and a comparison by identity,
+ancestry or tree reports landed work as absent. Three sweeps reached a wrong
+verdict first. A wrong "already landed" closes work that is not on main and is
+the only outcome in that drain that loses something.
+
 
 Primary development happens in the `rrnewton/hermit` fork. Configure `origin`
 for that fork and `upstream` for `facebookexperimental/hermit`. Meta's internal
@@ -246,28 +359,293 @@ not use the upstream repository for routine feature branches or CI iteration.
 
 Typical flow for a change:
 
-- Branch from `origin/main`, make one coherent change per branch, and write an
-  imperative, descriptive commit subject that states what changed. Explain the
-  reason and any non-obvious constraints in the body.
+- Branch from `origin/main` and make one coherent change per branch. When the
+  `dev-hermit` parent is available, obtain the exact disclosure with
+  `./ci-hub/bin/who-am-i --tag --role ROLE`; paste it on the first line of the
+  commit body and do not reconstruct it. Never put the disclosure in a commit
+  subject or pull-request title. Keep both titles as concise, descriptive prose.
+- Immediately after the disclosure, the first commit-body section is exactly
+  **Plain Language Summary and Project Impact**. Explain what project
+  capability, correctness property, evidence
+  quality, or developer workflow moves forward; connect it to the product
+  vision or owner request; and state the meaningful before/after difference.
+  Administrative history, task bookkeeping, and review mechanics come later.
+  Record `Task: <task-id>` after this opening section when the change implements
+  task work.
 - Run the workspace test, format, and Clippy gates relevant to the change, and
   report the assurance level reached along with the backend, log level, and any
   relaxations.
 - Push the branch and open a pull request against fork `main`. Keep fork `main`
   green; repair a regression before landing more work.
+- The PR author owns the branch through landing: resolve review findings,
+  rebase when needed, rerun validation at the new exact head, and verify the
+  landed commit on freshly fetched `main`.
+
+When this repository is coordinated through the `dev-hermit` parent, **either a
+local validation run or a GitHub CI result is acceptable evidence for landing.**
+Neither is required and neither outranks the other; whichever you have is the one
+you use. A local run is queried through `ci-hub validate-status`. A label or a
+copied status is a cache of evidence rather than evidence itself, so read the
+result it points at.
+
+Do not require both, and do not require the one you happen to have. **Requiring a
+GitHub signal would be unsatisfiable wherever Actions are disabled**, which is the
+same defect as requiring a local receipt when none can be produced — the direction
+differs and the dead end is identical.
+
+**An exact-head receipt is NOT a hard prerequisite for landing, and work must not
+serialise behind one.** Do not restate that rule here in your own words — it is
+stated once, with its reasoning, in the OWNER-APPROVED RULE block that begins at
+`scripts/check-reverie-pin.rs:9` and runs to the end of its clause 3. Read **the
+whole block**, not its first clause: it replaced equality-to-the-tip on
+2026-08-08, and it has three clauses that only work together.
+
+Clause 1 is the one usually quoted, and it is why a soft-green landing on an
+ancestor is permitted rather than a shortcut: tip equality is allowed but not
+required, because "a lagging ancestor is legitimate; requiring the tip made the
+verdict a property of WHEN you looked rather than of the tree."
+
+**Clause 2 is the one that gets dropped, and dropping it is a known defect rather
+than a shortcut.** It says the pin "may only advance," because "ancestry ALONE
+would accept a pin walked backwards, because an ancient commit is also an
+ancestor." So *ancestry alone is not the rule.* The same owner ruling has already
+been applied to a non-pin case elsewhere in this project, reaching the same
+conclusion independently: the `dev-hermit` parent's
+`scripts/check-gitlink-currency.sh` records that "ancestry ALONE is what permitted
+374 commits. So the rule is ancestry PLUS a bounded lag." Anyone citing clause 1
+to justify accepting something arbitrarily stale is citing half a rule.
+
+That block is about a Reverie pin, but the property it names is general.
+
+Two things it does not say, and both are separate questions rather than extra
+conditions on landing. Validation ADMISSION has the opposite answer:
+`scripts/validate.rs` refuses to start a run whose head is behind `origin/main`,
+because a run must measure a commit that includes everything available when it
+starts. And a REVIEW attestation binds an exact sha, so a head move leaves an
+approval bound to the older one. Neither makes an earlier commit's validation
+evidence unusable at the landing boundary.
+
+## A gate nobody can pass is a defect, not a high standard
+
+**Before adding or restating any landing requirement, check that it can actually
+be satisfied from what is written down.** A requirement whose satisfaction depends
+on something unobtainable stops every landing and teaches the next reader that the
+protocol is theatre.
+
+Two shapes to refuse, and they are the same defect facing opposite ways:
+
+- Requiring evidence that cannot be produced — an exact-head local receipt while
+  the validation graph cannot complete, or a GitHub result where Actions are
+  disabled.
+- Requiring a named participant to act before anyone can proceed. Any reader must
+  be able to complete the protocol from this document alone. If a rule only works
+  when a particular reviewer, lane or coordinator shows up, it is unsatisfiable
+  the moment they do not.
+
+If you find such a requirement, the correct response is to fix the requirement
+rather than to route around it quietly, and to fix every place that states it at
+the same time — leaving one copy behind is how the old rule comes back.
 
 Follow `CONTRIBUTING.md`, update documentation for user-visible changes, and
 never publish security vulnerabilities as ordinary issues.
 
-GitHub Issues are the public issue tracker. On Meta devservers, direct GitHub
-API access is unavailable, so set the proxy for every `gh` invocation:
+Apply `post-facto-human-review` exactly for: (1) new syscall support, with both
+audit tags above; (2) a Reverie API/core-abstraction change to `Tool`, `Guest`,
+`Backend`, or the syscall-interception model; (3) a new determinization
+strategy; or (4) a core DetCore scheduling change affecting how programs are
+scheduled, especially race search. Trigger 4 is always labeled. Hermit
+[PR #1151](https://github.com/rrnewton/hermit/pull/1151), which moved slowdown
+into virtual-time/epoch scheduling, is the canonical good example. Routine
+backend-parity work toward the golden ptrace reference does not trigger review
+unless it also meets one of these four criteria.
+
+The exact `who-am-i` disclosure belongs on the first line of the PR description,
+never in its title. After that line, every PR description starts with **Plain
+Language Summary and Project Impact**, giving the substantive outcome and its
+connection to the product vision or owner request rather than administrative
+history. It also requires **Determinism** (why the change is
+deterministic plus a logic or informal proof, not only tests), **Linux
+Semantics** (how the change preserves faithful Linux behavior), and
+**Validation**. KVM changes also require **Relationship to gVisor**. A labeled
+PR additionally requires **Human Review Required**, naming the specific
+numbered trigger rather than a vague category such as "backend change". For a
+`post-facto-human-review` PR these sections and the dual-reviewer approval
+labels are checked by `scripts/core-review-protocol-lint.sh` — **which you must
+run by hand. Nothing runs it for you, and nothing blocks a landing that skips
+it.**
+
+This document previously said the script was "enforced by the
+`core-review-protocol` merge-gate job, which blocks landing when any are
+missing". That was false in three independent layers, each measured on
+2026-08-26 against `rrnewton/hermit`:
+
+- its only caller is `.github/workflows/merge-gate.yml`, whose `on:` block is
+  `workflow_dispatch:` alone, so it cannot fire on a pull request;
+- `branches/main/protection` returns **404 Branch not protected**;
+- ruleset *"main check gating (admin-bypassable)"* is `enforcement=active` with
+  **`rules: []`** — active and empty, so it requires no check at all.
+
+⚠️ **A FALSE ENFORCEMENT CLAIM IS WORSE THAN A MISSING GATE**, which is why the
+correction is written out rather than quietly swapped. A reader who believes
+landing is gated has no reason to run anything by hand, so the claim removed the
+very behaviour it described. Every agent is told to read this file; almost none
+read the workflow YAML that would have contradicted it.
+
+**The script itself is sound — it is the wiring that is absent.** Its self-test
+must pass, and the live invocation below checks labels, body sections, exact-head
+review comments, and outstanding refusals. Run it before you land a labeled PR:
 
 ```bash
-export HTTPS_PROXY=http://fwdproxy:8080
+set -euo pipefail
+repo=rrnewton/hermit
+pr=<N>
+
+if ! pr_json=$(with-proxy gh api "repos/$repo/pulls/$pr"); then
+  echo "pull-request fetch FAILED -- this is not a pass" >&2
+  exit 2
+fi
+labels=$(jq -r '.labels[].name' <<<"$pr_json")
+body=$(jq -r '.body // ""' <<<"$pr_json")
+head_sha=$(jq -r '.head.sha' <<<"$pr_json")
+if ! files=$(with-proxy gh api --paginate "repos/$repo/pulls/$pr/files" \
+    --jq '.[].filename'); then
+  echo "changed-file fetch FAILED -- cannot decide whether this is KVM" >&2
+  exit 2
+fi
+files_kvm_status=0
+grep -qiE 'kvm' <<<"$files" || files_kvm_status=$?
+labels_kvm_status=0
+grep -Fixq kvm <<<"$labels" || labels_kvm_status=$?
+case "$files_kvm_status" in
+  0 | 1) ;;
+  *) echo "KVM changed-file lookup FAILED (grep exit $files_kvm_status)" >&2; exit 2 ;;
+esac
+case "$labels_kvm_status" in
+  0 | 1) ;;
+  *) echo "KVM label lookup FAILED (grep exit $labels_kvm_status)" >&2; exit 2 ;;
+esac
+if [ "$files_kvm_status" -eq 0 ] || [ "$labels_kvm_status" -eq 0 ]; then
+  is_kvm=true
+else
+  is_kvm=false
+fi
+pr_comments_file=$(mktemp)
+trap 'rm -f "$pr_comments_file"' EXIT
+if ! with-proxy gh api "repos/$repo/issues/$pr/comments?per_page=100" \
+    --paginate --slurp | jq -ce 'add // []' >"$pr_comments_file"; then
+  echo "comment fetch FAILED -- this is not a pass" >&2
+  exit 2
+fi
+
+PR_NUMBER="$pr" PR_LABELS="$labels" PR_BODY="$body" PR_IS_KVM="$is_kvm" \
+PR_HEAD_SHA="$head_sha" PR_COMMENTS_FILE="$pr_comments_file" \
+  bash scripts/core-review-protocol-lint.sh
+```
+
+⚠️ **THE INPUTS ARE REQUIRED, AND THE SCRIPT REFUSES RATHER THAN GUESSING.** An
+unset `PR_LABELS` or `PR_BODY` exits 2. For a labeled pull request, a missing
+`PR_HEAD_SHA` or missing/unreadable `PR_COMMENTS_FILE`/`PR_COMMENTS_JSON` exits
+1. Pass an explicit empty string only to mean "genuinely none". The file form is
+used above because a complete comment history can exceed the per-environment-
+variable size limit.
+
+⚠️ **DO NOT "FIX" THIS BY ARMING THE GATE.** Adding a `pull_request` trigger
+contradicts the standing directive that Actions never run automatically for
+pull requests or `main`. The portable workflow's automatic integration-branch
+run is supplemental evidence only. A trigger without a `required_status_checks`
+rule — or a rule without a trigger — yields either a check that gates nothing or
+a requirement nothing can satisfy. Both layers or neither, and that pairing is
+an owner decision.
+
+**What actually holds this line today is agents choosing to hold it.**
+
+GitHub Issues are the public issue tracker. In Meta environments, use
+appropriate proxies for accessing the web.
+
+```bash
 gh issue list -R rrnewton/hermit
 gh issue view <number> -R rrnewton/hermit
 ```
 
-The proxy is an environment requirement, not an authentication workaround. If
-`gh auth status` fails without it, retry with `HTTPS_PROXY` before concluding
-that the token is invalid. Create, edit, or close issues only when the task
-explicitly calls for that repository-side change.
+Network configuration is an environment requirement, not an authentication
+workaround. Create, edit, or close issues only when the task explicitly calls
+for that repository-side change.
+
+## Task Closure Policy
+
+Closing a task and landing the change are two different facts, and they are
+recorded by two different tags. Phantom closures — a task that reads as
+delivered while the work never reached `main` — are a recurring, expensive
+failure mode, which is what the second tag exists to prevent. The rules below
+are mandatory for every implementation and review agent.
+
+1. **You close your own task.** When your work is done, post the evidence, add
+   the `implemented` tag, and close the task yourself with
+   `tg update <task> --status closed`. Closure is not routed through a
+   coordinator. Leaving a finished, evidenced task open is itself a defect: it
+   hides the task from every queue that reads status, and the parent's health
+   tick reports `implemented` without `closed` as a lifecycle violation.
+2. **The implementor adds `implemented`; whoever lands the change adds
+   `landed`.** Both are tags, not TaskGraph statuses, and carrying them
+   separately is what makes "closed but not landed" a cheap query. `implemented`
+   means the feature branch is pushed and a pull request is open against
+   `rrnewton/hermit:main` — it does not claim a landing. Preserve the task's
+   existing tags when recording the transition and evidence:
+
+   ```bash
+   tg note <task> "IMPLEMENTED: https://github.com/rrnewton/hermit/pull/<n> \
+     | branch <feature-branch> @ <40-hex SHA> | base origin/main <SHA> \
+     | validation: <exact commands + results, assurance level, backend>"
+   tg update <task> --tags <existing-tags>,implemented
+   tg update <task> --status closed
+   ```
+
+   The PR link and the exact tested SHA are required, not optional. A branch
+   name alone is not evidence.
+3. **Adversarial review confirms the work exists in the PR.** Before a task's
+   `implemented` tag is trusted, a reviewer independently verifies that the claimed
+   change is actually present in the pull request diff, that the cited tests
+   exist and were run at the PR head SHA, and that the reported assurance level
+   (L0–L4), backend, and relaxations match reality. A claim that does not
+   survive this check must lose the `implemented` tag.
+4. **A closed task tagged `implemented` but not `landed` is unlanded work, and
+   it stays visible as exactly that.** Do not add `landed` for an open,
+   in-review, validation-red, awaiting-merge, or blocked-on-a-dependency pull
+   request. Removing a tag is how a false claim is retracted: if the published
+   artifact disappears or the implementation claim proves false, drop
+   `implemented` and say so in a note. Do not invent a status that TaskGraph
+   does not have.
+5. **Add `landed` once the commit is on `main`, verified against freshly
+   fetched ancestry.** A local green run, a GitHub state field, or a label is
+   not landing evidence. Recording the landing through the dev-hermit parent's
+   `./ci-hub/bin/close-task <task> --code <PR-or-full-SHA> --repo <owner/repo>
+   --source <checkout>` additionally writes the `CLOSURE-VERIFIED` note, which
+   is what the parent's health tick currently reads to discharge landing debt.
+
+### Landed vs. Not Landed
+
+Use these concrete examples to decide which tags a closed task carries. When in
+doubt, claim the weaker tag and say why in a task note.
+
+**`landed`:**
+
+- PR #### is merged into `rrnewton/hermit:main`; the merge commit is on `main`
+  and its freshly fetched ancestry confirms it.
+- A coordinated Hermit/Reverie change: both PRs merged, the parent gitlink(s)
+  updated to the exact landed SHAs, and the pair revalidated.
+
+**`implemented` but not `landed` (close the task; the tag carries the debt):**
+
+- Branch pushed, PR open, exact-head validation green, awaiting merge.
+- PR open but validation red, or an exact-head receipt missing/stale — report
+  the exact failure in a note.
+- Work committed and pushed but blocked on another PR or a reverie pin bump —
+  name the blocker and the dependency SHAs.
+
+**Neither tag — the work is not done, so the task stays open:**
+
+- Code written but uncommitted or not pushed. Do not use a stash as a handoff.
+- "It builds/tests pass locally" with no pushed branch and no open PR.
+- A green local `cargo test` presented as project completion — a local run is
+  not a landing, and one backend passing is not "done" across all backends.
+- Tests marked `#[ignore]`, masked, or deleted to make a checkout look green.

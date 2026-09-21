@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 set -euo pipefail
 
 export LC_ALL=C
@@ -14,16 +8,21 @@ known_failure_manifest="$repository/hermit-cli/tests/fail_closed_known_failures.
 allowed_ignore_manifest="$repository/hermit-cli/tests/fail_closed_allowed_ignores.tsv"
 cargo_args=("$@")
 cargo_bin=${CARGO:-cargo}
+results_writer="$repository/ci/write-structured-test-counts.sh"
+
+# AUTONOMOUS-BOT-IMPLEMENTED: Prevent one scheduler hang from exhausting the hardware CI job.
+# TODO-HUMAN-REVIEW(#680): Confirm 180 seconds covers the slowest supported host.
+test_timeout_seconds=${HERMIT_FAIL_CLOSED_TEST_TIMEOUT_SECONDS:-180}
 
 fail() {
   printf 'fail-closed ratchet: %s\n' "$*" >&2
   exit 1
 }
 
-run_cargo() {
+run_command() {
   local stderr_file status
   stderr_file=$(mktemp "${TMPDIR:-/tmp}/hermit-fail-closed-cargo.XXXXXX")
-  if "$cargo_bin" "$@" 2>"$stderr_file"; then
+  if "$@" 2>"$stderr_file"; then
     rm -f "$stderr_file"
   else
     status=$?
@@ -32,6 +31,66 @@ run_cargo() {
     return "$status"
   fi
 }
+
+run_cargo() {
+  run_command "$cargo_bin" "$@"
+}
+
+executed=0
+filtered=0
+current_test=
+declare -a test_results=()
+
+publish_test_results() {
+  local status=$? count_status
+  trap - EXIT
+  set +e
+  write_current_test_results "$status"
+  count_status=$?
+  if ((status == 0 && count_status != 0)); then
+    status=$count_status
+  fi
+  exit "$status"
+}
+
+write_current_test_results() { # <command-status>
+  local status=$1
+  local -a rows=("${test_results[@]}")
+  if ((status != 0)) && [[ -n "$current_test" ]]; then
+    rows+=("$current_test" fail 1)
+  fi
+  "$results_writer" "$executed" "$filtered" "${rows[@]}"
+}
+
+self_test_typed_results() {
+  local scratch canonical
+  scratch=$(mktemp -d)
+  trap 'rm -rf -- "$scratch"' RETURN
+  executed=2
+  filtered=3
+  # shellcheck disable=SC2016 # `$` is part of the stable test identity.
+  current_test='suite$fails'
+  # shellcheck disable=SC2016 # `$` is part of the stable test identity.
+  test_results=('suite$passes' pass 1)
+  DAGRUN_TEST_COUNTS_PATH="$scratch/results.json" write_current_test_results 1 || return 1
+  canonical=$("$repository/ci/structured-test-results.rs" read "$scratch/results.json") || return 1
+  jq -e '
+    .executed_tests == 2
+    and .filtered_tests == 3
+    and .results == [
+      {"attempts": 1, "id": "suite$passes", "result": "pass"},
+      {"attempts": 1, "id": "suite$fails", "result": "fail"}
+    ]
+  ' <<<"$canonical" >/dev/null || return 1
+  printf 'test-fail-closed: typed test-result self-test PASS\n'
+}
+
+if [[ ${1:-} == --self-test && $# -eq 1 ]]; then
+  self_test_typed_results
+  exit
+fi
+
+trap publish_test_results EXIT
 
 cd "$repository"
 [[ -f "$known_failure_manifest" ]] || fail "missing $known_failure_manifest"
@@ -109,6 +168,7 @@ for target in "${targets[@]}"; do
 
   if [[ -n "${mode_na_targets[$target]+set}" ]]; then
     mode_na=$((mode_na + ${#tests[@]}))
+    filtered=$((filtered + ${#tests[@]}))
     printf '    mode N/A (%d tests)\n' "${#tests[@]}"
     continue
   fi
@@ -133,20 +193,28 @@ for target in "${targets[@]}"; do
     fi
     if [[ -n "${target_ignored[$key]+set}" ]]; then
       ignored=$((ignored + 1))
+      filtered=$((filtered + 1))
       continue
     fi
     if [[ -n "${mode_na_tests[$key]+set}" ]]; then
       mode_na=$((mode_na + 1))
+      filtered=$((filtered + 1))
       continue
     fi
     if [[ -n "${known_failures[$key]+set}" ]]; then
+      filtered=$((filtered + 1))
       continue
     fi
 
     printf '\n==> Fail-closed: %s\n' "$key"
-    run_cargo test -p hermit --test "$target" "${cargo_args[@]}" "$test" \
+    current_test=$key
+    executed=$((executed + 1))
+    run_command timeout --kill-after=10s "${test_timeout_seconds}s" \
+      "$cargo_bin" test -p hermit --test "$target" "${cargo_args[@]}" "$test" \
       -- --exact --test-threads=1
     passed=$((passed + 1))
+    test_results+=("$key" pass 1)
+    current_test=
   done
 done
 

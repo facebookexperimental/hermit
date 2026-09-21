@@ -70,7 +70,7 @@ fn run_pattern(pattern: &str, iteration: usize) -> String {
             "run",
             "--base-env=minimal",
             "--no-virtualize-cpuid",
-            "--preemption-timeout=disabled",
+            "--max-timeslice=disabled",
             "--",
         ])
         .arg(ipc_guest())
@@ -87,6 +87,12 @@ fn ipc_patterns_are_deterministic_across_five_runs() {
             expected.starts_with(&format!("{pattern}:")),
             "unexpected {pattern} output: {expected:?}"
         );
+        if pattern == "pipe-capacity" {
+            assert_eq!(
+                expected, "pipe-capacity:8192:a5\n",
+                "Hermit must not expose the host-wide pipe-page pressure state"
+            );
+        }
         for iteration in 2..=REPEAT_COUNT {
             assert_eq!(
                 run_pattern(pattern, iteration),

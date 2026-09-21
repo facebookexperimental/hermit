@@ -1,13 +1,38 @@
 [workspace]
 members = [
-  "common/digest",
-  "common/edit-distance",
   "common/test-allocator",
+  "common/test-workdir",
+  "ci/manifest-plan",
+  "detcore",
+  "detcore-model",
+  "detcore-dbt",
+  "detcore-sabre",
+  "detcore/tests/testutils",
+  "flaky-tests",
+  "hermit-cli",
+  "hermit-install",
+  "hermit-resources",
+  "hermit-verify",
+  "tests",
+]
+exclude = ["agent-utils"]
+# Bare `cargo build`/`cargo test` (no `--workspace`) builds only these members.
+# The three third-party-dependency crates -- `detcore-dbt` and `hermit-install`
+# (pull `reverie-dbt`/DynamoRIO) and `detcore-sabre` (pulls `reverie-sabre`) --
+# are deliberately excluded so the default developer build produces the
+# `hermit` binary (ptrace/kvm/liteinst) with no DynamoRIO/e9patch/SaBRe
+# third-party dependencies. CI opts them back in with `--workspace` plus
+# `cargo ... -p hermit --features third-party-backends`.
+default-members = [
+  "common/test-allocator",
+  "common/test-workdir",
+  "ci/manifest-plan",
   "detcore",
   "detcore-model",
   "detcore/tests/testutils",
   "flaky-tests",
   "hermit-cli",
+  "hermit-resources",
   "hermit-verify",
   "tests",
 ]
@@ -16,3 +41,20 @@ resolver = "2"
 [workspace.package]
 license = "BSD-3-Clause"
 repository = "https://github.com/facebookexperimental/hermit"
+
+# SHA-256 is the io-buffer hash, and an unoptimised build of it is the single
+# dominant cost of `--detlog-io-buffers`. Measured on a 64 MiB buffer: 1.590s
+# unoptimised versus 0.046s optimised -- 25.4 s/GB versus 0.7 s/GB, a 34.6x
+# gap, against a documented capability cost of ~0.75 s/GB. Most validate nodes
+# build debug, so the unoptimised figure is the one that reaches wall time.
+#
+# Optimising ONLY this dependency keeps every hermit crate debuggable. sha2's
+# own dependencies (digest, block-buffer, generic-array, crypto-common,
+# cpufeatures) were measured too and contribute nothing further -- 0.046s with
+# or without them -- so this is deliberately one stanza and not six.
+#
+# Optimisation cannot change a hash: the digest is byte-identical before and
+# after, which is asserted by digest_is_independent_of_optimisation_level in
+# detcore/src/digest.rs.
+[profile.dev.package.sha2]
+opt-level = 3

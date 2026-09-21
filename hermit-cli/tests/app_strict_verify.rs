@@ -12,25 +12,18 @@
 //!
 //! These deliberately use the built-in `--verify` execution path (Hermit runs
 //! the guest twice and diffs the two logs) rather than the manual "run N times
-//! and compare stdout" style used elsewhere. They also cover applications that
-//! previously had no strict-mode coverage at all:
-//!
-//! - `curl` and `nginx` were only exercised in default run mode
-//!   (`arbitrary_binaries.rs`, `integration_matrix.rs`), never under `--strict`.
-//! - `redis-server` and `java` have strict workloads elsewhere
-//!   (`redis_strict.rs`, `language_runtime_determinism.rs`); the bounded
-//!   version invocations here add a cheap, self-contained L2 smoke check for
-//!   process startup and static initialization under the deterministic runtime.
+//! and compare stdout" style used elsewhere. The corpus uses real compiled
+//! workloads rather than help/version startup probes.
 //!
 //! Each workload is a bounded, self-contained invocation (no network, no
 //! long-running server) so the run terminates and its output depends only on
 //! the guest, which is what lets `--verify` reach L2.
 //!
-//! # Managed runtimes: Go and the JVM
+//! # Managed runtimes and interpreters
 //!
-//! This file also covers the Go runtime and the JVM. The results below were
-//! measured with the ptrace backend, `--log=off`, and relaxations
-//! `--no-virtualize-cpuid --preemption-timeout=disabled` (which keep strict
+//! This file also covers CPython, Lua, the Go runtime, and the JVM. The results
+//! below were measured with the ptrace backend, `--log=info`, and relaxations
+//! `--no-virtualize-cpuid --max-timeslice=disabled` (which keep strict
 //! determinism; they only accommodate hosts without CPUID/PMU interception),
 //! using Go 1.26.4 (Red Hat 1.26.4-1.el9) and OpenJDK 1.8.0_492.
 //!
@@ -38,30 +31,63 @@
 //!
 //! - **L2 (bitwise-identical repeat run, `--strict --verify`):** compiled Go
 //!   programs (a hello world and a goroutine workload) and the JVM running
-//!   compiled classes (`java Hello`, a multi-thread `Threads`, and
-//!   `java -version`). The managed runtimes' scheduling, GC, and static
+//!   compiled classes. Every JVM case — the `java Hello` and `Threads`
+//!   baselines and the small JIT+runtime programs (`ThreadCounter`, `GcStress`,
+//!   `JitHotLoop`, `HashMapString`) — runs under
+//!   `assert_l2_jvm_under_strict_verify` with Hermit's default RCB preemption.
+//!   The managed runtimes' scheduling, GC, JIT compilation, and static
 //!   initialization are fully determinized.
+//!
+//!   A compute-bound JVM livelocks under Hermit when preemption is disabled
+//!   (`--max-timeslice=disabled`): the VM's internal GC/JIT/dispatcher threads
+//!   are starved once an application thread enters a CPU-bound region, so even a
+//!   trivial program never completes its first run within the timeout (this
+//!   reproduces even for `java Hello`). Keeping RCB-based preemption on breaks
+//!   the livelock while remaining deterministic (the RCB count is reproducible),
+//!   so `--verify` still reaches L2. These programs therefore require a usable
+//!   PMU; see `assert_l2_jvm_under_strict_verify`.
 //! - **L1 only (output-deterministic under `--strict`, but `--verify`'s
-//!   internal two-run log diff diverges):** the toolchain *drivers*
-//!   `go version` (the `go` command) and `javac`. Their exit code and
-//!   user-visible output are stable across strict runs -- `javac` even emits a
-//!   bytewise-identical `.class` -- but Hermit's `--verify` reports
-//!   `Failure: nondeterministic`, so they are asserted at L1, not L2.
+//!   internal two-run log diff diverges):** toolchain drivers such as `javac`
+//!   and a `make`-driven `gcc` build. Their exit code and emitted artifacts are
+//!   byte-stable across strict runs, but Hermit's `--verify` reports `Failure:
+//!   nondeterministic`, so they are asserted at L1.
 //!
 //! The compiled-guest tests build their guests with the host `go`/`javac`
 //! toolchain first and then run the resulting artifact under Hermit, which
 //! isolates managed-runtime determinism from compiler determinism.
+//!
+//! # Why toolchain builds are asserted at L1, not L2
+//!
+//! A build that writes its outputs into the working directory cannot be checked
+//! with the built-in `--verify` path: Hermit runs the guest twice in the *same*
+//! directory, so the second run observes the object files and executable the
+//! first run created. That is a filesystem-state difference (e.g. an early
+//! `newfstatat("app")` returns `ENOENT` in run 1 but `S_IFREG` in run 2), which
+//! is outside Hermit's determinism contract ("Hermit does not make a changing
+//! filesystem deterministic"), not compiler or scheduler nondeterminism. The
+//! `make`+`gcc` test therefore isolates build determinism by compiling into two
+//! separate directories with distinct absolute paths and byte-comparing the
+//! resulting artifacts, exactly as the `javac` L1 test does.
 
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fs;
+use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Output;
+use std::process::Stdio;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 
-/// Serialize the Hermit runs; the deterministic scheduler and PMU counters are
-/// process-global resources on the self-hosted runner.
+#[path = "common/hermit_binary.rs"]
+mod hermit_test_binary;
+
+/// Serialize Hermit runs because the deterministic scheduler and runtime
+/// fixtures are process-global resources on the shared host.
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
 /// Wall-clock cap for a single `--verify` (two-run) invocation.
@@ -69,6 +95,113 @@ const HERMIT_VERIFY_TIMEOUT: &str = "120s";
 
 /// Grace period before `timeout(1)` escalates from SIGTERM to SIGKILL.
 const HERMIT_VERIFY_KILL_AFTER: &str = "10s";
+const ISOLATED_WORKDIR_ENV: &str = "HERMIT_E2E_EMPTY_WORKDIR";
+const HERMETIC_TEST_WORKDIR: &str = "/test";
+
+fn guest_execution_args(
+    requested: Option<&OsStr>,
+    ordinary_base_env: Option<&str>,
+) -> Result<Vec<OsString>, String> {
+    match requested {
+        None => Ok(ordinary_base_env
+            .map(|base_env| OsString::from(format!("--base-env={base_env}")))
+            .into_iter()
+            .collect()),
+        Some(value) if value == OsStr::new(HERMETIC_TEST_WORKDIR) => Ok(vec![
+            "--base-env=minimal".into(),
+            "--mount=type=tmpfs,target=/test".into(),
+            "--workdir=/test".into(),
+        ]),
+        Some(value) => Err(format!(
+            "{ISOLATED_WORKDIR_ENV} must be {HERMETIC_TEST_WORKDIR}, got {value:?}"
+        )),
+    }
+}
+
+fn configure_guest_execution(command: &mut Command, ordinary_base_env: Option<&str>) {
+    let requested = std::env::var_os(ISOLATED_WORKDIR_ENV);
+    let args = guest_execution_args(requested.as_deref(), ordinary_base_env)
+        .unwrap_or_else(|error| panic!("PATH-CONTRACT: {error}"));
+    command.args(args);
+}
+
+fn guest_execution_args_with_directory(
+    requested: Option<&OsStr>,
+    directory: &Path,
+) -> Result<Vec<OsString>, String> {
+    match requested {
+        None => Ok(Vec::new()),
+        Some(value) if value == OsStr::new(HERMETIC_TEST_WORKDIR) => Ok(vec![
+            "--base-env=minimal".into(),
+            "--mount=type=tmpfs,target=/test".into(),
+            format!(
+                "--mount=type=bind,source={},target={}",
+                directory.display(),
+                directory.display()
+            )
+            .into(),
+            format!("--workdir={HERMETIC_TEST_WORKDIR}").into(),
+        ]),
+        Some(value) => Err(format!(
+            "{ISOLATED_WORKDIR_ENV} must be {HERMETIC_TEST_WORKDIR}, got {value:?}"
+        )),
+    }
+}
+
+#[test]
+#[ignore = "validate: fixed /test argument contract"]
+fn pinned_root_arguments_are_exact_and_fail_closed() {
+    assert!(guest_execution_args(None, None).unwrap().is_empty());
+    assert_eq!(
+        guest_execution_args(None, Some("minimal")).unwrap(),
+        [OsString::from("--base-env=minimal")]
+    );
+    assert_eq!(
+        guest_execution_args(Some(OsStr::new("/test")), None).unwrap(),
+        [
+            OsString::from("--base-env=minimal"),
+            OsString::from("--mount=type=tmpfs,target=/test"),
+            OsString::from("--workdir=/test"),
+        ]
+    );
+    assert_eq!(
+        guest_execution_args(Some(OsStr::new("/test")), Some("minimal")).unwrap(),
+        [
+            OsString::from("--base-env=minimal"),
+            OsString::from("--mount=type=tmpfs,target=/test"),
+            OsString::from("--workdir=/test"),
+        ]
+    );
+    let error = guest_execution_args(Some(OsStr::new("/tmp")), None).unwrap_err();
+    assert!(error.contains("HERMIT_E2E_EMPTY_WORKDIR must be /test"));
+
+    let directory = Path::new("/host/private-project");
+    assert!(
+        guest_execution_args_with_directory(None, directory)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        guest_execution_args_with_directory(Some(OsStr::new("/test")), directory).unwrap(),
+        [
+            OsString::from("--base-env=minimal"),
+            OsString::from("--mount=type=tmpfs,target=/test"),
+            OsString::from(
+                "--mount=type=bind,source=/host/private-project,target=/host/private-project"
+            ),
+            OsString::from("--workdir=/test"),
+        ]
+    );
+    let error =
+        guest_execution_args_with_directory(Some(OsStr::new("/tmp")), directory).unwrap_err();
+    assert!(error.contains("HERMIT_E2E_EMPTY_WORKDIR must be /test"));
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#657)
+fn hermit_verify_timeout() -> String {
+    std::env::var("HERMIT_APP_VERIFY_TIMEOUT").unwrap_or_else(|_| HERMIT_VERIFY_TIMEOUT.to_owned())
+}
 
 fn hermit_run_lock() -> MutexGuard<'static, ()> {
     HERMIT_RUN_LOCK
@@ -76,9 +209,56 @@ fn hermit_run_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#651)
+/// Run a bounded Hermit command without waiting for orphaned guest pipe FDs.
+///
+/// If `timeout(1)` kills Hermit while a guest descendant is still alive, that
+/// descendant can retain inherited stdout/stderr pipes. `Command::output`
+/// would then wait forever for EOF even though `timeout` has already exited.
+/// Regular files let the harness observe the timeout status immediately.
+fn run_hermit_command(mut command: Command) -> Output {
+    let rendered = format!("{command:?}");
+    let mut stdout = tempfile::tempfile().expect("failed to create Hermit stdout capture");
+    let mut stderr = tempfile::tempfile().expect("failed to create Hermit stderr capture");
+
+    command
+        .stdout(Stdio::from(
+            stdout
+                .try_clone()
+                .expect("failed to clone Hermit stdout capture"),
+        ))
+        .stderr(Stdio::from(
+            stderr
+                .try_clone()
+                .expect("failed to clone Hermit stderr capture"),
+        ));
+
+    let status = command
+        .status()
+        .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
+
+    let mut stdout_bytes = Vec::new();
+    stdout
+        .seek(SeekFrom::Start(0))
+        .and_then(|_| stdout.read_to_end(&mut stdout_bytes))
+        .expect("failed to read Hermit stdout capture");
+    let mut stderr_bytes = Vec::new();
+    stderr
+        .seek(SeekFrom::Start(0))
+        .and_then(|_| stderr.read_to_end(&mut stderr_bytes))
+        .expect("failed to read Hermit stderr capture");
+
+    Output {
+        status,
+        stdout: stdout_bytes,
+        stderr: stderr_bytes,
+    }
+}
+
 /// Resolve the first candidate path that names an existing regular file.
 ///
-/// These applications are installed by the self-hosted CI job, so a missing
+/// These applications are installed by the portable CI job, so a missing
 /// binary is a hard error rather than a silent skip.
 fn required_app(name: &str, candidates: &[&str]) -> PathBuf {
     candidates
@@ -88,9 +268,57 @@ fn required_app(name: &str, candidates: &[&str]) -> PathBuf {
         .unwrap_or_else(|| {
             panic!(
                 "ERROR: required application {name} is missing; expected an executable at one of \
-                 {candidates:?} (the self-hosted CI job installs it)"
+                 {candidates:?} (the portable CI job installs it)"
             )
         })
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#651)
+/// Resolve a JDK tool from the setup-java toolchain before host fallbacks.
+fn required_jdk_app(name: &str, fallbacks: &[&str]) -> PathBuf {
+    if let Some(java_home) = std::env::var_os("JAVA_HOME") {
+        let path = PathBuf::from(java_home).join("bin").join(name);
+        assert!(
+            path.is_file(),
+            "ERROR: JAVA_HOME is set but required JDK tool {} is missing",
+            path.display(),
+        );
+        return path;
+    }
+
+    required_app(name, fallbacks)
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#651)
+/// Bound JVM-internal concurrency while retaining application thread coverage.
+fn java_vm_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let mut bounded: Vec<&'a str> = vec!["-Xint", "-XX:+UseSerialGC", "-XX:ActiveProcessorCount=1"];
+    bounded.extend_from_slice(args);
+    bounded
+}
+
+/// Like [`java_vm_args`], but leaves the JIT compiler enabled (no `-Xint`) so a
+/// hot method is actually C1/C2-compiled at runtime. Used by the JIT hot-loop
+/// program to exercise the compiler's determinism rather than the interpreter's.
+/// GC and the compiler thread pool stay bounded so the run remains reproducible.
+fn java_jit_vm_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let mut bounded: Vec<&'a str> = vec!["-XX:+UseSerialGC", "-XX:ActiveProcessorCount=1"];
+    bounded.extend_from_slice(args);
+    bounded
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#651)
+fn javac_vm_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let mut bounded: Vec<&'a str> = vec![
+        "-J-Xint",
+        "-J-XX:+UseSerialGC",
+        "-J-XX:ActiveProcessorCount=1",
+    ];
+    bounded.extend_from_slice(args);
+    bounded
 }
 
 /// Run `hermit run --strict --verify -- <program> <args>` and assert that
@@ -104,31 +332,25 @@ fn assert_l2_under_strict_verify(program: &Path, args: &[&str]) {
 
     let mut command = Command::new("timeout");
     command
+        .args(["--kill-after", HERMIT_VERIFY_KILL_AFTER])
+        .arg(hermit_verify_timeout())
+        .arg(hermit_test_binary::hermit_binary())
         .args([
-            "--kill-after",
-            HERMIT_VERIFY_KILL_AFTER,
-            HERMIT_VERIFY_TIMEOUT,
-        ])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args([
-            "--log=off",
+            "--log=info",
             "run",
             "--strict",
             "--verify",
-            // The self-hosted runner exposes real CPUID/PMU; these relaxations
-            // keep the test usable on VMs without CPUID interception without
+            // The test does not assert CPUID or PMU behavior; these flags
+            // keep the test portable to runners without those capabilities. They do not
             // weakening determinism (they do not disable strict mode).
             "--no-virtualize-cpuid",
-            "--preemption-timeout=disabled",
-            "--",
-        ])
-        .arg(program)
-        .args(args);
+            "--max-timeslice=disabled",
+        ]);
+    configure_guest_execution(&mut command, None);
+    command.arg("--").arg(program).args(args);
 
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
+    let output = run_hermit_command(command);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -146,35 +368,311 @@ fn assert_l2_under_strict_verify(program: &Path, args: &[&str]) {
     );
 }
 
-#[test]
-#[ignore = "e2e: requires hermit + PMU/mount namespaces + the curl binary"]
-fn curl_version_is_deterministic_under_strict_verify() {
-    let curl = required_app("curl", &["/usr/bin/curl", "/usr/local/bin/curl"]);
-    assert_l2_under_strict_verify(&curl, &["--version"]);
+const PYTHON_HOST_ENV_SENTINEL: &str = "HERMIT_APP_STRICT_VERIFY_HOST_SENTINEL";
+
+/// Build a native Python command with no ambient host environment.
+fn sanitized_native_python(program: &Path, home: &Path) -> Command {
+    let mut command = Command::new(program);
+    command
+        .env_clear()
+        .env("HOME", home)
+        .env("PATH", "/usr/bin:/bin")
+        .env("LANG", "C")
+        .env("LC_ALL", "C");
+    command
 }
 
-#[test]
-#[ignore = "e2e: requires hermit + PMU/mount namespaces + the nginx binary"]
-fn nginx_version_is_deterministic_under_strict_verify() {
-    let nginx = required_app("nginx", &["/usr/sbin/nginx", "/usr/bin/nginx"]);
-    assert_l2_under_strict_verify(&nginx, &["-v"]);
-}
-
-#[test]
-#[ignore = "e2e: requires hermit + PMU/mount namespaces + the redis-server binary"]
-fn redis_server_version_is_deterministic_under_strict_verify() {
-    let redis_server = required_app(
-        "redis-server",
-        &["/usr/bin/redis-server", "/usr/local/bin/redis-server"],
+/// Return the versioned user-site directory that CPython derives below `home`.
+fn python_user_site(program: &Path, home: &Path) -> PathBuf {
+    let mut command = sanitized_native_python(program, home);
+    let output = command
+        // Isolated mode ignores Python-specific environment switches, while
+        // `-S` prevents site initialization during fixture discovery.
+        .args([
+            "-I",
+            "-S",
+            "-c",
+            "import sys; print(f'python{sys.version_info.major}.{sys.version_info.minor}')",
+        ])
+        .output()
+        .expect("failed to query the Python runtime version");
+    assert!(
+        output.status.success(),
+        "failed to query Python runtime version: status={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
     );
-    assert_l2_under_strict_verify(&redis_server, &["--version"]);
+    let version = String::from_utf8(output.stdout)
+        .expect("Python runtime version is valid UTF-8")
+        .trim()
+        .to_owned();
+    assert!(
+        version.starts_with("python") && !version.contains('/') && !version.contains('\\'),
+        "unexpected Python runtime version directory: {version:?}",
+    );
+    home.join(".local")
+        .join("lib")
+        .join(version)
+        .join("site-packages")
 }
 
-#[test]
-#[ignore = "e2e: requires hermit + PMU/mount namespaces + a JVM"]
-fn java_version_is_deterministic_under_strict_verify() {
-    let java = required_app("java", &["/usr/local/bin/java", "/usr/bin/java"]);
-    assert_l2_under_strict_verify(&java, &["-version"]);
+/// Plant an observable user-site startup hook in a fresh, visible home.
+///
+/// The `.pth` hook imports a module that writes a marker. Ordinary startup also
+/// writes that module's `.pyc`, giving the native negative control two positive
+/// observations. Keeping the home below Cargo's target temp directory (rather
+/// than host `/tmp`, which Hermit hides) makes the fixture visible to the guest.
+fn plant_pristine_python_user_site(
+    program: &Path,
+    prefix: &str,
+) -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let home = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create pristine Python home");
+    let site = python_user_site(program, home.path());
+    fs::create_dir_all(&site).expect("failed to create pristine Python user site");
+
+    let marker = site.join("hermit_pristine_user_site.loaded");
+    let module = format!(
+        "with open({:?}, 'w', encoding='utf-8') as marker:\n    marker.write('loaded\\n')\n",
+        marker.to_string_lossy(),
+    );
+    fs::write(site.join("hermit_pristine_user_site.py"), module)
+        .expect("failed to plant Python user-site module");
+    fs::write(
+        site.join("hermit-pristine-user-site.pth"),
+        "import hermit_pristine_user_site\n",
+    )
+    .expect("failed to plant Python user-site startup hook");
+
+    (home, site, marker)
+}
+
+fn python_bytecode_exists(source_dir: &Path) -> bool {
+    let cache = source_dir.join("__pycache__");
+    match fs::read_dir(&cache) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(error) => panic!("failed to inspect Python bytecode cache: {error}"),
+    }
+    .map(|entry| {
+        entry
+            .expect("failed to inspect Python bytecode cache entry")
+            .path()
+    })
+    .any(|path| path.extension().is_some_and(|extension| extension == "pyc"))
+}
+
+/// Assert canonical full-INFO parity for a hermetic Python arithmetic case.
+///
+/// Each isolation mechanism has a separate observable: `-I` suppresses a
+/// planted user-site hook, `-B` suppresses bytecode for an explicitly imported
+/// source module, and `--base-env=minimal` suppresses a host-only sentinel that
+/// makes the guest fail if inherited. The native negative control proves that
+/// the user-site fixture is live and bytecode-capable before the Hermit run.
+fn assert_python_arithmetic_canonical_parity(program: &Path) {
+    let _guard = hermit_run_lock();
+
+    let (negative_home, negative_site, negative_marker) =
+        plant_pristine_python_user_site(program, "python-user-site-negative-");
+    let mut negative_command = sanitized_native_python(program, negative_home.path());
+    let negative = negative_command
+        .args(["-c", "print(sum(range(1000)))"])
+        .output()
+        .expect("failed to run Python user-site negative control");
+    assert!(
+        negative.status.success(),
+        "Python user-site negative control failed: status={} stderr={}",
+        negative.status,
+        String::from_utf8_lossy(&negative.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&negative.stdout).trim(),
+        "499500",
+        "Python user-site negative control did not run the arithmetic workload",
+    );
+    assert!(
+        negative_marker.is_file(),
+        "Python user-site negative control was inert: startup hook did not run",
+    );
+    assert!(
+        python_bytecode_exists(&negative_site),
+        "Python user-site negative control was inert: no bytecode was written",
+    );
+
+    let (positive_home, _, positive_marker) =
+        plant_pristine_python_user_site(program, "python-user-site-positive-");
+    let bound_source = positive_home.path().join("bound-source");
+    fs::create_dir_all(&bound_source).expect("failed to create bound Python source directory");
+    fs::write(
+        bound_source.join("hermit_bound_probe.py"),
+        "VALUE = 271828\n",
+    )
+    .expect("failed to plant bound Python source module");
+
+    let guest = format!(
+        r#"import os, sys
+if os.environ.get({sentinel:?}) is not None:
+    raise SystemExit("host environment leaked into minimal guest environment")
+sys.path.insert(0, {bound_source:?})
+import hermit_bound_probe
+print(hermit_bound_probe.VALUE + sum(range(1000)))
+"#,
+        sentinel = PYTHON_HOST_ENV_SENTINEL,
+        bound_source = bound_source.to_string_lossy(),
+    );
+    let report_path = positive_home.path().join("verify.json");
+    let mut command = Command::new("timeout");
+    command
+        // This reaches Hermit itself. The guest must not inherit it through
+        // the explicitly selected minimal base environment.
+        .env(
+            PYTHON_HOST_ENV_SENTINEL,
+            format!("must-not-leak: {}", positive_home.path().display()),
+        )
+        .args(["--kill-after", HERMIT_VERIFY_KILL_AFTER])
+        .arg(hermit_verify_timeout())
+        .arg(hermit_test_binary::hermit_binary())
+        .args([
+            "--log=info",
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+        ])
+        .arg(format!("--verify-json={}", report_path.display()))
+        .arg(format!("--env=HOME={}", positive_home.path().display()))
+        .args([
+            // The test does not assert CPUID or PMU behavior; these flags keep
+            // it portable without weakening strict determinism.
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+        ]);
+    configure_guest_execution(&mut command, Some("minimal"));
+    command
+        .arg("--")
+        .arg(program)
+        .args(["-I", "-B", "-c"])
+        .arg(guest);
+
+    let rendered = format!("{command:?}");
+    let output = run_hermit_command(command);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !positive_marker.exists(),
+        "isolated Python loaded the planted user site for {rendered}",
+    );
+    assert!(
+        !python_bytecode_exists(&bound_source),
+        "no-bytecode Python wrote the explicitly imported module cache for {rendered}",
+    );
+    assert!(
+        output.status.success(),
+        "hermit canonical Python verification failed for {rendered}\n\
+         status: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status,
+    );
+    assert!(
+        stdout.lines().any(|line| line.trim() == "771328"),
+        "Python did not import the bound source module and complete arithmetic for {rendered}\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}",
+    );
+
+    let report_bytes = fs::read(&report_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read verification report {} for {rendered}: {error}",
+            report_path.display(),
+        )
+    });
+    let report: serde_json::Value =
+        serde_json::from_slice(&report_bytes).expect("Hermit verification report is valid JSON");
+    let typed =
+        hermit::canonical_verdict::VerificationReport::from_current_json_slice(&report_bytes)
+            .expect("real verification producer emitted a complete current report");
+    typed.require_exact_output_match().expect(
+        "real verification producer retained equal output hashes, lengths and dispositions",
+    );
+    let outputs = typed.compared_outputs.as_ref().unwrap();
+    assert!(
+        outputs.left.stdout_bytes > 0,
+        "Python arithmetic produced no retained stdout evidence"
+    );
+    assert_eq!(outputs.left.exit_code, Some(0));
+    assert!(
+        report["verdict"] == "matched"
+            && report["verified"] == true
+            && report["bitwise_parity"] == true
+            && report["comparison"]["strictness"] == "canonical"
+            && report["comparison"]["log_scope"] == "info"
+            && report["comparison"]["full_trace"] == true
+            && report["compared_log_messages"]["left"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+            && report["compared_log_messages"]["right"]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+        "verification report was not nonempty canonical bitwise parity: {report}",
+    );
+}
+
+/// Like [`assert_l2_under_strict_verify`], but keeps Hermit's default RCB-based
+/// preemption enabled (it does **not** pass `--max-timeslice=disabled`).
+///
+/// The JVM spins up internal helper threads (GC, the JIT compiler, the signal
+/// dispatcher) that must make progress concurrently with the application
+/// threads. With `--max-timeslice=disabled`, Hermit never preempts a running
+/// guest thread, so once one JVM thread enters a CPU-bound region the others are
+/// starved and the process livelocks under Hermit — even a trivial
+/// `System.out.println` never completes its first run within the 120s budget.
+/// Enabling PMU/RCB-based preemption breaks that livelock, and because the RCB
+/// count is itself deterministic, `--verify` still reaches a bitwise-identical
+/// repeat run (L2).
+///
+/// Consequently these JVM tests require accessible hardware performance counters
+/// (a working PMU), like the bulk of Hermit's determinism suite. On a host
+/// without a usable PMU they will fail; report that as a host limitation rather
+/// than weakening the assertion. CPUID interception is still relaxed via
+/// `--no-virtualize-cpuid`, which does not weaken strict determinism.
+fn assert_l2_jvm_under_strict_verify(program: &Path, args: &[&str]) {
+    let _guard = hermit_run_lock();
+
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after", HERMIT_VERIFY_KILL_AFTER])
+        .arg(hermit_verify_timeout())
+        .arg(hermit_test_binary::hermit_binary())
+        .args([
+            "--log=info",
+            "run",
+            "--strict",
+            "--verify",
+            // Relax only CPUID virtualization; keep RCB preemption on so the
+            // JVM's internal threads make progress (see the doc comment).
+            "--no-virtualize-cpuid",
+        ]);
+    configure_guest_execution(&mut command, None);
+    command.arg("--").arg(program).args(args);
+
+    let rendered = format!("{command:?}");
+    let output = run_hermit_command(command);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "hermit run --strict --verify was not deterministic (L2) for {rendered}\n\
+         status: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status,
+    );
+    assert!(
+        stderr.contains("Determinism verified") || stdout.contains("Determinism verified"),
+        "hermit --verify exited 0 but did not report determinism for {rendered}\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -183,7 +681,7 @@ fn java_version_is_deterministic_under_strict_verify() {
 // The compiled-guest tests build a tiny program with the host toolchain and run
 // the artifact under Hermit, isolating managed-runtime determinism from
 // compiler determinism. The `go`/`javac`/`java` binaries are installed by the
-// self-hosted CI job, so a missing toolchain is a hard error, matching the
+// portable CI job, so a missing toolchain is a hard error, matching the
 // `required_app` policy above.
 // ---------------------------------------------------------------------------
 
@@ -251,6 +749,98 @@ public class Threads {
 }
 "#;
 
+// Small JVM programs exercising the JIT and runtime (threads, GC, hot-loop
+// compilation, hashing) without paying javac's compile cost. Each is bounded and
+// prints a single deterministic line, so `--verify` can reach L2.
+
+/// Multithreaded atomic counter: exercises thread creation/join and lock-free
+/// atomic contention. The final count is independent of interleaving.
+const JAVA_THREAD_COUNTER_SRC: &str = r#"import java.util.concurrent.atomic.AtomicLong;
+
+public class ThreadCounter {
+    public static void main(String[] args) throws InterruptedException {
+        final int nThreads = 4;
+        final int perThread = 5000;
+        final AtomicLong counter = new AtomicLong(0);
+        Thread[] ts = new Thread[nThreads];
+        for (int i = 0; i < nThreads; i++) {
+            ts[i] = new Thread(() -> {
+                for (int j = 0; j < perThread; j++) {
+                    counter.incrementAndGet();
+                }
+            });
+            ts[i].start();
+        }
+        for (Thread t : ts) {
+            t.join();
+        }
+        System.out.println("counter=" + counter.get());
+    }
+}
+"#;
+
+/// GC micro-stress: churns many short-lived allocations to drive minor GC. The
+/// checksum depends only on the loop, not on collection timing.
+const JAVA_GC_STRESS_SRC: &str = r#"public class GcStress {
+    public static void main(String[] args) {
+        long checksum = 0;
+        for (int i = 0; i < 50000; i++) {
+            byte[] b = new byte[64];
+            b[0] = (byte) i;
+            b[63] = (byte) (i >> 8);
+            checksum += (b[0] & 0xff) + (b[63] & 0xff);
+        }
+        System.out.println("gc checksum=" + checksum);
+    }
+}
+"#;
+
+/// JIT hot loop: a small integer method called enough times to be JIT-compiled
+/// (run with the JIT enabled, not `-Xint`), exercising compiler determinism.
+const JAVA_JIT_HOT_LOOP_SRC: &str = r#"public class JitHotLoop {
+    static long collatzSteps(long n) {
+        long steps = 0;
+        while (n != 1) {
+            n = (n % 2 == 0) ? n / 2 : 3 * n + 1;
+            steps++;
+        }
+        return steps;
+    }
+    public static void main(String[] args) {
+        long total = 0;
+        for (int i = 1; i <= 20000; i++) {
+            total += collatzSteps(i);
+        }
+        System.out.println("jit collatz total=" + total);
+    }
+}
+"#;
+
+/// HashMap/String workload: repeated string construction, hashing, and map
+/// merges, then a TreeMap-sorted checksum so output is iteration-order
+/// independent.
+const JAVA_HASHMAP_STRING_SRC: &str = r#"import java.util.HashMap;
+import java.util.Map;
+import java.util.TreeMap;
+
+public class HashMapString {
+    public static void main(String[] args) {
+        Map<String, Integer> counts = new HashMap<>();
+        String[] words = {"alpha", "beta", "gamma", "delta", "alpha", "beta", "alpha"};
+        for (int rep = 0; rep < 1000; rep++) {
+            for (String w : words) {
+                counts.merge(w + (rep % 7), 1, Integer::sum);
+            }
+        }
+        long sum = 0;
+        for (Map.Entry<String, Integer> e : new TreeMap<>(counts).entrySet()) {
+            sum += (long) e.getKey().hashCode() * e.getValue();
+        }
+        System.out.println("hashmap sum=" + sum + " keys=" + counts.size());
+    }
+}
+"#;
+
 /// Create (and clean) a per-test build directory under Cargo's target tmpdir.
 ///
 /// Cargo's `CARGO_TARGET_TMPDIR` lives under `target/`, i.e. on the real
@@ -307,7 +897,7 @@ fn compile_go(source: &str, bin_name: &str) -> PathBuf {
 /// Compile a single Java class with the host `javac`, returning the classpath
 /// directory that holds the resulting `.class`.
 fn compile_java(source: &str, class_name: &str) -> PathBuf {
-    let javac = required_app("javac", &["/usr/local/bin/javac", "/usr/bin/javac"]);
+    let javac = required_jdk_app("javac", &["/usr/local/bin/javac", "/usr/bin/javac"]);
     let dir = build_dir(class_name);
     let src = dir.join(format!("{class_name}.java"));
     fs::write(&src, source).expect("failed to write Java source");
@@ -324,113 +914,157 @@ fn compile_java(source: &str, class_name: &str) -> PathBuf {
 fn run_once_under_strict(program: &Path, args: &[&str]) -> Output {
     let mut command = Command::new("timeout");
     command
-        .args([
-            "--kill-after",
-            HERMIT_VERIFY_KILL_AFTER,
-            HERMIT_VERIFY_TIMEOUT,
-        ])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--kill-after", HERMIT_VERIFY_KILL_AFTER])
+        .arg(hermit_verify_timeout())
+        .arg(hermit_test_binary::hermit_binary())
         .args([
             "--log=off",
             "run",
             "--strict",
             "--no-virtualize-cpuid",
-            "--preemption-timeout=disabled",
-            "--",
-        ])
-        .arg(program)
-        .args(args);
+            "--max-timeslice=disabled",
+        ]);
+    configure_guest_execution(&mut command, None);
+    command.arg("--").arg(program).args(args);
 
-    let rendered = format!("{command:?}");
-    command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"))
+    run_hermit_command(command)
 }
 
-/// Assert assurance level L1 for a driver that does not reach L2: two separate
-/// `--strict` runs must both succeed and produce identical stdout, but we do not
-/// require `--verify` to agree (its internal two-run log diff diverges for these
-/// toolchain drivers).
-fn assert_l1_stdout_deterministic(program: &Path, args: &[&str]) {
-    let _guard = hermit_run_lock();
+// --- L2: installed application runtimes and databases are deterministic ---
 
-    let first = run_once_under_strict(program, args);
-    let second = run_once_under_strict(program, args);
+#[test]
+#[ignore = "e2e: requires hermit + mount namespaces + Python 3"]
+fn python_arithmetic_is_deterministic_under_strict_verify() {
+    let python = required_app("python3", &["/usr/local/bin/python3", "/usr/bin/python3"]);
+    assert_python_arithmetic_canonical_parity(&python);
+}
 
-    for (label, output) in [("run 1", &first), ("run 2", &second)] {
-        assert!(
-            output.status.success(),
-            "hermit run --strict ({label}) failed for {} {args:?}\nstatus: {}\nstderr:\n{}",
-            program.display(),
-            output.status,
-            String::from_utf8_lossy(&output.stderr),
-        );
-    }
+#[test]
+#[ignore = "e2e: requires hermit + mount namespaces + sqlite3"]
+fn sqlite_query_is_deterministic_under_strict_verify() {
+    let sqlite = required_app("sqlite3", &["/usr/bin/sqlite3", "/usr/local/bin/sqlite3"]);
+    assert_l2_under_strict_verify(&sqlite, &[":memory:", "SELECT 1+1"]);
+}
 
-    assert_eq!(
-        first.stdout,
-        second.stdout,
-        "hermit run --strict produced non-deterministic stdout (not even L1) for {} {args:?}\n\
-         run 1 stdout:\n{}\nrun 2 stdout:\n{}",
-        program.display(),
-        String::from_utf8_lossy(&first.stdout),
-        String::from_utf8_lossy(&second.stdout),
+#[test]
+#[ignore = "e2e: requires hermit + mount namespaces + the CPython runtime"]
+fn python_is_deterministic_under_strict_verify() {
+    let python = required_app("python3", &["/usr/bin/python3", "/bin/python3"]);
+    assert_l2_under_strict_verify(
+        &python,
+        &[
+            "-B",
+            "-c",
+            "import sys; print(sys.version); print(sum(range(10000)))",
+        ],
     );
+}
+
+#[test]
+#[ignore = "e2e: requires hermit + mount namespaces + the Lua runtime"]
+fn lua_is_deterministic_under_strict_verify() {
+    let lua = required_app("lua", &["/usr/bin/lua", "/bin/lua"]);
+    assert_l2_under_strict_verify(&lua, &["-e", "print(1+1)"]);
 }
 
 // --- L2: compiled managed-runtime programs are bitwise deterministic ---
 
 #[test]
-#[ignore = "e2e: requires hermit + PMU/mount namespaces + the Go toolchain"]
+#[ignore = "e2e: requires hermit + mount namespaces + the Go toolchain"]
+// TODO(#2791): Remove the portable-DAG exclusion after #2801 determinizes mountinfo.
 fn go_hello_is_deterministic_under_strict_verify() {
     let bin = compile_go(GO_HELLO_SRC, "hermit_go_hello");
     assert_l2_under_strict_verify(&bin, &[]);
 }
 
 #[test]
-#[ignore = "e2e: requires hermit + PMU/mount namespaces + the Go toolchain"]
+#[ignore = "e2e: requires hermit + mount namespaces + the Go toolchain"]
+// TODO(#2791): Remove the portable-DAG exclusion after #2801 determinizes mountinfo.
 fn go_goroutines_are_deterministic_under_strict_verify() {
     let bin = compile_go(GO_GOROUTINES_SRC, "hermit_go_goroutines");
     assert_l2_under_strict_verify(&bin, &[]);
 }
 
 #[test]
-#[ignore = "e2e: requires hermit + PMU/mount namespaces + a JDK"]
+#[ignore = "e2e: requires hermit + mount namespaces + PMU (RCB preemption) + a JDK"]
 fn java_hello_is_deterministic_under_strict_verify() {
-    let java = required_app("java", &["/usr/local/bin/java", "/usr/bin/java"]);
+    let java = required_jdk_app("java", &["/usr/local/bin/java", "/usr/bin/java"]);
     let classpath = compile_java(JAVA_HELLO_SRC, "Hello");
     let classpath = classpath.to_str().expect("classpath is valid UTF-8");
-    assert_l2_under_strict_verify(&java, &["-cp", classpath, "Hello"]);
+    let args = java_vm_args(&["-cp", classpath, "Hello"]);
+    // Keep RCB preemption on: a JVM livelocks under `--max-timeslice=disabled`
+    // (see `assert_l2_jvm_under_strict_verify`), even for this startup-only case.
+    assert_l2_jvm_under_strict_verify(&java, &args);
 }
 
 #[test]
-#[ignore = "e2e: requires hermit + PMU/mount namespaces + a JDK"]
+#[ignore = "e2e: requires hermit + mount namespaces + PMU (RCB preemption) + a JDK"]
 fn java_threads_are_deterministic_under_strict_verify() {
-    let java = required_app("java", &["/usr/local/bin/java", "/usr/bin/java"]);
+    let java = required_jdk_app("java", &["/usr/local/bin/java", "/usr/bin/java"]);
     let classpath = compile_java(JAVA_THREADS_SRC, "Threads");
     let classpath = classpath.to_str().expect("classpath is valid UTF-8");
-    assert_l2_under_strict_verify(&java, &["-cp", classpath, "Threads"]);
+    let args = java_vm_args(&["-cp", classpath, "Threads"]);
+    // Keep RCB preemption on: a JVM livelocks under `--max-timeslice=disabled`
+    // (see `assert_l2_jvm_under_strict_verify`).
+    assert_l2_jvm_under_strict_verify(&java, &args);
+}
+
+// Small JVM JIT + runtime programs. These use `assert_l2_jvm_under_strict_verify`
+// (RCB preemption enabled) rather than the `--max-timeslice=disabled` helper the
+// startup-only `java_hello`/`java_threads` tests use, because a compute-bound JVM
+// livelocks under Hermit without preemption; see that helper's doc comment.
+
+#[test]
+#[ignore = "e2e: requires hermit + mount namespaces + a JDK + a usable PMU"]
+fn java_thread_counter_is_deterministic_under_strict_verify() {
+    let java = required_jdk_app("java", &["/usr/local/bin/java", "/usr/bin/java"]);
+    let classpath = compile_java(JAVA_THREAD_COUNTER_SRC, "ThreadCounter");
+    let classpath = classpath.to_str().expect("classpath is valid UTF-8");
+    let args = java_vm_args(&["-cp", classpath, "ThreadCounter"]);
+    assert_l2_jvm_under_strict_verify(&java, &args);
+}
+
+#[test]
+#[ignore = "e2e: requires hermit + mount namespaces + a JDK + a usable PMU"]
+fn java_gc_stress_is_deterministic_under_strict_verify() {
+    let java = required_jdk_app("java", &["/usr/local/bin/java", "/usr/bin/java"]);
+    let classpath = compile_java(JAVA_GC_STRESS_SRC, "GcStress");
+    let classpath = classpath.to_str().expect("classpath is valid UTF-8");
+    let args = java_vm_args(&["-cp", classpath, "GcStress"]);
+    assert_l2_jvm_under_strict_verify(&java, &args);
+}
+
+#[test]
+#[ignore = "e2e: requires hermit + mount namespaces + a JDK + a usable PMU"]
+fn java_jit_hot_loop_is_deterministic_under_strict_verify() {
+    let java = required_jdk_app("java", &["/usr/local/bin/java", "/usr/bin/java"]);
+    let classpath = compile_java(JAVA_JIT_HOT_LOOP_SRC, "JitHotLoop");
+    let classpath = classpath.to_str().expect("classpath is valid UTF-8");
+    // Run with the JIT compiler enabled (no -Xint) to exercise compilation.
+    let args = java_jit_vm_args(&["-cp", classpath, "JitHotLoop"]);
+    assert_l2_jvm_under_strict_verify(&java, &args);
+}
+
+#[test]
+#[ignore = "e2e: requires hermit + mount namespaces + a JDK + a usable PMU"]
+fn java_hashmap_string_is_deterministic_under_strict_verify() {
+    let java = required_jdk_app("java", &["/usr/local/bin/java", "/usr/bin/java"]);
+    let classpath = compile_java(JAVA_HASHMAP_STRING_SRC, "HashMapString");
+    let classpath = classpath.to_str().expect("classpath is valid UTF-8");
+    let args = java_vm_args(&["-cp", classpath, "HashMapString"]);
+    assert_l2_jvm_under_strict_verify(&java, &args);
 }
 
 // --- L1: toolchain drivers are output-deterministic but not bitwise (no L2) ---
 
 #[test]
-#[ignore = "e2e: requires hermit + PMU/mount namespaces + the Go toolchain"]
-fn go_version_is_l1_deterministic_under_strict() {
-    // `go version` is output-deterministic under --strict but Hermit's --verify
-    // reports it nondeterministic, so it is asserted at L1 only.
-    let go = required_app("go", &["/usr/bin/go", "/usr/local/bin/go"]);
-    assert_l1_stdout_deterministic(&go, &["version"]);
-}
-
-#[test]
-#[ignore = "e2e: requires hermit + PMU/mount namespaces + a JDK"]
+#[ignore = "e2e: requires hermit + mount namespaces + a JDK"]
 fn javac_is_l1_deterministic_under_strict() {
     // `javac` produces a bytewise-identical class file across --strict runs, but
     // Hermit's --verify reports it nondeterministic, so it is asserted at L1.
     // Compile into two separate output directories under --strict and compare
     // both the exit status (via `run_once_under_strict`) and the emitted class.
-    let javac = required_app("javac", &["/usr/local/bin/javac", "/usr/bin/javac"]);
+    let javac = required_jdk_app("javac", &["/usr/local/bin/javac", "/usr/bin/javac"]);
 
     let src_dir = build_dir("javac_l1_src");
     let src = src_dir.join("Hello.java");
@@ -443,7 +1077,8 @@ fn javac_is_l1_deterministic_under_strict() {
         let out_dir = build_dir(&format!("javac_l1_out{run}"));
         let out_dir_str = out_dir.to_str().expect("out dir is valid UTF-8");
         let src_str = src.to_str().expect("src path is valid UTF-8");
-        let output = run_once_under_strict(&javac, &["-d", out_dir_str, src_str]);
+        let args = javac_vm_args(&["-d", out_dir_str, src_str]);
+        let output = run_once_under_strict(&javac, &args);
         assert!(
             output.status.success(),
             "hermit run --strict javac (run {run}) failed\nstatus: {}\nstderr:\n{}",
@@ -461,4 +1096,353 @@ fn javac_is_l1_deterministic_under_strict() {
         class_bytes[0], class_bytes[1],
         "javac emitted a non-deterministic class file across two --strict runs (not even L1)"
     );
+}
+
+// --- L1: a make-driven gcc build is artifact-deterministic under --strict ---
+
+const MAKE_BUILD_MATHLIB_H: &str = r#"#ifndef MATHLIB_H
+#define MATHLIB_H
+long fib(int n);
+long fact(int n);
+#endif
+"#;
+
+const MAKE_BUILD_MATHLIB_C: &str = r#"#include "mathlib.h"
+long fib(int n) {
+    long a = 0, b = 1;
+    for (int i = 0; i < n; i++) {
+        long t = a + b;
+        a = b;
+        b = t;
+    }
+    return a;
+}
+long fact(int n) {
+    long r = 1;
+    for (int i = 2; i <= n; i++) {
+        r *= i;
+    }
+    return r;
+}
+"#;
+
+const MAKE_BUILD_MAIN_C: &str = r#"#include <stdio.h>
+#include "mathlib.h"
+int main(void) {
+    for (int i = 0; i < 15; i++) {
+        printf("fib(%d)=%ld fact(%d)=%ld\n", i, fib(i), i, fact(i));
+    }
+    return 0;
+}
+"#;
+
+// Recipe lines are tab-indented, as make requires. Flags are chosen for a
+// reproducible build: -g0 drops DWARF (which would embed the build path),
+// -fno-ident drops the toolchain `.comment`, and -ffile-prefix-map normalizes
+// any embedded build path so artifacts do not depend on the absolute build dir.
+const MAKE_BUILD_MAKEFILE: &str = "\
+CC = gcc\n\
+CFLAGS = -O2 -g0 -fno-ident -ffile-prefix-map=$(CURDIR)=. -Wall\n\
+OBJS = mathlib.o main.o\n\
+\n\
+app: $(OBJS)\n\
+\t$(CC) $(CFLAGS) -o app $(OBJS)\n\
+\n\
+%.o: %.c mathlib.h\n\
+\t$(CC) $(CFLAGS) -c -o $@ $<\n\
+\n\
+clean:\n\
+\trm -f $(OBJS) app\n";
+
+/// Write the minimal `make`+`gcc` project into `dir`.
+fn write_make_project(dir: &Path) {
+    for (name, contents) in [
+        ("mathlib.h", MAKE_BUILD_MATHLIB_H),
+        ("mathlib.c", MAKE_BUILD_MATHLIB_C),
+        ("main.c", MAKE_BUILD_MAIN_C),
+        ("Makefile", MAKE_BUILD_MAKEFILE),
+    ] {
+        let path = dir.join(name);
+        fs::write(&path, contents)
+            .unwrap_or_else(|error| panic!("failed to write {}: {error}", path.display()));
+    }
+}
+
+/// Run `hermit run --strict -- make -B app` with the guest working directory set
+/// to `project_dir`, returning the process output.
+///
+/// Unlike [`run_once_under_strict`], the working directory matters: `make` and
+/// the `gcc` children it spawns resolve the sources and place the artifacts
+/// relative to the cwd, and Hermit gives the guest a private `/tmp`, so an
+/// absolute `make -C /tmp/...` path would not be visible inside the guest. The
+/// inherited cwd is, which is what lets the build find its inputs and write its
+/// outputs where the test reads them back.
+fn make_command_with_execution_root(
+    make: &Path,
+    project_dir: &Path,
+    requested: Option<&OsStr>,
+) -> Result<Command, String> {
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after", HERMIT_VERIFY_KILL_AFTER])
+        .arg(hermit_verify_timeout())
+        .arg(hermit_test_binary::hermit_binary())
+        .args([
+            "--log=off",
+            "run",
+            "--strict",
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+        ]);
+    // The empty execution root is separate from the populated input/output
+    // fixture. Keep each project's original distinct absolute guest path so
+    // make and its compilers still expose accidental embedded build paths.
+    command.args(guest_execution_args_with_directory(requested, project_dir)?);
+    command.arg("--").arg(make);
+    if requested.is_some() {
+        command.arg("-C").arg(project_dir);
+    }
+    command.args(["-B", "app"]).current_dir(project_dir);
+    Ok(command)
+}
+
+fn run_make_under_strict(make: &Path, project_dir: &Path) -> Output {
+    let requested = std::env::var_os(ISOLATED_WORKDIR_ENV);
+    run_hermit_command(
+        make_command_with_execution_root(make, project_dir, requested.as_deref())
+            .unwrap_or_else(|error| panic!("PATH-CONTRACT: {error}")),
+    )
+}
+
+#[test]
+#[ignore = "validate: distinct make input/output paths with an empty execution root"]
+fn make_projects_retain_distinct_guest_paths_in_the_pinned_root() {
+    let projects = [Path::new("/host/project0"), Path::new("/host/project1")];
+    let mut guest_paths = Vec::new();
+    for project in projects {
+        let command = make_command_with_execution_root(
+            Path::new("/bin/make"),
+            project,
+            Some(OsStr::new("/test")),
+        )
+        .unwrap();
+        let args = command.get_args().collect::<Vec<_>>();
+        assert!(args.contains(&OsStr::new("--mount=type=tmpfs,target=/test")));
+        let binding = format!(
+            "--mount=type=bind,source={},target={}",
+            project.display(),
+            project.display()
+        );
+        assert!(args.contains(&OsStr::new(&binding)));
+        let guest = args
+            .iter()
+            .position(|arg| *arg == OsStr::new("--"))
+            .unwrap();
+        assert_eq!(
+            &args[guest + 1..],
+            [
+                OsStr::new("/bin/make"),
+                OsStr::new("-C"),
+                project.as_os_str(),
+                OsStr::new("-B"),
+                OsStr::new("app")
+            ]
+        );
+        guest_paths.push(args[guest + 3].to_owned());
+        let ordinary =
+            make_command_with_execution_root(Path::new("/bin/make"), project, None).unwrap();
+        assert_eq!(ordinary.get_current_dir(), Some(project));
+        let ordinary = ordinary.get_args().collect::<Vec<_>>();
+        let guest = ordinary
+            .iter()
+            .position(|arg| *arg == OsStr::new("--"))
+            .unwrap();
+        assert_eq!(
+            &ordinary[guest + 1..],
+            [OsStr::new("/bin/make"), OsStr::new("-B"), OsStr::new("app")]
+        );
+    }
+    assert_ne!(guest_paths[0], guest_paths[1]);
+}
+
+#[test]
+#[ignore = "e2e: requires hermit + mount namespaces + make + a C compiler"]
+fn make_gcc_build_is_l1_deterministic_under_strict() {
+    // A `make`-driven C build (make invoking gcc: two translation units plus a
+    // link) produces byte-identical object files and a byte-identical executable
+    // across independent `hermit run --strict` builds (assurance level L1). Like
+    // `javac`, it is asserted at L1 rather than via `--verify`; see the module
+    // docs for why an in-place build defeats `--verify`'s two-run,
+    // same-directory check. Building into two directories with distinct absolute
+    // paths also proves the artifacts do not embed the build path.
+    let make = required_app("make", &["/usr/bin/make", "/usr/local/bin/make"]);
+
+    let _guard = hermit_run_lock();
+
+    const ARTIFACTS: [&str; 3] = ["mathlib.o", "main.o", "app"];
+    let mut builds: Vec<Vec<Vec<u8>>> = Vec::new();
+    for run in 0..2 {
+        let dir = build_dir(&format!("make_gcc_l1_out{run}"));
+        write_make_project(&dir);
+        let output = run_make_under_strict(&make, &dir);
+        assert!(
+            output.status.success(),
+            "hermit run --strict make (run {run}) failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let built = ARTIFACTS
+            .iter()
+            .map(|name| {
+                let path = dir.join(name);
+                fs::read(&path)
+                    .unwrap_or_else(|error| panic!("make did not emit {}: {error}", path.display()))
+            })
+            .collect();
+        builds.push(built);
+    }
+
+    for (idx, name) in ARTIFACTS.iter().enumerate() {
+        assert_eq!(
+            builds[0][idx], builds[1][idx],
+            "make+gcc produced a non-deterministic `{name}` across two --strict runs (not even L1)"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Git subprocess/pipe/pack-negotiation coverage.
+
+/// Build a tiny two-commit Git repository with a fixed identity and fixed
+/// author/committer dates so the fixture is byte-reproducible across hosts and
+/// independent of host `git` config and wall-clock time. Returns the path to
+/// the repository top level, suitable for use in a `file://` clone URL.
+fn build_git_fixture(git: &Path, dir: &Path) -> PathBuf {
+    let src = dir.join("src");
+    fs::create_dir_all(&src).unwrap_or_else(|error| {
+        panic!(
+            "failed to create git fixture dir {}: {error}",
+            src.display()
+        )
+    });
+
+    // Configure every fixture git invocation with a deterministic identity and
+    // timestamp, and neutralize host git config, so the resulting pack is the
+    // same regardless of who runs the test.
+    let git_command = |args: &[&str]| -> Command {
+        let mut command = Command::new(git);
+        command
+            .current_dir(&src)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "hermit-test")
+            .env("GIT_AUTHOR_EMAIL", "hermit-test@example.com")
+            .env("GIT_COMMITTER_NAME", "hermit-test")
+            .env("GIT_COMMITTER_EMAIL", "hermit-test@example.com")
+            .env("GIT_AUTHOR_DATE", "2020-01-01T00:00:00 +0000")
+            .env("GIT_COMMITTER_DATE", "2020-01-01T00:00:00 +0000")
+            .args(args);
+        command
+    };
+
+    run_build(git_command(&["init", "-q", "-b", "main"]), "git init");
+
+    fs::write(src.join("a.txt"), b"hello\n").expect("failed to write fixture a.txt");
+    fs::create_dir_all(src.join("d")).expect("failed to create fixture subdir");
+    fs::write(src.join("d/b.txt"), b"world\n").expect("failed to write fixture d/b.txt");
+
+    run_build(git_command(&["add", "-A"]), "git add");
+    run_build(git_command(&["commit", "-q", "-m", "c1"]), "git commit c1");
+
+    fs::write(src.join("a.txt"), b"hello\nmore\n").expect("failed to rewrite fixture a.txt");
+    run_build(
+        git_command(&["commit", "-q", "-a", "-m", "c2"]),
+        "git commit c2",
+    );
+
+    src
+}
+
+#[test]
+#[ignore = "e2e: requires hermit + mount namespaces + git"]
+fn git_clone_file_protocol_is_l1_deterministic_under_strict() {
+    // `git clone file://<src> <dest>` spawns a child `git-upload-pack`, talks to
+    // it over pipes, negotiates a pack, and runs `git-index-pack` on the result.
+    // Two independent `hermit run --strict` clones produce byte-identical
+    // working trees and the same resolved HEAD (assurance level L1).
+    //
+    // This is asserted at L1 (two independent `--strict` runs) rather than via
+    // the built-in `--verify` two-run path. `git clone` is *usually* L2 under
+    // `--strict --verify`, but the fork/exec/pipe scheduling of the git
+    // subprocess tree diverges rarely (~1 run in 25 observed on ptrace) -- the
+    // same vfork / BlockingExternalIO scheduling nondeterminism that makes
+    // gcc/make flaky under `--verify`. The clone *output* is content-addressed
+    // by git and therefore stable, so the L1 comparison of the resulting trees
+    // is the durable, non-flaky regression signal. See
+    // `make_gcc_build_is_l1_deterministic_under_strict` for the same
+    // L1-vs-`--verify` rationale.
+    //
+    // The fixture and clone targets live under `CARGO_TARGET_TMPDIR` (under
+    // `target/` on the real filesystem, not Hermit's isolated guest `/tmp`), so
+    // they are visible to the guest -- a `/tmp` fixture would be invisible and
+    // the clone would fail with "does not appear to be a git repository".
+    let git = required_app("git", &["/usr/bin/git", "/usr/local/bin/git"]);
+    let sh = required_app("sh", &["/bin/sh", "/usr/bin/sh"]);
+
+    let dir = build_dir("git-clone");
+    let src = build_git_fixture(&git, &dir);
+
+    // The checked-out working tree the clone should reproduce identically.
+    const CHECKED_OUT: [&str; 2] = ["a.txt", "d/b.txt"];
+
+    let _guard = hermit_run_lock();
+
+    let mut heads: Vec<String> = Vec::new();
+    let mut trees: Vec<Vec<Vec<u8>>> = Vec::new();
+    for run in 0..2 {
+        // Clone into a distinct absolute path each run so a stale directory can
+        // never mask nondeterminism and no path is embedded in the comparison.
+        let dest = dir.join(format!("dest{run}"));
+        let _ = fs::remove_dir_all(&dest);
+        let script = format!(
+            "GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+             '{git}' clone -q 'file://{src}' '{dest}' && \
+             '{git}' -C '{dest}' rev-parse HEAD",
+            git = git.display(),
+            src = src.display(),
+            dest = dest.display(),
+        );
+        let output = run_once_under_strict(&sh, &["-c", &script]);
+        assert!(
+            output.status.success(),
+            "hermit run --strict git clone (run {run}) failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        heads.push(String::from_utf8_lossy(&output.stdout).trim().to_string());
+        let tree = CHECKED_OUT
+            .iter()
+            .map(|name| {
+                let path = dest.join(name);
+                fs::read(&path).unwrap_or_else(|error| {
+                    panic!("clone did not check out {}: {error}", path.display())
+                })
+            })
+            .collect();
+        trees.push(tree);
+    }
+
+    assert_eq!(
+        heads[0], heads[1],
+        "git clone resolved different HEADs across two --strict runs ({} vs {})",
+        heads[0], heads[1],
+    );
+    for (idx, name) in CHECKED_OUT.iter().enumerate() {
+        assert_eq!(
+            trees[0][idx], trees[1][idx],
+            "git clone produced a non-deterministic `{name}` across two --strict runs (not even L1)"
+        );
+    }
 }

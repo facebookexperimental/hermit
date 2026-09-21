@@ -55,8 +55,8 @@ void abort_if_failed(
   if (!cond) {
     fprintf(
         stderr, "%s: %s:%d: Assertion `%s' failed.\n", func, file, line, desc);
-    if (errno > 0) {
-      fprintf(stderr, "           os error (%d): %s\n", errno, strerror(errno));
+    if (error > 0) {
+      fprintf(stderr, "           os error (%d): %s\n", error, strerror(error));
     }
     raise(SIGABRT);
     abort();

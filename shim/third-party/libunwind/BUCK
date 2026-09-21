@@ -1,0 +1,33 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is licensed under both the MIT license found in the
+# LICENSE-MIT file in the root directory of this source tree and the Apache
+# License, Version 2.0 found in the LICENSE-APACHE file in the root directory
+# of this source tree.
+
+load("@//third-party:defs.bzl", "pkgconfig_system_library")
+
+oncall("open_source")
+
+pkgconfig_system_library(
+    name = "unwind",
+    packages = {
+        "//os:linux-fedora": ["libunwind-devel"],
+        "//os:linux-ubuntu": ["libunwind-dev"],
+        "//os:macos-homebrew": ["libunwind"],
+    },
+    pkgconfig_name = "libunwind",
+)
+
+# The ptrace flavour of libunwind, used for remote backtraces. It ships in the
+# same distribution packages as the library above and has its own pkg-config
+# name.
+pkgconfig_system_library(
+    name = "unwind-ptrace",
+    packages = {
+        "//os:linux-fedora": ["libunwind-devel"],
+        "//os:linux-ubuntu": ["libunwind-dev"],
+        "//os:macos-homebrew": ["libunwind"],
+    },
+    pkgconfig_name = "libunwind-ptrace",
+)

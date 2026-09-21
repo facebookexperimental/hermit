@@ -6,9 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
-#endif
 
 #include <fcntl.h>
 #include <stdio.h>
@@ -18,7 +16,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-static void fail(const char* message) {
+static void fail(const char *message) {
   perror(message);
   exit(EXIT_FAILURE);
 }
@@ -43,7 +41,7 @@ int main(void) {
       .msg_control = send_control,
       .msg_controllen = sizeof(send_control),
   };
-  struct cmsghdr* send_cmsg = CMSG_FIRSTHDR(&send_message);
+  struct cmsghdr *send_cmsg = CMSG_FIRSTHDR(&send_message);
   send_cmsg->cmsg_level = SOL_SOCKET;
   send_cmsg->cmsg_type = SCM_RIGHTS;
   send_cmsg->cmsg_len = CMSG_LEN(sizeof(source));
@@ -69,7 +67,7 @@ int main(void) {
   if (recvmsg(sockets[1], &receive_message, 0) != sizeof(received_byte)) {
     fail("recvmsg");
   }
-  struct cmsghdr* receive_cmsg = CMSG_FIRSTHDR(&receive_message);
+  struct cmsghdr *receive_cmsg = CMSG_FIRSTHDR(&receive_message);
   if (received_byte != byte || receive_cmsg == NULL ||
       receive_cmsg->cmsg_level != SOL_SOCKET ||
       receive_cmsg->cmsg_type != SCM_RIGHTS ||
@@ -88,16 +86,14 @@ int main(void) {
     fputs("SCM_RIGHTS descriptor slots collided\n", stderr);
     return EXIT_FAILURE;
   }
-  unsigned char* mapping =
+  unsigned char *mapping =
       mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, received, 0);
   if (mapping == MAP_FAILED) {
     fail("mmap");
   }
-  if (memcmp(
-          mapping,
-          "\x7f"
-          "ELF",
-          4) != 0) {
+  if (memcmp(mapping, "\x7f"
+                      "ELF",
+             4) != 0) {
     fputs("mapped descriptor did not contain an ELF file\n", stderr);
     return EXIT_FAILURE;
   }

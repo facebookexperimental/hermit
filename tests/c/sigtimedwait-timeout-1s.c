@@ -43,15 +43,21 @@ SOFTWARE.
 
 static _Atomic int thread_should_exit;
 
+static void write_stdout(const char* message, size_t length) {
+  if (write(STDOUT_FILENO, message, length) != (ssize_t)length) {
+    _exit(2);
+  }
+}
+
 static void thread_exit(int signum, siginfo_t* info, void* uctxt) {
-  write(STDOUT_FILENO, "caught SIGTERM, preparing exit\n", 31);
+  write_stdout("caught SIGTERM, preparing exit\n", 31);
   atomic_store(&thread_should_exit, 1);
 }
 
 static void* second_thread(void* param) {
   pthread_t thread_suspend = *(pthread_t*)param;
 
-  write(STDOUT_FILENO, "2. sending SIGTERM\n", 19);
+  write_stdout("2. sending SIGTERM\n", 19);
   pthread_kill(thread_suspend, SIGTERM);
 
   return NULL;
@@ -65,9 +71,9 @@ static void* first_thread(void* param) {
   sigemptyset(&set);
   sigaddset(&set, SIGTERM);
 
-  write(STDOUT_FILENO, "1. sigtimedwait timeout one second\n", 35);
+  write_stdout("1. sigtimedwait timeout one second\n", 35);
   sigtimedwait(&set, &siginfo, &tp);
-  write(STDOUT_FILENO, "1. sigtimedwait finished\n", 25);
+  write_stdout("1. sigtimedwait finished\n", 25);
 
   return NULL;
 }

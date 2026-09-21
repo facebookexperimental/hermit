@@ -6,19 +6,30 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Output;
+use std::process::Stdio;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::OnceLock;
+use std::time::Duration;
+use std::time::Instant;
+
+use hermit::HERMIT_VERIFICATION_DIVERGENCE_EXIT;
+use hermit::Verdict;
 
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 static WORKLOADS: OnceLock<Workloads> = OnceLock::new();
+const ISOLATED_WORKDIR_ENV: &str = "HERMIT_E2E_EMPTY_WORKDIR";
+const HERMETIC_TEST_WORKDIR: &str = "/test";
 
 #[derive(Debug)]
 struct Workload {
@@ -32,6 +43,7 @@ struct Workloads {
     default_only: Vec<Workload>,
     hello_race: Workload,
     resource_determinism: Workload,
+    sabre_exit_group_parked: Workload,
 }
 
 #[derive(Clone, Copy)]
@@ -74,6 +86,34 @@ fn hermit_run_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+fn execution_root_args(requested: Option<&OsStr>) -> Result<Vec<OsString>, String> {
+    match requested {
+        None => Ok(Vec::new()),
+        Some(value) if value == OsStr::new(HERMETIC_TEST_WORKDIR) => Ok(vec![
+            "--mount=type=tmpfs,target=/test".into(),
+            "--workdir=/test".into(),
+        ]),
+        Some(value) => Err(format!(
+            "{ISOLATED_WORKDIR_ENV} must be {HERMETIC_TEST_WORKDIR}, got {value:?}"
+        )),
+    }
+}
+
+fn configure_execution_root(command: &mut Command) {
+    let requested = std::env::var_os(ISOLATED_WORKDIR_ENV);
+    let args = execution_root_args(requested.as_deref())
+        .unwrap_or_else(|error| panic!("PATH-CONTRACT: {error}"));
+    command.args(args);
+}
+
+fn minimal_execution_root_args(requested: Option<&OsStr>) -> Result<Vec<OsString>, String> {
+    let mut args = execution_root_args(requested)?;
+    if requested.is_some() {
+        args.insert(0, "--base-env=minimal".into());
+    }
+    Ok(args)
+}
+
 fn compile_c(source: &Path, output: &Path) {
     let mut command = Command::new("cc");
     command
@@ -110,55 +150,31 @@ fn compile_rust(source: &Path, output: &Path) {
     command_output(command, "Rust workload compilation");
 }
 
-const CARGO_GUEST_BINARIES: [&str; 21] = [
-    "rustbin_bind_connect_race",
-    "rustbin_clock_gettime",
-    "rustbin_clock_total_order",
-    "rustbin_exit_group",
-    "rustbin_futex_and_print",
-    "rustbin_futex_timeout",
-    "rustbin_futex_wait_child",
-    "rustbin_futex_wake_some",
-    "rustbin_interrogate_tty",
-    "rustbin_nanosleep",
-    "rustbin_network_hello_world",
-    "rustbin_pipe_basics",
-    "rustbin_poll",
-    "rustbin_poll_spin",
-    "rustbin_print_clock_nanosleep_monotonic_abs_race",
-    "rustbin_print_clock_nanosleep_monotonic_race",
-    "rustbin_print_clock_nanosleep_realtime_abs_race",
-    "rustbin_print_nanosleep_race",
-    "rustbin_sched_yield",
-    "rustbin_socketpair",
-    "rustbin_thread_random",
-];
+#[path = "../../ci/cargo-guest-binaries.rs"]
+mod cargo_guests;
+use cargo_guests::CARGO_GUEST_BINARIES;
 
-fn cargo_guest_workloads(repository: &Path) -> Vec<Workload> {
-    let binary_directory = Path::new(env!("CARGO_BIN_EXE_hermit"))
-        .parent()
-        .expect("Hermit binary should have a parent directory");
-    if CARGO_GUEST_BINARIES
-        .iter()
-        .any(|name| !binary_directory.join(name).is_file())
-    {
-        let mut command = Command::new(env!("CARGO"));
-        command.current_dir(repository).args([
-            "build",
-            "-p",
-            "hermetic_infra_hermit_tests",
-            "--bins",
-        ]);
-        command_output(command, "Cargo guest workload compilation");
-    }
-
+fn cargo_guest_workloads(_repository: &Path) -> Vec<Workload> {
+    let raw = std::env::var("HERMIT_PREPARED_CARGO_GUESTS").expect(
+        "Cargo guests must be prepared and verified by ci/nextest-binaries.rs before hermit_modes runs",
+    );
+    let guests: std::collections::BTreeMap<String, PathBuf> =
+        serde_json::from_str(&raw).expect("prepared Cargo guest paths must be a JSON object");
+    assert_eq!(
+        guests
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        CARGO_GUEST_BINARIES.into_iter().collect(),
+        "prepared Cargo guest identities must match every hermit_modes fixture",
+    );
     CARGO_GUEST_BINARIES
         .iter()
         .map(|&name| {
-            let path = binary_directory.join(name);
+            let path = guests[name].clone();
             assert!(
                 path.is_file(),
-                "missing Cargo guest binary: {}",
+                "missing prepared Cargo guest: {}",
                 path.display()
             );
             workload(name, path)
@@ -314,25 +330,50 @@ fn workloads() -> &'static Workloads {
             &hello_race.path,
         );
 
+        let sabre_exit_group_parked = workload(
+            "sabre_exit_group_parked",
+            build_root.join("sabre_exit_group_parked"),
+        );
+        compile_c(
+            &repository.join("tests/c/sabre_exit_group_parked.c"),
+            &sabre_exit_group_parked.path,
+        );
+
         Workloads {
             stable,
             default_only,
             hello_race,
             resource_determinism,
+            sabre_exit_group_parked,
         }
     })
 }
 
 fn hermit_command(base_env: &str) -> Command {
+    let requested = std::env::var_os(ISOLATED_WORKDIR_ENV);
+    hermit_command_with_execution_root(base_env, requested.as_deref())
+        .unwrap_or_else(|error| panic!("PATH-CONTRACT: {error}"))
+}
+
+fn hermit_command_with_execution_root(
+    base_env: &str,
+    requested_workdir: Option<&OsStr>,
+) -> Result<Command, String> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command
         .arg("run")
         .arg(format!("--base-env={base_env}"))
-        .args(["--no-virtualize-cpuid", "--preemption-timeout=disabled"]);
-    command
+        .args(["--no-virtualize-cpuid", "--max-timeslice=disabled"])
+        .args(execution_root_args(requested_workdir)?);
+    Ok(command)
 }
 
-fn verify_guest_command(tmp: &Path, script: &str, extra_options: &[&str]) -> Command {
+fn verify_guest_command(
+    tmp: &Path,
+    report: &Path,
+    script: &str,
+    extra_options: &[&str],
+) -> Command {
     let guest = tmp.join("guest");
     fs::write(&guest, script).expect("failed to write verify guest");
     let mut permissions = fs::metadata(&guest)
@@ -344,15 +385,39 @@ fn verify_guest_command(tmp: &Path, script: &str, extra_options: &[&str]) -> Com
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command
         .args(["run", "--verify"])
+        .arg("--verify-json")
+        .arg(report)
         .args(extra_options)
         .args([
             "--base-env=minimal",
             "--no-virtualize-cpuid",
-            "--preemption-timeout=disabled",
-        ])
+            "--max-timeslice=disabled",
+        ]);
+    configure_execution_root(&mut command);
+    command
         .arg(format!("--tmp={}", tmp.display()))
         .arg("/tmp/guest");
     command
+}
+
+fn read_verification_report(path: &Path) -> serde_json::Value {
+    serde_json::from_slice(&fs::read(path).unwrap_or_else(|error| {
+        panic!(
+            "verification did not publish report {}: {error}",
+            path.display()
+        )
+    }))
+    .unwrap_or_else(|error| panic!("verification report was not valid JSON: {error}"))
+}
+
+fn verification_verdict(report: &serde_json::Value) -> Verdict {
+    serde_json::from_value(
+        report
+            .get("verdict")
+            .cloned()
+            .expect("verification report has no verdict field"),
+    )
+    .expect("verification report verdict is not a known Verdict")
 }
 
 fn remove_retained_verify_logs(stderr: &str) {
@@ -411,25 +476,68 @@ fn run_buck_chaos_workload(name: &str) {
         .unwrap_or_else(|| panic!("unknown Buck chaos workload: {name}"));
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command
+        .current_dir(
+            workload
+                .path
+                .parent()
+                .expect("Buck chaos workload should have a build directory"),
+        )
         .args([
             "run",
             "--verify",
             "--chaos",
             "--base-env=empty",
-            "--preemption-timeout=1000000",
+            "--max-timeslice=1000000",
             "--env=HERMIT_MODE=chaos",
-            "--",
-        ])
-        .arg(&workload.path)
-        .args(workload.args);
+        ]);
+    configure_execution_root(&mut command);
+    command.arg("--").arg(&workload.path).args(workload.args);
     command_output(command, &format!("Buck chaos mode for {}", workload.name));
+}
+
+#[test]
+fn pinned_root_arguments_are_exact_and_fail_closed() {
+    assert!(execution_root_args(None).unwrap().is_empty());
+    assert_eq!(
+        execution_root_args(Some(OsStr::new("/test"))).unwrap(),
+        [
+            OsString::from("--mount=type=tmpfs,target=/test"),
+            OsString::from("--workdir=/test"),
+        ]
+    );
+    let error = execution_root_args(Some(OsStr::new("/tmp"))).unwrap_err();
+    assert!(error.contains("HERMIT_E2E_EMPTY_WORKDIR must be /test"));
+
+    assert!(minimal_execution_root_args(None).unwrap().is_empty());
+    assert_eq!(
+        minimal_execution_root_args(Some(OsStr::new("/test"))).unwrap(),
+        [
+            OsString::from("--base-env=minimal"),
+            OsString::from("--mount=type=tmpfs,target=/test"),
+            OsString::from("--workdir=/test"),
+        ]
+    );
+
+    let command = hermit_command_with_execution_root("minimal", Some(OsStr::new("/test")))
+        .expect("the documented workdir request should build a command");
+    let args: Vec<_> = command.get_args().collect();
+    assert!(args.windows(2).any(|args| {
+        args == [
+            OsStr::new("--mount=type=tmpfs,target=/test"),
+            OsStr::new("--workdir=/test"),
+        ]
+    }));
+    assert!(
+        hermit_command_with_execution_root("minimal", Some(OsStr::new("/tmp")))
+            .unwrap_err()
+            .contains("HERMIT_E2E_EMPTY_WORKDIR must be /test")
+    );
 }
 
 macro_rules! buck_chaos_tests {
     ($($test_name:ident => $workload_name:literal),+ $(,)?) => {
         $(
             #[test]
-            #[ignore = "requires PMU branch counters and working mount namespaces"]
             fn $test_name() {
                 run_buck_chaos_workload($workload_name);
             }
@@ -442,10 +550,24 @@ buck_chaos_tests! {
     chaos_buck_uname => "uname",
     chaos_buck_sysinfo => "sysinfo",
     chaos_buck_wait_on_child => "wait_on_child",
-    chaos_buck_nanosleep_parallel => "nanosleep_parallel",
     chaos_buck_clone => "clone",
     chaos_buck_hello_alarm => "hello_alarm",
-    chaos_buck_mem_race => "rust_mem_race",
+}
+
+// TODO(#2792): Replace this static PMU partition with shared RCB/PMU
+// prerequisite selection once that policy is decided.
+#[test]
+#[ignore = "known PMU chaos failure; tracked by #2791"]
+// TODO(#2791): The workload fails after an interrupted nanosleep reports EINTR.
+fn chaos_buck_nanosleep_parallel() {
+    run_buck_chaos_workload("nanosleep_parallel");
+}
+
+#[test]
+#[ignore = "known PMU chaos no-verdict; tracked by #2791"]
+// TODO(#2791): The workload produced no verdict within its 300-second bound.
+fn chaos_buck_mem_race() {
+    run_buck_chaos_workload("rust_mem_race");
 }
 
 #[test]
@@ -461,7 +583,7 @@ fn resource_syscalls_are_deterministic_across_five_runs() {
 
     for run in 1..=5 {
         let mut command = hermit_command("minimal");
-        command.arg("--").arg(&workload.path);
+        command.args(["--strict", "--"]).arg(&workload.path);
         let output = command_output(command, &format!("resource determinism run {run}"));
         let stdout = String::from_utf8(output.stdout).expect("resource output should be UTF-8");
 
@@ -473,10 +595,15 @@ fn resource_syscalls_are_deterministic_across_five_runs() {
             "prlimit64",
             "prlimit64 refusals deterministic",
             "prlimit64 fork inheritance deterministic",
-            "rusage self maxrss",
-            "rusage thread maxrss",
+            "rusage self before modeled-cpu",
+            "rusage thread before modeled-cpu",
+            "rusage self and thread logical CPU advances",
             "rusage children zero",
+            "rusage children before reap modeled-cpu",
+            "rusage children after reap modeled-cpu",
             "sysinfo",
+            "sysinfo memory matches configured memory",
+            "times logical process and child CPU ticks",
         ] {
             assert!(
                 stdout.contains(expected),
@@ -503,6 +630,152 @@ fn run_default_workload(name: &str) {
         .find(|workload| workload.name == name)
         .unwrap_or_else(|| panic!("unknown default-mode workload: {name}"));
     hermit_run(RunMode::Default, workload);
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-1023): Review the SaBRe exit-group teardown regression.
+fn run_bounded_sabre_strict_verify(program: &Path, args: &[&str], label: &str) {
+    let hermit_binary = Path::new(env!("CARGO_BIN_EXE_hermit"));
+    let executable_dir = hermit_binary.parent().unwrap();
+    let target_dir = executable_dir.parent().unwrap();
+    let configured_loader = std::env::var_os("HERMIT_SABRE_BINARY").map(PathBuf::from);
+    let loader = configured_loader
+        .clone()
+        .unwrap_or_else(|| target_dir.join("sabre/sabre"));
+    let plugin = executable_dir.join("libdetcore_sabre.so");
+    if !loader.is_file() || !plugin.is_file() {
+        if configured_loader.is_some() {
+            panic!(
+                "configured SaBRe regression artifacts are unavailable: loader={}, plugin={}",
+                loader.display(),
+                plugin.display(),
+            );
+        }
+        eprintln!(
+            "skipping {label}: SaBRe regression artifacts are unavailable: loader={}, plugin={}",
+            loader.display(),
+            plugin.display(),
+        );
+        return;
+    }
+
+    let _guard = hermit_run_lock();
+    let mut command = Command::new(hermit_binary);
+    let requested = std::env::var_os(ISOLATED_WORKDIR_ENV);
+    command.env("HERMIT_SABRE_BINARY", &loader).args([
+        "run",
+        "--backend",
+        "sabre",
+        "--strict",
+        "--verify",
+    ]);
+    command.args(
+        minimal_execution_root_args(requested.as_deref())
+            .unwrap_or_else(|error| panic!("PATH-CONTRACT: {error}")),
+    );
+    command
+        .arg("--")
+        .arg(program)
+        .args(args)
+        .process_group(0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let rendered = format!("{command:?}");
+    let started = Instant::now();
+    let mut child = command
+        .spawn()
+        .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
+    let timed_out = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break false,
+            Ok(None) if started.elapsed() >= Duration::from_secs(30) => {
+                let process_group = -(child.id() as libc::pid_t);
+                unsafe {
+                    libc::kill(process_group, libc::SIGKILL);
+                }
+                break true;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(error) => panic!("failed to poll {label}: {rendered}: {error}"),
+        }
+    };
+    let output = child
+        .wait_with_output()
+        .unwrap_or_else(|error| panic!("failed to collect {label}: {rendered}: {error}"));
+    assert!(
+        !timed_out && output.status.success(),
+        "{label} failed: {rendered}\nstatus: {}\ntimed out: {timed_out}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn sabre_exit_group_cancels_parked_futex_thread() {
+    let workload = &workloads().sabre_exit_group_parked;
+    run_bounded_sabre_strict_verify(
+        &workload.path,
+        workload.args,
+        "SaBRe exit-group teardown regression",
+    );
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-1154): Review the SaBRe fork/exec pipe-state regression.
+#[test]
+fn sabre_exec_pipeline_preserves_blocking_pipe_semantics() {
+    run_bounded_sabre_strict_verify(
+        Path::new("/usr/bin/bash"),
+        &[
+            "-c",
+            "set -euo pipefail; paste -d: <(printf 'alpha\\nbeta\\n') <(printf '1\\n2\\n') | diff -u <(printf 'alpha:1\\nbeta:2\\n') -; printf 'paste-ok\\n'",
+        ],
+        "SaBRe exec pipe-metadata regression",
+    );
+}
+
+#[test]
+fn sabre_timeout_observes_child_exit_before_virtual_alarm() {
+    run_bounded_sabre_strict_verify(
+        Path::new("/usr/bin/timeout"),
+        &["1", "/usr/bin/true"],
+        "SaBRe timeout physical-exit regression",
+    );
+}
+
+#[test]
+fn sabre_root_exit_with_orphan_child_is_bounded() {
+    run_bounded_sabre_strict_verify(
+        Path::new("/usr/bin/bash"),
+        &["-c", "/usr/bin/sleep 0.01 & exit 0"],
+        "SaBRe root exit with orphan child regression",
+    );
+}
+
+#[test]
+fn sabre_ignored_sigchld_does_not_block_parent_timer() {
+    run_bounded_sabre_strict_verify(
+        Path::new("/usr/bin/bash"),
+        &[
+            "-c",
+            "trap \"\" CHLD; /usr/bin/true & /usr/bin/sleep 0.01; exit 0",
+        ],
+        "SaBRe ignored SIGCHLD timer regression",
+    );
+}
+
+#[test]
+fn sabre_ignored_blocked_sigchld_external_wait_does_not_block_alarm() {
+    run_bounded_sabre_strict_verify(
+        Path::new("/usr/bin/python3"),
+        &[
+            "-c",
+            "import ctypes, os, signal, time; signal.signal(signal.SIGCHLD, signal.SIG_IGN); signal.signal(signal.SIGALRM, lambda s,f: None); libc=ctypes.CDLL(None, use_errno=True); Mask=ctypes.c_ulong*16; mask=Mask(); assert libc.sigemptyset(ctypes.byref(mask)) == 0; assert libc.sigaddset(ctypes.byref(mask), signal.SIGCHLD) == 0; pid=os.fork(); (time.sleep(0.005), os._exit(0)) if pid == 0 else None; signal.alarm(1); rc=libc.sigsuspend(ctypes.byref(mask)); print('done', rc, ctypes.get_errno())",
+        ],
+        "SaBRe ignored and blocked SIGCHLD external-wait alarm regression",
+    );
 }
 
 macro_rules! default_workload_tests {
@@ -769,10 +1042,10 @@ fn no_hardware_stacktrace_signal() {
         "--record-preemptions",
         "--base-env=minimal",
         "--no-virtualize-cpuid",
-        "--preemption-timeout=disabled",
-        "--",
-        "/bin/date",
+        "--max-timeslice=disabled",
     ]);
+    configure_execution_root(&mut command);
+    command.args(["--", "/bin/date"]);
     let rendered = format!("{command:?}");
     let output = command
         .output()
@@ -807,57 +1080,62 @@ fn verify_mode_matrix() {
 }
 
 #[test]
-fn verify_captures_debug_logs_when_a_lower_level_is_requested() {
+fn verify_rejects_explicit_log_levels_below_info() {
     let _guard = hermit_run_lock();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
-    command.args([
-        "--log=error",
-        "run",
-        "--verify",
-        "--base-env=minimal",
-        "--no-virtualize-cpuid",
-        "--preemption-timeout=disabled",
-        "--",
-        "/bin/true",
-    ]);
-
-    let output = command_output(command, "verify minimum log level");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("Logs contain "),
-        "missing log counts:\n{stderr}"
-    );
-    assert!(
-        !stderr.contains("Logs contain 0 | 0 messages total"),
-        "verify compared empty logs:\n{stderr}"
-    );
+    for level in ["off", "error", "warn"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+            .args([
+                &format!("--log={level}"),
+                "run",
+                "--verify",
+                "--",
+                "/bin/true",
+            ])
+            .output()
+            .unwrap_or_else(|error| panic!("failed to start verify with {level} logs: {error}"));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "--log={level} unexpectedly passed"
+        );
+        assert!(
+            stderr.contains("--verify requires --log=info"),
+            "unexpected --log={level} error:\n{stderr}"
+        );
+    }
 }
 
 #[test]
 fn verify_reports_stdout_divergence() {
     let _guard = hermit_run_lock();
     let tmp = tempfile::tempdir().expect("failed to create verify tmp directory");
+    let report = tempfile::NamedTempFile::new().expect("failed to create verification report");
     let mut command = verify_guest_command(
         tmp.path(),
+        report.path(),
         "#!/bin/sh\nif [ -e /tmp/state ]; then printf second; else printf first; fi\n: > /tmp/state\n",
         &[],
     );
 
     let output = command.output().expect("failed to run stdout verification");
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "divergent verification unexpectedly exited successfully:\n{stderr}"
+    );
+    let report = read_verification_report(report.path());
+    assert_eq!(
+        verification_verdict(&report),
+        Verdict::Diverged,
+        "unexpected verification report: {report}"
+    );
     assert_eq!(
         output.status.code(),
-        Some(1),
+        Some(HERMIT_VERIFICATION_DIVERGENCE_EXIT),
         "unexpected status:\n{stderr}"
     );
-    assert!(
-        stderr.contains("Mismatch in stdout between run 1 and run 2"),
-        "missing stdout diagnostic:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("Failure: nondeterministic."),
-        "missing verification failure:\n{stderr}"
-    );
+    assert!(!stderr.contains("HERMIT_INTERNAL_FAILURE"), "{stderr}");
+    assert_eq!(report["guest_exit_code"], serde_json::json!(0));
     remove_retained_verify_logs(&stderr);
 }
 
@@ -865,8 +1143,10 @@ fn verify_reports_stdout_divergence() {
 fn verify_reports_exit_status_divergence() {
     let _guard = hermit_run_lock();
     let tmp = tempfile::tempdir().expect("failed to create verify tmp directory");
+    let report = tempfile::NamedTempFile::new().expect("failed to create verification report");
     let mut command = verify_guest_command(
         tmp.path(),
+        report.path(),
         "#!/bin/sh\nif [ -e /tmp/state ]; then exit 17; fi\n: > /tmp/state\nexit 0\n",
         &["--verify-allow=both"],
     );
@@ -875,63 +1155,184 @@ fn verify_reports_exit_status_divergence() {
         .output()
         .expect("failed to run exit-status verification");
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "divergent verification unexpectedly exited successfully:\n{stderr}"
+    );
+    let report = read_verification_report(report.path());
+    assert_eq!(
+        verification_verdict(&report),
+        Verdict::Diverged,
+        "unexpected verification report: {report}"
+    );
     assert_eq!(
         output.status.code(),
-        Some(1),
+        Some(HERMIT_VERIFICATION_DIVERGENCE_EXIT),
         "unexpected status:\n{stderr}"
     );
-    assert!(
-        stderr.contains("Mismatch in exit status between run 1 and run 2"),
-        "missing exit-status diagnostic:\n{stderr}"
-    );
+    assert_eq!(report["guest_exit_code"], serde_json::json!(17));
     remove_retained_verify_logs(&stderr);
 }
 
 #[test]
 fn verify_verbose_compares_the_full_trace() {
     let _guard = hermit_run_lock();
+    let report = tempfile::NamedTempFile::new().expect("failed to create verification report");
     let mut command = hermit_command("minimal");
-    command.args(["--verify", "--verify-verbose", "--", "/bin/true"]);
+    command
+        .args(["--verify", "--verify-verbose"])
+        .arg("--verify-json")
+        .arg(report.path())
+        .args(["--", "/bin/true"]);
 
     let output = command
         .output()
         .expect("failed to run verbose verification");
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "divergent verification unexpectedly exited successfully:\n{stderr}"
+    );
+    let report = read_verification_report(report.path());
+    assert_eq!(
+        verification_verdict(&report),
+        Verdict::Diverged,
+        "unexpected verification report: {report}"
+    );
     assert_eq!(
         output.status.code(),
-        Some(1),
+        Some(HERMIT_VERIFICATION_DIVERGENCE_EXIT),
         "unexpected status:\n{stderr}"
     );
-    assert!(
-        stderr.contains("Comparing full trace messages"),
-        "missing full-trace comparison:\n{stderr}"
+    assert_eq!(
+        report["comparison"]["log_scope"],
+        serde_json::json!("full_trace"),
+        "verbose verification did not report a full-trace comparison: {report}"
     );
-    assert!(
-        stderr.contains("Failure: nondeterministic."),
-        "missing verification failure:\n{stderr}"
-    );
+    assert_eq!(report["guest_exit_code"], serde_json::json!(0));
     remove_retained_verify_logs(&stderr);
+}
+
+#[test]
+fn verify_strict_info_reports_typed_memory_parity_on_landed_fixture() {
+    let _guard = hermit_run_lock();
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let tmp = tempfile::Builder::new()
+        .prefix("verify-memory-regions-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create strict verification directory");
+    // This existing fixture intentionally materializes both a C stack value and
+    // several malloc allocations. A no-libc hello fixture has no [heap] mapping
+    // and cannot witness --detlog-heap even when aggregate INFO counts are nonzero.
+    let guest = tmp.path().join("print_memaddrs");
+    compile_c(&repository.join("tests/c/print_memaddrs.c"), &guest);
+    let report = tmp.path().join("verify.json");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command
+        .args([
+            "--log=info",
+            "run",
+            "--verify",
+            "--verify-strict",
+            "--verify-logs",
+        ])
+        .arg("--verify-json")
+        .arg(&report)
+        .args([
+            "--detlog-heap",
+            "--detlog-stack",
+            "--base-env=minimal",
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+        ]);
+    configure_execution_root(&mut command);
+    let output = command
+        .arg("--")
+        .arg(&guest)
+        .output()
+        .expect("failed to run strict INFO verification");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "strict INFO verification failed:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Comparing INFO messages"),
+        "strict comparison did not name its INFO envelope:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Comparing full trace messages"),
+        "ordinary strict verification unexpectedly promoted diagnostics:\n{stderr}"
+    );
+    let memory_region_count = |region: &str| {
+        let marker = format!("[{region}]->");
+        stderr
+            .lines()
+            .filter(|line| {
+                line.contains(" INFO ")
+                    && line.contains("DETLOG [memory]")
+                    && line.contains(&marker)
+            })
+            .count()
+    };
+    let heap_info_messages = memory_region_count("heap");
+    let stack_info_messages = memory_region_count("stack");
+    assert!(
+        heap_info_messages > 0,
+        "fixture produced no compared INFO heap evidence:\n{stderr}"
+    );
+    assert!(
+        stack_info_messages > 0,
+        "fixture produced no compared INFO stack evidence:\n{stderr}"
+    );
+
+    let report: serde_json::Value = serde_json::from_slice(
+        &fs::read(&report).expect("strict verification did not publish its report"),
+    )
+    .expect("strict verification report was not valid JSON");
+    assert_eq!(report["verified"], serde_json::json!(true));
+    assert_eq!(report["bitwise_parity"], serde_json::json!(true));
+    assert_eq!(report["comparison"]["log_scope"], serde_json::json!("info"));
+    assert!(
+        report["compared_log_messages"]["left"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
+    assert!(
+        report["compared_log_messages"]["right"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
 }
 
 #[test]
 fn verify_honors_tmp_and_environment() {
     let _guard = hermit_run_lock();
     let tmp = tempfile::tempdir().expect("failed to create verify tmp directory");
+    let source = tmp.path().join("guest.c");
     let guest = tmp.path().join("guest");
     fs::write(
-        &guest,
-        r#"#!/bin/sh
-[ "${VERIFY_CONFIGURED-}" = expected ] || exit 11
-[ "${VERIFY_HOST_ONLY+set}" != set ] || exit 12
-printf 'configured\n'
+        &source,
+        r#"#include <stdlib.h>
+#include <string.h>
+
+int main(void) {
+    const char *configured = getenv("VERIFY_CONFIGURED");
+    if (configured == NULL || strcmp(configured, "expected") != 0) {
+        return 11;
+    }
+    if (getenv("VERIFY_HOST_ONLY") != NULL) {
+        return 12;
+    }
+    return 0;
+}
 "#,
     )
-    .expect("failed to write verify guest");
-    let mut permissions = fs::metadata(&guest)
-        .expect("failed to stat verify guest")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&guest, permissions).expect("failed to make verify guest executable");
+    .expect("failed to write verify guest source");
+    compile_c(&source, &guest);
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command
@@ -941,9 +1342,11 @@ printf 'configured\n'
             "--base-env=empty",
             "--env=VERIFY_CONFIGURED=expected",
             "--no-virtualize-cpuid",
-            "--preemption-timeout=disabled",
+            "--max-timeslice=disabled",
         ])
-        .arg(format!("--tmp={}", tmp.path().display()))
+        .arg(format!("--tmp={}", tmp.path().display()));
+    configure_execution_root(&mut command);
+    command
         .arg("/tmp/guest")
         .env("VERIFY_HOST_ONLY", "unexpected");
     command_output(command, "verify configuration");
@@ -954,18 +1357,18 @@ fn hello_race_chaos_verify() {
     let _guard = hermit_run_lock();
     let workload = &workloads().hello_race;
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
-    command
-        .args([
-            "run",
-            "--verify",
-            "--verify-allow=both",
-            "--chaos",
-            "--base-env=minimal",
-            "--no-virtualize-cpuid",
-            "--preemption-timeout=disabled",
-            "--env=HERMIT_MODE=chaos",
-        ])
-        .arg(&workload.path);
+    command.args([
+        "run",
+        "--verify",
+        "--verify-allow=both",
+        "--chaos",
+        "--base-env=minimal",
+        "--no-virtualize-cpuid",
+        "--max-timeslice=disabled",
+        "--env=HERMIT_MODE=chaos",
+    ]);
+    configure_execution_root(&mut command);
+    command.arg("--").arg(&workload.path);
     let rendered = format!("{command:?}");
     let output = command
         .output()

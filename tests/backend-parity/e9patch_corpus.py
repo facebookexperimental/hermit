@@ -1,0 +1,414 @@
+#!/usr/bin/env python3
+"""Ratchet e9patch preprocessing parity against the golden ptrace backend.
+
+e9patch is binary-rewriting *preprocessing* for the ptrace backend, not a
+standalone Detcore backend: e9tool rewrites the guest ELF ahead of time to
+pre-trap its `SYSCALL` sites, then Detcore runs the rewritten image under
+ptrace. e9tool only rewrites the *main* executable, so a dynamically linked
+libc program exposes zero `SYSCALL` sites in its own ELF (they live in
+`libc.so`/`ld-linux`) and e9patch preprocessing becomes a no-op
+(`candidate_sites=0`). The shared `run_matrix.py` guests are all dynamic libc
+binaries and therefore never exercise the rewrite path. This harness instead
+uses a freestanding, statically linked, raw-`syscall` corpus (x86-64) whose
+`SYSCALL` sites live in the main ELF, so `candidate_sites > 0` and e9patch
+actually rewrites the guest.
+
+For each guest we compare the golden plain-ptrace run against the e9patch
+preprocessing + ptrace run and enforce, per guest:
+
+  * exit-status parity              (golden exit == e9patch exit),
+  * stdout parity                   (captured from a plain --strict run;
+                                      --verify diverts guest stdout for its own
+                                      log comparison),
+  * golden L2                       (hermit run --strict --verify verifies),
+  * e9patch L2                      (hermit --backend e9patch run --strict
+                                      --verify verifies),
+  * full direct-AOT coverage        (mapped_sites == candidate_sites > 0),
+  * no signal fallback              (b0_sites == 0; a nonzero B0 would reserve
+                                      SIGILL and change guest signal semantics),
+  * guest-syscall DETLOG tail-match (the golden guest-syscall sequence equals
+                                      the suffix of the e9patch sequence; the
+                                      removed prefix is the deterministic
+                                      e9loader prologue).
+
+Byte-identical DETLOG parity to plain ptrace is impossible by construction: the
+e9patch-rewritten image carries an e9loader stub that runs a fixed, deterministic
+startup prologue (readlink /proc/self/exe, open(self), arch_prctl GET/SET_FS,
+N * mmap of trampoline pages, close) before the guest's own `_start`. That
+prologue is a pure prefix; the achievable and enforced parity is guest-syscall
+DETLOG identity *modulo* that deterministic prologue (tail-match), plus L2 and
+guest-visible parity. This harness makes no claim of strict detlog identity.
+
+Prerequisites (absent in CI, hence BLOCKED there, mirroring the KVM /dev/kvm
+gate in run_matrix.py):
+  * a hermit built with the `e9patch` cargo feature
+    (`cargo build -p hermit --features e9patch`);
+  * HERMIT_E9TOOL and HERMIT_E9PATCH_BACKEND pointing at a built e9tool/e9patch
+    pair (the reverie checkout vendors them under
+    `third-party/e9patch/{e9tool,e9patch}`);
+  * an x86-64 host with `cc`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPOSITORY = SCRIPT_DIR.parent.parent
+CORPUS_DIR = SCRIPT_DIR / "e9patch_corpus"
+VERIFICATION_REPORT_BIN = os.environ.get("VERIFICATION_REPORT_BIN")
+
+# name -> (expected_exit, expected_stdout or None). stdout is exact when given.
+CORPUS: dict[str, tuple[int, bytes | None]] = {
+    "minimal_exit": (0, b""),
+    "write_stdout": (0, b"corpus-write\n"),
+    "getpid_check": (0, b""),
+    "clock_gettime": (0, b""),
+    "nanosleep": (0, b""),
+    "getrandom": (0, b""),
+    "multi_site": (0, b"multi\n"),
+    "loop_write": (0, b"xxxxxxxx\n"),
+    "mmap_anon": (0, b""),
+    "uname": (0, b""),
+    "sigmask": (0, b""),
+    "compute": (0, None),
+    # Round-2 fd/output-hygiene ratchet batch (non-time, non-gated). These probe
+    # descriptor allocation, reuse, and process-metadata output; e9patch
+    # preprocessing must not perturb any of it (the e9loader closes its self-fd
+    # and leaves /proc/self/exe pointing at the original guest binary). The two
+    # environment-dependent guests assert golden==e9patch parity only (None).
+    "fd_open_number": (0, b"fd=3\n"),
+    "fd_lowest_free": (0, b"a=3\nb=4\nc=3\n"),
+    "pipe_fds": (0, b"r=0\nrd=3\nwr=4\n"),
+    "dup3_high": (0, b"dup3=10\nviaten\n"),
+    "writev_multi": (0, b"ABC\nwrote=4\n"),
+    "fcntl_cloexec": (0, b"stdout_fd_flags=0\nopened_fd=3\nopened_flags=0\n"),
+    "proc_self_fd_count": (0, None),
+    "readlink_exe": (0, None),
+}
+
+FREESTANDING_FLAGS = (
+    "-nostdlib",
+    "-static",
+    "-ffreestanding",
+    "-O0",
+    "-fno-pie",
+    "-no-pie",
+)
+
+
+class CorpusError(Exception):
+    """A missing corpus source or a failed parity contract."""
+
+
+def compile_guest(name: str, out_dir: Path) -> Path:
+    source = CORPUS_DIR / f"{name}.c"
+    if not source.is_file():
+        raise CorpusError(f"missing corpus source: {source}")
+    compiler = shutil.which(os.environ.get("CC", "cc"))
+    if compiler is None:
+        raise CorpusError("C compiler unavailable (set CC or install cc)")
+    output = out_dir / name
+    command = [compiler, *FREESTANDING_FLAGS, str(source), "-o", str(output)]
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        raise CorpusError(f"compile failed: {command!r}\n{result.stdout}{result.stderr}")
+    return output
+
+
+def hermit_command(
+    hermit: Path,
+    e9: bool,
+    verify: bool,
+    guest: Path,
+    host_tmp: Path,
+    verify_json: Path | None = None,
+    backend_engagement_json: Path | None = None,
+) -> list[str]:
+    command = [str(hermit)]
+    if e9:
+        command.extend(["--backend", "e9patch"])
+    command.append("run")
+    command.append("--strict")
+    if verify:
+        command.append("--verify")
+        if verify_json is None:
+            raise CorpusError("a verification run requires a typed report path")
+        command.append(f"--verify-json={verify_json}")
+    if backend_engagement_json is not None:
+        command.append(f"--backend-engagement-json={backend_engagement_json}")
+    command.append(f"--tmp={host_tmp}")
+    command.extend(["--", str(guest)])
+    return command
+
+
+def run(command: list[str], timeout: int) -> tuple[int, bytes, bytes]:
+    try:
+        proc = subprocess.run(
+            command, capture_output=True, timeout=timeout, check=False
+        )
+    except subprocess.TimeoutExpired:
+        return 124, b"", b"<timeout>"
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def detlog_syscalls(
+    hermit: Path, e9: bool, guest: Path, host_tmp: Path
+) -> list[str]:
+    """Canonical guest-syscall sequence from a --log=info plain --strict run.
+
+    Uses the "inbound syscall:" lines (they include exit_group, which has no
+    finish line), with timestamps and addresses/large integers normalized so
+    the sequence is host-layout independent.
+    """
+    command = [str(hermit)]
+    if e9:
+        command.extend(["--backend", "e9patch"])
+    command.extend(
+        ["--log=info", "run", "--strict", f"--tmp={host_tmp}", "--", str(guest)]
+    )
+    _, _, stderr = run(command, timeout=60)
+    lines: list[str] = []
+    for raw in stderr.decode(errors="replace").splitlines():
+        match = re.search(r"inbound syscall: ([a-z_0-9]+\(.*\)) = \?$", raw)
+        if not match:
+            continue
+        canonical = re.sub(r"0x[0-9a-f]+", "A", match.group(1))
+        canonical = re.sub(r", [0-9]{4,}", ", N", canonical)
+        lines.append(canonical)
+    return lines
+
+
+def e9patch_engagement(path: Path) -> tuple[int, int, int]:
+    try:
+        report = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise CorpusError(f"e9patch engagement record is unavailable: {error}") from error
+    if not isinstance(report, dict) or set(report) != {"schema", "engagement"}:
+        raise CorpusError("e9patch engagement record has unexpected fields")
+    if report.get("schema") != 2:
+        raise CorpusError("e9patch engagement record must use schema 2")
+    engagement = report.get("engagement")
+    expected = {"backend", "candidate_sites", "mapped_sites", "b0_sites"}
+    if not isinstance(engagement, dict) or set(engagement) != expected:
+        raise CorpusError("e9patch engagement value is incomplete")
+    if engagement.get("backend") != "e9patch":
+        raise CorpusError("e9patch engagement record names another backend")
+    values = tuple(engagement[name] for name in ("candidate_sites", "mapped_sites", "b0_sites"))
+    if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in values):
+        raise CorpusError("e9patch engagement counts must be nonnegative integers")
+    return values
+
+
+def verification_report_bin(hermit: Path) -> Path:
+    if VERIFICATION_REPORT_BIN:
+        return Path(VERIFICATION_REPORT_BIN)
+    return hermit.parent / "verification-report"
+
+
+def verification_matched(hermit: Path, report: Path) -> tuple[bool, str]:
+    code, _, stderr = run(
+        [str(verification_report_bin(hermit)), "matched", str(report)], timeout=10
+    )
+    return code == 0, stderr.decode(errors="replace").strip()
+
+
+def e9patch_feature_from_build_info(raw: bytes) -> bool:
+    try:
+        report = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise CorpusError(f"hermit version record is not valid JSON: {error}") from error
+    if not isinstance(report, dict) or report.get("schema") != 1:
+        raise CorpusError("hermit version record must use schema 1")
+    features = report.get("features")
+    if not isinstance(features, dict) or not isinstance(features.get("e9patch"), bool):
+        raise CorpusError("hermit version record must carry boolean features.e9patch")
+    return features["e9patch"]
+
+
+def hermit_has_e9patch_feature(hermit: Path) -> bool:
+    code, stdout, stderr = run([str(hermit), "version", "--json"], timeout=10)
+    if code != 0:
+        detail = stderr.decode(errors="replace").strip() or f"exit {code}"
+        raise CorpusError(f"hermit version record unavailable: {detail}")
+    return e9patch_feature_from_build_info(stdout)
+
+
+def prerequisites(hermit: Path) -> str | None:
+    if not hermit.is_file() or not os.access(hermit, os.X_OK):
+        return f"hermit executable unavailable: {hermit}"
+    report_bin = verification_report_bin(hermit)
+    if not report_bin.is_file() or not os.access(report_bin, os.X_OK):
+        return (
+            f"typed verification-report reader unavailable: {report_bin} "
+            "(build it with cargo build -p hermit --bin verification-report)"
+        )
+    for var in ("HERMIT_E9TOOL", "HERMIT_E9PATCH_BACKEND"):
+        path = os.environ.get(var)
+        if not path or not Path(path).is_file():
+            return f"{var} is unset or does not point at a file"
+    if not hermit_has_e9patch_feature(hermit):
+        return "hermit was not built with the e9patch cargo feature"
+    return None
+
+
+def run_guest(hermit: Path, name: str, out_dir: Path) -> tuple[str, str]:
+    expected_exit, expected_stdout = CORPUS[name]
+    guest = compile_guest(name, out_dir)
+
+    sequence = 0
+
+    def host_tmp(label: str) -> Path:
+        nonlocal sequence
+        sequence += 1
+        path = out_dir / "host-tmp" / f"{name}-{label}-{sequence}"
+        path.mkdir(parents=True)
+        return path
+
+    gx, gout, _ = run(
+        hermit_command(hermit, False, False, guest, host_tmp("golden")), timeout=40
+    )
+    golden_report = out_dir / f"{name}-golden-verify.json"
+    e9patch_report = out_dir / f"{name}-e9patch-verify.json"
+    engagement_report = out_dir / f"{name}-e9patch-engagement.json"
+    _, _, _ = run(
+        hermit_command(
+            hermit,
+            False,
+            True,
+            guest,
+            host_tmp("golden-verify"),
+            golden_report,
+        ),
+        timeout=60,
+    )
+    ex, eout, _eerr = run(
+        hermit_command(
+            hermit,
+            True,
+            False,
+            guest,
+            host_tmp("e9patch"),
+            backend_engagement_json=engagement_report,
+        ),
+        timeout=60,
+    )
+    _, _, _ = run(
+        hermit_command(
+            hermit,
+            True,
+            True,
+            guest,
+            host_tmp("e9patch-verify"),
+            e9patch_report,
+        ),
+        timeout=90,
+    )
+
+    if gx == 124 or ex == 124:
+        return "FAIL", f"timeout (golden={gx}, e9patch={ex})"
+    if gx != expected_exit:
+        return "FAIL", f"golden exit {gx}, expected {expected_exit}"
+    if gx != ex:
+        return "FAIL", f"exit divergence golden={gx} e9patch={ex}"
+    if gout != eout:
+        return "FAIL", f"stdout divergence golden={gout!r} e9patch={eout!r}"
+    if expected_stdout is not None and gout != expected_stdout:
+        return "FAIL", f"golden stdout {gout!r}, expected {expected_stdout!r}"
+    golden_matched, golden_reason = verification_matched(hermit, golden_report)
+    if not golden_matched:
+        return "FAIL", f"golden typed verification report did not match: {golden_reason}"
+    e9patch_matched, e9patch_reason = verification_matched(hermit, e9patch_report)
+    if not e9patch_matched:
+        return "FAIL", f"e9patch typed verification report did not match: {e9patch_reason}"
+
+    try:
+        cand, mapped, b0 = e9patch_engagement(engagement_report)
+    except CorpusError as error:
+        return "FAIL", str(error)
+    if cand == 0:
+        return "FAIL", "candidate_sites=0 (guest did not exercise the rewrite path)"
+    if mapped != cand:
+        return "FAIL", f"incomplete coverage mapped={mapped} candidate={cand}"
+    if b0 != 0:
+        return "FAIL", f"b0_sites={b0} (SIGILL signal fallback rejected)"
+
+    golden_seq = detlog_syscalls(hermit, False, guest, host_tmp("golden-detlog"))
+    e9_seq = detlog_syscalls(hermit, True, guest, host_tmp("e9patch-detlog"))
+    prologue = len(e9_seq) - len(golden_seq)
+    if prologue < 0 or e9_seq[prologue:] != golden_seq:
+        return "FAIL", (
+            "guest-syscall DETLOG tail mismatch "
+            f"golden={golden_seq!r} e9patch={e9_seq!r}"
+        )
+    return "PASS_L2", (
+        f"exit={gx} sites c/{cand} m/{mapped} b0/{b0} "
+        f"prologue={prologue} tail_match=yes"
+    )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--hermit",
+        type=Path,
+        default=REPOSITORY / "target/debug/hermit",
+        help="Hermit executable (must be built --features e9patch)",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="validate the corpus contract and list guests without running",
+    )
+    parser.add_argument(
+        "--require-backend",
+        action="store_true",
+        help="fail instead of reporting BLOCKED when prerequisites are absent",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    print(f"CORPUS: {len(CORPUS)} freestanding e9patch parity guests")
+    for name in CORPUS:
+        source = CORPUS_DIR / f"{name}.c"
+        if not source.is_file():
+            raise CorpusError(f"missing corpus source: {source}")
+    if args.check:
+        for name in CORPUS:
+            print(f"  contract {name}")
+        return 0
+
+    hermit = args.hermit.resolve()
+    block = prerequisites(hermit)
+    if block:
+        print(f"BLOCKED: {block}")
+        return 1 if args.require_backend else 0
+
+    failures = 0
+    with tempfile.TemporaryDirectory(prefix="hermit-e9patch-corpus-") as tempdir:
+        for name in CORPUS:
+            status, detail = run_guest(hermit, name, Path(tempdir))
+            print(f"{status} {name}: {detail}")
+            if status != "PASS_L2":
+                failures += 1
+    passed = len(CORPUS) - failures
+    print(f"RATCHET e9patch: {passed}/{len(CORPUS)} PASS_L2")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except CorpusError as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        sys.exit(2)

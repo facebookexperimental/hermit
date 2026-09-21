@@ -21,11 +21,45 @@ use clap::Parser;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::happens_before::HappensBeforeProgram;
 use crate::pid::DetTid;
 use crate::schedule::SigWrapper;
+use crate::time::NANOS_PER_RCB;
+use crate::time::RcbTimeMultiplier;
 
 const fn default_true() -> bool {
     true
+}
+
+/// One mount row whose kernel-private root must be replaced before it becomes
+/// guest-visible.
+///
+/// The CLI populates this only after proving, with held file descriptors in the
+/// completed mount namespace, that the mount is one Hermit created.  The raw
+/// mount ID is namespace-local, so these entries are valid only for the one
+/// container run whose configuration carries them.
+#[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
+pub struct MountInfoRootRewrite {
+    /// Mount ID read from the held target descriptor's `/proc/self/fdinfo`.
+    pub raw_mount_id: u64,
+    /// Stable guest-visible replacement for the row's root field.
+    pub deterministic_root: Vec<u8>,
+    /// Exact encoded kernel root prefix used for descendant mount rows.
+    ///
+    /// This is present only for a proven private `/tmp`. Mounts installed below
+    /// that directory before it is bound over guest `/tmp` otherwise expose the
+    /// randomly named backing directory in mountinfo field 5.
+    #[serde(default)]
+    pub raw_root_prefix: Option<Vec<u8>>,
+    /// Guest-visible prefix replacing `raw_root_prefix`.
+    #[serde(default)]
+    pub deterministic_root_prefix: Option<Vec<u8>>,
+    /// Exact encoded host path prefix used for descendant mountpoints.
+    #[serde(default)]
+    pub raw_mountpoint_prefix: Option<Vec<u8>>,
+    /// Guest-visible prefix replacing `raw_mountpoint_prefix`.
+    #[serde(default)]
+    pub deterministic_mountpoint_prefix: Option<Vec<u8>>,
 }
 
 /// Configuration options for detcore.
@@ -49,10 +83,125 @@ pub struct Config {
     #[clap(skip = true)]
     pub backend_supports_madvise: bool,
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-845): Review in-process backend descriptor discovery.
+    /// The execution backend runs Detcore inside the guest and can inspect its live descriptors.
+    #[serde(default)]
+    #[clap(skip)]
+    pub discover_live_file_metadata: bool,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-845): Review backend-local guest clock observations.
+    /// Legacy serialized setting retained for record compatibility. Guest-visible wall and
+    /// monotonic clocks always use the coordinator's virtual-time domain.
+    #[serde(default)]
+    #[clap(skip)]
+    pub use_thread_local_clock_reads: bool,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-845): Review host-clock futex deadline detection.
+    /// Direct guest clock reads may bypass backend virtualization, so absolute futex deadlines
+    /// must be classified against both the host and logical clocks.
+    #[serde(default)]
+    #[clap(skip)]
+    pub detect_host_clock_futex_timeouts: bool,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-845): Review backend-owned syscall-clobber determinism.
+    /// The execution backend already returns deterministic values for registers clobbered by a
+    /// syscall instruction, so Detcore must not write the complete register set back afterward.
+    #[serde(default)]
+    #[clap(skip)]
+    pub syscall_clobbers_virtualized_by_backend: bool,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-845): Review backend-local exit-group RPC cancellation.
+    /// Logically killed guest threads need an explicit scheduler response because the backend
+    /// does not rely on ptrace's kernel-driven exit-group teardown.
+    #[serde(default)]
+    #[clap(skip)]
+    pub cancel_killed_thread_rpcs: bool,
+
+    /// The execution backend reports final physical process exits after logical tool cleanup, so
+    /// Detcore can prevent virtual timers from overtaking kernel child-exit publication.
+    #[serde(default)]
+    #[clap(skip)]
+    pub backend_reports_physical_process_exits: bool,
+
+    // TODO-HUMAN-REVIEW(PR-1013): Review backend child process execution ordering.
+    /// The execution backend completes forked process children before returning to the parent.
+    #[serde(default)]
+    #[clap(skip)]
+    pub backend_serializes_fork_children: bool,
+
+    // TODO-HUMAN-REVIEW(PR-1013): Review backend thread callback coverage.
+    /// The execution backend dispatches cloned thread syscalls through this tool.
+    #[serde(default = "default_true")]
+    #[clap(skip = true)]
+    pub backend_dispatches_thread_tools: bool,
+
+    /// The backend reports every process child through Detcore's child-registration protocol.
+    /// When true, an empty scheduler selection is authoritative ECHILD rather than a reason to
+    /// fall back to backend-specific wait filtering.
+    #[serde(default = "default_true")]
+    #[clap(skip = true)]
+    pub backend_tracks_process_children: bool,
+
+    /// The execution backend completes Linux's robust-list cleanup before its task-exit callback
+    /// lets another modeled thread run. Detcore still wakes waiters parked in its precise futex
+    /// model, but it leaves the owner-word transition to Linux so it remains atomic.
+    #[serde(default = "default_true")]
+    #[clap(skip = true)]
+    pub backend_runs_exit_robust_list: bool,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1058): Review process-signal identity translation.
+    /// The backend cannot execute process-directed signal syscalls using Detcore's guest PID and
+    /// therefore requires Detcore to translate an unambiguous process target to a specific thread.
+    #[serde(default)]
+    #[clap(skip)]
+    pub backend_requires_thread_directed_process_signals: bool,
+
+    /// Identifies KVM for its run-installed process alarm control.
+    #[serde(default)]
+    #[clap(skip)]
+    pub backend_is_kvm: bool,
+
+    /// Startup-only real-timer policy using acknowledged shared signal dequeues.
+    #[serde(default)]
+    #[clap(skip)]
+    pub kvm_shared_dequeue_timers: bool,
+
+    /// The backend can wake a scheduler-managed pipe write for a cross-task signal while
+    /// preserving Linux signal-mask, disposition, and syscall-restart behavior.
+    #[serde(default = "default_true")]
+    #[clap(skip = true)]
+    pub backend_supports_parked_write_signal_interruption: bool,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1125): Review backend-owned capability-control prctls.
+    /// The execution backend virtualizes capability bounding-set and ambient-capability state.
+    #[serde(default)]
+    #[clap(skip)]
+    pub backend_virtualizes_capability_prctls: bool,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1152): Review deferred vfork child registration.
+    /// The execution backend does not keep a `CLONE_VFORK` parent blocked inside the injected
+    /// `clone(2)` until the child registers. The ptrace backend relies on the kernel to suspend a
+    /// vfork parent until the child execs or exits, so the child always registers its vfork barrier
+    /// before the parent asks to continue. Out-of-process backends such as KVM service the clone by
+    /// deferring the child spawn, so the child registers only *after* the parent posts its
+    /// continuation. When this is set the scheduler keeps an unfulfilled vfork barrier in place at
+    /// parent continuation (waiting for the late child) instead of treating it as a failed clone.
+    #[serde(default)]
+    #[clap(skip)]
+    pub backend_defers_vfork_child_registration: bool,
+
     /// Epoch of the logical time.
     ///
     /// This is the datetime from which all time and date modtimes begin and
-    /// monotonically increase. It is in RFC3339 format such as: 2021-12-31T23:59:59Z"
+    /// monotonically increase. It is in RFC3339 format such as `2026-01-01T00:00:00Z`.
     #[clap(
         long,
         env = "HERMIT_EPOCH",
@@ -89,10 +238,60 @@ pub struct Config {
     #[clap(long, value_name = "float")]
     pub clock_multiplier: Option<f64>,
 
-    /// Disable substitution of virtual (deterministic) file metadata, in lieu
-    /// of the real metadata returned by `fstat`, implies `virtualize_time`.
+    /// Disable substitution of virtual (deterministic) file metadata in lieu
+    /// of the real metadata returned by `stat`/`statx`. This also preserves raw
+    /// mountinfo device numbers so those interfaces continue to agree. Raw
+    /// device values are host/filesystem observations and are not promised to
+    /// reproduce across machines. Virtual metadata implies `virtualize_time`.
     #[clap(long = "no-virtualize-metadata", action = clap::ArgAction::SetFalse)]
     pub virtualize_metadata: bool,
+
+    /// Proven Hermit-owned mount roots to hide from `/proc/*/mountinfo`.
+    ///
+    /// This is runtime provenance, not a user option.  `serde(default)` keeps
+    /// older serialized configurations compatible and makes backends which do
+    /// not use the common container setup explicitly receive no rewrite claim.
+    #[serde(default)]
+    #[clap(skip)]
+    pub mountinfo_root_rewrites: Vec<MountInfoRootRewrite>,
+
+    /// Backend-proven pairs of (`mountinfo` raw device, `stat`/`statx` raw device).
+    ///
+    /// A backend may synthesize mountinfo independently from its pathname
+    /// metadata implementation.  These pairs state that the two raw numbers
+    /// describe the same filesystem, so Detcore can feed both surfaces through
+    /// one device identity.  The pairs are runtime provenance, not a user
+    /// option; an absent pair must never be inferred from numeric coincidence.
+    #[serde(default)]
+    #[clap(skip)]
+    pub mountinfo_device_rewrites: Vec<(u64, u64)>,
+
+    /// Recording/container namespace mount IDs in canonical row order.
+    ///
+    /// Detcore uses this same mapping for `/proc/*/mountinfo` and
+    /// `/proc/*/fdinfo/*`. It is runtime provenance rather than a user option;
+    /// replay retains recording-time raw IDs because its read events contain
+    /// recording-time kernel bytes.
+    #[serde(default)]
+    #[clap(skip)]
+    pub mountinfo_mount_ids: Vec<u64>,
+
+    /// Whether `mountinfo_mount_ids` is an exact producer-owned snapshot.
+    ///
+    /// The distinction matters for an empty mountinfo file: an absent snapshot
+    /// asks Detcore to observe the completed guest namespace, while a captured
+    /// empty snapshot must remain empty during replay.
+    #[serde(default)]
+    #[clap(skip)]
+    pub mountinfo_mount_ids_captured: bool,
+
+    /// Raw fdinfo mount IDs absent from mountinfo, in first-observation order.
+    ///
+    /// Recording persists this producer-observed order so replay does not
+    /// derive identities from its fresh namespace or launch descriptor shape.
+    #[serde(default)]
+    #[clap(skip)]
+    pub fdinfo_unlisted_mount_ids: Vec<u64>,
 
     /// Sequentialize thread execution deterministically.
     #[clap(long)]
@@ -119,8 +318,8 @@ pub struct Config {
     /// Schedule threads chaotically.
     ///
     /// The behavior of this flag is subject to change. Current behavior is to randomize thread
-    /// priorities at every timeout caused by the `--preemption-timeout`.  Other randomization
-    /// strategies are possible with `--sched-heuristic`.
+    /// priorities at every logical timeslice. Other randomization strategies are possible with
+    /// `--sched-heuristic`.
     ///
     /// Thread scheduling remains deterministic, determined by the random seed.
     #[clap(long)]
@@ -139,6 +338,40 @@ pub struct Config {
     /// like the rest of chaos mode it remains reproducible under a fixed seed.
     #[clap(long)]
     pub chaos_target_races: bool,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1149)
+    // TODO-HUMAN-REVIEW(PR-1151)
+    /// Reproducible per-thread slowdown factors for chaos mode. A factor greater
+    /// than one makes each RCB consume proportionally more virtual time, while a
+    /// factor below one makes it consume less. Thus scheduling deadlines and the
+    /// guest-visible virtual clock describe the same slowed execution rather than
+    /// applying an out-of-band scheduling bias. The factor is a pure function of
+    /// scheduler seed, stable deterministic thread id, and chaos epoch. A fixed
+    /// seed therefore reproduces both timing and interleavings.
+    #[clap(long)]
+    pub chaos_per_thread_slowdown: bool,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1149)
+    // TODO-HUMAN-REVIEW(PR-1151)
+    /// Maximum ratio between the slowest and fastest per-thread slowdown factor
+    /// for `--chaos-per-thread-slowdown`. Each thread's factor is drawn
+    /// log-uniformly from `[1/R, R]` where `R` is this value. Must fit the Q32
+    /// virtual-time representation and be `>= 1.0`; `1.0` disables the spread.
+    #[clap(long, default_value = "10.0", value_name = "double")]
+    pub chaos_slowdown_max_factor: f64,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    /// Length of a deterministic slowdown epoch in elapsed per-thread logical
+    /// nanoseconds. At the first scheduler commit at or after each boundary the
+    /// factor is redrawn as `factor(seed, stable_dettid, epoch)`. This is never
+    /// wall time. `0` means one epoch for the entire run, making constant slowdown
+    /// the single-epoch special case. Recorded preemption artifacts carry exact
+    /// epoch transitions and factors for replay. Inert without chaos slowdown.
+    #[clap(long, default_value = "0", value_name = "nanos")]
+    pub chaos_epoch_length_ns: u64,
 
     /// Record the timing of preemption events for future replay or experimentation.
     /// This is only useful in chaos modes.
@@ -205,10 +438,31 @@ pub struct Config {
     #[clap(long)]
     pub deterministic_io: bool,
 
-    /// DANGEROUS: Panic on unsupported syscalls, this is useful for
-    /// debugging detcore itself, not recommended otherwise.
+    /// Fail immediately on unsupported syscalls instead of forwarding them.
+    /// Ordinary `hermit run` enables this policy; compatibility requires the
+    /// explicit `--allow-unsupported-syscalls` opt-out.
     #[clap(long)]
     pub panic_on_unsupported_syscalls: bool,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-644): Review backend-safe fail-closed termination.
+    /// Return a typed Tool error instead of unwinding through a backend callback.
+    #[serde(default)]
+    #[clap(skip)]
+    pub exit_on_unsupported_syscall: bool,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-644): Review process-tree shutdown for ptrace fail-closed mode.
+    /// Terminate the whole tracer when an unsupported syscall is observed.
+    #[serde(default)]
+    #[clap(skip)]
+    pub shutdown_on_unsupported_syscall: bool,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-644): Review the internal cross-process warning report channel.
+    /// Internal inherited file descriptor used to aggregate unsupported syscalls.
+    #[serde(default)]
+    #[clap(skip)]
+    pub unsupported_syscall_report_fd: Option<i32>,
 
     /// Panic when a precise PMU timer overshoots its expected RCB target instead of logging an
     /// error and continuing through normal timer handling. Intended for Detcore debugging.
@@ -246,17 +500,28 @@ pub struct Config {
     )]
     pub gdbserver_port: u16,
 
-    /// Configure the longest time slice for which a guest thread should be allowed to run
-    /// uninterrupted. This uses the unit of "virtual nanoseconds", and is implemented using
-    /// retired conditional branche (RCB) counting.
+    /// Configure the maximum time a guest thread may run without returning to Detcore. This is
+    /// measured in virtual nanoseconds and enforced with retired conditional branch (RCB)
+    /// counting. `--preemption-timeout` is retained as a deprecated alias.
     ///
-    /// To disable preemption based on RCB count, set`preemption_timeout` to "disabled" or "0".
-    /// Note: Set `preemption_timeout` to a non-zero value requires hardware performance counters.
-    #[clap(long,
+    /// Set this to `disabled` or `0` to disable PMU-backed preemption. Positive values must be at
+    /// least one RCB (10 virtual nanoseconds at the default clock multiplier) and require
+    /// user-space hardware performance counters.
+    #[serde(alias = "preemption_timeout")]
+    #[clap(
+                long,
+                visible_alias = "preemption-timeout",
                 value_name = "uint64|'disabled'",
                 default_value = "200000000",
-                value_parser = parse_preemption_timeout)]
-    pub preemption_timeout: MaybePreemptionTimeout,
+                value_parser = parse_timeslice)]
+    pub max_timeslice: MaybeTimeslice,
+
+    /// Target logical timeslice checked at syscall boundaries, in virtual nanoseconds. This avoids
+    /// PMU preemption for workloads that enter the kernel frequently. Omit this option to use only
+    /// `--max-timeslice`.
+    #[serde(default)]
+    #[clap(long, value_name = "virtual-nanoseconds")]
+    pub target_timeslice: Option<NonZeroU64>,
 
     /// Shut down immediately upon SIGINT, rather than letting the guest handle it.
     #[clap(long)]
@@ -319,7 +584,7 @@ pub struct Config {
     /// Do not count the retired conditional branches (RCBs) of each thread towards its logical
     /// time.  Instead, count each checkin with the scheduler as a fixed increment to logical time.
     /// Even when this option is set, HW RCB performance counters may still be enabled if a
-    /// preemption-timeout is specified.
+    /// max-timeslice is specified.
     #[clap(long)]
     pub no_rcb_time: bool,
 
@@ -328,8 +593,86 @@ pub struct Config {
     pub detlog_heap: bool,
 
     /// An option to enable logging the hash of stack memory maps for the purpose of determinism checking
+    ///
+    /// THIS HASH COVERS argv AND THE ENVIRONMENT, which the kernel places at the
+    /// top of the initial process stack. Two runs whose command lines differ by a
+    /// single character therefore produce different stack hashes from the first
+    /// sample, even when the command lines are the same LENGTH and every stack
+    /// address matches. Measured: equal-length-but-different argv diverged the
+    /// hash 14 records in, while byte-identical argv held it for 5023 records.
+    ///
+    /// Holding a run-directory name to a fixed WIDTH is a sufficient control when
+    /// only addresses matter, and is NOT sufficient here. Comparing two runs
+    /// under this flag requires byte-identical argv and environment; otherwise
+    /// the first divergence you find is your own input.
     #[clap(long)]
     pub detlog_stack: bool,
+
+    /// Log a hash of the guest REGISTER FILE at guest-logical-control points, for determinism
+    /// checking. stdout, the INFO log, the stack and the heap are all hashed today; the register
+    /// file is not, so two backends can differ in register state and every existing check still
+    /// reports parity.
+    ///
+    /// SAMPLED ONLY AT GUEST-LOGICAL-CONTROL POINTS -- see `Detcore::detlog_registers`. Registers
+    /// are NOT sampled inside a tool handler: a backend running its handler in-guest executes code
+    /// the ptrace reference never executes, so a difference there is correct behaviour, not a
+    /// determinism bug.
+    #[clap(long)]
+    pub detlog_regs: bool,
+
+    /// Log a hash of each syscall's OUTPUT BUFFER, taken at the syscall boundary from the
+    /// address and length in the syscall's own arguments.
+    ///
+    /// WHAT IT SEES THAT THE MAPPING HASHES DO NOT. `--detlog-heap` and `--detlog-stack` hash a
+    /// whole named mapping, so their coverage is decided by where the guest happened to ALLOCATE
+    /// a buffer. Measured, three runs per cell, same netlink exchange with only the receive
+    /// buffer's home changed: a `[stack]` buffer is missed by `--detlog-heap`, a `[heap]` buffer
+    /// is missed by `--detlog-stack`, and a BSS/static or anonymous-`mmap` buffer is missed by
+    /// BOTH even with both enabled. Anonymous `mmap` is where glibc puts any `malloc` above the
+    /// 128 KiB `M_MMAP_THRESHOLD`. Reading the extent out of the syscall arguments makes the
+    /// buffer's home irrelevant.
+    ///
+    /// WHY IT IS NOT REDUNDANT WITH `--verify`. A syscall whose buffer is a bare pointer in
+    /// Reverie prints the ADDRESS, not the contents, so a `recvmsg` returning a stable
+    /// `Ok(1468)` whose payload varies produces a character-identical record and `--verify`
+    /// reports `bitwise_parity: true`. 44.1% of the syscalls in a QEMU/Linux boot move bytes
+    /// through such a buffer.
+    ///
+    /// COST is proportional to bytes actually moved, NOT to syscall count or mapping size:
+    /// ~0.75 s per GB of guest I/O. A QEMU/Linux boot moves 139.1 MB through these buffers,
+    /// against the 10.9 TB `--detlog-heap` hashes over the same run.
+    ///
+    /// NAME IS PROVISIONAL: `io-buffers` is the owner's candidate and is not settled.
+    ///
+    /// ON BY DEFAULT. It was opt-in until 2026-08-24, and opt-in made the
+    /// determinism gate weaker than its name: with the hash absent, the netlink
+    /// `recvmsg` above compares equal and `--verify` reports success. A check
+    /// that must be requested is not a standard. The opt-out exists for the
+    /// deliberate case (bulk I/O where the cost matters and content parity is
+    /// not the question), not as the ordinary setting.
+    ///
+    /// COST OF THE DEFAULT, measured 2026-08-24 on a 316-core x86_64 Linux
+    /// build host: a typical small test guest pays about ONE MILLISECOND
+    /// (`/bin/true` 0.029s -> 0.030s, `/bin/ls` 0.041s -> 0.041s, 8 runs each).
+    /// 64 MiB through `cat` costs +0.07-0.10s in a RELEASE build, which is the
+    /// ~1.1-1.6 s/GB matching the figure quoted above. The same workload in a
+    /// DEBUG build costs +3.4s, roughly 50x more, because the hash loop is
+    /// unoptimized -- so a debug-built node moving tens of megabytes is the one
+    /// place the default is felt.
+    #[clap(long = "no-detlog-io-buffers", action = clap::ArgAction::SetFalse)]
+    pub detlog_io_buffers: bool,
+
+    /// Sampling cadence for `--detlog-regs`: hash every Nth guest-logical-control point.
+    ///
+    /// COST TIER. 1 (the default) is the FULL tier -- every control point hashed -- and is what a
+    /// short test should use. Measured cost at this scale is within run-to-run noise: /bin/true
+    /// (49 control points), `wc -l /etc/passwd` (135) and a 5-iteration shell loop (195) were
+    /// 0.04-0.07s with the flag on and the same with it off. A larger N is the SPOT-CHECK tier for
+    /// runs where full hashing is too expensive; it trades detection latency for cost, since a
+    /// divergence is only seen at the next sampled point. Every emitted line records the tier it
+    /// was produced under, so a cell can state which tier it met instead of leaving it implicit.
+    #[clap(long, default_value = "1", value_name = "uint64")]
+    pub detlog_regs_cadence: u64,
 
     /// Configure a time offset (in seconds) between a container OS considered booted and a guest is executed
     /// This primarily affects 'sysinfo' syscall's 'uptime' field reporting
@@ -347,6 +690,18 @@ pub struct Config {
     /// interrupt points specified
     #[clap(long, value_name = "tid:rcbs", value_parser = try_parse_numbers_with_colon)]
     pub interrupt_at: Vec<(DetTid, u64)>,
+
+    /// Resolved happens-before program: deterministic ordering edges between
+    /// anchored events (see `detcore_model::happens_before`). This is populated
+    /// programmatically by hermit-cli after loading and resolving a
+    /// `--happens-before` spec against the guest binary; it is not a direct CLI
+    /// flag and is not serialized (it is reconstructed from the spec file each
+    /// run, so `#[serde(skip)]` avoids requiring serde on `Sysno`-bearing
+    /// positions and keeps save-config output stable). The scheduler enforces
+    /// these edges only when `sequentialize_threads` is set.
+    #[serde(skip)]
+    #[clap(skip)]
+    pub happens_before: Option<HappensBeforeProgram>,
 }
 
 fn try_parse_numbers_with_colon(from_str: &str) -> anyhow::Result<(DetTid, u64)> {
@@ -372,10 +727,49 @@ fn try_parse_memory(from_str: &str) -> anyhow::Result<u64> {
 }
 
 impl Config {
-    /// Sanity check the flags, and update any wherever flag B is implied by A.
-    pub fn validate(&mut self) {
+    /// Smallest PMU-backed maximum representable by one RCB at this clock multiplier.
+    pub fn minimum_max_timeslice_nanos(&self) -> u64 {
+        let slowdown = if self.chaos && self.chaos_per_thread_slowdown {
+            self.chaos_slowdown_max_factor
+        } else {
+            1.0
+        };
+        let multiplier = self.clock_multiplier.unwrap_or(1.0) * slowdown;
+        ((NANOS_PER_RCB * multiplier).ceil() as u64).max(NANOS_PER_RCB as u64)
+    }
+
+    /// Check invariants that must hold at every execution boundary without mutating the config.
+    pub fn validate_invariants(&self) {
         assert!(self.sched_sticky_random_param >= 0.0);
         assert!(self.sched_sticky_random_param <= 1.0);
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-1149)
+        assert!(
+            self.chaos_slowdown_max_factor.is_finite()
+                && self.chaos_slowdown_max_factor >= 1.0
+                && self.chaos_slowdown_max_factor <= RcbTimeMultiplier::MAX,
+            "chaos_slowdown_max_factor must be finite and in [1.0, {}], got {}",
+            RcbTimeMultiplier::MAX,
+            self.chaos_slowdown_max_factor
+        );
+        if let Some(multiplier) = self.clock_multiplier {
+            assert!(
+                multiplier.is_finite() && multiplier > 0.0,
+                "clock_multiplier must be finite and positive"
+            );
+        }
+        let minimum_max_timeslice = self.minimum_max_timeslice_nanos();
+        assert!(
+            self.max_timeslice
+                .is_none_or(|timeslice| u64::from(timeslice) >= minimum_max_timeslice),
+            "max_timeslice must be at least one RCB ({} virtual nanoseconds)",
+            minimum_max_timeslice
+        );
+    }
+
+    /// Sanity check the flags, and update any wherever flag B is implied by A.
+    pub fn validate(&mut self) {
+        self.validate_invariants();
 
         // TODO(T124429978) Restore the eprintln! calls below to tracing::warn! when the tracing
         // subscriber is set up early enough for these warnings to print.
@@ -441,9 +835,9 @@ impl Config {
     /// Should we use RCB in computing logical time?
     ///
     /// The answer is NO either if `--no-rcb-time` is specified or if HW counters are disabled by
-    /// setting `--preemption-timeout=disabled`.
+    /// setting `--max-timeslice=disabled`.
     pub fn use_rcb_time(&self) -> bool {
-        self.preemption_timeout.is_some() && !self.no_rcb_time
+        self.max_timeslice.is_some() && !self.no_rcb_time
     }
 
     /// Should we convert sockets to SOCK_NONBLOCK?
@@ -512,6 +906,21 @@ impl fmt::Display for Config {
         if self.chaos_target_races {
             write!(f, " --chaos-target-races")?;
         }
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-1149)
+        if self.chaos_per_thread_slowdown {
+            write!(f, " --chaos-per-thread-slowdown")?;
+            write!(
+                f,
+                " --chaos-slowdown-max-factor={}",
+                self.chaos_slowdown_max_factor
+            )?;
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-1151)
+            if self.chaos_epoch_length_ns > 0 {
+                write!(f, " --chaos-epoch-length-ns={}", self.chaos_epoch_length_ns)?;
+            }
+        }
         if let Some(m) = self.clock_multiplier {
             write!(f, " --clock-multiplier={}", m)?;
         }
@@ -568,15 +977,18 @@ impl fmt::Display for Config {
         if self.gdbserver_port != /* default */ 1234u16 {
             write!(f, " --gdbserver-port={}", self.gdbserver_port)?;
         }
-        match &self.preemption_timeout {
+        match &self.max_timeslice {
             Some(x) => {
                 if *x != NonZeroU64::new(200_000_000).unwrap() {
-                    write!(f, " --preemption-timeout={}", x)?;
+                    write!(f, " --max-timeslice={}", x)?;
                 }
             }
             None => {
-                write!(f, " --preemption-timeout=disabled")?;
+                write!(f, " --max-timeslice=disabled")?;
             }
+        }
+        if let Some(target_timeslice) = self.target_timeslice {
+            write!(f, " --target-timeslice={}", target_timeslice)?;
         }
         if self.sigint_instakill {
             write!(f, " --sigint-instakill")?;
@@ -632,6 +1044,15 @@ impl fmt::Display for Config {
         }
         if self.detlog_stack {
             write!(f, " --detlog-stack")?;
+        }
+        if self.detlog_regs {
+            write!(f, " --detlog-regs")?;
+        }
+        if self.detlog_regs_cadence != /* default */ 1 {
+            write!(f, " --detlog-regs-cadence={}", self.detlog_regs_cadence)?;
+        }
+        if !self.detlog_io_buffers {
+            write!(f, " --no-detlog-io-buffers")?;
         }
         if self.sysinfo_uptime_offset != /* default */ 120 {
             write!(f, " --sysinfo-uptime-offset={}", self.sysinfo_uptime_offset)?;
@@ -772,21 +1193,27 @@ impl FromStr for SchedHeuristic {
     }
 }
 
-/// If this is set to None, the RCB (retired conditional branch) hardware counter feature is disabled.
-///
-/// Limitations with clap require a type alias here.
-pub type MaybePreemptionTimeout = Option<NonZeroU64>;
+/// An optional virtual-timeslice duration. `None` disables that preemption mechanism.
+pub type MaybeTimeslice = Option<NonZeroU64>;
 
-fn parse_preemption_timeout(
-    src: &str,
-) -> Result<MaybePreemptionTimeout, ParsePreemptionTimeoutError> {
+/// Deprecated name for an optional PMU-backed virtual-timeslice duration.
+#[deprecated(note = "use MaybeTimeslice")]
+pub type MaybePreemptionTimeout = MaybeTimeslice;
+
+fn parse_timeslice(src: &str) -> Result<MaybeTimeslice, ParseTimesliceError> {
     if let Ok(n) = src.parse::<u64>() {
-        Ok(NonZeroU64::new(n))
+        if n != 0 && n < NANOS_PER_RCB as u64 {
+            Err(ParseTimesliceError::new(
+                "PMU-backed timeslices must be at least one RCB (10 virtual nanoseconds)",
+            ))
+        } else {
+            Ok(NonZeroU64::new(n))
+        }
     } else {
         match src {
             "disabled" => Ok(None),
-            _ => Err(ParsePreemptionTimeoutError::new(
-                "Unable to parse string as preemption-timeout, expected 'disabled' or an non-negative integer",
+            _ => Err(ParseTimesliceError::new(
+                "Unable to parse timeslice, expected disabled or a non-negative integer",
             )),
         }
     }
@@ -805,25 +1232,25 @@ fn parse_index_with_path(src: &str) -> Result<(u64, Option<PathBuf>), String> {
 }
 
 #[derive(Debug)]
-struct ParsePreemptionTimeoutError {
+struct ParseTimesliceError {
     details: String,
 }
 
-impl fmt::Display for ParsePreemptionTimeoutError {
+impl fmt::Display for ParseTimesliceError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}", self.details)
     }
 }
 
-impl ParsePreemptionTimeoutError {
-    fn new(msg: &str) -> ParsePreemptionTimeoutError {
-        ParsePreemptionTimeoutError {
+impl ParseTimesliceError {
+    fn new(msg: &str) -> ParseTimesliceError {
+        ParseTimesliceError {
             details: msg.to_string(),
         }
     }
 }
 
-impl std::error::Error for ParsePreemptionTimeoutError {
+impl std::error::Error for ParseTimesliceError {
     fn description(&self) -> &str {
         &self.details
     }
@@ -833,7 +1260,7 @@ impl std::error::Error for ParsePreemptionTimeoutError {
 ///
 /// N.B. Default to a reasonable date. Some programs (like zip) have trouble with the
 /// original unix epoch (time zero).
-pub static DEFAULT_EPOCH_STR: &str = "2021-12-31T23:59:59Z";
+pub static DEFAULT_EPOCH_STR: &str = "2026-01-01T00:00:00Z";
 
 impl Config {
     /// Construct the config using environment variables only, not CLI args.
@@ -866,6 +1293,91 @@ impl Config {
 
 /// N.B. we don't want to specify two different notions of "default", so we use the
 /// `Clap` instance above.
+/// Environment variable carrying the coordinator's [`config_wire_fingerprint`]
+/// to an out-of-process plugin.
+///
+/// Named alongside the other `REVERIE_SABRE_HERMIT_*` launch variables so the
+/// two travel together and a reader finds them in one place.
+pub const CONFIG_FINGERPRINT_ENV: &str = "REVERIE_SABRE_HERMIT_CONFIG_FINGERPRINT";
+
+const CONFIG_DEFINITION_SOURCES: &[&[u8]] = &[
+    include_bytes!("config.rs"),
+    include_bytes!("happens_before.rs"),
+    include_bytes!("pid.rs"),
+    include_bytes!("schedule.rs"),
+    include_bytes!("time.rs"),
+];
+
+/// A fingerprint of this build's [`Config`] payload and the configuration and
+/// clock RPC definitions shared by a plugin and its coordinator.
+///
+/// # Why this exists
+///
+/// An out-of-process plugin such as `libdetcore_sabre.so` is a separate Cargo
+/// artifact that lands in the same target directory as `hermit`. Changing
+/// `Config` or `DetTime` -- or merely switching branches -- leaves the plugin
+/// stale while everything still *looks* built. `Config` is transferred during
+/// the RPC handshake, and `DetTime` is the first field in every Detcore request.
+/// A stale plugin decodes either against the wrong layout and the failure
+/// surfaces as an opaque codec error: measured, one added `bool` field
+/// produced `Decode(InvalidBooleanValue(20))` at connect, which points nowhere
+/// near "your plugin is from a different build" and cost a long diagnosis while
+/// blocking every SaBRe measurement.
+///
+/// # What it measures
+///
+/// Two encodings of `Config::default()` and the source definitions for the
+/// configuration and clock RPC fields are fingerprinted with separate domains:
+///
+/// - the exact legacy-bincode bytes used by Reverie RPC, which detect changes
+///   such as `u32` to `u64` even when both default to JSON number zero; and
+/// - the JSON encoding, which carries every field name and makes a pure rename
+///   visible even though bincode is positional; and
+/// - the source files defining `Config`, its local serialized field types, and
+///   `DetTime`, which catch wire-incompatible changes hidden by a default such
+///   as `Option<u64>::None` to `Option<u32>::None`, or an added clock field that
+///   leaves both encodings of `Config` unchanged.
+///
+/// The source and JSON domains are deliberately stricter than the wire format
+/// strictly requires. A documentation-only edit in one of these files can
+/// require rebuilding the plugin; missing a wire-incompatible hidden variant
+/// can make it decode the handshake or a subsequent request at the wrong offsets.
+pub fn config_wire_fingerprint() -> String {
+    let config = Config::default();
+    let wire = bincode::serde::encode_to_vec(&config, bincode::config::legacy())
+        .expect("Config::default() must encode with the Reverie RPC bincode configuration");
+    let named_shape = serde_json::to_string(&config)
+        .expect("Config::default() must encode as JSON for field-name checking");
+    fingerprint_of_config_material(&wire, &named_shape, CONFIG_DEFINITION_SOURCES)
+}
+
+/// Domain-separated FNV-1a over wire bytes, named JSON, and defining source.
+/// This is a mismatch detector, not a security boundary. Length-prefixing each
+/// domain prevents two different source-file boundaries from hashing the same
+/// concatenation.
+fn fingerprint_of_config_material(
+    wire: &[u8],
+    named_shape: &str,
+    definition_sources: &[&[u8]],
+) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut update = |domain: u8, bytes: &[u8]| {
+        for byte in std::iter::once(&domain)
+            .chain((bytes.len() as u64).to_le_bytes().iter())
+            .chain(bytes.iter())
+        {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x1000_0000_01b3);
+        }
+    };
+    update(0, wire);
+    update(1, named_shape.as_bytes());
+    for source in definition_sources {
+        update(2, source);
+    }
+    format!("{hash:016x}")
+}
+
 impl Default for Config {
     fn default() -> Self {
         let v: Vec<String> = vec![];
@@ -876,6 +1388,55 @@ impl Default for Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_epoch_is_2026() {
+        assert_eq!(DEFAULT_EPOCH_STR, "2026-01-01T00:00:00Z");
+        let epoch = DEFAULT_EPOCH_STR.parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(epoch.timestamp(), 1_767_225_600);
+    }
+
+    #[test]
+    fn default_backend_capabilities_match_instrumented_backends() {
+        let config = Config::default();
+        assert!(!config.backend_reports_physical_process_exits);
+        assert!(!config.backend_serializes_fork_children);
+        assert!(config.backend_dispatches_thread_tools);
+        assert!(config.backend_tracks_process_children);
+        assert!(config.backend_runs_exit_robust_list);
+        assert!(!config.backend_requires_thread_directed_process_signals);
+        assert!(config.backend_supports_parked_write_signal_interruption);
+        assert!(!config.backend_virtualizes_capability_prctls);
+        assert!(!config.backend_defers_vfork_child_registration);
+    }
+
+    #[test]
+    fn missing_mountinfo_provenance_deserializes_as_empty() {
+        let mut value = serde_json::to_value(Config::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("mountinfo_root_rewrites");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("mountinfo_device_rewrites");
+        value.as_object_mut().unwrap().remove("mountinfo_mount_ids");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("mountinfo_mount_ids_captured");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("fdinfo_unlisted_mount_ids");
+        let restored: Config = serde_json::from_value(value).unwrap();
+        assert!(restored.mountinfo_root_rewrites.is_empty());
+        assert!(restored.mountinfo_device_rewrites.is_empty());
+        assert!(restored.mountinfo_mount_ids.is_empty());
+        assert!(!restored.mountinfo_mount_ids_captured);
+        assert!(restored.fdinfo_unlisted_mount_ids.is_empty());
+    }
 
     #[test]
     fn runs_post_fork_parses_all_modes_and_defaults_to_child() {
@@ -913,5 +1474,299 @@ mod tests {
 
         config.runs_post_fork = RunsPostFork::Random;
         assert!(config.to_string().contains(" --runs-post-fork=random"));
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1149)
+    #[test]
+    fn chaos_per_thread_slowdown_is_opt_in_and_round_trips() {
+        // Off by default; the factor default is present but inert.
+        let dflt = Config::default();
+        assert!(!dflt.chaos_per_thread_slowdown);
+        assert_eq!(dflt.chaos_slowdown_max_factor, 10.0);
+        // Default (disabled) config does not emit the flags.
+        assert!(!dflt.to_string().contains("--chaos-per-thread-slowdown"));
+
+        let config = Config::parse_from([
+            "detcore",
+            "--chaos",
+            "--chaos-per-thread-slowdown",
+            "--chaos-slowdown-max-factor=4.5",
+        ]);
+        assert!(config.chaos_per_thread_slowdown);
+        assert_eq!(config.chaos_slowdown_max_factor, 4.5);
+
+        // The Display round-trips both flags into the recorded schedule artifact.
+        let rendered = config.to_string();
+        assert!(rendered.contains(" --chaos-per-thread-slowdown"));
+        assert!(rendered.contains(" --chaos-slowdown-max-factor=4.5"));
+        let reparsed = Config::parse_from(
+            std::iter::once("detcore".to_string())
+                .chain(rendered.split_whitespace().map(String::from)),
+        );
+        assert!(reparsed.chaos_per_thread_slowdown);
+        assert_eq!(reparsed.chaos_slowdown_max_factor, 4.5);
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    #[test]
+    fn chaos_epoch_length_is_opt_in_and_round_trips() {
+        // Off by default (single stable factor == plain per-thread-slowdown).
+        let dflt = Config::default();
+        assert_eq!(dflt.chaos_epoch_length_ns, 0);
+        assert!(!dflt.to_string().contains("--chaos-epoch-length-ns"));
+
+        // Epochs are only emitted alongside per-thread-slowdown.
+        let config = Config::parse_from([
+            "detcore",
+            "--chaos",
+            "--chaos-per-thread-slowdown",
+            "--chaos-epoch-length-ns=100000",
+        ]);
+        assert_eq!(config.chaos_epoch_length_ns, 100000);
+
+        let rendered = config.to_string();
+        assert!(rendered.contains(" --chaos-epoch-length-ns=100000"));
+        let reparsed = Config::parse_from(
+            std::iter::once("detcore".to_string())
+                .chain(rendered.split_whitespace().map(String::from)),
+        );
+        assert_eq!(reparsed.chaos_epoch_length_ns, 100000);
+
+        // Without per-thread-slowdown the epoch flag is inert and not rendered.
+        let no_slowdown = Config::parse_from(["detcore", "--chaos", "--chaos-epoch-length-ns=100"]);
+        assert_eq!(no_slowdown.chaos_epoch_length_ns, 100);
+        assert!(!no_slowdown.to_string().contains("--chaos-epoch-length-ns"));
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1149)
+    #[test]
+    #[should_panic(expected = "chaos_slowdown_max_factor must be finite and in")]
+    fn validate_rejects_chaos_slowdown_max_factor_below_one() {
+        let mut config = Config {
+            chaos_slowdown_max_factor: 0.5,
+            ..Default::default()
+        };
+        config.validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "max_timeslice must be at least one RCB")]
+    fn validate_rejects_max_timeslice_below_one_rcb() {
+        let mut config = Config {
+            max_timeslice: NonZeroU64::new(NANOS_PER_RCB as u64 - 1),
+            ..Default::default()
+        };
+
+        config.validate();
+    }
+
+    #[test]
+    fn validate_accepts_one_rcb_max_timeslice() {
+        let mut config = Config {
+            max_timeslice: NonZeroU64::new(NANOS_PER_RCB as u64),
+            ..Default::default()
+        };
+
+        config.validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "clock_multiplier must be finite and positive")]
+    fn validate_rejects_invalid_clock_multiplier() {
+        let mut config = Config {
+            clock_multiplier: Some(0.0),
+            ..Default::default()
+        };
+        config.validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "max_timeslice must be at least one RCB")]
+    fn validate_scales_one_rcb_minimum_with_clock_multiplier() {
+        let mut config = Config {
+            max_timeslice: NonZeroU64::new(10),
+            clock_multiplier: Some(2.0),
+            ..Default::default()
+        };
+        config.validate();
+    }
+
+    #[test]
+    fn config_fingerprint_includes_clock_rpc_definitions() {
+        let config = Config::default();
+        let wire = bincode::serde::encode_to_vec(&config, bincode::config::legacy()).unwrap();
+        let named_shape = serde_json::to_string(&config).unwrap();
+        let current = config_wire_fingerprint();
+        let clock_source = include_bytes!("time.rs").as_slice();
+
+        // The previous guard covered these same Config bytes and definitions,
+        // but omitted DetTime. Adding a positional clock field could therefore
+        // pass the handshake guard and corrupt the following request on decode.
+        let without_clock: Vec<_> = CONFIG_DEFINITION_SOURCES
+            .iter()
+            .copied()
+            .filter(|source| *source != clock_source)
+            .collect();
+        assert_ne!(
+            fingerprint_of_config_material(&wire, &named_shape, &without_clock),
+            current,
+            "the published fingerprint must reject source inputs that omit the RPC clock"
+        );
+
+        // Hold all Config material fixed and remove only the added serialized
+        // clock field from its definition. A future clock-only change must also
+        // invalidate the existing artifact guard, independently of config.rs.
+        let changed_clock =
+            include_str!("time.rs").replacen("    inherited_nanos: LogicalDuration,", "", 1);
+        assert_ne!(changed_clock.as_bytes(), clock_source);
+        let changed_sources: Vec<_> = CONFIG_DEFINITION_SOURCES
+            .iter()
+            .map(|source| {
+                if *source == clock_source {
+                    changed_clock.as_bytes()
+                } else {
+                    *source
+                }
+            })
+            .collect();
+        assert_ne!(
+            fingerprint_of_config_material(&wire, &named_shape, &changed_sources),
+            current,
+            "a clock-only serialized field change must invalidate the fingerprint"
+        );
+    }
+
+    #[test]
+    fn config_fingerprint_is_stable_and_shape_sensitive() {
+        // STABLE: a build must agree with itself, or the guard would reject a
+        // MATCHED pair -- which would be worse than having no guard at all.
+        assert_eq!(config_wire_fingerprint(), config_wire_fingerprint());
+        assert_eq!(config_wire_fingerprint().len(), 16);
+
+        let config = Config::default();
+        let base = serde_json::to_string(&config).unwrap();
+        let wire = bincode::serde::encode_to_vec(&config, bincode::config::legacy()).unwrap();
+        assert_eq!(
+            fingerprint_of_config_material(&wire, &base, CONFIG_DEFINITION_SOURCES),
+            config_wire_fingerprint()
+        );
+
+        // SHAPE-SENSITIVE, checked on the same mechanism the real function uses.
+        // One added field is exactly the change that caused the outage.
+        let with_extra_field = format!("{},\"a_new_flag\":false}}", &base[..base.len() - 1]);
+        assert_ne!(
+            fingerprint_of_config_material(&wire, &with_extra_field, CONFIG_DEFINITION_SOURCES),
+            config_wire_fingerprint()
+        );
+        // A removed field.
+        let removed = base.replacen("\"virtualize_time\":true,", "", 1);
+        assert_ne!(
+            fingerprint_of_config_material(&wire, &removed, CONFIG_DEFINITION_SOURCES),
+            config_wire_fingerprint()
+        );
+        // A pure rename, which bincode would tolerate but which we still refuse.
+        let renamed = base.replacen("\"virtualize_time\"", "\"virtualise_time\"", 1);
+        assert_ne!(
+            fingerprint_of_config_material(&wire, &renamed, CONFIG_DEFINITION_SOURCES),
+            config_wire_fingerprint()
+        );
+
+        // The counterexample the JSON-only fingerprint missed: serde_json emits
+        // the same text for integer zero regardless of width, but legacy bincode
+        // changes the payload width. A stale peer would decode every following
+        // field at the wrong offset.
+        #[derive(Serialize)]
+        struct U32Field {
+            field: u32,
+        }
+        #[derive(Serialize)]
+        struct U64Field {
+            field: u64,
+        }
+        let u32_value = U32Field { field: 0 };
+        let u64_value = U64Field { field: 0 };
+        let u32_json = serde_json::to_string(&u32_value).unwrap();
+        let u64_json = serde_json::to_string(&u64_value).unwrap();
+        assert_eq!(
+            u32_json, u64_json,
+            "the planted JSON collision must be real"
+        );
+        let u32_wire =
+            bincode::serde::encode_to_vec(&u32_value, bincode::config::legacy()).unwrap();
+        let u64_wire =
+            bincode::serde::encode_to_vec(&u64_value, bincode::config::legacy()).unwrap();
+        assert_ne!(u32_wire, u64_wire, "the planted wire retype must be real");
+        assert_ne!(
+            fingerprint_of_config_material(&u32_wire, &u32_json, &[b"struct S { field: u32 }"]),
+            fingerprint_of_config_material(&u64_wire, &u64_json, &[b"struct S { field: u64 }"]),
+            "a wire-incompatible integer retype must change the fingerprint"
+        );
+
+        // Defaults can hide an incompatible inner type in BOTH value encodings.
+        // The definition source is therefore load-bearing, not decorative.
+        #[derive(Serialize)]
+        struct OptionalU32 {
+            field: Option<u32>,
+        }
+        #[derive(Serialize)]
+        struct OptionalU64 {
+            field: Option<u64>,
+        }
+        let optional_u32 = OptionalU32 { field: None };
+        let optional_u64 = OptionalU64 { field: None };
+        let optional_u32_json = serde_json::to_string(&optional_u32).unwrap();
+        let optional_u64_json = serde_json::to_string(&optional_u64).unwrap();
+        assert_eq!(optional_u32_json, optional_u64_json);
+        let optional_u32_wire =
+            bincode::serde::encode_to_vec(&optional_u32, bincode::config::legacy()).unwrap();
+        let optional_u64_wire =
+            bincode::serde::encode_to_vec(&optional_u64, bincode::config::legacy()).unwrap();
+        assert_eq!(
+            optional_u32_wire, optional_u64_wire,
+            "the planted default must be invisible in both value encodings"
+        );
+        assert_ne!(
+            fingerprint_of_config_material(
+                &optional_u32_wire,
+                &optional_u32_json,
+                &[b"struct S { field: Option<u32> }"]
+            ),
+            fingerprint_of_config_material(
+                &optional_u64_wire,
+                &optional_u64_json,
+                &[b"struct S { field: Option<u64> }"]
+            ),
+            "a hidden wire-incompatible inner-type change must alter the fingerprint"
+        );
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    #[test]
+    #[should_panic(expected = "max_timeslice must be at least one RCB")]
+    fn validate_scales_one_rcb_minimum_with_chaos_slowdown() {
+        let mut config = Config {
+            chaos: true,
+            chaos_per_thread_slowdown: true,
+            chaos_slowdown_max_factor: 4.0,
+            max_timeslice: NonZeroU64::new(39),
+            ..Default::default()
+        };
+        config.validate();
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    #[test]
+    #[should_panic(expected = "chaos_slowdown_max_factor must be finite and in")]
+    fn validate_rejects_unrepresentable_chaos_slowdown_factor() {
+        let mut config = Config {
+            chaos_slowdown_max_factor: RcbTimeMultiplier::MAX * 2.0,
+            ..Default::default()
+        };
+        config.validate();
     }
 }

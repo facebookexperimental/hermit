@@ -6,7 +6,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use digest::Digest;
 pub use procfs::process::MMapPath;
 pub use procfs::process::MemoryMap;
 use reverie::Guest;
@@ -14,6 +13,8 @@ use reverie::Pid;
 use reverie::Tool;
 use reverie::syscalls::Addr;
 use reverie::syscalls::MemoryAccess;
+
+use crate::Digest;
 
 fn display_pathname(p: &MMapPath) -> String {
     match p {
@@ -32,16 +33,30 @@ fn display_pathname(p: &MMapPath) -> String {
 }
 
 pub fn display(map: &MemoryMap) -> String {
+    display_as(map, &display_pathname(&map.pathname))
+}
+
+/// Render a mapping with an explicit pathname column.
+///
+/// Used to report a region that *is* the guest heap but which the kernel did
+/// not label `[heap]`, so the record is textually comparable with the labelled
+/// one another backend produces. Every other column is the mapping's real
+/// procfs data.
+pub fn display_as(map: &MemoryMap, pathname: &str) -> String {
+    display_range_as(map, map.address.0, map.address.1, pathname)
+}
+
+/// Render a mapping's real procfs columns against an EXPLICIT address range.
+///
+/// The two address columns come from `start`/`end`; every other column is the
+/// mapping's real procfs data. Used where the region being reported is a SUBSET
+/// of the mapping that contains it -- the observed program break inside its
+/// enclosing anonymous mapping -- so the record's extent is the region actually
+/// hashed rather than the arena that happens to hold it.
+pub fn display_range_as(map: &MemoryMap, start: u64, end: u64, pathname: &str) -> String {
     format!(
         "{:#x}-{:#x} {:?} {:x} {:x}:{:x} {} {}",
-        map.address.0,
-        map.address.1,
-        map.perms,
-        map.offset,
-        map.dev.0,
-        map.dev.1,
-        map.inode,
-        display_pathname(&map.pathname)
+        start, end, map.perms, map.offset, map.dev.0, map.dev.1, map.inode, pathname
     )
 }
 
@@ -72,10 +87,25 @@ pub fn compute_hash<G, T: Tool>(guest: &mut G, map: &MemoryMap) -> Result<Digest
 where
     G: Guest<T>,
 {
-    let size = (map.address.1 - map.address.0) as usize;
+    compute_hash_range(guest, map.address.0, map.address.1)
+}
+
+/// Hash the guest bytes in the half-open guest-virtual range `[start, end)`,
+/// read through `guest.memory()`. Used for backend-reported memory regions
+/// ([`reverie::Guest::detlog_memory_regions`]) where the range is a guest
+/// address rather than an entry parsed from a host `/proc/<pid>/maps`.
+pub fn compute_hash_range<G, T: Tool>(
+    guest: &mut G,
+    start: u64,
+    end: u64,
+) -> Result<Digest, reverie::Error>
+where
+    G: Guest<T>,
+{
+    let size = end.saturating_sub(start) as usize;
     let memory = guest.memory();
     let mut buf = vec![0; size];
-    let start = Addr::<u8>::from_raw(map.address.0 as usize).unwrap();
+    let start = Addr::<u8>::from_raw(start as usize).unwrap();
     memory.read_values(start, buf.as_mut_slice())?;
     Ok(Digest::new(buf.as_slice()))
 }

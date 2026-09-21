@@ -20,16 +20,27 @@ impl InterceptedCpuid {
 }
 
 impl InterceptedCpuid {
-    pub fn cpuid(&self, index: u32) -> Option<CpuIdResult> {
-        let request = index as usize;
-        if request >= 0x80000000 && request < 0x80000000 + EXTENDED_CPUIDS.len() {
-            Some(EXTENDED_CPUIDS[request - 0x80000000])
+    pub fn cpuid(&self, leaf: u32, subleaf: u32) -> Option<CpuIdResult> {
+        let request = leaf as usize;
+        let result = if request >= 0x80000000 && request < 0x80000000 + EXTENDED_CPUIDS.len() {
+            EXTENDED_CPUIDS[request - 0x80000000]
         } else if request < CPUIDS.len() {
-            Some(CPUIDS[request])
+            CPUIDS[request]
         } else {
-            None
+            return None;
+        };
+
+        if subleaf != 0 && uses_subleaf(leaf) {
+            Some(cpuid_result(0, 0, 0, 0))
+        } else {
+            Some(result)
         }
     }
+}
+
+/// Whether ECX selects an entry for a basic leaf represented by [`CPUIDS`].
+fn uses_subleaf(leaf: u32) -> bool {
+    matches!(leaf, 0x04 | 0x07 | 0x0b | 0x0d | 0x0f | 0x10 | 0x12 | 0x14)
 }
 
 const fn cpuid_result(eax: u32, ebx: u32, ecx: u32, edx: u32) -> CpuIdResult {
@@ -86,6 +97,10 @@ const EXTENDED_CPUIDS: &[CpuIdResult] = &[
 mod tests {
     use super::*;
 
+    fn registers(result: CpuIdResult) -> [u32; 4] {
+        [result.eax, result.ebx, result.ecx, result.edx]
+    }
+
     #[test]
     fn cpuid_leaf_count() {
         assert!(CPUIDS[0].eax as usize <= CPUIDS.len());
@@ -93,5 +108,45 @@ mod tests {
             1 + (EXTENDED_CPUIDS[0].eax as usize & !0x80000000usize),
             EXTENDED_CPUIDS.len()
         );
+    }
+
+    #[test]
+    fn indexed_leaves_do_not_alias_subleaf_zero() {
+        let cpuid = InterceptedCpuid::new();
+
+        assert_eq!(registers(cpuid.cpuid(0x07, 1).unwrap()), [0; 4]);
+        for leaf in [0x04, 0x0b, 0x0d, 0x0f, 0x10, 0x12, 0x14] {
+            assert_eq!(
+                registers(cpuid.cpuid(leaf, 1).unwrap()),
+                [0; 4],
+                "leaf {leaf:#x}"
+            );
+        }
+        assert_eq!(
+            registers(cpuid.cpuid(0x07, 0).unwrap()),
+            [0, 0x0018_0fb9, 0, 0]
+        );
+        assert_eq!(registers(cpuid.cpuid(0x0b, 0).unwrap()), [0, 1, 0x100, 1]);
+    }
+
+    #[test]
+    fn nonindexed_leaves_ignore_subleaf() {
+        let cpuid = InterceptedCpuid::new();
+
+        for leaf in (0..CPUIDS.len() as u32).filter(|leaf| !uses_subleaf(*leaf)) {
+            assert_eq!(
+                registers(cpuid.cpuid(leaf, 0).unwrap()),
+                registers(cpuid.cpuid(leaf, u32::MAX).unwrap()),
+                "basic leaf {leaf:#x}"
+            );
+        }
+        for offset in 0..EXTENDED_CPUIDS.len() as u32 {
+            let leaf = 0x8000_0000 + offset;
+            assert_eq!(
+                registers(cpuid.cpuid(leaf, 0).unwrap()),
+                registers(cpuid.cpuid(leaf, u32::MAX).unwrap()),
+                "extended leaf {leaf:#x}"
+            );
+        }
     }
 }

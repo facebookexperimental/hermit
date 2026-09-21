@@ -1,0 +1,2141 @@
+schema: 3
+bucket: system-utils
+test:
+  - id: system-utils/clock-determinism
+    description: clock_gettime/gettimeofday output is identical across repeated Hermit runs
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/clock_determinism.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    build:
+      cflags:
+        - -O0
+        - -D_GNU_SOURCE
+    modes:
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: The date-nanoseconds entry owns the native clock nondeterminism control
+      verify:
+        ci:
+          ptrace: true
+          kvm: true
+          liteinst: true
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+        backends_disabled:
+          dbt: Enable after the ptrace baseline for direct C guests is trusted
+          sabre: SaBRe does not intercept RDTSCP; clock probes can leak raw host TSC
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Clock replay divergence is tracked separately from this determinism entry
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The clock matrix guest is single-threaded
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: true
+        args:
+          - --base-env=minimal
+          - --no-virtualize-cpuid
+          - --max-timeslice=disabled
+        assert:
+          runs: 5
+          repeat_identical: true
+        backends_enabled:
+          - ptrace
+          - liteinst
+        backends_disabled:
+          dbt: The custom clock matrix baseline is ptrace-only
+          kvm: The custom clock matrix baseline is ptrace-only
+          sabre: The custom clock matrix baseline is ptrace-only
+  - id: system-utils/date-nanoseconds
+    description: A valid wall-clock timestamp varies natively and repeats under Hermit
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+    occasional: false
+    program: tests/e2e/system-utils/date-nanoseconds.sh
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        runs: 3
+        assert:
+          min_distinct: 2
+        backends_enabled:
+          - native
+        backends_disabled: {}
+        ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
+      verify:
+        ci:
+          ptrace: true
+          kvm: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled:
+          dbt: DBT coverage is owned by its backend parity partition
+          liteinst: LiteInst coverage is owned by its backend compatibility partition
+          sabre: The exec socket is fixed, but required date/clock virtual-time support remains owner-gated for SaBRe
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The date utility currently diverges while replaying timezone-file reads
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: A single-threaded wall-clock probe has no scheduling oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+  - id: system-utils/example-date
+    description: The user-facing nanosecond date example repeats under every applicable backend
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - date
+    occasional: false
+    direct: ./examples/date.sh
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: The existing date-nanoseconds test owns the native-variation assertion
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled:
+          dbt: DBT wedges when the guest execs a new program image, and this script ends in `exec /usr/bin/date`. Measured 2026-08-24 - the run never exits and emits zero DETLOG records after "[dbt backend] Detcore Tool active"; a cell timeout then misreports it as "failed to launch drrun". Note DBT refuses execveat legibly with ENOSYS (tests/c/dbt_execveat_unsupported.c passes), so it is execve specifically that hangs
+          sabre: Required date/clock virtual-time support remains owner-gated for SaBRe
+          liteinst: The preload runtime cannot survive the date script's post-start exec
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Strict verification owns the examples-directory parity contract
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The example is single-threaded
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+  - id: system-utils/example-devrand
+    description: The user-facing /dev/urandom example repeats under every applicable backend
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - hexdump
+    occasional: false
+    direct: ./examples/devrand.sh
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: The existing random-device test owns the native-variation assertion
+      verify:
+        ci:
+          ptrace: true
+          kvm: true
+          sabre: false
+        backends_enabled:
+          - ptrace
+          - kvm
+          - sabre
+        backends_disabled:
+          dbt: DBT wedges when the guest execs a new program image, and this script ends in `exec hexdump`. Measured 2026-08-24 - the run never exits and emits zero DETLOG records after "[dbt backend] Detcore Tool active"; a cell timeout then misreports it as "failed to launch drrun". Note DBT refuses execveat legibly with ENOSYS (tests/c/dbt_execveat_unsupported.c passes), so it is execve specifically that hangs
+          liteinst: The preload runtime cannot survive the hexdump script's post-start exec
+        ci_disabled_reason:
+          sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites", "result": "crash-error"}
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Strict verification owns the examples-directory parity contract
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The example is single-threaded
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+  - id: system-utils/mcookie-random
+    description: mcookie's 128-bit magic cookie varies natively and repeats under Hermit
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+    occasional: false
+    program: tests/e2e/system-utils/mcookie-random.sh
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        runs: 3
+        assert:
+          min_distinct: 2
+        backends_enabled:
+          - native
+        backends_disabled: {}
+        ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled:
+          dbt: DBT coverage is owned by its backend parity partition
+          sabre: SaBRe requires its external runtime
+          liteinst: LiteInst coverage is owned by its backend compatibility partition
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The record-getpid sentinel owns the blocking replay contract
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Magic-cookie generation is single-threaded with no scheduling oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+  - id: system-utils/mktemp-name
+    description: mktemp -u random temp-name suffix varies natively and repeats under Hermit
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+    occasional: false
+    program: tests/e2e/system-utils/mktemp-name.sh
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        runs: 3
+        assert:
+          min_distinct: 2
+        backends_enabled:
+          - native
+        backends_disabled: {}
+        ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        assert:
+          bitwise_parity: true
+        backends_disabled:
+          dbt: DBT coverage is owned by its backend parity partition
+          sabre: Ptrace and SaBRe each reach L2, but coreutils mktemp consumes different deterministic entropy positions and emits different name suffixes
+          liteinst: LiteInst coverage is owned by its backend compatibility partition
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The focused C sentinel owns the blocking replay contract
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The temp-name workload is single-threaded
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+  - id: system-utils/openssl-enc
+    description: openssl symmetric encryption with a random salt varies natively and repeats under Hermit
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - openssl
+    occasional: false
+    program: tests/e2e/system-utils/openssl-enc.sh
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        runs: 3
+        assert:
+          min_distinct: 2
+        backends_enabled:
+          - native
+        backends_disabled: {}
+        ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
+      verify:
+        ci:
+          ptrace: true
+          kvm: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled:
+          dbt: DBT coverage is owned by its backend parity partition
+          sabre: SaBRe requires its external runtime
+          liteinst: LiteInst coverage is owned by its backend compatibility partition
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The focused C sentinel owns the blocking replay contract
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The encryption workload is single-threaded
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+  - id: system-utils/openssl-genpkey
+    description: An OpenSSL Ed25519 keypair varies natively and repeats under Hermit
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - openssl
+    occasional: false
+    program: tests/e2e/system-utils/openssl-genpkey.sh
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        runs: 3
+        assert:
+          min_distinct: 2
+        backends_enabled:
+          - native
+        backends_disabled: {}
+        ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled:
+          dbt: DBT coverage is owned by its backend parity partition
+          sabre: SaBRe requires its external runtime
+          liteinst: LiteInst coverage is owned by its backend compatibility partition
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The focused C sentinel owns the blocking replay contract
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The openssl workload is single-threaded
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+  - id: system-utils/openssl-passwd
+    description: openssl passwd -6 salted hash varies natively and repeats under Hermit
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+    occasional: false
+    program: tests/e2e/system-utils/openssl-passwd.sh
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        runs: 3
+        assert:
+          min_distinct: 2
+        backends_enabled:
+          - native
+        backends_disabled: {}
+        ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled:
+          dbt: DBT coverage is owned by its backend parity partition
+          sabre: SaBRe requires its external runtime
+          liteinst: LiteInst coverage is owned by its backend compatibility partition
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The record-getpid sentinel owns the blocking replay contract
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The password-hash probe is single-threaded
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+  - id: system-utils/openssl-rand
+    description: OpenSSL DRBG hex output varies natively and repeats under Hermit
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - openssl
+    occasional: false
+    program: tests/e2e/system-utils/openssl-rand.sh
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        runs: 3
+        assert:
+          min_distinct: 2
+        backends_enabled:
+          - native
+        backends_disabled: {}
+        ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        assert:
+          bitwise_parity: true
+        backends_disabled:
+          dbt: DBT coverage is owned by its backend parity partition
+          sabre: SaBRe and ptrace each reach L2, but libcrypto consumes different deterministic entropy positions and emits different hex stdout
+          liteinst: LiteInst coverage is owned by its backend compatibility partition
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The focused C sentinel owns the blocking replay contract
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: DRBG generation is single-threaded with no scheduling oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+  - id: system-utils/openssl-x509
+    description: openssl self-signed X.509 cert varies natively and repeats under Hermit
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+    occasional: false
+    program: tests/e2e/system-utils/openssl-x509.sh
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        runs: 3
+        assert:
+          min_distinct: 2
+        backends_enabled:
+          - native
+        backends_disabled: {}
+        ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled:
+          dbt: DBT coverage is owned by its backend parity partition
+          sabre: Certificate issuance combines wall-clock validity with multiple entropy draws; clock, random-stream, and full-trace support remain unqualified
+          liteinst: LiteInst coverage is owned by its backend compatibility partition
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The record-getpid sentinel owns the blocking replay contract
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The certificate issuance is single-threaded
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+  - id: system-utils/overflow-gid-resolves
+    description: The frozen /etc/group resolves the overflow GID to a name, not a number
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+    occasional: false
+    program: tests/e2e/system-utils/overflow-gid-resolves.sh
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: DBT coverage is owned by its backend parity partition
+          kvm: KVM requires the privileged runner
+          liteinst: LiteInst coverage is owned by its backend compatibility partition
+          sabre: SaBRe coverage is owned by its backend compatibility partition
+      naked:
+        ci: false
+        ci_disabled_reason: A native arm would observe the host /etc/group, which is the state this control replaces; it would assert the control's absence rather than its presence.
+        backends_enabled: []
+        backends_disabled:
+          native: Native runs outside the container see the host /etc/group, which is the state this control exists to replace; a native arm would assert the absence of the control rather than its presence
+      replay:
+        ci: false
+        ci_disabled_reason: A single stat of a static file has no record/replay divergence surface to exercise.
+        backends_enabled: []
+        backends_disabled:
+          ptrace: A single stat of a static file has no record/replay divergence surface
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        ci_disabled_reason: A single-threaded identity probe has no scheduling oracle for chaos to search.
+        backends_enabled: []
+        backends_disabled:
+          ptrace: A single-threaded identity probe has no scheduling oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        ci_disabled_reason: No edge-case Hermit arguments are required to exercise the frozen group database.
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+  - id: system-utils/proc-uptime
+    description: Boot-relative uptime from /proc/uptime varies natively and repeats under Hermit
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+    occasional: false
+    program: tests/e2e/system-utils/proc-uptime.sh
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        runs: 3
+        assert:
+          min_distinct: 2
+        backends_enabled:
+          - native
+        backends_disabled: {}
+        ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled:
+          dbt: DBT coverage is owned by its backend parity partition
+          sabre: SaBRe requires its external runtime
+          liteinst: LiteInst coverage is owned by its backend compatibility partition
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The record-getpid sentinel owns the blocking replay contract
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Reading uptime is single-threaded with no scheduling oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+  - id: system-utils/random-device
+    description: Kernel random bytes vary natively and repeat under Hermit
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+    occasional: false
+    program: tests/e2e/system-utils/random-device.sh
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        runs: 3
+        assert:
+          min_distinct: 2
+        backends_enabled:
+          - native
+        backends_disabled: {}
+        ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled:
+          dbt: DBT coverage is owned by its backend parity partition
+          liteinst: LiteInst coverage is owned by its backend compatibility partition
+          sabre: Path evidence found 33 raw syscall sites per execution in ld-linux and libc; trusted shared-object native execution is not SaBRe support
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The hexdump process tree currently diverges during replay
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Random-byte generation has no scheduling oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+  - id: system-utils/record-getpid
+    description: Process identity is deterministic in run and record/replay modes
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/getpid.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    build:
+      cflags: []
+    modes:
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: The test asserts Hermit's virtualized process identity
+      verify:
+        ci:
+          ptrace: true
+          kvm: true
+          liteinst: true
+          sabre: true
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - sabre
+        backends_disabled:
+          dbt: DBT coverage is owned by its backend parity partition
+      replay:
+        ci: true
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The guest is single-threaded
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+  - id: system-utils/shuf-permutation
+    description: A shuf random permutation varies natively and repeats under Hermit
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+    occasional: false
+    program: tests/e2e/system-utils/shuf-permutation.sh
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        runs: 3
+        assert:
+          min_distinct: 2
+        backends_enabled:
+          - native
+        backends_disabled: {}
+        ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled:
+          dbt: DBT coverage is owned by its backend parity partition
+          sabre: SaBRe requires its external runtime
+          liteinst: LiteInst coverage is owned by its backend compatibility partition
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The focused C sentinel owns the blocking replay contract
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The shuf workload is single-threaded
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+  - id: system-utils/sort-random
+    description: sort -R random-key permutation varies natively and repeats under Hermit
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+    occasional: false
+    program: tests/e2e/system-utils/sort-random.sh
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        runs: 3
+        assert:
+          min_distinct: 2
+        backends_enabled:
+          - native
+        backends_disabled: {}
+        ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: DBT coverage is owned by its backend parity partition
+          kvm: KVM requires the privileged runner
+          sabre: SaBRe requires its external runtime
+          liteinst: LiteInst coverage is owned by its backend compatibility partition
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The focused C sentinel owns the blocking replay contract
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The random-permutation workload is single-threaded
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+  - id: system-utils/ssh-keygen-ed25519
+    description: ssh-keygen Ed25519 public key varies natively and repeats under Hermit
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+    occasional: false
+    program: tests/e2e/system-utils/ssh-keygen-ed25519.sh
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        runs: 3
+        assert:
+          min_distinct: 2
+        backends_enabled:
+          - native
+        backends_disabled: {}
+        ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
+      verify:
+        ci:
+          ptrace: true
+          kvm: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled:
+          dbt: DBT coverage is owned by its backend parity partition
+          sabre: SaBRe requires its external runtime
+          liteinst: LiteInst coverage is owned by its backend compatibility partition
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The record-getpid sentinel owns the blocking replay contract
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The key-generation probe is single-threaded
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+  - id: system-utils/uuidgen-random
+    description: uuidgen -r random UUID varies natively and repeats under Hermit
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+    occasional: false
+    program: tests/e2e/system-utils/uuidgen-random.sh
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        runs: 3
+        assert:
+          min_distinct: 2
+        backends_enabled:
+          - native
+        backends_disabled: {}
+        ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        assert:
+          bitwise_parity: true
+        backends_disabled:
+          dbt: DBT coverage is owned by its backend parity partition
+          sabre: SaBRe requires its external runtime
+          liteinst: LiteInst coverage is owned by its backend compatibility partition
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The record-getpid sentinel owns the blocking replay contract
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The UUID probe is single-threaded
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+  - id: system-utils/proc-random-uuid
+    description: Kernel /proc random UUID varies natively and repeats under Hermit
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+    occasional: false
+    program: tests/e2e/system-utils/proc-random-uuid.sh
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        runs: 3
+        assert:
+          min_distinct: 2
+        backends_enabled:
+          - native
+        backends_disabled: {}
+        ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: DBT coverage is owned by its backend parity partition
+          kvm: KVM requires the privileged runner
+          sabre: SaBRe requires its external runtime
+          liteinst: LiteInst coverage is owned by its backend compatibility partition
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The record-getpid sentinel owns the blocking replay contract
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The procfs UUID read is single-threaded
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+  - id: system-utils/procfs-sanitized-paths
+    description: One guest asserts the sanitizer-specific invariants for eighteen previously untouched procfs paths
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - bash
+      - cc
+    occasional: false
+    program: tests/e2e/system-utils/procfs-sanitized-paths.sh
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: Native execution removes all eighteen sanitizers together and is a negative control, not a green cell
+        ci_disabled_reason: 'NOT-EXERCISED: native execution removes every sanitizer under test and fails the guest assertions.'
+      verify:
+        ci:
+          ptrace: false
+        ci_disabled_reason:
+          ptrace: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
+        compare_io_buffers: false
+        compare_io_buffers_disabled_reason: The guest asserts sanitizer-specific invariants for sixteen procfs files that legitimately retain process, virtual-time, topology, or host data; comparing their raw whole-file bytes would manufacture flakes.
+        rcb_time: false
+        rcb_time_disabled_reason: The guest intentionally parses sanitizer outputs whose non-sanitized fields may vary; RCB-derived virtual time would turn legitimate data-dependent assertion work into unrelated INFO timestamp divergence.
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: The procfs read sanitizers are backend-independent; ptrace is the enabled diagnostic witness, but no backend is CI-qualified
+          kvm: The procfs read sanitizers are backend-independent; ptrace is the enabled diagnostic witness, but no backend is CI-qualified
+          sabre: The procfs read sanitizers are backend-independent; ptrace is the enabled diagnostic witness, but no backend is CI-qualified
+          liteinst: The procfs read sanitizers are backend-independent; ptrace is the enabled diagnostic witness, but no backend is CI-qualified
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The verify guest owns these assertions, but its ptrace tuple is quarantined from required CI
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+        ci_disabled_reason: 'NOT-EXERCISED: the verify guest owns these assertions, but its ptrace tuple is quarantined from required CI.'
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The guest makes sequential reads and has no scheduling surface for chaos to explore
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+        ci_disabled_reason: 'NOT-EXERCISED: no scheduling surface; the verify guest owns these assertions but is not CI-qualified.'
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The verify guest already self-asserts every procfs invariant; a custom arm adds no observation
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+        ci_disabled_reason: 'NOT-EXERCISED: the verify guest owns these assertions, but its ptrace tuple is quarantined from required CI.'
+  - id: system-utils/du-tree-summary
+    description: GNU du recursively traverses and byte-accounts the shared e2e tree under Hermit
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - du
+    occasional: false
+    direct:
+      - /usr/bin/du
+      - -sb
+      - --
+      - tests/e2e
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: The checkout byte count is deterministic by construction; this row establishes the ptrace execution reference
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled:
+          dbt: Qualify recursive du independently against the new ptrace golden baseline
+          sabre: Qualify recursive du independently against the new ptrace golden baseline
+          liteinst: Qualify recursive du independently against the new ptrace golden baseline
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The record-getpid sentinel owns the blocking replay contract
+          dbt: Record/replay is unsupported by DBI
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The directory accounting workload is single-threaded
+          dbt: Chaos scheduling is unsupported by DBI
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+  - id: system-utils/find-tree-metadata
+    description: GNU find traverses the shared e2e tree and emits each file path and byte size under Hermit
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - find
+    occasional: false
+    direct:
+      - /usr/bin/find
+      - tests/e2e
+      - -mindepth
+      - '1'
+      - -maxdepth
+      - '3'
+      - -type
+      - f
+      - -printf
+      - '%P %s\n'
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: The checkout path/size inventory is deterministic by construction; this row establishes the ptrace execution reference
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled:
+          dbt: Qualify recursive find independently against the new ptrace golden baseline
+          sabre: Qualify recursive find independently against the new ptrace golden baseline
+          liteinst: Qualify recursive find independently against the new ptrace golden baseline
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The record-getpid sentinel owns the blocking replay contract
+          dbt: Record/replay is unsupported by DBI
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The directory traversal workload is single-threaded
+          dbt: Chaos scheduling is unsupported by DBI
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+  - id: system-utils/file-timestamp-identity
+    description: timestamps and metadata on guest-created files are identical across repeated Hermit runs
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/file_timestamp_identity.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    build:
+      cflags:
+        - -O0
+        - -D_GNU_SOURCE
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled:
+          dbt: Enable once measured on this backend; ptrace is the proven baseline
+          liteinst: Enable once measured on this backend; ptrace is the proven baseline
+          sabre: Enable once measured on this backend; ptrace is the proven baseline
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: 'Native is the NEGATIVE control: real filesystem timestamps differ every run by design, so this cell must never be enabled'
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          dbt: File timestamps are set on write and are not what chaos scheduling perturbs
+          kvm: File timestamps are set on write and are not what chaos scheduling perturbs
+          liteinst: File timestamps are set on write and are not what chaos scheduling perturbs
+          ptrace: File timestamps are set on write and are not what chaos scheduling perturbs
+          sabre: File timestamps are set on write and are not what chaos scheduling perturbs
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          dbt: No custom multi-run assertion needed; verify's double-run comparison is the contract
+          kvm: No custom multi-run assertion needed; verify's double-run comparison is the contract
+          liteinst: No custom multi-run assertion needed; verify's double-run comparison is the contract
+          ptrace: No custom multi-run assertion needed; verify's double-run comparison is the contract
+          sabre: No custom multi-run assertion needed; verify's double-run comparison is the contract
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          dbt: Record/replay identity of file timestamps is a separate contract
+          kvm: Record/replay identity of file timestamps is a separate contract
+          liteinst: Record/replay identity of file timestamps is a separate contract
+          ptrace: Record/replay identity of file timestamps is a separate contract
+          sabre: Record/replay identity of file timestamps is a separate contract
+  - id: system-utils/startup-surface-identity
+    description: argv, environ order, the full auxv vector (incl. AT_RANDOM bytes and the raw vDSO base) and initial stack layout are identical across repeated Hermit runs
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/startup_surface_identity.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    build:
+      cflags:
+        - -O0
+        - -D_GNU_SOURCE
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled:
+          dbt: Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in the RAW vDSO base or AT_RANDOM is a FINDING to report, never something to normalise away
+          liteinst: Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in the RAW vDSO base or AT_RANDOM is a FINDING to report, never something to normalise away
+          sabre: Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in the RAW vDSO base or AT_RANDOM is a FINDING to report, never something to normalise away
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: 'Native is the NEGATIVE control: AT_RANDOM, the vDSO base and stack addresses differ every run by design, so this cell must never be enabled'
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          dbt: The startup surface is fixed before main() and is not what chaos scheduling perturbs
+          kvm: The startup surface is fixed before main() and is not what chaos scheduling perturbs
+          liteinst: The startup surface is fixed before main() and is not what chaos scheduling perturbs
+          ptrace: The startup surface is fixed before main() and is not what chaos scheduling perturbs
+          sabre: The startup surface is fixed before main() and is not what chaos scheduling perturbs
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          dbt: No custom multi-run assertion is needed; verify's double-run comparison is the whole contract
+          kvm: No custom multi-run assertion is needed; verify's double-run comparison is the whole contract
+          liteinst: No custom multi-run assertion is needed; verify's double-run comparison is the whole contract
+          ptrace: No custom multi-run assertion is needed; verify's double-run comparison is the whole contract
+          sabre: No custom multi-run assertion is needed; verify's double-run comparison is the whole contract
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          dbt: Record/replay identity of the startup surface is a separate contract and is not what this fixture pins
+          kvm: Record/replay identity of the startup surface is a separate contract and is not what this fixture pins
+          liteinst: Record/replay identity of the startup surface is a separate contract and is not what this fixture pins
+          ptrace: Record/replay identity of the startup surface is a separate contract and is not what this fixture pins
+          sabre: Record/replay identity of the startup surface is a separate contract and is not what this fixture pins
+  - id: system-utils/startup-tls-guards
+    description: the x86-64 glibc TLS stack canary and pointer guard initialized before main are identical across repeated runs
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/startup_tls_guards.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    build:
+      cflags:
+        - -O0
+    modes:
+      verify:
+        ci:
+          ptrace: true
+          kvm: true
+          sabre: false
+        ci_disabled_reason:
+          sabre: {"result": "determinism-failure", "evidence": "Generated scorecard ci/compat-envelope/cells.json at Hermit 5b811757980b9cab599206c047560a7962176a6b retains historical results determinism-failure at Hermit 90e46cba9ad83550205f3c9cd232ae222c6b6173; retained first divergent record positions: 117, 117, 117.", "reason": "Historical canonical verification diverged at recorded positions. The later clean observations do not erase that retained failure, so this backend remains excluded pending separate qualification."}
+        backends_enabled:
+          - ptrace
+          - kvm
+          - sabre
+        backends_disabled:
+          dbt: Qualify the DBT startup TLS path independently after the ptrace and SaBRe ownership boundary is fixed
+          liteinst: Qualify the LiteInst startup TLS path independently after the ptrace and SaBRe ownership boundary is fixed
+      naked:
+        ci: false
+        ci_disabled_reason: Native execution intentionally receives fresh kernel AT_RANDOM bytes, so repeated TLS guards differ by design
+        backends_enabled: []
+        backends_disabled:
+          native: Native execution intentionally receives fresh kernel AT_RANDOM bytes and therefore different TLS guards on every run
+      chaos:
+        ci: false
+        ci_disabled_reason: Guard initialization happens before chaos scheduling and is not the schedule-diversity contract
+        backends_enabled: []
+        backends_disabled:
+          dbt: Guard initialization happens before chaos scheduling and is not the schedule-diversity contract
+          kvm: Guard initialization happens before chaos scheduling and is not the schedule-diversity contract
+          liteinst: Guard initialization happens before chaos scheduling and is not the schedule-diversity contract
+          ptrace: Guard initialization happens before chaos scheduling and is not the schedule-diversity contract
+          sabre: Guard initialization happens before chaos scheduling and is not the schedule-diversity contract
+      custom:
+        ci: false
+        ci_disabled_reason: No custom Hermit arguments are needed because verify's repeated-run comparison is the contract
+        backends_enabled: []
+        backends_disabled:
+          dbt: No custom Hermit arguments are needed; verify's repeated-run comparison is the contract
+          kvm: No custom Hermit arguments are needed; verify's repeated-run comparison is the contract
+          liteinst: No custom Hermit arguments are needed; verify's repeated-run comparison is the contract
+          ptrace: No custom Hermit arguments are needed; verify's repeated-run comparison is the contract
+          sabre: No custom Hermit arguments are needed; verify's repeated-run comparison is the contract
+      replay:
+        ci: false
+        ci_disabled_reason: Record/replay ownership of startup TLS guards is a separate contract from repeated-run verification
+        backends_enabled: []
+        backends_disabled:
+          dbt: Record/replay ownership of startup TLS guards is a separate contract
+          kvm: Record/replay ownership of startup TLS guards is a separate contract
+          liteinst: Record/replay ownership of startup TLS guards is a separate contract
+          ptrace: Record/replay ownership of startup TLS guards is a separate contract
+          sabre: Record/replay ownership of startup TLS guards is a separate contract
+  - id: system-utils/shm-coherency-identity
+    description: what each process observes through MAP_SHARED / memfd / COW mappings is identical across repeated Hermit runs, including partial updates
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/shm_coherency_identity.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    build:
+      cflags:
+        - -O0
+        - -D_GNU_SOURCE
+    modes:
+      verify:
+        ci:
+          ptrace: true
+          kvm: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled:
+          dbt: Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in WHICH partial state a reader catches is a FINDING, not something to stabilise away
+          liteinst: Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in WHICH partial state a reader catches is a FINDING, not something to stabilise away
+          sabre: Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in WHICH partial state a reader catches is a FINDING, not something to stabilise away
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: 'Native is the NEGATIVE control: the reader catches a different prefix of the writer''s record run to run, by design, so this cell must never be enabled'
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          dbt: Chaos deliberately perturbs the interleaving this fixture pins; a difference there would not be a regression
+          kvm: Chaos deliberately perturbs the interleaving this fixture pins; a difference there would not be a regression
+          liteinst: Chaos deliberately perturbs the interleaving this fixture pins; a difference there would not be a regression
+          ptrace: Chaos deliberately perturbs the interleaving this fixture pins; a difference there would not be a regression
+          sabre: Chaos deliberately perturbs the interleaving this fixture pins; a difference there would not be a regression
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          dbt: No custom multi-run assertion needed; verify's double-run comparison is the contract
+          kvm: No custom multi-run assertion needed; verify's double-run comparison is the contract
+          liteinst: No custom multi-run assertion needed; verify's double-run comparison is the contract
+          ptrace: No custom multi-run assertion needed; verify's double-run comparison is the contract
+          sabre: No custom multi-run assertion needed; verify's double-run comparison is the contract
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          dbt: Record/replay identity of shared-memory observation is a separate contract
+          kvm: Record/replay identity of shared-memory observation is a separate contract
+          liteinst: Record/replay identity of shared-memory observation is a separate contract
+          ptrace: Record/replay identity of shared-memory observation is a separate contract
+          sabre: Record/replay identity of shared-memory observation is a separate contract
+  - id: system-utils/clock-exec-continuity
+    description: Guest clock keeps advancing across execs and is never rebased onto a round origin
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/clock_exec_continuity.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    build:
+      cflags:
+        - -O0
+        - -D_GNU_SOURCE
+    modes:
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: The guard asserts Hermit's virtual clock; the host clock is not the contract
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Enable once the DBI post-exec clock path is qualified against the ptrace baseline
+          kvm: Enable once the KVM post-exec clock path is qualified against the ptrace baseline
+          sabre: SaBRe does not intercept RDTSCP; clock probes can leak raw host TSC
+          liteinst: The preload runtime does not survive the guest's own re-exec
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Clock replay divergence is tracked by the clock-determinism entry
+          dbt: Record/replay is unsupported by DBI
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The guard guest is single-threaded
+          dbt: Chaos scheduling is unsupported by DBI
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The verify mode owns this contract; the guest self-asserts
+          dbt: The verify mode owns this contract; the guest self-asserts
+          kvm: The verify mode owns this contract; the guest self-asserts
+          sabre: The verify mode owns this contract; the guest self-asserts
+          liteinst: The verify mode owns this contract; the guest self-asserts
+  - id: system-utils/errno-path-identity
+    description: syscall FAILURE paths return identical errno across repeated Hermit runs
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/errno_path_identity.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    build:
+      cflags:
+        - -O0
+        - -D_GNU_SOURCE
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled:
+          dbt: Enable once measured on this backend; ptrace is the proven baseline
+          liteinst: Enable once measured on this backend; ptrace is the proven baseline
+          sabre: Enable once measured on this backend; ptrace is the proven baseline
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: A single run cannot observe run-to-run identity; verify's double run is the contract
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          dbt: These failures are argument-intrinsic and not what chaos scheduling perturbs
+          kvm: These failures are argument-intrinsic and not what chaos scheduling perturbs
+          liteinst: These failures are argument-intrinsic and not what chaos scheduling perturbs
+          ptrace: These failures are argument-intrinsic and not what chaos scheduling perturbs
+          sabre: These failures are argument-intrinsic and not what chaos scheduling perturbs
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          dbt: No custom multi-run assertion needed; verify's double-run comparison is the contract
+          kvm: No custom multi-run assertion needed; verify's double-run comparison is the contract
+          liteinst: No custom multi-run assertion needed; verify's double-run comparison is the contract
+          ptrace: No custom multi-run assertion needed; verify's double-run comparison is the contract
+          sabre: No custom multi-run assertion needed; verify's double-run comparison is the contract
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          dbt: Record/replay identity of error paths is a separate contract
+          kvm: Record/replay identity of error paths is a separate contract
+          liteinst: Record/replay identity of error paths is a separate contract
+          ptrace: Record/replay identity of error paths is a separate contract
+          sabre: Record/replay identity of error paths is a separate contract
+  - id: system-utils/auxv-loader-dump
+    description: 'LD_SHOW_AUXV loader dump: AT_RANDOM, vdso base and the rest of the auxiliary vector'
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+    occasional: false
+    program: tests/e2e/system-utils/auxv-loader-dump.sh
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: AT_RANDOM and the vdso base vary on every native execution by design; native repetition is not a contract
+        ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Established on ptrace first; other backends ratchet against this shared entry
+          kvm: KVM requires the privileged runner and does not start on the validation host
+          sabre: Established on ptrace first; other backends ratchet against this shared entry
+          liteinst: Established on ptrace first; other backends ratchet against this shared entry
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is tracked separately from this strict-verify entry
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+        ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The dump is produced once at startup and has no schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+        ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this entry
+          dbt: No custom edge-case arguments have been calibrated for this entry
+          kvm: No custom edge-case arguments have been calibrated for this entry
+          sabre: No custom edge-case arguments have been calibrated for this entry
+          liteinst: No custom edge-case arguments have been calibrated for this entry
+        ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
+  - id: system-utils/ps-proc-table
+    description: 'ps walking the virtualized /proc process table: getdents plus per-pid stat parsing'
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+    occasional: false
+    program: tests/e2e/system-utils/ps-proc-table.sh
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: The host process table changes continuously, so native repetition is not a contract
+        ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Established on ptrace first; other backends ratchet against this shared entry
+          kvm: KVM requires the privileged runner and does not start on the validation host
+          sabre: Established on ptrace first; other backends ratchet against this shared entry
+          liteinst: Established on ptrace first; other backends ratchet against this shared entry
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is tracked separately from this strict-verify entry
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+        ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling perturbs the guest process tree that this entry reports
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+        ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this entry
+          dbt: No custom edge-case arguments have been calibrated for this entry
+          kvm: No custom edge-case arguments have been calibrated for this entry
+          sabre: No custom edge-case arguments have been calibrated for this entry
+          liteinst: No custom edge-case arguments have been calibrated for this entry
+        ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
+  - id: system-utils/nscd-neutralised
+    description: The host nscd socket and cache are hidden from the guest by an empty read-only mount
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - bash
+    occasional: false
+    program: tests/e2e/system-utils/nscd-neutralised.sh
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: Natively the control is absent by definition, so this is the cell's RED arm and must not run as a green cell
+        ci_disabled_reason: 'NOT-EXERCISED: running natively removes the control under test; that arm is the demonstrated red, not a passing cell.'
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: The mount is container setup and backend-independent; ptrace is the canonical required witness
+          kvm: The mount is container setup and backend-independent; ptrace is the canonical required witness
+          sabre: The mount is container setup and backend-independent; ptrace is the canonical required witness
+          liteinst: The mount is container setup and backend-independent; ptrace is the canonical required witness
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The control is established at container setup; the verify cell owns it
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+        ci_disabled_reason: 'NOT-EXERCISED: the required verify cell owns the nscd neutralisation contract.'
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: A container-setup assertion has no scheduling surface for chaos to explore
+          dbt: A container-setup assertion has no scheduling surface for chaos to explore
+          kvm: A container-setup assertion has no scheduling surface for chaos to explore
+          sabre: A container-setup assertion has no scheduling surface for chaos to explore
+          liteinst: A container-setup assertion has no scheduling surface for chaos to explore
+        ci_disabled_reason: 'NOT-EXERCISED: no scheduling surface; the verify cell owns this contract.'
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The verify cell already self-asserts the mount; a custom arm adds no observation
+          dbt: The verify cell already self-asserts the mount; a custom arm adds no observation
+          kvm: The verify cell already self-asserts the mount; a custom arm adds no observation
+          sabre: The verify cell already self-asserts the mount; a custom arm adds no observation
+          liteinst: The verify cell already self-asserts the mount; a custom arm adds no observation
+        ci_disabled_reason: 'NOT-EXERCISED: the required verify cell owns the nscd neutralisation contract.'
+  - id: system-utils/sysfs-sanitized-prefixes
+    description: One guest asserts readable stable leaves under the eight previously untouched sanitized sysfs prefixes
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - bash
+    occasional: false
+    program: tests/e2e/system-utils/sysfs-sanitized-prefixes.sh
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: Native execution removes all eight sanitizers together and is the demonstrated red arm, not a green cell
+        ci_disabled_reason: 'NOT-EXERCISED: native execution removes every sanitizer under test and fails the guest assertion.'
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled:
+          dbt: The sysfs read sanitizers are backend-independent; ptrace is the canonical required witness
+          sabre: The sysfs read sanitizers are backend-independent; ptrace is the canonical required witness
+          liteinst: The sysfs read sanitizers are backend-independent; ptrace is the canonical required witness
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The guest assertions and required verify cell own this sysfs readability contract
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+        ci_disabled_reason: 'NOT-EXERCISED: the required verify cell owns the sysfs readability and stability contract.'
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Sequential sysfs reads expose no scheduling surface for chaos to explore
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+        ci_disabled_reason: 'NOT-EXERCISED: sequential sysfs reads expose no scheduling surface for chaos.'
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The verify guest already asserts all eight prefixes; custom arguments add no observation
+          dbt: The verify guest already asserts all eight prefixes; custom arguments add no observation
+          kvm: The verify guest already asserts all eight prefixes; custom arguments add no observation
+          sabre: The verify guest already asserts all eight prefixes; custom arguments add no observation
+          liteinst: The verify guest already asserts all eight prefixes; custom arguments add no observation
+        ci_disabled_reason: 'NOT-EXERCISED: the required verify cell already asserts every targeted sysfs prefix.'
+  - id: system-utils/harness-width-contract
+    description: The system-utils bucket runs at the measured deterministic worker width of one
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - bash
+    occasional: false
+    program: tests/e2e/system-utils/harness-width-contract.sh
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: The contract describes test-harness scheduling, not native guest behavior
+        ci_disabled_reason: 'NOT-EXERCISED: the required verify cell owns the harness-width contract.'
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled:
+          dbt: The harness control is backend-independent; ptrace is the canonical required witness
+          sabre: The harness control is backend-independent; ptrace is the canonical required witness
+          liteinst: The harness control is backend-independent; ptrace is the canonical required witness
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Replay does not strengthen the harness-width assertion
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+        ci_disabled_reason: 'NOT-EXERCISED: the required verify cell owns the harness-width contract.'
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is unrelated to the harness worker-pool width
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+        ci_disabled_reason: 'NOT-EXERCISED: the required verify cell owns the harness-width contract.'
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The exact verify cell already self-asserts the configured width
+          dbt: The exact verify cell already self-asserts the configured width
+          kvm: The exact verify cell already self-asserts the configured width
+          sabre: The exact verify cell already self-asserts the configured width
+          liteinst: The exact verify cell already self-asserts the configured width
+        ci_disabled_reason: 'NOT-EXERCISED: the required verify cell owns the harness-width contract.'

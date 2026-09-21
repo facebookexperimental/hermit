@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Give a compiled script harness and its fixture children retained runner logs.
+set -euo pipefail
+
+ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)
+if (($# < 3)) || [[ $2 != -- ]]; then
+    echo 'usage: run-test-harness <source> -- <command> [args...]' >&2
+    exit 2
+fi
+source=$1
+shift 2
+
+# Allocate before exec, rather than mutating the environment from parallel Rust
+# tests. Nested launchers deliberately allocate another child directory: no
+# caller-supplied marker can make separate harnesses share one evidence root.
+# Keep these directories after success, failure or a signal so the enclosing
+# validation retains the fixture evidence alongside the original outer logs.
+parent=${DAGRUN_LOG_DIR:-$ROOT_DIR/target/ci/script-test-logs}
+saved_umask=$(umask)
+umask 077
+mkdir -p -- "$parent"
+parent=$(cd -- "$parent" && pwd -P)
+logs=$(mktemp -d "$parent/script-test.XXXXXXXX")
+printf '%s\0' "$source" > "$logs/source.path"
+printf '%s\0' "$@" > "$logs/command.argv"
+umask "$saved_umask"
+
+printf 'rust-script test runner logs: %s\n' "$logs" >&2
+export DAGRUN_LOG_DIR=$logs
+# Preserve the actual command's argv, exit status, signals, limits and all other
+# environment variables. In particular, normal script runs never call this.
+exec "$@"

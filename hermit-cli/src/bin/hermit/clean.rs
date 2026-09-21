@@ -31,7 +31,7 @@ impl CleanOpts {
 
         let hermit = HermitData::from(self.data_dir.as_ref());
 
-        for id in hermit.recordings() {
+        for id in hermit.try_recordings()? {
             println!("{} {} ...", "Deleting".red().bold(), id.to_string().bold());
             hermit
                 .remove(id)

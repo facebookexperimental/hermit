@@ -1,0 +1,25 @@
+load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
+
+oncall("hermit")
+
+rust_binary(
+    name = "hermit-verify",
+    srcs = glob(["src/**/*.rs"]),
+    test_deps = ["fbsource//third-party/rust:pretty_assertions"],
+    test_srcs = glob([
+        "src/**/*.rs",
+    ]),
+    deps = [
+        "fbsource//third-party/rust:anyhow",
+        "fbsource//third-party/rust:clap",
+        "fbsource//third-party/rust:colored",
+        "fbsource//third-party/rust:rand",
+        "fbsource//third-party/rust:serde_json",
+        "fbsource//third-party/rust:similar",
+        "fbsource//third-party/rust:tempfile",
+        "fbsource//third-party/rust:tracing",
+        "//common/rust/shed/fbinit:fbinit",
+        "//hermetic_infra/hermit/detcore:detcore",
+        "//hermetic_infra/hermit/detcore-model:detcore-model",
+    ],
+)

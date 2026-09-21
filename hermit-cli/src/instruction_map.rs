@@ -32,7 +32,7 @@ use uuid::Uuid;
 use crate::Context;
 use crate::Error;
 
-const CACHE_SCHEMA_VERSION: u32 = 1;
+const CACHE_SCHEMA_VERSION: u32 = 2;
 
 /// One instruction that can expose host nondeterminism or enter the kernel.
 #[derive(Debug, Clone, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -335,15 +335,19 @@ fn scan_range(
     Ok(())
 }
 
+// TODO-HUMAN-REVIEW(PR-594): Review the expanded public instruction-map coverage.
 fn nondeterministic_instruction(instruction: &Instruction) -> Option<&'static str> {
     match instruction.mnemonic() {
         Mnemonic::Syscall => Some("syscall"),
         Mnemonic::Cpuid => Some("cpuid"),
         Mnemonic::Rdrand => Some("rdrand"),
         Mnemonic::Rdtsc => Some("rdtsc"),
+        Mnemonic::Rdtscp => Some("rdtscp"),
         Mnemonic::Rdseed => Some("rdseed"),
+        Mnemonic::Sysenter => Some("sysenter"),
         Mnemonic::Xbegin => Some("xbegin"),
         Mnemonic::Xend => Some("xend"),
+        Mnemonic::Int if instruction.immediate8() == 0x80 => Some("int80"),
         _ => None,
     }
 }
@@ -402,7 +406,7 @@ mod tests {
     fn all_target_instructions() -> Vec<u8> {
         vec![
             0x0f, 0x05, 0x0f, 0xa2, 0x48, 0x0f, 0xc7, 0xf0, 0x0f, 0x31, 0x48, 0x0f, 0xc7, 0xf8,
-            0xc7, 0xf8, 0, 0, 0, 0, 0x0f, 0x01, 0xd5,
+            0x0f, 0x01, 0xf9, 0x0f, 0x34, 0xcd, 0x80, 0xc7, 0xf8, 0, 0, 0, 0, 0x0f, 0x01, 0xd5,
         ]
     }
 
@@ -439,11 +443,26 @@ mod tests {
                 },
                 InstructionSite {
                     offset: 78,
+                    instruction: "rdtscp".into(),
+                    length: 3
+                },
+                InstructionSite {
+                    offset: 81,
+                    instruction: "sysenter".into(),
+                    length: 2
+                },
+                InstructionSite {
+                    offset: 83,
+                    instruction: "int80".into(),
+                    length: 2
+                },
+                InstructionSite {
+                    offset: 85,
                     instruction: "xbegin".into(),
                     length: 6
                 },
                 InstructionSite {
-                    offset: 84,
+                    offset: 91,
                     instruction: "xend".into(),
                     length: 3
                 },
@@ -477,5 +496,41 @@ mod tests {
         let third = load_or_generate(&binary, &cache).unwrap();
         assert_eq!(third.cache_status, CacheStatus::Miss);
         assert_ne!(third.cache_path, first.cache_path);
+    }
+
+    #[test]
+    fn stale_schema_cache_is_regenerated() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("fixture");
+        let cache = temp.path().join("cache");
+        fs::write(
+            &binary,
+            elf_with_executable_section(&all_target_instructions()),
+        )
+        .unwrap();
+
+        let canonical = fs::canonicalize(&binary).unwrap();
+        let metadata = fs::metadata(&canonical).unwrap();
+        let identity = FileIdentity::new(canonical.clone(), &metadata);
+        let cache_path = cache.join(format!("{}.json", cache_key(&identity)));
+        let stale = InstructionMap {
+            schema_version: CACHE_SCHEMA_VERSION - 1,
+            binary: canonical,
+            file_length: identity.file_length,
+            modified: identity.modified,
+            sites: Vec::new(),
+        };
+        write_cache(&cache_path, &stale).unwrap();
+
+        let regenerated = load_or_generate(&binary, &cache).unwrap();
+        assert_eq!(regenerated.cache_status, CacheStatus::Miss);
+        assert_eq!(regenerated.map.schema_version, CACHE_SCHEMA_VERSION);
+        assert!(
+            regenerated
+                .map
+                .sites
+                .iter()
+                .any(|site| site.instruction == "rdtscp")
+        );
     }
 }

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Test Shrink Optimization"
+  short_description: "Make Hermit tests faster without losing coverage"
+  default_prompt: "Use $test-shrink-optimization to shrink this Hermit test while preserving its real execution surface and coverage."

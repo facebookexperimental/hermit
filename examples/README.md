@@ -77,11 +77,9 @@ time elapses. However, running with `hermit run` ensures that the same
 date output is received on every call.
 
 - `devrand.sh`: Generates random numbers similar to `rand.py`, but uses
-`/dev/random` as the source of its data. **Note:** Reading from `/dev/random`
-will block until sufficient entropy is available to generate the random output,
-so this example can take a while to run.
+`/dev/urandom` as the source of its data.
 
-It is highly reccommended to take a look at the contents of these example
+It is highly recommended to take a look at the contents of these example
 scripts to see what is being tested.
 
 It is also worthwhile to experiment with running arbitrary commands in

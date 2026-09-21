@@ -16,8 +16,10 @@ use hermit::Id;
 use hermit::Shebang;
 use reverie::process::ExitStatus;
 
-use super::container::default_container;
+use super::container::deterministic_container;
 use super::container::with_container;
+use super::gdb_client::CLIENT_EXITED_BEFORE_CONNECTING;
+use super::gdb_client::GdbClientWatch;
 use super::global_opts::GlobalOpts;
 
 /// Command-line options for the "replay" subcommand.
@@ -42,8 +44,12 @@ pub struct ReplayOpts {
     #[clap(long, short)]
     autopilot: bool,
 
+    /// Serve the replay through the gdb remote protocol without launching gdb.
+    #[clap(long, conflicts_with = "autopilot")]
+    serve_only: bool,
+
     /// Additional gdb command passed by `-ex`
-    #[clap(long, value_delimiter = ';')]
+    #[clap(long, value_delimiter = ';', conflicts_with = "serve_only")]
     gdbex: Vec<String>,
 }
 
@@ -58,8 +64,8 @@ impl ReplayOpts {
                 .context("Failed to find last recording ID")?,
         };
 
-        if self.autopilot {
-            let mut container = default_container(true);
+        if self.autopilot || self.serve_only {
+            let (mut container, _identity_guard) = deterministic_container()?;
             with_container(&mut container, || {
                 self.container_main(global, self.autopilot, &hermit, id)
             })
@@ -84,7 +90,7 @@ impl ReplayOpts {
             for ex in &self.gdbex {
                 gdb_command.arg("-ex").arg(ex);
             }
-            let mut gdb_client = gdb_command
+            let gdb_client = gdb_command
                 .spawn()
                 .context("Failed to run gdb command. Please make sure it is in your $PATH.")?;
 
@@ -93,12 +99,30 @@ impl ReplayOpts {
             // to initialize logging inside the container because it may spawn a
             // thread. If we can guarantee that tracing won't spawn a thread, then
             // that restriction be lifted.
-            let mut container = default_container(true);
+            // Same unbounded accept as the record path: the client is spawned
+            // before the container that binds the port, so a client that dies
+            // early leaves the gdbserver waiting for a peer that cannot arrive.
+            // ⚠️ CORRECTION TO WHAT LANDED HERE. This comment used to claim this
+            // file's `wait()` "WAS reached on every path ... so it never leaked a
+            // zombie", and that only the record path leaked. That is wrong:
+            // `deterministic_container()?` on the next line precedes the wait, so
+            // an error building the container skipped it here too. BOTH files
+            // leaked, and the merged description of hermit#2654 says otherwise.
+            // Recorded rather than quietly deleted, because the claim is in a
+            // landed commit message where it cannot be edited.
+            let mut gdb_watch = GdbClientWatch::spawn(gdb_client, self.gdbserver_port);
+            let (mut container, _identity_guard) = deterministic_container()?;
             let result = with_container(&mut container, || {
                 self.container_main(global, self.autopilot, &hermit, id)
             });
-            let _ = gdb_client.wait();
-            result
+            let client_exited_early = gdb_watch.finish();
+            match result {
+                Ok(status) => Ok(status),
+                Err(error) if client_exited_early => {
+                    Err(error.context(CLIENT_EXITED_BEFORE_CONNECTING))
+                }
+                Err(error) => Err(error),
+            }
         }
     }
 

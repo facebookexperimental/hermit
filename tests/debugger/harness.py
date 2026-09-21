@@ -306,7 +306,7 @@ class DebuggerTestBase(unittest.TestCase):
         if cls.require_lldb and not have_lldb_module():
             raise unittest.SkipTest(
                 "lldb python module not importable "
-                '(set PYTHONPATH="$(lldb -P)"); see run_debugger_tests.sh'
+                "(set PYTHONPATH=\"$(lldb -P)\"); see run_debugger_tests.sh"
             )
         ok, reason = can_run_hermit(cls.hermit)
         if not ok:

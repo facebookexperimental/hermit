@@ -1,0 +1,115 @@
+name: Linux boot (QEMU) — dedicated lane
+
+# WHY THIS IS ITS OWN WORKFLOW.
+#
+# Booting a Linux kernel under Hermit is the heaviest thing in the demo suite:
+# it needs QEMU, a pinned kernel, a BusyBox initramfs, and — because it runs
+# under `--strict` — PMU retired-branch preemption, so it can only run on the
+# self-hosted `pmu` lane. The broader `demo-hot-path.yml` diagnostic also runs
+# this boot as part of `scripts/super-validate.sh --demos-only`.
+#
+# This lane does one thing: boot Linux under Hermit and assert it reached
+# userspace deterministically. It is manually dispatched and never runs on a
+# pull request, `main`, or a schedule. It also uses Hermit's OWN self-contained demo
+# (`demos/05-qemu-busybox.sh`) rather than the parent's demo harness, so the
+# check lives in the repository whose commits can break it.
+#
+# NOTE FOR ANYONE RUNNING THE PARENT HARNESS INSTEAD: `dev-hermit`'s
+# `demos/05-qemu-boot.py` shells out to `make check-deps`, which runs
+# `git submodule update` on the PARENT and will detach the primary checkouts.
+# That is why this lane calls the in-repo demo directly.
+
+on:
+  workflow_dispatch:
+
+# One boot at a time. There is a single PMU runner; queuing two of these behind
+# each other starves every other lane that needs it.
+concurrency:
+  group: linux-boot
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  linux-boot:
+    runs-on: [Linux, X64, hermit, pmu]
+    # A clean boot is ~48s and `VERIFY=1` runs the guest twice and compares, so
+    # the boot itself is a couple of minutes; the rest is the release build.
+    # 45 is deliberately generous against a cold cargo cache while staying 8x
+    # under demo-hot-path's 360 — a hang should fail this lane, not occupy the
+    # PMU runner for six hours.
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install boot dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          # busybox-static + cpio build the initramfs; qemu-img is needed by the
+          # snapshot path; curl fetches the pinned kernel when it is not cached.
+          if command -v dnf >/dev/null; then
+            sudo dnf install -y busybox cpio curl gzip qemu-img qemu-kvm-core \
+              || echo "::notice::dnf install reported an error; continuing to the doctor check"
+          elif command -v apt-get >/dev/null; then
+            sudo apt-get update || true
+            sudo apt-get install -y busybox-static cpio curl gzip qemu-system-x86 qemu-utils \
+              || echo "::notice::apt-get install reported an error; continuing to the doctor check"
+          fi
+
+      - name: Verify the boot prerequisites are actually present
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Fail here with a legible message rather than inside the demo. Each of
+          # these has gone missing on the self-hosted box at least once.
+          missing=()
+          for tool in qemu-system-x86_64 qemu-img busybox cpio curl grep sha256sum tee timeout; do
+            command -v "$tool" >/dev/null || missing+=("$tool")
+          done
+          if ((${#missing[@]})); then
+            echo "::error::missing boot prerequisites: ${missing[*]}"
+            exit 1
+          fi
+          # `--strict` preemption needs the PMU. A runner without readable perf
+          # counters produces a confusing mid-boot failure, so assert it up front.
+          test -r /proc/sys/kernel/perf_event_paranoid \
+            || { echo "::error::no /proc/sys/kernel/perf_event_paranoid; this is not a PMU runner"; exit 1; }
+          echo "perf_event_paranoid=$(cat /proc/sys/kernel/perf_event_paranoid)"
+
+      - name: Build the release hermit binary
+        shell: bash
+        run: cargo build --release -p hermit --bin hermit
+
+      - name: Boot Linux under Hermit (--strict --verify)
+        shell: bash
+        env:
+          # VERIFY=1 makes the demo pass `--verify`, so the guest is run twice
+          # and the two executions are compared. A boot that merely succeeds is
+          # not the property this lane exists to protect; a boot that succeeds
+          # IDENTICALLY TWICE is.
+          VERIFY: "1"
+          # Per-run cap inside the demo. The historical failure mode is the HPET
+          # boot wedge, which hangs rather than erroring, so this bound is what
+          # converts a wedge into a red instead of a six-hour occupancy.
+          DEMO_TIMEOUT_SECONDS: "600"
+        run: ./demos/05-qemu-busybox.sh
+
+      - name: Upload boot logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-boot-logs
+          # console.log is the guest serial: on the known wedge it stops at
+          # "hpet0: 3 comparators" instead of reaching the PASS marker, which is
+          # the first thing to look at when this lane goes red.
+          path: |
+            target/qemu-busybox/console.log
+            target/qemu-busybox/hermit-info.log
+            target/qemu-busybox/hermit-stderr.log
+          if-no-files-found: warn
+          retention-days: 14

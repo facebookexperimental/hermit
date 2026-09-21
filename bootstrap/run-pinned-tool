@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=tool-pins.sh
+source "$script_dir/tool-pins.sh"
+
+usage() {
+  echo "usage: $0 reindeer [arguments...]" >&2
+  exit 2
+}
+
+[[ $# -ge 1 ]] || usage
+tool=$1
+shift
+
+case "$tool" in
+  reindeer)
+    repository=$REINDEER_REPOSITORY
+    revision=$REINDEER_REVISION
+    toolchain=$REINDEER_RUST_TOOLCHAIN
+    ;;
+  *)
+    usage
+    ;;
+esac
+
+if [[ -n ${HERMIT_BUCK2_TOOL_CACHE:-} ]]; then
+  cache_root=$HERMIT_BUCK2_TOOL_CACHE
+elif [[ -n ${XDG_CACHE_HOME:-} ]]; then
+  cache_root=$XDG_CACHE_HOME/hermit-buck2-tools
+else
+  cache_root=$HOME/.cache/hermit-buck2-tools
+fi
+
+source_dir=$cache_root/source/$tool-$revision
+target_dir=$cache_root/target/$tool-$revision
+binary=$target_dir/release/$tool
+
+if [[ ! -x $binary ]]; then
+  command -v git >/dev/null || { echo "git is required" >&2; exit 1; }
+  command -v rustup >/dev/null || { echo "rustup is required" >&2; exit 1; }
+
+  mkdir -p "$cache_root/source" "$cache_root/target"
+  if [[ ! -d $source_dir/.git ]]; then
+    mkdir -p "$source_dir"
+    git -C "$source_dir" init
+    git -C "$source_dir" remote add origin "$repository"
+  fi
+  git -C "$source_dir" fetch --depth 1 origin "$revision"
+  git -C "$source_dir" checkout --detach FETCH_HEAD
+  actual_revision=$(git -C "$source_dir" rev-parse HEAD)
+  if [[ $actual_revision != "$revision" ]]; then
+    echo "expected $tool revision $revision, got $actual_revision" >&2
+    exit 1
+  fi
+
+  if ! rustup run "$toolchain" rustc --version >/dev/null 2>&1; then
+    rustup toolchain install "$toolchain" --profile minimal
+  fi
+
+  CARGO_TARGET_DIR=$target_dir \
+    rustup run "$toolchain" cargo build \
+      --locked \
+      --release \
+      --manifest-path "$source_dir/Cargo.toml" \
+      --bin "$tool"
+fi
+
+exec "$binary" "$@"

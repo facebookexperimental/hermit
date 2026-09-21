@@ -4,11 +4,29 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
+#
+# Generate a Hermit progress report with LIVE test numbers.
+#
+# Runs the strict/fail-closed ratchet, the working-envelope vector (L1-L4+rr),
+# the record_replay suite, and the per-app e2e suites, then writes a dated
+# report to docs/progress-reports/vN-YYYY-MM-DD.md. Every number in the report
+# is measured, never estimated. Suites that cannot run are recorded with the
+# exact reason. See .llms/skills/progress-rubric/SKILL.md for the rubric.
+#
+# Usage:
+#   scripts/progress-report.sh                 # version defaults to v3
+#   REPORT_VERSION=v4 scripts/progress-report.sh
+#   NO_PULL=1 scripts/progress-report.sh       # skip the git pull step
+#
+# Idempotent: re-running overwrites today's report and the /tmp logs.
 
 set -uo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR" || exit 1
+
+# shellcheck source=scripts/lib/test_results.sh
+source "$ROOT_DIR/scripts/lib/test_results.sh"
 
 REPORT_VERSION=${REPORT_VERSION:-v3}
 DATE_UTC=$(date -u +%Y-%m-%d)
@@ -17,9 +35,12 @@ REPORT="$REPORT_DIR/${REPORT_VERSION}-${DATE_UTC}.md"
 mkdir -p "$REPORT_DIR"
 
 STRICT_LOG=/tmp/progress-strict.log
+STRICT_RESULTS=/tmp/progress-strict-results.json
 ENVELOPE_LOG=/tmp/progress-envelope.log
 RECORD_LOG=/tmp/progress-record.log
+RECORD_RESULTS=/tmp/progress-record-results.json
 APPS_LOG=/tmp/progress-apps.log
+APPS_RESULTS_DIR=/tmp/progress-app-results
 
 # with-proxy wrapper: use it when present (Meta devserver), else run bare.
 proxy() {
@@ -30,12 +51,99 @@ proxy() {
   fi
 }
 
-# Extract "N passed; M failed; K ignored" from a `cargo test` result line.
-counts_from() { # <logfile> <target-marker-or-empty>
-  local file=$1
-  grep -E 'test result:' "$file" 2>/dev/null | tail -n1 \
-    | sed -E 's/.*result: [a-zA-Z]+\. ([0-9]+) passed; ([0-9]+) failed; ([0-9]+) ignored.*/\1 \2 \3/'
+test_result_counts() { # <result-file> <command-status>
+  local result_file=$1 command_status=$2
+  if ! load_test_results "$result_file"; then
+    printf 'unknown (typed test result unavailable; command exit %s)' "$command_status"
+    return
+  elif ((command_status != 0 && TEST_RESULTS_FAILED > 0)); then
+    printf 'ABORTED at exit %s after %s passed; first failure: %s' \
+      "$command_status" "$TEST_RESULTS_PASSED" "$TEST_RESULTS_FIRST_FAILURE"
+  elif ((command_status != 0)); then
+    printf 'ABORTED at exit %s after %s passed; no typed individual-test failure was recorded' \
+      "$command_status" "$TEST_RESULTS_PASSED"
+  elif ((TEST_RESULTS_FAILED > 0)); then
+    printf 'UNKNOWN (exit 0 disagrees with %s typed failure(s))' "$TEST_RESULTS_FAILED"
+  else
+    printf '%s passed, %s failed, %s filtered' \
+      "$TEST_RESULTS_PASSED" "$TEST_RESULTS_FAILED" "$TEST_RESULTS_FILTERED"
+  fi
 }
+
+strict_result() { # <result-file> <command-status>
+  local result_file=$1 command_status=$2
+  if ! load_test_results "$result_file"; then
+    printf 'UNKNOWN (typed test result unavailable; command exit %s)' "$command_status"
+  elif ((command_status == 0 && TEST_RESULTS_FAILED == 0)); then
+    printf 'passed (%s enabled, %s filtered)' \
+      "$TEST_RESULTS_PASSED" "$TEST_RESULTS_FILTERED"
+  elif ((command_status == 0)); then
+    printf 'UNKNOWN (exit 0 disagrees with %s typed failure(s))' "$TEST_RESULTS_FAILED"
+  elif ((TEST_RESULTS_FAILED > 0)); then
+    printf 'ABORTED at exit %s after %s passed; first failure: %s' \
+      "$command_status" "$TEST_RESULTS_PASSED" "$TEST_RESULTS_FIRST_FAILURE"
+  else
+    printf 'ABORTED at exit %s after %s passed; no typed individual-test failure was recorded' \
+      "$command_status" "$TEST_RESULTS_PASSED"
+  fi
+}
+
+self_test() {
+  local scratch fixed_log_hash first second missing_status=0
+  scratch=$(mktemp -d)
+  trap 'rm -rf -- "$scratch"' RETURN
+  printf 'running 999 tests\ntest result: ok. 999 passed; 0 failed; 0 ignored\n' \
+    >"$scratch/fixed-human.log"
+  fixed_log_hash=$(sha256sum "$scratch/fixed-human.log")
+
+  # shellcheck disable=SC2016 # `$` is part of the stable test identity.
+  DAGRUN_TEST_COUNTS_PATH="$scratch/results.json" \
+    "$ROOT_DIR/ci/write-structured-test-counts.sh" 2 7 \
+      'suite$passes' pass 1 'suite$fails' fail 1 || return 1
+  first=$(test_result_counts "$scratch/results.json" 1)
+  # shellcheck disable=SC2016 # `$` is part of the expected failure identity.
+  [[ $first == 'ABORTED at exit 1 after 1 passed; first failure: suite$fails' ]] \
+    || return 1
+  [[ $(test_result_counts "$scratch/results.json" 0) == \
+    'UNKNOWN (exit 0 disagrees with 1 typed failure(s))' ]] || return 1
+  # shellcheck disable=SC2016 # `$` is part of the expected failure identity.
+  [[ $(strict_result "$scratch/results.json" 1) == \
+    'ABORTED at exit 1 after 1 passed; first failure: suite$fails' ]] || return 1
+
+  # shellcheck disable=SC2016 # `$` is part of the stable test identity.
+  DAGRUN_TEST_COUNTS_PATH="$scratch/results.json" \
+    "$ROOT_DIR/ci/write-structured-test-counts.sh" 3 4 \
+      'suite$one' pass 1 'suite$two' pass 1 'suite$three' pass 1 || return 1
+  second=$(test_result_counts "$scratch/results.json" 0)
+  [[ $second == '3 passed, 0 failed, 4 filtered' ]] || return 1
+  [[ $(strict_result "$scratch/results.json" 0) == \
+    'passed (3 enabled, 4 filtered)' ]] || return 1
+  [[ $(strict_result "$scratch/results.json" 7) == \
+    'ABORTED at exit 7 after 3 passed; no typed individual-test failure was recorded' ]] \
+    || return 1
+  [[ $(test_result_counts "$scratch/results.json" 7) == \
+    'ABORTED at exit 7 after 3 passed; no typed individual-test failure was recorded' ]] \
+    || return 1
+
+  DAGRUN_TEST_COUNTS_PATH="$scratch/results.json" \
+    "$ROOT_DIR/ci/write-structured-test-counts.sh" 0 0 || return 1
+  [[ $(test_result_counts "$scratch/results.json" 100) == \
+    'ABORTED at exit 100 after 0 passed; no typed individual-test failure was recorded' ]] \
+    || return 1
+  [[ $(sha256sum "$scratch/fixed-human.log") == "$fixed_log_hash" ]] || return 1
+
+  rm -f -- "$scratch/results.json"
+  test_result_counts "$scratch/results.json" 0 >"$scratch/missing" || missing_status=$?
+  [[ $missing_status == 0 ]] || return 1
+  [[ $(<"$scratch/missing") == \
+    'unknown (typed test result unavailable; command exit 0)' ]] || return 1
+  printf 'progress-report: typed test-result self-test PASS\n'
+}
+
+if [[ ${1:-} == --self-test && $# -eq 1 ]]; then
+  self_test
+  exit
+fi
 
 echo "== Hermit progress report ${REPORT_VERSION} (${DATE_UTC}) =="
 
@@ -69,22 +177,17 @@ done
 # 1. Strict / fail-closed ratchet (fail-fast; may abort)
 # ---------------------------------------------------------------------------
 echo "-- strict / fail-closed ratchet"
-./scripts/test-fail-closed.sh >"$STRICT_LOG" 2>&1
+rm -f -- "$STRICT_RESULTS"
+DAGRUN_TEST_COUNTS_PATH="$STRICT_RESULTS" \
+  ./scripts/test-fail-closed.sh >"$STRICT_LOG" 2>&1
 STRICT_EXIT=$?
-STRICT_PASSED=$(grep -c '==> Fail-closed:' "$STRICT_LOG")
-STRICT_RATCHET=$(grep -E 'Fail-closed ratchet passed' "$STRICT_LOG" | tail -n1)
-STRICT_FAIL=$(grep -E '^failures:' -A2 "$STRICT_LOG" | grep -vE '^failures:|^--' | sed 's/^ *//' | grep -v '^$' | head -n1)
-if [[ $STRICT_EXIT -eq 0 ]]; then
-  STRICT_STATUS="passed ($STRICT_RATCHET)"
-else
-  STRICT_STATUS="ABORTED at exit $STRICT_EXIT after $STRICT_PASSED enabled tests; first failure: ${STRICT_FAIL:-see log}"
-fi
+STRICT_STATUS=$(strict_result "$STRICT_RESULTS" "$STRICT_EXIT")
 
 # ---------------------------------------------------------------------------
 # 2. Working-envelope vector (L1-L4 + rr)
 # ---------------------------------------------------------------------------
 echo "-- working-envelope vector"
-./validate.sh --envelope-only >"$ENVELOPE_LOG" 2>&1
+./scripts/validate.rs --envelope-only >"$ENVELOPE_LOG" 2>&1
 ENV_JSON=$(grep -E '^\{"l1_pass"' "$ENVELOPE_LOG" | tail -n1)
 [[ -z "$ENV_JSON" && -f "$ROOT_DIR/envelope.json" ]] && ENV_JSON=$(cat "$ROOT_DIR/envelope.json")
 
@@ -92,21 +195,29 @@ ENV_JSON=$(grep -E '^\{"l1_pass"' "$ENVELOPE_LOG" | tail -n1)
 # 3. Record / replay
 # ---------------------------------------------------------------------------
 echo "-- record_replay suite"
-cargo test -p hermit --test record_replay >"$RECORD_LOG" 2>&1
-read -r REC_P REC_F REC_I <<<"$(counts_from "$RECORD_LOG")"
+rm -f -- "$RECORD_RESULTS"
+REC_EXIT=0
+DAGRUN_TEST_COUNTS_PATH="$RECORD_RESULTS" \
+  ./ci/run-nextest-counted.sh -p hermit --test record_replay >"$RECORD_LOG" 2>&1 \
+  || REC_EXIT=$?
+RECORD_STATUS=$(test_result_counts "$RECORD_RESULTS" "$REC_EXIT")
 
 # ---------------------------------------------------------------------------
 # 4. App e2e suites
 # ---------------------------------------------------------------------------
 echo "-- app e2e suites"
 : >"$APPS_LOG"
-declare -A APP_P APP_F APP_I
+mkdir -p "$APPS_RESULTS_DIR"
+declare -A APP_STATUS
 for t in sqlite_veryquick redis_strict python_stdlib language_runtime_determinism; do
+  result_file="$APPS_RESULTS_DIR/$t.json"
+  rm -f -- "$result_file"
   echo "########## TARGET: $t ##########" >>"$APPS_LOG"
-  cargo test -p hermit --test "$t" >>"$APPS_LOG" 2>&1
-  line=$(grep -E 'test result:' "$APPS_LOG" | tail -n1)
-  read -r p f i <<<"$(printf '%s' "$line" | sed -E 's/.*result: [a-zA-Z]+\. ([0-9]+) passed; ([0-9]+) failed; ([0-9]+) ignored.*/\1 \2 \3/')"
-  APP_P[$t]=${p:-?}; APP_F[$t]=${f:-?}; APP_I[$t]=${i:-?}
+  app_exit=0
+  DAGRUN_TEST_COUNTS_PATH="$result_file" \
+    ./ci/run-nextest-counted.sh -p hermit --test "$t" >>"$APPS_LOG" 2>&1 \
+    || app_exit=$?
+  APP_STATUS[$t]=$(test_result_counts "$result_file" "$app_exit")
 done
 
 # ---------------------------------------------------------------------------
@@ -123,7 +234,7 @@ PRS=$(git log --oneline -40 | grep -iE 'Merge pull request' | head -12 \
   echo
   echo "Generated by \`scripts/progress-report.sh\`. All numbers are live measurements."
   echo "Suites that cannot run are recorded with the exact reason (see rubric:"
-  echo "\`.llms/skills/progress-rubric.md\`)."
+  echo "\`.llms/skills/progress-rubric/SKILL.md\`)."
   echo
   echo "## Test context"
   echo
@@ -144,10 +255,10 @@ PRS=$(git log --oneline -40 | grep -iE 'Merge pull request' | head -12 \
   echo "| Suite | Command | Result |"
   echo "| --- | --- | --- |"
   echo "| Strict / fail-closed | scripts/test-fail-closed.sh | $STRICT_STATUS |"
-  echo "| Working-envelope L1-L4+rr | validate.sh --envelope-only | $ENV_JSON |"
-  echo "| Record/replay | cargo test -p hermit --test record_replay | ${REC_P:-?} passed, ${REC_F:-?} failed, ${REC_I:-?} ignored |"
+  echo "| Working-envelope L1-L4+rr | scripts/validate.rs --envelope-only | $ENV_JSON |"
+  echo "| Record/replay | ci/run-nextest-counted.sh -p hermit --test record_replay | $RECORD_STATUS |"
   for t in sqlite_veryquick redis_strict python_stdlib language_runtime_determinism; do
-    echo "| App: $t | cargo test -p hermit --test $t | ${APP_P[$t]} passed, ${APP_F[$t]} failed, ${APP_I[$t]} ignored |"
+    echo "| App: $t | ci/run-nextest-counted.sh -p hermit --test $t | ${APP_STATUS[$t]} |"
   done
   echo
   echo "## rr suite"
@@ -176,4 +287,4 @@ echo
 echo "Report written: $REPORT"
 echo "Strict: $STRICT_STATUS"
 echo "Envelope: $ENV_JSON"
-echo "Record/replay: ${REC_P:-?}/${REC_F:-?}/${REC_I:-?} (passed/failed/ignored)"
+echo "Record/replay: $RECORD_STATUS"

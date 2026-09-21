@@ -1,0 +1,160 @@
+load("@fbcode_macros//build_defs:cpp_unittest.bzl", "cpp_unittest")
+
+oncall("hermit")
+
+cpp_unittest(
+    name = "fp_reduction_nondeterminism",
+    srcs = ["fp_reduction_nondeterminism.c"],
+    labels = ["autodeps2_generated"],
+    external_deps = [("openmp", None, "omp")],
+)
+
+cpp_unittest(
+    name = "ppoll_readv",
+    srcs = ["ppoll_readv.c"],
+    labels = ["autodeps2_generated"],
+)
+
+cpp_unittest(
+    name = "madvise_determinism",
+    srcs = ["madvise_determinism.c"],
+    labels = ["autodeps2_generated"],
+)
+
+cpp_unittest(
+    name = "ipc_determinism",
+    srcs = ["ipc_determinism.c"],
+    labels = ["autodeps2_generated"],
+)
+
+cpp_unittest(
+    name = "setitimer_determinism",
+    srcs = ["setitimer_determinism.c"],
+    labels = ["autodeps2_generated"],
+)
+
+cpp_unittest(
+    name = "ioctl_siocethtool",
+    srcs = ["ioctl_siocethtool.c"],
+    labels = ["autodeps2_generated"],
+)
+
+cpp_unittest(
+    name = "timer_create_determinism",
+    srcs = ["timer_create_determinism.c"],
+    labels = ["autodeps2_generated"],
+)
+
+cpp_unittest(
+    name = "getsockopt_null",
+    srcs = ["getsockopt_null.c"],
+    labels = ["autodeps2_generated"],
+)
+
+cpp_unittest(
+    name = "epoll_determinism",
+    srcs = ["epoll_determinism.c"],
+    labels = ["autodeps2_generated"],
+)
+
+cpp_unittest(
+    name = "ppoll_simulation",
+    srcs = ["ppoll_simulation.c"],
+    labels = ["autodeps2_generated"],
+)
+
+cpp_unittest(
+    name = "sigpipe_siginfo",
+    srcs = ["sigpipe_siginfo.c"],
+    labels = ["autodeps2_generated"],
+)
+
+cpp_unittest(
+    name = "arch_prctl_determinism",
+    srcs = ["arch_prctl_determinism.c"],
+    labels = ["autodeps2_generated"],
+)
+
+cpp_unittest(
+    name = "clock_determinism",
+    srcs = ["clock_determinism.c"],
+    labels = ["autodeps2_generated"],
+)
+
+cpp_unittest(
+    name = "dbi_mmap_exec",
+    srcs = ["dbi_mmap_exec.c"],
+    labels = ["autodeps2_generated"],
+)
+
+cpp_unittest(
+    name = "writev_determinism",
+    srcs = ["writev_determinism.c"],
+    labels = ["autodeps2_generated"],
+)
+
+cpp_unittest(
+    name = "resource_determinism",
+    srcs = ["resource_determinism.c"],
+    labels = ["autodeps2_generated"],
+)
+
+cpp_unittest(
+    name = "ioctl_fioclex",
+    srcs = ["ioctl_fioclex.c"],
+    labels = ["autodeps2_generated"],
+)
+
+cpp_unittest(
+    name = "sched_yield_progress",
+    srcs = ["sched_yield_progress.c"],
+    labels = ["autodeps2_generated"],
+)
+
+cpp_unittest(
+    name = "recvmsg_scm_rights_mmap",
+    srcs = ["recvmsg_scm_rights_mmap.c"],
+    labels = ["autodeps2_generated"],
+)
+
+cpp_unittest(
+    name = "thread_sync_determinism",
+    srcs = ["thread_sync_determinism.c"],
+    labels = ["autodeps2_generated"],
+)
+
+cpp_unittest(
+    name = "random_sources",
+    srcs = ["random_sources.c"],
+    labels = ["autodeps2_generated"],
+)
+
+cpp_unittest(
+    name = "record_replay_fd_close",
+    srcs = ["record_replay_fd_close.c"],
+    labels = ["autodeps2_generated"],
+)
+
+cpp_unittest(
+    name = "mmap_determinism",
+    srcs = ["mmap_determinism.c"],
+    labels = ["autodeps2_generated"],
+)
+
+cpp_unittest(
+    name = "rcx_canonicalization",
+    srcs = ["rcx_canonicalization.c"],
+    labels = ["autodeps2_generated"],
+)
+
+cpp_unittest(
+    name = "io_uring_fallback",
+    srcs = ["io_uring_fallback.c"],
+    labels = ["autodeps2_generated"],
+)
+
+cpp_unittest(
+    name = "signal_determinism",
+    srcs = ["signal_determinism.c"],
+    labels = ["autodeps2_generated"],
+)
