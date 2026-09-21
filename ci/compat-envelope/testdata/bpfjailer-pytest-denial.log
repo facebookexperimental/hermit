@@ -1,0 +1,12 @@
+An action was blocked on this server based on a security policy!
+
+Bunnylol `scuba bpfjailer_enforce` for more details
+Command: git -C worktrees/slot/hermit init -q
+Enforcer: FS, Reason: FILE_OPEN
+Oncall: bpfj
+
+E               subprocess.CalledProcessError: Command '['git', '-C', 'worktrees/slot/hermit', 'init', '-q']' returned non-zero exit status 77.
+
+=========================== short test summary info ============================
+FAILED ci-hub/ledger/tests/test_validate_rows.py::test_schema6_artifact_digest_mismatch_is_refused_before_spool
+1 failed, 20 passed in 3.52s

@@ -39,7 +39,12 @@ pub struct LogDiffOptions {
 
 impl LogDiffOptions {
     fn into_args(self) -> Vec<String> {
-        let mut result = Vec::new();
+        // hermit-verify compares ordinary Hermit logs with the all-records
+        // envelope, which is the standalone command's default. It is NOT named
+        // explicitly here: `hermit_bin` defaults to whatever `HERMIT_BIN` or
+        // the PATH supplies, which can be a published bundle built without the
+        // flag, and passing it there is `error: unexpected argument`, exit 2.
+        let mut result: Vec<String> = Vec::new();
         if self.skip_detlog_others && self.skip_detlog_syscalls && self.skip_detlog_syscall_results
         {
             result.push("--skip-detlog".to_owned());
@@ -258,6 +263,26 @@ mod test {
         assert_eq!(
             args.into_iter().any(|x| x.contains("--ignore-lines")),
             false
+        );
+        Ok(())
+    }
+
+    /// hermit-verify must NOT name a record envelope on the `log-diff` it
+    /// spawns. `hermit_bin` defaults to `HERMIT_BIN` or the PATH, so the child
+    /// can be a published bundle built without the flag, where passing it is
+    /// `error: unexpected argument` and exit 2. The all-records envelope this
+    /// callsite wants is that command's default, so omitting it is both
+    /// correct and compatible.
+    #[test]
+    fn log_diff_command_does_not_pin_a_record_envelope_the_child_may_lack() -> anyhow::Result<()> {
+        let env = TemporaryEnvironmentBuilder::new().run_count(2).build()?;
+        let verify = Verify::new(PathBuf::from("hermit"));
+        let args =
+            verify.build_command_args(&env.runs()[0], &env.runs()[1], LogDiffOptions::default());
+
+        assert!(
+            !args.iter().any(|arg| arg.starts_with("--record-envelope")),
+            "hermit-verify must not pass --record-envelope to a hermit it did not build: {args:?}"
         );
         Ok(())
     }

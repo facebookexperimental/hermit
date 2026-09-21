@@ -2,12 +2,10 @@ name: Docs
 
 # Build the rustdoc API documentation for the workspace and publish it to the
 # `gh-pages` branch, which GitHub Pages serves at
-# https://rrnewton.github.io/hermit/. The redirect written below sends the site
-# root to the primary `hermit` crate.
+# https://rrnewton.github.io/hermit/. The workspace rustdoc remains available
+# below the landing page at `hermit/index.html`.
 
 on:
-  push:
-    branches: [ "main" ]
   workflow_dispatch:
 
 # Supersede older runs for the same ref so documentation deploys do not
@@ -33,12 +31,94 @@ jobs:
 
     steps:
     - uses: actions/checkout@v3
+      with:
+        # The release download and deploy steps receive the token explicitly;
+        # do not leave the write credential in git configuration while building.
+        persist-credentials: false
+        # The publication gate compares the registry with every earlier version
+        # so an already-public content-addressed path cannot disappear or change.
+        fetch-depth: 0
+    - name: Initialize dagrun submodule
+      run: git submodule update --init --depth 1 -- agent-utils
     - name: Dependencies
       run: sudo apt-get install -y libunwind-dev liblzma-dev
     - name: Build documentation
       run: cargo doc --workspace --no-deps
-    - name: Add root redirect to the hermit crate
-      run: echo '<meta http-equiv="refresh" content="0; url=hermit/index.html">' > target/doc/index.html
+    - name: Add Hermetic Infra landing page
+      run: |
+        install -m 0644 docs/site/index.html target/doc/index.html
+        install -m 0644 docs/site/site.css target/doc/site.css
+    - name: Add reviewed compatibility website
+      # Release assets are checksum-bound handoffs from separately reviewed
+      # real-ledger builds. Reconstruct every retained content-addressed path and
+      # independently validate every byte and mode before publishing it.
+      if: github.ref == 'refs/heads/main'
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        umask 077
+
+        scratch=$(mktemp -d)
+        trap 'rm -rf -- "$scratch"' EXIT
+        pins=.github/compatibility-site-releases.json
+        archives="$scratch/archives"
+        pin_rows="$scratch/pins"
+        mkdir "$archives" "$pin_rows"
+
+        python3 .github/scripts/publish-compatibility-site.py validate "$pins" .
+
+        release_repository=$(jq -er '.release_repository' "$pins")
+        release_count=$(jq -er '.releases | length' "$pins")
+        index=0
+        while (( index < release_count )); do
+          pin="$pin_rows/$index.json"
+          jq -ce ".releases[$index]" "$pins" > "$pin"
+          identity=$(jq -er '.identity' "$pin")
+          tag=$(jq -er '.tag' "$pin")
+          title=$(jq -er '.release_title' "$pin")
+          asset=$(jq -er '.asset' "$pin")
+          archive_sha256=$(jq -er '.archive_sha256' "$pin")
+          archive_bytes=$(jq -er '.archive_bytes' "$pin")
+          release_json="$scratch/release-$identity.json"
+          archive="$archives/$asset"
+
+          gh api "repos/$release_repository/releases/tags/$tag" > "$release_json"
+          asset_id=$(
+            jq -er \
+              --arg tag "$tag" \
+              --arg title "$title" \
+              --arg name "$asset" \
+              --arg digest "sha256:$archive_sha256" \
+              --argjson size "$archive_bytes" \
+              '
+                if .tag_name != $tag or .name != $title
+                     or .draft != false or .prerelease != false then
+                  error("release identity or publication state disagrees with the pin")
+                else . end
+                | ([.assets[] | select(.name == $name)]
+                   | if length == 1 then .[0]
+                     else error("release must contain exactly one pinned asset") end)
+                | if .state == "uploaded"
+                     and .size == $size
+                     and .digest == $digest
+                     and (.id | type) == "number"
+                  then .id
+                  else error("release asset metadata disagrees with the pin") end
+              ' "$release_json"
+          )
+          gh api \
+            -H 'Accept: application/octet-stream' \
+            "repos/$release_repository/releases/assets/$asset_id" \
+            > "$archive"
+
+          python3 .github/scripts/publish-compatibility-site.py extract "$archive" \
+            "target/doc/compatibility/$identity" "$pins" "$index"
+          ((index += 1))
+        done
+
+        python3 .github/scripts/publish-compatibility-site.py \
+          finalize "$pins" target/doc/compatibility
     - name: Deploy to GitHub Pages
       # Only publish from the canonical branch, not from manual dispatch on a
       # feature branch.

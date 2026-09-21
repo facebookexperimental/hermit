@@ -49,20 +49,17 @@ struct cpu_info {
   uint64_t rcb_event;
 };
 
-static void usage(const char* program) {
-  fprintf(
-      stderr,
-      "Usage: %s [--iterations N] [--period RCB] [--cpu CPU]\n"
-      "\n"
-      "Measure retired-conditional-branch PMU overflow skid.\n"
-      "Defaults: --iterations %d --period %d --cpu current\n",
-      program,
-      DEFAULT_ITERATIONS,
-      DEFAULT_PERIOD);
+static void usage(const char *program) {
+  fprintf(stderr,
+          "Usage: %s [--iterations N] [--period RCB] [--cpu CPU]\n"
+          "\n"
+          "Measure retired-conditional-branch PMU overflow skid.\n"
+          "Defaults: --iterations %d --period %d --cpu current\n",
+          program, DEFAULT_ITERATIONS, DEFAULT_PERIOD);
 }
 
-static bool parse_u64(const char* value, uint64_t* result) {
-  char* end = NULL;
+static bool parse_u64(const char *value, uint64_t *result) {
+  char *end = NULL;
   errno = 0;
   unsigned long long parsed = strtoull(value, &end, 0);
   if (errno != 0 || end == value || *end != '\0') {
@@ -72,7 +69,7 @@ static bool parse_u64(const char* value, uint64_t* result) {
   return true;
 }
 
-static struct options parse_options(int argc, char** argv) {
+static struct options parse_options(int argc, char **argv) {
   struct options options = {
       .iterations = DEFAULT_ITERATIONS,
       .period = DEFAULT_PERIOD,
@@ -91,34 +88,34 @@ static struct options parse_options(int argc, char** argv) {
          -1) {
     uint64_t parsed;
     switch (option) {
-      case 'i':
-        if (!parse_u64(optarg, &parsed) || parsed == 0 ||
-            parsed > MAX_ITERATIONS) {
-          fprintf(stderr, "Invalid iteration count: %s\n", optarg);
-          exit(EXIT_FAILURE);
-        }
-        options.iterations = (size_t)parsed;
-        break;
-      case 'p':
-        if (!parse_u64(optarg, &parsed) || parsed == 0 || parsed > INT64_MAX) {
-          fprintf(stderr, "Invalid RCB period: %s\n", optarg);
-          exit(EXIT_FAILURE);
-        }
-        options.period = parsed;
-        break;
-      case 'c':
-        if (!parse_u64(optarg, &parsed) || parsed >= CPU_SETSIZE) {
-          fprintf(stderr, "Invalid CPU index: %s\n", optarg);
-          exit(EXIT_FAILURE);
-        }
-        options.cpu = (int)parsed;
-        break;
-      case 'h':
-        usage(argv[0]);
-        exit(EXIT_SUCCESS);
-      default:
-        usage(argv[0]);
+    case 'i':
+      if (!parse_u64(optarg, &parsed) || parsed == 0 ||
+          parsed > MAX_ITERATIONS) {
+        fprintf(stderr, "Invalid iteration count: %s\n", optarg);
         exit(EXIT_FAILURE);
+      }
+      options.iterations = (size_t)parsed;
+      break;
+    case 'p':
+      if (!parse_u64(optarg, &parsed) || parsed == 0 || parsed > INT64_MAX) {
+        fprintf(stderr, "Invalid RCB period: %s\n", optarg);
+        exit(EXIT_FAILURE);
+      }
+      options.period = parsed;
+      break;
+    case 'c':
+      if (!parse_u64(optarg, &parsed) || parsed >= CPU_SETSIZE) {
+        fprintf(stderr, "Invalid CPU index: %s\n", optarg);
+        exit(EXIT_FAILURE);
+      }
+      options.cpu = (int)parsed;
+      break;
+    case 'h':
+      usage(argv[0]);
+      exit(EXIT_SUCCESS);
+    default:
+      usage(argv[0]);
+      exit(EXIT_FAILURE);
     }
   }
 
@@ -139,8 +136,8 @@ static void pin_to_cpu(int cpu) {
   }
 }
 
-static void trim_brand(char* brand) {
-  char* start = brand;
+static void trim_brand(char *brand) {
+  char *start = brand;
   while (*start == ' ') {
     ++start;
   }
@@ -179,8 +176,8 @@ static struct cpu_info read_cpu_info(void) {
   info.family =
       base_family == 0xf ? base_family + extended_family : base_family;
   info.model = (base_family == 0x6 || base_family == 0xf)
-      ? base_model + (extended_model << 4)
-      : base_model;
+                   ? base_model + (extended_model << 4)
+                   : base_model;
   info.stepping = eax & 0xf;
   info.precise_ip = (edx & (1u << 21)) != 0;
 
@@ -207,11 +204,8 @@ static struct cpu_info read_cpu_info(void) {
   return info;
 }
 
-static int open_counter(
-    pid_t pid,
-    uint64_t event,
-    uint64_t sample_period,
-    bool precise_ip) {
+static int open_counter(pid_t pid, uint64_t event, uint64_t sample_period,
+                        bool precise_ip) {
   struct perf_event_attr attr = {0};
   attr.type = PERF_TYPE_RAW;
   attr.size = sizeof(attr);
@@ -225,8 +219,8 @@ static int open_counter(
   attr.wakeup_events = 1;
   attr.precise_ip = precise_ip ? 1 : 0;
 
-  return (int)syscall(
-      SYS_perf_event_open, &attr, pid, -1, -1, PERF_FLAG_FD_CLOEXEC);
+  return (int)syscall(SYS_perf_event_open, &attr, pid, -1, -1,
+                      PERF_FLAG_FD_CLOEXEC);
 }
 
 static void configure_signal_delivery(int fd, pid_t tid) {
@@ -249,13 +243,12 @@ static void configure_signal_delivery(int fd, pid_t tid) {
 __attribute__((noreturn)) static void branch_loop(void) {
   const unsigned one = 1;
   for (;;) {
-    __asm__ volatile(
-        "test %[one], %[one]\n\t"
-        "jnz 1f\n\t"
-        "1:"
-        :
-        : [one] "r"(one)
-        : "cc");
+    __asm__ volatile("test %[one], %[one]\n\t"
+                     "jnz 1f\n\t"
+                     "1:"
+                     :
+                     : [one] "r"(one)
+                     : "cc");
   }
 }
 
@@ -277,8 +270,8 @@ static void terminate_child(pid_t child) {
   }
 }
 
-static void
-checked_ioctl(int fd, unsigned long request, const char* operation) {
+static void checked_ioctl(int fd, unsigned long request,
+                          const char *operation) {
   if (ioctl(fd, request, 0) != 0) {
     perror(operation);
     exit(EXIT_FAILURE);
@@ -309,9 +302,9 @@ static uint64_t read_counter(int fd) {
   return value;
 }
 
-static int compare_i64(const void* left, const void* right) {
-  int64_t a = *(const int64_t*)left;
-  int64_t b = *(const int64_t*)right;
+static int compare_i64(const void *left, const void *right) {
+  int64_t a = *(const int64_t *)left;
+  int64_t b = *(const int64_t *)right;
   return (a > b) - (a < b);
 }
 
@@ -320,10 +313,8 @@ static uint64_t recommended_margin(uint64_t maximum) {
   return margin < 100 ? 100 : margin;
 }
 
-static void print_results(
-    const struct options* options,
-    const struct cpu_info* cpu,
-    const int64_t* samples) {
+static void print_results(const struct options *options,
+                          const struct cpu_info *cpu, const int64_t *samples) {
   int64_t minimum = samples[0];
   int64_t maximum = samples[options->iterations - 1];
   size_t p99_index = (99 * options->iterations + 99) / 100 - 1;
@@ -333,35 +324,21 @@ static void print_results(
   }
 
   printf("CPU: %s\n", cpu->brand);
-  printf(
-      "Vendor: %s family=0x%x model=0x%x stepping=0x%x cpu=%d\n",
-      cpu->vendor,
-      cpu->family,
-      cpu->model,
-      cpu->stepping,
-      options->cpu);
-  printf(
-      "RCB event: 0x%" PRIx64 ", precise_ip=%u\n",
-      cpu->rcb_event,
-      cpu->precise_ip ? 1 : 0);
-  printf(
-      "Iterations: %zu, programmed period: %" PRIu64 " RCB\n",
-      options->iterations,
-      options->period);
-  printf(
-      "Skid (RCB): min=%" PRId64 " max=%" PRId64 " mean=%.2Lf p99=%" PRId64
-      "\n",
-      minimum,
-      maximum,
-      sum / options->iterations,
-      samples[p99_index]);
-  printf(
-      "Recommended margin: %" PRIu64
-      " RCB (2x observed max, minimum 100; empirical, not a hard bound)\n",
-      recommended_margin(maximum > 0 ? (uint64_t)maximum : 0));
+  printf("Vendor: %s family=0x%x model=0x%x stepping=0x%x cpu=%d\n",
+         cpu->vendor, cpu->family, cpu->model, cpu->stepping, options->cpu);
+  printf("RCB event: 0x%" PRIx64 ", precise_ip=%u\n", cpu->rcb_event,
+         cpu->precise_ip ? 1 : 0);
+  printf("Iterations: %zu, programmed period: %" PRIu64 " RCB\n",
+         options->iterations, options->period);
+  printf("Skid (RCB): min=%" PRId64 " max=%" PRId64 " mean=%.2Lf p99=%" PRId64
+         "\n",
+         minimum, maximum, sum / options->iterations, samples[p99_index]);
+  printf("Recommended margin: %" PRIu64
+         " RCB (2x observed max, minimum 100; empirical, not a hard bound)\n",
+         recommended_margin(maximum > 0 ? (uint64_t)maximum : 0));
 }
 
-int main(int argc, char** argv) {
+int main(int argc, char **argv) {
   struct options options = parse_options(argc, argv);
   if (options.cpu < 0) {
     options.cpu = sched_getcpu();
@@ -401,28 +378,26 @@ int main(int argc, char** argv) {
   int timer_fd =
       open_counter(child, cpu.rcb_event, options.period, cpu.precise_ip);
   if (timer_fd < 0) {
-    fprintf(
-        stderr,
-        "perf_event_open failed: %s. Check perf_event_paranoid and PMU "
-        "access.\n",
-        strerror(errno));
+    fprintf(stderr,
+            "perf_event_open failed: %s. Check perf_event_paranoid and PMU "
+            "access.\n",
+            strerror(errno));
     terminate_child(child);
     return EXIT_FAILURE;
   }
   int clock_fd = open_counter(child, cpu.rcb_event, 0, false);
   if (clock_fd < 0) {
-    fprintf(
-        stderr,
-        "perf_event_open failed: %s. Check perf_event_paranoid and PMU "
-        "access.\n",
-        strerror(errno));
+    fprintf(stderr,
+            "perf_event_open failed: %s. Check perf_event_paranoid and PMU "
+            "access.\n",
+            strerror(errno));
     close(timer_fd);
     terminate_child(child);
     return EXIT_FAILURE;
   }
   configure_signal_delivery(timer_fd, child);
 
-  int64_t* samples = calloc(options.iterations, sizeof(*samples));
+  int64_t *samples = calloc(options.iterations, sizeof(*samples));
   if (samples == NULL) {
     perror("calloc");
     terminate_child(child);
@@ -453,11 +428,8 @@ int main(int argc, char** argv) {
     checked_ioctl(timer_fd, PERF_EVENT_IOC_DISABLE, "disable timer counter");
     checked_ioctl(clock_fd, PERF_EVENT_IOC_DISABLE, "disable clock counter");
     if (!WIFSTOPPED(status) || WSTOPSIG(status) != PERF_SIGNAL) {
-      fprintf(
-          stderr,
-          "Unexpected child stop at iteration %zu: status=0x%x\n",
-          i,
-          status);
+      fprintf(stderr, "Unexpected child stop at iteration %zu: status=0x%x\n",
+              i, status);
       terminate_child(child);
       return EXIT_FAILURE;
     }

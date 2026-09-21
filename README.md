@@ -1,19 +1,17 @@
 # Hermit
 
-Hermit is a reproducible container for x86-64 Linux programs. It runs an
-unmodified guest under the [Reverie](https://github.com/facebookexperimental/reverie)
-ptrace backend and controls sources of nondeterminism including thread
-scheduling, time, random data, CPUID results, and selected file metadata.
+Hermit is a deterministic execution environment for x86-64 Linux programs. It
+runs an unmodified guest under the
+[Reverie](https://github.com/rrnewton/reverie) ptrace backend and controls
+sources of nondeterminism including thread scheduling, time, random data,
+CPUID results, and selected file metadata. That is the fork this repository
+builds against — both the Cargo git dependency and the workspace submodule pin
+`https://github.com/rrnewton/reverie.git`. Reverie's upstream reference
+repository is
+[facebookexperimental/reverie](https://github.com/facebookexperimental/reverie).
 
 Hermit is useful for repeatable execution, controlled concurrency testing,
 record/replay experiments, and diagnosing schedule-sensitive failures.
-
-> [!WARNING]
->
-> Hermit is in maintenance mode. Linux compatibility is substantial but
-> incomplete, especially for uncommon syscalls and complex record/replay
-> workloads. Hermit is not a security boundary, and changing files or external
-> network responses remain inputs to the guest.
 
 ## Requirements
 
@@ -59,6 +57,22 @@ cargo build --workspace
 ./target/debug/hermit --version
 ```
 
+An optimized workspace build also assembles every backend runtime into one
+installation staging directory:
+
+```bash
+cargo build --release
+./target/install_pkg/hermit --version
+```
+
+`target/install_pkg/rsrcs/` contains the SaBRe and e9patch rewriters, Detcore
+backend shared libraries, the DynamoRIO launcher/runtime, and its relocatable
+client. Hermit finds that directory from its invocation path or executable
+path. Set `HERMIT_INSTALL_DIR` only when the resources live under a different
+prefix. The staging `hermit` entry is a symlink to `target/release/hermit`; use
+a dereferencing copy such as `cp -aL target/install_pkg/ DESTINATION` when
+making a standalone installation or archive.
+
 ## Quick Start
 
 Run a command deterministically by placing `hermit run --` before it:
@@ -80,9 +94,20 @@ hermit run --strict -- /bin/echo hello
 
 ### Execution Backends
 
-Hermit accepts `--backend=ptrace|dbi|kvm` as a global option, before the
-subcommand, since the backend applies to how any subcommand instruments the
-guest. Omitting the option selects `ptrace`, preserving the existing behavior:
+A *backend* is the low-level mechanism Hermit uses to observe and control a
+running guest — how it intercepts the program's system calls and CPU events.
+Different backends make different trade-offs in speed, host requirements, and
+which programs they support, which is why there is more than one. The default
+`ptrace` backend needs no special setup and is the most thoroughly tested; the
+rest are experimental or specialized. If you are just getting started, use the
+default and skip the rest of this section. See [Architecture](#architecture)
+for how a backend fits into the whole system.
+
+Hermit accepts `--backend=ptrace|dbt|liteinst|sabre|kvm|e9patch` as a global
+option before the subcommand. Backend scope is command-specific: LiteInst and
+e9patch support only `run`, while SaBRe supports `run` and `strace`; unsupported
+combinations fail closed. Omitting the option selects `ptrace`, preserving the
+existing behavior:
 
 ```bash
 hermit --backend=ptrace run -- /bin/echo hello
@@ -92,11 +117,69 @@ For backwards compatibility, `run` still accepts `--backend` after the
 subcommand (`hermit run --backend=ptrace -- /bin/echo hello`).
 
 Backend selection fails closed. Hermit never substitutes ptrace after an
-explicit `dbi` or `kvm` request. The DynamoRIO prototype requires a discoverable
-SDK and does not yet expose a Detcore process launcher. The bare KVM prototype
-requires read-write `/dev/kvm` access (commonly through the `kvm` group or root)
-and a guest-kernel Linux ABI. Until those adapters are integrated, either returns
-an availability error rather than running the command without determinization.
+explicit backend request. LiteInst is an experimental ptrace-hosted hybrid for
+dynamically linked Linux x86-64 guests:
+
+```bash
+./scripts/stage-liteinst-runtime.sh dev \
+  "$PWD/target/debug/libreverie_liteinst.so" \
+  "$PWD/target/liteinst-runtime-build"
+cargo build --locked -p hermit --bin hermit
+./target/debug/hermit run --backend=liteinst --strict --verify -- /bin/echo hello
+```
+
+The ptrace host owns the sole generic Reverie `Detcore` Tool and GlobalTool.
+The standalone manifest enables and statically verifies the preload constructor;
+Hermit rejects non-runtime or constructor-free overrides before activation.
+The resulting Reverie preload DSO initializes only the LiteInst patch/helper
+side; it never installs another Tool in the guest. The host observes the first
+invocation of each eligible syscall site and installs an instruction-punning
+hook. Later invocations enter the LiteInst trampoline and return to the same
+ptrace-owned Detcore lifecycle.
+
+`--verify` compares captured status and output and applies the `Stripped`
+comparison to selected Detcore scheduler messages. A successful result is a
+useful diagnostic, but it is not strict determinism. Strict verification requires
+`--verify-strict --verify-json REPORT.json`, `bitwise_parity: true`, and nonzero
+compared-message counts.
+Guests may create threads and child processes: `clone`, `clone3` and `fork` run
+under the ordinary ptrace lifecycle. Hook installation is single-task only,
+though -- the patch helper runs on a process-global stack and the installer is
+not re-entrant across tasks -- so the hook set freezes at the first
+task-creating syscall while the tasks themselves keep running. `vfork` still
+fails closed with `EOPNOTSUPP`, and `exec` is also unsupported, because neither
+can preserve the preload runtime after the address space is replaced. RCB preemption and CPUID/RDTSC interception use the ptrace host
+and retain its PMU and CPU capability requirements.
+The default Hermit namespace path is supported; `--no-namespace` remains an
+explicit option for trusted guests. The in-guest patch runtime is experimental
+and continues to receive compatibility and lifecycle improvements.
+The release installation package supplies the DynamoRIO, SaBRe, LiteInst, and
+e9patch runtime artifacts. KVM requires read-write `/dev/kvm` access plus its
+guest-kernel Linux ABI.
+
+SaBRe is built only with the non-default `third-party-backends` feature. Its
+measured post-0.2 `Stripped` envelope, build instructions, and explicit
+unsupported cases are documented in
+[SaBRe backend compatibility](docs/SABRE_COMPATIBILITY.md).
+
+The experimental `e9patch` selection is intentionally a hybrid backend. At
+startup it loads or generates the main ELF's cached instruction map, then runs
+`e9tool -O0` with exact file-offset matches to install semantics-preserving
+trampolines at every candidate offset that e9tool recovers as an instruction.
+The conservative optimizer setting avoids known multi-class rewrite failures.
+The linear scan can include embedded data, so Hermit reports candidate and
+recovered counts separately. Partial e9tool coverage fails closed. Hermit does
+not enable e9patch's B0 fallback because it reserves SIGILL and changes guest
+signal semantics. The rewritten ELF still runs through Detcore's ptrace backend,
+which executes the original instructions and covers trapped events in shared
+libraries, the vDSO, and dynamic code. Raw `RDRAND`, `RDSEED`, and TSX in code
+remain unsupported even when present in the offline map because this initial
+integration installs empty trampolines. Privilege-bearing executables fail
+closed rather than losing set-ID or file-capability semantics. This
+establishes the cached-rewrite pipeline but does not yet reduce ptrace events.
+Install `e9tool` in `PATH` or set `HERMIT_E9TOOL` to its executable.
+Non-ELF entrypoints, including shebang scripts, skip preprocessing and run
+through the ptrace correctness path.
 
 A quick determinism check is to run the same virtual random-data read twice:
 
@@ -126,7 +209,7 @@ virtual-machine configuration.
 | Goal | Command | Status |
 | --- | --- | --- |
 | Deterministic execution | `hermit run -- PROGRAM ARGS...` | Default and recommended mode |
-| Verify two executions | `hermit run --verify -- PROGRAM` | Compares output, status, and deterministic logs |
+| Verify two executions | `hermit run --verify -- PROGRAM` | Runs the `Stripped` diagnostic over output, status, and selected logs; not strict determinism |
 | Explore schedules | `hermit run --chaos --sched-seed=N -- PROGRAM` | Seeded, reproducible schedule variation |
 | Record an execution | `hermit record start -- PROGRAM ARGS...` | Experimental |
 | Replay the latest recording | `hermit replay --autopilot` | Experimental |
@@ -137,6 +220,90 @@ A minimal record/replay session is:
 ```bash
 hermit record start -- /bin/echo recorded
 hermit replay --autopilot
+```
+
+### Debug Adapter Protocol
+
+Hermit exposes a GDB remote target with `run --gdbserver` and `replay`.
+`hermit-dap` starts GDB's Debug Adapter Protocol interpreter with the local
+system root configured so GDB does not request shared libraries from Hermit's
+remote server. A GDB build with the DAP interpreter is required. Use `--gdb`
+when that executable is not `/usr/bin/gdb`:
+
+```bash
+cargo build -p hermit --bin hermit --bin hermit-dap
+target/debug/hermit run --gdbserver --gdbserver-port=1234 -- /path/to/program
+
+# Or serve the latest recording without launching GDB itself.
+target/debug/hermit replay --serve-only --gdbserver-port=1234
+```
+
+In another terminal, a DAP client can spawn `target/debug/hermit-dap` and send
+an `attach` request containing the executable and remote target. For example,
+[Dapper](https://github.com/facebookexperimental/dapper) can run this session
+from a JSON configuration:
+
+```json
+{
+  "spawnConfig": {
+    "type": "stdio",
+    "cmd": "/path/to/hermit/target/debug/hermit-dap"
+  },
+  "debugRequest": {
+    "request": "attach",
+    "program": "/path/to/program",
+    "target": "127.0.0.1:1234"
+  },
+  "breakpoints": [
+    {
+      "type": "source",
+      "path": "/path/to/program.c",
+      "line": 12
+    }
+  ],
+  "installDefaultExceptionBreakpoints": false
+}
+```
+
+```bash
+dapper proxy --control-port 4711 from-config hermit-dap.json
+dapper debug --control-port 4711 continue 1
+dapper debug --control-port 4711 stack-trace 1
+dapper debug --control-port 4711 step over 1
+```
+
+The same adapter command can be used by an editor or another DAP client. To
+enable reverse execution for a recording, let the adapter manage the replay by
+adding the recording arguments to `spawnConfig`:
+
+```json
+{
+  "spawnConfig": {
+    "type": "stdio",
+    "cmd": "/path/to/hermit/target/debug/hermit-dap",
+    "args": [
+      "--replay", "RECORDING_ID",
+      "--data-dir", "/path/to/recordings",
+      "--gdbserver-port", "1234"
+    ]
+  },
+  "debugRequest": {
+    "request": "attach",
+    "program": "/path/to/program",
+    "target": "127.0.0.1:1234"
+  }
+}
+```
+
+In this mode the adapter advertises `supportsStepBack` and implements DAP
+`stepBack` and `reverseContinue` by restarting the deterministic replay and
+running forward to the requested earlier source position. This first
+implementation favors correctness over speed.
+
+```bash
+dapper proxy --control-port 4711 from-config hermit-dap-replay.json
+dapper debug --control-port 4711 step back 1
+dapper debug --control-port 4711 reverse-continue 1
 ```
 
 ### Chaos Mode Demonstration
@@ -152,7 +319,7 @@ cc -std=c11 -O2 -pthread tests/chaos/order_violation.c \
   -o target/chaos-demo/order-violation
 
 for run in 1 2; do
-  target/release/hermit run --preemption-timeout=disabled -- \
+  target/release/hermit run --max-timeslice=disabled -- \
     ./target/chaos-demo/order-violation
 done
 ```
@@ -163,7 +330,7 @@ schedules; this bounded search reports the guest status for each seed:
 ```bash
 for seed in {0..15}; do
   target/release/hermit run --chaos --sched-heuristic=random \
-    --preemption-timeout=disabled --seed="$seed" -- \
+    --max-timeslice=disabled --seed="$seed" -- \
     ./target/chaos-demo/order-violation
   printf 'seed=%s status=%s\n' "$seed" "$?"
 done
@@ -175,7 +342,7 @@ reproduces the same failure:
 
 ```bash
 target/release/hermit run --chaos --sched-heuristic=random \
-  --preemption-timeout=disabled --seed=9 -- \
+  --max-timeslice=disabled --seed=9 -- \
   ./target/chaos-demo/order-violation
 ```
 
@@ -187,6 +354,19 @@ it also works on hosts without accessible performance counters.
 Record/replay is less broadly compatible than deterministic `run` mode. Keep
 the recording directory, executable, inputs, environment, and Hermit revision
 unchanged between phases.
+
+Hermit presents deterministic mount identities in `/proc/*/mountinfo` and the
+matching `mnt_id` fields in `/proc/*/fdinfo/*`. Mount topology, stacking order,
+and non-identity Linux fields remain visible; Hermit-owned temporary roots are
+rewritten only when their source object has been proved. The `scm_fds` fdinfo
+field passes through because it is the socket's queued-descriptor count, not a
+host-assigned identity. With `run --no-namespace`, Hermit snapshots the live
+mount-ID order on first use and refuses if that order changes during the run,
+rather than applying an identity map to a different host mount-ID layout. A
+chroot may expose an order-preserving subset of a captured mount table; those
+rows retain their positions in the captured identity order, including gaps.
+If a new mount namespace exposes a mount ID absent from the captured order, a
+mountinfo read refuses instead of assigning a plausible but unproved identity.
 
 ## Compatibility
 
@@ -288,10 +468,16 @@ and licensing guidelines.
 
 ## More Documentation
 
+- [Compatibility scorecard](SCORECARD.md): the current green/red totals by
+  backend and the commands that verify or pressure-test them.
 - [User Guide](docs/USER_GUIDE.md): modes, flags, examples, and troubleshooting.
 - [Architecture](docs/ARCHITECTURE.md): Reverie, Detcore, scheduling, time, and
   record/replay internals.
+- [e9patch Compatibility](docs/E9PATCH_COMPATIBILITY.md): measured application
+  envelope, preprocessing classifications, and known limits.
 - [Error Catalog](docs/ERROR_CATALOG.md): errors, triggers, and remediations.
+- [Per-test Hermit Code Coverage](docs/HERMIT_CODE_COVERAGE.md): measure and
+  diff the Hermit/Detcore implementation paths exercised by a test.
 - [Examples](examples/README.md): small programs demonstrating controlled
   nondeterminism.
 - [License](LICENSE): BSD 3-Clause.

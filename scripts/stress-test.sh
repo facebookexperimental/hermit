@@ -4,6 +4,34 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
+#
+# Hermit stress-test framework.
+#
+# Runs the test suite (or a filtered subset) N times under cargo-nextest with a
+# chosen degree of parallelism, aggregates per-test pass/fail counts across all
+# iterations, categorizes any failures, and writes structured results
+# (Markdown + JSON).
+#
+# CPU oversubscription is intentional: running many tests concurrently produces
+# chaotic host scheduling that deterministic Hermit tests must be robust against.
+# A flaky result here is a signal, not noise.
+#
+# Usage:
+#   scripts/stress-test.sh [-n RUNS] [-j THREADS] [-E FILTERSET] [-p PKG]
+#                          [-t TIMEOUT_SECS] [-o OUTDIR]
+#
+#   -n RUNS      Repeat count per test (default: 20)
+#   -j THREADS   nextest test-threads; raise above core count to oversubscribe
+#                (default: number of CPUs)
+#   -E FILTERSET nextest filter expression, e.g. 'package(detcore-model)'
+#   -p PKG       shorthand for -E 'package(PKG)'
+#   -t SECS      per-iteration wall-clock timeout (default: 1800 = 30 min)
+#   -o OUTDIR    output directory (default: docs)
+#
+# Examples:
+#   scripts/stress-test.sh                          # whole suite, 20x
+#   scripts/stress-test.sh -n 20 -j 32 -p hermit-detcore   # oversubscribed detcore
+#   scripts/stress-test.sh -n 5 -E 'test(/futex/)'  # just futex tests, 5x
 
 set -uo pipefail
 

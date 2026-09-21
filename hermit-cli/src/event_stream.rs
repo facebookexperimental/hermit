@@ -9,11 +9,15 @@
 use std::fmt;
 use std::fs;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
-use reverie::Tid;
+use reverie::Errno;
 use reverie::syscalls::Displayable;
 use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::ReadAddr;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallArgs;
 use reverie::syscalls::SyscallInfo;
@@ -22,6 +26,133 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::event::Event;
+
+/// Stable event-stream identity derived from the guest process tree.
+///
+/// Each component after the root is the parent's deterministic child ordinal.
+/// Unlike a process-local counter, this remains collision-free when Reverie
+/// forks the tool itself and each process receives its own tool instance.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct EventStreamId(Vec<u64>);
+
+impl EventStreamId {
+    pub(crate) fn root() -> Self {
+        Self(Vec::new())
+    }
+
+    pub(crate) fn child(&self, ordinal: u64) -> Self {
+        let mut path = self.0.clone();
+        path.push(ordinal);
+        Self(path)
+    }
+
+    fn file_name(&self) -> String {
+        let mut identity = b"hermit-event-stream-v1\0".to_vec();
+        for ordinal in &self.0 {
+            identity.extend_from_slice(&ordinal.to_be_bytes());
+        }
+        format!("stream-{}", detcore::Digest::new(&identity))
+    }
+}
+
+impl fmt::Display for EventStreamId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", detcore::ROOT_DETPID.as_raw())?;
+        for ordinal in &self.0 {
+            write!(f, ".{ordinal}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Allocates child ordinals within one deterministic parent stream.
+///
+/// The counter belongs to the parent thread state rather than the Recorder or
+/// Replayer process instance. When Reverie forks a tool process, the child
+/// receives its already-assigned stream identity and a fresh descendant
+/// counter, while the continuing parent retains the incremented counter.
+#[derive(Default)]
+pub(crate) struct ChildEventStreamIds(AtomicU64);
+
+impl ChildEventStreamIds {
+    pub(crate) fn next(&self, parent: &EventStreamId) -> EventStreamId {
+        let ordinal = self
+            .0
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .unwrap_or_else(|_| panic!("record/replay child stream ordinal overflow"));
+        parent.child(ordinal)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct EventStreamHeader {
+    stream_id: EventStreamId,
+}
+
+fn decode_stream_header(
+    reader: &mut io::BufReader<fs::File>,
+    expected: &EventStreamId,
+) -> io::Result<()> {
+    let header: EventStreamHeader =
+        bincode::serde::decode_from_std_read(reader, bincode::config::legacy()).map_err(
+            |error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid event-stream identity header: {error}"),
+                )
+            },
+        )?;
+    if header.stream_id != *expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "event-stream identity mismatch: expected {expected}, found {}",
+                header.stream_id
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn encode_stream_header(
+    writer: &mut io::BufWriter<fs::File>,
+    stream_id: &EventStreamId,
+) -> io::Result<()> {
+    bincode::serde::encode_into_std_write(
+        EventStreamHeader {
+            stream_id: stream_id.clone(),
+        },
+        writer,
+        bincode::config::legacy(),
+    )
+    .map(|_| ())
+    .map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("failed to encode event-stream identity header: {error}"),
+        )
+    })
+}
+
+impl Serialize for ChildEventStreamIds {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u64(self.0.load(Ordering::Relaxed))
+    }
+}
+
+impl<'de> Deserialize<'de> for ChildEventStreamIds {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(Self(AtomicU64::new(u64::deserialize(deserializer)?)))
+    }
+}
 
 /// An event to help with debugging, but is not actually necessary for the
 /// functionality of record/replay.
@@ -32,20 +163,70 @@ pub struct DebugEvent {
 
     /// The pretty, displayable version of the syscall.
     pretty: String,
+
+    /// Exec pathname bytes and lookup context. Raw syscall registers only hold
+    /// a pointer, so this snapshot prevents a changed failed exec request from
+    /// silently consuming an event that happened to return the same errno.
+    exec_request: Option<DebugExecRequest>,
+}
+
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct DebugExecRequest {
+    dirfd: libc::c_int,
+    path: Result<Vec<u8>, Errno>,
+    flags: libc::c_int,
 }
 
 impl DebugEvent {
     /// Constructs a new `DebugEvent`.
     pub fn new<M: MemoryAccess>(syscall: Syscall, memory: &M) -> Self {
+        let exec_request = match syscall {
+            Syscall::Execve(call) => {
+                let call: reverie::syscalls::Execveat = call.into();
+                Some(DebugExecRequest {
+                    dirfd: call.dirfd(),
+                    path: call
+                        .path()
+                        .ok_or(Errno::EFAULT)
+                        .and_then(|path| path.read(memory))
+                        .map(|path| path.as_os_str().as_bytes().to_vec()),
+                    flags: call.flags(),
+                })
+            }
+            Syscall::Execveat(call) => Some(DebugExecRequest {
+                dirfd: call.dirfd(),
+                path: call
+                    .path()
+                    .ok_or(Errno::EFAULT)
+                    .and_then(|path| path.read(memory))
+                    .map(|path| path.as_os_str().as_bytes().to_vec()),
+                flags: call.flags(),
+            }),
+            _ => None,
+        };
         Self {
             syscall: syscall.into_parts(),
             pretty: format!("{}", syscall.display(memory)),
+            exec_request,
         }
     }
 
     /// Returns the syscall associated with this debug event.
     pub fn syscall(&self) -> Syscall {
         Syscall::from_raw(self.syscall.0, self.syscall.1)
+    }
+
+    pub(crate) fn exec_request_matches(&self, other: &Self) -> bool {
+        self.exec_request == other.exec_request
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(sysno: Sysno, pretty: &str) -> Self {
+        Self {
+            syscall: (sysno, SyscallArgs::new(0, 0, 0, 0, 0, 0)),
+            pretty: pretty.to_owned(),
+            exec_request: None,
+        }
     }
 }
 
@@ -80,12 +261,12 @@ fn kernel_arg_count(sysno: Sysno) -> Option<u8> {
     Some(match sysno {
         close | fchdir | dup | time | unlink => 1,
         access | stat | fstat | lstat | dup2 | clock_gettime | gettimeofday | settimeofday
-        | mkdir | statfs | fstatfs => 2,
+        | mkdir | statfs | fstatfs | ftruncate | kill | listen | rt_sigpending => 2,
         mprotect | read | readv | write | writev | lseek | getdents | getdents64 | dup3 | ioctl
         | socket | fcntl | connect | sendmsg | poll | getpeername | getsockname | getrandom
-        | readlink | unlinkat | open | execve | close_range => 3,
+        | readlink | unlinkat | open | execve | close_range | tgkill => 3,
         pread64 | pwrite64 | newfstatat | fadvise64 | openat => 4,
-        statx | pwritev | preadv | ppoll | setsockopt | getsockopt | execveat => 5,
+        statx | pwritev | preadv | ppoll | setsockopt | getsockopt | execveat | prctl => 5,
         recvfrom | sendto | pwritev2 | preadv2 | mmap => 6,
         _ => return None,
     })
@@ -141,14 +322,17 @@ fn default_reader() -> io::BufReader<fs::File> {
 
 impl EventReader {
     /// Opens an existing event stream.
-    pub fn open(path: &Path, thread_id: Tid) -> io::Result<Self> {
+    pub fn open(path: &Path, stream_id: &EventStreamId) -> io::Result<Self> {
+        let file_name = stream_id.file_name();
+        let mut reader = io::BufReader::new(fs::File::open(path.join("thread").join(&file_name))?);
+        let mut debug_events = io::BufReader::new(fs::File::open(
+            path.join("thread").join(format!("{file_name}.debug")),
+        )?);
+        decode_stream_header(&mut reader, stream_id)?;
+        decode_stream_header(&mut debug_events, stream_id)?;
         Ok(Self {
-            reader: io::BufReader::new(fs::File::open(
-                path.join("thread").join(thread_id.to_string()),
-            )?),
-            debug_events: io::BufReader::new(fs::File::open(
-                path.join("thread").join(format!("{}.debug", thread_id)),
-            )?),
+            reader,
+            debug_events,
             count: 0,
         })
     }
@@ -198,16 +382,26 @@ fn default_writer() -> io::BufWriter<fs::File> {
 
 impl EventWriter {
     /// Creates a new event stream.
-    pub fn create(path: &Path, thread_id: Tid) -> io::Result<Self> {
+    pub fn create(path: &Path, stream_id: &EventStreamId) -> io::Result<Self> {
         let path = path.join("thread");
 
         fs::create_dir_all(&path)?;
+        let file_name = stream_id.file_name();
 
+        let create = |path| {
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+        };
+
+        let mut writer = io::BufWriter::new(create(path.join(&file_name))?);
+        let mut debug_events = io::BufWriter::new(create(path.join(format!("{file_name}.debug")))?);
+        encode_stream_header(&mut writer, stream_id)?;
+        encode_stream_header(&mut debug_events, stream_id)?;
         Ok(Self {
-            writer: io::BufWriter::new(fs::File::create(path.join(thread_id.to_string()))?),
-            debug_events: io::BufWriter::new(fs::File::create(
-                path.join(format!("{}.debug", thread_id)),
-            )?),
+            writer,
+            debug_events,
         })
     }
 
@@ -239,10 +433,16 @@ impl Default for EventWriter {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::io;
+
     use reverie::syscalls::Syscall;
     use reverie::syscalls::SyscallArgs;
     use reverie::syscalls::Sysno;
 
+    use super::ChildEventStreamIds;
+    use super::EventStreamId;
+    use super::kernel_arg_count;
     use super::normalize_unused_args;
 
     fn raw(sysno: Sysno, args: SyscallArgs) -> Syscall {
@@ -302,11 +502,91 @@ mod tests {
     }
 
     #[test]
+    fn delegated_syscalls_have_kernel_arities() {
+        assert_eq!(kernel_arg_count(Sysno::kill), Some(2));
+        assert_eq!(kernel_arg_count(Sysno::ftruncate), Some(2));
+        assert_eq!(kernel_arg_count(Sysno::listen), Some(2));
+        assert_eq!(kernel_arg_count(Sysno::rt_sigpending), Some(2));
+        assert_eq!(kernel_arg_count(Sysno::tgkill), Some(3));
+        assert_eq!(kernel_arg_count(Sysno::prctl), Some(5));
+    }
+
+    #[test]
     fn unknown_syscall_compares_all_registers() {
         // A syscall without an arity entry keeps the conservative behavior of
         // comparing every register.
         let a = raw(Sysno::getpid, SyscallArgs::new(0, 0, 0xaa, 0, 0, 0));
         let b = raw(Sysno::getpid, SyscallArgs::new(0, 0, 0xbb, 0, 0, 0));
         assert_ne!(normalize_unused_args(a), normalize_unused_args(b));
+    }
+
+    #[test]
+    fn pedigree_stream_ids_are_stable_and_collision_free() {
+        let root = EventStreamId::root();
+        let recording = ChildEventStreamIds::default();
+        let replay = ChildEventStreamIds::default();
+        let first = recording.next(&root);
+        let second = recording.next(&root);
+        assert_eq!(first.to_string(), "3.0");
+        assert_eq!(second.to_string(), "3.1");
+        assert_ne!(first, second);
+        assert_eq!(first, replay.next(&root));
+        assert_eq!(second, replay.next(&root));
+
+        let serialized = serde_json::to_vec(&recording).expect("serialize child ordinal");
+        let restored: ChildEventStreamIds =
+            serde_json::from_slice(&serialized).expect("restore child ordinal");
+        assert_eq!(restored.next(&root).to_string(), "3.2");
+
+        let grandchildren = ChildEventStreamIds::default();
+        assert_eq!(grandchildren.next(&first).to_string(), "3.0.0");
+    }
+
+    #[test]
+    fn deeply_nested_stream_names_remain_bounded() {
+        let mut stream_id = EventStreamId::root();
+        for ordinal in 0..125 {
+            stream_id = stream_id.child(ordinal);
+        }
+        assert_eq!(stream_id.file_name().len(), "stream-".len() + 64);
+        assert!(stream_id.file_name().len() <= 255);
+    }
+
+    #[test]
+    fn duplicate_stream_identity_refuses_instead_of_overwriting() {
+        let data = tempfile::tempdir().expect("create recording directory");
+        let stream_id = EventStreamId::root().child(0);
+        let first = super::EventWriter::create(data.path(), &stream_id).expect("create stream");
+        let error = super::EventWriter::create(data.path(), &stream_id)
+            .err()
+            .expect("duplicate stream must refuse");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        drop(first);
+    }
+
+    #[test]
+    fn mismatched_stream_header_refuses_instead_of_aliasing() {
+        let data = tempfile::tempdir().expect("create recording directory");
+        let expected = EventStreamId::root().child(0);
+        let different = EventStreamId::root().child(1);
+        let writer = super::EventWriter::create(data.path(), &expected).expect("create stream");
+        drop(writer);
+
+        let file_name = expected.file_name();
+        let mut file = io::BufWriter::new(
+            fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(data.path().join("thread").join(file_name))
+                .expect("open stream for corruption"),
+        );
+        super::encode_stream_header(&mut file, &different).expect("write mismatched header");
+        drop(file);
+
+        let error = super::EventReader::open(data.path(), &expected)
+            .err()
+            .expect("mismatched stream identity must refuse");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("identity mismatch"));
     }
 }

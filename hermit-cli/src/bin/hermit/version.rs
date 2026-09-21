@@ -6,10 +6,12 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::io::Write;
 use std::sync::OnceLock;
 
-#[cfg(not(fbcode_build))]
-const OSS_VERSION: &str = "0.1";
+use clap::Args;
+use hermit::Error;
+use hermit::ExitStatus;
 
 pub struct Version(String);
 
@@ -43,6 +45,37 @@ impl Version {
         }
 
         #[cfg(not(fbcode_build))]
-        Self(OSS_VERSION.to_owned())
+        {
+            // Single source of truth: the crate version from `Cargo.toml`,
+            // augmented with the build date and source revision emitted by
+            // `build.rs`. Produces, for example:
+            //   0.2.0 (2026-07-31, gabc123def456)
+            Self(format!(
+                "{} ({}, g{})",
+                env!("CARGO_PKG_VERSION"),
+                env!("HERMIT_BUILD_DATE"),
+                env!("HERMIT_BUILD_GIT_SHA"),
+            ))
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct VersionOpts {
+    /// Emit the producer-owned build facts as one JSON object.
+    #[clap(long)]
+    json: bool,
+}
+
+impl VersionOpts {
+    pub fn main(&self) -> Result<ExitStatus, Error> {
+        let mut stdout = std::io::stdout().lock();
+        if self.json {
+            serde_json::to_writer(&mut stdout, &hermit::build_info::current())?;
+            writeln!(stdout)?;
+        } else {
+            writeln!(stdout, "hermit {}", Version::get())?;
+        }
+        Ok(ExitStatus::Exited(0))
     }
 }

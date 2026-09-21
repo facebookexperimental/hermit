@@ -2,11 +2,16 @@
 
 Status: fail-closed batches through PID and file-offset handling complete, 2026-07-22
 
-Hermit's fail-closed diagnostic converts an unsupported syscall that reaches
-Detcore into a panic instead of silently passing it through. The integration
-ratchet sets `HERMIT_FAIL_CLOSED=1`; `hermit run` consumes that internal test
-environment variable as if `--panic-on-unsupported-syscalls` had been passed.
-The normal command-line default remains unchanged.
+Hermit fails closed when an unsupported syscall reaches Detcore. Ordinary
+`hermit run`, recording, and replay all reject it instead of silently passing
+it through. `hermit run --allow-unsupported-syscalls` is the explicit,
+warning-producing compatibility escape hatch; it cannot establish complete
+deterministic execution and it is unavailable to recording and replay.
+
+The integration ratchet still sets `HERMIT_FAIL_CLOSED=1` so it exercises the
+same policy explicitly. Optimized subscriptions also include every syscall
+classified Unsupported, so the reduced subscription set cannot bypass this
+boundary.
 
 ## Baseline
 
@@ -94,19 +99,26 @@ enabled. Therefore:
    Counts may only move from failure/ignored to pass unless expansion is
    deliberately approved.
 
-The self-hosted CI job runs the ratchet after the regular Hermit integration
-suite when mount namespaces are available.
+Portable CI runs the ratchet after the regular Hermit integration suite when
+mount namespaces are available.
 
 ## Current Limitation
 
-This metric is a lower bound on unsupported-syscall exposure, not a claim of
-complete fail-closed enforcement. Optimized Detcore runs subscribe to selected
-syscalls. An unsubscribed syscall executes in the kernel without reaching the
-unsupported-syscall panic. The current coverage audit identifies 291 such
-missing release entries; see
-[`ai_docs/syscall-coverage-map.md`](../ai_docs/syscall-coverage-map.md).
+This metric is a lower bound on deterministic syscall modeling, not a claim
+that every Linux syscall is determinized. Optimized Detcore runs subscribe to
+selected modeled calls plus every call currently classified Unsupported. Calls
+classified PassThrough may still execute in the kernel without deterministic
+modeling. A 2026-07-21 coverage audit identified 291 missing release entries;
+see
+[`ai_docs/syscall-coverage-map.md`](../ai_docs/syscall-coverage-map.md) (a
+dated snapshot). That count is now stale: several syscall families it marked
+`MISSING` (for example the SysV IPC, Landlock, and `cachestat` groups) have
+since gained `Determinized` entries in `detcore/src/syscall_classification.rs`.
+Re-derive the current missing-entry count from that file rather than citing
+291 as current.
 
-A future true fail-closed mode must subscribe to all syscalls (or install an
-equivalent deny policy). Until then, the ratchet prevents regressions in the
-calls that Detcore does observe and provides a visible path from 69/89 to full
-coverage of the currently applicable integration inventory.
+Fail-closed therefore covers the explicit Unsupported class in both full and
+reduced subscription modes. It does not convert the reviewed PassThrough class
+into modeled behavior. The ratchet prevents regressions in calls Detcore
+observes and provides a visible path from 69/89 to full coverage of the
+currently applicable integration inventory.

@@ -1,0 +1,374 @@
+schema: 3
+bucket: data-handling
+test:
+  - id: data-handling/archive-roundtrip
+    description: Create, extract, and verify a normalized tar archive
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+    occasional: false
+    program: tests/e2e/data-handling/archive-roundtrip.sh
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: Normalized archive metadata is deterministic by construction
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: DBT coverage is owned by its backend parity partition
+          kvm: KVM requires the privileged runner
+          liteinst: LiteInst coverage is owned by its backend compatibility partition
+          sabre: The exec socket is fixed, but SaBRe strict verification intermittently diverges in shell PATH lookup and multi-exec DETLOG ordering
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The focused C sentinel owns the blocking replay contract
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The workload is single-threaded
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+  - id: data-handling/shell-pipeline
+    description: Deterministic multi-stage shell pipeline (sort|uniq|awk|wc) exercising fork/exec/pipe
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+    occasional: false
+    program: tests/e2e/data-handling/shell-pipeline.sh
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: The LC_ALL=C pipeline output is deterministic by construction
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: DBT coverage is owned by its backend parity partition
+          kvm: KVM requires the privileged runner
+          sabre: Forwarded-DETLOG verification exposes nondeterministic multi-process scheduler and SIGCHLD ordering under SaBRe despite stable stdout
+          liteinst: LiteInst omits the fork/clone/pipe process model this pipeline requires
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The verify mode owns this fixture's blocking determinism contract
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The pipeline stages are short-lived and single-threaded per process
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+  - id: data-handling/jq-json-transform
+    description: jq JSON transform with now() varies natively and repeats under Hermit
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - jq
+    occasional: false
+    program: tests/e2e/data-handling/jq-json-transform.sh
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        runs: 3
+        assert:
+          min_distinct: 2
+        backends_enabled:
+          - native
+        backends_disabled: {}
+        ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
+      verify:
+        ci:
+          ptrace: true
+          kvm: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled:
+          dbt: DBT coverage is owned by its backend parity partition
+          sabre: SaBRe jq qualification is tracked by backend compatibility
+          liteinst: LiteInst coverage is owned by its backend compatibility partition
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The focused C sentinel owns the blocking replay contract
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The jq workload is single-threaded
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+  - id: data-handling/sqlite-query-determinism
+    description: SQLite random()/clock output varies natively and repeats under Hermit
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - sqlite3
+    occasional: false
+    program: tests/e2e/data-handling/sqlite-query-determinism.sh
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        runs: 3
+        assert:
+          min_distinct: 2
+        backends_enabled:
+          - native
+        backends_disabled: {}
+        ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: DBT SQLite qualification is tracked by backend compatibility
+          kvm: KVM requires the privileged runner
+          sabre: SaBRe requires its external runtime
+          liteinst: LiteInst SQLite qualification is tracked by backend compatibility
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The focused C sentinel owns the blocking replay contract
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The SQLite workload is single-threaded
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+  - id: data-handling/zstd-multithread
+    description: Multithreaded zstd worker pool reassembles a byte-identical frame under Hermit
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - zstd
+    occasional: false
+    program: tests/e2e/data-handling/zstd-multithread.sh
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: zstd fixes job boundaries by input offset, not by which worker claims a job, so the frame is deterministic by construction natively; this is a mechanism test, not a native-variance test
+      verify:
+        ci: true
+        timeout_seconds:
+          ptrace: 118
+        cpu_timeout_seconds:
+          ptrace: 56
+        slow_reason:
+          ptrace: Across 59 retained typed passing rows, nearest-rank p90 was 39.112 wall seconds and 37.109853 CPU seconds; 4x wall exceeds 120, so ceil(3x wall)=118 and ceil(1.5x CPU)=56.
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: DBI coverage is owned by its backend parity partition
+          kvm: KVM requires the privileged runner
+          sabre: SaBRe strict verification intermittently diverges on multi-thread DETLOG ordering
+          liteinst: LiteInst coverage is owned by its backend compatibility partition
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The focused C sentinel owns the blocking replay contract
+          dbt: Record/replay is unsupported by DBI
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: 'Enabling chaos here is a genuine follow-up: the worker pool is real guest concurrency, but the frame digest must first be shown stable under chaos scheduling before it can gate CI'
+          dbt: Chaos scheduling is unsupported by DBI
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+  - id: data-handling/dd-partial-transfers
+    description: 'Byte-at-a-time dd across a pipe and a file: partial transfers in a real coreutil'
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+    occasional: false
+    program: tests/e2e/data-handling/dd-partial-transfers.sh
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: The byte counts and the content compare are deterministic by construction, so native repetition is not a nondeterminism contract
+        ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
+      verify:
+        ci: true
+        timeout_seconds:
+          ptrace: 58
+        cpu_timeout_seconds:
+          ptrace: 22
+        slow_reason:
+          ptrace: Across 60 retained typed passing rows, nearest-rank p90 was 14.275 wall seconds and 12.732855 CPU seconds; ceil(4x wall)=58 while the owner-approved 22-second CPU default already covers ceil(1.5x CPU)=20.
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Established on ptrace first; other backends ratchet against this shared entry
+          kvm: KVM requires the privileged runner and does not start on the validation host
+          sabre: Established on ptrace first; other backends ratchet against this shared entry
+          liteinst: Established on ptrace first; other backends ratchet against this shared entry
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is tracked separately from this strict-verify entry
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+        ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling does not add a second oracle to a single-process byte copy
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+        ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this entry
+          dbt: No custom edge-case arguments have been calibrated for this entry
+          kvm: No custom edge-case arguments have been calibrated for this entry
+          sabre: No custom edge-case arguments have been calibrated for this entry
+          liteinst: No custom edge-case arguments have been calibrated for this entry
+        ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'

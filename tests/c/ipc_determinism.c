@@ -22,13 +22,13 @@
 #define PRODUCERS 3
 #define RECORDS 12
 
-static void fail(const char* message) {
+static void fail(const char *message) {
   perror(message);
   exit(1);
 }
 
-static void write_exact(int fd, const void* buffer, size_t length) {
-  const uint8_t* cursor = buffer;
+static void write_exact(int fd, const void *buffer, size_t length) {
+  const uint8_t *cursor = buffer;
   while (length > 0) {
     ssize_t written = write(fd, cursor, length);
     if (written < 0 && errno == EINTR) {
@@ -42,8 +42,8 @@ static void write_exact(int fd, const void* buffer, size_t length) {
   }
 }
 
-static void read_exact(int fd, void* buffer, size_t length) {
-  uint8_t* cursor = buffer;
+static void read_exact(int fd, void *buffer, size_t length) {
+  uint8_t *cursor = buffer;
   while (length > 0) {
     ssize_t count = read(fd, cursor, length);
     if (count < 0 && errno == EINTR) {
@@ -85,11 +85,11 @@ static void verify_blocking_flag_roundtrip(int fd) {
 struct producer_args {
   int fd;
   int producer;
-  pthread_barrier_t* barrier;
+  pthread_barrier_t *barrier;
 };
 
-static void* write_pipe_records(void* opaque) {
-  struct producer_args* args = opaque;
+static void *write_pipe_records(void *opaque) {
+  struct producer_args *args = opaque;
   pthread_barrier_wait(args->barrier);
   for (int sequence = 0; sequence < RECORDS; sequence++) {
     uint16_t token = (uint16_t)(args->producer * 100 + sequence);
@@ -99,7 +99,7 @@ static void* write_pipe_records(void* opaque) {
   return NULL;
 }
 
-static void validate_tokens(const uint16_t* tokens) {
+static void validate_tokens(const uint16_t *tokens) {
   int seen[PRODUCERS][RECORDS] = {{0}};
   for (int i = 0; i < PRODUCERS * RECORDS; i++) {
     int producer = tokens[i] / 100;
@@ -152,11 +152,11 @@ static void pipe_order(void) {
 struct byte_writer_args {
   int fd;
   uint8_t byte;
-  pthread_barrier_t* barrier;
+  pthread_barrier_t *barrier;
 };
 
-static void* write_one_byte(void* opaque) {
-  struct byte_writer_args* args = opaque;
+static void *write_one_byte(void *opaque) {
+  struct byte_writer_args *args = opaque;
   pthread_barrier_wait(args->barrier);
   write_exact(args->fd, &args->byte, sizeof(args->byte));
   return NULL;
@@ -171,7 +171,7 @@ static void pipe_capacity(void) {
   if (capacity <= 0) {
     fail("fcntl(F_GETPIPE_SZ)");
   }
-  uint8_t* fill = malloc((size_t)capacity);
+  uint8_t *fill = malloc((size_t)capacity);
   if (fill == NULL) {
     fail("malloc");
   }
@@ -243,11 +243,11 @@ static void socketpair_order(void) {
 struct event_writer_args {
   int fd;
   uint64_t value;
-  pthread_barrier_t* barrier;
+  pthread_barrier_t *barrier;
 };
 
-static void* write_event_values(void* opaque) {
-  struct event_writer_args* args = opaque;
+static void *write_event_values(void *opaque) {
+  struct event_writer_args *args = opaque;
   pthread_barrier_wait(args->barrier);
   for (int i = 0; i < RECORDS; i++) {
     write_exact(args->fd, &args->value, sizeof(args->value));
@@ -300,11 +300,11 @@ static void eventfd_signaling(void) {
 struct epoll_writer_args {
   int fd;
   int eventfd;
-  pthread_barrier_t* barrier;
+  pthread_barrier_t *barrier;
 };
 
-static void* signal_epoll_source(void* opaque) {
-  struct epoll_writer_args* args = opaque;
+static void *signal_epoll_source(void *opaque) {
+  struct epoll_writer_args *args = opaque;
   pthread_barrier_wait(args->barrier);
   if (args->eventfd) {
     uint64_t value = 1;
@@ -377,10 +377,8 @@ static void epoll_sources(void) {
         read_exact(event, &value, sizeof(value));
         seen |= 2;
       } else {
-        fprintf(
-            stderr,
-            "duplicate or invalid epoll source: %llu\n",
-            (unsigned long long)id);
+        fprintf(stderr, "duplicate or invalid epoll source: %llu\n",
+                (unsigned long long)id);
         exit(1);
       }
     }
@@ -397,7 +395,7 @@ static void epoll_sources(void) {
   pthread_barrier_destroy(&barrier);
 }
 
-int main(int argc, char** argv) {
+int main(int argc, char **argv) {
   if (argc != 2) {
     fprintf(stderr, "usage: %s PATTERN\n", argv[0]);
     return 2;

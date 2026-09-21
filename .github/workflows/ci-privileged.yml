@@ -1,0 +1,165 @@
+name: CI (privileged)
+
+on:
+  workflow_dispatch:
+
+# The event-specific job condition and per-ref concurrency behavior are retained
+# for interpreting old runs. The current workflow trigger is manual only.
+concurrency:
+  group: privileged-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  NEXTEST_VERSION: "0.9.100"
+  RUSTFLAGS: -D warnings -C link-arg=-llzma
+  RUSTDOCFLAGS: -D warnings
+
+jobs:
+  # GitHub Actions supports timeout-minutes on jobs, not at workflow scope.
+  # This workflow has one independent job, so its job timeout is also stronger
+  # than the requested 60-minute workflow ceiling.
+  # This scarce lane is a sub-five-minute privileged capability smoke only:
+  #   * retired-conditional-branch PMU timer delivery,
+  #   * CPUID faulting used to mask RDRAND/RDSEED, and
+  #   * strict guest execution through /dev/kvm.
+  # Full workspace builds, lint, portable tests, record/replay matrices,
+  # language runtimes, debugger tests, and heavyweight QEMU boots belong on
+  # portable or local validation.
+  privileged:
+    name: Privileged capability and E2E tests
+    if: >-
+      ${{
+        github.repository == 'rrnewton/hermit' &&
+        (
+          github.event_name == 'push' ||
+          github.event_name == 'workflow_dispatch' ||
+          (
+            github.event_name == 'pull_request' &&
+            github.event.action != 'closed' &&
+            github.event.pull_request.user.login == 'rrnewton' &&
+            github.event.pull_request.draft == false
+          )
+        )
+      }}
+    runs-on: [Linux, X64, hermit, pmu]
+    # This is a WALL, not an expected duration: a green run of this job measured
+    # 126s end to end on 2026-08-08 (run 31282467953). The wall must still cover
+    # the case where every budgeted step spends its whole allowance, which is
+    # 2160s (DAG launcher) + 450s (30s locks + 60s submodule init + 30s hardware
+    # capabilities + 120s boxing probe + 210s occasional KVM probes) = 2610s.
+    # The 3000s job bound leaves 390s for steps without their own `timeout`
+    # (job setup, checkout, and the two artifact uploads). target/debug/test-harness reads the
+    # privileged launcher and DAG budgets from their deployed files and fails
+    # closed on their ordering drift, so
+    # raise the step budgets and rerun `target/debug/test-harness validate` rather
+    # than guessing here.
+    timeout-minutes: 50
+    env:
+      DETCORE_TEST_RUST_LOG: "off"
+
+    steps:
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#647)
+    - name: Remove stale checkout locks
+      run: |
+        timeout --foreground --kill-after=5s 30s bash -euo pipefail -c '
+          if [[ -d "$GITHUB_WORKSPACE/.git" ]]; then
+            find "$GITHUB_WORKSPACE/.git" -type f -name "*.lock" -print -delete
+          fi
+        '
+
+    - uses: actions/checkout@v4
+    - name: Trust self-hosted checkout path
+      run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+    - name: Initialize DAG runner
+      run: timeout --foreground --kill-after=10s 60s git submodule update --init agent-utils
+    - name: Require hardware capabilities
+      run: |
+        timeout --foreground --kill-after=5s 30s bash -euo pipefail -c '
+          test -r /proc/sys/kernel/perf_event_paranoid
+          test -r /dev/kvm -a -w /dev/kvm
+          command -v cc
+        '
+    # The privileged lane is NOT serialized by a PMU counter lock. Measurement
+    # (experiments/pmu-concurrency-ceiling-measured_20260803 in the dev-hermit
+    # parent) showed the counter-exhaustion premise is false: reverie's RCB
+    # counters are per-task (cpu=-1), so the kernel context-switches them and
+    # only the running task's 2 counters need be resident; 32 concurrent
+    # --strict --verify pinned to ONE core all pass with zero perf_event_open
+    # failures. The former `flock /tmp/hermit-privileged-pmu.lock` guarded that
+    # non-existent limit and had no other purpose (perf-dir is already keyed by
+    # $RUNNER_TEMP; kvm nodes are capped in-DAG by resource_caps.kvm), so it is
+    # removed. The `pmu-serial` runner label was retired for the same reason:
+    # PMU skid is an instruction-space hardware property independent of
+    # concurrency, so no determinism argument justifies serializing PMU work.
+    # DIAGNOSTIC ONLY, and deliberately NOT `continue-on-error` — the script always exits 0, and
+    # target/debug/test-harness asserts this workflow contains exactly one continue-on-error line (the
+    # occasional-KVM one), so a second would fail the DAG correspondence audit.
+    #
+    # Answers a question that has been ASSUMED for weeks rather than measured. dagrun
+    # skips cgroup boxing whenever $CI or $GITHUB_ACTIONS is set: cgroup.rs reexec_in_scope returns
+    # its SUCCESS value without entering a scope, and the real capability probe sits after that
+    # early return, so it never executes on a runner. This lane therefore selects
+    # the runner's explicit unboxed mode only after proving that it is running in
+    # GitHub Actions. It must not use --allow-cgroup-failure: that flag accepts any
+    # boxing failure, including failures unrelated to the Actions policy skip. The
+    # step prints FACT1_SCOPE_CREATED and FACT2_ESCAPEE_KILLED and changes no
+    # default either way.
+    - name: PROBE — can this runner actually box? (diagnostic, never gates)
+      run: timeout --foreground --kill-after=10s 120s ./ci/probe-runner-boxing.sh
+
+    - name: PMU, CPUID-faulting, and KVM smoke DAG
+      # GitHub Actions sets GITHUB_ACTIONS=true, which makes the runner's ordinary
+      # scope bring-up deliberately skip systemd --user. Select explicit unboxed
+      # execution only in that exact context. A copied/local invocation, or any
+      # boxing failure outside Actions, must fail closed instead of silently
+      # downgrading through --allow-cgroup-failure.
+      # 2160s exceeds the selected graph's audited 2100s critical path plus 30s
+      # runner teardown. A warm exact-tree build measured 77s; the first
+      # canonical cold-cache run exceeded 180s before completing.
+      # This number is the SINGLE AUTHOR
+      # of the inner DAG budget: target/debug/test-harness reads it back out of this
+      # line instead of keeping its own copy, so it cannot drift out of sync
+      # with the guard that checks it. It must exceed the privileged DAG's
+      # critical path plus 30s of runner overhead; the harness recomputes that
+      # path from the privileged label in ci/dag/validate.json and fails closed.
+      run: |
+        if [[ ${GITHUB_ACTIONS:-} != true ]]; then
+          echo 'privileged DAG: refusing explicit unboxed execution outside GitHub Actions' >&2
+          exit 2
+        fi
+        timeout --foreground --kill-after=10s 2160s env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 --unsafe-no-cgroups --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v
+    - name: Run non-gating occasional KVM probes
+      id: kvm_occasional
+      continue-on-error: true
+      run: |
+        timeout --foreground --kill-after=10s 210s \
+          env HERMIT_BIN="$PWD/target/debug/hermit" \
+          bash -euo pipefail -c '
+            target/debug/test-harness build --lane privileged --category applications \
+              --ci-only --include-occasional
+            target/debug/test-harness run --lane privileged --category applications \
+              --ci-only --include-occasional --prebuilt \
+              --results ignored/e2e/privileged/occasional/results.jsonl \
+              --junit ignored/e2e/privileged/occasional/junit.xml
+          '
+    - name: Warn when an occasional KVM probe is red
+      if: steps.kvm_occasional.outcome == 'failure'
+      run: echo '::warning::Known load-sensitive KVM probes are RED; see the privileged E2E artifact and fix-load-dependent-scheduling-vtime.'
+    - name: Upload privileged DAG performance report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: privileged-dag-perf-${{ github.job }}
+        path: ${{ runner.temp }}/hermit-privileged-dag-perf
+        if-no-files-found: warn
+        retention-days: 14
+    - name: Upload privileged E2E structured results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: e2e-results-${{ github.job }}
+        path: ignored/e2e/privileged
+        if-no-files-found: error
+        retention-days: 14

@@ -130,7 +130,7 @@ impl<T: Debug> PartialEq for Ivar<T> {
 
 impl<T: Debug> Display for Ivar<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
-        f.write_fmt(format_args!("<ivar {:p} ", Arc::as_ptr(&self.inner)))?;
+        f.write_str("<ivar ")?;
         let shared = self.inner.lock().unwrap();
         match &shared.contents {
             Some(val) => {
@@ -188,6 +188,24 @@ impl<T: Debug + Clone> Future for Ivar<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_excludes_host_address() {
+        let ivar = Ivar::new();
+        assert_eq!(ivar.to_string(), "<ivar NoWaiter>");
+
+        let mut waiting = ivar.clone();
+        let waker = futures::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
+        assert!(matches!(
+            Pin::new(&mut waiting).poll(&mut context),
+            Poll::Pending
+        ));
+        assert_eq!(ivar.to_string(), "<ivar HasWaiter>");
+
+        ivar.put(7);
+        assert_eq!(ivar.to_string(), "<ivar 7>");
+    }
 
     #[tokio::test]
     async fn test_ivar_simple1() {

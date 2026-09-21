@@ -262,10 +262,11 @@ stable artifact.
 
 - **Runtime coverage.** Deterministic replay must cover the workload's syscalls
   and threading model; e.g. Ruby multithreading currently livelocks under strict
-  sequentialization (see `research-ruby-deadlock` / `experiments/ruby-threads`).
+  sequentialization (see `research-ruby-deadlock` and the parent workspace's
+  [`ruby-threads`](https://github.com/rrnewton/dev-hermit/tree/main/experiments/hermit-experiments-migration_20260727/ruby-threads) evidence).
   Agent debugging is only as good as the set of programs Hermit can replay.
 - **Overhead.** Strict deterministic mode is markedly slower than native (see
-  `experiments/benchmarks`); recording cost and replay latency shape how snappy
+  the parent workspace's [`benchmarks`](https://github.com/rrnewton/dev-hermit/tree/main/experiments/hermit-experiments-migration_20260727/benchmarks)); recording cost and replay latency shape how snappy
   the agent loop feels.
 - **State legibility.** The MCP tools must present state (memory, threads, logical
   time, schedules) in forms an LLM reasons about well — schedule diffs and event

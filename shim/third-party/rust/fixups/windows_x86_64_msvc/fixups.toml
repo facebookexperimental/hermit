@@ -1,0 +1,13 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is dual-licensed under either the MIT license found in the
+# LICENSE-MIT file in the root directory of this source tree or the Apache
+# License, Version 2.0 found in the LICENSE-APACHE file in the root directory
+# of this source tree. You may select, at your option, one of the
+# above-listed licenses.
+
+buildscript.run = false
+
+[['cfg(all(version = "=0.48.0", target_os = "windows", target_env = "msvc"))'.prebuilt_cxx_library]]
+name = "windows"
+static_libs = ["lib/windows.0.48.0.lib"]

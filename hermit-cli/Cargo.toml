@@ -2,32 +2,65 @@
 
 [package]
 name = "hermit"
-version = "0.0.0"
+description = "Hermit: a deterministic Linux execution engine for reproducible runs, record and replay, and concurrency-race search."
+version = "0.2.0"
 edition = "2024"
 repository = "https://github.com/facebookexperimental/hermit"
 license = "BSD-3-Clause"
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+# Third-party-dependency execution backends are OFF by default so the shipped
+# `hermit` binary is a single static binary with the ptrace/kvm/liteinst
+# backends and no DynamoRIO/e9patch/SaBRe third-party dependencies. CI builds
+# with `--features third-party-backends` to compile and test them. `dbt` is the
+# only feature that adds Rust dependencies (detcore-dbt + reverie-dbt); `sabre`
+# and `e9patch` shell out to external artifacts at runtime and only gate their
+# in-crate dispatch code.
+[features]
+default = []
+# Native controls exercise real KVM ownership/RPC helpers without a VM.
+kvm-native-test-support = ["reverie-kvm/native-test-support"]
+dbt = ["dep:detcore-dbt", "dep:reverie-dbt"]
+sabre = []
+e9patch = []
+third-party-backends = ["dbt", "sabre", "e9patch"]
+# Hardware qualification selected only by the existing KVM validation nodes.
+kvm-execution-tests = []
+
 [dependencies]
 anyhow = "1.0.104"
 bincode = { version = "2", features = ["serde"] }
+addr2line = "0.26.1"
 clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 colored = "2.1.0"
-detcore = { path = "../detcore" }
+detcore = { package = "hermit-detcore", version = "0.2.0", path = "../detcore" }
+detcore-dbt = { version = "0.2.0", path = "../detcore-dbt", optional = true }
+detcore-model = { version = "0.2.0", path = "../detcore-model" }
 diff = "0.1.13"
 dirs = "7.0"
-edit-distance = { path = "../common/edit-distance" }
 fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 goblin = { version = "0.10.7", features = ["elf32", "elf64", "endian_fd"] }
-iced-x86 = "1.21.0"
+hermit-resources = { version = "0.2.0", path = "../hermit-resources" }
+hermit-test-workdir = { version = "0.2.0", path = "../common/test-workdir" }
+iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder"] }
 libc = "0.2.186"
-nix = { version = "0.31.3", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
+nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
 num_cpus = "1.16"
+object = { version = "0.36.7", features = ["read"] }
 pretty_assertions = { version = "1.4.1", features = ["alloc"], default-features = false }
 rand = "0.10.2"
 rand_pcg = { version = "0.10.2", features = ["serde"] }
 regex = "1.13.1"
-reverie = { version = "0.1.0", git = "https://github.com/facebookexperimental/reverie.git", branch = "main" }
-reverie-ptrace = { version = "0.1.0", git = "https://github.com/facebookexperimental/reverie.git", branch = "main" }
+# Reverie is pinned to a specific commit for reproducibility. Keep this rev in
+# sync across all crates and bump it via docs/updating-reverie.md.
+reverie = { package = "reverie-core", version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "123df7c4c0169006fbfe1f11a1553fe333eac937" }
+reverie-dbt = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "123df7c4c0169006fbfe1f11a1553fe333eac937", default-features = false, optional = true }
+reverie-kvm = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "123df7c4c0169006fbfe1f11a1553fe333eac937" }
+reverie-ptrace = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "123df7c4c0169006fbfe1f11a1553fe333eac937" }
+reverie-liteinst = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "123df7c4c0169006fbfe1f11a1553fe333eac937", default-features = false }
+reverie-rpc-transport = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "123df7c4c0169006fbfe1f11a1553fe333eac937" }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = { version = "1.0.151", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 shell-words = "1.1.1"
@@ -35,5 +68,6 @@ tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 tracing-appender = "0.2.5"
+tracing-log = "0.2.0"
 tracing-subscriber = { version = "0.3.23", features = ["chrono", "env-filter", "json", "local-time", "parking_lot", "registry"] }
 uuid = { version = "1.26.1", features = ["rng-getrandom", "serde", "v4", "v5", "v6", "v7", "v8"] }

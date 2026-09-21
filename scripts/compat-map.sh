@@ -1,35 +1,29 @@
 #!/usr/bin/env bash
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 #
 # compat-map.sh — quick Hermit compatibility / frontier status at a glance.
 #
 # Answers "where are we?" without running the full stress/envelope suite:
-#   * which instrumentation backends are usable on this host (ptrace/kvm/dbi),
+#   * which instrumentation backends are usable on this host (ptrace/kvm/dbt),
 #   * pass/fail counts for a small set of system binaries at assurance
 #     levels L1..L3, on the ptrace backend, and
 #   * an inventory of the rr-test and OSS-app buckets (counted, not executed,
 #     because those download/build or take minutes).
 #
 # It is intentionally FAST (a handful of tiny guest runs) so it can be run
-# on-demand. For the authoritative determinism envelope use ./validate.sh.
+# on-demand. For the authoritative determinism envelope use scripts/validate.rs.
 #
 # Output: a human-readable summary by default; machine-readable JSON with
 # --json (and/or written to a file with --out FILE).
 #
-# The assurance probes deliberately mirror validate.sh's host-capability-matched
+# The assurance probes deliberately mirror scripts/validate.rs's host-capability-matched
 # flags (NOT full --strict): --base-env=minimal --no-virtualize-cpuid
-# --preemption-timeout=disabled. This runs on hosts without PMU access or CPUID
+# --max-timeslice=disabled. This runs on hosts without PMU access or CPUID
 # faulting, so the counts are comparable to the working-envelope rubric.
 #
 #   L1  deterministic run            run ... -- PROG
 #   L2  bitwise-identical repeat     run ... --verify -- PROG
 #   L3  memory determinism           run ... --verify --detlog-heap --detlog-stack -- PROG
-#   L4  stress-hardened              not measured here (see ./validate.sh)
+#   L4  stress-hardened              not measured here (see scripts/validate.rs)
 
 set -uo pipefail
 
@@ -40,11 +34,15 @@ set -uo pipefail
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd "$script_dir/.." && pwd)
 
+# shellcheck source=scripts/lib/test_results.sh
+source "$repo_root/scripts/lib/test_results.sh"
+
 HERMIT_BIN=${HERMIT_BIN:-"$repo_root/target/debug/hermit"}
 CASE_TIMEOUT=${CASE_TIMEOUT_SECONDS:-30}
 emit_json=0
 json_out=""
 run_rr=0
+self_test=0
 
 usage() {
     cat <<'EOF'
@@ -55,6 +53,7 @@ Options:
                     (instead of the human summary).
   --out FILE        Also write the JSON report to FILE.
   --run-rr          Additionally execute the rr suite (slow; off by default).
+  --self-test       Exercise typed rr result consumption without running Hermit.
   -h, --help        Show this help.
 
 Environment:
@@ -68,11 +67,127 @@ while [[ $# -gt 0 ]]; do
         --json) emit_json=1 ;;
         --out) shift; json_out=${1:-} ;;
         --run-rr) run_rr=1 ;;
+        --self-test) self_test=1 ;;
         -h|--help) usage; exit 0 ;;
         *) printf 'error: unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
     shift
 done
+
+rr_status="inventory-only"
+rr_pass=""
+rr_fail=""
+rr_filtered=""
+rr_exit=""
+rr_reason=""
+
+load_rr_results() { # <result-file> <command-status>
+    local result_file=$1 command_status=${2:-0}
+    if ! load_test_results "$result_file"; then
+        rr_status="unknown"
+        rr_pass=""
+        rr_fail=""
+        rr_filtered=""
+        rr_exit=$command_status
+        rr_reason="typed test result unavailable"
+        return 1
+    fi
+    if ((command_status == 0 && TEST_RESULTS_FAILED == 0)); then
+        rr_status="executed"
+        rr_reason=""
+    elif ((command_status == 0)); then
+        rr_status="unknown"
+        rr_reason="exit 0 disagrees with $TEST_RESULTS_FAILED typed failure(s)"
+    else
+        rr_status="aborted"
+        rr_reason="command exited nonzero"
+    fi
+    rr_pass=$TEST_RESULTS_PASSED
+    rr_fail=$TEST_RESULTS_FAILED
+    rr_filtered=$TEST_RESULTS_FILTERED
+    rr_exit=$command_status
+}
+
+rr_result_summary() { # <catalogued-case-count>
+    local case_count=$1
+    if [[ $rr_status == executed ]]; then
+        printf 'executed: %s passed, %s failed, %s filtered (of %d cases)' \
+            "${rr_pass:-?}" "${rr_fail:-?}" "${rr_filtered:-?}" "$case_count"
+    elif [[ $rr_status == aborted ]]; then
+        printf 'ABORTED at exit %s after %s passed; %s failed, %s filtered (of %d cases)' \
+            "${rr_exit:-?}" "${rr_pass:-?}" "${rr_fail:-?}" "${rr_filtered:-?}" \
+            "$case_count"
+    elif [[ $rr_status == unknown ]]; then
+        printf 'unknown: %s; command exit %s (of %d cases)' \
+            "$rr_reason" "${rr_exit:-?}" "$case_count"
+    else
+        printf '%d cases catalogued (inventory-only; run with --run-rr or' "$case_count"
+    fi
+}
+
+self_test_typed_results() {
+    local scratch fixed_log_hash='' missing_status=0
+    scratch=$(mktemp -d)
+    trap 'rm -rf -- "$scratch"' RETURN
+    printf 'test result: ok. 999 passed; 0 failed; 0 ignored\n' >"$scratch/fixed-human.log"
+    fixed_log_hash=$(sha256sum "$scratch/fixed-human.log")
+
+    # shellcheck disable=SC2016 # `$` is part of the stable test identity.
+    DAGRUN_TEST_COUNTS_PATH="$scratch/results.json" \
+        "$repo_root/ci/write-structured-test-counts.sh" 2 7 \
+            'rr_suite$passes' pass 1 'rr_suite$fails' fail 1 || return 1
+    load_rr_results "$scratch/results.json" 1 || return 1
+    [[ $rr_status == aborted && $rr_pass == 1 && $rr_fail == 1 \
+        && $rr_filtered == 7 && $rr_exit == 1 \
+        && $rr_reason == 'command exited nonzero' ]] || return 1
+    [[ $(rr_result_summary 212) == \
+        'ABORTED at exit 1 after 1 passed; 1 failed, 7 filtered (of 212 cases)' ]] \
+        || return 1
+
+    load_rr_results "$scratch/results.json" 0 || return 1
+    [[ $rr_status == unknown && $rr_pass == 1 && $rr_fail == 1 \
+        && $rr_filtered == 7 && $rr_exit == 0 \
+        && $rr_reason == 'exit 0 disagrees with 1 typed failure(s)' ]] || return 1
+
+    # shellcheck disable=SC2016 # `$` is part of the stable test identity.
+    DAGRUN_TEST_COUNTS_PATH="$scratch/results.json" \
+        "$repo_root/ci/write-structured-test-counts.sh" 3 4 \
+            'rr_suite$one' pass 1 'rr_suite$two' pass 1 'rr_suite$three' pass 1 \
+        || return 1
+    load_rr_results "$scratch/results.json" 0 || return 1
+    [[ $rr_status == executed && $rr_pass == 3 && $rr_fail == 0 && $rr_filtered == 4 ]] \
+        || return 1
+    load_rr_results "$scratch/results.json" 7 || return 1
+    [[ $rr_status == aborted && $rr_pass == 3 && $rr_fail == 0 \
+        && $rr_filtered == 4 && $rr_exit == 7 ]] || return 1
+    [[ $(rr_result_summary 212) == \
+        'ABORTED at exit 7 after 3 passed; 0 failed, 4 filtered (of 212 cases)' ]] \
+        || return 1
+
+    DAGRUN_TEST_COUNTS_PATH="$scratch/results.json" \
+        "$repo_root/ci/write-structured-test-counts.sh" 0 0 || return 1
+    load_rr_results "$scratch/results.json" 100 || return 1
+    [[ $rr_status == aborted && $rr_pass == 0 && $rr_fail == 0 \
+        && $rr_filtered == 0 && $rr_exit == 100 ]] || return 1
+    [[ $(rr_result_summary 212) == \
+        'ABORTED at exit 100 after 0 passed; 0 failed, 0 filtered (of 212 cases)' ]] \
+        || return 1
+    [[ $(sha256sum "$scratch/fixed-human.log") == "$fixed_log_hash" ]] || return 1
+
+    rm -f -- "$scratch/results.json"
+    load_rr_results "$scratch/results.json" 9 >/dev/null 2>&1 || missing_status=$?
+    [[ $missing_status != 0 && $rr_status == unknown && $rr_exit == 9 \
+        && $rr_reason == 'typed test result unavailable' ]] || return 1
+    [[ $(rr_result_summary 212) == \
+        'unknown: typed test result unavailable; command exit 9 (of 212 cases)' ]] \
+        || return 1
+    printf 'compat-map: typed rr result self-test PASS\n'
+}
+
+if [[ $self_test -eq 1 ]]; then
+    self_test_typed_results
+    exit
+fi
 
 log() { [[ $emit_json -eq 1 ]] || printf '%s\n' "$*" >&2; }
 
@@ -84,7 +199,7 @@ if [[ ! -x $HERMIT_BIN ]]; then
 fi
 
 # Host-matched run flags shared by every assurance level (see header).
-declare -ar RUN_FLAGS=(run --base-env=minimal --no-virtualize-cpuid --preemption-timeout=disabled)
+declare -ar RUN_FLAGS=(run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled)
 
 # System binaries probed on the ptrace backend, each with a stable,
 # side-effect-free, exit-0 invocation (filter tools use a version probe, matching
@@ -161,15 +276,15 @@ if [[ $backend_flag_supported -eq 1 ]]; then
     fi
 fi
 
-# dbi needs a configured DynamoRIO environment.
-dbi_available=0
-dbi_reason="no --backend flag"
+# dbt needs a configured DynamoRIO environment.
+dbt_available=0
+dbt_reason="no --backend flag"
 if [[ $backend_flag_supported -eq 1 ]]; then
-    if [[ -n ${DYNAMORIO_HOME:-} && -n ${HERMIT_DRRUN:-} && -n ${HERMIT_DBI_CLIENT:-} ]]; then
-        dbi_available=1
-        dbi_reason="DynamoRIO environment configured"
+    if [[ -n ${DYNAMORIO_HOME:-} && -n ${HERMIT_DRRUN:-} && -n ${HERMIT_DBT_CLIENT:-} ]]; then
+        dbt_available=1
+        dbt_reason="DynamoRIO environment configured"
     else
-        dbi_reason="DynamoRIO env not set (DYNAMORIO_HOME/HERMIT_DRRUN/HERMIT_DBI_CLIENT)"
+        dbt_reason="DynamoRIO env not set (DYNAMORIO_HOME/HERMIT_DRRUN/HERMIT_DBT_CLIENT)"
     fi
 fi
 
@@ -223,7 +338,7 @@ if [[ $ptrace_available -eq 1 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Backend launch probes (kvm/dbi run only a builtin hello-world)
+# Backend launch probes (kvm/dbt run only a builtin hello-world)
 # ---------------------------------------------------------------------------
 
 kvm_probe="not-run"
@@ -235,12 +350,12 @@ if [[ $kvm_available -eq 1 ]]; then
     fi
 fi
 
-dbi_probe="not-run"
-if [[ $dbi_available -eq 1 ]]; then
-    if timeout "$CASE_TIMEOUT" "$HERMIT_BIN" run --backend dbi -- /bin/true </dev/null >/dev/null 2>&1; then
-        dbi_probe="pass"
+dbt_probe="not-run"
+if [[ $dbt_available -eq 1 ]]; then
+    if timeout "$CASE_TIMEOUT" "$HERMIT_BIN" run --backend dbt -- /bin/true </dev/null >/dev/null 2>&1; then
+        dbt_probe="pass"
     else
-        dbi_probe="fail"
+        dbt_probe="fail"
     fi
 fi
 
@@ -252,34 +367,27 @@ rr_suite_file="$repo_root/hermit-cli/tests/rr_suite.rs"
 rr_count=0
 [[ -f $rr_suite_file ]] && rr_count=$(grep -cE 'rr_test!\(' "$rr_suite_file" 2>/dev/null || echo 0)
 
-rr_status="inventory-only"
-rr_pass=""
-rr_fail=""
 if [[ $run_rr -eq 1 && $rr_count -gt 0 ]]; then
     log "Running rr suite (this is slow)..."
     rr_log=$(mktemp)
-    ( cd "$repo_root" && timeout 1800 cargo test -p hermit --test rr_suite -- --ignored ) \
-        >"$rr_log" 2>&1
-    line=$(grep -E 'test result:' "$rr_log" | tail -1)
-    rr_pass=$(sed -nE 's/.* ([0-9]+) passed.*/\1/p' <<<"$line")
-    rr_fail=$(sed -nE 's/.* ([0-9]+) failed.*/\1/p' <<<"$line")
-    rr_status="executed"
-    rm -f "$rr_log"
+    rr_results=$(mktemp)
+    rm -f -- "$rr_results"
+    rr_exit=0
+    ( cd "$repo_root" && DAGRUN_TEST_COUNTS_PATH="$rr_results" \
+        timeout 1800 ./ci/run-nextest-counted.sh -p hermit --test rr_suite -- --ignored ) \
+        >"$rr_log" 2>&1 || rr_exit=$?
+    load_rr_results "$rr_results" "$rr_exit" || true
+    if [[ $rr_status == unknown ]]; then
+        log "rr suite result is unknown ($rr_reason; command exit $rr_exit)"
+    fi
+    rm -f -- "$rr_log" "$rr_results"
 fi
 
-# OSS apps: detect integration tests and experiment evidence dirs.
+# OSS apps: detect integration tests.
 declare -a oss_apps=()
 for t in leveldb redis_strict sqlite_veryquick python_stdlib language_runtime_determinism; do
     [[ -f "$repo_root/hermit-cli/tests/$t.rs" ]] && oss_apps+=("test:$t")
 done
-if [[ -d "$repo_root/experiments" ]]; then
-    for d in "$repo_root"/experiments/*/; do
-        base=$(basename "$d")
-        case "$base" in
-            lulesh*|ninja*|leveldb*|redis*|sqlite*) oss_apps+=("experiment:$base") ;;
-        esac
-    done
-fi
 oss_count=${#oss_apps[@]}
 
 # ---------------------------------------------------------------------------
@@ -299,8 +407,8 @@ build_json() {
     printf '    "ptrace": {"available": true, "probe": "system-binaries-matrix"},\n'
     printf '    "kvm": {"available": %s, "reason": %s, "probe": %s},\n' \
         "$([[ $kvm_available -eq 1 ]] && echo true || echo false)" "$(json_str "$kvm_reason")" "$(json_str "$kvm_probe")"
-    printf '    "dbi": {"available": %s, "reason": %s, "probe": %s}\n' \
-        "$([[ $dbi_available -eq 1 ]] && echo true || echo false)" "$(json_str "$dbi_reason")" "$(json_str "$dbi_probe")"
+    printf '    "dbt": {"available": %s, "reason": %s, "probe": %s}\n' \
+        "$([[ $dbt_available -eq 1 ]] && echo true || echo false)" "$(json_str "$dbt_reason")" "$(json_str "$dbt_probe")"
     printf '  },\n'
     printf '  "buckets": {\n'
     printf '    "system_binaries": {\n'
@@ -322,8 +430,15 @@ build_json() {
     printf '\n      ]\n'
     printf '    },\n'
     printf '    "rr_tests": {"status": %s, "case_count": %d' "$(json_str "$rr_status")" "$rr_count"
-    if [[ $rr_status == executed ]]; then
-        printf ', "passed": %s, "failed": %s' "${rr_pass:-null}" "${rr_fail:-null}"
+    if [[ $rr_status == executed || $rr_status == aborted ]]; then
+        printf ', "passed": %s, "failed": %s, "filtered": %s' \
+            "${rr_pass:-null}" "${rr_fail:-null}" "${rr_filtered:-null}"
+        if [[ $rr_status == aborted ]]; then
+            printf ', "command_exit": %s' "${rr_exit:-null}"
+        fi
+    elif [[ $rr_status == unknown ]]; then
+        printf ', "reason": %s, "command_exit": %s' \
+            "$(json_str "$rr_reason")" "${rr_exit:-null}"
     fi
     printf '},\n'
     printf '    "oss_apps": {"status": "inventory-only", "count": %d, "items": [' "$oss_count"
@@ -369,14 +484,14 @@ echo "Backends"
 printf '  ptrace  available     (arbitrary ELF; used for the matrix below)\n'
 printf '  kvm     %-11s %s [probe: %s]\n' \
     "$([[ $kvm_available -eq 1 ]] && echo available || echo unavailable)" "$kvm_reason" "$kvm_probe"
-printf '  dbi     %-11s %s [probe: %s]\n' \
-    "$([[ $dbi_available -eq 1 ]] && echo available || echo unavailable)" "$dbi_reason" "$dbi_probe"
+printf '  dbt     %-11s %s [probe: %s]\n' \
+    "$([[ $dbt_available -eq 1 ]] && echo available || echo unavailable)" "$dbt_reason" "$dbt_probe"
 hr
 echo "System binaries (ptrace backend) — pass/total per assurance level"
 printf '  L1 deterministic run        %d/%d\n' "${pass[L1]}" "$sysbin_total"
 printf '  L2 bitwise-identical repeat %d/%d\n' "${pass[L2]}" "$sysbin_total"
 printf '  L3 memory determinism       %d/%d\n' "${pass[L3]}" "$sysbin_total"
-printf '  L4 stress-hardened          (not measured here; run ./validate.sh)\n'
+printf '  L4 stress-hardened          (not measured here; run ./scripts/validate.rs)\n'
 if [[ ${#sysbin_detail[@]} -gt 0 ]]; then
     echo "  per-binary (L1 L2 L3):"
     for entry in "${sysbin_detail[@]}"; do
@@ -386,16 +501,13 @@ if [[ ${#sysbin_detail[@]} -gt 0 ]]; then
 fi
 hr
 echo "Other buckets"
-if [[ $rr_status == executed ]]; then
-    printf '  rr tests   %s: %s passed, %s failed (of %d cases)\n' \
-        "$rr_status" "${rr_pass:-?}" "${rr_fail:-?}" "$rr_count"
-else
-    printf '  rr tests   %d cases catalogued (inventory-only; run with --run-rr or\n' "$rr_count"
+printf '  rr tests   %s\n' "$(rr_result_summary "$rr_count")"
+if [[ $rr_status == inventory-only ]]; then
     # shellcheck disable=SC2016  # backticks are a literal hint, not a command substitution
-    printf '             `cargo test -p hermit --test rr_suite -- --ignored`)\n'
+    printf '             `./ci/run-nextest-counted.sh -p hermit --test rr_suite -- --ignored`)\n'
 fi
 printf '  oss apps   %d catalogued (inventory-only): %s\n' "$oss_count" "${oss_apps[*]:-none}"
 hr
 echo "Note: assurance probes use host-matched flags (no --strict/PMU); this is a"
-echo "quick map, not the full envelope. Use ./validate.sh for L4 and strict gates."
+echo "quick map, not the full envelope. Use ./scripts/validate.rs for L4 and strict gates."
 echo

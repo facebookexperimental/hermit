@@ -10,6 +10,10 @@
 
 use std::mem::MaybeUninit;
 use std::ptr;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::thread;
 use std::time;
 
 use chrono::DateTime;
@@ -20,6 +24,9 @@ use detcore::types::NANOS_PER_SYSCALL;
 use reverie::Rdtsc;
 use reverie::RdtscResult;
 use reverie_ptrace::testing::check_fn_with_config;
+
+// Keep this synchronized with the clock-query category in `syscall_time`.
+const NANOS_PER_CLOCK_GETTIME: f64 = 10_000.0;
 
 #[global_allocator]
 static ALLOC: test_allocator::Global = test_allocator::Global;
@@ -190,6 +197,100 @@ fn tod_clock_gettime() {
 }
 
 #[test]
+fn target_timeslice_yields_at_syscall_boundaries_without_pmu() {
+    let config = detcore::Config {
+        virtualize_time: true,
+        max_timeslice: None,
+        target_timeslice: std::num::NonZeroU64::new(100_000),
+        sequentialize_threads: true,
+        no_rcb_time: true,
+        // Cancel no_rcb_time's 500x fallback so the target is literal virtual nanoseconds.
+        clock_multiplier: Some(1.0 / 500.0),
+        ..Default::default()
+    };
+    check_fn_with_config::<Detcore, _>(
+        || {
+            let read_time = || {
+                let mut now = MaybeUninit::<libc::timespec>::uninit();
+                let result = unsafe {
+                    libc::syscall(
+                        libc::SYS_clock_gettime,
+                        libc::CLOCK_MONOTONIC,
+                        now.as_mut_ptr(),
+                    )
+                };
+                assert_eq!(result, 0);
+                unsafe { now.assume_init() }
+            };
+
+            let done = Arc::new(AtomicBool::new(false));
+            let worker_done = Arc::clone(&done);
+            let worker = thread::spawn(move || {
+                thread::sleep(time::Duration::from_millis(1));
+                worker_done.store(true, Ordering::Release);
+            });
+
+            let mut calls = 0;
+            while !done.load(Ordering::Acquire) && calls < 1_000 {
+                read_time();
+                calls += 1;
+            }
+
+            assert!(
+                done.load(Ordering::Acquire),
+                "clock_gettime loop starved its peer for {calls} calls"
+            );
+            worker.join().unwrap();
+        },
+        config,
+        true,
+    );
+}
+
+#[test]
+fn max_timeslice_preempts_cpu_bound_code_without_rcb_logical_time() {
+    let config = detcore::Config {
+        virtualize_time: true,
+        max_timeslice: std::num::NonZeroU64::new(1_000_000),
+        target_timeslice: None,
+        sequentialize_threads: true,
+        no_rcb_time: true,
+        clock_multiplier: Some(1.0),
+        record_preemptions: true,
+        ..Default::default()
+    };
+    check_fn_with_config::<Detcore, _>(
+        || {
+            let start = Arc::new(AtomicBool::new(false));
+            let done = Arc::new(AtomicBool::new(false));
+            let worker_start = Arc::clone(&start);
+            let worker_done = Arc::clone(&done);
+            let worker = thread::spawn(move || {
+                while !worker_start.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                worker_done.store(true, Ordering::Release);
+            });
+
+            start.store(true, Ordering::Release);
+            let mut spins = 0;
+            while !done.load(Ordering::Acquire) && spins < 50_000_000 {
+                std::hint::spin_loop();
+                spins += 1;
+            }
+
+            assert!(
+                done.load(Ordering::Acquire),
+                "PMU maximum did not schedule the peer after {spins} spins"
+            );
+            worker.join().unwrap();
+        },
+        config,
+        true,
+    );
+}
+
+#[test]
 fn tod_clock_getres() {
     let mut tp: MaybeUninit<libc::timespec> = MaybeUninit::uninit();
     let config = detcore::Config {
@@ -212,6 +313,32 @@ fn tod_clock_getres() {
     );
 }
 
+// Regression: a NULL `res` pointer is valid for clock_getres (the kernel
+// validates the clockid and returns 0 without storing the resolution). GHC's
+// threaded RTS probes the per-thread CPU clock this way in
+// getCurrentThreadCPUTime; returning EFAULT here spuriously aborts the guest.
+#[test]
+fn clock_getres_null_res_is_ok() {
+    let config = detcore::Config {
+        virtualize_time: true,
+        ..Default::default()
+    };
+    check_fn_with_config::<Detcore, _>(
+        || {
+            assert_eq!(
+                unsafe { libc::clock_getres(libc::CLOCK_MONOTONIC, std::ptr::null_mut()) },
+                0
+            );
+            assert_eq!(
+                unsafe { libc::clock_getres(libc::CLOCK_THREAD_CPUTIME_ID, std::ptr::null_mut()) },
+                0
+            );
+        },
+        config,
+        true,
+    );
+}
+
 #[test]
 fn tod_clock_getres_2() {
     let multiplier = 1000.0;
@@ -221,7 +348,7 @@ fn tod_clock_getres_2() {
         ..Default::default()
     };
     let sequentialize = config.sequentialize_threads;
-    let timeout_disabled = config.preemption_timeout.is_none();
+    let timeout_disabled = config.max_timeslice.is_none();
     check_fn_with_config::<Detcore, _>(
         || {
             let now = time::Instant::now();
@@ -229,9 +356,9 @@ fn tod_clock_getres_2() {
             let nanos = now.elapsed().as_nanos();
             let expected = if sequentialize && timeout_disabled {
                 // Additional multiplier, see DetTime::new():
-                500 * (multiplier * NANOS_PER_SYSCALL) as u128
+                500 * (multiplier * NANOS_PER_CLOCK_GETTIME) as u128
             } else {
-                (multiplier * NANOS_PER_SYSCALL) as u128
+                (multiplier * NANOS_PER_CLOCK_GETTIME) as u128
             };
             // account for some slop from RCBs
             assert!(nanos >= expected);
@@ -261,6 +388,117 @@ fn rdtsc_deltas() {
             );
             // Whatever the delta is, it has to have stepped by AT LEAST the multiplier:
             assert!(tsc2 - tsc1 > 12345);
+        },
+        config,
+        true,
+    );
+}
+
+/// `rdtsc` and `clock_gettime` must name the same instant.
+///
+/// They used to read two different clocks: `rdtsc` returned the calling
+/// thread's own logical time while `clock_gettime` returned the coordinator's,
+/// which is the sum over threads. A guest comparing them -- a clocksource
+/// watchdog, a delay loop calibrated against a device timer -- saw two clocks
+/// disagreeing by milliseconds and diverging in rate with the thread count.
+///
+/// Sampling repeatedly rather than once is deliberate: agreeing on a first read
+/// while drifting afterwards is the failure this is meant to catch.
+#[test]
+fn rdtsc_agrees_with_clock_gettime() {
+    let config = detcore::Config {
+        virtualize_time: true,
+        ..Default::default()
+    };
+    check_fn_with_config::<Detcore, _>(
+        || {
+            // One intercepted syscall's worth of virtual time separates the two
+            // reads, plus slack for the retired branches between them.
+            let tolerance = 100 * NANOS_PER_SYSCALL as u64;
+            for i in 0..8 {
+                let tsc = RdtscResult::new(Rdtsc::Tsc).tsc;
+                let mut ts = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                };
+                assert_eq!(
+                    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) },
+                    0
+                );
+                let mono = ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64;
+                let gap = mono.abs_diff(tsc);
+                println!(
+                    "sample {}: rdtsc {} clock_gettime {} gap {}",
+                    i, tsc, mono, gap
+                );
+                assert!(
+                    gap < tolerance,
+                    "rdtsc and clock_gettime are {} ns apart on sample {}, which is more \
+                     than the {} ns a single intercepted syscall accounts for; they are \
+                     reading different clocks again",
+                    gap,
+                    i,
+                    tolerance,
+                );
+            }
+        },
+        config,
+        true,
+    );
+}
+
+/// A malformed `timespec` must fail EINVAL, not become an indefinite sleep.
+///
+/// Detcore fed `Timespec`'s signed fields through `as u64`, so `tv_sec = -1`
+/// wrapped to `u64::MAX` and produced `SleepUntil(INDEFINITE)`. The only guest
+/// thread then parked with no deadline, the run queue emptied, and the
+/// scheduler deliberately does not jump the clock for an indefinite waiter, so
+/// the container died instead of returning an errno.
+///
+/// Both directions matter here, which is why the past-absolute case is in the
+/// same test: rejecting a malformed field must not also reject an early
+/// deadline. Measured against native Linux on x86_64: all three malformed
+/// shapes give EINVAL, and a past absolute deadline gives 0.
+#[test]
+fn nanosleep_rejects_malformed_timespec_but_not_a_past_deadline() {
+    let config = detcore::Config {
+        virtualize_time: true,
+        ..Default::default()
+    };
+    check_fn_with_config::<Detcore, _>(
+        || {
+            // `clock_nanosleep` returns the error directly rather than via errno.
+            let sleep = |sec: i64, nsec: i64, flags: libc::c_int| -> libc::c_int {
+                let ts = libc::timespec {
+                    tv_sec: sec,
+                    tv_nsec: nsec,
+                };
+                unsafe { libc::clock_nanosleep(libc::CLOCK_MONOTONIC, flags, &ts, ptr::null_mut()) }
+            };
+
+            // Malformed: negative seconds is the case that used to hang.
+            assert_eq!(sleep(-1, 0, 0), libc::EINVAL, "relative tv_sec=-1");
+            assert_eq!(sleep(0, -1, 0), libc::EINVAL, "relative tv_nsec=-1");
+            assert_eq!(
+                sleep(0, 1_000_000_000, 0),
+                libc::EINVAL,
+                "relative tv_nsec out of range"
+            );
+            assert_eq!(
+                sleep(-1, 0, libc::TIMER_ABSTIME),
+                libc::EINVAL,
+                "absolute tv_sec=-1"
+            );
+
+            // Well-formed, and must still succeed: a zero interval, and an
+            // absolute deadline already in the past. Neither is an error on
+            // Linux, so a fix that rejected them would be too aggressive.
+            assert_eq!(sleep(0, 0, 0), 0, "zero relative interval");
+            assert_eq!(
+                sleep(1, 0, libc::TIMER_ABSTIME),
+                0,
+                "past absolute deadline"
+            );
         },
         config,
         true,

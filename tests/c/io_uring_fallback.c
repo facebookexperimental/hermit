@@ -32,15 +32,18 @@ int main(void) {
   struct io_uring_params params = {0};
 
   errno = 0;
-  expect_enosys("io_uring_setup", syscall(SYS_io_uring_setup, 8, &params));
+  expect_enosys(
+      "io_uring_setup", syscall(SYS_io_uring_setup, 8, &params));
 
   errno = 0;
   expect_enosys(
-      "io_uring_enter", syscall(SYS_io_uring_enter, -1, 0, 0, 0, NULL, 0));
+      "io_uring_enter",
+      syscall(SYS_io_uring_enter, -1, 0, 0, 0, NULL, 0));
 
   errno = 0;
   expect_enosys(
-      "io_uring_register", syscall(SYS_io_uring_register, -1, 0, NULL, 0));
+      "io_uring_register",
+      syscall(SYS_io_uring_register, -1, 0, NULL, 0));
 
   int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
   if (epoll_fd < 0) {

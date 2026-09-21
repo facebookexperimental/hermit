@@ -15,20 +15,35 @@ conditional test execution; if those are wanted, track them in a separate
 implementation issue and link it here.
 
 > The headline rule: **not every x86-64 Linux machine can run every Hermit
-> test.** A green `cargo test --workspace` on a hosted VM demonstrates the
+> test.** A green `cargo test --workspace` on a portable VM demonstrates the
 > environment-independent subset only, not the PMU- and namespace-dependent
 > integration matrix.
 
-## `validate.sh` levels
+## `scripts/validate.rs` levels
 
-`./validate.sh` accepts one optional validation level. With no level argument,
+`./scripts/validate.rs` accepts one optional validation level. With no level argument,
 it runs `full` for backward compatibility.
 
-| Level | Coverage |
-| --- | --- |
-| `quick` | Builds the workspace, runs Detcore's core unit tests, and exercises ptrace run, repeat-output, verify, record, and replay smoke tests. It does not execute DBI or KVM or build the optimized binary. |
-| `full` (default) | Runs everything in `quick`, the pre-existing workspace, compatibility, record/replay, stress, rr, analyze, documentation, formatting, and lint gates, then runs the KVM and DBI parity ratchets when those backends are available. |
-| `super` | Builds Hermit and repeats each bounded determinism probe 20 times by default. It reports `passed/total` for every probe and fails if any iteration fails. Available KVM and DBI verify probes join the ptrace strict-verify, pipeline, and record/replay probes. |
+| Level | Typical estimate | Coverage |
+| --- | --- | --- |
+| `quick` | About 3 minutes | Builds the workspace, runs Detcore's core unit tests, and exercises ptrace run, repeat-output, verify, record, and replay smoke tests. It does not execute DBT or KVM or build the optimized binary. |
+| `portable-only` | About 8 minutes | Constructs the portable plan also selected by the integration-branch and manually dispatched GitHub-managed portable workflow: build, portable workspace tests, Hermit and Detcore library/binary tests, docs, Clippy, and rustfmt. It does not require PMU or guest namespaces. |
+| `full` (default) | About 20-70 minutes | Constructs the portable and privileged plan from the committed validation data. This includes the portable product gates plus the focused CPUID, PMU, KVM, and record/replay capability partition. |
+| `super` | About 30-90 minutes | Builds Hermit and repeats each bounded determinism probe 20 times by default. It reports `passed/total` for every probe and fails if any iteration fails. Available KVM and DBT verify probes join the ptrace strict-verify, pipeline, and record/replay probes. |
+
+Select a level positionally or with `VALIDATE_LEVEL`. The long-form aliases are
+useful in scripts and make the intended capability tier explicit:
+
+```sh
+./scripts/validate.rs --quick
+./scripts/validate.rs --portable
+VALIDATE_LEVEL=portable-only ./scripts/validate.rs
+```
+
+`--quick` is an alias for `quick`; `--portable` and `--portable-only` are aliases
+for `portable-only`. The script prints the selected profile and its estimate
+before starting any gate. Treat estimates as planning guidance: a cold Cargo
+cache and host contention can increase elapsed time.
 
 Super mode defaults to `SUPER_REPETITIONS=20` and a concurrency limit of about
 1.5 times the online CPU count. Override those with positive integers in
@@ -37,8 +52,51 @@ run. The runner prints the host OS from `/etc/os-release`, repetition count,
 concurrency, and online CPU count so pass-rate reports retain their execution
 context.
 
+### Relaxed-mode flag matrix
+
+The `super` tier includes an occasional ptrace matrix that checks every
+meaningful combination from strict deterministic execution through the
+passthrough endpoints. The 60-state cross-product is:
+
+| Axis | States |
+| --- | --- |
+| Policy | relaxed; strict (which requires sequentialization and deterministic I/O) |
+| Thread scheduling | sequentialized; non-sequentialized (relaxed only) |
+| I/O | deterministic; host behavior (relaxed only) |
+| Time and metadata | both virtualized; time only; neither (metadata cannot be virtualized without time) |
+| CPUID | virtualized; host behavior |
+| Verification | off; two-run verification on |
+
+Three endpoint configurations add `--strace-only`, `--strace-only --verify`,
+and `--namespace-only`. Verification is invalid with `--namespace-only` and is
+therefore not presented as a runnable state. Each of the 63 configurations runs
+`/bin/true`, fixed stdio, and a threaded workload that observes clocks, file
+metadata, CPUID, and randomness: 189 bounded cases in total.
+
+Run the matrix directly with:
+
+```sh
+HERMIT_FLAG_MATRIX_REPORT=target/relaxed-flag-matrix/results.tsv \
+  cargo test -p hermit --test relaxed_flag_matrix \
+  meaningful_flag_combinations_run_without_crashing -- \
+  --exact --ignored --test-threads=1 --nocapture
+```
+
+The TSV report records the configuration, program, verification setting,
+outcome, and elapsed milliseconds. A valid non-verifying run must exit zero.
+A verifying run must either carry Hermit's deterministic success marker or its
+explicit nondeterminism result; timeouts, signals, panics, and unexplained
+nonzero exits fail the test. This distinction makes relaxed and passthrough
+verification useful without pretending those modes promise determinism.
+
+The exact strict/no-time `clock_gettime` failure is temporarily ratcheted as an
+expected failure linked to [issue #1176](https://github.com/rrnewton/hermit/issues/1176).
+Only that diagnostic signature is accepted, and the test requires its expected
+count so a fix prompts removal of the exception instead of silently leaving a
+stale waiver.
+
 The full and super backend gates probe actual runtime capability: KVM requires
-a readable and writable `/dev/kvm`; DBI must complete a bounded `/bin/true`
+a readable and writable `/dev/kvm`; DBT must complete a bounded `/bin/true`
 smoke using either its bundled DynamoRIO runtime or explicit environment
 configuration. An unavailable alternate backend is reported as `SKIP`, not as
 a ptrace failure.
@@ -77,10 +135,10 @@ namespaces (see the [CI tiers](#ci-tiers-what-runs-where) below).
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | **Bare metal (supported CPU)** | ✅ | ✅ (if recognized) | ✅ | ✅ (if `perf_event_paranoid` permits) | usually ✅ | ✅ | Full suite can pass, including PMU + namespace integration tests |
 | **Bare metal (newer/unrecognized CPU)** | ✅ | ❌ maybe | ✅ | ✅ | ✅ | ✅ | Timer/perf layer may reject the model → PMU tests fail; file a CPU-support bug (see below) |
-| **Hosted VM (typical cloud)** | ✅ | varies | ❌ usually | n/a | ❌ often | often ✅ | Env-independent subset passes; PMU and CPUID/RDRAND tests fail or skip |
-| **Self-hosted VM with virtualized PMU** | ✅ | ✅ | ✅ (if configured) | ✅ | varies | ✅ | Approaches bare metal; validate PMU tests explicitly before trusting them |
+| **Portable VM (typical cloud)** | ✅ | varies | ❌ usually | n/a | ❌ often | often ✅ | Env-independent subset passes; PMU and CPUID/RDRAND tests fail or skip |
+| **Privileged VM with virtualized PMU** | ✅ | ✅ | ✅ (if configured) | ✅ | varies | ✅ | Approaches bare metal; validate PMU tests explicitly before trusting them |
 | **Container (shares host CPU)** | ✅ | inherits host | inherits host, but | ❌ often restricted | inherits host | ❌ often blocked | CPU/PMU capabilities come from the host, but perf perms and namespaces are commonly restricted independently |
-| **WSL** | ✅ | varies | ❌ usually | n/a | varies | varies | Treat like a hosted VM; PMU-dependent tests are not expected to pass |
+| **WSL** | ✅ | varies | ❌ usually | n/a | varies | varies | Treat like a portable VM; PMU-dependent tests are not expected to pass |
 
 Notes:
 
@@ -94,48 +152,65 @@ Notes:
 
 ## CI tiers: what runs where
 
-CI (`.github/workflows/ci.yml`) is the reference for which tests are expected in
-ordinary GitHub Actions versus a specialized runner. There are two jobs:
+Local exact-head `scripts/validate.rs` is the canonical validation and landing
+path. The portable workflow also runs automatically after pushes to
+`integration`; that run is a second signal and never gates a pull request or a
+landing. Portable and privileged workflows remain manually dispatchable for
+comparing an ordinary GitHub Actions runner with a capability-bearing runner:
 
-### `regular` — GitHub-hosted (`ubuntu-latest`)
+### `regular` — GitHub-managed portable (`ubuntu-latest`)
 
-Runs on every push and pull request. Covers the **environment-independent
-subset**:
+Runs after a push to `integration` or by `workflow_dispatch`. It asks
+`scripts/validate.rs` for selected step tags from the constructed portable plan and covers the
+**environment-independent subset**:
 
 - `cargo build --workspace`
-- `cargo nextest run --profile ci --workspace` **excluding** `detcore`,
+- `cargo nextest run --profile ci --workspace` **excluding** `hermit-detcore`,
   `hermit`, and `hermetic_infra_hermit_flaky-tests`
 - `cargo test -p hermit --lib --bins` (no namespace-dependent integration tests)
-- `cargo test -p detcore --lib --bins` and
-  `cargo test -p detcore --test tests_misc getrandom_intercepted -- --exact`
-  (PMU-free: this test calls `reverie_ptrace::ret_without_perf!()`)
+- `cargo test -p hermit-detcore --lib --bins`
 - doc tests (`cargo test --workspace --doc`), `cargo doc`, Clippy, rustfmt
 
-GitHub-hosted runners have **no usable PMU and no CPUID faulting**, so the
+GitHub-managed portable runners have **no usable PMU and no CPUID faulting**, so the
 detcore and hermit integration suites are deliberately excluded here.
 
-### `hardware` — self-hosted (`[self-hosted, Linux, X64, hermit, pmu]`)
+### `privileged` — capability runner (`[Linux, X64, hermit, pmu]`)
 
-Runs on push, and on pull requests only from the trusted `rrnewton` account.
-Requires a bare-metal-class host with PMU access. Covers:
+Runs only by `workflow_dispatch`.
+Requires PMU access, CPUID faulting, and read/write `/dev/kvm`. It is a focused
+sub-five-minute sentinel: one CPUID test, one direct PMU overflow/skid probe,
+and one KVM multi-mode E2E cell. Broad product and stress coverage remains in
+portable or local validation.
 
-- **CPUID/RDRAND/RDSEED:** `tests_misc has_rdrand_without_detcore`,
-  `tests_misc rdrand_rdseed_is_masked`
-- **PMU timing/parallelism:** `tests_time --ignored`,
-  `tests_parallelism futex_wait_parent --ignored`,
-  `tests_parallelism 'mem_race::' --ignored`,
-  `tests_parallelism 'mem_print_race::' --ignored`
-- **Namespace-gated Hermit integration** (only if a mount-namespace probe
-  succeeds): `arbitrary_binaries`, `cli`, `clock_determinism`,
-  `epoll_determinism`, `mmap_determinism`, `procfs_determinism`,
-  `signal_determinism`, `record_replay_matrix`, `strict_mode_matrix`, the
-  fail-closed ratchet (`scripts/test-fail-closed.sh`), the working-envelope gate
-  (`validate.sh --envelope-compare`), and the debugger integration tests
-- **Backend parity ratchet:** always for `ptrace`; `kvm` only when `/dev/kvm` is
-  readable+writable; `dbi` only when the DynamoRIO environment is configured
+## Named measurement hosts
 
-If the mount-namespace probe fails, the job falls back to
-`cargo test -p hermit --lib --bins` only.
+`scripts/check-portable-paths.sh` refuses a literal hostname in a file that
+**builds or runs** — its scope predicate is `is_build_or_run_file`, and its own
+self-test pins that arbitrary text evidence is deliberately outside it. The harm it
+exists to prevent is a build or a run breaking on another machine; prose cannot do
+that. So this file is out of scope BY DESIGN, and that is what makes it the right
+home for a host identity.
+
+⚠️ **"The scanner does not look here" would NOT be a good enough reason.** Unscanned
+is not the same as permitted, and treating it as such is how a rule gets evaded by
+relocation. The claim above is the stronger one — the scope is deliberate, named and
+tested — and `scripts/check-portable-paths.sh` names this section as the designated
+destination, with a self-test, so the permission is declared rather than inferred.
+
+A measurement whose host is unrecorded cannot be re-run, compared, or challenged.
+Four fixes on 2026-08-25 (#2646, #2647, #2648, #2652) each satisfied the checker by
+erasing the host; this table is where the erased identities go back.
+
+| lane / node | measured on | what was measured |
+| --- | --- | --- |
+| `privileged` lane, node `test.cli_kvm` | `devbig014` | `/dev/kvm` mode 666; `open(O_RDWR)` succeeds; `KVM_GET_API_VERSION` = 12; `hermit run --backend kvm` exits 0 |
+| `privileged` lane, cell `applications/kvm-python-examples` | `devbig014`, `devbig030` | Retained passing validations measured 14.87-56.51 seconds; the same SHA measured 16.29 and 39.85 seconds respectively, so 15-second and 30-second bounds both cut valid L2 work |
+| `scripts/check-reverie-pin.rs` git-env lock | `devbig014` | 30x no-guard run failed 0 times; mutation of `under_git_env` failed 9 of 10 at load average ~39 |
+| `scripts/bisect-probe.rs` cost split | `devbig014` | BUILD 36.33s (hermit binary 36.21 + guest 0.12/id) vs TEST 3.53s per cell, range 1.6-10.9; `run --prebuilt` 6 cells 21.76s serial vs 11.55s at `--jobs 6`; 237 portable test ids expand to 304 required cells |
+| pinned authority outage, validation DAG node `check.lint_checks` | `devbig014` | On 2026-09-04, an HTTP 504 fetching the check-status authority made `make lint-checks` exit 2 and the node report FAILED; an unreachable review-label contract raised `RuntimeError` and made `make lint-checks` exit 1. Two gates went red on four consecutive hourly runs of a tree that had passed 267/267 earlier that day. |
+| pre-push submodule diagnosis | `devbig014` | On 2026-09-04, a fresh detached worktree with unpopulated submodules made Cargo fail before linting a Python-and-Makefile-only change; the hook incorrectly described that as a compile failure until the diagnosis was made explicit. |
+| `portable` lane, node `test.hermit_unit` | `devbig030` | Warm repeats at `a6b0c37648df`: nextest `-j1` 27.0s and 27.3s; `-j16` 14.4s and 13.7s; `CARGO_BUILD_JOBS=8` unchanged |
+| `refusal_detail_tests::REAL` in `scripts/validate.rs`, run 1838 | `devbig014` | On 2026-09-17, validation of `158a89f6217b25db9540237f9c1e256cdbaf785c` recorded `parity history changes candidate identity` for `portable/backend-parity-c/backend-parity-c/aio-refusal/verify@kvm`, run `validate-ops-tick-158a89f6217b-088d91951315`, outer attempt 2. The original 407-byte diagnostic is preserved unchanged in `tests/fixtures/scorecard-writeback/refusal.txt` and included as test data; its historical artifact path is evidence, not a runtime filesystem dependency. |
 
 ## Hardware-sensitive Cargo tests
 
@@ -146,7 +221,7 @@ root.
 | --- | --- | --- | --- |
 | `has_rdrand_without_detcore` | `detcore/tests/misc/mod.rs` | Host RDRAND | Probes host features; returns early if RDRAND absent |
 | `rdrand_rdseed_is_masked` | `detcore/tests/misc/mod.rs` | RDRAND/RDSEED **and** CPUID faulting | Runs without PMU (`det_test_fn_without_pmu`); skips if faulting unsupported |
-| `getrandom_intercepted` | `detcore/tests/misc/mod.rs` | None (PMU-free) | Uses `ret_without_perf!`; runs on GitHub-hosted CI |
+| `getrandom_intercepted` | `detcore/tests/misc/mod.rs` | None (PMU-free) | Uses `ret_without_perf!`; belongs in portable validation |
 | `tests_time` (`--ignored`) | `detcore/tests/time.rs` | PMU (RCB counters) | |
 | `tests_parallelism` `futex_wait_parent`, `mem_race::`, `mem_print_race::` (`--ignored`) | `detcore/tests/parallelism*` | PMU (RCB counters) | |
 | chaos schedule-bisection tests (`--ignored`) | `hermit-cli/tests/analyze.rs` | PMU **and** mount/user namespaces | `#[ignore]`: "requires PMU branch counters and working mount namespaces" |
@@ -157,9 +232,48 @@ root.
 | `python_stdlib` | `hermit-cli/tests/python_stdlib.rs` | System CPython 3 + full `Lib/test` | |
 | `redis_strict`, `sqlite_veryquick` | `hermit-cli/tests/` | Network/build to fetch+build pinned Redis/SQLite | Slow; `#[ignore]` by default |
 
-`#[ignore]` tests are excluded from a plain `cargo test`; the `hardware` CI job
-opts into them with `-- --ignored`. Running them locally requires the matching
+`#[ignore]` tests are excluded from a plain `cargo test`. Scheduled or explicit
+local validation may opt into them; running them requires the matching
 capability, not just removing `--ignored`.
+
+### KVM memory-hash repeatability: why the guest must be statically linked
+
+`kvm_memory_hashes_repeat_for_a_static_guest`
+(`hermit-cli/tests/kvm_info_log_determinism.rs`) asserts that KVM produces
+identical stack and heap **content** hashes across two runs of the same guest. It
+uses a **statically linked** guest deliberately, and that restriction is the
+whole scope of the claim.
+
+**A dynamically linked guest fails this property today, and not marginally.**
+Measured on **devbig030**:
+
+| guest | backend | stack-content hashes differing run to run |
+| --- | --- | --- |
+| `/bin/echo hello` (dynamic) | KVM | **98 of 113** |
+| `/bin/echo hello` (dynamic) | ptrace | **0 of 193** |
+
+The cause is known and tracked rather than papered over: the KVM backend never
+delivers `rdtsc` to the Reverie `Tool`, so Detcore's existing virtualization never
+runs and the guest reads a raw host-derived cycle counter, which the dynamic
+loader then leaves on the stack. See
+<https://github.com/rrnewton/reverie/issues/448>.
+
+A static binary executes **zero** `rdtsc` (measured: 0, against 10 for every
+dynamically linked guest tested), which is exactly why the property holds there
+and only there.
+
+When #448 lands, the static restriction should be removed and that test should
+pass for a dynamic guest too — that is the intended signal.
+
+> **Why this measurement lives here and not beside the test.** The figures above
+> are only meaningful with the host they were taken on, and this project's
+> reporting standard requires naming it. `scripts/check-portable-paths.sh`
+> forbids literal hostnames in `.rs`, `.sh`, `.py` and similar build/run files —
+> correctly, because a hostname in code is how a real host dependency starts —
+> but it does not scan `.md`. Recording the provenance here keeps the measurement
+> auditable without weakening that gate or writing a hostname into a test file.
+> Renaming the host to something generic was rejected: it would leave a sentence
+> that reads as evidence and carries none.
 
 ## Expected failure signatures
 
@@ -168,14 +282,14 @@ Match observed output to a cause before filing a bug. Exact strings live in
 
 ### Missing or blocked PMU / perf permissions
 
-- `--preemption-timeout requires user-space perf counters ... continuing with timer preemption disabled`
-- `perf_event_open is unavailable; continuing with --preemption-timeout=disabled. Check the host perf_event_paranoid value ...` (`hermit-cli/src/bin/hermit/run.rs`)
+- `--max-timeslice requires user-space perf counters ... continuing with timer preemption disabled`
+- `perf_event_open is unavailable; continuing with --max-timeslice=disabled. Check the host perf_event_paranoid value ...` (`hermit-cli/src/bin/hermit/run.rs`)
 - `Hardware perf counters are not supported on this machine. Records/Replays may randomly fail`
 - Guest **hangs after a PMU warning**: timer preemption is disabled and a
   CPU-bound thread reaches no scheduling event.
 
 **Action:** lower `/proc/sys/kernel/perf_event_paranoid`, grant PMU access, or
-accept `--preemption-timeout=disabled` (weaker scheduling fidelity). This is an
+accept `--max-timeslice=disabled` (weaker scheduling fidelity). This is an
 **environment** condition, not a Hermit bug.
 
 ### Unsupported / unrecognized CPU model
@@ -198,8 +312,9 @@ filing (include the diagnostic block below).
   `virtual CPU should expose basic feature information`, or the post-mask
   `assert!(!feature.has_rdrand())` fails — the environment prevented CPUID
   faulting from taking effect or exposed an unexpected feature combination.
-- `cpuid leaf 0x... not in deterministic table; returning zero result` — a guest
-  probed a CPUID leaf with no deterministic table entry.
+- `cpuid leaf 0x... subleaf 0x... not in deterministic table; returning zero
+  result` — a guest probed a CPUID leaf with no deterministic table entry; the
+  reported subleaf is the guest's ECX input.
 
 **Action:** on a VM this is usually an **environment** limitation (no CPUID
 faulting). On bare metal with faulting support, a reproducible mismatch may be a
@@ -226,7 +341,7 @@ grep -m1 '^flags' /proc/cpuinfo
 cat /proc/sys/kernel/perf_event_paranoid
 systemd-detect-virt || true
 cargo test --workspace --no-fail-fast
-cargo test -p detcore --test tests_misc -- --nocapture
+cargo test -p hermit-detcore --test tests_misc -- --nocapture
 ```
 
 What matters in the output:
@@ -248,7 +363,7 @@ the failure; remove hostnames and any internal identifiers before sharing.
 1. **Reproduce** with the diagnostic block above.
 2. **Classify** the failure using the signatures:
    - PMU/perf or namespace signature → **adjust the environment** (grant perf
-     access, enable namespaces, or use a self-hosted/bare-metal runner). Not a
+     access, enable namespaces, or use a privileged/bare-metal runner). Not a
      bug.
    - VM/container without PMU or CPUID faulting → **expected limitation**. Run
      the environment-independent subset only, or move to a capable host.
@@ -286,7 +401,7 @@ When filing an environment-related bug, include:
     host kernel because Hermit virtualizes `uname -r`
   - [#6](https://github.com/rrnewton/hermit/issues/6) — virtualized host time
     corrupts QEMU guest clock calibration
-  - [#94](https://github.com/rrnewton/hermit/issues/94) — self-hosted CI stays
+  - [#94](https://github.com/rrnewton/hermit/issues/94) — privileged CI stays
     red after mount fix (statfs replay)
 - **This issue:** [#11](https://github.com/rrnewton/hermit/issues/11).
 - [docs/ERROR_CATALOG.md](ERROR_CATALOG.md) — exact error text → cause → fix.

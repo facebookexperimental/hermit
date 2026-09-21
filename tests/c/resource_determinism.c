@@ -12,9 +12,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/sysinfo.h>
+#include <sys/times.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -55,8 +57,8 @@ static void require_limit(
       actual->rlim_max != expected->rlim_max) {
     fprintf(
         stderr,
-        "%s mismatch: got %" PRIu64 ":%" PRIu64 ", expected %" PRIu64
-        ":%" PRIu64 "\n",
+        "%s mismatch: got %" PRIu64 ":%" PRIu64
+        ", expected %" PRIu64 ":%" PRIu64 "\n",
         operation,
         (uint64_t)actual->rlim_cur,
         (uint64_t)actual->rlim_max,
@@ -108,8 +110,11 @@ static void check_limit_queries(void) {
       fail("SYS_getrlimit");
     }
     if (syscall(
-            SYS_prlimit64, 0, resources[i].resource, NULL, &prlimit_limit) !=
-        0) {
+            SYS_prlimit64,
+            0,
+            resources[i].resource,
+            NULL,
+            &prlimit_limit) != 0) {
       fail("SYS_prlimit64 query");
     }
 
@@ -172,8 +177,12 @@ static void check_limit_mutations(void) {
 
   changed = original;
   changed.rlim_cur = lower_soft_limit(original.rlim_cur, 3);
-  if (syscall(SYS_prlimit64, getpid(), RLIMIT_NOFILE, &changed, &previous) !=
-      0) {
+  if (syscall(
+          SYS_prlimit64,
+          getpid(),
+          RLIMIT_NOFILE,
+          &changed,
+          &previous) != 0) {
     fail("SYS_prlimit64 mutation");
   }
   require_limit("prlimit64 previous", &previous, &original);
@@ -182,7 +191,8 @@ static void check_limit_mutations(void) {
   }
   require_limit("prlimit64 mutation", &observed, &changed);
   printf(
-      "prlimit64 old=%" PRIu64 ":%" PRIu64 " new=%" PRIu64 ":%" PRIu64 "\n",
+      "prlimit64 old=%" PRIu64 ":%" PRIu64 " new=%" PRIu64 ":%" PRIu64
+      "\n",
       (uint64_t)previous.rlim_cur,
       (uint64_t)previous.rlim_max,
       (uint64_t)observed.rlim_cur,
@@ -205,11 +215,7 @@ static void check_limit_mutations(void) {
       EINVAL,
       "other-pid invalid-resource prlimit64 query");
   require_prlimit_error(
-      getpid() + 1,
-      RLIMIT_NOFILE,
-      (void*)1,
-      EFAULT,
-      "other-pid bad prlimit64 input");
+      getpid() + 1, RLIMIT_NOFILE, (void*)1, EFAULT, "other-pid bad prlimit64 input");
   require_prlimit_error(
       0, RLIMIT_NLIMITS, NULL, EINVAL, "invalid-resource prlimit64 query");
 
@@ -278,10 +284,14 @@ static void check_prlimit_fork_inheritance(void) {
   puts("prlimit64 fork inheritance deterministic");
 }
 
-// Every rusage field except ru_maxrss must be a deterministic zero. When
-// expect_maxrss is set, ru_maxrss must be positive (the guest's peak RSS);
-// otherwise it must also be zero (e.g. RUSAGE_CHILDREN with no children).
-static void check_rusage(int who, const char* name, int expect_maxrss) {
+// Read one getrusage snapshot and validate its shape. CPU time is retained in
+// the returned value so callers can compare two snapshots; only a copy is
+// cleared for the byte scan that proves every unmodeled field remains zero.
+static struct rusage read_rusage(
+    int who,
+    const char* name,
+    int expect_maxrss,
+    int allow_cpu) {
   struct rusage usage;
   memset(&usage, 0xa5, sizeof(usage));
   if (getrusage(who, &usage) != 0) {
@@ -297,13 +307,27 @@ static void check_rusage(int who, const char* name, int expect_maxrss) {
           (long)usage.ru_maxrss);
       exit(1);
     }
-    // Clear the field we allow to be nonzero so the byte scan below can prove
-    // everything else is a deterministic zero.
-    usage.ru_maxrss = 0;
   }
 
-  const unsigned char* bytes = (const unsigned char*)&usage;
-  for (size_t i = 0; i < sizeof(usage); ++i) {
+  if (allow_cpu) {
+    if (usage.ru_utime.tv_sec < 0 || usage.ru_utime.tv_usec < 0 ||
+        usage.ru_utime.tv_usec >= 1000000 || usage.ru_stime.tv_sec < 0 ||
+        usage.ru_stime.tv_usec < 0 || usage.ru_stime.tv_usec >= 1000000) {
+      fprintf(stderr, "getrusage %s reported invalid CPU time\n", name);
+      exit(1);
+    }
+  }
+
+  struct rusage unmodeled = usage;
+  if (expect_maxrss) {
+    unmodeled.ru_maxrss = 0;
+  }
+  if (allow_cpu) {
+    memset(&unmodeled.ru_utime, 0, sizeof(unmodeled.ru_utime));
+    memset(&unmodeled.ru_stime, 0, sizeof(unmodeled.ru_stime));
+  }
+  const unsigned char* bytes = (const unsigned char*)&unmodeled;
+  for (size_t i = 0; i < sizeof(unmodeled); ++i) {
     if (bytes[i] != 0) {
       fprintf(
           stderr,
@@ -313,7 +337,59 @@ static void check_rusage(int who, const char* name, int expect_maxrss) {
       exit(1);
     }
   }
-  printf("rusage %s %s\n", name, expect_maxrss ? "maxrss" : "zero");
+  printf(
+      "rusage %s %s\n",
+      name,
+      allow_cpu ? "modeled-cpu" : (expect_maxrss ? "maxrss" : "zero"));
+  return usage;
+}
+
+static uint64_t rusage_cpu_micros(const struct rusage* usage) {
+  return (uint64_t)usage->ru_utime.tv_sec * 1000000 +
+      (uint64_t)usage->ru_utime.tv_usec +
+      (uint64_t)usage->ru_stime.tv_sec * 1000000 +
+      (uint64_t)usage->ru_stime.tv_usec;
+}
+
+static uint64_t rusage_system_micros(const struct rusage* usage) {
+  return (uint64_t)usage->ru_stime.tv_sec * 1000000 +
+      (uint64_t)usage->ru_stime.tv_usec;
+}
+
+static int rusage_cpu_equal(
+    const struct rusage* left,
+    const struct rusage* right) {
+  return left->ru_utime.tv_sec == right->ru_utime.tv_sec &&
+      left->ru_utime.tv_usec == right->ru_utime.tv_usec &&
+      left->ru_stime.tv_sec == right->ru_stime.tv_sec &&
+      left->ru_stime.tv_usec == right->ru_stime.tv_usec;
+}
+
+static void check_self_and_thread_rusage_advances(void) {
+  struct rusage self_before = read_rusage(RUSAGE_SELF, "self before", 1, 1);
+  struct rusage thread_before =
+      read_rusage(RUSAGE_THREAD, "thread before", 1, 1);
+
+  for (int i = 0; i < 2048; ++i) {
+    (void)syscall(SYS_getpid);
+  }
+
+  struct rusage self_after = read_rusage(RUSAGE_SELF, "self after", 1, 1);
+  struct rusage thread_after =
+      read_rusage(RUSAGE_THREAD, "thread after", 1, 1);
+  if (rusage_cpu_micros(&self_after) <= rusage_cpu_micros(&self_before) ||
+      rusage_system_micros(&self_after) <=
+          rusage_system_micros(&self_before)) {
+    fprintf(stderr, "getrusage self CPU did not advance across syscall work\n");
+    exit(1);
+  }
+  if (rusage_cpu_micros(&thread_after) <= rusage_cpu_micros(&thread_before) ||
+      rusage_system_micros(&thread_after) <=
+          rusage_system_micros(&thread_before)) {
+    fprintf(stderr, "getrusage thread CPU did not advance across syscall work\n");
+    exit(1);
+  }
+  puts("rusage self and thread logical CPU advances");
 }
 
 static void check_rusage_errors(void) {
@@ -354,14 +430,190 @@ static void check_sysinfo(void) {
       info.mem_unit);
 }
 
+// Regression for sysinfo(2) free-memory determinism. Linux reports system-wide
+// memory here, not one process's virtual mappings. Detcore does not model
+// allocation pressure within its configured memory limit, so total and free
+// memory must remain equal before and after a mapping is populated.
+static void check_sysinfo_memory_matches_configured_memory(void) {
+  const unsigned long configured_memory = 1000000000UL;
+  struct sysinfo before = {0};
+  if (sysinfo(&before) != 0) {
+    fail("sysinfo before allocation");
+  }
+  if (before.mem_unit != 1 || before.totalram != configured_memory ||
+      before.freeram != configured_memory || before.bufferram != 0 ||
+      before.sharedram != 0 || before.totalswap != 0 || before.freeswap != 0 ||
+      before.totalhigh != 0 || before.freehigh != 0) {
+    fprintf(
+        stderr,
+        "sysinfo memory mismatch before allocation: total=%lu free=%lu "
+        "buffer=%lu shared=%lu swap=%lu/%lu high=%lu/%lu unit=%u\n",
+        before.totalram,
+        before.freeram,
+        before.bufferram,
+        before.sharedram,
+        before.totalswap,
+        before.freeswap,
+        before.totalhigh,
+        before.freehigh,
+        before.mem_unit);
+    exit(1);
+  }
+
+  const size_t region = (size_t)16 * 1024 * 1024;
+  void* mapping = mmap(
+      NULL, region, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (mapping == MAP_FAILED) {
+    fail("mmap for free-ram regression");
+  }
+
+  // Neither a new private mapping nor faulting in its pages changes Detcore's
+  // configured system-wide memory value.
+  memset(mapping, 0x5a, region);
+
+  struct sysinfo after = {0};
+  if (sysinfo(&after) != 0) {
+    fail("sysinfo after touch");
+  }
+
+  if (after.mem_unit != 1 || after.totalram != configured_memory ||
+      after.freeram != configured_memory || after.bufferram != 0 ||
+      after.sharedram != 0 || after.totalswap != 0 || after.freeswap != 0 ||
+      after.totalhigh != 0 || after.freehigh != 0) {
+    fprintf(
+        stderr,
+        "sysinfo memory mismatch after allocation: total=%lu free=%lu "
+        "buffer=%lu shared=%lu swap=%lu/%lu high=%lu/%lu unit=%u\n",
+        after.totalram,
+        after.freeram,
+        after.bufferram,
+        after.sharedram,
+        after.totalswap,
+        after.freeswap,
+        after.totalhigh,
+        after.freehigh,
+        after.mem_unit);
+    exit(1);
+  }
+
+  if (munmap(mapping, region) != 0) {
+    fail("munmap for free-ram regression");
+  }
+  puts("sysinfo memory matches configured memory");
+}
+
+static void check_times(void) {
+  struct tms first_usage;
+  struct tms second_usage;
+  memset(&first_usage, 0xa5, sizeof(first_usage));
+  memset(&second_usage, 0xa5, sizeof(second_usage));
+
+  clock_t first = times(&first_usage);
+  if (first == (clock_t)-1) {
+    fail("times first");
+  }
+
+  // Syscall-heavy work advances logical execution time even on no-PMU hosts.
+  for (int i = 0; i < 2048; ++i) {
+    (void)syscall(SYS_getpid);
+  }
+  clock_t second = times(&second_usage);
+  if (second == (clock_t)-1) {
+    fail("times second");
+  }
+  if (second <= first) {
+    fprintf(stderr, "times elapsed clock did not advance across logical work\n");
+    exit(1);
+  }
+  if (second_usage.tms_stime <= first_usage.tms_stime) {
+    fprintf(stderr, "times system CPU clock did not advance across syscall work\n");
+    exit(1);
+  }
+
+  clock_t child_system_before = second_usage.tms_cstime;
+  struct rusage child_rusage_before =
+      read_rusage(RUSAGE_CHILDREN, "children before fork", 0, 1);
+  pid_t child = fork();
+  if (child < 0) {
+    fail("times fork");
+  }
+  if (child == 0) {
+    for (int i = 0; i < 2048; ++i) {
+      (void)syscall(SYS_getpid);
+    }
+    _exit(0);
+  }
+
+  siginfo_t child_info;
+  memset(&child_info, 0, sizeof(child_info));
+  if (waitid(P_PID, child, &child_info, WEXITED | WNOWAIT) != 0) {
+    fail("times waitid WNOWAIT");
+  }
+  if (child_info.si_pid != child) {
+    fprintf(stderr, "times waitid WNOWAIT returned the wrong child\n");
+    exit(1);
+  }
+  struct tms before_reap;
+  if (times(&before_reap) == (clock_t)-1) {
+    fail("times before child reap");
+  }
+  if (before_reap.tms_cstime != child_system_before) {
+    fprintf(stderr, "times child CPU clock advanced before reap\n");
+    exit(1);
+  }
+  struct rusage child_rusage_before_reap =
+      read_rusage(RUSAGE_CHILDREN, "children before reap", 0, 1);
+  if (!rusage_cpu_equal(&child_rusage_before_reap, &child_rusage_before)) {
+    fprintf(stderr, "getrusage children CPU advanced before reap\n");
+    exit(1);
+  }
+  if (waitpid(child, NULL, WUNTRACED) != child) {
+    fail("times waitpid");
+  }
+  struct tms after_child;
+  if (times(&after_child) == (clock_t)-1) {
+    fail("times after child");
+  }
+  if (after_child.tms_cstime <= child_system_before) {
+    fprintf(stderr, "times child system CPU clock did not include reaped child\n");
+    exit(1);
+  }
+  struct rusage child_rusage_after =
+      read_rusage(RUSAGE_CHILDREN, "children after reap", 0, 1);
+  if (rusage_cpu_micros(&child_rusage_after) <=
+          rusage_cpu_micros(&child_rusage_before) ||
+      rusage_system_micros(&child_rusage_after) <=
+          rusage_system_micros(&child_rusage_before)) {
+    fprintf(
+        stderr,
+        "getrusage children CPU did not include the reaped child\n");
+    exit(1);
+  }
+
+  clock_t without_usage = times(NULL);
+  if (without_usage == (clock_t)-1 || without_usage < second) {
+    fprintf(stderr, "times(NULL) did not preserve elapsed ticks\n");
+    exit(1);
+  }
+
+  errno = 0;
+  if (syscall(SYS_times, (void*)1) != -1 || errno != EFAULT) {
+    fprintf(stderr, "invalid times destination did not return EFAULT\n");
+    exit(1);
+  }
+  puts("times logical process and child CPU ticks");
+}
+
 int main(void) {
   check_limit_queries();
   check_limit_mutations();
+  // No child has been created or reaped yet, so CHILDREN CPU and RSS are zero.
+  (void)read_rusage(RUSAGE_CHILDREN, "children", 0, 0);
   check_prlimit_fork_inheritance();
-  check_rusage(RUSAGE_SELF, "self", 1);
-  check_rusage(RUSAGE_THREAD, "thread", 1);
-  check_rusage(RUSAGE_CHILDREN, "children", 0);
+  check_self_and_thread_rusage_advances();
   check_rusage_errors();
   check_sysinfo();
+  check_sysinfo_memory_matches_configured_memory();
+  check_times();
   return 0;
 }

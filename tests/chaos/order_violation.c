@@ -7,8 +7,8 @@
  */
 
 #include <pthread.h>
-#include <stdatomic.h>
 #include <stdio.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 
 // Though one thread does a lot of work before checking, there's no enforcement

@@ -38,7 +38,7 @@ fn run_guest(guest: &Path, seed: u64) -> Vec<u8> {
             "run",
             "--base-env=minimal",
             "--no-virtualize-cpuid",
-            "--preemption-timeout=disabled",
+            "--max-timeslice=disabled",
         ])
         .arg(format!("--rng-seed={seed}"))
         .arg(guest)
@@ -53,11 +53,23 @@ fn run_guest(guest: &Path, seed: u64) -> Vec<u8> {
     output.stdout
 }
 
-fn assert_guest_l2(guest: &Path) {
-    let output = Command::new("timeout")
+fn assert_guest_l2(guest: &Path, backend: Option<&str>) {
+    let mut command = Command::new("timeout");
+    command
         .args(["--kill-after", "10s", "60s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log=off", "run", "--strict", "--verify", "--"])
+        .args(["--log=info", "run"]);
+    if let Some(backend) = backend {
+        command.args(["--backend", backend]);
+    }
+    let output = command
+        .args([
+            "--strict",
+            "--verify",
+            "--no-virtualize-cpuid",
+            "--preemption-timeout=disabled",
+            "--",
+        ])
         .arg(guest)
         .output()
         .expect("failed to run random guest under strict verification");
@@ -89,10 +101,20 @@ fn random_sources_repeat_across_runs_and_change_with_seed() {
 }
 
 #[test]
-#[ignore = "e2e: requires hermit + PMU/mount namespaces"]
+#[ignore = "e2e: requires hermit + mount namespaces"]
 fn random_sources_are_deterministic_under_strict_verify() {
     let guest =
         Path::new(env!("CARGO_TARGET_TMPDIR")).join("random-determinism/random-sources-strict");
     compile_guest(&guest);
-    assert_guest_l2(&guest);
+    assert_guest_l2(&guest, None);
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-1060): Review DBT child identity and RNG lifecycle coverage.
+#[test]
+fn dbt_random_sources_are_deterministic_under_strict_verify() {
+    let guest =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join("random-determinism/dbt-random-sources");
+    compile_guest(&guest);
+    assert_guest_l2(&guest, Some("dbt"));
 }

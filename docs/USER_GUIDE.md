@@ -56,8 +56,25 @@ cargo build --workspace
 The debug executable is `target/debug/hermit`. For an optimized build:
 
 ```bash
-cargo build --release -p hermit --bin hermit
-./target/release/hermit --version
+cargo build --release
+./target/install_pkg/hermit --version
+```
+
+The release build creates `target/install_pkg/hermit` and
+`target/install_pkg/rsrcs/`. The resource directory contains the SaBRe and
+e9patch rewriters, Detcore backend shared libraries, and the minimal DynamoRIO
+runtime. Hermit discovers it beside the invoked executable and, for an in-tree
+release binary, under `target/install_pkg`. Set
+`HERMIT_INSTALL_DIR=/path/to/install` to select another installation root.
+Backend-specific environment variables remain compatibility overrides, but a
+complete package needs none of them.
+
+`target/install_pkg/hermit` is a staging symlink to the release binary. Follow
+it when creating a standalone installation, for example:
+
+```bash
+cp -aL target/install_pkg/ /opt/hermit
+/opt/hermit/hermit --version
 ```
 
 To install the current checkout into Cargo's binary directory, normally
@@ -114,6 +131,7 @@ default stricter.
 - serializes guest threads and schedules them deterministically;
 - makes I/O completion behavior deterministic;
 - virtualizes time, random inputs, CPUID, and selected file metadata;
+- rejects syscalls classified Unsupported instead of forwarding them silently;
 - gives the guest an isolated PID namespace and `/tmp`;
 - uses an isolated local network namespace;
 - exposes most of the host file system read/write.
@@ -127,10 +145,12 @@ hermit run --base-env=minimal -e LANG=C --workdir=/tmp -- /bin/pwd
 
 #### Backend Selection
 
-Use `--backend=ptrace|dbi|kvm` to select the process instrumentation backend.
-It is a global option and belongs before the subcommand, because the backend
-governs how any subcommand instruments the guest. The default is `ptrace`, so
-existing commands are unchanged:
+Use `--backend=ptrace|dbt|liteinst|sabre|kvm|e9patch` to select the process
+instrumentation backend.
+It is a global option and belongs before the subcommand, but backend scope is
+command-specific. LiteInst and e9patch support only `run`, while SaBRe supports
+`run` and `strace`; unsupported combinations fail closed. The default is
+`ptrace`, so existing commands are unchanged:
 
 ```bash
 hermit --backend=ptrace run -- /bin/echo hello
@@ -140,12 +160,73 @@ For backwards compatibility, `run` also accepts `--backend` after the
 subcommand (`hermit run --backend=ptrace -- /bin/echo hello`).
 
 Hermit detects whether the requested backend is integrated and available on
-the current host. It does not silently fall back to a different backend. The
-current DynamoRIO prototype requires a discoverable SDK and has no Detcore
-process launcher. The bare KVM prototype requires read-write `/dev/kvm` access,
-commonly through the `kvm` group or root, plus a guest-kernel ABI. Requests for
-those prototypes therefore fail before the guest starts and explain the missing
-capability.
+the current host. It does not silently fall back to a different backend.
+LiteInst requires `libreverie_liteinst.so` beside the Hermit executable. That
+DSO initializes only the in-guest patch/helper runtime. The ptrace host owns the
+sole `Detcore` Tool and GlobalTool from the initial exec; it observes the first
+syscall at each site and installs a LiteInst trampoline for later invocations.
+There is no second in-guest Detcore instance or coordinator RPC Tool.
+
+Build and stage the constructor-enabled runtime with its locked standalone
+manifest before building Hermit:
+
+```bash
+./scripts/stage-liteinst-runtime.sh dev \
+  "$PWD/target/debug/libreverie_liteinst.so" \
+  "$PWD/target/liteinst-runtime-build"
+cargo build --locked -p hermit --bin hermit
+```
+
+Hermit verifies the DSO architecture, required exports, and preload constructor
+before activation; an arbitrary shared object or constructor-free runtime is
+rejected rather than silently falling back.
+
+LiteInst uses the normal Hermit run and verification paths. A successful
+`--strict --verify` run compares status/stdout/stderr exactly and applies the
+`Stripped` comparison to selected Detcore scheduler messages; it is useful
+diagnostic evidence, but it is not strict determinism. Strict verification requires
+`--verify-strict --verify-json REPORT.json`, `bitwise_parity: true`, and nonzero
+compared-message counts. Verification snapshots guest stdin once and supplies
+the identical bytes to both runs. The supported execution scope is dynamically
+linked, single-threaded, single-process Linux x86-64 guests. Thread clone,
+`fork`, and `vfork` fail closed with `EOPNOTSUPP`, and `exec` remains
+unsupported because the patch runtime is not yet re-bootstrapped and
+revalidated after image replacement. PMU/RCB timer delivery, CPUID, RDTSC, and
+RDTSCP use the ptrace host path and therefore have the same host capability
+requirements as the normal ptrace backend.
+
+The default namespace, mount, and network setup is shared with Hermit's other
+backends; `--no-namespace` remains available for trusted guests. The preload
+runtime reserves `SIGSYS` in kernel-visible signal masks. This experimental
+patch-helper path is not a security boundary for intentionally hostile code.
+The release installation package provides the DynamoRIO, SaBRe, LiteInst, and
+e9patch runtime artifacts. KVM requires read-write `/dev/kvm` access plus a
+guest-kernel ABI.
+
+SaBRe is available only in builds using the non-default
+`third-party-backends` feature. See
+[SaBRe backend compatibility](SABRE_COMPATIBILITY.md) for the measured
+`Stripped` allowlist, build commands, and known gaps. An enabled probe is
+not a blanket support claim for every workload in its subsystem.
+
+`e9patch` is an experimental hybrid rather than a standalone Detcore runtime.
+It uses the cached offline instruction map and conservative `e9tool -O0` mode
+to apply `before empty` trampolines at exact candidate offsets in the main ELF.
+Because the linear candidate scan
+can include embedded data, e9tool decides which candidates are instructions;
+Hermit reports both counts and rejects partial coverage of the recovered set.
+Hermit does not enable e9patch's B0 fallback because reserving SIGILL would
+change guest signal semantics. The rewritten program is bind-mounted read-only
+at the original executable path, then runs under the ptrace Detcore backend, which
+preserves strict-mode semantics for trapped events in shared libraries, the
+vDSO, and dynamic code. Empty trampolines do not make raw `RDRAND`, `RDSEED`,
+or TSX deterministic even when those sites are mapped, so those instructions
+remain unsupported. Privilege-bearing executables fail closed rather than
+losing set-ID or file-capability semantics. This first integration validates
+rewrite coverage; it does not yet remove ptrace overhead. Put
+`e9tool` in `PATH` or set `HERMIT_E9TOOL=/path/to/e9tool`.
+Non-ELF entrypoints, including shebang scripts, skip preprocessing and run
+through the ptrace correctness path.
 
 `--namespace-only` bypasses instrumentation entirely. Combining it with any
 explicit `--backend` selection is rejected because the backend would be ignored.
@@ -182,10 +263,16 @@ The seed options have distinct roles:
 - `--seed-from=Args` derives a stable seed from the guest command and arguments.
 
 Chaos scheduling is most effective when hardware performance counters are
-available. `--preemption-timeout=N` controls the longest uninterrupted virtual
+available. `--max-timeslice=N` controls the longest uninterrupted virtual
 time slice. Smaller values create more scheduling opportunities at additional
-runtime cost. `--preemption-timeout=disabled` avoids PMU use but can miss bugs
-in CPU-bound code that rarely makes system calls.
+runtime cost; positive values must be at least one RCB, which is 10 virtual
+nanoseconds at the default clock multiplier and scales with that multiplier.
+`--target-timeslice=N` adds a cheaper logical deadline checked at syscall
+boundaries; it is useful for workloads that enter the kernel frequently.
+`--max-timeslice=disabled` avoids PMU use but can miss bugs in
+CPU-bound code that rarely makes system calls. The old
+`--preemption-timeout` spelling is a deprecated alias for
+`--max-timeslice`.
 
 Advanced investigations can save preemption decisions with
 `--record-preemptions-to=FILE` and replay them with
@@ -201,7 +288,52 @@ hermit run --verify -- /bin/echo reproducible
 
 Hermit runs the guest twice and compares observable output, including stdout,
 stderr, and its internal deterministic execution log. Verification fails if
-the executions differ or if the guest exit status is not allowed.
+the compared observations differ or if the guest exit status is not allowed.
+
+The default log comparison is `Stripped`: it can erase numbers, addresses,
+temporary paths, and time values from selected messages. It is a fast
+diagnostic, not strict determinism. Use
+`--verify-strict --verify-json REPORT.json` when a canonical strict result is
+required.
+
+Matching verification logs are temporary by default; divergent comparisons
+retain both. Hermit keeps the newest 64 implicitly retained failed comparisons
+under `$XDG_STATE_HOME/hermit/verify-failures` (or a bounded directory under the
+system temporary directory when no state directory is available) and prints
+their final, readable paths. A `hermit log-diff` reading one of those paths
+prevents its comparison directory from being retired until the read finishes.
+Keep both runs regardless of verdict, without that automatic retirement, with
+`--keep-logs`; Hermit prints only the final, readable paths. The default
+destination is `$XDG_STATE_HOME/hermit/verify-logs`, normally
+`~/.local/state/hermit/verify-logs`, and `--verify-log-dir=DIR` selects another
+durable directory. `--print-verify-logs` instead copies the first run's captured
+log to stderr; it does not retain either file.
+
+`hermit log-diff LOG` prints the canonical INFO stream from one retained log.
+The default `--record-envelope=all-records-v1` preserves every parsed record.
+For a DBT evidence log, select
+`--record-envelope=dbt-evidence-transport-v1` explicitly to exclude only the
+transport's self-description records. This is an offline inspection option;
+live `--backend=dbt run --verify` goes through its dedicated DBT adapter,
+which compares its two runs with `all-records-v1` and publishes its own verdict
+when `--verify-json` is requested. Selecting this envelope there would exclude
+records that adapter compares today, so it is offered here for offline
+inspection rather than applied to a live run.
+`hermit log-diff LEFT RIGHT --json REPORT.json` compares
+the same canonical INFO stream and atomically records a one-line result. Its
+`comparison.record_envelope` field names that versioned policy, alongside the
+first divergent scheduler turn and virtual nanoseconds when the logs contain
+that position. An empty or unreadable comparison exits with an error rather
+than reporting a match.
+
+For a two-log comparison, add `--print-logs` to print both selected streams to
+stderr exactly as the comparator receives them. The output names the active
+policy: `Deterministic` for the default DETLOG/scheduler-COMMIT subset,
+`Stripped` when `--unsafe-strip-lines` applies its lossy substitutions, or
+`Canonical` when `--canonical-info` selects the INFO stream and canonicalizes
+marked host addresses. This output is produced by the shared comparator path,
+after wall-clock-prefix removal, line filtering, message selection, and any
+requested substitutions.
 
 The guest must be idempotent. A first run that modifies an input file,
 database, cache, or other host-visible state can legitimately change the
@@ -302,13 +434,16 @@ reproducible target condition.
 | Option | Effect |
 | --- | --- |
 | `--strict` | Compatibility spelling for the current deterministic defaults. |
-| `--passthru-opt` | Use the reduced syscall subscription set for performance. Unlisted syscalls bypass Detcore, weakening deterministic accounting. |
+| `--allow-unsupported-syscalls` | Run-only compatibility escape hatch that permits Unsupported syscalls to reach Linux and prints a warning. A successful exit does not establish complete deterministic execution. |
+| `--passthru-opt` | Use the reduced syscall subscription set for performance. Requires `--allow-unsupported-syscalls`; unlisted PassThrough syscalls bypass Detcore, weakening deterministic accounting. Unsupported syscalls remain subscribed so the explicit policy is observable. |
 | `--no-sequentialize-threads` | Lets Linux schedule guest threads concurrently. This weakens schedule reproducibility. |
 | `--no-deterministic-io` | Disables Hermit's deterministic short-I/O completion behavior. |
 | `--chaos` | Uses seeded randomized deterministic scheduling. |
 | `--sched-seed=N` | Selects a reproducible chaos schedule. |
-| `--preemption-timeout=N` | Sets the maximum virtual time slice and requires PMU support. |
-| `--preemption-timeout=disabled` | Disables PMU timer preemption. |
+| `--target-timeslice=N` | Ends a logical turn at the first syscall boundary after N virtual nanoseconds. |
+| `--max-timeslice=N` | Sets the maximum virtual time slice (minimum one scaled RCB) and requires PMU support. |
+| `--max-timeslice=disabled` | Disables PMU timer preemption. |
+| `--preemption-timeout=N` | Deprecated alias for `--max-timeslice=N`. |
 
 `--no-sequentialize-threads` is useful for compatibility experiments and
 workloads such as virtual machines that need real host parallelism. It removes
@@ -330,7 +465,7 @@ all user-space locking policies are writer-fair. Blocked threads are absent from
 the run queue, higher priorities run first, polling operations use deterministic
 backoff, and external I/O completion can add delay. Hermit does not change a
 standard library's reader/writer-lock preference policy. PMU preemption bounds a CPU-only
-time slice; with `--preemption-timeout=disabled`, a thread that never reaches an
+time slice; with `--max-timeslice=disabled`, a thread that never reaches an
 intercepted event can starve its peers. No separate fairness flag is needed for
 the default equal-priority policy.
 
@@ -460,7 +595,7 @@ cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || true
 
 ### Performance Counters Are Unavailable
 
-Hermit prints a warning and continues with `--preemption-timeout=disabled`
+Hermit prints a warning and continues with `--max-timeslice=disabled`
 when `perf_event_open` is unavailable. Check:
 
 ```bash
@@ -469,7 +604,7 @@ cat /proc/sys/kernel/perf_event_paranoid
 
 The host setting, VM PMU exposure, and container seccomp policy can all block
 performance counters. Enable them when precise scheduling preemption matters.
-Otherwise pass `--preemption-timeout=disabled` explicitly and understand that
+Otherwise pass `--max-timeslice=disabled` explicitly and understand that
 CPU-bound threads may run until another intercepted event.
 
 ### Unsupported System Calls

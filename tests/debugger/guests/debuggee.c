@@ -26,17 +26,17 @@
 
 /* Marked noinline so the breakpoint on `compute` always has a real frame. */
 __attribute__((noinline)) int compute(int a, int b) {
-  int sum = a + b; /* line: BP_COMPUTE (breakpoint target) */
-  int product = a * b;
-  return sum + product;
+    int sum = a + b;     /* line: BP_COMPUTE (breakpoint target) */
+    int product = a * b;
+    return sum + product;
 }
 
 int main(void) {
-  int pid = (int)getpid(); /* deterministic under Hermit */
-  int x = 7;
-  int y = 6;
-  int result = compute(x, y); /* line: BP_MAIN */
-  printf("pid=%d result=%d\n", pid, result);
-  fflush(stdout);
-  return 0;
+    int pid = (int)getpid();          /* deterministic under Hermit */
+    int x = 7;
+    int y = 6;
+    int result = compute(x, y);       /* line: BP_MAIN */
+    printf("pid=%d result=%d\n", pid, result);
+    fflush(stdout);
+    return 0;
 }

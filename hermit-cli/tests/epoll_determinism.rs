@@ -6,6 +6,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -16,7 +21,6 @@ use std::sync::MutexGuard;
 use std::sync::OnceLock;
 
 const RUNS: usize = 5;
-
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 static EPOLL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 
@@ -27,6 +31,7 @@ fn hermit_run_lock() -> MutexGuard<'static, ()> {
 }
 
 fn command_output(mut command: Command, label: &str) -> Output {
+    hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
     let output = command
         .output()
@@ -46,7 +51,11 @@ fn epoll_guest() -> &'static Path {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("epoll-determinism");
+        // This integration target is selected by more than one DAG step. Each
+        // nextest invocation is a separate process, so the lock and OnceLock
+        // above cannot protect a shared output path across those invocations.
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("epoll-determinism-{}", std::process::id()));
         fs::create_dir_all(&build_root).expect("failed to create epoll guest build directory");
         let output = build_root.join("epoll_determinism");
 
@@ -70,17 +79,20 @@ fn epoll_guest() -> &'static Path {
 }
 
 fn run_scenario(scenario: &str, run: usize) -> Vec<u8> {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
-    command
-        .args([
-            "run",
-            "--base-env=minimal",
-            "--no-virtualize-cpuid",
-            "--preemption-timeout=disabled",
-            "--",
-        ])
-        .arg(epoll_guest())
-        .arg(scenario);
+    let guest = epoll_guest();
+    let mut command = Command::new(hermit_test::hermit_binary());
+    command.current_dir(
+        guest
+            .parent()
+            .expect("epoll guest should have a build directory"),
+    );
+    command.args([
+        "run",
+        "--base-env=minimal",
+        "--no-virtualize-cpuid",
+        "--max-timeslice=disabled",
+    ]);
+    command.arg("--").arg(guest).arg(scenario);
 
     let output = command_output(command, &format!("{scenario} epoll run {run}/{RUNS}"));
     let expected_success = format!("{scenario} success\n");
@@ -110,13 +122,25 @@ fn assert_scenario_is_deterministic(scenario: &str) {
 
 fn assert_scenario_reaches_l2(scenario: &str) {
     let _guard = hermit_run_lock();
+    let guest = epoll_guest();
     let mut command = Command::new("timeout");
     command
+        .current_dir(
+            guest
+                .parent()
+                .expect("epoll guest should have a build directory"),
+        )
         .args(["--kill-after", "10s", "60s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log=off", "run", "--strict", "--verify", "--"])
-        .arg(epoll_guest())
-        .arg(scenario);
+        .arg(hermit_test::hermit_binary())
+        .args([
+            "--log=info",
+            "run",
+            "--strict",
+            "--verify",
+            "--no-virtualize-cpuid",
+            "--preemption-timeout=disabled",
+        ]);
+    command.arg("--").arg(guest).arg(scenario);
 
     let output = command_output(command, &format!("{scenario} strict verification"));
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -124,6 +148,223 @@ fn assert_scenario_reaches_l2(scenario: &str) {
     assert!(
         stdout.contains("Determinism verified") || stderr.contains("Determinism verified"),
         "{scenario} exited 0 without Hermit's determinism marker\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+#[ignore = "validate: fixed /test argument contract"]
+fn pinned_root_arguments_are_exact_and_fail_closed() {
+    assert_eq!(
+        hermit_test::guest_args_for(["run", "--strict", "--", "/bin/true"], None,).unwrap(),
+        ["run", "--strict", "--", "/bin/true"].map(OsString::from)
+    );
+    assert_eq!(
+        hermit_test::guest_args_for(
+            ["run", "--strict", "--", "/bin/true"],
+            Some(OsStr::new("/test")),
+        )
+        .unwrap(),
+        [
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--mount=type=tmpfs,target=/test",
+            "--workdir=/test",
+            "--",
+            "/bin/true",
+        ]
+        .map(OsString::from)
+    );
+    assert_eq!(
+        hermit_test::guest_args_for(
+            [
+                "run",
+                "--backend=dbt",
+                "--base-env=minimal",
+                "--",
+                "/bin/true",
+            ],
+            Some(OsStr::new("/test")),
+        )
+        .unwrap(),
+        [
+            "run",
+            "--backend=dbt",
+            "--base-env=minimal",
+            "--workdir=/test",
+            "--",
+            "/bin/true",
+        ]
+        .map(OsString::from)
+    );
+    assert_eq!(
+        hermit_test::guest_args_for(
+            ["run", "--no-namespace", "--", "/bin/true"],
+            Some(OsStr::new("/test")),
+        )
+        .unwrap(),
+        [
+            "run",
+            "--no-namespace",
+            "--base-env=minimal",
+            "--workdir=/test",
+            "--",
+            "/bin/true",
+        ]
+        .map(OsString::from)
+    );
+    let error = hermit_test::guest_args_for(
+        ["run", "--base-env=inherit", "--", "/bin/true"],
+        Some(OsStr::new("/test")),
+    )
+    .unwrap_err();
+    assert!(error.contains("requires --base-env=minimal"));
+
+    let mut timeout = Command::new("timeout");
+    timeout.arg("60s").arg(hermit_test::hermit_binary()).args([
+        "run",
+        "--strict",
+        "--",
+        "/bin/true",
+    ]);
+    hermit_test::configure_guest_execution_for(&mut timeout, Some(OsStr::new("/test"))).unwrap();
+    assert_eq!(
+        timeout
+            .get_args()
+            .map(OsStr::to_os_string)
+            .collect::<Vec<_>>(),
+        vec![
+            OsString::from("60s"),
+            hermit_test::hermit_binary().as_os_str().to_os_string(),
+            OsString::from("run"),
+            OsString::from("--strict"),
+            OsString::from("--base-env=minimal"),
+            OsString::from("--mount=type=tmpfs,target=/test"),
+            OsString::from("--workdir=/test"),
+            OsString::from("--"),
+            OsString::from("/bin/true"),
+        ]
+    );
+
+    let mut refused = Command::new(hermit_test::hermit_binary());
+    refused.args(["run", "--", "/bin/true"]);
+    let original = refused
+        .get_args()
+        .map(OsStr::to_os_string)
+        .collect::<Vec<_>>();
+    let error = hermit_test::configure_guest_execution_for(&mut refused, Some(OsStr::new("/tmp")))
+        .unwrap_err();
+    assert!(error.contains("HERMIT_E2E_EMPTY_WORKDIR must be /test"));
+    assert_eq!(
+        refused
+            .get_args()
+            .map(OsStr::to_os_string)
+            .collect::<Vec<_>>(),
+        original
+    );
+
+    let error = hermit_test::guest_args_for(["run", "--", "/bin/true"], Some(OsStr::new("/tmp")))
+        .unwrap_err();
+    assert!(error.contains("HERMIT_E2E_EMPTY_WORKDIR must be /test"));
+}
+
+#[test]
+fn pinned_root_mount_exact_target_preserves_the_explicit_fixture() {
+    use std::ffi::OsStr;
+    use std::ffi::OsString;
+
+    for mount in [
+        "type=bind,source=/fixture,target=/test",
+        "target=/test,type=tmpfs",
+    ] {
+        for split in [false, true] {
+            let mut args = vec![OsString::from("run")];
+            if split {
+                args.extend([OsString::from("--mount"), OsString::from(mount)]);
+            } else {
+                args.push(OsString::from(format!("--mount={mount}")));
+            }
+            let mut expected = args.clone();
+            expected.extend(
+                ["--base-env=minimal", "--workdir=/test", "--", "/bin/true"].map(OsString::from),
+            );
+            args.extend([OsString::from("--"), OsString::from("/bin/true")]);
+            assert_eq!(
+                hermit_test::guest_args_for(args, Some(OsStr::new("/test"))).unwrap(),
+                expected,
+                "explicit /test fixture must not be hidden: split={split}, {mount}",
+            );
+        }
+    }
+}
+
+#[test]
+fn pinned_root_mount_other_targets_still_receive_the_empty_execution_root() {
+    use std::ffi::OsStr;
+    use std::ffi::OsString;
+
+    for mount in [
+        "type=tmpfs,target=/test-data",
+        "type=tmpfs,target=/test/subdir",
+        "type=bind,source=/fixture/target=/test,target=/elsewhere",
+    ] {
+        for split in [false, true] {
+            let mut args = vec![OsString::from("run")];
+            if split {
+                args.extend([OsString::from("--mount"), OsString::from(mount)]);
+            } else {
+                args.push(OsString::from(format!("--mount={mount}")));
+            }
+            let mut expected = vec![
+                OsString::from("run"),
+                OsString::from("--mount=type=tmpfs,target=/test"),
+            ];
+            expected.extend(args[1..].iter().cloned());
+            expected.extend(
+                ["--base-env=minimal", "--workdir=/test", "--", "/bin/true"].map(OsString::from),
+            );
+            args.extend([OsString::from("--"), OsString::from("/bin/true")]);
+            assert_eq!(
+                hermit_test::guest_args_for(args, Some(OsStr::new("/test"))).unwrap(),
+                expected,
+                "different mount must not suppress /test: split={split}, {mount}",
+            );
+        }
+    }
+
+    assert_eq!(
+        hermit_test::guest_args_for(
+            [
+                "--log-file",
+                "/fixture/log",
+                "run",
+                "--strict",
+                "--mount",
+                "type=tmpfs,target=/test/subdir",
+                "--mount=type=tmpfs,target=/test-data",
+                "--",
+                "/bin/printf",
+                "--mount=type=tmpfs,target=/test",
+            ],
+            Some(OsStr::new("/test")),
+        )
+        .unwrap(),
+        [
+            "--log-file",
+            "/fixture/log",
+            "run",
+            "--strict",
+            "--mount=type=tmpfs,target=/test",
+            "--mount",
+            "type=tmpfs,target=/test/subdir",
+            "--mount=type=tmpfs,target=/test-data",
+            "--base-env=minimal",
+            "--workdir=/test",
+            "--",
+            "/bin/printf",
+            "--mount=type=tmpfs,target=/test",
+        ]
+        .map(OsString::from),
     );
 }
 
@@ -160,7 +401,7 @@ fn notification_control_syscalls_are_deterministic() {
 }
 
 #[test]
-#[ignore = "e2e: requires hermit + PMU/mount namespaces"]
+#[ignore = "e2e: requires hermit + mount namespaces"]
 fn notification_control_syscalls_reach_strict_verify_l2() {
     assert_scenario_reaches_l2("control-fds");
 }

@@ -11,16 +11,13 @@ use std::io::Write;
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::Condvar;
-use std::sync::Mutex;
+use std::sync::mpsc;
+use std::sync::mpsc::SyncSender;
 use std::thread;
 
 use tempfile::tempdir;
 
 const BUFFER_SIZE: usize = 128;
-
-type ServerReadyPair = Arc<(Mutex<bool>, Condvar)>;
 
 fn main() {
     if matches!(std::env::var("HERMIT_MODE"), Ok(mode) if mode == "record") {
@@ -33,20 +30,13 @@ fn main() {
     let socket_path = temp_dir.path().join("net-hello-world.sock");
     let socket_path2 = socket_path.clone();
 
-    #[allow(clippy::mutex_atomic)]
-    let server_ready_pair = Arc::new((Mutex::new(false), Condvar::new()));
-    let server_ready_pair2 = Arc::clone(&server_ready_pair);
+    let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+    let server_thread = run_server(socket_path, ready_tx);
 
-    let server_thread = run_server(socket_path, server_ready_pair);
-
-    // Wait for the server to be ready
-    {
-        let (lock, cvar) = &*server_ready_pair2;
-        let mut started = lock.lock().unwrap();
-        while !*started {
-            started = cvar.wait(started).unwrap();
-        }
-    }
+    ready_rx
+        .recv()
+        .expect("server thread exited before reporting startup")
+        .expect("server to bind its socket");
 
     let client_thread = run_client(socket_path2);
 
@@ -54,16 +44,19 @@ fn main() {
     server_thread.join().expect("server to be ok");
 }
 
-fn run_server(socket_path: PathBuf, server_ready_pair: ServerReadyPair) -> thread::JoinHandle<()> {
+fn run_server(
+    socket_path: PathBuf,
+    ready_tx: SyncSender<Result<(), String>>,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        let listener = UnixListener::bind(&socket_path).unwrap();
-
-        {
-            let (lock, cvar) = &*server_ready_pair;
-            let mut started = lock.lock().unwrap();
-            *started = true;
-            cvar.notify_one();
-        }
+        let listener = match UnixListener::bind(&socket_path) {
+            Ok(listener) => listener,
+            Err(error) => {
+                ready_tx.send(Err(error.to_string())).unwrap();
+                return;
+            }
+        };
+        ready_tx.send(Ok(())).unwrap();
 
         println!("[Server] Listening...");
         let mut incoming = listener.incoming().next().unwrap().unwrap();

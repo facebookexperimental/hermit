@@ -1,0 +1,151 @@
+{
+  "_comment": [
+    "Job-assignment map for the parallel portable fan-out (ci-portable.yml).",
+    "Every step in validate's constructed portable-only plan is assigned to exactly one",
+    "hosted job here. ci/check-shard-coverage.sh asks validate for that plan and fails",
+    "closed if this map drifts, so lane merging, deduplication, or edge changes cannot",
+    "silently create a second hosted definition.",
+    "That wording is deliberate: this comment previously said coverage == the trusted DAG",
+    "'by construction' while the guard's only caller was .github/workflows/ci-portable.yml.",
+    "A correct fail-closed guard with no live reader is indistinguishable from no guard,",
+    "and two nodes drifted out of this map behind it -- check.dbt_runtime_abi (corrected",
+    "2026-08-21 by 3b6cd503cc) and check.exit_status_class (corrected here).",
+    "Node commands and resource policy live only in validate's constructed plan; shards",
+    "reference steps by group.job key and execute them via ci/run-node.sh."
+  ],
+  "preflight_nodes": [
+    "pre.submodules",
+    "pre.reverie_pin",
+    "build.rust_scripts",
+    "setup.manifest_plan",
+    "gate.manifest"
+  ],
+  "check_nodes": [
+    "check.skill_discovery",
+    "check.exit_status_class",
+    "check.shard_coverage",
+    "check.backend_abstraction",
+    "check.backend_parity_mutation",
+    "check.portability_paths",
+    "check.dagrun_naming",
+    "check.run_node_args",
+    "check.check_outcome_consumers",
+    "check.lint_checks",
+    "check.script_sigpipe",
+    "lint.rustfmt"
+  ],
+  "build_debug_nodes": [
+    "e2e.audit_compile_backend_parity_c",
+    "setup.nextest",
+    "build.workspace",
+    "build.manifest_guests"
+  ],
+  "build_dbt_nodes": [
+    "build.runtime_release"
+  ],
+  "build_aux_nodes": [
+    "build.e2e_artifact",
+    "build.liteinst_runtime_release"
+  ],
+  "e2e_nodes": [
+    "e2e.manifest_applications_on_host",
+    "e2e.manifest_backend_parity_c_on_host",
+    "e2e.manifest_bin_c_on_host",
+    "e2e.manifest_c_programs_on_host",
+    "e2e.manifest_chaos_c_on_host",
+    "e2e.manifest_data_handling_on_host",
+    "e2e.manifest_debugger_c_on_host",
+    "e2e.manifest_determinism_stress_c_on_host",
+    "e2e.manifest_determinism_stress_on_host",
+    "e2e.manifest_language_runtimes_on_host",
+    "e2e.manifest_system_utils_on_host"
+  ],
+  "final_nodes": [
+    "scorecard.compatibility_on_host"
+  ],
+  "strict_compat_nodes": [
+    "test.strict_compat"
+  ],
+  "debug_shards": [
+    {
+      "slug": "unit",
+      "nodes": [
+        "test.hermit_unit",
+        "test.detcore_unit",
+        "test.detcore_misc"
+      ]
+    },
+    {
+      "slug": "unit-parallel",
+      "nodes": [
+        "test.detcore_parallel",
+        "test.regular_crates"
+      ]
+    },
+    {
+      "slug": "integration",
+      "nodes": [
+        "check.backend_parity_suites",
+        "test.hermit_integration",
+        "test.cli_on_host",
+        "test.arbitrary_binaries",
+        "test.applications_e2e",
+        "e2e.manifest_shared_futex_c_on_host",
+        "e2e.manifest_util_c_on_host"
+      ]
+    },
+    {
+      "slug": "modes",
+      "nodes": [
+        "test.hermit_modes_on_host",
+        "test.app_strict_verify"
+      ]
+    },
+    {
+      "slug": "strict-verify",
+      "nodes": [
+        "test.command_strict_verify",
+        "test.ignored_syscall_regressions",
+        "test.envelope_levels",
+        "test.rr_suite_contract"
+      ]
+    },
+    {
+      "slug": "clippy",
+      "nodes": [
+        "lint.clippy"
+      ]
+    },
+    {
+      "slug": "docs",
+      "nodes": [
+        "doc.doctests",
+        "doc.rustdoc"
+      ]
+    }
+  ],
+  "release_shards": [
+    {
+      "slug": "dbt-parity",
+      "needs": "dbt",
+      "nodes": [
+        "check.dbt_runtime_abi",
+        "test.dbt_parity"
+      ]
+    },
+    {
+      "slug": "sabre",
+      "needs": "dbt",
+      "nodes": [
+        "test.sabre_examples"
+      ]
+    },
+    {
+      "slug": "liteinst",
+      "needs": "aux",
+      "nodes": [
+        "test.liteinst_strict"
+      ]
+    }
+  ]
+}

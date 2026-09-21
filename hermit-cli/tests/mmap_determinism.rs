@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -27,6 +30,7 @@ fn hermit_run_lock() -> MutexGuard<'static, ()> {
 }
 
 fn command_output(mut command: Command, label: &str) -> Output {
+    hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
     let output = command
         .output()
@@ -62,13 +66,13 @@ fn mmap_guest() -> &'static Path {
 }
 
 fn run_scenario(scenario: &str, run: usize) -> Vec<u8> {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    let mut command = Command::new(hermit_test::hermit_binary());
     command
         .args([
             "run",
             "--base-env=minimal",
             "--no-virtualize-cpuid",
-            "--preemption-timeout=disabled",
+            "--max-timeslice=disabled",
             "--",
         ])
         .arg(mmap_guest())

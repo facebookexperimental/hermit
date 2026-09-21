@@ -32,11 +32,64 @@ const MICROS_PER_SEC: u64 = 1_000_000;
 
 // TODO: make all of these integral types to rule out fractional values.
 
-/// Virtual nanoseconds elapsed per system call (uniform for now).
+/// Default virtual nanoseconds elapsed for callers that do not provide a syscall-specific cost.
 pub const NANOS_PER_SYSCALL: f64 = 10000.0;
 
 /// Virtual nanoseconds elapsed per Retired Conditional Branch.
 pub const NANOS_PER_RCB: f64 = 10.0;
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-1151)
+/// Fixed-point scale used for deterministic per-thread RCB time multipliers.
+/// Q32 keeps accumulation independent of how a backend batches RCB updates.
+const RCB_TIME_MULTIPLIER_SCALE: u64 = 1_u64 << 32;
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-1151)
+/// A positive Q32 multiplier for converting RCB progress into virtual time.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Serialize,
+    Deserialize,
+    Ord,
+    PartialOrd,
+    Eq,
+    PartialEq,
+    Hash
+)]
+pub struct RcbTimeMultiplier(u64);
+
+impl RcbTimeMultiplier {
+    /// The identity multiplier.
+    pub const ONE: Self = Self(RCB_TIME_MULTIPLIER_SCALE);
+
+    /// Largest representable multiplier.
+    pub const MAX: f64 = u64::MAX as f64 / RCB_TIME_MULTIPLIER_SCALE as f64;
+
+    /// Quantize a finite positive multiplier to deterministic Q32 units.
+    pub fn from_f64(value: f64) -> Self {
+        assert!(value.is_finite() && value > 0.0 && value <= Self::MAX);
+        let scaled = (value * RCB_TIME_MULTIPLIER_SCALE as f64).round() as u64;
+        Self(scaled.max(1))
+    }
+
+    /// Convert the fixed-point value back to a floating-point multiplier.
+    pub fn as_f64(self) -> f64 {
+        self.0 as f64 / RCB_TIME_MULTIPLIER_SCALE as f64
+    }
+
+    fn units(self) -> u64 {
+        self.0
+    }
+}
+
+impl Default for RcbTimeMultiplier {
+    fn default() -> Self {
+        Self::ONE
+    }
+}
 
 /// Virtual nanoseconds elapsed per nondeterministic instruction other than system calls.
 pub const NANOS_PER_NONDET_INSTR: f64 = 25.0;
@@ -76,6 +129,25 @@ impl LogicalTime {
     pub const ZERO: LogicalTime = LogicalTime(0);
     /// The maximum representable integer nanoseconds.
     pub const MAX: LogicalTime = LogicalTime(u64::MAX);
+
+    /// The sentinel deadline for a wait that has *no* deadline.
+    ///
+    /// A `pause(2)` blocks until a signal arrives and can never time out, so it
+    /// registers this value rather than a real deadline. The saturating `Add`
+    /// impls below also land here when a guest arms an absurdly far-future timer
+    /// (issue #219), which is the same situation: a deadline that can never be
+    /// reached while virtual time remains representable.
+    ///
+    /// Callers that fast-forward virtual time to a pending deadline must check
+    /// [`LogicalTime::is_indefinite`] first. Jumping the global clock onto this
+    /// value would both destroy the continuity of virtual time (a ~584-year
+    /// step) and wake a waiter that Linux would have left blocked.
+    pub const INDEFINITE: LogicalTime = LogicalTime::MAX;
+
+    /// Is this the [`LogicalTime::INDEFINITE`] sentinel, i.e. "no deadline"?
+    pub fn is_indefinite(&self) -> bool {
+        *self == LogicalTime::INDEFINITE
+    }
 
     /// Returns the total number of whole microseconds contained by this `LogicalTime`.
     pub fn as_micros(&self) -> u64 {
@@ -155,6 +227,12 @@ impl LogicalTime {
     /// coarser grained unit of time.
     pub fn into_rcbs(self) -> u64 {
         (self.0 as f64 / NANOS_PER_RCB) as u64
+    }
+
+    /// Convert a virtual duration to RCBs after applying a logical clock multiplier.
+    pub fn into_rcbs_with_multiplier(self, multiplier: f64) -> u64 {
+        debug_assert!(multiplier > 0.0);
+        (self.0 as f64 / (NANOS_PER_RCB * multiplier)).floor() as u64
     }
 
     /// Test if the quantity is zero nanoseconds.
@@ -279,6 +357,18 @@ fn subsecond_units_are_converted_from_nanoseconds() {
 }
 
 #[test]
+fn indefinite_is_recognized_and_nothing_else_is() {
+    assert!(LogicalTime::INDEFINITE.is_indefinite());
+    assert!(!LogicalTime::ZERO.is_indefinite());
+    assert!(!LogicalTime::from_secs(1_767_225_600).is_indefinite());
+    assert!(!LogicalTime(u64::MAX - 1).is_indefinite());
+
+    // A saturated far-future deadline (issue #219) lands on the same sentinel,
+    // and is equally unreachable, so the scheduler must treat it the same way.
+    assert!((LogicalTime(u64::MAX - 10) + LogicalTime::from_secs(1)).is_indefinite());
+}
+
+#[test]
 fn add_saturates_instead_of_overflowing() {
     // Regression for issue #219: Java arms a far-future timer whose deadline
     // overflows u64. All three `Add` impls must saturate at LogicalTime::MAX
@@ -342,18 +432,45 @@ pub struct DetTime {
     /// The syscalls issued by this thread.
     syscalls: u64,
 
+    /// Accumulated syscall cost before applying `multiplier`.
+    ///
+    /// `None` preserves the uniform-cost interpretation of serialized `DetTime` values created
+    /// before syscall-specific costs were introduced.
+    #[serde(default)]
+    syscall_nanos: Option<u64>,
+
     /// Retired conditional branches, as given "opaquely" by the reverie clock.
     /// Technically, that these are RCBs is an implementation detail of reverie.
     rcbs: u64,
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    /// RCB progress weighted by per-thread virtual-time multipliers, in Q32 RCB units.
+    /// `None` preserves the uniform interpretation of older serialized values.
+    // This field participates in Reverie's non-self-describing bincode RPC.
+    // Never skip it during serialization: doing so would shift the following
+    // `GlobalRequest` bytes and corrupt the tuple on decode.
+    #[serde(default)]
+    weighted_rcbs: Option<u128>,
+
     /// Number of nondeterministic instructions (rdtsc, cpuid)
     nondet_instrs: u64,
+
+    /// Explicit virtual-time advances, such as a PMU maximum when RCB accounting is disabled.
+    #[serde(default)]
+    extra_nanos: u64,
 
     /// Baseline amount of time to add.
     starting_micros: Microseconds,
 
     /// Multiplier for all time advances.
     multiplier: f64,
+
+    /// Elapsed local time inherited when this thread was created. It remains
+    /// part of the absolute clock, but is work already charged to its ancestors.
+    /// Like the other clock fields, this must always be present in bincode RPCs.
+    #[serde(default)]
+    inherited_nanos: LogicalDuration,
 }
 
 // Don't derive Default because it would give us a 0.0 multiplier:
@@ -361,10 +478,14 @@ impl Default for DetTime {
     fn default() -> Self {
         DetTime {
             syscalls: 0,
+            syscall_nanos: Some(0),
             rcbs: 0,
+            weighted_rcbs: None,
             nondet_instrs: 0,
+            extra_nanos: 0,
             starting_micros: 0,
             multiplier: 1.0,
+            inherited_nanos: LogicalTime::ZERO,
         }
     }
 }
@@ -397,10 +518,14 @@ impl From<&DateTime<Utc>> for DetTime {
     fn from(dt: &DateTime<Utc>) -> Self {
         DetTime {
             syscalls: 0,
+            syscall_nanos: Some(0),
             rcbs: 0,
+            weighted_rcbs: None,
             nondet_instrs: 0,
+            extra_nanos: 0,
             starting_micros: micros_from_utc(dt),
             multiplier: 1.0,
+            inherited_nanos: LogicalTime::ZERO,
         }
     }
 }
@@ -441,19 +566,47 @@ impl DetTime {
     pub fn zero() -> Self {
         DetTime {
             syscalls: 0,
+            syscall_nanos: Some(0),
             rcbs: 0,
+            weighted_rcbs: None,
             nondet_instrs: 0,
+            extra_nanos: 0,
             starting_micros: 0,
             multiplier: 1.0,
+            inherited_nanos: LogicalTime::ZERO,
         }
+    }
+
+    /// Inherit an absolute clock for a newly created thread without attributing
+    /// its ancestors' work to that thread. Ordinary `Clone` still copies an
+    /// existing clock, including its original inheritance, for RPC snapshots.
+    pub fn clone_for_child(&self) -> Self {
+        let mut child = self.clone();
+        child.inherited_nanos = self.without_starting();
+        child
+    }
+
+    /// Local elapsed time already accounted for by this thread's ancestors.
+    pub fn inherited_nanos(&self) -> LogicalDuration {
+        self.inherited_nanos
     }
 
     /// Register that another syscall has executed.
     pub fn add_syscall(&mut self) {
+        self.add_syscall_with_cost(NANOS_PER_SYSCALL as u64);
+    }
+
+    /// Register a syscall with its unscaled virtual-time cost in nanoseconds.
+    pub fn add_syscall_with_cost(&mut self, nanos: u64) {
+        let previous_uniform_nanos = (self.syscalls as f64 * NANOS_PER_SYSCALL) as u64;
         self.syscalls += 1;
+        match &mut self.syscall_nanos {
+            Some(syscall_nanos) => *syscall_nanos += nanos,
+            None => self.syscall_nanos = Some(previous_uniform_nanos + nanos),
+        }
         trace!(
-            "[detcore] added syscall to logical time, yielding: {:?}",
-            self
+            "[detcore] added syscall cost of {}ns to logical time, yielding: {:?}",
+            nanos, self
         );
     }
 
@@ -469,7 +622,31 @@ impl DetTime {
 
     /// Update internal counts using the reverie clock value.
     pub fn add_rcbs(&mut self, count: u64) {
+        if let Some(weighted_rcbs) = &mut self.weighted_rcbs {
+            *weighted_rcbs += u128::from(count) * u128::from(RCB_TIME_MULTIPLIER_SCALE);
+        }
         self.rcbs += count;
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    /// Add RCB progress using a deterministic per-thread virtual-time multiplier.
+    ///
+    /// The Q32 accumulator makes the result independent of whether a backend reports
+    /// the same RCB total in one update or several smaller updates.
+    pub fn add_rcbs_with_multiplier(&mut self, count: u64, factor: RcbTimeMultiplier) {
+        let weighted_rcbs = self
+            .weighted_rcbs
+            .get_or_insert_with(|| u128::from(self.rcbs) * u128::from(RCB_TIME_MULTIPLIER_SCALE));
+        *weighted_rcbs += u128::from(count) * u128::from(factor.units());
+        self.rcbs += count;
+    }
+
+    /// Advance this local clock to an explicit virtual deadline.
+    pub fn advance_to(&mut self, deadline: LogicalTime) {
+        let current = self.as_nanos();
+        assert!(deadline >= current);
+        self.extra_nanos += (deadline - current).as_nanos();
     }
 
     /// Return current rcbs
@@ -481,10 +658,18 @@ impl DetTime {
     pub fn as_nanos(&self) -> LogicalTime {
         // Note: these counts could be pre-collapsed into scalar within the DetTime
         // representation.  But currently we leave them separate for debuggability.
+        let syscall_nanos = self
+            .syscall_nanos
+            .unwrap_or((self.syscalls as f64 * NANOS_PER_SYSCALL) as u64);
+        let rcb_nanos = self.weighted_rcbs.map_or_else(
+            || self.rcbs as f64 * NANOS_PER_RCB,
+            |weighted| weighted as f64 * NANOS_PER_RCB / RCB_TIME_MULTIPLIER_SCALE as f64,
+        );
         LogicalTime(
             (self.starting_micros * 1000)
-                + ((self.syscalls as f64 * NANOS_PER_SYSCALL * self.multiplier) as u64)
-                + ((self.rcbs as f64 * NANOS_PER_RCB * self.multiplier) as u64)
+                + self.extra_nanos
+                + ((syscall_nanos as f64 * self.multiplier) as u64)
+                + ((rcb_nanos * self.multiplier) as u64)
                 + ((self.nondet_instrs as f64 * NANOS_PER_NONDET_INSTR * self.multiplier) as u64),
         )
     }
@@ -493,6 +678,28 @@ impl DetTime {
     pub fn without_starting(&self) -> LogicalDuration {
         let LogicalTime(t1) = self.as_nanos();
         LogicalTime(t1 - (self.starting_micros * 1000))
+    }
+
+    // TODO-HUMAN-REVIEW(#797): Review logical user/system CPU-time projections.
+    /// Guest-execution time that corresponds to user-space instructions.
+    pub fn user_cpu_time(&self) -> LogicalDuration {
+        let rcb_nanos = self.weighted_rcbs.map_or_else(
+            || self.rcbs as f64 * NANOS_PER_RCB,
+            |weighted| weighted as f64 * NANOS_PER_RCB / RCB_TIME_MULTIPLIER_SCALE as f64,
+        );
+        LogicalTime(
+            ((rcb_nanos + (self.nondet_instrs as f64 * NANOS_PER_NONDET_INSTR)) * self.multiplier)
+                as u64,
+        )
+    }
+
+    // TODO-HUMAN-REVIEW(#797): Review logical user/system CPU-time projections.
+    /// Synthetic time charged for intercepted syscall execution.
+    pub fn system_cpu_time(&self) -> LogicalDuration {
+        let syscall_nanos = self
+            .syscall_nanos
+            .unwrap_or((self.syscalls as f64 * NANOS_PER_SYSCALL) as u64);
+        LogicalTime((syscall_nanos as f64 * self.multiplier) as u64)
     }
 
     /// Project deterministic logical time into a rough number of microseconds.
@@ -512,16 +719,57 @@ impl DetTime {
     }
 }
 
+#[cfg(test)]
+mod rcb_multiplier_tests {
+    use super::*;
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    #[test]
+    fn weighted_rcb_time_is_batching_independent() {
+        let factor = RcbTimeMultiplier::from_f64(2.5);
+        let mut one_batch = DetTime::zero();
+        one_batch.add_rcbs_with_multiplier(10, factor);
+
+        let mut split_batches = DetTime::zero();
+        split_batches.add_rcbs_with_multiplier(4, factor);
+        split_batches.add_rcbs_with_multiplier(6, factor);
+
+        assert_eq!(one_batch.rcbs(), 10);
+        assert_eq!(split_batches.rcbs(), 10);
+        assert_eq!(one_batch.as_nanos(), LogicalTime::from_nanos(250));
+        assert_eq!(one_batch.as_nanos(), split_batches.as_nanos());
+        assert_eq!(one_batch.user_cpu_time(), split_batches.user_cpu_time());
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    #[test]
+    fn uniform_rcbs_after_weighted_rcbs_keep_continuity() {
+        let mut time = DetTime::zero();
+        time.add_rcbs_with_multiplier(10, RcbTimeMultiplier::from_f64(0.5));
+        assert_eq!(time.as_nanos(), LogicalTime::from_nanos(50));
+
+        time.add_rcbs(5);
+        assert_eq!(time.rcbs(), 15);
+        assert_eq!(time.as_nanos(), LogicalTime::from_nanos(100));
+    }
+}
+
 /// Deterministic global time, combining local times.
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub struct GlobalTime {
     /// The time when the container began execution.
     starting_nanos: LogicalTime,
 
-    /// The local work performed by each threads, quantified as virtual
-    /// nanoseconds, NOT including `starting_micros` and not including time
-    /// waiting.
+    /// Latest absolute local duration for each thread, excluding the epoch.
+    /// This includes inherited history for scheduler and replay consumers.
     time_vector: HashMap<DetTid, LogicalTime>,
+
+    /// The inherited part of each local duration. It contributes no new work
+    /// to aggregate time. Missing entries represent zero for older snapshots.
+    #[serde(default)]
+    inherited_time: HashMap<DetTid, LogicalDuration>,
 
     /// A source of central, logically external, time passage generated by the scheduler.
     extra_time: LogicalTime,
@@ -541,6 +789,7 @@ impl GlobalTime {
         GlobalTime {
             starting_nanos: LogicalTime::from_micros(micros_from_utc(&cfg.epoch)),
             time_vector: HashMap::new(),
+            inherited_time: HashMap::new(),
             extra_time: LogicalTime::from_nanos(0),
             total: base.as_nanos(),
             multiplier: cfg.clock_multiplier.unwrap_or(1.0),
@@ -548,7 +797,12 @@ impl GlobalTime {
     }
 
     /// Tick the time of a particular thread.
-    pub fn update_global_time(&mut self, tid: DetTid, newtime: LogicalTime) {
+    pub fn update_global_time(
+        &mut self,
+        tid: DetTid,
+        newtime: LogicalTime,
+        inherited: LogicalDuration,
+    ) {
         if newtime < self.starting_nanos {
             panic!(
                 "update_global_time: Cannot set thread {} time to {}, which is before start of container execution {}",
@@ -562,20 +816,31 @@ impl GlobalTime {
             "[tid {}] ticked its global time component to {}",
             tid, newtime,
         );
-        if let Some(old) = self.time_vector.insert(tid, newtime) {
-            if old > newtime {
+        if let Some(old) = self.time_vector.get_mut(&tid) {
+            if *old > newtime {
                 panic!(
                     "Attempted to update tid {} time to {}, but was already {}",
                     tid, newtime, old
                 );
             }
             // Update the cached total for efficiency:
-            let LogicalTime(diff) = newtime - old;
+            let LogicalTime(diff) = newtime - *old;
+            *old = newtime;
+            // Exec may reload fresh local state. Its first response restores
+            // the absolute clock, while this existing component retains the
+            // original inherited baseline rather than charging that work again.
             self.bump_total(Duration::from_nanos(diff));
         } else {
-            // Don't add starting_nanos in because it's already accounted for
-            // and we don't want to count it multiple times anyway:
-            self.bump_total(Duration::from_nanos(newtime.0));
+            assert!(
+                inherited <= newtime,
+                "thread {tid} inherited time {inherited} beyond its local duration {newtime}"
+            );
+            self.time_vector.insert(tid, newtime);
+            self.inherited_time.insert(tid, inherited);
+            // A child's first startup RPC reports its inherited clock before
+            // it has executed guest work. Its arrival must contribute zero,
+            // whether it precedes or follows the scheduler's time snapshot.
+            self.bump_total(Duration::from_nanos((newtime - inherited).0));
         }
     }
 
@@ -591,8 +856,8 @@ impl GlobalTime {
     // The expensive way to get the total (internal)
     fn sum_up(&self) -> LogicalTime {
         let mut sum = self.starting_nanos;
-        for tm in self.time_vector.values() {
-            sum = sum + *tm;
+        for (tid, tm) in &self.time_vector {
+            sum = sum + (*tm - self.inherited_duration(*tid));
         }
         sum + self.extra_time
     }
@@ -618,13 +883,52 @@ impl GlobalTime {
         self.as_nanos()
     }
 
-    /// Project out the time of a particular thread, which includes its own work only plus any
-    /// global starting time.
+    /// Project a thread's absolute local clock, including its inherited history
+    /// and the epoch. Exec recovery and scheduler replay use this projection.
     pub fn threads_time(&self, dtid: DetTid) -> LogicalTime {
         self.starting_nanos + self.threads_duration(dtid)
     }
 
-    /// Project out the time consumed by the work of a given thread, i.e., its running duration.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-845): Review thread-presence detection for backend reconnects.
+    /// Returns whether this clock has observed work from a thread.
+    pub fn contains_thread(&self, dtid: DetTid) -> bool {
+        self.time_vector.contains_key(&dtid)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1173): Review SaBRe exec clock reassignment.
+    /// Move a surviving thread's clock component to the process-leader TID
+    /// installed by Linux after a non-leader thread successfully execs.
+    ///
+    /// Work previously performed by the old leader remains part of aggregate
+    /// time, but no longer belongs to the new image's local thread clock.
+    pub fn reassign_thread(&mut self, from: DetTid, to: DetTid) {
+        if from == to {
+            return;
+        }
+
+        let survivor_time = self
+            .time_vector
+            .remove(&from)
+            .unwrap_or_else(|| panic!("cannot reassign missing thread clock {from}"));
+        let survivor_inherited = self.inherited_time.remove(&from).unwrap_or_default();
+        let retired_inherited = self.inherited_time.remove(&to).unwrap_or_default();
+        if let Some(retired_leader_time) = self.time_vector.remove(&to) {
+            self.extra_time = self.extra_time + (retired_leader_time - retired_inherited);
+        }
+        self.time_vector.insert(to, survivor_time);
+        self.inherited_time.insert(to, survivor_inherited);
+        self.sanity();
+    }
+
+    fn inherited_duration(&self, dtid: DetTid) -> LogicalDuration {
+        self.inherited_time.get(&dtid).copied().unwrap_or_default()
+    }
+
+    /// Project a thread's local duration, including inherited history but
+    /// excluding the epoch. This is the duration used by scheduler replay;
+    /// aggregate time separately excludes the inherited part.
     pub fn threads_duration(&self, dtid: DetTid) -> LogicalDuration {
         *self.time_vector.get(&dtid).unwrap_or_else(|| {
             panic!(
@@ -640,5 +944,187 @@ impl GlobalTime {
     /// This roughly models something like real time if all threads were running on one core.
     pub fn as_nanos(&self) -> LogicalTime {
         self.total
+    }
+}
+
+#[cfg(test)]
+mod global_time_tests {
+    use super::*;
+
+    fn publish(time: &mut GlobalTime, tid: DetTid, clock: &DetTime) {
+        time.update_global_time(tid, clock.as_nanos(), clock.inherited_nanos());
+    }
+
+    #[test]
+    fn descendants_preserve_absolute_clocks_and_charge_only_their_own_work() {
+        let config = Config {
+            clock_multiplier: Some(2.0),
+            ..Config::default()
+        };
+        let root = DetTid::from_raw(3);
+        let child = DetTid::from_raw(4);
+        let grandchild = DetTid::from_raw(5);
+        let mut time = GlobalTime::new(&config);
+        let start = time.as_nanos();
+        let mut root_clock = DetTime::new(&config);
+        root_clock.add_syscall_with_cost(11);
+        root_clock.add_rcbs(3);
+        root_clock.add_rdtsc();
+        root_clock.advance_to(root_clock.as_nanos() + LogicalTime::from_nanos(1));
+        assert_eq!(root_clock.without_starting(), LogicalTime::from_nanos(133));
+        publish(&mut time, root, &root_clock);
+
+        let mut child_clock = root_clock.clone_for_child();
+        assert_eq!(child_clock.as_nanos(), root_clock.as_nanos());
+        publish(&mut time, child, &child_clock);
+        assert_eq!(time.as_nanos(), start + LogicalTime::from_nanos(133));
+        assert_eq!(time.threads_time(child), child_clock.as_nanos());
+        child_clock.add_syscall_with_cost(7);
+        let mut split_rcbs = child_clock.clone();
+        split_rcbs.add_rcbs_with_multiplier(1, RcbTimeMultiplier::from_f64(0.5));
+        split_rcbs.add_rcbs_with_multiplier(3, RcbTimeMultiplier::from_f64(0.5));
+        child_clock.add_rcbs_with_multiplier(4, RcbTimeMultiplier::from_f64(0.5));
+        assert_eq!(split_rcbs.as_nanos(), child_clock.as_nanos());
+        assert_eq!(split_rcbs.inherited_nanos(), child_clock.inherited_nanos());
+        child_clock.add_cpuid();
+        child_clock.advance_to(child_clock.as_nanos() + LogicalTime::from_nanos(1));
+        assert_eq!(child_clock.without_starting(), LogicalTime::from_nanos(238));
+        let snapshot = child_clock.clone();
+        assert_eq!(snapshot.inherited_nanos(), LogicalTime::from_nanos(133));
+        publish(&mut time, child, &snapshot);
+        assert_eq!(time.as_nanos(), start + LogicalTime::from_nanos(238));
+        publish(&mut time, child, &snapshot);
+        publish(&mut time, child, &snapshot);
+        assert_eq!(time.as_nanos(), start + LogicalTime::from_nanos(238));
+
+        let mut grandchild_clock = child_clock.clone_for_child();
+        assert_eq!(
+            grandchild_clock.inherited_nanos(),
+            LogicalTime::from_nanos(238)
+        );
+        publish(&mut time, grandchild, &grandchild_clock);
+        assert_eq!(time.as_nanos(), start + LogicalTime::from_nanos(238));
+        grandchild_clock.add_syscall_with_cost(3);
+        grandchild_clock.advance_to(grandchild_clock.as_nanos() + LogicalTime::from_nanos(1));
+        publish(&mut time, grandchild, &grandchild_clock);
+        assert_eq!(time.as_nanos(), start + LogicalTime::from_nanos(245));
+        assert_eq!(time.threads_time(child), child_clock.as_nanos());
+        assert_eq!(time.threads_time(grandchild), grandchild_clock.as_nanos());
+        assert_eq!(
+            time.threads_duration(grandchild),
+            LogicalTime::from_nanos(245)
+        );
+
+        time.add_scheduler_time();
+        assert_eq!(time.as_nanos(), start + LogicalTime::from_nanos(1_000_245));
+    }
+
+    #[test]
+    fn exec_preserves_inherited_baselines_and_each_retired_threads_work() {
+        let config = Config::default();
+        let ancestor = DetTid::from_raw(3);
+        let leader = DetTid::from_raw(4);
+        let worker = DetTid::from_raw(5);
+        let child_after_exec = DetTid::from_raw(6);
+        let mut time = GlobalTime::new(&config);
+        let start = time.as_nanos();
+        let mut ancestor_clock = DetTime::new(&config);
+        ancestor_clock.advance_to(start + LogicalTime::from_nanos(1_000));
+        publish(&mut time, ancestor, &ancestor_clock);
+        let mut leader_clock = ancestor_clock.clone_for_child();
+        leader_clock.advance_to(start + LogicalTime::from_nanos(1_100));
+        publish(&mut time, leader, &leader_clock);
+        let mut worker_clock = leader_clock.clone_for_child();
+        worker_clock.advance_to(start + LogicalTime::from_nanos(1_350));
+        publish(&mut time, worker, &worker_clock);
+        assert_eq!(time.as_nanos(), start + LogicalTime::from_nanos(1_350));
+
+        time.reassign_thread(worker, leader);
+        assert_eq!(time.as_nanos(), start + LogicalTime::from_nanos(1_350));
+        assert_eq!(time.threads_time(leader), worker_clock.as_nanos());
+        assert!(!time.contains_thread(worker));
+
+        // An in-process backend reloads DetTime after exec and restores its
+        // absolute clock from the RPC response. The global component must keep
+        // the pre-exec baseline even though this fresh local field is zero.
+        let mut reloaded = DetTime::new(&config);
+        reloaded.advance_to(time.threads_time(leader));
+        assert_eq!(reloaded.inherited_nanos(), LogicalTime::ZERO);
+        publish(&mut time, leader, &reloaded);
+        assert_eq!(time.as_nanos(), start + LogicalTime::from_nanos(1_350));
+        reloaded.advance_to(reloaded.as_nanos() + LogicalTime::from_nanos(1));
+        publish(&mut time, leader, &reloaded);
+        assert_eq!(time.as_nanos(), start + LogicalTime::from_nanos(1_351));
+        // A subsequent leader exec retains the same component and baseline.
+        time.reassign_thread(leader, leader);
+        let mut leader_reload = DetTime::new(&config);
+        leader_reload.advance_to(time.threads_time(leader));
+        publish(&mut time, leader, &leader_reload);
+        assert_eq!(time.as_nanos(), start + LogicalTime::from_nanos(1_351));
+        let mut after_exec = reloaded.clone_for_child();
+        publish(&mut time, child_after_exec, &after_exec);
+        assert_eq!(time.as_nanos(), start + LogicalTime::from_nanos(1_351));
+        after_exec.advance_to(after_exec.as_nanos() + LogicalTime::from_nanos(1));
+        publish(&mut time, child_after_exec, &after_exec);
+        assert_eq!(time.as_nanos(), start + LogicalTime::from_nanos(1_352));
+    }
+
+    #[test]
+    fn inherited_clock_survives_rpc_serialization_and_legacy_json_defaults() {
+        let mut parent = DetTime::zero();
+        parent.add_syscall_with_cost(13);
+        let child = parent.clone_for_child();
+        // The following tuple field detects a skipped positional clock field,
+        // which would otherwise consume bytes from the RPC request.
+        let wire = bincode::serde::encode_to_vec(
+            (child.clone(), 0x1234_5678_u64),
+            bincode::config::legacy(),
+        )
+        .unwrap();
+        let ((restored, following), consumed): ((DetTime, u64), usize) =
+            bincode::serde::decode_from_slice(&wire, bincode::config::legacy()).unwrap();
+        assert_eq!(consumed, wire.len());
+        assert_eq!(following, 0x1234_5678);
+        assert_eq!(restored.as_nanos(), child.as_nanos());
+        assert_eq!(restored.inherited_nanos(), LogicalTime::from_nanos(13));
+
+        let mut legacy = serde_json::to_value(parent.clone()).unwrap();
+        legacy.as_object_mut().unwrap().remove("inherited_nanos");
+        let restored: DetTime = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.as_nanos(), parent.as_nanos());
+        assert_eq!(restored.inherited_nanos(), LogicalTime::ZERO);
+    }
+
+    #[test]
+    #[should_panic(expected = "beyond its local duration")]
+    fn inherited_baseline_cannot_exceed_the_first_local_duration() {
+        let config = Config::default();
+        let mut time = GlobalTime::new(&config);
+        time.update_global_time(
+            DetTid::from_raw(3),
+            time.as_nanos(),
+            LogicalTime::from_nanos(1),
+        );
+    }
+
+    #[test]
+    fn exec_reassigns_survivor_clock_without_losing_aggregate_time() {
+        let config = Config::default();
+        let mut time = GlobalTime::new(&config);
+        let leader = DetTid::from_raw(17);
+        let worker = DetTid::from_raw(18);
+        let start = DetTime::new(&config).as_nanos();
+        let leader_time = start + LogicalTime::from_nanos(100);
+        let worker_time = start + LogicalTime::from_nanos(250);
+        time.update_global_time(leader, leader_time, LogicalTime::ZERO);
+        time.update_global_time(worker, worker_time, LogicalTime::ZERO);
+        let total_before = time.as_nanos();
+
+        time.reassign_thread(worker, leader);
+
+        assert_eq!(time.as_nanos(), total_before);
+        assert_eq!(time.threads_time(leader), worker_time);
+        assert!(time.contains_thread(leader));
+        assert!(!time.contains_thread(worker));
     }
 }

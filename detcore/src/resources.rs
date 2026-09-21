@@ -10,18 +10,46 @@
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::fmt;
 use std::path::PathBuf;
 
+use reverie::Errno;
 use reverie::syscalls::Syscall;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::types::ChildWaitSpec;
 use crate::types::DetInode;
 use crate::types::DetPid;
 use crate::types::DetTid;
 use crate::types::LogicalTime;
 use crate::types::MmId;
+use crate::types::RcbTimeMultiplier;
 use crate::types::SigWrapper;
+
+/// Identifies the outer resource turn for a physically nonblocking, guest-internal pipe
+/// operation. SaBRe reports these inherited stdio pipes as device resources before Detcore's
+/// `InternalIOPolling` turn, so the scheduler tags the outer turn for the same retry-count
+/// normalization as the polling turn itself.
+pub(crate) const SABRE_INTERNAL_PIPE_IO_FYI: &str = "sabre-internal-pipe-io";
+
+/// Identifies the strong one-turn yield issued before a SaBRe task with a loopback peer performs
+/// a zero-timeout poll. The number of these guest polling-loop iterations depends on when the
+/// peer's kernel readiness becomes visible, so the verifier normalizes their scheduler-only turns.
+pub(crate) const SABRE_LOOPBACK_POLL_YIELD_FYI: &str = "sabre-loopback-poll-zero-timeout";
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-1151)
+/// An exact slowdown-factor transition recorded at a scheduler commit boundary.
+#[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize, Hash)]
+pub struct ChaosEpochTransition {
+    /// Per-thread absolute logical time at which the new epoch begins.
+    pub logical_time: LogicalTime,
+    /// Deterministic epoch number.
+    pub epoch: u64,
+    /// Exact fixed-point factor used for virtual-time progression.
+    pub factor: RcbTimeMultiplier,
+}
 
 /// Identity of one syscall executing outside Hermit's serialized guest turns.
 #[derive(
@@ -227,6 +255,18 @@ pub enum ResourceID {
     /// In general these should be recorded if strict reproducibility is to be achieved.
     BlockingExternalIO(ExternalOpId),
 
+    // TODO-HUMAN-REVIEW(PR-868): Review the vfork registration scheduler token.
+    /// A `CLONE_VFORK` parent entering the kernel. The scheduler must not admit
+    /// another guest turn until the child has registered or the clone has failed.
+    BlockingVfork(ExternalOpId),
+
+    // TODO-HUMAN-REVIEW(PR-1152): Review failed deferred-vfork cancellation.
+    /// A clone operation governed by [`ResourceID::BlockingVfork`] failed before a child could
+    /// register. This is a continuation outcome rather than a new blocking operation: it lets the
+    /// scheduler cancel the pending vfork barrier, re-admit the parent, and preserve the original
+    /// injected syscall error.
+    VforkFailed(ExternalOpId),
+
     /// Permission to CONTINUE execution after returning from a potentially-blocking
     /// operation that reaches outside the container.
     BlockedExternalContinue(ExternalOpId),
@@ -238,15 +278,48 @@ pub enum ResourceID {
     /// No guarantees are made about how it will be used.
     ///
     /// Also includes the local time at which the guest observed the preemption point.
-    PriorityChangePoint(u64, LogicalTime),
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    PriorityChangePoint(u64, LogicalTime, u64, Vec<ChaosEpochTransition>),
+
+    /// Park until an exact or any-child process wait has a logical exit to reap.
+    WaitChild {
+        /// The process issuing the wait.
+        parent: DetPid,
+        /// Child population selected by the syscall.
+        spec: ChildWaitSpec,
+    },
+
+    /// Park until a backend reports that a logically exited child is physically waitable.
+    WaitPhysicalChild(DetPid),
 
     /// A physical signal has been received by the thread, request to continue delivering it and
     /// invoking the signal handler as the next thing to run.
     InboundSignal(SigWrapper),
 
+    /// A scheduler notification that one or more guest-generated signals are
+    /// physically pending. An unmarked request wakes waitid polling; a request
+    /// carrying `signal_interrupt_errno` wakes internal IO polling. Kept as one
+    /// resource because scheduler requests currently admit one resource only.
+    WaitidSignals(Vec<SigWrapper>),
+
     /// Relinquish the current scheduler turn without changing the thread's
     /// persistent priority.
     SchedYield,
+
+    /// A guest thread checking in with the scheduler at a happens-before anchor
+    /// point, carrying the thread's running syscall count. The scheduler
+    /// consults the configured `HappensBeforeProgram`: it fires any anchors this
+    /// checkpoint reaches, and parks the thread (removing it from the run queue)
+    /// when the checkpoint is the AFTER endpoint of a Hard edge whose BEFORE
+    /// endpoint has not yet fired. The contained value is the post-increment
+    /// syscall count observed by the guest.
+    HappensBeforeCheckpoint(u64),
+
+    /// A real `rt_sigsuspend` executing outside the runnable set while the kernel
+    /// atomically installs its temporary signal mask. Unlike arbitrary external
+    /// IO, this operation cannot complete without a signal.
+    BlockingRtSigsuspend(ExternalOpId),
 }
 
 /// Permission to a device, which behaves like a predefined "inode".
@@ -273,7 +346,7 @@ pub enum Device {
 /// `Resources` is a request to lock zero or more resources so that the thread can perform an action.
 ///
 /// There can only be one outstanding request at a time for a given TID.
-#[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Clone, Serialize, Deserialize)]
 pub struct Resources {
     /// The thread ID requesting the resources.
     pub tid: DetTid,
@@ -287,6 +360,28 @@ pub struct Resources {
     /// A bit of metadata (just for debugging), about what the thread is trying to do with the
     /// resources.
     pub fyi: String,
+    /// Errno returned when an established signal interruption happens before a
+    /// syscall makes progress. Its presence also asks the caller to classify a
+    /// signal wake after partial progress, when Linux returns the byte count
+    /// instead. `None` does not make an `InternalIOPolling` request eligible
+    /// for the scheduler's cross-task signal wakeup.
+    #[serde(default)]
+    pub(crate) signal_interrupt_errno: Option<i32>,
+}
+
+impl fmt::Debug for Resources {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = f.debug_struct("Resources");
+        debug
+            .field("tid", &self.tid)
+            .field("resources", &self.resources)
+            .field("poll_attempt", &self.poll_attempt)
+            .field("fyi", &self.fyi);
+        if let Some(errno) = self.signal_interrupt_errno {
+            debug.field("signal_interrupt_errno", &errno);
+        }
+        debug.finish()
+    }
 }
 
 impl Resources {
@@ -297,6 +392,7 @@ impl Resources {
             resources: HashMap::new(),
             poll_attempt: 0,
             fyi: String::new(),
+            signal_interrupt_errno: None,
         }
     }
 
@@ -316,6 +412,19 @@ impl Resources {
                 }
             }
         }
+        match (self.signal_interrupt_errno, other.signal_interrupt_errno) {
+            (None, interrupt) => self.signal_interrupt_errno = interrupt,
+            (Some(left), Some(right)) => assert_eq!(left, right),
+            (Some(_), None) => {}
+        }
+    }
+
+    pub fn set_signal_interrupt_errno(&mut self, errno: Errno) {
+        self.signal_interrupt_errno = Some(errno.into_raw());
+    }
+
+    pub fn signal_interrupt_errno(&self) -> Option<i32> {
+        self.signal_interrupt_errno
     }
 
     /// Insert a new individual resource into a set of resources.
@@ -401,6 +510,10 @@ mod tests {
         assert_ne!(
             ResourceID::BlockingExternalIO(ExternalOpId::new(tid1, 7)),
             ResourceID::BlockingExternalIO(ExternalOpId::new(tid2, 7))
+        );
+        assert_ne!(
+            ResourceID::BlockingExternalIO(ExternalOpId::new(tid1, 7)),
+            ResourceID::BlockingRtSigsuspend(ExternalOpId::new(tid1, 7))
         );
         assert_ne!(
             ResourceID::ParentContinue {

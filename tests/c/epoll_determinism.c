@@ -15,8 +15,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/epoll.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
@@ -49,8 +49,12 @@ static void create_pipe(int pipefd[2]) {
   }
 }
 
-static void
-control_fd(int epoll_fd, int operation, int fd, uint32_t events, uint64_t tag) {
+static void control_fd(
+    int epoll_fd,
+    int operation,
+    int fd,
+    uint32_t events,
+    uint64_t tag) {
   struct epoll_event event = {
       .events = events,
       .data.u64 = tag,
@@ -322,8 +326,10 @@ static void run_nested(void) {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#549)
-static void
-expect_notification_flags(int fd, const char* label, bool expect_nonblocking) {
+static void expect_notification_flags(
+    int fd,
+    const char* label,
+    bool expect_nonblocking) {
   const int descriptor_flags = fcntl(fd, F_GETFD);
   if (descriptor_flags < 0) {
     fail_errno("fcntl(F_GETFD) on notification fd");
@@ -371,8 +377,7 @@ static void run_control_fds(void) {
   expect_events(epoll_fd, "control-add", add_tags, ARRAY_SIZE(add_tags));
 
   control_fd(epoll_fd, EPOLL_CTL_MOD, event_fd, EPOLLIN, modified_tag);
-  expect_events(
-      epoll_fd, "control-mod", modified_tags, ARRAY_SIZE(modified_tags));
+  expect_events(epoll_fd, "control-mod", modified_tags, ARRAY_SIZE(modified_tags));
 
   uint64_t counter;
   read_exact(event_fd, &counter, sizeof(counter));

@@ -9,13 +9,13 @@
 import java.security.SecureRandom;
 
 public final class RuntimeRandom {
-  public static void main(String[] args) {
-    byte[] bytes = new byte[16];
-    new SecureRandom().nextBytes(bytes);
-    StringBuilder output = new StringBuilder();
-    for (byte value : bytes) {
-      output.append(String.format("%02x", value & 0xff));
+    public static void main(String[] args) {
+        byte[] bytes = new byte[16];
+        new SecureRandom().nextBytes(bytes);
+        StringBuilder output = new StringBuilder();
+        for (byte value : bytes) {
+            output.append(String.format("%02x", value & 0xff));
+        }
+        System.out.println(output);
     }
-    System.out.println(output);
-  }
 }

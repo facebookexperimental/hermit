@@ -1,13 +1,6 @@
 name: Validation Levels
 
 on:
-  pull_request:
-    branches: [main]
-  merge_group:
-    types: [checks_requested]
-  schedule:
-    # Weekly stress run on Sunday. Scheduled workflows run from the default branch.
-    - cron: "23 05 * * 0"
   workflow_dispatch:
     inputs:
       level:
@@ -15,10 +8,7 @@ on:
         required: true
         type: choice
         default: quick
-        options:
-          - quick
-          - full
-          - super
+        options: [quick, full, super]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
@@ -32,28 +22,58 @@ env:
   NEXTEST_VERSION: "0.9.100"
   RUSTFLAGS: -D warnings -C link-arg=-llzma
   RUSTDOCFLAGS: -D warnings
+  DETCORE_TEST_RUST_LOG: "off"
 
 jobs:
   quick:
-    name: Quick validation (PR)
+    name: Portable validation (manual)
     if: >-
       ${{
-        github.event_name == 'pull_request' ||
-        (github.event_name == 'workflow_dispatch' && inputs.level == 'quick')
+        github.event_name == 'workflow_dispatch' && inputs.level == 'quick'
       }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 180
+    env:
+      STRICT_COMPAT_HERMIT_BIN: ${{ github.workspace }}/target/debug/hermit
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: portable-validation
+          cache-on-failure: true
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libunwind-dev liblzma-dev
-      - name: Core ptrace validation
-        run: ./validate.sh quick --no-label-pr
+          sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal ncat netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
+      - name: Enable namespaces
+        run: |
+          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
+      - name: Install cargo-nextest (prebuilt)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+      - name: Rust components
+        run: rustup component add clippy rustfmt
+      - name: GitHub-managed portable test lane
+        run: ./scripts/validate.rs --portable-only --no-label-pr
+      - name: Upload nextest JUnit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-levels-nextest-${{ github.job }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
+          retention-days: 14
 
   full:
-    name: Full validation (merge gate)
+    name: Privileged validation (merge gate)
     if: >-
       ${{
         github.repository == 'rrnewton/hermit' &&
@@ -62,11 +82,14 @@ jobs:
           (github.event_name == 'workflow_dispatch' && inputs.level == 'full')
         )
       }}
-    runs-on: [self-hosted, Linux, X64, hermit, pmu]
-    timeout-minutes: 180
+    # No pmu-serial: PMU work is not counter-scarce and PMU skid is an
+    # instruction-space hardware property independent of concurrency, so there
+    # is no determinism reason to pin this lane to one serialized box. `pmu`
+    # already selects a PMU+CPUID+/dev/kvm-capable host.
+    runs-on: [Linux, X64, hermit, pmu]
+    timeout-minutes: 360
     env:
       DETCORE_TEST_RUST_LOG: "off"
-      VALIDATE_GATE_TIMEOUT_SECONDS: "1200"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -80,26 +103,45 @@ jobs:
           if command -v dnf >/dev/null; then
             sudo dnf makecache || echo "::notice::dnf makecache failed; using existing metadata"
             sudo dnf install -y gcc-c++ libunwind-devel xz-devel
-            for pkg in cmake zlib-devel redis sqlite golang; do
-              sudo dnf install -y "$pkg" || echo "::notice::$pkg unavailable; skipping"
+            for pkg in cmake zlib-devel redis sqlite ruby nodejs java-latest-openjdk-devel ocaml python3-test gdb lldb; do
+              sudo dnf install -y "$pkg" || echo "::notice::$pkg unavailable; checking existing tools"
             done
           elif command -v apt-get >/dev/null; then
             sudo apt-get update || echo "::notice::apt-get update failed; using existing package index"
             sudo apt-get install -y g++ libunwind-dev liblzma-dev
-            for pkg in cmake zlib1g-dev redis-server redis-tools sqlite3 golang-go; do
-              sudo apt-get install -y "$pkg" || echo "::notice::$pkg unavailable; skipping"
+            for pkg in cmake zlib1g-dev redis-server redis-tools sqlite3 ruby nodejs default-jdk-headless ocaml-nox libpython3.12-testsuite gdb lldb; do
+              sudo apt-get install -y "$pkg" || echo "::notice::$pkg unavailable; checking existing tools"
             done
           else
             echo "::error::Unsupported package manager"
             exit 1
           fi
-      - name: Namespace preflight
-        run: >-
-          unshare --user --map-root-user --pid --fork --uts --net --mount
-          sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys &&
-          mount --bind /tmp /tmp && mount --make-rshared /tmp && umount /tmp'
-      - name: Complete validation suite
-        run: ./validate.sh full --no-label-pr
+      - name: Privileged capability and runtime preflight
+        run: |
+          test -r /proc/sys/kernel/perf_event_paranoid
+          test -r /dev/kvm -a -w /dev/kvm
+          command -v go ruby node javac java ocamlopt python3 redis-server redis-cli sqlite3 gdb lldb
+          python3 -c 'import test.support'
+          unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
+      - name: Privileged PMU and CPUID test DAG
+        # No flock: the PMU counter-exhaustion premise the lock guarded was
+        # measured false (per-task counters; 32 concurrent runs, 0 failures).
+        # In-DAG resource_caps still serialize genuinely exclusive resources.
+        # --allow-cgroup-failure: at the advanced runner pin the runner skips its
+        # systemd --user scope under $GITHUB_ACTIONS (hosted AND self-hosted) and
+        # would otherwise fail-close (exit 3); opt out to best-effort UNBOXED
+        # (pre-pin behavior) so this self-hosted lane does not regress RED.
+        run: env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v
+      - name: Record/replay compatibility ratchet (139 programs)
+        run: ./scripts/validate.rs --rr-compat-only --no-label-pr --verbose
+      - name: Upload privileged DAG performance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-levels-privileged-dag-perf
+          path: ${{ runner.temp }}/hermit-privileged-dag-perf
+          if-no-files-found: warn
+          retention-days: 14
       - name: Upload working-envelope JSON
         if: always()
         uses: actions/upload-artifact@v4
@@ -119,12 +161,14 @@ jobs:
           (github.event_name == 'workflow_dispatch' && inputs.level == 'super')
         )
       }}
-    runs-on: [self-hosted, Linux, X64, hermit, pmu]
-    timeout-minutes: 180
+    # No pmu-serial: PMU work is not counter-scarce and PMU skid is an
+    # instruction-space hardware property independent of concurrency, so there
+    # is no determinism reason to pin this lane to one serialized box. `pmu`
+    # already selects a PMU+CPUID+/dev/kvm-capable host.
+    runs-on: [Linux, X64, hermit, pmu]
+    timeout-minutes: 360
     env:
       DETCORE_TEST_RUST_LOG: "off"
-      SUPER_REPETITIONS: "20"
-      VALIDATE_GATE_TIMEOUT_SECONDS: "1200"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -134,23 +178,24 @@ jobs:
           if command -v dnf >/dev/null; then
             sudo dnf makecache || echo "::notice::dnf makecache failed; using existing metadata"
             sudo dnf install -y gcc-c++ libunwind-devel xz-devel
-            for pkg in cmake zlib-devel; do
-              sudo dnf install -y "$pkg" || echo "::notice::$pkg unavailable; skipping"
+            for pkg in cmake zlib-devel curl unzip patch tcl-devel java-latest-openjdk-devel; do
+              sudo dnf install -y "$pkg" || echo "::notice::$pkg unavailable; checking existing tools"
             done
           elif command -v apt-get >/dev/null; then
             sudo apt-get update || echo "::notice::apt-get update failed; using existing package index"
             sudo apt-get install -y g++ libunwind-dev liblzma-dev
-            for pkg in cmake zlib1g-dev; do
-              sudo apt-get install -y "$pkg" || echo "::notice::$pkg unavailable; skipping"
+            for pkg in cmake zlib1g-dev curl unzip patch tcl-dev default-jdk-headless; do
+              sudo apt-get install -y "$pkg" || echo "::notice::$pkg unavailable; checking existing tools"
             done
           else
             echo "::error::Unsupported package manager"
             exit 1
           fi
-      - name: Namespace preflight
-        run: >-
-          unshare --user --map-root-user --pid --fork --uts --net --mount
-          sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys &&
-          mount --bind /tmp /tmp && mount --make-rshared /tmp && umount /tmp'
-      - name: Repeated determinism stress
-        run: ./validate.sh super --no-label-pr
+      - name: PMU and namespace preflight
+        run: |
+          test -r /proc/sys/kernel/perf_event_paranoid
+          command -v java javac
+          unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
+      - name: Repeated and long-form privileged validation
+        # No flock: retired with the disproven PMU counter-exhaustion premise.
+        run: ./scripts/validate.rs super --no-label-pr

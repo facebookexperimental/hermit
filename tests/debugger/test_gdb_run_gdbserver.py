@@ -12,6 +12,7 @@ inspection, and continue-to-exit. Each test starts a fresh Hermit gdbserver so
 the tests are independent and order-insensitive.
 """
 
+import re
 import unittest
 
 import harness
@@ -54,7 +55,9 @@ class GdbRunGdbserver(DebuggerTestBase):
 
     def test_step_over_and_local_variable(self):
         # Stop at compute, step over the first statement, then `sum` is defined.
-        out, _ = self._gdb(["break compute", "continue", "next", "print sum", "kill"])
+        out, _ = self._gdb(
+            ["break compute", "continue", "next", "print sum", "kill"]
+        )
         self.assertRegex(out, r"\$\d+ = %d" % EXPECT_SUM)
 
     def test_step_in_from_main(self):
@@ -77,11 +80,15 @@ class GdbRunGdbserver(DebuggerTestBase):
         # NOTE: `finish` must NOT be followed by `continue` -- that currently
         # panics reverie ("unexpected resume action"), see README. We end with
         # `kill` instead.
-        out, _ = self._gdb(["break compute", "continue", "finish", "kill"])
+        out, _ = self._gdb(
+            ["break compute", "continue", "finish", "kill"]
+        )
         self.assertRegex(out, r"Value returned is \$\d+ = %d" % EXPECT_RESULT)
 
     def test_register_inspection(self):
-        out, _ = self._gdb(["break compute", "continue", "info registers rip", "kill"])
+        out, _ = self._gdb(
+            ["break compute", "continue", "info registers rip", "kill"]
+        )
         # rip should be a concrete hex value inside the text segment.
         self.assertRegex(out, r"rip\s+0x[0-9a-f]+")
 

@@ -9,10 +9,12 @@
 //! System calls for dealing with threads and concurrency.
 use std::time::Duration;
 
+use nix::sys::signal::Signal;
 use reverie::Error;
 use reverie::Guest;
 use reverie::Stack;
 use reverie::syscalls;
+use reverie::syscalls::ClockId;
 use reverie::syscalls::Errno;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
@@ -31,7 +33,7 @@ use crate::resources::Resources;
 use crate::scheduler::Priority;
 use crate::scheduler::entropy_to_priority;
 use crate::tool_global::ResumeStatus;
-use crate::tool_global::resource_request;
+use crate::tool_global::register_posix_timer;
 use crate::tool_global::thread_observe_time;
 use crate::tool_local::Detcore;
 use crate::types::LogicalTime;
@@ -64,6 +66,46 @@ fn ns_to_timespec(ns: u64) -> libc::timespec {
     libc::timespec {
         tv_sec: (ns / 1_000_000_000) as libc::time_t,
         tv_nsec: (ns % 1_000_000_000) as libc::c_long,
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-857): Query-only timex mode boundary.
+fn timex_mode_is_query(modes: libc::c_uint) -> bool {
+    modes == 0 || modes == libc::ADJ_OFFSET_SS_READ
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-857): Host-independent NTP discipline snapshot.
+fn deterministic_timex(now: Timespec) -> libc::timex {
+    // SAFETY: `libc::timex` contains only integer fields and padding; zero is a
+    // valid baseline for the fields not modeled by Hermit.
+    let mut tx: libc::timex = unsafe { std::mem::zeroed() };
+    tx.status = libc::STA_UNSYNC;
+    tx.tick = 10_000;
+    tx.time = libc::timeval {
+        tv_sec: now.tv_sec,
+        tv_usec: now.tv_nsec / 1_000,
+    };
+    tx
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-845): Review SaBRe thread-local guest clock reads.
+pub(crate) async fn guest_clock_time<G, T>(guest: &mut G) -> LogicalTime
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let raw = thread_observe_time(guest).await;
+    guest.thread_state().observe_guest_clock(raw)
+}
+
+fn remaining_sleep_duration(target: LogicalTime, now: LogicalTime) -> Duration {
+    if target > now {
+        target.duration_since(now)
+    } else {
+        Duration::ZERO
     }
 }
 
@@ -113,7 +155,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         change_time: LogicalTime,
         new_priority: Priority,
     ) -> Resources {
-        let resource = ResourceID::PriorityChangePoint(new_priority, change_time);
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-1151)
+        let epochs = guest.thread_state_mut().take_pending_chaos_epochs();
+        let rcbs = guest.thread_state().committed_clock_value;
+        let resource = ResourceID::PriorityChangePoint(new_priority, change_time, rcbs, epochs);
         guest.thread_state().mk_request(resource, Permission::W)
     }
 
@@ -123,7 +169,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Gettimeofday,
     ) -> Result<i64, Error> {
-        let time_ns = thread_observe_time(guest).await;
+        let time_ns = guest_clock_time(guest).await;
 
         let ret = self.record_or_replay(guest, call).await?;
 
@@ -144,7 +190,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Time,
     ) -> Result<i64, Error> {
-        let time_ns = thread_observe_time(guest).await;
+        let time_ns = guest_clock_time(guest).await;
         let secs = time_ns.as_secs() as i64;
 
         if let Some(tloc) = call.tloc() {
@@ -161,7 +207,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::ClockGettime,
     ) -> Result<i64, Error> {
-        let time_ns = thread_observe_time(guest).await;
+        let time_ns = guest_clock_time(guest).await;
         trace!("Converting nanoseconds into clock_gettime: {}", time_ns);
 
         let tp = call.tp().ok_or(Errno::EFAULT)?;
@@ -179,19 +225,68 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::ClockGetres,
     ) -> Result<i64, Error> {
-        let res = call.res().ok_or(Errno::EFAULT)?;
+        // A NULL `res` pointer is valid for clock_getres: the kernel validates
+        // the clockid and returns 0 without storing the resolution. GHC's RTS
+        // probes the per-thread CPU clock exactly this way
+        // (clock_getres(clockid, NULL)) in getCurrentThreadCPUTime, so
+        // returning EFAULT here spuriously aborts the guest. Only write the
+        // resolution when the caller supplied a destination.
+        if let Some(res) = call.res() {
+            // For now we report a constant clock res of 10ms:
+            let clock_res = 10;
 
-        // For now we report a constant clock res of 10ms:
-        let clock_res = 10;
+            let t = Timespec {
+                tv_sec: 0,
+                tv_nsec: 1000 * clock_res as i64,
+            };
 
-        let t = Timespec {
-            tv_sec: 0,
-            tv_nsec: 1000 * clock_res as i64,
-        };
-
-        guest.memory().write_value(res, &t)?;
+            guest.memory().write_value(res, &t)?;
+        }
 
         Ok(0)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-857): Deterministic adjtimex query/refusal policy.
+    /// Report Hermit's virtual clock with a fixed unsynchronized discipline.
+    /// Adjustment modes are capability-gated host mutations and receive EPERM.
+    pub async fn handle_adjtimex<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Adjtimex,
+    ) -> Result<i64, Error> {
+        self.write_deterministic_timex(guest, call.buf()).await
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-857): Deterministic clock_adjtime query/refusal policy.
+    /// Apply the adjtimex policy to CLOCK_REALTIME. Linux does not permit NTP
+    /// adjustment of the other fixed clock IDs, so reject them with EOPNOTSUPP.
+    pub async fn handle_clock_adjtime<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::ClockAdjtime,
+    ) -> Result<i64, Error> {
+        if call.clockid() != ClockId::CLOCK_REALTIME {
+            return Err(Errno::EOPNOTSUPP.into());
+        }
+        self.write_deterministic_timex(guest, call.buf()).await
+    }
+
+    async fn write_deterministic_timex<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        buf: Option<reverie::syscalls::AddrMut<'_, libc::timex>>,
+    ) -> Result<i64, Error> {
+        let buf = buf.ok_or(Errno::EFAULT)?;
+        let request: libc::timex = guest.memory().read_value(buf)?;
+        if !timex_mode_is_query(request.modes) {
+            return Err(Errno::EPERM.into());
+        }
+
+        let now: Timespec = thread_observe_time(guest).await.into();
+        guest.memory().write_value(buf, &deterministic_timex(now))?;
+        Ok(libc::TIME_ERROR as i64)
     }
 
     /// Helper function to wait a given period, which may either succeed or be interrupted by a signal.
@@ -202,12 +297,26 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: NanosleepFamily,
     ) -> Result<i64, Error> {
         let target_time = time_from_resources(&request).expect("a sleepuntil resource request");
-        match resource_request(guest, request).await {
+        match crate::tool_global::parked_wait_request(
+            guest,
+            request,
+            crate::scheduler::parked::ParkedWaitPolicy::NanosleepNoHandlerRestart {
+                absolute_deadline: target_time,
+            },
+        )
+        .await
+        {
             ResumeStatus::Normal => Ok(0),
-            ResumeStatus::Signaled => {
+            ResumeStatus::Signaled(_) => {
                 let now = thread_observe_time(guest).await;
-                let delta: Duration = target_time.duration_since(now);
-                let addr2 = call.rem();
+                let delta = remaining_sleep_duration(target_time, now);
+                // Linux never touches remain for TIMER_ABSTIME, even when
+                // a caught signal interrupts the absolute sleep.
+                let addr2 = if call.flags() & libc::TIMER_ABSTIME == 0 {
+                    call.rem()
+                } else {
+                    None
+                };
                 if let Some(addr2) = addr2 {
                     info!(
                         "[interrupted] sleep till (until {}), woke up {:?} early, writing into nanosleep rem argument.",
@@ -237,13 +346,27 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(guest.inject(Syscall::from(call)).await?);
         }
 
-        // TODO: use 2nd, `rem` argument when providing a way for a signal to interrupt the
-        // logical sleep.
         let addr = call.req().ok_or(Errno::EFAULT)?;
-        let t: Timespec = guest
-            .memory()
-            .read_value(addr)
-            .expect("should be able to read from memory");
+        let t: Timespec = guest.memory().read_value(addr)?;
+
+        // Linux validates the requested interval BEFORE sleeping: nanosleep(2)
+        // and clock_nanosleep(2) both fail EINVAL when tv_nsec is outside
+        // [0, 999999999] or tv_sec is negative.
+        //
+        // Detcore skipped that check and fed the raw fields through `as u64`.
+        // `Timespec` stores both as i64, so `tv_sec = -1` wrapped to
+        // u64::MAX (~1.8e19 seconds) and became `SleepUntil(INDEFINITE)`: the
+        // only guest thread parked with no deadline, the run queue emptied, and
+        // `step2d_handle_empty_queue` deliberately never jumps the clock for an
+        // indefinite waiter (doing so would also wake a `pause(2)`). The
+        // container then died -- exit 1, "Sandbox container exited
+        // unexpectedly" -- where Linux returns an errno and keeps running.
+        //
+        // A past *absolute* deadline is NOT an error and must still return 0,
+        // so this rejects only malformed fields, never an early deadline.
+        if t.tv_sec < 0 || t.tv_nsec < 0 || t.tv_nsec > 999_999_999 {
+            return Err(Errno::EINVAL.into());
+        }
 
         match call.flags() {
             0 => {
@@ -306,7 +429,24 @@ impl<T: RecordOrReplay> Detcore<T> {
         target_time: LogicalTime,
     ) -> Timespec {
         let base_time = thread_observe_time(guest).await;
-        let relative_logical = target_time - base_time;
+
+        // An absolute deadline already in the past is NOT an error on Linux --
+        // clock_nanosleep(TIMER_ABSTIME) simply returns 0 without sleeping.
+        // `LogicalTime`'s `Sub` is a plain subtraction (unlike its `Add` impls,
+        // which saturate deliberately), so `target_time - base_time` underflows
+        // for a past deadline: a debug build panics with "attempt to subtract
+        // with overflow", and a release build wraps to an enormous interval --
+        // the same effectively-indefinite sleep this handler exists to avoid.
+        //
+        // Clamped here rather than by making the shared operator saturate,
+        // because this is the only subtraction of two `LogicalTime`s in the
+        // tree and a silently-saturating operator could hide a real underflow
+        // in some future caller.
+        let relative_logical = if target_time <= base_time {
+            LogicalTime::from_nanos(0)
+        } else {
+            target_time - base_time
+        };
 
         Timespec {
             tv_sec: relative_logical.as_secs() as i64,
@@ -314,9 +454,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#869)
     /// timer_create: allocate a per-process POSIX timer and hand back a
-    /// deterministic id. The timer's arming is tracked (in the process-local
-    /// `PosixTimers` table) but expiration signals are not delivered.
+    /// deterministic id, retaining any scheduler-deliverable signal.
     pub async fn handle_timer_create<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -325,22 +466,42 @@ impl<T: RecordOrReplay> Detcore<T> {
         // The kernel writes the new timer id here; a null pointer is EFAULT.
         let timerid_ptr = call.timerid().ok_or(Errno::EFAULT)?;
         let clockid = call.clockid();
+        let signal = if let Some(event_ptr) = call.sevp() {
+            let event: libc::sigevent = guest.memory().read_value(event_ptr)?;
+            match event.sigev_notify {
+                libc::SIGEV_NONE => None,
+                // Linux uses 4 for SIGEV_THREAD_ID. Treat it as process-directed
+                // until Detcore tracks per-timer thread targeting.
+                libc::SIGEV_SIGNAL | 4 => {
+                    if !(1..=64).contains(&event.sigev_signo) {
+                        return Err(Errno::EINVAL.into());
+                    }
+                    Signal::try_from(event.sigev_signo).ok()
+                }
+                _ => return Err(Errno::ENOSYS.into()),
+            }
+        } else {
+            Some(Signal::SIGALRM)
+        };
         let id = {
             let mut timers = guest.thread_state().posix_timers.lock().unwrap();
-            timers.create()
+            timers.create(signal.map(|sig| sig as i32))
         };
         guest
             .memory()
             .write_value(timerid_ptr, &(id as libc::c_int))?;
         detlog!(
-            "[dtid {}] timer_create(clockid={:?}) => deterministic timer id {} (arming tracked; signal delivery not emulated)",
+            "[dtid {}] timer_create(clockid={:?}) => deterministic timer id {}, signal {:?}",
             guest.thread_state().dettid,
             clockid,
             id,
+            signal,
         );
         Ok(0)
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#869)
     /// timer_settime: arm or disarm a timer against the deterministic virtual
     /// clock. The old arming is reported through `old_value` when requested.
     pub async fn handle_timer_settime<G: Guest<Self>>(
@@ -364,11 +525,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             Some(now + Duration::from_nanos(value_ns))
         };
 
-        let old = {
+        let (old, signal_number) = {
             let mut timers = guest.thread_state().posix_timers.lock().unwrap();
-            timers.settime(id, interval_ns, deadline, now)
+            let old = timers.settime(id, interval_ns, deadline, now);
+            let signal = timers.signal(id);
+            (old, signal)
         };
         let (old_remaining_ns, old_interval_ns) = old.ok_or(Errno::EINVAL)?;
+        let signal_number = signal_number.ok_or(Errno::EINVAL)?;
 
         if let Some(old_ptr) = call.old_value() {
             let old_spec = libc::itimerspec {
@@ -378,8 +542,19 @@ impl<T: RecordOrReplay> Detcore<T> {
             guest.memory().write_value(old_ptr, &old_spec)?;
         }
 
+        if let Some(signal) = signal_number.and_then(|signum| Signal::try_from(signum).ok()) {
+            register_posix_timer(
+                guest,
+                id,
+                deadline,
+                LogicalTime::from_nanos(interval_ns),
+                signal,
+            )
+            .await;
+        }
+
         detlog!(
-            "[dtid {}] timer_settime(id={}, interval_ns={}, value_ns={}) armed against virtual clock (not delivered)",
+            "[dtid {}] timer_settime(id={}, interval_ns={}, value_ns={}) armed against virtual clock",
             guest.thread_state().dettid,
             id,
             interval_ns,
@@ -411,8 +586,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(0)
     }
 
-    /// timer_getoverrun: we never deliver expirations, so the overrun count is
-    /// always 0 for a live timer.
+    /// timer_getoverrun: coalesced expiration accounting is not modeled, so the
+    /// overrun count is always 0 for a live timer.
     pub async fn handle_timer_getoverrun<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -432,6 +607,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#869)
     /// timer_delete: destroy a timer created by `timer_create`.
     pub async fn handle_timer_delete<G: Guest<Self>>(
         &self,
@@ -439,11 +616,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::TimerDelete,
     ) -> Result<i64, Error> {
         let id = call.timerid();
+        let signal_number = guest
+            .thread_state()
+            .posix_timers
+            .lock()
+            .unwrap()
+            .signal(id)
+            .ok_or(Errno::EINVAL)?;
         let existed = {
             let mut timers = guest.thread_state().posix_timers.lock().unwrap();
             timers.remove(id)
         };
         if existed {
+            if let Some(signal) = signal_number.and_then(|signum| Signal::try_from(signum).ok()) {
+                register_posix_timer(guest, id, None, LogicalTime::ZERO, signal).await;
+            }
             detlog!(
                 "[dtid {}] timer_delete(id={})",
                 guest.thread_state().dettid,
@@ -453,5 +640,45 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             Err(Errno::EINVAL.into())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timex_policy_distinguishes_queries_from_mutations() {
+        assert!(timex_mode_is_query(0));
+        assert!(timex_mode_is_query(libc::ADJ_OFFSET_SS_READ));
+        assert!(!timex_mode_is_query(libc::ADJ_OFFSET));
+        assert!(!timex_mode_is_query(libc::ADJ_FREQUENCY));
+    }
+
+    #[test]
+    fn timex_snapshot_is_unsynchronized_and_uses_virtual_time() {
+        let tx = deterministic_timex(Timespec {
+            tv_sec: 123,
+            tv_nsec: 456_789_000,
+        });
+        assert_eq!(tx.status, libc::STA_UNSYNC);
+        assert_eq!(tx.tick, 10_000);
+        assert_eq!(tx.time.tv_sec, 123);
+        assert_eq!(tx.time.tv_usec, 456_789);
+    }
+
+    #[test]
+    fn interrupted_sleep_remaining_time_floors_at_zero() {
+        let target = LogicalTime::from_nanos(1_000);
+
+        assert_eq!(
+            remaining_sleep_duration(target, LogicalTime::from_nanos(750)),
+            Duration::from_nanos(250)
+        );
+        assert_eq!(remaining_sleep_duration(target, target), Duration::ZERO);
+        assert_eq!(
+            remaining_sleep_duration(target, LogicalTime::from_nanos(1_250)),
+            Duration::ZERO
+        );
     }
 }

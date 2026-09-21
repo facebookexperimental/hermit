@@ -52,10 +52,11 @@ fn arch_prctl_controls_verify_in_run_and_record_modes() {
         .arg(&guest);
     command_output(compile, "arch_prctl guest compilation");
 
-    for (label, extra_args) in [
-        ("strict arch_prctl verification", None),
+    for (label, strict, extra_args) in [
+        ("strict arch_prctl verification", true, None),
         (
             "passthru-opt arch_prctl verification",
+            false,
             Some("--passthru-opt"),
         ),
     ] {
@@ -64,19 +65,28 @@ fn arch_prctl_controls_verify_in_run_and_record_modes() {
             .args(["--kill-after", "5s", "30s"])
             .arg(env!("CARGO_BIN_EXE_hermit"))
             .args([
-                "--log=off",
+                "--log=info",
                 "run",
-                "--strict",
                 "--verify",
                 "--preemption-timeout=disabled",
                 "--base-env=minimal",
             ]);
+        if strict {
+            verify.arg("--strict");
+        }
         if let Some(arg) = extra_args {
-            verify.arg(arg);
+            verify.args(["--allow-unsupported-syscalls", arg]);
         }
         verify.arg("--").arg(&guest);
         let output = command_output(verify, label);
         assert_marker(&output, "Determinism verified", label);
+        if !strict {
+            assert_marker(
+                &output,
+                "a successful exit does not establish complete deterministic execution",
+                "passthru-opt arch_prctl compatibility warning",
+            );
+        }
     }
 
     let mut host_cpuid = Command::new("timeout");
@@ -84,7 +94,7 @@ fn arch_prctl_controls_verify_in_run_and_record_modes() {
         .args(["--kill-after", "5s", "30s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args([
-            "--log=off",
+            "--log=info",
             "run",
             "--strict",
             "--verify",
@@ -109,7 +119,7 @@ fn arch_prctl_controls_verify_in_run_and_record_modes() {
         .args(["--kill-after", "5s", "60s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args([
-            "--log=off",
+            "--log=info",
             "record",
             "start",
             "--verify",

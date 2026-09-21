@@ -1,0 +1,9 @@
+load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
+
+oncall("hermit")
+
+rust_library(
+    name = "hermit-resources",
+    srcs = glob(["src/**/*.rs"]),
+    autocargo = {"cargo_toml_dir": "."},
+)

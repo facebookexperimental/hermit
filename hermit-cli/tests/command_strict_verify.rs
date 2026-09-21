@@ -7,8 +7,10 @@
  */
 
 //! End-to-end L2 coverage for standard command-line tools that are expected on
-//! the self-hosted CI runner.
+//! the portable CI runner.
 
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
@@ -20,6 +22,8 @@ static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
 const HERMIT_VERIFY_TIMEOUT: &str = "60s";
 const HERMIT_VERIFY_KILL_AFTER: &str = "10s";
+const ISOLATED_WORKDIR_ENV: &str = "HERMIT_E2E_EMPTY_WORKDIR";
+const HERMETIC_TEST_WORKDIR: &str = "/test";
 
 struct StrictCommandCase {
     name: &'static str,
@@ -47,8 +51,36 @@ fn required_command(case: &StrictCommandCase) -> PathBuf {
         })
 }
 
+fn pinned_root_args(requested: Option<&OsStr>) -> Result<Vec<OsString>, String> {
+    match requested {
+        None => Ok(Vec::new()),
+        Some(value) if value == OsStr::new(HERMETIC_TEST_WORKDIR) => Ok(vec![
+            "--base-env=minimal".into(),
+            "--mount=type=tmpfs,target=/test".into(),
+            "--workdir=/test".into(),
+        ]),
+        Some(value) => Err(format!(
+            "{ISOLATED_WORKDIR_ENV} must be {HERMETIC_TEST_WORKDIR}, got {value:?}"
+        )),
+    }
+}
+
+fn configure_pinned_root(command: &mut Command) {
+    let requested = std::env::var_os(ISOLATED_WORKDIR_ENV);
+    let args = pinned_root_args(requested.as_deref())
+        .unwrap_or_else(|error| panic!("PATH-CONTRACT: {error}"));
+    command.args(args);
+}
+
 fn assert_l2_under_strict_verify(case: &StrictCommandCase) {
     let program = required_command(case);
+    let home = tempfile::tempdir().expect("failed to create isolated command HOME");
+    std::fs::create_dir_all(home.path().join(".config/procps"))
+        .expect("failed to preseed the isolated procps HOME");
+    let working_directory = tempfile::Builder::new()
+        .prefix("command-working-directory-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create isolated command working directory");
     let mut command = Command::new("timeout");
     command
         .args([
@@ -57,9 +89,19 @@ fn assert_l2_under_strict_verify(case: &StrictCommandCase) {
             HERMIT_VERIFY_TIMEOUT,
         ])
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log=off", "run", "--strict", "--verify", "--"])
+        .args(["--log=info", "run", "--strict", "--verify"])
+        .arg(format!("--env=HOME={}", home.path().display()))
+        .arg(format!(
+            "--env=XDG_CONFIG_HOME={}",
+            home.path().join(".config").display()
+        ));
+    configure_pinned_root(&mut command);
+    command
+        .arg("--")
         .arg(&program)
         .args(case.args)
+        .env("HOME", home.path())
+        .current_dir(working_directory.path())
         .stdin(if case.stdin.is_some() {
             Stdio::piped()
         } else {
@@ -107,6 +149,12 @@ fn common_commands_are_deterministic_under_strict_verify() {
     let _guard = hermit_run_lock();
     let cases = [
         StrictCommandCase {
+            name: "ls",
+            candidates: &["/usr/bin/ls", "/bin/ls"],
+            args: &["-1", "/etc/hostname"],
+            stdin: None,
+        },
+        StrictCommandCase {
             name: "cat",
             candidates: &["/usr/bin/cat", "/bin/cat"],
             args: &["/etc/hostname"],
@@ -129,6 +177,18 @@ fn common_commands_are_deterministic_under_strict_verify() {
             candidates: &["/usr/bin/sort", "/bin/sort"],
             args: &[],
             stdin: Some(b"gamma\nalpha\nbeta\n"),
+        },
+        StrictCommandCase {
+            name: "uniq",
+            candidates: &["/usr/bin/uniq", "/bin/uniq"],
+            args: &["/etc/passwd"],
+            stdin: None,
+        },
+        StrictCommandCase {
+            name: "tail",
+            candidates: &["/usr/bin/tail", "/bin/tail"],
+            args: &["-n", "3", "/etc/passwd"],
+            stdin: None,
         },
         StrictCommandCase {
             name: "env",
@@ -235,6 +295,38 @@ fn common_commands_are_deterministic_under_strict_verify() {
             args: &["/etc/../etc/passwd"],
             stdin: None,
         },
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#877)
+        StrictCommandCase {
+            name: "readlink mount namespace",
+            candidates: &["/usr/bin/readlink", "/bin/readlink"],
+            args: &["/proc/self/ns/mnt"],
+            stdin: None,
+        },
+        StrictCommandCase {
+            name: "readlink executable control",
+            candidates: &["/usr/bin/readlink", "/bin/readlink"],
+            args: &["/proc/self/exe"],
+            stdin: None,
+        },
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        StrictCommandCase {
+            name: "Python PID namespace readlink",
+            candidates: &["/usr/bin/python3"],
+            args: &[
+                "-c",
+                "import os; d=os.open('/', os.O_RDONLY); \
+                 print(os.readlink('/proc/self/ns/pid', dir_fd=d))",
+            ],
+            stdin: None,
+        },
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        StrictCommandCase {
+            name: "Perl user namespace readlink",
+            candidates: &["/usr/bin/perl", "/bin/perl"],
+            args: &["-e", "print readlink('/proc/self/ns/user'), qq(\\n)"],
+            stdin: None,
+        },
         StrictCommandCase {
             name: "md5sum",
             candidates: &["/usr/bin/md5sum", "/bin/md5sum"],
@@ -283,6 +375,226 @@ fn common_commands_are_deterministic_under_strict_verify() {
 }
 
 #[test]
+fn pinned_root_arguments_are_exact_and_fail_closed() {
+    assert!(pinned_root_args(None).unwrap().is_empty());
+    assert_eq!(
+        pinned_root_args(Some(OsStr::new("/test"))).unwrap(),
+        [
+            OsString::from("--base-env=minimal"),
+            OsString::from("--mount=type=tmpfs,target=/test"),
+            OsString::from("--workdir=/test"),
+        ]
+    );
+    let error = pinned_root_args(Some(OsStr::new("/tmp"))).unwrap_err();
+    assert!(error.contains("HERMIT_E2E_EMPTY_WORKDIR must be /test"));
+}
+
+#[test]
+#[ignore = "e2e: requires hermit + mount namespaces + whoami/groups"]
+fn identity_commands_are_deterministic_under_strict_verify() {
+    let _guard = hermit_run_lock();
+    let cases = [
+        StrictCommandCase {
+            name: "whoami",
+            candidates: &["/usr/bin/whoami", "/bin/whoami"],
+            args: &[],
+            stdin: None,
+        },
+        StrictCommandCase {
+            name: "groups",
+            candidates: &["/usr/bin/groups", "/bin/groups"],
+            args: &[],
+            stdin: None,
+        },
+    ];
+
+    for case in &cases {
+        assert_l2_under_strict_verify(case);
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-843): Review strict process-accounting command coverage.
+#[test]
+#[ignore = "e2e: requires hermit + PMU/mount namespaces + procps-ng tools"]
+fn process_accounting_commands_are_deterministic_under_strict_verify() {
+    let _guard = hermit_run_lock();
+    let cases = [
+        StrictCommandCase {
+            name: "ps aux",
+            candidates: &["/usr/bin/ps", "/bin/ps"],
+            args: &["aux"],
+            stdin: None,
+        },
+        StrictCommandCase {
+            name: "free -m",
+            candidates: &["/usr/bin/free", "/bin/free"],
+            args: &["-m"],
+            stdin: None,
+        },
+        StrictCommandCase {
+            name: "vmstat -s",
+            candidates: &["/usr/bin/vmstat", "/bin/vmstat"],
+            args: &["-s"],
+            stdin: None,
+        },
+        StrictCommandCase {
+            name: "top batch",
+            candidates: &["/usr/bin/top", "/bin/top"],
+            args: &["-b", "-n", "1", "-p", "1", "-w", "80"],
+            stdin: None,
+        },
+    ];
+
+    for case in &cases {
+        assert_l2_under_strict_verify(case);
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-861): Review strict I/O-accounting command coverage.
+#[test]
+#[ignore = "e2e: requires hermit + PMU/mount namespaces + sysstat tools"]
+fn io_accounting_commands_are_deterministic_under_strict_verify() {
+    let _guard = hermit_run_lock();
+    let cases = [
+        StrictCommandCase {
+            name: "iostat disk",
+            candidates: &["/usr/bin/iostat"],
+            args: &["-d", "-x", "1", "1"],
+            stdin: None,
+        },
+        StrictCommandCase {
+            name: "vmstat disk",
+            candidates: &["/usr/bin/vmstat"],
+            args: &["-d", "1", "2"],
+            stdin: None,
+        },
+        StrictCommandCase {
+            name: "pidstat disk",
+            candidates: &["/usr/bin/pidstat"],
+            args: &["-d", "-p", "1", "1", "1"],
+            stdin: None,
+        },
+    ];
+
+    for case in &cases {
+        assert_l2_under_strict_verify(case);
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-873): Review kernel pseudo-file command coverage.
+#[test]
+#[ignore = "e2e: requires hermit + mount namespaces + util-linux/procps/sysstat"]
+// TODO(#2791): Remove the portable-DAG exclusion after #2801 determinizes mountinfo.
+fn kernel_pseudofile_commands_are_deterministic_under_strict_verify() {
+    let _guard = hermit_run_lock();
+    let cases = [
+        StrictCommandCase {
+            name: "findmnt",
+            candidates: &["/usr/bin/findmnt", "/bin/findmnt"],
+            args: &[
+                "--kernel",
+                "--list",
+                "--output",
+                "TARGET,SOURCE,FSTYPE,OPTIONS",
+            ],
+            stdin: None,
+        },
+        StrictCommandCase {
+            name: "sysctl random UUID",
+            candidates: &["/usr/sbin/sysctl", "/usr/bin/sysctl"],
+            args: &["kernel.random.uuid"],
+            stdin: None,
+        },
+        StrictCommandCase {
+            name: "sar resource tables",
+            candidates: &["/usr/bin/sar"],
+            args: &["-v", "1", "1"],
+            stdin: None,
+        },
+    ];
+
+    for case in &cases {
+        assert_l2_under_strict_verify(case);
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-881)
+#[test]
+#[ignore = "e2e: requires hermit + PMU/mount namespaces + util-linux ionice"]
+fn ionice_query_is_deterministic_under_strict_verify() {
+    let _guard = hermit_run_lock();
+    let case = StrictCommandCase {
+        name: "ionice current-process query",
+        candidates: &["/usr/bin/ionice", "/bin/ionice"],
+        args: &["-p", "0"],
+        stdin: None,
+    };
+    assert_l2_under_strict_verify(&case);
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-883): Review interrupt and module command coverage.
+#[test]
+#[ignore = "e2e: requires hermit + util-linux/sysstat/kmod"]
+fn kernel_activity_commands_are_deterministic_under_strict_verify() {
+    let _guard = hermit_run_lock();
+    let cases = [
+        StrictCommandCase {
+            name: "lsirq",
+            candidates: &["/usr/bin/lsirq"],
+            args: &["--noheadings", "--output", "IRQ,TOTAL,NAME"],
+            stdin: None,
+        },
+        StrictCommandCase {
+            name: "mpstat softirqs",
+            candidates: &["/usr/bin/mpstat"],
+            args: &["-I", "SCPU", "1", "1"],
+            stdin: None,
+        },
+        StrictCommandCase {
+            name: "lsmod",
+            candidates: &["/usr/sbin/lsmod", "/usr/bin/lsmod"],
+            args: &[],
+            stdin: None,
+        },
+    ];
+
+    for case in &cases {
+        assert_l2_under_strict_verify(case);
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-865): Review NUMA and sensor command coverage.
+#[test]
+#[ignore = "e2e: requires hermit + PMU/mount namespaces + numactl/lm_sensors tools"]
+fn hardware_accounting_commands_are_deterministic_under_strict_verify() {
+    let _guard = hermit_run_lock();
+    let cases = [
+        StrictCommandCase {
+            name: "numastat",
+            candidates: &["/usr/bin/numastat"],
+            args: &[],
+            stdin: None,
+        },
+        StrictCommandCase {
+            name: "numactl hardware",
+            candidates: &["/usr/bin/numactl"],
+            args: &["--hardware"],
+            stdin: None,
+        },
+    ];
+
+    for case in &cases {
+        assert_l2_under_strict_verify(case);
+    }
+}
+
+#[test]
 #[ignore = "e2e: requires hermit + PMU/mount namespaces + /usr/bin/python3"]
 fn python_prlimit64_query_is_deterministic_under_strict_verify() {
     let _guard = hermit_run_lock();
@@ -294,17 +606,26 @@ fn python_prlimit64_query_is_deterministic_under_strict_verify() {
     };
     let python = required_command(&case);
     let query = "import resource; print(resource.getrlimit(resource.RLIMIT_NOFILE))";
+    let working_directory = tempfile::Builder::new()
+        .prefix("python-prlimit64-working-directory-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create isolated Python working directory");
 
-    let strict_output = Command::new("timeout")
+    let mut strict_command = Command::new("timeout");
+    strict_command
         .args([
             "--kill-after",
             HERMIT_VERIFY_KILL_AFTER,
             HERMIT_VERIFY_TIMEOUT,
         ])
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log=off", "run", "--strict", "--"])
+        .args(["--log=off", "run", "--strict"]);
+    configure_pinned_root(&mut strict_command);
+    let strict_output = strict_command
+        .arg("--")
         .arg(&python)
         .args(["-c", query])
+        .current_dir(working_directory.path())
         .output()
         .expect("failed to start Python prlimit64 strict-mode value regression");
     let strict_stdout = String::from_utf8_lossy(&strict_output.stdout);
@@ -321,16 +642,21 @@ fn python_prlimit64_query_is_deterministic_under_strict_verify() {
         "Python observed a non-deterministic RLIMIT_NOFILE value"
     );
 
-    let output = Command::new("timeout")
+    let mut command = Command::new("timeout");
+    command
         .args([
             "--kill-after",
             HERMIT_VERIFY_KILL_AFTER,
             HERMIT_VERIFY_TIMEOUT,
         ])
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log=off", "run", "--strict", "--verify", "--"])
+        .args(["--log=info", "run", "--strict", "--verify"]);
+    configure_pinned_root(&mut command);
+    let output = command
+        .arg("--")
         .arg(&python)
         .args(["-c", query])
+        .current_dir(working_directory.path())
         .output()
         .expect("failed to start Python prlimit64 strict/verify regression");
 

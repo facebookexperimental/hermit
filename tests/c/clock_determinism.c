@@ -26,8 +26,7 @@ static int64_t timespec_ns(const struct timespec* value) {
 static int check_clock(const struct clock_case* test) {
   struct timespec before;
   if (clock_gettime(test->id, &before) != 0) {
-    fprintf(
-        stderr, "%s clock_gettime failed: %s\n", test->name, strerror(errno));
+    fprintf(stderr, "%s clock_gettime failed: %s\n", test->name, strerror(errno));
     return 1;
   }
 
@@ -49,11 +48,7 @@ static int check_clock(const struct clock_case* test) {
 
   struct timespec after;
   if (clock_gettime(test->id, &after) != 0) {
-    fprintf(
-        stderr,
-        "%s second clock_gettime failed: %s\n",
-        test->name,
-        strerror(errno));
+    fprintf(stderr, "%s second clock_gettime failed: %s\n", test->name, strerror(errno));
     return 1;
   }
 
@@ -69,10 +64,8 @@ static int check_clock(const struct clock_case* test) {
   }
 
   printf(
-      "%s gettime=%lld.%09ld nanosleep_rc=%d delta_ns=%lld\n",
+      "%s nanosleep_rc=%d delta_ns=%lld\n",
       test->name,
-      (long long)before.tv_sec,
-      before.tv_nsec,
       sleep_error,
       (long long)delta);
   return 0;

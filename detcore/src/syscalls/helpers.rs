@@ -22,6 +22,7 @@ use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::ProtFlags;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
+use reverie::syscalls::Sysno;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::WaitPidFlag;
 
@@ -31,16 +32,74 @@ use crate::resources::ExternalOpId;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::syscalls::threads::KernelSigaction;
+use crate::syscalls::threads::KernelSigset;
+use crate::syscalls::threads::WaitSignalDisposition;
+use crate::syscalls::threads::block_signals_for_disposition;
+use crate::syscalls::threads::blocked_signal_mask;
+use crate::syscalls::threads::restore_signals_after_disposition;
+use crate::syscalls::threads::wait_signal_disposition;
 use crate::tool_global::ResumeStatus;
 use crate::tool_global::resource_request;
 use crate::tool_global::thread_observe_time;
 use crate::tool_global::trace_schedevent;
 use crate::tool_local::Detcore;
+use crate::tool_local::finish_partial_record_or_replay_write;
+use crate::types::DetTid;
 use crate::types::LogicalTime;
+use crate::types::OpenFileId;
 use crate::types::SchedEvent;
 use crate::types::SyscallPhase;
 
 impl<T: RecordOrReplay> Detcore<T> {
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#2373)
+    /// Apply the established unsupported-syscall refusal policy to a *supported*
+    /// syscall whose particular operation Detcore cannot serve deterministically.
+    ///
+    /// This exists so such a refusal cannot invent its own policy. Three separate
+    /// config knobs govern how a fail-closed run dies -- `shutdown_on_unsupported_syscall`
+    /// (hard `exit(1)` through `unrecoverable_shutdown`), `exit_on_unsupported_syscall`
+    /// (a typed `UnsupportedSyscallError` the backend terminates on without
+    /// unwinding), and the `panic!` fallback -- and `Detcore::handle_unsupported_syscall`
+    /// consults all three in that order. The normal `hermit run` CLI happens to set
+    /// `shutdown_on_unsupported_syscall = panic_on_unsupported_syscalls`, so reading
+    /// only the latter looks equivalent, but that coupling is a CLI default, not an
+    /// invariant: an embedder that sets just `exit_on_unsupported_syscall` would get a
+    /// process-wide `exit(1)` from a bespoke call site where the standard path returns
+    /// a catchable error.
+    ///
+    /// When the run is *not* fail-closed, the caller's `fallback` errno is returned,
+    /// because the operation itself is legal and the guest is entitled to a normal
+    /// failure code (`handle_unsupported_syscall` passes the call through instead,
+    /// which is not available here -- passing through is precisely the thing the
+    /// caller has determined it cannot do).
+    pub(crate) async fn refuse_unserviceable_operation<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: reverie::syscalls::Sysno,
+        fallback: Errno,
+    ) -> Result<i64, Error> {
+        if !self.cfg.panic_on_unsupported_syscalls {
+            return Err(fallback.into());
+        }
+        if guest.config().shutdown_on_unsupported_syscall {
+            // Fail-closed policy: the operation is unserviceable and the config
+            // forbids passing it through.
+            crate::tool_global::unrecoverable_shutdown(
+                guest,
+                detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
+            )
+            .await;
+        }
+        if guest.config().exit_on_unsupported_syscall {
+            return Err(Error::Tool(anyhow::Error::new(
+                crate::UnsupportedSyscallError(sysno),
+            )));
+        }
+        panic!("unserviceable operation on syscall: {sysno:?}");
+    }
+
     /// Record or replay a BLOCKING syscall without stalling the current thread (and thus
     /// deadlocking).  This uses a protocol of an extra resource request before/after the
     /// syscall to inform the scheduler that the thread is leaving/rejoining the runnable
@@ -56,6 +115,40 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let dettid = guest.thread_state().dettid;
         let op_id = ExternalOpId::new(dettid, guest.thread_state().stats.syscall_count);
+        self.record_or_replay_blocking_resource(guest, call, ResourceID::BlockingExternalIO(op_id))
+            .await
+    }
+
+    /// Execute the real `rt_sigsuspend` outside the runnable set while preserving
+    /// its signal-only completion condition for the scheduler.
+    pub async fn record_or_replay_rt_sigsuspend<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::RtSigsuspend,
+    ) -> Result<i64, Error> {
+        let dettid = guest.thread_state().dettid;
+        let op_id = ExternalOpId::new(dettid, guest.thread_state().stats.syscall_count);
+        self.record_or_replay_blocking_resource(
+            guest,
+            call.into(),
+            ResourceID::BlockingRtSigsuspend(op_id),
+        )
+        .await
+    }
+
+    async fn record_or_replay_blocking_resource<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+        blocking_resource: ResourceID,
+    ) -> Result<i64, Error> {
+        let dettid = guest.thread_state().dettid;
+        let op_id = match &blocking_resource {
+            ResourceID::BlockingExternalIO(op_id) | ResourceID::BlockingRtSigsuspend(op_id) => {
+                *op_id
+            }
+            _ => unreachable!("blocking syscall helper requires a blocking resource"),
+        };
         // Internal-vs-external fd classification happens at the call sites that hold the
         // typed, nonblockize-able syscall (see execute_nonblockable_fd_syscall):
         // container-internal pipes are routed to the InternalIOPolling nonblockize-retry
@@ -78,7 +171,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             let mut rsrcs = Resources::new(dettid);
             // With sequentialization enabled, only truly EXTERNAL endpoints reach here.
             // Without it, resource_request is a no-op and internal fds may block directly.
-            rsrcs.insert(ResourceID::BlockingExternalIO(op_id), Permission::RW);
+            rsrcs.insert(blocking_resource, Permission::RW);
             rsrcs.fyi(call.name());
             resource_request(guest, rsrcs).await;
         }
@@ -86,7 +179,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             "Guest proceeding to execute potentially blocking call {}...",
             call.name()
         );
-        let res = self.record_or_replay(guest, call).await;
+        let res = self
+            .record_or_replay_preserving_tool_errors(guest, call)
+            .await;
         // N.B. BlockingExternalIO is a "oneshot" resource, so no need to release
         // explicitly here:
         {
@@ -95,7 +190,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             rsrcs.fyi(call.name());
             resource_request(guest, rsrcs).await;
         }
-        Ok(res?)
+        res
     }
 
     /// Executes a nonblockable syscall according to the following strategy:
@@ -114,7 +209,22 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let wrapped: Syscall = call.into();
 
-        let action = ioaction_based_on_fd_status(guest, call);
+        let action = match ioaction_based_on_fd_status(guest, call) {
+            Ok(action) => action,
+            Err(errno) => {
+                // Descriptor metadata is advisory for choosing an execution strategy. If the
+                // descriptor is invalid or cannot be classified, execute through the
+                // scheduler-safe blocking path and let the kernel provide the syscall errno.
+                // Returning the metadata error (or panicking on it) can change Linux error
+                // precedence, for example connect(-1, invalid_sockaddr, ...).
+                tracing::trace!(
+                    "NonblockableSyscall: fd classification failed with {}; executing kernel-authoritatively: {}",
+                    errno,
+                    call.name()
+                );
+                return self.record_or_replay_blocking(guest, wrapped).await;
+            }
+        };
 
         // Is this operation on a container-INTERNAL fd (currently: pipes)? Internal
         // pipes are made physically nonblocking even in record/replay (see
@@ -162,7 +272,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 call.name()
             );
             // Otherwise, the socket was already nonblocking, so we can safely execute it just once.
-            Ok(self.record_or_replay(guest, wrapped).await?)
+            self.record_or_replay_preserving_tool_errors(guest, wrapped)
+                .await
         }
     }
 
@@ -177,12 +288,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         &self,
         guest: &mut G,
         call: syscalls::Writev,
+        expected_open_file: OpenFileId,
     ) -> Result<i64, Error> {
         const MAX_IOVECS: usize = 1024;
         // Linux limits a single vectored transfer to INT_MAX rounded down to a page.
         const MAX_RW_COUNT: usize = 0x7fff_f000;
         // Linux guarantees pipe writes through this size are atomic.
         const PIPE_BUF: usize = 4096;
+        // Every backend provides at least 512 bytes of tool scratch. Linux's
+        // own fast-iovec path is smaller; this covers common vectors.
+        const STACK_IOVECS: usize = 32;
 
         let Some(iov_addr) = call.iov() else {
             return self.execute_nonblockable_fd_syscall(guest, call).await;
@@ -221,37 +336,99 @@ impl<T: RecordOrReplay> Detcore<T> {
         tracing::trace!(
             "NonblockableSyscall: converting to nonblocking syscall (internal polling): writev"
         );
-        let mut resources = Resources::new(guest.thread_state().dettid);
-        resources.insert(ResourceID::InternalIOPolling, Permission::W);
-        resources.fyi(call.name());
+        let mut resources = pipe_writev_resources(guest.thread_state().dettid, call);
         let subtool = self.cfg.recordreplay_modes.then_some(self);
         let mut current = Syscall::Writev(call);
         let mut written_total = 0usize;
 
-        loop {
+        // Keep ordinary signals pending while the scheduler and the target-side
+        // disposition check decide whether a wakeup interrupts this write. The
+        // ptrace-owned backends need the explicit mask while inspecting the
+        // target's current disposition.
+        let blocked_mask = blocked_signal_mask();
+        let mut stack = guest.stack().await;
+        let atomic_scratch_iov = if atomic_pipe_write && iovecs.len() <= STACK_IOVECS {
+            let mut raw_iovecs = [libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0,
+            }; STACK_IOVECS];
+            for (raw, (base, length)) in raw_iovecs.iter_mut().zip(&iovecs) {
+                raw.iov_base = *base as *mut libc::c_void;
+                raw.iov_len = *length;
+            }
+            let scratch_iov: Addr<libc::iovec> = stack.push(raw_iovecs).cast();
+            Some(scratch_iov.as_raw())
+        } else {
+            None
+        };
+        let blocked_mask_addr = stack.push(blocked_mask);
+        let old_mask_addr = stack.reserve::<KernelSigset>();
+        let action_addr = stack.reserve::<KernelSigaction>();
+        let _mask_guard = stack.commit()?;
+        let guest_signal_mask =
+            block_signals_for_disposition(guest, blocked_mask_addr, old_mask_addr).await?;
+
+        let result: Result<i64, Error> = loop {
+            // A cross-task signal can replace the initial scheduler request,
+            // before the first physical attempt, as well as a later retry.
+            let status = resource_request(guest, resources.clone()).await;
+            let disposition = match wait_signal_disposition(
+                guest,
+                status.clone(),
+                &guest_signal_mask,
+                action_addr,
+                true,
+            )
+            .await
+            {
+                Ok(disposition) => disposition,
+                Err(error) => break Err(error),
+            };
+            if matches!(status, ResumeStatus::Signaled(_))
+                && let Some(result) = interrupted_write_result(&call, written_total, disposition)
+            {
+                break result;
+            }
+
             if resources.poll_attempt > 0
-                && resource_request(guest, resources.clone()).await == ResumeStatus::Signaled
+                && !guest
+                    .thread_state()
+                    .with_detfd(call.fd(), |detfd| {
+                        detfd.open_file_id() == expected_open_file
+                    })
+                    .unwrap_or(false)
             {
                 break if written_total > 0 {
                     Ok(written_total as i64)
                 } else {
-                    Err(call.signal_interrupt_errno().into())
+                    self.refuse_unserviceable_operation(guest, Sysno::writev, Errno::EOPNOTSUPP)
+                        .await
                 };
             }
 
             let result = if atomic_pipe_write {
-                self.execute_atomic_pipe_writev_attempt(guest, call, &iovecs)
+                self.execute_atomic_pipe_writev_attempt(guest, call, &iovecs, atomic_scratch_iov)
                     .await
             } else {
                 match subtool {
-                    Some(detcore) => detcore.record_or_replay(guest, current).await,
-                    None => guest.inject_with_retry(current).await,
+                    Some(detcore) => {
+                        detcore
+                            .record_or_replay_preserving_tool_errors(guest, current)
+                            .await
+                    }
+                    None => guest.inject_with_retry(current).await.map_err(Error::from),
                 }
             };
             match result {
                 Ok(written) if written > 0 => {
-                    let written = usize::try_from(written).map_err(|_| Errno::EIO)?;
-                    written_total = written_total.checked_add(written).ok_or(Errno::EIO)?;
+                    let written = match usize::try_from(written) {
+                        Ok(written) => written,
+                        Err(_) => break Err(Errno::EIO.into()),
+                    };
+                    written_total = match written_total.checked_add(written) {
+                        Some(written_total) => written_total,
+                        None => break Err(Errno::EIO.into()),
+                    };
                     if written_total >= target {
                         break Ok(written_total as i64);
                     }
@@ -270,7 +447,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     };
                 }
                 Ok(0) => break Ok(written_total as i64),
-                Err(Errno::EAGAIN) => {
+                Err(Error::Errno(Errno::EAGAIN)) => {
                     if !atomic_pipe_write && matches!(current, Syscall::Writev(_)) {
                         current = match remaining_writev_segment(call.fd(), &iovecs, 0, target) {
                             Ok(Some(write)) => Syscall::Write(write),
@@ -280,21 +457,143 @@ impl<T: RecordOrReplay> Detcore<T> {
                     }
                 }
                 Err(error) => {
-                    break if written_total > 0 {
-                        Ok(written_total as i64)
-                    } else {
-                        Err(error.into())
-                    };
+                    break finish_partial_record_or_replay_write(written_total as i64, error);
                 }
                 Ok(_) => break Err(Errno::EIO.into()),
             }
 
             resources.poll_attempt += 1;
             tracing::trace!(
-                "Retry #{} for {}blocking pipe writev after {:?}: {}",
+                "Retry #{} for {}blocking pipe writev after EAGAIN: {}",
                 resources.poll_attempt,
                 if atomic_pipe_write { "atomic " } else { "" },
-                result,
+                call.display(&guest.memory())
+            );
+            record_retry_event(guest, call).await;
+        };
+
+        restore_signals_after_disposition(guest, old_mask_addr).await?;
+        result
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#2176): Review scalar blocking-pipe write completion and
+    // the fail-closed descriptor-replacement boundary.
+    /// Complete a logically blocking scalar pipe write after Hermit has made the pipe
+    /// physically nonblocking.
+    ///
+    /// Linux may return a positive short write for a request larger than `PIPE_BUF`, then
+    /// continue blocking for the remainder. Hermit's physical `O_NONBLOCK` is an internal
+    /// scheduler mechanism, so exposing that first short write changes guest behavior. Retry
+    /// the unconsumed suffix until the logical write completes, a signal arrives, or a real
+    /// error occurs. A signal or error after progress returns the partial byte count, matching
+    /// Linux.
+    ///
+    /// A concurrent close/dup2 can replace the numeric fd while this helper is yielded. Linux
+    /// keeps the original open-file description alive inside a blocking syscall, but Reverie
+    /// does not yet expose a backend-neutral retained-fd handle. Detect replacement before a
+    /// retry and fail closed rather than writing the suffix into an unrelated object.
+    pub async fn execute_blocking_pipe_write<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Write,
+        expected_open_file: OpenFileId,
+    ) -> Result<i64, Error> {
+        const MAX_RW_COUNT: usize = 0x7fff_f000;
+
+        let target = call.len().min(MAX_RW_COUNT);
+        if target == 0 {
+            return self.execute_nonblockable_fd_syscall(guest, call).await;
+        }
+
+        tracing::trace!(
+            "NonblockableSyscall: converting to nonblocking syscall (internal polling): write"
+        );
+        let mut resources = Resources::new(guest.thread_state().dettid);
+        resources.insert(ResourceID::InternalIOPolling, Permission::W);
+        resources.fyi(call.name());
+        let subtool = self.cfg.recordreplay_modes.then_some(self);
+        let mut current = call;
+        let mut written_total = 0usize;
+
+        loop {
+            if resources.poll_attempt > 0
+                && matches!(
+                    resource_request(guest, resources.clone()).await,
+                    ResumeStatus::Signaled(_)
+                )
+            {
+                break if written_total > 0 {
+                    Ok(written_total as i64)
+                } else {
+                    Err(call.signal_interrupt_errno().into())
+                };
+            }
+
+            if resources.poll_attempt > 0
+                && !guest
+                    .thread_state()
+                    .with_detfd(call.fd(), |detfd| {
+                        detfd.open_file_id() == expected_open_file
+                    })
+                    .unwrap_or(false)
+            {
+                break if written_total > 0 {
+                    Ok(written_total as i64)
+                } else {
+                    self.refuse_unserviceable_operation(guest, Sysno::write, Errno::EOPNOTSUPP)
+                        .await
+                };
+            }
+
+            let result = match subtool {
+                Some(detcore) => {
+                    detcore
+                        .record_or_replay_preserving_tool_errors(guest, current)
+                        .await
+                }
+                None => guest.inject_with_retry(current).await.map_err(Error::from),
+            };
+            match result {
+                Ok(written) if written > 0 => {
+                    let written = usize::try_from(written).map_err(|_| Errno::EIO)?;
+                    let remaining = target.checked_sub(written_total).ok_or(Errno::EIO)?;
+                    if written > remaining {
+                        break Err(Errno::EIO.into());
+                    }
+                    written_total = written_total.checked_add(written).ok_or(Errno::EIO)?;
+                    if written_total == target {
+                        break Ok(written_total as i64);
+                    }
+                    let Some(buffer) = call.buf() else {
+                        break Err(Errno::EFAULT.into());
+                    };
+                    let Some(next_buffer) = buffer
+                        .as_raw()
+                        .checked_add(written_total)
+                        .and_then(Addr::<u8>::from_raw)
+                    else {
+                        break finish_partial_record_or_replay_write(
+                            written_total as i64,
+                            Errno::EFAULT.into(),
+                        );
+                    };
+                    current = call
+                        .with_buf(Some(next_buffer))
+                        .with_len(target - written_total);
+                }
+                Ok(0) => break Ok(written_total as i64),
+                Err(Error::Errno(Errno::EAGAIN)) => {}
+                Err(error) => {
+                    break finish_partial_record_or_replay_write(written_total as i64, error);
+                }
+                Ok(_) => break Err(Errno::EIO.into()),
+            }
+
+            resources.poll_attempt += 1;
+            tracing::trace!(
+                "Retry #{} for blocking pipe write: {}",
+                resources.poll_attempt,
                 call.display(&guest.memory())
             );
             record_retry_event(guest, call).await;
@@ -306,32 +605,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Writev,
         iovecs: &[(usize, usize)],
-    ) -> Result<i64, Errno> {
-        // Every backend provides at least 512 bytes of tool scratch. Linux's own fast-iovec
-        // path is smaller; this covers common vectors without consuming guest VM mappings.
-        const STACK_IOVECS: usize = 32;
-        if iovecs.len() <= STACK_IOVECS {
-            let mut stack = guest.stack().await;
-            let scratch_array = {
-                let mut raw_iovecs = [libc::iovec {
-                    iov_base: std::ptr::null_mut(),
-                    iov_len: 0,
-                }; STACK_IOVECS];
-                for (raw, (base, length)) in raw_iovecs.iter_mut().zip(iovecs) {
-                    raw.iov_base = *base as *mut libc::c_void;
-                    raw.iov_len = *length;
-                }
-                stack.push(raw_iovecs)
-            };
-            let scratch_iov: Addr<libc::iovec> = scratch_array.cast();
-            let _guard = stack
-                .commit()
-                .unwrap_or_else(|error| panic!("failed to commit atomic writev scratch: {error}"));
-            let scratch_call = call.with_iov(Some(scratch_iov));
+        stack_iov: Option<usize>,
+    ) -> Result<i64, Error> {
+        if let Some(stack_iov) = stack_iov {
+            let scratch_call = call.with_iov(Addr::from_raw(stack_iov));
             return if self.cfg.recordreplay_modes {
-                self.record_or_replay(guest, scratch_call).await
+                self.record_or_replay_preserving_tool_errors(guest, scratch_call)
+                    .await
             } else {
-                guest.inject_with_retry(scratch_call).await
+                guest
+                    .inject_with_retry(scratch_call)
+                    .await
+                    .map_err(Error::from)
             };
         }
 
@@ -387,9 +672,13 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         let scratch_call = call.with_iov(Some(scratch_iov));
         let result = if self.cfg.recordreplay_modes {
-            self.record_or_replay(guest, scratch_call).await
+            self.record_or_replay_preserving_tool_errors(guest, scratch_call)
+                .await
         } else {
-            guest.inject_with_retry(scratch_call).await
+            guest
+                .inject_with_retry(scratch_call)
+                .await
+                .map_err(Error::from)
         };
         guest
             .inject_with_retry(Syscall::Munmap(
@@ -449,7 +738,10 @@ pub enum IOAction {
     PassThru,
 }
 
-/// Returns strategy based on FD-based call may actually block when executed.
+/// Returns the strategy for an FD-based call that may block when executed.
+///
+/// Failure means descriptor metadata could not classify the call; the caller must preserve the
+/// kernel's authority over the syscall result rather than exposing this advisory lookup error.
 pub fn ioaction_based_on_fd_status<
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -457,15 +749,12 @@ pub fn ioaction_based_on_fd_status<
 >(
     guest: &mut G,
     call: C,
-) -> IOAction {
+) -> Result<IOAction, Errno> {
     let wrapped: Syscall = call.into();
     let fd = get_fd(wrapped).unwrap_or_else(|| panic!("Failed to get fd for {}", call.name()));
-    let (phys, virt) = guest
-        .thread_state()
-        .with_detfd(fd, |detfd| {
-            (detfd.physically_nonblocking(), detfd.is_nonblocking())
-        })
-        .unwrap();
+    let (phys, virt) = guest.thread_state().with_detfd(fd, |detfd| {
+        (detfd.physically_nonblocking(), detfd.is_nonblocking())
+    })?;
     tracing::trace!(
         "Checking FD {} for nonblocking: physical {} / virtual {}",
         fd,
@@ -480,13 +769,13 @@ pub fn ioaction_based_on_fd_status<
         );
     } else if !virt && !phys {
         // FF: logically blocking, physically blocking, this could only work with BlockingExternalIO.
-        IOAction::Blocking
+        Ok(IOAction::Blocking)
     } else if virt && phys {
         // TT: both nonblocking, so firing once is sufficient
-        IOAction::PassThru
+        Ok(IOAction::PassThru)
     } else {
         // FT: Need to simulate blocking on top of nonblocking.
-        IOAction::NonblockizeRetry
+        Ok(IOAction::NonblockizeRetry)
     }
 }
 
@@ -523,7 +812,7 @@ pub fn syscall_targets_internal_fd<G: Guest<Detcore<T>>, T: RecordOrReplay>(
 ///
 /// It does not cover system calls with multiple fd arguments, with pointers to heap
 /// structures that contain fds.
-fn get_fd(s: Syscall) -> Option<i32> {
+pub(crate) fn get_fd(s: Syscall) -> Option<i32> {
     match s {
         Syscall::Recvfrom(s) => Some(s.fd()),
         Syscall::Recvmsg(s) => Some(s.sockfd()),
@@ -635,6 +924,13 @@ fn get_fd(s: Syscall) -> Option<i32> {
 }
 
 /// A system call which may or may not block, but which can be MADE nonblocking.
+// `async_trait` rewrites `into_nonblocking` to return a boxed future and marks it
+// `#[must_use]`; the future is already `#[must_use]` in its own right, so clippy sees a double
+// annotation. Both are generated, so the lint's own suggestion -- give the `must_use` an explicit
+// reason -- cannot be applied at this source. Allowed at the item rather than crate-wide so any
+// hand-written double `must_use` elsewhere still fails `#![deny(clippy::all)]` (detcore/src/lib.rs:35).
+// Appeared with nightly-2026-08-08 (rustc 1.99.0-nightly 1a98b1e13) against an unchanged tree.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait NonblockableSyscall: SyscallInfo {
     /// Convert the system call to a nonblocking version of itself.  Sometimes this means
@@ -674,6 +970,26 @@ pub trait NonblockableSyscall: SyscallInfo {
 pub trait TimeoutableSyscall: SyscallInfo {
     /// What would the syscall return IF it timed out?
     fn timeout_return_val(&self) -> Result<i64, Errno>;
+}
+
+fn interrupted_write_result<C: NonblockableSyscall>(
+    call: &C,
+    written_total: usize,
+    disposition: Option<WaitSignalDisposition>,
+) -> Option<Result<i64, Error>> {
+    match disposition {
+        None => None,
+        Some(_) if written_total > 0 => Some(Ok(written_total as i64)),
+        Some(_) => Some(Err(call.signal_interrupt_errno().into())),
+    }
+}
+
+fn pipe_writev_resources(dettid: DetTid, call: reverie::syscalls::Writev) -> Resources {
+    let mut resources = Resources::new(dettid);
+    resources.insert(ResourceID::InternalIOPolling, Permission::W);
+    resources.fyi(call.name());
+    resources.set_signal_interrupt_errno(call.signal_interrupt_errno());
+    resources
 }
 
 #[async_trait]
@@ -734,6 +1050,36 @@ impl NonblockableSyscall for reverie::syscalls::EpollWait {
 }
 
 impl TimeoutableSyscall for reverie::syscalls::EpollWait {
+    fn timeout_return_val(&self) -> Result<i64, Errno> {
+        Ok(0)
+    }
+}
+
+// `epoll_pwait` was the one member of the
+// poll/epoll family with no nonblocking form, even though `Ppoll` -- the
+// sigmask variant of `poll` -- has had one all along. Programs that issue
+// `epoll_pwait` DIRECTLY (libuv does, which is how the `cmake` hang surfaced)
+// therefore reached an unhandled path while the `EpollWait` impl above went
+// unused by them. Note this is NOT glibc's `epoll_wait(2)` on x86_64: glibc
+// only spells it `epoll_pwait` where `__NR_epoll_wait` is absent, which x86_64
+// is not. With a NULL sigmask the two calls are semantically identical, so the
+// nonblocking form is the same: timeout 0, EINTR, and a 0 (no events) timeout
+// return.
+#[async_trait]
+impl NonblockableSyscall for reverie::syscalls::EpollPwait {
+    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+        self,
+        _guest: &mut G,
+    ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
+        (self.with_timeout(0), None)
+    }
+
+    fn signal_interrupt_errno(&self) -> Errno {
+        Errno::EINTR
+    }
+}
+
+impl TimeoutableSyscall for reverie::syscalls::EpollPwait {
     fn timeout_return_val(&self) -> Result<i64, Errno> {
         Ok(0)
     }
@@ -856,6 +1202,23 @@ impl NonblockableSyscall for reverie::syscalls::Write {
     fn syscall_would_have_blocked(&self, res: Result<i64, Errno>) -> bool {
         // A return value of Ok(0) indicates end of file.
         // Note that we've ruled out 0-count reads before this point.
+        res == Err(Errno::EAGAIN) || res == Err(Errno::EWOULDBLOCK)
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#794)
+/// Vectored reads have the same blocking behavior as scalar reads on pipes and sockets.
+#[async_trait]
+impl NonblockableSyscall for reverie::syscalls::Readv {
+    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+        self,
+        guest: &mut G,
+    ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
+        network_comm_syscall(self, guest)
+    }
+
+    fn syscall_would_have_blocked(&self, res: Result<i64, Errno>) -> bool {
         res == Err(Errno::EAGAIN) || res == Err(Errno::EWOULDBLOCK)
     }
 }
@@ -1104,7 +1467,13 @@ where
     let mut rsrc = rsrc.clone();
 
     loop {
-        if resource_request(guest, rsrc.clone()).await == ResumeStatus::Signaled {
+        let resumed = match call.into() {
+            Syscall::Read(read) if maybe_timeout.is_none() && _maybe_stackguard.is_none() => {
+                crate::tool_global::polled_read_request(guest, read, rsrc.clone()).await
+            }
+            _ => resource_request(guest, rsrc.clone()).await,
+        };
+        if matches!(resumed, ResumeStatus::Signaled(_)) {
             let errno = call.signal_interrupt_errno();
             tracing::trace!(
                 "retry_nonblocking_syscall: interrupted by signal before retrying {}: {:?}",
@@ -1117,10 +1486,19 @@ where
         // EAGAIN, or the final data-bearing read) becomes one recorded event that replay
         // reproduces deterministically; otherwise execute the syscall directly.
         let res = match subtool {
-            Some(detcore) => detcore.record_or_replay(guest, call).await,
-            None => guest.inject_with_retry(call).await,
+            Some(detcore) => {
+                detcore
+                    .record_or_replay_preserving_tool_errors(guest, call)
+                    .await
+            }
+            None => guest.inject_with_retry(call).await.map_err(Error::from),
         };
-        if call.syscall_would_have_blocked(res) {
+        let syscall_result = match res {
+            Ok(value) => Ok(value),
+            Err(Error::Errno(error)) => Err(error),
+            Err(error) => return Err(error),
+        };
+        if call.syscall_would_have_blocked(syscall_result) {
             rsrc.poll_attempt += 1;
             if let Some((timeout, timeout_result)) = maybe_timeout {
                 let new_time = thread_observe_time(guest).await;
@@ -1135,7 +1513,7 @@ where
                     tracing::trace!(
                         "Retry #{} for syscall due to result {:?}, {} from timeout: {}",
                         rsrc.poll_attempt,
-                        res,
+                        syscall_result,
                         timeout - new_time,
                         call.display(&guest.memory())
                     );
@@ -1145,14 +1523,14 @@ where
                 tracing::trace!(
                     "Retry #{} for syscall due to result {:?}: {}",
                     rsrc.poll_attempt,
-                    res,
+                    syscall_result,
                     call.display(&guest.memory())
                 );
                 record_retry_event(guest, call).await;
             }
         } else {
             let res = call
-                .normalize_nonblocking_result(res, rsrc.poll_attempt > 0)
+                .normalize_nonblocking_result(syscall_result, rsrc.poll_attempt > 0)
                 .map_err(|e| e.into());
             tracing::trace!(
                 "retry_nonblocking_syscall: syscall completed after {} retries: {} = {:?}",
@@ -1216,11 +1594,23 @@ pub async fn millis_duration_to_absolute_timeout<G: Guest<Detcore<T>>, T: Record
     guest: &mut G,
     timeout_millis: i32,
 ) -> Option<LogicalTime> {
-    if timeout_millis > 0 {
-        nanos_duration_to_absolute_timeout(guest, (timeout_millis as u128) * 1000).await
-    } else {
-        None
+    match positive_millis_as_nanos(timeout_millis) {
+        Some(timeout_nanos) => nanos_duration_to_absolute_timeout(guest, timeout_nanos).await,
+        None => None,
     }
+}
+
+/// Milliseconds to nanoseconds for a strictly positive timeout; `None` for the
+/// non-positive values Linux treats as "return immediately" (0) or "wait
+/// forever" (-1), neither of which is a deadline.
+///
+/// Kept as a separate, unit-bracketed function on purpose. This conversion was
+/// previously inlined as `* 1000` instead of `* 1_000_000`, which made every
+/// finite deadline 1000x too short (a 1 ms timeout expired after 1 us). That
+/// is invisible in an end-to-end test that only checks a syscall's return
+/// value, so the arithmetic is pinned here by `millis_to_nanos_conversion`.
+fn positive_millis_as_nanos(timeout_millis: i32) -> Option<u128> {
+    (timeout_millis > 0).then(|| (timeout_millis as u128) * 1_000_000)
 }
 
 // Convert to absolute logical time point for the timeout.
@@ -1242,6 +1632,40 @@ pub async fn nanos_duration_to_absolute_timeout<G: Guest<Detcore<T>>, T: RecordO
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bracket the millisecond-to-nanosecond timeout conversion in both
+    /// directions: the non-positive values that are NOT deadlines, and the
+    /// positive values whose magnitude must be exactly 1e6 ns per ms.
+    ///
+    /// The 1 ms case is the specific regression guard: an inlined `* 1000`
+    /// yields 1_000 here instead of 1_000_000, i.e. a deadline 1000x too
+    /// short. Asserting the exact value (not merely "nonzero" or "greater
+    /// than") is what makes that failure visible.
+    #[test]
+    fn millis_to_nanos_conversion() {
+        // Not deadlines: -1 is "infinite", 0 is "return immediately".
+        assert_eq!(positive_millis_as_nanos(-1), None);
+        assert_eq!(positive_millis_as_nanos(i32::MIN), None);
+        assert_eq!(positive_millis_as_nanos(0), None);
+
+        // Positive timeouts: exactly 1e6 nanoseconds per millisecond.
+        assert_eq!(positive_millis_as_nanos(1), Some(1_000_000));
+        assert_eq!(positive_millis_as_nanos(1_000), Some(1_000_000_000));
+        assert_eq!(
+            positive_millis_as_nanos(i32::MAX),
+            Some(i32::MAX as u128 * 1_000_000)
+        );
+
+        // The scale itself, stated independently of any single case so a
+        // future refactor cannot satisfy the above by coincidence.
+        for millis in [1, 2, 7, 250, 1_000, 86_400_000] {
+            assert_eq!(
+                positive_millis_as_nanos(millis),
+                Some(millis as u128 * 1_000_000),
+                "1 ms must convert to 1_000_000 ns, not 1_000"
+            );
+        }
+    }
 
     #[test]
     fn connect_nonblocking_results() {
@@ -1280,9 +1704,48 @@ mod tests {
             reverie::syscalls::Read::new().signal_interrupt_errno(),
             Errno::ERESTARTSYS
         );
+        // A zero-progress writev interruption returns this internal errno on
+        // ptrace so Linux applies the handler's SA_RESTART policy.
+        assert_eq!(
+            reverie::syscalls::Writev::new().signal_interrupt_errno(),
+            Errno::ERESTARTSYS
+        );
         assert_eq!(
             reverie::syscalls::Futex::new().signal_interrupt_errno(),
             Errno::ERESTARTSYS
         );
+    }
+
+    #[test]
+    fn writev_signal_result_uses_disposition_and_progress() {
+        let call = reverie::syscalls::Writev::new();
+        for disposition in [
+            WaitSignalDisposition::Interrupt,
+            WaitSignalDisposition::Restart,
+        ] {
+            assert!(matches!(
+                interrupted_write_result(&call, 0, Some(disposition)),
+                Some(Err(Error::Errno(Errno::ERESTARTSYS)))
+            ));
+            assert!(matches!(
+                interrupted_write_result(&call, 17, Some(disposition)),
+                Some(Ok(17))
+            ));
+        }
+        assert!(interrupted_write_result(&call, 0, None).is_none());
+        assert!(interrupted_write_result(&call, 17, None).is_none());
+    }
+
+    #[test]
+    fn pipe_writev_requests_signal_disposition() {
+        let dettid = DetTid::from_raw(42);
+        let call = reverie::syscalls::Writev::new();
+        let request = pipe_writev_resources(dettid, call);
+
+        assert_eq!(
+            request.signal_interrupt_errno(),
+            Some(Errno::ERESTARTSYS.into_raw())
+        );
+        assert_eq!(request.resources.len(), 1);
     }
 }

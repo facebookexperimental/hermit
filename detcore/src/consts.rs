@@ -18,11 +18,11 @@ use crate::types::DetTid;
 
 /// A separate offset for special devices, including file descriptors 0,1,2
 /// stdin/stdout/stderr.
-pub static DET_SPECIAL_INODE_OFFSET: DetInode = 1000;
+pub static DET_SPECIAL_INODE_OFFSET: DetInode = DetInode::mint(1000);
 
 /// The starting point for deterministic inodes *other* than those addressed by
 /// `DET_SPECIAL_INODE_OFFSET`.
-pub static DET_INODE_OFFSET: DetInode = 9000;
+pub static DET_INODE_OFFSET: DetInode = DetInode::mint(9000);
 
 pub const DEFAULT_HOSTNAME: &str = "hermetic-container.local";
 

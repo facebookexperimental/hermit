@@ -4,6 +4,26 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
+#
+# Probe whether user-space retired-branch hardware performance counters are
+# actually usable on this host. Hermit's chaos mode and --max-timeslice
+# depend on these counters.
+#
+# We probe by *opening* the retired-branch counter with a minimal
+# `perf stat -e branches:u` command, rather than by matching presentation text
+# from `perf list`. The `perf list` text is not a reliable capability signal:
+# on current x86_64 hosts the retired-branch counter works, yet `perf list
+# hardware` labels the section "legacy hardware" and never prints the phrase
+# "Hardware event", so a `grep -i "Hardware event"` probe reports a false
+# negative and silently skips chaos coverage (GH #21).
+#
+# Exit status:
+#   0  - user-space retired-branch counters are available and usable
+#   1  - counters are unavailable (perf missing, event unsupported, or the
+#         kernel refused to open the counter)
+#
+# All diagnostics go to stderr; nothing is printed to stdout. The `perf` binary
+# can be overridden with the PERF environment variable (used by tests).
 
 set -uo pipefail
 

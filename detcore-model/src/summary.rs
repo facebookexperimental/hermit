@@ -17,6 +17,27 @@ use serde::Serialize;
 use crate::pid::DetTid;
 use crate::time::LogicalTime;
 
+/// Per-execution SaBRe path evidence written as one JSON object per line.
+///
+/// The Hermit SaBRe runner produces this record at the path named by
+/// `HERMIT_SABRE_PATH_EVIDENCE`; the manifest runner reads the same type before
+/// deciding whether a SaBRe cell exercised the intended path. Keep the wire
+/// fields here rather than independently defining the producer and reader
+/// shapes: a missing or renamed counter changes whether a cell is accepted.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PathEvidence {
+    pub schema: u8,
+    pub guest_rpc_observed: bool,
+    pub ptrace_fallback_sites: usize,
+    pub trusted_shared_object_sites: usize,
+    pub trusted_shared_objects: Vec<String>,
+}
+
+impl PathEvidence {
+    pub const SCHEMA: u8 = 1;
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#252): Confirm the overflow and rounding policy for long-running guests.
 /// Running distribution statistics over timeslice durations, measured in virtual
@@ -101,6 +122,10 @@ pub struct RunSummary {
     /// The number of total system threads that were created during the execution.
     pub num_threads: u64,
 
+    /// Total syscalls completed by all guest threads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub syscalls: Option<u64>,
+
     /// Deterministic virtual nanoseconds elapsed while computing.
     pub virttime_elapsed: u64,
     /// Absolute (virtual) time in nanoseconds since epoch at program completion.
@@ -118,18 +143,50 @@ pub struct RunSummary {
     pub per_thread_timeslice: Vec<(DetTid, TimesliceStats)>,
 }
 
-/// A human-readable, multi-line summary.
+/// A human-readable, multi-line summary. Serialized report fields are unchanged.
 impl fmt::Display for RunSummary {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt_summary(f, true, self.reprio_descrip.as_deref())
+    }
+}
+
+/// INFO view built with the producer's preemption description, before its host
+/// destination is appended. It does not alter the full report or serialized fields.
+pub struct RunSummaryInfo<'a> {
+    summary: &'a RunSummary,
+    reprio_description: Option<&'a str>,
+}
+
+impl fmt::Display for RunSummaryInfo<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.summary.fmt_summary(f, false, self.reprio_description)
+    }
+}
+
+impl RunSummary {
+    pub fn info<'a>(&'a self, reprio_description: Option<&'a str>) -> RunSummaryInfo<'a> {
+        RunSummaryInfo {
+            summary: self,
+            reprio_description,
+        }
+    }
+
+    fn fmt_summary(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+        include_replay_bookkeeping: bool,
+        reprio_description: Option<&str>,
+    ) -> fmt::Result {
         let RunSummary {
             sched_turns,
             schedevent_replayed,
             schedevent_recorded,
             schedevent_desynced,
             desync_descrip,
-            reprio_descrip,
+            reprio_descrip: _,
             num_processes,
             num_threads,
+            syscalls,
             virttime_elapsed,
             virttime_final,
             realtime_elapsed,
@@ -143,16 +200,27 @@ impl fmt::Display for RunSummary {
             "There were {} group leaders of {} thread(s) total.",
             num_processes, num_threads
         )?;
-        writeln!(
-            f,
-            "Internally, the hermit scheduler ran {} turns, recorded {} events, replayed {} events ({} desynced)",
-            sched_turns, schedevent_recorded, schedevent_replayed, schedevent_desynced,
-        )?;
+        if let Some(syscalls) = syscalls {
+            writeln!(f, "Guest threads completed {syscalls} syscalls.")?;
+        }
+        if include_replay_bookkeeping {
+            writeln!(
+                f,
+                "Internally, the hermit scheduler ran {} turns, recorded {} events, replayed {} events ({} desynced)",
+                sched_turns, schedevent_recorded, schedevent_replayed, schedevent_desynced,
+            )?;
+        } else {
+            writeln!(
+                f,
+                "Internally, the hermit scheduler ran {} turns, recorded {} events ({} desynced)",
+                sched_turns, schedevent_recorded, schedevent_desynced,
+            )?;
+        }
 
         if let Some(txt) = desync_descrip {
             write!(f, "{}", txt)?;
         }
-        if let Some(txt) = reprio_descrip {
+        if let Some(txt) = reprio_description {
             write!(f, "{}", txt)?;
         }
 
@@ -219,7 +287,44 @@ Timeslice stats: min=199999995ns max=200000000ns mean=199999998ns count=4
 
 #[cfg(test)]
 mod tests {
+    use super::PathEvidence;
+    use super::RunSummary;
     use super::TimesliceStats;
+
+    #[test]
+    fn path_evidence_json_is_exact() {
+        let evidence = PathEvidence {
+            schema: PathEvidence::SCHEMA,
+            guest_rpc_observed: true,
+            ptrace_fallback_sites: 0,
+            trusted_shared_object_sites: 1,
+            trusted_shared_objects: vec!["/usr/lib/libc.so.6".into()],
+        };
+        let json = serde_json::to_string(&evidence).unwrap();
+        assert_eq!(
+            json,
+            r#"{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":1,"trusted_shared_objects":["/usr/lib/libc.so.6"]}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<PathEvidence>(&json).unwrap(),
+            evidence
+        );
+
+        let unknown = json.replace(
+            r#""trusted_shared_objects""#,
+            r#""unexpected":0,"trusted_shared_objects""#,
+        );
+        let error = serde_json::from_str::<PathEvidence>(&unknown).unwrap_err();
+        assert!(error.to_string().contains("unknown field `unexpected`"));
+
+        let missing = json.replace(r#""guest_rpc_observed":true,"#, "");
+        let error = serde_json::from_str::<PathEvidence>(&missing).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("missing field `guest_rpc_observed`")
+        );
+    }
 
     #[test]
     fn timeslice_stats_empty() {
@@ -266,5 +371,23 @@ mod tests {
         let mut empty = TimesliceStats::default();
         empty.merge(&b);
         assert_eq!(empty, b);
+    }
+
+    #[test]
+    fn older_summary_json_keeps_an_unrecorded_syscall_total_absent() {
+        let value = serde_json::to_value(RunSummary::default()).unwrap();
+        let mut object = value.as_object().unwrap().clone();
+        object.remove("syscalls");
+        let parsed: RunSummary = serde_json::from_value(object.into()).unwrap();
+        assert_eq!(parsed.syscalls, None);
+
+        let measured = RunSummary {
+            syscalls: Some(0),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&measured).unwrap();
+        assert_eq!(value["syscalls"], 0);
+        let parsed: RunSummary = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.syscalls, Some(0));
     }
 }

@@ -1,0 +1,99 @@
+name: CI (DAG runner, manual)
+
+# Manual entrypoint for comparing or debugging the portable and privileged DAGs.
+# The integration-branch GitHub-managed portable signal uses the same portable
+# DAG directly from ci-portable.yml; this workflow adds no automatic load.
+on:
+  workflow_dispatch:
+    inputs:
+      lane:
+        description: Which validation lane to run as a DAG
+        required: true
+        type: choice
+        default: portable
+        options: [portable, privileged]
+      max_mem:
+        description: RAM budget for memory-aware -j (e.g. 32G); blank = one CPU per job
+        required: false
+        type: string
+        default: ""
+
+env:
+  CARGO_TERM_COLOR: always
+  NEXTEST_VERSION: "0.9.100"
+  RUSTFLAGS: -D warnings -C link-arg=-llzma
+  RUSTDOCFLAGS: -D warnings
+  DETCORE_TEST_RUST_LOG: "off"
+  STRICT_COMPAT_HERMIT_BIN: ${{ github.workspace }}/target/debug/hermit
+
+jobs:
+  dag-portable:
+    name: DAG lane (GitHub-managed portable)
+    if: ${{ inputs.lane == 'portable' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialize dagrun
+        run: git submodule update --init agent-utils
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: portable-validation
+          cache-on-failure: true
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal ncat netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
+      - name: Enable unprivileged user and mount namespaces
+        run: |
+          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
+      - name: Install cargo-nextest (prebuilt)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+      - name: Rust components
+        run: rustup component add clippy rustfmt
+      - name: Run portable lane as a DAG
+        run: env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh portable ${{ inputs.max_mem != '' && format('--max-mem {0}', inputs.max_mem) || '' }} -v
+
+  dag-privileged:
+    name: DAG lane (privileged)
+    if: ${{ inputs.lane == 'privileged' && github.repository == 'rrnewton/hermit' }}
+    # No pmu-serial: `pmu` already selects a PMU+CPUID+/dev/kvm-capable host
+    # (docs/ci-validate-alignment.md). PMU counters are NOT scarce for concurrent
+    # hermit runs (measured: 32 concurrent --strict --verify on one core, 0
+    # failures; experiments/pmu-concurrency-ceiling-measured_20260803 in the
+    # dev-hermit parent) and PMU skid is an instruction-space hardware property
+    # independent of concurrency, so there is no determinism reason to pin this
+    # lane to a single serialized box.
+    runs-on: [Linux, X64, hermit, pmu]
+    timeout-minutes: 240
+    env:
+      DETCORE_TEST_RUST_LOG: "off"
+    steps:
+      - name: Remove stale checkout locks
+        run: |
+          if [[ -d "$GITHUB_WORKSPACE/.git" ]]; then
+            find "$GITHUB_WORKSPACE/.git" -type f -name "*.lock" -print -delete
+          fi
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      # No PMU counter lock: reverie's RCB counters are per-task and
+      # context-switched, so concurrent hermit runs do not exhaust the PMU
+      # (measured: 32 concurrent --strict --verify on one core, 0 failures).
+      # The DAG's in-run resource_caps still serialize genuine exclusive
+      # resources (kvm).
+      - name: Run privileged lane as a DAG
+        run: env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 -v

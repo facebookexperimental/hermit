@@ -3,9 +3,10 @@
 Hermit can boot a minimal x86_64 Linux guest with QEMU's TCG accelerator in
 two modes:
 
-- A strict, sequentialized run reached the initramfs marker and powered off in
-  166.486 wall seconds on current main. This is an L1 result; it has not yet
-  been repeated with `--verify` for L2 assurance.
+- The strict, sequentialized profile passed Stripped verification, not L2. The harness boots to
+  the initramfs marker and powers off once as an oracle, then repeats that
+  exact boot twice under `--strict --verify` and compares Detcore logs after
+  selected numeric, address, path, and time fields are stripped.
 - A faster compatibility profile reached the same marker in 13.25 seconds. It
   uses `--no-sequentialize-threads`, so QEMU's host-thread interleavings are not
   controlled by Hermit.
@@ -49,7 +50,7 @@ initramfs, starts QEMU under Hermit, and requires the kernel marker before the
 90-second host timeout:
 
 ```bash
-./experiments/qemu-boot-debug/smoke_test.sh
+./tests/qemu-boot/smoke_test.sh
 ```
 
 It writes the initramfs and console log under `target/qemu-boot-smoke/`. Set
@@ -60,7 +61,7 @@ KERNEL_IMAGE=/path/to/arch/x86/boot/bzImage \
 QEMU_BIN=/path/to/qemu-system-x86_64 \
 HERMIT_BIN=target/release/hermit \
 QEMU_BOOT_TIMEOUT_SECONDS=90 \
-  ./experiments/qemu-boot-debug/smoke_test.sh
+  ./tests/qemu-boot/smoke_test.sh
 ```
 
 The test passes only when QEMU exits successfully, the console contains
@@ -78,10 +79,13 @@ after 166.486 seconds:
 timeout --kill-after=10s --signal=TERM 180s \
   target/release/hermit --log info run --strict -- \
   qemu-system-x86_64 \
+  -nodefaults \
+  -nic none \
   -m 256M \
   -accel tcg,thread=single \
   -smp 1 \
   -icount shift=0,sleep=off \
+  -rtc base=utc,clock=vm \
   -kernel /boot/vmlinuz \
   -initrd target/qemu-boot-smoke/initramfs.cpio.gz \
   -display none \
@@ -92,14 +96,38 @@ timeout --kill-after=10s --signal=TERM 180s \
 ```
 
 This command uses the ptrace backend, INFO logging, and no relaxations. A
-successful exit and marker establish L1 only. Add `--verify` for an L2 test;
-the current evidence does not claim L2.
+successful exit and marker establish L1. Use the bounded harness for Stripped
+two-run verification; it also rejects the known clock-calibration failures and
+gives each verifier phase its own timeout. The environment variable and script
+retain historical `L2` names, but bare `--verify` does not establish L2:
+
+```bash
+env HERMIT_BIN="$PWD/target/release/hermit" \
+    KERNEL_IMAGE=/boot/vmlinuz \
+    QEMU_BIN=/usr/local/bin/qemu-system-x86_64 \
+    QEMU_L2_PHASE_TIMEOUT_SECONDS=360 \
+    bash tests/qemu-boot/strict_l2_test.sh
+```
+
+The harness runs the same QEMU command shown above, first with `run --strict`
+to require `SHARED_FUTEX_QEMU_KERNEL_OK`, then with
+`run --strict --verify`. A 2026-07-28 run on QEMU 10.1.0 and Linux 6.17.13
+compared 516137 messages per verifier run, including 459588 Detcore messages
+and 363693 DETLOG/scheduler COMMIT messages after Stripped normalization. It
+found no substantive differences and reported the harness's historical marker:
+
+```text
+:: Success: deterministic. Determinism verified.
+QEMU strict L2 boot passed.
+```
+
+That marker records a Stripped pass; it is not canonical L2 evidence.
 
 Do not add `--no-sequentialize-threads` or disable preemption when evaluating
 the strict profile. Those options select the compatibility profile below.
 
-The source-revisioned trace analysis is in
-[`STRICT_BOOT_20260723.md`](../experiments/qemu-boot-debug/STRICT_BOOT_20260723.md).
+The source-revisioned trace analysis is preserved in the parent workspace's
+[`STRICT_BOOT_20260723.md`](https://github.com/rrnewton/dev-hermit/blob/main/experiments/hermit-experiments-migration_20260727/qemu-boot-debug/STRICT_BOOT_20260723.md).
 
 ## Fast compatibility command
 
@@ -109,13 +137,16 @@ is:
 ```bash
 timeout --signal=KILL 90s target/release/hermit --log error run \
   --no-sequentialize-threads \
-  --preemption-timeout disabled \
+  --max-timeslice disabled \
   --no-virtualize-cpuid -- \
   qemu-system-x86_64 \
+  -nodefaults \
+  -nic none \
   -m 256M \
   -accel tcg,thread=single \
   -smp 1 \
   -icount shift=0,sleep=off \
+  -rtc base=utc,clock=vm \
   -kernel /boot/vmlinuz \
   -initrd target/qemu-boot-smoke/initramfs.cpio.gz \
   -display none \
@@ -129,6 +160,10 @@ timeout --signal=KILL 90s target/release/hermit --log error run \
 provide usable CPUID faulting. It exposes host CPUID results and is separate
 from the scheduling and clock configuration. A host on which Hermit's CPUID
 virtualization works may omit this option.
+
+Both profiles use `-nodefaults -nic none` to omit QEMU's unused default
+peripherals and network interface. The serial console remains explicit, and
+`-rtc base=utc,clock=vm` keeps the RTC on QEMU's instruction-derived VM clock.
 
 ## Scheduling profiles
 
@@ -152,42 +187,96 @@ relaxation was used.
 The faster compatibility profile still uses both:
 
 - `--no-sequentialize-threads`, so QEMU's host threads can run concurrently;
-- `--preemption-timeout disabled`, so Hermit does not apply PMU preemption to
+- `--max-timeslice disabled`, so Hermit does not apply PMU preemption to
   this compatibility run.
 
 That profile trades deterministic QEMU host-thread scheduling for lower wall
 time. `-accel tcg,thread=single -smp 1` keeps the emulated guest to one TCG
 vCPU in either profile; it does not remove QEMU's host-side support threads.
 
-## Why fixed QEMU icount is required
+## What `-icount` does, and when a boot needs it
 
-Without `-icount`, QEMU obtains guest TSC and device time from different host
-clock paths. Under Hermit, the emulated TSC ultimately observes a thread-local
-synthetic RDTSC value, while PIT, APIC, and PM timers observe virtualized
-`CLOCK_MONOTONIC` aggregated across QEMU threads. Linux compares those clock
-domains while calibrating its clocksource.
-
-The no-icount control reached the kernel console but reported PIT calibration
-failure, a 374 ms TSC watchdog skew, and finally:
-
-```text
-clocksource: No current clocksource.
-```
-
-`-icount shift=0,sleep=off` makes QEMU use one instruction-derived virtual
-clock for guest TSC and device timers:
+`-icount shift=0,sleep=off` makes QEMU drive the guest TSC and the emulated
+device timers from one instruction-derived virtual clock:
 
 - `shift=0` advances QEMU virtual time by one nanosecond per guest
   instruction;
 - `sleep=off` disables pacing that clock against host wall time.
 
-The verified boot calibrated a coherent 1000.031 MHz TSC and emitted none of
-the PIT, watchdog-skew, or no-clocksource warnings.
+That removes the clock-domain mismatch described in the next section, and the
+verified strict boot calibrates a coherent 1000.031 MHz TSC with none of the
+PIT, watchdog-skew, or no-clocksource warnings.
+
+An earlier revision of this document titled this section "Why fixed QEMU icount
+is required" and presented `-icount` as a precondition for booting at all.
+**That is not what the measurements show, and the claim is retracted.** Whether
+a boot needs `-icount` depends on the profile and on the guest command line,
+and `-icount` carries two costs that the old framing hid.
+
+### Measured: `-icount` is not required, and is not free
+
+Measured 2026-08-18 at hermit `770b95c505` (binary SHA-256 `4d8e8924…`), QEMU
+10.1.2, guest 6.17.13, BusyBox initramfs. PASS means the guest reached
+the run's success marker.
+
+| profile | `-icount` | vCPUs | guest cmdline | wall | outcome |
+| --- | --- | ---: | --- | ---: | --- |
+| compatibility | off | 1 | default | 19.3 s | PASS |
+| compatibility | off | 2 | default | 23.4 s | PASS |
+| compatibility | on | 1 | default | 31.8 s | PASS |
+| strict | off | 1 | default | 59.4 s | fails, guest panic |
+| strict | off | 2 | default | 60.6 s | fails, guest panic |
+| strict | on | 1 | default | 151.8 s | PASS |
+| strict | on | 2 | default | 0.1 s | QEMU refuses to start |
+| strict | off | 1 | `no_timer_check` | 103.5 s | PASS, TSC 999.964 MHz |
+| strict | off | 2 | `no_timer_check lpj=999964` | 382.0 s | PASS |
+
+Three things follow, none of them consistent with "required":
+
+1. **In the compatibility profile, no-icount boots and is the faster option.**
+   19.3 s without `-icount` against 31.8 s with it, at one vCPU. Turning
+   `-icount` on cost about 1.6x here.
+2. **In the strict profile the default-cmdline no-icount failure is real**, and
+   it is the panic documented in the next section. But it is a *guest timer
+   setup* failure, not an inability to run QEMU: adding `no_timer_check` to the
+   guest command line reaches PASS without `-icount` at all.
+3. **`-icount` is what produces the zero-output case, not no-icount.** The one
+   cell above that emits no console bytes is `-icount` with two vCPUs, and the
+   cause is QEMU declining the combination outright — see below.
+
+### `-icount` forecloses multi-threaded TCG, by QEMU's own rule
+
+This is the mechanical constraint the document never stated, and it is a
+property of QEMU rather than a Hermit limitation. QEMU refuses the combination:
+
+```text
+qemu-system-x86_64: -accel tcg,thread=multi: No MTTCG when icount is enabled
+```
+
+So enabling `-icount` forces `thread=single`, collapsing every guest vCPU onto
+one host thread. A reader who takes `-icount` as mandatory would reasonably
+conclude that steering the interleaving of two guest vCPUs is impossible under
+Hermit. It is not impossible; it is incompatible *with `-icount`*. The strict,
+no-icount, two-vCPU row above reaches PASS with both vCPUs on separate host
+threads, which is the configuration in which interleaving can be steered at
+all.
+
+### An unreconciled report
+
+A separate report described no-icount stalling with zero output. Nothing in the
+matrix above reproduces that: every no-icount cell produced console output —
+9,233 bytes even in the failing strict rows — and the only zero-output cell is
+`-icount` at two vCPUs, which is QEMU's MTTCG refusal above. That report may
+have used a configuration not covered here, or may have attributed the
+`-icount` two-vCPU case to no-icount. Treat the shape of a no-icount failure as
+configuration-dependent, and record the profile, vCPU count and guest command
+line alongside any future result.
+
 
 ## Host time virtualization and clock calibration (issue #6)
 
-Even without `-icount`, the QEMU-side symptom above has a Hermit-side cause and
-a Hermit-side workaround.
+The QEMU-side symptom above has a Hermit-side cause. It does not currently have
+a working Hermit-side workaround; see the measurements later in this section.
 
 By default Hermit virtualizes the guest's clocks, but it does so from **two
 independent logical-time bases that are not coordinated with each other**:
@@ -212,24 +301,73 @@ clocksource: No current clocksource.
 tsc: Marking TSC unstable due to clocksource watchdog
 ```
 
-There are two independent ways to avoid this:
+Of the two conceivable ways out, only the QEMU-side one works as written:
 
-1. **QEMU side (deterministic-friendly):** `-icount shift=0,sleep=off`, which
-   makes QEMU drive both the guest TSC and the emulated device timers from one
-   instruction-derived virtual clock, as used by the verified profile above.
-2. **Hermit side:** `--no-virtualize-time --no-virtualize-metadata`, which lets
-   QEMU read the real, mutually consistent host clocks. This sacrifices time
-   determinism for the whole run but calibrates normally and reaches the
-   expected boot outcome.
+1. **QEMU side (works):** `-icount shift=0,sleep=off`,
+   which makes QEMU drive both the guest TSC and the emulated device timers from
+   one instruction-derived virtual clock, as used by the verified profile above.
+2. **Hermit side (does *not* work):** `--no-virtualize-time
+   --no-virtualize-metadata` is intended to let QEMU read the real, mutually
+   consistent host clocks. It does not rescue a boot that lacks `-icount`.
 
-To surface this, `hermit run` prints a one-line advisory when it launches a
-`qemu-system-*` program while virtual time is enabled, pointing at both
-workarounds. The advisory is informational only; it does not change behavior.
+An earlier revision of this section claimed the Hermit-side option "calibrates
+normally and reaches the expected boot outcome". That claim was wrong. Measured
+on 2026-08-18 with the canonical command above, changing only `-icount` and the
+Hermit time flags, and using this document's own oracle
+(`SHARED_FUTEX_QEMU_KERNEL_OK` followed by `reboot: Power down`):
+
+| kernel | `-icount` | Hermit time | `--strict` | outcome |
+| --- | --- | --- | --- | --- |
+| 6.19.2 | yes | virtualized | yes | boot OK, 110 s |
+| 6.13.2 | yes | virtualized | yes | boot OK, 109 s |
+| 6.19.2 | no | virtualized | yes | guest panic after 8,953 serial bytes |
+| 6.19.2 | no | `--no-virtualize-time` | yes | Hermit exits 1 immediately |
+| 6.19.2 | no | `--no-virtualize-time` | no | guest panic, same signature |
+| 6.13.2 | no | `--no-virtualize-time` | no | guest panic, same signature |
+
+`6.13.2` is `6.13.2-0_fbk15_hardened_0_g33ebba20e5e4`, the kernel named in the
+Evidence section below, so this is not a newer-kernel regression. The two
+`-icount` rows establish that the reproduction is faithful: the supported route
+boots cleanly on both kernels on the same host.
+
+The failure is a guest panic during timer setup, not the softer calibration
+degradation described above:
+
+```text
+..MP-BIOS bug: 8254 timer not connected to IO-APIC
+Kernel panic - not syncing: IO-APIC + timer doesn't work!
+```
+
+Two further points. The option is *inert* against this failure: the panic
+signature is identical with and without it, so it changes nothing about the
+outcome. And it is incompatible with `--strict`, which the canonical command
+uses — strict mode rejects the now-unvirtualized `gettimeofday`, so Hermit exits
+before the guest starts:
+
+```text
+ERROR detcore: [detcore, dtid 3] inbound syscall: gettimeofday(...) = ?
+Error: Sandbox container exited unexpectedly
+```
+
+So `-icount shift=0,sleep=off` is the one *Hermit-flag-free* way to make the
+canonical strict command boot as written. It is not the only way to boot
+without `-icount` at all: as the matrix earlier in this document shows, the
+compatibility profile boots without it, and the strict profile boots without it
+once the guest is given `no_timer_check`. Choose `-icount` when you want the
+canonical command to work unchanged; avoid it when you need more than one TCG
+thread, which it forbids.
+
+`hermit run` prints a one-line advisory when it launches a
+`qemu-system-*` program while virtual time is enabled. It recommends the two
+measured routes: `-icount shift=0,sleep=off`, or `no_timer_check` on the nested
+guest kernel command line. It does not recommend the ineffective Hermit time
+flags. The advisory is informational only; it does not change behavior.
 
 A fully coherent multi-clock model (a single Hermit time base shared by
 `rdtsc`, `clock_gettime`, and their derived clocks, coordinated across threads)
-would remove the need for either workaround but is out of scope here; this
-section documents the supported workarounds instead.
+would remove the need for `-icount` here, and is the real fix for the
+Hermit-side cause described in this section. It remains out of scope for this
+document, which records what is measured to work today.
 
 ## Kernel and initramfs
 
@@ -261,7 +399,7 @@ manually from the repository root with:
 out=target/qemu-boot-smoke
 mkdir -p "$out/initramfs-root"
 gcc -Os -nostdlib -static -fno-stack-protector -fno-pie -no-pie \
-  experiments/shared-futex-verify_20260722/qemu_init.c \
+  tests/shared-futex-verify/qemu_init.c \
   -o "$out/initramfs-root/init"
 (
   cd "$out/initramfs-root"
@@ -296,10 +434,17 @@ reboot: Power down
 
 ## Evidence
 
-The preserved experiment in
-[`experiments/qemu-boot-debug/`](../experiments/qemu-boot-debug/) contains the
+The preserved experiment in the parent workspace's
+[`qemu-boot-debug/`](https://github.com/rrnewton/dev-hermit/tree/main/experiments/hermit-experiments-migration_20260727/qemu-boot-debug) contains the
 original six-mode comparison plus the strict current-main follow-up. The fast
-compatibility row is `virtual_minimal_fixed_icount`; the strict L1 row is
+compatibility row is `virtual_minimal_fixed_icount`; the original strict L1 row is
 `strict_current_main_ppoll` in
-[`results.csv`](../experiments/qemu-boot-debug/results.csv). Large raw traces
+[`results.csv`](https://github.com/rrnewton/dev-hermit/blob/main/experiments/hermit-experiments-migration_20260727/qemu-boot-debug/results.csv). Large raw traces
 and console logs are intentionally excluded.
+
+The source-revisioned, historically named
+[`qemu_strict_l2_boot_20260727`](https://github.com/rrnewton/dev-hermit/tree/main/experiments/qemu_strict_l2_boot_20260727)
+experiment records the first successful strict Stripped run, including the exact
+Hermit and Reverie revisions, kernel and QEMU versions, guest command, boot
+oracle, and verifier comparison counts. Its directory name predates the
+Stripped-versus-L2 distinction.

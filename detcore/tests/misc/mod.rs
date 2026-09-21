@@ -11,10 +11,63 @@
 mod notification_fds;
 mod vfork;
 
+use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
+use std::io::Write;
+use std::os::fd::AsRawFd;
+use std::sync::atomic::AtomicI32;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
 use nix::unistd;
+use reverie::Error;
+use reverie::ExitStatus;
+use reverie::Guest;
+use reverie::Subscription;
+use reverie::Tool;
+use reverie::syscalls::Syscall;
 
 #[global_allocator]
 static ALLOC: test_allocator::Global = test_allocator::Global;
+
+/// Test-only inner tool that turns an otherwise inert getter into a raw kernel
+/// timer-slack observation. Detcore handles the virtual getter itself, so the
+/// bracket needs this lower layer to observe the physical tracee value.
+#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
+struct PhysicalTimerSlackProbe;
+
+#[reverie::tool]
+impl Tool for PhysicalTimerSlackProbe {
+    type GlobalState = detcore::GlobalState;
+    type ThreadState = ();
+
+    fn subscriptions(_config: &detcore::Config) -> Subscription {
+        Subscription::none()
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+    ) -> Result<i64, Error> {
+        let call = match call {
+            Syscall::Prctl(call) if call.option() == libc::PR_GET_DUMPABLE => {
+                Syscall::Prctl(call.with_option(libc::PR_GET_TIMERSLACK))
+            }
+            call => call,
+        };
+        Ok(guest.inject(call).await?)
+    }
+}
+
+#[repr(C)]
+struct TimerSlackBracketState {
+    stage: AtomicU8,
+    physical_before: AtomicI32,
+    physical_after: AtomicI32,
+}
 
 #[derive(Clone, Copy)]
 struct HardwareRandomFeatures {
@@ -49,10 +102,10 @@ fn cpuid_faulting_supported() -> bool {
 
 fn det_test_fn_without_pmu<F>(f: F)
 where
-    F: Fn(),
+    F: Fn() + Send + Sync,
 {
     let config = detcore::Config {
-        preemption_timeout: None,
+        max_timeslice: None,
         ..Default::default()
     };
     detcore_testutils::det_test_fn_with_config(true, f, config, detcore_testutils::expect_success)
@@ -60,17 +113,17 @@ where
 
 fn det_test_fn_sequential_without_pmu<F>(f: F)
 where
-    F: Fn(),
+    F: Fn() + Send + Sync,
 {
     det_test_fn_sequential_without_pmu_with_post_fork(detcore::RunsPostFork::Child, f);
 }
 
 fn det_test_fn_sequential_without_pmu_with_post_fork<F>(runs_post_fork: detcore::RunsPostFork, f: F)
 where
-    F: Fn(),
+    F: Fn() + Send + Sync,
 {
     let config = detcore::Config {
-        preemption_timeout: None,
+        max_timeslice: None,
         sequentialize_threads: true,
         runs_post_fork,
         ..Default::default()
@@ -91,7 +144,7 @@ fn madvise_result(address: *mut libc::c_void, len: usize, advice: libc::c_int) -
 
 fn run_madvise_policy_test(passthru_opt: bool) {
     let config = detcore::Config {
-        preemption_timeout: None,
+        max_timeslice: None,
         passthru_opt,
         ..Default::default()
     };
@@ -229,6 +282,602 @@ fn madvise_policy_is_deterministic_and_preserves_semantic_advice() {
 #[test]
 fn passthru_opt_still_intercepts_madvise() {
     run_madvise_policy_test(true);
+}
+
+#[test]
+fn prctl_keepcaps_round_trips_deterministically() {
+    // `setpriv` (used by the `date` privilege-drop wrapper) sets and reads the
+    // per-thread PR_SET_KEEPCAPS flag during startup. Detcore must support it
+    // instead of returning ENOSYS, which made setpriv abort with
+    // "keep process capabilities failed: Function not implemented". The flag is
+    // process-local, so the set/get round trip is deterministic regardless of
+    // the initial state.
+    det_test_fn_sequential_without_pmu(|| unsafe {
+        assert_eq!(libc::prctl(libc::PR_SET_KEEPCAPS, 1), 0);
+        assert_eq!(libc::prctl(libc::PR_GET_KEEPCAPS), 1);
+        assert_eq!(libc::prctl(libc::PR_SET_KEEPCAPS, 0), 0);
+        assert_eq!(libc::prctl(libc::PR_GET_KEEPCAPS), 0);
+    });
+}
+
+#[test]
+fn timer_slack_prctl_and_procfs_share_virtual_state() {
+    const DEFAULT_TIMER_SLACK_NS: libc::c_int = 50_000;
+    det_test_fn_sequential_without_pmu(|| unsafe {
+        assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), DEFAULT_TIMER_SLACK_NS);
+
+        // Detcore exposes one guest scheduling policy (SCHED_OTHER). Even a
+        // successful request for an RT policy therefore cannot reach Linux's
+        // physical RT/DL special case that forces timer slack to zero.
+        let param = libc::sched_param { sched_priority: 1 };
+        assert_eq!(libc::sched_setscheduler(0, libc::SCHED_FIFO, &param), 0);
+        assert_eq!(libc::sched_getscheduler(0), libc::SCHED_OTHER);
+
+        const REQUESTED_SLACK_NS: libc::c_int = 1_000_000;
+        assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, REQUESTED_SLACK_NS), 0);
+        assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), REQUESTED_SLACK_NS);
+        assert_eq!(
+            std::fs::read_to_string("/proc/self/timerslack_ns")
+                .unwrap()
+                .trim(),
+            REQUESTED_SLACK_NS.to_string()
+        );
+
+        let tid = libc::syscall(libc::SYS_gettid) as libc::pid_t;
+        assert_eq!(
+            std::fs::read_to_string(format!("/proc/{tid}/timerslack_ns"))
+                .unwrap()
+                .trim(),
+            REQUESTED_SLACK_NS.to_string()
+        );
+        for absent in [
+            "/proc/thread-self/timerslack_ns".to_owned(),
+            format!("/proc/self/task/{tid}/timerslack_ns"),
+            format!("/proc/{tid}/task/{tid}/timerslack_ns"),
+        ] {
+            assert_eq!(
+                std::fs::File::open(absent).unwrap_err().raw_os_error(),
+                Some(libc::ENOENT)
+            );
+        }
+
+        let read_only = std::fs::File::open("/proc/self/timerslack_ns").unwrap();
+        assert_eq!(
+            libc::write(read_only.as_raw_fd(), b"1".as_ptr().cast(), 1),
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        let write_only = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/proc/self/timerslack_ns")
+            .unwrap();
+        let mut denied = [0_u8; 1];
+        assert_eq!(
+            libc::read(
+                write_only.as_raw_fd(),
+                denied.as_mut_ptr().cast(),
+                denied.len(),
+            ),
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+
+        let mut writable = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/proc/self/timerslack_ns")
+            .unwrap();
+        writable.write_all(b"222222\n").unwrap();
+        assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), 222_222);
+
+        assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, 333_333), 0);
+        let mut readable = std::fs::File::open("/proc/self/timerslack_ns").unwrap();
+        assert_eq!(
+            libc::read(readable.as_raw_fd(), std::ptr::null_mut(), 1),
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EFAULT)
+        );
+        assert_eq!(
+            libc::lseek(readable.as_raw_fd(), 0, libc::SEEK_CUR),
+            0,
+            "a failed copy must not advance the procfs cursor"
+        );
+
+        let mut prefix = [0_u8; 2];
+        readable.read_exact(&mut prefix).unwrap();
+        assert_eq!(&prefix, b"33");
+        assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, 444_444), 0);
+        let mut suffix = String::new();
+        readable.read_to_string(&mut suffix).unwrap();
+        assert_eq!(suffix, "3333\n", "partial reads retain one snapshot");
+        readable.seek(SeekFrom::Start(0)).unwrap();
+        let mut rewound = String::new();
+        readable.read_to_string(&mut rewound).unwrap();
+        assert_eq!(rewound, "444444\n", "rewind regenerates the snapshot");
+
+        assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, 555_555), 0);
+        let mut positioned = [0_u8; 6];
+        assert_eq!(
+            libc::pread(
+                readable.as_raw_fd(),
+                positioned.as_mut_ptr().cast(),
+                positioned.len(),
+                1,
+            ),
+            positioned.len() as isize
+        );
+        assert_eq!(&positioned, b"55555\n");
+
+        let mut writable = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/proc/self/timerslack_ns")
+            .unwrap();
+        writable.write_all(b"0\n").unwrap();
+        assert_eq!(
+            libc::prctl(libc::PR_GET_TIMERSLACK),
+            DEFAULT_TIMER_SLACK_NS,
+            "zero restores the thread's inherited default"
+        );
+    });
+}
+
+#[test]
+fn timer_slack_procfs_vector_io_matches_linux() {
+    det_test_fn_sequential_without_pmu(|| unsafe {
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/proc/self/timerslack_ns")
+            .unwrap();
+        let fd = file.as_raw_fd();
+
+        let first = b"343";
+        let second = b"434\n";
+        let writes = [
+            libc::iovec {
+                iov_base: first.as_ptr().cast_mut().cast(),
+                iov_len: first.len(),
+            },
+            libc::iovec {
+                iov_base: second.as_ptr().cast_mut().cast(),
+                iov_len: second.len(),
+            },
+        ];
+        assert_eq!(libc::writev(fd, writes.as_ptr(), writes.len() as i32), 7);
+        assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), 434);
+
+        assert_eq!(file.seek(SeekFrom::Start(0)).unwrap(), 0);
+        let mut left = [0_u8; 2];
+        let mut right = [0_u8; 8];
+        let reads = [
+            libc::iovec {
+                iov_base: left.as_mut_ptr().cast(),
+                iov_len: left.len(),
+            },
+            libc::iovec {
+                iov_base: right.as_mut_ptr().cast(),
+                iov_len: right.len(),
+            },
+        ];
+        assert_eq!(libc::readv(fd, reads.as_ptr(), reads.len() as i32), 4);
+        assert_eq!(&left, b"43");
+        assert_eq!(&right[..2], b"4\n");
+
+        assert_eq!(file.seek(SeekFrom::Start(0)).unwrap(), 0);
+        assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, 246_810), 0);
+        let mut untouched = [0_u8; 2];
+        let bad_first = [
+            libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 1,
+            },
+            libc::iovec {
+                iov_base: untouched.as_mut_ptr().cast(),
+                iov_len: untouched.len(),
+            },
+        ];
+        assert_eq!(
+            libc::readv(fd, bad_first.as_ptr(), bad_first.len() as i32),
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EFAULT)
+        );
+        assert_eq!(
+            libc::lseek(fd, 0, libc::SEEK_CUR),
+            0,
+            "a failed first iovec must not advance the procfs cursor"
+        );
+
+        assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, 987_654), 0);
+        let mut partial = [0_u8; 2];
+        let bad_second = [
+            libc::iovec {
+                iov_base: partial.as_mut_ptr().cast(),
+                iov_len: partial.len(),
+            },
+            libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 1,
+            },
+        ];
+        assert_eq!(
+            libc::readv(fd, bad_second.as_ptr(), bad_second.len() as i32),
+            partial.len() as isize
+        );
+        assert_eq!(&partial, b"98");
+        assert_eq!(libc::lseek(fd, 0, libc::SEEK_CUR), 2);
+        assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, 111_111), 0);
+        let mut retained = String::new();
+        file.read_to_string(&mut retained).unwrap();
+        assert_eq!(
+            retained, "7654\n",
+            "a later failed iovec retains only the successfully copied prefix"
+        );
+
+        let pfirst = b"515";
+        let psecond = b"151\n";
+        let pwrites = [
+            libc::iovec {
+                iov_base: pfirst.as_ptr().cast_mut().cast(),
+                iov_len: pfirst.len(),
+            },
+            libc::iovec {
+                iov_base: psecond.as_ptr().cast_mut().cast(),
+                iov_len: psecond.len(),
+            },
+        ];
+        assert_eq!(
+            libc::pwritev(fd, pwrites.as_ptr(), pwrites.len() as i32, -1),
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINVAL)
+        );
+        assert_eq!(
+            libc::syscall(
+                libc::SYS_pwritev2,
+                fd,
+                pwrites.as_ptr(),
+                pwrites.len(),
+                u64::MAX,
+                0_u64,
+                libc::RWF_HIPRI,
+            ),
+            7
+        );
+        assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), 151);
+        assert_eq!(
+            libc::pwritev(fd, pwrites.as_ptr(), pwrites.len() as i32, 0),
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESPIPE)
+        );
+        assert_eq!(libc::pwrite(fd, first.as_ptr().cast(), first.len(), -1), -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINVAL)
+        );
+
+        assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, 987_654), 0);
+        let mut pleft = [0_u8; 2];
+        let mut pright = [0_u8; 4];
+        let preads = [
+            libc::iovec {
+                iov_base: pleft.as_mut_ptr().cast(),
+                iov_len: pleft.len(),
+            },
+            libc::iovec {
+                iov_base: pright.as_mut_ptr().cast(),
+                iov_len: pright.len(),
+            },
+        ];
+        assert_eq!(
+            libc::preadv(fd, preads.as_ptr(), preads.len() as i32, -1),
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINVAL)
+        );
+        assert_eq!(file.seek(SeekFrom::Start(0)).unwrap(), 0);
+        assert_eq!(
+            libc::syscall(
+                libc::SYS_preadv2,
+                fd,
+                preads.as_ptr(),
+                preads.len(),
+                u64::MAX,
+                0_u64,
+                libc::RWF_HIPRI,
+            ),
+            6
+        );
+        assert_eq!(&pleft, b"98");
+        assert_eq!(&pright, b"7654");
+        pleft.fill(0);
+        pright.fill(0);
+        assert_eq!(libc::preadv(fd, preads.as_ptr(), preads.len() as i32, 1), 6);
+        assert_eq!(&pleft, b"87");
+        assert_eq!(&pright, b"654\n");
+    });
+}
+
+#[test]
+fn timer_slack_procfs_binds_target_at_open() {
+    det_test_fn_sequential_without_pmu(|| unsafe {
+        const PARENT_SLACK_NS: libc::c_int = 1_000_000;
+        assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, PARENT_SLACK_NS), 0);
+
+        let (tid_send, tid_recv) = std::sync::mpsc::channel();
+        let (file_send, file_recv) = std::sync::mpsc::channel::<std::fs::File>();
+        let (back_send, back_recv) = std::sync::mpsc::channel::<std::fs::File>();
+        let worker = std::thread::spawn(move || {
+            let tid = libc::syscall(libc::SYS_gettid) as libc::pid_t;
+            tid_send.send(tid).unwrap();
+            let mut file = file_recv.recv().unwrap();
+
+            assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), PARENT_SLACK_NS);
+            assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, 0), 0);
+            assert_eq!(
+                libc::prctl(libc::PR_GET_TIMERSLACK),
+                PARENT_SLACK_NS,
+                "a new thread resets to its inherited current value"
+            );
+            assert_eq!(
+                std::fs::read_to_string("/proc/self/timerslack_ns")
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::EPERM),
+                "/proc/self remains bound to the process leader"
+            );
+
+            file.seek(SeekFrom::Start(0)).unwrap();
+            let mut inherited = String::new();
+            file.read_to_string(&mut inherited).unwrap();
+            assert_eq!(inherited.trim(), PARENT_SLACK_NS.to_string());
+            let mut own = std::fs::OpenOptions::new()
+                .write(true)
+                .open(format!("/proc/{tid}/timerslack_ns"))
+                .unwrap();
+            own.write_all(b"777777\n").unwrap();
+            assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), 777_777);
+            file.seek(SeekFrom::Start(0)).unwrap();
+            back_send.send(file).unwrap();
+        });
+
+        let tid = tid_recv.recv().unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(format!("/proc/{tid}/timerslack_ns"))
+            .unwrap();
+        let mut byte = [0_u8; 1];
+        assert_eq!(libc::read(file.as_raw_fd(), byte.as_mut_ptr().cast(), 0), 0);
+        assert_eq!(
+            libc::pread(file.as_raw_fd(), byte.as_mut_ptr().cast(), 0, 0),
+            0
+        );
+        assert_eq!(libc::lseek(file.as_raw_fd(), 0, libc::SEEK_SET), 0);
+        assert_eq!(libc::lseek(file.as_raw_fd(), 0, libc::SEEK_CUR), 0);
+        assert_eq!(libc::lseek(file.as_raw_fd(), 0, libc::SEEK_END), -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINVAL)
+        );
+        assert_eq!(
+            file.read(&mut byte).unwrap_err().raw_os_error(),
+            Some(libc::EPERM),
+            "a live other task requires CAP_SYS_NICE"
+        );
+        file_send.send(file).unwrap();
+        let mut file = back_recv.recv().unwrap();
+        worker.join().unwrap();
+        assert_eq!(libc::read(file.as_raw_fd(), byte.as_mut_ptr().cast(), 0), 0);
+        assert_eq!(
+            libc::pread(file.as_raw_fd(), byte.as_mut_ptr().cast(), 0, 0),
+            0
+        );
+        assert_eq!(libc::lseek(file.as_raw_fd(), 0, libc::SEEK_SET), 0);
+        assert_eq!(libc::lseek(file.as_raw_fd(), 0, libc::SEEK_CUR), 0);
+        assert_eq!(libc::lseek(file.as_raw_fd(), 0, libc::SEEK_END), -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINVAL)
+        );
+        assert_eq!(
+            file.read(&mut byte).unwrap_err().raw_os_error(),
+            Some(libc::ESRCH),
+            "the open description retains the exited task incarnation"
+        );
+        assert_eq!(
+            libc::prctl(libc::PR_GET_TIMERSLACK),
+            PARENT_SLACK_NS,
+            "the worker's write must not disturb the leader"
+        );
+    });
+}
+
+#[test]
+fn timer_slack_is_mediated_under_passthru_opt() {
+    let config = detcore::Config {
+        max_timeslice: None,
+        sequentialize_threads: true,
+        passthru_opt: true,
+        ..Default::default()
+    };
+    detcore_testutils::det_test_fn_with_config(
+        true,
+        || unsafe {
+            assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), 50_000);
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/proc/self/timerslack_ns")
+                .unwrap();
+            file.write_all(b"123456\n").unwrap();
+            assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), 123_456);
+            file.seek(SeekFrom::Start(0)).unwrap();
+            let mut value = String::new();
+            file.read_to_string(&mut value).unwrap();
+            assert_eq!(value, "123456\n");
+        },
+        config,
+        detcore_testutils::expect_success,
+    );
+}
+
+#[test]
+fn timer_slack_virtual_state_is_isolated_from_physical_tracee() {
+    const PHYSICAL_SENTINEL_NS: libc::c_int = 7_654_321;
+    const VIRTUAL_REQUEST_NS: libc::c_int = 1_000_000_000;
+    const VIRTUAL_PROC_REQUEST_NS: libc::c_int = 888_888_888;
+
+    struct RestoreTimerSlack(libc::c_int);
+    impl Drop for RestoreTimerSlack {
+        fn drop(&mut self) {
+            assert_eq!(unsafe { libc::prctl(libc::PR_SET_TIMERSLACK, self.0) }, 0);
+        }
+    }
+
+    let original = unsafe { libc::prctl(libc::PR_GET_TIMERSLACK) };
+    assert!(original >= 0);
+    let _restore = RestoreTimerSlack(original);
+    assert_eq!(
+        unsafe { libc::prctl(libc::PR_SET_TIMERSLACK, PHYSICAL_SENTINEL_NS) },
+        0
+    );
+
+    let mapping = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            std::mem::size_of::<TimerSlackBracketState>(),
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(mapping, libc::MAP_FAILED);
+    let bracket = mapping.cast::<TimerSlackBracketState>();
+    unsafe {
+        bracket.write(TimerSlackBracketState {
+            stage: AtomicU8::new(0),
+            physical_before: AtomicI32::new(-1),
+            physical_after: AtomicI32::new(-1),
+        })
+    };
+
+    let config = detcore::Config {
+        max_timeslice: None,
+        sequentialize_threads: true,
+        ..Default::default()
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let tracer =
+            reverie_ptrace::spawn_fn_with_config::<detcore::Detcore<PhysicalTimerSlackProbe>, _>(
+                move || unsafe {
+                    let bracket = &*bracket;
+                    assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), 50_000);
+                    assert_eq!(
+                        std::fs::read_to_string("/proc/self/timerslack_ns")
+                            .unwrap()
+                            .trim(),
+                        "50000"
+                    );
+                    bracket
+                        .physical_before
+                        .store(libc::prctl(libc::PR_GET_DUMPABLE), Ordering::Release);
+                    bracket.stage.store(1, Ordering::Release);
+                    while bracket.stage.load(Ordering::Acquire) != 2 {
+                        std::hint::spin_loop();
+                    }
+
+                    assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, VIRTUAL_REQUEST_NS), 0);
+                    assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), VIRTUAL_REQUEST_NS);
+                    assert_eq!(
+                        std::fs::read_to_string("/proc/self/timerslack_ns")
+                            .unwrap()
+                            .trim(),
+                        VIRTUAL_REQUEST_NS.to_string()
+                    );
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open("/proc/self/timerslack_ns")
+                        .unwrap()
+                        .write_all(b"888888888\n")
+                        .unwrap();
+                    assert_eq!(
+                        libc::prctl(libc::PR_GET_TIMERSLACK),
+                        VIRTUAL_PROC_REQUEST_NS
+                    );
+                    bracket
+                        .physical_after
+                        .store(libc::prctl(libc::PR_GET_DUMPABLE), Ordering::Release);
+                    bracket.stage.store(3, Ordering::Release);
+                    while bracket.stage.load(Ordering::Acquire) != 4 {
+                        std::hint::spin_loop();
+                    }
+                },
+                config,
+                true,
+            )
+            .await
+            .unwrap();
+        let bracket = unsafe { &*bracket };
+
+        async fn await_stage(stage: &AtomicU8, expected: u8) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while stage.load(Ordering::Acquire) != expected {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("tracee did not reach stage {expected}"));
+        }
+
+        let controller = async {
+            await_stage(&bracket.stage, 1).await;
+            assert_eq!(
+                bracket.physical_before.load(Ordering::Acquire),
+                PHYSICAL_SENTINEL_NS,
+                "the launcher's physical timer slack must not seed virtual state"
+            );
+            bracket.stage.store(2, Ordering::Release);
+
+            await_stage(&bracket.stage, 3).await;
+            assert_eq!(
+                bracket.physical_after.load(Ordering::Acquire),
+                PHYSICAL_SENTINEL_NS,
+                "a virtual timer-slack update must not mutate the physical tracee"
+            );
+            bracket.stage.store(4, Ordering::Release);
+        };
+        let ((), trace_result) = tokio::join!(controller, tracer.wait_with_output());
+        let (output, _) = trace_result.unwrap();
+        assert_eq!(output.status, ExitStatus::Exited(0));
+    });
+
+    assert_eq!(
+        unsafe { libc::munmap(mapping, std::mem::size_of::<TimerSlackBracketState>()) },
+        0
+    );
 }
 
 #[test]
@@ -649,14 +1298,57 @@ fn dup_shares_status_flags_but_not_cloexec() {
 }
 
 #[test]
-fn bound_port_survives_closing_dup_alias() {
+fn fcntl_advisory_set_lock_succeeds() {
     det_test_fn_sequential_without_pmu(|| {
-        fn bind_loopback_ephemeral(fd: libc::c_int) -> libc::c_int {
+        let path = b"/tmp/detcore-fcntl-lock\0";
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr().cast(),
+                libc::O_CREAT | libc::O_CLOEXEC | libc::O_RDWR | libc::O_TRUNC,
+                0o600,
+            )
+        };
+        assert!(fd >= 0);
+
+        let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+        lock.l_type = libc::F_WRLCK as libc::c_short;
+        lock.l_whence = libc::SEEK_SET as libc::c_short;
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETLK, &lock) }, 0);
+
+        lock.l_type = libc::F_UNLCK as libc::c_short;
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETLK, &lock) }, 0);
+        assert_eq!(unsafe { libc::close(fd) }, 0);
+        assert_eq!(unsafe { libc::unlink(path.as_ptr().cast()) }, 0);
+    });
+}
+
+#[test]
+fn bound_port_survives_closing_dup_alias() {
+    const LINUX_PID_LIMIT_EXCLUSIVE: u32 = 1 << 22;
+
+    let host_pid = std::process::id();
+    assert!(
+        host_pid < LINUX_PID_LIMIT_EXCLUSIVE,
+        "host PID {host_pid} exceeds the 22-bit Linux PID limit"
+    );
+    let loopback_address = [
+        127,
+        0x80 | ((host_pid >> 16) as u8),
+        ((host_pid >> 8) & 0xff) as u8,
+        (host_pid & 0xff) as u8,
+    ];
+    // Every address in 127.0.0.0/8 is loopback on Linux. Use 127.128.0.0/10
+    // for this test, encoding every bit of Linux's 22-bit PID limit so
+    // independent host test processes do not bind the same address and port.
+    // Repetitions inside this test process retain one address and still exercise
+    // the same deterministic port sequence.
+    det_test_fn_sequential_without_pmu(move || {
+        fn bind_loopback(fd: libc::c_int, address_bytes: [u8; 4], port: u16) -> libc::c_int {
             let mut address = libc::sockaddr_in {
                 sin_family: libc::AF_INET as libc::sa_family_t,
-                sin_port: 0,
+                sin_port: port.to_be(),
                 sin_addr: libc::in_addr {
-                    s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+                    s_addr: u32::from_ne_bytes(address_bytes),
                 },
                 sin_zero: [0; 8],
             };
@@ -669,32 +1361,240 @@ fn bound_port_survives_closing_dup_alias() {
             }
         }
 
+        fn socket_name(fd: libc::c_int) -> ([u8; 4], u16) {
+            let mut address: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            let mut length = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+            assert_eq!(
+                unsafe {
+                    libc::getsockname(
+                        fd,
+                        (&mut address as *mut libc::sockaddr_in).cast(),
+                        &mut length,
+                    )
+                },
+                0
+            );
+            assert_eq!(length as usize, std::mem::size_of::<libc::sockaddr_in>());
+            assert_eq!(address.sin_family, libc::AF_INET as libc::sa_family_t);
+            (
+                address.sin_addr.s_addr.to_ne_bytes(),
+                address.sin_port.to_be(),
+            )
+        }
+
+        fn socket_option(fd: libc::c_int, option: libc::c_int) -> libc::c_int {
+            let mut value = 0;
+            let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            assert_eq!(
+                unsafe {
+                    libc::getsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        option,
+                        (&mut value as *mut libc::c_int).cast(),
+                        &mut length,
+                    )
+                },
+                0
+            );
+            assert_eq!(length as usize, std::mem::size_of::<libc::c_int>());
+            value
+        }
+
+        fn socket_identity(fd: libc::c_int) -> (libc::dev_t, libc::ino_t) {
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::fstat(fd, &mut stat) }, 0);
+            (stat.st_dev, stat.st_ino)
+        }
+
         let socket = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
         assert!(socket >= 0);
         let mut first_bound = false;
         for _ in 0..128 {
-            if bind_loopback_ephemeral(socket) == 0 {
+            if bind_loopback(socket, loopback_address, 0) == 0 {
                 first_bound = true;
                 break;
             }
             assert_eq!(nix::errno::Errno::last(), nix::errno::Errno::EADDRINUSE);
         }
         assert!(first_bound, "no deterministic ephemeral port was available");
+        let first_name = socket_name(socket);
+        let first_identity = socket_identity(socket);
+        assert_eq!(first_name.0, loopback_address);
+        assert_ne!(first_name.1, 0);
 
         let duplicate = unsafe { libc::dup(socket) };
         assert!(duplicate >= 0);
+        assert_eq!(socket_identity(duplicate), first_identity);
         assert_eq!(unsafe { libc::close(socket) }, 0);
+
+        assert_ne!(unsafe { libc::fcntl(duplicate, libc::F_GETFD) }, -1);
+        assert_eq!(socket_identity(duplicate), first_identity);
+        assert_eq!(socket_name(duplicate), first_name);
+        assert_eq!(socket_option(duplicate, libc::SO_TYPE), libc::SOCK_STREAM);
+        assert_eq!(socket_option(duplicate, libc::SO_ERROR), 0);
 
         let second = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
         assert!(second >= 0);
+        let second_bind = bind_loopback(second, loopback_address, 0);
+        let second_errno = (second_bind == -1).then(nix::errno::Errno::last);
         assert_eq!(
-            bind_loopback_ephemeral(second),
-            0,
-            "closing one dup alias must not free its bound port reservation"
+            second_bind, 0,
+            "closing one dup alias must not free its bound port reservation: {second_errno:?}"
+        );
+        let second_name = socket_name(second);
+        assert_eq!(second_name.0, loopback_address);
+        assert_ne!(second_name.1, first_name.1);
+        eprintln!(
+            "bound-port state after first alias close: first={:?}:{}, next={:?}:{}, second_bind={}, second_errno={:?}",
+            first_name.0, first_name.1, second_name.0, second_name.1, second_bind, second_errno
         );
 
         assert_eq!(unsafe { libc::close(duplicate) }, 0);
+
+        let reuse = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+        assert!(reuse >= 0);
+        assert_eq!(
+            bind_loopback(reuse, loopback_address, first_name.1),
+            0,
+            "the kernel must release the bound port after the final alias closes"
+        );
+        assert_eq!(socket_name(reuse), first_name);
+
+        assert_eq!(unsafe { libc::close(reuse) }, 0);
         assert_eq!(unsafe { libc::close(second) }, 0);
+    });
+}
+
+#[test]
+fn unix_autobind_names_are_deterministic() {
+    det_test_fn_sequential_without_pmu(|| {
+        let mut open_fds = Vec::new();
+        let mut names = Vec::new();
+        for (socket_type, label) in [
+            (libc::SOCK_DGRAM, "dgram"),
+            (libc::SOCK_STREAM, "stream"),
+            (libc::SOCK_SEQPACKET, "seqpacket"),
+        ] {
+            let fd = unsafe { libc::socket(libc::AF_UNIX, socket_type, 0) };
+            assert!(fd >= 0, "{label} socket creation failed");
+
+            let mut requested: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+            requested.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            assert_eq!(
+                unsafe {
+                    libc::bind(
+                        fd,
+                        (&requested as *const libc::sockaddr_un).cast(),
+                        std::mem::offset_of!(libc::sockaddr_un, sun_path) as libc::socklen_t,
+                    )
+                },
+                0,
+                "{label} autobind failed"
+            );
+
+            let mut observed: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+            let mut observed_len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+            assert_eq!(
+                unsafe {
+                    libc::getsockname(
+                        fd,
+                        (&mut observed as *mut libc::sockaddr_un).cast(),
+                        &mut observed_len,
+                    )
+                },
+                0,
+                "{label} getsockname failed"
+            );
+
+            assert_eq!(observed.sun_family, libc::AF_UNIX as libc::sa_family_t);
+            assert_eq!(
+                observed_len as usize,
+                std::mem::offset_of!(libc::sockaddr_un, sun_path) + 6
+            );
+            assert_eq!(observed.sun_path[0], 0);
+            let name = observed.sun_path[1..6]
+                .iter()
+                .map(|byte| *byte as u8)
+                .collect::<Vec<_>>();
+            assert!(
+                name.iter()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+            );
+            println!("{label}={}", String::from_utf8(name).unwrap());
+            open_fds.push(fd);
+            names.push(observed.sun_path[1..6].to_vec());
+        }
+
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            3,
+            "live autobind sockets must have unique names"
+        );
+        for fd in open_fds {
+            assert_eq!(unsafe { libc::close(fd) }, 0);
+        }
+    });
+}
+
+#[test]
+fn netlink_autobind_port_ids_are_deterministic() {
+    det_test_fn_sequential_without_pmu(|| {
+        fn bind_netlink(protocol: libc::c_int) -> (libc::c_int, u32) {
+            let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW, protocol) };
+            assert!(fd >= 0, "Netlink socket creation failed for {protocol}");
+
+            let mut requested: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+            requested.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+            assert_eq!(
+                unsafe {
+                    libc::bind(
+                        fd,
+                        (&requested as *const libc::sockaddr_nl).cast(),
+                        std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+                    )
+                },
+                0,
+                "Netlink autobind failed for {protocol}"
+            );
+
+            let mut observed: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+            let mut observed_len = std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
+            assert_eq!(
+                unsafe {
+                    libc::getsockname(
+                        fd,
+                        (&mut observed as *mut libc::sockaddr_nl).cast(),
+                        &mut observed_len,
+                    )
+                },
+                0,
+                "Netlink getsockname failed for {protocol}"
+            );
+            assert_eq!(
+                observed_len as usize,
+                std::mem::size_of::<libc::sockaddr_nl>()
+            );
+            assert_eq!(observed.nl_family, libc::AF_NETLINK as libc::sa_family_t);
+            assert_ne!(observed.nl_pid, 0);
+            assert_eq!(observed.nl_groups, 0);
+            (fd, observed.nl_pid)
+        }
+
+        for (protocol, label) in [
+            (libc::NETLINK_ROUTE, "route"),
+            (libc::NETLINK_USERSOCK, "usersock"),
+            (libc::NETLINK_GENERIC, "generic"),
+        ] {
+            let (first_fd, first_port_id) = bind_netlink(protocol);
+            let (second_fd, second_port_id) = bind_netlink(protocol);
+            assert_ne!(first_port_id, second_port_id);
+            println!("{label}={first_port_id},{second_port_id}");
+            assert_eq!(unsafe { libc::close(first_fd) }, 0);
+            assert_eq!(unsafe { libc::close(second_fd) }, 0);
+        }
     });
 }
 
@@ -1016,7 +1916,7 @@ fn network_syscalls_are_deterministic_across_five_runs() {
     let config = detcore::Config {
         sequentialize_threads: true,
         deterministic_io: true,
-        preemption_timeout: None,
+        max_timeslice: None,
         ..Default::default()
     };
 

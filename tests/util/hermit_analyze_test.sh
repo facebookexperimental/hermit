@@ -44,7 +44,7 @@ HERMIT_ARGS+=" -- "
 # hermit run args:
 HERMIT_ARGS+="--chaos "
 HERMIT_ARGS+="--summary "
-HERMIT_ARGS+="--preemption-timeout=400000 "
+HERMIT_ARGS+="--max-timeslice=400000 "
 
 TEMP=$(mktemp -d /tmp/analyze_test_XXXXX)
 echo ":: [analyze_test] Temporary workspace: $TEMP"

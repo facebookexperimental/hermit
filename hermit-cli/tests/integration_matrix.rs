@@ -157,12 +157,12 @@ fn fixture() -> Fixture {
         .expect("failed to write basic command fixture");
     fs::write(
         root.join("node_worker.js"),
-        include_str!("../../experiments/shared-futex-verify_20260722/node_worker.js"),
+        include_str!("../../tests/shared-futex-verify/node_worker.js"),
     )
     .expect("failed to write Node.js fixture");
     fs::write(
         root.join("Threaded.java"),
-        include_str!("../../experiments/shared-futex-verify_20260722/Threaded.java"),
+        include_str!("../../tests/shared-futex-verify/Threaded.java"),
     )
     .expect("failed to write Java fixture");
     fs::write(
@@ -274,18 +274,22 @@ fn cases(fixture: &Fixture) -> Vec<Case> {
         case(
             "threaded",
             "node",
-            &["/usr/local/bin/node", "/usr/bin/node"],
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#565)
+            // Prefer the distro ELF; /usr/local may be a telemetry wrapper.
+            &["/usr/bin/node", "/bin/node", "/usr/local/bin/node"],
             &["/tmp/integration-matrix/node_worker.js"],
             Some("SHARED_FUTEX_NODE_OK workers=4"),
             Expectation::Pass,
             false,
         ),
-        // Use the distro binary rather than Meta's instrumented /usr/local
-        // build, which starts telemetry polling threads even for --version.
+        // `git --version` is a stable compatibility probe that does not depend
+        // on the worktree's internal gitdir being visible in the container.
+        // Prefer the distro binary over instrumented wrappers.
         case(
             "threaded",
             "git",
-            &["/usr/bin/git"],
+            &["/usr/bin/git", "/usr/local/bin/git"],
             &["--version"],
             Some("git version"),
             Expectation::Pass,
@@ -336,7 +340,7 @@ fn run_case(case: &Case, fixture: &Fixture) -> TimedRun {
             "run",
             "--base-env=minimal",
             "--no-virtualize-cpuid",
-            "--preemption-timeout=disabled",
+            "--max-timeslice=disabled",
         ])
         .arg(format!("--bind={}:{GUEST_FIXTURE}", fixture.root.display()))
         .arg("--")
