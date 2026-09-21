@@ -11,5 +11,5 @@ license = "BSD-3-Clause"
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 
 [dev-dependencies]
-rand = "0.10.2"
+rand = "0.10.3"
 serde_json = { version = "1.0.151", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }

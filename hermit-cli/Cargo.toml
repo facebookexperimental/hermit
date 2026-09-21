@@ -23,7 +23,7 @@ libc = "0.2.186"
 nix = { version = "0.31.3", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
 num_cpus = "1.16"
 pretty_assertions = { version = "1.4.1", features = ["alloc"], default-features = false }
-rand = "0.10.2"
+rand = "0.10.3"
 rand_pcg = { version = "0.10.2", features = ["serde"] }
 regex = "1.13.1"
 reverie = { version = "0.1.0", git = "https://github.com/facebookexperimental/reverie.git", branch = "main" }
