@@ -24,6 +24,8 @@ def build_test(
     if raw:
         # # Also run tests without any sort of syscall interception. "raw" mode:
         buck_sh_test(
+            # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+            target_compatible_with = ["ovr_config//cpu:x86_64"],
             name = "raw_run__" + name,
             args = [
                 "--no-sequentialize-threads",
@@ -37,6 +39,8 @@ def build_test(
         # Run tests in hermit run mode, default settings:
         # TODO: add determinism-assertion by adding a hermit flag for running twice.
         buck_sh_test(
+            # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+            target_compatible_with = ["ovr_config//cpu:x86_64"],
             name = "hermit_run_default__" + name,
             args = [
                 "run",
@@ -119,6 +123,8 @@ def build_test(
 
     if record_and_replay:
         buck_sh_test(
+            # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+            target_compatible_with = ["ovr_config//cpu:x86_64"],
             name = "hermit_record_" + name,
             args = [
                 "record",
@@ -143,6 +149,8 @@ def hermit_verify_c_bin(path, name_suffix, guest_args = [], args = [], hermit_ar
     target = resolve_target_name(path, "c")
     if not native.rule_exists(target):
         cpp_binary(
+            # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+            target_compatible_with = ["ovr_config//cpu:x86_64"],
             name = target,
             srcs = [path],
             headers = ["c/util/assert.h"],
@@ -154,6 +162,8 @@ def hermit_verify_c_bin(path, name_suffix, guest_args = [], args = [], hermit_ar
 
 def hermit_verify(name, guest, guest_args = [], args = [], hermit_args = [], env = {}):
     buck_sh_test(
+        # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+        target_compatible_with = ["ovr_config//cpu:x86_64"],
         name = name,
         args = ["--hermit-bin=$(location //hermetic_infra/hermit/hermit-cli:hermit)"]
         + args
@@ -233,6 +243,8 @@ def hermit_c_test(
     bin_name = "cbin_" + basename
     bin_target = ":" + bin_name
     cpp_binary(
+        # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+        target_compatible_with = ["ovr_config//cpu:x86_64"],
         name = bin_name,
         srcs = [path],
         headers = ["c/util/assert.h"],
@@ -279,6 +291,8 @@ def hermit_rust_test(
     bin_name = "rustbin_" + basename
     bin_target = ":" + bin_name
     rust_binary(
+        # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+        target_compatible_with = ["ovr_config//cpu:x86_64"],
         name = bin_name,
         srcs = [path, paths.dirname(path) + "/test_utils/mod.rs"],
         crate_root = path,
