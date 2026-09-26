@@ -22,6 +22,7 @@ mod clean;
 mod container;
 mod global_opts;
 mod instruction_map;
+mod integration;
 mod list;
 mod logdiff;
 mod record;
@@ -89,6 +90,7 @@ use self::analyze::AnalyzeOpts;
 use self::bisect::BisectOpts;
 use self::global_opts::GlobalOpts;
 use self::instruction_map::InstructionMapOpts;
+use self::integration::IntegrationOpts;
 use self::logdiff::LogDiffCLIOpts;
 use self::record::RecordOpts;
 use self::replay::ReplayOpts;
@@ -140,6 +142,10 @@ enum Subcommand {
     /// Generate a JSON map of nondeterministic instructions in an ELF binary.
     #[clap(name = "instruction-map")]
     InstructionMap(InstructionMapOpts),
+
+    /// Run the Cargo-native integration test matrix (replaces internal Buck matrix).
+    #[clap(name = "integration")]
+    Integration(IntegrationOpts),
 }
 
 impl Subcommand {
@@ -160,6 +166,7 @@ impl Subcommand {
             Subcommand::Analyze(x) => x.main(global),
             Subcommand::Bisect(x) => x.main(global),
             Subcommand::InstructionMap(x) => x.main(global),
+            Subcommand::Integration(x) => x.main(global),
         }
     }
 }
