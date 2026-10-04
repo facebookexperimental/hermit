@@ -1,0 +1,746 @@
+schema: 3
+bucket: determinism-stress-c
+test:
+  - id: determinism-stress-c/fork-tree
+    description: Strict verification for tests/e2e/determinism-stress/fork_tree.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/e2e/determinism-stress/fork_tree.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci:
+          ptrace: true
+          sabre: false
+        backends_enabled:
+          - ptrace
+          - sabre
+        backends_disabled:
+          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
+          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
+        ci_disabled_reason:
+          sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: This migration inventories strict verification; it does not assert native nondeterminism
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from the initial strict-verification migration
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+  - id: determinism-stress-c/lock-free
+    description: Strict verification for tests/e2e/determinism-stress/guests/lock_free.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/e2e/determinism-stress/guests/lock_free.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    build:
+      cflags:
+        - -D_GNU_SOURCE
+        - -pthread
+        - -Wno-error=unused-parameter
+        - -Wno-error=unused-function
+        - -Wno-error=unused-variable
+        - -Wno-error=attributes
+        - -Wno-error=unknown-pragmas
+        - -Wno-error=sign-compare
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: This determinism cell calibrates the ptrace strict-verify baseline; qualify DBT separately
+          kvm: This determinism cell calibrates the ptrace strict-verify baseline; qualify KVM separately
+          sabre: This determinism cell calibrates the ptrace strict-verify baseline; qualify SaBRe separately
+          liteinst: This determinism cell calibrates the ptrace strict-verify baseline; qualify LiteInst separately
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: This migration inventories strict verification; it does not assert native nondeterminism
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from the initial strict-verification migration
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+  - id: determinism-stress-c/mmap-fork-shared
+    description: Strict verification for tests/e2e/determinism-stress/mmap_fork_shared.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/e2e/determinism-stress/mmap_fork_shared.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci:
+          ptrace: true
+          sabre: false
+        backends_enabled:
+          - ptrace
+          - sabre
+        backends_disabled:
+          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
+          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
+        ci_disabled_reason:
+          sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: This migration inventories strict verification; it does not assert native nondeterminism
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from the initial strict-verification migration
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+  - id: determinism-stress-c/pid-tid
+    description: Strict verification for tests/e2e/determinism-stress/guests/pid_tid.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/e2e/determinism-stress/guests/pid_tid.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: This determinism cell calibrates the ptrace strict-verify baseline; qualify DBT separately
+          kvm: This determinism cell calibrates the ptrace strict-verify baseline; qualify KVM separately
+          sabre: This determinism cell calibrates the ptrace strict-verify baseline; qualify SaBRe separately
+          liteinst: This determinism cell calibrates the ptrace strict-verify baseline; qualify LiteInst separately
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: This migration inventories strict verification; it does not assert native nondeterminism
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from the initial strict-verification migration
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+  - id: determinism-stress-c/pid-tid-identity
+    description: Pid/tid virtualization identity across procfs, wait-status, exec, and a pid branch
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/e2e/determinism-stress/pid_tid_identity.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    build:
+      cflags:
+        - -D_GNU_SOURCE
+        - -pthread
+        - -Wno-error=unused-parameter
+        - -Wno-error=unused-variable
+        - -Wno-error=sign-compare
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: DBT was observed emitting a raw host tid in DETLOG records; this fixture is the gate for enabling it
+          kvm: KVM compares output only and cannot assert DETLOG identity yet
+          sabre: Not yet qualified for the pid-identity fixture
+          liteinst: Not yet qualified for the pid-identity fixture
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: Native pids are host values by definition; this fixture asserts virtualization
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from the pid-identity contract
+          dbt: Record/replay qualification is separate from the pid-identity contract
+          kvm: Record/replay qualification is separate from the pid-identity contract
+          sabre: Record/replay qualification is separate from the pid-identity contract
+          liteinst: Record/replay qualification is separate from the pid-identity contract
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is orthogonal to pid-identity virtualization
+          dbt: Chaos scheduling is orthogonal to pid-identity virtualization
+          kvm: Chaos scheduling is orthogonal to pid-identity virtualization
+          sabre: Chaos scheduling is orthogonal to pid-identity virtualization
+          liteinst: Chaos scheduling is orthogonal to pid-identity virtualization
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No calibrated custom arguments for the pid-identity fixture
+          dbt: No calibrated custom arguments for the pid-identity fixture
+          kvm: No calibrated custom arguments for the pid-identity fixture
+          sabre: No calibrated custom arguments for the pid-identity fixture
+          liteinst: No calibrated custom arguments for the pid-identity fixture
+  - id: determinism-stress-c/pipe-chain
+    description: Strict verification for tests/e2e/determinism-stress/pipe_chain.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/e2e/determinism-stress/pipe_chain.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci:
+          ptrace: true
+          kvm: true
+          sabre: false
+        backends_enabled:
+          - ptrace
+          - kvm
+          - sabre
+        backends_disabled:
+          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
+        ci_disabled_reason:
+          sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: This migration inventories strict verification; it does not assert native nondeterminism
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from the initial strict-verification migration
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+  - id: determinism-stress-c/pipe-prefill
+    description: Strict verification for tests/e2e/determinism-stress/pipe_prefill.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/e2e/determinism-stress/pipe_prefill.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci:
+          ptrace: true
+          kvm: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled:
+          dbt: This determinism cell calibrates the ptrace strict-verify baseline; qualify DBT separately
+          sabre: Forwarded-DETLOG SaBRe verification exits during the first run before producing guest output; the historical stdout-only qualification is insufficient
+          liteinst: This determinism cell calibrates the ptrace strict-verify baseline; qualify LiteInst separately
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: This migration inventories strict verification; it does not assert native nondeterminism
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from the initial strict-verification migration
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+  - id: determinism-stress-c/producer-consumer
+    description: Multi-producer/multi-consumer bounded queue (mutex + not_full/not_empty condvars) repeats under strict verification
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/e2e/determinism-stress/producer_consumer.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: This condvar/futex determinism cell calibrates the ptrace strict-verify baseline; qualify DBT separately
+          kvm: This condvar/futex determinism cell calibrates the ptrace strict-verify baseline; qualify KVM separately
+          sabre: This condvar/futex determinism cell calibrates the ptrace strict-verify baseline; qualify SaBRe separately
+          liteinst: This condvar/futex determinism cell calibrates the ptrace strict-verify baseline; qualify LiteInst separately
+      naked:
+        ci: false
+        runs: 5
+        assert:
+          min_distinct: 2
+        backends_enabled:
+          - native
+        backends_disabled: {}
+        ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from the strict-verification determinism cell
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+  - id: determinism-stress-c/signal-order
+    description: Strict verification for tests/e2e/determinism-stress/guests/signal_order.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/e2e/determinism-stress/guests/signal_order.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    build:
+      cflags:
+        - -D_GNU_SOURCE
+        - -pthread
+        - -Wno-error=unused-parameter
+        - -Wno-error=unused-function
+        - -Wno-error=unused-variable
+        - -Wno-error=attributes
+        - -Wno-error=unknown-pragmas
+        - -Wno-error=sign-compare
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: This determinism cell calibrates the ptrace strict-verify baseline; qualify DBT separately
+          kvm: This determinism cell calibrates the ptrace strict-verify baseline; qualify KVM separately
+          sabre: This determinism cell calibrates the ptrace strict-verify baseline; qualify SaBRe separately
+          liteinst: This determinism cell calibrates the ptrace strict-verify baseline; qualify LiteInst separately
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: This migration inventories strict verification; it does not assert native nondeterminism
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from the initial strict-verification migration
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+  - id: determinism-stress-c/thread-contention
+    description: Strict verification for tests/e2e/determinism-stress/thread_contention.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/e2e/determinism-stress/thread_contention.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+        guest_args:
+          ptrace:
+            - contention
+          kvm:
+            - contention
+          liteinst:
+            - "contention"
+        backends_disabled:
+          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
+          sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
+          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: This migration inventories strict verification; it does not assert native nondeterminism
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from the initial strict-verification migration
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: true
+        # Six unique writer completions admit 6! epoll orders, and the initial poll can
+        # observe any nonempty prefix of that order, giving exactly 6 * 6! = 4320
+        # classes. The mechanically selected prefix 0..31 produced 22 classes with
+        # normalized entropy 0.340512 under strict verification. Serializing only the
+        # writer completion order kept the six-writer workload intact but collapsed
+        # the same population to one class and zero entropy.
+        seeds:
+          - 0
+          - 1
+          - 2
+          - 3
+          - 4
+          - 5
+          - 6
+          - 7
+          - 8
+          - 9
+          - 10
+          - 11
+          - 12
+          - 13
+          - 14
+          - 15
+          - 16
+          - 17
+          - 18
+          - 19
+          - 20
+          - 21
+          - 22
+          - 23
+          - 24
+          - 25
+          - 26
+          - 27
+          - 28
+          - 29
+          - 30
+          - 31
+        guest_args:
+          ptrace:
+            - epoll
+        outcome_classes: 4320
+        assert:
+          min_distinct: 12
+          min_passes: 32
+          min_failures: 0
+          min_normalized_entropy: 0.25
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+  - id: determinism-stress-c/thread-stress
+    description: Strict verification for tests/e2e/determinism-stress/thread_stress.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/e2e/determinism-stress/thread_stress.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci:
+          ptrace: true
+          sabre: false
+        backends_enabled:
+          - ptrace
+          - sabre
+        backends_disabled:
+          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
+          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
+        ci_disabled_reason:
+          sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites", "result": "crash-error"}
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: This migration inventories strict verification; it does not assert native nondeterminism
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from the initial strict-verification migration
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest

@@ -33,6 +33,16 @@
 #define MAX_ITERATIONS 1000000
 #define PERF_SIGNAL SIGUSR1
 
+/* Child status when PTRACE_TRACEME fails with EPERM. */
+#define CHILD_TRACEME_REFUSED 4
+/*
+ * Exit status when this process is not permitted to trace its own child, for
+ * example under a ptrace-restricting sandbox or Hermit's privileged-observation
+ * boundary. It is distinct from EXIT_FAILURE so a caller can tell this
+ * environment refusal from every other failure path.
+ */
+#define EXIT_PTRACE_REFUSED 3
+
 struct options {
   size_t iterations;
   uint64_t period;
@@ -261,7 +271,7 @@ __attribute__((noreturn)) static void branch_loop(void) {
 
 __attribute__((noreturn)) static void child_main(void) {
   if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) != 0) {
-    _exit(2);
+    _exit(errno == EPERM ? CHILD_TRACEME_REFUSED : 2);
   }
   if (raise(SIGSTOP) != 0) {
     _exit(3);
@@ -387,6 +397,14 @@ int main(int argc, char** argv) {
   do {
     waited = waitpid(child, &status, 0);
   } while (waited < 0 && errno == EINTR);
+  if (waited == child && WIFEXITED(status) &&
+      WEXITSTATUS(status) == CHILD_TRACEME_REFUSED) {
+    fprintf(
+        stderr,
+        "PTRACE_TRACEME refused with EPERM; this diagnostic must "
+        "be allowed to trace its own child\n");
+    return EXIT_PTRACE_REFUSED;
+  }
   if (waited != child || !WIFSTOPPED(status) || WSTOPSIG(status) != SIGSTOP) {
     fprintf(stderr, "Child failed to enter its initial ptrace stop\n");
     terminate_child(child);

@@ -86,9 +86,9 @@ fn unused_loopback_port() -> u16 {
 
 fn system_redis() -> (PathBuf, PathBuf) {
     let redis_server = executable(&["/usr/bin/redis-server", "/usr/local/bin/redis-server"])
-        .expect("redis-server is required; the self-hosted CI job installs it");
+        .expect("redis-server is required; the portable CI job installs it");
     let redis_cli = executable(&["/usr/bin/redis-cli", "/usr/local/bin/redis-cli"])
-        .expect("redis-cli is required; the self-hosted CI job installs it");
+        .expect("redis-cli is required; the portable CI job installs it");
     (redis_server, redis_cli)
 }
 
@@ -100,20 +100,22 @@ fn redis_cli_output(redis_cli: &Path, port: u16, args: &[&str]) -> Output {
         .expect("failed to start redis-cli")
 }
 
-fn run_strict_workload(
+fn run_deterministic_workload(
     redis_server: &Path,
     redis_cli: &Path,
     mode: &str,
     iteration: usize,
 ) -> Output {
-    let workload = repository().join("experiments/redis-strict/workload.sh");
+    let workload = repository().join("hermit-cli/tests/fixtures/redis-strict/workload.sh");
     let instance = format!("cargo-{}-{iteration}", std::process::id());
     let port = unused_loopback_port();
+    // Compatibility workloads keep deterministic defaults while normal mode reports any
+    // unsupported syscalls; strict fail-closed behavior is covered by dedicated tests.
     let mut command = Command::new("timeout");
     command
         .arg("90")
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log", "off", "run", "--strict", "--", "/bin/sh"])
+        .args(["--log", "off", "run", "--", "/bin/sh"])
         .arg(workload)
         .arg(redis_server)
         .arg(redis_cli)
@@ -122,17 +124,17 @@ fn run_strict_workload(
         .arg(port.to_string());
     command_output(
         command,
-        &format!("strict Redis {mode} workload, iteration {iteration}"),
+        &format!("Redis deterministic {mode} workload, iteration {iteration}"),
     )
 }
 
 #[test]
-fn redis_small_subset_is_deterministic_under_strict_hermit() {
+fn redis_small_subset_is_deterministic_under_hermit() {
     let _guard = hermit_redis_lock();
     let (redis_server, redis_cli) = system_redis();
 
-    let first = run_strict_workload(&redis_server, &redis_cli, "small", 1);
-    let second = run_strict_workload(&redis_server, &redis_cli, "small", 2);
+    let first = run_deterministic_workload(&redis_server, &redis_cli, "small", 1);
+    let second = run_deterministic_workload(&redis_server, &redis_cli, "small", 2);
     assert_eq!(
         first.stdout, second.stdout,
         "Redis stdout changed between runs"
@@ -158,12 +160,12 @@ fn redis_small_subset_is_deterministic_under_strict_hermit() {
 }
 
 #[test]
-fn redis_persistence_restart_is_deterministic_under_strict_hermit() {
+fn redis_persistence_restart_is_deterministic_under_hermit() {
     let _guard = hermit_redis_lock();
     let (redis_server, redis_cli) = system_redis();
 
-    let first = run_strict_workload(&redis_server, &redis_cli, "extended", 1);
-    let second = run_strict_workload(&redis_server, &redis_cli, "extended", 2);
+    let first = run_deterministic_workload(&redis_server, &redis_cli, "extended", 1);
+    let second = run_deterministic_workload(&redis_server, &redis_cli, "extended", 2);
     assert_eq!(
         first.stdout, second.stdout,
         "Redis persistence stdout changed between runs"
@@ -239,7 +241,7 @@ fn redis_workload_refuses_to_control_a_preexisting_server() {
         .trim()
         .to_owned();
 
-    let workload = repository().join("experiments/redis-strict/workload.sh");
+    let workload = repository().join("hermit-cli/tests/fixtures/redis-strict/workload.sh");
     let output = Command::new("/bin/sh")
         .arg(workload)
         .arg(&redis_server)
@@ -280,7 +282,7 @@ fn redis_workload_refuses_to_control_a_preexisting_server() {
 #[ignore = "downloads and builds pinned Redis, then runs the extended strict suite"]
 fn redis_source_build_and_extended_suite_under_strict_hermit() {
     let _guard = hermit_redis_lock();
-    let runner = repository().join("experiments/redis-strict/run.sh");
+    let runner = repository().join("hermit-cli/tests/fixtures/redis-strict/run.sh");
     let mut command = Command::new("timeout");
     command
         .arg("900")

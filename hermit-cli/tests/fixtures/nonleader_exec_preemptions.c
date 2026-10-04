@@ -1,0 +1,93 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
+#include <limits.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <time.h>
+#include <unistd.h>
+
+#define CHECK(expression)                                                    \
+  do {                                                                       \
+    if (!(expression)) {                                                     \
+      fprintf(                                                               \
+          stderr, "line %d: %s (errno=%d)\n", __LINE__, #expression, errno); \
+      _exit(90);                                                             \
+    }                                                                        \
+  } while (0)
+
+static const char* target;
+
+static void* worker(void* unused) {
+  (void)unused;
+  pid_t pid = (pid_t)syscall(SYS_getpid);
+  pid_t tid = (pid_t)syscall(SYS_gettid);
+  CHECK(pid != tid);
+  uint64_t previous = 0;
+  for (unsigned sample = 0; sample < 2; ++sample) {
+    volatile uint64_t work = 1;
+    /* 120k actual branches exceed the ordinary 100k-RCB maximum at 1ms;
+     * compact instructions bound precise-timer single-step TRACE output. */
+    uint64_t remaining = 120000;
+    __asm__ volatile("1: loop 1b" : "+c"(remaining));
+    CHECK(remaining == 0);
+    work += 3 * (120000 - remaining);
+    struct timespec now;
+    CHECK(syscall(SYS_clock_gettime, CLOCK_REALTIME, &now) == 0);
+    CHECK(now.tv_sec >= 0 && now.tv_nsec >= 0 && now.tv_nsec < 1000000000);
+    uint64_t nanos = (uint64_t)now.tv_sec * 1000000000 + (uint64_t)now.tv_nsec;
+    CHECK(nanos > previous);
+    printf(
+        "prefix sample=%u pid=%d worker=%d nanos=%" PRIu64 " work=%" PRIu64
+        "\n",
+        sample,
+        pid,
+        tid,
+        nanos,
+        work);
+    previous = nanos;
+  }
+  CHECK(fflush(stdout) == 0);
+  /* Every phase uses the same binary, argv, and pathname. Only the host's
+   * presence of an executable at this path changes the result of exec. */
+  char* const args[] = {(char*)target, "replacement", "image", NULL};
+  execv(target, args);
+  CHECK(errno == ENOENT);
+  puts("failed-exec-preserved");
+  return NULL;
+}
+
+int main(int argc, char** argv) {
+  if (argc == 3 && strcmp(argv[1], "replacement") == 0 &&
+      strcmp(argv[2], "image") == 0) {
+    char marker[PATH_MAX];
+    int length = snprintf(marker, sizeof(marker), "%s.ran", argv[0]);
+    CHECK(length > 0 && (size_t)length < sizeof(marker));
+    int fd = open(marker, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    CHECK(fd >= 0);
+    CHECK(write(fd, "1", 1) == 1);
+    CHECK(close(fd) == 0);
+    puts("replacement-image-ran");
+    return 0;
+  }
+  CHECK(argc == 2);
+  target = argv[1];
+  pthread_t thread;
+  CHECK(pthread_create(&thread, NULL, worker, NULL) == 0);
+  CHECK(pthread_join(thread, NULL) == 0);
+  puts("failed-exec-control-ok");
+  return 0;
+}

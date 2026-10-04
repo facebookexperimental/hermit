@@ -32,7 +32,7 @@ use uuid::Uuid;
 use crate::Context;
 use crate::Error;
 
-const CACHE_SCHEMA_VERSION: u32 = 1;
+const CACHE_SCHEMA_VERSION: u32 = 2;
 
 /// One instruction that can expose host nondeterminism or enter the kernel.
 #[derive(Debug, Clone, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -335,15 +335,19 @@ fn scan_range(
     Ok(())
 }
 
+// TODO-HUMAN-REVIEW(PR-594): Review the expanded public instruction-map coverage.
 fn nondeterministic_instruction(instruction: &Instruction) -> Option<&'static str> {
     match instruction.mnemonic() {
         Mnemonic::Syscall => Some("syscall"),
         Mnemonic::Cpuid => Some("cpuid"),
         Mnemonic::Rdrand => Some("rdrand"),
         Mnemonic::Rdtsc => Some("rdtsc"),
+        Mnemonic::Rdtscp => Some("rdtscp"),
         Mnemonic::Rdseed => Some("rdseed"),
+        Mnemonic::Sysenter => Some("sysenter"),
         Mnemonic::Xbegin => Some("xbegin"),
         Mnemonic::Xend => Some("xend"),
+        Mnemonic::Int if instruction.immediate8() == 0x80 => Some("int80"),
         _ => None,
     }
 }
@@ -402,7 +406,7 @@ mod tests {
     fn all_target_instructions() -> Vec<u8> {
         vec![
             0x0f, 0x05, 0x0f, 0xa2, 0x48, 0x0f, 0xc7, 0xf0, 0x0f, 0x31, 0x48, 0x0f, 0xc7, 0xf8,
-            0xc7, 0xf8, 0, 0, 0, 0, 0x0f, 0x01, 0xd5,
+            0x0f, 0x01, 0xf9, 0x0f, 0x34, 0xcd, 0x80, 0xc7, 0xf8, 0, 0, 0, 0, 0x0f, 0x01, 0xd5,
         ]
     }
 
@@ -439,11 +443,26 @@ mod tests {
                 },
                 InstructionSite {
                     offset: 78,
+                    instruction: "rdtscp".into(),
+                    length: 3
+                },
+                InstructionSite {
+                    offset: 81,
+                    instruction: "sysenter".into(),
+                    length: 2
+                },
+                InstructionSite {
+                    offset: 83,
+                    instruction: "int80".into(),
+                    length: 2
+                },
+                InstructionSite {
+                    offset: 85,
                     instruction: "xbegin".into(),
                     length: 6
                 },
                 InstructionSite {
-                    offset: 84,
+                    offset: 91,
                     instruction: "xend".into(),
                     length: 3
                 },
@@ -477,5 +496,164 @@ mod tests {
         let third = load_or_generate(&binary, &cache).unwrap();
         assert_eq!(third.cache_status, CacheStatus::Miss);
         assert_ne!(third.cache_path, first.cache_path);
+    }
+
+    #[test]
+    fn stale_schema_cache_is_regenerated() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("fixture");
+        let cache = temp.path().join("cache");
+        fs::write(
+            &binary,
+            elf_with_executable_section(&all_target_instructions()),
+        )
+        .unwrap();
+
+        let canonical = fs::canonicalize(&binary).unwrap();
+        let metadata = fs::metadata(&canonical).unwrap();
+        let identity = FileIdentity::new(canonical.clone(), &metadata);
+        let cache_path = cache.join(format!("{}.json", cache_key(&identity)));
+        let stale = InstructionMap {
+            schema_version: CACHE_SCHEMA_VERSION - 1,
+            binary: canonical,
+            file_length: identity.file_length,
+            modified: identity.modified,
+            sites: Vec::new(),
+        };
+        write_cache(&cache_path, &stale).unwrap();
+
+        let regenerated = load_or_generate(&binary, &cache).unwrap();
+        assert_eq!(regenerated.cache_status, CacheStatus::Miss);
+        assert_eq!(regenerated.map.schema_version, CACHE_SCHEMA_VERSION);
+        assert!(
+            regenerated
+                .map
+                .sites
+                .iter()
+                .any(|site| site.instruction == "rdtscp")
+        );
+    }
+
+    /// Two read-write pages that meet at a 4 GiB-aligned address.
+    struct FourGibBoundary {
+        base: *mut u8,
+    }
+
+    impl FourGibBoundary {
+        const PAGE: usize = 4096;
+
+        /// Maps the pages at the first free 4 GiB multiple. MAP_FIXED_NOREPLACE
+        /// never displaces an existing mapping; a kernel too old to know the
+        /// flag treats the address as a hint, so a placement elsewhere is
+        /// unmapped and the next multiple is tried.
+        fn map() -> Self {
+            for multiple in 1..=64usize {
+                let base = (multiple << 32) - Self::PAGE;
+                // SAFETY: an anonymous private mapping that cannot replace
+                // any existing mapping.
+                let mapped = unsafe {
+                    libc::mmap(
+                        base as *mut libc::c_void,
+                        2 * Self::PAGE,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE,
+                        -1,
+                        0,
+                    )
+                };
+                if mapped == libc::MAP_FAILED {
+                    continue;
+                }
+                if mapped as usize == base {
+                    return Self {
+                        base: mapped.cast(),
+                    };
+                }
+                // SAFETY: unmaps only the mapping created just above.
+                unsafe { libc::munmap(mapped, 2 * Self::PAGE) };
+            }
+            panic!("no 4 GiB-aligned address below 256 GiB was free to map");
+        }
+
+        /// The bytes of both pages; index `PAGE` is the 4 GiB-aligned address.
+        fn bytes(&mut self) -> &mut [u8] {
+            // SAFETY: `map` created exactly these two read-write pages and
+            // `self` owns them until drop.
+            unsafe { std::slice::from_raw_parts_mut(self.base, 2 * Self::PAGE) }
+        }
+    }
+
+    impl Drop for FourGibBoundary {
+        fn drop(&mut self) {
+            // SAFETY: unmaps the two pages that `map` created.
+            unsafe { libc::munmap(self.base.cast(), 2 * Self::PAGE) };
+        }
+    }
+
+    /// iced-x86 1.21.0 computes an instruction's length as
+    /// `end as u32 - start as u32` on host pointers (decoder.rs:1421 and its
+    /// invalid-instruction twin at 1468). That difference is exact under
+    /// wrapping arithmetic but panics with "attempt to subtract with overflow"
+    /// when overflow checks are on and the instruction ends at or past a
+    /// 4 GiB-aligned host address. Where a buffer lands is an allocator
+    /// accident, so the panic was intermittent: the LiteInst census decodes
+    /// all of libc's text in the tracer, and it failed full validations as a
+    /// container-child panic
+    /// (https://github.com/rrnewton/hermit/issues/3462). The workspace
+    /// therefore builds iced-x86 without overflow checks; this places the
+    /// instructions at the boundary on purpose so that the setting is tested
+    /// on every run rather than once in a few thousand.
+    #[test]
+    fn decodes_instructions_that_end_at_or_cross_a_4gib_host_address() {
+        const NOP: u8 = 0x90;
+        const CPUID: [u8; 2] = [0x0f, 0xa2];
+        const RDTSC: [u8; 2] = [0x0f, 0x31];
+        // mov rax, [rip + 0x10]
+        const MOV_RIP_RELATIVE: [u8; 7] = [0x48, 0x8b, 0x05, 0x10, 0x00, 0x00, 0x00];
+        let boundary = FourGibBoundary::PAGE;
+        let mut mapping = FourGibBoundary::map();
+        let bytes = mapping.bytes();
+        assert_eq!(bytes[boundary..].as_ptr() as usize & 0xffff_ffff, 0);
+
+        // `cpuid` ends exactly at the boundary, `rdtsc` crosses it, and both
+        // are sites the instruction map records with their encoded lengths.
+        for (instruction, start, name) in [
+            (CPUID, boundary - 2, "cpuid"),
+            (RDTSC, boundary - 1, "rdtsc"),
+        ] {
+            bytes.fill(NOP);
+            bytes[start..start + instruction.len()].copy_from_slice(&instruction);
+            let window = boundary - 16..boundary + 16;
+            let range = ExecutableRange {
+                file_offset: 0x1000,
+                address: CODE_ADDRESS,
+                size: window.len() as u64,
+            };
+            let mut sites = Vec::new();
+            scan_range(&bytes[window.clone()], range, 64, &mut sites).unwrap();
+            assert_eq!(
+                sites,
+                vec![InstructionSite {
+                    offset: range.file_offset + (start - window.start) as u64,
+                    instruction: name.into(),
+                    length: 2,
+                }]
+            );
+        }
+
+        // A longer instruction crossing the boundary decodes to its true
+        // length and next instruction pointer.
+        bytes.fill(NOP);
+        let start = boundary - 3;
+        bytes[start..start + MOV_RIP_RELATIVE.len()].copy_from_slice(&MOV_RIP_RELATIVE);
+        let mut decoder = Decoder::with_ip(64, &bytes[start..], CODE_ADDRESS, DecoderOptions::NONE);
+        let instruction = decoder.decode();
+        assert_eq!(instruction.mnemonic(), Mnemonic::Mov);
+        assert_eq!(instruction.len(), MOV_RIP_RELATIVE.len());
+        assert_eq!(
+            instruction.next_ip(),
+            CODE_ADDRESS + MOV_RIP_RELATIVE.len() as u64
+        );
+        assert_eq!(decoder.position(), MOV_RIP_RELATIVE.len());
     }
 }

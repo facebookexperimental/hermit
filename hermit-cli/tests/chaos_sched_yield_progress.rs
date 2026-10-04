@@ -11,12 +11,15 @@
 //!
 //! Before the fix, a guest whose main thread spins on `sched_yield()` while
 //! waiting for a worker thread could hang forever under
-//! `--chaos --preemption-timeout=disabled`: priorities are fixed at thread
+//! `--chaos --max-timeslice=disabled`: priorities are fixed at thread
 //! creation and only re-randomized at (now-disabled) timer preemptions, so a
 //! spinner holding the highest priority monopolized the single logical CPU. The
 //! seeds exercised below deterministically reproduced that starvation. The fix
 //! turns `sched_yield` into a chaos reprioritization point, so every seed now
 //! makes progress and exits cleanly.
+
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
 
 use std::fs;
 use std::path::Path;
@@ -74,18 +77,19 @@ fn run_seed(seed: u64) {
     command
         .arg("--kill-after=2s")
         .arg(format!("{TIMEOUT_SECONDS}s"))
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test::hermit_binary())
         .args([
             "run",
             "--base-env=minimal",
             "--no-virtualize-cpuid",
             "--chaos",
-            "--preemption-timeout=disabled",
+            "--max-timeslice=disabled",
             &format!("--seed={seed}"),
             "--",
         ])
         .arg(guest());
 
+    hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
     let output = command
         .output()
@@ -125,7 +129,7 @@ fn run_strict_guest(args: &[&str]) {
     command
         .arg("--kill-after=2s")
         .arg(format!("{TIMEOUT_SECONDS}s"))
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test::hermit_binary())
         .args([
             "run",
             "--strict",
@@ -137,6 +141,7 @@ fn run_strict_guest(args: &[&str]) {
         .arg(guest())
         .args(args);
 
+    hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
     let output = command
         .output()
@@ -185,7 +190,7 @@ fn preemption_replay_preserves_vfork_sched_yield_progress() {
         command
             .arg("--kill-after=2s")
             .arg(format!("{TIMEOUT_SECONDS}s"))
-            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .arg(hermit_test::hermit_binary())
             .args([
                 "run",
                 "--strict",
@@ -198,6 +203,7 @@ fn preemption_replay_preserves_vfork_sched_yield_progress() {
             .arg(guest())
             .arg("--vfork");
 
+        hermit_test::configure_guest_execution(&mut command);
         let rendered = format!("{command:?}");
         let output = command.output().unwrap_or_else(|error| {
             panic!("failed to start preemption {phase}: {rendered}: {error}")

@@ -72,6 +72,44 @@ For each source, label it **eliminated**, **normalized**, **ordered**,
 **recorded**, **assumed stable**, or **unsupported**. A host-derived value with
 no classification is a review blocker.
 
+#### Where host state actually got in: five routes in one night
+
+The table above lists what to look for. This lists what has actually been found,
+measured on 2026-08-25, and the point is the SHAPE rather than the five bugs:
+**five distinct instances by five different routes, none sharing code.** A guest
+does not usually see the host because one determinizer is wrong; it sees the host
+because a path exists that no determinizer is on.
+
+| # | Route | How the host got in |
+| --- | --- | --- |
+| 1 | `netlink recvmsg` content | message bytes returned unmediated |
+| 2 | `st_size` | host file metadata surfaced directly |
+| 3 | child RNG identity under `--no-namespace` | child seeded from host-derived identity |
+| 4 | `wait4` polling | host TIMING became scheduler turns, on ptrace *and* KVM |
+| 5 | copied DBT process child | child's `/dev/urandom` is raw host entropy |
+
+Two things generalise from them, and both are worth asking of any new change:
+
+**It is usually a path, not a value.** Route 5 is the clearest: the parent is
+determinized perfectly and matches the ptrace reference exactly, while the copied
+child is on an ABI that *cannot* determinize — `reverie_dbt_runtime_copied_syscall`
+has no Detcore Tool and no guest-memory writer, so there is nowhere to put a
+determinized byte. Nothing about the RNG code is wrong. Route 4 is the same shape
+across two backends at once.
+
+**Test the derived path, not just the primary one.** Routes 3, 4 and 5 all reach
+the guest through a CHILD, a POLL, or a COPY — a second path created by the first
+one working correctly. A determinism argument that covers `fork` but not the
+child, or the syscall but not its retry, has covered the half that was never at
+risk.
+
+⚠️ **And measure against the golden reference rather than for stability alone.**
+Route 5 was found by running the same probe under `ptrace` and under `DBT`:
+ptrace gave the identical value five times out of five, DBT gave five different
+ones. Five identical DBT runs would have proved nothing on their own — a wrong
+value can be perfectly stable, and several defects this month were exactly that.
+The comparison, not the repetition, is the evidence.
+
 ### 3. Mitigation Strategy
 
 Connect every entropy source to a concrete mechanism and code path.

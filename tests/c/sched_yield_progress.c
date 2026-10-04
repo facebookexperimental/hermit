@@ -12,7 +12,7 @@
  *
  * The main thread spins on an atomic flag, calling sched_yield() while it
  * waits. A worker thread does a small amount of work and then publishes a
- * value and sets the flag. Under `--chaos --preemption-timeout=disabled`,
+ * value and sets the flag. Under `--chaos --max-timeslice=disabled`,
  * priorities are fixed at thread creation and only re-randomized at timer
  * preemptions, which are off. Before the fix, a spinning sched_yield loop that
  * happened to hold the highest priority would monopolize the single logical CPU

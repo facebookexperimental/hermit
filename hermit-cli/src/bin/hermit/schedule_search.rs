@@ -10,11 +10,11 @@ use std::ops::Range;
 
 use anyhow::bail;
 use colored::Colorize;
+use detcore::edit_distance::NeedlemanWunsch;
+use detcore::edit_distance::NeedlemanWunschError;
+use detcore::edit_distance::generate_permutation;
+use detcore::edit_distance::iterable_bubble_sort;
 use detcore::types::SchedEvent;
-use edit_distance::NeedlemanWunsch;
-use edit_distance::NeedlemanWunschError;
-use edit_distance::generate_permutation;
-use edit_distance::iterable_bubble_sort;
 
 /// User configurable settings.
 pub struct Config {

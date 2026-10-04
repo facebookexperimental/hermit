@@ -12,6 +12,7 @@ inspection, and continue-to-exit. Each test starts a fresh Hermit gdbserver so
 the tests are independent and order-insensitive.
 """
 
+import re
 import unittest
 
 import harness

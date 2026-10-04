@@ -187,7 +187,8 @@ impl AnalyzeOpts {
     fn phase1_establish_target_run(&self) -> Result<RunData, Error> {
         let mut run1data = RunData::new_run1_target(self, "run1_target".to_string())?;
         eprintln!(
-            ":: {} hermit run {}",
+            // `to_repro` is already a complete `hermit ... run ...` command.
+            ":: {} {}",
             "Studying target execution: ".yellow().bold(),
             run1data.to_repro()
         );
@@ -286,7 +287,8 @@ impl AnalyzeOpts {
         if self.verbose {
             yellow_msg("[comparing] with log-diff command:");
             eprintln!(
-                "    hermit log-diff --ignore-lines=CHAOSRAND {} {}",
+                "    hermit log-diff --record-envelope=all-records-v1 \
+                 --ignore-lines=CHAOSRAND {} {}",
                 run1_log_path.display(),
                 run2_log_path.display(),
             );
@@ -304,14 +306,14 @@ impl AnalyzeOpts {
         min_run: &mut RunData,
     ) -> Result<(), Error> {
         let min_log_path = &min_run.log_path().unwrap().to_path_buf();
-        let min_preempts_path = min_run.preempts_path_out();
+        let min_preempts_path = min_run.preempts_path_out().to_path_buf();
 
         if self.selfcheck {
             yellow_msg("[selfcheck] Verifying target run preserved under preemption-replay");
 
             let runname = "run1b_selfcheck";
-            let mut run1b = RunData::new_run1_target(self, runname.to_string())?
-                .with_preempts_path_in(min_preempts_path.to_path_buf())
+            let mut run1b = RunData::new_run1_replay(self, runname.to_string(), &min_run.runopts)?
+                .with_preempts_path_in(min_preempts_path.clone())
                 .with_preemption_recording();
             eprintln!("    {}", run1b.to_repro());
 
@@ -329,7 +331,7 @@ impl AnalyzeOpts {
                 )
             }
             let run1b_preempts_path = run1b.preempts_path_out();
-            if !preempt_files_equal(min_preempts_path, run1b_preempts_path) {
+            if !preempt_files_equal(&min_preempts_path, run1b_preempts_path) {
                 bail!(
                     "The preemptions recorded by the additional run did not match the preemptions replayed (no fixed point): {} vs {}",
                     min_preempts_path.display(),
@@ -723,7 +725,15 @@ impl AnalyzeOpts {
         }
     }
 
+    /// Take the settings `analyze` inherits from the global options: every
+    /// trial runs on the globally selected backend
+    /// (`hermit --backend <BACKEND> analyze ...`).
+    pub fn apply_global(&mut self, global: &GlobalOpts) {
+        self.backend = global.backend;
+    }
+
     pub fn main(&mut self, global: &GlobalOpts) -> anyhow::Result<ExitStatus> {
+        self.apply_global(global);
         // Not implemented yet:
         if self.run1_schedule.is_some() {
             unimplemented!()
@@ -737,7 +747,7 @@ impl AnalyzeOpts {
             let dummy = RunData::new_baseline(self, "dummy".to_string())?;
             if !dummy.runopts.det_opts.det_config.chaos {
                 eprintln!(
-                    ":: {} You may want to turn it on explicitly, along with a --preemption-timeout that works well for this program.",
+                    ":: {} You may want to turn it on explicitly, along with a --max-timeslice that works well for this program.",
                     "WARNING: implicitly activating --chaos.".yellow().bold()
                 );
             }

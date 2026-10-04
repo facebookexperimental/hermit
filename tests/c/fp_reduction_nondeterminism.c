@@ -12,6 +12,7 @@
  */
 
 #include <omp.h>
+#include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -28,8 +29,10 @@ static uint32_t mix(uint32_t value) {
 
 /*
  * Give iterations deterministic but unequal costs. Native OpenMP workers then
- * acquire dynamic chunks in a timing-dependent order. Hermit makes the same
- * thread schedule repeatable.
+ * acquire dynamic chunks in a timing-dependent order. Periodic sched_yield
+ * calls give Hermit's chaos scheduler explicit points at which to vary that
+ * order even when PMU timeslicing is disabled. Hermit makes each seeded thread
+ * schedule repeatable.
  */
 static void variable_work(uint32_t index) {
   uint32_t state = index * 747796405u + 2891336453u;
@@ -41,7 +44,12 @@ static void variable_work(uint32_t index) {
   }
 }
 
-int main(void) {
+int main(int argc, char** argv) {
+  if (argc > 2 || (argc == 2 && strcmp(argv[1], "chaos") != 0)) {
+    fprintf(stderr, "usage: %s [chaos]\n", argv[0]);
+    return 2;
+  }
+
   float sum = 0.0f;
 
   omp_set_dynamic(0);
@@ -49,6 +57,9 @@ int main(void) {
 
 #pragma omp parallel for schedule(dynamic, 1) reduction(+ : sum)
   for (uint32_t i = 0; i < ELEMENTS; ++i) {
+    if ((i & 255u) == 0u) {
+      sched_yield();
+    }
     variable_work(i);
 
     /*
@@ -61,10 +72,14 @@ int main(void) {
 
   uint32_t bits;
   memcpy(&bits, &sum, sizeof(bits));
-  printf(
-      "threads=%d bits=%08x sum=%a\n",
-      omp_get_max_threads(),
-      bits,
-      (double)sum);
+  if (argc == 2) {
+    printf("outcome=%u\n", bits & 7u);
+  } else {
+    printf(
+        "threads=%d bits=%08x sum=%a\n",
+        omp_get_max_threads(),
+        bits,
+        (double)sum);
+  }
   return 0;
 }

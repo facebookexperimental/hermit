@@ -31,6 +31,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -44,6 +45,8 @@ enum {
   OWNER_SET_ROBUST_LIST_FAILED = 12,
   OWNER_LOCK_FAILED = 13,
   OWNER_WAITER_NOT_BLOCKED = 14,
+  OWNER_READY_WRITE_FAILED = 15,
+  OWNER_RELEASE_READ_FAILED = 16,
   WAITER_LOCK_RESULT_WRONG = 20,
   WAITER_CONSISTENT_FAILED = 21,
   WAITER_UNLOCK_FAILED = 22,
@@ -52,6 +55,7 @@ enum {
 static pthread_mutex_t mutex;
 static atomic_bool owner_locked = false;
 static atomic_bool waiter_started = false;
+static bool wait_before_owner_exit = false;
 
 static void* thread_result(int code) {
   return (void*)(uintptr_t)code;
@@ -96,6 +100,31 @@ static void* owner_thread(void* unused) {
   for (int attempts = 0; attempts < 1000000; ++attempts) {
     int lock_word = __atomic_load_n(&mutex.__data.__lock, __ATOMIC_ACQUIRE);
     if (((unsigned int)lock_word & FUTEX_WAITERS) != 0) {
+      if (wait_before_owner_exit) {
+        static const char ready[] = "ready\n";
+        ssize_t written;
+        do {
+          written = write(STDOUT_FILENO, ready, sizeof(ready) - 1);
+        } while (written < 0 && errno == EINTR);
+        if (written != (ssize_t)(sizeof(ready) - 1)) {
+          perror("write ready");
+          return thread_result(OWNER_READY_WRITE_FAILED);
+        }
+
+        char release;
+        ssize_t received;
+        do {
+          received = read(STDIN_FILENO, &release, 1);
+        } while (received < 0 && errno == EINTR);
+        if (received != 1) {
+          if (received == 0) {
+            fprintf(stderr, "release input reached EOF\n");
+          } else {
+            perror("read release");
+          }
+          return thread_result(OWNER_RELEASE_READ_FAILED);
+        }
+      }
       return NULL; /* Exit while still owning mutex. */
     }
     sched_yield();
@@ -146,7 +175,14 @@ static void check_pthread(int ret, const char* operation) {
   }
 }
 
-int main(void) {
+int main(int argc, char** argv) {
+  if (argc == 2 && strcmp(argv[1], "--wait-before-owner-exit") == 0) {
+    wait_before_owner_exit = true;
+  } else if (argc != 1) {
+    fprintf(stderr, "usage: %s [--wait-before-owner-exit]\n", argv[0]);
+    return EXIT_FAILURE;
+  }
+
   pthread_mutexattr_t attr;
   check_pthread(pthread_mutexattr_init(&attr), "pthread_mutexattr_init");
   check_pthread(

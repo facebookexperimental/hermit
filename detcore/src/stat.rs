@@ -56,9 +56,9 @@ pub struct DetStat {
     pub attributes: StatxAttributes,
     /// stx_attributes_mask
     pub attributes_mask: StatxAttributes,
-    /// stx_dev (maj << 32 | min)
+    /// st_dev in Linux `dev_t` encoding
     pub dev: u64,
-    /// stx_rdev (maj << 32 | min)
+    /// st_rdev in Linux `dev_t` encoding
     pub rdev: u64,
     /// inode
     pub inode: u64,
@@ -191,8 +191,8 @@ impl From<&libc::statx> for DetStat {
             gid: st.stx_gid,
             attributes: StatxAttributes::from_bits_truncate(st.stx_attributes),
             attributes_mask: StatxAttributes::from_bits_truncate(st.stx_attributes_mask),
-            dev: (st.stx_dev_major as u64) << 32 | st.stx_dev_minor as u64,
-            rdev: (st.stx_rdev_major as u64) << 32 | st.stx_rdev_minor as u64,
+            dev: libc::makedev(st.stx_dev_major, st.stx_dev_minor),
+            rdev: libc::makedev(st.stx_rdev_major, st.stx_rdev_minor),
             inode: st.stx_ino,
             nlink: st.stx_nlink as u64,
             size: st.stx_size as i64,
@@ -231,10 +231,10 @@ impl From<&DetStat> for libc::statx {
         statx.stx_btime = st.btime.into();
         statx.stx_ctime = st.ctime.into();
         statx.stx_mtime = st.mtime.into();
-        statx.stx_rdev_major = (st.rdev >> 32) as u32;
-        statx.stx_rdev_minor = (st.rdev & 0xffffffffu64) as u32;
-        statx.stx_dev_major = (st.dev >> 32) as u32;
-        statx.stx_dev_minor = (st.dev & 0xffffffff) as u32;
+        statx.stx_rdev_major = libc::major(st.rdev);
+        statx.stx_rdev_minor = libc::minor(st.rdev);
+        statx.stx_dev_major = libc::major(st.dev);
+        statx.stx_dev_minor = libc::minor(st.dev);
         statx
     }
 }
@@ -242,5 +242,39 @@ impl From<&DetStat> for libc::statx {
 impl From<DetStat> for libc::statx {
     fn from(st: DetStat) -> Self {
         (&st).into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stat_and_statx_use_the_same_device_encoding() {
+        let dev = libc::makedev(259, 5);
+        let rdev = libc::makedev(8, 1);
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        stat.st_dev = dev;
+        stat.st_rdev = rdev;
+        let mut statx: libc::statx = unsafe { std::mem::zeroed() };
+        statx.stx_dev_major = 259;
+        statx.stx_dev_minor = 5;
+        statx.stx_rdev_major = 8;
+        statx.stx_rdev_minor = 1;
+
+        let from_stat = DetStat::from(&stat);
+        let from_statx = DetStat::from(&statx);
+        assert_eq!(from_stat.dev, from_statx.dev);
+        assert_eq!(from_stat.rdev, from_statx.rdev);
+
+        let round_trip = libc::statx::from(&from_statx);
+        assert_eq!(
+            (round_trip.stx_dev_major, round_trip.stx_dev_minor),
+            (259, 5)
+        );
+        assert_eq!(
+            (round_trip.stx_rdev_major, round_trip.stx_rdev_minor),
+            (8, 1)
+        );
     }
 }

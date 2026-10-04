@@ -49,8 +49,8 @@ with `rseq` disabled at the glibc level
 stops glibc from issuing the `rseq` startup syscall, exposing the *next*
 unsupported syscall so we can measure how deep each app gets.
 
-`python3` on this host resolves (via `$PATH`) to Meta's `fbpython` wrapper, which
-crashes independently; the real interpreter `/usr/bin/python3.9` was used
+`python3` on this host resolves (via `$PATH`) to a site-provided wrapper, which
+crashes independently; the system interpreter `/usr/bin/python3.9` was used
 instead.
 
 ## Results

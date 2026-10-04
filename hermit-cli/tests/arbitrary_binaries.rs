@@ -6,6 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -19,6 +21,8 @@ use std::time::Instant;
 
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 const BINARY_TIMEOUT: Duration = Duration::from_secs(20);
+const ISOLATED_WORKDIR_ENV: &str = "HERMIT_E2E_EMPTY_WORKDIR";
+const HERMETIC_TEST_WORKDIR: &str = "/test";
 const RUN_TOOLS: &[&str] = &[
     "static_busybox",
     "dynamic_ls",
@@ -52,15 +56,6 @@ fn executable(candidates: &[&str]) -> Option<PathBuf> {
     })
 }
 
-fn rustup_tool(name: &str) -> Option<PathBuf> {
-    let output = Command::new("rustup").args(["which", name]).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let path = PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
-    executable(&[path.to_str()?])
-}
-
 fn tool(
     name: &'static str,
     candidates: &[&str],
@@ -76,7 +71,7 @@ fn tool(
 }
 
 fn available_tools(allowed: &[&str]) -> Vec<Tool> {
-    let mut tools = [
+    [
         tool(
             "static_busybox",
             &["/usr/sbin/busybox", "/usr/bin/busybox", "/bin/busybox"],
@@ -86,8 +81,8 @@ fn available_tools(allowed: &[&str]) -> Vec<Tool> {
         tool(
             "dynamic_ls",
             &["/usr/bin/ls", "/bin/ls"],
-            &["--version"],
-            "ls",
+            &["-d", "/bin"],
+            "/bin",
         ),
         tool(
             "shell",
@@ -108,47 +103,34 @@ fn available_tools(allowed: &[&str]) -> Vec<Tool> {
             "node-ok",
         ),
         tool(
-            "java",
-            &["/usr/bin/java", "/usr/local/bin/java"],
-            &["-version"],
-            "version",
-        ),
-        tool(
             "go",
             &["/usr/bin/go", "/usr/local/bin/go"],
-            &["version"],
-            "go version",
+            &["env", "GOARCH"],
+            "amd64",
         ),
         tool(
             "curl",
             &["/usr/bin/curl", "/usr/local/bin/curl"],
-            &["--version"],
-            "curl",
-        ),
-        tool(
-            "wget",
-            &["/usr/bin/wget", "/usr/local/bin/wget"],
-            &["--version"],
-            "Wget",
+            &["--silent", "--show-error", "file:///etc/os-release"],
+            "NAME=",
         ),
         tool(
             "git",
             &["/usr/bin/git", "/bin/git"],
-            &["--version"],
-            "git version",
+            &["check-ref-format", "--normalize", "refs//heads//hermit-e2e"],
+            "refs/heads/hermit-e2e",
         ),
-        tool("gcc", &["/usr/bin/gcc", "/bin/gcc"], &["--version"], "gcc"),
         tool(
-            "make",
-            &["/usr/bin/make", "/bin/make"],
-            &["--version"],
-            "Make",
+            "gcc",
+            &["/usr/bin/gcc", "/bin/gcc"],
+            &["-print-file-name=libgcc.a"],
+            "libgcc.a",
         ),
         tool(
             "cmake",
             &["/usr/bin/cmake", "/usr/local/bin/cmake"],
-            &["--version"],
-            "cmake version",
+            &["-E", "echo", "cmake-ok"],
+            "cmake-ok",
         ),
         tool(
             "sqlite",
@@ -163,19 +145,7 @@ fn available_tools(allowed: &[&str]) -> Vec<Tool> {
     .into_iter()
     .flatten()
     .filter(|tool| allowed.contains(&tool.name))
-    .collect::<Vec<_>>();
-
-    if allowed.contains(&"cargo")
-        && let Some(path) = rustup_tool("cargo")
-    {
-        tools.push(Tool {
-            name: "cargo",
-            path,
-            args: &["--version"],
-            marker: "cargo",
-        });
-    }
-    tools
+    .collect()
 }
 
 fn bounded_command(program: &Path, timeout: Duration) -> Command {
@@ -202,6 +172,26 @@ fn command_output(mut command: Command, label: &str) -> Output {
     output
 }
 
+fn execution_root_args(requested: Option<&OsStr>) -> Result<Vec<OsString>, String> {
+    match requested {
+        None => Ok(Vec::new()),
+        Some(value) if value == OsStr::new(HERMETIC_TEST_WORKDIR) => Ok(vec![
+            "--mount=type=tmpfs,target=/test".into(),
+            "--workdir=/test".into(),
+        ]),
+        Some(value) => Err(format!(
+            "{ISOLATED_WORKDIR_ENV} must be {HERMETIC_TEST_WORKDIR}, got {value:?}"
+        )),
+    }
+}
+
+fn configure_execution_root(command: &mut Command) {
+    let requested = std::env::var_os(ISOLATED_WORKDIR_ENV);
+    let args = execution_root_args(requested.as_deref())
+        .unwrap_or_else(|error| panic!("PATH-CONTRACT: {error}"));
+    command.args(args);
+}
+
 fn assert_marker(tool: &Tool, output: &Output, label: &str) {
     let combined = format!(
         "{}{}",
@@ -219,16 +209,14 @@ fn assert_marker(tool: &Tool, output: &Output, label: &str) {
 
 fn hermit_run(tool: &Tool) -> Output {
     let mut command = bounded_command(Path::new(env!("CARGO_BIN_EXE_hermit")), BINARY_TIMEOUT);
-    command
-        .args([
-            "run",
-            "--base-env=minimal",
-            "--no-virtualize-cpuid",
-            "--preemption-timeout=disabled",
-            "--",
-        ])
-        .arg(&tool.path)
-        .args(tool.args);
+    command.args([
+        "run",
+        "--base-env=minimal",
+        "--no-virtualize-cpuid",
+        "--max-timeslice=disabled",
+    ]);
+    configure_execution_root(&mut command);
+    command.arg("--").arg(&tool.path).args(tool.args);
     command_output(command, &format!("run for {}", tool.name))
 }
 
@@ -244,11 +232,24 @@ fn record_replay(tool: &Tool) -> Output {
     let mut command = bounded_command(Path::new(env!("CARGO_BIN_EXE_hermit")), BINARY_TIMEOUT);
     command
         .args(["record", "start", "--verify"])
-        .arg(format!("--data-dir={}", data_dir.display()))
-        .arg("--")
-        .arg(&tool.path)
-        .args(tool.args);
+        .arg(format!("--data-dir={}", data_dir.display()));
+    configure_execution_root(&mut command);
+    command.arg("--").arg(&tool.path).args(tool.args);
     command_output(command, &format!("record/replay for {}", tool.name))
+}
+
+#[test]
+fn pinned_root_arguments_are_exact_and_fail_closed() {
+    assert!(execution_root_args(None).unwrap().is_empty());
+    assert_eq!(
+        execution_root_args(Some(OsStr::new("/test"))).unwrap(),
+        [
+            OsString::from("--mount=type=tmpfs,target=/test"),
+            OsString::from("--workdir=/test"),
+        ]
+    );
+    let error = execution_root_args(Some(OsStr::new("/tmp"))).unwrap_err();
+    assert!(error.contains("HERMIT_E2E_EMPTY_WORKDIR must be /test"));
 }
 
 #[test]

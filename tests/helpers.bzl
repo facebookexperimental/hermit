@@ -27,10 +27,8 @@ def build_test(
             # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
             target_compatible_with = ["ovr_config//cpu:x86_64"],
             name = "raw_run__" + name,
-            args = [
-                "--no-sequentialize-threads",
-                "--no-deterministic-io",
-            ],
+            # The guest runs directly here; hermit flags would reach its argv.
+            args = [],
             env = common_env,
             test = bin_target,
         )
@@ -57,7 +55,7 @@ def build_test(
     # if strict:
     # Run tests in hermit run mode, strict settings:
     if not (no_deterministic_io or no_sequentialize_threads):
-        # Warning: hacky tuning! The preemption-timeout here is
+        # Warning: hacky tuning! The max-timeslice here is
         # arbitrary, and is basically selected to be the largest
         # number that we can tolerate while still observing some
         # context switches in the mem_race test.  It needs to be
@@ -69,7 +67,7 @@ def build_test(
             guest = "$(location " + bin_target + ")",
             guest_args = [],
             args = ["run", "--isolate-workdir"],
-            hermit_args = ["--base-env=empty", "--env=HERMIT_MODE=strict", "--preemption-timeout=80000000"],
+            hermit_args = ["--base-env=empty", "--env=HERMIT_MODE=strict", "--max-timeslice=80000000"],
             env = {},
         )
 
@@ -95,7 +93,7 @@ def build_test(
     if chaos:
         # Run tests in hermit run mode, strict settings, chaotic scheduling:
 
-        # Warning: hacky tuning! The preemption-timeout here is
+        # Warning: hacky tuning! The max-timeslice here is
         # arbitrary, and is basically selected to be the smallest
         # number that we can tolerate for chaos tests. Smaller numbers
         # create more priority change points, which are deterministic
@@ -107,7 +105,7 @@ def build_test(
             guest = "$(location " + bin_target + ")",
             guest_args = [],
             args = ["run", "--isolate-workdir"],
-            hermit_args = ["--chaos", "--base-env=empty", "--env=HERMIT_MODE=chaos", "--preemption-timeout=1000000"],
+            hermit_args = ["--chaos", "--base-env=empty", "--env=HERMIT_MODE=chaos", "--max-timeslice=1000000"],
             env = {},
         )
     if chaosreplay:
@@ -285,11 +283,25 @@ def hermit_bin_test(
     )
 
 def hermit_rust_test(
-    path, raw, run, no_sequentialize_threads, no_deterministic_io, chaos, record_and_replay, chaosreplay, tracereplay = False, tracereplay_chaos = False
+    path,
+    raw,
+    run,
+    no_sequentialize_threads,
+    no_deterministic_io,
+    chaos,
+    record_and_replay,
+    chaosreplay,
+    tracereplay = False,
+    tracereplay_chaos = False,
+    allocator = None,
 ):
     basename = paths.replace_extension(paths.basename(path), "")
     bin_name = "rustbin_" + basename
     bin_target = ":" + bin_name
+
+    # A guest that must stay single-threaded names an allocator without a
+    # background thread (see tests/BUCK).
+    allocator_args = {"allocator": allocator} if allocator else {}
     rust_binary(
         # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
         target_compatible_with = ["ovr_config//cpu:x86_64"],
@@ -306,6 +318,7 @@ def hermit_rust_test(
             "-Aunused-crate-dependencies",
         ],
         unittests = False,
+        **allocator_args,
     )
     build_test(
         "rs_" + basename,
@@ -327,6 +340,6 @@ def hermit_chaos_stress_test(name, bin_target, preempt_interval, max_iterations)
         guest = "$(location " + bin_target + ")",
         guest_args = [],
         args = ["chaos-stress", "--max-iterations-count=" + str(max_iterations)],
-        hermit_args = ["--chaos", "--base-env=minimal", "--preemption-timeout=" + str(preempt_interval)],
+        hermit_args = ["--chaos", "--base-env=minimal", "--max-timeslice=" + str(preempt_interval)],
         env = {},
     )

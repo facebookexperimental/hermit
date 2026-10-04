@@ -23,6 +23,16 @@ readonly RACEWRITE="$TARGET_DIR/debug/racewrite_nostdlib"
 readonly ANALYZE_DRIVER="$ROOT_DIR/tests/util/hermit_analyze_test.sh"
 readonly ANALYZE_TIMEOUT="${ANALYZE_TIMEOUT:-300s}"
 
+ANALYZE_SKID_OPT=""
+if [[ -n "${HERMIT_ANALYZE_SKID_MARGIN:-}" ]]; then
+    if [[ ! "$HERMIT_ANALYZE_SKID_MARGIN" =~ ^[1-9][0-9]*$ ]]; then
+        echo "HERMIT_ANALYZE_SKID_MARGIN must be a positive integer" >&2
+        exit 2
+    fi
+    ANALYZE_SKID_OPT=" --run-arg=--skid-margin=$HERMIT_ANALYZE_SKID_MARGIN"
+fi
+readonly ANALYZE_SKID_OPT
+
 echo ":: [schedule_search] Building Hermit and analyzer fixtures"
 cargo build -p hermit --bin hermit
 cargo build -p hermetic_infra_hermit_flaky-tests --bin hello_race
@@ -34,13 +44,13 @@ mkdir -p "$TARGET_DIR/debug"
 echo ":: [schedule_search] Localizing hello_race"
 # Neither fixture uses the network. Host mode avoids requiring a network/sysfs
 # namespace on otherwise PMU-capable CI runners.
-ANALYZE_OPTS="--run-arg=--network=host" \
+ANALYZE_OPTS="--run-arg=--network=host$ANALYZE_SKID_OPT" \
     EXPECTED_OUTPUT="flaky-tests/hello_race.rs:37" \
     timeout "$ANALYZE_TIMEOUT" \
     "$ANALYZE_DRIVER" "$HERMIT" "$HELLO_RACE"
 
 echo ":: [schedule_search] Localizing racewrite_nostdlib"
-ANALYZE_OPTS="--run-arg=--network=host --run-arg=--base-env=empty --target-exit-code=0 --target-stdout=foobar" \
+ANALYZE_OPTS="--run-arg=--network=host$ANALYZE_SKID_OPT --run-arg=--base-env=empty --target-exit-code=0 --target-stdout=foobar" \
     EXPECTED_OUTPUT="tests/c/simple/racewrite_nostdlib.c:35" \
     timeout "$ANALYZE_TIMEOUT" \
     "$ANALYZE_DRIVER" "$HERMIT" "$RACEWRITE"

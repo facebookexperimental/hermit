@@ -20,6 +20,21 @@ The process pins itself and its tracee to one CPU. Use `--cpu` to select a
 different online CPU and `--period` to change the default 1,000,000-RCB sample
 period. Raw PMU access must be permitted by the host kernel.
 
+The tool exits 0 on success and 1 on most failures. If it is not permitted to
+trace its own child, because `PTRACE_TRACEME` fails with `EPERM` (for example
+under a ptrace-restricting sandbox or under Hermit, which refuses guest
+`ptrace`), it exits 3 instead, so callers can tell that environment refusal
+apart from the other failures.
+
 The reported margin is twice the largest observed skid, with a minimum of 100
 RCBs. It is an empirical starting point rather than a hardware guarantee; run
 the tool repeatedly under representative host load before changing a margin.
+
+`scripts/validate.rs` runs this calibration before every PMU-dependent analyze test and
+passes the result through `HERMIT_ANALYZE_SKID_MARGIN`. Analyze uses the larger
+of the calibrated recommendation and a conservative 20,000-RCB floor, because
+short idle-host probes did not capture a 10,366-RCB tail observed while
+schedule search repeatedly started tracees. `ANALYZE_SKID_CALIBRATION_ITERATIONS`,
+`ANALYZE_SKID_CALIBRATION_PERIOD`, `ANALYZE_SKID_CALIBRATION_TIMEOUT`, and
+`ANALYZE_SKID_MINIMUM_MARGIN` allow CI experiments to tune the calibration;
+each override must be a positive integer.

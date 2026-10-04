@@ -1,0 +1,21 @@
+[package]
+name = "detcore-sabre"
+description = "SaBRe backend glue for Detcore, the Hermit deterministic execution engine."
+version = "0.4.0"
+edition = "2024"
+license = "BSD-3-Clause"
+repository = "https://github.com/facebookexperimental/hermit"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+detcore = { package = "hermit-detcore", version = "0.4.0", path = "../detcore" }
+libc = "0.2.186"
+reverie = { package = "reverie-core", version = "0.4.0", git = "https://github.com/rrnewton/reverie.git", rev = "b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359" }
+reverie-memory = { version = "0.4.0", git = "https://github.com/rrnewton/reverie.git", rev = "b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359" }
+reverie-rpc-transport = { version = "0.4.0", git = "https://github.com/rrnewton/reverie.git", rev = "b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359" }
+reverie-sabre = { version = "0.4.0", git = "https://github.com/rrnewton/reverie.git", rev = "b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359" }
+reverie-syscalls = { version = "0.4.0", git = "https://github.com/rrnewton/reverie.git", rev = "b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359" }
+syscalls = { version = "0.6.7", features = ["serde"] }

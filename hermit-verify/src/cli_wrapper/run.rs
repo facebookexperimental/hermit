@@ -195,7 +195,10 @@ impl HermitRunBuilder {
             ));
         }
 
-        if let Some(bind) = bind {
+        // This convenience bind exposes our retained temp root through Hermit's
+        // private /tmp. Outside /tmp the root is already visible; the CLI would
+        // ignore this bind and emit a warning. Keep explicit workdir mounts below.
+        if let Some(bind) = bind.filter(|path| path.starts_with("/tmp")) {
             command_args.push(String::from("--bind"));
             command_args.push(bind.display().to_string());
         }
@@ -216,6 +219,35 @@ impl HermitRunBuilder {
 
 #[cfg(test)]
 mod test {
+    #[test]
+    fn temp_root_bind_follows_tmp_overlay_without_changing_workdir_mount() {
+        for (root, needs_bind) in [
+            ("/tmp/runs", true),
+            ("/work/runs", false),
+            ("/tmp-other/runs", false),
+        ] {
+            let workdir = PathBuf::from(root).join("1/workdir");
+            let args = HermitRunBuilder::new(PathBuf::from("/bin/true"), vec![])
+                .bind(PathBuf::from(root))
+                .workdir_isolate(workdir.clone(), true)
+                .into_args();
+            let mut expected = vec!["--log=info".to_owned(), "run".to_owned()];
+            if needs_bind {
+                expected.extend(["--bind".to_owned(), root.to_owned()]);
+            }
+            expected.extend([
+                format!(
+                    "--mount=type=bind,source={},target=/tmp/out",
+                    workdir.display()
+                ),
+                "--workdir=/tmp/out".to_owned(),
+                "--".to_owned(),
+                "/bin/true".to_owned(),
+            ]);
+            assert_eq!(args, expected);
+        }
+    }
+
     use std::path::PathBuf;
     use std::vec;
 

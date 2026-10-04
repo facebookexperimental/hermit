@@ -39,14 +39,11 @@ impl MmId {
 
     /// Create the replacement address space installed by exec.
     pub fn for_exec(self, creator: DetTid) -> Self {
-        let generation = if self.creator == creator {
-            self.generation + 1
-        } else {
-            0
-        };
         Self {
             creator,
-            generation,
+            // Exec generations must remain monotonic even when Linux changes a
+            // non-leader caller's TID to the process leader's TID.
+            generation: self.generation + 1,
         }
     }
 }
@@ -120,6 +117,19 @@ mod tests {
             FutexID::private(parent.for_exec(DetTid::from_raw(10)), 0x1000),
             "exec should replace the private futex namespace"
         );
+    }
+
+    #[test]
+    fn exec_generation_never_repeats_when_caller_identity_changes() {
+        let leader = DetTid::from_raw(10);
+        let worker = DetTid::from_raw(11);
+        let initial = MmId::initial(leader);
+        let worker_exec = initial.for_exec(worker);
+        let leader_exec = worker_exec.for_exec(leader);
+
+        assert_ne!(worker_exec, initial);
+        assert_ne!(leader_exec, initial);
+        assert_ne!(leader_exec, worker_exec);
     }
 
     #[test]

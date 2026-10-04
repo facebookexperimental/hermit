@@ -385,7 +385,7 @@ logical point, siginfo, and handler-visible context.
 ### P4: Exact PMU preemption (XL, 6-12+ weeks after P2)
 
 - Add per-thread PMU setup and precise timer callbacks.
-- Implement safe TF/SIGTRAP stepping or choose broader DBI/basic-block
+- Implement safe TF/SIGTRAP stepping or choose broader DBT/basic-block
   instrumentation instead.
 - Validate counter monotonicity, migration, virtualization, throttling, nested
   signals, and CPU model selection.

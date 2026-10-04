@@ -1,13 +1,38 @@
 [workspace]
 members = [
-  "common/digest",
-  "common/edit-distance",
   "common/test-allocator",
+  "common/test-workdir",
+  "ci/manifest-plan",
+  "detcore",
+  "detcore-model",
+  "detcore-dbt",
+  "detcore-sabre",
+  "detcore/tests/testutils",
+  "flaky-tests",
+  "hermit-cli",
+  "hermit-install",
+  "hermit-resources",
+  "hermit-verify",
+  "tests",
+]
+exclude = ["agent-utils"]
+# Bare `cargo build`/`cargo test` (no `--workspace`) builds only these members.
+# The three third-party-dependency crates -- `detcore-dbt` and `hermit-install`
+# (pull `reverie-dbt`/DynamoRIO) and `detcore-sabre` (pulls `reverie-sabre`) --
+# are deliberately excluded so the default developer build produces the
+# `hermit` binary (ptrace/kvm) with no DynamoRIO/e9patch/SaBRe third-party
+# dependencies; LiteInst is likewise behind hermit-cli's `liteinst` feature. CI opts them back in with `--workspace` plus
+# `cargo ... -p hermit --features third-party-backends`.
+default-members = [
+  "common/test-allocator",
+  "common/test-workdir",
+  "ci/manifest-plan",
   "detcore",
   "detcore-model",
   "detcore/tests/testutils",
   "flaky-tests",
   "hermit-cli",
+  "hermit-resources",
   "hermit-verify",
   "tests",
 ]
@@ -16,3 +41,68 @@ resolver = "2"
 [workspace.package]
 license = "BSD-3-Clause"
 repository = "https://github.com/facebookexperimental/hermit"
+
+# SHA-256 is the io-buffer hash, and an unoptimised build of it is the single
+# dominant cost of `--detlog-io-buffers`. Measured on a 64 MiB buffer: 1.590s
+# unoptimised versus 0.046s optimised -- 25.4 s/GB versus 0.7 s/GB, a 34.6x
+# gap, against a documented capability cost of ~0.75 s/GB. Most validate nodes
+# build debug, so the unoptimised figure is the one that reaches wall time.
+#
+# Optimising ONLY this dependency keeps every hermit crate debuggable. sha2's
+# own dependencies (digest, block-buffer, generic-array, crypto-common,
+# cpufeatures) were measured too and contribute nothing further -- 0.046s with
+# or without them -- so this is deliberately one stanza and not six.
+#
+# Optimisation cannot change a hash: the digest is byte-identical before and
+# after, which is asserted by digest_is_independent_of_optimisation_level in
+# detcore/src/digest.rs.
+[profile.dev.package.sha2]
+opt-level = 3
+
+# iced-x86 1.21.0 (the latest release) computes every decoded instruction's
+# length as `end as u32 - start as u32` on host pointers (src/decoder.rs:1421
+# and 1468). The difference is exact under wrapping arithmetic, which is what a
+# release build uses, but with overflow checks on it panics whenever an
+# instruction ends at or past a 4 GiB-aligned host address. Where a buffer
+# lands is an allocator accident, so the panic is intermittent: the LiteInst
+# census decodes all of libc's text inside the tracer and failed full
+# validations with "attempt to subtract with overflow"
+# (https://github.com/rrnewton/hermit/issues/3462). Upstream fixed both lines
+# with wrapping_sub in icedland/iced 1e37b3d6 (issue
+# https://github.com/icedland/iced/issues/696), which no release contains yet.
+# Building only this crate without overflow checks restores the wrapping it
+# relies on; debug assertions stay on, including its own check that the length
+# is at most 15. Drop both stanzas once a release containing 1e37b3d6 is used.
+# instruction_map::tests::decodes_instructions_that_end_at_or_cross_a_4gib_host_address
+# places instructions at the boundary on every run, and scripts/validate.rs
+# cargo_identity_is_the_validate_profile admits exactly these two stanzas.
+[profile.dev.package.iced-x86]
+overflow-checks = false
+
+# The one profile a validation builds. It inherits release optimisation, so the
+# end-to-end and compatibility cells run an optimised Hermit, and keeps
+# debug-assertions and overflow-checks ON so detcore's debug_assert invariants,
+# the run-queue duplicate check and the determinism-log hash lines that
+# --verify compares stay compiled in. Every consumer of a validation -- the
+# nextest suites, the E2E manifests and the strict compatibility cells -- uses
+# this profile's one Hermit binary, published at target/ci/hermit by
+# build.e2e_artifact. clippy, rustdoc and the doctests stay in the dev profile:
+# under this profile they rebuild units whose build scripts (hermit-install's
+# among them) rewrite target/install_pkg and target/validate under running
+# tests.
+[profile.validate]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true
+
+# The Rust guest programs keep the unoptimised code generation they had when the
+# prepared tests were built in the dev profile, so an optimiser cannot change
+# the programs whose behaviour the hermit_modes and record/replay tests observe.
+# Their dependencies share the validate build above.
+[profile.validate.package.hermetic_infra_hermit_tests]
+opt-level = 0
+
+# Same reason as [profile.dev.package.iced-x86] above:
+# https://github.com/rrnewton/hermit/issues/3462
+[profile.validate.package.iced-x86]
+overflow-checks = false

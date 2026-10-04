@@ -7,4 +7,6 @@
  */
 
 //! Detcore configuration and widely used types.
+pub use detcore_model::config::CONFIG_FINGERPRINT_ENV;
+pub use detcore_model::config::config_wire_fingerprint;
 pub use detcore_model::config::*;

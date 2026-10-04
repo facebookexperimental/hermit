@@ -1,0 +1,51 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is dual-licensed under either the MIT license found in the
+# LICENSE-MIT file in the root directory of this source tree or the Apache
+# License, Version 2.0 found in the LICENSE-APACHE file in the root directory
+# of this source tree. You may select, at your option, one of the
+# above-listed licenses.
+
+# reverie-dbt is a pinned git dependency, so Reindeer vendors the exact source
+# selected by Cargo.lock. Its build script supplies the compile-time paths used
+# for the bundled DynamoRIO fallback; omitting it produces a target that reaches
+# rustc but cannot compile the crate's env! calls.
+cargo_env = ["CARGO_MANIFEST_DIR"]
+
+# The native client and DynamoRIO source are read at build-script/runtime rather
+# than through Rust modules, so precise source discovery cannot find them.
+extra_srcs = [
+    "native/**",
+    "vendor/dynamorio/**",
+]
+
+# Do not compile a second copy of Reverie's core types from the vendored git
+# package. Detcore implements Tool against the pinned Reverie cell; DbtGuest
+# must implement Guest from that same crate instance.
+omit_deps = [
+    # Cargo names this dependency `reverie` and selects package
+    # `reverie-core`; omit_deps keys on the dependency name.
+    "reverie",
+    "reverie-memory",
+    "reverie-rpc-transport",
+]
+extra_deps = [
+    "reverie//:reverie",
+    "reverie//:reverie-memory",
+    "reverie//:reverie-rpc-transport",
+]
+
+[buildscript.build]
+extra_srcs = [
+    "native/**",
+    "vendor/dynamorio/**",
+]
+
+# CMake changes into its build tree before invoking the compiler. Prelude's
+# system-toolchain shim embeds the bare name `gcc` and uses exec rather than a
+# PATH search, so that shim fails from CMake's subdirectory. The Phase-0 worker
+# image contract supplies these versioned tools at their standard Linux paths.
+[buildscript.run.env]
+AR = "/usr/bin/ar"
+CC = "/usr/bin/gcc"
+CXX = "/usr/bin/g++"

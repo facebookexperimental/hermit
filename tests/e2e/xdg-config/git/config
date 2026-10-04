@@ -1,0 +1,7 @@
+[user]
+	name = Hermit E2E
+	email = hermit-e2e@example.invalid
+[commit]
+	gpgSign = false
+[init]
+	defaultBranch = main

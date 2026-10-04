@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <script>
+    // Resolve the saved choice before loading CSS, including when storage is blocked.
+    (() => {
+      const root = document.documentElement;
+      const dark = window.matchMedia?.("(prefers-color-scheme: dark)");
+      const light = window.matchMedia?.("(prefers-color-scheme: light)");
+      const validChoice = value => ["system", "dark", "light"].includes(value) ? value : "system";
+      let choice = "system";
+      try { choice = validChoice(localStorage.getItem("hermit-theme")); } catch {}
+      const applyTheme = () => {
+        root.dataset.theme = choice === "system"
+          ? (dark?.matches ? "dark" : light?.matches ? "light" : "dark") : choice;
+        root.style.colorScheme = root.dataset.theme;
+      };
+      applyTheme();
+      [dark, light].forEach(query => query?.addEventListener("change", applyTheme));
+      document.addEventListener("DOMContentLoaded", () => {
+        const control = document.getElementById("theme-choice");
+        control.value = choice;
+        control.addEventListener("change", () => {
+          choice = validChoice(control.value);
+          applyTheme();
+          try { localStorage.setItem("hermit-theme", choice); } catch {}
+        });
+        window.addEventListener("storage", event => {
+          if (event.key !== "hermit-theme" && event.key !== null) return;
+          choice = validChoice(event.newValue);
+          control.value = choice;
+          applyTheme();
+        });
+      });
+    })();
+  </script>
+  <meta name="description" content="Hermit controls scheduling, time, and randomness to make Linux programs reproducible. Explore concurrency bugs, record and replay executions, and build instrumentation tools.">
+  <title>Tools for Reproducible Linux Execution | Hermetic Infra</title>
+  <link rel="stylesheet" href="site.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header" id="top">
+    <a class="wordmark" href="#top" aria-label="Hermetic Infra home">
+      <span class="wordmark-icon" aria-hidden="true">H//I</span>
+      <span>Hermetic Infra</span>
+    </a>
+    <nav aria-label="Main navigation">
+      <a href="#why-hermit">Why Hermit?</a>
+      <a href="#tools">Software components</a>
+      <a href="#compatibility">Compatibility</a>
+      <a href="#examples">Examples</a>
+    </nav>
+    <select id="theme-choice" class="theme-control" aria-label="Color theme" title="Color theme: System follows your device settings">
+      <option value="system">System</option>
+      <option value="dark">Dark</option>
+      <option value="light">Light</option>
+    </select>
+  </header>
+
+  <main id="main">
+    <section class="hero" aria-labelledby="hero-title">
+      <div class="hero-copy">
+        <p class="eyebrow">Hermit</p>
+        <h1 id="hero-title">Tools for Reproducible <em>Linux Execution</em></h1>
+        <p class="lede">
+          Hermit runs unmodified Linux programs in a controlled, repeatable
+          environment. It controls inputs that can change a program's outcome:
+          thread scheduling, time, and random numbers. Use it to reproduce
+          failures, explore different thread schedules, and investigate
+          concurrency bugs.
+        </p>
+        <div class="actions">
+          <a class="button primary" href="#try-hermit">Get started</a>
+          <a class="button secondary" href="hermit/index.html">Rust API</a>
+        </div>
+        <p class="blog-link">
+          Read the original introduction:<br>
+          <a href="https://developers.facebook.com/blog/post/2022/11/22/hermit-deterministic-linux-testing/">Hermit: Deterministic Linux for Controlled Testing and Software Bug-finding</a>
+        </p>
+      </div>
+      <figure class="hero-visual">
+        <input class="motion-toggle" type="checkbox" id="pause-orbits">
+        <label class="motion-control" for="pause-orbits">Pause animation</label>
+        <div class="orbit-scene">
+          <div class="architecture" role="group" aria-label="Guest above Hermit above Linux">
+            <div class="layer"><strong>Guest</strong><span>Your Linux program</span></div>
+            <div class="layer hermit-layer"><strong>Hermit</strong><span>Controls execution</span></div>
+            <div class="layer"><strong>Linux</strong><span>Host kernel</span></div>
+          </div>
+          <ul class="orbit" aria-label="Sources of variation controlled by Hermit">
+            <li class="entropy entropy-1"><span class="entropy-label">Thread scheduling</span></li>
+            <li class="entropy entropy-2"><span class="entropy-label">Clocks</span></li>
+            <li class="entropy entropy-3"><span class="entropy-label">Random bytes</span></li>
+            <li class="entropy entropy-4"><span class="entropy-label">Process IDs</span></li>
+            <li class="entropy entropy-5"><span class="entropy-label">File metadata</span></li>
+            <li class="entropy entropy-6"><span class="entropy-label">CPU clock<br> and features</span></li>
+          </ul>
+        </div>
+        <figcaption>
+          Hermit sits between your program and Linux, controlling system calls
+          and processor events that can make executions differ.
+        </figcaption>
+      </figure>
+    </section>
+
+    <section id="why-hermit" class="section" aria-labelledby="why-title">
+      <div class="section-heading">
+        <h2 id="why-title">Why Hermit?</h2>
+        <p>
+          A running program, such as a build job or a CI test, has more inputs
+          than its arguments and files. Its result can also depend on which
+          thread runs first, what the clock says, or which random bytes it
+          receives. These implicit inputs can make a failure difficult to
+          reproduce.
+        </p>
+      </div>
+      <div class="use-grid">
+        <article>
+          <h3>Repeat an execution</h3>
+          <p>Run a supported program again with the same inputs and settings to investigate a failure.</p>
+        </article>
+        <article>
+          <h3>Look for concurrency bugs</h3>
+          <p>Change the scheduling seed to explore other thread interleavings. Keep the seed to reproduce an interesting run with the same program and Hermit build.</p>
+        </article>
+        <article>
+          <h3>Narrow down a failure</h3>
+          <p>Compare passing and failing schedules to find changes in event order that trigger the bug.</p>
+        </article>
+      </div>
+      <p class="context-note">
+        Reproducible runs need a fixed program, input files, environment, and
+        Hermit configuration, including the starting clock time. Responses from
+        external services outside the container must also be controlled:
+        repeatable, blocked, or recorded.
+      </p>
+    </section>
+
+    <section id="try-hermit" class="section try-section" aria-labelledby="try-title">
+      <div class="section-heading">
+        <h2 id="try-title">Try Hermit</h2>
+        <p><a href="https://github.com/rrnewton/hermit#install-from-source">Install Hermit on x86-64 Linux</a>, then try reading random bytes:</p>
+      </div>
+      <div class="command-example">
+        <span class="command-label">In your terminal</span>
+        <pre><code>hermit run -- /bin/sh -c 'od -An -N8 -tx1 /dev/urandom'</code></pre>
+      </div>
+      <div class="reading-width">
+        <p>Run the command twice. With the same Hermit build and random seed, it prints the same bytes. Hermit supplies repeatable data when the program asks Linux for randomness.</p>
+        <p>To run your own program, place <code>hermit run --</code> before its command. The <a href="https://github.com/rrnewton/hermit/blob/main/docs/USER_GUIDE.md">user guide</a> explains host requirements, clock settings, and schedule exploration.</p>
+      </div>
+      <article class="replay-panel" aria-labelledby="replay-title">
+        <div>
+          <p class="eyebrow">Beta</p>
+          <h3 id="replay-title">Record and replay</h3>
+        </div>
+        <div>
+          <p>Record a program execution, then replay it to investigate a failure. Hermit offers a workflow similar to <a href="https://rr-project.org/">Mozilla's rr</a>, with GDB debugging. Its experimental Debug Adapter Protocol (DAP) adapter has known failures with GDB 17.2; see the instructions below for details.</p>
+          <p>Record/replay supports fewer workloads than deterministic execution.</p>
+          <div class="text-links">
+            <a href="https://github.com/rrnewton/hermit/blob/main/docs/USER_GUIDE.md#record-and-replay">Record/replay guide <span aria-hidden="true">&rarr;</span></a>
+            <a href="https://github.com/rrnewton/hermit#debug-adapter-protocol">DAP status and instructions <span aria-hidden="true">&rarr;</span></a>
+          </div>
+        </div>
+      </article>
+    </section>
+
+    <section id="tools" class="section" aria-labelledby="tools-title">
+      <div class="section-heading">
+        <h2 id="tools-title">Software components</h2>
+        <p>Use Hermit to run programs, or use the libraries below to build your own tools.</p>
+      </div>
+      <div class="card-grid">
+        <article class="tool-card accent-coral">
+          <p class="eyebrow">Run programs</p>
+          <h3>Hermit</h3>
+          <p>A command-line tool for repeatable execution and concurrency testing of x86-64 Linux programs. Hermit uses Reverie to intercept system calls and processor events, then controls scheduling, time, and other inputs to the program.</p>
+          <div class="card-links">
+            <a href="https://github.com/rrnewton/hermit">Source <span aria-hidden="true">&nearr;</span></a>
+            <a href="hermit/index.html">Rust API <span aria-hidden="true">&rarr;</span></a>
+          </div>
+        </article>
+        <article class="tool-card accent-blue">
+          <p class="eyebrow">Build tools</p>
+          <h3>Reverie</h3>
+          <p>A Rust library for building tools that observe and change the behavior of Linux programs. Write handlers for system calls and processor events to inspect a program, change results, or perform additional operations. Hermit uses these handlers to implement deterministic execution.</p>
+          <div class="card-links">
+            <a href="https://github.com/rrnewton/reverie">Source and guide <span aria-hidden="true">&nearr;</span></a>
+          </div>
+        </article>
+        <article class="tool-card accent-gold">
+          <p class="eyebrow">Patch instructions</p>
+          <h3>LiteInst</h3>
+          <p>A library for patching x86-64 machine instructions while a program runs. LiteInst2 brings the original C++ project's patching core to Rust. Hermit's experimental LiteInst integration uses this technique to intercept program operations.</p>
+          <div class="card-links">
+            <a href="https://github.com/rrnewton/liteinst2">LiteInst2 Rust port <span aria-hidden="true">&nearr;</span></a>
+            <a href="https://github.com/iu-parfunc/liteinst">Original LiteInst <span aria-hidden="true">&nearr;</span></a>
+            <a href="https://doi.org/10.1145/2908080.2908084">PLDI '16 &mdash; Living on the edge <span aria-hidden="true">&nearr;</span></a>
+            <a href="https://doi.org/10.1145/3062341.3062344">PLDI '17 &mdash; Instruction punning <span aria-hidden="true">&nearr;</span></a>
+            <a href="https://github.com/rrnewton/hermit#execution-backends">Hermit integration <span aria-hidden="true">&rarr;</span></a>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <section id="compatibility" class="section compatibility" aria-labelledby="compatibility-title">
+      <div class="section-heading">
+        <h2 id="compatibility-title">Compatibility</h2>
+        <p>Hermit supports x86-64 Linux. Which programs work depends on the system calls they use, the host machine, and how Hermit intercepts their execution.</p>
+      </div>
+      <div class="reading-width">
+        <p>These interception mechanisms are called execution backends. Start with the default, <strong>ptrace</strong>, which uses Linux's process-tracing interface and is the most thoroughly tested. Other backends are experimental or specialized.</p>
+        <p>Recorded passing workloads on the ptrace backend include:</p>
+      </div>
+      <ul class="compat-highlights">
+        <li><a href="compatibility/latest/cells/detail.html?cell=29686202d784eee06e035afd32191edffee25c2946b9a01b11ee184d28f506b1"><strong>Python</strong></a> scripts using hash collections, files, and subprocesses.</li>
+        <li><a href="compatibility/latest/cells/detail.html?cell=494000d5da5ced70055b6b51fa3eb54e5ab9ab6f974d79acb6aa92083eab9880"><strong>Node.js</strong></a> running a hot JavaScript loop and generating random numbers.</li>
+        <li><a href="compatibility/latest/cells/detail.html?cell=e94153044ab653736c80d6451d14d31217a89201347a0780fbf0d45fe11487d7"><strong>Rust</strong></a> programs using randomized hash collections, files, and clocks.</li>
+        <li><a href="compatibility/latest/cells/detail.html?cell=841666ca0a4d9bc178f3bd642449fa8555cee6159e19ddfe52d8d063d4b5e613"><strong>SQLite</strong></a> creating and reopening a database, then running queries that use random numbers and time.</li>
+      </ul>
+      <p class="reading-width">These checks compare repeated executions. The scorecard records results separately for each workload, mode, and backend; try the workload you depend on.</p>
+      <a id="compatibility-scorecard" class="button primary" href="compatibility/latest/">Latest compatibility scorecard <span aria-hidden="true">&rarr;</span></a>
+    </section>
+
+    <section id="examples" class="section" aria-labelledby="examples-title">
+      <div class="section-heading">
+        <p class="eyebrow">Experiments</p>
+        <h2 id="examples-title">Linux, filesystems, and builds</h2>
+        <p>Some of the larger workloads explored with Hermit.</p>
+      </div>
+      <div class="card-grid">
+        <article class="example-card accent-coral">
+          <h3>Boot and inspect Linux under QEMU</h3>
+          <p>A minimal Linux guest boots under QEMU with Hermit's controlled thread scheduling and QEMU's instruction-based clock. Repeated boots matched after log normalization. Separate experiments with the drgn kernel debugger reproduced kernel task lists at chosen stopping points.</p>
+          <div class="card-links">
+            <a href="https://github.com/rrnewton/hermit/blob/main/docs/QEMU_BOOT.md">QEMU boot guide <span aria-hidden="true">&rarr;</span></a>
+          </div>
+        </article>
+        <article class="example-card accent-blue">
+          <h3>Reproduce a btrfs concurrency bug</h3>
+          <p>With a historical bug restored in an instrumented btrfs-convert and its progress timer replaced by a pipe, Hermit's chaos scheduler triggered a use-after-free. Repeating the seed reproduced the same failure report; the fixed version had no such crashes in the same sweep.</p>
+          <div class="card-links">
+            <a href="https://github.com/rrnewton/hermit/blob/main/docs/USER_GUIDE.md#chaos-mode">Explore thread schedules <span aria-hidden="true">&rarr;</span></a>
+          </div>
+        </article>
+        <article class="example-card accent-gold">
+          <h3>Reproduce build outputs</h3>
+          <p>Hermit has rebuilt Debian packages such as hello, hostname, and tree with byte-identical package files across independent build environments. A Nix builder prototype also made an example build that reads the clock and random bytes reproducible.</p>
+        </article>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <a class="footer-brand" href="#top">Hermetic Infra</a>
+    <nav aria-label="Project links">
+      <a href="https://github.com/rrnewton/hermit">Source</a>
+      <a href="https://github.com/rrnewton/hermit#more-documentation">Documentation</a>
+      <a href="https://github.com/rrnewton/hermit/tree/main/examples">Examples</a>
+      <a href="https://github.com/rrnewton/hermit/issues">Report an issue</a>
+      <a href="https://github.com/rrnewton/hermit/tree/main/docs/site">Page source</a>
+    </nav>
+  </footer>
+</body>
+</html>

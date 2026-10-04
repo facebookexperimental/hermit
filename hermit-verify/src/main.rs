@@ -48,8 +48,10 @@ pub enum Commands {
 fn main() -> Result<()> {
     let Args {
         command,
-        common_opts,
+        mut common_opts,
     } = Args::parse();
+    common_opts
+        .resolve_comparison_epoch(std::env::var_os("HERMIT_EPOCH"), std::time::SystemTime::now);
 
     let mut print_success = true;
     let result = match command {

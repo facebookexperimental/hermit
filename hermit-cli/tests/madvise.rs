@@ -52,28 +52,41 @@ fn madvise_policy_verifies_in_run_record_and_kvm_modes() {
         .arg(&guest);
     command_output(compile, "madvise guest compilation");
 
-    for (label, extra_arg) in [
-        ("strict madvise verification", None),
-        ("passthru-opt madvise verification", Some("--passthru-opt")),
+    for (label, strict, extra_arg) in [
+        ("strict madvise verification", true, None),
+        (
+            "passthru-opt madvise verification",
+            false,
+            Some("--passthru-opt"),
+        ),
     ] {
         let mut verify = Command::new("timeout");
         verify
             .args(["--kill-after", "5s", "30s"])
             .arg(env!("CARGO_BIN_EXE_hermit"))
             .args([
-                "--log=off",
+                "--log=info",
                 "run",
-                "--strict",
                 "--verify",
                 "--preemption-timeout=disabled",
                 "--base-env=minimal",
             ]);
+        if strict {
+            verify.arg("--strict");
+        }
         if let Some(arg) = extra_arg {
-            verify.arg(arg);
+            verify.args(["--allow-unsupported-syscalls", arg]);
         }
         verify.arg("--").arg(&guest);
         let output = command_output(verify, label);
         assert_marker(&output, "Determinism verified", label);
+        if !strict {
+            assert_marker(
+                &output,
+                "a successful exit does not establish complete deterministic execution",
+                "passthru-opt madvise compatibility warning",
+            );
+        }
     }
 
     if Path::new("/dev/kvm").exists() {
@@ -82,7 +95,7 @@ fn madvise_policy_verifies_in_run_record_and_kvm_modes() {
             .args(["--kill-after", "5s", "30s"])
             .arg(env!("CARGO_BIN_EXE_hermit"))
             .args([
-                "--log=off",
+                "--log=info",
                 "--backend=kvm",
                 "run",
                 "--strict",
@@ -94,7 +107,16 @@ fn madvise_policy_verifies_in_run_record_and_kvm_modes() {
             .arg(&guest)
             .arg("--kvm");
         let output = command_output(verify, "KVM madvise verification");
-        assert_marker(&output, "Determinism verified", "KVM madvise verification");
+        assert_marker(
+            &output,
+            "Comparing captured verification logs",
+            "KVM madvise verification",
+        );
+        assert_marker(
+            &output,
+            "Success: deterministic. Determinism verified.",
+            "KVM madvise verification",
+        );
     }
 
     let recording = build_root.join("recording");
@@ -104,7 +126,7 @@ fn madvise_policy_verifies_in_run_record_and_kvm_modes() {
         .args(["--kill-after", "5s", "60s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args([
-            "--log=off",
+            "--log=info",
             "record",
             "start",
             "--verify",

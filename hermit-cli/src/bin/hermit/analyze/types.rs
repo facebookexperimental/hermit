@@ -194,6 +194,12 @@ pub struct AnalyzeOpts {
     /// A full set of CLI arguments for the original `hermit run` to analyze.
     #[clap(value_name = "ARGS")]
     pub run_args: Vec<String>,
+
+    /// The backend every trial runs on, taken from the global option
+    /// (`hermit --backend <BACKEND> analyze ...`) by [`AnalyzeOpts::main`].
+    /// `run` has no `--backend` of its own, so this is the only way to choose it.
+    #[clap(skip)]
+    pub backend: Option<hermit::Backend>,
 }
 
 // TODO: introduce a new type to encapsulate the state of the search, and make it immutable.

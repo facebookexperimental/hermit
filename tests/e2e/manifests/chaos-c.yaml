@@ -1,0 +1,133 @@
+schema: 3
+bucket: chaos-c
+test:
+  - id: chaos-c/lock-granularity
+    description: Strict verification for tests/chaos/lock_granularity.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/chaos/lock_granularity.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    build:
+      cflags:
+        - -D_GNU_SOURCE
+        - -pthread
+        - -Wno-error=unused-parameter
+        - -Wno-error=unused-function
+        - -Wno-error=unused-variable
+        - -Wno-error=attributes
+        - -Wno-error=unknown-pragmas
+        - -Wno-error=sign-compare
+    modes:
+      verify:
+        ci:
+          ptrace: true
+          sabre: false
+        backends_enabled:
+          - ptrace
+          - sabre
+        backends_disabled:
+          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
+          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
+        ci_disabled_reason:
+          sabre: {"result": "determinism-failure", "evidence": "Generated scorecard ci/compat-envelope/cells.json at Hermit 5b811757980b9cab599206c047560a7962176a6b retains historical results determinism-failure, crash-error at Hermit 90e46cba9ad83550205f3c9cd232ae222c6b6173; retained first divergent record positions: 16, 16.", "reason": "Historical canonical verification diverged at recorded positions. The later clean observations do not erase that retained failure, so this backend remains excluded pending separate qualification."}
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: This migration inventories strict verification; it does not assert native nondeterminism
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from the initial strict-verification migration
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: true
+        # The contiguous prefix 0..31 is a mechanically selected sample, not a
+        # list curated around outcomes. The guest has exactly two observable
+        # classes: Thread2 either computes before Thread1 stores 42/43 (prints
+        # Fail, exit 1), or it computes after that store (prints Success,
+        # exit 0).
+        #
+        # Direct ptrace verification at e2f9a36b1ad8 used
+        # --log=info, --verify-strict, --detlog-stack and --detlog-heap. Seeds
+        # 0..31 reproduced 32/32 with 28 successes and 4 failures; seeds 32..63
+        # reproduced 32/32 with 20 successes and 12 failures. A retained-work
+        # change that joined Thread1 before creating Thread2 preserved both
+        # thread bodies but collapsed seeds 0..31 to 32 successes and no
+        # failures, which the assertions below refuse.
+        #
+        # The distinct count is saturated at the two-class ceiling. Do not set
+        # an entropy floor from these populations: the 32-seed splits moved
+        # from 28/4 to 20/12 while both remained healthy. Recalibrate across
+        # builds before adding a balance assertion, and widen the seed prefix
+        # instead of weakening either class assertion if a future build changes
+        # the sampled split.
+        seeds:
+          - 0
+          - 1
+          - 2
+          - 3
+          - 4
+          - 5
+          - 6
+          - 7
+          - 8
+          - 9
+          - 10
+          - 11
+          - 12
+          - 13
+          - 14
+          - 15
+          - 16
+          - 17
+          - 18
+          - 19
+          - 20
+          - 21
+          - 22
+          - 23
+          - 24
+          - 25
+          - 26
+          - 27
+          - 28
+          - 29
+          - 30
+          - 31
+        outcome_classes: 2
+        assert:
+          min_distinct: 2
+          min_passes: 1
+          min_failures: 1
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest

@@ -7,11 +7,44 @@ target/
 # pr-dag-health.sh report artifact (regenerate with the script)
 pr-dag-health.json
 
-# validate.sh live working-envelope measurement (regenerate with --envelope-only).
+# scripts/validate.rs live working-envelope measurement (regenerate with --envelope-only).
 # The committed baseline lives in envelope-baseline.json; this is the fresh run.
 envelope.json
+
+# validate.rs checkout-local validation ledger (used when neither
+# HERMIT_VALIDATE_LEDGER nor DEV_HERMIT_PARENT is set). Disposable per-checkout
+# receipts, regenerated on every run.
+.hermit-validate-ledger.jsonl
 
 # Local backup and Python cache files.
 *.orig
 **/__pycache__/
 **/.mypy_cache/
+
+# Generated validation/e2e output. Everything under ignored/ is disposable and
+# must not taint source provenance or the version string.
+/ignored/
+
+# Backend-parity observations belong to the outer dev-hermit compat scorecard.
+/tests/backend-parity/matrix.tsv
+
+# dagrun's per-checkout profile store. The DAG runner writes it into
+# whatever checkout it runs in, so without this every scripts/validate.rs run leaves its
+# own tree dirty and `ci-hub validate-run` then REFUSES the next run in that
+# checkout ("checkout is dirty (?? .dagrun/); refusing unrepeatable
+# validation") -- a slot self-poisons after exactly one validation. The profiles
+# are useful output, so ignore them in place rather than relocating them.
+/.dagrun/
+
+# Validate ledger shards: one append-only JSONL per (team, short-machine).
+# Machine-scoped BY DESIGN so concurrent writers never collide, and each row
+# records absolute cwd/log_file paths -- so a tracked shard can never satisfy
+# scripts/check-portable-paths.sh. Kept in-tree for locality, never committed.
+ci/validate-ledger/
+
+# Buck2 and Reindeer output. The generated Rust graph is reproducible from the
+# tracked Cargo lockfile and bootstrap pins.
+buck-out/
+/shim/third-party/rust/.cargo/
+/shim/third-party/rust/BUCK
+/shim/third-party/rust/vendor/

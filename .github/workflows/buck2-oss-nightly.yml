@@ -1,0 +1,546 @@
+name: OSS Buck2 nightly
+
+# This workflow exercises the documented public Buck2 reproduction path. It is
+# deliberately separate from landing evidence and never runs for a pull request
+# or a push to main.
+on:
+  schedule:
+    - cron: "17 10 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: oss-buck2-nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  buck-release-evidence:
+    name: Supplemental feature-complete Buck release evidence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Check out Hermit and its pinned sources
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Configure isolated per-run caches
+        shell: bash
+        env:
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          ACTIONS_RUNTIME_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          AWS_ACCESS_KEY_ID: ""
+          AWS_SECRET_ACCESS_KEY: ""
+          AWS_SESSION_TOKEN: ""
+        run: |
+          set -euo pipefail
+          {
+            echo "CARGO_HOME=$RUNNER_TEMP/cargo-home"
+            echo "DOTSLASH_CACHE=$RUNNER_TEMP/dotslash-cache"
+            echo "HERMIT_BUCK2_TOOL_CACHE=$RUNNER_TEMP/hermit-buck2-tools"
+            echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home"
+          } >>"$GITHUB_ENV"
+          echo "$RUNNER_TEMP/cargo-home/bin" >>"$GITHUB_PATH"
+
+      - name: Install build prerequisites and pinned Rust toolchain
+        timeout-minutes: 15
+        shell: bash
+        env:
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          ACTIONS_RUNTIME_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          AWS_ACCESS_KEY_ID: ""
+          AWS_SECRET_ACCESS_KEY: ""
+          AWS_SESSION_TOKEN: ""
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y liblzma-dev libunwind-dev zstd
+          channel="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -n 1)"
+          test -n "$channel"
+          rustup toolchain install "$channel" --profile minimal --component clippy --component rustfmt
+          rustc --version --verbose
+          cargo install rust-script --version 0.36.0 --locked --root "$CARGO_HOME"
+          test -x "$CARGO_HOME/bin/rust-script"
+          resolved_rust_script="$(command -v rust-script)"
+          test "$(realpath "$resolved_rust_script")" = "$(realpath "$CARGO_HOME/bin/rust-script")"
+          test "$("$resolved_rust_script" --version)" = "rust-script 0.36.0"
+
+      # Two driver tests (matrix_private_tmp_readback_* and
+      # matrix_proxy_refuses_to_launch_safehermit_inside_a_user_namespace) run
+      # `unshare --user --map-root-user`, which ubuntu-24.04's AppArmor policy
+      # refuses with EPERM on /proc/self/uid_map.
+      - name: Enable unprivileged user namespaces
+        timeout-minutes: 2
+        shell: bash
+        env:
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          ACTIONS_RUNTIME_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          AWS_ACCESS_KEY_ID: ""
+          AWS_SECRET_ACCESS_KEY: ""
+          AWS_SESSION_TOKEN: ""
+        run: |
+          set -euo pipefail
+          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare --user --map-root-user true
+
+      - name: Test the Buck release driver and refusal contracts
+        timeout-minutes: 15
+        shell: bash
+        env:
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          ACTIONS_RUNTIME_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          AWS_ACCESS_KEY_ID: ""
+          AWS_SECRET_ACCESS_KEY: ""
+          AWS_SESSION_TOKEN: ""
+        run: rust-script --test scripts/build-buck-release.rs
+
+      - name: Install public DotSlash
+        timeout-minutes: 5
+        shell: bash
+        env:
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          ACTIONS_RUNTIME_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          AWS_ACCESS_KEY_ID: ""
+          AWS_SECRET_ACCESS_KEY: ""
+          AWS_SESSION_TOKEN: ""
+          DOTSLASH_SHA256: 4c75c6eb7890ae35993b962073f6d9bbe78b42b81a5691303ad70f63bfbf7196
+          DOTSLASH_URL: https://github.com/facebook/dotslash/releases/download/v0.5.9/dotslash-linux-musl.x86_64.v0.5.9.tar.gz
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/dotslash.tar.gz"
+          bin_dir="$RUNNER_TEMP/dotslash-bin"
+          curl --proto '=https' --tlsv1.2 --fail --show-error --location \
+            "$DOTSLASH_URL" --output "$archive"
+          printf '%s  %s\n' "$DOTSLASH_SHA256" "$archive" | sha256sum --check --strict
+          mkdir -p "$bin_dir"
+          tar -xzf "$archive" -C "$bin_dir"
+          test -x "$bin_dir/dotslash"
+          echo "$bin_dir" >>"$GITHUB_PATH"
+          echo "PUBLIC_DOTSLASH=$bin_dir/dotslash" >>"$GITHUB_ENV"
+
+      - name: Regenerate the shared Rust dependency graph
+        timeout-minutes: 45
+        shell: bash
+        env:
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          ACTIONS_RUNTIME_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          AWS_ACCESS_KEY_ID: ""
+          AWS_SECRET_ACCESS_KEY: ""
+          AWS_SESSION_TOKEN: ""
+        run: ./bootstrap/regenerate-rust-deps
+
+      - name: Configure Buck Rust flags
+        shell: bash
+        env:
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          ACTIONS_RUNTIME_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          AWS_ACCESS_KEY_ID: ""
+          AWS_SECRET_ACCESS_KEY: ""
+          AWS_SESSION_TOKEN: ""
+          RUSTFLAGS: -C link-arg=-llzma
+        run: |
+          set -euo pipefail
+          # Buck invokes rustc directly, so Cargo's RUSTFLAGS is not consumed.
+          wrapper_dir="$RUNNER_TEMP/buck2-rustc-wrapper"
+          real_rustc="$(rustup which rustc)"
+          read -r -a rustflags <<<"$RUSTFLAGS"
+          mkdir -p "$wrapper_dir"
+          {
+            echo '#!/usr/bin/env bash'
+            printf 'exec %q' "$real_rustc"
+            printf ' %q' "${rustflags[@]}"
+            printf ' "$@"\n'
+          } >"$wrapper_dir/rustc"
+          chmod +x "$wrapper_dir/rustc"
+          echo "$wrapper_dir" >>"$GITHUB_PATH"
+
+      - name: Capture the feature-complete Hermit release build
+        id: release-build
+        timeout-minutes: 45
+        shell: bash
+        env:
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          ACTIONS_RUNTIME_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          AWS_ACCESS_KEY_ID: ""
+          AWS_SECRET_ACCESS_KEY: ""
+          AWS_SESSION_TOKEN: ""
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/buck2-phase1-release"
+          if [[ -e $evidence ]]; then
+            echo "::error::refusing stale release evidence path: $evidence"
+            exit 1
+          fi
+          mkdir "$evidence"
+          capture_rc=99
+          # shellcheck disable=SC2317 # invoked indirectly by the EXIT trap
+          retain_shell_exit() {
+            final_rc=$?
+            if [[ $capture_rc -eq 99 ]]; then
+              capture_rc=$final_rc
+            fi
+            printf 'shell_exit\t%s\n' "$capture_rc" >"$evidence/shell-exit.tsv"
+            echo "shell-exit=$capture_rc" >>"$GITHUB_OUTPUT"
+          }
+          trap retain_shell_exit EXIT
+          event_log="$evidence/hermit-release.json-lines.gz"
+          version="$(sed -n '/^\[package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' hermit-cli/Cargo.toml | head -n 1)"
+          build_date="$(date -u +%F)"
+          hermit_sha="$(git rev-parse --short=12 HEAD)"
+          reverie_sha="$(git rev-parse HEAD:reverie)"
+          test -n "$version"
+          test "${#hermit_sha}" -eq 12
+          test "${#reverie_sha}" -eq 40
+          printf 'version\t%s\nbuild_date\t%s\nhermit_sha\t%s\nreverie_sha\t%s\n' \
+            "$version" "$build_date" "$hermit_sha" "$reverie_sha" >"$evidence/metadata.tsv"
+
+          set +e
+          timeout --foreground --kill-after=30s 40m \
+            "$PUBLIC_DOTSLASH" ./bootstrap/buck2 build --show-output --no-remote-cache \
+            --event-log "$event_log" \
+            -c "hermit_release.version=$version" \
+            -c "hermit_release.build_date=$build_date" \
+            -c "hermit_release.hermit_sha=$hermit_sha" \
+            -c "hermit_release.reverie_sha=$reverie_sha" \
+            //hermit-cli:hermit-release \
+            >"$evidence/build.stdout" 2>"$evidence/build.stderr"
+          shell_rc=$?
+          capture_rc=$shell_rc
+          set -e
+          exit "$shell_rc"
+
+      - name: Reconcile and scan release evidence
+        id: release-evidence
+        if: always()
+        timeout-minutes: 10
+        shell: bash
+        env:
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          ACTIONS_RUNTIME_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          AWS_ACCESS_KEY_ID: ""
+          AWS_SECRET_ACCESS_KEY: ""
+          AWS_SESSION_TOKEN: ""
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/buck2-phase1-release"
+          test -d "$evidence"
+          shell_rc="$(awk -F '\t' '$1 == "shell_exit" { print $2 }' "$evidence/shell-exit.tsv")"
+          [[ $shell_rc =~ ^[0-9]+$ ]]
+
+          set +e
+          "$PUBLIC_DOTSLASH" ./bootstrap/buck2 log summary \
+            "$evidence/hermit-release.json-lines.gz" \
+            >"$evidence/log-summary.txt" 2>"$evidence/log-summary.stderr"
+          summary_rc=$?
+          ./scripts/build-buck-release.rs --reconcile-release-evidence \
+            --event-log "$evidence/hermit-release.json-lines.gz" \
+            --show-output "$evidence/build.stdout" \
+            --shell-exit "$shell_rc" \
+            --workspace "$GITHUB_WORKSPACE" \
+            --receipt "$evidence/reconciliation.tsv" \
+            >"$evidence/reconciliation.stdout" 2>"$evidence/reconciliation.stderr"
+          reconciliation_rc=$?
+          ./scripts/build-buck-release.rs --validate-release-candidate \
+            --show-output "$evidence/build.stdout" \
+            --metadata "$evidence/metadata.tsv" \
+            --workspace "$GITHUB_WORKSPACE" \
+            --version-json "$evidence/candidate-version.json" \
+            --receipt "$evidence/candidate-validation.tsv" \
+            >"$evidence/candidate-validation.stdout" \
+            2>"$evidence/candidate-validation.stderr"
+          candidate_rc=$?
+          set -e
+          archive="$RUNNER_TEMP/buck2-phase1-release.tar.gz"
+          scan_receipt="$RUNNER_TEMP/buck2-phase1-release-scan.tsv"
+          ./scripts/build-buck-release.rs --scan-and-package-public-evidence \
+            --root "$evidence" \
+            --archive "$archive" \
+            --receipt-output "$scan_receipt" \
+            >"$RUNNER_TEMP/release-evidence-scan.stdout" \
+            2>"$RUNNER_TEMP/release-evidence-scan.stderr"
+          marker_count="$(awk -F '\t' '$1 == "known_credential_marker_lines" { print $2 }' "$scan_receipt")"
+          test "$marker_count" = 0
+          {
+            echo "### Feature-complete Hermit release evidence"
+            echo
+            echo "Shell exit: \`$shell_rc\`"
+            echo "Buck log-summary exit: \`$summary_rc\`"
+            echo "Typed reconciliation exit: \`$reconciliation_rc\`"
+            echo "Typed candidate-version exit: \`$candidate_rc\`"
+            echo "Known credential-marker lines: \`$marker_count\`"
+          } >>"$GITHUB_STEP_SUMMARY"
+          artifact_path="$(realpath -e "$archive")"
+          test "$artifact_path" = "$archive"
+          echo "artifact-path=$artifact_path" >>"$GITHUB_OUTPUT"
+          # safe-to-upload means secret-scan/artifact safety only, never parity/pass;
+          # the typed verdict below controls this step's success.
+          echo "safe-to-upload=true" >>"$GITHUB_OUTPUT"
+          ./scripts/build-buck-release.rs --release-evidence-verdict \
+            --summary-exit "$summary_rc" \
+            --reconciliation-exit "$reconciliation_rc" \
+            --candidate-exit "$candidate_rc"
+
+      - name: Upload feature-complete release evidence
+        if: always() && steps.release-evidence.outputs.safe-to-upload == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: buck2-phase1-release-${{ github.run_id }}
+          path: ${{ steps.release-evidence.outputs.artifact-path }}
+          if-no-files-found: error
+          retention-days: 7
+
+  oss-buck2:
+    name: Regenerate and build the OSS Buck2 graph
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out Hermit and its pinned sources
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Configure isolated legacy-job caches
+        shell: bash
+        env:
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          ACTIONS_RUNTIME_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          AWS_ACCESS_KEY_ID: ""
+          AWS_SECRET_ACCESS_KEY: ""
+          AWS_SESSION_TOKEN: ""
+        run: |
+          set -euo pipefail
+          {
+            echo "CARGO_HOME=$RUNNER_TEMP/cargo-home"
+            echo "DOTSLASH_CACHE=$RUNNER_TEMP/dotslash-cache"
+            echo "HERMIT_BUCK2_TOOL_CACHE=$RUNNER_TEMP/hermit-buck2-tools"
+            echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home"
+          } >>"$GITHUB_ENV"
+          echo "$RUNNER_TEMP/cargo-home/bin" >>"$GITHUB_PATH"
+
+      - name: Install legacy-job prerequisites and pinned Rust toolchain
+        timeout-minutes: 15
+        shell: bash
+        env:
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          ACTIONS_RUNTIME_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          AWS_ACCESS_KEY_ID: ""
+          AWS_SECRET_ACCESS_KEY: ""
+          AWS_SESSION_TOKEN: ""
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y liblzma-dev libunwind-dev zstd
+          channel="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -n 1)"
+          test -n "$channel"
+          rustup toolchain install "$channel" --profile minimal --component clippy --component rustfmt
+          rustc --version --verbose
+          cargo install rust-script --version 0.36.0 --locked --root "$CARGO_HOME"
+          test -x "$CARGO_HOME/bin/rust-script"
+          resolved_rust_script="$(command -v rust-script)"
+          test "$(realpath "$resolved_rust_script")" = "$(realpath "$CARGO_HOME/bin/rust-script")"
+          test "$("$resolved_rust_script" --version)" = "rust-script 0.36.0"
+
+      - name: Install legacy-job public DotSlash
+        timeout-minutes: 5
+        shell: bash
+        env:
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          ACTIONS_RUNTIME_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          AWS_ACCESS_KEY_ID: ""
+          AWS_SECRET_ACCESS_KEY: ""
+          AWS_SESSION_TOKEN: ""
+          DOTSLASH_SHA256: 4c75c6eb7890ae35993b962073f6d9bbe78b42b81a5691303ad70f63bfbf7196
+          DOTSLASH_URL: https://github.com/facebook/dotslash/releases/download/v0.5.9/dotslash-linux-musl.x86_64.v0.5.9.tar.gz
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/dotslash.tar.gz"
+          bin_dir="$RUNNER_TEMP/dotslash-bin"
+          curl --proto '=https' --tlsv1.2 --fail --show-error --location \
+            "$DOTSLASH_URL" --output "$archive"
+          printf '%s  %s\n' "$DOTSLASH_SHA256" "$archive" | sha256sum --check --strict
+          mkdir -p "$bin_dir"
+          tar -xzf "$archive" -C "$bin_dir"
+          test -x "$bin_dir/dotslash"
+          echo "$bin_dir" >>"$GITHUB_PATH"
+          echo "PUBLIC_DOTSLASH=$bin_dir/dotslash" >>"$GITHUB_ENV"
+
+      - name: Regenerate the legacy shared Rust dependency graph
+        timeout-minutes: 45
+        shell: bash
+        env:
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          ACTIONS_RUNTIME_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          AWS_ACCESS_KEY_ID: ""
+          AWS_SECRET_ACCESS_KEY: ""
+          AWS_SESSION_TOKEN: ""
+        run: ./bootstrap/regenerate-rust-deps
+
+      - name: Configure legacy Buck Rust flags
+        shell: bash
+        env:
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          ACTIONS_RUNTIME_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          AWS_ACCESS_KEY_ID: ""
+          AWS_SECRET_ACCESS_KEY: ""
+          AWS_SESSION_TOKEN: ""
+          RUSTFLAGS: -C link-arg=-llzma
+        run: |
+          set -euo pipefail
+          wrapper_dir="$RUNNER_TEMP/buck2-rustc-wrapper"
+          real_rustc="$(rustup which rustc)"
+          read -r -a rustflags <<<"$RUSTFLAGS"
+          mkdir -p "$wrapper_dir"
+          {
+            echo '#!/usr/bin/env bash'
+            printf 'exec %q' "$real_rustc"
+            printf ' %q' "${rustflags[@]}"
+            printf ' "$@"\n'
+          } >"$wrapper_dir/rustc"
+          chmod +x "$wrapper_dir/rustc"
+          echo "$wrapper_dir" >>"$GITHUB_PATH"
+
+      - name: Build the four Reverie targets
+        timeout-minutes: 45
+        shell: bash
+        env:
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          ACTIONS_RUNTIME_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          AWS_ACCESS_KEY_ID: ""
+          AWS_SECRET_ACCESS_KEY: ""
+          AWS_SESSION_TOKEN: ""
+        run: |
+          set -euo pipefail
+          "$PUBLIC_DOTSLASH" ./bootstrap/buck2 build \
+            reverie//:reverie-ptrace \
+            reverie//:reverie-rpc-transport \
+            reverie//:reverie-liteinst \
+            reverie//:reverie-kvm
+
+      - name: Run the full third-party diagnostic
+        id: third-party-diagnostic
+        if: always()
+        timeout-minutes: 45
+        shell: bash
+        env:
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          ACTIONS_RUNTIME_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          AWS_ACCESS_KEY_ID: ""
+          AWS_SECRET_ACCESS_KEY: ""
+          AWS_SESSION_TOKEN: ""
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/buck2-third-party-evidence"
+          if [[ -e $evidence ]]; then
+            echo "::error::refusing stale third-party evidence path: $evidence"
+            exit 1
+          fi
+          mkdir "$evidence"
+          log="$evidence/buck2-third-party.log"
+          set +e
+          timeout --foreground --kill-after=30s 40m \
+            "$PUBLIC_DOTSLASH" ./bootstrap/buck2 build --keep-going shim//third-party/rust/... >"$log" 2>&1
+          diagnostic_rc=$?
+          set -e
+          printf 'diagnostic_exit\t%s\n' "$diagnostic_rc" >"$evidence/diagnostic-exit.tsv"
+          echo "exit-code=$diagnostic_rc" >>"$GITHUB_OUTPUT"
+          {
+            echo "### Full third-party Buck2 diagnostic"
+            echo
+            echo "Exit code: \`$diagnostic_rc\`"
+            echo
+            echo "This target pattern is diagnostic and includes optional or non-host targets."
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Scan and package the full third-party diagnostic
+        id: third-party-evidence
+        if: always()
+        timeout-minutes: 10
+        shell: bash
+        env:
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          ACTIONS_RUNTIME_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          AWS_ACCESS_KEY_ID: ""
+          AWS_SECRET_ACCESS_KEY: ""
+          AWS_SESSION_TOKEN: ""
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/buck2-third-party-evidence"
+          test -d "$evidence"
+          staging="$RUNNER_TEMP/buck2-third-party-upload"
+          ./scripts/build-buck-release.rs --scan-and-stage-public-evidence \
+            --source "$evidence/buck2-third-party.log" \
+            --staging "$staging" \
+            --name buck2-third-party.log
+          tail -n 200 "$staging/buck2-third-party.log"
+          artifact_path="$(realpath -e "$staging")"
+          test "$artifact_path" = "$staging"
+          echo "artifact-path=$artifact_path" >>"$GITHUB_OUTPUT"
+          echo "safe-to-upload=true" >>"$GITHUB_OUTPUT"
+
+      - name: Upload the full third-party diagnostic log
+        if: always() && steps.third-party-evidence.outputs.safe-to-upload == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: buck2-third-party-diagnostic-${{ github.run_id }}
+          path: ${{ steps.third-party-evidence.outputs.artifact-path }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Build the Hermit green gate
+        if: always()
+        timeout-minutes: 45
+        shell: bash
+        env:
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          ACTIONS_RUNTIME_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          AWS_ACCESS_KEY_ID: ""
+          AWS_SECRET_ACCESS_KEY: ""
+          AWS_SESSION_TOKEN: ""
+        run: '"$PUBLIC_DOTSLASH" ./bootstrap/buck2 build //hermit-cli:hermit'

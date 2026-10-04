@@ -1,3 +1,13 @@
 [toolchain]
 # @fb-only: path = "../../../third-party/rust-toolchain/rustup/current/basic"
-channel = "nightly" # @oss-only
+# Pinned so the OSS Buck2 build is reproducible. The shim's Rust toolchain is
+# `system_rust_toolchain`, which runs whatever `rustc` is on PATH; under rustup
+# that resolves through this file, so a floating `nightly` gives a cold reviewer
+# a different compiler on a different day and leaves every other bootstrap pin
+# (Buck2 release, Reindeer revision) without effect. nightly-2026-07-12 is the
+# toolchain used by the recorded Buck2 validation: rustc 1.99.0-nightly
+# (be8e82435 2026-07-11). See docs/BUCK2_OSS.md.
+channel = "nightly-2026-07-12" # @oss-only
+# Date-pinning installs a fresh dated toolchain; rustup only adds clippy and
+# rustfmt for it when they are requested here.
+components = ["clippy", "rustfmt"] # @oss-only

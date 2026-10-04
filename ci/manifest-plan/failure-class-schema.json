@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "values": [
+    "product_failure",
+    "understood_infrastructure_failure",
+    "understood_prerequisite_failure",
+    "no_result"
+  ]
+}

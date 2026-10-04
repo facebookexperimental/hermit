@@ -5,248 +5,175 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+# Nextest flake census: run a nextest selection N times with retries off and
+# give every test a verdict.
+#
+# This is the Rust-test half of the flake census. The end-to-end manifest half
+# is `ci/compat-envelope/pressure-test.rs run --green --repetitions N
+# --no-retry`; see ci/compat-envelope/README.md "Flake census". Both use the
+# same verdicts:
+#
+#   CLEAN       every run passed
+#   FLAKY       some runs passed and some failed
+#   FAILING     no run passed, and at least one failed
+#   INCOMPLETE  no product failure, but some run produced no product verdict
+#
+# There is no loop here and no message matching. Nextest repeats the selection
+# itself (`--stress-count`), and each failure is classified from the typed
+# `type` that nextest writes on its JUnit <failure>, mirroring the manifest
+# harness's failure classes:
+#
+#   "test failure ..." (nonzero exit, leak)   -> product failure
+#   "test abort" with a signal other than 9   -> product failure (crash)
+#   "test abort" with SIGKILL                 -> no result (OOM or external kill)
+#   "test timeout"                            -> no result (wall limit; a hang
+#                                                looks like this, so read it)
+#   anything else                             -> no result, and named
+#
+# Usage:
+#   scripts/stress-test.sh [-n RUNS] [-o OUTDIR] -- NEXTEST_SELECTION...
+#
+#   -n RUNS    nextest --stress-count (default: 20)
+#   -o OUTDIR  output directory (default: ignored/stress-test/<UTC time>)
+#   NEXTEST_SELECTION  the selection exactly as a validate DAG test.* node passes
+#              it to ci/run-nextest-counted.sh, e.g. for test.detcore_misc:
+#              -p hermit-detcore --test tests_misc -j 1 -- --skip has_rdrand_without_detcore
+#
+# Writes OUTDIR/stress-test-results.json, OUTDIR/STRESS_TEST_RESULTS.md and
+# OUTDIR/junit.xml. Exit status: 0 when every test is CLEAN, 1 otherwise, 2 on
+# usage or build errors.
+#
+# The canonical .config/nextest.toml timeouts apply. The validate node's
+# per-machine wall multiplier and per-test CPU budgets come from
+# ci/run-nextest-counted.sh, which does not support --stress-count yet: its
+# per-attempt CPU records are keyed without the stress iteration.
+
 set -uo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT_DIR" || exit 1
+cd "$ROOT_DIR" || exit 2
 
 RUNS=20
-THREADS="$(nproc 2>/dev/null || echo 4)"
-FILTERSET=""
-TIMEOUT_SECS=1800
-OUTDIR="docs"
+OUTDIR=""
 
-while getopts "n:j:E:p:t:o:h" opt; do
+while getopts "n:o:h" opt; do
   case "$opt" in
     n) RUNS="$OPTARG" ;;
-    j) THREADS="$OPTARG" ;;
-    E) FILTERSET="$OPTARG" ;;
-    p) FILTERSET="package($OPTARG)" ;;
-    t) TIMEOUT_SECS="$OPTARG" ;;
     o) OUTDIR="$OPTARG" ;;
-    h) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    h) sed -n '8,48p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "run with -h for usage" >&2; exit 2 ;;
   esac
 done
-
-command -v cargo-nextest >/dev/null 2>&1 || {
-  echo "error: cargo-nextest is required (https://nexte.st). Install with:" >&2
-  echo "  cargo install cargo-nextest --locked" >&2
+shift $((OPTIND - 1))
+[ "${1:-}" = "--" ] && shift
+if [ "$#" -eq 0 ]; then
+  echo "error: give the nextest selection after --; run with -h for usage" >&2
   exit 2
-}
-
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/hermit-stress.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT
-JUNIT="target/nextest/ci/junit.xml"   # written by the [profile.ci.junit] config
-
-declare -a NEXTEST_FILTER=()
-[ -n "$FILTERSET" ] && NEXTEST_FILTER=(-E "$FILTERSET")
-
-echo ":: Hermit stress test"
-echo "   root:     $ROOT_DIR"
-echo "   runs:     $RUNS"
-echo "   threads:  $THREADS  (cores: $(nproc 2>/dev/null || echo '?'))"
-echo "   filter:   ${FILTERSET:-<whole suite>}"
-echo "   timeout:  ${TIMEOUT_SECS}s per iteration"
-echo
-
-# Build test binaries once so iteration timing/parallelism isn't polluted by
-# compilation, and so a build failure aborts before we waste the window.
-echo ":: building test binaries (cargo nextest run --no-run) ..."
-if ! cargo nextest run --no-run "${NEXTEST_FILTER[@]}" >"$WORK/build.log" 2>&1; then
-  echo "error: test build failed; see below" >&2
-  tail -30 "$WORK/build.log" >&2
-  exit 1
 fi
+case "$RUNS" in
+  ''|*[!0-9]*|0) echo "error: -n needs a positive integer" >&2; exit 2 ;;
+esac
+OUTDIR="${OUTDIR:-ignored/stress-test/$(date -u +%Y%m%dT%H%M%SZ)}"
+mkdir -p "$OUTDIR" || exit 2
 
-# Run the suite RUNS times; keep each iteration's JUnit report.
-for i in $(seq 1 "$RUNS"); do
-  printf ":: iteration %d/%d ... " "$i" "$RUNS"
-  rm -f "$JUNIT"
-  start=$(date +%s)
-  timeout "$TIMEOUT_SECS" cargo nextest run --profile ci --no-fail-fast \
-    --test-threads "$THREADS" "${NEXTEST_FILTER[@]}" \
-    >"$WORK/run_$i.log" 2>&1
-  rc=$?
-  end=$(date +%s)
-  if [ -f "$JUNIT" ]; then
-    cp "$JUNIT" "$WORK/iter_$i.xml"
-    printf "done rc=%d (%ds)\n" "$rc" "$((end - start))"
-  elif [ "$rc" -eq 124 ]; then
-    printf "TIMEOUT after %ds (no report)\n" "$TIMEOUT_SECS"
-  else
-    printf "no JUnit report (rc=%d) -- see run_%d.log\n" "$rc" "$i"
-    cp "$WORK/run_$i.log" "$WORK/iter_${i}_nolog.txt" 2>/dev/null || true
-  fi
-done
+JUNIT="target/nextest/ci/junit.xml"   # written by the [profile.ci.junit] config
+rm -f "$JUNIT"
+echo ":: nextest flake census: $RUNS run(s), retries off: $*"
+start=$(date +%s)
+cargo nextest run --profile ci --no-fail-fast --retries 0 \
+  --stress-count "$RUNS" "$@" >"$OUTDIR/nextest.log" 2>&1
+rc=$?
+end=$(date +%s)
+echo ":: nextest exited $rc after $((end - start))s; log: $OUTDIR/nextest.log"
+if [ ! -f "$JUNIT" ]; then
+  echo "error: nextest wrote no JUnit report; see $OUTDIR/nextest.log" >&2
+  tail -20 "$OUTDIR/nextest.log" >&2
+  exit 2
+fi
+cp "$JUNIT" "$OUTDIR/junit.xml"
 
-mkdir -p "$OUTDIR"
-MD="$OUTDIR/STRESS_TEST_RESULTS.md"
-JSON="$OUTDIR/stress-test-results.json"
-
-# Aggregate all iteration XMLs into per-test pass/total + categorized failures.
-python3 - "$WORK" "$MD" "$JSON" "$RUNS" "$THREADS" "${FILTERSET:-<whole suite>}" <<'PY'
-import glob, os, sys, json, re
+python3 - "$OUTDIR" "$RUNS" "$((end - start))" "$*" <<'PY'
+import json, os, re, sys
 from xml.etree import ElementTree as ET
 
-work, md_path, json_path, runs, threads, filterset = sys.argv[1:7]
-runs = int(runs)
+outdir, runs, wall, selection = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+root = ET.parse(os.path.join(outdir, "junit.xml")).getroot()
 
-# Infra markers => "system-infra" rather than a hermit/test defect.
-INFRA = [
-    "perf_event_open", "perf_event_paranoid", "seccomp", "operation not permitted",
-    "eperm", "namespace", "/dev/kvm", "cannot allocate memory", "enomem",
-    "no space left", "enospc", "resource temporarily unavailable", "too many open files",
-    "address already in use", "connection refused",
-]
+def classify(failure):
+    kind = failure.get("type") or ""
+    message = failure.get("message") or ""
+    if kind.startswith("test failure"):
+        return "product", kind
+    if kind == "test abort":
+        signal = re.search(r"signal (\d+)", message)
+        if signal and signal.group(1) == "9":
+            return "no_result", message
+        return "product", message or kind
+    if kind == "test timeout":
+        return "no_result", kind
+    return "no_result", kind or "unclassified JUnit failure"
 
-tests = {}   # id -> {"pass":int, "fail":int, "msgs":set}
-iters_seen = 0
-for xml in sorted(glob.glob(os.path.join(work, "iter_*.xml"))):
-    iters_seen += 1
-    try:
-        root = ET.parse(xml).getroot()
-    except Exception:
-        continue
-    for tc in root.iter("testcase"):
-        cls = tc.get("classname", "")
-        name = tc.get("name", "")
-        tid = f"{cls}::{name}" if cls else name
-        t = tests.setdefault(tid, {"pass": 0, "fail": 0, "msgs": set()})
-        failed = False
-        for child in tc:
-            if child.tag in ("failure", "error"):
-                failed = True
-                msg = (child.get("message") or "") + " " + (child.text or "")
-                msg = re.sub(r"\s+", " ", msg).strip()
-                if msg:
-                    t["msgs"].add(msg[:500])
-        if failed:
-            t["fail"] += 1
-        else:
-            t["pass"] += 1
+tests = {}
+iterations = set()
+for suite in root.iter("testsuite"):
+    # Nextest names each suite <binary>@stress-<i>; count iterations, not
+    # binaries x iterations.
+    stress = re.search(r"@stress-(\d+)$", suite.get("name") or "")
+    iterations.add(stress.group(1) if stress else suite.get("name"))
+    for case in suite.iter("testcase"):
+        if any(c.tag == "skipped" for c in case):
+            continue
+        test = f"{case.get('classname')}::{case.get('name')}"
+        row = tests.setdefault(test, {"test": test, "runs": 0, "passes": 0,
+                                      "product_failures": 0, "no_results": 0,
+                                      "signatures": {}})
+        row["runs"] += 1
+        failures = [c for c in case if c.tag in ("failure", "error")]
+        if not failures:
+            row["passes"] += 1
+            continue
+        klass, signature = classify(failures[0])
+        row["product_failures" if klass == "product" else "no_results"] += 1
+        row["signatures"][signature] = row["signatures"].get(signature, 0) + 1
 
-def categorize(rec):
-    total = rec["pass"] + rec["fail"]
-    if rec["fail"] == 0:
-        return "green"
-    blob = " ".join(rec["msgs"]).lower()
-    if any(m in blob for m in INFRA):
-        return "system-infra"
-    if rec["pass"] > 0:
-        return "flaky"          # nondeterministic: hermit flake or test nondeterminism
-    return "consistent-failure" # 0/N: test bug or hermit bug (needs triage)
+def verdict(row):
+    # Same rule as flake_verdict in ci/compat-envelope/pressure-test.rs: a
+    # test is CLEAN only if every requested run was observed and passed.
+    if row["product_failures"] > 0:
+        return "FLAKY" if row["passes"] > 0 else "FAILING"
+    if row["runs"] == runs and row["passes"] == runs:
+        return "CLEAN"
+    return "INCOMPLETE"
 
-results = []
-for tid, rec in sorted(tests.items()):
-    total = rec["pass"] + rec["fail"]
-    results.append({
-        "test": tid,
-        "category": categorize(rec),
-        "pass": rec["pass"],
-        "total": total,
-        "failures": sorted(rec["msgs"]),
-    })
-
-# Note: os.environ TZ-free timestamp; the harness disallows live clocks in some
-# contexts, so read wall time from the filesystem of the newest iteration file.
-ts = "unknown"
-xmls = sorted(glob.glob(os.path.join(work, "iter_*.xml")))
-if xmls:
-    import datetime
-    ts = datetime.datetime.fromtimestamp(
-        os.path.getmtime(xmls[-1]), datetime.timezone.utc
-    ).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-by_cat = {}
-for r in results:
-    by_cat.setdefault(r["category"], []).append(r)
-
-summary = {c: len(v) for c, v in by_cat.items()}
-payload = {
-    "timestamp": ts,
-    "runs_requested": runs,
-    "iterations_recorded": iters_seen,
-    "threads": int(threads),
-    "filter": filterset,
-    "total_tests": len(results),
-    "summary": summary,
-    "results": results,
-}
-with open(json_path, "w") as f:
-    json.dump(payload, f, indent=2)
+rows = sorted(tests.values(), key=lambda r: r["test"])
+counts = {}
+for row in rows:
+    row["verdict"] = verdict(row)
+    counts[row["verdict"]] = counts.get(row["verdict"], 0) + 1
+summary = {"runs_requested": runs, "iterations_recorded": len(iterations),
+           "selection": selection, "retries": 0, "wall_seconds": wall,
+           "tests": len(rows), "verdicts": counts, "results": rows}
+with open(os.path.join(outdir, "stress-test-results.json"), "w") as f:
+    json.dump(summary, f, indent=2)
     f.write("\n")
 
-green = summary.get("green", 0)
-flaky = by_cat.get("flaky", [])
-infra = by_cat.get("system-infra", [])
-consistent = by_cat.get("consistent-failure", [])
-
-lines = []
-lines.append("# Hermit stress-test results")
-lines.append("")
-lines.append("Generated by `scripts/stress-test.sh` (each test run N times under "
-             "cargo-nextest; CPU oversubscription is intentional). Re-run with a "
-             "wider filter for full coverage; `-E`/`-p` scope the run.")
-lines.append("")
-lines.append(f"- Last stress-tested: `{ts}`")
-lines.append(f"- Iterations: {iters_seen}/{runs} recorded  |  test-threads: {threads}"
-             f"  |  filter: `{filterset}`")
-lines.append(f"- Tests: {len(results)}  |  "
-             f"green: {green}  |  flaky: {len(flaky)}  |  "
-             f"system-infra: {len(infra)}  |  consistent-failure: {len(consistent)}")
-lines.append("")
-verdict = "ALL GREEN ✅" if len(results) and not (flaky or consistent or infra) else \
-          ("FLAKY / FAILURES ⚠️" if results else "NO RESULTS ❌")
-lines.append(f"**Verdict: {verdict}**")
-lines.append("")
-lines.append("Categories: **green** = passed every run; **flaky** = passed some / "
-             "failed some (hermit flake or test nondeterminism); **system-infra** = "
-             "failure text matches a known host/runner limitation; "
-             "**consistent-failure** = failed every run (test bug or hermit bug — needs triage).")
-lines.append("")
-
-def table(rows):
-    out = ["| test | pass/total | category |", "| --- | --- | --- |"]
-    for r in rows:
-        out.append(f"| `{r['test']}` | {r['pass']}/{r['total']} | {r['category']} |")
-    return out
-
-for title, rows in (("Flaky", flaky), ("Consistent failures", consistent),
-                    ("System-infra failures", infra)):
-    if rows:
-        lines.append(f"## {title}")
-        lines += table(rows)
-        lines.append("")
-        for r in rows:
-            if r["failures"]:
-                lines.append(f"<details><summary>{r['test']} diagnostics</summary>")
-                lines.append("")
-                for m in r["failures"][:5]:
-                    lines.append(f"- {m}")
-                lines.append("")
-                lines.append("</details>")
-                lines.append("")
-
-lines.append(f"## All tests ({len(results)})")
-lines += table(results)
-lines.append("")
-lines.append(f"Machine-readable results: `{os.path.basename(json_path)}`.")
-
-with open(md_path, "w") as f:
+lines = ["# Nextest flake census", "",
+         f"- Selection: `{selection}`",
+         f"- Runs: {len(iterations)}/{runs} recorded, retries off, {wall} s wall",
+         "- Verdicts: " + ", ".join(f"{counts.get(v, 0)} {v}" for v in
+                                     ("CLEAN", "FLAKY", "FAILING", "INCOMPLETE")),
+         "",
+         "| Test | Runs | Passes | Product failures | No result | Signatures | Verdict |",
+         "| --- | ---: | ---: | ---: | ---: | --- | --- |"]
+for row in rows:
+    signatures = "; ".join(f"{k} x{v}" for k, v in sorted(row["signatures"].items()))
+    lines.append(f"| `{row['test']}` | {row['runs']} | {row['passes']} | "
+                 f"{row['product_failures']} | {row['no_results']} | {signatures} | {row['verdict']} |")
+with open(os.path.join(outdir, "STRESS_TEST_RESULTS.md"), "w") as f:
     f.write("\n".join(lines) + "\n")
-
-print(f"\n:: wrote {md_path} and {json_path}")
-print(f":: tests={len(results)} green={green} flaky={len(flaky)} "
-      f"infra={len(infra)} consistent-failure={len(consistent)}")
-sys.exit(0 if not (flaky or consistent) else 1)
+print("\n".join(lines[:5]))
+for row in rows:
+    if row["verdict"] != "CLEAN":
+        print(f"  {row['verdict']} {row['test']}: {row['passes']}/{row['runs']} passed {row['signatures']}")
+sys.exit(0 if counts.get("CLEAN", 0) == len(rows) and rows else 1)
 PY
-STATUS=$?
-
-echo
-if [ "$STATUS" -eq 0 ]; then
-  echo ":: RESULT: all recorded tests are green."
-else
-  echo ":: RESULT: flaky or failing tests detected (see $MD)."
-fi
-exit "$STATUS"

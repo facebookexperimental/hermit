@@ -6,11 +6,16 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <errno.h>
 #include <locale.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/sysinfo.h>
+#include <time.h>
+#include <unistd.h>
 
 static long long x = 0;
 pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -88,7 +93,7 @@ void* thread2(void* vargp) {
   return NULL;
 }
 
-int main() {
+static int original_workload(void) {
   setlocale(LC_NUMERIC, ""); // Print large numbers with commas.
   pthread_t thread[2];
   pthread_mutex_lock(&mutex);
@@ -103,4 +108,135 @@ int main() {
     return 1;
   }
   return 0;
+}
+
+struct observation {
+  long uptime;
+  struct timespec clock;
+};
+
+static struct observation observe(const char* label) {
+  struct sysinfo info;
+  struct observation result;
+  if (sysinfo(&info) != 0 ||
+      clock_gettime(CLOCK_MONOTONIC, &result.clock) != 0) {
+    perror("sysinfo/clock_gettime observation");
+    exit(1);
+  }
+  result.uptime = info.uptime;
+  printf("sysinfo observation %s uptime=%ld\n", label, result.uptime);
+  return result;
+}
+
+static void require_order(struct observation before, struct observation after) {
+  if (after.uptime < before.uptime ||
+      after.clock.tv_sec < before.clock.tv_sec ||
+      (after.clock.tv_sec == before.clock.tv_sec &&
+       after.clock.tv_nsec < before.clock.tv_nsec)) {
+    fprintf(stderr, "sysinfo uptime or monotonic clock moved backwards\n");
+    exit(1);
+  }
+}
+
+struct worker_observations {
+  struct observation before;
+  struct observation after;
+};
+
+static void* observation_worker(void* arg) {
+  struct worker_observations* observations = arg;
+  observations->before = observe("worker before work");
+  // This advances time; pthread_create/join, not this delay, establishes the
+  // observation order between the parent and worker.
+  const struct timespec work = {.tv_sec = 0, .tv_nsec = 250000000};
+  if (nanosleep(&work, NULL) != 0) {
+    perror("observation nanosleep");
+    exit(1);
+  }
+  observations->after = observe("worker after work");
+  require_order(observations->before, observations->after);
+  if (observations->before.clock.tv_sec == observations->after.clock.tv_sec &&
+      observations->before.clock.tv_nsec == observations->after.clock.tv_nsec) {
+    fprintf(stderr, "monotonic clock did not advance during subsecond work\n");
+    exit(1);
+  }
+  return NULL;
+}
+
+static void require_pthread_success(int error, const char* operation) {
+  if (error != 0) {
+    fprintf(stderr, "%s: %s\n", operation, strerror(error));
+    exit(1);
+  }
+}
+
+static long observation_argument(const char* text) {
+  char* end;
+  errno = 0;
+  long value = strtol(text, &end, 10);
+  if (errno != 0 || text == end || *end != '\0' || value < 0) {
+    fprintf(stderr, "invalid observation argument: %s\n", text);
+    exit(1);
+  }
+  return value;
+}
+
+static int observe_thread_and_exec(const char* executable) {
+  struct observation before = observe("parent before thread");
+  struct worker_observations worker;
+  pthread_t thread;
+  require_pthread_success(
+      pthread_create(&thread, NULL, observation_worker, &worker),
+      "pthread_create");
+  require_pthread_success(pthread_join(thread, NULL), "pthread_join");
+  struct observation after = observe("parent after join");
+  require_order(before, worker.before);
+  require_order(worker.after, after);
+
+  // Carry both observations through exec: integer uptime must not regress, and
+  // the finer clock must retain progress that its integer projection can hide.
+  char uptime[32], seconds[32], nanos[32];
+  if (snprintf(uptime, sizeof(uptime), "%ld", after.uptime) < 0 ||
+      snprintf(seconds, sizeof(seconds), "%ld", after.clock.tv_sec) < 0 ||
+      snprintf(nanos, sizeof(nanos), "%ld", after.clock.tv_nsec) < 0 ||
+      fflush(stdout) != 0) {
+    perror("prepare observation exec");
+    return 1;
+  }
+  execl(
+      executable,
+      executable,
+      "--observe-after-exec",
+      uptime,
+      seconds,
+      nanos,
+      NULL);
+  perror("observation execl");
+  return 1;
+}
+
+int main(int argc, char** argv) {
+  if (argc == 1) {
+    return original_workload();
+  }
+  if (argc == 2 && strcmp(argv[1], "--observe-thread-exec") == 0) {
+    return observe_thread_and_exec(argv[0]);
+  }
+  if (argc == 5 && strcmp(argv[1], "--observe-after-exec") == 0) {
+    struct observation before = {
+        .uptime = observation_argument(argv[2]),
+        .clock =
+            {.tv_sec = observation_argument(argv[3]),
+             .tv_nsec = observation_argument(argv[4])},
+    };
+    if (before.clock.tv_nsec >= 1000000000) {
+      fprintf(stderr, "invalid observation nanoseconds\n");
+      return 1;
+    }
+    require_order(before, observe("after exec"));
+    puts("sysinfo thread join and exec continuity checked");
+    return 0;
+  }
+  fprintf(stderr, "unknown sysinfo_uptime arguments\n");
+  return 1;
 }

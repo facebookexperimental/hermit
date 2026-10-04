@@ -1,14 +1,6 @@
 name: Merge Gate
 
 on:
-  pull_request:
-    branches: [main]
-    types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review]
-  merge_group:
-    types: [checks_requested]
-  workflow_run:
-    workflows: ["Rust"]
-    types: [completed]
   workflow_dispatch:
     inputs:
       pr_number:
@@ -18,31 +10,50 @@ on:
         required: true
         type: string
 
-# This lightweight required check accepts an exact PR head after the repository
-# CI workflow succeeds or after a fully green local validate.sh run applies the
-# locally-validated label. Merge-group checks inspect their constituent PR heads
-# instead of trusting the synthetic queue commit.
+# This is a manually dispatched diagnostic retained for inspecting a pull
+# request's recorded evidence. It is not a landing authority. A qualifying
+# local exact-head `scripts/validate.rs` receipt remains canonical, and neither
+# this workflow nor the portable workflow's integration-branch result gates a
+# pull request, `main`, or a landing.
 #
-# The gate is fork-only because facebookexperimental/hermit has no access to the
-# fork self-hosted runners and fork pull requests receive a read-only token in
-# that repository. Upstream relies on the GitHub-hosted Rust job instead.
+# The jobs below retain handling for historical event payloads because they are
+# useful when reading old runs. The only active trigger in this file is
+# `workflow_dispatch`; adding any automatic trigger is an owner-level policy
+# change and is refused by scripts/check-github-actions-triggers.rs.
+
+# Historical event-specific grouping remains in place for old run inspection;
+# the only current trigger is workflow_dispatch.
+concurrency:
+  group: merge-gate-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.event.workflow_run.head_sha || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   actions: read
   contents: read
   pull-requests: read
 
+# All merge-gate jobs run on the dedicated `gate` self-hosted runner pool rather
+# than `ubuntu-latest`. They are pure control-plane work — `gh api` reads, `jq`,
+# a shallow trusted-ref checkout, and one bash lint — with no Rust build, PMU, or
+# ptrace needs. On 2026-08-03 the public-repo GitHub-hosted concurrency cap left
+# ci-portable's ~34-min build flood saturating the hosted pool, so even this ~5s
+# stamp-check queued behind 40-min builds. Routing to
+# `[self-hosted, gate]` targets an always-idle lightweight runner
+# (selected by the `gate` label only) that picks these jobs up in seconds;
+# the three PMU runners also carry the `gate` label as fallback, so a single-node
+# outage cannot block a requested diagnostic.
 jobs:
   refire-on-ci-completion:
     name: refire-on-ci-completion
     if: github.repository == 'rrnewton/hermit' && github.event_name == 'workflow_run'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, gate]
     timeout-minutes: 5
     permissions:
       actions: write
       contents: read
       pull-requests: read
     steps:
-      - name: Re-dispatch the gate for a completed PR CI run
+      - name: Re-dispatch the gate for completed portable, privileged, or demo runs
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -81,55 +92,705 @@ jobs:
       github.repository == 'rrnewton/hermit' &&
       github.event_name == 'pull_request' &&
       github.event.action == 'synchronize'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, gate]
     timeout-minutes: 5
     permissions:
       contents: read
       issues: write
       pull-requests: write
     steps:
-      - name: Remove validation inherited from an older PR head
+      - name: Check out the trusted label-strip evidence helper
+        uses: actions/checkout@v4
+        with:
+          # Pin to the trusted base branch, NOT the PR head. This job runs on a
+          # self-hosted runner, so executing scripts/label-strip-evidence.sh from
+          # PR-controlled code would run arbitrary PR code on our infrastructure.
+          # The helper only reads its arguments and calls the GitHub API, so
+          # main's copy is the correct and safe version to run.
+          ref: main
+          persist-credentials: false
+      - name: Remove validation and stale approvals inherited from an older PR head
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.event.after }}
         run: |
           set -euo pipefail
+          # A new push invalidates prior sign-off on the previous revision:
+          #   - locally-validated: the local test evidence no longer matches HEAD.
+          #   - passed-review-{codex,claude}: the reviewers approved an older diff,
+          #     so their approval must be re-earned before the core-review-protocol
+          #     job (below) will let a post-facto-human-review PR land again.
           labels="$(gh api "repos/${REPO}/issues/${PR_NUMBER}/labels" --jq '.[].name')"
-          if grep -Fxq locally-validated <<< "$labels"; then
-            gh api --method DELETE \
-              "repos/${REPO}/issues/${PR_NUMBER}/labels/locally-validated" \
-              --silent
-            echo "Removed stale locally-validated label from PR #$PR_NUMBER."
+          cleared=()
+          locally_validated_cleared=0
+          for stale in locally-validated passed-review-codex passed-review-claude; do
+            if grep -Fxq "$stale" <<< "$labels"; then
+              gh api --method DELETE \
+                "repos/${REPO}/issues/${PR_NUMBER}/labels/${stale}" \
+                --silent
+              echo "Removed stale ${stale} label from PR #$PR_NUMBER."
+              cleared+=("$stale")
+              [ "$stale" = locally-validated ] && locally_validated_cleared=1
+            fi
+          done
+
+          # Preserve the validation record so stripping the label never silently
+          # erases WHAT was validated (commit, profile, durable log pointer). The
+          # helper is best-effort and always exits 0, so it can never fail this
+          # job — merge-gate requires invalidate-local-validation to succeed.
+          if [ "$locally_validated_cleared" = 1 ]; then
+            bash scripts/label-strip-evidence.sh \
+              --pr "$PR_NUMBER" \
+              --repo "$REPO" \
+              --validated-sha "$BEFORE_SHA" \
+              --new-sha "$AFTER_SHA" \
+              --labels "${cleared[*]}" \
+              --actor "invalidate-local-validation (push synchronize)" \
+              --reason "a new push advanced the PR head; local validation applied to the previous head" \
+              || echo "label-strip-evidence helper returned non-zero (ignored; best-effort)."
           fi
 
-  merge-gate:
-    name: merge-gate
-    needs: [invalidate-local-validation]
+  invalidate-mutated-validation-evidence:
+    name: invalidate-mutated-validation-evidence
     if: >-
-      always() &&
       github.repository == 'rrnewton/hermit' &&
-      github.event_name != 'workflow_run'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request != null
+    runs-on: [self-hosted, gate]
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      checks: write
+      issues: write
+      pull-requests: read
     steps:
-      - name: Require successful CI or local validation
+      - name: Fetch the trusted receipt verifier
+        # Fetch the verifier and both registries from one immutable parent
+        # revision.  Advance both refs and all three digests together, and
+        # register this workflow blob in MERGE_GATE_V4_BLOB in the same landing
+        # operation.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_REF: cb78bf76a498809c7b24b1a973574e7c863d5109
+          VERIFIER_REF: cb78bf76a498809c7b24b1a973574e7c863d5109
+        run: |
+          set -euo pipefail
+          verifier="$RUNNER_TEMP/verify-local-validation-receipt.sh"
+          predicate="$RUNNER_TEMP/qualifying-receipt.json"
+          producer="$RUNNER_TEMP/producer-definition.json"
+
+          fetch() { # fetch <repo-path> <destination> <expected-sha256>
+            ref=$REGISTRY_REF
+            [ "$1" = ci-hub/validation/verify_receipt.sh ] && ref=$VERIFIER_REF
+            gh api \
+              "repos/rrnewton/dev-hermit/contents/$1?ref=$ref" \
+              --jq .content | tr -d '\n' | base64 --decode >"$2"
+            echo "$3  $2" | sha256sum --check
+          }
+
+          fetch ci-hub/validation/verify_receipt.sh "$verifier" \
+            1b0792415134afed7066ee70e1bc35319a204c5192cac69d33a8ca96b2f01082
+          fetch ci-hub/validate/qualifying-receipt.json "$predicate" \
+            09f01dd1435ac7cd6ebbcf28b619ff9ff739587b19bf88f1dd23a53f5c881760
+          fetch ci-hub/validate/producer-definition.json "$producer" \
+            fab77f72485776a4bbd00e8674e0315d26443177d80d6a715743846814b5546c
+
+          chmod +x "$verifier"
+          echo "RECEIPT_VERIFIER=$verifier" >>"$GITHUB_ENV"
+          echo "QUALIFYING_RECEIPT_PREDICATE=$predicate" >>"$GITHUB_ENV"
+          echo "PRODUCER_DEFINITION_REGISTRY=$producer" >>"$GITHUB_ENV"
+      - name: Remove local-validation label when its evidence is no longer valid
+        # The verifier fetch is part of the authorization boundary. If that
+        # preceding step fails (API outage, missing commit, or digest mismatch),
+        # this step must still publish a failing exact-head check and clear the
+        # cache label instead of preserving an old green result.
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          pr="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")"
+          state="$(jq -r '.state' <<< "$pr")"
+          head_sha="$(jq -r '.head.sha' <<< "$pr")"
+          head_ref="$(jq -r '.head.ref' <<< "$pr")"
+          head_repo="$(jq -r '.head.repo.full_name // empty' <<< "$pr")"
+          if [ "$state" != open ]; then
+            echo "PR #${PR_NUMBER} is ${state}; no live validation label to protect."
+            exit 0
+          fi
+          if ! jq -e 'any(.labels[]?; .name == "locally-validated")' \
+              <<< "$pr" >/dev/null; then
+            echo "PR #${PR_NUMBER} has no locally-validated label."
+            exit 0
+          fi
+
+          if ! comments_json="$(
+            gh api --paginate --slurp \
+              "repos/${REPO}/issues/${PR_NUMBER}/comments?per_page=100"
+          )"; then
+            echo "::warning::Could not re-read evidence comments; failing closed by removing the label."
+            comments_json='[]'
+          fi
+          comments_file=$(mktemp)
+          trap 'rm -f -- "$comments_file"' EXIT
+          printf '%s\n' "$comments_json" >"$comments_file"
+          if [ -n "${RECEIPT_VERIFIER:-}" ] && [ -x "$RECEIPT_VERIFIER" ]; then
+            if evidence=$("$RECEIPT_VERIFIER" \
+                --repo "$REPO" --sha "$head_sha" --comments "$comments_file"); then
+              echo "PR #${PR_NUMBER} still has a dereferenced exact-head receipt: ${evidence}"
+              exit 0
+            fi
+          else
+            echo "::warning::Trusted receipt verifier is unavailable; failing closed."
+          fi
+
+          # Invalidate both the steady-state v4 context and the transition-only
+          # v3 context before mutating the label. The issue_comment job
+          # itself is not required, and a follow-up dispatch can fail (fork
+          # heads cannot be dispatched at all). Publishing both failures keeps
+          # either ruleset version fail-closed at the exact PR head.
+          summary="No immutable counted full-validation receipt remains for exact head ${head_sha}."
+          for context in merge-gate-v4 merge-gate-v3; do
+            gh api --method POST \
+              -H "Accept: application/vnd.github+json" \
+              "repos/${REPO}/check-runs" \
+              -f name="$context" \
+              -f head_sha="$head_sha" \
+              -f status=completed \
+              -f conclusion=failure \
+              -f details_url="${GITHUB_SERVER_URL}/${REPO}/actions/runs/${GITHUB_RUN_ID}" \
+              -f 'output[title]=Local validation evidence invalidated' \
+              -f "output[summary]=${summary}" \
+              --silent
+            echo "Published failing ${context} for PR #${PR_NUMBER} at ${head_sha}."
+          done
+
+          gh api --method DELETE \
+            "repos/${REPO}/issues/${PR_NUMBER}/labels/locally-validated" \
+            --silent
+          body="[coordinator, github-actions]
+
+          Removed \`locally-validated\`: no remotely readable counted validation receipt remains for exact head \`${head_sha}\`."
+          gh api --method POST "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            -f body="$body" --silent
+          echo "Removed locally-validated from PR #${PR_NUMBER}; evidence no longer validates head ${head_sha}."
+
+          # Events caused by GITHUB_TOKEN do not recursively start workflows.
+          # Same-repository refs can run the normal gate immediately. Fork refs
+          # cannot be passed to workflow_dispatch in the base repository, so the
+          # failing check above remains authoritative until a new validation
+          # record and label re-fire the pull_request gate.
+          if [ "$head_repo" = "$REPO" ]; then
+            gh workflow run merge-gate.yml \
+              --repo "$REPO" \
+              --ref "$head_ref" \
+              -f pr_number="$PR_NUMBER"
+            echo "Dispatched merge-gate for PR #${PR_NUMBER} at ${head_sha}."
+          else
+            echo "PR #${PR_NUMBER} head is in ${head_repo:-an unknown fork}; retaining the failing check until revalidation."
+          fi
+
+  core-review-protocol:
+    name: core-review-protocol
+    if: >-
+      github.repository == 'rrnewton/hermit' &&
+      github.event_name != 'workflow_run' &&
+      github.event_name != 'issue_comment'
+    runs-on: [self-hosted, gate]
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # A pull request's APPROVED-AT bindings live in its ISSUE comments, read
+      # through /issues/{n}/comments, so this job needs issues:read alongside
+      # pull-requests:read. Both stay read-only: the gate never writes.
+      issues: read
+      pull-requests: read
+    steps:
+      - name: Check out the review-protocol linter
+        uses: actions/checkout@v4
+        with:
+          # Pin to the trusted base branch, NOT the PR head. This job runs on a
+          # self-hosted runner, so checking out PR-controlled code and executing
+          # scripts/core-review-protocol-lint.sh from it would run arbitrary PR
+          # code on our infrastructure. The linter reads only environment inputs
+          # (PR_LABELS/PR_BODY/PR_IS_KVM/PR_NUMBER/PR_HEAD_SHA and
+          # PR_COMMENTS_FILE or PR_COMMENTS_JSON), so main's copy is the correct
+          # and safe version to run — and a PR cannot weaken its own gate by
+          # editing the lint script.
+          ref: main
+          persist-credentials: false
+      - name: Enforce the core-change review protocol
         env:
           BASE_REF: ${{ github.event.merge_group.base_ref }}
           EVENT_NAME: ${{ github.event_name }}
-          INVALIDATION_RESULT: ${{ needs.invalidate-local-validation.result }}
-          PR_ACTION: ${{ github.event.action }}
           GH_TOKEN: ${{ github.token }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
           REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
 
-          if [ "$EVENT_NAME" = pull_request ] && [ "$PR_ACTION" = synchronize ] &&
-             [ "$INVALIDATION_RESULT" != success ]; then
-            echo "::error::Could not invalidate local validation from the previous PR head."
+          # Resolve the pull request number(s) this event covers, mirroring the
+          # merge-gate job so the same PRs are gated at PR time and in the queue.
+          if [ "$EVENT_NAME" = pull_request ] || [ "$EVENT_NAME" = workflow_dispatch ]; then
+            if [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = null ]; then
+              echo "::error::workflow_dispatch requires a pr_number input."
+              exit 1
+            fi
+            expected_head="$SHA"
+            [ "$EVENT_NAME" = pull_request ] && expected_head="$PR_HEAD_SHA"
+            pr_numbers="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" |
+              jq -r --arg sha "$expected_head" '
+                select(.base.ref == "main" and .state == "open" and .head.sha == $sha)
+                | .number')"
+            if [ -z "$pr_numbers" ]; then
+              echo "::error::PR #${PR_NUMBER} is not an open main PR at dispatched head ${expected_head}."
+              exit 1
+            fi
+          else
+            owner="${REPO%%/*}"
+            name="${REPO#*/}"
+            base_branch="${BASE_REF#refs/heads/}"
+            pr_numbers="$(
+              gh api graphql \
+                -f owner="$owner" \
+                -f name="$name" \
+                -f branch="$base_branch" \
+                -f query='query($owner: String!, $name: String!, $branch: String!) {
+                repository(owner: $owner, name: $name) {
+                  mergeQueue(branch: $branch) {
+                    entries(first: 100) {
+                      nodes {
+                        headCommit { oid }
+                        pullRequest { number baseRefName }
+                      }
+                    }
+                  }
+                }
+              }' | jq -r --arg sha "$SHA" --arg base "$base_branch" '
+                .data.repository.mergeQueue.entries.nodes
+                | map(select(
+                    .headCommit.oid == $sha
+                    and .pullRequest.baseRefName == $base
+                  ) | .pullRequest.number)
+                | .[]
+              ')"
+          fi
+
+          if [ -z "$pr_numbers" ]; then
+            echo "No main-branch pull request is associated with $SHA; nothing to enforce."
+            exit 0
+          fi
+
+          failed=0
+          while read -r pr_number; do
+            [ -n "$pr_number" ] || continue
+
+            pr_json="$(gh api "repos/${REPO}/pulls/${pr_number}")"
+            labels="$(jq -r '.labels[].name' <<< "$pr_json")"
+            body="$(jq -r '.body // ""' <<< "$pr_json")"
+
+            # The exact head the reviews must bind, read from the PR itself
+            # rather than from the event payload, so a merge_group entry and a
+            # pull_request event resolve it the same way.
+            pr_head="$(jq -r '.head.sha' <<< "$pr_json")"
+
+            # Issue comments carry the APPROVED-AT bindings. `--paginate
+            # --slurp` returns one array PER PAGE, so `add` flattens them into
+            # the single oldest-first array the linter expects; `// []` covers a
+            # PR with no comments at all. A failed fetch aborts the step under
+            # `set -e` rather than degrading into an empty list, because an
+            # empty list would read as "nobody approved" for the wrong reason.
+            #
+            # Written to a FILE, never passed inline: one environment variable
+            # is capped at 128 KiB and PR #2176's comment array is already
+            # 154,666 bytes, which fails exec with E2BIG. Comment volume grows
+            # with review activity, so the inline form would break first on the
+            # PRs this gate matters most for.
+            pr_comments_file="$(mktemp)"
+            gh api "repos/${REPO}/issues/${pr_number}/comments?per_page=100" \
+              --paginate --slurp | jq -c 'add // []' > "$pr_comments_file"
+
+            # A PR "touches KVM" when a changed file path or a label mentions kvm.
+            files="$(gh api "repos/${REPO}/pulls/${pr_number}/files" \
+              --paginate --jq '.[].filename')"
+            files_kvm_status=0
+            grep -qiE 'kvm' <<< "$files" || files_kvm_status=$?
+            labels_kvm_status=0
+            grep -Fixq kvm <<< "$labels" || labels_kvm_status=$?
+            case "$files_kvm_status" in
+              0 | 1) ;;
+              *)
+                echo "::error::KVM changed-file lookup could not decide (grep exit ${files_kvm_status})."
+                exit 2
+                ;;
+            esac
+            case "$labels_kvm_status" in
+              0 | 1) ;;
+              *)
+                echo "::error::KVM label lookup could not decide (grep exit ${labels_kvm_status})."
+                exit 2
+                ;;
+            esac
+            if [ "$files_kvm_status" -eq 0 ] || [ "$labels_kvm_status" -eq 0 ]; then
+              is_kvm=true
+            else
+              is_kvm=false
+            fi
+
+            if PR_LABELS="$labels" PR_BODY="$body" PR_IS_KVM="$is_kvm" \
+               PR_NUMBER="$pr_number" PR_HEAD_SHA="$pr_head" \
+               PR_COMMENTS_FILE="$pr_comments_file" \
+               bash scripts/core-review-protocol-lint.sh; then
+              :
+            else
+              failed=1
+            fi
+            rm -f "$pr_comments_file"
+          done <<< "$pr_numbers"
+
+          exit "$failed"
+
+  reverie-pin:
+    name: reverie-pin-ancestor-and-monotonic
+    if: >-
+      github.repository == 'rrnewton/hermit' &&
+      github.event_name != 'workflow_run'
+    runs-on: [self-hosted, gate]
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Check out the trusted pin checker
+        uses: actions/checkout@v4
+        with:
+          # Execute main's checker, never PR-controlled code, on the self-hosted
+          # runner. Exact PR heads are fetched below only as data to inspect.
+          ref: main
+          path: trusted
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Require every exact PR head to carry an ancestor-and-monotonic reverie/main pin
+        env:
+          BASE_REF: ${{ github.event.merge_group.base_ref }}
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # Self-hosted gate runners use Actions' minimal PATH; Rust lives in
+          # the agent user's tracked rustup installation rather than /usr/bin.
+          export PATH="$HOME/.cargo/bin:$PATH"
+          command -v rustc >/dev/null || {
+            echo "::error::trusted pin checker requires rustc on the gate runner"
             exit 1
+          }
+
+          if [ "$EVENT_NAME" = pull_request ] || [ "$EVENT_NAME" = workflow_dispatch ]; then
+            if [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = null ]; then
+              echo "::error::workflow_dispatch requires a pr_number input."
+              exit 1
+            fi
+            pr_numbers="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" |
+              jq -r 'select(.base.ref == "main") | .number')"
+          else
+            owner="${REPO%%/*}"
+            name="${REPO#*/}"
+            base_branch="${BASE_REF#refs/heads/}"
+            pr_numbers="$(
+              gh api graphql \
+                -f owner="$owner" \
+                -f name="$name" \
+                -f branch="$base_branch" \
+                -f query='query($owner: String!, $name: String!, $branch: String!) {
+                repository(owner: $owner, name: $name) {
+                  mergeQueue(branch: $branch) {
+                    entries(first: 100) {
+                      nodes {
+                        headCommit { oid }
+                        pullRequest { number baseRefName }
+                      }
+                    }
+                  }
+                }
+              }' | jq -r --arg sha "$SHA" --arg base "$base_branch" '
+                .data.repository.mergeQueue.entries.nodes
+                | map(select(
+                    .headCommit.oid == $sha
+                    and .pullRequest.baseRefName == $base
+                  ) | .pullRequest.number)
+                | .[]
+              ')"
+          fi
+
+          if [ -z "$pr_numbers" ]; then
+            echo "No main-branch pull request is associated with $SHA; merge-gate will reject it."
+            exit 0
+          fi
+
+          checker="$RUNNER_TEMP/check-reverie-pin"
+          RUSTUP_TOOLCHAIN=stable rustc --edition=2021 \
+            trusted/scripts/check-reverie-pin.rs -o "$checker"
+          scratch="$(mktemp -d "$RUNNER_TEMP/reverie-pin.XXXXXX")"
+          cleanup() {
+            for checkout in "$scratch"/pr-*; do
+              [ -d "$checkout" ] || continue
+              git -C trusted worktree remove --force "$checkout" >/dev/null 2>&1 || true
+            done
+            rm -rf "$scratch"
+          }
+          trap cleanup EXIT
+
+          while read -r pr_number; do
+            [ -n "$pr_number" ] || continue
+            head_sha="$(gh api "repos/${REPO}/pulls/${pr_number}" --jq '.head.sha')"
+            checkout="$scratch/pr-${pr_number}"
+            git -C trusted fetch --quiet --no-tags origin "$head_sha"
+            git -C trusted worktree add --quiet --detach "$checkout" "$head_sha"
+            echo "Checking PR #${pr_number} exact head ${head_sha} against live Reverie main."
+            if command -v with-proxy >/dev/null 2>&1; then
+              with-proxy "$checker" --repo "$checkout"
+            else
+              "$checker" --repo "$checkout"
+            fi
+          done <<< "$pr_numbers"
+
+  merge-gate:
+    name: merge-gate-v4
+    needs: [invalidate-local-validation, core-review-protocol, reverie-pin]
+    if: >-
+      always() &&
+      github.repository == 'rrnewton/hermit' &&
+      github.event_name != 'workflow_run' &&
+      github.event_name != 'issue_comment'
+    runs-on: [self-hosted, gate]
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+      issues: read
+      pull-requests: read
+    steps:
+      - name: Require the registered v4 gate definition
+        env:
+          EXPECTED_GATE_BLOB: ${{ vars.MERGE_GATE_V4_BLOB }}
+          GATE_PATH: .github/workflows/merge-gate.yml
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "$EXPECTED_GATE_BLOB" ]; then
+            echo "::error::MERGE_GATE_V4_BLOB is not configured; refusing an unbound gate result."
+            exit 1
+          fi
+          actual_blob="$(
+            gh api "repos/${REPO}/contents/${GATE_PATH}?ref=${SHA}" --jq .sha
+          )"
+          if [ "$actual_blob" != "$EXPECTED_GATE_BLOB" ]; then
+            echo "::error::Gate definition mismatch: run used ${actual_blob}, registered v4 is ${EXPECTED_GATE_BLOB}. Rebase onto current main; a branch-owned gate cannot authorize itself."
+            exit 1
+          fi
+          echo "Gate definition is registered v4 blob ${actual_blob}."
+      - name: Fetch the trusted receipt verifier
+        # Fetch the verifier and both registries from one immutable parent
+        # revision.  Advance both refs and all three digests together, and
+        # register this workflow blob in MERGE_GATE_V4_BLOB in the same landing
+        # operation.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_REF: cb78bf76a498809c7b24b1a973574e7c863d5109
+          VERIFIER_REF: cb78bf76a498809c7b24b1a973574e7c863d5109
+        run: |
+          set -euo pipefail
+          verifier="$RUNNER_TEMP/verify-local-validation-receipt.sh"
+          predicate="$RUNNER_TEMP/qualifying-receipt.json"
+          producer="$RUNNER_TEMP/producer-definition.json"
+
+          fetch() { # fetch <repo-path> <destination> <expected-sha256>
+            ref=$REGISTRY_REF
+            [ "$1" = ci-hub/validation/verify_receipt.sh ] && ref=$VERIFIER_REF
+            gh api \
+              "repos/rrnewton/dev-hermit/contents/$1?ref=$ref" \
+              --jq .content | tr -d '\n' | base64 --decode >"$2"
+            echo "$3  $2" | sha256sum --check
+          }
+
+          fetch ci-hub/validation/verify_receipt.sh "$verifier" \
+            1b0792415134afed7066ee70e1bc35319a204c5192cac69d33a8ca96b2f01082
+          fetch ci-hub/validate/qualifying-receipt.json "$predicate" \
+            09f01dd1435ac7cd6ebbcf28b619ff9ff739587b19bf88f1dd23a53f5c881760
+          fetch ci-hub/validate/producer-definition.json "$producer" \
+            fab77f72485776a4bbd00e8674e0315d26443177d80d6a715743846814b5546c
+
+          chmod +x "$verifier"
+          echo "RECEIPT_VERIFIER=$verifier" >>"$GITHUB_ENV"
+          echo "QUALIFYING_RECEIPT_PREDICATE=$predicate" >>"$GITHUB_ENV"
+          echo "PRODUCER_DEFINITION_REGISTRY=$producer" >>"$GITHUB_ENV"
+      - name: Fetch the trusted check-outcome authority
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          authority="$RUNNER_TEMP/check_outcome.py"
+          gh api \
+            'repos/rrnewton/dev-hermit/contents/ci-hub/check_outcome.py?ref=4b78d727f35bc8612ac460a6e270dda5f5df304c' \
+            --jq .content | tr -d '\n' | base64 --decode >"$authority"
+          echo '2f1c61d5ec9d98b9697317fd9e66b705161defb69b808d23e6d83384e1e2a1e8  '"$authority" | sha256sum --check
+          chmod +x "$authority"
+          echo "CHECK_OUTCOME_AUTHORITY=$authority" >>"$GITHUB_ENV"
+      - name: Check the Reverie-pin ancestor-and-monotonic result
+        env:
+          PIN_RESULT: ${{ needs.reverie-pin.result }}
+        run: |
+          set -euo pipefail
+          if [ "$PIN_RESULT" != success ]; then
+            echo "::error::Exact-head Reverie pin check did not pass (result=$PIN_RESULT); manual diagnostic failed."
+            exit 1
+          fi
+          echo "Exact-head Reverie pin check passed."
+      - name: Inspect CI and local validation evidence
+        env:
+          BASE_REF: ${{ github.event.merge_group.base_ref }}
+          EVENT_NAME: ${{ github.event_name }}
+          GATE_RUN_ID: ${{ github.run_id }}
+          HEAD_REF: ${{ github.head_ref || github.ref_name }}
+          INVALIDATION_RESULT: ${{ needs.invalidate-local-validation.result }}
+          PR_ACTION: ${{ github.event.action }}
+          GH_TOKEN: ${{ github.token }}
+          PROTOCOL_RESULT: ${{ needs.core-review-protocol.result }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          classify_check() {
+            "$CHECK_OUTCOME_AUTHORITY" --status "$1" --conclusion "$2"
+          }
+
+          # Prove the exact predicate used by this gate on every invocation.
+          [ "$(classify_check completed success)" = PASSED ]
+          [ "$(classify_check "" success)" = PASSED ]
+          for conclusion in failure timed_out error startup_failure; do
+            [ "$(classify_check completed "$conclusion")" = FAILED ]
+          done
+          for state in \
+            completed:cancelled completed:skipped completed:neutral \
+            completed:stale completed:action_required queued:none \
+            in_progress:none waiting:none requested:none pending:none missing:none \
+            completed:future_state; do
+            status=${state%%:*}
+            conclusion=${state#*:}
+            [ "$conclusion" != none ] || conclusion=
+            [ "$(classify_check "$status" "$conclusion")" = NO_RESULT ]
+          done
+          echo "Required-check predicate: N=2 PASSED, N=4 FAILED, N=12 NO_RESULT."
+
+          dispatch_file="${RUNNER_TEMP:-/tmp}/merge-gate-redispatch-${GATE_RUN_ID}.tsv"
+          : >"$dispatch_file"
+          no_result=0
+
+          queue_dispatch() {
+            local workflow=$1 head_ref=$2 head_repo=$3 pr_number=$4 head_sha=$5
+            local run_id=${6:-}
+            no_result=1
+            if [ "$head_repo" != "$REPO" ]; then
+              echo "::warning::NO_RESULT for PR #$pr_number at $head_sha cannot be dispatched from external head repository $head_repo."
+              return
+            fi
+            printf '%s\t%s\t%s\t%s\t%s\n' \
+              "$workflow" "$head_ref" "$pr_number" "$head_sha" "$run_id" >>"$dispatch_file"
+          }
+
+          queue_hosted_retry() {
+            local status=$1
+            shift
+            case "$status" in
+              queued | in_progress | waiting | requested | pending)
+                no_result=1
+                echo "NO_RESULT is still active ($status); completion will refire the gate."
+                ;;
+              *) queue_dispatch "$@" ;;
+            esac
+          }
+
+          dispatch_no_result() {
+            sort -u "$dispatch_file" | while IFS=$'\t' read -r workflow head_ref pr_number head_sha run_id; do
+              [ -n "$workflow" ] || continue
+              echo "NO_RESULT: re-dispatching $workflow for PR #$pr_number at $head_sha (ref=$head_ref)."
+              case "$workflow" in
+                merge-gate.yml)
+                  gh workflow run "$workflow" --repo "$REPO" --ref "$head_ref" \
+                    -f pr_number="$pr_number"
+                  ;;
+                demo-hot-path-rerun)
+                  if [ -z "$run_id" ]; then
+                    echo "::warning::No pull-request demo run exists to rerun for PR #$pr_number at $head_sha."
+                    continue
+                  fi
+                  gh api --method POST \
+                    "repos/${REPO}/actions/runs/${run_id}/rerun" --silent
+                  ;;
+                *)
+                  gh workflow run "$workflow" --repo "$REPO" --ref "$head_ref"
+                  ;;
+              esac
+            done
+          }
+
+          cancel_no_result_gate() {
+            echo "NO_RESULT leaves this manual diagnostic inconclusive; cancelling run $GATE_RUN_ID after re-dispatch."
+            # This job uses `if: always()` so the ordinary /cancel endpoint
+            # deliberately leaves it running. force-cancel is required to make
+            # the historical status context conclude CANCELLED rather than later timing
+            # out or exiting red.
+            gh api --method POST \
+              "repos/${REPO}/actions/runs/${GATE_RUN_ID}/force-cancel" --silent
+            # GitHub terminates this runner asynchronously. Reaching the end of
+            # this loop means force-cancellation itself failed, a gate fault.
+            for _ in {1..60}; do sleep 5; done
+            echo "::error::Gate cancellation request did not terminate run $GATE_RUN_ID."
+            exit 1
+          }
+
+          protocol_state=$(classify_check "" "$PROTOCOL_RESULT")
+          case "$protocol_state" in
+            PASSED) echo "core-review-protocol result: PASSED" ;;
+            FAILED)
+              echo "::error::Core-change review protocol FAILED (result=$PROTOCOL_RESULT)."
+              exit 1
+              ;;
+            NO_RESULT)
+              echo "Core-change review protocol has NO_RESULT (result=$PROTOCOL_RESULT)."
+              no_result=1
+              ;;
+          esac
+
+          if [ "$EVENT_NAME" = pull_request ] && [ "$PR_ACTION" = synchronize ]; then
+            invalidation_state=$(classify_check "" "$INVALIDATION_RESULT")
+            case "$invalidation_state" in
+              PASSED) ;;
+              FAILED)
+                echo "::error::Local-validation invalidation FAILED."
+                exit 1
+                ;;
+              NO_RESULT)
+                echo "Local-validation invalidation has NO_RESULT."
+                no_result=1
+                ;;
+            esac
           fi
 
           if [ "$EVENT_NAME" = pull_request ] || [ "$EVENT_NAME" = workflow_dispatch ]; then
@@ -137,10 +798,12 @@ jobs:
               echo "::error::workflow_dispatch requires a pr_number input."
               exit 1
             fi
-            pull_requests="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" | jq -c '
-              [select(.base.ref == "main") | {
+            expected_head="$SHA"
+            [ "$EVENT_NAME" = pull_request ] && expected_head="$PR_HEAD_SHA"
+            pull_requests="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" | jq -c --arg sha "$expected_head" '
+              [select(.base.ref == "main" and .state == "open" and .head.sha == $sha) | {
                 number,
-                head: {sha: .head.sha},
+                head: {sha: .head.sha, ref: .head.ref, repo: .head.repo.full_name},
                 labels
               }]
             ')"
@@ -162,6 +825,8 @@ jobs:
                         pullRequest {
                           number
                           headRefOid
+                          headRefName
+                          headRepository { nameWithOwner }
                           baseRefName
                           labels(first: 100) { nodes { name } }
                         }
@@ -176,7 +841,11 @@ jobs:
                     and .pullRequest.baseRefName == $base
                   ) | {
                     number: .pullRequest.number,
-                    head: {sha: .pullRequest.headRefOid},
+                    head: {
+                      sha: .pullRequest.headRefOid,
+                      ref: .pullRequest.headRefName,
+                      repo: .pullRequest.headRepository.nameWithOwner
+                    },
                     labels: .pullRequest.labels.nodes
                   })
               ')"
@@ -188,39 +857,207 @@ jobs:
           fi
 
           failed=0
-          while IFS=$'\t' read -r pr_number head_sha locally_validated; do
+          while IFS=$'\t' read -r pr_number head_sha head_ref head_repo locally_validated; do
             if [ -z "$head_sha" ] || [ "$head_sha" = null ]; then
               echo "::error::PR #${pr_number} has no head SHA."
               failed=1
               continue
             fi
+            local_pass=false
             if [ "$locally_validated" = true ]; then
-              echo "PR #${pr_number} is locally validated at $head_sha."
-              continue
+              comments_file=$(mktemp)
+              if gh api --paginate --slurp \
+                   "repos/${REPO}/issues/${pr_number}/comments?per_page=100" \
+                   >"$comments_file" &&
+                 evidence=$("$RECEIPT_VERIFIER" \
+                   --repo "$REPO" --sha "$head_sha" --comments "$comments_file"); then
+                local_pass=true
+                echo "PR #${pr_number} has a dereferenced exact-head receipt: ${evidence}"
+              else
+                echo "::warning::locally-validated on PR #${pr_number} has no immutable counted receipt for exact head ${head_sha}."
+              fi
+              rm -f -- "$comments_file"
             fi
 
             runs="$(
-              gh api "repos/${REPO}/actions/workflows/ci.yml/runs?head_sha=${head_sha}&per_page=100"
+              gh api "repos/${REPO}/actions/workflows/ci-portable.yml/runs?head_sha=${head_sha}&per_page=100"
             )"
-            run="$(jq --arg sha "$head_sha" '
-              [.workflow_runs[] | select(.head_sha == $sha)]
-              | sort_by(.created_at)
-              | last // {}
-            ' <<< "$runs")"
-            status="$(jq -r '.status // "missing"' <<< "$run")"
-            conclusion="$(jq -r '.conclusion // ""' <<< "$run")"
-            url="$(jq -r '.html_url // ""' <<< "$run")"
+            run="$("$CHECK_OUTCOME_AUTHORITY" \
+              --select-latest-run --head-sha "$head_sha" <<<"$runs")"
+            run_id="$(jq -r '.id // ""' <<< "$run")"
+            run_status="$(jq -r '.status // "missing"' <<< "$run")"
+            run_conclusion="$(jq -r '.conclusion // ""' <<< "$run")"
+            run_state=$(classify_check "$run_status" "$run_conclusion")
+            job_status=missing
+            job_conclusion=
+            job_url="$(jq -r '.html_url // ""' <<< "$run")"
+            job_found=false
+            if [ -n "$run_id" ]; then
+              jobs="$(
+                gh api "repos/${REPO}/actions/runs/${run_id}/jobs?filter=latest&per_page=100"
+              )"
+              regular_job="$(
+                jq '.jobs' <<<"$jobs" \
+                  | "$CHECK_OUTCOME_AUTHORITY" --select-latest-rollup \
+                  | jq '[.[] | select(.name == "Regular tests (GitHub-managed portable)")] | first // {}'
+              )"
+              if [ "$(jq 'length' <<< "$regular_job")" -gt 0 ]; then
+                job_found=true
+                job_status="$(jq -r '.status // "missing"' <<< "$regular_job")"
+                job_conclusion="$(jq -r '.conclusion // ""' <<< "$regular_job")"
+                job_url="$(jq -r '.html_url // ""' <<< "$regular_job")"
+              fi
+            fi
+            portable_state=$(classify_check "$job_status" "$job_conclusion")
+            if [ "$job_found" != true ] && [ "$run_state" = FAILED ]; then
+              portable_state=FAILED
+            fi
 
-            if [ "$status:$conclusion" = completed:success ]; then
-              echo "CI passed for PR #${pr_number} at $head_sha: $url"
-            else
-              echo "::error::CI for PR #${pr_number} at $head_sha is $status/${conclusion:-none}: ${url:-no run URL}."
+            priv_runs="$(
+              gh api "repos/${REPO}/actions/workflows/ci-privileged.yml/runs?head_sha=${head_sha}&per_page=100"
+            )"
+            priv_run="$("$CHECK_OUTCOME_AUTHORITY" \
+              --select-latest-run --head-sha "$head_sha" <<<"$priv_runs")"
+            priv_run_id="$(jq -r '.id // ""' <<< "$priv_run")"
+            priv_status="$(jq -r '.status // "missing"' <<< "$priv_run")"
+            priv_conclusion="$(jq -r '.conclusion // ""' <<< "$priv_run")"
+            priv_run_status=$priv_status
+            priv_run_state=$(classify_check "$priv_status" "$priv_conclusion")
+            priv_job_url="$(jq -r '.html_url // ""' <<< "$priv_run")"
+            priv_job_found=false
+            priv_status=missing
+            priv_conclusion=
+            if [ -n "$priv_run_id" ]; then
+              priv_jobs="$(
+                gh api "repos/${REPO}/actions/runs/${priv_run_id}/jobs?filter=latest&per_page=100"
+              )"
+              priv_job="$(
+                jq '.jobs' <<<"$priv_jobs" \
+                  | "$CHECK_OUTCOME_AUTHORITY" --select-latest-rollup \
+                  | jq '[.[] | select(.name == "Privileged capability and E2E tests")] | first // {}'
+              )"
+              if [ "$(jq 'length' <<< "$priv_job")" -gt 0 ]; then
+                priv_job_found=true
+                priv_status="$(jq -r '.status // "missing"' <<< "$priv_job")"
+                priv_conclusion="$(jq -r '.conclusion // ""' <<< "$priv_job")"
+                priv_job_url="$(jq -r '.html_url // ""' <<< "$priv_job")"
+              fi
+            fi
+            privileged_state=$(classify_check "$priv_status" "$priv_conclusion")
+            if [ "$priv_job_found" != true ] && [ "$priv_run_state" = FAILED ]; then
+              privileged_state=FAILED
+            fi
+
+            if [ "$portable_state" = FAILED ] || [ "$privileged_state" = FAILED ]; then
+              echo "::error::Hosted validation FAILED for PR #${pr_number} at $head_sha: portable=$job_status/${job_conclusion:-none} privileged=$priv_status/${priv_conclusion:-none}. Local evidence cannot override a failure."
               failed=1
+            elif [ "$portable_state" = PASSED ] && [ "$privileged_state" = PASSED ]; then
+              echo "Hosted portable and privileged validation PASSED for PR #${pr_number} at $head_sha."
+            elif [ "$local_pass" = true ]; then
+              echo "Exact-head full local validation PASSED; it supplies the alternate leg for hosted NO_RESULT on PR #${pr_number}."
+            else
+              echo "Hosted validation has NO_RESULT for PR #${pr_number}: portable=$job_status/${job_conclusion:-none} privileged=$priv_status/${priv_conclusion:-none}."
+              [ "$portable_state" = PASSED ] || queue_hosted_retry "$run_status" \
+                ci-portable.yml "$head_ref" "$head_repo" "$pr_number" "$head_sha"
+              [ "$privileged_state" = PASSED ] || queue_hosted_retry "$priv_run_status" \
+                ci-privileged.yml "$head_ref" "$head_repo" "$pr_number" "$head_sha"
+            fi
+
+            # Keep this classifier synchronized with demo-hot-path.yml's paths.
+            # Match the hot-path globs, then subtract the test trees the demo
+            # suite provably never executes. The demo job runs
+            # `scripts/super-validate.sh --demos-only` (parent demos 1-8 only)
+            # and never runs the Hermit e2e corpus, so nothing under
+            # `tests/e2e/**` can change a demo outcome; the standalone
+            # `tests/backend-parity/**` parity fixtures are likewise never read.
+            # A PR whose only hot-path-matching files live under those trees is
+            # NOT a demo hot path, so it does not require the serial P0 gate.
+            # Genuinely demo-affecting paths (detcore*/, hermit-cli/, other
+            # guest programs under tests/ such as tests/c/**, Cargo.*, and
+            # demo-hot-path.yml itself) are NOT subtracted and stay hot.
+            files="$(
+              gh api "repos/${REPO}/pulls/${pr_number}/files" \
+                --paginate --jq '.[].filename'
+            )"
+            hot_files="$(
+              grep -E '^([.]github/workflows/demo-hot-path[.]yml|Cargo[.](lock|toml)|rust-toolchain[.]toml|common/|detcore[^/]*/|examples/|flaky-tests/|hermit-cli/|hermit-install/|hermit-resources/|tests/)' <<< "$files" \
+                | grep -vE '^tests/(e2e|backend-parity)/' || true
+            )"
+            if [ -n "$hot_files" ]; then
+              demo_runs="$(
+                gh api "repos/${REPO}/actions/workflows/demo-hot-path.yml/runs?head_sha=${head_sha}&per_page=100"
+              )"
+              demo_run="$("$CHECK_OUTCOME_AUTHORITY" \
+                --select-latest-run --head-sha "$head_sha" \
+                --event pull_request <<<"$demo_runs")"
+              demo_status="$(jq -r '.status // "missing"' <<< "$demo_run")"
+              demo_conclusion="$(jq -r '.conclusion // ""' <<< "$demo_run")"
+              demo_url="$(jq -r '.html_url // ""' <<< "$demo_run")"
+              demo_run_id="$(jq -r '.id // ""' <<< "$demo_run")"
+              demo_state=$(classify_check "$demo_status" "$demo_conclusion")
+              case "$demo_state" in
+                PASSED)
+                  echo "P0 demo gate PASSED for hot-path PR #${pr_number} at $head_sha: $demo_url"
+                  ;;
+                FAILED)
+                  echo "::error::P0 demo gate FAILED for hot-path PR #${pr_number} at $head_sha ($demo_status/${demo_conclusion:-none}): ${demo_url:-no run URL}."
+                  failed=1
+                  ;;
+                NO_RESULT)
+                  echo "P0 demo gate has NO_RESULT for hot-path PR #${pr_number} at $head_sha ($demo_status/${demo_conclusion:-none})."
+                  queue_hosted_retry "$demo_status" demo-hot-path-rerun "$head_ref" "$head_repo" \
+                    "$pr_number" "$head_sha" "$demo_run_id"
+                  ;;
+              esac
+            else
+              echo "PR #${pr_number} does not touch a demo hot path; P0 demo gate not required."
             fi
           done < <(jq -r '
             .[]
-            | [.number, .head.sha, any(.labels[]?; .name == "locally-validated")]
+            | [.number, .head.sha, .head.ref, .head.repo,
+               any(.labels[]?; .name == "locally-validated")]
             | @tsv
           ' <<< "$pull_requests")
 
-          exit "$failed"
+          if [ "$failed" -ne 0 ]; then
+            exit "$failed"
+          fi
+          if [ "$no_result" -ne 0 ]; then
+            # A skipped/cancelled dependency also needs a fresh gate evaluation.
+            if [ "$protocol_state" = NO_RESULT ] ||
+               { [ "$EVENT_NAME" = pull_request ] && [ "$PR_ACTION" = synchronize ] &&
+                 [ "${invalidation_state:-PASSED}" = NO_RESULT ]; }; then
+              while IFS=$'\t' read -r pr_number head_sha head_ref head_repo _; do
+                queue_dispatch merge-gate.yml "$head_ref" "$head_repo" "$pr_number" "$head_sha"
+              done < <(jq -r '.[] | [.number, .head.sha, .head.ref, .head.repo, ""] | @tsv' <<< "$pull_requests")
+            fi
+            dispatch_no_result
+            cancel_no_result_gate
+          fi
+
+          echo "Every inspected leg has a PASSED result in this advisory run."
+
+  # Transition only: before the ruleset moves from `merge-gate-v3` to
+  # `merge-gate-v4`, mirror v4 into the legacy context so this policy PR can
+  # land without an admin bypass. The reconciler disables this variable after
+  # the ruleset switch, leaving a skipped job that consumes no runner.
+  merge-gate-legacy-context:
+    name: merge-gate-v3
+    needs: merge-gate
+    if: >-
+      always() &&
+      github.repository == 'rrnewton/hermit' &&
+      vars.MERGE_GATE_LEGACY_CONTEXT == 'true'
+    runs-on: [self-hosted, gate]
+    timeout-minutes: 5
+    steps:
+      - name: Mirror the registered v4 result during migration
+        env:
+          V4_RESULT: ${{ needs.merge-gate.result }}
+        run: |
+          set -euo pipefail
+          if [ "$V4_RESULT" != success ]; then
+            echo "::error::merge-gate-v4 did not pass (result=${V4_RESULT})."
+            exit 1
+          fi
+          echo "merge-gate-v4 passed; emitting temporary v3 context."

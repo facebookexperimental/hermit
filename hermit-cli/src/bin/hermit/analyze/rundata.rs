@@ -171,21 +171,37 @@ impl RunData {
         self.sched_path_out = Some(normalized_path);
     }
 
-    /// Execute the run. (Including setting up logging and temp dir binding.)
-    pub fn launch(&mut self) -> anyhow::Result<()> {
-        let root = self.root_path();
+    /// The global options a trial run is launched with. Trials go through
+    /// `RunOpts::run`, which dispatches on the trial `RunOpts`' own backend (set
+    /// from `hermit --backend <BACKEND> analyze` by `get_raw_runopts`); this
+    /// copy keeps the trial's global options consistent with it.
+    fn trial_global_opts(&self) -> GlobalOpts {
         let log_path = self.root_path().with_extension(LOG_EXT);
-        let gopts = GlobalOpts {
+        GlobalOpts {
             log: Some(self.log_level),
             log_file: if self.analyze_opts.verbose || self.analyze_opts.selfcheck {
                 Some(log_path)
             } else {
                 None
             },
-            // Analyze threads the backend through its own `RunOpts`, so there is no
-            // separate global-position backend to apply here.
-            backend: None,
-        };
+            backend: self.analyze_opts.backend,
+            log_file_handle: None,
+            run_evidence_log_handle: None,
+            run_evidence_write_error: None,
+        }
+    }
+
+    /// Execute the run. (Including setting up logging and temp dir binding.)
+    pub fn launch(&mut self) -> anyhow::Result<()> {
+        let root = self.root_path();
+        let gopts = self.trial_global_opts();
+        // Open it HERE, on the host, for the same reason `main` does: `launch` runs
+        // before the container exists, and opening later would resolve this path in
+        // the guest namespace. Analyze's log lands under the run's own directory, so
+        // it is only exposed when that directory is itself inside the container's
+        // /tmp -- but the fix is the same and costs nothing.
+        let mut gopts = gopts;
+        gopts.open_log_file()?;
         let final_record_path = self
             .runopts
             .det_opts
@@ -308,6 +324,25 @@ impl RunData {
         Ok(Self::new(aopts, runname, ro))
     }
 
+    /// Replay with the selected run's seeds and the original replay policy.
+    pub fn new_run1_replay(
+        aopts: &AnalyzeOpts,
+        runname: String,
+        selected: &RunOpts,
+    ) -> anyhow::Result<Self> {
+        let mut replay = Self::new_run1_target(aopts, runname)?;
+        let target = &selected.det_opts.det_config;
+        let config = &mut replay.runopts.det_opts.det_config;
+        // Search chooses an effective scheduler seed independently of the
+        // initial command line. Preserve all selected seed inputs, without
+        // copying search-only overrides such as --imprecise-search into replay.
+        config.seed = target.seed;
+        config.rng_seed = target.rng_seed;
+        config.fuzz_seed = target.fuzz_seed;
+        config.sched_seed = target.sched_seed;
+        Ok(replay)
+    }
+
     /// The baseline RunOpts based on user flags plus some sanitation/validation.
     fn get_base_runopts(aopts: &AnalyzeOpts) -> anyhow::Result<RunOpts> {
         let mut ro = Self::get_raw_runopts(aopts);
@@ -356,7 +391,45 @@ impl RunData {
         for arg in &aopts.run_args {
             run_cmd.push(arg.to_string());
         }
-        RunOpts::parse_from(run_cmd.iter())
+        let mut runopts = RunOpts::try_parse_from(run_cmd.iter()).unwrap_or_else(|error| {
+            if crate::misplaced_backend_argument(&error).is_some() {
+                // `--backend` is global. Point at the spelling that selects the
+                // trials' backend instead of letting clap suggest the unrelated
+                // `--backend-engagement-json`. clap reports only the flag name,
+                // so read the value from the run arguments themselves.
+                // The first `--backend` is the one clap refused; later tokens may
+                // be the guest's own arguments.
+                let value = run_cmd
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, arg)| {
+                        if arg == "--backend" {
+                            Some(run_cmd.get(index + 1).map(String::as_str).unwrap_or(""))
+                        } else {
+                            arg.strip_prefix("--backend=")
+                        }
+                    })
+                    .filter(|value| !value.is_empty() && !value.starts_with('-'))
+                    .unwrap_or("<BACKEND>");
+                clap::Error::raw(
+                    clap::error::ErrorKind::UnknownArgument,
+                    format!(
+                        "`--backend` is not a `run` option, so it cannot be passed through \
+                         the run arguments of `hermit analyze` or `hermit bisect`. It is a \
+                         global option: select the backend for every trial with `hermit \
+                         --backend={value} analyze ...` or `hermit --backend={value} bisect \
+                         ...`.\n"
+                    ),
+                )
+                .exit()
+            }
+            error.exit()
+        });
+        // Apply the global backend before `get_base_runopts` validates these
+        // options, so backend-specific validation sees the backend the trials
+        // will run on.
+        runopts.set_backend(aopts.backend);
+        runopts
     }
 
     /// Extract the (initial) RunOpts for target/run1 that are implied by all of hermit analyze's arguments.
@@ -478,10 +551,150 @@ impl RunData {
         // } else {
         //     "".to_string()
         // };
-        format!("hermit{} run {}", logging, self.runopts)
+        format!(
+            "hermit{}{} run {}",
+            logging,
+            self.runopts.global_backend_arg(),
+            self.runopts
+        )
     }
 
     pub fn into_runopts(self) -> RunOpts {
         self.runopts
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `run` has no `--backend`, so `hermit --backend <BACKEND> analyze` is the
+    /// only way to choose the trials' backend. The selection must pass the
+    /// scope check and reach the options every trial is launched with: the
+    /// `GlobalOpts` that `RunOpts::main` takes its backend from, the validated
+    /// trial `RunOpts`, and the printed reproducer.
+    #[test]
+    fn global_backend_reaches_every_trial_run() {
+        for flag in ["ptrace", "kvm"] {
+            let argv = [
+                "hermit".to_owned(),
+                format!("--backend={flag}"),
+                "analyze".to_owned(),
+                "--".to_owned(),
+                "/bin/true".to_owned(),
+            ];
+            let args = crate::Args::try_parse_from(&argv).unwrap();
+            args.command
+                .validate_backend_scope(args.global.backend)
+                .unwrap_or_else(|error| panic!("{argv:?} must be in scope: {error:#}"));
+            let crate::Subcommand::Analyze(mut options) = args.command else {
+                panic!("{argv:?} is not analyze")
+            };
+            options.apply_global(&args.global);
+            let workspace = tempfile::tempdir().unwrap();
+            options.tmp_dir = Some(workspace.path().to_path_buf());
+            let run = RunData::new_baseline(&options, "backend".to_owned())
+                .unwrap_or_else(|error| panic!("{flag}: {error:#}"));
+            assert_eq!(
+                run.trial_global_opts().backend,
+                args.global.backend,
+                "{flag}"
+            );
+            assert_eq!(
+                run.runopts.global_backend_arg(),
+                format!(" --backend={flag}")
+            );
+            let repro = run.to_repro();
+            assert!(
+                repro.contains(&format!(" --backend={flag} run ")),
+                "{flag}: reproducer does not select the backend: {repro}"
+            );
+        }
+    }
+
+    #[test]
+    fn analyzer_reproducer_retains_actual_default_and_fractional_epoch() {
+        use clap::CommandFactory;
+        for epoch in ["2026-01-01T00:00:00Z", "2000-12-31T23:59:59.123456789Z"] {
+            let mut options = AnalyzeOpts::try_parse_from([
+                "analyze",
+                "--",
+                "--epoch",
+                epoch,
+                "--seed=71",
+                "/bin/true",
+            ])
+            .unwrap();
+            let workspace = tempfile::tempdir().unwrap();
+            options.tmp_dir = Some(workspace.path().to_path_buf());
+            let run = RunData::new_baseline(&options, "epoch-repro".to_owned()).unwrap();
+            let repro = run.to_repro();
+            assert_eq!(repro.matches("--epoch=").count(), 1, "{repro}");
+            let matches = crate::Args::command()
+                .try_get_matches_from(shell_words::split(&repro).unwrap())
+                .unwrap();
+            let args = crate::args_from_matches_with_clock(&matches, || {
+                panic!("analyzer reproduction must retain its actual fixed input")
+            })
+            .unwrap();
+            let crate::Subcommand::Run(parsed) = args.command else {
+                panic!("expected run")
+            };
+            assert_eq!(
+                parsed.det_opts.det_config.epoch,
+                run.runopts.det_opts.det_config.epoch
+            );
+            assert_eq!(
+                parsed.det_opts.det_config.seed,
+                run.runopts.det_opts.det_config.seed
+            );
+        }
+    }
+
+    #[test]
+    fn preemption_replay_preserves_selected_seeds_and_original_timer_policy() {
+        for explicit_imprecise_timers in [false, true] {
+            let mut args = vec![
+                "analyze",
+                "--selfcheck",
+                "--search",
+                "--imprecise-search",
+                "--run1-seed=211",
+                "--",
+            ];
+            if explicit_imprecise_timers {
+                args.push("--imprecise-timers");
+            }
+            args.push("/bin/true");
+            let mut options = AnalyzeOpts::try_parse_from(args).unwrap();
+            let workspace = tempfile::tempdir().unwrap();
+            options.tmp_dir = Some(workspace.path().to_path_buf());
+            let mut selected = RunData::new_baseline(&options, "selected".to_owned()).unwrap();
+            let selected_config = &mut selected.runopts.det_opts.det_config;
+            selected_config.seed = 101;
+            selected_config.rng_seed = Some(102);
+            selected_config.fuzz_seed = Some(103);
+            selected_config.sched_seed = Some(104);
+            // This is the override launch_search applies, not a replay option.
+            selected_config.imprecise_timers = true;
+            let preempts = workspace.path().join("selected.preempts");
+            let replay = RunData::new_run1_replay(&options, "replay".to_owned(), &selected.runopts)
+                .unwrap()
+                .with_preempts_path_in(preempts.clone())
+                .with_preemption_recording();
+            let config = &replay.runopts.det_opts.det_config;
+            assert_eq!(config.seed, 101);
+            assert_eq!(config.rng_seed, Some(102));
+            assert_eq!(config.fuzz_seed, Some(103));
+            assert_eq!(config.sched_seed, Some(104));
+            assert_eq!(config.imprecise_timers, explicit_imprecise_timers);
+            assert_eq!(config.replay_preemptions_from.as_ref(), Some(&preempts));
+            assert_ne!(replay.runopts.save_config, selected.runopts.save_config);
+            assert_ne!(replay.runopts.summary_json, selected.runopts.summary_json);
+            assert_eq!(
+                config.record_preemptions_to.as_ref(),
+                Some(&workspace.path().join("replay_out.preempts")),
+            );
+        }
     }
 }

@@ -58,7 +58,7 @@ stderr2=$(mktemp "$tempdir"/stderr2_XXXX)
 # shellcheck disable=SC2086 # Intended splitting of args and command:
 RUST_BACKTRACE=1 RUST_LOG=detcore=trace "$HERMIT_BIN" --log-file="$log2" run \
    --replay-schedule-from="$sched1" --record-preemptions-to="$sched2" \
-   --base-env=minimal --preemption-timeout=10000000000000000000 --bind "$tempdir" -- $command 1> "$stdout2" 2> "$stderr2";
+   --base-env=minimal --max-timeslice=10000000000000000000 --bind "$tempdir" -- $command 1> "$stdout2" 2> "$stderr2";
 code2=$?
 echo ":: Second run exited with code $code2"
 

@@ -1,0 +1,336 @@
+name: P0 Demo Gate (Hermit hot paths)
+
+# The unified demos live in rrnewton/dev-hermit, but the parent repository has
+# no self-hosted runner. A manual dispatch runs the suite on Hermit's trusted PMU
+# lane: it checks out the current parent demo harness, then overlays the exact
+# Hermit commit selected by the caller. This diagnostic never runs automatically
+# and never gates a pull request or a landing.
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: >-
+          Exact Hermit SHA to test on demand. Use this to attribute a failure
+          to a specific commit (git-bisect style). Empty = the dispatched ref's
+          tip.
+        required: false
+        type: string
+      force_cold_calibration:
+        description: >-
+          Remove the restored Demo 8 crash-seed hint and exercise the full cold
+          calibration path.
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  # HISTORICAL EVENT HANDLING: the workflow now has only a workflow_dispatch
+  # trigger, but these branches remain intact for interpretation of old runs.
+  # Group each ref's runs, but NEVER cancel a RUNNING main demo (owner directive
+  # 2026-08-03, Directive B). cancel-in-progress is event-aware:
+  #   * pull_request -> TRUE: a new push to a PR supersedes the older head, so PR
+  #     demo runs never STACK on the scarce serial PMU lane (the head that lands
+  #     re-runs). Grouped per PR number. This is the pre-land gate merge-gate.yml
+  #     requires at the PR head SHA.
+  #   * push(main) -> FALSE: all main pushes share ONE group (github.ref), so a
+  #     burst of N landings is queue-depth-1 -- GitHub lets the RUNNING demo
+  #     finish and supersedes only the older PENDING run. The old
+  #     cancel-in-progress:true KILLED the running main demo on every landing,
+  #     producing a pile of CANCELLED runs with no data; this stops that and
+  #     yields a sparse dataset of COMPLETE post-land health runs.
+  #   * workflow_dispatch -> FALSE, grouped per github.run_id (unique): manual
+  #     on-demand runs never collide, preserving per-SHA post-land culprit
+  #     attribution (bisect a post-land main red by dispatching several `sha`
+  #     inputs; they queue serially, or `git bisect` with
+  #     scripts/super-validate.sh --demos-only).
+  # cancel-in-progress never touches COMPLETED runs, so a submodule bump or
+  # queue-health check citing the newest completed main demo run is unaffected.
+  group: hermit-demo-gate-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.event_name == 'push' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  DEMO08_REQUIRE_ASSETS: "1"
+  DETCORE_TEST_RUST_LOG: "off"
+  RUSTFLAGS: -D warnings -C link-arg=-llzma
+  RUSTDOCFLAGS: -D warnings
+  SUITE_DIR: ${{ github.workspace }}/dev-hermit-demo-suite
+  TARGET_SHA: ${{ github.event.inputs.sha || github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  reject-untrusted-fork:
+    name: P0 demo gate requires a trusted branch
+    if: >-
+      github.repository == 'rrnewton/hermit' &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: |
+          echo "::error title=P0 demo gate not executed::Self-hosted demos do not execute fork-authored code. Move this change to a trusted rrnewton/hermit branch before landing."
+          exit 1
+
+  demos:
+    name: P0 demo gate (demos 1-8)
+    if: >-
+      github.repository == 'rrnewton/hermit' &&
+      (
+        github.event_name != 'pull_request' ||
+        github.event.pull_request.head.repo.full_name == github.repository
+      )
+    # No pmu-serial: demos are not counter-scarce and PMU skid is an
+    # instruction-space hardware property independent of concurrency, so there
+    # is no determinism reason to pin every demo to one serialized box. If a
+    # demo turns out to be load-sensitive once it can co-run, that is a real
+    # determinism finding to file, not a reason to restore serialization. The
+    # concurrency block below still collapses each ref to its newest run so
+    # bursts of landings do not stack.
+    runs-on: [Linux, X64, hermit, pmu]
+    timeout-minutes: 360
+    steps:
+      - name: Remove stale checkout locks
+        run: |
+          set -euo pipefail
+          if [[ -d "$GITHUB_WORKSPACE/.git" ]]; then
+            timeout --foreground --kill-after=5s 30s \
+              find "$GITHUB_WORKSPACE/.git" -type f -name "*.lock" -print -delete
+          fi
+
+      - name: Check out the unified demo suite
+        uses: actions/checkout@v4
+        with:
+          repository: rrnewton/dev-hermit
+          ref: main
+          path: dev-hermit-demo-suite
+          submodules: false
+
+      - name: Overlay the exact Hermit commit under test
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          path: dev-hermit-demo-suite/hermit
+          submodules: false
+
+      - name: Verify exact culprit attribution
+        run: |
+          set -euo pipefail
+          actual="$(git -C "$SUITE_DIR/hermit" rev-parse HEAD)"
+          test "$actual" = "$TARGET_SHA"
+          # The parent harness records a stable Hermit gitlink. Stage the
+          # overlaid PR SHA so its recursive submodule init cannot restore the
+          # older parent pin before the demos run.
+          git -C "$SUITE_DIR" add hermit
+          recorded="$(git -C "$SUITE_DIR" rev-parse :hermit)"
+          test "$recorded" = "$TARGET_SHA"
+          echo "Demo suite Hermit SHA: $actual"
+          echo "Demo suite staged Hermit gitlink: $recorded"
+          echo "Demo harness SHA: $(git -C "$SUITE_DIR" rev-parse HEAD)"
+
+      - name: Ensure the repository Rust toolchain
+        working-directory: dev-hermit-demo-suite/hermit
+        run: |
+          set -euo pipefail
+          if ! command -v rustup >/dev/null 2>&1; then
+            rustup_init="$RUNNER_TEMP/rustup-init.sh"
+            download=(curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o "$rustup_init")
+            if command -v with-proxy >/dev/null 2>&1; then
+              with-proxy "${download[@]}"
+            else
+              "${download[@]}"
+            fi
+            install_rustup=(sh "$rustup_init" -y --profile minimal --default-toolchain none)
+            if command -v with-proxy >/dev/null 2>&1; then
+              with-proxy "${install_rustup[@]}"
+            else
+              "${install_rustup[@]}"
+            fi
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
+          echo "$HOME/.cargo/bin" >>"$GITHUB_PATH"
+          channel="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -n 1)"
+          test -n "$channel"
+          install_toolchain=(rustup toolchain install "$channel" --profile minimal --component clippy --component rustfmt)
+          if command -v with-proxy >/dev/null 2>&1; then
+            with-proxy "${install_toolchain[@]}"
+          else
+            "${install_toolchain[@]}"
+          fi
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: dev-hermit-demo-suite/hermit -> target
+          shared-key: hermit-hot-path-demo-gate
+          cache-on-failure: true
+          # The self-hosted runner's rustup/cargo executables are toolchain
+          # prerequisites, not disposable build cache entries.
+          cache-bin: false
+
+      - name: Install demo dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v dnf >/dev/null; then
+            sudo dnf makecache || echo "::notice::dnf makecache failed; using existing metadata"
+            sudo dnf install -y \
+              autoconf automake binutils bpftool busybox cpio e2fsprogs e2fsprogs-devel \
+              clang cmake curl elfutils-libelf-devel file gcc gcc-c++ git gdb gzip \
+              libblkid-devel libunwind-devel libuuid-devel libzstd-devel \
+              lua lzo-devel make patch pkgconf-pkg-config python3 python3-devel \
+              python3-pip qemu-img qemu-kvm-core ruby tcl-devel xz-devel zlib-devel
+          elif command -v apt-get >/dev/null; then
+            sudo apt-get update || echo "::notice::apt-get update failed; using existing metadata"
+            sudo apt-get install -y \
+              autoconf automake binutils build-essential busybox-static cpio linux-tools-generic \
+              clang cmake curl e2fsprogs file gdb git gzip libblkid-dev libdw-dev libelf-dev \
+              libext2fs-dev liblzo2-dev liblzma-dev libunwind-dev libzstd-dev \
+              lua5.4 patch pkg-config python3 python3-dev python3-pip \
+              qemu-system-x86 qemu-utils ruby tcl-dev uuid-dev zlib1g-dev
+          else
+            echo "::error::Unsupported package manager"
+            exit 1
+          fi
+
+          # Ubuntu's /usr/bin/bpftool wrapper insists that its packaged kernel
+          # version match uname. This runner uses an Ubuntu userspace on a
+          # Fedora host kernel, but the real generic bpftool is kernel-agnostic
+          # for BTF decoding. Install it into a PATH dir promoted ahead of the
+          # wrapper (via $GITHUB_PATH) rather than a hardcoded system prefix, so
+          # this works on any runner. Override the destination with BPFTOOL_BIN_DIR.
+          if ! bpftool version >/dev/null 2>&1; then
+            # linux-tools ships bpftool under a hyphen/version-suffixed dir
+            # (e.g. /usr/lib/linux-tools-6.8.0-136/), not a bare
+            # /usr/lib/linux-tools, so search /usr/lib for any linux-tools* path.
+            bpftool_bin=$(find /usr/lib -path '*linux-tools*' -name bpftool \
+              -type f -perm -111 -print 2>/dev/null | sort -V | tail -n 1)
+            if [ -z "$bpftool_bin" ] || [ ! -x "$bpftool_bin" ]; then
+              echo "::error::no usable bpftool found under /usr/lib/*linux-tools*; install linux-tools-generic (Debian/Ubuntu) or the equivalent, or set BPFTOOL_BIN_DIR to a dir containing a working bpftool" >&2
+              exit 1
+            fi
+            bpftool_dir="${BPFTOOL_BIN_DIR:-$HOME/.local/bin}"
+            mkdir -p "$bpftool_dir"
+            install -m755 "$bpftool_bin" "$bpftool_dir/bpftool"
+            echo "$bpftool_dir" >>"$GITHUB_PATH"
+          fi
+
+          if ! command -v drgn >/dev/null 2>&1; then
+            if command -v with-proxy >/dev/null 2>&1; then
+              with-proxy python3 -m pip install --user drgn || \
+                with-proxy python3 -m pip install --user --break-system-packages drgn
+            else
+              python3 -m pip install --user drgn || \
+                python3 -m pip install --user --break-system-packages drgn
+            fi
+            echo "$HOME/.local/bin" >>"$GITHUB_PATH"
+          fi
+
+      - name: Require the demo host capabilities
+        working-directory: dev-hermit-demo-suite
+        run: |
+          set -euo pipefail
+          make doctor-qemu
+          command -v bpftool drgn gcc readelf mkfs.ext4 patch
+          bpftool version
+          test -r /proc/sys/kernel/perf_event_paranoid
+          unshare --user --map-root-user --pid --fork true
+
+      - name: Restore pinned heavy-demo assets
+        id: demo08-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            dev-hermit-demo-suite/ignored/demo08-btrfs
+            dev-hermit-demo-suite/ignored/demo08-build/btrfs-progs-v7.1
+          key: hermit-demo-assets-v1-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Select the Demo 8 calibration path
+        shell: bash
+        env:
+          CACHE_HIT: ${{ steps.demo08-cache.outputs.cache-hit }}
+          FORCE_COLD: ${{ github.event_name == 'schedule' || inputs.force_cold_calibration }}
+        run: |
+          set -euo pipefail
+          seed_file="$SUITE_DIR/ignored/demo08-btrfs/.crash-seed"
+          if [[ "$FORCE_COLD" == true ]]; then
+            rm -f -- "$seed_file"
+            selected=forced-cold-calibration
+          else
+            selected=default-parent-behavior
+          fi
+          echo "DEMO08_SELECTED_PATH=$selected" >>"$GITHUB_ENV"
+          echo "::notice title=Demo 8 calibration path::$selected; cache_hit=${CACHE_HIT:-false}"
+
+      - name: Run demos 1-8 at the exact Hermit SHA
+        id: demo-sweep
+        working-directory: dev-hermit-demo-suite
+        run: |
+          set -euo pipefail
+          command=(scripts/super-validate.sh --demos-only)
+          if command -v with-proxy >/dev/null 2>&1; then
+            command=(with-proxy "${command[@]}")
+          fi
+          timeout --foreground --kill-after=60s 21000s \
+            "${command[@]}" 2>&1 | tee demo-sweep-validation.log
+
+      - name: Verify the selected Demo 8 calibration path
+        if: always()
+        shell: bash
+        env:
+          DEMO_SWEEP_OUTCOME: ${{ steps.demo-sweep.outcome }}
+          FORCE_COLD: ${{ github.event_name == 'schedule' || inputs.force_cold_calibration }}
+        run: |
+          set -euo pipefail
+          log="$SUITE_DIR/demo-sweep-validation.log"
+          actual=no-evidence
+          if [[ -r "$log" ]] && grep -q 'Demo 8 crash seed calibrated:' "$log"; then
+            actual=cold-calibration
+          elif [[ -r "$log" ]] && grep -q 'Demo 8 crash seed ready (cached seed' "$log"; then
+            actual=cached-seed-shortcut
+          fi
+          {
+            echo "## Demo 8 calibration path"
+            echo
+            echo "- selected path: ${DEMO08_SELECTED_PATH:-unknown}"
+            echo "- observed path: $actual"
+            echo "- demo sweep outcome: ${DEMO_SWEEP_OUTCOME:-unknown}"
+          } >>"$GITHUB_STEP_SUMMARY"
+          if [[ "$FORCE_COLD" == true && "$actual" != cold-calibration ]]; then
+            echo "::error title=Demo 8 cold calibration NO-RESULT::forced cold run did not publish the calibration-success marker"
+            exit 1
+          fi
+
+      - name: Upload per-demo diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermit-demo-sweep-${{ github.event_name }}-${{ github.run_id }}
+          path: |
+            dev-hermit-demo-suite/demo-sweep-validation.log
+            dev-hermit-demo-suite/target/demo-sweep/
+            dev-hermit-demo-suite/ignored/qemu-linux/boot-anchor/run-metadata.json
+            dev-hermit-demo-suite/ignored/qemu-linux/run-history/*/run-metadata.json
+            dev-hermit-demo-suite/ignored/demo07-drgn/
+            dev-hermit-demo-suite/ignored/demo08-run/*.txt
+            dev-hermit-demo-suite/ignored/demo08-run/*.out
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Escalate every demo red as P0
+        if: failure()
+        run: |
+          echo "::error title=P0 Hermit demo regression::Demos 1-8 failed at exact Hermit SHA $TARGET_SHA. Treat this red as P0 and inspect the per-demo summary and artifacts."
+          {
+            echo
+            echo "## P0 demo-regression escalation"
+            echo "**Owner policy: every demo-sweep red is P0 advisory evidence requiring investigation.**"
+            echo
+            echo "- Hermit commit: \`$TARGET_SHA\`"
+            echo "- Event: \`${{ github.event_name }}\`"
+            echo "- Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo
+            echo "The exact-SHA run identifies the Hermit commit or PR that introduced the regression."
+          } >>"$GITHUB_STEP_SUMMARY"
+          exit 1

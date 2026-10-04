@@ -16,8 +16,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define ALT_STACK_SIZE (64 * 1024)
@@ -25,6 +27,7 @@
 static volatile sig_atomic_t alarm_deliveries;
 static volatile sig_atomic_t alarm_phase;
 static volatile sig_atomic_t alarm_observed_phase;
+static volatile sig_atomic_t suspend_deliveries;
 
 static volatile sig_atomic_t reentrant_depth;
 static volatile sig_atomic_t reentrant_deliveries;
@@ -44,7 +47,9 @@ static volatile sig_atomic_t nonrestartable_deliveries;
 static volatile sig_atomic_t nonrestartable_handler_failed;
 
 static void write_message(const char* message, size_t length) {
-  (void)write(STDOUT_FILENO, message, length);
+  if (write(STDOUT_FILENO, message, length) != (ssize_t)length) {
+    _exit(2);
+  }
 }
 
 static int signal_is_blocked(int signal_number) {
@@ -401,6 +406,218 @@ static int test_sigtimedwait_interrupted_despite_sa_restart(void) {
   return 0;
 }
 
+static void suspend_handler(int signal_number) {
+  (void)signal_number;
+  ++suspend_deliveries;
+  static const char message[] = "sigsuspend delivered\n";
+  write_message(message, sizeof(message) - 1);
+}
+
+static int test_blocking_sigsuspend(void) {
+  suspend_deliveries = 0;
+
+  sigset_t blocked;
+  sigset_t previous;
+  sigemptyset(&blocked);
+  sigaddset(&blocked, SIGUSR1);
+  if (sigprocmask(SIG_BLOCK, &blocked, &previous) != 0) {
+    perror("sigprocmask");
+    return 1;
+  }
+
+  struct sigaction action;
+  memset(&action, 0, sizeof(action));
+  action.sa_handler = suspend_handler;
+  sigemptyset(&action.sa_mask);
+  if (sigaction(SIGUSR1, &action, NULL) != 0) {
+    perror("sigaction");
+    return 1;
+  }
+
+  const pid_t child = fork();
+  if (child < 0) {
+    perror("fork");
+    return 1;
+  }
+  if (child == 0) {
+    struct timespec remaining = {
+        .tv_sec = 0,
+        .tv_nsec = 1000000,
+    };
+    while (nanosleep(&remaining, &remaining) != 0) {
+      if (errno != EINTR) {
+        _exit(1);
+      }
+    }
+    if (kill(getppid(), SIGUSR1) != 0) {
+      _exit(1);
+    }
+    _exit(0);
+  }
+
+  sigset_t wait_mask = previous;
+  sigdelset(&wait_mask, SIGUSR1);
+  errno = 0;
+  const int suspend_result = sigsuspend(&wait_mask);
+  const int suspend_errno = errno;
+  const int restored = signal_is_blocked(SIGUSR1);
+
+  int status = 0;
+  const pid_t waited = waitpid(child, &status, 0);
+  if (sigprocmask(SIG_SETMASK, &previous, NULL) != 0) {
+    perror("sigprocmask restore");
+    return 1;
+  }
+
+  if (suspend_result != -1 || suspend_errno != EINTR) {
+    fprintf(
+        stderr,
+        "sigsuspend returned result=%d errno=%d\n",
+        suspend_result,
+        suspend_errno);
+    return 1;
+  }
+  if (waited != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    fputs("signal child failed\n", stderr);
+    return 1;
+  }
+  if (suspend_deliveries != 1 || restored != 1) {
+    fprintf(
+        stderr,
+        "unexpected sigsuspend state: deliveries=%d restored=%d\n",
+        (int)suspend_deliveries,
+        restored);
+    return 1;
+  }
+
+  printf(
+      "sigsuspend restored=%d deliveries=%d\n",
+      restored,
+      (int)suspend_deliveries);
+  return 0;
+}
+
+static int test_pending_sigsuspend(void) {
+  suspend_deliveries = 0;
+
+  sigset_t blocked;
+  sigset_t previous;
+  sigemptyset(&blocked);
+  sigaddset(&blocked, SIGUSR1);
+  if (sigprocmask(SIG_BLOCK, &blocked, &previous) != 0) {
+    perror("sigprocmask");
+    return 1;
+  }
+
+  struct sigaction action;
+  memset(&action, 0, sizeof(action));
+  action.sa_handler = suspend_handler;
+  sigemptyset(&action.sa_mask);
+  if (sigaction(SIGUSR1, &action, NULL) != 0) {
+    perror("sigaction");
+    return 1;
+  }
+  if (raise(SIGUSR1) != 0) {
+    perror("raise");
+    return 1;
+  }
+
+  sigset_t pending;
+  if (sigpending(&pending) != 0 || sigismember(&pending, SIGUSR1) != 1) {
+    fputs("SIGUSR1 was not pending before sigsuspend\n", stderr);
+    return 1;
+  }
+
+  sigset_t wait_mask = previous;
+  sigdelset(&wait_mask, SIGUSR1);
+  errno = 0;
+  const int suspend_result = sigsuspend(&wait_mask);
+  const int suspend_errno = errno;
+  const int restored = signal_is_blocked(SIGUSR1);
+  if (sigpending(&pending) != 0) {
+    perror("sigpending after sigsuspend");
+    return 1;
+  }
+  const int remains_pending = sigismember(&pending, SIGUSR1);
+
+  if (sigprocmask(SIG_SETMASK, &previous, NULL) != 0) {
+    perror("sigprocmask restore");
+    return 1;
+  }
+  if (suspend_result != -1 || suspend_errno != EINTR) {
+    fprintf(
+        stderr,
+        "pending sigsuspend returned result=%d errno=%d\n",
+        suspend_result,
+        suspend_errno);
+    return 1;
+  }
+  if (suspend_deliveries != 1 || restored != 1 || remains_pending != 0) {
+    fprintf(
+        stderr,
+        "unexpected pending sigsuspend state: deliveries=%d restored=%d pending=%d\n",
+        (int)suspend_deliveries,
+        restored,
+        remains_pending);
+    return 1;
+  }
+
+  printf(
+      "pending sigsuspend restored=%d deliveries=%d pending=%d\n",
+      restored,
+      (int)suspend_deliveries,
+      remains_pending);
+  return 0;
+}
+
+static int test_sigsuspend_invalid_arguments(void) {
+  const void* invalid_mask = (const void*)(uintptr_t)1;
+
+  errno = 0;
+  const long invalid_size = syscall(SYS_rt_sigsuspend, invalid_mask, 7UL);
+  const int invalid_size_errno = errno;
+  if (invalid_size != -1 || invalid_size_errno != EINVAL) {
+    fprintf(
+        stderr,
+        "rt_sigsuspend invalid size result=%ld errno=%d, expected EINVAL\n",
+        invalid_size,
+        invalid_size_errno);
+    return 1;
+  }
+
+  errno = 0;
+  const long invalid_pointer = syscall(SYS_rt_sigsuspend, invalid_mask, 8UL);
+  const int invalid_pointer_errno = errno;
+  if (invalid_pointer != -1 || invalid_pointer_errno != EFAULT) {
+    fprintf(
+        stderr,
+        "rt_sigsuspend invalid pointer result=%ld errno=%d, expected EFAULT\n",
+        invalid_pointer,
+        invalid_pointer_errno);
+    return 1;
+  }
+
+  puts("rt_sigsuspend invalid size=EINVAL invalid pointer=EFAULT");
+  return 0;
+}
+
+static int test_blocking_sigsuspend_without_signal(void) {
+  sigset_t wait_mask;
+  sigfillset(&wait_mask);
+
+  static const char ready[] = "sigsuspend waiting without a signal\n";
+  write_message(ready, sizeof(ready) - 1);
+
+  errno = 0;
+  const int suspend_result = sigsuspend(&wait_mask);
+  fprintf(
+      stderr,
+      "unexpected sigsuspend return result=%d errno=%d\n",
+      suspend_result,
+      errno);
+  return 2;
+}
+
 static void* check_clone_mask(void* argument) {
   (void)argument;
   const int blocked = signal_is_blocked(SIGUSR1);
@@ -649,6 +866,38 @@ static int test_pending_across_exec(const char* executable) {
   return 1;
 }
 
+static int test_itimer_is_discarded_on_process_exit(void) {
+  const pid_t child = fork();
+  if (child < 0) {
+    perror("fork");
+    return 1;
+  }
+  if (child == 0) {
+    const struct itimerval timer = {
+        .it_value = {.tv_sec = 1, .tv_usec = 0},
+    };
+    if (setitimer(ITIMER_REAL, &timer, NULL) != 0) {
+      _exit(2);
+    }
+    _exit(0);
+  }
+
+  int status;
+  if (waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
+      WEXITSTATUS(status) != 0) {
+    fputs("child failed to arm timer before exit\n", stderr);
+    return 1;
+  }
+
+  const struct timespec delay = {.tv_sec = 2, .tv_nsec = 0};
+  if (nanosleep(&delay, NULL) != 0) {
+    perror("nanosleep");
+    return 1;
+  }
+  puts("timer discarded after process exit");
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc != 2) {
     fprintf(stderr, "usage: %s SCENARIO\n", argv[0]);
@@ -656,6 +905,21 @@ int main(int argc, char** argv) {
   }
   if (strcmp(argv[1], "itimer-delivery") == 0) {
     return test_itimer_delivery();
+  }
+  if (strcmp(argv[1], "itimer-exit") == 0) {
+    return test_itimer_is_discarded_on_process_exit();
+  }
+  if (strcmp(argv[1], "blocking-sigsuspend") == 0) {
+    return test_blocking_sigsuspend();
+  }
+  if (strcmp(argv[1], "pending-sigsuspend") == 0) {
+    return test_pending_sigsuspend();
+  }
+  if (strcmp(argv[1], "sigsuspend-invalid-arguments") == 0) {
+    return test_sigsuspend_invalid_arguments();
+  }
+  if (strcmp(argv[1], "blocking-sigsuspend-no-signal") == 0) {
+    return test_blocking_sigsuspend_without_signal();
   }
   if (strcmp(argv[1], "masks-fork-clone") == 0) {
     return test_masks_across_fork_and_clone();

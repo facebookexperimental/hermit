@@ -1,0 +1,1 @@
+{"run_id":"fixture-v10","hermit_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","path":"full","producer":{"source":"node","node":"e2e.manifest_backend_parity_c_on_host","outer_attempt":1},"id":"synthetic fixture","result":"pass","attempts":1}

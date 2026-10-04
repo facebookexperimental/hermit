@@ -31,13 +31,31 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
+#include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
 int main() {
-  int cpu = 0;
-  int node = 0;
-  syscall(SYS_getcpu, &cpu, &node, NULL);
-  printf("CPU %d, Node %d\n", cpu, node);
+  unsigned cpu = UINT_MAX;
+  unsigned node = UINT_MAX;
+  enum { EXPECTED_CHECKS = 3 };
+  int ok = 0;
+
+  if (syscall(SYS_getcpu, &cpu, &node, NULL) == 0) {
+    ok++;
+  }
+  /* Hermit exposes a single virtual CPU in NUMA node 0. Poison both outputs
+     above so a successful call that fails to initialize either result cannot
+     accidentally satisfy the contract. */
+  if (cpu == 0) {
+    ok++;
+  }
+  if (node == 0) {
+    ok++;
+  }
+
+  printf("CPU %u, Node %u\n", cpu, node);
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

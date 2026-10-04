@@ -268,6 +268,15 @@ impl Replayer {
         self.cursor.peek().cloned()
     }
 
+    /// The next task and its relative duration, without consuming a replay
+    /// event. A successful exec can replace that task's scheduler registration
+    /// after its prehook already selected it as the replay foreground task.
+    pub(super) fn next_resume(&self) -> Option<(DetTid, Option<LogicalTime>)> {
+        self.cursor
+            .peek()
+            .map(|next| (next.dettid, self.resolve_time_to_run(next)))
+    }
+
     fn next_replay_matches(&self, observed: &SchedEvent) -> bool {
         if let Some(expected) = self.cursor.peek() {
             !is_hard_desync(observed, expected)

@@ -24,12 +24,12 @@
 //! and runs it as:
 //!
 //! ```text
-//! hermit run --base-env=minimal --preemption-timeout=80000000 -- <program> [args]
+//! hermit run --base-env=minimal --max-timeslice=80000000 -- <program> [args]
 //! ```
 //!
 //! The programs are ptrace-heavy and rely on PMU branch counters plus working
 //! user/mount namespaces, so like the other Hermit integration suites these are
-//! `#[ignore]`d by default and exercised explicitly (e.g. from `validate.sh`):
+//! `#[ignore]`d by default and exercised explicitly (e.g. from `scripts/validate.rs`):
 //!
 //! ```text
 //! cargo test -p hermit --test rr_suite -- --ignored
@@ -197,7 +197,7 @@ fn run_rr_test(basename: &str, expected_exit: i32, args: &[&str], success_marker
         .args([
             "run",
             "--base-env=minimal",
-            "--preemption-timeout=80000000",
+            "--max-timeslice=80000000",
             "--",
         ])
         .arg(&binary)

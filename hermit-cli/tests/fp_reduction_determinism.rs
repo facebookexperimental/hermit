@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
@@ -21,6 +24,7 @@ const TIMEOUT_SECONDS: u64 = 30;
 static FP_REDUCTION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 
 fn command_output(mut command: Command, label: &str) -> Output {
+    hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
     let output = command
         .output()
@@ -92,13 +96,13 @@ fn run_native(iteration: usize) -> Vec<u8> {
 }
 
 fn run_strict(iteration: usize) -> Vec<u8> {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    let mut command = Command::new(hermit_test::hermit_binary());
     command.args([
         "run",
         "--strict",
         "--base-env=minimal",
         "--no-virtualize-cpuid",
-        "--preemption-timeout=disabled",
+        "--max-timeslice=disabled",
         "--",
     ]);
     command.arg(fp_reduction_guest());

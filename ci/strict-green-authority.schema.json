@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/rrnewton/hermit/blob/main/ci/strict-green-authority.schema.json",
+  "title": "Hermit strict-green claims",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "claims"],
+  "properties": {
+    "schema": { "const": 1 },
+    "claims": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/claim" }
+    }
+  },
+  "$defs": {
+    "claim": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_id",
+        "hermit_sha",
+        "source_tree_dirty",
+        "cell",
+        "tier",
+        "memory_cadence",
+        "state",
+        "control_points",
+        "register_coverage",
+        "runs"
+      ],
+      "properties": {
+        "run_id": { "type": "string", "minLength": 1 },
+        "hermit_sha": { "type": "string", "pattern": "^[0-9A-Fa-f]{40}$" },
+        "source_tree_dirty": { "const": false },
+        "cell": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["test", "mode", "reference_backend", "observed_backend"],
+          "properties": {
+            "test": { "type": "string", "minLength": 1 },
+            "mode": { "type": "string", "minLength": 1 },
+            "reference_backend": { "type": "string", "minLength": 1 },
+            "observed_backend": { "type": "string", "minLength": 1 }
+          }
+        },
+        "tier": { "enum": ["short", "large"] },
+        "memory_cadence": { "type": "integer", "minimum": 1 },
+        "state": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["ci_enabled", "exercise", "execution_count"],
+          "properties": {
+            "ci_enabled": { "const": true },
+            "exercise": { "const": "exercised" },
+            "execution_count": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "control_points": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["boundary", "kind"],
+          "properties": {
+            "boundary": { "const": "guest-logical-control-v1" },
+            "kind": { "const": "syscall-exit" }
+          }
+        },
+        "register_coverage": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "cadence"],
+              "properties": {
+                "kind": { "const": "not-included" },
+                "cadence": { "type": "null" }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "cadence"],
+              "properties": {
+                "kind": { "const": "bounded-gpr-control-v1" },
+                "cadence": { "type": "integer", "minimum": 1 }
+              }
+            }
+          ]
+        },
+        "runs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["index", "control_point_count", "surfaces"],
+            "properties": {
+              "index": { "type": "integer", "minimum": 1 },
+              "control_point_count": { "type": "integer", "minimum": 1 },
+              "surfaces": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "stdout": { "$ref": "#/$defs/artifact_pair" },
+                  "info_log": { "$ref": "#/$defs/artifact_pair" },
+                  "stack": { "$ref": "#/$defs/artifact_pair" },
+                  "heap": { "$ref": "#/$defs/artifact_pair" },
+                  "registers": { "$ref": "#/$defs/artifact_pair" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "artifact_pair": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reference_path", "observed_path"],
+      "properties": {
+        "reference_path": { "type": "string", "minLength": 1 },
+        "observed_path": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# Refuse a push whose working tree does not compile in the DEFAULT feature
+# configuration with warnings denied.
+#
+# See scripts/check-default-build-warnings.sh for why this configuration and not
+# another: `cargo test` does not set `-D warnings` and every workflow does, so
+# local green does not imply CI green. rrnewton/hermit#2359 reached `main`
+# through that gap after passing two independent review lanes.
+#
+# WHAT THIS CHECKS, STATED PLAINLY SO IT IS NOT OVERREAD: it lints the WORKING
+# TREE, not the exact commits being pushed. Those are the same thing in the
+# normal case of pushing the branch you are standing on, and differ if you push
+# a ref you are not checked out at. Checking each pushed commit would mean a
+# temporary checkout and a cold build per commit, which is far more than this
+# gate is worth. Treat a pass as "the tree in front of you lints", which is
+# exactly the fact reviewers were missing.
+#
+# Cost on a green tree, measured 2026-08-24 on a 316-core x86_64 Linux build
+# host: 0.3s with nothing touched, 1.0s after touching one source file, and 25s
+# from a cold CARGO_TARGET_DIR.
+#
+# Escape hatch: `git push --no-verify`. It is deliberately the standard one
+# rather than a bespoke variable -- a project-specific override is one more
+# thing to learn, and anyone who wants past a hook already knows --no-verify.
+
+set -uo pipefail
+
+root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+checker="$root/scripts/check-default-build-warnings.sh"
+
+if [[ ! -x "$checker" ]]; then
+    echo "pre-push: $checker missing or not executable; skipping." >&2
+    echo "  This is a skip, NOT a pass. Run scripts/setup-hooks.sh." >&2
+    exit 0
+fi
+
+# A pre-push hook receives "<local ref> <local sha> <remote ref> <remote sha>"
+# per ref on stdin. A local sha of all zeros is a branch DELETION, which pushes
+# no code and must not be blocked on a lint -- refusing to let someone delete a
+# stale branch because an unrelated file has a warning would be absurd.
+has_content=0
+while read -r _local_ref local_sha _remote_ref _remote_sha; do
+    [[ -z "${local_sha:-}" ]] && continue
+    if [[ "$local_sha" =~ ^0+$ ]]; then
+        continue
+    fi
+    has_content=1
+done
+
+if [[ $has_content -eq 0 ]]; then
+    exit 0
+fi
+
+if "$checker" --quiet; then
+    exit 0
+fi
+
+# ⚠️ "COULD NOT CHECK" IS NOT "DOES NOT COMPILE", AND THIS HOOK USED TO SAY THE
+# SECOND FOR BOTH. In a fresh worktree the submodules are not populated, so a
+# path dependency such as agent-utils/rs/dagrun is simply absent and Cargo fails
+# to resolve the workspace before it lints anything. The tree was never checked,
+# but the message below announced a compile failure and pointed at
+# `cargo clippy`, which cannot reproduce it and does not mention the submodule.
+#
+# Measured 2026-09-04 on the host recorded for this check in
+# docs/TESTING_ENVIRONMENTS.md under "Named measurement hosts": this fired on a
+# diff touching NO RUST AT ALL -- a Python CI helper plus a Makefile line -- with
+# "error: no matching package named `dagrun` found". The remedy was
+# `git submodule update --init agent-utils`, which the message never named.
+#
+# ⚠️ IT IS THE DOCUMENTED LANDING PROCEDURE THAT PRODUCES THIS. CLAUDE.md tells
+# every agent to land from a clean detached worktree, and a clean detached
+# worktree is exactly where submodules are unpopulated. So the safe procedure
+# reliably produced a misleading failure and each agent paid to rediagnose it.
+#
+# The discriminator is Git's own submodule state, NOT the text of Cargo's error.
+# `git submodule status` prefixes an uninitialised submodule with `-`. Matching
+# on git state rather than on an error string means a reworded Cargo message
+# cannot silently turn this back into the misleading branch.
+#
+# ⚠️ CHECKED ONLY AFTER THE CHECKER HAS ALREADY FAILED, DELIBERATELY. Some
+# submodules are optional (see the parent's checkout-optional-submodules
+# target), so an unpopulated one does not imply a broken build. Testing this
+# first would refuse pushes from trees that lint perfectly well.
+# Only agent-utils is required by the default workspace checker today:
+# ci/manifest-plan/Cargo.toml resolves dagrun through agent-utils/rs/dagrun.
+# third-party/rr is runtime input for ignored rr tests and an unpopulated rr
+# checkout does not stop `cargo clippy --workspace --all-targets`. Treating every
+# unpopulated submodule as causal hides a real compiler error whenever an
+# unrelated optional submodule happens to be absent.
+required_checker_submodules=(agent-utils)
+
+submodule_state_status=0
+submodule_state=$(git -C "$root" submodule status 2>&1) || submodule_state_status=$?
+if [[ $submodule_state_status -ne 0 ]]; then
+    {
+        echo
+        echo "pre-push REFUSED: the build check failed, and the hook could not"
+        echo "inspect submodule state to determine whether a missing required"
+        echo "submodule prevented the check from running."
+        echo
+        echo "state: CHECK FAILED; SUBMODULE DIAGNOSIS FAILED"
+        echo
+        echo "git submodule status reported:"
+        printf '%s\n' "$submodule_state"
+        echo
+        echo "Fix the submodule-state error, then push again. The hook will not"
+        echo "call this a compile failure when its own diagnosis did not run."
+        echo
+        echo "To push anyway: git push --no-verify"
+        echo
+    } >&2
+    exit 1
+fi
+
+unpopulated=()
+while read -r state submodule _rest; do
+    [[ $state == -* ]] || continue
+    for required in "${required_checker_submodules[@]}"; do
+        if [[ $submodule == "$required" ]]; then
+            unpopulated+=("$submodule")
+        fi
+    done
+done <<<"$submodule_state"
+
+if [[ ${#unpopulated[@]} -ne 0 ]]; then
+    {
+        echo
+        echo "pre-push REFUSED: the working tree COULD NOT BE CHECKED, because"
+        echo "these submodules are not populated:"
+        echo
+        for submodule in "${unpopulated[@]}"; do
+            echo "    $submodule"
+        done
+        echo
+        echo "state: NOT LINTED -- this is not a compile failure and says nothing"
+        echo "about whether your change compiles. Cargo cannot resolve a path"
+        echo "dependency whose directory is absent, so it stops before linting."
+        echo
+        echo "remedy:"
+        for submodule in "${unpopulated[@]}"; do
+            echo "    git submodule update --init $submodule"
+        done
+        echo
+        echo "then push again. A fresh detached worktree -- the landing procedure"
+        echo "CLAUDE.md prescribes -- always starts in this state."
+        echo
+        echo "To push anyway: git push --no-verify"
+        echo
+    } >&2
+    exit 1
+fi
+
+cat >&2 <<'MESSAGE'
+
+pre-push REFUSED: the working tree does not compile in the default feature
+configuration with warnings denied.
+
+The failure above is what CI's lint.clippy node will report. `cargo test` will
+not show it, because it does not set -D warnings -- that gap is the reason this
+hook exists.
+
+If the offending item is only used behind a feature gate, gate the item to match
+its consumer rather than deleting it; deleting an item that IS used under the
+feature just moves the break into the feature build.
+
+Reproduce and iterate with:
+    cargo clippy --workspace --all-targets -- -D warnings
+
+To push anyway: git push --no-verify
+
+MESSAGE
+exit 1

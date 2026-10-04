@@ -14,11 +14,14 @@ use std::iter::FromIterator;
 use std::path::Path;
 use std::path::PathBuf;
 
+use chrono::DateTime;
+use chrono::Utc;
 use detcore_model::collections::ReplayCursor;
 use serde::Deserialize;
 use serde::Serialize;
 use tracing::trace;
 
+use crate::resources::ChaosEpochTransition;
 use crate::scheduler::Priority;
 use crate::scheduler::runqueue::DEFAULT_PRIORITY;
 use crate::scheduler::runqueue::FIRST_PRIORITY;
@@ -35,6 +38,15 @@ pub struct PreemptionRecord {
     /// A sorted list of end-of-timeslice preemption times for each thread.
     per_thread: BTreeMap<DetTid, ThreadHistory>,
     global: Vec<SchedEvent>,
+    /// The virtual-time epoch of the run that produced this record.
+    ///
+    /// Every `LogicalTime` above is an absolute virtual instant, i.e. an offset
+    /// from this epoch, so the record only describes a run whose clock starts
+    /// here. A replay started from any other epoch would see every recorded
+    /// timeslice end shifted by the difference. `None` for records written
+    /// before the epoch was stored, and for records synthesized in memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    epoch: Option<DateTime<Utc>>,
 }
 
 impl std::fmt::Display for PreemptionRecord {
@@ -50,7 +62,13 @@ impl PreemptionRecord {
         Self {
             per_thread: Default::default(),
             global: events,
+            epoch: None,
         }
+    }
+
+    /// The virtual-time epoch this record was produced under, if it was stored.
+    pub fn epoch(&self) -> Option<DateTime<Utc>> {
+        self.epoch
     }
 
     /// Make a copy of everything in the `PreemptionRecord` in a public format.
@@ -70,6 +88,8 @@ impl PreemptionRecord {
     pub fn strip_contents(mut self) -> Self {
         for history in self.per_thread.values_mut() {
             history.prio_changes = Vec::new();
+            history.preemption_rcbs = Vec::new();
+            history.chaos_epochs = Vec::new();
             history.final_prio = 1000;
         }
         self.global = Vec::new();
@@ -110,6 +130,7 @@ impl PreemptionRecord {
         PreemptionRecord {
             per_thread: self.per_thread.clone(),
             global: Vec::new(),
+            epoch: self.epoch,
         }
     }
 
@@ -132,6 +153,8 @@ impl PreemptionRecord {
                 ThreadHistory {
                     final_prio: DEFAULT_PRIORITY,
                     prio_changes: Vec::new(),
+                    preemption_rcbs: Vec::new(),
+                    chaos_epochs: Vec::new(),
                 }
             } else {
                 // We could insist on this invariant, but it's a little more flexible not to:
@@ -155,6 +178,8 @@ impl PreemptionRecord {
                 ThreadHistory {
                     final_prio,
                     prio_changes,
+                    preemption_rcbs: Vec::new(),
+                    chaos_epochs: Vec::new(),
                 }
             };
             bt2.insert(*tid, th);
@@ -162,6 +187,7 @@ impl PreemptionRecord {
         PreemptionRecord {
             per_thread: bt2,
             global: Vec::new(),
+            epoch: None,
         }
     }
 
@@ -219,6 +245,50 @@ impl PreemptionRecord {
                     time_last = Some(*ns);
                 }
             }
+            if !history.preemption_rcbs.is_empty()
+                && history.preemption_rcbs.len() != history.prio_changes.len()
+            {
+                return Err(format!(
+                    "thread {} has {} preemption times but {} RCB targets",
+                    tid,
+                    history.prio_changes.len(),
+                    history.preemption_rcbs.len()
+                ));
+            }
+            if history
+                .preemption_rcbs
+                .windows(2)
+                .any(|pair| pair[1] < pair[0])
+            {
+                return Err(format!(
+                    "preemption RCB targets failed to increase for thread {}",
+                    tid
+                ));
+            }
+            let mut transition_last = None;
+            let mut epoch_last = None;
+            for transition in &history.chaos_epochs {
+                if transition.factor.as_f64() <= 0.0 {
+                    return Err(format!(
+                        "chaos epoch factor for thread {} must be positive",
+                        tid
+                    ));
+                }
+                if transition_last.is_some_and(|last| transition.logical_time <= last) {
+                    return Err(format!(
+                        "chaos epoch transition times failed to increase for thread {}",
+                        tid
+                    ));
+                }
+                if epoch_last.is_some_and(|last| transition.epoch <= last) {
+                    return Err(format!(
+                        "chaos epoch numbers failed to increase for thread {}",
+                        tid
+                    ));
+                }
+                transition_last = Some(transition.logical_time);
+                epoch_last = Some(transition.epoch);
+            }
         }
         Ok(())
     }
@@ -249,7 +319,10 @@ impl PreemptionRecord {
         // One more pass to remove anything that just has default priority its whole lifetime.
         let mut finalmap = BTreeMap::new();
         for (tid, history) in clone.per_thread.into_iter() {
-            if history.final_prio != DEFAULT_PRIORITY || !history.prio_changes.is_empty() {
+            if history.final_prio != DEFAULT_PRIORITY
+                || !history.prio_changes.is_empty()
+                || !history.chaos_epochs.is_empty()
+            {
                 assert!(finalmap.insert(tid, history).is_none());
             }
         }
@@ -290,6 +363,9 @@ impl PreemptionRecord {
                 // There were prio changes for at least one of the threads, remove that
                 // preemption as the one to drop
                 let removed_prio = thread_history.prio_changes.pop().unwrap().1;
+                if !thread_history.preemption_rcbs.is_empty() {
+                    thread_history.preemption_rcbs.pop();
+                }
                 thread_history.final_prio = removed_prio;
             } else {
                 // There were no prio changes for any threads, so just remove the last
@@ -320,6 +396,23 @@ pub struct ThreadHistory {
     /// private, and thus you must go through the iterator, as this will change in the
     /// future.
     prio_changes: Vec<(LogicalTime, Priority)>,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    /// Exact per-thread PMU RCB target for each matching priority change. Empty
+    /// in older JSON artifacts, which fall back to logical-time replay.
+    // `ThreadHistory` crosses a non-self-describing bincode RPC; never skip it.
+    #[serde(default)]
+    preemption_rcbs: Vec<u64>,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    /// Exact per-thread slowdown transitions. Empty artifacts from older Hermit
+    /// versions remain wire-compatible when read through Serde's default.
+    // `ThreadHistory` also crosses Reverie's non-self-describing bincode RPC,
+    // so this field must never be skipped when it is empty.
+    #[serde(default)]
+    chaos_epochs: Vec<ChaosEpochTransition>,
 }
 
 impl ThreadHistory {
@@ -328,6 +421,8 @@ impl ThreadHistory {
         ThreadHistory {
             final_prio: DEFAULT_PRIORITY,
             prio_changes: Vec::new(),
+            preemption_rcbs: Vec::new(),
+            chaos_epochs: Vec::new(),
         }
     }
 
@@ -337,7 +432,26 @@ impl ThreadHistory {
         ThreadHistoryIterator {
             full_history: self,
             ix: 0,
+            chaos_epoch_ix: 0,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_chaos_epochs(mut self, chaos_epochs: Vec<ChaosEpochTransition>) -> Self {
+        self.chaos_epochs = chaos_epochs;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_prio_changes(mut self, prio_changes: Vec<(LogicalTime, Priority)>) -> Self {
+        self.prio_changes = prio_changes;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_preemption_rcbs(mut self, preemption_rcbs: Vec<u64>) -> Self {
+        self.preemption_rcbs = preemption_rcbs;
+        self
     }
 
     /// Flatten the time series into a uniform representation.
@@ -382,6 +496,10 @@ pub struct ThreadHistoryIterator {
     full_history: ThreadHistory,
     /// Index that tracks our position.
     ix: usize,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    #[serde(default)]
+    chaos_epoch_ix: usize,
 }
 
 impl ThreadHistoryIterator {
@@ -393,6 +511,44 @@ impl ThreadHistoryIterator {
     /// Return the priority of the last slice after the last preemption.
     pub fn final_priority(&self) -> Priority {
         self.full_history.final_prio
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    /// Consume recorded epoch transitions up to `current_time`, returning a
+    /// transition only when the active recorded factor changed.
+    pub fn advance_chaos_epoch(
+        &mut self,
+        current_time: LogicalTime,
+    ) -> Option<ChaosEpochTransition> {
+        let mut changed = None;
+        while let Some(transition) = self.full_history.chaos_epochs.get(self.chaos_epoch_ix)
+            && transition.logical_time <= current_time
+        {
+            changed = Some(*transition);
+            self.chaos_epoch_ix += 1;
+        }
+        changed
+    }
+
+    /// Whether this artifact carries recorded slowdown epochs.
+    pub fn has_chaos_epochs(&self) -> bool {
+        !self.full_history.chaos_epochs.is_empty()
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    /// Return the next recorded logical boundary and its exact RCB target when
+    /// the artifact was produced by a version that records one.
+    pub fn next_with_rcbs(&mut self) -> Option<(LogicalTime, Priority, Option<u64>)> {
+        let ix = self.ix;
+        self.next().map(|(time, priority)| {
+            (
+                time,
+                priority,
+                self.full_history.preemption_rcbs.get(ix).copied(),
+            )
+        })
     }
 }
 
@@ -418,6 +574,104 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::types::RcbTimeMultiplier;
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    #[test]
+    fn chaos_epoch_transitions_round_trip_and_replay_exact_factors() {
+        let tid = DetTid::from_raw(2);
+        let first = ChaosEpochTransition {
+            logical_time: LogicalTime::from_nanos(100),
+            epoch: 0,
+            factor: RcbTimeMultiplier::from_f64(2.5),
+        };
+        let second = ChaosEpochTransition {
+            logical_time: LogicalTime::from_nanos(500),
+            epoch: 1,
+            factor: RcbTimeMultiplier::from_f64(0.75),
+        };
+
+        let mut writer = PreemptionWriter::new(None);
+        writer.register_thread(tid, DEFAULT_PRIORITY);
+        writer.insert_chaos_epoch(tid, first);
+        writer.insert_chaos_epoch(tid, second);
+        let encoded = writer.into_string();
+        assert!(encoded.contains("chaos_epochs"));
+
+        let decoded: PreemptionRecord = serde_json::from_str(&encoded).unwrap();
+        decoded.validate().unwrap();
+        let mut history = decoded.extract_all().remove(&tid).unwrap().into_iter();
+        assert_eq!(
+            history.advance_chaos_epoch(LogicalTime::from_nanos(99)),
+            None
+        );
+        assert_eq!(
+            history.advance_chaos_epoch(LogicalTime::from_nanos(100)),
+            Some(first)
+        );
+        assert_eq!(
+            history.advance_chaos_epoch(LogicalTime::from_nanos(499)),
+            None
+        );
+        assert_eq!(
+            history.advance_chaos_epoch(LogicalTime::from_nanos(500)),
+            Some(second)
+        );
+        assert_eq!(history.advance_chaos_epoch(LogicalTime::MAX), None);
+    }
+
+    /// <https://github.com/rrnewton/hermit/issues/3411>: the epoch a record was
+    /// made under survives serialization, the preemptions-only copy, and the
+    /// non-panicking CLI reader; records written before it was stored read as
+    /// `None`, and a malformed file is an error rather than a panic.
+    #[test]
+    fn recorded_epoch_round_trips_and_legacy_records_have_none() {
+        let epoch: DateTime<Utc> = "2000-12-31T23:59:59.123456789Z".parse().unwrap();
+        let tid = DetTid::from_raw(3);
+        let mut writer = PreemptionWriter::new(None).with_epoch(epoch);
+        writer.register_thread(tid, DEFAULT_PRIORITY);
+        writer.insert_reprioritization(
+            tid,
+            LogicalTime::from_nanos(978_307_199_223_456_789),
+            7,
+            DEFAULT_PRIORITY,
+            5,
+        );
+        let encoded = writer.into_string();
+
+        let decoded: PreemptionRecord = serde_json::from_str(&encoded).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(decoded.epoch(), Some(epoch));
+        assert_eq!(decoded.clone_preemptions_only().epoch(), Some(epoch));
+
+        let directory = tempfile::tempdir().unwrap();
+        let current = directory.path().join("current.json");
+        std::fs::write(&current, &encoded).unwrap();
+        assert_eq!(read_recorded_epoch(&current), Ok(Some(epoch)));
+
+        let mut legacy_value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        legacy_value
+            .as_object_mut()
+            .unwrap()
+            .remove("epoch")
+            .unwrap();
+        let legacy = directory.path().join("legacy.json");
+        std::fs::write(&legacy, legacy_value.to_string()).unwrap();
+        assert_eq!(read_recorded_epoch(&legacy), Ok(None));
+        let legacy_record: PreemptionRecord = serde_json::from_value(legacy_value.clone()).unwrap();
+        assert_eq!(legacy_record.epoch(), None);
+        assert!(
+            !serde_json::to_string(&legacy_record)
+                .unwrap()
+                .contains("\"epoch\"")
+        );
+
+        let malformed = directory.path().join("malformed.json");
+        std::fs::write(&malformed, "{\"epoch\": 7}").unwrap();
+        assert!(read_recorded_epoch(&malformed).is_err());
+        assert!(read_recorded_epoch(&directory.path().join("absent.json")).is_err());
+    }
 
     #[test]
     fn print_preemptionrecord() {
@@ -429,12 +683,12 @@ mod tests {
         pw.register_thread(tid1, 1000);
         pw.register_thread(tid2, 1000);
 
-        pw.insert_reprioritization(tid1, LogicalTime::from_nanos(3), 1000, 3);
-        pw.insert_reprioritization(tid1, LogicalTime::from_nanos(30), 3, 30);
-        pw.insert_reprioritization(tid1, LogicalTime::from_nanos(300), 30, 300);
-        pw.insert_reprioritization(tid2, LogicalTime::from_nanos(2), 1000, 2);
-        pw.insert_reprioritization(tid2, LogicalTime::from_nanos(20), 2, 20);
-        pw.insert_reprioritization(tid2, LogicalTime::from_nanos(200), 20, 200);
+        pw.insert_reprioritization(tid1, LogicalTime::from_nanos(3), 3, 1000, 3);
+        pw.insert_reprioritization(tid1, LogicalTime::from_nanos(30), 30, 3, 30);
+        pw.insert_reprioritization(tid1, LogicalTime::from_nanos(300), 300, 30, 300);
+        pw.insert_reprioritization(tid2, LogicalTime::from_nanos(2), 2, 1000, 2);
+        pw.insert_reprioritization(tid2, LogicalTime::from_nanos(20), 20, 2, 20);
+        pw.insert_reprioritization(tid2, LogicalTime::from_nanos(200), 200, 20, 200);
 
         // First, round trip through a pretty-printed string
         // ------------------------------------------------
@@ -452,6 +706,16 @@ mod tests {
         let th2 = reader.extract_thread_record(&tid2).unwrap();
         assert_eq!(th1.final_prio, 300);
         assert_eq!(th2.final_prio, 200);
+
+        let mut exact = th1.clone().into_iter();
+        assert_eq!(
+            exact.next_with_rcbs(),
+            Some((LogicalTime::from_nanos(3), 1000, Some(3)))
+        );
+        assert_eq!(
+            exact.next_with_rcbs(),
+            Some((LogicalTime::from_nanos(30), 3, Some(30)))
+        );
 
         let it1 = th1.into_iter();
         let it2 = th2.into_iter();
@@ -671,6 +935,13 @@ impl PreemptionWriter {
         }
     }
 
+    /// Store the virtual-time epoch the recorded logical times are measured
+    /// from, so a replay can start its clock at the same instant.
+    pub fn with_epoch(mut self, epoch: DateTime<Utc>) -> Self {
+        self.inner.epoch = Some(epoch);
+        self
+    }
+
     /// Does the record have zero entries?
     pub fn is_empty(&self) -> bool {
         self.inner.per_thread.is_empty()
@@ -680,7 +951,7 @@ impl PreemptionWriter {
     pub fn len(&self) -> usize {
         let mut count = 0;
         for v in self.inner.per_thread.values() {
-            count += v.prio_changes.len();
+            count += v.prio_changes.len() + v.chaos_epochs.len();
         }
         count
     }
@@ -695,6 +966,8 @@ impl PreemptionWriter {
                 ThreadHistory {
                     final_prio: prio,
                     prio_changes: Vec::new(),
+                    preemption_rcbs: Vec::new(),
+                    chaos_epochs: Vec::new(),
                 },
             )
             .is_some()
@@ -715,6 +988,7 @@ impl PreemptionWriter {
         &mut self,
         tid: DetTid,
         time: LogicalTime,
+        rcbs: u64,
         prior_prio: Priority,
         next_prio: Priority,
     ) {
@@ -730,7 +1004,25 @@ impl PreemptionWriter {
             assert!(&time > last);
         }
         history.prio_changes.push((time, prior_prio));
+        history.preemption_rcbs.push(rcbs);
         history.final_prio = next_prio;
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    /// Record a deterministic slowdown epoch transition for replay.
+    pub fn insert_chaos_epoch(&mut self, tid: DetTid, transition: ChaosEpochTransition) {
+        let history = self.inner.per_thread.get_mut(&tid).unwrap_or_else(|| {
+            panic!(
+                "PreemptionRecord: Cannot insert a chaos epoch before registering thread {}",
+                tid
+            )
+        });
+        if let Some(last) = history.chaos_epochs.last() {
+            assert!(transition.logical_time > last.logical_time);
+            assert!(transition.epoch > last.epoch);
+        }
+        history.chaos_epochs.push(transition);
     }
 
     /// Add a SchedEvent to the global log of thread behavior.
@@ -821,6 +1113,24 @@ fn read_preemption_record(path: &Path) -> PreemptionRecord {
         );
     }
     pr
+}
+
+/// Read only the virtual-time epoch stored in a preemption record file.
+///
+/// Unlike [`PreemptionReader::new`], this reports an unreadable or malformed
+/// file as an error instead of panicking, because the CLI consults it before
+/// any guest starts. `Ok(None)` means the record predates stored epochs.
+pub fn read_recorded_epoch(path: &Path) -> Result<Option<DateTime<Utc>>, String> {
+    #[derive(Deserialize)]
+    struct EpochOnly {
+        #[serde(default)]
+        epoch: Option<DateTime<Utc>>,
+    }
+    let file = File::open(path)
+        .map_err(|e| format!("cannot read preemption record {}: {}", path.display(), e))?;
+    let record: EpochOnly = serde_json::from_reader(std::io::BufReader::new(file))
+        .map_err(|e| format!("cannot parse preemption record {}: {}", path.display(), e))?;
+    Ok(record.epoch)
 }
 
 // TODO: eventually this should do streaming IO, and abstract it behind this interface.

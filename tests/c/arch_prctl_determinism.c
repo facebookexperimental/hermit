@@ -133,10 +133,20 @@ int main(int argc, char** argv) {
         0);
   } else if (cpuid_state == 1) {
     expect_cpuid_instruction();
-    expect_result(
-        "fallback ARCH_SET_CPUID(1)",
-        syscall(SYS_arch_prctl, ARCH_SET_CPUID, 1),
-        0);
+    /* Linux documents ENODEV when the hardware lacks CPUID faulting. A host can
+     * still report the always-enabled state above; require that it remains
+     * enabled below rather than dropping the rest of this arch_prctl cell. */
+    errno = 0;
+    long enable_result = syscall(SYS_arch_prctl, ARCH_SET_CPUID, 1);
+    if (enable_result != 0 && (enable_result != -1 || errno != ENODEV)) {
+      fprintf(
+          stderr,
+          "fallback ARCH_SET_CPUID(1): result=%ld errno=%d "
+          "expected=0 or -1/ENODEV\n",
+          enable_result,
+          errno);
+      failures++;
+    }
     expect_result(
         "fallback ARCH_GET_CPUID",
         syscall(SYS_arch_prctl, ARCH_GET_CPUID, 0),

@@ -55,7 +55,19 @@ if ! command -v "$cc_bin" > /dev/null 2>&1; then
 fi
 
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd -- "$here/../.." && pwd)"
+if [[ $hermit == */* ]]; then
+    default_verification_report_bin="$(dirname -- "$hermit")/verification-report"
+else
+    default_verification_report_bin="$repo_root/target/debug/verification-report"
+fi
+VERIFICATION_REPORT_BIN=${VERIFICATION_REPORT_BIN:-$default_verification_report_bin}
 src="$here/../c/setitimer_determinism.c"
+
+if [[ ! -x $VERIFICATION_REPORT_BIN ]]; then
+    echo "FAIL: typed verification-report reader is not executable: $VERIFICATION_REPORT_BIN" >&2
+    exit 1
+fi
 
 work=$(mktemp -d strict_setitimer_test_XXXXXXX)
 function on_exit {
@@ -84,8 +96,10 @@ strict_count="$(printf '%s\n' "$strict_out" | sed -n 's/^SIGALRM deliveries: \([
 strict_count="${strict_count:-<none>}"
 
 # --strict --verify for the determinism verdict.
-verify_out="$("$hermit" run --strict --verify -- "$guest" < /dev/null 2>&1 || true)"
-if printf '%s\n' "$verify_out" | grep -q "Determinism verified"; then
+verify_report="$work/verify.json"
+verify_out="$("$hermit" run --strict --verify --verify-json "$verify_report" -- \
+    "$guest" < /dev/null 2>&1 || true)"
+if "$VERIFICATION_REPORT_BIN" matched "$verify_report"; then
     deterministic=1
 else
     deterministic=0

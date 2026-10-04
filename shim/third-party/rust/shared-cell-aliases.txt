@@ -1,0 +1,33 @@
+# Crates the Reverie cell's BUCK files name without a version suffix.
+#
+# Reverie's first-party BUCK files say `fbsource//third-party/rust:thiserror`,
+# the same spelling Meta's internal build uses. Reindeer only emits such an
+# unsuffixed alias for crates that are direct dependencies of the manifest it
+# ran on, so Hermit's cell has aliases for Hermit's direct dependencies and not
+# for Reverie's. That gap is the only thing that stopped one cell from serving
+# both; there is no version conflict behind it.
+#
+# bootstrap/regenerate-rust-deps appends one alias per line below, resolving
+# each to whatever versioned target the generated BUCK actually contains, so a
+# version bump does not silently strand an entry -- a missing crate is an error.
+#
+# Reindeer has no configuration for this: buckify.rs gates alias emission on
+# `index.is_public_target`, which is derived from the manifest's own direct
+# dependencies and is not configurable.
+byteorder
+bytes
+derive_more
+kvm-bindings
+kvm-ioctls
+linked-hash-map
+liteinst2
+memmap2
+never-say-never
+num-traits
+parking_lot
+paste
+perf-event-open-sys
+thiserror
+tokio-stream
+typed-arena
+unwind

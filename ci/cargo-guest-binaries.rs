@@ -1,0 +1,33 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+// Cargo guest fixtures required by hermit_modes.
+// Keep the exact names shared by the producer and the consumer.
+pub const CARGO_GUEST_BINARIES: [&str; 21] = [
+    "rustbin_bind_connect_race",
+    "rustbin_clock_gettime",
+    "rustbin_clock_total_order",
+    "rustbin_exit_group",
+    "rustbin_futex_and_print",
+    "rustbin_futex_timeout",
+    "rustbin_futex_wait_child",
+    "rustbin_futex_wake_some",
+    "rustbin_interrogate_tty",
+    "rustbin_nanosleep",
+    "rustbin_network_hello_world",
+    "rustbin_pipe_basics",
+    "rustbin_poll",
+    "rustbin_poll_spin",
+    "rustbin_print_clock_nanosleep_monotonic_abs_race",
+    "rustbin_print_clock_nanosleep_monotonic_race",
+    "rustbin_print_clock_nanosleep_realtime_abs_race",
+    "rustbin_print_nanosleep_race",
+    "rustbin_sched_yield",
+    "rustbin_socketpair",
+    "rustbin_thread_random",
+];

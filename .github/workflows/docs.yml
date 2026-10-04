@@ -2,19 +2,33 @@ name: Docs
 
 # Build the rustdoc API documentation for the workspace and publish it to the
 # `gh-pages` branch, which GitHub Pages serves at
-# https://rrnewton.github.io/hermit/. The redirect written below sends the site
-# root to the primary `hermit` crate.
+# https://rrnewton.github.io/hermit/. The workspace rustdoc remains available
+# below the landing page at `hermit/index.html`.
 
 on:
-  push:
-    branches: [ "main" ]
+  # Owner-authorized website refresh only; no automatic PR or main-push tests.
+  schedule:
+    - cron: "23 8 * * *"
   workflow_dispatch:
+    inputs:
+      rebuild_compatibility:
+        description: "Fetch the cell ledger and rebuild the website (does not run Hermit tests)"
+        required: false
+        type: boolean
+        default: false
+      compatibility_registry_asset:
+        description: "Optional immutable registry asset; cannot be combined with a fresh rebuild"
+        required: false
+        type: string
+      compatibility_registry_sha256:
+        description: "SHA-256 of that complete append-only release registry"
+        required: false
+        type: string
 
-# Supersede older runs for the same ref so documentation deploys do not
-# accumulate behind newer commits.
+# Serialize full-site publication so manual Docs cannot race the nightly registry.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: hermit-docs-pages
+  cancel-in-progress: false
 
 # peaceiris/actions-gh-pages pushes the built docs to the gh-pages branch using
 # GITHUB_TOKEN, which needs write access to repository contents.
@@ -29,16 +43,257 @@ env:
 jobs:
   build-and-deploy:
     name: Build rustdoc and deploy to GitHub Pages
+    # Source delivery is safe before private-source access is installed. A
+    # skipped scheduled job is inactive, not a successful ledger rebuild.
+    # Manual Docs remains available; an explicit rebuild still checks access.
+    if: >-
+      github.repository == 'rrnewton/hermit' && github.ref == 'refs/heads/main' &&
+      (github.event_name != 'schedule' || vars.COMPATIBILITY_NIGHTLY_ENABLED == 'true')
     runs-on: ubuntu-latest
+    # Room for the 101-minute rebuild step below plus the steps around it
+    # (about 10 minutes on 2026-09-27, with an 11-minute public-byte check cap).
+    timeout-minutes: 150
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
+      with:
+        # The release download and deploy steps receive the token explicitly;
+        # do not leave the write credential in git configuration while building.
+        persist-credentials: false
+        # The publication gate compares the registry with every earlier version
+        # so an already-public content-addressed path cannot disappear or change.
+        fetch-depth: 0
+    - name: Initialize dagrun submodule
+      run: git submodule update --init --depth 1 -- agent-utils
+    - name: Check nightly source access and pins
+      id: website-source
+      if: github.event_name == 'schedule' || inputs.rebuild_compatibility
+      env:
+        SOURCE_DEPLOY_KEY: ${{ secrets.COMPATIBILITY_SOURCE_DEPLOY_KEY }}
+        REQUESTED_ASSET: ${{ inputs.compatibility_registry_asset }}
+        REQUESTED_SHA: ${{ inputs.compatibility_registry_sha256 }}
+      run: |
+        set -euo pipefail
+        if [[ -n "$REQUESTED_ASSET" || -n "$REQUESTED_SHA" ]]; then
+          echo "::error::Choose a fresh ledger rebuild or an immutable registry handoff, not both."
+          exit 1
+        fi
+        if [[ -z "$SOURCE_DEPLOY_KEY" ]]; then
+          echo "::error::Nightly rebuild needs COMPATIBILITY_SOURCE_DEPLOY_KEY: a read-only deploy key for rrnewton/dev-hermit. No old archive was rebuilt."
+          exit 1
+        fi
+        python3 .github/scripts/rebuild-compatibility-site.py source-config > "$RUNNER_TEMP/website-source.json"
+        jq -r '"parent_commit=" + .parent_commit, "hermit_commit=" + .hermit_commit' \
+          "$RUNNER_TEMP/website-source.json" >> "$GITHUB_OUTPUT"
+        # Capture public data before the authenticated full-history P fetch.
+        python3 .github/scripts/rebuild-compatibility-site.py capture-ledger > "$RUNNER_TEMP/website-ledger.json"
+        jq -r '"ledger_commit=" + .commit' "$RUNNER_TEMP/website-ledger.json" >> "$GITHUB_OUTPUT"
+    - name: Check out reviewed website builder
+      if: github.event_name == 'schedule' || inputs.rebuild_compatibility
+      uses: actions/checkout@v4
+      with:
+        repository: rrnewton/dev-hermit
+        ref: ${{ steps.website-source.outputs.parent_commit }}
+        path: _website_source
+        ssh-key: ${{ secrets.COMPATIBILITY_SOURCE_DEPLOY_KEY }}
+        persist-credentials: false
+        fetch-depth: 0
+    - name: Capture current canonical validation history
+      id: website-history
+      if: github.event_name == 'schedule' || inputs.rebuild_compatibility
+      run: |
+        set -euo pipefail
+        # The preceding authenticated checkout fetched all branch history after
+        # the public ledger SHA was fixed. No persisted private key is needed.
+        [[ $(git -C _website_source rev-parse --is-shallow-repository) == false ]]
+        history=$(git -C _website_source rev-parse 'refs/remotes/origin/main^{commit}')
+        [[ "$history" =~ ^[0-9a-f]{40}$ ]]
+        printf 'validation_history_commit=%s\n' "$history" >> "$GITHUB_OUTPUT"
+        printf '%s\n' "$history" > "$RUNNER_TEMP/website-validation-history.txt"
     - name: Dependencies
       run: sudo apt-get install -y libunwind-dev liblzma-dev
+    - name: Prepare only the builder's public source dependencies
+      if: github.event_name == 'schedule' || inputs.rebuild_compatibility
+      timeout-minutes: 15
+      run: |
+        set -euo pipefail
+        # H history is required for source ancestry/depth. Do not recursively
+        # initialize unrelated Reverie, rr, backend, or parent submodules.
+        git -C _website_source submodule update --init -- hermit hermit_test_ledger
+        git -C _website_source/hermit submodule update --init --depth 1 -- agent-utils
+        git -C _website_source/hermit fetch --no-tags origin main:refs/remotes/origin/main
+        channel=$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("_website_source/hermit/rust-toolchain.toml").read_text())["toolchain"]["channel"])')
+        rustup toolchain install "$channel" --profile minimal
+        RUSTUP_TOOLCHAIN="$channel" cargo install rust-script --version 0.36.0 --locked
+    - name: Rebuild from the current published cell ledger
+      id: website-rebuild
+      if: github.event_name == 'schedule' || inputs.rebuild_compatibility
+      # Measured duration of this step on the nightly runs: 31.6 min
+      # (2026-09-23), 31.4, 36.9, 44.0, 49.5 min (2026-09-27). It grows with
+      # the ledger, and the old 60-minute cap would have ended the build
+      # within days. Keep a finite cap; the step still fails if it is reached.
+      timeout-minutes: 101
+      env:
+        GH_TOKEN: ${{ github.token }}
+        CARGO_TARGET_DIR: ${{ runner.temp }}/compatibility-target
+        RUSTUP_AUTO_INSTALL: "0"
+        PYTHONDONTWRITEBYTECODE: "1"
+        # Print one wall/CPU line per build phase to this step's log, so the
+        # step's duration can be split by phase from the log alone
+        # (https://github.com/rrnewton/dev-hermit/issues/391).
+        COMPATIBILITY_WEBSITE_PHASE_TIMING: "1"
+        LEDGER_COMMIT: ${{ steps.website-source.outputs.ledger_commit }}
+        VALIDATION_HISTORY_COMMIT: ${{ steps.website-history.outputs.validation_history_commit }}
+      run: |
+        set -euo pipefail
+        timeout --signal=TERM --kill-after=30s 6000s \
+          python3 -B .github/scripts/rebuild-compatibility-site.py rebuild \
+          --builder-parent "$GITHUB_WORKSPACE/_website_source" \
+          --scratch "$RUNNER_TEMP/compatibility-nightly-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+          --receipt "$RUNNER_TEMP/compatibility-rebuild.json" \
+          --ledger-commit "$LEDGER_COMMIT" \
+          --validation-history-commit "$VALIDATION_HISTORY_COMMIT"
+        jq -r '"registry_asset=" + (.registry_asset | tostring), "registry_sha256=" + .registry_sha256' \
+          "$RUNNER_TEMP/compatibility-rebuild.json" >> "$GITHUB_OUTPUT"
+        {
+          echo '### Compatibility website rebuild'
+          jq -r '"Cell ledger: `" + .ledger_commit + "`", "Built identity: `" + .identity + "`", "Canonical validation history: `" + .validation_history_commit + "`"' "$RUNNER_TEMP/compatibility-rebuild.json"
+          echo 'No Hermit tests ran. Measurement timestamps and unavailable evidence remain unchanged. Pages byte verification follows deployment.'
+        } >> "$GITHUB_STEP_SUMMARY"
     - name: Build documentation
+      id: rustdoc
+      # A documentation lint must not throw away a finished website rebuild.
+      # Run https://github.com/rrnewton/hermit/actions/runs/36461693420
+      # rebuilt the compatibility site in 61.7 minutes and then failed here on
+      # one bare URL in a doc comment, so nothing was deployed. The strict
+      # build still runs, and a lint still fails this job, but only after the
+      # site is deployed (see the last step). The validation DAG's
+      # Documentation node remains the gate for documentation lints.
+      continue-on-error: true
       run: cargo doc --workspace --no-deps
-    - name: Add root redirect to the hermit crate
-      run: echo '<meta http-equiv="refresh" content="0; url=hermit/index.html">' > target/doc/index.html
+    - name: Build documentation without the lint gate
+      if: steps.rustdoc.outcome == 'failure'
+      env:
+        RUSTFLAGS: -C link-arg=-llzma
+        RUSTDOCFLAGS: ""
+      run: |
+        set -euo pipefail
+        echo '::warning::cargo doc failed under -D warnings. Rebuilding the documentation without -D warnings so the website still deploys; the job fails after deployment.'
+        cargo doc --workspace --no-deps
+    - name: Add Hermetic Infra landing page
+      run: |
+        install -m 0644 docs/site/index.html target/doc/index.html
+        install -m 0644 docs/site/site.css target/doc/site.css
+    - name: Add reviewed compatibility website
+      # Release assets are checksum-bound handoffs from separately reviewed
+      # real-ledger builds. Reconstruct every retained content-addressed path and
+      # independently validate every byte and mode before publishing it.
+      if: github.ref == 'refs/heads/main'
+      env:
+        GH_TOKEN: ${{ github.token }}
+        NIGHTLY_REGISTRY_ASSET: ${{ steps.website-rebuild.outputs.registry_asset || inputs.compatibility_registry_asset }}
+        NIGHTLY_REGISTRY_SHA256: ${{ steps.website-rebuild.outputs.registry_sha256 || inputs.compatibility_registry_sha256 }}
+      run: |
+        set -euo pipefail
+        umask 077
+
+        scratch=$(mktemp -d)
+        trap 'rm -rf -- "$scratch"' EXIT
+        pins=.github/compatibility-site-releases.json
+        archives="$scratch/archives"
+        pin_rows="$scratch/pins"
+        mkdir "$archives" "$pin_rows"
+
+        python3 .github/scripts/publish-compatibility-site.py validate "$pins" .
+
+        # Scheduled rebuilds and manual immutable handoffs share the same
+        # digest/history gates. Neither starts Hermit validation or PR tests.
+        # Always preserve the registry already served by Pages, even on an
+        # ordinary manual docs rebuild with no new compatibility artifact.
+        pages_sha=$(gh api repos/rrnewton/hermit/git/ref/heads/gh-pages --jq .object.sha)
+        gh api "repos/rrnewton/hermit/contents/compatibility?ref=$pages_sha" > "$scratch/served.json"
+        previous="$scratch/previous.json"
+        if jq -e 'any(.[]; .name == "releases.json" and .type == "file")' "$scratch/served.json" >/dev/null; then
+          gh api -H 'Accept: application/vnd.github.raw+json' \
+            "repos/rrnewton/hermit/contents/compatibility/releases.json?ref=$pages_sha" > "$previous"
+        else
+          # One-time adoption of the old checked-in registry is allowed only
+          # when it accounts for every already-public content-addressed tree.
+          jq -e --slurpfile pins "$pins" \
+            '([.[] | .name] | sort) == ([$pins[0].releases[].identity, "latest"] | sort)' \
+            "$scratch/served.json" >/dev/null
+          cp "$pins" "$previous"
+        fi
+        candidate="$scratch/registry.json"
+        selection=("$pins" . "$previous")
+        if [[ -n "$NIGHTLY_REGISTRY_ASSET" || -n "$NIGHTLY_REGISTRY_SHA256" ]]; then
+          [[ "$NIGHTLY_REGISTRY_ASSET" =~ ^[0-9]{1,20}$ ]]
+          [[ "$NIGHTLY_REGISTRY_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          requested="$scratch/requested-registry.json"
+          gh api -H 'Accept: application/octet-stream' \
+            "repos/rrnewton/hermit/releases/assets/$NIGHTLY_REGISTRY_ASSET" > "$requested"
+          printf '%s  %s\n' "$NIGHTLY_REGISTRY_SHA256" "$requested" | sha256sum -c -
+          selection+=("$requested")
+        fi
+        # Select the exact superset without losing committed or served pins.
+        # Equal maps preserve served latest; an explicit asset owns that choice.
+        python3 .github/scripts/publish-compatibility-site.py select-registry \
+          "${selection[@]}" > "$candidate"
+        python3 .github/scripts/publish-compatibility-site.py validate-update \
+          "$candidate" "$pins" . "$previous"
+        pins="$candidate"
+
+        release_repository=$(jq -er '.release_repository' "$pins")
+        release_count=$(jq -er '.releases | length' "$pins")
+        index=0
+        while (( index < release_count )); do
+          pin="$pin_rows/$index.json"
+          jq -ce ".releases[$index]" "$pins" > "$pin"
+          identity=$(jq -er '.identity' "$pin")
+          tag=$(jq -er '.tag' "$pin")
+          title=$(jq -er '.release_title' "$pin")
+          asset=$(jq -er '.asset' "$pin")
+          archive_sha256=$(jq -er '.archive_sha256' "$pin")
+          archive_bytes=$(jq -er '.archive_bytes' "$pin")
+          release_json="$scratch/release-$identity.json"
+          archive="$archives/$asset"
+
+          gh api "repos/$release_repository/releases/tags/$tag" > "$release_json"
+          asset_id=$(
+            jq -er \
+              --arg tag "$tag" \
+              --arg title "$title" \
+              --arg name "$asset" \
+              --arg digest "sha256:$archive_sha256" \
+              --argjson size "$archive_bytes" \
+              '
+                if .tag_name != $tag or .name != $title
+                     or .draft != false or .prerelease != false then
+                  error("release identity or publication state disagrees with the pin")
+                else . end
+                | ([.assets[] | select(.name == $name)]
+                   | if length == 1 then .[0]
+                     else error("release must contain exactly one pinned asset") end)
+                | if .state == "uploaded"
+                     and .size == $size
+                     and .digest == $digest
+                     and (.id | type) == "number"
+                  then .id
+                  else error("release asset metadata disagrees with the pin") end
+              ' "$release_json"
+          )
+          gh api \
+            -H 'Accept: application/octet-stream' \
+            "repos/$release_repository/releases/assets/$asset_id" \
+            > "$archive"
+
+          python3 .github/scripts/publish-compatibility-site.py extract "$archive" \
+            "target/doc/compatibility/$identity" "$pins" "$index"
+          ((index += 1))
+        done
+
+        python3 .github/scripts/publish-compatibility-site.py \
+          finalize "$pins" target/doc/compatibility
     - name: Deploy to GitHub Pages
       # Only publish from the canonical branch, not from manual dispatch on a
       # feature branch.
@@ -49,3 +304,34 @@ jobs:
         publish_dir: ./target/doc
         # Overwrite the branch each run instead of accumulating history.
         force_orphan: true
+    - name: Verify the rebuilt website at ordinary public URLs
+      if: github.event_name == 'schedule' || inputs.rebuild_compatibility
+      timeout-minutes: 11
+      run: |
+        python3 -B .github/scripts/rebuild-compatibility-site.py verify-public \
+          --receipt "$RUNNER_TEMP/compatibility-rebuild.json"
+        echo 'Nine ordinary public files (manifest, page, CSS, JavaScript and browser data) match this rebuild.' >> "$GITHUB_STEP_SUMMARY"
+    - name: Retain exact website source and deployment receipt
+      if: always() && (github.event_name == 'schedule' || inputs.rebuild_compatibility)
+      uses: actions/upload-artifact@v4
+      with:
+        name: compatibility-website-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+        path: |
+          ${{ runner.temp }}/website-source.json
+          ${{ runner.temp }}/website-ledger.json
+          ${{ runner.temp }}/website-validation-history.txt
+          ${{ runner.temp }}/compatibility-rebuild.json
+          ${{ runner.temp }}/compatibility-rebuild.resources.json
+        if-no-files-found: ignore
+        retention-days: 30
+    - name: Fail on the documentation lint after deployment
+      # Keeps a documentation lint visible as a red run (tick-hub's website
+      # rebuild check reports it) without discarding the deployed website.
+      if: steps.rustdoc.outcome == 'failure'
+      run: |
+        echo '::error::cargo doc --workspace --no-deps failed under RUSTDOCFLAGS=-D warnings; see the "Build documentation" step. The website was deployed from the lint-free rebuild of the same documentation.'
+        {
+          echo '### Documentation lint'
+          echo 'cargo doc failed under -D warnings. The website was still deployed; fix the lint named in the "Build documentation" step.'
+        } >> "$GITHUB_STEP_SUMMARY"
+        exit 1

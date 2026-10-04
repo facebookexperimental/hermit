@@ -6,6 +6,12 @@
 # LICENSE file in the root directory of this source tree.
 
 set -euo pipefail
+# Git exports its repository-location variables to hooks and `git rebase
+# --exec` steps, and they override `git -C`. Every repository below is named
+# explicitly, so run without them; otherwise a scratch `git init` rewrites the
+# caller's repository (https://github.com/rrnewton/hermit/issues/3362).
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY \
+    GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_PREFIX
 
 readonly LEVELDB_REPOSITORY="https://github.com/google/leveldb.git"
 readonly LEVELDB_REVISION="7ee830d02b623e8ffe0b95d59a74db1e58da04c5"
@@ -17,6 +23,19 @@ fi
 
 readonly source_dir=$1
 readonly build_dir=$2
+
+# Repeated validation may reuse only a complete fixture at the pinned revision.
+if [[ -d "$source_dir/.git" &&
+      -x "$build_dir/c_test" &&
+      -x "$build_dir/env_posix_test" &&
+      -x "$build_dir/leveldb_tests" ]] &&
+   actual_revision=$(git -C "$source_dir" rev-parse HEAD 2>/dev/null) &&
+   [[ "$actual_revision" == "$LEVELDB_REVISION" ]] &&
+   git -C "$source_dir" diff --quiet &&
+   git -C "$source_dir" diff --cached --quiet; then
+  echo "$build_dir"
+  exit 0
+fi
 
 if [[ -e "$source_dir" || -e "$build_dir" ]]; then
   echo "source and build destinations must not already exist" >&2

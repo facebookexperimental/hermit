@@ -36,7 +36,7 @@ fail_count=0
 function run_test_once {
   seed=$RANDOM
   >&2 echo "=========== Chaos run #$run_count ==========="
-  if (set -x; time "$hermit" run --base-env=minimal --chaos --seed "$seed" --preemption-timeout "$preempt" -- "$program"); then
+  if (set -x; time "$hermit" run --base-env=minimal --chaos --seed "$seed" --max-timeslice "$preempt" -- "$program"); then
     ((success_count=success_count+1))
   else
     ((fail_count=fail_count+1))

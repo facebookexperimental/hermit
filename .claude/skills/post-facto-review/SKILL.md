@@ -1,106 +1,100 @@
 ---
 name: post-facto-review
-description: "Land reviewed, CI-green Hermit changes before human review and mark them for follow-up. Use as the default autonomous landing discipline."
+description: "Current Hermit post-facto human-review protocol: exact trigger set, dual Claude+Codex adversarial review for triggered changes, the close precondition an adversarial reviewer must satisfy before closing a PR, exact-head validation, and fix-forward human review after landing."
 ---
 
-# Post-Facto-Review Mode
+# Post-facto human review
 
-## PR Comment Convention
+Every bot-authored PR description or comment starts with the applicable
+`[impl agent, MODEL]`, `[adversarial-reviewer agent, MODEL]`, or
+`[coordinator, MODEL]` tag. Human comments use `[Human]`.
+The tag belongs in the description or comment body, never in the PR title.
 
-Every PR description and comment created under this workflow MUST start with
-the applicable role tag:
+Immediately after that disclosure, every PR description starts with `## Plain
+Language Summary and Project Impact`. It states the substantive outcome, its
+connection to the product vision or owner request, and the meaningful
+before/after difference. Administrative history and review mechanics follow.
 
-- `[impl agent, MODEL]` for implementation agents
-- `[adversarial-reviewer agent, MODEL]` for review agents
-- `[coordinator, MODEL]` for coordinator agents
-- `[Human]` for the human owner
+Apply `post-facto-human-review` if and only if the PR has one of these triggers:
 
-Examples: `[impl agent, gpt-5.6-sol]`,
-`[adversarial-reviewer agent, opus-4.8]`.
+1. New syscall support, with `AUTONOMOUS-BOT-IMPLEMENTED` at the new dispatch or
+   classification entry and `TODO-HUMAN-REVIEW(PR-id)` at the implementation or
+   determinization block.
+2. A Reverie `Tool`, `Guest`, `Backend`, syscall-interception, or other core API
+   abstraction change.
+3. A new determinization strategy, not routine implementation of an established
+   one.
+4. A core DetCore scheduling change affecting how programs are scheduled,
+   especially race search.
 
-The **currently-active** landing discipline for autonomous multi-agent work.
-Changes land as soon as they are reviewed and CI-green; the human reviews them
-*after* they are on `main` and fixes forward. This is the fast counterpart to
-[human-review-first](../human-review-first/SKILL.md), which is dormant and gated on an
-explicit human request.
+Routine parity work toward the ptrace reference is not a trigger by itself.
+The label routes after-the-fact human review and never waits for human approval
+before landing. Never apply `pre-land-human-review`, alter `human-approved`, or
+recreate obsolete review labels under the current owner directive.
 
-> **Status: ON (default).** This is how the repo runs today. To switch to the
-> cautious gate, the user must explicitly ask for
-> [human-review-first](../human-review-first/SKILL.md) mode.
+## Adversarial review and evidence
 
-## The trade being made
+A triggered PR requires independent exact-head approval from one Claude-family
+reviewer and one Codex-family reviewer. Neither is the author. Role-tagged review
+comments carrying the full head SHA are authority; numbered review and
+`passed-review-*` labels are caches. Any push invalidates both approvals.
 
-Optimize for merge velocity while keeping a real quality bar. Autonomy is not an
-excuse to skip review — key changes are still adversarially reviewed. The
-difference from human-review-first is *ordering*: the human's review happens
-after landing, and mistakes are corrected by follow-up commits rather than by
-blocking the queue.
+Every PR contains `Plain Language Summary and Project Impact` first, then
+`Determinism`, `Linux Semantics`, and `Validation`.
+KVM changes also contain `Relationship to gVisor`; a triggered PR contains
+`Human Review Required` naming the numbered triggers. A determinism proof
+explains the model, not only tests.
 
-## 1. Key changes still get adversarial review (multiple rounds)
+For non-KVM L2 evidence, use `--verify --verify-strict --verify-json` and require
+`bitwise_parity: true`. Exit status/stdout/stderr are byte-equal; INFO events use
+the declared `BitwiseInfoV1` envelope (only the wall-clock prefix is removed and
+host addresses are ordinalized, while virtual time, branch counts, syscall
+values, sizes, flags, and other payloads remain exact). Default `--verify` is
+lossy, and KVM is output/status-only, so neither is full L2 INFO parity.
+First-sample agreement is not proof of a continuously evolving clock.
 
-The "key change" definition is identical to
-[human-review-first](../human-review-first/SKILL.md): new syscalls, major Reverie API
-changes (small additive extensions are OK), scheduler/determinism-model changes,
-record/replay format changes.
+## Close precondition
 
-Before landing a key change:
-- Spawn independent reviewer agents whose job is to **refute** the change, over
-  **multiple rounds** — author fixes, reviewers re-attack — until it survives.
-- Cover correctness, determinism (preserve L1/L2/L3 per AGENTS.md), the
-  reverie/detcore boundary, and security.
-- Ground every claim in evidence (exact command + observed output), per
-  AGENTS.md "Precise Communication". No vague "works"/"looks good".
+Closing a pull request is the reviewer's last resort, not a review verdict. The
+default outcome of an adversarial review that finds defects is to **update the
+PR in place**: push a corrected head to the same branch, restate the objection
+against the new head, and let the one PR carry the work forward. A PR generally
+should be UPDATED, not replaced. Three predicates gate a close:
 
-## 2. Labels
+1. **No close without a named successor or an explicit owner instruction.** The
+   closing comment contains a literal `SUPERSEDED-BY: #<n>` naming the open pull
+   request that carries the same work forward, or it quotes an explicit owner
+   instruction to close this PR. A closing comment carrying neither is invalid:
+   reopen the PR and update it in place. "The head is recoverable" is not a
+   successor — a recoverable SHA is a rescue path, not published work.
+2. **A rejection names the concrete change required.** State the exact defect
+   and the exact change that resolves it: the file, the gate, the missing
+   evidence, or the command whose output would settle it. "Procedurally
+   deficient", "not closure-grade", and "does not meet the bar" are verdicts,
+   not reviews. A reviewer who cannot name what to change has not finished the
+   review, and the PR is not ready to be rejected.
+3. **"A task exists in the TaskGraph" is NOT a valid reason to close.**
+   Deferring the work to a task does not satisfy rule 1 and never substitutes
+   for a successor PR. A task is neither a guarantee the work happens nor an
+   artifact on `main`. Owner-cited fleet measurement, 2026-08-07: 106 tasks
+   tagged `implemented` → 38 landed → 4 met their stated goal. Closing a PR
+   against a task trades a reviewable diff for that attrition.
 
-- `human-review` — marks a PR the human still wants to look at. **Never
-  auto-close or auto-land a `human-review` PR.** Under post-facto mode these
-  stay open for the human even though other work lands around them.
-- `post-facto-review` — marks a PR that landed autonomously and is awaiting the
-  human's after-the-fact review.
-- **Never apply `human-approved`.** That label means a human actually approved,
-  and only a human may apply it. A bot claiming approval is a defect.
-- `locally-validated` — the legitimate substitute for green CI when the CI lane
-  cannot go green for environmental reasons: run the checks the PR can affect
-  locally, prove any residual failure is baseline/environmental, then label +
-  merge on real GitHub-hosted green where possible (avoid `--admin` over red CI).
+Hermit [PR #1635](https://github.com/rrnewton/hermit/pull/1635) is the incident
+these rules encode: a critical-path change was closed without landing, with no
+successor PR named and remediation deferred to two TaskGraph tasks. It then had
+to be reopened and updated in place — which is what rule 1 requires first.
 
-## 3. Code markers
+## Landing
 
-Autonomously-landed code carries in-source breadcrumbs so a human reviewing
-post-facto can find exactly what a bot wrote and what still needs eyes:
+Inside dev-hermit, the parent `AGENTS.md` and ci-hub executable are canonical:
+the exact current Hermit head needs a clean, counted, full-profile receipt
+accepted by `ci-hub validate-status`. A `locally-validated` label, command exit,
+or comment is only a cache. GitHub checks are supplemental; a genuine failure
+they reveal still blocks. A standalone checkout follows its current
+repository-defined exact-head authority.
 
-- `// AUTONOMOUS-BOT-IMPLEMENTED` — this code was written and landed by a bot
-  without prior human review.
-- `// TODO-HUMAN-REVIEW(PR-id)` — a specific spot the human should scrutinize;
-  include the PR number, e.g. `// TODO-HUMAN-REVIEW(#206)`.
-
-Keep markers at the smallest meaningful scope (the function/block that is
-novel), not blanketed across untouched code.
-
-## 4. Land immediately after review + CI green
-
-Once a key change survives adversarial review and CI is green, **land it** —
-squash-merge to `main`. Do not wait for a human.
-
-- Merge gate = **GitHub-hosted "Regular tests" green**. The self-hosted
-  "Host-dependent tests" lane is environmental and non-required (`main` is
-  unprotected); a red self-hosted lane does not block landing.
-- Prefer merging on real GitHub-hosted green. When using `--admin`, it should
-  only be bypassing the known-environmental self-hosted lane, not a genuine
-  red on GitHub-hosted or on a meaningful check.
-- After landing, rebase dependent PRs onto the new `main` (see the PR DAG
-  section of [human-review-first](../human-review-first/SKILL.md)).
-
-## 5. Human reviews post-facto, fix-forward
-
-The human reviews landed changes after the fact (aided by the labels and code
-markers above). Corrections are made by **follow-up commits/PRs**, not by
-reverting the queue — fix forward. If a human review finds a real defect, open a
-fix PR that removes the relevant `// TODO-HUMAN-REVIEW` marker once addressed.
-
-## Deactivation
-
-Switch to [human-review-first](../human-review-first/SKILL.md) when the user explicitly
-asks for it. Announce the switch; from that point every key change waits for
-human approval *before* landing.
+Land only when the task authorizes it, required adversarial review is resolved,
+and the semantic verifier accepts the current head. Use the serialized tracked
+landing path, never `--admin`, then fetch main and prove ancestry. Human review
+happens after landing and corrections fix forward.

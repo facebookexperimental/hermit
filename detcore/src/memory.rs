@@ -54,12 +54,46 @@ impl SharedMapping {
 pub(crate) struct MemoryMetadata {
     next_anonymous_sequence: u64,
     shared_mappings: BTreeMap<usize, SharedMapping>,
+    /// The guest's program break when it was first observed, i.e. the base of
+    /// the brk heap.
+    #[serde(default)]
+    brk_start: Option<u64>,
+    /// The guest's most recently observed program break.
+    #[serde(default)]
+    brk_current: Option<u64>,
 }
 
 impl MemoryMetadata {
     /// Create an empty address-space model.
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// Record a program break reported by a `brk(2)` return.
+    ///
+    /// Both `brk(NULL)` (a query) and `brk(addr)` (a request) return the break
+    /// in effect afterwards, so every successful return is a valid observation.
+    /// The first one seen fixes the heap base.
+    pub(crate) fn observe_brk(&mut self, brk: u64) {
+        if brk == 0 {
+            return;
+        }
+        self.brk_start.get_or_insert(brk);
+        self.brk_current = Some(brk);
+    }
+
+    /// The guest's brk heap as a half-open `[start, end)` guest-address range,
+    /// or `None` before the break has moved.
+    ///
+    /// This is the *observed* heap rather than the kernel's `[heap]` label.
+    /// The label only exists when the kernel's own program break is the guest's:
+    /// under a backend that loads the guest itself (DynamoRIO), `mm->start_brk`
+    /// belongs to the loader, the kernel tags nothing, and the guest's heap is
+    /// an ordinary anonymous mapping. Binding to the observed break keeps the
+    /// heap identifiable on every backend.
+    pub(crate) fn brk_heap_range(&self) -> Option<(u64, u64)> {
+        let (start, current) = (self.brk_start?, self.brk_current?);
+        (current > start).then_some((start, current))
     }
 
     /// Resolve a futex address, falling back to a private key outside tracked shared mappings.
@@ -195,6 +229,54 @@ impl MemoryMetadata {
         if let Some((object, object_offset)) = source {
             self.insert_mapping(new_start, new_len, object, object_offset);
         }
+    }
+}
+
+#[cfg(test)]
+mod brk_tests {
+    use super::*;
+
+    #[test]
+    fn brk_range_tracks_the_observed_program_break() {
+        let mut mm = MemoryMetadata::new();
+        // Nothing observed yet: no heap to report.
+        assert_eq!(mm.brk_heap_range(), None);
+
+        // The first observation fixes the base. A heap that has not grown is
+        // empty, not a zero-length record.
+        mm.observe_brk(0x405000);
+        assert_eq!(mm.brk_heap_range(), None);
+
+        // Growth is reported as [start, current).
+        mm.observe_brk(0x426000);
+        assert_eq!(mm.brk_heap_range(), Some((0x405000, 0x426000)));
+        mm.observe_brk(0x447000);
+        assert_eq!(mm.brk_heap_range(), Some((0x405000, 0x447000)));
+
+        // A repeated brk(NULL) query must not move the base.
+        mm.observe_brk(0x447000);
+        assert_eq!(mm.brk_heap_range(), Some((0x405000, 0x447000)));
+
+        // Shrinking the break is legal and narrows the heap; the base is sticky.
+        mm.observe_brk(0x410000);
+        assert_eq!(mm.brk_heap_range(), Some((0x405000, 0x410000)));
+
+        // Back to the base means an empty heap again, not an inverted range.
+        mm.observe_brk(0x405000);
+        assert_eq!(mm.brk_heap_range(), None);
+    }
+
+    #[test]
+    fn a_zero_break_is_ignored() {
+        // brk returning 0 is not a usable address; recording it would make the
+        // heap base 0 and hash a wild range.
+        let mut mm = MemoryMetadata::new();
+        mm.observe_brk(0);
+        assert_eq!(mm.brk_heap_range(), None);
+        mm.observe_brk(0x405000);
+        mm.observe_brk(0);
+        mm.observe_brk(0x426000);
+        assert_eq!(mm.brk_heap_range(), Some((0x405000, 0x426000)));
     }
 }
 

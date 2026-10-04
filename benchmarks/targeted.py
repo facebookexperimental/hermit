@@ -5,7 +5,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Measure targeted native, ptrace, DBI, and KVM backend workloads."""
+"""Measure targeted native, ptrace, DBT, and KVM backend workloads."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parent.parent
 BENCHMARK_DIR = ROOT / "benchmarks"
 WORK_DIR = ROOT / "target" / "hermit-targeted-benchmarks"
 DEFAULT_OUTPUT_DIR = BENCHMARK_DIR / "results" / "targeted"
-BACKEND_NAMES = ("native", "ptrace", "dbi", "kvm")
+BACKEND_NAMES = ("native", "ptrace", "dbt", "kvm")
 
 
 class BenchmarkError(RuntimeError):
@@ -84,8 +84,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--backends",
-        default="native,ptrace,dbi,kvm",
-        help="comma-separated backend set (default: native,ptrace,dbi,kvm)",
+        default="native,ptrace,dbt,kvm",
+        help="comma-separated backend set (default: native,ptrace,dbt,kvm)",
     )
     parser.add_argument(
         "--benchmarks",
@@ -349,7 +349,7 @@ def measure_benchmark(
     native = modes["native"]
     assert isinstance(native, dict)
     native_median = float(native["median_seconds"])
-    for _backend, mode in modes.items():
+    for mode in modes.values():
         assert isinstance(mode, dict)
         if mode["status"] != "ok":
             continue
@@ -419,7 +419,7 @@ def render_summary(results: dict[str, object]) -> str:
         f"(+ {configuration['warmups']} warmup per available backend)",
         "Hermit modes: strict, log=error, relaxations=none",
         "",
-        "| Benchmark | Native median | Ptrace median | DBI median | KVM median |",
+        "| Benchmark | Native median | Ptrace median | DBT median | KVM median |",
         "| --- | ---: | ---: | ---: | ---: |",
     ]
     benchmarks = results["benchmarks"]

@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::env;
 use std::path::Path;
 use std::path::PathBuf;
@@ -51,6 +54,7 @@ raise SystemExit(not result.wasSuccessful())
 "#;
 
 fn command_output(mut command: Command, label: &str) -> Output {
+    hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
     let output = command
         .output()
@@ -115,13 +119,13 @@ fn run_stdlib_tests(python: &Path) -> Output {
     command
         .arg(format!("--kill-after={HERMIT_KILL_GRACE_SECONDS}s"))
         .arg(format!("{HERMIT_TIMEOUT_SECONDS}s"))
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test::hermit_binary())
         .args([
             "run",
             "--strict",
             "--base-env=minimal",
             "--no-virtualize-cpuid",
-            "--preemption-timeout=disabled",
+            "--max-timeslice=disabled",
             "--",
         ])
         .arg(python)

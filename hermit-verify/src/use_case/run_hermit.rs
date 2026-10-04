@@ -42,6 +42,7 @@ pub fn run_hermit(
     common_args: &CommonOpts,
     run: &RunEnvironment,
 ) -> anyhow::Result<()> {
+    let hermit_cli_args = common_args.pin_comparison_epoch(hermit_cli_args);
     let mut command = build_hermit_cmd(&common_args.hermit_bin, hermit_cli_args, run)?;
     println!("   {}", display_cmd(&command).white().bold());
     let status = command.status()?;
