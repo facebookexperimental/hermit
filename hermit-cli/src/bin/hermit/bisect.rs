@@ -144,8 +144,9 @@ mod tests {
 
     #[test]
     fn schedule_fixture_contains_events() {
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
         let schedule = read_schedule(
-            &Path::new(env!("CARGO_MANIFEST_DIR"))
+            &Path::new(&manifest_dir)
                 .join("test-resources/flaky_cas_sequence_schedules-passing.json"),
             "good",
         )
