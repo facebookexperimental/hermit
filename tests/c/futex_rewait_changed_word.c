@@ -7,12 +7,17 @@
  */
 
 /*
- * A futex waiter woken for a process-directed signal that another thread
- * takes, while the word changes (https://github.com/rrnewton/hermit/issues/4033).
- * Linux's __futex_wait, finding no signal pending after the wake, retries
- * futex_wait_setup on its own word: EAGAIN if the word changed. A waiter that
- * was never woken returns 0 at the final FUTEX_WAKE instead. Both are legal;
- * a woken waiter that returns 0 is not.
+ * A futex word changed under a parked waiter, then a process-directed SIGALRM
+ * (https://github.com/rrnewton/hermit/issues/4033). Linux-legal outcomes:
+ *   - the signal goes to main and the waiter is never woken: the final
+ *     FUTEX_WAKE wakes it, 0 (the usual native outcome);
+ *   - the waiter is woken for the signal but main takes it: __futex_wait
+ *     finds nothing pending and retries futex_wait_setup on the changed word,
+ *     EAGAIN;
+ *   - the handler runs on the waiter: the wait is interrupted and restarted
+ *     (SA_RESTART), and the restarted FUTEX_WAIT finds the changed word,
+ *     EAGAIN.
+ * A waiter woken by the signal that answers 0 is not legal.
  */
 
 #define _GNU_SOURCE

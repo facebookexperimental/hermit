@@ -21602,20 +21602,23 @@ fn futex_requeue_and_wake_op_match_linux() {
     );
 }
 
-/// A futex waiter woken for a process-directed signal that another thread
-/// takes re-reads its word, as Linux's `__futex_wait` retry does, and returns
-/// EAGAIN when the word changed (https://github.com/rrnewton/hermit/issues/4033).
-/// The guest changes the word while the waiter is parked, then arms a one-shot
-/// SIGALRM.
+/// A futex waiter whose word changed while it was parked answers EAGAIN when a
+/// signal ends its wait, as Linux does
+/// (https://github.com/rrnewton/hermit/issues/4033). The guest changes the word
+/// under the parked waiter without waking it, then arms a one-shot SIGALRM.
 /// - By default, as natively, the signal goes to the spinning main thread and
 ///   the waiter is woken only by the final FUTEX_WAKE: 0.
-/// - Some targeted-chaos schedules wake the waiter for the signal, then run the
-///   main thread first, so the signal is no longer pending for the waiter. That
-///   waiter must answer EAGAIN; before the fix it answered 0, as if woken.
+/// - When the handler runs on the main thread after the scheduler woke the
+///   waiter for the signal, nothing is pending for the waiter, and Linux's
+///   `__futex_wait` retries `futex_wait_setup` on the changed word: EAGAIN.
+/// - When the handler runs on the waiter, its wait is interrupted and restarted
+///   (`SA_RESTART`), and the restarted FUTEX_WAIT finds the changed word:
+///   EAGAIN. Natively, with the signal forced onto the waiter, that is 30/30.
 ///
-/// The test requires every listed seed to give a legal line and at least one
-/// to reach the retry, so a scheduler change that moves the seeds still fails
-/// loudly rather than passing without the path.
+/// Before the fix both chaos classes answered 0, which Linux cannot produce.
+/// The listed targeted-chaos seeds must each give a legal line, and both
+/// EAGAIN classes must be reached, so a scheduler change that moves the seeds
+/// fails loudly rather than passing without the paths.
 #[test]
 fn a_futex_waiter_woken_for_a_signal_another_thread_takes_rereads_its_word() {
     let guest = futex_c_guest(
@@ -21646,18 +21649,20 @@ fn a_futex_waiter_woken_for_a_signal_another_thread_takes_rereads_its_word() {
         stdout
     };
     assert_eq!(run(&[]), "handler on main, waiter woken (0)\n");
-    let mut retried = 0;
-    for seed in ["19", "34", "35", "45"] {
+    let (mut retried_on_main, mut restarted_on_waiter) = (0, 0);
+    for seed in ["1", "2", "19", "34"] {
         let stdout = run(&["--chaos", "--chaos-target-races", "--seed", seed]);
         match stdout.as_str() {
-            "handler on main, waiter EAGAIN\n" => retried += 1,
-            "handler on main, waiter woken (0)\n" | "handler on waiter, waiter woken (0)\n" => {}
-            other => panic!("seed {seed}: a line Linux cannot produce: {other:?}"),
+            "handler on main, waiter EAGAIN\n" => retried_on_main += 1,
+            "handler on waiter, waiter EAGAIN\n" => restarted_on_waiter += 1,
+            "handler on main, waiter woken (0)\n" => {}
+            other => panic!("seed {seed}: a line Linux cannot produce here: {other:?}"),
         }
     }
     assert!(
-        retried > 0,
-        "no listed chaos seed reached the retry any more; pick new seeds"
+        retried_on_main > 0 && restarted_on_waiter > 0,
+        "the listed chaos seeds no longer reach both EAGAIN paths \
+         (main: {retried_on_main}, waiter: {restarted_on_waiter}); pick new seeds"
     );
 }
 
