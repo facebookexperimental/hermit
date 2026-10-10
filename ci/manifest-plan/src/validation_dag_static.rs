@@ -2119,7 +2119,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // record_pselect_whose_mask_a_sibling_rewrites_while_it_sleeps
     // (https://github.com/rrnewton/hermit/issues/3992 and its review) add two
     // and retain all 148 (`cargo nextest list` lists 150).
-    ("test.record_replay", 150),
+    // record_pselect_whose_mask_unblocks_the_timer_signal_on_a_tight_stack
+    // (follow-up to https://github.com/rrnewton/hermit/pull/4052): 151.
+    ("test.record_replay", 151),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.

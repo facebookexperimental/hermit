@@ -69,6 +69,14 @@
  *                call still ends with EINTR, and replay must not read the
  *                buffer again (review of
  *                https://github.com/rrnewton/hermit/pull/4052)
+ *   pselect-mask-unblocks-tight-stack
+ *                the unblocks wait as a raw pselect6 made on a stack 144 bytes
+ *                into a writable page with an inaccessible page below it, so
+ *                there is no writable memory below the red zone; the handler
+ *                runs on an alternate stack. Replay stages the call's mask
+ *                where it can on such a stack and must still deliver the
+ *                signal (follow-up to
+ *                https://github.com/rrnewton/hermit/pull/4052)
  *
  * The first three modes each run four shapes: a ready pipe with a 5 s timeout,
  * the same with a zero timeout, the same with nfds == FD_SETSIZE (larger than
@@ -902,6 +910,95 @@ static int pselect_mask_unblocks_alarm(int rewrite) {
   return 0;
 }
 
+/* No instruction between the stack switch and its restoration touches the
+ * stack. SysV inputs: new_sp, nfds, readfds, timeout, wrapper. Preserves the
+ * caller's r12 on the original stack and keeps the original rsp in r12 across
+ * the syscall. */
+extern long pselect_on_stack(void*, long, fd_set*, struct timespec*, void*);
+__asm__(
+    ".text\n"
+    ".globl pselect_on_stack\n"
+    ".type pselect_on_stack,@function\n"
+    "pselect_on_stack:\n"
+    "push %r12\n"
+    "mov %rsp,%r12\n"
+    "mov %rdi,%r11\n"
+    "mov %rsi,%rdi\n"
+    "mov %rdx,%rsi\n"
+    "mov %rcx,%rax\n"
+    "xor %edx,%edx\n"
+    "xor %r10d,%r10d\n"
+    "mov %r8,%r9\n"
+    "mov %rax,%r8\n"
+    "mov %r11,%rsp\n"
+    "mov $270,%eax\n"
+    "syscall\n"
+    "mov %r12,%rsp\n"
+    "pop %r12\n"
+    "ret\n"
+    ".size pselect_on_stack,.-pselect_on_stack\n");
+
+static unsigned char alternate_stack[65536];
+
+static int pselect_mask_unblocks_tight_stack(void) {
+  long page = sysconf(_SC_PAGESIZE);
+  if (page <= 144) {
+    return 1;
+  }
+  unsigned char* area = mmap(
+      NULL, (size_t)page * 2, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (area == MAP_FAILED ||
+      mprotect(area + page, (size_t)page, PROT_READ | PROT_WRITE) != 0) {
+    perror("tight stack");
+    return 1;
+  }
+  stack_t alternate = {
+      .ss_sp = alternate_stack, .ss_size = sizeof alternate_stack, .ss_flags = 0};
+  struct sigaction action;
+  memset(&action, 0, sizeof action);
+  action.sa_handler = count_masked_alarm;
+  action.sa_flags = SA_ONSTACK;
+  if (sigaltstack(&alternate, NULL) != 0 ||
+      sigaction(SIGALRM, &action, NULL) != 0 || pipe(alarm_pipe_fds) != 0) {
+    perror("setup");
+    return 1;
+  }
+  sigset_t alarm_set;
+  sigemptyset(&alarm_set);
+  sigaddset(&alarm_set, SIGALRM);
+  if (pthread_sigmask(SIG_BLOCK, &alarm_set, NULL) != 0) {
+    perror("pthread_sigmask block");
+    return 1;
+  }
+  static uint64_t empty_mask;
+  static struct pselect_mask_wrapper wrapper = {
+      (const void*)&empty_mask, sizeof(uint64_t)};
+  struct itimerval alarm_in = {{0, 0}, {0, 100000}};
+  if (setitimer(ITIMER_REAL, &alarm_in, NULL) != 0) {
+    perror("setitimer");
+    return 1;
+  }
+  static fd_set read_set;
+  FD_ZERO(&read_set);
+  FD_SET(alarm_pipe_fds[0], &read_set);
+  static struct timespec bound = {30, 0};
+  long raw = pselect_on_stack(
+      area + page + 144, alarm_pipe_fds[0] + 1, &read_set, &bound, &wrapper);
+  int alarms_at_return = (int)masked_alarms;
+  close(alarm_pipe_fds[0]);
+  close(alarm_pipe_fds[1]);
+  printf(
+      "%-24s result=%011ld alarms=%01d\n",
+      "pselect-tight-stack",
+      raw,
+      alarms_at_return);
+  if (raw != -EINTR || alarms_at_return != 1) {
+    fprintf(stderr, "pselect-mask-unblocks-tight-stack mismatch\n");
+    return 1;
+  }
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc != 2) {
     fprintf(
@@ -909,7 +1006,8 @@ int main(int argc, char** argv) {
         "usage: %s [raw|glibc|pselect-mask|efault|einval|poll|thread-wake|"
         "pselect-mask-blocks-alarm|pselect-mask-shared-alarm|"
         "pselect-mask-writeonly-wrapper|pselect-mask-sibling-rewrite|"
-        "pselect-mask-unblocks-alarm|pselect-mask-unblocks-rewritten]\n",
+        "pselect-mask-unblocks-alarm|pselect-mask-unblocks-rewritten|"
+        "pselect-mask-unblocks-tight-stack]\n",
         argv[0]);
     return 2;
   }
@@ -939,6 +1037,9 @@ int main(int argc, char** argv) {
   }
   if (strcmp(argv[1], "pselect-mask-unblocks-rewritten") == 0) {
     return pselect_mask_unblocks_alarm(1);
+  }
+  if (strcmp(argv[1], "pselect-mask-unblocks-tight-stack") == 0) {
+    return pselect_mask_unblocks_tight_stack();
   }
   if (strcmp(argv[1], "efault") == 0) {
     return efault();

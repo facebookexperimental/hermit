@@ -2749,6 +2749,16 @@ fn record_pselect_whose_mask_a_sibling_rewrites_while_it_sleeps() {
     record_select_mode("pselect-mask-unblocks-rewritten");
 }
 
+/// The unblocks wait on a stack with no writable memory below its red zone.
+/// Replay delivers the signal through an injected pselect6 whose mask it must
+/// stage somewhere: the stack scratch did not commit, replay skipped the
+/// delivery, and the guest's restarted pselect6 no longer matched the
+/// recording (follow-up to https://github.com/rrnewton/hermit/pull/4052).
+#[test]
+fn record_pselect_whose_mask_unblocks_the_timer_signal_on_a_tight_stack() {
+    record_select_mode("pselect-mask-unblocks-tight-stack");
+}
+
 /// Replayer substitutes an eventfd for this proc descriptor. The Detcore
 /// procfs layer must bind the live task incarnation named by an absolute or
 /// AT_FDCWD-relative path rather than the placeholder inode. Zero-length

@@ -179,21 +179,76 @@ async fn end_replayed_pselect6_under_its_temporary_mask<G, T>(
     }
     let mut stack = guest.stack().await;
     let mask_copy = stack.push(temporary_mask);
-    let wrapper = stack
-        .push(Pselect6SigmaskArg {
-            sigmask: mask_copy.as_raw(),
-            sigsetsize: KERNEL_SIGSET_SIZE,
-        })
-        .cast();
+    let wrapper = stack.push(Pselect6SigmaskArg {
+        sigmask: mask_copy.as_raw(),
+        sigsetsize: KERNEL_SIGSET_SIZE,
+    });
     // A reserved cell is staged as zeroes, which `commit` writes: a zero
     // timeout.
     let zero_timeout = stack.reserve::<Timespec>();
-    let Ok(_guard) = stack.commit() else {
+    match stack.commit() {
+        Ok(_guard) => {
+            inject_pselect6_delivery(guest, wrapper.as_raw(), zero_timeout.as_raw()).await;
+            return;
+        }
+        Err(Errno::EFAULT) => {}
+        Err(_) => return,
+    }
+    // The stack scratch below the red zone is not writable: the thread runs on
+    // a stack it placed near the start of a page, which is valid. Stage the
+    // three cells at the top of the red zone instead, and put the guest's bytes
+    // back once the injected call has returned. The kernel builds a signal
+    // frame below the red zone, and the guest runs no code before the bytes
+    // are back, so it never sees them change. Nothing is mapped, so the
+    // replayed address space stays the recording's.
+    let Some(staged) = (guest.regs().await.rsp as usize)
+        .checked_sub(PSELECT6_DELIVERY_LEN)
+        .map(|at| at & !7)
+    else {
         return;
     };
-    // An injection, as recording ran the call itself: the kernel delivers the
-    // signal as the injected call returns, as it did after the recorded call,
-    // and the guest then gets the recorded `ERESTARTNOHAND`.
+    let mut saved = [0u8; PSELECT6_DELIVERY_LEN];
+    let Some(staged_bytes) = AddrMut::<u8>::from_raw(staged) else {
+        return;
+    };
+    if guest.memory().read_exact(staged_bytes, &mut saved).is_err() {
+        return;
+    }
+    let mut cells = Vec::with_capacity(PSELECT6_DELIVERY_LEN);
+    cells.extend_from_slice(&temporary_mask.to_ne_bytes());
+    cells.extend_from_slice(&staged.to_ne_bytes());
+    cells.extend_from_slice(&KERNEL_SIGSET_SIZE.to_ne_bytes());
+    cells.extend_from_slice(&[0u8; std::mem::size_of::<Timespec>()]);
+    if guest.memory().write_exact(staged_bytes, &cells).is_err() {
+        return;
+    }
+    let mask_size = std::mem::size_of::<KernelSigset>();
+    let wrapper_size = std::mem::size_of::<Pselect6SigmaskArg>();
+    inject_pselect6_delivery(guest, staged + mask_size, staged + mask_size + wrapper_size).await;
+    if let Err(errno) = guest.memory().write_exact(staged_bytes, &saved) {
+        // Not expected: the same bytes were written just before the call.
+        tracing::warn!(
+            "[detcore] could not restore the red zone after a pselect6 delivery: {errno}"
+        );
+    }
+}
+
+/// The mask, its `{ sigmask, sigsetsize }` wrapper and a zero timeout that
+/// `end_replayed_pselect6_under_its_temporary_mask` stages, in that order.
+const PSELECT6_DELIVERY_LEN: usize = std::mem::size_of::<KernelSigset>()
+    + std::mem::size_of::<Pselect6SigmaskArg>()
+    + std::mem::size_of::<Timespec>();
+
+/// Injects the zero-timeout pselect6 with no descriptors that delivers a
+/// replayed call's signal under its temporary mask (`wrapper`), as recording
+/// ran the call itself: the kernel delivers the signal as the injected call
+/// returns, as it did after the recorded call, and the guest then gets the
+/// recorded `ERESTARTNOHAND`.
+async fn inject_pselect6_delivery<G, T>(guest: &mut G, wrapper: usize, zero_timeout: usize)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
     let _ = guest
         .inject(
             syscalls::Pselect6::new()
@@ -201,8 +256,8 @@ async fn end_replayed_pselect6_under_its_temporary_mask<G, T>(
                 .with_readfds(None)
                 .with_writefds(None)
                 .with_exceptfds(None)
-                .with_timeout(Some(zero_timeout))
-                .with_sigmask(Some(wrapper)),
+                .with_timeout(AddrMut::from_raw(zero_timeout))
+                .with_sigmask(Addr::from_raw(wrapper)),
         )
         .await;
 }
