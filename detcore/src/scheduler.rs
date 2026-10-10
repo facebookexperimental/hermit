@@ -7920,25 +7920,36 @@ impl Scheduler {
                     // The hold waits for the backend's report that `process`
                     // is consumed, so it is sound only if this grant ends that
                     // process: the exiting thread must belong to it in the
-                    // thread tree. A backend can name another process here: a
-                    // raw clone child with a non-SIGCHLD exit signal is its own
-                    // process in the tree, but ptrace reports it with its
-                    // creator's pid, so its exit_group names the creator, which
-                    // keeps running and is never reported. Such a grant keeps
-                    // the synthetic timer it had before Phase A.
+                    // thread tree. A backend can name another process here
+                    // (a raw clone child's exit_group named its creator before
+                    // Reverie built such a child as its own process,
+                    // https://github.com/rrnewton/hermit/issues/4012); such a
+                    // grant keeps the synthetic timer it had before Phase A.
                     let ends_named_process =
                         if self.thread_tree.thread_group_leaders.contains(&dettid) {
                             dettid == *process
                         } else {
                             self.registered_process(dettid) == Some(*process)
                         };
-                    let notification =
-                        if self.backend.reports_child_exit_publication && ends_named_process {
-                            self.classify_child_exit_notification(*process, parent)
-                        } else {
-                            ChildExitNotification::Undecided
-                        };
+                    // A child whose exit signal is not SIGCHLD (a raw clone
+                    // with exit signal 0 or SIGUSR1) is not notified with
+                    // SIGCHLD: Linux sends its own exit signal, if any, and the
+                    // kernel delivers that itself, so there is nothing to
+                    // synthesize and nothing to hold.
+                    let non_sigchld_exit_signal = ends_named_process
+                        && matches!(
+                            self.thread_tree.notification_signal(*process),
+                            Some(signal) if signal != libc::SIGCHLD
+                        );
+                    let notification = if non_sigchld_exit_signal {
+                        None
+                    } else if self.backend.reports_child_exit_publication && ends_named_process {
+                        Some(self.classify_child_exit_notification(*process, parent))
+                    } else {
+                        Some(ChildExitNotification::Undecided)
+                    };
                     match notification {
+                        None => {}
                         // Linux generates nothing (explicit SIG_IGN) or discards
                         // the signal at generation (default-ignored, unblocked),
                         // so the guest observes no SIGCHLD from Linux. Send no
@@ -7947,7 +7958,7 @@ impl Scheduler {
                         // kernel's own notification, which this hold places at
                         // the first scheduling pass after the backend reports its
                         // publication.
-                        ChildExitNotification::None | ChildExitNotification::Discard => {
+                        Some(ChildExitNotification::None | ChildExitNotification::Discard) => {
                             // A publication already reported (the process was
                             // consumed before this grant) needs no hold: the
                             // kernel has already notified the parent.
@@ -7955,9 +7966,9 @@ impl Scheduler {
                                 self.child_exit_publications_pending.insert(*process);
                             }
                         }
-                        // Caught, blocked, other exit signals and every state
-                        // Hermit cannot classify keep the synthetic SIGCHLD.
-                        ChildExitNotification::Deliver | ChildExitNotification::Undecided => {
+                        // Caught, blocked and every state Hermit cannot classify
+                        // keep the synthetic SIGCHLD.
+                        Some(ChildExitNotification::Deliver | ChildExitNotification::Undecided) => {
                             // Fire strictly after the current committed time so the event
                             // is dispatched on a subsequent scheduler pass.
                             //
@@ -16759,8 +16770,9 @@ mod test {
     }
 
     /// An exit_group from a thread that, in the thread tree, leads its own
-    /// process but names another process (ptrace names a raw clone child with a
-    /// non-SIGCHLD exit signal by its creator's pid) does not end the named
+    /// process but names another process (as ptrace did for a raw clone child
+    /// with a non-SIGCHLD exit signal, naming it by its creator's pid, before
+    /// https://github.com/rrnewton/reverie/pull/992) does not end the named
     /// process, which is never reported consumed. It must keep the synthetic
     /// timer and install no hold, which would stop every turn for good.
     #[test]

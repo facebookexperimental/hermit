@@ -1067,7 +1067,7 @@ fn pre_flock_recordings_are_refused_by_the_version_gate() {
         .as_u64()
         .expect("recording metadata has no numeric version");
     assert_eq!(
-        current, 0x129,
+        current, 0x12b,
         "RECORD_VERSION moved; point this test at the current and pre-flock epochs"
     );
     metadata["version"] = serde_json::json!(0x10b);

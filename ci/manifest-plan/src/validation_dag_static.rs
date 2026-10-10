@@ -1340,7 +1340,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // canonical_verdict::tests::run_failure_round_trips_and_names_no_guest_disposition
     // and verify::tests::a_typed_run_failure_replaces_the_stamp_and_an_untyped_error_does_not
     // (the run_failed verification reason) retain all 1023: 1025.
-    ("test.hermit_unit", 1025),
+    // metadata::tests::record_version_rejects_streams_from_before_raw_clone_processes
+    // (https://github.com/rrnewton/hermit/issues/4012) retains all 1025: 1026.
+    ("test.hermit_unit", 1026),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1933,7 +1935,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // review cases of https://github.com/rrnewton/hermit/pull/3972): 118.
     // subreaper's eleven child-subreaper guest tests
     // (https://github.com/rrnewton/hermit/issues/3997): 129.
-    ("test.detcore_misc", 129),
+    // raw_clone's five raw-clone process tests
+    // (https://github.com/rrnewton/hermit/issues/4012) retain all 129: 134.
+    ("test.detcore_misc", 134),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -2683,7 +2687,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same procfs inode guest tests: 106.
     // And the same twelve descriptor-entry identity tests: 118.
     // And the same eleven child-subreaper guest tests: 129.
-    ("test.detcore_misc_on_host", 129),
+    // And the same five raw-clone process tests: 134.
+    ("test.detcore_misc_on_host", 134),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
@@ -2919,7 +2924,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two signal-target metadata tests: 1022.
     // And the 0x129 record-version refusal test: 1023.
     // And the two run_failed tests: 1025.
-    ("test.hermit_unit_on_host", 1025),
+    // And the raw-clone-process record-version test: 1026.
+    ("test.hermit_unit_on_host", 1026),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
