@@ -1921,8 +1921,25 @@ impl<T: RecordOrReplay> Detcore<T> {
         // unmapped, PROT_NONE or otherwise unreadable word
         // (https://github.com/rrnewton/hermit/issues/4030). A wake left to the
         // polling mode reads nothing, as Linux's `futex_wake` reads nothing.
+        //
+        // Linux checks a wait's other arguments first, without touching the
+        // word: `sys_futex` (kernel/futex/syscalls.c) copies and validates the
+        // timeout (EFAULT, EINVAL), then `__futex_wait` refuses a zero bitset
+        // (EINVAL). A restarted wait keeps its validated deadline.
         let init_val = match call.futex_op() & libc::FUTEX_CMD_MASK {
-            libc::FUTEX_WAIT | libc::FUTEX_WAIT_BITSET => {
+            command @ (libc::FUTEX_WAIT | libc::FUTEX_WAIT_BITSET) => {
+                if matches!(deadline, FutexDeadline::FromCall)
+                    && let Some(timeout) = call.timeout()
+                {
+                    let timeout = guest
+                        .memory()
+                        .read_value(timeout)
+                        .map_err(|_| Error::Errno(Errno::EFAULT))?;
+                    parse_futex_timeout(call.futex_op(), timeout)?;
+                }
+                if command == libc::FUTEX_WAIT_BITSET && call.val3() == 0 {
+                    return Err(Error::Errno(Errno::EINVAL));
+                }
                 read_futex_word(guest, AddrMut::as_raw(ptr))?
             }
             _ => 0,

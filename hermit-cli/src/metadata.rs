@@ -261,7 +261,15 @@ impl RecordVersion {
 // (https://github.com/rrnewton/hermit/issues/4033). Replay recomputes
 // precise futex results, so an older recording replayed here could see another
 // result and take another branch, although no event shape changed.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x12c);
+// 0x12c -> 0x12d: a precise FUTEX_WAIT or FUTEX_WAIT_BITSET checks its timeout
+// and bitset before the word, and reads the word with user-mode permissions, as
+// Linux's `futex_wait_setup` does: EFAULT for an unmapped or PROT_NONE word,
+// where the tracer's read gave EIO or compared a PROT_NONE word's value
+// (https://github.com/rrnewton/hermit/issues/4030). Replay recomputes precise
+// futex results, so an older recording replayed here could see another errno
+// and take another branch, although no event shape changed (Codex review of
+// https://github.com/rrnewton/hermit/pull/4061).
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x12d);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -286,7 +294,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x12c);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x12c;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x12d;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -906,6 +914,11 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_that_answered_a_futex_rewait_as_woken() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x12b)));
+    }
+
+    #[test]
+    fn record_version_rejects_streams_that_read_a_futex_wait_word_through_the_tracer() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x12c)));
     }
 
     /// Record and replay run under ptrace with serialized threads, so their

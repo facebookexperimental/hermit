@@ -21728,7 +21728,9 @@ fn a_futex_waiter_woken_for_a_signal_another_thread_takes_rereads_its_word() {
 /// (https://github.com/rrnewton/hermit/issues/4030). Before the fix, Detcore
 /// read every futex word through the tracer: an unmapped word gave EIO, which
 /// futex(2) never returns, and a PROT_NONE word was read anyway and compared,
-/// giving EAGAIN. Every line matches native Linux.
+/// giving EAGAIN. The timeout and a zero bitset are checked first, without
+/// touching the word, as Linux does. Every line matches native Linux, and a
+/// record/replay of the guest matches.
 #[test]
 fn a_futex_wait_on_an_unreadable_word_is_efault() {
     let guest = futex_c_guest(
@@ -21759,8 +21761,30 @@ fn a_futex_wait_on_an_unreadable_word_is_efault() {
          wait, PROT_NONE private word: -1 EFAULT\n\
          wait, unmapped shared word: -1 EFAULT\n\
          wait_bitset, unmapped private word: -1 EFAULT\n\
-         wait_bitset, PROT_NONE private word: -1 EFAULT\n",
+         wait_bitset, PROT_NONE private word: -1 EFAULT\n\
+         wait_bitset, mask 0, PROT_NONE private word: -1 EINVAL\n\
+         wait, tv_nsec 1e9, PROT_NONE private word: -1 EINVAL\n\
+         wait, tv_nsec 1e9, readable word 7, expecting 1: -1 EINVAL\n",
         "stderr:\n{log}"
+    );
+    // Record and replay recompute these results (no futex event is recorded),
+    // so a recording made now replays to the same lines; RECORD_VERSION keeps an
+    // older recording, made with the tracer's read, from being replayed here.
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&["record", "--verify", "--", guest.as_str()]),
+        directory.path(),
+        Duration::from_secs(240),
+        false,
+    );
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "record --verify must succeed:\nstderr:\n{log}"
+    );
+    assert!(
+        log.contains("Success: replay matched recording."),
+        "the replay must match the recording:\nstderr:\n{log}"
     );
 }
 

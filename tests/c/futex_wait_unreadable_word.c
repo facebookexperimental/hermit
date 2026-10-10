@@ -11,7 +11,9 @@
  * (https://github.com/rrnewton/hermit/issues/4030). Linux's futex_wait_setup
  * reads the word with user-mode permissions and fails with EFAULT for an
  * unmapped or PROT_NONE word, private or shared; a readable word that differs
- * from the expected value is EAGAIN. Every call carries a 10 ms timeout, so a
+ * from the expected value is EAGAIN. The timeout and the bitset are checked
+ * first, without touching the word: an invalid timeout or a zero bitset is
+ * EINVAL even on an unreadable word. Every call carries a timeout, so a
  * wait that wrongly blocks still returns. Every line is the same natively and
  * under Hermit.
  */
@@ -27,14 +29,19 @@
 #include <time.h>
 #include <unistd.h>
 
-static void report(const char* what, uint32_t* word, int op, uint32_t bitset) {
-  struct timespec timeout = {0, 10 * 1000 * 1000};
+static void report_timeout(const char* what, uint32_t* word, int op, uint32_t bitset,
+                           struct timespec timeout) {
   long ret = syscall(SYS_futex, word, op, 1, &timeout, NULL, bitset);
   if (ret == 0) {
     printf("%s: 0\n", what);
   } else {
     printf("%s: %ld %s\n", what, ret, strerrorname_np(errno));
   }
+}
+
+static void report(const char* what, uint32_t* word, int op, uint32_t bitset) {
+  struct timespec timeout = {0, 10 * 1000 * 1000};
+  report_timeout(what, word, op, bitset, timeout);
 }
 
 int main(void) {
@@ -57,5 +64,13 @@ int main(void) {
          FUTEX_BITSET_MATCH_ANY);
   report("wait_bitset, PROT_NONE private word", hidden, FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG,
          FUTEX_BITSET_MATCH_ANY);
+  /* The timeout and the bitset are checked before the word is touched. */
+  struct timespec bad_timeout = {0, 1000 * 1000 * 1000};
+  report("wait_bitset, mask 0, PROT_NONE private word", hidden,
+         FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG, 0);
+  report_timeout("wait, tv_nsec 1e9, PROT_NONE private word", hidden, FUTEX_WAIT_PRIVATE, 0,
+                 bad_timeout);
+  report_timeout("wait, tv_nsec 1e9, readable word 7, expecting 1", readable,
+                 FUTEX_WAIT_PRIVATE, 0, bad_timeout);
   return 0;
 }
