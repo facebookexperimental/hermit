@@ -27,6 +27,12 @@
  *             Linux updates to the time remaining when the signal ends the
  *             call. Hermit writes the remaining virtual time; the guest prints
  *             it, so strict verification sees any host time written there.
+ *   unblocks-rewritten
+ *             unblocks, with a second thread, which blocks SIGALRM, adding
+ *             SIGALRM to the call's mask buffer at 50 ms, while the call
+ *             sleeps. Linux copied the mask at entry, so the rewrite changes
+ *             nothing: EINTR with the handler run before return (review of
+ *             https://github.com/rrnewton/hermit/pull/4051).
  *
  * The guest checks its result against Linux's and exits nonzero on a
  * mismatch.
@@ -49,10 +55,18 @@
 
 static volatile sig_atomic_t alarms;
 static int pipe_fds[2];
+static sigset_t during;
 
 static void count_alarm(int signal) {
   (void)signal;
   alarms++;
+}
+
+static void* rewrite_mask_later(void* arg) {
+  (void)arg;
+  usleep(50000);
+  sigaddset(&during, SIGALRM);
+  return NULL;
 }
 
 static void* fill_pipe_later(void* arg) {
@@ -70,12 +84,16 @@ static void* fill_pipe_later(void* arg) {
 int main(int argc, char** argv) {
   if (argc != 2 ||
       (strcmp(argv[1], "blocks") != 0 && strcmp(argv[1], "unblocks") != 0 &&
-       strcmp(argv[1], "unblocks-timed") != 0)) {
-    fprintf(stderr, "usage: %s blocks|unblocks|unblocks-timed\n", argv[0]);
+       strcmp(argv[1], "unblocks-timed") != 0 &&
+       strcmp(argv[1], "unblocks-rewritten") != 0)) {
+    fprintf(
+        stderr, "usage: %s blocks|unblocks|unblocks-timed|unblocks-rewritten\n",
+        argv[0]);
     return 2;
   }
   int blocks = strcmp(argv[1], "blocks") == 0;
   int timed = strcmp(argv[1], "unblocks-timed") == 0;
+  int rewritten = strcmp(argv[1], "unblocks-rewritten") == 0;
   struct sigaction action;
   memset(&action, 0, sizeof action);
   action.sa_handler = count_alarm;
@@ -90,8 +108,17 @@ int main(int argc, char** argv) {
     perror("pthread_sigmask");
     return 1;
   }
+  sigemptyset(&during);
+  if (blocks) {
+    sigaddset(&during, SIGALRM);
+  }
   pthread_t writer;
   if (pthread_create(&writer, NULL, fill_pipe_later, NULL) != 0) {
+    perror("pthread_create");
+    return 1;
+  }
+  pthread_t rewriter;
+  if (rewritten && pthread_create(&rewriter, NULL, rewrite_mask_later, NULL) != 0) {
     perror("pthread_create");
     return 1;
   }
@@ -103,11 +130,6 @@ int main(int argc, char** argv) {
   if (setitimer(ITIMER_REAL, &alarm_in, NULL) != 0) {
     perror("setitimer");
     return 1;
-  }
-  sigset_t during;
-  sigemptyset(&during);
-  if (blocks) {
-    sigaddset(&during, SIGALRM);
   }
   fd_set read_set;
   FD_ZERO(&read_set);
@@ -130,7 +152,8 @@ int main(int argc, char** argv) {
   int result_errno = errno;
   int ready = result > 0 && FD_ISSET(pipe_fds[0], &read_set);
   int alarms_at_return = (int)alarms;
-  if (pthread_join(writer, NULL) != 0) {
+  if (pthread_join(writer, NULL) != 0 ||
+      (rewritten && pthread_join(rewriter, NULL) != 0)) {
     perror("pthread_join");
     return 1;
   }

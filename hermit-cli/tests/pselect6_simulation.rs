@@ -97,6 +97,10 @@ fn pselect6_preserves_kernel_abi_and_unblocks_scheduler() {
 ///   the call's mask must end it with EINTR, with the handler run before
 ///   pselect returns. It returned EINTR, but the handler did not run until the
 ///   guest unblocked SIGALRM itself.
+/// - `unblocks-rewritten`: `unblocks`, with a sibling rewriting the call's mask
+///   buffer to block SIGALRM while the call sleeps. Linux copied the mask at
+///   entry; delivering under a mask read again from the buffer returned 0 from
+///   an untimed call (review of https://github.com/rrnewton/hermit/pull/4051).
 /// - `unblocks-timed`: the same with a 5 s timeout, whose remaining time the
 ///   guest prints. The kernel must not write it, measured on the host clock,
 ///   over the remaining virtual time Hermit writes.
@@ -119,7 +123,7 @@ fn pselect6_sleeps_under_its_temporary_mask() {
         .arg(&guest);
     command_output(compile, "pselect temporary-mask guest compilation");
 
-    for mode in ["blocks", "unblocks", "unblocks-timed"] {
+    for mode in ["blocks", "unblocks", "unblocks-timed", "unblocks-rewritten"] {
         let verdict = build_root.join(format!("verify-{mode}.json"));
         let mut command = Command::new("timeout");
         command

@@ -2670,13 +2670,6 @@ impl KernelSignalWait {
         }
     }
 
-    /// Adds `signals` to the ones this wait holds until the call returns
-    /// (`held_until_return`). The gated loop passes, in each of its turns, the
-    /// signals that a host-timed source armed by a guest can post to this
-    /// process, such as a parent-death signal (`tool_global::host_timed_signals`):
-    /// the kernel posts those at a moment set by host timing, so ending the wait
-    /// for one would make the run depend on host timing. Never called for a
-    /// `select` wait (`for_select`), which holds nothing.
     /// This wait, sleeping under `mask` instead of the guest's own (`wait_mask`):
     /// a `pselect6` with a temporary mask. Linux installs that mask for the
     /// whole call, so a signal it blocks never ends the call, even one the
@@ -2706,6 +2699,13 @@ impl KernelSignalWait {
             && state.pending & self.could_interrupt(state) & !self.held_until_return & own_mask != 0
     }
 
+    /// Adds `signals` to the ones this wait holds until the call returns
+    /// (`held_until_return`). The gated loop passes, in each of its turns, the
+    /// signals that a host-timed source armed by a guest can post to this
+    /// process, such as a parent-death signal (`tool_global::host_timed_signals`):
+    /// the kernel posts those at a moment set by host timing, so ending the wait
+    /// for one would make the run depend on host timing. Never called for a
+    /// `select` wait (`for_select`), which holds nothing.
     pub(crate) fn hold_until_return(&mut self, signals: KernelSigset) {
         self.held_until_return |= signals;
         self.host_timed |= signals;

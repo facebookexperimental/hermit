@@ -1205,12 +1205,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         // The inner mask was snapshotted above. Do not let later guest mutations of the
         // outer wrapper change the meaning of a retry probe.
-        let guest_sigmask_argument = sigmask
-            .and(call.sigmask())
-            .map(|argument| argument.as_raw());
         let call = call.with_sigmask(None);
 
-        self.handle_internal_pselect6(guest, call, timeout, sigmask, guest_sigmask_argument)
+        self.handle_internal_pselect6(guest, call, timeout, sigmask)
             .await
     }
 
@@ -1220,7 +1217,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Pselect6,
         timeout: Option<Duration>,
         sigmask: Option<u64>,
-        guest_sigmask_argument: Option<usize>,
     ) -> Result<i64, Error> {
         let len = pselect6_fd_set_len(call.nfds())?;
         let deadline = match timeout {
@@ -1454,39 +1450,48 @@ impl<T: RecordOrReplay> Detcore<T> {
         // blocks, but check again that the backend holds nothing.
         if deliver_under_temporary_mask
             && !signals.as_ref().is_some_and(KernelSignalWait::holds_signal)
-            && let Some(argument) = guest_sigmask_argument.and_then(Addr::from_raw)
+            && let Some(mask) = sigmask
             && matches!(result, Err(Error::Errno(Errno::ERESTARTNOHAND)))
         {
             // Linux delivers such a signal before it puts the guest's own mask
             // back, which may block it, and the handler's frame restores the
             // guest's mask when it returns. Only the kernel can do both, so the
-            // call ends as a pselect6 with no descriptors, the guest's temporary
-            // mask and a zero timeout: the kernel installs the mask, finds the
-            // signal pending, returns ERESTARTNOHAND (EINTR after a handler) and
-            // delivers it (https://github.com/rrnewton/hermit/issues/3991). The
-            // guest's timeout already holds the remaining time written above.
-            // Passing it instead would let Linux overwrite it with a remaining
-            // time measured on the host clock, and an untimed call could sleep;
-            // a zero timeout never sleeps and gets no write-back.
-            guest.memory().write_value(
-                probe_timeout,
-                &Timespec {
-                    tv_sec: 0,
-                    tv_nsec: 0,
-                },
-            )?;
+            // thread makes one more pselect6, with no descriptors, a zero
+            // timeout and the call's temporary mask: the kernel installs the
+            // mask, finds the signal pending, returns ERESTARTNOHAND and
+            // delivers it as the call returns, EINTR after a handler
+            // (https://github.com/rrnewton/hermit/issues/3991).
+            // - The mask is a scratch copy of the one this call read at entry
+            //   (`sigmask`), as Linux copies it once at entry; the guest's
+            //   buffer, which a sibling may have rewritten since, is not read
+            //   again (review of https://github.com/rrnewton/hermit/pull/4051).
+            // - A zero timeout never sleeps, and Linux writes no remaining time
+            //   back for it; the guest's timeout already holds the remaining
+            //   time written above.
+            // - A plain injection, not a tail injection, so the rest of this
+            //   handler and Detcore's post-syscall work still run.
             drop(_guard);
-            match guest
-                .tail_inject(
+            let mut stack = guest.stack().await;
+            let mask_copy = stack.push(mask);
+            let wrapper = stack
+                .push(Pselect6SigmaskArg {
+                    sigmask: mask_copy.as_raw(),
+                    sigsetsize: KERNEL_SIGSET_SIZE,
+                })
+                .cast();
+            let zero_timeout = stack.reserve::<Timespec>();
+            let _delivery_guard = stack.commit()?;
+            let _ = guest
+                .inject(
                     syscalls::Pselect6::new()
                         .with_nfds(0)
                         .with_readfds(None)
                         .with_writefds(None)
                         .with_exceptfds(None)
-                        .with_timeout(Some(probe_timeout))
-                        .with_sigmask(Some(argument)),
+                        .with_timeout(Some(zero_timeout))
+                        .with_sigmask(Some(wrapper)),
                 )
-                .await {}
+                .await;
         }
         refuse_held_signal_loss(guest, Sysno::pselect6, result).await
     }
