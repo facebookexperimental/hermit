@@ -21664,6 +21664,24 @@ fn a_futex_waiter_woken_for_a_signal_another_thread_takes_rereads_its_word() {
         "the listed chaos seeds no longer reach both EAGAIN paths \
          (main: {retried_on_main}, waiter: {restarted_on_waiter}); pick new seeds"
     );
+    // Record and replay recompute futex results; a recording made now replays
+    // to a match, and RECORD_VERSION refuses one made before the change.
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&["record", "--verify", "--", guest.as_str()]),
+        directory.path(),
+        Duration::from_secs(240),
+        false,
+    );
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "record --verify must succeed:\nstderr:\n{log}"
+    );
+    assert!(
+        log.contains("Success: replay matched recording."),
+        "the replay must match the recording:\nstderr:\n{log}"
+    );
 }
 
 /// A priority-inheritance futex command is refused by name, never a panic
