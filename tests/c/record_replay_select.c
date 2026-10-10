@@ -53,6 +53,22 @@
  *                SIGALRM unblocked, so the kernel gives the process-directed
  *                SIGALRM to the writer while the main thread's pselect6 blocks
  *                it; replay must deliver it to the same thread
+ *   pselect-mask-unblocks-alarm
+ *                the opposite idiom: the main thread blocks SIGALRM, which it
+ *                catches, and waits in glibc pselect() with a 30 s bound and
+ *                an empty temporary mask; the 100 ms ITIMER_REAL SIGALRM ends
+ *                the wait with EINTR and its handler runs, under the temporary
+ *                mask, before the call returns. Replay serves the call from the
+ *                recording, and the kernel, finding the signal blocked by the
+ *                thread's own mask, restarted it
+ *                (https://github.com/rrnewton/hermit/issues/3992)
+ *   pselect-mask-unblocks-rewritten
+ *                the unblocks wait, with a second thread, which blocks SIGALRM,
+ *                adding SIGALRM to the call's mask buffer after 1000 yields,
+ *                once the call sleeps. Linux copied the mask at entry, so the
+ *                call still ends with EINTR, and replay must not read the
+ *                buffer again (review of
+ *                https://github.com/rrnewton/hermit/pull/4052)
  *
  * The first three modes each run four shapes: a ready pipe with a 5 s timeout,
  * the same with a zero timeout, the same with nfds == FD_SETSIZE (larger than
@@ -803,13 +819,97 @@ static int pselect_mask_sibling_rewrite(void) {
       "pselect-sibling", writer, result, result_errno, &read_set, 1);
 }
 
+/*
+ * The waiter keeps SIGALRM blocked outside the call, so a SIGALRM the timer
+ * sends before the waiter enters the kernel stays pending until pselect6
+ * installs its empty mask, and the call ends with EINTR either way. Nothing
+ * else can end the call early: there is no writer, and the 30 s timeout is only
+ * a bound. A writer whose real sleep raced the virtual 100 ms timer made the
+ * recording return 1 in about 1 run in 12 (Claude re-check of
+ * https://github.com/rrnewton/hermit/pull/4052). A broken implementation
+ * returns 0 after 30 s and fails the check.
+ */
+static sigset_t unblocks_during;
+
+/* Adds SIGALRM to the waiter's mask buffer while its pselect6 sleeps. The
+ * yields keep the scheduler busy first, as in fill_alarm_pipe_later, so the
+ * waiter enters the kernel and copies its mask before the rewrite. There is no
+ * sleep: while this thread is runnable the timer cannot fire, so the rewrite
+ * lands between the call's entry and the SIGALRM that ends it. */
+static void* rewrite_unblocks_mask_later(void* arg) {
+  (void)arg;
+  for (int i = 0; i < 1000; i++) {
+    sched_yield();
+  }
+  sigaddset(&unblocks_during, SIGALRM);
+  return NULL;
+}
+
+static int pselect_mask_unblocks_alarm(int rewrite) {
+  struct sigaction action;
+  memset(&action, 0, sizeof action);
+  action.sa_handler = count_masked_alarm;
+  if (sigaction(SIGALRM, &action, NULL) != 0 || pipe(alarm_pipe_fds) != 0) {
+    perror("setup");
+    return 1;
+  }
+  sigset_t alarm_set;
+  sigemptyset(&alarm_set);
+  sigaddset(&alarm_set, SIGALRM);
+  if (pthread_sigmask(SIG_BLOCK, &alarm_set, NULL) != 0) {
+    perror("pthread_sigmask block");
+    return 1;
+  }
+  sigemptyset(&unblocks_during);
+  pthread_t rewriter;
+  if (rewrite &&
+      pthread_create(&rewriter, NULL, rewrite_unblocks_mask_later, NULL) != 0) {
+    perror("pthread_create");
+    return 1;
+  }
+  struct itimerval alarm_in = {{0, 0}, {0, 100000}};
+  if (setitimer(ITIMER_REAL, &alarm_in, NULL) != 0) {
+    perror("setitimer");
+    return 1;
+  }
+  fd_set read_set;
+  FD_ZERO(&read_set);
+  FD_SET(alarm_pipe_fds[0], &read_set);
+  struct timespec bound = {30, 0};
+  errno = 0;
+  int result = pselect(
+      alarm_pipe_fds[0] + 1, &read_set, NULL, NULL, &bound, &unblocks_during);
+  int result_errno = errno;
+  int alarms_at_return = (int)masked_alarms;
+  if (rewrite && pthread_join(rewriter, NULL) != 0) {
+    perror("pthread_join");
+    return 1;
+  }
+  close(alarm_pipe_fds[0]);
+  close(alarm_pipe_fds[1]);
+  printf(
+      "%-24s result=%011d errno=%011d alarms=%01d\n",
+      "pselect-mask-unblocks",
+      result,
+      result < 0 ? result_errno : 0,
+      alarms_at_return);
+  /* Linux copied the mask at entry, so the rewrite, which lands after the
+   * waiter entered the kernel, changes nothing: EINTR in both modes. */
+  if (result != -1 || result_errno != EINTR || alarms_at_return != 1) {
+    fprintf(stderr, "pselect-mask-unblocks-alarm mismatch\n");
+    return 1;
+  }
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc != 2) {
     fprintf(
         stderr,
         "usage: %s [raw|glibc|pselect-mask|efault|einval|poll|thread-wake|"
         "pselect-mask-blocks-alarm|pselect-mask-shared-alarm|"
-        "pselect-mask-writeonly-wrapper|pselect-mask-sibling-rewrite]\n",
+        "pselect-mask-writeonly-wrapper|pselect-mask-sibling-rewrite|"
+        "pselect-mask-unblocks-alarm|pselect-mask-unblocks-rewritten]\n",
         argv[0]);
     return 2;
   }
@@ -833,6 +933,12 @@ int main(int argc, char** argv) {
   }
   if (strcmp(argv[1], "pselect-mask-shared-alarm") == 0) {
     return pselect_mask_shared_alarm();
+  }
+  if (strcmp(argv[1], "pselect-mask-unblocks-alarm") == 0) {
+    return pselect_mask_unblocks_alarm(0);
+  }
+  if (strcmp(argv[1], "pselect-mask-unblocks-rewritten") == 0) {
+    return pselect_mask_unblocks_alarm(1);
   }
   if (strcmp(argv[1], "efault") == 0) {
     return efault();
