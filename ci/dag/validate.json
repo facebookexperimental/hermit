@@ -2350,6 +2350,20 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/exec-pipe-state",
+          "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/exec-pipe-state",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/faccessat2-flags",
           "mode": "verify",
           "backend": "dbt"
@@ -23176,6 +23190,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/exec-pipe-state",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/faccessat2-flags",
           "mode": "verify",
           "backend": "ptrace"
@@ -28662,6 +28683,20 @@
           "test": "c-programs/eventfd-semantics",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/exec-pipe-state",
+          "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/exec-pipe-state",
+          "mode": "verify",
+          "backend": "ptrace"
         },
         {
           "lane": "portable",
@@ -45201,6 +45236,20 @@
           "test": "c-programs/eventfd-semantics",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/exec-pipe-state",
+          "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/exec-pipe-state",
+          "mode": "verify",
+          "backend": "ptrace"
         },
         {
           "lane": "portable",

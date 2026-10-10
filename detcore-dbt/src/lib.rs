@@ -540,6 +540,7 @@ fn send_dbt_prepare_exec(
 ) -> PreparedExec {
     let runtime = current_runtime();
     let mm = thread_state.mm_id;
+    let blocking_overrides = thread_state.exec_blocking_overrides();
     let (tid, pid) = prepare_exec_guest_identity(scheduler_tid, physical_pid);
     let mut guest = DbtGuest::<Detcore>::new(
         context as usize,
@@ -554,11 +555,7 @@ fn send_dbt_prepare_exec(
         read_registers,
         write_registers,
     );
-    run_ready(prepare_exec(
-        &mut guest,
-        mm,
-        std::collections::BTreeSet::new(),
-    ));
+    run_ready(prepare_exec(&mut guest, mm, blocking_overrides));
     PreparedExec {
         context: context as usize,
         branches,
@@ -2834,7 +2831,8 @@ mod tests {
 
     #[test]
     fn a_rejected_versioned_config_keeps_the_existing_parse_fallback_policy() {
-        let (sent, legacy) = hermit_run_dbt_detconfig();
+        let (sent, _) = hermit_run_dbt_detconfig();
+        let legacy = detcore::to_legacy_backend_json(&sent).unwrap();
         let backend = serde_json::to_string(&sent.backend).unwrap();
         for json in [
             format!("{{\"dbt_config_version\":2,\"config\":{legacy},\"backend\":{backend}}}"),
@@ -2874,10 +2872,10 @@ mod tests {
         assert!(!config.backend.supports_parked_write_signal_interruption);
     }
 
-    /// Without a configuration from `hermit run`, the runtime reads exactly
-    /// the backend facts it read before capabilities existed: the strict
-    /// default's ptrace values, with only parked-write interruption disabled.
-    /// In particular these four differ from DBT's own capabilities.
+    /// In admitted standalone initialization, a missing fallback configuration
+    /// keeps the previous strict default's ptrace facts, with only parked-write
+    /// interruption disabled. These differ from DBT's own capabilities;
+    /// coordinated startup instead requires its authoritative configuration.
     #[test]
     fn a_dbt_run_without_a_cli_configuration_keeps_its_previous_backend_facts() {
         let (_, json) = hermit_run_dbt_detconfig();
@@ -2912,13 +2910,14 @@ mod tests {
         }
     }
 
-    /// `hermit run --backend=dbt` writes the configuration with
-    /// [`detcore::to_legacy_backend_json`]; the runtime reads it back
-    /// with every field intact, DBT's capabilities included.
+    /// The CLI encodes the admitted standalone fallback with
+    /// [`detcore::encode_backend_config_json`]. Its standalone reader retains
+    /// every field, DBT's capabilities included. Coordinated startup receives
+    /// the authoritative typed Config through its separate handshake.
     #[test]
     fn the_cli_configuration_round_trips_through_its_environment_encoding() {
         let (sent, json) = hermit_run_dbt_detconfig();
-        assert!(!json.contains("\"backend\":"), "{json}");
+        assert!(detcore::from_legacy_backend_json(&json).is_err());
         let (received, source) = dbt_config_from(Some(&json));
         assert!(matches!(source, ConfigSource::Cli));
         assert_eq!(received.backend, backend_capabilities());
@@ -2928,21 +2927,25 @@ mod tests {
         );
     }
 
-    /// A parseable configuration is read for the backend facts it carries,
-    /// not replaced by DBT's: a guest can edit the inherited variable before
-    /// it execs, and the runtime reads it again in the new image. Each fact
-    /// keeps the value the configuration gives it, as it did when the facts
-    /// were separate `Config` fields; only parked-write interruption is held
-    /// off. A legacy key that is absent takes that field's old default.
+    /// In the admitted standalone fallback, a parseable configuration keeps
+    /// the backend facts it carries, as it did when those facts were separate
+    /// `Config` fields; only parked-write interruption is held off. A legacy
+    /// key that is absent takes that field's old default. This fallback does
+    /// not replace a present coordinator's authoritative typed Config.
     #[test]
-    fn a_cli_configuration_keeps_the_backend_facts_it_carries() {
-        let (_, json) = hermit_run_dbt_detconfig();
+    fn a_legacy_cli_configuration_keeps_the_backend_facts_it_carries() {
+        let (mut sent, _) = hermit_run_dbt_detconfig();
+        // Preserve the pre-discovery DBT input: legacy keys, with no envelope
+        // whose typed capabilities would take precedence over their projection.
+        sent.backend.tool_shares_guest_descriptor_table = false;
+        sent.backend.rediscovers_descriptors_after_exec = false;
+        let json = detcore::to_legacy_backend_json(&sent).unwrap();
         let key = "\"backend_requires_thread_directed_process_signals\"";
         let edited = json.replacen(&format!("{key}:true"), &format!("{key}:false"), 1);
         assert_ne!(edited, json);
         let (config, source) = dbt_config_from(Some(&edited));
         assert!(matches!(source, ConfigSource::Cli));
-        let mut expected = backend_capabilities();
+        let mut expected = sent.backend;
         expected.requires_thread_directed_process_signals = false;
         assert_eq!(config.backend, expected);
 
@@ -2950,7 +2953,7 @@ mod tests {
         let edited = json.replacen(&format!("{key}:false"), &format!("{key}:true"), 1);
         assert_ne!(edited, json);
         let (config, _) = dbt_config_from(Some(&edited));
-        assert_eq!(config.backend, backend_capabilities());
+        assert_eq!(config.backend, sent.backend);
 
         let mut object: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(&json).unwrap();
@@ -2958,7 +2961,7 @@ mod tests {
         let edited = serde_json::to_string(&object).unwrap();
         let (config, source) = dbt_config_from(Some(&edited));
         assert!(matches!(source, ConfigSource::Cli));
-        let mut expected = backend_capabilities();
+        let mut expected = sent.backend;
         expected.tracks_process_children = true;
         assert_eq!(config.backend, expected);
     }

@@ -355,6 +355,12 @@
       "why": "tests/c/exec_clock_continuity.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test compiles this self-re-execing guest and asserts that guest virtual time is strictly monotonic ACROSS the execve boundary, comparing pre-exec and post-exec CLOCK_REALTIME samples handed through argv; it remains a guest fixture because a generic manifest cannot express the exec-boundary hand-off contract or the cross-image ordering assertion."
     },
     {
+      "disposition": "manifest-test",
+      "path": "tests/c/exec_pipe_state.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
+      "why": "tests/c/exec_pipe_state.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): Blocking pipe EOF across exec and nonblocking I/O contracts are calibrated under strict verification for ptrace and DBT"
+    },
+    {
       "disposition": "guest-fixture",
       "path": "tests/c/exit_reaping_probe.c",
       "runner": "hermit-cli/tests/cli.rs",

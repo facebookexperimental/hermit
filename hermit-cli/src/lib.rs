@@ -3252,7 +3252,11 @@ mod dbt_detconfig_tests {
 
     #[test]
     fn dbt_detconfig_matches_806cf2fa_bytes() {
-        for ((name, config), (golden_name, golden)) in cases().into_iter().zip(GOLDEN) {
+        for ((name, mut config), (golden_name, golden)) in cases().into_iter().zip(GOLDEN) {
+            // Keep the historical capability value as well as its byte oracle.
+            // Current DBT descriptor facts need the versioned transport below.
+            config.backend.tool_shares_guest_descriptor_table = false;
+            config.backend.rediscovers_descriptors_after_exec = false;
             assert_eq!(name, golden_name);
             let encoded = dbt_detconfig_json(&config).unwrap();
             assert_eq!(
@@ -3280,6 +3284,20 @@ mod dbt_detconfig_tests {
                 "{name}: decoded config differs from the encoded one"
             );
         }
+    }
+
+    #[test]
+    fn current_dbt_uses_exact_descriptor_facts_without_host_timed_turns() {
+        let config = prepare_backend_config(default_config(), Backend::Dbt);
+        assert!(config.backend.tool_shares_guest_descriptor_table);
+        assert!(config.backend.rediscovers_descriptors_after_exec);
+        assert!(!config.backend.internal_pipe_turns_are_host_timed);
+        assert!(!config.backend.loopback_pollers_yield_to_peers);
+        let encoded = dbt_detconfig_json(&config).unwrap();
+        assert!(detcore::from_legacy_backend_json(&encoded).is_err());
+        let decoded = detcore::decode_backend_config_json(&encoded).unwrap();
+        assert_eq!(decoded.backend, reverie::BackendCapabilities::DBT);
+        assert_eq!(decoded.backend, config.backend);
     }
 
     #[test]
@@ -3328,7 +3346,10 @@ mod dbt_detconfig_tests {
     #[test]
     fn versioned_dbt_config_rejects_unknown_or_malformed_envelopes() {
         let config = prepare_backend_config(default_config(), Backend::Dbt);
-        let legacy = dbt_detconfig_json(&config).unwrap();
+        let legacy =
+            insert_legacy_dbt_detconfig_keys(&detcore::to_legacy_backend_json(&config).unwrap())
+                .unwrap();
+        let legacy_backend = detcore::from_legacy_backend_json(&legacy).unwrap().backend;
         let backend = serde_json::to_string(&config.backend).unwrap();
         let envelope = |version: &str| {
             format!(
@@ -3346,7 +3367,7 @@ mod dbt_detconfig_tests {
                 detcore::decode_backend_config_json(&tagged_legacy)
                     .unwrap()
                     .backend,
-                config.backend,
+                legacy_backend,
                 "an unknown legacy key must remain ignored"
             );
         }

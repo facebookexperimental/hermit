@@ -2700,6 +2700,10 @@ mod tests {
     fn legacy_expressible(mut backend: BackendCapabilities) -> BackendCapabilities {
         backend.process_exits_complete_asynchronously = false;
         backend.virtualizes_guest_sigalrm = false;
+        // The legacy discover_live_file_metadata bit couples four facts.
+        backend.rediscovers_descriptors_after_exec = backend.tool_shares_guest_descriptor_table;
+        backend.internal_pipe_turns_are_host_timed = backend.tool_shares_guest_descriptor_table;
+        backend.loopback_pollers_yield_to_peers = backend.tool_shares_guest_descriptor_table;
         backend
     }
 
@@ -2757,7 +2761,7 @@ mod tests {
                 true,
             ),
             ("SABRE", BackendCapabilities::SABRE, false),
-            ("DBT", BackendCapabilities::DBT, false),
+            ("DBT", BackendCapabilities::DBT, true),
             ("KVM", BackendCapabilities::KVM, false),
         ] {
             for sequentialize_threads in [false, true] {
@@ -3806,7 +3810,10 @@ mod tests {
         if let Some(input) = std::env::var_os(LEGACY_INPUT_IN_CHILD) {
             let expected = std::env::var(LEGACY_EXPECTED_IN_CHILD).unwrap();
             let received = from_legacy_backend_json(input.to_str().unwrap()).unwrap();
-            assert_eq!(received.backend, BackendCapabilities::DBT);
+            assert_eq!(
+                received.backend,
+                legacy_expressible(BackendCapabilities::DBT)
+            );
             assert_eq!(received.seed, 7);
             assert_eq!(received.sched_seed, Some(11));
             assert_eq!(to_legacy_backend_json(&received).unwrap(), expected);
@@ -3878,7 +3885,7 @@ mod tests {
     #[test]
     fn keys_the_legacy_form_did_not_name_are_ignored() {
         let sent = Config {
-            backend: BackendCapabilities::DBT,
+            backend: legacy_expressible(BackendCapabilities::DBT),
             seed: 7,
             ..Config::default()
         };
@@ -3898,7 +3905,7 @@ mod tests {
                 format!("{},{extra}}}", &json[..json.len() - 1]),
             ] {
                 let received = from_legacy_backend_json(&edited).unwrap();
-                assert_eq!(received.backend, BackendCapabilities::DBT, "{edited}");
+                assert_eq!(received.backend, sent.backend, "{edited}");
                 assert_eq!(
                     serde_json::to_string(&received).unwrap(),
                     serde_json::to_string(&sent).unwrap(),

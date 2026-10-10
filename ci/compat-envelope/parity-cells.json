@@ -8,59 +8,59 @@
   "population_rule": "Every manifest test whose ptrace verify cell full validation selects (Population::Required), crossed with every candidate backend (dbt, in-guest-trap, kvm, liteinst, sabre). A candidate whose verify cell is disabled, enabled but not selected, red, refused or missing is in the population and scores 0. A cell whose ptrace reference left no usable golden log is outside it and is counted apart.",
   "counts": {
     "all": {
-      "cells": 4080,
-      "applicable": 1700,
-      "selectable": 1396,
-      "population": 2770,
-      "population_candidate_selected": 1396,
+      "cells": 4085,
+      "applicable": 1701,
+      "selectable": 1397,
+      "population": 2775,
+      "population_candidate_selected": 1397,
       "population_candidate_not_selected": 260,
-      "population_candidate_disabled": 1114
+      "population_candidate_disabled": 1118
     },
     "by_backend": {
       "dbt": {
-        "cells": 816,
-        "applicable": 251,
-        "selectable": 204,
-        "population": 554,
-        "population_candidate_selected": 204,
+        "cells": 817,
+        "applicable": 252,
+        "selectable": 205,
+        "population": 555,
+        "population_candidate_selected": 205,
         "population_candidate_not_selected": 46,
         "population_candidate_disabled": 304
       },
       "in-guest-trap": {
-        "cells": 816,
+        "cells": 817,
         "applicable": 319,
         "selectable": 313,
-        "population": 554,
+        "population": 555,
         "population_candidate_selected": 313,
-        "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 241
-      },
-      "kvm": {
-        "cells": 816,
-        "applicable": 334,
-        "selectable": 328,
-        "population": 554,
-        "population_candidate_selected": 328,
-        "population_candidate_not_selected": 5,
-        "population_candidate_disabled": 221
-      },
-      "liteinst": {
-        "cells": 816,
-        "applicable": 318,
-        "selectable": 312,
-        "population": 554,
-        "population_candidate_selected": 312,
         "population_candidate_not_selected": 0,
         "population_candidate_disabled": 242
       },
+      "kvm": {
+        "cells": 817,
+        "applicable": 334,
+        "selectable": 328,
+        "population": 555,
+        "population_candidate_selected": 328,
+        "population_candidate_not_selected": 5,
+        "population_candidate_disabled": 222
+      },
+      "liteinst": {
+        "cells": 817,
+        "applicable": 318,
+        "selectable": 312,
+        "population": 555,
+        "population_candidate_selected": 312,
+        "population_candidate_not_selected": 0,
+        "population_candidate_disabled": 243
+      },
       "sabre": {
-        "cells": 816,
+        "cells": 817,
         "applicable": 478,
         "selectable": 239,
-        "population": 554,
+        "population": 555,
         "population_candidate_selected": 239,
         "population_candidate_not_selected": 209,
-        "population_candidate_disabled": 106
+        "population_candidate_disabled": 107
       }
     }
   },
@@ -290,6 +290,11 @@
     {"test_id":"c-programs/eventfd-semantics","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/eventfd-semantics","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/eventfd-semantics","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/exec-pipe-state","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/exec-pipe-state","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
+    {"test_id":"c-programs/exec-pipe-state","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: This descriptor regression is calibrated on ptrace and DBT; KVM qualification is separate"},
+    {"test_id":"c-programs/exec-pipe-state","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: New top-of-funnel coverage is established on the ptrace reference first; LiteInst ratchets against it separately"},
+    {"test_id":"c-programs/exec-pipe-state","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: New top-of-funnel coverage is established on the ptrace reference first; SaBRe ratchets against it separately"},
     {"test_id":"c-programs/faccessat2-flags","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/faccessat2-flags","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/faccessat2-flags","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},

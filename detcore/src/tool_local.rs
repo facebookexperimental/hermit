@@ -2576,9 +2576,10 @@ impl<T> ThreadState<T> {
         let file_metadata = if cfg.backend.tool_shares_guest_descriptor_table {
             let mut metadata = FileMetadata::new(pid);
             for fd in 0..=2 {
-                metadata
-                    .discover_fd_from_current_process(pid, fd)
-                    .expect("SaBRe guest stdio must be open");
+                match metadata.discover_fd_from_current_process(pid, fd) {
+                    Ok(()) | Err(Errno::EBADF) => {}
+                    Err(error) => panic!("unable to discover guest stdio {fd}: {error}"),
+                }
             }
             metadata
         } else {
@@ -2981,6 +2982,12 @@ impl<T> ThreadState<T> {
             metadata.discover_fd_from_current_process(self.dettid, fd)?;
         }
         metadata.with_detfd(fd, f)
+    }
+
+    /// Preserve logical blocking for scheduler-managed descriptors when exec
+    /// replaces an in-process tool and its descriptor metadata.
+    pub fn exec_blocking_overrides(&self) -> ExecFdBlockingOverrides {
+        self.metadata().exec_blocking_overrides()
     }
 
     /// Descriptors in this table that Detcore manages as internal pipes: typed

@@ -19932,6 +19932,74 @@ test:
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
           in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: c-programs/exec-pipe-state
+    description: Blocking pipes preserve payload and EOF across exec; nonblocking read, readv, write and writev preserve EAGAIN and flags
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/exec_pipe_state.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci:
+          ptrace: true
+          dbt: true
+        backends_enabled:
+          - ptrace
+          - dbt
+        backends_disabled:
+          kvm: This descriptor regression is calibrated on ptrace and DBT; KVM qualification is separate
+          sabre: New top-of-funnel coverage is established on the ptrace reference first; SaBRe ratchets against it separately
+          liteinst: New top-of-funnel coverage is established on the ptrace reference first; LiteInst ratchets against it separately
+          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: This row asserts strict-verify determinism; it does not assert native nondeterminism'
+        backends_enabled: []
+        backends_disabled:
+          native: This row asserts strict-verify determinism; it does not assert native nondeterminism
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: Record/replay qualification is separate from strict-verification entry / Record/replay is unsupported by DBT / Record/replay is unsupported by KVM / Record/replay is unsupported by SaBRe / Record/replay is unsupported by LiteInst'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from strict-verification entry
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle / Chaos scheduling is unsupported by DBT / Chaos scheduling is unsupported by KVM / Chaos scheduling is unsupported by SaBRe / Chaos scheduling is unsupported by LiteInst'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: No custom edge-case arguments have been calibrated for this C guest'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
   - id: c-programs/fork-exec-pipeline
     description: 'fork+execve pipeline: fd inheritance across an execve image replacement, output captured through a pipe, exit status propagated'
     lane: portable

@@ -1366,7 +1366,16 @@ fi
 # inventory 941, the 16-job clamp, 1050-job-second wrapper and 572-job-second
 # fallback. This carries the SDK budget, not a timing sample, runtime
 # identity or earlier validation evidence.
-expected_pin=20b4d1f81d5b5a78cc6bfe02c20db1038b916a6d
+# PIPE-SEMANTICS CARRY TO 15374907e7359d639ce62b7e67179736707af332 (2026-10-10):
+# Relative to 20b4d1f81d5b5a78cc6bfe02c20db1038b916a6d, all seven SDK build
+# inputs (build.rs, vendor/dynamorio, DBT Cargo.toml/native CMakeLists.txt,
+# third-party, root Cargo.toml and rust-toolchain.toml) retain their Git objects.
+# Native pipe/RPC behavior and two descriptor facts changed, so the full DBT
+# source is not identical and requires fresh runtime checks. With unchanged
+# CMAKE/CMAKE_GENERATOR and normalized SOURCE_DATE_EPOCH, carry the existing
+# 16-job clamp and 1050/572-job-second SDK budgets only. This is not a new
+# timing sample or a claim that earlier native/runtime evidence applies.
+expected_pin=15374907e7359d639ce62b7e67179736707af332
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

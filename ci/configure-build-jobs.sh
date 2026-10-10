@@ -1443,8 +1443,17 @@ fi
 # inventory 941, the 16-job clamp, 1050-job-second wrapper and 572-job-second
 # fallback. This carries the SDK budget, not a timing sample, runtime
 # identity or earlier validation evidence.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 20b4d1f81d5b5a78cc6bfe02c20db1038b916a6d ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 20b4d1f81d5b5a78cc6bfe02c20db1038b916a6d (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# PIPE-SEMANTICS CARRY TO 15374907e7359d639ce62b7e67179736707af332 (2026-10-10):
+# Relative to 20b4d1f81d5b5a78cc6bfe02c20db1038b916a6d, all seven SDK build
+# inputs (build.rs, vendor/dynamorio, DBT Cargo.toml/native CMakeLists.txt,
+# third-party, root Cargo.toml and rust-toolchain.toml) retain their Git objects.
+# Native pipe/RPC behavior and two descriptor facts changed, so the full DBT
+# source is not identical and requires fresh runtime checks. With unchanged
+# CMAKE/CMAKE_GENERATOR and normalized SOURCE_DATE_EPOCH, carry the existing
+# 16-job clamp and 1050/572-job-second SDK budgets only. This is not a new
+# timing sample or a claim that earlier native/runtime evidence applies.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 15374907e7359d639ce62b7e67179736707af332 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 15374907e7359d639ce62b7e67179736707af332 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
