@@ -348,7 +348,7 @@ pub const DETCONFIG_ENV: &str = "HERMIT_DBT_DETCONFIG";
 enum ConfigSource {
     /// Received from the coordinator through its existing first Config frame.
     RpcHandshake,
-    /// Deserialized from [`DETCONFIG_ENV`] provided by `hermit run`.
+    /// Deserialized from [`DETCONFIG_ENV`] in admitted standalone initialization.
     Cli,
     /// [`DETCONFIG_ENV`] was set but could not be parsed; strict default used.
     ParseFallback,
@@ -375,12 +375,13 @@ pub const fn backend_capabilities() -> reverie::BackendCapabilities {
     reverie_dbt::DbtRunner::capabilities()
 }
 
-/// Builds the Detcore [`Config`] for this DBT runtime.
+/// Builds the admitted standalone Detcore [`Config`] fallback.
 ///
 /// The configuration is taken from the CLI-derived Detcore config serialized
 /// into [`DETCONFIG_ENV`] when present; otherwise a strict default is used.
 /// Regardless of the source, the DBT execution-model invariants are re-asserted
-/// by [`assert_dbt_execution_model`].
+/// by [`assert_dbt_execution_model`]. A present coordinator control is handled
+/// by [`initial_dbt_config`] and never falls back through this function.
 fn load_dbt_config() -> (Config, ConfigSource) {
     dbt_config_from(std::env::var(DETCONFIG_ENV).ok().as_deref())
 }
@@ -389,15 +390,14 @@ fn load_dbt_config() -> (Config, ConfigSource) {
 /// variable is absent or not Unicode.
 ///
 /// The backend facts are those the value carries, decoded by
-/// [`detcore::from_legacy_backend_json`]; `hermit run` encodes
+/// [`detcore::decode_backend_config_json`]; `hermit run` encodes
 /// [`backend_capabilities`] there. Without a parseable value they are the
-/// strict default's, which are ptrace's: a bare `drrun -c client.so` run, or a
-/// guest that execs with an empty environment, therefore keeps its
-/// process-directed signals untranslated, so `kill(-2147483647, SIGKILL)` fails
-/// with `ESRCH` as it did before Detcore read capabilities.
+/// strict default's, which are ptrace's. This is the admitted standalone
+/// fallback only: coordinated startup, including an empty-environment exec,
+/// receives the authoritative physical Config through [`initial_dbt_config`].
 fn dbt_config_from(value: Option<&str>) -> (Config, ConfigSource) {
     let (mut config, source) = match value {
-        Some(value) if !value.is_empty() => match detcore::from_legacy_backend_json(value) {
+        Some(value) if !value.is_empty() => match detcore::decode_backend_config_json(value) {
             Ok(config) => (config, ConfigSource::Cli),
             Err(_) => (default_dbt_config(), ConfigSource::ParseFallback),
         },
@@ -2803,8 +2803,53 @@ mod tests {
         sent.seed = 7;
         sent.chaos = true;
         sent.backend = backend_capabilities();
-        let json = detcore::to_legacy_backend_json(&sent).unwrap();
+        let json = detcore::encode_backend_config_json(
+            detcore::to_legacy_backend_json(&sent).unwrap(),
+            sent.backend,
+        )
+        .unwrap();
         (sent, json)
+    }
+
+    #[test]
+    fn versioned_config_preserves_independent_descriptor_facts_in_the_runtime() {
+        for mask in 0_u8..16 {
+            let (mut sent, _) = hermit_run_dbt_detconfig();
+            sent.backend.tool_shares_guest_descriptor_table = mask & 1 != 0;
+            sent.backend.rediscovers_descriptors_after_exec = mask & 2 != 0;
+            sent.backend.internal_pipe_turns_are_host_timed = mask & 4 != 0;
+            sent.backend.loopback_pollers_yield_to_peers = mask & 8 != 0;
+            let json = detcore::encode_backend_config_json(
+                detcore::to_legacy_backend_json(&sent).unwrap(),
+                sent.backend,
+            )
+            .unwrap();
+            let (received, source) = dbt_config_from(Some(&json));
+            assert!(matches!(source, ConfigSource::Cli), "mask {mask}");
+            assert_eq!(received.backend, sent.backend, "mask {mask}");
+            assert_eq!(received.max_timeslice, None);
+            assert!(received.sequentialize_threads);
+        }
+    }
+
+    #[test]
+    fn a_rejected_versioned_config_keeps_the_existing_parse_fallback_policy() {
+        let (sent, legacy) = hermit_run_dbt_detconfig();
+        let backend = serde_json::to_string(&sent.backend).unwrap();
+        for json in [
+            format!("{{\"dbt_config_version\":2,\"config\":{legacy},\"backend\":{backend}}}"),
+            format!("{{\"dbt_config_version\":1,\"config\":{legacy}}}"),
+        ] {
+            assert!(detcore::decode_backend_config_json(&json).is_err());
+            let (received, source) = dbt_config_from(Some(&json));
+            assert!(matches!(source, ConfigSource::ParseFallback));
+            let (expected, _) = dbt_config_from(None);
+            // Defaults include a freshly sampled epoch; the fallback policy
+            // is established by the source, capabilities and execution model.
+            assert_eq!(received.backend, expected.backend);
+            assert_eq!(received.max_timeslice, None);
+            assert!(received.sequentialize_threads);
+        }
     }
 
     #[test]

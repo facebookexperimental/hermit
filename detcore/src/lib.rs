@@ -97,6 +97,8 @@ pub use config::RunsPostFork;
 pub use config::SchedHeuristic;
 pub use config::config_fingerprint_mismatch;
 pub use config::config_wire_fingerprint;
+pub use config::decode_backend_config_json;
+pub use config::encode_backend_config_json;
 pub use config::from_legacy_backend_json;
 pub use config::to_legacy_backend_json;
 // AUTONOMOUS-BOT-IMPLEMENTED

@@ -3022,10 +3022,11 @@ fn dbt_client_thread_start_failed(status: &std::process::ExitStatus) -> bool {
 /// longer has the switches they named. Each entry is the key, its fixed value,
 /// and the key it preceded in the old field order.
 ///
-/// These are serialization constants. Nothing reads them back: the DBT runtime
-/// decodes the variable with [`detcore::from_legacy_backend_json`], which
-/// ignores keys the legacy form did not name. The values are the only ones the
-/// deleted switches ever took on any backend.
+/// These are serialization constants. Nothing reads them back: the admitted
+/// DBT standalone path decodes the variable with
+/// [`detcore::decode_backend_config_json`], whose legacy reader ignores these
+/// keys. The values are the only ones the deleted switches ever took on any
+/// backend.
 const LEGACY_DBT_DETCONFIG_KEYS: [(&str, bool, &str); 3] = [
     (
         "use_thread_local_clock_reads",
@@ -3059,18 +3060,19 @@ const LEGACY_DBT_DETCONFIG_KEYS: [(&str, bool, &str); 3] = [
 ///   the variable by 117 bytes. The keys in `LEGACY_DBT_DETCONFIG_KEYS` are
 ///   re-inserted at their old positions.
 ///
-/// The output is byte-identical to what the same config produced before
-/// either change. That is pinned by golden bytes in the tests below.
+/// When the legacy keys express every backend capability exactly, the output
+/// is byte-identical to what the same config produced before either change.
+/// That is pinned by golden bytes in the tests below. Otherwise a versioned
+/// envelope carries the exact capabilities alongside the legacy config.
 ///
-/// Remove this shim when the config reaches the DBT runtime through a private
-/// channel that is stripped before the guest starts. SaBRe already works that
-/// way: its plugin receives the config over the coordinator RPC handshake and
-/// removes its own variables with `take_private_env` before guest code runs.
-/// After that, the variable is no longer guest-visible and its bytes stop
-/// mattering.
+/// Coordinated DBT startup receives the authoritative typed Config through the
+/// RPC handshake. This JSON remains guest-visible and supplies the admitted
+/// standalone fallback, so its representable bytes still need preservation.
+/// Remove this shim only when that variable no longer reaches the guest.
 #[doc(hidden)]
 pub fn dbt_detconfig_json(config: &DetConfig) -> serde_json::Result<String> {
-    insert_legacy_dbt_detconfig_keys(&detcore::to_legacy_backend_json(config)?)
+    let legacy = insert_legacy_dbt_detconfig_keys(&detcore::to_legacy_backend_json(config)?)?;
+    detcore::encode_backend_config_json(legacy, config.backend)
 }
 
 /// Re-insert [`LEGACY_DBT_DETCONFIG_KEYS`] into a serialized [`DetConfig`].
@@ -3260,8 +3262,8 @@ mod dbt_detconfig_tests {
         }
     }
 
-    /// The DBT runtime decodes the variable with
-    /// `detcore::from_legacy_backend_json` and falls back to its default
+    /// The DBT standalone fallback decodes the variable with
+    /// `detcore::decode_backend_config_json` and falls back to its default
     /// config on a parse error. The three deleted switches' keys must be
     /// accepted and ignored, and the fifteen backend keys must decode back to
     /// the backend facts, so the runtime sees exactly the config that was
@@ -3270,13 +3272,99 @@ mod dbt_detconfig_tests {
     fn dbt_detconfig_decodes_to_the_encoded_config() {
         for (name, config) in cases() {
             let encoded = dbt_detconfig_json(&config).unwrap();
-            let decoded = detcore::from_legacy_backend_json(&encoded)
+            let decoded = detcore::decode_backend_config_json(&encoded)
                 .unwrap_or_else(|error| panic!("{name}: DBT config does not decode: {error}"));
             assert_eq!(
                 serde_json::to_string(&decoded).unwrap(),
                 serde_json::to_string(&config).unwrap(),
                 "{name}: decoded config differs from the encoded one"
             );
+        }
+    }
+
+    #[test]
+    fn dbt_detconfig_keeps_descriptor_facts_independent() {
+        // Exercise the real CLI encoder and the admitted standalone JSON
+        // reader. In particular, descriptor discovery must not silently
+        // opt into host-timed turns or loopback poller yielding.
+        for mask in 0_u8..16 {
+            let mut config = prepare_backend_config(default_config(), Backend::Dbt);
+            config.backend.tool_shares_guest_descriptor_table = mask & 1 != 0;
+            config.backend.rediscovers_descriptors_after_exec = mask & 2 != 0;
+            config.backend.internal_pipe_turns_are_host_timed = mask & 4 != 0;
+            config.backend.loopback_pollers_yield_to_peers = mask & 8 != 0;
+            let encoded = dbt_detconfig_json(&config).unwrap();
+            assert_eq!(
+                detcore::from_legacy_backend_json(&encoded).is_ok(),
+                mask == 0 || mask == 15,
+                "only coupled facts fit the legacy form: mask {mask}"
+            );
+            let decoded = detcore::decode_backend_config_json(&encoded).unwrap();
+            assert_eq!(decoded.backend, config.backend, "capability mask {mask}");
+            assert_eq!(
+                serde_json::to_string(&decoded).unwrap(),
+                serde_json::to_string(&config).unwrap(),
+                "configuration mask {mask}"
+            );
+        }
+    }
+
+    #[test]
+    fn representable_descriptor_facts_keep_the_current_config_bytes() {
+        for discover in [false, true] {
+            let mut config = prepare_backend_config(rich_config(), Backend::Dbt);
+            config.backend.tool_shares_guest_descriptor_table = discover;
+            config.backend.rediscovers_descriptors_after_exec = discover;
+            config.backend.internal_pipe_turns_are_host_timed = discover;
+            config.backend.loopback_pollers_yield_to_peers = discover;
+            let legacy = detcore::to_legacy_backend_json(&config).unwrap();
+            assert_eq!(
+                dbt_detconfig_json(&config).unwrap(),
+                insert_legacy_dbt_detconfig_keys(&legacy).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn versioned_dbt_config_rejects_unknown_or_malformed_envelopes() {
+        let config = prepare_backend_config(default_config(), Backend::Dbt);
+        let legacy = dbt_detconfig_json(&config).unwrap();
+        let backend = serde_json::to_string(&config.backend).unwrap();
+        let envelope = |version: &str| {
+            format!(
+                "{{\"dbt_config_version\":{version},\"config\":{legacy},\"backend\":{backend}}}"
+            )
+        };
+        for version in ["0", "2", "-1", "null", "\"1\""] {
+            assert!(
+                detcore::decode_backend_config_json(&envelope(version)).is_err(),
+                "version {version} must be refused"
+            );
+            let tagged_legacy =
+                legacy.replacen('{', &format!("{{\"dbt_config_version\":{version},"), 1);
+            assert_eq!(
+                detcore::decode_backend_config_json(&tagged_legacy)
+                    .unwrap()
+                    .backend,
+                config.backend,
+                "an unknown legacy key must remain ignored"
+            );
+        }
+        let duplicate = format!(
+            "{{\"dbt_config_version\":1,\"dbt_config_version\":1,\"config\":{legacy},\"backend\":{backend}}}"
+        );
+        assert!(detcore::decode_backend_config_json(&duplicate).is_err());
+        let missing_backend = format!("{{\"dbt_config_version\":1,\"config\":{legacy}}}");
+        assert!(detcore::decode_backend_config_json(&missing_backend).is_err());
+        let missing_config = format!("{{\"dbt_config_version\":1,\"backend\":{backend}}}");
+        assert!(detcore::decode_backend_config_json(&missing_config).is_err());
+        for duplicate in [
+            format!("\"config\":{legacy}"),
+            format!("\"backend\":{backend}"),
+            "\"unknown\":true".to_owned(),
+        ] {
+            let json = envelope("1").replacen('{', &format!("{{{duplicate},"), 1);
+            assert!(detcore::decode_backend_config_json(&json).is_err());
         }
     }
 
@@ -5899,7 +5987,7 @@ mod tests {
     #[cfg(feature = "sabre")]
     use std::ffi::OsStr;
     use std::fs;
-    #[cfg(any(feature = "sabre", feature = "dbt"))]
+    #[cfg(feature = "sabre")]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     #[cfg(feature = "sabre")]
@@ -6812,7 +6900,7 @@ mod tests {
         assert!(reason.contains("read-write"));
     }
 
-    #[cfg(any(feature = "sabre", feature = "dbt"))]
+    #[cfg(feature = "sabre")]
     fn write_test_executable(path: &std::path::Path) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, b"test loader").unwrap();

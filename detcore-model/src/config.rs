@@ -1896,8 +1896,8 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
 /// reinterpreted. (`backend_is_kvm` given to a backend that offers no control,
 /// such as DBT, already misdescribed that backend and stays outside this
 /// guarantee; the production launcher never writes it.) A failed parse is
-/// handled like any malformed value: the DBT runtime, the only production
-/// reader, falls back to its strict default configuration and emits its
+/// handled like any malformed value: the DBT standalone JSON reader falls
+/// back to its strict default configuration and emits its
 /// `could not parse HERMIT_DBT_DETCONFIG` warning.
 ///
 /// Everything else is read as the legacy form was read, by `Config`'s own
@@ -1936,6 +1936,67 @@ pub fn from_legacy_backend_json(json: &str) -> serde_json::Result<Config> {
     }
     config.backend = legacy.capabilities();
     Ok(config)
+}
+
+/// Preserve the exact backend facts alongside an already encoded legacy config.
+///
+/// The legacy form couples some capabilities and omits others. When it can
+/// express `backend` exactly, return `legacy_json` byte for byte: DBT exposes
+/// this string in the guest's environment. Otherwise wrap it in a versioned
+/// envelope whose typed backend replaces the legacy projection on decoding.
+/// Non-backend fields keep the legacy form's semantics in either case.
+pub fn encode_backend_config_json(
+    legacy_json: String,
+    backend: BackendCapabilities,
+) -> serde_json::Result<String> {
+    if from_legacy_backend_json(&legacy_json)?.backend == backend {
+        return Ok(legacy_json);
+    }
+    serde_json::to_string(&VersionedBackendConfig {
+        dbt_config_version: 1,
+        config: serde_json::from_str(&legacy_json)?,
+        backend,
+    })
+}
+
+/// Read a legacy configuration or a versioned envelope with exact backend facts.
+///
+/// Any valid legacy object or positional array retains
+/// [`from_legacy_backend_json`]'s behavior, including ignored unknown fields.
+/// Otherwise the input must be an envelope: unknown versions, duplicate fields
+/// and missing typed capabilities are parse errors.
+/// This parser does not choose the caller's error policy. The admitted DBT
+/// standalone JSON path retains its strict-default parse fallback; coordinated
+/// startup receives its authoritative typed Config through the RPC handshake.
+pub fn decode_backend_config_json(json: &str) -> serde_json::Result<Config> {
+    // Legacy inputs take precedence: even dbt_config_version was an ignored
+    // unknown key in that form, and its presence must not change a valid run.
+    if let Ok(config) = from_legacy_backend_json(json) {
+        return Ok(config);
+    }
+    // Deserialize the original bytes, not a Value map that would erase
+    // duplicate keys before the typed deserializers can reject them.
+    let envelope: VersionedBackendConfig<'_> = serde_json::from_str(json)?;
+    if envelope.dbt_config_version != 1 {
+        return Err(<serde_json::Error as serde::de::Error>::custom(
+            format_args!(
+                "unsupported DBT configuration version {}",
+                envelope.dbt_config_version
+            ),
+        ));
+    }
+    let mut config = from_legacy_backend_json(envelope.config.get())?;
+    config.backend = envelope.backend;
+    Ok(config)
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionedBackendConfig<'a> {
+    dbt_config_version: u32,
+    #[serde(borrow)]
+    config: &'a serde_json::value::RawValue,
+    backend: BackendCapabilities,
 }
 
 /// The names of the fifteen legacy backend keys, in the order
@@ -2681,6 +2742,124 @@ mod tests {
                 );
                 assert_eq!(to_legacy_backend_json(&received).unwrap(), json, "{name}");
                 assert_controlled_key_is_checked(&json, &sent, name);
+            }
+        }
+    }
+
+    #[test]
+    fn backend_config_json_preserves_every_backend_and_representable_bytes() {
+        for (name, backend, needs_envelope) in [
+            ("PTRACE", BackendCapabilities::PTRACE, false),
+            ("E9PATCH", BackendCapabilities::E9PATCH, false),
+            (
+                "LITEINST_IN_GUEST",
+                BackendCapabilities::LITEINST_IN_GUEST,
+                true,
+            ),
+            ("SABRE", BackendCapabilities::SABRE, false),
+            ("DBT", BackendCapabilities::DBT, false),
+            ("KVM", BackendCapabilities::KVM, false),
+        ] {
+            for sequentialize_threads in [false, true] {
+                let sent = Config {
+                    backend,
+                    sequentialize_threads,
+                    ..Config::default()
+                };
+                let legacy = to_legacy_backend_json(&sent).unwrap();
+                let encoded = encode_backend_config_json(legacy.clone(), backend).unwrap();
+                assert_eq!(encoded != legacy, needs_envelope, "{name}");
+                assert_eq!(
+                    from_legacy_backend_json(&encoded).is_err(),
+                    needs_envelope,
+                    "{name}: an envelope must not be accepted as a legacy config"
+                );
+                let received = decode_backend_config_json(&encoded).unwrap();
+                assert_eq!(received.backend, backend, "{name}");
+                assert_eq!(
+                    serde_json::to_string(&received).unwrap(),
+                    serde_json::to_string(&sent).unwrap(),
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn backend_config_json_round_trips_each_independent_capability() {
+        let baseline = serde_json::to_value(BackendCapabilities::DBT).unwrap();
+        for (name, value) in baseline.as_object().unwrap() {
+            let mut edited = baseline.clone();
+            edited[name] = serde_json::Value::Bool(!value.as_bool().unwrap());
+            let backend = serde_json::from_value(edited).unwrap();
+            let sent = Config {
+                backend,
+                ..Config::default()
+            };
+            let legacy = to_legacy_backend_json(&sent).unwrap();
+            let encoded = encode_backend_config_json(legacy, backend).unwrap();
+            let received = decode_backend_config_json(&encoded).unwrap();
+            assert_eq!(received.backend, backend, "{name}");
+        }
+    }
+
+    #[test]
+    fn backend_config_json_requires_each_typed_capability_once() {
+        let sent = Config {
+            backend: BackendCapabilities::LITEINST_IN_GUEST,
+            ..Config::default()
+        };
+        let encoded =
+            encode_backend_config_json(to_legacy_backend_json(&sent).unwrap(), sent.backend)
+                .unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        for (name, value) in envelope["backend"].as_object().unwrap() {
+            let mut missing = envelope.clone();
+            missing["backend"].as_object_mut().unwrap().remove(name);
+            assert!(
+                decode_backend_config_json(&missing.to_string()).is_err(),
+                "missing {name}"
+            );
+            let backend = serde_json::to_string(&sent.backend).unwrap();
+            let duplicate = backend.replacen('{', &format!("{{\"{name}\":{value},"), 1);
+            let duplicate = encoded.replace(&backend, &duplicate);
+            assert_ne!(duplicate, encoded);
+            assert!(
+                decode_backend_config_json(&duplicate).is_err(),
+                "duplicate {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_config_json_keeps_legacy_object_and_array_semantics() {
+        let legacy = to_legacy_backend_json(&Config::default()).unwrap();
+        let unknown_duplicates = legacy.replacen(
+            '{',
+            r#"{"unrecognized":1,"unrecognized":null,"backend":null,"backend":true,"dbt_config_version":null,"dbt_config_version":2,"#,
+            1,
+        );
+        let known_duplicate = legacy.replacen('{', r#"{"seed":1,"#, 1);
+        let mistyped = legacy.replacen("\"backend_is_kvm\":false", "\"backend_is_kvm\":null", 1);
+        assert_ne!(mistyped, legacy);
+        for json in [
+            legacy.clone(),
+            positional(&legacy),
+            unknown_duplicates,
+            known_duplicate,
+            mistyped,
+            format!("{legacy} trailing"),
+            "[]".to_owned(),
+        ] {
+            let old = from_legacy_backend_json(&json);
+            let new = decode_backend_config_json(&json);
+            match (old, new) {
+                (Ok(old), Ok(new)) => assert_eq!(
+                    serde_json::to_string(&old).unwrap(),
+                    serde_json::to_string(&new).unwrap()
+                ),
+                (Err(_), Err(_)) => {}
+                _ => panic!("legacy parse outcome changed for {json}"),
             }
         }
     }
