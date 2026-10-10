@@ -129,6 +129,7 @@ static FUTEX_REQUEUE_WAKE_OP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_LOCK_PI_REFUSED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_KEYED_ACCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_WAKE_OP_FILE_SHARED_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static FUTEX_REWAIT_CHANGED_WORD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_MULTITHREADED_PROCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_PROCESS_GROUP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_CREATE_RT_SIGNAL_REFUSED_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -21598,6 +21599,65 @@ fn futex_requeue_and_wake_op_match_linux() {
          wake B 1 released waiter 2\n\
          wake B 1 released waiter 3\n",
         "stderr:\n{log}"
+    );
+}
+
+/// A futex waiter woken for a process-directed signal that another thread
+/// takes re-reads its word, as Linux's `__futex_wait` retry does, and returns
+/// EAGAIN when the word changed (https://github.com/rrnewton/hermit/issues/4033).
+/// The guest changes the word while the waiter is parked, then arms a one-shot
+/// SIGALRM.
+/// - By default, as natively, the signal goes to the spinning main thread and
+///   the waiter is woken only by the final FUTEX_WAKE: 0.
+/// - Some targeted-chaos schedules wake the waiter for the signal, then run the
+///   main thread first, so the signal is no longer pending for the waiter. That
+///   waiter must answer EAGAIN; before the fix it answered 0, as if woken.
+///
+/// The test requires every listed seed to give a legal line and at least one
+/// to reach the retry, so a scheduler change that moves the seeds still fails
+/// loudly rather than passing without the path.
+#[test]
+fn a_futex_waiter_woken_for_a_signal_another_thread_takes_rereads_its_word() {
+    let guest = futex_c_guest(
+        &FUTEX_REWAIT_CHANGED_WORD_GUEST,
+        "futex_rewait_changed_word",
+    )
+    .to_str()
+    .unwrap()
+    .to_owned();
+    let run = |extra: &[&str]| {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let mut args = vec!["run", "--strict", "--timeout", "60"];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["--", guest.as_str()]);
+        let (status, log) = run_with_deadline(
+            hermit_command(&args),
+            directory.path(),
+            Duration::from_secs(120),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{extra:?}: the run must finish and exit 0:\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        stdout
+    };
+    assert_eq!(run(&[]), "handler on main, waiter woken (0)\n");
+    let mut retried = 0;
+    for seed in ["19", "34", "35", "45"] {
+        let stdout = run(&["--chaos", "--chaos-target-races", "--seed", seed]);
+        match stdout.as_str() {
+            "handler on main, waiter EAGAIN\n" => retried += 1,
+            "handler on main, waiter woken (0)\n" | "handler on waiter, waiter woken (0)\n" => {}
+            other => panic!("seed {seed}: a line Linux cannot produce: {other:?}"),
+        }
+    }
+    assert!(
+        retried > 0,
+        "no listed chaos seed reached the retry any more; pick new seeds"
     );
 }
 

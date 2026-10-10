@@ -529,6 +529,12 @@
       "why": "tests/c/futex_requeue_wake_op.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test futex_requeue_and_wake_op_match_linux compiles this guest, which exercises FUTEX_REQUEUE, FUTEX_CMP_REQUEUE, FUTEX_WAKE_OP and the futex commands Linux answers with an errno and requires Linux's native output (https://github.com/rrnewton/hermit/issues/3958); it remains a guest fixture because a generic manifest cannot assert this exact output or refusal status."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/futex_rewait_changed_word.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/futex_rewait_changed_word.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_futex_waiter_woken_for_a_signal_another_thread_takes_rereads_its_word compiles this guest, which changes a futex word under a parked waiter and arms a one-shot SIGALRM, and requires the native outcome by default and Linux's EAGAIN retry answer under the targeted-chaos seeds that wake the waiter for a signal another thread takes (https://github.com/rrnewton/hermit/issues/4033); it remains a guest fixture because a generic manifest cannot assert per-seed outcomes."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/futex_waitv_enosys.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",

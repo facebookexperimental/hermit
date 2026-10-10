@@ -2471,7 +2471,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/dev-hermit/issues/553) retain all 294: 297.
     // group_kills_never_reach_the_host_without_sequentialized_threads
     // (https://github.com/rrnewton/hermit/issues/4057) retains all 297: 298.
-    ("test.cli", 298),
+    // a_futex_waiter_woken_for_a_signal_another_thread_takes_rereads_its_word
+    // (https://github.com/rrnewton/hermit/issues/4033) retains all 298: 299.
+    ("test.cli", 299),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2695,7 +2697,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Nor do the three HERMIT_VERIFY_TMPDIR tests, which start ptrace guests or
     // none: 233.
     // Nor does the unsequentialized group-kill test: 234.
-    ("test.cli_on_host", 234),
+    // Nor does the futex re-wait test: 235.
+    ("test.cli_on_host", 235),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 55),

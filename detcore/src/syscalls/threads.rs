@@ -1979,30 +1979,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                     // read, sends no `WaitFinished`, as before.
                     let mut requested = false;
                     let res = loop {
-                        if rewait {
-                            // The scheduler woke this wait for a signal, and the check
-                            // below decides, in this thread's own turn, whether one is
-                            // still pending for it. While the wait was off the waiter
-                            // list a `FUTEX_WAKE` could not reach it, so a changed value
-                            // ends it first, returning 0 as a wakeup; a signal still
-                            // pending is then delivered as the call returns. Linux
-                            // differs here: `__futex_wait` returns -ERESTARTSYS if a
-                            // signal is pending, and otherwise retries
-                            // `futex_wait_setup`, which returns EAGAIN for a changed
-                            // word (https://github.com/rrnewton/hermit/issues/4033). An
-                            // unreadable word goes on to the check.
-                            if let Ok(observed) = guest.memory().read_value(ptr)
-                                && observed != call.val()
-                            {
-                                trace!(
-                                    "[detcore, dtid {}] futex value changed while its wait was woken for a signal ({} != {}); returning as woken",
-                                    &dettid,
-                                    observed,
-                                    call.val()
-                                );
-                                break Ok(0);
-                            }
-                        }
                         // On a backend whose kernel reports the guest's signal state,
                         // a blocked, ignored, or default-ignored signal leaves the wait
                         // parked until its wakeup or its original deadline. As in
@@ -2030,10 +2006,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                         // parks again with its original absolute deadline, as
                         // `__futex_wait` retries a wait woken with no signal pending:
                         // an expired deadline ends it at the scheduler's next timed pop
-                        // with ETIMEDOUT. A word that changed meanwhile ends it with 0
-                        // instead of Linux's EAGAIN (see the check above). Returning the restart errno with nothing to
-                        // deliver would instead have leaked it to the guest, or
-                        // restarted the call with a fresh timeout.
+                        // with ETIMEDOUT. Before parking again it reads the word, as
+                        // `futex_wait_setup` does on that retry (see the re-check below).
+                        // Returning the restart errno with nothing to deliver would
+                        // instead have leaked it to the guest, or restarted the call
+                        // with a fresh timeout.
                         //
                         // The scheduler is given only the mask, which only this thread
                         // can change and so cannot change while it is parked. A sibling
@@ -2077,6 +2054,27 @@ impl<T: RecordOrReplay> Detcore<T> {
                             None
                         };
                         if rewait {
+                            // No signal is pending for this thread, so Linux's
+                            // `__futex_wait` retries `futex_wait_setup`, which reads the
+                            // word again with user-mode permissions: EFAULT if it cannot,
+                            // EAGAIN if it changed, and otherwise the wait parks again
+                            // (https://github.com/rrnewton/hermit/issues/4033). While the
+                            // wait was off the waiter list a `FUTEX_WAKE` could not reach
+                            // it, and a waker that saw no waiter is consistent with
+                            // exactly this retry window.
+                            let observed = match read_futex_word(guest, AddrMut::as_raw(ptr)) {
+                                Ok(observed) => observed,
+                                Err(error) => break Err(error),
+                            };
+                            if observed != call.val() {
+                                trace!(
+                                    "[detcore, dtid {}] futex value changed while its wait was woken for a signal ({} != {}); EAGAIN",
+                                    &dettid,
+                                    observed,
+                                    call.val()
+                                );
+                                break Err(Error::Errno(Errno::EAGAIN));
+                            }
                             debug!(
                                 "[detcore, dtid {}] futex wait woken for a signal that is not pending for it; waiting again until {:?}",
                                 &dettid, maybe_timeout_lt
