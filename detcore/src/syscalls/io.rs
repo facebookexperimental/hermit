@@ -1205,9 +1205,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         // The inner mask was snapshotted above. Do not let later guest mutations of the
         // outer wrapper change the meaning of a retry probe.
+        let guest_sigmask_argument = sigmask
+            .and(call.sigmask())
+            .map(|argument| argument.as_raw());
         let call = call.with_sigmask(None);
 
-        self.handle_internal_pselect6(guest, call, timeout, sigmask)
+        self.handle_internal_pselect6(guest, call, timeout, sigmask, guest_sigmask_argument)
             .await
     }
 
@@ -1217,6 +1220,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Pselect6,
         timeout: Option<Duration>,
         sigmask: Option<u64>,
+        guest_sigmask_argument: Option<usize>,
     ) -> Result<i64, Error> {
         let len = pselect6_fd_set_len(call.nfds())?;
         let deadline = match timeout {
@@ -1257,7 +1261,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         // applies it atomically: a pending, mask-unblocked signal makes the probe return
         // EINTR at a deterministic scheduler point. The probe's wrapper points at scratch
         // memory the guard keeps alive across each injection.
-        let probe_sigmask = sigmask.map(|mask| {
+        // On a backend whose kernel reports the guest's signal state, a
+        // `KernelSignalWait` below decides interruption against the temporary
+        // mask instead (`with_wait_mask`), and the probes carry no mask.
+        let kernel_signal_wait = self.cfg.backend_supports_blocked_wait_signal_interruption;
+        let probe_sigmask = sigmask.filter(|_| !kernel_signal_wait).map(|mask| {
             let sigset = stack.push(mask);
             stack
                 .push(Pselect6SigmaskArg {
@@ -1266,18 +1274,27 @@ impl<T: RecordOrReplay> Detcore<T> {
                 })
                 .cast()
         });
-        // Without a temporary mask, on a backend whose kernel reports the guest's
-        // signal state, only a signal that would end the wait natively does; the mask
-        // cell lets the wait block signals under the one scratch-stack guard
-        // (https://github.com/rrnewton/hermit/issues/3146). A restart resumes from
+        // On a backend whose kernel reports the guest's signal state, only a
+        // signal that would end the wait natively does; the mask cell lets the
+        // wait block signals under the one scratch-stack guard
+        // (https://github.com/rrnewton/hermit/issues/3146). A temporary mask is
+        // the mask the call sleeps under, as Linux installs it for the whole
+        // call: a signal it blocks never ends the call, and one it unblocks ends
+        // it although the guest's own mask blocks it (`with_wait_mask`,
+        // https://github.com/rrnewton/hermit/issues/3991). A restart resumes from
         // the remaining time written back below, so a default stop ends the wait
         // as on Linux. Unlike the other waits, it holds no signal until the call
         // returns, so a pending caught `SIGCHLD` ends it as on Linux, whoever
         // sent it, at a turn that host timing can choose: a known gap that this
         // wait had before (`KernelSignalWait::for_select`).
-        let mut signals = (sigmask.is_none()
-            && self.cfg.backend_supports_blocked_wait_signal_interruption)
-            .then(|| KernelSignalWait::for_select(guest));
+        let mut signals = kernel_signal_wait.then(|| {
+            KernelSignalWait::for_select(guest)
+                .with_wait_mask(sigmask.map(crate::syscalls::signal::kernel_installed_signal_mask))
+        });
+        // Set when a signal the temporary mask unblocks, pending in the kernel,
+        // ends the call: the kernel must then deliver it under that mask (see
+        // below).
+        let mut deliver_under_temporary_mask = false;
         let mask_cell = signals.as_ref().map(|_| stack.reserve::<KernelSigset>());
         let _guard = stack.commit()?;
         let probe = call
@@ -1304,6 +1321,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             let guest = &mut *guest;
             let signals = &mut signals;
             let resources = &mut resources;
+            let deliver_under_temporary_mask = &mut deliver_under_temporary_mask;
             async move {
                 loop {
                     let signaled = matches!(
@@ -1386,8 +1404,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                     if let Some(signals) = signals.as_ref() {
                         match signals.interrupted_with_state() {
                             Ok((false, _)) => {}
-                            Ok((true, _)) => {
+                            Ok((true, state)) => {
                                 self.write_pselect6_remaining(guest, call, deadline).await?;
+                                // A signal the backend holds, or one the guest's own
+                                // mask leaves unblocked, is delivered as the call
+                                // returns. One that only the temporary mask unblocks
+                                // stays pending under the guest's own mask, and must be
+                                // delivered under the temporary mask.
+                                *deliver_under_temporary_mask = !signals.holds_signal()
+                                    && signals.interrupts_only_under_wait_mask(&state);
                                 break Err(Errno::ERESTARTNOHAND.into());
                             }
                             Err(error) => break Err(error),
@@ -1425,6 +1450,44 @@ impl<T: RecordOrReplay> Detcore<T> {
             Some(signals) => result_after_restore(signals.restore(guest, mask_cell).await, result)?,
             None => result,
         };
+        // Restoring the guest's mask cannot deliver that signal, which the mask
+        // blocks, but check again that the backend holds nothing.
+        if deliver_under_temporary_mask
+            && !signals.as_ref().is_some_and(KernelSignalWait::holds_signal)
+            && let Some(argument) = guest_sigmask_argument.and_then(Addr::from_raw)
+            && matches!(result, Err(Error::Errno(Errno::ERESTARTNOHAND)))
+        {
+            // Linux delivers such a signal before it puts the guest's own mask
+            // back, which may block it, and the handler's frame restores the
+            // guest's mask when it returns. Only the kernel can do both, so the
+            // call ends as a pselect6 with no descriptors, the guest's temporary
+            // mask and a zero timeout: the kernel installs the mask, finds the
+            // signal pending, returns ERESTARTNOHAND (EINTR after a handler) and
+            // delivers it (https://github.com/rrnewton/hermit/issues/3991). The
+            // guest's timeout already holds the remaining time written above.
+            // Passing it instead would let Linux overwrite it with a remaining
+            // time measured on the host clock, and an untimed call could sleep;
+            // a zero timeout never sleeps and gets no write-back.
+            guest.memory().write_value(
+                probe_timeout,
+                &Timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                },
+            )?;
+            drop(_guard);
+            match guest
+                .tail_inject(
+                    syscalls::Pselect6::new()
+                        .with_nfds(0)
+                        .with_readfds(None)
+                        .with_writefds(None)
+                        .with_exceptfds(None)
+                        .with_timeout(Some(probe_timeout))
+                        .with_sigmask(Some(argument)),
+                )
+                .await {}
+        }
         refuse_held_signal_loss(guest, Sysno::pselect6, result).await
     }
 

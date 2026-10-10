@@ -1424,6 +1424,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/pselect_temporary_mask.c",
+      "runner": "hermit-cli/tests/pselect6_simulation.rs",
+      "why": "tests/c/pselect_temporary_mask.c is owned by hermit-cli/tests/pselect6_simulation.rs: The integration test compiles this guest and checks, under strict verification, that pselect6 sleeps under its temporary signal mask: a signal the mask blocks does not end the call, and one only the mask unblocks ends it with EINTR after its handler ran."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/pselect_tight_stack.c",
       "runner": "hermit-cli/tests/external_signal_interrupt.rs",
       "why": "tests/c/pselect_tight_stack.c is owned by hermit-cli/tests/external_signal_interrupt.rs: The integration suite compiles this guest and checks that pselect6 calls with nfds=65 and a temporary mask, made on a stack with no writable memory below its red zone, return what Linux returns: ready, ended by a signal only the temporary mask unblocks, restarted by the kernel for an ignored signal, and ready again, and that the bytes mapped do not change across those calls or across two batches of threads making them."

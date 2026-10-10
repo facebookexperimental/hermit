@@ -2448,6 +2448,11 @@ pub(crate) struct KernelSignalWait {
     /// Signals the scheduler committed to this thread in the current turn,
     /// which end the wait even though it holds them (`admit_committed`).
     committed: KernelSigset,
+    /// The mask the wait sleeps under, when it is not the guest's own: the
+    /// temporary mask of a `pselect6` (`with_wait_mask`). A signal decides
+    /// against it whether it ends the wait; `restore` still puts back the
+    /// guest's own mask (https://github.com/rrnewton/hermit/issues/3991).
+    wait_mask: Option<KernelSigset>,
 }
 
 /// A signal that stopped one of a wait's injections and that the backend holds
@@ -2627,6 +2632,7 @@ impl KernelSignalWait {
             held_unidentified: false,
             host_timed: 0,
             committed: 0,
+            wait_mask: None,
         }
     }
 
@@ -2671,6 +2677,35 @@ impl KernelSignalWait {
     /// the kernel posts those at a moment set by host timing, so ending the wait
     /// for one would make the run depend on host timing. Never called for a
     /// `select` wait (`for_select`), which holds nothing.
+    /// This wait, sleeping under `mask` instead of the guest's own (`wait_mask`):
+    /// a `pselect6` with a temporary mask. Linux installs that mask for the
+    /// whole call, so a signal it blocks never ends the call, even one the
+    /// guest's own mask leaves unblocked, and one it leaves unblocked ends the
+    /// call although the guest's own mask blocks it.
+    pub(crate) fn with_wait_mask(self, mask: Option<KernelSigset>) -> Self {
+        Self {
+            wait_mask: mask,
+            ..self
+        }
+    }
+
+    /// Whether the backend holds a signal from a stop of one of this wait's
+    /// injections (`held`, `held_unidentified`), which it delivers when the
+    /// guest resumes.
+    pub(crate) fn holds_signal(&self) -> bool {
+        self.held.is_some() || self.held_unidentified
+    }
+
+    /// Whether a signal that ends the wait, pending in the kernel per `state`,
+    /// is one the guest's own mask blocks: it ends the wait only because the
+    /// wait mask (`with_wait_mask`) leaves it unblocked, and it stays pending
+    /// when the guest's own mask is put back.
+    pub(crate) fn interrupts_only_under_wait_mask(&self, state: &KernelSignalState) -> bool {
+        let own_mask = self.saved_mask.unwrap_or(state.blocked);
+        self.wait_mask.is_some()
+            && state.pending & self.could_interrupt(state) & !self.held_until_return & own_mask != 0
+    }
+
     pub(crate) fn hold_until_return(&mut self, signals: KernelSigset) {
         self.held_until_return |= signals;
         self.host_timed |= signals;
@@ -2716,7 +2751,7 @@ impl KernelSignalWait {
     }
 
     fn could_interrupt(&self, state: &KernelSignalState) -> KernelSigset {
-        let guest_mask = self.saved_mask.unwrap_or(state.blocked);
+        let guest_mask = self.wait_mask.or(self.saved_mask).unwrap_or(state.blocked);
         state.interrupting_wait(guest_mask, self.defers_default_stops) & !self.consumed
     }
 
@@ -3102,7 +3137,7 @@ impl KernelSignalWait {
             // The backend delivers the signal rather than the wait consuming it,
             // as Linux does for one the guest does not block, so it is classified
             // as if the wait did not consume it.
-            let guest_mask = self.saved_mask.unwrap_or(before.blocked);
+            let guest_mask = self.wait_mask.or(self.saved_mask).unwrap_or(before.blocked);
             before.interrupting_wait(guest_mask, self.defers_default_stops) & bit != 0
         } else {
             self.could_interrupt(before) & bit != 0
