@@ -1879,7 +1879,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // an_unreadable_own_mask_at_the_grant_still_arms_the_entry_barrier and
     // an_unproved_background_entry_ends_the_run_by_name_after_the_valve
     // (Codex review of https://github.com/rrnewton/hermit/pull/4053): 1347.
-    ("test.detcore_unit", 1347),
+    // syscalls::threads::tests::futex_timeout_clamps_a_huge_valid_timespec_like_ktime
+    // (Codex re-check of https://github.com/rrnewton/hermit/pull/4061) retains
+    // all 1342: 1348.
+    ("test.detcore_unit", 1348),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2877,7 +2880,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same descriptor rediscovery history test: 1343.
     // And a_background_call_with_a_temporary_mask_holds_the_schedule_until_the_kernel_installs_it (https://github.com/rrnewton/hermit/issues/3993): 1344.
     // And the three background-entry proof tests: 1347.
-    ("test.detcore_unit_on_host", 1347),
+    // And the futex timeout clamp test: 1348.
+    ("test.detcore_unit_on_host", 1348),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
