@@ -1849,6 +1849,12 @@
       "why": "tests/c/sigchld_once_per_child_exit.c is owned by hermit-cli/tests/cli.rs: a child's exit must notify its parent with exactly one SIGCHLD carrying Linux's siginfo (CLD_EXITED, the child's pid, its status), although both the kernel and the scheduler send one (https://github.com/rrnewton/hermit/issues/3895); the integration test runs its exit-group mode under run --strict --verify --verify-strict. It remains a fixture because its raw-exit mode documents a known deadlock and no generic manifest mode runs only one of its modes."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/sigkill_cross_process.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/sigkill_cross_process.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_cross_process_sigkill_verifies_at_bitwise_parity compiles this guest, in which a process kills its parent with SIGKILL (with and without a bystander process taking scheduler turns), and requires five consecutive `run --strict --verify --verify-strict` runs per mode to reach canonical bitwise parity and print how the parent ended (https://github.com/rrnewton/hermit/issues/3994); it remains a guest fixture because a manifest cell runs one verified run, while this regression needs repeated runs to show the retirement no longer lands at a host-chosen position."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/sigmask_preemption.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

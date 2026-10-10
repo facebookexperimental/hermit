@@ -860,6 +860,34 @@ fn poll_timeout_vs_spinner_guest() -> &'static Path {
     })
 }
 
+static SIGKILL_CROSS_PROCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+
+fn sigkill_cross_process_guest() -> &'static Path {
+    SIGKILL_CROSS_PROCESS_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("sigkill-cross-process");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create sigkill-cross-process guest directory");
+        let guest = build_root.join("sigkill_cross_process");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/sigkill_cross_process.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile sigkill-cross-process guest");
+        assert!(
+            output.status.success(),
+            "sigkill-cross-process guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
 fn vfork_parent_killed_guest() -> &'static Path {
     VFORK_PARENT_KILLED_GUEST.get_or_init(|| {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -21164,6 +21192,48 @@ fn a_killed_vfork_parent_does_not_stop_the_schedule() {
         "the run must finish and exit 0:\nstdout:\n{stdout}\nstderr:\n{log}"
     );
     assert_eq!(stdout, "A killed by signal 9\n", "stderr:\n{log}");
+}
+
+/// A SIGKILL from one guest process to another retires its target at the
+/// sending turn (https://github.com/rrnewton/hermit/issues/3994), so the
+/// committed schedule and the INFO log no longer depend on when the host
+/// reports the target's death. Each mode must reach canonical bitwise parity
+/// in five consecutive verified runs. Before the fix the retirement landed at
+/// a host-chosen position: these controls matched in 2 and 6 of 10 runs.
+#[test]
+fn a_cross_process_sigkill_verifies_at_bitwise_parity() {
+    let _guard = hermit_run_guard();
+    let program = sigkill_cross_process_guest()
+        .to_str()
+        .expect("sigkill guest path should be UTF-8");
+    for (mode, expected) in [
+        ("parent", "A killed by signal 9\n"),
+        ("bystander", "A killed by signal 9\nB exited 0\n"),
+    ] {
+        for attempt in 1..=5 {
+            let args = [
+                "run",
+                "--strict",
+                "--verify",
+                "--verify-strict",
+                "--",
+                program,
+                mode,
+            ];
+            let output = hermit(&args);
+            let log = stderr(&output);
+            assert_success(&output, &args);
+            assert_eq!(stdout(&output), expected, "{mode} attempt {attempt}");
+            assert!(
+                log.contains(":: comparison=BitwiseInfoV1 relaxations=none"),
+                "{mode} attempt {attempt}: comparison was not canonical:\n{log}"
+            );
+            assert!(
+                log.contains(":: Success: deterministic. Determinism verified."),
+                "{mode} attempt {attempt}: verification failed:\n{log}"
+            );
+        }
+    }
 }
 
 /// A vfork child that kills its parent and then execs into a program that
