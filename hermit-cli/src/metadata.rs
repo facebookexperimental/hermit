@@ -254,10 +254,11 @@ impl RecordVersion {
 // its parent's notification) from it, so an older recording replayed here
 // could take another branch, although no event shape changed.
 // 0x12b -> 0x12c: a precise FUTEX_WAIT woken for a signal that is no longer
-// pending for it re-reads its word as Linux's `__futex_wait` retry does, and
-// answers EAGAIN if the word changed (EFAULT if unreadable), where it answered 0
-// as a wakeup; and a signal still pending for it is answered before the word is
-// compared (https://github.com/rrnewton/hermit/issues/4033). Replay recomputes
+// pending for it re-reads its word and answers EAGAIN if the word changed
+// (EFAULT if unreadable), where it answered 0 as a wakeup; Linux's woken waiter
+// reaches the same EAGAIN through -ERESTARTSYS and the restarted wait. A signal
+// still pending for it is answered before the word is compared
+// (https://github.com/rrnewton/hermit/issues/4033). Replay recomputes
 // precise futex results, so an older recording replayed here could see another
 // result and take another branch, although no event shape changed.
 pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x12c);

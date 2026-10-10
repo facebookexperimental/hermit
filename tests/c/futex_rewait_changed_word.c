@@ -11,9 +11,10 @@
  * (https://github.com/rrnewton/hermit/issues/4033). Linux-legal outcomes:
  *   - the signal goes to main and the waiter is never woken: the final
  *     FUTEX_WAKE wakes it, 0 (the usual native outcome);
- *   - the waiter is woken for the signal but main takes it: __futex_wait
- *     finds nothing pending and retries futex_wait_setup on the changed word,
- *     EAGAIN;
+ *   - the waiter is woken for the signal but main takes it: the woken waiter
+ *     keeps TIF_SIGPENDING, so __futex_wait returns -ERESTARTSYS, get_signal
+ *     finds nothing to deliver, and the restarted FUTEX_WAIT finds the changed
+ *     word, EAGAIN;
  *   - the handler runs on the waiter: the wait is interrupted and restarted
  *     (SA_RESTART), and the restarted FUTEX_WAIT finds the changed word,
  *     EAGAIN.

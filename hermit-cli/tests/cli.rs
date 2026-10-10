@@ -21609,8 +21609,10 @@ fn futex_requeue_and_wake_op_match_linux() {
 /// - By default, as natively, the signal goes to the spinning main thread and
 ///   the waiter is woken only by the final FUTEX_WAKE: 0.
 /// - When the handler runs on the main thread after the scheduler woke the
-///   waiter for the signal, nothing is pending for the waiter, and Linux's
-///   `__futex_wait` retries `futex_wait_setup` on the changed word: EAGAIN.
+///   waiter for the signal, Linux's woken waiter keeps TIF_SIGPENDING, returns
+///   -ERESTARTSYS, finds nothing to deliver, and its restarted FUTEX_WAIT finds
+///   the changed word: EAGAIN. (Detcore reaches the same answer by re-reading
+///   the word when nothing is pending, as `__futex_wait`'s retry would.)
 /// - When the handler runs on the waiter, its wait is interrupted and restarted
 ///   (`SA_RESTART`), and the restarted FUTEX_WAIT finds the changed word:
 ///   EAGAIN. Natively, with the signal forced onto the waiter, that is 30/30.
