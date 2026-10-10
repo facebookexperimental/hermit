@@ -2754,6 +2754,9 @@ fn record_pselect_whose_mask_a_sibling_rewrites_while_it_sleeps() {
 /// stage somewhere: the stack scratch did not commit, replay skipped the
 /// delivery, and the guest's restarted pselect6 no longer matched the
 /// recording (follow-up to https://github.com/rrnewton/hermit/pull/4052).
+/// Replay now stages it in the red zone, so the guest also checks that a
+/// pattern it wrote to the 128 bytes below its stack pointer is intact after
+/// the call (re-check of that follow-up).
 #[test]
 fn record_pselect_whose_mask_unblocks_the_timer_signal_on_a_tight_stack() {
     record_select_mode("pselect-mask-unblocks-tight-stack");

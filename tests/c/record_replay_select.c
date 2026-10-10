@@ -75,8 +75,10 @@
  *                there is no writable memory below the red zone; the handler
  *                runs on an alternate stack. Replay stages the call's mask
  *                where it can on such a stack and must still deliver the
- *                signal (follow-up to
- *                https://github.com/rrnewton/hermit/pull/4052)
+ *                signal, and the 128-byte red zone below the stack pointer,
+ *                filled with a pattern before the call, must hold it after
+ *                (follow-up to https://github.com/rrnewton/hermit/pull/4052,
+ *                and its re-check)
  *
  * The first three modes each run four shapes: a ready pipe with a 5 s timeout,
  * the same with a zero timeout, the same with nfds == FD_SETSIZE (larger than
@@ -982,17 +984,26 @@ static int pselect_mask_unblocks_tight_stack(void) {
   FD_ZERO(&read_set);
   FD_SET(alarm_pipe_fds[0], &read_set);
   static struct timespec bound = {30, 0};
+  unsigned char* tight_stack = area + page + 144;
+  for (int i = -128; i < 0; i++) {
+    tight_stack[i] = (unsigned char)(0xa5 ^ (i & 0xff));
+  }
   long raw = pselect_on_stack(
-      area + page + 144, alarm_pipe_fds[0] + 1, &read_set, &bound, &wrapper);
+      tight_stack, alarm_pipe_fds[0] + 1, &read_set, &bound, &wrapper);
   int alarms_at_return = (int)masked_alarms;
+  int red_zone_changed = 0;
+  for (int i = -128; i < 0; i++) {
+    red_zone_changed += tight_stack[i] != (unsigned char)(0xa5 ^ (i & 0xff));
+  }
   close(alarm_pipe_fds[0]);
   close(alarm_pipe_fds[1]);
   printf(
-      "%-24s result=%011ld alarms=%01d\n",
+      "%-24s result=%011ld alarms=%01d red_zone_changed=%03d\n",
       "pselect-tight-stack",
       raw,
-      alarms_at_return);
-  if (raw != -EINTR || alarms_at_return != 1) {
+      alarms_at_return,
+      red_zone_changed);
+  if (raw != -EINTR || alarms_at_return != 1 || red_zone_changed != 0) {
     fprintf(stderr, "pselect-mask-unblocks-tight-stack mismatch\n");
     return 1;
   }
