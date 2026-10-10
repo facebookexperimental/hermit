@@ -2497,7 +2497,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // privileged-test.pmu_cli_cases (hosted portable run
     // https://github.com/rrnewton/hermit/actions/runs/38110887257): 299 - 6 =
     // 293, listed with this node's arguments.
-    ("test.cli", 293),
+    // a_futex_wait_on_an_unreadable_word_is_efault
+    // (https://github.com/rrnewton/hermit/issues/4030) retains all 293: 294.
+    ("test.cli", 294),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2732,7 +2734,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/actions/runs/38110887257. They are
     // skipped by exact name here and run in privileged-test.pmu_cli_cases:
     // 235 - 6 = 229, listed with this node's arguments.
-    ("test.cli_on_host", 229),
+    // Nor does the unreadable futex word test: 230.
+    ("test.cli_on_host", 230),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 55),

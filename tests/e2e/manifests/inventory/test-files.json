@@ -535,6 +535,12 @@
       "why": "tests/c/futex_rewait_changed_word.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_futex_waiter_woken_for_a_signal_another_thread_takes_rereads_its_word compiles this guest, which changes a futex word under a parked waiter and arms a one-shot SIGALRM, and requires the native outcome by default and Linux's EAGAIN retry answer under the targeted-chaos seeds that wake the waiter for a signal another thread takes (https://github.com/rrnewton/hermit/issues/4033); it remains a guest fixture because a generic manifest cannot assert per-seed outcomes."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/futex_wait_unreadable_word.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/futex_wait_unreadable_word.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_futex_wait_on_an_unreadable_word_is_efault compiles this guest, which calls FUTEX_WAIT and FUTEX_WAIT_BITSET on unmapped and PROT_NONE words, private and shared, and requires Linux's EFAULT for each (EAGAIN for the readable control) under run --strict (https://github.com/rrnewton/hermit/issues/4030); it remains a guest fixture because a generic manifest cannot assert this exact output."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/futex_waitv_enosys.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",

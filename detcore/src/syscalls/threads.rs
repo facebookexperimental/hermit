@@ -1906,26 +1906,37 @@ impl<T: RecordOrReplay> Detcore<T> {
             // `get_futex_key` refuses a misaligned futex word before any access.
             return Err(Error::Errno(Errno::EINVAL));
         }
-        let init_val = guest.memory().read_value(ptr)?;
+        if !self.cfg.sequentialize_threads {
+            return Ok(guest.inject(call).await?);
+        }
+        let polling = match self.cfg.debug_futex_mode {
+            BlockingMode::External => {
+                return self.record_or_replay_blocking(guest, call.into()).await;
+            }
+            BlockingMode::Precise => false,
+            BlockingMode::Polling => true,
+        };
+        // Only the waits compare the word, and they read it as Linux's
+        // `futex_wait_setup` does, with user-mode permissions: EFAULT for an
+        // unmapped, PROT_NONE or otherwise unreadable word
+        // (https://github.com/rrnewton/hermit/issues/4030). A wake left to the
+        // polling mode reads nothing, as Linux's `futex_wake` reads nothing.
+        let init_val = match call.futex_op() & libc::FUTEX_CMD_MASK {
+            libc::FUTEX_WAIT | libc::FUTEX_WAIT_BITSET => {
+                read_futex_word(guest, AddrMut::as_raw(ptr))?
+            }
+            _ => 0,
+        };
         trace!(
             "[detcore, dtid {}] futex op with memory address containing value {}",
             &dettid, init_val
         );
-
-        if !self.cfg.sequentialize_threads {
-            Ok(guest.inject(call).await?)
+        if polling {
+            self.handle_futex_polling(guest, call, init_val, deadline)
+                .await
         } else {
-            match self.cfg.debug_futex_mode {
-                BlockingMode::Precise => {
-                    self.handle_futex_blocking(guest, call, init_val, deadline)
-                        .await
-                }
-                BlockingMode::Polling => {
-                    self.handle_futex_polling(guest, call, init_val, deadline)
-                        .await
-                }
-                BlockingMode::External => self.record_or_replay_blocking(guest, call.into()).await,
-            }
+            self.handle_futex_blocking(guest, call, init_val, deadline)
+                .await
         }
     }
 

@@ -130,6 +130,7 @@ static FUTEX_LOCK_PI_REFUSED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_KEYED_ACCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_WAKE_OP_FILE_SHARED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_REWAIT_CHANGED_WORD_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static FUTEX_WAIT_UNREADABLE_WORD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_MULTITHREADED_PROCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_PROCESS_GROUP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_CREATE_RT_SIGNAL_REFUSED_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -21719,6 +21720,47 @@ fn a_futex_waiter_woken_for_a_signal_another_thread_takes_rereads_its_word() {
     assert!(
         log.contains("Success: replay matched recording."),
         "the replay must match the recording:\nstderr:\n{log}"
+    );
+}
+
+/// FUTEX_WAIT and FUTEX_WAIT_BITSET on a word they cannot read give EFAULT,
+/// as Linux's `futex_wait_setup` does with its user-mode read
+/// (https://github.com/rrnewton/hermit/issues/4030). Before the fix, Detcore
+/// read every futex word through the tracer: an unmapped word gave EIO, which
+/// futex(2) never returns, and a PROT_NONE word was read anyway and compared,
+/// giving EAGAIN. Every line matches native Linux.
+#[test]
+fn a_futex_wait_on_an_unreadable_word_is_efault() {
+    let guest = futex_c_guest(
+        &FUTEX_WAIT_UNREADABLE_WORD_GUEST,
+        "futex_wait_unreadable_word",
+    )
+    .to_str()
+    .unwrap()
+    .to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&["run", "--strict", "--timeout", "60", "--", guest.as_str()]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "the run must finish and exit 0:\nstdout:\n{stdout}\nstderr:\n{log}"
+    );
+    assert_eq!(
+        stdout,
+        "wait, readable word 7, expecting 1: -1 EAGAIN\n\
+         wait, unmapped private word: -1 EFAULT\n\
+         wait, PROT_NONE private word: -1 EFAULT\n\
+         wait, unmapped shared word: -1 EFAULT\n\
+         wait_bitset, unmapped private word: -1 EFAULT\n\
+         wait_bitset, PROT_NONE private word: -1 EFAULT\n",
+        "stderr:\n{log}"
     );
 }
 
