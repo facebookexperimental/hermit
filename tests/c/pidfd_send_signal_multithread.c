@@ -16,7 +16,9 @@
  * the policy-refusal status at the two-thread send, and
  * --allow-unsupported-syscalls returns ENOSYS. Everything else is the
  * kernel's answer: signal 0, a zombie target (still 0), and SIGKILL to a
- * two-threaded child, which kills it whichever thread it reaches.
+ * two-threaded child, which kills it whichever thread it reaches. A one-thread
+ * child blocked in pause() must be woken to run its handler, as kill wakes it
+ * (https://github.com/rrnewton/hermit/issues/4099).
  */
 
 #define _GNU_SOURCE
@@ -42,6 +44,11 @@ static void report(const char* what, long ret) {
   } else {
     printf("%s: %ld %s\n", what, ret, strerrorname_np(errno));
   }
+}
+
+static void exit_42(int sig) {
+  (void)sig;
+  _exit(42);
 }
 
 static volatile int stop;
@@ -86,6 +93,28 @@ int main(void) {
   int zombie_fd = syscall(SYS_pidfd_open, zombie, 0);
   report("zombie, pidfd_send_signal", syscall(SYS_pidfd_send_signal, zombie_fd, SIGUSR1, NULL, 0));
   waitpid(zombie, NULL, 0);
+
+  /* A one-thread child blocked in pause() takes the signal and runs its
+   * handler, which exits 42. */
+  int blocked_ready[2];
+  pipe(blocked_ready);
+  pid_t blocked = fork();
+  if (blocked == 0) {
+    signal(SIGUSR1, exit_42);
+    write(blocked_ready[1], "r", 1);
+    for (;;) {
+      pause();
+    }
+  }
+  char blocked_byte;
+  read(blocked_ready[0], &blocked_byte, 1);
+  int blocked_fd = syscall(SYS_pidfd_open, blocked, 0);
+  report("blocked child, pidfd_send_signal",
+         syscall(SYS_pidfd_send_signal, blocked_fd, SIGUSR1, NULL, 0));
+  int blocked_status = 0;
+  waitpid(blocked, &blocked_status, 0);
+  printf("blocked child: %s %d\n", WIFSIGNALED(blocked_status) ? "killed by signal" : "exited",
+         WIFSIGNALED(blocked_status) ? WTERMSIG(blocked_status) : WEXITSTATUS(blocked_status));
 
   /* SIGKILL kills a two-threaded process whichever thread it reaches. */
   int ready[2];

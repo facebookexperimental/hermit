@@ -6435,23 +6435,36 @@ impl<T: RecordOrReplay> Detcore<T> {
         // only checks that the process exists; SIGKILL, which kills the whole
         // group whichever thread it reaches; and a process with one thread or
         // none (a zombie, which Linux still signals successfully).
+        let mut receiver = None;
         if signal != 0
             && signal != libc::SIGKILL
             && guest.config().sequentialize_threads
             && let Some(target) = guest
                 .thread_state()
                 .with_detfd(pidfd, |detfd| detfd.pidfd_target())?
-            && resolve_kill_targets(guest, target).await.len() >= 2
         {
-            self.process_signal_target(
-                guest,
-                reverie::syscalls::Sysno::pidfd_send_signal,
-                target,
-                signal,
-            )
-            .await?;
+            match resolve_kill_targets(guest, target).await.as_slice() {
+                [] => {}
+                [thread] => receiver = Some((*thread, target)),
+                _ => {
+                    self.process_signal_target(
+                        guest,
+                        reverie::syscalls::Sysno::pidfd_send_signal,
+                        target,
+                        signal,
+                    )
+                    .await?;
+                }
+            }
         }
         let value = self.record_or_replay(guest, call).await?;
+        if let Some((thread, process)) = receiver {
+            // Tell the scheduler, as `kill` does, so a receiver parked in a
+            // blocking call (pause(), a futex wait) is woken to take it
+            // (https://github.com/rrnewton/hermit/issues/4099).
+            self.notify_cross_task_signal(guest, thread, signal, Some(process))
+                .await;
+        }
         if signal == libc::SIGKILL {
             // A process killed through a pidfd will die; the scheduler must
             // not count a wait for it as part of a deadlock

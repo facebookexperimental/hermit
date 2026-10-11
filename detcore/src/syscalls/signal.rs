@@ -1278,7 +1278,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// thread hang a `waitid` that a `kill` from a sibling process could
     /// interrupt. Self-directed signals are excluded: the sender is running, so
     /// it is not parked waiting to be woken.
-    async fn notify_cross_task_signal<G: Guest<Self>>(
+    pub(crate) async fn notify_cross_task_signal<G: Guest<Self>>(
         &self,
         guest: &mut G,
         target: DetTid,

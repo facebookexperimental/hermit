@@ -21284,6 +21284,9 @@ fn a_process_directed_signal_to_several_threads_is_refused_by_name() {
 /// sequentialized threads it is forwarded. Everything else stays the kernel's
 /// answer: a one-thread target, a zombie target (0, as Linux), signal 0, and
 /// SIGKILL to a two-threaded child, which kills it whichever thread it reaches.
+/// A one-thread child blocked in pause() is woken to run its handler, as `kill`
+/// wakes it; before https://github.com/rrnewton/hermit/issues/4099
+/// the scheduler was not told and the run hung to its deadline.
 #[test]
 fn a_pidfd_signal_to_several_threads_is_refused_by_name() {
     let guest = futex_c_guest(
@@ -21296,6 +21299,8 @@ fn a_pidfd_signal_to_several_threads_is_refused_by_name() {
     let answered = "one thread, pidfd_send_signal: 0\n\
                     one thread, handled: 1\n\
                     zombie, pidfd_send_signal: 0\n\
+                    blocked child, pidfd_send_signal: 0\n\
+                    blocked child: exited 42\n\
                     two-threaded child, pidfd_send_signal SIGKILL: 0\n\
                     two-threaded child: killed by signal 9\n\
                     two threads, pidfd_send_signal 0: 0\n";

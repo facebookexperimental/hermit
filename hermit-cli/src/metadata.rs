@@ -269,7 +269,13 @@ impl RecordVersion {
 // futex results, so an older recording replayed here could see another errno
 // and take another branch, although no event shape changed (Codex review of
 // https://github.com/rrnewton/hermit/pull/4061).
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x12d);
+// 0x12d -> 0x12e: a pidfd_send_signal to a process with one live thread tells
+// the scheduler the signal is pending for that thread, as kill does, so a
+// receiver parked in a blocking call is woken to take it
+// (https://github.com/rrnewton/hermit/issues/4099). Replay recomputes
+// the schedule, so an older recording replayed here could be scheduled
+// differently, although no event shape changed.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x12e);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -294,7 +300,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x12d);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x12d;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x12e;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -919,6 +925,11 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_that_read_a_futex_wait_word_through_the_tracer() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x12c)));
+    }
+
+    #[test]
+    fn record_version_rejects_streams_whose_pidfd_signals_woke_no_receiver() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x12d)));
     }
 
     /// Record and replay run under ptrace with serialized threads, so their
