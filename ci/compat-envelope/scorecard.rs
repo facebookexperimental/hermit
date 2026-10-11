@@ -11136,10 +11136,9 @@ fn project_observations(root: &Path, series_root: &Path, refreshed_at: &str) -> 
     let unrepresented = rows
         .iter()
         .filter(|row| !representation.represented_event_ids.contains(&row.event_id))
-        .cloned()
-        .collect::<Vec<_>>();
+        .collect::<Vec<&SeriesRow>>();
     let mut projection =
-        apply_series_rows(root, &mut tracked, &unrepresented, Some(&snapshot.source))?;
+        apply_series_rows_in_place(root, &mut tracked, &unrepresented, Some(&snapshot.source))?;
     projection.represented_rows += representation.represented_event_ids.len();
     let skipped = &projection.skipped;
 
@@ -11853,7 +11852,7 @@ where
     // Validate and hold caller-owned operands before unrelated catalogue work.
     // A malformed or nonregular snapshot must not wait for history decoding or
     // manifest generation. The held file is still rechecked before publication.
-    let snapshot = HeldScorecardSeriesSnapshot::open(snapshot_path, snapshot_sha256)?;
+    let mut snapshot = HeldScorecardSeriesSnapshot::open(snapshot_path, snapshot_sha256)?;
     let worktree = observation_worktree_state(root)?;
     let head = worktree.head.clone();
     if head != *expected_head {
@@ -11911,7 +11910,11 @@ where
     // encounter the old compact run matcher. Reconcile the complete snapshot
     // first; only exactly represented events may be suppressed. Existing
     // projected events still undergo their full-source ownership check.
-    let mut preview = tracked.clone();
+    // TRACKED is still exactly BEFORE here, so the preview takes TRACKED itself
+    // and TRACKED is cloned back from BEFORE once the preview is gone: one copy
+    // of the history fewer at this peak, 2.7 GB on 2026-10-11
+    // (https://github.com/rrnewton/dev-hermit/issues/554).
+    let mut preview = tracked;
     apply_validate_results_from(
         &mut preview,
         &result_rows,
@@ -11935,8 +11938,9 @@ where
     let preview_representation =
         direct_representation(&preview, &snapshot.rows, &current_attempts)?;
     // Both results above are owned. Release the preview, a whole copy of the
-    // history, before each projection below clones `tracked` once more.
+    // history, before the projection below starts from a fresh copy of it.
     drop(preview);
+    let mut tracked = before.clone();
     remove_replaceable_projected_observations(
         &mut tracked,
         &snapshot.rows,
@@ -11951,9 +11955,8 @@ where
                 .contains(&row.event_id)
                 && !custom_retention.event_ids.contains(&row.event_id)
         })
-        .cloned()
-        .collect::<Vec<_>>();
-    let _initial_projection = apply_series_rows(
+        .collect::<Vec<&SeriesRow>>();
+    let _initial_projection = apply_series_rows_in_place(
         root,
         &mut tracked,
         &initial_rows,
@@ -12039,9 +12042,8 @@ where
             !representation.represented_event_ids.contains(&row.event_id)
                 && !custom_retention.event_ids.contains(&row.event_id)
         })
-        .cloned()
-        .collect::<Vec<_>>();
-    let projection = apply_series_rows(
+        .collect::<Vec<&SeriesRow>>();
+    let projection = apply_series_rows_in_place(
         root,
         &mut tracked,
         &projected_rows,
@@ -12081,12 +12083,19 @@ where
             selected_lines: None,
         },
     )?;
+    // Each of the history's large copies is released as soon as nothing below
+    // reads it, so they are not all held while the generated files are built
+    // and written (https://github.com/rrnewton/dev-hermit/issues/554). After
+    // here the snapshot is read only for its held identity (verify).
+    snapshot.rows = Vec::new();
     enforce_projection_preserves_evidence(&before, &tracked, rows_read)?;
     refresh_measurement(&mut tracked);
     enforce_writer_boundary(&before, &tracked, Writer::Observations)?;
     let transitions = measurement_transitions(root, &before, &tracked, &head)?;
+    drop(before);
     let parity = load_parity_summary(root, &tracked)?;
     let updated = history_generated_files(&derived, &tracked, &parity, &original)?;
+    drop(tracked);
     let partial_scorecard = updated.scorecard.clone();
 
     let changed = replace_history_files_with(
@@ -15147,9 +15156,9 @@ fn should_replace_last_tested(previous: Option<&LastTested>, row: &PreparedSerie
     should_replace_last_tested_at(previous, &row.hermit_sha, row.main_ancestry, &row.depth)
 }
 
-fn remove_replaceable_projected_observations(
+fn remove_replaceable_projected_observations<R: std::borrow::Borrow<SeriesRow>>(
     tracked: &mut TrackedCells,
-    rows: &[SeriesRow],
+    rows: &[R],
     projection_source: Option<&str>,
 ) -> Result<usize, String> {
     let owned = tracked
@@ -15186,7 +15195,7 @@ fn remove_replaceable_projected_observations(
     }
     let current_event_ids = rows
         .iter()
-        .map(|row| row.event_id.as_str())
+        .map(|row| row.borrow().event_id.as_str())
         .collect::<BTreeSet<_>>();
     if let Some((cell, event_id)) = tracked.cells.iter().find_map(|cell| {
         cell.observations.iter().find_map(|observation| {
@@ -15209,10 +15218,10 @@ fn remove_replaceable_projected_observations(
     Ok(owned)
 }
 
-fn apply_series_rows(
+fn apply_series_rows<R: std::borrow::Borrow<SeriesRow>>(
     ambient_git_root: &Path,
     tracked: &mut TrackedCells,
-    rows: &[SeriesRow],
+    rows: &[R],
     projection_source: Option<&str>,
 ) -> Result<ProjectObservationsOutcome, String> {
     let mut updated = tracked.clone();
@@ -15221,10 +15230,23 @@ fn apply_series_rows(
     Ok(outcome)
 }
 
-fn apply_series_rows_inner(
+/// apply_series_rows for a caller that discards TRACKED when this fails, as
+/// every caller that returns the error with `?` does. It skips the copy of the
+/// whole history that keeps TRACKED unchanged on failure: 2.7 GB for the
+/// 2026-10-11 history, taken twice per write-back.
+fn apply_series_rows_in_place<R: std::borrow::Borrow<SeriesRow>>(
+    ambient_git_root: &Path,
+    tracked: &mut TrackedCells,
+    rows: &[R],
+    projection_source: Option<&str>,
+) -> Result<ProjectObservationsOutcome, String> {
+    apply_series_rows_inner(ambient_git_root, tracked, rows, projection_source)
+}
+
+fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
     _ambient_git_root: &Path,
     tracked: &mut TrackedCells,
-    rows: &[SeriesRow],
+    rows: &[R],
     projection_source: Option<&str>,
 ) -> Result<ProjectObservationsOutcome, String> {
     validate_observation_identity_namespace(tracked)?;
@@ -15241,6 +15263,7 @@ fn apply_series_rows_inner(
     let mut prepared = Vec::new();
     let mut skipped = Vec::new();
     for row in rows {
+        let row: &SeriesRow = row.borrow();
         let label = row.label();
         if let Err(why) = row.validate_for_projection() {
             if row.series.no_verdict_evidence.is_some() {
@@ -16072,9 +16095,16 @@ impl HeldScorecardSeriesSnapshot {
         // the producer's exact byte spelling for the canonical-row digest.
         serde_json::from_slice::<UniqueJsonFields>(&payload)
             .map_err(|error| format!("scorecard snapshot is not valid strict JSON: {error}"))?;
-        let snapshot: ScorecardSeriesSnapshot = serde_json::from_slice(&payload)
+        let mut snapshot: ScorecardSeriesSnapshot = serde_json::from_slice(&payload)
             .map_err(|error| format!("scorecard snapshot is not valid strict JSON: {error}"))?;
+        // Each RawValue owns its bytes, and the digest above already bound the
+        // payload: it is the snapshot's whole size, so release it now.
+        drop(payload);
         let rows = validate_scorecard_snapshot(&snapshot, path)?;
+        // The raw rows exist for that validation's canonical-byte digest. Only
+        // the typed rows are read after it; holding both kept another copy of
+        // every row through the render.
+        snapshot.rows = Vec::new();
         let held = Self {
             path: path.to_path_buf(),
             parent,
@@ -16405,7 +16435,12 @@ fn snapshot_series_source(series_root: &Path) -> Result<SeriesSourceSnapshot, St
 /// are contradictory evidence and refuse instead of depending on traversal
 /// order.
 fn read_series_rows(snapshot: &SeriesSourceSnapshot) -> Result<Vec<SeriesRow>, String> {
-    let mut canonical: BTreeMap<String, (JsonValue, SeriesRow, String)> = BTreeMap::new();
+    // A repeated event_id must carry an identical body. That used to be checked
+    // by keeping every row's JsonValue: about 12 GB of a 23.7 GB render for the
+    // 1,140,698 rows of 2026-10-11. A Value serializes with its object keys in
+    // order, so two Values are equal exactly when their serializations are, and
+    // the digest of that serialization is what is kept.
+    let mut canonical: BTreeMap<String, ([u8; 32], SeriesRow, String)> = BTreeMap::new();
     for shard in &snapshot.shards {
         if !shard.bytes.is_empty() && !shard.bytes.ends_with(b"\n") {
             return Err(format!(
@@ -16428,12 +16463,18 @@ fn read_series_rows(snapshot: &SeriesSourceSnapshot) -> Result<Vec<SeriesRow>, S
             let source = format!("{}:{}", shard.display_path.display(), index + 1);
             let value: JsonValue = serde_json::from_str(line)
                 .map_err(|why| format!("malformed series row at {source}: {why}"))?;
-            let row: SeriesRow = serde_json::from_value(value.clone())
+            let row = SeriesRow::deserialize(&value)
                 .map_err(|why| format!("malformed series row at {source}: {why}"))?;
             row.validate_for_read()
                 .map_err(|why| format!("invalid series row at {source}: {why}"))?;
-            if let Some((previous_value, _, previous_source)) = canonical.get(&row.event_id) {
-                if previous_value == &value {
+            let body: [u8; 32] = Sha256::digest(
+                serde_json::to_vec(&value)
+                    .map_err(|why| format!("cannot encode series row at {source}: {why}"))?,
+            )
+            .into();
+            drop(value);
+            if let Some((previous_body, _, previous_source)) = canonical.get(&row.event_id) {
+                if previous_body == &body {
                     continue;
                 }
                 return Err(format!(
@@ -16441,7 +16482,7 @@ fn read_series_rows(snapshot: &SeriesSourceSnapshot) -> Result<Vec<SeriesRow>, S
                     row.event_id
                 ));
             }
-            canonical.insert(row.event_id.clone(), (value, row, source));
+            canonical.insert(row.event_id.clone(), (body, row, source));
         }
     }
     Ok(canonical
@@ -30432,6 +30473,33 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
                 .map(|row| row.event_id.as_str())
                 .collect::<Vec<_>>()
         ));
+    }
+
+    // The duplicate check compares a digest of each row's sorted serialization,
+    // not the row's text: the same event spelled with its keys in another order
+    // is still one event.
+    let reordered_json = {
+        let value = serde_json::to_value(&source_row)
+            .map_err(|e| format!("cannot encode source series row: {e}"))?;
+        let object = value
+            .as_object()
+            .ok_or("source series row is not an object")?;
+        let fields = object
+            .iter()
+            .rev()
+            .map(|(key, value)| format!("{}: {value}", JsonValue::String(key.clone())))
+            .collect::<Vec<_>>();
+        format!("{{ {} }}", fields.join(" , "))
+    };
+    if reordered_json == source_json {
+        return Err("the reordered spelling of the source row is not a different spelling".into());
+    }
+    let reordered_rows = read_series_rows(&memory_snapshot(
+        format!("{source_json}\n"),
+        format!("{reordered_json}\n"),
+    ))?;
+    if reordered_rows.len() != 1 || reordered_rows[0].event_id != source_row.event_id {
+        return Err("snapshot did not collapse one event spelled with its keys reordered".into());
     }
 
     let mut conflicting_row = source_row.clone();
