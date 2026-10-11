@@ -21202,15 +21202,17 @@ fn a_futex_wake_count_of_zero_or_negative_wakes_one_waiter() {
 /// returned ENOSYS as an ordinary errno, so a fail-closed run went on with a
 /// failure Linux never returns. A fail-closed run now stops with the
 /// policy-refusal status after the one-thread block, which still delivers; with
-/// `--allow-unsupported-syscalls` both calls return ENOSYS, as before.
+/// `--allow-unsupported-syscalls` both calls return ENOSYS, as before. `kill`
+/// to a zombie child answers 0, as Linux does, and ESRCH once it is reaped;
+/// before https://github.com/rrnewton/hermit/issues/4091 the zombie was ESRCH.
 #[test]
 fn a_process_directed_signal_to_several_threads_is_refused_by_name() {
     let guest = kill_multithreaded_process_guest()
         .to_str()
         .unwrap()
         .to_owned();
-    let one_thread =
-        "one thread, kill: 0\none thread, rt_sigqueueinfo: 0\none thread, handled: 2\n";
+    let one_thread = "one thread, kill: 0\none thread, rt_sigqueueinfo: 0\none thread, handled: 2\n\
+                      zombie, kill: 0\nreaped, kill: -1 ESRCH\n";
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let (status, log) = run_with_deadline(
         hermit_command(&[

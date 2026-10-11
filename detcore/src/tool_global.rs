@@ -2608,11 +2608,13 @@ impl GlobalTool for GlobalState {
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#663)
-            GlobalRequest::ResolveKillTargets(dpid) => R::ResolveKillTargets(
-                self.lock_rpc_scheduler(false)
-                    .await
-                    .process_signal_targets(dpid),
-            ),
+            GlobalRequest::ResolveKillTargets(dpid) => {
+                let scheduler = self.lock_rpc_scheduler(false).await;
+                R::ResolveKillTargets(
+                    scheduler.process_signal_targets(dpid),
+                    scheduler.is_unreaped_exited_process(dpid),
+                )
+            }
             GlobalRequest::NamesHermitTask(caller, tgid, tid) => {
                 R::NamesHermitTask(hermit_task_named(caller, tgid, tid))
             }
@@ -4281,7 +4283,8 @@ pub enum GlobalRequest {
     SetProcessGroup(DetPid, DetPid),
     /// Apply a successful setsid transition.
     CreateSession(DetPid),
-    /// Query live threads before translating process-directed signal delivery.
+    /// Query live threads before translating process-directed signal delivery,
+    /// and whether the process is an unreaped zombie.
     ResolveKillTargets(DetPid),
     /// Whether a pid or tid that a guest task named (with the thread group it
     /// named, if any) is one of Hermit's own tasks; see `hermit_task_named`.
@@ -4436,7 +4439,7 @@ pub enum GlobalResponse {
     AlarmRemaining(ItimerSnapshot),
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
-    ResolveKillTargets(Vec<DetTid>),
+    ResolveKillTargets(Vec<DetTid>, bool),
     NamesHermitTask(bool),
     NotifySignalPending(()),
     NotifyUnresolvedSigkill(()),
@@ -5930,9 +5933,22 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
+    resolve_kill_targets_and_exit(guest, detpid).await.0
+}
+
+/// The live threads of `detpid`, and whether it has exited logically without
+/// being reaped (a zombie: no live threads, still signalled successfully).
+pub async fn resolve_kill_targets_and_exit<G, T>(
+    guest: &mut G,
+    detpid: DetPid,
+) -> (Vec<DetTid>, bool)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
     let response = send_and_update_time(guest, GlobalRequest::ResolveKillTargets(detpid)).await;
     match response.1 {
-        GlobalResponse::ResolveKillTargets(targets) => targets,
+        GlobalResponse::ResolveKillTargets(targets, unreaped) => (targets, unreaped),
         _ => unreachable!(),
     }
 }

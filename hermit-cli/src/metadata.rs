@@ -275,7 +275,12 @@ impl RecordVersion {
 // (https://github.com/rrnewton/hermit/issues/4099). Replay recomputes
 // the schedule, so an older recording replayed here could be scheduled
 // differently, although no event shape changed.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x12e);
+// 0x12e -> 0x12f: a kill to a zombie (exited, its status not yet reaped)
+// answers 0, as Linux's kill_pid_info does, where it answered ESRCH
+// (https://github.com/rrnewton/hermit/issues/4091). Replay recomputes the
+// answer, so an older recording replayed here could see another result and take
+// another branch, although no event shape changed.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x12f);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -300,7 +305,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x12e);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x12e;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x12f;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -930,6 +935,11 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_whose_pidfd_signals_woke_no_receiver() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x12d)));
+    }
+
+    #[test]
+    fn record_version_rejects_streams_that_answered_a_zombie_kill_with_esrch() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x12e)));
     }
 
     /// Record and replay run under ptrace with serialized threads, so their

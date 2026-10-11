@@ -5799,6 +5799,12 @@ impl Scheduler {
         }
     }
 
+    /// Whether `detpid` has exited logically and its terminal wait status has
+    /// not been consumed: a zombie, which Linux still signals successfully.
+    pub fn is_unreaped_exited_process(&self, detpid: DetPid) -> bool {
+        self.logically_exited_processes.contains(&detpid)
+    }
+
     pub fn process_signal_targets(&self, detpid: DetPid) -> Vec<DetTid> {
         if !self.thread_tree.thread_group_leaders.contains(&detpid) {
             return Vec::new();

@@ -14,7 +14,9 @@
  * signal; Detcore does not model that choice yet, so with two threads it
  * refuses the call by name: a fail-closed run stops with the policy-refusal
  * status after the first block, and --allow-unsupported-syscalls returns
- * ENOSYS.
+ * ENOSYS. A zombie child (exited, not reaped) is still signalled
+ * successfully, and once reaped it is ESRCH
+ * (https://github.com/rrnewton/hermit/issues/4091).
  */
 
 #define _GNU_SOURCE
@@ -24,6 +26,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static volatile sig_atomic_t handled;
@@ -78,6 +81,16 @@ int main(void) {
   report("one thread, kill", kill(getpid(), SIGUSR1));
   report("one thread, rt_sigqueueinfo", queue_to_self());
   printf("one thread, handled: %d\n", (int)handled);
+
+  pid_t zombie = fork();
+  if (zombie == 0) {
+    _exit(0);
+  }
+  siginfo_t info;
+  waitid(P_PID, zombie, &info, WEXITED | WNOWAIT);
+  report("zombie, kill", kill(zombie, SIGTERM));
+  waitpid(zombie, NULL, 0);
+  report("reaped, kill", kill(zombie, SIGTERM));
 
   pthread_t thread;
   pthread_create(&thread, NULL, pauser, NULL);
