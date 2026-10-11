@@ -364,7 +364,7 @@ lint-check-nested-lockfiles:
 	$(SUBMODULE_PROXY) ./scripts/check-nested-lockfiles.rs
 
 lint-check-record-version-floor:
-	./scripts/check-record-version-floor.rs
+	./scripts/check-record-version-floor.rs $(_VALIDATE_PIN_ARG)
 
 lint-check-buck-reindeer-features:
 	./scripts/check-buck-reindeer-features.rs
