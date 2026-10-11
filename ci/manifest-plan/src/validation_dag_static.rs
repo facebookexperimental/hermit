@@ -1882,7 +1882,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // syscalls::threads::tests::futex_timeout_clamps_a_huge_valid_timespec_like_ktime
     // (Codex re-check of https://github.com/rrnewton/hermit/pull/4061) retains
     // all 1347: 1348.
-    ("test.detcore_unit", 1348),
+    // tool_global::tests::only_hermits_own_thread_group_is_hermits
+    // (https://github.com/rrnewton/hermit/issues/4066) retains all 1348: 1349.
+    ("test.detcore_unit", 1349),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2506,7 +2508,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4030) retains all 293: 294.
     // a_pidfd_signal_to_several_threads_is_refused_by_name
     // (https://github.com/rrnewton/hermit/issues/4047) retains all 294: 295.
-    ("test.cli", 295),
+    // signals_to_hermits_own_tasks_are_dropped_in_every_mode,
+    // a_nested_pid_namespace_signals_its_own_tasks and
+    // a_signal_to_a_newborn_thread_is_never_taken_for_hermits
+    // (https://github.com/rrnewton/hermit/issues/4066) retain all 295: 298.
+    ("test.cli", 298),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2746,7 +2752,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 235 - 6 = 229, listed with this node's arguments.
     // Nor does the unreadable futex word test: 230.
     // Nor does the pidfd multi-thread signal test: 231.
-    ("test.cli_on_host", 231),
+    // Nor do the three tests of signals to Hermit's own tasks: 234.
+    ("test.cli_on_host", 234),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -2890,7 +2897,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And a_background_call_with_a_temporary_mask_holds_the_schedule_until_the_kernel_installs_it (https://github.com/rrnewton/hermit/issues/3993): 1344.
     // And the three background-entry proof tests: 1347.
     // And the futex timeout clamp test: 1348.
-    ("test.detcore_unit_on_host", 1348),
+    // And the Hermit thread-group test: 1349.
+    ("test.detcore_unit_on_host", 1349),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
