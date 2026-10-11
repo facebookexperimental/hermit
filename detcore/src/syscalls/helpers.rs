@@ -1879,6 +1879,8 @@ where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
+    // The signals the wait takes from the queue (rt_sigtimedwait's set).
+    let consumed = call0.signals_consumed_by_wait(&guest.memory());
     // The stack-allocated memory here needs to live across the loop, which means
     // surviving multiple syscall injections:
     let (call, _maybe_stackguard) = call0.into_nonblocking(guest).await;
@@ -1901,6 +1903,9 @@ where
             );
             return Err(errno.into());
         }
+        // A pending real-time timer expiration in the set this wait takes
+        // (https://github.com/rrnewton/hermit/issues/4089).
+        observe_pending_real_time_expirations(guest, consumed, 0).await;
         // Route through the record/replay subtool for internal pipes so each poll (an
         // EAGAIN, or the final data-bearing read) becomes one recorded event that replay
         // reproduces deterministically; otherwise execute the syscall directly.
@@ -2040,6 +2045,12 @@ where
         // (`KernelSignalWait::admit_committed`,
         // https://github.com/rrnewton/hermit/issues/4005).
         signals.admit_committed(committed_signals(&resumed) & kernel_sigset_bit(libc::SIGCHLD));
+        // A pending real-time timer expiration that this wait would consume or
+        // be ended by (https://github.com/rrnewton/hermit/issues/4089).
+        match signals.observable_now() {
+            Ok(observable) => observe_pending_real_time_expirations(guest, observable, 0).await,
+            Err(error) => break Err(error),
+        }
         let first = std::mem::take(&mut first_turn);
         // Never `inject_with_retry`: see `KernelSignalWait`.
         let injected = if first {
@@ -2293,6 +2304,60 @@ where
 /// pointer, https://github.com/rrnewton/hermit/issues/3328), `block` leaves the
 /// guest's own mask in place and every later probe runs under it, as the first
 /// probe does.
+/// The real-time signals, 32 to 64, as kernel sigset bits.
+pub(crate) const REAL_TIME_SIGNALS: KernelSigset = !0 << 31;
+
+/// The signals a thread whose mask becomes `mask` lets the kernel take from
+/// its queues: those `mask` does not block, split into the ones whose delivery
+/// the guest observes and the ones Linux discards on delivery because their
+/// disposition is `SIG_IGN`.
+pub(crate) fn unblocked_by(
+    state: &KernelSignalState,
+    mask: KernelSigset,
+) -> (KernelSigset, KernelSigset) {
+    let unblocked = !mask;
+    (unblocked & !state.ignored, unblocked & state.ignored)
+}
+
+/// Where a call lets the guest observe some pending signals (`observable`:
+/// deliver, dequeue or report them), refuse the run by name if one of them is
+/// a real-time POSIX timer expiration that every thread of the process blocked
+/// when it expired, which Detcore keeps pending instead of refusing at once
+/// (`Scheduler::pending_real_time_expirations`,
+/// https://github.com/rrnewton/hermit/issues/4089). Discard the pending ones in
+/// `discarded`, which Linux discards there. Asks the scheduler only when one of
+/// the sets holds a real-time signal, in the calling thread's turn.
+pub(crate) async fn observe_pending_real_time_expirations<T, G>(
+    guest: &mut G,
+    observable: KernelSigset,
+    discarded: KernelSigset,
+) where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let candidates = (observable | discarded) & REAL_TIME_SIGNALS;
+    if candidates == 0 {
+        return;
+    }
+    let Some(detpid) = guest.thread_state().detpid else {
+        return;
+    };
+    let pending =
+        crate::tool_global::pending_real_time_expirations(guest, detpid).await & candidates;
+    let observed = pending & observable;
+    if observed != 0 {
+        crate::scheduler::refuse_real_time_expiration(observed.trailing_zeros() as i32 + 1);
+    }
+    if pending & discarded != 0 {
+        crate::tool_global::discard_pending_real_time_expirations(
+            guest,
+            detpid,
+            pending & discarded,
+        )
+        .await;
+    }
+}
+
 pub(crate) struct KernelSignalWait {
     pid: reverie::Pid,
     tid: reverie::Pid,
@@ -2607,6 +2672,14 @@ impl KernelSignalWait {
 
     /// The signals that would end the wait natively under the guest's mask, given
     /// the kernel's `state`.
+    /// The signals whose pending presence this wait would observe now: those
+    /// it consumes, and those that would end it under the guest's mask
+    /// (`could_interrupt`). Read from the kernel's state in this turn.
+    pub(crate) fn observable_now(&self) -> Result<KernelSigset, Error> {
+        let state = read_wait_signal_state(self.pid, self.tid)?;
+        Ok(self.consumed | self.could_interrupt(&state))
+    }
+
     fn could_interrupt(&self, state: &KernelSignalState) -> KernelSigset {
         let guest_mask = self.saved_mask.unwrap_or(state.blocked);
         state.interrupting_wait(guest_mask, self.defers_default_stops) & !self.consumed

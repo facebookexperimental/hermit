@@ -6324,6 +6324,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Signalfd4,
     ) -> Result<i64, Error> {
+        // A signalfd of a pending real-time timer expiration that every thread
+        // blocked when it expired would be readable at once
+        // (https://github.com/rrnewton/hermit/issues/4089). A mask the kernel
+        // cannot read fails the call below.
+        if let Some(mask) = call.mask().and_then(|mask| Addr::from_raw(mask.as_raw()))
+            && let Ok(mask) = crate::syscalls::signal::read_kernel_sigset(guest, mask).await
+        {
+            crate::syscalls::helpers::observe_pending_real_time_expirations(guest, mask, 0).await;
+        }
         let signalfd = self.record_or_replay(guest, call).await? as RawFd;
         self.add_fd(
             guest,

@@ -46,17 +46,20 @@ use crate::syscalls::helpers::RestartCall;
 use crate::syscalls::helpers::is_accepted_connection;
 use crate::syscalls::helpers::keep_restart_block;
 use crate::syscalls::helpers::millis_duration_to_absolute_timeout;
+use crate::syscalls::helpers::observe_pending_real_time_expirations;
 use crate::syscalls::helpers::poll_deadline_for;
 use crate::syscalls::helpers::record_retry_event;
 use crate::syscalls::helpers::refuse_held_signal_loss;
 use crate::syscalls::helpers::result_after_restore;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
+use crate::syscalls::helpers::unblocked_by;
 use crate::syscalls::network_trace::received_descriptors;
 use crate::syscalls::signal::STACK_RED_ZONE;
 use crate::syscalls::signal::kernel_installed_signal_mask;
 use crate::syscalls::signal::read_kernel_sigset;
 use crate::syscalls::threads::KernelSigset;
 use crate::syscalls::threads::read_thread_signal_state;
+use crate::syscalls::threads::read_thread_wait_signal_state;
 use crate::tool_global::*;
 use crate::tool_local::Detcore;
 use crate::types::DetTid;
@@ -911,6 +914,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             None => None,
         };
         let timeout = raw_timeout.map(ppoll_timeout_duration).transpose()?;
+        if let Some(argument) = sigmask_argument
+            && argument.sigmask != 0
+        {
+            self.observe_under_temporary_mask(
+                guest,
+                Addr::<libc::sigset_t>::from_raw(argument.sigmask),
+                argument.sigsetsize,
+            )
+            .await?;
+        }
         if timeout == Some(Duration::ZERO) {
             return Ok(guest.inject(call).await?);
         }
@@ -1108,6 +1121,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                         resource_request(guest, resources.clone()).await,
                         ResumeStatus::Signaled(_)
                     );
+                    // A pending real-time timer expiration that this wait would
+                    // be ended by, under the guest's mask or the call's temporary
+                    // one (https://github.com/rrnewton/hermit/issues/4089).
+                    let (observable, discarded) = match (signals.as_ref(), sigmask) {
+                        (Some(signals), _) => (signals.observable_now()?, 0),
+                        (None, Some(mask)) => unblocked_by(
+                            &read_thread_wait_signal_state(guest.pid(), guest.tid())?,
+                            mask,
+                        ),
+                        (None, None) => (0, 0),
+                    };
+                    observe_pending_real_time_expirations(guest, observable, discarded).await;
                     // Every turn probes before it looks at pending signals, as Linux
                     // does: do_select polls every descriptor on each pass and returns
                     // the count of ready ones before it tests signal_pending, and at
@@ -1388,6 +1413,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                         resource_request(guest, resources.clone()).await,
                         ResumeStatus::Signaled(_)
                     );
+                    // A pending real-time timer expiration that this wait would
+                    // be ended by (https://github.com/rrnewton/hermit/issues/4089).
+                    if let Some(signals) = signals.as_ref() {
+                        let observable = signals.observable_now()?;
+                        observe_pending_real_time_expirations(guest, observable, 0).await;
+                    }
                     // Every turn probes before it looks at pending signals, as Linux
                     // does: do_select polls every descriptor on each pass and returns
                     // the count of ready ones before it tests signal_pending, and at
@@ -1655,6 +1686,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                     return Err(Errno::EINVAL.into());
                 }
                 let signal_mask = read_kernel_sigset(guest, signal_mask).await?;
+                // The probe's temporary mask lets the kernel take a pending
+                // real-time timer expiration that every thread blocked when it
+                // expired (https://github.com/rrnewton/hermit/issues/4089).
+                let state = read_thread_wait_signal_state(guest.pid(), guest.tid())?;
+                let (observable, discarded) = unblocked_by(&state, signal_mask);
+                observe_pending_real_time_expirations(guest, observable, discarded).await;
                 Some(sanitize_ppoll_signal_mask(signal_mask))
             }
             None => None,
@@ -1897,6 +1934,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             return self.record_or_replay_masked_epoll_pwait(guest, call).await;
         }
         if call.sigmask().is_some() {
+            self.observe_under_temporary_mask(guest, call.sigmask(), call.sigsetsize())
+                .await?;
             let dettid = guest.thread_state().dettid;
             resource_request(guest, Resources::new(dettid)).await; // empty request
             return Ok(self.record_or_replay(guest, call).await?);
@@ -2043,9 +2082,44 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: Syscall,
     ) -> Result<i64, Error> {
+        // epoll_pwait2(epfd, events, maxevents, timeout, sigmask, sigsetsize)
+        let (_, args) = call.into_parts();
+        self.observe_under_temporary_mask(
+            guest,
+            Addr::<libc::sigset_t>::from_raw(args.arg4 as usize),
+            args.arg5 as usize,
+        )
+        .await?;
         let dettid = guest.thread_state().dettid;
         resource_request(guest, Resources::new(dettid)).await; // empty request
         Ok(self.record_or_replay(guest, call).await?)
+    }
+
+    /// Before a call that sleeps or probes under the temporary mask at `mask`
+    /// (`sigsetsize` bytes), refuse the run by name if the mask lets the kernel
+    /// take a pending real-time timer expiration that every thread blocked when
+    /// it expired, and discard the ones it lets the kernel discard
+    /// (https://github.com/rrnewton/hermit/issues/4089). A mask the kernel would
+    /// reject fails the call itself, which then observes nothing.
+    async fn observe_under_temporary_mask<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        mask: Option<Addr<'_, libc::sigset_t>>,
+        sigsetsize: usize,
+    ) -> Result<(), Error> {
+        let Some(mask) = mask else {
+            return Ok(());
+        };
+        if sigsetsize != KERNEL_SIGSET_SIZE {
+            return Ok(());
+        }
+        let Ok(mask) = read_kernel_sigset(guest, mask).await else {
+            return Ok(());
+        };
+        let state = read_thread_wait_signal_state(guest.pid(), guest.tid())?;
+        let (observable, discarded) = unblocked_by(&state, mask);
+        observe_pending_real_time_expirations(guest, observable, discarded).await;
+        Ok(())
     }
 
     /// epoll_wait syscall (MAYHANG)

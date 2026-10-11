@@ -32,7 +32,10 @@ use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::resources::SigalrmSleepDisposition;
+use crate::syscalls::helpers::REAL_TIME_SIGNALS;
+use crate::syscalls::helpers::observe_pending_real_time_expirations;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
+use crate::syscalls::helpers::unblocked_by;
 use crate::syscalls::threads::KERNEL_SIGSET_SIZE;
 use crate::syscalls::threads::KernelSigaction;
 use crate::syscalls::threads::KernelSigset;
@@ -636,6 +639,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
 
         let temporary_mask = read_kernel_sigset(guest, mask_addr).await?;
+        // The temporary mask lets the kernel take a pending real-time timer
+        // expiration that every thread blocked when it expired
+        // (https://github.com/rrnewton/hermit/issues/4089).
+        let state = read_thread_wait_signal_state(guest.pid(), guest.tid())?;
+        let (observable, discarded) = unblocked_by(&state, temporary_mask);
+        observe_pending_real_time_expirations(guest, observable, discarded).await;
         // The real call sleeps under a private copy of the mask read here, not
         // under the guest's buffer. The scheduler decides from this copy which
         // signals can end the call (`Resources::blocked_signal_mask`), and
@@ -799,6 +808,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await;
             }
         }
+        // Linux flushes the pending instances of a signal whose disposition
+        // becomes SIG_IGN (`do_sigaction`), among them a pending real-time timer
+        // expiration (https://github.com/rrnewton/hermit/issues/4089).
+        if result.is_ok()
+            && kernel_action.is_some_and(|action| action.handler == libc::SIG_IGN as u64)
+            && (1..=64).contains(&call.signum())
+        {
+            observe_pending_real_time_expirations(guest, 0, kernel_sigset_bit(call.signum())).await;
+        }
         Ok(result?)
     }
 
@@ -864,6 +882,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         validate_kernel_sigset_size(call.sigsetsize())?;
 
         let result = self.rt_sigprocmask_inner(guest, call).await;
+        if call.how() != libc::SIG_BLOCK && call.set().is_some() {
+            // The new mask may unblock a pending real-time timer expiration
+            // that every thread blocked when it expired, which the kernel then
+            // delivers (https://github.com/rrnewton/hermit/issues/4089). Whatever
+            // the call returned: an EFAULT copying the old set out comes after
+            // the change. A mask that cannot be read could unblock any of them.
+            let (observable, discarded) =
+                match read_thread_wait_signal_state(guest.pid(), guest.tid()) {
+                    Ok(state) => unblocked_by(&state, state.blocked),
+                    Err(_) => (REAL_TIME_SIGNALS, 0),
+                };
+            observe_pending_real_time_expirations(guest, observable, discarded).await;
+        }
         if self.cfg.backend.virtualizes_guest_sigalrm && guest.thread_state().sigalrm_handled {
             // Signal phase 1: the scheduler's blocked bit follows the virtual
             // mask, whatever the call returned (an EFAULT copying the old set
@@ -1482,7 +1513,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         // Signal phase 1 refuses rt_sigpending in a process that handles
         // SIGALRM (`sigalrm_phase1`), so the ledger's entry never needs to be
-        // shown here.
+        // shown here. The pending set would show a real-time timer expiration
+        // that every thread blocked when it expired, which the kernel never
+        // queued (https://github.com/rrnewton/hermit/issues/4089).
+        observe_pending_real_time_expirations(guest, REAL_TIME_SIGNALS, 0).await;
         Ok(self.record_or_replay(guest, call).await?)
     }
 }

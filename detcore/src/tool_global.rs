@@ -2638,6 +2638,17 @@ impl GlobalTool for GlobalState {
             GlobalRequest::ThreadIsLive(dtid) => {
                 R::ThreadIsLive(self.lock_rpc_scheduler(false).await.thread_is_live(dtid))
             }
+            GlobalRequest::PendingRealTimeExpirations(detpid) => R::PendingRealTimeExpirations(
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .pending_real_time_expirations(detpid),
+            ),
+            GlobalRequest::DiscardPendingRealTimeExpirations(detpid, signals) => {
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .discard_pending_real_time_expirations(detpid, signals);
+                R::DiscardPendingRealTimeExpirations(())
+            }
             GlobalRequest::RecordHostTimedSignals(dtid, scope, signals) => R::HostTimedSignals(
                 self.lock_rpc_scheduler(false)
                     .await
@@ -4305,6 +4316,12 @@ pub enum GlobalRequest {
     NotifyUnresolvedSigkill(Option<DetPid>),
     /// Liveness of one tid, leader or not; see [`thread_is_live`].
     ThreadIsLive(DetTid),
+    /// The pending real-time timer expirations of a process; see
+    /// [`pending_real_time_expirations`].
+    PendingRealTimeExpirations(DetPid),
+    /// Discard pending real-time timer expirations of a process (a kernel
+    /// sigset) whose disposition became `SIG_IGN`.
+    DiscardPendingRealTimeExpirations(DetPid, u64),
     /// Scheduler-owned lifecycle state for a direct child process.
     ExactChildWaitState(DetPid, DetPid),
 
@@ -4457,6 +4474,8 @@ pub enum GlobalResponse {
     NotifySignalPending(()),
     NotifyUnresolvedSigkill(()),
     ThreadIsLive(bool),
+    PendingRealTimeExpirations(u64),
+    DiscardPendingRealTimeExpirations(()),
     ExactChildWaitState(ExactChildWaitState),
     // TODO: use void_send_rpc, and remove this bogus response:
     UnrecoverableShutdown(()),
@@ -5705,6 +5724,50 @@ where
         GlobalResponse::ThreadIsLive(live) => live,
         _ => unreachable!(),
     }
+}
+
+/// The real-time signals (a kernel sigset) of `detpid`'s POSIX timers that
+/// expired while every thread of the process blocked them, and that are still
+/// pending (https://github.com/rrnewton/hermit/issues/4089). Asked in the
+/// calling thread's turn, while no timed event can pop, so the answer is a
+/// function of the schedule.
+pub(crate) async fn pending_real_time_expirations<G, T>(guest: &mut G, detpid: DetPid) -> u64
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response =
+        send_and_update_time(guest, GlobalRequest::PendingRealTimeExpirations(detpid)).await;
+    match response.1 {
+        GlobalResponse::PendingRealTimeExpirations(pending) => pending,
+        GlobalResponse::ThreadExited => 0,
+        other => unreachable!("unexpected response to PendingRealTimeExpirations: {other:?}"),
+    }
+}
+
+/// Discard `signals` from `detpid`'s pending real-time timer expirations, as
+/// Linux flushes a pending signal whose disposition becomes `SIG_IGN`.
+pub(crate) async fn discard_pending_real_time_expirations<G, T>(
+    guest: &mut G,
+    detpid: DetPid,
+    signals: u64,
+) where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(
+        guest,
+        GlobalRequest::DiscardPendingRealTimeExpirations(detpid, signals),
+    )
+    .await;
+    assert!(
+        matches!(
+            response.1,
+            GlobalResponse::DiscardPendingRealTimeExpirations(()) | GlobalResponse::ThreadExited
+        ),
+        "unexpected response to DiscardPendingRealTimeExpirations: {:?}",
+        response.1
+    );
 }
 
 /// Records, in the calling thread's turn, that it armed a host-timed source of

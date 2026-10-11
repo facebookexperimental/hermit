@@ -2276,6 +2276,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/timer_rt_signal_pending_observed.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/timer_rt_signal_pending_observed.c is owned by hermit-cli/tests/cli.rs: a real-time POSIX timer expiration that every thread blocks stays pending, and a run --strict refuses it by name exactly where it becomes observable (a mask change or temporary mask that unblocks it, rt_sigtimedwait, signalfd, sigpending), while SIG_IGN and exit discard it and exec keeps it, with the PMU timeslice and without it (https://github.com/rrnewton/hermit/issues/4089). It stays a fixture because each case ends a run with a refusal exit that the generic manifest cannot express."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/timerslack_proc_record_replay.c",
       "runner": "hermit-cli/tests/record_replay.rs",
       "why": "tests/c/timerslack_proc_record_replay.c is owned by hermit-cli/tests/record_replay.rs: The Rust integration test compiles this guest and runs its strict record/replay contract, asserting that one timer-slack value composes across relative and absolute procfs reads/writes, prctl access, zero-length I/O, seek behavior, and replay. It remains a test-owned guest fixture because that phase-spanning contract is asserted by the dedicated record/replay test rather than a generic manifest cell."

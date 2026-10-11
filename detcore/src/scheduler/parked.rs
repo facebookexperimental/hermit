@@ -29,7 +29,6 @@ use super::SchedRequest;
 use super::SchedResponse;
 use super::Scheduler;
 use super::ThreadNextTurn;
-use super::exit_on_scheduler_refusal;
 use super::kernel_signal_bit;
 use super::real_timer::TimerFailure;
 use super::runqueue::SuspendedRunQueueEntry;
@@ -669,12 +668,32 @@ impl Scheduler {
             {
                 return;
             }
+            // Linux queues a signal that every thread of its process blocks,
+            // and a queued signal changes nothing until the process could
+            // observe it. Keep the expiration as pending instead of refusing,
+            // and refuse where it would become observable
+            // (https://github.com/rrnewton/hermit/issues/4089). Under the
+            // 500x clock of a run without retired-branch time, a timer armed
+            // just before its process exits can expire in the turn that ends
+            // with the exit request.
+            timed_waiters::TimerSignal::RefuseRealTime(signo)
+                if self.real_time_expiration_is_queued(id.process(), signo) =>
+            {
+                *self
+                    .pending_real_time_expirations
+                    .entry(id.process())
+                    .or_default() |= kernel_signal_bit(signo);
+                tracing::debug!(
+                    "[scheduler] real-time signal {} of a timer of process {} expired while every thread blocked it; pending",
+                    signo,
+                    id.process()
+                );
+                return;
+            }
             // Only a fail-closed run registers such an expiration
             // (`Detcore::handle_timer_settime`); a permissive one never arms it.
             timed_waiters::TimerSignal::RefuseRealTime(signo) => {
-                exit_on_scheduler_refusal(&format_args!(
-                    "hermit: a POSIX timer expired that notifies with real-time signal {signo}, which Detcore cannot deliver; refusing the run rather than dropping the expiration (https://github.com/rrnewton/hermit/issues/3893)"
-                ))
+                super::refuse_real_time_expiration(signo)
             }
         };
         if self.signal_control_installed() && matches!(id, SignalTimerId::Alarm(_)) {
@@ -719,6 +738,60 @@ impl Scheduler {
             }
         } else if !self.divert_in_guest_fatal_alarm(deadline, id, tid, signal, observed_now) {
             self.fire_alarm(id.process(), tid, signal);
+        }
+    }
+
+    /// Whether an expiration of a real-time-signal timer of `process` is
+    /// queued by Linux rather than delivered: every live thread of the process
+    /// blocks `signo`. A thread Detcore holds under a private mask
+    /// (`saved_guest_sigmasks`) is judged by the guest's own mask. A thread in
+    /// a `KernelSignalWait` shows every signal blocked; its wait refuses at its
+    /// next turn if its own mask does not block the signal
+    /// (`KernelSignalWait::observable`). A thread whose state cannot be read
+    /// makes the expiration deliverable, so the run refuses as before.
+    ///
+    /// Read at the same points as the ignored-signal check above, where no
+    /// guest thread holds the turn.
+    pub(super) fn real_time_expiration_is_queued(&self, process: DetPid, signo: i32) -> bool {
+        let bit = kernel_signal_bit(signo);
+        let mut blocking = 0_usize;
+        for thread in self.thread_tree.my_thread_group(&process) {
+            if !self.next_turns.contains_key(&thread) {
+                continue;
+            }
+            let blocked = match self.saved_guest_sigmasks.get(&thread) {
+                Some(mask) => *mask,
+                None => match self.read_sleeper_signal_state(thread) {
+                    Ok(state) => state.blocked,
+                    Err(SleeperStateUnreadable::Gone) => continue,
+                    Err(SleeperStateUnreadable::Unreadable(_)) => return false,
+                },
+            };
+            if blocked & bit == 0 {
+                return false;
+            }
+            blocking += 1;
+        }
+        blocking > 0
+    }
+
+    /// The real-time signals pending for `process` from timer expirations
+    /// that every thread blocked (`pending_real_time_expirations`).
+    pub(crate) fn pending_real_time_expirations(&self, process: DetPid) -> u64 {
+        self.pending_real_time_expirations
+            .get(&process)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Discard `signals` from `process`'s pending real-time expirations, as
+    /// Linux flushes a pending signal whose disposition becomes `SIG_IGN`.
+    pub(crate) fn discard_pending_real_time_expirations(&mut self, process: DetPid, signals: u64) {
+        if let Some(pending) = self.pending_real_time_expirations.get_mut(&process) {
+            *pending &= !signals;
+            if *pending == 0 {
+                self.pending_real_time_expirations.remove(&process);
+            }
         }
     }
 
