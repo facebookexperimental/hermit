@@ -1926,7 +1926,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And scheduler::runqueue::tests::threads_queued_by_a_yield_are_not_work_a_background_call_waits_behind
     // (https://github.com/rrnewton/hermit/issues/4092): 1385.
     // The 29 SIGKILL-retirement, signalfd-reconciliation and iovec tests (https://github.com/rrnewton/hermit/issues/3994) retain all 1385: 1414.
-    ("test.detcore_unit", 1414),
+    // scheduler::test::a_sigkill_arm_on_an_rt_sigsuspend_sleeper_ends_with_its_exit
+    // (https://github.com/rrnewton/hermit/issues/3941): 1415.
+    ("test.detcore_unit", 1415),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3003,7 +3005,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the chaos yield-epoch tests: 1384.
     // And the yielder harvest-gate unit test: 1385.
     // And the 29 SIGKILL-retirement tests: 1414.
-    ("test.detcore_unit_on_host", 1414),
+    // And the rt_sigsuspend SIGKILL-arm test: 1415.
+    ("test.detcore_unit_on_host", 1415),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

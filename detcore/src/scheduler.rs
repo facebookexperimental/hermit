@@ -496,7 +496,7 @@ pub struct BlockedPool {
     /// sent one turn later, when it slept; otherwise the pool would hold a
     /// sleeper the scheduler counts as unwakeable, and the next pass reports a
     /// deadlock before the thread's signal stop is posted.
-    pub signaled_sigsuspend_requests: BTreeMap<DetTid, Signal>,
+    pub signaled_sigsuspend_requests: BTreeMap<DetTid, SigWrapper>,
 
     /// Threads in `external_io_blockers` whose call `hermit replay` serves
     /// from the recording (`Resources::replay_served_from_log`). Such a call
@@ -6268,7 +6268,7 @@ impl Scheduler {
     /// stopped at a `BlockingRtSigsuspend` request whose temporary mask does not
     /// block it (`BlockedPool::signaled_sigsuspend_requests`). A later signal
     /// of the same kind adds nothing: either one wakes the call.
-    fn note_signaled_sigsuspend_request(&mut self, dettid: DetTid, signal: Signal) {
+    fn note_signaled_sigsuspend_request(&mut self, dettid: DetTid, signal: SigWrapper) {
         let Some(Some(Ok(request))) = self.next_turns.get(&dettid).map(|nt| nt.req.try_read())
         else {
             return;
@@ -6279,7 +6279,7 @@ impl Scheduler {
             .any(|rid| matches!(rid, ResourceID::BlockingRtSigsuspend(_)));
         let unblocked = matches!(
             request.blocked_signal_mask,
-            Some(mask) if mask & kernel_signal_bit(signal as i32) == 0
+            Some(mask) if mask & kernel_signal_bit(signal.raw()) == 0
         );
         if suspends && unblocked {
             self.blocked
@@ -6307,8 +6307,8 @@ impl Scheduler {
     /// thread the signal does not wake at a known point: a vfork parent (it
     /// sleeps killable, so a non-fatal signal does not wake it) and a thread
     /// whose recorded sleeping mask is unknown or blocks the signal.
-    fn arm_signaled_background(&mut self, dettid: DetTid, signal: Signal) {
-        let bit = kernel_signal_bit(signal as i32);
+    fn arm_signaled_background(&mut self, dettid: DetTid, signal: SigWrapper) {
+        let bit = kernel_signal_bit(signal.raw());
         let wakes = !self.vfork_barriers.contains_key(&dettid)
             && matches!(
                 self.blocked.out_of_scheduler_masks.get(&dettid),
@@ -6326,7 +6326,7 @@ impl Scheduler {
             dettid, signal
         );
         self.blocked.signaled_background.insert(dettid);
-        if signal == Signal::SIGCHLD {
+        if signal.raw() == libc::SIGCHLD {
             self.blocked.sigchld_ready.insert(dettid);
         }
     }
@@ -6335,7 +6335,12 @@ impl Scheduler {
     /// queued a physical signal for it. The signal itself is not sent here;
     /// this only prevents an internal polling request from hiding a pending
     /// signal indefinitely.
-    fn wake_signaled_guest(&mut self, dettid: DetTid, signal: Signal) {
+    ///
+    /// `signal` is the raw number (`SigWrapper`), so a realtime signal, which
+    /// `nix`'s `Signal` cannot name, arms and notes a thread like a standard one
+    /// (<https://github.com/rrnewton/hermit/issues/3941>).
+    fn wake_signaled_guest(&mut self, dettid: DetTid, signal: impl Into<SigWrapper>) {
+        let signal = signal.into();
         if self.in_guest_fatal_alarm_pending(dettid) {
             return;
         }
@@ -6343,7 +6348,7 @@ impl Scheduler {
         // pending/ignored semantics, but never invent an interrupted sleep
         // for an alarm this exact owner snapshot blocks or ignores. This
         // covers both filed requests and sleeps already outside the queue.
-        if signal == Signal::SIGALRM
+        if signal.raw() == libc::SIGALRM
             && self
                 .in_guest_sleep_sigalrm(dettid)
                 .is_some_and(|(snapshot, _)| {
@@ -6429,10 +6434,7 @@ impl Scheduler {
                 if is_internal_io_polling {
                     assert!(self.run_queue.remove_tid(dettid));
                     let mut rsrcs = Resources::new(dettid);
-                    rsrcs.insert(
-                        ResourceID::InboundSignal(SigWrapper::from(signal)),
-                        Permission::W,
-                    );
+                    rsrcs.insert(ResourceID::InboundSignal(signal), Permission::W);
                     self.force_unblock_thread(dettid, rsrcs);
                 }
                 // TODO(T137242449): other runnable requests could be reprioritized to run
@@ -6458,9 +6460,9 @@ impl Scheduler {
                 // as a Linux waiter that the signal never reached would still be
                 // waiting.
                 if let Some(interrupting) =
-                    self.parked_futex_interrupting_signals(dettid, kernel_signal_bit(signal as i32))
+                    self.parked_futex_interrupting_signals(dettid, kernel_signal_bit(signal.raw()))
                 {
-                    if interrupting & kernel_signal_bit(signal as i32) == 0 {
+                    if interrupting & kernel_signal_bit(signal.raw()) == 0 {
                         // Blocked, ignored, or default-ignored for this waiter now,
                         // or a signal the wait holds until the call returns
                         // (`parked_futex_interrupting_signals`): the kernel
@@ -6480,18 +6482,12 @@ impl Scheduler {
                     // front of its band, so it is the next thread to resume and
                     // dequeue the signal (`force_unblock_thread_at`).
                     let mut rsrcs = Resources::new(dettid);
-                    rsrcs.insert(
-                        ResourceID::InboundSignal(SigWrapper::from(signal)),
-                        Permission::W,
-                    );
+                    rsrcs.insert(ResourceID::InboundSignal(signal), Permission::W);
                     self.force_unblock_thread_at(dettid, rsrcs, true);
                     return;
                 }
                 let mut rsrcs = Resources::new(dettid);
-                rsrcs.insert(
-                    ResourceID::InboundSignal(SigWrapper::from(signal)),
-                    Permission::W,
-                );
+                rsrcs.insert(ResourceID::InboundSignal(signal), Permission::W);
                 self.force_unblock_thread(dettid, rsrcs);
             }
         }
@@ -9329,7 +9325,11 @@ impl Scheduler {
                 // an empty run queue was reported as a deadlock first.
                 signals.sort_by_key(SigWrapper::raw);
                 signals.dedup();
-                for signal in signals.iter().filter_map(SigWrapper::signal) {
+                // Every signal, by its raw number: a realtime signal its mask
+                // admits ends the call as a standard one does, and `nix`'s
+                // `Signal` cannot name it, so filtering through it dropped the
+                // wake (https://github.com/rrnewton/hermit/issues/3941).
+                for signal in signals {
                     self.wake_signaled_guest(dettid, signal);
                 }
                 continue;
@@ -14873,10 +14873,25 @@ mod test {
     /// its `rt_sigsuspend` request gets the record its grant arms. Before, such
     /// a signal was not recorded at all, the scheduler did not wait for the
     /// wake's signal stop, and on a slow host it reported a deadlock first.
+    ///
+    /// A realtime signal is placed the same way: `nix` cannot name it, and the
+    /// drain used to drop it (https://github.com/rrnewton/hermit/issues/3941).
+    /// SIGKILL arms too, although it has no delivery stop under ptrace: the
+    /// arm is cleared when the thread's exit is processed
+    /// (`a_sigkill_arm_on_an_rt_sigsuspend_sleeper_ends_with_its_exit`), and
+    /// without it the killed sleeper would count as unwakeable until then.
     #[test]
     fn a_guest_signal_to_an_rt_sigsuspend_sleeper_arms_the_release_barrier() {
         let usr1 = SigWrapper::from(Signal::SIGUSR1);
-        for (sleeping_mask, armed) in [(0, true), (kernel_signal_bit(libc::SIGUSR1), false)] {
+        let realtime = SigWrapper(35);
+        let kill = SigWrapper::from(Signal::SIGKILL);
+        for (signal, sleeping_mask, armed) in [
+            (usr1, 0, true),
+            (usr1, kernel_signal_bit(libc::SIGUSR1), false),
+            (realtime, 0, true),
+            (realtime, kernel_signal_bit(35), false),
+            (kill, 0, true),
+        ] {
             let (mut scheduler, _parent, creator, _child) = sigchld_family(libc::SIGCHLD);
             commit_out_of_scheduler_call(
                 &mut scheduler,
@@ -14884,29 +14899,60 @@ mod test {
                 ResourceID::BlockingRtSigsuspend(ExternalOpId::new(creator, 5)),
                 Some(sleeping_mask),
             );
-            scheduler.notify_signal_pending(creator, usr1);
+            scheduler.notify_signal_pending(creator, signal);
             scheduler.drain_pending_cross_task_signals();
             assert_eq!(
                 scheduler.blocked.signaled_background.contains(&creator),
                 armed,
-                "sleeping mask {sleeping_mask:#x}"
+                "signal {signal}, sleeping mask {sleeping_mask:#x}"
             );
         }
 
+        for signal in [usr1, realtime, kill] {
+            let (mut scheduler, _parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+            let mut request = Resources::new(creator);
+            request.insert(
+                ResourceID::BlockingRtSigsuspend(ExternalOpId::new(creator, 6)),
+                Permission::RW,
+            );
+            request.blocked_signal_mask = Some(0);
+            scheduler.next_turns.get_mut(&creator).unwrap().req = Ivar::full(Ok(request));
+            scheduler.runqueue_push_back(creator);
+            scheduler.notify_signal_pending(creator, signal);
+            scheduler.drain_pending_cross_task_signals();
+            assert_eq!(
+                scheduler.blocked.signaled_sigsuspend_requests.get(&creator),
+                Some(&signal),
+                "signal {signal}"
+            );
+        }
+    }
+
+    /// The SIGKILL policy of https://github.com/rrnewton/hermit/issues/3941: a
+    /// guest's SIGKILL to a thread asleep in `rt_sigsuspend` arms it like any
+    /// signal its mask admits (the installed mask can never block SIGKILL).
+    /// There is no delivery stop to wait for; the thread exits, and processing
+    /// that exit clears the arm (`remove_blocking_entries`), so the release
+    /// barrier does not wait past it.
+    #[test]
+    fn a_sigkill_arm_on_an_rt_sigsuspend_sleeper_ends_with_its_exit() {
         let (mut scheduler, _parent, creator, _child) = sigchld_family(libc::SIGCHLD);
-        let mut request = Resources::new(creator);
-        request.insert(
-            ResourceID::BlockingRtSigsuspend(ExternalOpId::new(creator, 6)),
-            Permission::RW,
+        commit_out_of_scheduler_call(
+            &mut scheduler,
+            creator,
+            ResourceID::BlockingRtSigsuspend(ExternalOpId::new(creator, 5)),
+            Some(0),
         );
-        request.blocked_signal_mask = Some(0);
-        scheduler.next_turns.get_mut(&creator).unwrap().req = Ivar::full(Ok(request));
-        scheduler.runqueue_push_back(creator);
-        scheduler.notify_signal_pending(creator, usr1);
+        scheduler.notify_signal_pending(creator, SigWrapper::from(Signal::SIGKILL));
         scheduler.drain_pending_cross_task_signals();
-        assert_eq!(
-            scheduler.blocked.signaled_sigsuspend_requests.get(&creator),
-            Some(&Signal::SIGUSR1)
+        assert!(scheduler.blocked.signaled_background.contains(&creator));
+        scheduler.remove_blocking_entries(&creator);
+        assert!(!scheduler.blocked.signaled_background.contains(&creator));
+        assert!(
+            !scheduler
+                .blocked
+                .rt_sigsuspend_blockers
+                .contains_key(&creator)
         );
     }
 
@@ -15530,11 +15576,20 @@ mod test {
     #[test]
     fn a_sibling_signal_sent_at_an_rt_sigsuspend_request_arms_the_call_it_wakes() {
         let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        // Realtime signals and SIGKILL follow the policy of
+        // https://github.com/rrnewton/hermit/issues/3941: a realtime signal the
+        // mask admits is noted and armed like a standard one; SIGKILL is too.
         for (case, signal, temporary_mask, armed) in [
-            ("admitted", Signal::SIGUSR1, 0, true),
-            // Gap: main's drain drops a realtime signal sent at an rt_sigsuspend request.
-            ("blocked", Signal::SIGUSR1, usr1, false),
-            // Gap: main notes SIGKILL sent at an rt_sigsuspend request (open policy question).
+            ("admitted", SigWrapper::from(Signal::SIGUSR1), 0, true),
+            ("realtime admitted", SigWrapper(35), 0, true),
+            (
+                "realtime blocked",
+                SigWrapper(35),
+                kernel_signal_bit(35),
+                false,
+            ),
+            ("blocked", SigWrapper::from(Signal::SIGUSR1), usr1, false),
+            ("SIGKILL", SigWrapper::from(Signal::SIGKILL), 0, true),
         ] {
             let (mut scheduler, _parent, creator, _child) = sigchld_family(libc::SIGCHLD);
             let op = ExternalOpId::new(creator, 7);
@@ -15545,10 +15600,10 @@ mod test {
             // Its request is posted, so it waits in the run queue for its turn.
             scheduler.runqueue_push_back(creator);
 
-            scheduler.notify_signal_pending(creator, SigWrapper::from(signal));
+            scheduler.notify_signal_pending(creator, signal);
             assert_eq!(
                 scheduler.pending_cross_task_signals.get(&creator),
-                Some(&vec![SigWrapper::from(signal)]),
+                Some(&vec![signal]),
                 "{case}"
             );
             assert!(
@@ -15622,7 +15677,7 @@ mod test {
         assert!(scheduler.blocked.signaled_background.is_empty());
         assert_eq!(
             scheduler.blocked.signaled_sigsuspend_requests.get(&creator),
-            Some(&Signal::SIGUSR1)
+            Some(&SigWrapper::from(Signal::SIGUSR1))
         );
 
         assert!(scheduler.run_queue.remove_tid(creator));
