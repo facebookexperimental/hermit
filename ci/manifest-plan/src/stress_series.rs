@@ -442,7 +442,17 @@ impl SeriesPressureAttempt {
                         .is_ok()
                         && declared.hermit_status_matches(self.status, self.signal)
                 });
-                timed_out_match || (completed_pass && (ordinary_exit || declared_exit))
+                // A match the runner failed by its declared exit or stdout
+                // (`SeriesNoVerdictKind::FailedMatch`): the crash-error red,
+                // retained as a non-canonical match, never a pass.
+                let failed_match = !comparison.canonical
+                    && self.outcome == "FAIL"
+                    && !self.timed_out
+                    && self.error_kind.is_none()
+                    && self.status.is_some() != self.signal.is_some();
+                timed_out_match
+                    || failed_match
+                    || (completed_pass && (ordinary_exit || declared_exit))
             }
             Verdict::Diverged => {
                 self.outcome == "FAIL"
@@ -2614,6 +2624,54 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{label}: {error}"));
             row.validate_for_read()
                 .unwrap_or_else(|error| panic!("{label}: read: {error}"));
+        }
+    }
+
+    /// A matched report from an attempt the runner failed by its declared
+    /// exit or stdout (a failed match) is retained in pressure evidence as a
+    /// match that is not canonical, from a FAIL attempt with no error kind and
+    /// one process disposition; it never stands for a pass.
+    #[test]
+    fn failed_match_pressure_evidence_is_a_non_canonical_failed_attempt() {
+        let failed = SeriesPressureAttempt {
+            index: "1".into(),
+            outcome: "FAIL".into(),
+            error_kind: None,
+            status: Some(0),
+            signal: None,
+            timed_out: false,
+            comparison: Some(SeriesPressureComparison {
+                verdict: Verdict::Matched,
+                canonical: false,
+                report_sha256: "c".repeat(64),
+                no_result_kind: None,
+            }),
+        };
+        for mode in ["verify", "replay", "chaos"] {
+            failed.validate_for_mode(mode, None).unwrap();
+        }
+        let mut nonzero = failed.clone();
+        nonzero.status = Some(3);
+        nonzero.validate_for_mode("verify", None).unwrap();
+        type InnerEdit = fn(&mut SeriesPressureAttempt);
+        let refused: [(&str, InnerEdit); 5] = [
+            ("canonical", |a| {
+                a.comparison.as_mut().unwrap().canonical = true
+            }),
+            ("error kind", |a| {
+                a.error_kind = Some("infrastructure".into())
+            }),
+            ("no process disposition", |a| a.status = None),
+            ("status and signal", |a| a.signal = Some(9)),
+            ("attempt ERROR", |a| a.outcome = "ERROR".into()),
+        ];
+        for (label, edit) in refused {
+            let mut bad = failed.clone();
+            edit(&mut bad);
+            assert!(
+                bad.validate_for_mode("verify", None).is_err(),
+                "{label}: admitted"
+            );
         }
     }
 
