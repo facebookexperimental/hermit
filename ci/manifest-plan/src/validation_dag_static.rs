@@ -1376,7 +1376,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4094): 1042.
     // And metadata::tests::pre_yield_readmission_recordings_are_refused_by_the_version_gate
     // (Codex review of https://github.com/rrnewton/hermit/pull/4120): 1043.
-    ("test.hermit_unit", 1043),
+    // And metadata::tests::pre_tight_stack_ppoll_recordings_are_refused_by_the_version_gate
+    // (Claude review of https://github.com/rrnewton/hermit/pull/4127): 1044.
+    ("test.hermit_unit", 1044),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2230,7 +2232,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/issues/4113): 178.
     // And recording_refuses_a_masked_pselect_8_bytes_into_its_stack
     // (https://github.com/rrnewton/hermit/issues/4112): 179.
-    ("test.record_replay", 179),
+    // And record_masked_ppoll_whose_timeout_is_in_the_red_zone (Claude review of
+    // https://github.com/rrnewton/hermit/pull/4127): 180.
+    ("test.record_replay", 180),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -3113,7 +3117,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the thread-id kill record-epoch test: 1042.
     // And metadata::tests::pre_yield_readmission_recordings_are_refused_by_the_version_gate
     // (Codex review of https://github.com/rrnewton/hermit/pull/4120): 1043.
-    ("test.hermit_unit_on_host", 1043),
+    // And metadata::tests::pre_tight_stack_ppoll_recordings_are_refused_by_the_version_gate
+    // (Claude review of https://github.com/rrnewton/hermit/pull/4127): 1044.
+    ("test.hermit_unit_on_host", 1044),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

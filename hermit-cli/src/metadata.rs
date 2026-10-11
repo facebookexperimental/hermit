@@ -304,7 +304,16 @@ impl RecordVersion {
 // older replayer's gate stays shut in that state, so it could not consume the
 // readmission: it would refuse, or hang behind a yielder that never stops
 // (Codex review of https://github.com/rrnewton/hermit/pull/4120).
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x133);
+// 0x133 -> 0x134:
+// a masked or zero-timeout ppoll on a stack with no scratch below its red zone
+// stages its private timeout and mask in the red zone, where it returned EFAULT
+// and recorded nothing, and a masked record/replay pselect6 that replay could
+// not deliver an interruption of is refused
+// (https://github.com/rrnewton/hermit/issues/4113,
+// https://github.com/rrnewton/hermit/issues/4112). An older recording of such a
+// ppoll holds no event for the call, so this replayer would desynchronize at it
+// (Claude review of https://github.com/rrnewton/hermit/pull/4127).
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x134);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -329,7 +338,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x133);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x133;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x134;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -714,6 +723,15 @@ mod tests {
         // yielder was queued, and its replayer cannot follow one that did.
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x132)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x131)));
+    }
+
+    #[test]
+    fn pre_tight_stack_ppoll_recordings_are_refused_by_the_version_gate() {
+        // A recording from before this epoch of a ppoll on a nearly full stack
+        // holds its EFAULT and no event, which this replayer does not
+        // reproduce: 0x133 (the previous epoch) and 0x132.
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x133)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x132)));
     }
 
     #[test]

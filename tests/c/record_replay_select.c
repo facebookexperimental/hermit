@@ -186,6 +186,11 @@
  *                a masked ppoll at 128 bytes on a ready pipe whose pollfd sits
  *                at the top of the red zone, where the kernel writes revents:
  *                1 with POLLIN, so the private copy must go below it
+ *   ppoll-mask-timeout-in-red-zone
+ *                a masked ppoll at 48 bytes whose 30 s timeout sits at the top
+ *                of the red zone, ended by a writer at 300 ms: 1, POLLIN, and
+ *                29 s left written back, so the private mask copy must stay
+ *                clear of the timeout
  *   ppoll-mask-raise-tight8
  *                at 8 bytes no 24-byte window is writable; a fail-closed run
  *                refuses the call by name
@@ -1503,6 +1508,78 @@ static int ppoll_tight(
   return 0;
 }
 
+static int timeout_pipe_fds[2];
+
+static void* fill_timeout_pipe_later(void* arg) {
+  (void)arg;
+  usleep(300000);
+  if (write(timeout_pipe_fds[1], "x", 1) != 1) {
+    perror("fill pipe");
+  }
+  return NULL;
+}
+
+/* A masked ppoll with a 30 s timeout on a stack 48 bytes into a writable page
+ * with an inaccessible page below it, its timeout in the top 16 bytes of the
+ * red zone, and a writer that fills the pipe after 300 ms. Linux returns 1
+ * with POLLIN and writes the time left (29 s and change) into the timeout;
+ * the pattern in the rest of the red zone must survive. Hermit's private mask
+ * copy must stay clear of the timeout, which the kernel reads at entry and
+ * writes when the call returns (Claude review of
+ * https://github.com/rrnewton/hermit/pull/4127). */
+static int ppoll_timeout_in_red_zone(void) {
+  long page = sysconf(_SC_PAGESIZE);
+  unsigned char* area = mmap(
+      NULL, (size_t)page * 2, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (area == MAP_FAILED ||
+      mprotect(area + page, (size_t)page, PROT_READ | PROT_WRITE) != 0 ||
+      pipe(timeout_pipe_fds) != 0) {
+    perror("setup");
+    return 1;
+  }
+  unsigned char* tight_stack = area + page + 48;
+  struct timespec* timeout = (struct timespec*)(tight_stack - sizeof(struct timespec));
+  for (int i = -48; i < -(int)sizeof(struct timespec); i++) {
+    tight_stack[i] = (unsigned char)(0xa5 ^ (i & 0xff));
+  }
+  timeout->tv_sec = 30;
+  timeout->tv_nsec = 0;
+  static struct pollfd watched;
+  watched.fd = timeout_pipe_fds[0];
+  watched.events = POLLIN;
+  watched.revents = 0;
+  static uint64_t empty_mask;
+  pthread_t writer;
+  if (pthread_create(&writer, NULL, fill_timeout_pipe_later, NULL) != 0) {
+    perror("pthread_create");
+    return 1;
+  }
+  const long args[5] = {(long)&watched, 1, (long)timeout, (long)&empty_mask, 8};
+  long raw = syscall5_on_stack(tight_stack, SYS_ppoll, args);
+  long left_sec = timeout->tv_sec;
+  int red_zone_changed = 0;
+  for (int i = -48; i < -(int)sizeof(struct timespec); i++) {
+    red_zone_changed += tight_stack[i] != (unsigned char)(0xa5 ^ (i & 0xff));
+  }
+  pthread_join(writer, NULL);
+  close(timeout_pipe_fds[0]);
+  close(timeout_pipe_fds[1]);
+  printf(
+      "%-30s result=%011ld revents=%02x time_left=%01d red_zone_changed=%03d\n",
+      "ppoll-timeout-in-red-zone",
+      raw,
+      watched.revents,
+      left_sec >= 20 && left_sec <= 29,
+      red_zone_changed);
+  /* Any time left below the 30 s asked for, short of a stalled writer. */
+  if (raw != 1 || watched.revents != POLLIN || left_sec < 20 || left_sec > 29 ||
+      red_zone_changed != 0) {
+    fprintf(stderr, "ppoll-mask-timeout-in-red-zone mismatch\n");
+    return 1;
+  }
+  return 0;
+}
+
 static int epoll_pipe_fds[2];
 
 static void* fill_epoll_pipe_later(void* arg) {
@@ -2011,7 +2088,8 @@ int main(int argc, char** argv) {
         "ppoll-mask-zero-raise-tight|ppoll-mask-zero-raise-tight24|"
         "ppoll-mask-raise-tight24|ppoll-mask-raise-tight128|"
         "ppoll-zero-tight16|ppoll-mask-redzone-pollfd|"
-        "ppoll-mask-raise-tight8|pselect-mask-hook-race|"
+        "ppoll-mask-raise-tight8|ppoll-mask-timeout-in-red-zone|"
+        "pselect-mask-hook-race|"
         "epoll-pwait-ready|epoll-pwait-mask-ready|epoll-pwait-writer|"
         "epoll-pwait-mask-blocks-alarm|epoll-pwait-mask-unblocks-alarm|"
         "epoll-pwait-mask-raise|epoll-pwait-mask-sibling-race|"
@@ -2125,6 +2203,9 @@ int main(int argc, char** argv) {
   }
   if (strcmp(argv[1], "ppoll-mask-redzone-pollfd") == 0) {
     return ppoll_tight(argv[1], 128, 1, 1, 1);
+  }
+  if (strcmp(argv[1], "ppoll-mask-timeout-in-red-zone") == 0) {
+    return ppoll_timeout_in_red_zone();
   }
   if (strcmp(argv[1], "ppoll-mask-raise-tight8") == 0) {
     return ppoll_tight(argv[1], 8, 1, 1, 0);

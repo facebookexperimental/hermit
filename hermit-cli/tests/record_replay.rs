@@ -2880,6 +2880,15 @@ fn record_masked_ppoll_whose_pollfd_is_in_the_red_zone() {
     record_select_mode("ppoll-mask-redzone-pollfd");
 }
 
+/// A masked ppoll 48 bytes into its page whose timeout sits at the top of the
+/// red zone, ended by a writer: the kernel reads the timeout at entry and
+/// writes the time left back, so the private mask copy must go below it
+/// (Claude review of https://github.com/rrnewton/hermit/pull/4127).
+#[test]
+fn record_masked_ppoll_whose_timeout_is_in_the_red_zone() {
+    record_select_mode("ppoll-mask-timeout-in-red-zone");
+}
+
 /// A masked ppoll that would block: its temporary mask blocks the timer's
 /// SIGALRM, and a writer's byte ends it with 1. Under sequentialization the
 /// call recorded ENOSYS; record/replay now lets the kernel own the wait
