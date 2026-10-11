@@ -6412,16 +6412,21 @@ impl<T: RecordOrReplay> Detcore<T> {
             refuse_sigalrm(guest, control).await?;
         }
         // A pidfd names a whole process (Detcore's pidfd_open accepts no
-        // PIDFD_THREAD), so this is a process-directed signal, and with several
-        // live threads it is refused by name as `kill` refuses it: Linux's
-        // complete_signal picks the receiving thread, which Detcore does not
-        // model (https://github.com/rrnewton/hermit/issues/4047). Signal 0
-        // only checks that the process exists.
+        // PIDFD_THREAD), so this is a process-directed signal. To a process
+        // with two or more live threads it is refused by name as `kill` refuses
+        // it: Linux's complete_signal picks the receiving thread, which Detcore
+        // does not model (https://github.com/rrnewton/hermit/issues/4047).
+        // Everything else is forwarded and the kernel answers: signal 0, which
+        // only checks that the process exists; SIGKILL, which kills the whole
+        // group whichever thread it reaches; and a process with one thread or
+        // none (a zombie, which Linux still signals successfully).
         if signal != 0
+            && signal != libc::SIGKILL
             && guest.config().sequentialize_threads
             && let Some(target) = guest
                 .thread_state()
                 .with_detfd(pidfd, |detfd| detfd.pidfd_target())?
+            && resolve_kill_targets(guest, target).await.len() >= 2
         {
             self.process_signal_target(
                 guest,

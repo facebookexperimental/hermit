@@ -13,9 +13,10 @@
  * process, so this is a process-directed signal: Linux's complete_signal picks
  * the receiving thread, which Detcore does not model, so with two threads it
  * refuses the call by name as it refuses kill. A fail-closed run stops with
- * the policy-refusal status after the one-thread block, and
- * --allow-unsupported-syscalls returns ENOSYS. Signal 0 only checks that the
- * process exists, so it is answered with two threads too.
+ * the policy-refusal status at the two-thread send, and
+ * --allow-unsupported-syscalls returns ENOSYS. Everything else is the
+ * kernel's answer: signal 0, a zombie target (still 0), and SIGKILL to a
+ * two-threaded child, which kills it whichever thread it reaches.
  */
 
 #define _GNU_SOURCE
@@ -25,6 +26,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static volatile sig_atomic_t handled;
@@ -73,6 +75,39 @@ int main(void) {
 
   report("one thread, pidfd_send_signal", syscall(SYS_pidfd_send_signal, pidfd, SIGUSR1, NULL, 0));
   printf("one thread, handled: %d\n", (int)handled);
+
+  /* A zombie (exited, not reaped) is still signalled successfully. */
+  pid_t zombie = fork();
+  if (zombie == 0) {
+    _exit(0);
+  }
+  siginfo_t info;
+  waitid(P_PID, zombie, &info, WEXITED | WNOWAIT);
+  int zombie_fd = syscall(SYS_pidfd_open, zombie, 0);
+  report("zombie, pidfd_send_signal", syscall(SYS_pidfd_send_signal, zombie_fd, SIGUSR1, NULL, 0));
+  waitpid(zombie, NULL, 0);
+
+  /* SIGKILL kills a two-threaded process whichever thread it reaches. */
+  int ready[2];
+  pipe(ready);
+  pid_t child = fork();
+  if (child == 0) {
+    pthread_t sibling;
+    pthread_create(&sibling, NULL, waiter, NULL);
+    write(ready[1], "r", 1);
+    for (;;) {
+      pause();
+    }
+  }
+  char byte;
+  read(ready[0], &byte, 1);
+  int child_fd = syscall(SYS_pidfd_open, child, 0);
+  report("two-threaded child, pidfd_send_signal SIGKILL",
+         syscall(SYS_pidfd_send_signal, child_fd, SIGKILL, NULL, 0));
+  int status = 0;
+  waitpid(child, &status, 0);
+  printf("two-threaded child: %s %d\n", WIFSIGNALED(status) ? "killed by signal" : "exited",
+         WIFSIGNALED(status) ? WTERMSIG(status) : WEXITSTATUS(status));
 
   pthread_t thread;
   pthread_create(&thread, NULL, waiter, NULL);

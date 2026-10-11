@@ -21253,10 +21253,11 @@ fn a_process_directed_signal_to_several_threads_is_refused_by_name() {
 /// a whole process, so the signal is process-directed, and Linux's
 /// complete_signal would pick the receiving thread, which Detcore does not
 /// model. Before the change the call was forwarded to the kernel, which chose
-/// the thread. A fail-closed run stops with the policy-refusal status after the
-/// one-thread block, which still delivers; signal 0 is still answered with two
-/// threads; with `--allow-unsupported-syscalls` the two-thread call returns
-/// ENOSYS.
+/// the thread. A fail-closed run stops with the policy-refusal status at that
+/// call; with `--allow-unsupported-syscalls` it returns ENOSYS; without
+/// sequentialized threads it is forwarded. Everything else stays the kernel's
+/// answer: a one-thread target, a zombie target (0, as Linux), signal 0, and
+/// SIGKILL to a two-threaded child, which kills it whichever thread it reaches.
 #[test]
 fn a_pidfd_signal_to_several_threads_is_refused_by_name() {
     let guest = futex_c_guest(
@@ -21268,6 +21269,9 @@ fn a_pidfd_signal_to_several_threads_is_refused_by_name() {
     .to_owned();
     let answered = "one thread, pidfd_send_signal: 0\n\
                     one thread, handled: 1\n\
+                    zombie, pidfd_send_signal: 0\n\
+                    two-threaded child, pidfd_send_signal SIGKILL: 0\n\
+                    two-threaded child: killed by signal 9\n\
                     two threads, pidfd_send_signal 0: 0\n";
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let (status, log) = run_with_deadline(
@@ -21323,6 +21327,34 @@ fn a_pidfd_signal_to_several_threads_is_refused_by_name() {
     assert_eq!(
         stdout,
         format!("{answered}two threads, pidfd_send_signal: -1 ENOSYS\n"),
+        "stderr:\n{log}"
+    );
+    // Without sequentialized threads nothing is refused: the call is forwarded
+    // and the kernel answers, as natively.
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "run",
+            "--no-sequentialize-threads",
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+        ]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "stdout:\n{stdout}\nstderr:\n{log}"
+    );
+    assert_eq!(
+        stdout,
+        format!("{answered}two threads, pidfd_send_signal: 0\n"),
         "stderr:\n{log}"
     );
 }
