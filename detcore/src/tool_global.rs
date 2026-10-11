@@ -2621,6 +2621,9 @@ impl GlobalTool for GlobalState {
             GlobalRequest::NotifySignalPending(dettid, SigWrapper(signal), target_process) => {
                 let mut scheduler = self.lock_rpc_scheduler(false).await;
                 scheduler.notify_signal_pending(dettid, SigWrapper(signal));
+                // A kill may name the process by a non-leader thread's id.
+                let target_process = target_process
+                    .map(|named| scheduler.signal_target_process(named).unwrap_or(named));
                 if signal == libc::SIGKILL {
                     scheduler.record_committed_sigkill(dettid, target_process);
                     if let Some(detpid) = target_process {

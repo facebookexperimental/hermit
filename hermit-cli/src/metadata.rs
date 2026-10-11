@@ -292,7 +292,12 @@ impl RecordVersion {
 // ESRCH (https://github.com/rrnewton/hermit/issues/4091). Replay recomputes
 // the answer, so an older recording replayed here could see another result
 // and take another branch, although no event shape changed.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x131);
+// 0x131 -> 0x132: a process-directed signal naming a live non-leader thread's
+// id goes to that thread's process, as Linux's kill_pid_info does, where it
+// answered ESRCH (https://github.com/rrnewton/hermit/issues/4094). Replay
+// recomputes the answer, so an older recording replayed here could see another
+// result and take another branch, although no event shape changed.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x132);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -317,7 +322,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x131);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x131;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x132;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -970,6 +975,11 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_that_answered_a_zombie_sigqueueinfo_with_esrch() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x130)));
+    }
+
+    #[test]
+    fn record_version_rejects_streams_that_answered_a_thread_id_kill_with_esrch() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x131)));
     }
 
     /// Record and replay run under ptrace with serialized threads, so their

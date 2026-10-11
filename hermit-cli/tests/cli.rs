@@ -21240,6 +21240,10 @@ fn a_futex_wake_count_of_zero_or_negative_wakes_one_waiter() {
 /// only for an exit signal of SIGCHLD, with the disposition a fork inherits
 /// and an exec keeps only while ignored; a zombie reparented to an ignoring
 /// subreaper is reaped.
+/// A live non-leader thread's id names its whole process, so a signal to it
+/// is refused by name as well, where it was ESRCH before
+/// https://github.com/rrnewton/hermit/issues/4094; an exited thread's id names
+/// nothing (ESRCH).
 #[test]
 fn a_process_directed_signal_to_several_threads_is_refused_by_name() {
     let guest = kill_multithreaded_process_guest()
@@ -21247,8 +21251,10 @@ fn a_process_directed_signal_to_several_threads_is_refused_by_name() {
         .unwrap()
         .to_owned();
     let one_thread = "one thread, kill: 0\none thread, rt_sigqueueinfo: 0\n\
-                      one thread, handled: 2\nzombie, kill: 0\nzombie, kill 0: 0\n\
-                      zombie, kill 99: -1 EINVAL\nzombie, rt_sigqueueinfo: 0\n\
+                      one thread, handled: 2\nexited thread id, kill: -1 ESRCH\n\
+                      exited thread id, kill 0: -1 ESRCH\nzombie, kill: 0\n\
+                      zombie, kill 0: 0\nzombie, kill 99: -1 EINVAL\n\
+                      zombie, rt_sigqueueinfo: 0\n\
                       zombie, rt_sigqueueinfo SI_USER: -1 EPERM\nreaped, kill: -1 ESRCH\n\
                       reaped, kill 0: -1 ESRCH\nreaped, rt_sigqueueinfo: -1 ESRCH\n\
                       SIG_IGN child, kill: -1 ESRCH\nSIG_IGN child, kill 0: -1 ESRCH\n\
@@ -21320,7 +21326,9 @@ fn a_process_directed_signal_to_several_threads_is_refused_by_name() {
     assert_eq!(
         stdout,
         format!(
-            "{one_thread}two threads, kill: -1 ENOSYS\ntwo threads, rt_sigqueueinfo: -1 ENOSYS\n"
+            "{one_thread}two threads, kill: -1 ENOSYS\ntwo threads, rt_sigqueueinfo: -1 ENOSYS\n\
+             two threads, kill by thread id: -1 ENOSYS\n\
+             two threads, kill by exited thread id: -1 ESRCH\n"
         ),
         "stderr:\n{log}"
     );

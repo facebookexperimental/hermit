@@ -1372,7 +1372,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Three physical constructor-registration controls retain all prior cases.
     // tests::backend_timer_delivery_is_explicit
     // (https://github.com/rrnewton/hermit/issues/4068) retains all 1040: 1041.
-    ("test.hermit_unit", 1041),
+    // And metadata::tests::record_version_rejects_streams_that_answered_a_thread_id_kill_with_esrch
+    // (https://github.com/rrnewton/hermit/issues/4094): 1042.
+    ("test.hermit_unit", 1042),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3090,7 +3092,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the zombie-sigqueueinfo record-epoch test: 1037.
     // Three physical constructor-registration controls retain all prior cases.
     // And the backend timer-delivery test: 1041.
-    ("test.hermit_unit_on_host", 1041),
+    // And the thread-id kill record-epoch test: 1042.
+    ("test.hermit_unit_on_host", 1042),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

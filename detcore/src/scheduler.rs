@@ -5984,11 +5984,26 @@ impl Scheduler {
         Some(!self.autoreaped_exits.contains(&detpid) && !self.thread_tree.is_init_orphan(detpid))
     }
 
-    pub fn process_signal_targets(&self, detpid: DetPid) -> Vec<DetTid> {
-        if !self.thread_tree.thread_group_leaders.contains(&detpid) {
-            return Vec::new();
+    /// The process a process-directed signal naming `detpid` goes to. Linux's
+    /// kill_pid_info looks the id up as a task, so a live non-leader thread's
+    /// id names its whole thread group (https://github.com/rrnewton/hermit/issues/4094).
+    /// `None` when the id names neither a thread group nor a live thread: the
+    /// id of an exited thread names nothing.
+    pub fn signal_target_process(&self, detpid: DetPid) -> Option<DetPid> {
+        if self.thread_tree.thread_group_leaders.contains(&detpid) {
+            return Some(detpid);
         }
-        let mut targets = self.thread_tree.my_thread_group(&detpid);
+        if !self.next_turns.contains_key(&detpid) {
+            return None;
+        }
+        self.thread_tree.thread_to_leader.get(&detpid).copied()
+    }
+
+    pub fn process_signal_targets(&self, detpid: DetPid) -> Vec<DetTid> {
+        let Some(leader) = self.signal_target_process(detpid) else {
+            return Vec::new();
+        };
+        let mut targets = self.thread_tree.my_thread_group(&leader);
         targets.retain(|tid| self.next_turns.contains_key(tid));
         targets.sort();
         targets
@@ -11093,16 +11108,19 @@ mod test {
     /// applied through `remove_tid`'s `tentative_selection.is_none()` guard, and
     /// a pending-removal thread whose `next_turns` entry is already gone must not
     /// crash `are_all_quiesced`. The removal lands at the next drain.
-    /// ITEM 1 REGRESSION: a NON-LEADER thread is live, even though it is not a
-    /// kill target.
+    /// ITEM 1 REGRESSION: whether a thread is live and whether an id names a
+    /// signal target are different questions.
     ///
-    /// `process_signal_targets` models `kill(2)`, whose first act is to refuse
-    /// anything that is not a thread-group leader. `sched_setattr(2)` and its
-    /// relatives resolve through `find_task_by_vpid`, which finds any live
-    /// task. Answering the second question with the first resolver reports
-    /// ESRCH for a thread that is plainly running, so the two must stay
-    /// distinguishable -- this test fails the moment `thread_is_live` is
-    /// reduced to the kill resolver.
+    /// `process_signal_targets` models `kill(2)`: Linux's `kill_pid_info` looks
+    /// the id up as a task and signals its whole thread group, so a live
+    /// non-leader thread's id names its process
+    /// (<https://github.com/rrnewton/hermit/issues/4094>; this test used to
+    /// assert the opposite). `sched_setattr(2)` and its relatives resolve
+    /// through `find_task_by_vpid`, which finds the live task itself. The two
+    /// still differ for a group whose leader has exited while a member lives:
+    /// the leader's id names a process with one live thread, but the leader is
+    /// not live. This test fails the moment `thread_is_live` is reduced to the
+    /// kill resolver.
     #[test]
     fn a_non_leader_thread_is_live_without_being_a_kill_target() {
         let mut sched = Scheduler::new(&Config::default());
@@ -11124,17 +11142,24 @@ mod test {
             "a tid that was never registered is not live"
         );
 
-        // The distinction being preserved: the kill resolver still declines the
-        // non-leader, which is correct for kill(2) and wrong for sched_setattr.
+        // kill(2) names a process by any of its live threads' ids.
+        assert_eq!(sched.process_signal_targets(member), vec![leader, member]);
+        assert_eq!(sched.process_signal_targets(leader), vec![leader, member]);
+        assert!(sched.process_signal_targets(stranger).is_empty());
+
+        // The distinction being preserved: once the leader has exited, its id
+        // still names the process (one live thread), but it is not live.
+        sched.next_turns.remove(&leader);
         assert!(
-            sched.process_signal_targets(member).is_empty(),
-            "kill(2) semantics: a non-leader is not a signal target, which is \
-             exactly why it is the wrong resolver for a tid lookup"
+            !sched.thread_is_live(leader),
+            "an exited leader is not live; sched_setattr must not reach it"
         );
-        assert!(
-            !sched.process_signal_targets(leader).is_empty(),
-            "the leader is a signal target, so the fixture is wired correctly"
+        assert_eq!(
+            sched.process_signal_targets(leader),
+            vec![member],
+            "kill(2) to the exited leader's id reaches its live member"
         );
+        assert!(sched.thread_is_live(member));
     }
 
     #[test]

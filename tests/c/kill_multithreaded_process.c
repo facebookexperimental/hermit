@@ -22,7 +22,9 @@
  * container's init reaps. Linux decides at exit (a later disposition change
  * does not matter), only for a child whose exit signal is SIGCHLD, with the
  * disposition a fork inherits and an exec keeps only while it is SIG_IGN; a
- * zombie reparented to a subreaper that ignores SIGCHLD is reaped then.
+ * zombie reparented to a subreaper that ignores SIGCHLD is reaped then. A
+ * signal naming a live non-leader thread's id goes to its whole process, and
+ * an exited thread's id names nothing.
  */
 
 #define _GNU_SOURCE
@@ -300,10 +302,19 @@ static long queue_to(pid_t pid, int code) {
 
 static volatile int stop;
 
+static void* record_tid(void* tid) {
+  *(pid_t*)tid = gettid();
+  return NULL;
+}
+
 /* The second thread waits with SIGUSR1 blocked except inside sigsuspend, so
  * the final pthread_kill cannot slip in between its check and its wait. */
+static int pauser_tid_pipe[2];
+
 static void* pauser(void* unused) {
   (void)unused;
+  pid_t tid = gettid();
+  write(pauser_tid_pipe[1], &tid, sizeof(tid));
   sigset_t usr1, none;
   sigemptyset(&usr1);
   sigaddset(&usr1, SIGUSR1);
@@ -332,6 +343,14 @@ int main(int argc, char** argv) {
   report("one thread, rt_sigqueueinfo", queue_to_self());
   printf("one thread, handled: %d\n", (int)handled);
 
+  /* The id of a thread that has exited names nothing. */
+  pthread_t exited;
+  pid_t exited_tid = 0;
+  pthread_create(&exited, NULL, record_tid, &exited_tid);
+  pthread_join(exited, NULL);
+  report("exited thread id, kill", kill(exited_tid, SIGUSR1));
+  report("exited thread id, kill 0", kill(exited_tid, 0));
+
   pid_t zombie = fork();
   if (zombie == 0) {
     _exit(0);
@@ -359,9 +378,17 @@ int main(int argc, char** argv) {
   zombie_reparented_to_ignoring_subreaper();
 
   pthread_t thread;
+  pipe(pauser_tid_pipe);
   pthread_create(&thread, NULL, pauser, NULL);
+  pid_t pauser_tid;
+  read(pauser_tid_pipe[0], &pauser_tid, sizeof(pauser_tid));
   report("two threads, kill", kill(getpid(), SIGUSR1));
   report("two threads, rt_sigqueueinfo", queue_to_self());
+  /* A live non-leader thread's id names its whole process
+   * (https://github.com/rrnewton/hermit/issues/4094). */
+  report("two threads, kill by thread id", kill(pauser_tid, SIGUSR1));
+  /* With two live threads, an exited thread's id still names nothing. */
+  report("two threads, kill by exited thread id", kill(exited_tid, SIGUSR1));
 
   stop = 1;
   pthread_kill(thread, SIGUSR1);
