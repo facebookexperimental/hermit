@@ -133,6 +133,7 @@ static FUTEX_WAKE_OP_FILE_SHARED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_REWAIT_CHANGED_WORD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_WAIT_UNREADABLE_WORD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PIDFD_SEND_SIGNAL_MULTITHREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static PIDFD_SEND_SIGNAL_FLAGS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_MULTITHREADED_PROCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static OWN_PROCESS_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_PROCESS_GROUP_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -22051,6 +22052,328 @@ fn each_unscheduled_signal_to_the_senders_own_process_is_refused_by_name() {
     assert!(
         log.contains("the run replays a recorded schedule"),
         "the refusal must name the schedule replay:\nstderr:\n{log}"
+    );
+}
+
+/// pidfd_send_signal's flags and descriptors answer as Linux answers them
+/// (https://github.com/rrnewton/hermit/issues/4108). Before, Detcore answered
+/// EINVAL for any flag and EBADF for any descriptor it had not opened with
+/// pidfd_open. Under `--strict --verify --verify-strict` the guest must print
+/// what Linux prints (measured natively) at bitwise parity:
+/// - `PIDFD_SIGNAL_THREAD` and `PIDFD_SIGNAL_THREAD_GROUP` deliver; two scope
+///   flags or an unknown bit are EINVAL;
+/// - a `/proc/<pid>` directory, also opened as `/proc/self`, names the process,
+///   with or without a flag; a task directory, a procfs file, `/`, a closed
+///   descriptor and an `O_PATH` `/proc/self` are EBADF (Linux's `fdget` skips
+///   `O_PATH`); a reaped child's `/proc/<pid>` is ESRCH, and so is the pidfd of
+///   a child reaped at its exit (its parent ignores SIGCHLD), however late the
+///   tracer releases it, after Linux's checks of a non-NULL siginfo (EFAULT for
+///   a bad pointer, EINVAL for another `si_signo`, EPERM for a forged
+///   `si_code`, and the layout checked against the info's own `si_signo`, so
+///   E2BIG for a code that signal does not know), through its pidfd and its
+///   `/proc/<pid>`;
+/// - a worker's `PIDFD_SIGNAL_THREAD` send reaches the main thread, waiting in
+///   `pthread_join`, which the pid names;
+/// - a one-thread child blocked in `pause()` is woken by a `PIDFD_SIGNAL_THREAD`
+///   send and its handler exits 42, so the scheduler must be told the receiver
+///   (as for https://github.com/rrnewton/hermit/issues/4099);
+/// - a sibling thread takes a `PIDFD_SIGNAL_THREAD` send through its own
+///   `/proc/<tid>`, and a child in `pause()` a send through `/proc/<child>`;
+/// - a SIGKILL ends a two-thread child through `/proc/<child>`, through
+///   `/proc/<tid>` of its second thread, through its pidfd and through its
+///   pidfd with `PIDFD_SIGNAL_THREAD`, and a SIGKILL through an `O_PATH`
+///   `/proc/self` of the two-thread sender is EBADF and kills nothing. Each
+///   SIGKILL that is sent is retired at the kill turn, as
+///   `kill`'s is (https://github.com/rrnewton/hermit/issues/3994); without
+///   that, `--verify` failed in 2 and 3 of 3 runs for the `/proc` sends.
+#[test]
+fn pidfd_send_signal_flags_and_proc_descriptors_answer_as_linux_does_at_bitwise_parity() {
+    let guest = futex_c_guest(&PIDFD_SEND_SIGNAL_FLAGS_GUEST, "pidfd_send_signal_flags")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let expected = "no flag rc=0 - ran=1\n\
+                    thread rc=0 - ran=1\n\
+                    thread group rc=0 - ran=1\n\
+                    two scopes rc=-1 EINVAL ran=0\n\
+                    unknown flag rc=-1 EINVAL ran=0\n\
+                    /proc/<pid> rc=0 - ran=1\n\
+                    /proc/<pid>, signal 0 rc=0 - ran=0\n\
+                    /proc/<pid>, thread rc=0 - ran=1\n\
+                    /proc/<pid>, two scopes rc=-1 EINVAL ran=0\n\
+                    /proc/self rc=0 - ran=1\n\
+                    /proc/<pid>/task/<tid> rc=-1 EBADF ran=0\n\
+                    /proc/self/status rc=-1 EBADF ran=0\n\
+                    / rc=-1 EBADF ran=0\n\
+                    closed rc=-1 EBADF ran=0\n\
+                    /proc/self, O_PATH rc=-1 EBADF ran=0\n\
+                    /proc/<reaped child> rc=-1 ESRCH ran=0\n\
+                    /proc/<reaped child>, signal 0 rc=-1 ESRCH ran=0\n\
+                    auto-reaped child, pidfd rc=-1 ESRCH ran=0\n\
+                    auto-reaped child, pidfd, bad info rc=-1 EFAULT ran=0\n\
+                    auto-reaped child, pidfd, SI_QUEUE info rc=-1 ESRCH ran=0\n\
+                    auto-reaped child, pidfd, other si_signo rc=-1 EINVAL ran=0\n\
+                    auto-reaped child, pidfd, forged SI_USER rc=-1 EPERM ran=0\n\
+                    auto-reaped child, pidfd, SIGFPE layout for SIGUSR1 rc=-1 EINVAL ran=0\n\
+                    auto-reaped child, pidfd, SIGUSR1 layout for SIGFPE rc=-1 E2BIG ran=0\n\
+                    auto-reaped child, /proc, bad info rc=-1 EFAULT ran=0\n\
+                    auto-reaped child, /proc, SI_QUEUE info rc=-1 ESRCH ran=0\n\
+                    auto-reaped child, /proc, other si_signo rc=-1 EINVAL ran=0\n\
+                    auto-reaped child, /proc, forged SI_USER rc=-1 EPERM ran=0\n\
+                    auto-reaped child, /proc, SIGFPE layout for SIGUSR1 rc=-1 EINVAL ran=0\n\
+                    auto-reaped child, /proc, SIGUSR1 layout for SIGFPE rc=-1 E2BIG ran=0\n\
+                    worker, thread flag rc=0 -\n\
+                    main after the worker's thread send rc=0 - ran=1\n\
+                    blocked child, thread rc=0 - ran=0\n\
+                    blocked child: exited 42\n\
+                    /proc/<sibling tid>, thread rc=0 - ran=0\n\
+                    sibling ran=1\n\
+                    SIGKILL, /proc/self, O_PATH rc=-1 EBADF ran=0\n\
+                    /proc/<paused child> rc=0 - ran=0\n\
+                    /proc/<paused child>: exited 42\n\
+                    SIGKILL, /proc/<child> rc=0 - ran=0\n\
+                    SIGKILL, /proc/<child>: killed by signal 9\n\
+                    SIGKILL, /proc/<child worker> rc=0 - ran=0\n\
+                    SIGKILL, /proc/<child worker>: killed by signal 9\n\
+                    SIGKILL, pidfd rc=0 - ran=0\n\
+                    SIGKILL, pidfd: killed by signal 9\n\
+                    SIGKILL, pidfd, thread rc=0 - ran=0\n\
+                    SIGKILL, pidfd, thread: killed by signal 9\n";
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let verdict = directory.path().join("verify.json");
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "--log=info",
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            verdict.to_str().unwrap(),
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+        ]),
+        directory.path(),
+        Duration::from_secs(180),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "stdout:\n{stdout}\nstderr:\n{log}"
+    );
+    assert_eq!(stdout, expected, "stderr:\n{log}");
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
+            .expect("the verdict must be JSON");
+    assert_eq!(report["bitwise_parity"], true, "{report}");
+}
+
+/// A `/proc/<pid>` descriptor for Hermit's own process, PID 1 of the guest's
+/// namespace, or `/proc/<tid>` of any other thread of it, is answered EPERM,
+/// with or without a flag, as `pidfd_open` of Hermit's process is
+/// (https://github.com/rrnewton/hermit/issues/4066). Before, `/proc/<tid>` of
+/// a Hermit thread passed the check, and a SIGTERM through it ended the run
+/// (exit 143). The run must survive every send.
+#[test]
+fn a_pidfd_signal_through_hermits_own_proc_directories_is_eperm() {
+    let guest = futex_c_guest(&PIDFD_SEND_SIGNAL_FLAGS_GUEST, "pidfd_send_signal_flags")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "--log=error",
+            "run",
+            "--strict",
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+            "hermit",
+        ]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "stdout:\n{stdout}\nstderr:\n{log}"
+    );
+    assert_eq!(
+        stdout,
+        "/proc/1, signal 0 rc=-1 EPERM ran=0\n\
+         /proc/1 rc=-1 EPERM ran=0\n\
+         /proc/1, O_PATH rc=-1 EBADF ran=0\n\
+         another thread of process 1: found\n\
+         /proc/<hermit thread>, signal 0 rc=-1 EPERM ran=0\n\
+         /proc/<hermit thread> rc=-1 EPERM ran=0\n\
+         /proc/<hermit thread>, thread rc=-1 EPERM ran=0\n",
+        "stderr:\n{log}"
+    );
+}
+
+/// A send with no flag through `/proc/<tid>` of a sibling thread names the
+/// sender's own two-thread process (https://github.com/rrnewton/hermit/issues/4094),
+/// so it is refused by name as `kill(getpid())` is there: a fail-closed run
+/// stops with the policy-refusal status, and with
+/// `--allow-unsupported-syscalls` the send returns ENOSYS.
+#[test]
+fn a_pidfd_signal_through_a_siblings_proc_directory_names_the_process() {
+    let guest = futex_c_guest(&PIDFD_SEND_SIGNAL_FLAGS_GUEST, "pidfd_send_signal_flags")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    // The refusal names the process, not the sibling's thread id.
+    let refusal = |stdout: &str| {
+        let pid = stdout
+            .strip_prefix("process ")
+            .and_then(|rest| rest.lines().next())
+            .expect("the guest prints its pid first")
+            .to_owned();
+        let text = format!(
+            "process-directed signal 10 to process {pid} by pidfd_send_signal is not \
+             supported: the process has 2 live threads"
+        );
+        (pid, text)
+    };
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "--log=error",
+            "run",
+            "--strict",
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+            "sibling",
+        ]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "stderr:\n{log}"
+    );
+    let (_, text) = refusal(&stdout);
+    assert!(
+        log.contains(&text),
+        "the refusal must name the process:\n{log}"
+    );
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "run",
+            "--allow-unsupported-syscalls",
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+            "sibling",
+        ]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "stdout:\n{stdout}\nstderr:\n{log}"
+    );
+    let (pid, text) = refusal(&stdout);
+    assert_eq!(
+        stdout,
+        format!("process {pid}\n/proc/<sibling tid> rc=-1 ENOSYS ran=0\n"),
+        "stderr:\n{log}"
+    );
+    assert!(
+        log.contains(&text),
+        "the refusal must name the process:\n{log}"
+    );
+}
+
+/// `PIDFD_SIGNAL_PROCESS_GROUP` is refused by name, even with signal 0
+/// (https://github.com/rrnewton/hermit/issues/4108): the guest's process group
+/// is inherited from Hermit's, so a group send could reach Hermit and the
+/// processes that started it, and even the existence check would answer for
+/// them. A fail-closed run stops with the policy-refusal status; with
+/// `--allow-unsupported-syscalls` both calls return ENOSYS.
+#[test]
+fn a_process_group_pidfd_signal_is_refused_by_name() {
+    let guest = futex_c_guest(&PIDFD_SEND_SIGNAL_FLAGS_GUEST, "pidfd_send_signal_flags")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let refusal = "by pidfd_send_signal with PIDFD_SIGNAL_PROCESS_GROUP is not supported";
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "--log=error",
+            "run",
+            "--strict",
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+            "pgrp",
+        ]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "stderr:\n{log}"
+    );
+    assert!(
+        log.contains(&format!("signal 0 {refusal}")),
+        "the refusal must name the call:\n{log}"
+    );
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "run",
+            "--allow-unsupported-syscalls",
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+            "pgrp",
+        ]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "stdout:\n{stdout}\nstderr:\n{log}"
+    );
+    assert_eq!(
+        stdout, "process group, signal 0 rc=-1 ENOSYS ran=0\nprocess group rc=-1 ENOSYS ran=0\n",
+        "stderr:\n{log}"
+    );
+    assert!(
+        log.contains(&format!("signal 10 {refusal}")),
+        "the refusal must name the call:\n{log}"
     );
 }
 

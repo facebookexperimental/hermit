@@ -350,7 +350,7 @@ fn logical_time_to_alarm_seconds(value: LogicalTime) -> i64 {
 /// `rt_sigqueueinfo` to it makes the kernel check the siginfo exactly as for
 /// any pid and then answer ESRCH, which is Linux's answer for a gone process
 /// (<https://github.com/rrnewton/hermit/issues/4124>).
-const NO_SUCH_PID: libc::pid_t = libc::pid_t::MAX;
+pub(crate) const NO_SUCH_PID: libc::pid_t = libc::pid_t::MAX;
 
 /// The 128 siginfo bytes at `info`. A page the kernel may write a siginfo to
 /// can lack read permission (`PROT_WRITE` alone), which `process_vm_readv`
@@ -1192,7 +1192,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// `ResourceID::Exit` is the same fence used by `exit_group`. A run without
     /// the installed control (`Unchanged`, including every non-sequentialized
     /// run) keeps its ordinary signal path and reserves nothing.
-    async fn reserve_controlled_self_sigkill_exit<G: Guest<Self>>(
+    pub(crate) async fn reserve_controlled_self_sigkill_exit<G: Guest<Self>>(
         &self,
         guest: &mut G,
         signal: libc::c_int,
@@ -1864,7 +1864,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// fence, which waits for victims that only the send itself kills. The
     /// reservation validated the target against the scheduler's record, so the
     /// send cannot fail in a way the caller sees.
-    async fn send_reserved_sigkill<G: Guest<Self>>(
+    pub(crate) async fn send_reserved_sigkill<G: Guest<Self>>(
         &self,
         guest: &mut G,
         reservation: crate::scheduler::sigkill_retirement::SigkillReservation,

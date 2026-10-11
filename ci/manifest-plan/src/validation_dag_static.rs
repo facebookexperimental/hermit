@@ -1387,7 +1387,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4111): 1049.
     // Three CLI-entry descriptor-keeper controls retain all 1045 prior IDs.
     // The current lib+bins Nextest inventory measured 1048 selected cases.
-    ("test.hermit_unit", 1052),
+    // And metadata::tests::record_version_rejects_streams_that_answered_pidfd_scope_flags_without_an_event
+    // (https://github.com/rrnewton/hermit/issues/4108): 1053.
+    ("test.hermit_unit", 1053),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1933,7 +1935,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // scheduler::test::a_sigkill_arm_on_an_rt_sigsuspend_sleeper_ends_with_its_exit
     // (https://github.com/rrnewton/hermit/issues/3941): 1415.
     // The 14 own-process signal and orphaned-group tests (https://github.com/rrnewton/hermit/issues/4034) retain all 1415: 1429.
-    ("test.detcore_unit", 1429),
+    // And the two pidfd_send_signal scope and descriptor tests (https://github.com/rrnewton/hermit/issues/4108): 1431.
+    ("test.detcore_unit", 1431),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2259,7 +2262,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // record_zero_timeout_epoll_pwait2_beside_a_busy_sibling and
     // record_epoll_pwait2_checks_its_timeout_before_its_mask (Claude review of
     // https://github.com/rrnewton/hermit/pull/4128): 189.
-    ("test.record_replay", 189),
+    // And record_pidfd_send_signal_scope_flags
+    // (https://github.com/rrnewton/hermit/issues/4108): 190.
+    ("test.record_replay", 190),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -2620,7 +2625,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4089) retains all 300: 301.
     // a_cross_process_sigkill_verifies_at_bitwise_parity and a_recorded_kill_of_a_victim_in_a_background_read_is_refused_at_replay (https://github.com/rrnewton/hermit/issues/3994) retain all 301: 303.
     // The four own-process signal CLI tests (https://github.com/rrnewton/hermit/issues/4034) retain all 303: 307.
-    ("test.cli", 307),
+    // And the four pidfd_send_signal flag, process-group, Hermit-directory and sibling tests (https://github.com/rrnewton/hermit/issues/4108): 311.
+    ("test.cli", 311),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2865,7 +2871,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Nor does the pending real-time timer expiration test: 237.
     // Nor do the cross-process SIGKILL parity and record-refusal tests: 239.
     // Nor do the four own-process signal CLI tests: 243.
-    ("test.cli_on_host", 243),
+    // Nor do the four pidfd_send_signal tests: 247.
+    ("test.cli_on_host", 247),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -3016,7 +3023,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the 29 SIGKILL-retirement tests: 1414.
     // And the rt_sigsuspend SIGKILL-arm test: 1415.
     // And the 14 own-process signal tests: 1429.
-    ("test.detcore_unit_on_host", 1429),
+    // And the two pidfd_send_signal scope and descriptor tests: 1431.
+    ("test.detcore_unit_on_host", 1431),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -3158,7 +3166,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4088): 1048.
     // And the orphaned-group record-epoch test: 1049.
     // The identical lib+bins selection includes the three descriptor controls.
-    ("test.hermit_unit_on_host", 1052),
+    // And the pidfd scope-flag record-epoch test: 1053.
+    ("test.hermit_unit_on_host", 1053),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

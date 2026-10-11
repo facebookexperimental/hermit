@@ -733,7 +733,7 @@ fn record_replay_command_with_policy(
     }
 }
 
-fn canonical_record_replay_command(name: &str, program: &Path, args: &[&OsStr]) {
+fn canonical_record_replay_command(name: &str, program: &Path, args: &[&OsStr]) -> String {
     let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
     let verdict_dir = tempfile::tempdir().expect("failed to create verification directory");
     let verdict_path = verdict_dir.path().join("verify.json");
@@ -784,6 +784,7 @@ fn canonical_record_replay_command(name: &str, program: &Path, args: &[&OsStr]) 
             .as_u64()
             .is_some_and(|count| count > 0)
     );
+    combined_output
 }
 
 fn record_then_replay_command(name: &str, program: &Path, args: &[&OsStr]) {
@@ -2372,6 +2373,51 @@ fn record_pidfd_open_modeled_descriptor_ops() {
     let _guard = hermit_record_lock();
     record_replay(workload("c_pidfd_open_self"));
     record_replay(workload("c_pidfd_poll_self"));
+}
+
+/// pidfd_send_signal's scope flags are forwarded and recorded, and an unknown
+/// bit, two scopes and a pipe descriptor are answered EINVAL and EBADF without
+/// an event, identically in record and replay
+/// (https://github.com/rrnewton/hermit/issues/4108).
+#[test]
+fn record_pidfd_send_signal_scope_flags() {
+    let _guard = hermit_record_lock();
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest build directory");
+    let guest = build.path().join("pidfd_send_signal_flags");
+    let output = Command::new("cc")
+        .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+        .arg(repository.join("tests/c/pidfd_send_signal_flags.c"))
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile the pidfd_send_signal_flags guest");
+    assert!(
+        output.status.success(),
+        "guest compilation failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = canonical_record_replay_command(
+        "pidfd_send_signal scope flags",
+        &guest,
+        &[OsStr::new("record")],
+    );
+    for line in [
+        "no flag rc=0 - ran=1\n",
+        "thread rc=0 - ran=1\n",
+        "thread group rc=0 - ran=1\n",
+        "two scopes rc=-1 EINVAL ran=0\n",
+        "unknown flag rc=-1 EINVAL ran=0\n",
+        "pipe rc=-1 EBADF ran=0\n",
+    ] {
+        assert!(
+            output.contains(line),
+            "the guest must print {line:?}:\n{output}"
+        );
+    }
 }
 
 #[test]

@@ -337,7 +337,12 @@ impl RecordVersion {
 // Record and replay refuse the newly admitted signal to the sender's own
 // process (https://github.com/rrnewton/hermit/issues/4034), so that change
 // alters no recording.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x138);
+// 0x138 -> 0x139: pidfd_send_signal with a PIDFD_SIGNAL_THREAD or
+// PIDFD_SIGNAL_THREAD_GROUP flag, or through a /proc/<pid> directory, is
+// forwarded, where Detcore answered EINVAL or EBADF without an event
+// (https://github.com/rrnewton/hermit/issues/4108). An older recording holds no
+// event for such a call, so this replayer would desynchronize at it.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x139);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -362,7 +367,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x138);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x138;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x139;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1093,6 +1098,14 @@ mod tests {
     #[test]
     fn record_version_rejects_pre_sigkill_retirement_streams() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x135)));
+    }
+
+    /// A 0x138 recording holds no event for a pidfd_send_signal with a scope
+    /// flag or a /proc/<pid> descriptor, which this replayer forwards
+    /// (https://github.com/rrnewton/hermit/issues/4108).
+    #[test]
+    fn record_version_rejects_streams_that_answered_pidfd_scope_flags_without_an_event() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x138)));
     }
 
     #[test]

@@ -702,6 +702,147 @@ fn resolved_open_path(pid: i32, fd: RawFd) -> Option<PathBuf> {
     link.is_absolute().then_some(link)
 }
 
+/// The scope `pidfd_send_signal`'s flags select (Linux's `pidfd_send_signal`
+/// since 6.9; <https://github.com/rrnewton/hermit/issues/4108>).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PidfdSignalScope {
+    /// No flag, or `PIDFD_SIGNAL_THREAD_GROUP`: the process (Detcore's
+    /// `pidfd_open` makes no thread pidfds).
+    Process,
+    /// `PIDFD_SIGNAL_THREAD`: the thread whose id is the pid.
+    Thread,
+    /// `PIDFD_SIGNAL_PROCESS_GROUP`: the process's process group.
+    ProcessGroup,
+}
+
+const PIDFD_SIGNAL_THREAD: u32 = 1 << 0;
+const PIDFD_SIGNAL_THREAD_GROUP: u32 = 1 << 1;
+const PIDFD_SIGNAL_PROCESS_GROUP: u32 = 1 << 2;
+
+/// `flags`' scope, or EINVAL as Linux answers: for a bit outside the three
+/// scope flags, or for more than one of them.
+pub(crate) fn pidfd_signal_scope(flags: u32) -> Result<PidfdSignalScope, Errno> {
+    match flags {
+        0 | PIDFD_SIGNAL_THREAD_GROUP => Ok(PidfdSignalScope::Process),
+        PIDFD_SIGNAL_THREAD => Ok(PidfdSignalScope::Thread),
+        PIDFD_SIGNAL_PROCESS_GROUP => Ok(PidfdSignalScope::ProcessGroup),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+/// What a descriptor that is not a modeled pidfd names for `pidfd_send_signal`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ProcessDirectoryDescriptor {
+    /// A `/proc/<pid>` directory of the guest's procfs: Linux takes it as the
+    /// process `<pid>`.
+    Process(DetPid),
+    /// Any other file, which Linux answers EBADF.
+    NotAProcess,
+    /// Detcore cannot tell; the reason names why.
+    Unknown(&'static str),
+}
+
+/// Facts the tracer reads about a guest descriptor (`process_directory_descriptor`).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DescriptorFacts {
+    /// The descriptor's `/proc/<tid>/fd/<fd>` link, as the kernel spells it.
+    pub(crate) link: PathBuf,
+    /// Whether the file is on procfs.
+    pub(crate) on_procfs: bool,
+    /// Whether the file is a directory.
+    pub(crate) is_dir: bool,
+    /// The file's device, and its parent directory's device and inode.
+    pub(crate) dev: u64,
+    pub(crate) parent: Option<(u64, u64)>,
+    /// The device of the procfs mounted at the guest's `/proc`.
+    pub(crate) guest_proc_dev: Option<u64>,
+}
+
+/// The inode of a procfs root directory (Linux's `PROC_ROOT_INO`).
+const PROC_ROOT_INO: u64 = 1;
+
+/// Classify a descriptor from `facts` (`None`: unreadable). Linux's
+/// `tgid_pidfd_to_pid` accepts exactly a procfs process directory, whose name
+/// is its pid in the procfs instance's pid namespace and whose parent is the
+/// procfs root. That instance must be the guest's own, at its `/proc`, so the
+/// pid is a guest pid. A pidfd Detcore did not open cannot be classified.
+pub(crate) fn classify_process_directory(
+    facts: Option<&DescriptorFacts>,
+) -> ProcessDirectoryDescriptor {
+    use ProcessDirectoryDescriptor as D;
+    let Some(facts) = facts else {
+        return D::Unknown("Hermit cannot read what the descriptor names");
+    };
+    let link = facts.link.to_string_lossy();
+    if link == "anon_inode:[pidfd]" || link.starts_with("pidfd:") {
+        return D::Unknown("it is a pidfd that Detcore did not open with pidfd_open");
+    }
+    if !facts.on_procfs {
+        return D::NotAProcess;
+    }
+    if !facts.is_dir {
+        return D::NotAProcess;
+    }
+    let name = facts
+        .link
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    // A reaped task's directory is spelled with " (deleted)", and its ".."
+    // cannot be read (ESRCH); Linux still takes it as the task, and answers
+    // ESRCH for it. The spelling is then the only evidence, so it must be a
+    // top-level entry of the guest's /proc.
+    let name = match name.strip_suffix(" (deleted)") {
+        Some(name) if facts.parent.is_none() => {
+            if facts.link.parent() != Some(Path::new("/proc")) {
+                return if facts.link.starts_with("/proc/") {
+                    D::NotAProcess
+                } else {
+                    D::Unknown("it names a reaped task outside the guest's /proc")
+                };
+            }
+            name.to_owned()
+        }
+        _ if facts.parent != Some((facts.dev, PROC_ROOT_INO)) => return D::NotAProcess,
+        _ => name,
+    };
+    let Ok(pid) = name.parse::<i32>() else {
+        return D::NotAProcess;
+    };
+    if pid <= 0 || name.starts_with(['+', '0']) {
+        return D::NotAProcess;
+    }
+    if facts.guest_proc_dev != Some(facts.dev) {
+        return D::Unknown("it is a procfs that is not the guest's /proc");
+    }
+    D::Process(DetPid::from_raw(pid))
+}
+
+/// Read the facts for the guest descriptor `fd` of thread `tid` through
+/// `/proc/<tid>/fd/<fd>` and classify it (`classify_process_directory`).
+fn process_directory_descriptor(tid: i32, fd: RawFd) -> ProcessDirectoryDescriptor {
+    let facts = (|| {
+        let (link, on_procfs) = descriptor_identity(tid, fd)?;
+        let target = std::fs::metadata(format!("/proc/{tid}/fd/{fd}")).ok()?;
+        let parent = std::fs::metadata(format!("/proc/{tid}/fd/{fd}/.."))
+            .ok()
+            .map(|parent| (parent.dev(), parent.ino()));
+        let guest_proc_dev = std::fs::metadata(format!("/proc/{tid}/root/proc"))
+            .ok()
+            .filter(|proc| proc.ino() == PROC_ROOT_INO)
+            .map(|proc| proc.dev());
+        Some(DescriptorFacts {
+            link,
+            on_procfs,
+            is_dir: target.is_dir(),
+            dev: target.dev(),
+            parent: if target.is_dir() { parent } else { None },
+            guest_proc_dev,
+        })
+    })();
+    classify_process_directory(facts.as_ref())
+}
+
 /// The host's default huge page size (`Hugepagesize` in /proc/meminfo), the
 /// size of a MAP_HUGETLB mapping that names none, or 2 MiB, the x86_64
 /// default, when it cannot be read (see [`may_change_untraced_code`]).
@@ -6676,14 +6817,23 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// and then tell the scheduler that the signal is pending for its receiver
     /// (`notify_cross_task_signal`), so that a receiver parked in a blocking call
     /// is woken. This handler does the same for a process with one live thread
-    /// (<https://github.com/rrnewton/hermit/issues/4099>). It also adds
-    /// deterministic argument validation ahead of the forward: a descriptor
-    /// that Detcore does not model as a pidfd fails
-    /// closed with `EBADF`, and the flags field the current kernel reserves is
-    /// required to be zero (`EINVAL` otherwise), so the guest-visible errno is
-    /// fixed and host-independent. A process-directed signal to a process with
-    /// several live threads is refused by name, as `kill` refuses it
-    /// (`Detcore::process_signal_target`).
+    /// (<https://github.com/rrnewton/hermit/issues/4099>).
+    ///
+    /// The flags and the descriptor are decided as Linux decides them, ahead of
+    /// the forward (<https://github.com/rrnewton/hermit/issues/4108>):
+    /// - an unknown flag bit, or more than one of the three scope flags, is
+    ///   EINVAL; `PIDFD_SIGNAL_THREAD_GROUP` is the scope a process pidfd has
+    ///   anyway, and `PIDFD_SIGNAL_THREAD` sends to the thread whose id is the
+    ///   pid, as `tgkill(pid, pid)` does; `PIDFD_SIGNAL_PROCESS_GROUP` is
+    ///   refused by name, even with signal 0, whose answer would come from the
+    ///   process group the guest inherits from Hermit;
+    /// - a descriptor names a process when it is a pidfd from `pidfd_open` or
+    ///   a `/proc/<pid>` directory of the guest's procfs
+    ///   (`process_directory_descriptor`); any other file is EBADF, and a
+    ///   descriptor Detcore cannot classify is refused by name.
+    ///
+    /// A process-directed signal to a process with several live threads is
+    /// refused by name, as `kill` refuses it (`Detcore::process_signal_target`).
     ///
     /// `call` is the raw `Syscall::Other`; `pidfd`/`flags` are pre-extracted from
     /// its arguments by the dispatcher.
@@ -6695,49 +6845,182 @@ impl<T: RecordOrReplay> Detcore<T> {
         signal: i32,
         flags: u32,
     ) -> Result<i64, Error> {
-        // The kernel currently reserves `flags`; a nonzero value is EINVAL.
-        if flags != 0 {
-            return Err(Errno::EINVAL.into());
-        }
-        // Fail closed unless Detcore models this descriptor as a pidfd. This also
-        // yields a deterministic EBADF for an unknown/closed descriptor.
-        let is_pidfd = guest
+        // Linux checks the flags before it looks at the descriptor.
+        let scope = pidfd_signal_scope(flags)?;
+        // An unknown or closed descriptor is EBADF, and so is any file that is
+        // neither a pidfd nor an opened path (a pipe, a socket, an eventfd...).
+        // Linux's fdget skips an O_PATH descriptor, so it is EBADF too.
+        let kind = guest
             .thread_state()
-            .with_detfd(pidfd, |detfd| matches!(detfd.ty(), FdType::Pidfd))?;
-        if !is_pidfd {
+            .with_detfd(pidfd, |detfd| match detfd.ty() {
+                FdType::Pidfd => Some(Some(detfd.pidfd_target())),
+                FdType::Regular if detfd.status_flags() & libc::O_PATH == 0 => Some(None),
+                _ => None,
+            })?;
+        let Some(kind) = kind else {
             return Err(Errno::EBADF.into());
+        };
+        // `named` is the pid the descriptor names. A pidfd from `pidfd_open`
+        // names a process leader; a `/proc/<tid>` directory may name any thread,
+        // whose process is its leader's (https://github.com/rrnewton/hermit/issues/4094).
+        let named = match kind {
+            Some(target) => target,
+            None => {
+                let descriptor = if self.cfg.recordreplay_modes {
+                    // Replay holds a placeholder for a reopened file, so the
+                    // descriptor cannot be read the same way in both.
+                    ProcessDirectoryDescriptor::Unknown(
+                        "record and replay do not read what a descriptor names",
+                    )
+                } else if !guest
+                    .config()
+                    .backend_supports_blocked_wait_signal_interruption
+                {
+                    // Only on ptrace are the guest's thread ids the host's, so
+                    // that its descriptors can be read through /proc/<tid>.
+                    ProcessDirectoryDescriptor::Unknown(
+                        "this backend's guest thread ids are not host thread ids",
+                    )
+                } else {
+                    process_directory_descriptor(guest.tid().as_raw(), pidfd)
+                };
+                match descriptor {
+                    ProcessDirectoryDescriptor::Process(task)
+                        if crate::tool_global::names_hermit_task(guest, None, task.as_raw())
+                            .await =>
+                    {
+                        // Any of Hermit's threads, as a `kill` naming one is
+                        // dropped and `pidfd_open` of Hermit's process is refused
+                        // (https://github.com/rrnewton/hermit/issues/4066).
+                        tracing::info!(
+                            "[detcore, dtid {}] pidfd_send_signal through /proc/{}, one of \
+                             Hermit's own threads: refused with EPERM",
+                            guest.thread_state().dettid,
+                            task,
+                        );
+                        return Err(Errno::EPERM.into());
+                    }
+                    ProcessDirectoryDescriptor::Process(task) => Some(task),
+                    ProcessDirectoryDescriptor::NotAProcess => return Err(Errno::EBADF.into()),
+                    ProcessDirectoryDescriptor::Unknown(reason) => {
+                        tracing::error!(
+                            "[detcore, dtid {}] pidfd_send_signal through descriptor {} is not \
+                             supported: {} (https://github.com/rrnewton/hermit/issues/4108)",
+                            guest.thread_state().dettid,
+                            pidfd,
+                            reason,
+                        );
+                        return self
+                            .refuse_unserviceable_operation(
+                                guest,
+                                Sysno::pidfd_send_signal,
+                                Errno::ENOSYS,
+                            )
+                            .await;
+                    }
+                }
+            }
+        };
+        if scope == PidfdSignalScope::ProcessGroup {
+            tracing::error!(
+                "[detcore, dtid {}] signal {} by pidfd_send_signal with PIDFD_SIGNAL_PROCESS_GROUP \
+                 is not supported: Detcore does not model process-group membership, and the \
+                 guest's process group is inherited from Hermit's \
+                 (https://github.com/rrnewton/hermit/issues/4108)",
+                guest.thread_state().dettid,
+                signal,
+            );
+            return self
+                .refuse_unserviceable_operation(guest, Sysno::pidfd_send_signal, Errno::ENOSYS)
+                .await;
         }
+        let process = match named {
+            Some(named) => Some(signal_target_process(guest, named).await.unwrap_or(named)),
+            None => None,
+        };
+        // A process Detcore saw exit and that is gone is ESRCH, as Linux
+        // answers once it is reaped, whatever the host has reaped by now
+        // (https://github.com/rrnewton/hermit/issues/4091).
+        if guest.config().sequentialize_threads
+            && let Some(process) = process
+        {
+            let (targets, zombie) = resolve_kill_targets_and_exit(guest, process).await;
+            if targets.is_empty() && zombie == Some(false) {
+                return self.gone_pidfd_signal_answer(guest, call, signal).await;
+            }
+        }
+        // The thread scope sends to the thread whose id is the pid, like
+        // `tgkill(pid, pid)`; the process scope to its process.
+        let thread_scope = scope == PidfdSignalScope::Thread;
+        let receiver_id = if thread_scope { named } else { process };
         self.record_orphaned_group_signals(guest, signal).await;
         if signal == libc::SIGALRM {
             // `pidfd_open` records the process a pidfd names; a pidfd with no
             // recorded target is refused while any process handles SIGALRM.
-            let control = match guest
-                .thread_state()
-                .with_detfd(pidfd, |detfd| detfd.pidfd_target())?
-            {
+            let control = match receiver_id {
                 Some(target) => SigalrmControl::SendTo(DetTid::from_raw(target.as_raw())),
                 None => SigalrmControl::SendToUnnamed,
             };
             refuse_sigalrm(guest, control).await?;
         }
-        // A pidfd names a whole process (Detcore's pidfd_open accepts no
-        // PIDFD_THREAD), so this is a process-directed signal. To a process
-        // with two or more live threads it is refused by name as `kill` refuses
-        // it: Linux's complete_signal picks the receiving thread, which Detcore
-        // does not model (https://github.com/rrnewton/hermit/issues/4047).
-        // Everything else is forwarded and the kernel answers: signal 0, which
-        // only checks that the process exists; SIGKILL, which kills the whole
-        // group whichever thread it reaches (the scheduler is told below); a
-        // process with one live thread, whose receiver the scheduler is then
-        // told about, as `kill` does; and a process with none (a zombie, which
-        // Linux still signals successfully).
+        if signal == libc::SIGKILL
+            && guest.config().sequentialize_threads
+            && let (Some(process), Some(receiver)) = (process, receiver_id)
+        {
+            // A SIGKILL ends the whole process whichever thread it names, and
+            // is retired at this turn as `kill`'s and `tgkill`'s are
+            // (https://github.com/rrnewton/hermit/issues/3994).
+            if self
+                .reserve_controlled_self_sigkill_exit(
+                    guest,
+                    signal,
+                    Some(process),
+                    thread_scope.then(|| DetTid::from_raw(receiver.as_raw())),
+                )
+                .await
+            {
+                return Ok(self.record_or_replay(guest, call).await?);
+            }
+            if let Some(reservation) =
+                reserve_sigkill(guest, DetTid::from_raw(receiver.as_raw())).await
+            {
+                return self.send_reserved_sigkill(guest, reservation, call).await;
+            }
+        }
+        if thread_scope {
+            let value = self.record_or_replay(guest, call).await?;
+            if let (Some(thread), Some(process)) = (named, process) {
+                let thread = DetTid::from_raw(thread.as_raw());
+                if signal == libc::SIGKILL {
+                    crate::tool_global::notify_signal_pending(
+                        guest,
+                        thread,
+                        SigWrapper(libc::SIGKILL),
+                        Some(process),
+                    )
+                    .await;
+                } else {
+                    self.notify_cross_task_signal(guest, thread, signal, Some(process))
+                        .await;
+                }
+            }
+            return Ok(value);
+        }
+        // A process-directed signal. To a process with two or more live threads
+        // it is refused by name as `kill` refuses it: Linux's complete_signal
+        // picks the receiving thread, which Detcore does not model
+        // (https://github.com/rrnewton/hermit/issues/4047). Everything else is
+        // forwarded and the kernel answers: signal 0, which only checks that
+        // the process exists; a SIGKILL that could not be reserved, which kills
+        // the whole group whichever thread it reaches (the scheduler is told
+        // below); a process with one live thread, whose receiver the scheduler
+        // is then told about, as `kill` does; and a process with none (a
+        // zombie, which Linux still signals successfully).
         let mut receiver = None;
         if signal != 0
             && signal != libc::SIGKILL
             && guest.config().sequentialize_threads
-            && let Some(target) = guest
-                .thread_state()
-                .with_detfd(pidfd, |detfd| detfd.pidfd_target())?
+            && let Some(target) = process
         {
             match resolve_kill_targets(guest, target).await.as_slice() {
                 [] => {}
@@ -6765,10 +7048,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // A process killed through a pidfd will die; the scheduler must
             // not count a wait for it as part of a deadlock
             // (https://github.com/rrnewton/hermit/issues/3904).
-            match guest
-                .thread_state()
-                .with_detfd(pidfd, |detfd| detfd.pidfd_target())?
-            {
+            match process {
                 Some(target) => {
                     crate::tool_global::notify_signal_pending(
                         guest,
@@ -6782,6 +7062,64 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         }
         Ok(value)
+    }
+
+    /// The answer to a `pidfd_send_signal` whose target Detcore saw exit and
+    /// that is gone, in Linux's order: a non-NULL `info` is copied and its
+    /// layout checked against its own `si_signo` (EFAULT, E2BIG), then that
+    /// `si_signo` against the signal (EINVAL), then a forged `si_code`
+    /// (EPERM), and only then is the task missing (ESRCH). The copy, the layout
+    /// check and the `si_code` check are the kernel's: the same `info` goes to
+    /// `rt_sigqueueinfo` naming a pid no task can have, which makes those
+    /// checks and sends nothing (as
+    /// <https://github.com/rrnewton/hermit/issues/4124> does for that call).
+    /// `rt_sigqueueinfo` checks the layout against the signal it is given, so
+    /// it is given the info's own `si_signo`.
+    async fn gone_pidfd_signal_answer<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+        signal: i32,
+    ) -> Result<i64, Error> {
+        let info = match call {
+            Syscall::Other(_, args) => args.arg2,
+            _ => 0,
+        };
+        let Some(info) = AddrMut::<libc::siginfo_t>::from_raw(info) else {
+            return Err(Errno::ESRCH.into());
+        };
+        let signo = guest.memory().read_value(info.cast::<libc::c_int>()).ok();
+        let checked = guest
+            .inject(
+                syscalls::RtSigqueueinfo::new()
+                    .with_tgid(super::signal::NO_SUCH_PID)
+                    .with_sig(signo.unwrap_or(signal))
+                    .with_siginfo(Some(info)),
+            )
+            .await;
+        let answer = match checked {
+            Err(errno @ (Errno::EPERM | Errno::ESRCH)) => errno,
+            Err(errno) => return Err(errno.into()),
+            Ok(_) => Errno::ESRCH,
+        };
+        // The copy succeeded, so the kernel could read `si_signo`; a page
+        // only the kernel reaches (`[vvar]`) cannot be decided here.
+        let Some(signo) = signo else {
+            tracing::error!(
+                "[detcore, dtid {}] pidfd_send_signal to a gone process with a siginfo_t at \
+                 {:#x} is not supported: Hermit cannot read its si_signo \
+                 (https://github.com/rrnewton/hermit/issues/4108)",
+                guest.thread_state().dettid,
+                info.as_raw(),
+            );
+            return self
+                .refuse_unserviceable_operation(guest, Sysno::pidfd_send_signal, Errno::ENOSYS)
+                .await;
+        };
+        if signo != signal {
+            return Err(Errno::EINVAL.into());
+        }
+        Err(answer.into())
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -9438,14 +9776,23 @@ mod rebound_path_tests {
 #[cfg(test)]
 mod untraced_code_tests {
     use std::path::Path;
+    use std::path::PathBuf;
 
     use nix::fcntl::OFlag;
+    use reverie::syscalls::Errno;
     use reverie::syscalls::SyscallArgs;
     use reverie::syscalls::Sysno;
 
+    use super::DescriptorFacts;
+    use super::DetPid;
+    use super::PROC_ROOT_INO;
+    use super::PidfdSignalScope;
+    use super::ProcessDirectoryDescriptor;
+    use super::classify_process_directory;
     use super::descriptor_identity;
     use super::may_change_untraced_code;
     use super::may_write_process_memory;
+    use super::pidfd_signal_scope;
 
     const PAGE: (u64, u64) = (0x7100_0000, 0x7100_1000);
 
@@ -9698,6 +10045,134 @@ mod untraced_code_tests {
                 "{label}"
             );
         }
+    }
+
+    /// `pidfd_send_signal`'s flags select one scope, as Linux's do; an unknown
+    /// bit or two scopes are EINVAL (https://github.com/rrnewton/hermit/issues/4108).
+    #[test]
+    fn pidfd_signal_flags_select_one_scope() {
+        assert_eq!(pidfd_signal_scope(0), Ok(PidfdSignalScope::Process));
+        assert_eq!(pidfd_signal_scope(1), Ok(PidfdSignalScope::Thread));
+        assert_eq!(pidfd_signal_scope(2), Ok(PidfdSignalScope::Process));
+        assert_eq!(pidfd_signal_scope(4), Ok(PidfdSignalScope::ProcessGroup));
+        for flags in [3, 5, 6, 7, 8, 9, 1 << 31, u32::MAX] {
+            assert_eq!(pidfd_signal_scope(flags), Err(Errno::EINVAL), "{flags:#x}");
+        }
+    }
+
+    /// A descriptor names a process for `pidfd_send_signal` only when it is a
+    /// directory whose parent is the root of the guest's procfs and whose name
+    /// is a pid; another file is EBADF, and a pidfd Detcore did not open, an
+    /// unreadable descriptor or another procfs instance cannot be classified.
+    #[test]
+    fn a_proc_process_directory_names_its_process() {
+        use ProcessDirectoryDescriptor as D;
+        let procfs = |link: &str, parent: Option<(u64, u64)>| DescriptorFacts {
+            link: PathBuf::from(link),
+            on_procfs: true,
+            is_dir: parent.is_some(),
+            dev: 22,
+            parent,
+            guest_proc_dev: Some(22),
+        };
+        let reaped = |link: &str| DescriptorFacts {
+            is_dir: true,
+            ..procfs(link, None)
+        };
+        let root = Some((22, PROC_ROOT_INO));
+        let cases = [
+            (
+                "process",
+                procfs("/proc/3", root),
+                D::Process(DetPid::from_raw(3)),
+            ),
+            (
+                "reaped process",
+                reaped("/proc/7 (deleted)"),
+                D::Process(DetPid::from_raw(7)),
+            ),
+            (
+                "reaped task directory",
+                reaped("/proc/7/task/8 (deleted)"),
+                D::NotAProcess,
+            ),
+            (
+                "reaped elsewhere",
+                reaped("/mnt/p/7 (deleted)"),
+                D::Unknown("it names a reaped task outside the guest's /proc"),
+            ),
+            (
+                "procfs mounted elsewhere",
+                procfs("/mnt/p/3", root),
+                D::Process(DetPid::from_raw(3)),
+            ),
+            (
+                "task directory",
+                procfs("/proc/3/task/3", Some((22, 4000))),
+                D::NotAProcess,
+            ),
+            (
+                "procfs file",
+                procfs("/proc/3/status", None),
+                D::NotAProcess,
+            ),
+            (
+                "named root entry",
+                procfs("/proc/sys", root),
+                D::NotAProcess,
+            ),
+            ("pid zero", procfs("/proc/0", root), D::NotAProcess),
+            ("leading zero", procfs("/proc/03", root), D::NotAProcess),
+            ("signed", procfs("/proc/+3", root), D::NotAProcess),
+            (
+                "another procfs root",
+                procfs("/proc/3", Some((23, PROC_ROOT_INO))),
+                D::NotAProcess,
+            ),
+            (
+                "not the guest's procfs",
+                DescriptorFacts {
+                    guest_proc_dev: Some(99),
+                    ..procfs("/proc/3", root)
+                },
+                D::Unknown("it is a procfs that is not the guest's /proc"),
+            ),
+            (
+                "ordinary directory",
+                DescriptorFacts {
+                    on_procfs: false,
+                    ..procfs("/tmp/3", root)
+                },
+                D::NotAProcess,
+            ),
+            (
+                "pidfd",
+                DescriptorFacts {
+                    on_procfs: false,
+                    ..procfs("anon_inode:[pidfd]", None)
+                },
+                D::Unknown("it is a pidfd that Detcore did not open with pidfd_open"),
+            ),
+            (
+                "pidfs pidfd",
+                DescriptorFacts {
+                    on_procfs: false,
+                    ..procfs("pidfd:[1234]", None)
+                },
+                D::Unknown("it is a pidfd that Detcore did not open with pidfd_open"),
+            ),
+        ];
+        for (label, facts, expected) in cases {
+            assert_eq!(
+                classify_process_directory(Some(&facts)),
+                expected,
+                "{label}"
+            );
+        }
+        assert_eq!(
+            classify_process_directory(None),
+            D::Unknown("Hermit cannot read what the descriptor names")
+        );
     }
 
     /// A write-mode open counts when its descriptor is a procfs file named

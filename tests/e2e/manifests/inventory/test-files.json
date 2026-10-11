@@ -1208,6 +1208,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/pidfd_send_signal_flags.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/pidfd_send_signal_flags.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration tests pidfd_send_signal_flags_and_proc_descriptors_answer_as_linux_does_at_bitwise_parity, a_process_group_pidfd_signal_is_refused_by_name, a_pidfd_signal_through_hermits_own_proc_directories_is_eperm and a_pidfd_signal_through_a_siblings_proc_directory_names_the_process, and record_replay.rs record_pidfd_send_signal_scope_flags, compile this guest, which sends pidfd_send_signal with each scope flag and through /proc descriptors, and require Linux's measured output at bitwise parity, EPERM for Hermit's own directories, and named refusals for PIDFD_SIGNAL_PROCESS_GROUP and a sibling's directory (https://github.com/rrnewton/hermit/issues/4108); it remains a guest fixture because a generic manifest cannot assert this exact output or refusal."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/pidfd_send_signal_multithread.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/pidfd_send_signal_multithread.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_pidfd_signal_to_several_threads_is_refused_by_name compiles this guest, which sends pidfd_send_signal to its own process with one thread and then two, and requires delivery with one thread, the policy-refusal status naming pidfd_send_signal under a fail-closed run, and ENOSYS with --allow-unsupported-syscalls (https://github.com/rrnewton/hermit/issues/4047); it remains a guest fixture because a generic manifest cannot assert this exact output or refusal status."
