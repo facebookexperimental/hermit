@@ -151,9 +151,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// `record_or_replay_blocking_with_unknown_mask`, running `after_grant` once
-    /// the scheduler has granted the call and before it runs: the point at
-    /// which a recorded call entered the kernel, after any sibling that ran
-    /// while the request waited.
+    /// the scheduler has granted the call and before it runs: after any
+    /// sibling that ran while the request waited. In replay nothing else runs
+    /// until the served call finishes; in recording a sibling turn may still
+    /// run before the call enters the kernel.
     pub async fn record_or_replay_blocking_with_unknown_mask_then<G: Guest<Self>>(
         &self,
         guest: &mut G,

@@ -290,23 +290,34 @@ fn ppoll_waits_use_nonblocking_probes_and_verify() {
         .arg(format!("--data-dir={}", trace_recording.path().display()))
         .arg("--")
         .arg(&guest)
-        .arg("masked-fail-closed");
+        .arg("masked-record-kernel-wait");
     let record_trace_output = command_output(record_trace_command, "strict ppoll record trace");
     let record_trace_stdout = String::from_utf8_lossy(&record_trace_output.stdout);
     let record_trace_stderr = String::from_utf8_lossy(&record_trace_output.stderr);
+    // Under record a masked ppoll that may wait is a kernel wait outside the
+    // turn, as a masked pselect6 is (https://github.com/rrnewton/hermit/issues/4042):
+    // the Recorder sees the guest's own non-zero timeout, not a zero-time
+    // probe, and the call holds a BlockingExternalIO resource. The guest
+    // requires the drained pipe's wait to time out with 0, as on Linux; a
+    // sequentialized run still fails it closed (the default workload above,
+    // under `run --strict`, checks ENOSYS).
+    assert!(
+        record_trace_stdout.contains("ppoll-simulation-ok"),
+        "masked record ppoll guest failed\nstdout:\n{record_trace_stdout}\nstderr:\n{record_trace_stderr}",
+    );
     assert!(
         record_trace_stderr.lines().any(|line| {
             line.contains("Recorder observed ppoll input")
                 && line.contains("has_signal_mask=true")
-                && line.contains("timeout_is_zero=true")
+                && line.contains("timeout_is_zero=false")
         }),
-        "masked zero-time ppoll probe did not reach Recorder\nstdout:\n{record_trace_stdout}\nstderr:\n{record_trace_stderr}",
+        "masked ppoll kernel wait did not reach Recorder\nstdout:\n{record_trace_stdout}\nstderr:\n{record_trace_stderr}",
     );
     assert!(
-        !record_trace_stderr
+        record_trace_stderr
             .lines()
             .any(|line| { line.contains("BlockingExternalIO") && line.contains("ppoll") }),
-        "masked ppoll used a BlockingExternalIO resource\nstdout:\n{record_trace_stdout}\nstderr:\n{record_trace_stderr}",
+        "masked ppoll did not wait outside the turn\nstdout:\n{record_trace_stdout}\nstderr:\n{record_trace_stderr}",
     );
 
     for backend in ["ptrace", "dbt"] {

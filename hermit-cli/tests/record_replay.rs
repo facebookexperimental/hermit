@@ -2802,6 +2802,16 @@ fn record_zero_timeout_pselect_whose_mask_a_sibling_toggles() {
     record_select_mode("pselect-mask-zero-race");
 }
 
+/// A masked pselect6 with a non-zero timeout whose mask buffer a sibling
+/// clears while the call's scheduler request waits: recording's kernel copied
+/// the cleared mask after the grant, and replay read the buffer at the call's
+/// entry, so it delivered under the old mask (review of
+/// https://github.com/rrnewton/hermit/pull/4084).
+#[test]
+fn record_pselect_whose_mask_a_sibling_clears_before_the_grant() {
+    record_select_mode("pselect-mask-hook-race");
+}
+
 /// The zero-timeout ppoll raise on a stack 160 bytes into its page, whose red
 /// zone the replayed delivery must leave as it found it (review of
 /// https://github.com/rrnewton/hermit/pull/4084).

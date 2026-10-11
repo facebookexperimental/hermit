@@ -815,12 +815,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             // scheduler records no mask for such a call
             // (`Resources::blocked_signal_mask_unknown`). Without a wrapper the
             // call sleeps under the thread's own mask, which the scheduler reads.
-            // Replay reads the temporary mask where the recorded call entered
-            // the kernel and copied it: once the scheduler has granted the
-            // call, after any sibling that ran while the request waited, and
-            // before the served call, while which a sibling may rewrite the
-            // buffer (review of https://github.com/rrnewton/hermit/pull/4052;
-            // review of https://github.com/rrnewton/hermit/pull/4084). A zero
+            // Replay reads the temporary mask once the scheduler has granted
+            // the call: after any sibling that ran while the request waited,
+            // and before the served call, during which a sibling may rewrite
+            // the buffer (review of https://github.com/rrnewton/hermit/pull/4052;
+            // review of https://github.com/rrnewton/hermit/pull/4084). That is
+            // the mask recording's kernel copied when no sibling turn ran
+            // between the grant and the call's entry into the kernel; a
+            // recorded call that a sibling raced there is not reproduced. A zero
             // timeout does not change that: Linux still installs the mask and
             // ends the call with ERESTARTNOHAND for a pending signal it
             // unblocks (https://github.com/rrnewton/hermit/issues/4054).
@@ -1607,8 +1609,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             };
             // A masked record/replay wait sleeps under a temporary mask the
             // scheduler records as unknown, as a masked pselect6's does
-            // (`Resources::blocked_signal_mask_unknown`); this turn cannot
-            // vouch for when the kernel installs it. The result has no `?`: an
+            // (`Resources::blocked_signal_mask_unknown`), although Hermit knows
+            // it exactly. A known mask would let the scheduler wait for the
+            // kernel to install it, and replay serves the call from the
+            // recording without the kernel ever doing so; recording and replay
+            // must schedule the call alike. The result has no `?`: an
             // interruption must reach the replay delivery below.
             let result: Result<i64, Error> =
                 if self.cfg.recordreplay_modes && temporary_mask.is_some() {

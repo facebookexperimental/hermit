@@ -96,6 +96,16 @@
  *                same sequence, which it did not when it read the buffer before
  *                the call's scheduler turn (review of
  *                https://github.com/rrnewton/hermit/pull/4084)
+ *   pselect-mask-hook-race
+ *                a raw pselect6 with a 1 s timeout and a mask buffer holding
+ *                SIGALRM, which the thread blocks, while a 100 ms ITIMER_REAL
+ *                runs; a sibling clears the buffer once, just after the main
+ *                thread announces its call, while the call's scheduler request
+ *                waits. The kernel copies the mask when the call enters it: an
+ *                empty mask gives EINTR with the handler run, the old one 0 at
+ *                the timeout. Replay must read the mask where recording's
+ *                kernel did, after the grant, not at the call's entry (review
+ *                of https://github.com/rrnewton/hermit/pull/4084)
  *   ppoll-mask-zero-raise-tight
  *                the ppoll zero-timeout raise on a stack 160 bytes into a
  *                writable page with an inaccessible page below it, with the
@@ -1106,6 +1116,66 @@ static int ppoll_mask_alarm(int blocks) {
   return 0;
 }
 
+static volatile uint64_t hook_mask = UINT64_C(1) << (SIGALRM - 1);
+static struct pselect_mask_wrapper hook_wrapper = {(const void*)&hook_mask, 8};
+static atomic_int hook_announced;
+
+static void* clear_hook_mask(void* arg) {
+  (void)arg;
+  while (!atomic_load(&hook_announced)) {
+    sched_yield();
+  }
+  hook_mask = 0;
+  return NULL;
+}
+
+static int pselect_mask_hook_race(void) {
+  struct sigaction action;
+  memset(&action, 0, sizeof action);
+  action.sa_handler = count_masked_alarm;
+  sigset_t alarm_set;
+  sigemptyset(&alarm_set);
+  sigaddset(&alarm_set, SIGALRM);
+  if (sigaction(SIGALRM, &action, NULL) != 0 ||
+      pthread_sigmask(SIG_BLOCK, &alarm_set, NULL) != 0) {
+    perror("setup");
+    return 1;
+  }
+  pthread_t clearer;
+  if (pthread_create(&clearer, NULL, clear_hook_mask, NULL) != 0) {
+    perror("pthread_create");
+    return 1;
+  }
+  struct itimerval alarm_in = {{0, 0}, {0, 100000}};
+  if (setitimer(ITIMER_REAL, &alarm_in, NULL) != 0) {
+    perror("setitimer");
+    return 1;
+  }
+  struct timespec bound = {1, 0};
+  atomic_store(&hook_announced, 1);
+  errno = 0;
+  long result = syscall(SYS_pselect6, 0, NULL, NULL, NULL, &bound, &hook_wrapper);
+  int result_errno = errno;
+  int handled = (int)masked_alarms;
+  if (pthread_join(clearer, NULL) != 0) {
+    perror("pthread_join");
+    return 1;
+  }
+  printf(
+      "%-24s result=%011ld errno=%011d alarms=%01d\n",
+      "pselect-hook-race",
+      result,
+      result < 0 ? result_errno : 0,
+      handled);
+  int interrupted = result == -1 && result_errno == EINTR && handled == 1;
+  int timed_out = result == 0 && handled == 0;
+  if (!interrupted && !timed_out) {
+    fprintf(stderr, "pselect-mask-hook-race mismatch\n");
+    return 1;
+  }
+  return 0;
+}
+
 /* Six-argument syscall on a switched stack: `args` holds the five arguments.
  * No instruction between the stack switch and its restoration touches the
  * stack. */
@@ -1336,7 +1406,7 @@ int main(int argc, char** argv) {
         "pselect-mask-unblocks-tight-stack|pselect-mask-zero-raise|"
         "ppoll-mask-zero-raise|ppoll-mask-blocks-alarm|"
         "ppoll-mask-unblocks-alarm|pselect-mask-zero-race|"
-        "ppoll-mask-zero-raise-tight]\n",
+        "ppoll-mask-zero-raise-tight|pselect-mask-hook-race]\n",
         argv[0]);
     return 2;
   }
@@ -1387,6 +1457,9 @@ int main(int argc, char** argv) {
   }
   if (strcmp(argv[1], "ppoll-mask-zero-raise-tight") == 0) {
     return ppoll_mask_zero_raise_tight();
+  }
+  if (strcmp(argv[1], "pselect-mask-hook-race") == 0) {
+    return pselect_mask_hook_race();
   }
   if (strcmp(argv[1], "efault") == 0) {
     return efault();

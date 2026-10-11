@@ -335,7 +335,11 @@ static int run_masked_readonly_zero_timeout(void) {
   return 0;
 }
 
-static int run_masked_fail_closed(void) {
+/* A masked ppoll on a ready pipe, then on the drained pipe with a 1 ms
+ * timeout. A sequentialized run fails the blocking call closed with ENOSYS;
+ * record and replay let the kernel own the wait, which times out with 0
+ * (https://github.com/rrnewton/hermit/issues/4042). */
+static int run_masked_fail_closed(int recording) {
   int pipefd[2];
   if (pipe(pipefd) != 0 || write(pipefd[1], "r", 1) != 1) {
     perror("masked fail-closed ready pipe");
@@ -360,12 +364,15 @@ static int run_masked_fail_closed(void) {
   fd.revents = 0;
   struct timespec blocked_timeout = {.tv_sec = 0, .tv_nsec = 1000000};
   errno = 0;
-  if (ppoll(&fd, 1, &blocked_timeout, &mask) != -1 || errno != ENOSYS) {
+  int blocked = ppoll(&fd, 1, &blocked_timeout, &mask);
+  if (recording ? blocked != 0 : blocked != -1 || errno != ENOSYS) {
     fprintf(
         stderr,
-        "blocking masked ppoll did not fail closed: errno=%d revents=%d\n",
+        "blocking masked ppoll: result=%d errno=%d revents=%d, expected %s\n",
+        blocked,
         errno,
-        fd.revents);
+        fd.revents,
+        recording ? "0 after the kernel's timeout" : "ENOSYS");
     return 1;
   }
 
@@ -422,7 +429,7 @@ static int run_inaccessible_mask_kernel_wait(void) {
   return 0;
 }
 
-static int run_default_workload(void) {
+static int run_default_workload(int recording) {
   int pipefd[2];
   if (pipe(pipefd) != 0 || write(pipefd[1], "r", 1) != 1) {
     perror("ready pipe");
@@ -488,9 +495,14 @@ static int run_default_workload(void) {
 
   struct timespec masked_timeout = {.tv_sec = 0, .tv_nsec = 1000000};
   errno = 0;
-  if (ppoll(&ready, 1, &masked_timeout, &mask) != -1 || errno != ENOSYS) {
+  int masked = ppoll(&ready, 1, &masked_timeout, &mask);
+  if (recording ? masked != 0 : masked != -1 || errno != ENOSYS) {
     fprintf(
-        stderr, "blocking masked ppoll did not fail closed: errno=%d\n", errno);
+        stderr,
+        "blocking masked ppoll: result=%d errno=%d, expected %s\n",
+        masked,
+        errno,
+        recording ? "0 after the kernel's timeout" : "ENOSYS");
     return 1;
   }
 
@@ -525,13 +537,14 @@ static int run_default_workload(void) {
 
 int main(int argc, char** argv) {
   if (argc == 1) {
-    return run_default_workload();
+    return run_default_workload(0);
   }
   if (argc != 2) {
     fprintf(
         stderr,
         "usage: %s [raw-timeout-copyout|masked-readonly-timeout|"
         "masked-readonly-zero-timeout|masked-fail-closed|"
+        "masked-record-kernel-wait|"
         "inaccessible-mask-kernel-wait|record-replay|zero-timeout-alias]\n",
         argv[0]);
     return 2;
@@ -548,7 +561,7 @@ int main(int argc, char** argv) {
     if (result == 0) {
       result = run_invalid_nfds();
     }
-    return result == 0 ? run_default_workload() : result;
+    return result == 0 ? run_default_workload(1) : result;
   }
   if (strcmp(argv[1], "masked-readonly-timeout") == 0) {
     int result = run_masked_readonly_timeout();
@@ -565,7 +578,14 @@ int main(int argc, char** argv) {
     return result;
   }
   if (strcmp(argv[1], "masked-fail-closed") == 0) {
-    int result = run_masked_fail_closed();
+    int result = run_masked_fail_closed(0);
+    if (result == 0) {
+      puts("ppoll-simulation-ok");
+    }
+    return result;
+  }
+  if (strcmp(argv[1], "masked-record-kernel-wait") == 0) {
+    int result = run_masked_fail_closed(1);
     if (result == 0) {
       puts("ppoll-simulation-ok");
     }
