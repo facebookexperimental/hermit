@@ -508,8 +508,11 @@ jobs:
       parity_archive_count: ${{ steps.cells.outputs.archive_count }}
     steps:
       - uses: actions/checkout@v4
-      - name: Initialize dagrun submodule
-        run: git submodule update --init agent-utils
+      # hermit-cli/tests/liteinst_allocator.rs compiles reverie/scripts/m1_artifact.rs
+      # from the pinned reverie submodule, so every job that builds workspace tests
+      # needs it checked out (run 38106386550 failed at build.workspace_on_host).
+      - name: Initialize dagrun and reverie submodules
+        run: git submodule update --init agent-utils reverie
       - uses: actions/setup-go@v5
         with:
           go-version: stable
@@ -938,8 +941,11 @@ jobs:
       matrix: ${{ fromJSON(needs.select.outputs.debug_matrix) }}
     steps:
       - uses: actions/checkout@v4
-      - name: Initialize dagrun submodule
-        run: git submodule update --init agent-utils
+      # hermit-cli/tests/liteinst_allocator.rs compiles reverie/scripts/m1_artifact.rs
+      # from the pinned reverie submodule, so every job that builds workspace tests
+      # needs it checked out (run 38106386550 failed at build.workspace_on_host).
+      - name: Initialize dagrun and reverie submodules
+        run: git submodule update --init agent-utils reverie
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: portable-parallel-debug
@@ -1209,8 +1215,11 @@ jobs:
       matrix: ${{ fromJSON(needs.select.outputs.release_matrix) }}
     steps:
       - uses: actions/checkout@v4
-      - name: Initialize dagrun submodule
-        run: git submodule update --init agent-utils
+      # hermit-cli/tests/liteinst_allocator.rs compiles reverie/scripts/m1_artifact.rs
+      # from the pinned reverie submodule, so every job that builds workspace tests
+      # needs it checked out (run 38106386550 failed at build.workspace_on_host).
+      - name: Initialize dagrun and reverie submodules
+        run: git submodule update --init agent-utils reverie
       # build-debug saves the only workspace cache; the release-profile cache
       # lost its producer with build-release
       # (https://github.com/rrnewton/hermit/issues/3458).
@@ -1552,8 +1561,11 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - name: Initialize dagrun submodule
-        run: git submodule update --init agent-utils
+      # hermit-cli/tests/liteinst_allocator.rs compiles reverie/scripts/m1_artifact.rs
+      # from the pinned reverie submodule, so every job that builds workspace tests
+      # needs it checked out (run 38106386550 failed at build.workspace_on_host).
+      - name: Initialize dagrun and reverie submodules
+        run: git submodule update --init agent-utils reverie
       - name: Install rust-script
         env:
           RUSTFLAGS: ""
