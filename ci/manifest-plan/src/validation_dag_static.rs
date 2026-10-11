@@ -984,7 +984,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // runner::tests::a_typed_run_failure_is_a_product_crash_with_its_reason
     // (hermit-manifest-plan, the run_failed verification reason) retains all
     // 1048: 1049.
-    ("test.regular_crates", 1058),
+    // config::tests::backend_config_json_{preserves_every_backend_and_representable_bytes,
+    // round_trips_each_independent_capability,keeps_legacy_object_and_array_semantics,
+    // requires_each_typed_capability_once} (detcore-model), plus
+    // tests::{versioned_config_preserves_independent_descriptor_facts_in_the_runtime,
+    // a_rejected_versioned_config_keeps_the_existing_parse_fallback_policy}
+    // (detcore-dbt), retain all 1058 prior cases: 1064.
+    ("test.regular_crates", 1064),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1342,7 +1348,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (the run_failed verification reason) retain all 1023: 1025.
     // metadata::tests::record_version_rejects_streams_from_before_raw_clone_processes
     // (https://github.com/rrnewton/hermit/issues/4012) retains all 1025: 1026.
-    ("test.hermit_unit", 1026),
+    // dbt_detconfig_tests::{current_dbt_uses_exact_descriptor_facts_without_host_timed_turns,
+    // dbt_detconfig_keeps_descriptor_facts_independent,
+    // representable_descriptor_facts_keep_the_current_config_bytes,
+    // versioned_dbt_config_rejects_unknown_or_malformed_envelopes}
+    // retain all 1025 prior cases: 1029. Historical-byte and legacy-projection
+    // test renames preserve their cases and do not add to this count.
+    ("test.hermit_unit", 1030),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1854,7 +1866,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/pull/4020) retains all 1340: 1341.
     // scheduler::tests::a_terminal_deadlock_report_reaches_the_installed_hook_until_it_is_removed
     // (run_failed with deadlock) retains all 1341: 1342.
-    ("test.detcore_unit", 1342),
+    // tool_local::file_metadata_tests::rediscovery_preserves_known_and_invalidated_flock_history
+    // retains all 1342 prior cases: 1343.
+    ("test.detcore_unit", 1343),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2816,7 +2830,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // test: 1340.
     // And the interrupted shared-key probe test: 1341.
     // And the terminal-deadlock hook test: 1342.
-    ("test.detcore_unit_on_host", 1342),
+    // And the same descriptor rediscovery history test: 1343.
+    ("test.detcore_unit_on_host", 1343),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -2931,7 +2946,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the 0x129 record-version refusal test: 1023.
     // And the two run_failed tests: 1025.
     // And the raw-clone-process record-version test: 1026.
-    ("test.hermit_unit_on_host", 1026),
+    // And the same four DBT config transport tests: 1029; two historical-test
+    // renames preserve existing cases without changing this count.
+    ("test.hermit_unit_on_host", 1030),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -3049,7 +3066,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The DBT startup-authority refusal regression retains all 1048 prior identities.
     // And the same depth-boundary, repeated-key and extension-count tests: 1056.
     // And the run_failed runner test: 1049.
-    ("test.regular_crates_on_host", 1058),
+    // And the same six model/runtime config transport tests: 1064.
+    ("test.regular_crates_on_host", 1064),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).

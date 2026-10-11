@@ -6479,6 +6479,9 @@ mod tests {
     /// phase 1). `in-guest-trap` is in-guest LiteInst with site patching off,
     /// which changes how a syscall reaches the Tool and nothing the Tool host
     /// can do, so it has exactly in-guest LiteInst's row.
+    /// DBT now also shares the guest descriptor table and rediscovers it after
+    /// exec (Reverie 15374907); its host-timed-turn and poller-yield
+    /// capabilities remain false.
     fn golden_backend_capabilities(backend: Backend) -> serde_json::Value {
         let sabre = backend == Backend::Sabre;
         let kvm = backend == Backend::Kvm;
@@ -6486,8 +6489,8 @@ mod tests {
         // LiteInst runs only through its in-guest runtime.
         let in_guest_liteinst = matches!(backend, Backend::Liteinst | Backend::InGuestTrap);
         serde_json::json!({
-            "tool_shares_guest_descriptor_table": sabre,
-            "rediscovers_descriptors_after_exec": sabre,
+            "tool_shares_guest_descriptor_table": sabre || dbt,
+            "rediscovers_descriptors_after_exec": sabre || dbt,
             "internal_pipe_turns_are_host_timed": sabre,
             "loopback_pollers_yield_to_peers": sabre,
             "guest_clock_reads_bypass_backend": sabre,
@@ -6616,15 +6619,19 @@ mod tests {
     /// complete variable. Every DBT run sequentializes threads, so the DBT
     /// cases do too. The fixtures carry one deliberate later change, the
     /// `fdinfo_unlisted_mount_ids` -> `mount_id_assignment_order` key rename
-    /// described on `dbt_detconfig_tests::GOLDEN`.
+    /// described on `dbt_detconfig_tests::GOLDEN`. Preserve the historical DBT
+    /// descriptor capabilities here as well as the historical bytes. Current
+    /// DBT's independent descriptor facts require the typed envelope, whose
+    /// exact round trip and all sixteen coupled-flag combinations are checked
+    /// by `dbt_detconfig_tests`.
     #[test]
-    fn dbt_detconfig_bytes_are_unchanged_by_backend_capabilities() {
+    fn historical_dbt_capabilities_preserve_legacy_detconfig_bytes() {
         let sequential = |mut config: DetConfig| {
             config.sequentialize_threads = true;
             config
         };
         let default_config = || env_free_detconfig("--epoch=2026-01-01T00:00:00Z", "--seed=0");
-        for (name, config, before) in [
+        for (name, mut config, before) in [
             (
                 "default",
                 default_config(),
@@ -6641,6 +6648,8 @@ mod tests {
                 include_str!("../tests/fixtures/dbt/detconfig-before-capabilities-rich_dbt.json"),
             ),
         ] {
+            config.backend.tool_shares_guest_descriptor_table = false;
+            config.backend.rediscovers_descriptors_after_exec = false;
             assert_eq!(
                 detcore::to_legacy_backend_json(&config).unwrap(),
                 before,
@@ -6681,24 +6690,22 @@ mod tests {
         "backend_defers_vfork_child_registration",
     ];
 
-    /// Only DBT puts the encoding in a guest's environment, but every backend
-    /// must encode the facts it had before. Each string is one digit per key
-    /// in [`LEGACY_BACKEND_KEYS`], captured with `serde_json::to_string` from
-    /// `prepare_backend_config` at the commit before Detcore read
-    /// [`reverie::BackendCapabilities`], once without and once with
-    /// sequentialized threads. LiteInst's row is its in-guest runtime, the only
-    /// one it has. KVM's first two digits are the values
-    /// `run_kvm` then set before it started Detcore; they are capabilities now,
-    /// so the prepared config already has them.
+    /// Pin the current projection onto all fifteen legacy backend keys, once
+    /// without and once with sequentialized threads. DBT's two descriptor
+    /// facts project to `discover_live_file_metadata=true`; that legacy bit
+    /// cannot retain their independence from the host-timed capabilities.
+    /// Current DBT therefore uses the separately checked typed envelope, not
+    /// this lossy projection. LiteInst's row is its in-guest runtime. KVM's
+    /// first two digits are the capabilities `run_kvm` formerly set itself.
     #[test]
-    fn every_backend_encodes_its_previous_backend_keys() {
+    fn every_backend_encodes_its_current_legacy_projection() {
         for (backend, unsequenced, sequential) in [
             (Backend::Ptrace, "010000011000100", "010000011000100"),
             (Backend::E9patch, "010000010000100", "010000010000100"),
             (Backend::Liteinst, "010001010000000", "010001010000000"),
             (Backend::InGuestTrap, "010001010000000", "010001010000000"),
             (Backend::Sabre, "011111110000000", "011111110000000"),
-            (Backend::Dbt, "010001000100000", "010001000100000"),
+            (Backend::Dbt, "011001000100000", "011001000100000"),
             (Backend::Kvm, "100001010010011", "100001010011011"),
         ] {
             for (sequentialize_threads, expected) in [(false, unsequenced), (true, sequential)] {
