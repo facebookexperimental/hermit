@@ -5986,7 +5986,7 @@ impl Scheduler {
 
     /// The process a process-directed signal naming `detpid` goes to. Linux's
     /// kill_pid_info looks the id up as a task, so a live non-leader thread's
-    /// id names its whole thread group (https://github.com/rrnewton/hermit/issues/4094).
+    /// id names its whole thread group (<https://github.com/rrnewton/hermit/issues/4094>).
     /// `None` when the id names neither a thread group nor a live thread: the
     /// id of an exited thread names nothing.
     pub fn signal_target_process(&self, detpid: DetPid) -> Option<DetPid> {
@@ -11143,6 +11143,9 @@ mod test {
         );
 
         // kill(2) names a process by any of its live threads' ids.
+        assert_eq!(sched.signal_target_process(member), Some(leader));
+        assert_eq!(sched.signal_target_process(leader), Some(leader));
+        assert_eq!(sched.signal_target_process(stranger), None);
         assert_eq!(sched.process_signal_targets(member), vec![leader, member]);
         assert_eq!(sched.process_signal_targets(leader), vec![leader, member]);
         assert!(sched.process_signal_targets(stranger).is_empty());
@@ -11159,6 +11162,7 @@ mod test {
             vec![member],
             "kill(2) to the exited leader's id reaches its live member"
         );
+        assert_eq!(sched.signal_target_process(leader), Some(leader));
         assert!(sched.thread_is_live(member));
     }
 

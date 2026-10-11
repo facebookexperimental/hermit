@@ -55,6 +55,7 @@ use crate::tool_global::resolve_kill_targets_and_exit;
 use crate::tool_global::resource_request;
 use crate::tool_global::set_sigchld_disposition;
 use crate::tool_global::sigalrm_refuses;
+use crate::tool_global::signal_target_process;
 use crate::tool_global::thread_observe_time;
 use crate::types::DetPid;
 use crate::types::DetTid;
@@ -1078,7 +1079,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let tgid = call.pid();
-        // A process-group or broadcast SIGALRM is refused by name below.
+        // A process-group or broadcast SIGALRM is refused by name below. The
+        // scheduler resolves a thread id to its process itself.
         if call.sig() == libc::SIGALRM && tgid > 0 {
             refuse_sigalrm(guest, SigalrmControl::SendTo(DetTid::from_raw(tgid))).await?;
         }
@@ -1110,6 +1112,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         if tgid <= 0 {
             return self.refuse_group_signal(guest, tgid, call.sig()).await;
         }
+        // A kill may name the process by any of its live threads' ids (Linux's
+        // kill_pid_info looks the id up as a task); everything below that acts
+        // on the process uses its leader
+        // (https://github.com/rrnewton/hermit/issues/4094).
+        let process = signal_target_process(guest, DetPid::from_raw(tgid))
+            .await
+            .map_or(tgid, |process| process.as_raw());
         // Exact self-SIGKILL is group-fatal, so it has no recipient-selection
         // ambiguity even when the process has several live threads. Reserve it
         // before the generic process-signal path rejects that thread set.
@@ -1117,7 +1126,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .reserve_controlled_self_sigkill_exit(
                 guest,
                 call.sig(),
-                Some(DetPid::from_raw(tgid)),
+                Some(DetPid::from_raw(process)),
                 None,
             )
             .await
@@ -1125,7 +1134,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(self.record_or_replay(guest, call).await?);
         }
         let Some(tid) = self
-            .process_signal_target(guest, Sysno::kill, DetPid::from_raw(tgid), call.sig())
+            .process_signal_target(guest, Sysno::kill, DetPid::from_raw(process), call.sig())
             .await?
         else {
             // A zombie: exited, and its parent can still wait for it. Linux's
@@ -1149,12 +1158,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             self.record_or_replay(guest, call).await?
         } else {
             let targeted = syscalls::Tgkill::new()
-                .with_tgid(tgid)
+                .with_tgid(process)
                 .with_tid(tid.as_raw())
                 .with_sig(call.sig());
             self.record_or_replay(guest, targeted).await?
         };
-        self.notify_cross_task_signal(guest, tid, call.sig(), Some(DetPid::from_raw(tgid)))
+        self.notify_cross_task_signal(guest, tid, call.sig(), Some(DetPid::from_raw(process)))
             .await;
         Ok(value)
     }
@@ -1477,11 +1486,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return Ok(0);
         }
+        // As for kill, a live non-leader thread's id names its process
+        // (https://github.com/rrnewton/hermit/issues/4094).
+        let process = signal_target_process(guest, DetPid::from_raw(tgid))
+            .await
+            .map_or(tgid, |process| process.as_raw());
         let Some(tid) = self
             .process_signal_target(
                 guest,
                 Sysno::rt_sigqueueinfo,
-                DetPid::from_raw(tgid),
+                DetPid::from_raw(process),
                 call.sig(),
             )
             .await?
@@ -1509,13 +1523,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             self.record_or_replay(guest, call).await?
         } else {
             let targeted = syscalls::RtTgsigqueueinfo::new()
-                .with_tgid(tgid)
+                .with_tgid(process)
                 .with_tid(tid.as_raw())
                 .with_sig(call.sig())
                 .with_siginfo(call.siginfo());
             self.record_or_replay(guest, targeted).await?
         };
-        self.notify_cross_task_signal(guest, tid, call.sig(), Some(DetPid::from_raw(tgid)))
+        self.notify_cross_task_signal(guest, tid, call.sig(), Some(DetPid::from_raw(process)))
             .await;
         Ok(value)
     }

@@ -2621,9 +2621,6 @@ impl GlobalTool for GlobalState {
             GlobalRequest::NotifySignalPending(dettid, SigWrapper(signal), target_process) => {
                 let mut scheduler = self.lock_rpc_scheduler(false).await;
                 scheduler.notify_signal_pending(dettid, SigWrapper(signal));
-                // A kill may name the process by a non-leader thread's id.
-                let target_process = target_process
-                    .map(|named| scheduler.signal_target_process(named).unwrap_or(named));
                 if signal == libc::SIGKILL {
                     scheduler.record_committed_sigkill(dettid, target_process);
                     if let Some(detpid) = target_process {
@@ -2714,6 +2711,11 @@ impl GlobalTool for GlobalState {
                     .await
                     .thread_tree
                     .process_of(dettid),
+            ),
+            GlobalRequest::SignalTargetProcess(named) => R::SignalTargetProcess(
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .signal_target_process(named),
             ),
             GlobalRequest::SetSigchldDisposition(process, ignored, nocldwait) => {
                 R::SetSigchldDisposition(
@@ -4426,6 +4428,10 @@ pub enum GlobalRequest {
     /// (`set_sigchld_disposition`). Appended after `RegisteredProcessOf`, for
     /// the same reason.
     SetSigchldDisposition(DetPid, bool, bool),
+    /// The process a signal naming this id goes to
+    /// (`Scheduler::signal_target_process`). Appended after
+    /// `SetSigchldDisposition`, for the same reason.
+    SignalTargetProcess(DetPid),
 }
 
 /// Responses from the global object
@@ -4534,6 +4540,8 @@ pub enum GlobalResponse {
     RegisteredProcessOf(Option<DetPid>),
     /// Appended after `RegisteredProcessOf`, for the same reason.
     SetSigchldDisposition(()),
+    /// Appended after `SetSigchldDisposition`, for the same reason.
+    SignalTargetProcess(Option<DetPid>),
 }
 
 /// `request`, carrying the number of records this guest thread produced for
@@ -6042,6 +6050,21 @@ where
     let response = send_and_update_time(guest, GlobalRequest::SetChildSubreaper(process, on)).await;
     match response.1 {
         GlobalResponse::SetChildSubreaper(()) => {}
+        _ => unreachable!(),
+    }
+}
+
+/// The process a process-directed signal naming `named` goes to: a live
+/// non-leader thread's id names its thread group, as Linux's kill_pid_info
+/// does (`Scheduler::signal_target_process`).
+pub async fn signal_target_process<G, T>(guest: &mut G, named: DetPid) -> Option<DetPid>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::SignalTargetProcess(named)).await;
+    match response.1 {
+        GlobalResponse::SignalTargetProcess(process) => process,
         _ => unreachable!(),
     }
 }
