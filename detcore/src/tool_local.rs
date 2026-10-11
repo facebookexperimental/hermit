@@ -2192,6 +2192,12 @@ pub struct ThreadState<T> {
     /// start of every handler and by that post-hook.
     #[serde(default)]
     pub(crate) yield_after_futex_wake: bool,
+    /// A signal this thread sent to its own multi-threaded process, which it
+    /// must dequeue before another thread runs: until its own delivery stop
+    /// for that signal no timeslice of it ends, at the target, at the PMU
+    /// maximum or in a timer callback (<https://github.com/rrnewton/hermit/issues/4034>).
+    #[serde(default)]
+    pub(crate) own_signal_turn_hold: Option<libc::c_int>,
 
     /// Thread state associated with record/replay.
     pub record_or_replay: T,
@@ -2697,6 +2703,7 @@ impl<T> ThreadState<T> {
             uncharged_bootstrap_syscalls: 0,
             in_uncharged_bootstrap_syscall: false,
             yield_after_futex_wake: false,
+            own_signal_turn_hold: None,
             end_of_timeslice: None, // Temporary/bogus.
             replay_rcb_end: None,
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -3041,6 +3048,15 @@ impl<T> ThreadState<T> {
     /// Overrides the task identity embedded in subsequently allocated open-file descriptions.
     pub fn set_open_file_creator(&mut self, creator: DetTid) {
         self.open_file_creator = Some(creator);
+    }
+
+    /// Whether this thread's descriptor table holds a signalfd, as Detcore
+    /// records its descriptors.
+    pub(crate) fn holds_a_signalfd(&self) -> bool {
+        self.metadata()
+            .file_handles
+            .values()
+            .any(|detfd| matches!(detfd.ty(), FdType::Signalfd))
     }
 
     /// Get a mutable reference of `DetFd` from a raw file descriptor, and

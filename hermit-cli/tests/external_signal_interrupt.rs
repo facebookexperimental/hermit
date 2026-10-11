@@ -212,7 +212,7 @@ const HANDLED_BEFORE_EXIT_MS: u64 = SIGNAL_DELAY_MS + SIGNAL_DELAY_MS / 2;
 /// Trials in the guest's `sigsuspend creator` mode (`CREATOR_TRIALS` in the
 /// guest).
 const CREATOR_TRIALS: usize = 6;
-/// Trials in the guest's `poll pdeathchld`, `poll pdeathusr1`, `poll exitusr1`,
+/// Trials in the guest's `poll pdeathchld`, `poll pdeathusr1`, `poll exitusr1`, `poll stophup`,
 /// `poll hupopen` and `poll hupctty` modes (`PDEATH_TRIALS` in the guest).
 const PDEATH_TRIALS: usize = 3;
 /// Unverified strict runs of a parent-death cell; each must match.
@@ -2769,6 +2769,36 @@ fn ptrace_child_exit_usr1_keeps_a_poll_to_its_deadline() {
     let args = ["poll", "exitusr1"];
     let expected =
         format!("RESULT call=poll role=exitusr1 trials={PDEATH_TRIALS} matched={PDEATH_TRIALS}");
+    let run = run_cell(backend, FutexMode::Precise, &args, false);
+    assert!(
+        run.status.success()
+            && run.result_line() == Some(expected.as_str())
+            && run.stdout.lines().any(|line| line == "DONE"),
+        "{backend} {args:?}: expected `{expected}`\n{}",
+        run.describe()
+    );
+    assert_verified(backend, FutexMode::Precise, &args, &run);
+}
+
+/// A send of a default-stop signal (the guest's `poll stophup` mode). A process
+/// catches SIGHUP, sends SIGTSTP to a child that ignores it, and polls; another
+/// guest process sends it SIGHUP 50 ms later. Linux returns EINTR then. A
+/// stopped member lets an exit orphan its process group, and Linux then sends
+/// the group SIGHUP and SIGCONT at the exiting process's physical exit, an
+/// instant set by the host (`kill_orphaned_pgrp`). Hermit cannot tell that
+/// SIGHUP from a guest's, so the SIGTSTP send records SIGHUP and SIGCONT as
+/// host-timed for every process of the container, in the sender's turn and
+/// whatever the target's disposition, and no gated wait ends for them
+/// afterwards: in each trial the poll returns 0 after its full timeout and the
+/// handler runs once afterwards (https://github.com/rrnewton/hermit/issues/4034).
+/// No guest kills a parked process, so the cell runs under strict verification
+/// and must show bitwise parity.
+#[test]
+fn ptrace_a_stop_signal_send_keeps_a_sighup_poll_to_its_deadline() {
+    let backend = "ptrace";
+    let args = ["poll", "stophup"];
+    let expected =
+        format!("RESULT call=poll role=stophup trials={PDEATH_TRIALS} matched={PDEATH_TRIALS}");
     let run = run_cell(backend, FutexMode::Precise, &args, false);
     assert!(
         run.status.success()

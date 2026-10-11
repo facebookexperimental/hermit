@@ -6707,6 +6707,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if !is_pidfd {
             return Err(Errno::EBADF.into());
         }
+        self.record_orphaned_group_signals(guest, signal).await;
         if signal == libc::SIGALRM {
             // `pidfd_open` records the process a pidfd names; a pidfd with no
             // recorded target is refused while any process handles SIGALRM.

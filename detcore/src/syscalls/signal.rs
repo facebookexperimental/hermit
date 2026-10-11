@@ -32,6 +32,9 @@ use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::resources::SigalrmSleepDisposition;
+use crate::scheduler::HostTimedSignalScope;
+use crate::scheduler::OwnProcessSignalInputs;
+use crate::scheduler::SiblingSignalState;
 use crate::syscalls::helpers::REAL_TIME_SIGNALS;
 use crate::syscalls::helpers::act_on_pending_real_time;
 use crate::syscalls::helpers::observe_under_mask;
@@ -49,6 +52,8 @@ use crate::tool_global::alarm_remaining;
 use crate::tool_global::commit_sigkill;
 use crate::tool_global::host_timed_signals;
 use crate::tool_global::notify_signal_pending;
+use crate::tool_global::own_process_signal_inputs;
+use crate::tool_global::record_host_timed_signals;
 use crate::tool_global::refuse_sigalrm;
 use crate::tool_global::register_alarm;
 use crate::tool_global::registered_process_of;
@@ -57,6 +62,7 @@ use crate::tool_global::reserve_sigkill_group;
 use crate::tool_global::resolve_kill_targets_and_exit;
 use crate::tool_global::resource_request;
 use crate::tool_global::set_sigchld_disposition;
+use crate::tool_global::set_sigtimedwait_set;
 use crate::tool_global::sigalrm_refuses;
 use crate::tool_global::signal_target_process;
 use crate::tool_global::thread_observe_time;
@@ -997,6 +1003,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut rsrc = Resources::new(dettid);
         rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
         rsrc.fyi("rt_sigtimedwait");
+        // While it polls, a signal in the set is taken at the next poll
+        // whatever the thread's mask, which a process-directed signal another
+        // thread sends must account for
+        // (`Scheduler::own_process_signal_inputs`). An unreadable set fails in
+        // the kernel at the first poll.
+        let waited = match call.set() {
+            Some(set) => read_kernel_sigset(guest, set.into()).await.ok(),
+            None => None,
+        };
+        if waited.is_some() {
+            set_sigtimedwait_set(guest, waited).await;
+        }
         // Linux writes the siginfo only for a signal it returns. A dropped
         // copy's siginfo is replaced by what the buffer held before.
         let before = match call.info() {
@@ -1005,19 +1023,23 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             _ => None,
         };
-        loop {
+        let result = loop {
             let result =
                 retry_nonblocking_syscall_with_timeout(guest, call, rsrc.clone(), maybe_timeout)
                     .await;
             // A consumed child-exit copy that the notification ledger drops
             // is not returned: the wait goes on, to the same deadline.
             if self.synchronous_sigchld_stands(guest, call, &result).await {
-                return result;
+                break result;
             }
             if let (Some(info), Some(bytes)) = (call.info(), before.as_ref()) {
                 let _ = guest.memory().write_value(info.cast::<[u8; 128]>(), bytes);
             }
+        };
+        if waited.is_some() {
+            set_sigtimedwait_set(guest, None).await;
         }
+        result
     }
 
     /// The `signalfd_siginfo` records a successful signalfd `read` returned,
@@ -1221,6 +1243,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Kill,
     ) -> Result<i64, Error> {
+        self.record_orphaned_group_signals(guest, call.sig()).await;
         if !guest.config().sequentialize_threads {
             // Without sequentialization every other kill goes to the kernel as
             // is, but never one to a process group or to every process: the
@@ -1340,6 +1363,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return self.send_reserved_sigkill(guest, reservation, call).await;
         }
+        match self
+            .own_process_signal(guest, Sysno::kill, tgid, process, call.sig())
+            .await?
+        {
+            OwnProcessSend::Admitted => {
+                return self
+                    .forward_own_process_signal(guest, call.sig(), call)
+                    .await;
+            }
+            OwnProcessSend::Refused(answer) => return answer,
+            OwnProcessSend::NotOwn => {}
+        }
         let Some(tid) = self
             .process_signal_target(guest, Sysno::kill, DetPid::from_raw(process), call.sig())
             .await?
@@ -1422,6 +1457,214 @@ impl<T: RecordOrReplay> Detcore<T> {
         );
         self.refuse_unserviceable_operation(guest, Sysno::kill, Errno::ENOSYS)
             .await
+    }
+
+    /// Decide a process-directed `sig` that the calling thread sends by `sysno`
+    /// to `pid` when `pid` names its own process (`process`, the process that
+    /// `pid` names: any of its live threads' ids names it), and the process
+    /// has another live thread (https://github.com/rrnewton/hermit/issues/4034).
+    /// Only on ptrace, where Detcore reads every input from the schedule.
+    async fn own_process_signal<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+        pid: libc::pid_t,
+        process: libc::pid_t,
+        sig: libc::c_int,
+    ) -> Result<OwnProcessSend, Error> {
+        if !guest
+            .config()
+            .backend_supports_blocked_wait_signal_interruption
+        {
+            return Ok(OwnProcessSend::NotOwn);
+        }
+        let sender = guest.thread_state().dettid;
+        if process != self.detpid.as_raw() {
+            return Ok(OwnProcessSend::NotOwn);
+        }
+        // Linux prefers the thread `pid` names when it takes the signal; a
+        // sibling's id, like the process's, leaves the sender as the receiver
+        // only when every sibling blocks it.
+        let names_sender = pid == sender.as_raw();
+        let inputs = own_process_signal_inputs(guest).await;
+        if inputs
+            .siblings
+            .iter()
+            .all(|(_, state)| *state == SiblingSignalState::ExitGranted)
+        {
+            return Ok(OwnProcessSend::NotOwn);
+        }
+        let state = read_thread_wait_signal_state(guest.pid(), guest.tid())?;
+        let send = OwnProcessSignal {
+            sig,
+            names_sender,
+            blocked: state.blocked,
+            thread_pending: state.thread_pending,
+            ignored: state.ignored,
+            caught: state.caught,
+            inputs,
+            record_replay: self.cfg.recordreplay_modes,
+            schedule_replay: self.cfg.replay_schedule_from.is_some(),
+            stacktrace_signal: self.cfg.stacktrace_signal.is_some(),
+            posthook_anchor: !guest.thread_state().stats.hb_pending_posthook.is_empty(),
+            signalfd: guest.thread_state().holds_a_signalfd(),
+        };
+        tracing::debug!(
+            "[detcore, dtid {}] signal {} to its own process: {:?}",
+            sender,
+            sig,
+            send
+        );
+        let Some(refusal) = own_process_signal_refusal(&send) else {
+            return Ok(OwnProcessSend::Admitted);
+        };
+        tracing::error!(
+            "[detcore, dtid {}] process-directed signal {} to process {} by {} is not supported: \
+             {} (https://github.com/rrnewton/hermit/issues/4034)",
+            sender,
+            sig,
+            self.detpid,
+            sysno,
+            refusal,
+        );
+        Ok(OwnProcessSend::Refused(
+            self.refuse_unserviceable_operation(guest, sysno, Errno::ENOSYS)
+                .await,
+        ))
+    }
+
+    /// Forward an admitted process-directed signal to the sender's own process
+    /// unchanged, holding the sender's turn until it takes the signal
+    /// (`own_signal_turn_hold`). A call the kernel fails sends nothing and
+    /// holds nothing.
+    async fn forward_own_process_signal<G: Guest<Self>, C>(
+        &self,
+        guest: &mut G,
+        sig: libc::c_int,
+        call: C,
+    ) -> Result<i64, Error>
+    where
+        C: Into<syscalls::Syscall>,
+        syscalls::Syscall: From<C>,
+    {
+        guest.thread_state_mut().own_signal_turn_hold = Some(sig);
+        let result = self.record_or_replay(guest, call).await;
+        if result.is_err() {
+            guest.thread_state_mut().own_signal_turn_hold = None;
+        }
+        Ok(result?)
+    }
+
+    /// What an `rt_sigqueueinfo` whose `siginfo_t` Hermit may not be able to
+    /// read comes to, decided before admission (`do_rt_sigqueueinfo` in
+    /// kernel/signal.c). No call that Linux could deliver reaches the kernel
+    /// without admission (Codex re-check 2 of
+    /// https://github.com/rrnewton/hermit/pull/4116).
+    ///
+    /// The kernel always copies the first 48 bytes (`kernel_siginfo_t`) and
+    /// the other 80 only for a `si_code` whose layout it does not know
+    /// (`copy_siginfo_from_user`). Its `copy_from_user` reads what user mode
+    /// can: on x86 a page with any of read, write or execute permission; it
+    /// faults on a `PROT_NONE` page; and a fault in a hole just below a
+    /// grow-down mapping can grow that mapping and succeed. The tracer's own
+    /// reads say nothing about that (`process_vm_readv` refuses a write-only
+    /// page, and `/proc/<tid>/mem` force-reads a `PROT_NONE` one), so the
+    /// mappings of `/proc/<tid>/smaps` decide first:
+    /// - the first byte of the 48 that user mode cannot read lies in a
+    ///   `PROT_NONE` mapping, or in a hole whose next mapping above is not
+    ///   grow-down (`VmFlags` `gd`; only that mapping can grow into it):
+    ///   EFAULT is certain, and Hermit answers it without the kernel;
+    /// - any other byte of the 128 that user mode cannot read (a hole below a
+    ///   grow-down mapping, a tail running into a hole or a `PROT_NONE` page),
+    ///   or a listing that cannot be read: `Unreadable`, refused by name;
+    /// - all 128 user-readable: the tracer reads them (`process_vm_readv`, then
+    ///   `/proc/<tid>/mem` for a write-only page), and a page neither reaches
+    ///   (a `VM_IO`/`VM_PFNMAP` page such as the vDSO's `[vvar]`) is
+    ///   `Unreadable`. A `si_code` only the target thread itself may use
+    ///   (`si_code >= 0` or `SI_TKILL`, from a caller that is not `pid`) is
+    ///   then `KernelFails`: after a complete copy Linux fails it with EPERM,
+    ///   or E2BIG first, and sends nothing, so it goes to the kernel unchanged.
+    fn rt_sigqueueinfo_precheck<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: &syscalls::RtSigqueueinfo,
+    ) -> RtSigqueueinfoPrecheck {
+        const SIZE: usize = std::mem::size_of::<libc::siginfo_t>();
+        // `sizeof(kernel_siginfo_t)` on x86_64: the part every copy reads.
+        const KERNEL_SIGINFO: usize = 48;
+        let address = call.siginfo().map_or(0, |address| address.as_raw());
+        let Ok(smaps) = std::fs::read_to_string(format!("/proc/{}/smaps", guest.tid().as_raw()))
+        else {
+            return RtSigqueueinfoPrecheck::Unreadable;
+        };
+        let mappings = parse_smaps(&smaps);
+        match first_user_unreadable(&mappings, address, KERNEL_SIGINFO) {
+            None => {}
+            Some(Unreadable::NoPermission)
+            | Some(Unreadable::Hole {
+                below_growsdown: false,
+            }) => {
+                return RtSigqueueinfoPrecheck::Efault;
+            }
+            Some(Unreadable::Hole {
+                below_growsdown: true,
+            }) => {
+                return RtSigqueueinfoPrecheck::Unreadable;
+            }
+        }
+        if first_user_unreadable(&mappings, address, SIZE).is_some() {
+            return RtSigqueueinfoPrecheck::Unreadable;
+        }
+        let read = call.siginfo().and_then(|info| {
+            guest.memory().read_value(info).ok().or_else(|| {
+                use std::os::unix::fs::FileExt;
+                let mut bytes = [0u8; SIZE];
+                std::fs::File::open(format!("/proc/{}/mem", guest.tid().as_raw()))
+                    .and_then(|mem| mem.read_exact_at(&mut bytes, address as u64))
+                    .ok()?;
+                // SAFETY: `siginfo_t` is plain data, and `bytes` holds exactly
+                // one, read from the guest.
+                Some(unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<libc::siginfo_t>()) })
+            })
+        });
+        let Some(info) = read else {
+            return RtSigqueueinfoPrecheck::Unreadable;
+        };
+        let code = info.si_code;
+        if (code >= 0 || code == libc::SI_TKILL)
+            && guest.thread_state().dettid.as_raw() != call.tgid()
+        {
+            RtSigqueueinfoPrecheck::KernelFails
+        } else {
+            RtSigqueueinfoPrecheck::Proceeds
+        }
+    }
+
+    /// Record, in the sending call's turn and before it reaches the kernel, the
+    /// signals a send of a default-stop signal lets Linux send to an orphaned
+    /// process group later (`orphaned_group_signals`), for every process of
+    /// the container, whatever the target and its disposition and whether the
+    /// send then succeeds: no gated wait ends for them, and a process-directed
+    /// send the sender does not block them for is refused
+    /// (https://github.com/rrnewton/hermit/issues/4034). A send of SIGSTKFLT,
+    /// Reverie's timer marker, is recorded too
+    /// (`Scheduler::record_guest_marker_signal`).
+    pub(crate) async fn record_orphaned_group_signals<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sig: libc::c_int,
+    ) {
+        if sig == libc::SIGSTKFLT {
+            crate::tool_global::record_guest_marker_signal(guest).await;
+        }
+        let signals = orphaned_group_signals(sig);
+        if signals != 0
+            && guest
+                .config()
+                .backend_supports_blocked_wait_signal_interruption
+        {
+            record_host_timed_signals(guest, HostTimedSignalScope::Container, signals).await;
+        }
     }
 
     /// Whether to drop, answering 0 and sending nothing, a signal `sig` the
@@ -1515,6 +1758,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Tgkill,
     ) -> Result<i64, Error> {
+        self.record_orphaned_group_signals(guest, call.sig()).await;
         if call.sig() == libc::SIGALRM {
             refuse_sigalrm(guest, SigalrmControl::SendTo(DetTid::from_raw(call.tid()))).await?;
         }
@@ -1574,6 +1818,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Tkill,
     ) -> Result<i64, Error> {
+        self.record_orphaned_group_signals(guest, call.sig()).await;
         if call.sig() == libc::SIGALRM {
             refuse_sigalrm(guest, SigalrmControl::SendTo(DetTid::from_raw(call.tid()))).await?;
         }
@@ -1696,6 +1941,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::RtTgsigqueueinfo,
     ) -> Result<i64, Error> {
+        self.record_orphaned_group_signals(guest, call.sig()).await;
         if call.sig() == libc::SIGALRM {
             refuse_sigalrm(guest, SigalrmControl::SendTo(DetTid::from_raw(call.tid()))).await?;
         }
@@ -1732,6 +1978,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::RtSigqueueinfo,
     ) -> Result<i64, Error> {
+        self.record_orphaned_group_signals(guest, call.sig()).await;
         if !guest.config().sequentialize_threads {
             if self
                 .drop_signal_to_hermit(guest, Sysno::rt_sigqueueinfo, None, call.tgid(), call.sig())
@@ -1776,11 +2023,56 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return Ok(0);
         }
+        // A call the kernel fails without sending, after a complete copy of
+        // its `siginfo_t` (EPERM for a `si_code` only the target thread itself
+        // may use), goes to it unchanged; a copy that certainly faults is
+        // answered EFAULT here; and a `siginfo_t` Hermit cannot read whole is
+        // refused by name (`rt_sigqueueinfo_precheck`).
+        if guest
+            .config()
+            .backend_supports_blocked_wait_signal_interruption
+        {
+            match self.rt_sigqueueinfo_precheck(guest, &call) {
+                RtSigqueueinfoPrecheck::KernelFails => {
+                    return Ok(self.record_or_replay(guest, call).await?);
+                }
+                RtSigqueueinfoPrecheck::Efault => return Err(Errno::EFAULT.into()),
+                RtSigqueueinfoPrecheck::Unreadable => {
+                    tracing::error!(
+                        "[detcore, dtid {}] rt_sigqueueinfo with a siginfo_t at {:#x} is not \
+                         supported: Hermit cannot read all 128 bytes of it to decide the call \
+                         (https://github.com/rrnewton/hermit/issues/4034)",
+                        guest.thread_state().dettid,
+                        call.siginfo().map_or(0, |info| info.as_raw()),
+                    );
+                    return self
+                        .refuse_unserviceable_operation(
+                            guest,
+                            Sysno::rt_sigqueueinfo,
+                            Errno::ENOSYS,
+                        )
+                        .await;
+                }
+                RtSigqueueinfoPrecheck::Proceeds => {}
+            }
+        }
         // As for kill, a live non-leader thread's id names its process
         // (https://github.com/rrnewton/hermit/issues/4094).
         let process = signal_target_process(guest, DetPid::from_raw(tgid))
             .await
             .map_or(tgid, |process| process.as_raw());
+        match self
+            .own_process_signal(guest, Sysno::rt_sigqueueinfo, tgid, process, call.sig())
+            .await?
+        {
+            OwnProcessSend::Admitted => {
+                return self
+                    .forward_own_process_signal(guest, call.sig(), call)
+                    .await;
+            }
+            OwnProcessSend::Refused(answer) => return answer,
+            OwnProcessSend::NotOwn => {}
+        }
         let target = match self
             .process_signal_target(
                 guest,
@@ -2296,6 +2588,358 @@ mod signalfd_record_tests {
     }
 }
 
+/// The signals a thread may send to its own multi-threaded process with `kill`
+/// or `rt_sigqueueinfo` (https://github.com/rrnewton/hermit/issues/4034): each
+/// is numbered below SIGCHLD, so a child-exit SIGCHLD, whenever the kernel
+/// posts it, is dequeued after it; none is in the kernel's synchronous set
+/// (`SYNCHRONOUS_MASK`); and none is a signal Reverie gives a meaning
+/// (SIGTRAP, its stop signal, and SIGSTKFLT, its timer marker).
+const OWN_PROCESS_SIGNALS: [libc::c_int; 7] = [
+    libc::SIGHUP,
+    libc::SIGINT,
+    libc::SIGQUIT,
+    libc::SIGUSR1,
+    libc::SIGUSR2,
+    libc::SIGPIPE,
+    libc::SIGTERM,
+];
+
+/// Why a process-directed signal a thread sends to its own multi-threaded
+/// process is refused, each a named refusal of the design for
+/// https://github.com/rrnewton/hermit/issues/4034.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OwnProcessSignalRefusal {
+    /// The signal is not one of `OWN_PROCESS_SIGNALS`.
+    SignalNotAdmitted,
+    /// The process leaves the signal at its default, fatal, disposition.
+    DefaultDisposition,
+    /// The run records or replays.
+    RecordReplay,
+    /// The run replays a recorded schedule (`--replay-schedule-from`).
+    ScheduleReplay,
+    /// A guest has sent SIGSTKFLT, which Reverie uses as its timer marker.
+    GuestMarkerSignal,
+    /// `--stacktrace-signal` is configured.
+    StacktraceSignal,
+    /// The sender blocks the signal.
+    SenderBlocks,
+    /// A thread of the process runs or sleeps outside the schedule.
+    OutOfSchedule(DetTid),
+    /// A thread of the process has an unknown mask.
+    UnknownMask(DetTid),
+    /// The sender is not the thread the call names, and a live thread does
+    /// not block the signal.
+    NotSoleReceiver(DetTid),
+    /// The sender's private queue holds these signals, which it does not block.
+    PrivatePending(u64),
+    /// These host-timed sources, which the sender does not block, are armed.
+    HostTimedSource(u64),
+    /// Unreaped children have these exit signals, which the sender does not block.
+    ForeignExitSignal(u64),
+    /// The scheduler sent these signals, at or below the one sent, and no
+    /// thread has taken them yet.
+    UndeliveredSchedulerSignal(u64),
+    /// A happens-before anchor is set on this call's completion.
+    PosthookAnchor,
+    /// The process holds a signalfd.
+    Signalfd,
+    /// An exec is in flight in the process.
+    ExecInFlight,
+}
+
+impl std::fmt::Display for OwnProcessSignalRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SignalNotAdmitted => write!(
+                f,
+                "only SIGHUP, SIGINT, SIGQUIT, SIGUSR1, SIGUSR2, SIGPIPE and SIGTERM are delivered \
+                 deterministically to the sender"
+            ),
+            Self::DefaultDisposition => write!(
+                f,
+                "the signal has its default disposition, which ends the process"
+            ),
+            Self::RecordReplay => write!(f, "the run records or replays"),
+            Self::ScheduleReplay => write!(
+                f,
+                "the run replays a recorded schedule (--replay-schedule-from), whose trace turn \
+                 after the send can hand the turn to another thread"
+            ),
+            Self::GuestMarkerSignal => write!(
+                f,
+                "a guest sent SIGSTKFLT, which Reverie also uses as its timer marker, so a pending \
+                 copy cannot be told from Reverie's"
+            ),
+            Self::StacktraceSignal => write!(f, "--stacktrace-signal is configured"),
+            Self::SenderBlocks => write!(f, "the sending thread blocks the signal"),
+            Self::OutOfSchedule(tid) => write!(
+                f,
+                "thread {tid} runs or sleeps outside the schedule, at moments host timing sets"
+            ),
+            Self::UnknownMask(tid) => write!(f, "thread {tid}'s signal mask is unknown"),
+            Self::NotSoleReceiver(tid) => write!(
+                f,
+                "thread {tid} does not block the signal, so Linux could give it to either thread"
+            ),
+            Self::PrivatePending(set) => write!(
+                f,
+                "the sending thread has signals pending ({set:#x}) that it would take first"
+            ),
+            Self::HostTimedSource(set) => write!(
+                f,
+                "a source that sends signals {set:#x} at moments host timing sets is armed"
+            ),
+            Self::ForeignExitSignal(set) => write!(
+                f,
+                "a child with exit signal {set:#x} is unreaped, and the kernel sends that signal at \
+                 a moment host timing sets"
+            ),
+            Self::UndeliveredSchedulerSignal(set) => write!(
+                f,
+                "the scheduler sent signals {set:#x} that no thread has taken yet"
+            ),
+            Self::PosthookAnchor => {
+                write!(f, "a happens-before anchor is set on the call's completion")
+            }
+            Self::Signalfd => write!(f, "the process holds a signalfd"),
+            Self::ExecInFlight => write!(f, "an exec is in flight in the process"),
+        }
+    }
+}
+
+/// Everything a process-directed signal `sig` that a thread sends to its own
+/// multi-threaded process is decided from, all fixed by the schedule at the
+/// sender's turn (`own_process_signal_refusal`).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct OwnProcessSignal {
+    pub(crate) sig: libc::c_int,
+    /// Whether the call names the sender itself (S1 of the design).
+    pub(crate) names_sender: bool,
+    /// The sender's mask (`SigBlk`).
+    pub(crate) blocked: u64,
+    /// The sender's private queue (`SigPnd`).
+    pub(crate) thread_pending: u64,
+    /// The process's `SIG_IGN` dispositions (`SigIgn`).
+    pub(crate) ignored: u64,
+    /// The process's handlers (`SigCgt`).
+    pub(crate) caught: u64,
+    pub(crate) inputs: OwnProcessSignalInputs,
+    pub(crate) record_replay: bool,
+    pub(crate) schedule_replay: bool,
+    pub(crate) stacktrace_signal: bool,
+    pub(crate) posthook_anchor: bool,
+    pub(crate) signalfd: bool,
+}
+
+/// The refusal for `send`, or `None` when the kernel's choice of receiver and
+/// the sender's dequeue are forced: the sender takes the signal on its way back
+/// to user mode, before any other thread of the process can run
+/// (https://github.com/rrnewton/hermit/issues/4034).
+pub(crate) fn own_process_signal_refusal(
+    send: &OwnProcessSignal,
+) -> Option<OwnProcessSignalRefusal> {
+    use OwnProcessSignalRefusal as R;
+    let bit = kernel_sigset_bit(send.sig);
+    if !OWN_PROCESS_SIGNALS.contains(&send.sig) {
+        return Some(R::SignalNotAdmitted);
+    }
+    if (send.ignored | send.caught) & bit == 0 {
+        return Some(R::DefaultDisposition);
+    }
+    if send.record_replay {
+        return Some(R::RecordReplay);
+    }
+    if send.schedule_replay {
+        return Some(R::ScheduleReplay);
+    }
+    if send.stacktrace_signal {
+        return Some(R::StacktraceSignal);
+    }
+    if send.blocked & bit != 0 {
+        return Some(R::SenderBlocks);
+    }
+    for (tid, state) in &send.inputs.siblings {
+        if *state == SiblingSignalState::OutOfSchedule {
+            return Some(R::OutOfSchedule(*tid));
+        }
+    }
+    for (tid, state) in &send.inputs.siblings {
+        if *state == SiblingSignalState::InSchedule(None) {
+            return Some(R::UnknownMask(*tid));
+        }
+    }
+    if !send.names_sender {
+        for (tid, state) in &send.inputs.siblings {
+            if matches!(state, SiblingSignalState::InSchedule(Some(mask)) if mask & bit == 0) {
+                return Some(R::NotSoleReceiver(*tid));
+            }
+        }
+    }
+    let unblocked = !send.blocked;
+    let private = without_perf_event_signal(send.thread_pending) & unblocked;
+    if private != 0 {
+        return Some(R::PrivatePending(private));
+    }
+    let host_timed = send.inputs.host_timed & unblocked;
+    if host_timed != 0 {
+        return Some(R::HostTimedSource(host_timed));
+    }
+    let foreign = send.inputs.foreign_exit_signals & unblocked;
+    if foreign != 0 {
+        return Some(R::ForeignExitSignal(foreign));
+    }
+    // A signal numbered at or below `sig` is dequeued first or coalesces.
+    let at_or_below = bit | (bit - 1);
+    let undelivered = send.inputs.undelivered_scheduler_signals & unblocked & at_or_below;
+    if undelivered != 0 {
+        return Some(R::UndeliveredSchedulerSignal(undelivered));
+    }
+    if send.posthook_anchor {
+        return Some(R::PosthookAnchor);
+    }
+    if send.signalfd {
+        return Some(R::Signalfd);
+    }
+    if send.inputs.exec_in_flight {
+        return Some(R::ExecInFlight);
+    }
+    if send.inputs.guest_marker_signal {
+        return Some(R::GuestMarkerSignal);
+    }
+    None
+}
+
+/// How a process-directed signal the calling thread sends goes on
+/// (`Detcore::own_process_signal`).
+enum OwnProcessSend {
+    /// The call does not name the sender's own multi-threaded process: the
+    /// ordinary path decides.
+    NotOwn,
+    /// Admitted: forward the call unchanged, holding the sender's turn.
+    Admitted,
+    /// Refused by name, with the policy's answer.
+    Refused(Result<i64, Error>),
+}
+
+/// What `Detcore::rt_sigqueueinfo_precheck` found.
+enum RtSigqueueinfoPrecheck {
+    /// The kernel fails the call without sending (EPERM, or E2BIG, after a
+    /// complete copy): forward it unchanged.
+    KernelFails,
+    /// The kernel's copy certainly faults: Hermit answers EFAULT itself.
+    Efault,
+    /// The call goes on to admission.
+    Proceeds,
+    /// Hermit cannot read the whole `siginfo_t`, and cannot prove that the
+    /// kernel's copy faults: `[vvar]`, which neither tracer read reaches; a
+    /// tail running into a gap; a first 48 bytes in the gap below a grow-down
+    /// mapping, which the kernel's copy may grow into; or an unreadable
+    /// `/proc/<tid>/smaps`.
+    Unreadable,
+}
+
+/// One mapping of a `/proc/<pid>/smaps` listing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Mapping {
+    start: usize,
+    end: usize,
+    /// Whether user mode can read it: on x86 any of read, write or execute
+    /// permission allows a read; none (`---`) faults.
+    user_readable: bool,
+    /// `VmFlags` `gd`: a fault just below it can grow it downwards.
+    growsdown: bool,
+}
+
+/// The mappings of a `/proc/<pid>/smaps` listing, in address order.
+fn parse_smaps(smaps: &str) -> Vec<Mapping> {
+    let mut mappings: Vec<Mapping> = Vec::new();
+    for line in smaps.lines() {
+        if let Some(flags) = line.strip_prefix("VmFlags:") {
+            if let Some(last) = mappings.last_mut() {
+                last.growsdown = flags.split_whitespace().any(|flag| flag == "gd");
+            }
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let Some((start, end)) = fields.next().and_then(|range| range.split_once('-')) else {
+            continue;
+        };
+        let (Ok(start), Ok(end), Some(perms)) = (
+            usize::from_str_radix(start, 16),
+            usize::from_str_radix(end, 16),
+            fields.next(),
+        ) else {
+            continue;
+        };
+        if perms.len() < 4 {
+            continue;
+        }
+        mappings.push(Mapping {
+            start,
+            end,
+            user_readable: perms.chars().take(3).any(|perm| perm != '-'),
+            growsdown: false,
+        });
+    }
+    mappings.sort_by_key(|mapping| mapping.start);
+    mappings
+}
+
+/// Why a byte is not readable by user mode (`first_user_unreadable`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unreadable {
+    /// In a mapping without read, write or execute permission.
+    NoPermission,
+    /// In no mapping; `below_growsdown` when the next mapping above it can
+    /// grow down into it.
+    Hole { below_growsdown: bool },
+}
+
+/// Where the first byte of `[address, address + len)` that user mode cannot
+/// read lies, or `None` when user mode can read them all. A range that
+/// overflows the address space counts as a hole.
+fn first_user_unreadable(mappings: &[Mapping], address: usize, len: usize) -> Option<Unreadable> {
+    let Some(end) = address.checked_add(len) else {
+        return Some(Unreadable::Hole {
+            below_growsdown: false,
+        });
+    };
+    let mut next = address;
+    while next < end {
+        match mappings.iter().find(|mapping| mapping.end > next) {
+            Some(mapping) if mapping.start <= next => {
+                if !mapping.user_readable {
+                    return Some(Unreadable::NoPermission);
+                }
+                next = mapping.end;
+            }
+            above => {
+                return Some(Unreadable::Hole {
+                    below_growsdown: above.is_some_and(|mapping| mapping.growsdown),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// The signals a send of `sig` lets Linux send later at a moment set by host
+/// timing, as a kernel sigset; 0 for every signal but the four that stop by
+/// default. A stopped member makes its process group one that an exit can
+/// orphan with a stopped job, and Linux then sends that whole group SIGHUP and
+/// SIGCONT at the exiting process's physical exit (`kill_orphaned_pgrp` in
+/// kernel/exit.c). Apart from a guest's send, only a terminal stops a guest
+/// process, and a terminal's signals, these two among them, are recorded with
+/// `terminal_signals`.
+fn orphaned_group_signals(sig: libc::c_int) -> u64 {
+    match sig {
+        libc::SIGSTOP | libc::SIGTSTP | libc::SIGTTIN | libc::SIGTTOU => {
+            kernel_sigset_bit(libc::SIGHUP) | kernel_sigset_bit(libc::SIGCONT)
+        }
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2304,6 +2948,24 @@ mod tests {
         libc::timeval {
             tv_sec: seconds,
             tv_usec: micros,
+        }
+    }
+
+    /// A send of each of the four default-stop signals arms the orphaned
+    /// process group's SIGHUP and SIGCONT; no other signal arms anything.
+    #[test]
+    fn only_a_default_stop_signal_arms_the_orphaned_group_signals() {
+        let hup_cont = kernel_sigset_bit(libc::SIGHUP) | kernel_sigset_bit(libc::SIGCONT);
+        for sig in 0..=65 {
+            let stops = matches!(
+                sig,
+                libc::SIGSTOP | libc::SIGTSTP | libc::SIGTTIN | libc::SIGTTOU
+            );
+            assert_eq!(
+                orphaned_group_signals(sig),
+                if stops { hup_cont } else { 0 },
+                "signal {sig}"
+            );
         }
     }
 
@@ -2769,6 +3431,301 @@ mod rt_sigsuspend_tests {
                 guest.arena[slot],
                 peer_rewrite.unwrap_or(original),
                 "slot {slot}: the caller's buffer holds only what the guest wrote"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod own_process_signal_tests {
+    use super::*;
+
+    const SENDER_SIBLING: i32 = 11;
+
+    /// The main thread sends SIGUSR1, which it catches, to its own process
+    /// while one other thread is parked with an empty mask: admitted (S1).
+    fn admitted_s1() -> OwnProcessSignal {
+        OwnProcessSignal {
+            sig: libc::SIGUSR1,
+            names_sender: true,
+            caught: kernel_sigset_bit(libc::SIGUSR1),
+            inputs: OwnProcessSignalInputs {
+                siblings: vec![(
+                    DetTid::from_raw(SENDER_SIBLING),
+                    SiblingSignalState::InSchedule(Some(0)),
+                )],
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn refusal(edit: impl FnOnce(&mut OwnProcessSignal)) -> Option<OwnProcessSignalRefusal> {
+        let mut send = admitted_s1();
+        edit(&mut send);
+        own_process_signal_refusal(&send)
+    }
+
+    /// The first byte user mode cannot read is found across contiguous
+    /// readable, write-only and execute-only mappings, and is a `PROT_NONE`
+    /// mapping, a hole, or a hole below a grow-down mapping.
+    #[test]
+    fn the_first_user_unreadable_byte_is_classified_by_its_mapping() {
+        let smaps = "1000-2000 r--p 0 0:0 0\nVmFlags: rd mr\n\
+                     2000-3000 -w-p 0 0:0 0\nVmFlags: wr mw\n\
+                     3000-4000 ---p 0 0:0 0\nVmFlags: mr\n\
+                     6000-7000 --xp 0 0:0 0 [vvar]\nVmFlags: ex\n\
+                     9000-a000 rw-p 0 0:0 0 [stack]\nVmFlags: rd wr gd\n";
+        let mappings = parse_smaps(smaps);
+        assert_eq!(mappings.len(), 5);
+        assert!(mappings[4].growsdown && !mappings[0].growsdown);
+        assert_eq!(
+            first_user_unreadable(&mappings, 0x1fc0, 128),
+            None,
+            "crosses from read-only into write-only"
+        );
+        assert_eq!(
+            first_user_unreadable(&mappings, 0x6000, 128),
+            None,
+            "execute-only"
+        );
+        assert_eq!(
+            first_user_unreadable(&mappings, 0x2fc0, 128),
+            Some(Unreadable::NoPermission),
+            "runs into PROT_NONE"
+        );
+        assert_eq!(
+            first_user_unreadable(&mappings, 0x4000, 48),
+            Some(Unreadable::Hole {
+                below_growsdown: false
+            }),
+            "a hole below a fixed mapping"
+        );
+        assert_eq!(
+            first_user_unreadable(&mappings, 0x8000, 48),
+            Some(Unreadable::Hole {
+                below_growsdown: true
+            }),
+            "a hole below the stack"
+        );
+        assert_eq!(
+            first_user_unreadable(&mappings, 0xb000, 48),
+            Some(Unreadable::Hole {
+                below_growsdown: false
+            }),
+            "above every mapping"
+        );
+        assert_eq!(
+            first_user_unreadable(&mappings, 0, 48),
+            Some(Unreadable::Hole {
+                below_growsdown: false
+            })
+        );
+        assert_eq!(
+            first_user_unreadable(&mappings, usize::MAX - 10, 48),
+            Some(Unreadable::Hole {
+                below_growsdown: false
+            })
+        );
+    }
+
+    #[test]
+    fn the_sender_named_by_its_call_is_admitted_whatever_its_siblings_masks() {
+        assert_eq!(refusal(|_| {}), None);
+    }
+
+    /// S2: the call names the leader but another thread sends; admitted only
+    /// when every other live thread blocks the signal or has its exit granted.
+    #[test]
+    fn another_sender_is_admitted_only_when_every_live_sibling_blocks() {
+        let usr1 = kernel_sigset_bit(libc::SIGUSR1);
+        let leader = DetTid::from_raw(SENDER_SIBLING);
+        assert_eq!(
+            refusal(|send| send.names_sender = false),
+            Some(OwnProcessSignalRefusal::NotSoleReceiver(leader))
+        );
+        assert_eq!(
+            refusal(|send| {
+                send.names_sender = false;
+                send.inputs.siblings = vec![(leader, SiblingSignalState::InSchedule(Some(usr1)))];
+            }),
+            None
+        );
+        assert_eq!(
+            refusal(|send| {
+                send.names_sender = false;
+                send.inputs.siblings = vec![(leader, SiblingSignalState::ExitGranted)];
+            }),
+            None
+        );
+    }
+
+    /// Only the seven admitted signals pass; each other signal is refused
+    /// whatever its disposition.
+    #[test]
+    fn only_the_seven_signals_below_sigchld_are_admitted() {
+        for sig in 1..=64 {
+            let admitted = OWN_PROCESS_SIGNALS.contains(&sig);
+            let got = refusal(|send| {
+                send.sig = sig;
+                send.caught = kernel_sigset_bit(sig);
+            });
+            if admitted {
+                assert!(sig < libc::SIGCHLD, "signal {sig}");
+                assert_eq!(got, None, "signal {sig}");
+            } else {
+                assert_eq!(
+                    got,
+                    Some(OwnProcessSignalRefusal::SignalNotAdmitted),
+                    "signal {sig}"
+                );
+            }
+        }
+        for sig in [
+            libc::SIGCHLD,
+            libc::SIGCONT,
+            libc::SIGTSTP,
+            libc::SIGRTMIN(),
+            libc::SIGSEGV,
+            libc::SIGTRAP,
+            libc::SIGSTKFLT,
+            libc::SIGKILL,
+            libc::SIGALRM,
+        ] {
+            assert!(!OWN_PROCESS_SIGNALS.contains(&sig), "signal {sig}");
+        }
+    }
+
+    #[test]
+    fn a_default_disposition_is_refused_and_sig_ign_is_admitted() {
+        assert_eq!(
+            refusal(|send| send.caught = 0),
+            Some(OwnProcessSignalRefusal::DefaultDisposition)
+        );
+        assert_eq!(
+            refusal(|send| {
+                send.caught = 0;
+                send.ignored = kernel_sigset_bit(libc::SIGUSR1);
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn each_mode_and_sender_state_refuses_by_name() {
+        use OwnProcessSignalRefusal as R;
+        let sibling = DetTid::from_raw(SENDER_SIBLING);
+        assert_eq!(
+            refusal(|send| send.record_replay = true),
+            Some(R::RecordReplay)
+        );
+        assert_eq!(
+            refusal(|send| send.schedule_replay = true),
+            Some(R::ScheduleReplay)
+        );
+        assert_eq!(
+            refusal(|send| send.inputs.guest_marker_signal = true),
+            Some(R::GuestMarkerSignal)
+        );
+        assert_eq!(
+            refusal(|send| send.stacktrace_signal = true),
+            Some(R::StacktraceSignal)
+        );
+        assert_eq!(
+            refusal(|send| send.blocked = kernel_sigset_bit(libc::SIGUSR1)),
+            Some(R::SenderBlocks)
+        );
+        assert_eq!(
+            refusal(|send| send.inputs.siblings[0].1 = SiblingSignalState::OutOfSchedule),
+            Some(R::OutOfSchedule(sibling))
+        );
+        assert_eq!(
+            refusal(|send| send.inputs.siblings[0].1 = SiblingSignalState::InSchedule(None)),
+            Some(R::UnknownMask(sibling))
+        );
+        assert_eq!(
+            refusal(|send| send.posthook_anchor = true),
+            Some(R::PosthookAnchor)
+        );
+        assert_eq!(refusal(|send| send.signalfd = true), Some(R::Signalfd));
+        assert_eq!(
+            refusal(|send| send.inputs.exec_in_flight = true),
+            Some(R::ExecInFlight)
+        );
+    }
+
+    /// The private queue refuses on any signal the sender does not block,
+    /// except Reverie's timer marker.
+    #[test]
+    fn a_private_pending_signal_refuses_unless_blocked_or_the_timer_marker() {
+        let hup = kernel_sigset_bit(libc::SIGHUP);
+        let marker = kernel_sigset_bit(reverie::PERF_EVENT_SIGNAL as i32);
+        assert_eq!(
+            refusal(|send| send.thread_pending = hup),
+            Some(OwnProcessSignalRefusal::PrivatePending(hup))
+        );
+        assert_eq!(
+            refusal(|send| {
+                send.thread_pending = hup;
+                send.blocked = hup;
+            }),
+            None
+        );
+        assert_eq!(refusal(|send| send.thread_pending = marker), None);
+    }
+
+    /// An armed host-timed source or a foreign exit signal refuses whatever its
+    /// number, unless the sender blocks it.
+    #[test]
+    fn armed_sources_refuse_unless_the_sender_blocks_them() {
+        let io = kernel_sigset_bit(libc::SIGIO);
+        let usr2 = kernel_sigset_bit(libc::SIGUSR2);
+        assert_eq!(
+            refusal(|send| send.inputs.host_timed = io),
+            Some(OwnProcessSignalRefusal::HostTimedSource(io))
+        );
+        assert_eq!(
+            refusal(|send| {
+                send.inputs.host_timed = io;
+                send.blocked = io;
+            }),
+            None
+        );
+        assert_eq!(
+            refusal(|send| send.inputs.foreign_exit_signals = usr2),
+            Some(OwnProcessSignalRefusal::ForeignExitSignal(usr2))
+        );
+        assert_eq!(
+            refusal(|send| {
+                send.inputs.foreign_exit_signals = usr2;
+                send.blocked = usr2;
+            }),
+            None
+        );
+    }
+
+    /// An undelivered scheduler signal refuses when numbered at or below the
+    /// one sent, which it would precede or coalesce with, and not above it.
+    #[test]
+    fn an_undelivered_scheduler_signal_refuses_only_at_or_below_the_sent_one() {
+        let term = libc::SIGTERM;
+        for (pending, refuses) in [
+            (libc::SIGHUP, true),
+            (libc::SIGALRM, true),
+            (libc::SIGTERM, true),
+            (libc::SIGSTKFLT, false),
+            (libc::SIGRTMIN(), false),
+        ] {
+            let bit = kernel_sigset_bit(pending);
+            let got = refusal(|send| {
+                send.sig = term;
+                send.caught = kernel_sigset_bit(term);
+                send.inputs.undelivered_scheduler_signals = bit;
+            });
+            assert_eq!(
+                got,
+                refuses.then_some(OwnProcessSignalRefusal::UndeliveredSchedulerSignal(bit)),
+                "pending {pending}"
             );
         }
     }

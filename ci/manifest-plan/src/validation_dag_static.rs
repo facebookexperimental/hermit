@@ -1383,7 +1383,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The two SIGKILL-retirement metadata/replay tests (https://github.com/rrnewton/hermit/issues/3994) retain all 1045: 1047.
     // And metadata::tests::pre_epoll_pwait2_recordings_are_refused_by_the_version_gate
     // (https://github.com/rrnewton/hermit/issues/4088): 1048.
-    ("test.hermit_unit", 1048),
+    // And metadata::tests::record_version_rejects_streams_whose_stop_signals_armed_no_orphaned_group_record
+    // (https://github.com/rrnewton/hermit/issues/4111): 1049.
+    ("test.hermit_unit", 1049),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1928,7 +1930,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The 29 SIGKILL-retirement, signalfd-reconciliation and iovec tests (https://github.com/rrnewton/hermit/issues/3994) retain all 1385: 1414.
     // scheduler::test::a_sigkill_arm_on_an_rt_sigsuspend_sleeper_ends_with_its_exit
     // (https://github.com/rrnewton/hermit/issues/3941): 1415.
-    ("test.detcore_unit", 1415),
+    // The 14 own-process signal and orphaned-group tests (https://github.com/rrnewton/hermit/issues/4034) retain all 1415: 1429.
+    ("test.detcore_unit", 1429),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2117,7 +2120,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4068): 281.
     // And external_signal_interrupt::ptrace_ppoll_on_a_stack_with_no_scratch_behaves_as_natively
     // (https://github.com/rrnewton/hermit/issues/4113): 282.
-    ("test.hermit_integration", 282),
+    // And external_signal_interrupt::ptrace_a_stop_signal_send_keeps_a_sighup_poll_to_its_deadline
+    // (https://github.com/rrnewton/hermit/issues/4111): 283.
+    ("test.hermit_integration", 283),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -2612,7 +2617,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_pending_real_time_timer_expiration_is_refused_only_where_it_is_observed
     // (https://github.com/rrnewton/hermit/issues/4089) retains all 300: 301.
     // a_cross_process_sigkill_verifies_at_bitwise_parity and a_recorded_kill_of_a_victim_in_a_background_read_is_refused_at_replay (https://github.com/rrnewton/hermit/issues/3994) retain all 301: 303.
-    ("test.cli", 303),
+    // The four own-process signal CLI tests (https://github.com/rrnewton/hermit/issues/4034) retain all 303: 307.
+    ("test.cli", 307),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2856,7 +2862,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Nor do the two namespace-only kill(0) and terminal tests: 236.
     // Nor does the pending real-time timer expiration test: 237.
     // Nor do the cross-process SIGKILL parity and record-refusal tests: 239.
-    ("test.cli_on_host", 239),
+    // Nor do the four own-process signal CLI tests: 243.
+    ("test.cli_on_host", 243),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -3006,7 +3013,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the yielder harvest-gate unit test: 1385.
     // And the 29 SIGKILL-retirement tests: 1414.
     // And the rt_sigsuspend SIGKILL-arm test: 1415.
-    ("test.detcore_unit_on_host", 1415),
+    // And the 14 own-process signal tests: 1429.
+    ("test.detcore_unit_on_host", 1429),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -3041,7 +3049,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the large-pselect6 tight-stack test: 277.
     // And the four targeted-chaos sched_yield tests: 281.
     // And the ppoll tight-stack test: 282.
-    ("test.hermit_integration_on_host", 282),
+    // And the stop-signal SIGHUP poll test: 283.
+    ("test.hermit_integration_on_host", 283),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
@@ -3145,7 +3154,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the SIGKILL-retirement record-version and replay-refusal tests: 1047.
     // And metadata::tests::pre_epoll_pwait2_recordings_are_refused_by_the_version_gate
     // (https://github.com/rrnewton/hermit/issues/4088): 1048.
-    ("test.hermit_unit_on_host", 1048),
+    // And the orphaned-group record-epoch test: 1049.
+    ("test.hermit_unit_on_host", 1049),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

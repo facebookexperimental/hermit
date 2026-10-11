@@ -289,6 +289,47 @@ pub enum HostTimedSignalScope {
     Container,
 }
 
+/// The state of one other thread of a process, as a process-directed signal
+/// that a thread sends to its own process reads it
+/// (`Scheduler::own_process_signal_inputs`,
+/// <https://github.com/rrnewton/hermit/issues/4034>).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SiblingSignalState {
+    /// Its exit is granted: it never resumes guest code.
+    ExitGranted,
+    /// It runs or sleeps outside the schedule (a real kernel sleep: external
+    /// I/O, `rt_sigsuspend`, a vfork parent), so the moment it next dequeues
+    /// is host-timed.
+    OutOfSchedule,
+    /// It is stopped at a request, parked in a precise futex wait or polling
+    /// `rt_sigtimedwait`, with the mask a signal sent now meets; `None` when
+    /// that mask is unknown.
+    InSchedule(Option<u64>),
+}
+
+/// What the scheduler knows, in a thread's own turn, about the inputs to a
+/// process-directed signal that the thread sends to its own process
+/// (<https://github.com/rrnewton/hermit/issues/4034>). Every field is a function
+/// of the schedule.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnProcessSignalInputs {
+    /// Every other thread of the process, in thread-ID order.
+    pub siblings: Vec<(DetTid, SiblingSignalState)>,
+    /// The host-timed signal record for the sender (`host_timed_signals`).
+    pub host_timed: u64,
+    /// The exit signals, other than 0 and SIGCHLD, of the process's unreaped
+    /// children, which the kernel sends itself at a host-timed moment.
+    pub foreign_exit_signals: u64,
+    /// Signals the scheduler sent to a thread of the process
+    /// (`signal_guest`) that no thread of the process has taken yet.
+    pub undelivered_scheduler_signals: u64,
+    /// Whether an exec is in flight in the process (`exec_teardowns`).
+    pub exec_in_flight: bool,
+    /// Whether any guest has sent SIGSTKFLT, which Reverie also uses as its
+    /// timer marker (`Scheduler::record_guest_marker_signal`).
+    pub guest_marker_signal: bool,
+}
+
 /// The one-bit kernel sigset for a 1-based signal number, or 0 when out of range.
 pub(crate) fn kernel_signal_bit(raw_signal: i32) -> u64 {
     if (1..=64).contains(&raw_signal) {
@@ -1359,6 +1400,22 @@ pub struct Scheduler {
     /// Recorded in the thread's own turn; never cleared.
     background_call_processes: BTreeSet<DetPid>,
 
+    /// The set each thread polling `rt_sigtimedwait` waits for: a signal in
+    /// it is taken at the thread's next poll whatever its mask, so the
+    /// thread's effective mask is `blocked & !set`
+    /// (`own_process_signal_inputs`).
+    sigtimedwait_sets: BTreeMap<DetTid, u64>,
+
+    /// For each process, the signals the scheduler sent to one of its threads
+    /// (`signal_guest`) that no thread of the process has taken yet. A
+    /// standard signal coalesces, so one delivery clears its bit.
+    undelivered_scheduler_signals: BTreeMap<DetPid, u64>,
+
+    /// Whether any guest has sent SIGSTKFLT, Reverie's timer marker
+    /// (`record_guest_marker_signal`). Set in the sending call's turn and
+    /// never cleared.
+    guest_sent_marker_signal: bool,
+
     /// Test-only stand-in for the /proc signal-mask fields, keyed by
     /// (process, thread, field). Unit tests use small fake pids that can name
     /// real host processes, so tests never read /proc: an absent entry reads
@@ -1820,6 +1877,19 @@ impl ThreadTree {
     /// signal to a `Gone` target.
     pub fn parent_process(&self, pid: &DetPid) -> Option<DetPid> {
         self.process_parent.get(pid).copied()
+    }
+
+    /// The processes whose parent process is `parent` and that it has not
+    /// reaped yet (`process_parent`), in pid order.
+    pub fn unreaped_children_of(&self, parent: DetPid) -> Vec<DetPid> {
+        let mut children: Vec<DetPid> = self
+            .process_parent
+            .iter()
+            .filter(|(_, owner)| **owner == parent)
+            .map(|(child, _)| *child)
+            .collect();
+        children.sort();
+        children
     }
 
     /// Preserve a surviving exec task's children when Linux replaces its TID
@@ -3130,6 +3200,9 @@ impl Scheduler {
             signalfd_masks: Default::default(),
             handler_restore_unblocked: Default::default(),
             background_call_processes: Default::default(),
+            sigtimedwait_sets: Default::default(),
+            undelivered_scheduler_signals: Default::default(),
+            guest_sent_marker_signal: false,
             #[cfg(test)]
             test_signal_masks: Default::default(),
             resources: Default::default(),
@@ -4609,6 +4682,111 @@ impl Scheduler {
             None => self.saved_guest_sigmasks.remove(&dettid),
         };
         true
+    }
+
+    /// Record (`Some`) or clear (`None`) the set `dettid` waits for in
+    /// `rt_sigtimedwait`. Returns false for a thread the scheduler no longer
+    /// knows.
+    pub(crate) fn set_sigtimedwait_set(&mut self, dettid: DetTid, set: Option<u64>) -> bool {
+        if !self.next_turns.contains_key(&dettid) {
+            return false;
+        }
+        match set {
+            Some(set) => self.sigtimedwait_sets.insert(dettid, set),
+            None => self.sigtimedwait_sets.remove(&dettid),
+        };
+        true
+    }
+
+    /// The inputs to a process-directed signal that `sender` sends to its own
+    /// process, read in `sender`'s turn (https://github.com/rrnewton/hermit/issues/4034).
+    /// Every other thread is then stopped at a request, parked, or outside the
+    /// schedule, so each mask read here is the one the schedule left it with
+    /// (`kernel_sigchld_target`).
+    pub(crate) fn own_process_signal_inputs(&self, sender: DetTid) -> OwnProcessSignalInputs {
+        let process = self.sigchld_process(sender);
+        // A thread is in `next_turns` from its creation to its removal
+        // (`process_signal_targets`), so this is every live thread.
+        let siblings = self
+            .process_signal_targets(process)
+            .into_iter()
+            .filter(|thread| *thread != sender)
+            .map(|thread| (thread, self.sibling_signal_state(thread)))
+            .collect();
+        let foreign_exit_signals = self
+            .thread_tree
+            .unreaped_children_of(process)
+            .into_iter()
+            .filter_map(|child| self.thread_tree.notification_signal(child))
+            .filter(|signal| *signal != 0 && *signal != libc::SIGCHLD)
+            .fold(0, |set, signal| set | kernel_signal_bit(signal));
+        OwnProcessSignalInputs {
+            siblings,
+            host_timed: self.host_timed_signals(sender),
+            foreign_exit_signals,
+            undelivered_scheduler_signals: self
+                .undelivered_scheduler_signals
+                .get(&process)
+                .copied()
+                .unwrap_or(0),
+            exec_in_flight: self.exec_teardowns.contains_key(&process),
+            guest_marker_signal: self.guest_sent_marker_signal,
+        }
+    }
+
+    /// Record that a guest sent SIGSTKFLT. Reverie uses SIGSTKFLT as its timer
+    /// marker, and a process-directed signal to the sender's own process
+    /// excludes only Reverie's own copy from its check of the sender's queue,
+    /// so it refuses once a guest copy may be pending
+    /// (https://github.com/rrnewton/hermit/issues/4034).
+    pub(crate) fn record_guest_marker_signal(&mut self) {
+        self.guest_sent_marker_signal = true;
+    }
+
+    /// The scheduler sent `signal` to `dettid` (`signal_guest`): no thread of
+    /// its process has taken it yet (`undelivered_scheduler_signals`).
+    fn note_scheduler_signal_sent(&mut self, dettid: DetTid, signal: libc::c_int) {
+        let process = self.sigchld_process(dettid);
+        *self
+            .undelivered_scheduler_signals
+            .entry(process)
+            .or_default() |= kernel_signal_bit(signal);
+    }
+
+    /// `dettid` took `signal` at its delivery stop: a standard signal the
+    /// scheduler sent to its process coalesced into this one.
+    fn note_signal_taken(&mut self, dettid: DetTid, signal: libc::c_int) {
+        let process = self.sigchld_process(dettid);
+        if let Some(undelivered) = self.undelivered_scheduler_signals.get_mut(&process) {
+            *undelivered &= !kernel_signal_bit(signal);
+        }
+    }
+
+    /// `thread`'s state for `own_process_signal_inputs`.
+    fn sibling_signal_state(&self, thread: DetTid) -> SiblingSignalState {
+        if self.parked.exit_fences.contains_key(&thread)
+            || self.logically_killed_threads.contains(&thread)
+        {
+            return SiblingSignalState::ExitGranted;
+        }
+        if self.blocked.external_io_blockers.contains_key(&thread)
+            || self.blocked.rt_sigsuspend_blockers.contains_key(&thread)
+        {
+            return SiblingSignalState::OutOfSchedule;
+        }
+        // The kernel chooses by the thread's own mask (`SigBlk`), which a
+        // stopped or parked thread cannot change, or by the guest's mask
+        // while Detcore holds the thread under a private one
+        // (`saved_guest_sigmasks`). A parked futex waiter's watch is the set
+        // that ends its wait, not its mask.
+        let mask = match self.saved_guest_sigmasks.get(&thread) {
+            Some(saved) => Some(*saved),
+            None => self.read_thread_blocked_mask(thread),
+        };
+        SiblingSignalState::InSchedule(mask.map(|mask| match self.sigtimedwait_sets.get(&thread) {
+            Some(set) => mask & !set,
+            None => mask,
+        }))
     }
 
     /// Classify `child`'s exit notification to `parent` at its exit grant, by
@@ -6229,7 +6407,7 @@ impl Scheduler {
             signal::kill(pid, signal)
         };
         match result {
-            Ok(()) => {}
+            Ok(()) => self.note_scheduler_signal_sent(dettid, signal as libc::c_int),
             // ⚠️ ESRCH IS AN EXPECTED OUTCOME HERE, NOT AN ERROR. The target
             // chose to exit between the moment it was selected and the moment
             // the signal was sent; that window is inherent and cannot be closed
@@ -8550,6 +8728,7 @@ impl Scheduler {
             // `fire_alarm`) are never SIGCHLD and are unaffected.
             ResourceID::WaitidSignals(_) => Ok(()),
             ResourceID::InboundSignal(sig) => {
+                self.note_signal_taken(dettid, sig.raw());
                 // `sigchld_ready` marks a parent step2e has already re-admitted,
                 // or a delivery the scheduler already placed; grant it now rather
                 // than deferring it (a second time).
@@ -14562,6 +14741,131 @@ mod test {
             register_known_thread(&mut scheduler, thread);
         }
         (scheduler, parent, creator, child)
+    }
+
+    /// The inputs of a process-directed signal the leader sends to its own
+    /// process read each sibling from the schedule
+    /// (https://github.com/rrnewton/hermit/issues/4034): a stopped thread's
+    /// `SigBlk`; the guest's own mask while Detcore holds the thread under a
+    /// private one (`saved_guest_sigmasks`); `blocked & !set` for an
+    /// `rt_sigtimedwait` poller; external I/O and a real `rt_sigsuspend` as
+    /// outside the schedule; and a logically killed thread as exit-granted.
+    #[test]
+    fn own_process_signal_inputs_read_each_sibling_from_the_schedule() {
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        let usr2 = kernel_signal_bit(libc::SIGUSR2);
+        let (mut scheduler, parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+        let state = |scheduler: &Scheduler| scheduler.own_process_signal_inputs(parent).siblings;
+        scheduler.test_kernel_signal_states.insert(
+            creator,
+            KernelSignalState {
+                blocked: usr1 | usr2,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            state(&scheduler),
+            vec![(creator, SiblingSignalState::InSchedule(Some(usr1 | usr2)))]
+        );
+        assert!(scheduler.set_sigtimedwait_set(creator, Some(usr1)));
+        assert_eq!(
+            state(&scheduler),
+            vec![(creator, SiblingSignalState::InSchedule(Some(usr2)))],
+            "a poller takes a signal in its set whatever its mask"
+        );
+        assert!(scheduler.set_sigtimedwait_set(creator, None));
+        assert!(scheduler.set_saved_guest_sigmask(creator, Some(usr2)));
+        assert_eq!(
+            state(&scheduler),
+            vec![(creator, SiblingSignalState::InSchedule(Some(usr2)))],
+            "the guest's own mask, not Detcore's private one"
+        );
+        assert!(scheduler.set_saved_guest_sigmask(creator, None));
+        let op = ExternalOpId {
+            tid: creator,
+            sequence: 1,
+        };
+        scheduler.blocked.external_io_blockers.insert(creator, op);
+        assert_eq!(
+            state(&scheduler),
+            vec![(creator, SiblingSignalState::OutOfSchedule)]
+        );
+        scheduler.blocked.external_io_blockers.remove(&creator);
+        scheduler.blocked.rt_sigsuspend_blockers.insert(creator, op);
+        assert_eq!(
+            state(&scheduler),
+            vec![(creator, SiblingSignalState::OutOfSchedule)]
+        );
+        scheduler.blocked.rt_sigsuspend_blockers.remove(&creator);
+        scheduler.logically_killed_threads.insert(creator);
+        assert_eq!(
+            state(&scheduler),
+            vec![(creator, SiblingSignalState::ExitGranted)]
+        );
+    }
+
+    /// An unreaped child whose exit signal is neither 0 nor SIGCHLD names that
+    /// signal in its parent's inputs, and a SIGCHLD child names nothing.
+    #[test]
+    fn own_process_signal_inputs_name_a_childs_foreign_exit_signal() {
+        let (scheduler, parent, _creator, _child) = sigchld_family(libc::SIGUSR2);
+        assert_eq!(
+            scheduler
+                .own_process_signal_inputs(parent)
+                .foreign_exit_signals,
+            kernel_signal_bit(libc::SIGUSR2)
+        );
+        let (scheduler, parent, _creator, _child) = sigchld_family(libc::SIGCHLD);
+        assert_eq!(
+            scheduler
+                .own_process_signal_inputs(parent)
+                .foreign_exit_signals,
+            0
+        );
+    }
+
+    /// A signal the scheduler sends to any thread of a process stays in the
+    /// process's undelivered set until a thread of that process takes one of
+    /// that number; another process's delivery, or another number, leaves it.
+    #[test]
+    fn a_scheduler_sent_signal_is_undelivered_until_its_process_takes_it() {
+        let hup = kernel_signal_bit(libc::SIGHUP);
+        let (mut scheduler, parent, creator, child) = sigchld_family(libc::SIGCHLD);
+        let undelivered = |scheduler: &Scheduler| {
+            scheduler
+                .own_process_signal_inputs(parent)
+                .undelivered_scheduler_signals
+        };
+        scheduler.note_scheduler_signal_sent(creator, libc::SIGHUP);
+        assert_eq!(undelivered(&scheduler), hup);
+        scheduler.note_signal_taken(child, libc::SIGHUP);
+        scheduler.note_signal_taken(parent, libc::SIGUSR1);
+        assert_eq!(undelivered(&scheduler), hup);
+        scheduler.note_signal_taken(parent, libc::SIGHUP);
+        assert_eq!(undelivered(&scheduler), 0);
+    }
+
+    /// A guest's send of SIGSTKFLT, Reverie's timer marker, is recorded for
+    /// every process and never forgotten.
+    #[test]
+    fn a_guest_marker_signal_send_is_recorded_for_every_process() {
+        let (mut scheduler, parent, _creator, child) = sigchld_family(libc::SIGCHLD);
+        assert!(
+            !scheduler
+                .own_process_signal_inputs(parent)
+                .guest_marker_signal
+        );
+        scheduler.record_guest_marker_signal();
+        assert!(
+            scheduler
+                .own_process_signal_inputs(parent)
+                .guest_marker_signal
+        );
+        assert!(
+            scheduler
+                .own_process_signal_inputs(child)
+                .guest_marker_signal
+        );
     }
 
     fn park_for_sigchld(scheduler: &mut Scheduler, thread: DetTid, unblocked: u64) {

@@ -935,6 +935,15 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Yield when accumulated logical time reaches the syscall-boundary target deadline.
     async fn end_timeslice_if_needed<G: Guest<Self>>(&self, guest: &mut G, boundary: CheckIn) {
         let thread_state = guest.thread_state();
+        // A thread that sent a signal to its own process keeps its turn until
+        // it dequeues that signal (`own_signal_turn_hold`).
+        if let Some(signal) = thread_state.own_signal_turn_hold {
+            trace!(
+                "[dtid {}] keeps its turn until it takes signal {}",
+                thread_state.dettid, signal
+            );
+            return;
+        }
         let Some(slice_end) = thread_state.end_of_timeslice else {
             return;
         };
@@ -961,6 +970,13 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// However, note that the thread's timeslice (turn) may have expired DURING this handler.
     /// Therefore the timeslice can end in the posthook as well as in the prehook.
     async fn post_handler_hook<G: Guest<Self>>(&self, guest: &mut G, boundary: CheckIn) {
+        // Only `kill` and `rt_sigqueueinfo` set the hold, and they wake no
+        // futex waiter (https://github.com/rrnewton/hermit/issues/4034).
+        assert!(
+            guest.thread_state().own_signal_turn_hold.is_none()
+                || !guest.thread_state().yield_after_futex_wake,
+            "a futex wake must not end the turn a signal to the sender's own process holds"
+        );
         if std::mem::take(&mut guest.thread_state_mut().yield_after_futex_wake) {
             // A turn of its own, outside the timeslice bookkeeping: the slice
             // keeps its deadlines, draws nothing from the thread's chaos PRNG
@@ -992,6 +1008,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             let epsilon = Duration::from_nanos((NANOS_PER_RCB * clock_multiplier).ceil() as u64);
 
             if replay_rcb_end.is_none() && current_time + epsilon > max_timeslice_end {
+                if guest.thread_state().own_signal_turn_hold.is_some() {
+                    // No guest instruction runs before the delivery stop that
+                    // ends the hold, and that stop's post-hook ends this slice
+                    // and sets the next timer (`own_signal_turn_hold`).
+                    trace!(
+                        "posthook [dtid {}] past PMU maximum {} while it keeps its turn",
+                        dettid, max_timeslice_end
+                    );
+                    return;
+                }
                 trace!(
                     "posthook [dtid {}] less than one RCB remains before PMU maximum {}; ending slice",
                     dettid, max_timeslice_end
@@ -1947,6 +1973,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             {
                 return Ok(None);
             }
+            // The kernel dequeued `signal` before this stop: a hold for it ends
+            // here, and this stop's hooks may end the slice
+            // (`own_signal_turn_hold`).
+            if guest.thread_state().own_signal_turn_hold == Some(signal as libc::c_int) {
+                guest.thread_state_mut().own_signal_turn_hold = None;
+            }
             self.pre_handler_hook(guest, false, CheckIn::Event).await;
 
             // For `hermit run --verify`: a guest that faulted on an illegal
@@ -2229,6 +2261,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     uncharged_bootstrap_syscalls: 0,
                     in_uncharged_bootstrap_syscall: false,
                     yield_after_futex_wake: false,
+                    own_signal_turn_hold: None,
 
                     end_of_timeslice: None,
                     replay_rcb_end: None,
@@ -2552,7 +2585,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 thread_state.last_rcb_timer = None;
                 thread_state.last_rcb_timer_is_max = false;
                 thread_state.stats.reset_timeslice();
-            } else {
+            } else if guest.thread_state().own_signal_turn_hold.is_none() {
                 self.end_timeslice(guest).await;
             }
         }
@@ -2574,6 +2607,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             return Ok(0);
         }
 
+        // A thread that keeps its turn for a signal it sent its own process
+        // takes that signal before it can make another syscall.
+        if let Some(signal) = guest.thread_state_mut().own_signal_turn_hold.take() {
+            tracing::error!(
+                "[detcore, dtid {}] reached a syscall without taking signal {} it sent to its own \
+                 process (https://github.com/rrnewton/hermit/issues/4034)",
+                guest.thread_state().dettid,
+                signal
+            );
+        }
         self.pre_handler_hook(guest, false, CheckIn::Event).await;
 
         // Linux's restart of an interrupted wait is the thread's very next syscall,

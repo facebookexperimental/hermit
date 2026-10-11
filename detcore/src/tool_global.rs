@@ -92,6 +92,7 @@ use crate::scheduler::ExecReconnect;
 use crate::scheduler::FutexSignalWatch;
 use crate::scheduler::HostTimedSignalScope;
 use crate::scheduler::MaybePrintStack;
+use crate::scheduler::OwnProcessSignalInputs;
 use crate::scheduler::Priority;
 use crate::scheduler::SchedResponse;
 use crate::scheduler::SchedValue;
@@ -2515,6 +2516,28 @@ impl GlobalTool for GlobalState {
                     R::ThreadExited
                 }
             }
+            GlobalRequest::SetSigtimedwaitSet(set) => {
+                let updated = self
+                    .lock_rpc_scheduler(false)
+                    .await
+                    .set_sigtimedwait_set(dtid, set);
+                if updated {
+                    R::SetSigtimedwaitSet(())
+                } else {
+                    R::ThreadExited
+                }
+            }
+            GlobalRequest::RecordGuestMarkerSignal => {
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .record_guest_marker_signal();
+                R::RecordGuestMarkerSignal(())
+            }
+            GlobalRequest::OwnProcessSignalInputs => R::OwnProcessSignalInputs(
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .own_process_signal_inputs(dtid),
+            ),
             GlobalRequest::SetChildTidAddress(address) => {
                 let updated = self
                     .lock_rpc_scheduler(false)
@@ -4362,6 +4385,17 @@ pub enum GlobalRequest {
     /// child-exit classification reads the guest's mask, not Detcore's.
     SetSavedGuestSigmask(Option<u64>),
 
+    /// Record (`Some`) or clear (`None`) the set the calling thread waits for
+    /// while it polls `rt_sigtimedwait`.
+    SetSigtimedwaitSet(Option<u64>),
+
+    /// The inputs to a process-directed signal the calling thread sends to its
+    /// own process (`Scheduler::own_process_signal_inputs`).
+    OwnProcessSignalInputs,
+
+    /// The calling thread sends SIGSTKFLT (`Scheduler::record_guest_marker_signal`).
+    RecordGuestMarkerSignal,
+
     /// Notify scheduler before/after futex action.
     /// The last two arguments are the initial contents of the memory word, and the mask.
     FutexAction(DetTid, FutexAction, FutexID, i32, u32),
@@ -4608,6 +4642,9 @@ pub enum GlobalResponse {
     DeregisterThread(()),
     SetChildTidAddress(()),
     SetSavedGuestSigmask(()),
+    SetSigtimedwaitSet(()),
+    OwnProcessSignalInputs(OwnProcessSignalInputs),
+    RecordGuestMarkerSignal(()),
     FutexAction(Option<SchedValue>),
     /// Return the mtime as well:
     DeterminizeInode((DetInode, LogicalTime)),
@@ -4900,6 +4937,53 @@ where
         ),
         "unexpected response to SetSavedGuestSigmask: {response:?}"
     );
+}
+
+/// Tells the scheduler the set the calling thread waits for while it polls
+/// `rt_sigtimedwait` (`Some`), or that it polls no more (`None`).
+pub(crate) async fn set_sigtimedwait_set<G, T>(guest: &mut G, set: Option<u64>)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let (_, response) = send_and_update_time(guest, GlobalRequest::SetSigtimedwaitSet(set)).await;
+    assert!(
+        matches!(
+            response,
+            GlobalResponse::SetSigtimedwaitSet(()) | GlobalResponse::ThreadExited
+        ),
+        "unexpected response to SetSigtimedwaitSet: {response:?}"
+    );
+}
+
+/// Tells the scheduler the calling thread sends SIGSTKFLT, in its own turn
+/// (`Scheduler::record_guest_marker_signal`).
+pub(crate) async fn record_guest_marker_signal<G, T>(guest: &mut G)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let (_, response) = send_and_update_time(guest, GlobalRequest::RecordGuestMarkerSignal).await;
+    assert!(
+        matches!(response, GlobalResponse::RecordGuestMarkerSignal(())),
+        "unexpected response to RecordGuestMarkerSignal: {response:?}"
+    );
+}
+
+/// The inputs to a process-directed signal the calling thread sends to its own
+/// process, read in its turn (`Scheduler::own_process_signal_inputs`).
+pub(crate) async fn own_process_signal_inputs<G, T>(guest: &mut G) -> OwnProcessSignalInputs
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match send_and_update_time(guest, GlobalRequest::OwnProcessSignalInputs)
+        .await
+        .1
+    {
+        GlobalResponse::OwnProcessSignalInputs(inputs) => inputs,
+        response => unreachable!("unexpected response to OwnProcessSignalInputs: {response:?}"),
+    }
 }
 
 pub(crate) async fn set_child_tid_address<G, T>(guest: &mut G, address: usize)

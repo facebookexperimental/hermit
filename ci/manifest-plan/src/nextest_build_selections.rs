@@ -640,8 +640,10 @@ mod tests {
             // and tight-stack tests (https://github.com/rrnewton/hermit/pull/4053),
             // plus the four targeted-chaos sched_yield tests
             // (https://github.com/rrnewton/hermit/issues/4068), plus the ppoll
-            // tight-stack test (https://github.com/rrnewton/hermit/issues/4113).
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "282");
+            // tight-stack test (https://github.com/rrnewton/hermit/issues/4113),
+            // plus the stop-signal SIGHUP poll test
+            // (https://github.com/rrnewton/hermit/issues/4111).
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "283");
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

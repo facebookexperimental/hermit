@@ -11,10 +11,11 @@
  * process, first with one thread and then with a second thread waiting in
  * sigsuspend() (https://github.com/rrnewton/hermit/issues/4034). Linux's
  * complete_signal picks the receiving thread from the threads that want the
- * signal; Detcore does not model that choice yet, so with two threads it
- * refuses the call by name: a fail-closed run stops with the policy-refusal
- * status after the first block, and --allow-unsupported-syscalls returns
- * ENOSYS. A zombie child (exited, not reaped) is still signalled
+ * signal; Detcore forwards the call only when the schedule fixes that
+ * choice, and here the second thread sleeps in sigsuspend, outside the
+ * schedule, so with two threads it refuses the call by name: a fail-closed run
+ * stops with the policy-refusal status after the first block, and
+ * --allow-unsupported-syscalls returns ENOSYS. A zombie child (exited, not reaped) is still signalled
  * successfully, and once reaped it is ESRCH
  * (https://github.com/rrnewton/hermit/issues/4091). A child that is never a
  * zombie is ESRCH once it exits: its parent ignores SIGCHLD or sets

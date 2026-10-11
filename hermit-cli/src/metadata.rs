@@ -328,7 +328,16 @@ impl RecordVersion {
 // 0x136 -> 0x137: `epoll_pwait2` is recorded with the event `epoll_wait`
 // records, and replay serves it from the recording; it ran live before
 // (https://github.com/rrnewton/hermit/issues/4088).
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x137);
+// 0x137 -> 0x138: a guest send of a default-stop signal records SIGHUP and
+// SIGCONT as host-timed for every process, which an orphaned process group
+// can receive at an exit's physical moment
+// (https://github.com/rrnewton/hermit/issues/4111), so no gated wait ends for
+// them afterwards. Replay recomputes the schedule, so an older recording
+// replayed here could see such a wait end, although no event shape changed.
+// Record and replay refuse the newly admitted signal to the sender's own
+// process (https://github.com/rrnewton/hermit/issues/4034), so that change
+// alters no recording.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x138);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -353,7 +362,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x137);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x137;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x138;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1048,6 +1057,11 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_that_answered_a_gone_sigqueueinfo_before_its_siginfo() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x134)));
+    }
+
+    #[test]
+    fn record_version_rejects_streams_whose_stop_signals_armed_no_orphaned_group_record() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x137)));
     }
 
     /// Record and replay run under ptrace with serialized threads, so their

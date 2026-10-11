@@ -134,6 +134,7 @@ static FUTEX_REWAIT_CHANGED_WORD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_WAIT_UNREADABLE_WORD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PIDFD_SEND_SIGNAL_MULTITHREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_MULTITHREADED_PROCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static OWN_PROCESS_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_PROCESS_GROUP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_CREATE_RT_SIGNAL_REFUSED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_RT_SIGNAL_PENDING_OBSERVED_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1037,6 +1038,31 @@ fn kill_multithreaded_process_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "kill-multithreaded-process guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn own_process_signal_guest() -> &'static Path {
+    OWN_PROCESS_SIGNAL_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("own-process-signal");
+        fs::create_dir_all(&build_root).expect("failed to create own-process-signal directory");
+        let guest = build_root.join("own_process_signal");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/own_process_signal.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile own-process-signal guest");
+        assert!(
+            output.status.success(),
+            "own-process-signal guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -21448,16 +21474,18 @@ fn a_futex_wake_count_of_zero_or_negative_wakes_one_waiter() {
     );
 }
 
-/// A process-directed signal to a process with two live threads is refused by
-/// name (https://github.com/rrnewton/hermit/issues/4034): Linux's
-/// `complete_signal` would give it to any thread that wants it, and Detcore
-/// does not model that choice. Before the change `kill` and `rt_sigqueueinfo`
-/// returned ENOSYS as an ordinary errno, so a fail-closed run went on with a
-/// failure Linux never returns. A fail-closed run now stops with the
-/// policy-refusal status after the one-thread block, which still delivers; with
-/// `--allow-unsupported-syscalls` both calls return ENOSYS, as before. `kill`
-/// to a zombie child answers 0, as Linux does, and ESRCH once it is reaped;
-/// before https://github.com/rrnewton/hermit/issues/4091 the zombie was ESRCH.
+/// A process-directed signal to the sender's own process with two live threads
+/// is delivered only when the schedule fixes the receiver, and refused by name
+/// otherwise (https://github.com/rrnewton/hermit/issues/4034). The main
+/// thread sends `kill(getpid(), SIGUSR1)`, then `rt_sigqueueinfo`, then a kill
+/// naming the other thread's id, while the other thread sleeps in
+/// `sigsuspend`, outside the schedule, at moments host timing sets, so each
+/// call is refused: a fail-closed run stops with the policy-refusal status at
+/// the first, and with `--allow-unsupported-syscalls` each returns ENOSYS.
+///
+/// `kill` to a zombie child answers 0, as Linux does, and ESRCH once it is
+/// reaped; before https://github.com/rrnewton/hermit/issues/4091 the zombie
+/// was ESRCH.
 /// A child that is never a zombie stays ESRCH: one auto-reaped because its
 /// parent ignores SIGCHLD or sets SA_NOCLDWAIT, and an orphan that init reaps.
 /// Signal 0 answers as a signal does, and `rt_sigqueueinfo` to a zombie is
@@ -21530,7 +21558,8 @@ fn a_process_directed_signal_to_several_threads_is_refused_by_name() {
     );
     assert!(
         log.contains("process-directed signal 10 to process")
-            && log.contains("by kill is not supported: the process has 2 live threads"),
+            && log.contains("by kill is not supported: thread ")
+            && log.contains("runs or sleeps outside the schedule"),
         "the refusal must name the call and the reason:\nstderr:\n{log}"
     );
     assert_eq!(stdout, one_thread, "stderr:\n{log}");
@@ -21568,6 +21597,460 @@ fn a_process_directed_signal_to_several_threads_is_refused_by_name() {
     assert!(
         log.contains("by rt_sigqueueinfo is not supported"),
         "the compatibility run must still name each refusal:\nstderr:\n{log}"
+    );
+}
+
+/// A process-directed signal a thread sends to its own multi-threaded process
+/// goes to the sender, before `kill` returns, exactly as Linux delivers it,
+/// when the schedule fixes the kernel's choice and the sender's dequeue
+/// (https://github.com/rrnewton/hermit/issues/4034). Each mode runs under
+/// `--strict --verify --verify-strict` and must print what Linux prints
+/// (measured natively) at bitwise parity:
+/// - the main thread sends each of the seven admitted signals, caught;
+/// - a worker sends `kill(gettid())`, and a worker sends to the process while
+///   the main thread blocks the signal;
+/// - the main thread sends to a worker's thread id, which names the process
+///   (https://github.com/rrnewton/hermit/issues/4094), while the worker blocks
+///   the signal;
+/// - an ignored signal, and `rt_sigqueueinfo` with `SI_QUEUE`;
+/// - a forged `SI_USER` from a worker, which Linux answers EPERM;
+/// - `rt_sigqueueinfo` of SIGSEGV and of SIGUSR2 whose valid `siginfo_t` sits
+///   in a `PROT_NONE` page, which Linux answers EFAULT (the tracer's
+///   `/proc/<tid>/mem` would force-read it; the page's protection decides);
+/// - an armed host-timed source (an `F_SETOWN_EX` thread owner, an `F_SETOWN`
+///   pid owner, a sibling's armed and disarmed parent-death signal, a sent
+///   SIGTSTP) whose signals the sender blocks.
+#[test]
+fn a_signal_to_the_senders_own_process_goes_to_the_sender_at_bitwise_parity() {
+    let guest = own_process_signal_guest().to_str().unwrap().to_owned();
+    let delivered = |mode: &str, sig: i32| {
+        format!("{mode} sig={sig} rc=0 ran_before_return=1 on_sender=1 code=0 pid_ok=1 uid_ok=1\n")
+    };
+    let all: String = [1, 2, 3, 10, 12, 13, 15]
+        .iter()
+        .map(|sig| delivered("all", *sig))
+        .collect();
+    let cases: Vec<(Vec<&str>, String)> = vec![
+        (vec!["leader"], delivered("leader", 10)),
+        (vec!["all"], all),
+        (vec!["tid"], delivered("tid", 10)),
+        (vec!["blocked"], delivered("blocked", 10)),
+        (vec!["sibling_tid"], delivered("sibling_tid", 10)),
+        (vec!["ignored"], "ignored sig=10 rc=0 ran=0\n".to_owned()),
+        (
+            vec!["queue"],
+            "queue rc=0 ran_before_return=1 on_sender=1 code=-1 value=42\n".to_owned(),
+        ),
+        (vec!["forged"], "forged rc=-1 EPERM\n".to_owned()),
+        (
+            vec!["prot_none_queue", "11"],
+            "prot_none_queue rc=-1 EFAULT\n".to_owned(),
+        ),
+        (
+            vec!["prot_none_queue", "12"],
+            "prot_none_queue rc=-1 EFAULT\n".to_owned(),
+        ),
+        (vec!["owner_tid", "blocked"], delivered("owner_tid", 10)),
+        (vec!["owner_pid", "blocked"], delivered("owner_pid", 10)),
+        (vec!["pdeathsig", "blocked"], delivered("pdeathsig", 10)),
+        (vec!["stop", "blocked"], delivered("stop", 10)),
+    ];
+    for (args, expected) in cases {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let verdict = directory.path().join("verify.json");
+        let mut command_args = vec![
+            "--log=info",
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            verdict.to_str().unwrap(),
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+        ];
+        command_args.extend(args.iter().copied());
+        let (status, log) = run_with_deadline(
+            hermit_command(&command_args),
+            directory.path(),
+            Duration::from_secs(180),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{args:?}:\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert_eq!(stdout, expected, "{args:?}: stderr:\n{log}");
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
+                .expect("the verdict must be JSON");
+        assert_eq!(report["bitwise_parity"], true, "{args:?}: {report}");
+    }
+}
+
+/// The sender keeps its turn from its forwarded `kill` to its own delivery
+/// stop for the signal (`own_signal_turn_hold`,
+/// https://github.com/rrnewton/hermit/issues/4034). The guest's `busy` mode has
+/// a runnable worker that loops on `getppid` with SIGUSR1 unblocked, and the
+/// main thread sends `kill(getpid(), SIGUSR1)` 400 times, each after a spin one
+/// iteration longer than the last. With `--target-timeslice` 2000 and 5000 the
+/// slice therefore expires at every phase around the send, its completion
+/// included. Linux gives every send to the main thread, which the call names
+/// and which is running, before `kill` returns. Each run is strict-verified at
+/// bitwise parity and must print that 400 of 400 did. Without the hold (the
+/// line that sets it removed), the worker took the signal in 34 and 38 of 400
+/// sends at these two settings (measured on the mutant, 2026-10-11).
+#[test]
+fn a_signal_to_the_senders_own_process_waits_for_the_sender_beside_a_runnable_sibling() {
+    let guest = own_process_signal_guest().to_str().unwrap().to_owned();
+    for slice in ["2000", "5000"] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let verdict = directory.path().join("verify.json");
+        let (status, log) = run_with_deadline(
+            hermit_command(&[
+                "--log=info",
+                "run",
+                "--strict",
+                "--target-timeslice",
+                slice,
+                "--verify",
+                "--verify-strict",
+                "--verify-json",
+                verdict.to_str().unwrap(),
+                "--timeout",
+                "120",
+                "--",
+                guest.as_str(),
+                "busy",
+                "400",
+                "1",
+            ]),
+            directory.path(),
+            Duration::from_secs(300),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "slice {slice}:\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert_eq!(
+            stdout, "busy sends=400 on_sender_before_return=400\n",
+            "slice {slice}: stderr:\n{log}"
+        );
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
+                .expect("the verdict must be JSON");
+        assert_eq!(report["bitwise_parity"], true, "slice {slice}: {report}");
+    }
+}
+
+/// A signal on the sender's private queue refuses its send to its own process,
+/// in a forced order (refusal 8 of the design for
+/// https://github.com/rrnewton/hermit/issues/4034). The guest's `pending` mode
+/// has a worker send `pthread_kill(main, n)` while the main thread sends
+/// `kill(getpid(), SIGUSR1)`. Two hard happens-before edges, at syscall counts
+/// a calibration run finds under an inert spec, put the worker's send between
+/// the main thread's previous syscall and its `kill`'s entry, and hold that
+/// `kill` until the worker's next syscall. So the `kill` starts with `n`
+/// pending on the main thread's private queue, which Linux dequeues before the
+/// shared SIGUSR1. Both the same signal (SIGUSR1) and another (SIGUSR2) must
+/// refuse by name; with `--allow-unsupported-syscalls` the `kill` returns
+/// ENOSYS.
+#[test]
+fn a_signal_pending_on_the_sender_refuses_its_send_to_its_own_process() {
+    let guest = own_process_signal_guest().to_str().unwrap().to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let inert = directory.path().join("inert.json");
+    fs::write(
+        &inert,
+        r#"{"version": 1, "events": {"inert": {"thread": "3", "syscalls": 1000000000}}, "edges": []}"#,
+    )
+    .unwrap();
+    for (signal, pending) in [("10", "0x200"), ("12", "0x800")] {
+        let run = |spec: &Path| {
+            hermit(&[
+                "--log",
+                "info",
+                "run",
+                "--allow-unsupported-syscalls",
+                "--happens-before",
+                spec.to_str().unwrap(),
+                "--timeout",
+                "60",
+                "--",
+                guest.as_str(),
+                "pending",
+                signal,
+            ])
+        };
+        let calibration = run(&inert);
+        let log = stderr(&calibration);
+        // `[syscall][detcore, dtid T] finish syscall #N: NAME(`
+        let count = |name: &str| {
+            log.lines()
+                .find_map(|line| {
+                    let after = line.split_once("[syscall][detcore, dtid ")?.1;
+                    let (dettid, rest) = after.split_once(']')?;
+                    let (count, rest) = rest.split_once("finish syscall #")?.1.split_once(": ")?;
+                    rest.starts_with(name)
+                        .then(|| (dettid.trim().to_owned(), count.parse::<u64>().ok()))
+                })
+                .and_then(|(dettid, count)| Some((dettid, count?)))
+                .unwrap_or_else(|| panic!("no {name} in the calibration log:\n{log}"))
+        };
+        let (sender, kill_count) = count("kill(");
+        let (sibling, tgkill_count) = count("tgkill(");
+        let spec = directory.path().join(format!("pending-{signal}.json"));
+        fs::write(
+            &spec,
+            format!(
+                r#"{{"version": 1,
+                    "events": {{"sender_before_kill": {{"thread": "{sender}", "syscalls": {}}},
+                                "sender_kills": {{"thread": "{sender}", "syscalls": {kill_count}}},
+                                "sibling_sends": {{"thread": "{sibling}", "syscalls": {tgkill_count}}},
+                                "sibling_sent": {{"thread": "{sibling}", "syscalls": {}}}}},
+                    "edges": [{{"before": "sender_before_kill", "after": "sibling_sends", "strength": "hard"}},
+                              {{"before": "sibling_sent", "after": "sender_kills", "strength": "hard"}}]}}"#,
+                kill_count - 1,
+                tgkill_count + 1,
+            ),
+        )
+        .unwrap();
+        let forced = run(&spec);
+        let log = stderr(&forced);
+        assert!(forced.status.success(), "signal {signal}:\n{log}");
+        assert_eq!(
+            String::from_utf8_lossy(&forced.stdout),
+            "pending rc=-1 ENOSYS\n",
+            "signal {signal}:\n{log}"
+        );
+        assert!(
+            log.contains(&format!(
+                "by kill is not supported: the sending thread has signals pending ({pending})"
+            )),
+            "signal {signal}: the refusal must name the pending signal:\n{log}"
+        );
+    }
+}
+
+/// Every process-directed signal to the sender's own multi-threaded process
+/// whose receiver or dequeue the schedule does not fix is refused by name, and
+/// sends nothing (https://github.com/rrnewton/hermit/issues/4034). Each mode
+/// runs with `--allow-unsupported-syscalls`, so the refused `kill` returns
+/// ENOSYS and the guest goes on; the log names the reason:
+/// - a worker sends while the main thread waits with the signal unblocked;
+/// - the main thread sends to the thread id of a worker that does not block
+///   the signal, which Linux prefers;
+/// - the sender blocks the signal;
+/// - SIGCHLD, SIGCONT, SIGTSTP, SIGRTMIN, SIGSEGV, SIGTRAP and SIGSTKFLT, each
+///   caught, are outside the seven admitted signals;
+/// - SIGTERM with its default, fatal, disposition;
+/// - armed host-timed sources the sender does not block: an `F_SETOWN_EX`
+///   thread owner with `F_SETSIG(SIGUSR2)`, an `F_SETOWN` pid owner, a sibling's
+///   armed and disarmed parent-death signal, a sent SIGTSTP (the orphaned
+///   process group's SIGHUP and SIGCONT), and a raw clone child with SIGUSR2 as
+///   its exit signal, which stays recorded after the child is reaped;
+/// - a signalfd in the process;
+/// - a guest's earlier send of SIGSTKFLT, Reverie's timer marker;
+/// - `rt_sigqueueinfo` of SIGSEGV and of SIGRTMIN whose `siginfo_t` is in a
+///   write-only page, which the kernel reads and the tracer reads through
+///   `/proc/<tid>/mem` (before, an unreadable-looking buffer went to the
+///   kernel unchecked and the signal was delivered);
+/// - `rt_sigqueueinfo` whose `siginfo_t` pointer is the vDSO's `[vvar]` page,
+///   which the kernel copies from but neither tracer read reaches, and one
+///   whose `siginfo_t` starts 48 bytes before an unmapped page (the kernel
+///   copies only those 48 for `SI_QUEUE`, and Linux delivers it);
+/// - `rt_sigqueueinfo` of SIGSEGV and of SIGUSR1 whose `siginfo_t` pointer is
+///   in the hole one page below a `MAP_GROWSDOWN` mapping, which the kernel's
+///   copy grows (Linux delivers);
+/// - `--stacktrace-signal` configured.
+///
+/// A fail-closed run of the default-disposition case stops with the
+/// policy-refusal status, and so does a replay of a recorded schedule
+/// (`--replay-schedule-from`) of an otherwise admitted send.
+#[test]
+fn each_unscheduled_signal_to_the_senders_own_process_is_refused_by_name() {
+    let guest = own_process_signal_guest().to_str().unwrap().to_owned();
+    let not_admitted = "only SIGHUP, SIGINT, SIGQUIT, SIGUSR1, SIGUSR2, SIGPIPE and SIGTERM";
+    let armed = "at moments host timing sets is armed";
+    let signum = |sig: i32| sig.to_string();
+    let rtmin = signum(libc::SIGRTMIN());
+    let cases: Vec<(Vec<&str>, &str)> = vec![
+        (vec!["marker"], "a guest sent SIGSTKFLT"),
+        (vec!["vvar_queue"], "Hermit cannot read all 128 bytes of it"),
+        (
+            vec!["straddle_queue"],
+            "Hermit cannot read all 128 bytes of it",
+        ),
+        (
+            vec!["growsdown_queue", "11"],
+            "Hermit cannot read all 128 bytes of it",
+        ),
+        (
+            vec!["growsdown_queue", "10"],
+            "Hermit cannot read all 128 bytes of it",
+        ),
+        (vec!["wo_queue", "11"], not_admitted),
+        (vec!["wo_queue", rtmin.as_str()], not_admitted),
+        (
+            vec!["--stacktrace-signal=SIGUSR2", "owner_tid", "blocked"],
+            "--stacktrace-signal is configured",
+        ),
+        (
+            vec!["sender_is_not_sole"],
+            "does not block the signal, so Linux could give it to either thread",
+        ),
+        (
+            vec!["sibling_tid_unblocked"],
+            "does not block the signal, so Linux could give it to either thread",
+        ),
+        (
+            vec!["sender_blocks"],
+            "the sending thread blocks the signal",
+        ),
+        (vec!["not_admitted", "17"], not_admitted),
+        (vec!["not_admitted", "18"], not_admitted),
+        (vec!["not_admitted", "20"], not_admitted),
+        (vec!["not_admitted", rtmin.as_str()], not_admitted),
+        (vec!["not_admitted", "11"], not_admitted),
+        (vec!["not_admitted", "5"], not_admitted),
+        (vec!["not_admitted", "16"], not_admitted),
+        (vec!["default"], "the signal has its default disposition"),
+        (vec!["owner_tid"], armed),
+        (vec!["owner_pid"], armed),
+        (vec!["pdeathsig"], armed),
+        (vec!["stop"], armed),
+        (vec!["exit_signal"], armed),
+        (vec!["exit_signal", "reaped"], armed),
+        (vec!["signalfd"], "the process holds a signalfd"),
+    ];
+    for (args, reason) in cases {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let (flags, args): (Vec<&str>, Vec<&str>) =
+            args.iter().partition(|arg| arg.starts_with("--"));
+        let mut command_args = vec![
+            "--log=error",
+            "run",
+            "--allow-unsupported-syscalls",
+            "--timeout",
+            "60",
+        ];
+        command_args.extend(flags.iter().copied());
+        command_args.push("--");
+        command_args.push(guest.as_str());
+        command_args.extend(args.iter().copied());
+        let (status, log) = run_with_deadline(
+            hermit_command(&command_args),
+            directory.path(),
+            Duration::from_secs(120),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{args:?}:\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert_eq!(
+            stdout,
+            format!("{} rc=-1 ENOSYS\n", args[0]),
+            "{args:?}: stderr:\n{log}"
+        );
+        let call = match args[0] {
+            "wo_queue" => "by rt_sigqueueinfo is not supported: ",
+            "vvar_queue" | "straddle_queue" | "growsdown_queue" => {
+                "rt_sigqueueinfo with a siginfo_t at "
+            }
+            _ => "by kill is not supported: ",
+        };
+        assert!(
+            log.contains(call) && log.contains(reason),
+            "{args:?}: the refusal must name `{call}` and the reason `{reason}`:\nstderr:\n{log}"
+        );
+    }
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "--log=error",
+            "run",
+            "--strict",
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+            "default",
+        ]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "a fail-closed run must stop with the policy-refusal status:\nstderr:\n{log}"
+    );
+
+    // A replayed schedule's trace turn after the send can hand the turn to
+    // another thread before the sender takes the signal, so the send is
+    // refused there, although the recording run admitted it.
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let schedule = directory.path().join("schedule.json");
+    let record_flag = format!("--record-preemptions-to={}", schedule.display());
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "--log=error",
+            "run",
+            "--strict",
+            record_flag.as_str(),
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+            "leader",
+        ]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "the recording run admits the send:\nstderr:\n{log}"
+    );
+    let replay_flag = format!("--replay-schedule-from={}", schedule.display());
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "--log=error",
+            "run",
+            "--strict",
+            replay_flag.as_str(),
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+            "leader",
+        ]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "a schedule replay must refuse the send:\nstderr:\n{log}"
+    );
+    assert!(
+        log.contains("the run replays a recorded schedule"),
+        "the refusal must name the schedule replay:\nstderr:\n{log}"
     );
 }
 

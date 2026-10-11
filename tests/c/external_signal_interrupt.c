@@ -15,7 +15,7 @@
  *             forkgrp|forkkill|forkthrexit|spin|spinkill|spinthrexit|usr2|
  *             extchld|extchldreaped|extchldlive|chldflood] [held]
  *        external_signal_interrupt sigsuspend creator
- *        external_signal_interrupt poll <pdeathchld|pdeathusr1|exitusr1|hupopen|hupctty|hupinherit|
+ *        external_signal_interrupt poll <pdeathchld|pdeathusr1|exitusr1|stophup|hupopen|hupctty|hupinherit|
  *            winchinherit>
  *        external_signal_interrupt <poll|ppoll|epoll|epollpwait|epollinval|epollbadf|sigtimedwaitfault|
  *            select|rawselect|selectbadf|rawselectbadf> <racing|racingchld>
@@ -834,6 +834,77 @@ static int exit_signal_main(const char *call) {
   return 0;
 }
 
+/* The `poll stophup` mode. Each of PDEATH_TRIALS trials forks a parent P. P
+ * catches SIGHUP, forks a child X that ignores SIGTSTP, sends X SIGTSTP, lets
+ * X exit and reaps it, tells the main process it is ready and polls no
+ * descriptors for PDEATH_POLL_MS. The main process waits PDEATH_KILL_DELAY_MS and sends P
+ * SIGHUP. On Linux the poll returns EINTR then. Under Hermit P's SIGTSTP made
+ * SIGHUP and SIGCONT host-timed for every process: a stopped member of a
+ * process group lets an exit orphan the group, and Linux then sends the group
+ * SIGHUP and SIGCONT at that exit's physical moment (kill_orphaned_pgrp), which
+ * Hermit cannot tell from a guest's send. So no gated wait ends for SIGHUP
+ * afterwards, and the poll must keep its deadline: it returns 0 after its full
+ * timeout and the handler runs once afterwards. Reports and prints as the
+ * parent-death modes do, ending with
+ * `RESULT call=poll role=stophup trials=<n> matched=<m>`. */
+static int stop_hup_main(const char *call) {
+  if (strcmp(call, "poll")) return 2;
+  int matched = 0;
+  for (int i = 0; i < PDEATH_TRIALS; i++) {
+    int ready[2], out[2];
+    if (pipe(ready) != 0 || pipe(out) != 0) return 84;
+    pid_t parent = fork();
+    if (parent < 0) return 85;
+    if (parent == 0) {
+      close(ready[0]);
+      close(out[0]);
+      set_handler(SIGHUP, on_pdeath);
+      int up[2], down[2];
+      if (pipe(up) != 0 || pipe(down) != 0) _exit(86);
+      pid_t stopped = fork();
+      if (stopped < 0) _exit(86);
+      if (stopped == 0) {
+        /* X ignores SIGTSTP, so the send arms the record and stops nothing;
+           X exits when P closes its end of `down`. */
+        signal(SIGTSTP, SIG_IGN);
+        close(up[0]);
+        close(down[1]);
+        if (write(up[1], "X", 1) != 1) _exit(1);
+        char none;
+        while (read(down[0], &none, 1) != 0) {
+        }
+        _exit(0);
+      }
+      close(up[1]);
+      close(down[0]);
+      char seen;
+      if (read(up[0], &seen, 1) != 1) _exit(92);
+      if (kill(stopped, SIGTSTP) != 0) _exit(92);
+      close(down[1]);
+      reap(stopped);
+      if (write(ready[1], "R", 1) != 1) _exit(82);
+      close(ready[1]);
+      report_poll_to_deadline(out[1]);
+    }
+    close(ready[1]);
+    close(out[1]);
+    char byte;
+    if (read(ready[0], &byte, 1) != 1) return 87;
+    close(ready[0]);
+    /* P is in its poll by now. */
+    sleep_ms(PDEATH_KILL_DELAY_MS);
+    if (kill(parent, SIGHUP) != 0) return 88;
+    int trial = collect_trial(i, out[0]);
+    reap(parent);
+    if (trial < 0) return 89;
+    matched += trial;
+  }
+  printf("RESULT call=poll role=stophup trials=%d matched=%d\n", PDEATH_TRIALS, matched);
+  printf("DONE\n");
+  fflush(stdout);
+  return 0;
+}
+
 /* The `poll hupopen` and `poll hupctty` modes. Each of PDEATH_TRIALS trials
  * opens a pseudoterminal master in the main process and forks a parent P. P
  * calls setsid(), which makes it the leader of a new session and process group
@@ -1342,7 +1413,7 @@ int main(int argc, char **argv) {
         "chldpend|stealgrp|stealkill|stealthrexit|forkgrp|forkkill|forkthrexit|spin|spinkill|"
         "spinthrexit|usr2|extchld|extchldreaped|extchldlive|chldflood]\n"
         "       external_signal_interrupt sigsuspend creator\n"
-        "       external_signal_interrupt poll <pdeathchld|pdeathusr1|exitusr1|hupopen|hupctty|hupinherit|"
+        "       external_signal_interrupt poll <pdeathchld|pdeathusr1|exitusr1|stophup|hupopen|hupctty|hupinherit|"
         "winchinherit>\n"
         "       external_signal_interrupt <poll|futex|bitset> <stopcont|stopcontusr1>\n"
         "       external_signal_interrupt <futex|bitset> restartfirst\n"
@@ -1359,6 +1430,7 @@ int main(int argc, char **argv) {
   if (!strcmp(sender, "pdeathchld")) return pdeath_main(call, SIGCHLD, "pdeathchld");
   if (!strcmp(sender, "pdeathusr1")) return pdeath_main(call, SIGUSR1, "pdeathusr1");
   if (!strcmp(sender, "exitusr1")) return exit_signal_main(call);
+  if (!strcmp(sender, "stophup")) return stop_hup_main(call);
   if (!strcmp(sender, "hupopen")) return hangup_main(call, 0, "hupopen");
   if (!strcmp(sender, "hupctty")) return hangup_main(call, 1, "hupctty");
   if (!strcmp(sender, "hupinherit")) return inherited_terminal_main(call, SIGHUP, "hupinherit");
