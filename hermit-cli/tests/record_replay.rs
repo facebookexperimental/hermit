@@ -2837,6 +2837,105 @@ fn record_ppoll_whose_mask_unblocks_the_scheduler_timer_signal() {
     record_select_mode("ppoll-mask-unblocks-alarm");
 }
 
+/// epoll_pwait on a ready pipe. It ran live in record and replay alike, and
+/// replay, which does not refill pipes, waited 30 s on an empty pipe and
+/// refused the run; replay now serves it from the recording, as it does
+/// epoll_wait.
+#[test]
+fn record_epoll_pwait_on_a_ready_pipe() {
+    record_select_mode("epoll-pwait-ready");
+}
+
+/// The same with an empty temporary mask, whose live replay returned 0 at its
+/// timeout where the recording returned 1.
+#[test]
+fn record_masked_epoll_pwait_on_a_ready_pipe() {
+    record_select_mode("epoll-pwait-mask-ready");
+}
+
+/// A blocking epoll_pwait that a second thread's write ends.
+#[test]
+fn record_epoll_pwait_woken_by_a_writer_thread() {
+    record_select_mode("epoll-pwait-writer");
+}
+
+/// A masked epoll_pwait whose mask blocks the timer's SIGALRM, ended by a
+/// writer's byte. It kept its scheduler turn, so the writer never ran and the
+/// recording returned 0 at the 30 s timeout
+/// (https://github.com/rrnewton/hermit/issues/4041).
+#[test]
+fn record_epoll_pwait_whose_mask_blocks_the_scheduler_timer_signal() {
+    record_select_mode("epoll-pwait-mask-blocks-alarm");
+}
+
+/// A masked epoll_pwait whose empty mask lets the timer's SIGALRM end it with
+/// EINTR after the handler runs; replay delivers the signal under that mask
+/// (https://github.com/rrnewton/hermit/issues/4041).
+#[test]
+fn record_epoll_pwait_whose_mask_unblocks_the_scheduler_timer_signal() {
+    record_select_mode("epoll-pwait-mask-unblocks-alarm");
+}
+
+/// A masked epoll_pwait entered with a signal already pending that only its
+/// mask unblocks: Linux ends it with EINTR and runs the handler. Replay served
+/// the EINTR from the log without installing the mask, so the handler never
+/// ran and the signal stayed pending (review of
+/// https://github.com/rrnewton/hermit/pull/4087).
+#[test]
+fn record_epoll_pwait_whose_mask_unblocks_a_pending_signal() {
+    record_select_mode("epoll-pwait-mask-raise");
+}
+
+/// A masked epoll_pwait whose mask buffer a sibling zeroes just after the
+/// call starts: recording's kernel copied whichever mask the call read, and
+/// replay delivers under the private copy the call slept under, so both agree
+/// (re-review of https://github.com/rrnewton/hermit/pull/4087).
+#[test]
+fn record_epoll_pwait_whose_mask_a_sibling_zeroes() {
+    record_select_mode("epoll-pwait-mask-sibling-race");
+}
+
+/// The pending-signal masked epoll_pwait on a stack 128 bytes into its page,
+/// where the private mask copy cannot go below the red zone: it returned
+/// EFAULT, and record and replay agreed on that wrong answer. The copy now
+/// goes in a red-zone window and the guest's bytes come back (re-review of
+/// https://github.com/rrnewton/hermit/pull/4087).
+#[test]
+fn record_epoll_pwait_whose_mask_unblocks_a_pending_signal_on_a_tight_stack() {
+    record_select_mode("epoll-pwait-mask-raise-tight");
+}
+
+/// The same 24 bytes into its page: recording staged its 24-byte mask copy at
+/// the top of the red zone, and replay's delivery needed 40 bytes and gave up,
+/// so the handler never ran (Claude round-4 review of
+/// https://github.com/rrnewton/hermit/pull/4087). The delivery now needs 24.
+#[test]
+fn record_epoll_pwait_whose_mask_unblocks_a_pending_signal_24_bytes_into_its_stack() {
+    record_select_mode("epoll-pwait-mask-raise-tight24");
+}
+
+/// A masked epoll_pwait on a tight stack whose events buffer sits in the red
+/// zone: the private mask copy must stay clear of it, or restoring the red
+/// zone overwrites the event the kernel wrote.
+#[test]
+fn record_epoll_pwait_whose_events_buffer_sits_in_the_red_zone() {
+    record_select_mode("epoll-pwait-mask-redzone-events");
+}
+
+/// A masked epoll_pwait whose epoll descriptor is a pipe gets EINVAL, as on
+/// Linux, rather than tripping the internal-pipe path.
+#[test]
+fn record_masked_epoll_pwait_on_a_pipe_descriptor() {
+    record_select_mode("epoll-pwait-mask-pipe-epfd");
+}
+
+/// The pselect6 unblocks wait 24 bytes into its stack: replay's delivery
+/// needed 40 bytes there and gave up, so replay diverged.
+#[test]
+fn record_pselect_whose_mask_unblocks_the_timer_signal_24_bytes_into_its_stack() {
+    record_select_mode("pselect-mask-unblocks-tight-stack24");
+}
+
 /// Replayer substitutes an eventfd for this proc descriptor. The Detcore
 /// procfs layer must bind the live task incarnation named by an absolute or
 /// AT_FDCWD-relative path rather than the placeholder inode. Zero-length

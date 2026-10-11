@@ -1366,7 +1366,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4065) retains all 1033: 1034.
     // And metadata::tests::record_version_rejects_streams_that_answered_a_zombie_kill_with_esrch
     // (https://github.com/rrnewton/hermit/issues/4091): 1035.
-    ("test.hermit_unit", 1035),
+    // And metadata::tests::pre_epoll_pwait_recordings_are_refused_by_the_version_gate: 1036.
+    ("test.hermit_unit", 1036),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2175,7 +2176,20 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (review of https://github.com/rrnewton/hermit/pull/4084): 158.
     // record_pselect_whose_mask_a_sibling_clears_before_the_grant (re-review of
     // https://github.com/rrnewton/hermit/pull/4084): 159.
-    ("test.record_replay", 159),
+    // record_epoll_pwait_on_a_ready_pipe, record_masked_epoll_pwait_on_a_ready_pipe,
+    // record_epoll_pwait_woken_by_a_writer_thread,
+    // record_epoll_pwait_whose_mask_blocks_the_scheduler_timer_signal,
+    // record_epoll_pwait_whose_mask_unblocks_the_scheduler_timer_signal,
+    // record_epoll_pwait_whose_mask_unblocks_a_pending_signal,
+    // record_epoll_pwait_whose_mask_a_sibling_zeroes,
+    // record_epoll_pwait_whose_mask_unblocks_a_pending_signal_on_a_tight_stack,
+    // record_epoll_pwait_whose_mask_unblocks_a_pending_signal_24_bytes_into_its_stack,
+    // record_epoll_pwait_whose_events_buffer_sits_in_the_red_zone,
+    // record_masked_epoll_pwait_on_a_pipe_descriptor and
+    // record_pselect_whose_mask_unblocks_the_timer_signal_24_bytes_into_its_stack
+    // (epoll_pwait recorded, https://github.com/rrnewton/hermit/issues/4086, and
+    // https://github.com/rrnewton/hermit/pull/4087's reviews): 171.
+    ("test.record_replay", 171),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -3043,7 +3057,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the pidfd wake record-epoch test: 1033.
     // And the namespace-only group-kill unit test: 1034.
     // And the zombie-kill record-epoch test: 1035.
-    ("test.hermit_unit_on_host", 1035),
+    // And metadata::tests::pre_epoll_pwait_recordings_are_refused_by_the_version_gate: 1036.
+    ("test.hermit_unit_on_host", 1036),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

@@ -133,6 +133,9 @@ enum StagedMaskStorage<Guard> {
 /// `{ sigmask, sigsetsize }` wrapper a pselect6 passes (`wrapper`).
 struct StagedMask<Guard> {
     wrapper: usize,
+    /// The mask copy itself, for a call that takes the mask without a wrapper
+    /// (`epoll_pwait`).
+    mask: usize,
     storage: StagedMaskStorage<Guard>,
 }
 
@@ -203,6 +206,7 @@ where
         Ok(guard) => {
             return Ok(Some(StagedMask {
                 wrapper: wrapper.as_raw(),
+                mask: mask_copy.as_raw(),
                 storage: StagedMaskStorage::Stack(guard),
             }));
         }
@@ -242,6 +246,7 @@ where
     cells[mask_len + 8..].copy_from_slice(&KERNEL_SIGSET_SIZE.to_ne_bytes());
     let staged = StagedMask {
         wrapper: at + mask_len,
+        mask: at,
         storage: StagedMaskStorage::RedZone { at, saved },
     };
     if guest.memory().write_exact(bytes, &cells).is_err() {
@@ -286,7 +291,7 @@ where
 /// matches the recording (https://github.com/rrnewton/hermit/issues/3992).
 /// Linux delivers such a signal before it puts the thread's own mask back, and
 /// the handler's frame restores that mask when it returns. Only the kernel can
-/// do both, so replay injects a pselect6 with no descriptors, a zero timeout
+/// do both, so replay injects a ppoll with no descriptors, a zero timeout
 /// and a scratch copy of the mask the call read at entry (`temporary_mask`,
 /// from `replayed_pselect6_temporary_mask`), never the guest's buffer, which a
 /// sibling may have rewritten while the call was served (review of
@@ -323,16 +328,12 @@ async fn end_replayed_pselect6_under_its_temporary_mask<G, T>(
     }
     let mut stack = guest.stack().await;
     let mask_copy = stack.push(temporary_mask);
-    let wrapper = stack.push(Pselect6SigmaskArg {
-        sigmask: mask_copy.as_raw(),
-        sigsetsize: KERNEL_SIGSET_SIZE,
-    });
     // A reserved cell is staged as zeroes, which `commit` writes: a zero
     // timeout.
     let zero_timeout = stack.reserve::<Timespec>();
     match stack.commit() {
         Ok(_guard) => {
-            inject_pselect6_delivery(guest, wrapper.as_raw(), zero_timeout.as_raw()).await;
+            inject_signal_delivery(guest, mask_copy.as_raw(), zero_timeout.as_raw()).await;
             return;
         }
         Err(Errno::EFAULT) => {}
@@ -340,68 +341,66 @@ async fn end_replayed_pselect6_under_its_temporary_mask<G, T>(
     }
     // The stack scratch below the red zone is not writable: the thread runs on
     // a stack it placed near the start of a page, which is valid. Stage the
-    // three cells at the top of the red zone instead, and put the guest's bytes
+    // two cells at the top of the red zone instead, and put the guest's bytes
     // back once the injected call has returned. The kernel builds a signal
     // frame below the red zone, and the guest runs no code before the bytes
     // are back, so it never sees them change. Nothing is mapped, so the
-    // replayed address space stays the recording's.
+    // replayed address space stays the recording's. The 24 bytes fit wherever
+    // recording staged its own 24-byte mask copy (`stage_pselect6_mask_copy`;
+    // Claude re-review of https://github.com/rrnewton/hermit/pull/4087).
     let Some(staged) = (guest.regs().await.rsp as usize)
-        .checked_sub(PSELECT6_DELIVERY_LEN)
+        .checked_sub(SIGNAL_DELIVERY_LEN)
         .map(|at| at & !7)
     else {
         return;
     };
-    let mut saved = [0u8; PSELECT6_DELIVERY_LEN];
+    let mut saved = [0u8; SIGNAL_DELIVERY_LEN];
     let Some(staged_bytes) = AddrMut::<u8>::from_raw(staged) else {
         return;
     };
     if guest.memory().read_exact(staged_bytes, &mut saved).is_err() {
         return;
     }
-    let mut cells = Vec::with_capacity(PSELECT6_DELIVERY_LEN);
+    let mut cells = Vec::with_capacity(SIGNAL_DELIVERY_LEN);
     cells.extend_from_slice(&temporary_mask.to_ne_bytes());
-    cells.extend_from_slice(&staged.to_ne_bytes());
-    cells.extend_from_slice(&KERNEL_SIGSET_SIZE.to_ne_bytes());
     cells.extend_from_slice(&[0u8; std::mem::size_of::<Timespec>()]);
     if guest.memory().write_exact(staged_bytes, &cells).is_err() {
         return;
     }
     let mask_size = std::mem::size_of::<KernelSigset>();
-    let wrapper_size = std::mem::size_of::<Pselect6SigmaskArg>();
-    inject_pselect6_delivery(guest, staged + mask_size, staged + mask_size + wrapper_size).await;
+    inject_signal_delivery(guest, staged, staged + mask_size).await;
     if let Err(errno) = guest.memory().write_exact(staged_bytes, &saved) {
         // Not expected: the same bytes were written just before the call.
-        tracing::warn!(
-            "[detcore] could not restore the red zone after a pselect6 delivery: {errno}"
-        );
+        tracing::warn!("[detcore] could not restore the red zone after a signal delivery: {errno}");
     }
 }
 
-/// The mask, its `{ sigmask, sigsetsize }` wrapper and a zero timeout that
-/// `end_replayed_pselect6_under_its_temporary_mask` stages, in that order.
-const PSELECT6_DELIVERY_LEN: usize = std::mem::size_of::<KernelSigset>()
-    + std::mem::size_of::<Pselect6SigmaskArg>()
-    + std::mem::size_of::<Timespec>();
+/// The mask and the zero timeout that
+/// `end_replayed_pselect6_under_its_temporary_mask` stages, in that order:
+/// 24 bytes, no more than recording stages for its own mask copy.
+const SIGNAL_DELIVERY_LEN: usize =
+    std::mem::size_of::<KernelSigset>() + std::mem::size_of::<Timespec>();
 
-/// Injects the zero-timeout pselect6 with no descriptors that delivers a
-/// replayed call's signal under its temporary mask (`wrapper`), as recording
-/// ran the call itself: the kernel delivers the signal as the injected call
+/// Injects the zero-timeout ppoll with no descriptors that delivers a
+/// replayed call's signal under its temporary mask (`mask`), as recording ran
+/// the call itself: the kernel installs the mask, finds the signal pending,
+/// returns `ERESTARTNOHAND` and delivers the signal as the injected call
 /// returns, as it did after the recorded call, and the guest then gets the
-/// recorded `ERESTARTNOHAND`.
-async fn inject_pselect6_delivery<G, T>(guest: &mut G, wrapper: usize, zero_timeout: usize)
+/// recorded result. ppoll takes the mask pointer directly, so the delivery
+/// needs no `{ sigmask, sigsetsize }` wrapper, which a pselect6 would.
+async fn inject_signal_delivery<G, T>(guest: &mut G, mask: usize, zero_timeout: usize)
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
     let _ = guest
         .inject(
-            syscalls::Pselect6::new()
+            syscalls::Ppoll::new()
+                .with_fds(None)
                 .with_nfds(0)
-                .with_readfds(None)
-                .with_writefds(None)
-                .with_exceptfds(None)
                 .with_timeout(AddrMut::from_raw(zero_timeout))
-                .with_sigmask(Addr::from_raw(wrapper)),
+                .with_sigmask(Addr::from_raw(mask))
+                .with_sigsetsize(KERNEL_SIGSET_SIZE),
         )
         .await;
 }
@@ -1885,14 +1884,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         // `cmake` hang was found. With a NULL sigmask the two calls are
         // semantically identical, so route them together.
         //
-        // A NON-NULL sigmask keeps the previous behavior: its whole purpose is
-        // to swap the signal mask atomically for the duration of the wait, and
-        // a timeout-0 polling loop cannot reproduce that atomicity. Such calls
-        // remain able to block the scheduler; that is a known remaining gap
-        // rather than something this change silently pretends to fix. Because
-        // such a call keeps its turn, it never sleeps outside the runnable set,
-        // so the scheduler needs no record of its temporary mask
-        // (`Resources::blocked_signal_mask`).
+        // A NON-NULL sigmask swaps the signal mask atomically for the duration
+        // of the wait, which a timeout-0 polling loop cannot reproduce. Under
+        // record and replay a masked call that may wait is a kernel wait
+        // outside the turn (`record_or_replay_masked_epoll_pwait`). Otherwise,
+        // and for a zero timeout, it keeps its turn: under a sequentialized
+        // run such a call can still block the scheduler, a known remaining
+        // gap (https://github.com/rrnewton/hermit/issues/4041), and because
+        // it never sleeps outside the runnable set the scheduler needs no
+        // record of its temporary mask (`Resources::blocked_signal_mask`).
+        if call.sigmask().is_some() && self.cfg.recordreplay_modes && call.timeout() != 0 {
+            return self.record_or_replay_masked_epoll_pwait(guest, call).await;
+        }
         if call.sigmask().is_some() {
             let dettid = guest.thread_state().dettid;
             resource_request(guest, Resources::new(dettid)).await; // empty request
@@ -1910,6 +1913,81 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             self.handle_internal_epoll_pwait(guest, call).await
         }
+    }
+
+    /// A masked `epoll_pwait` that may wait, under record and replay. As for a
+    /// masked pselect6 or ppoll there, the kernel owns the wait outside the
+    /// scheduler turn, so the timer's signal can end it as on Linux; it kept
+    /// its turn before, so nothing else ran and the call returned at its
+    /// timeout (https://github.com/rrnewton/hermit/issues/4041). The call sleeps
+    /// under a private copy of the mask read at entry, which a sibling cannot
+    /// rewrite, and the scheduler records its sleeping mask as unknown
+    /// (`Resources::blocked_signal_mask_unknown`). Replay serves the call from
+    /// the recording, so for a recorded EINTR it delivers the signal under that
+    /// mask (`end_replayed_pselect6_under_its_temporary_mask`).
+    async fn record_or_replay_masked_epoll_pwait<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::EpollPwait,
+    ) -> Result<i64, Error> {
+        if call.sigsetsize() != KERNEL_SIGSET_SIZE {
+            return Err(Errno::EINVAL.into());
+        }
+        let mask_address = call.sigmask().ok_or(Errno::EFAULT)?;
+        let mask = read_kernel_sigset(guest, mask_address.cast()).await?;
+        // The copy may go in the red zone on a stack with no scratch below it,
+        // clear of the events buffer the kernel writes (`stage_pselect6_mask_copy`;
+        // re-review of https://github.com/rrnewton/hermit/pull/4087).
+        let live: Vec<std::ops::Range<usize>> = call
+            .events()
+            .map(|events| {
+                let start = events.as_raw();
+                let len = usize::try_from(call.maxevents().max(0)).unwrap_or(0)
+                    * std::mem::size_of::<libc::epoll_event>();
+                start..start.saturating_add(len)
+            })
+            .into_iter()
+            .collect();
+        let Some(staged) = stage_pselect6_mask_copy(guest, mask, &live).await? else {
+            return self.refuse_unstageable_epoll_pwait_mask(guest, call).await;
+        };
+        let result = self
+            .record_or_replay_blocking_with_unknown_mask(
+                guest,
+                Syscall::EpollPwait(call.with_sigmask(Addr::from_raw(staged.mask))),
+            )
+            .await;
+        staged.release(guest);
+        if self.cfg.replaying && matches!(result, Err(Error::Errno(Errno::EINTR))) {
+            end_replayed_pselect6_under_its_temporary_mask(guest, mask).await;
+        }
+        result
+    }
+
+    /// Refuses a masked record/replay `epoll_pwait` whose private mask copy has
+    /// nowhere to go: no stack scratch below the red zone, and every red-zone
+    /// window overlaps the events buffer (`refuse_unstageable_pselect6_mask`
+    /// for pselect6). A run that allows unsupported operations forwards the
+    /// guest's own mask.
+    async fn refuse_unstageable_epoll_pwait_mask<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::EpollPwait,
+    ) -> Result<i64, Error> {
+        use std::io::Write as _;
+        let message = "unsupported: epoll_pwait with a temporary signal mask, on a stack \
+            with no room below its red zone whose red zone the call's events buffer fills: \
+            Hermit has nowhere to put the private copy of the mask \
+            (https://github.com/rrnewton/hermit/pull/4087)";
+        tracing::error!("[tid {}] {message}", guest.tid());
+        if self.cfg.panic_on_unsupported_syscalls {
+            let _ = writeln!(crate::util::RetryingStderr, "{message}");
+            return self
+                .refuse_unserviceable_operation(guest, Sysno::epoll_pwait, Errno::EFAULT)
+                .await;
+        }
+        self.record_or_replay_blocking_with_unknown_mask(guest, Syscall::EpollPwait(call))
+            .await
     }
 
     /// Handle a guest-internal `epoll_pwait` (NULL sigmask) that can be fully

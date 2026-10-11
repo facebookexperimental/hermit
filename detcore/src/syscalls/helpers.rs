@@ -915,6 +915,11 @@ pub fn syscall_targets_internal_fd<G: Guest<Detcore<T>>, T: RecordOrReplay>(
     guest: &mut G,
     call: Syscall,
 ) -> bool {
+    // An epoll wait's descriptor is the epoll set it waits on, never a pipe it
+    // reads; a guest that passes a pipe gets EINVAL from the kernel.
+    if matches!(call, Syscall::EpollWait(_) | Syscall::EpollPwait(_)) {
+        return false;
+    }
     match get_fd(call) {
         Some(fd) => guest
             .thread_state()

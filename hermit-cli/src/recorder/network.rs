@@ -20,6 +20,7 @@ use reverie::syscalls::Accept4;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::Close;
+use reverie::syscalls::EpollPwait;
 use reverie::syscalls::EpollWait;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Poll;
@@ -522,21 +523,55 @@ impl Recorder {
         guest: &mut G,
         syscall: EpollWait,
     ) -> Result<i64, Errno> {
+        self.record_epoll_wait(
+            guest,
+            Syscall::EpollWait(syscall),
+            syscall.epfd(),
+            syscall.events().map(|events| events.as_raw()),
+        )
+        .await
+    }
+
+    /// `epoll_pwait` is `epoll_wait` with a temporary signal mask, and records
+    /// the same event. It used to run unrecorded, so replay ran it live
+    /// against descriptors replay does not refill.
+    pub(super) async fn handle_epoll_pwait<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: EpollPwait,
+    ) -> Result<i64, Errno> {
+        self.record_epoll_wait(
+            guest,
+            Syscall::EpollPwait(syscall),
+            syscall.epfd(),
+            syscall.events().map(|events| events.as_raw()),
+        )
+        .await
+    }
+
+    /// Runs an `epoll_wait`-family `syscall` and records the events it wrote
+    /// to `events`.
+    async fn record_epoll_wait<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+        epfd: libc::c_int,
+        events: Option<usize>,
+    ) -> Result<i64, Errno> {
         let result = guest.inject(syscall).await;
 
         let event = result.and_then(|ret| {
             let updated = ret as usize;
-            let mut events = vec![0; updated * std::mem::size_of::<libc::epoll_event>()];
-            if !events.is_empty() {
-                guest
-                    .memory()
-                    .read_exact(syscall.events().ok_or(Errno::EFAULT)?.cast(), &mut events)?;
+            let mut bytes = vec![0; updated * std::mem::size_of::<libc::epoll_event>()];
+            if !bytes.is_empty() {
+                let address = events.and_then(Addr::<u8>::from_raw).ok_or(Errno::EFAULT)?;
+                guest.memory().read_exact(address, &mut bytes)?;
             }
             Ok(SyscallEvent::EpollWait(EpollWaitEvent {
-                events,
+                events: bytes,
                 updated,
                 replay_kernel_side_effect: self
-                    .epoll_requires_replay_kernel_side_effect(guest.pid(), syscall.epfd()),
+                    .epoll_requires_replay_kernel_side_effect(guest.pid(), epfd),
             }))
         });
 

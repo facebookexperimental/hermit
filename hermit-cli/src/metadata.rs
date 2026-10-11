@@ -283,7 +283,11 @@ impl RecordVersion {
 // Replay recomputes these answers and the schedule, so an older recording
 // replayed here could see another result and take another branch, although
 // no event shape changed.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x12f);
+// 0x12f -> 0x130: `epoll_pwait` is recorded with the event `epoll_wait`
+// records, and replay serves it from the recording. It used to run live in
+// record and replay alike, so an older recording holds no event for it and this
+// replayer would desynchronize at the first one.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x130);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -308,7 +312,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x12f);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x12f;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x130;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -684,6 +688,18 @@ mod tests {
         // Already off: stays off.
         disable_timeslice_without_a_timer(&mut config, "again");
         assert_eq!(config.max_timeslice, None);
+    }
+
+    #[test]
+    fn pre_epoll_pwait_recordings_are_refused_by_the_version_gate() {
+        // A recording from before this epoch ran epoll_pwait live and holds
+        // no event for it, so this replayer would desynchronize at the first
+        // one: 0x12f (the previous epoch), 0x12e, 0x12d, 0x12c and 0x12b.
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x12f)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x12e)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x12d)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x12c)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x12b)));
     }
 
     #[test]

@@ -70,7 +70,8 @@
  *                buffer again (review of
  *                https://github.com/rrnewton/hermit/pull/4052)
  *   pselect-mask-unblocks-tight-stack
- *                the unblocks wait as a raw pselect6 made on a stack 144 bytes
+ *   pselect-mask-unblocks-tight-stack24
+ *                the unblocks wait as a raw pselect6 made on a stack 144 (or 24) bytes
  *                into a writable page with an inaccessible page below it, so
  *                there is no writable memory below the red zone; the handler
  *                runs on an alternate stack. Replay stages the call's mask
@@ -79,6 +80,57 @@
  *                filled with a pattern before the call, must hold it after
  *                (follow-up to https://github.com/rrnewton/hermit/pull/4052,
  *                and its re-check)
+ *   epoll-pwait-ready
+ *   epoll-pwait-mask-ready
+ *   epoll-pwait-writer
+ *                raw epoll_pwait on an epoll set holding a pipe: a ready pipe
+ *                with no mask, the same with an empty temporary mask, and an
+ *                empty pipe that a second thread fills after 300 ms, with no
+ *                mask and a 30 s bound. Replay does not refill pipes,
+ *                and epoll_pwait ran live in record and replay alike, so replay
+ *                saw an empty pipe (a masked call returned 0 at its timeout; an
+ *                unmasked one was refused). Replay now serves it from the
+ *                recording, as it does epoll_wait
+ *   epoll-pwait-mask-blocks-alarm
+ *   epoll-pwait-mask-unblocks-alarm
+ *                epoll_pwait with a temporary mask while a 100 ms ITIMER_REAL
+ *                runs: a mask that blocks SIGALRM, ended by a writer's byte at
+ *                300 ms with 1 and the handler after; and an empty mask while
+ *                the thread blocks SIGALRM, ended by the SIGALRM with EINTR
+ *                after its handler. A masked epoll_pwait kept its scheduler
+ *                turn, so record returned 0 at its 30 s timeout
+ *                (https://github.com/rrnewton/hermit/issues/4041)
+ *   epoll-pwait-mask-raise-tight
+ *   epoll-pwait-mask-raise-tight24
+ *                the pending-SIGUSR1 masked epoll_pwait on a stack 128 (or 24)
+ *                bytes
+ *                into a writable page with an inaccessible page below it, with
+ *                the handler on an alternate stack and a pattern in the red
+ *                zone: Hermit stages its private mask copy in the red zone and
+ *                must restore it (re-review of
+ *                https://github.com/rrnewton/hermit/pull/4087)
+ *   epoll-pwait-mask-redzone-events
+ *                a masked epoll_pwait on a ready pipe on a stack 128 bytes into
+ *                its page, with its events buffer in the top 12 bytes of the red
+ *                zone: the kernel writes the event there, so Hermit's red-zone
+ *                mask copy must stay clear of it
+ *   epoll-pwait-mask-pipe-epfd
+ *                a masked epoll_pwait whose epoll descriptor is a pipe: EINVAL
+ *   epoll-pwait-mask-sibling-race
+ *                a masked epoll_pwait (mask buffer blocking SIGUSR1, 3 s timeout)
+ *                whose buffer a sibling zeroes as soon as it next runs after the
+ *                waiter announces the call; the sibling then sends SIGUSR1 at
+ *                100 ms and writes the pipe at 300 ms. Linux allows either
+ *                outcome; replay must reproduce the recording's, which needs
+ *                the call to sleep under a private copy of the mask it read
+ *                (re-review of https://github.com/rrnewton/hermit/pull/4087)
+ *   epoll-pwait-mask-raise
+ *                the thread catches and blocks SIGUSR1, raises it, then waits in
+ *                epoll_pwait with a 30 s timeout and an empty temporary mask:
+ *                the signal is pending when the call starts, so Linux ends it
+ *                with EINTR and runs the handler. Replay must deliver the
+ *                signal under that mask (review of
+ *                https://github.com/rrnewton/hermit/pull/4087)
  *   pselect-mask-zero-raise
  *   ppoll-mask-zero-raise
  *                the thread catches and blocks SIGUSR1, raises it, then calls
@@ -140,6 +192,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>
 #include <sys/mman.h>
 #include <sys/select.h>
 #include <sys/syscall.h>
@@ -985,7 +1038,7 @@ __asm__(
 
 static unsigned char alternate_stack[65536];
 
-static int pselect_mask_unblocks_tight_stack(void) {
+static int pselect_mask_unblocks_tight_stack(long offset) {
   long page = sysconf(_SC_PAGESIZE);
   if (page <= 144) {
     return 1;
@@ -1027,15 +1080,16 @@ static int pselect_mask_unblocks_tight_stack(void) {
   FD_ZERO(&read_set);
   FD_SET(alarm_pipe_fds[0], &read_set);
   static struct timespec bound = {30, 0};
-  unsigned char* tight_stack = area + page + 144;
-  for (int i = -128; i < 0; i++) {
+  unsigned char* tight_stack = area + page + offset;
+  int low = offset < 128 ? (int)-offset : -128;
+  for (int i = low; i < 0; i++) {
     tight_stack[i] = (unsigned char)(0xa5 ^ (i & 0xff));
   }
   long raw = pselect_on_stack(
       tight_stack, alarm_pipe_fds[0] + 1, &read_set, &bound, &wrapper);
   int alarms_at_return = (int)masked_alarms;
   int red_zone_changed = 0;
-  for (int i = -128; i < 0; i++) {
+  for (int i = low; i < 0; i++) {
     red_zone_changed += tight_stack[i] != (unsigned char)(0xa5 ^ (i & 0xff));
   }
   close(alarm_pipe_fds[0]);
@@ -1395,6 +1449,427 @@ static int ppoll_mask_zero_raise_tight(void) {
   return 0;
 }
 
+static int epoll_pipe_fds[2];
+
+static void* fill_epoll_pipe_later(void* arg) {
+  (void)arg;
+  usleep(300000);
+  if (write(epoll_pipe_fds[1], "x", 1) != 1) {
+    perror("fill pipe");
+  }
+  return NULL;
+}
+
+/* epoll_pwait on a pipe. `masked` passes an empty temporary mask; `writer`
+ * leaves the pipe empty for a second thread to fill. */
+static int epoll_pwait_mode(const char* name, int masked, int writer) {
+  int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+  if (epoll_fd < 0 || pipe(epoll_pipe_fds) != 0) {
+    perror("setup");
+    return 1;
+  }
+  struct epoll_event watched = {.events = EPOLLIN, .data.u64 = 0x5eedULL};
+  if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, epoll_pipe_fds[0], &watched) != 0) {
+    perror("epoll_ctl");
+    return 1;
+  }
+  pthread_t filler;
+  if (writer) {
+    if (pthread_create(&filler, NULL, fill_epoll_pipe_later, NULL) != 0) {
+      perror("pthread_create");
+      return 1;
+    }
+  } else if (write(epoll_pipe_fds[1], "x", 1) != 1) {
+    perror("write");
+    return 1;
+  }
+  sigset_t empty;
+  sigemptyset(&empty);
+  struct epoll_event ready;
+  memset(&ready, 0, sizeof ready);
+  errno = 0;
+  int result = epoll_pwait(epoll_fd, &ready, 1, 30000, masked ? &empty : NULL);
+  int result_errno = errno;
+  if (writer && pthread_join(filler, NULL) != 0) {
+    perror("pthread_join");
+    return 1;
+  }
+  printf(
+      "%-24s result=%011d errno=%011d events=%08x data=%016llx\n",
+      name,
+      result,
+      result < 0 ? result_errno : 0,
+      result > 0 ? ready.events : 0,
+      result > 0 ? (unsigned long long)ready.data.u64 : 0ULL);
+  close(epoll_pipe_fds[0]);
+  close(epoll_pipe_fds[1]);
+  close(epoll_fd);
+  if (result != 1 || !(ready.events & EPOLLIN) || ready.data.u64 != 0x5eedULL) {
+    fprintf(stderr, "%s mismatch\n", name);
+    return 1;
+  }
+  return 0;
+}
+
+static volatile sig_atomic_t epoll_raised;
+
+static void count_epoll_raised(int signo) {
+  (void)signo;
+  epoll_raised++;
+}
+
+/* epoll_pwait(epfd, events, 1, timeout, mask, 8) on a switched stack. SysV:
+ * new_sp, epfd, events, timeout, mask. No instruction between the stack switch
+ * and its restoration touches the stack. */
+extern long epoll_pwait_on_stack(void* new_sp, long epfd, void* events, long timeout,
+                                 void* mask);
+__asm__(
+    ".text\n"
+    ".globl epoll_pwait_on_stack\n"
+    ".type epoll_pwait_on_stack,@function\n"
+    "epoll_pwait_on_stack:\n"
+    "push %r12\n"
+    "mov %rsp,%r12\n"
+    "mov %rdi,%r11\n"
+    "mov %rsi,%rdi\n"
+    "mov %rdx,%rsi\n"
+    "mov %rcx,%r10\n"
+    "mov $1,%edx\n"
+    "mov $8,%r9d\n"
+    "mov %r11,%rsp\n"
+    "mov $281,%eax\n"
+    "syscall\n"
+    "mov %r12,%rsp\n"
+    "pop %r12\n"
+    "ret\n"
+    ".size epoll_pwait_on_stack,.-epoll_pwait_on_stack\n");
+
+static unsigned char epoll_alternate[65536];
+
+static int epoll_pwait_mask_raise_tight(long offset) {
+  long page = sysconf(_SC_PAGESIZE);
+  unsigned char* area = mmap(
+      NULL, (size_t)page * 2, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (area == MAP_FAILED ||
+      mprotect(area + page, (size_t)page, PROT_READ | PROT_WRITE) != 0) {
+    perror("tight stack");
+    return 1;
+  }
+  stack_t alternate = {
+      .ss_sp = epoll_alternate, .ss_size = sizeof epoll_alternate, .ss_flags = 0};
+  struct sigaction action;
+  memset(&action, 0, sizeof action);
+  action.sa_handler = count_epoll_raised;
+  action.sa_flags = SA_ONSTACK;
+  sigset_t usr1;
+  sigemptyset(&usr1);
+  sigaddset(&usr1, SIGUSR1);
+  int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+  int fds[2];
+  if (sigaltstack(&alternate, NULL) != 0 || sigaction(SIGUSR1, &action, NULL) != 0 ||
+      epoll_fd < 0 || pipe(fds) != 0 || pthread_sigmask(SIG_BLOCK, &usr1, NULL) != 0) {
+    perror("setup");
+    return 1;
+  }
+  struct epoll_event watched = {.events = EPOLLIN, .data.u64 = 0x5eedULL};
+  if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fds[0], &watched) != 0 || raise(SIGUSR1) != 0) {
+    perror("epoll_ctl or raise");
+    return 1;
+  }
+  static struct epoll_event ready;
+  static uint64_t empty_mask;
+  /* At 128 bytes the 8-byte copy cannot go below the red zone (rsp - 136);
+   * at 24 only the top 24 red-zone bytes are writable. */
+  unsigned char* tight_stack = area + page + offset;
+  int low = offset < 128 ? (int)-offset : -128;
+  for (int i = low; i < 0; i++) {
+    tight_stack[i] = (unsigned char)(0xa5 ^ (i & 0xff));
+  }
+  long raw = epoll_pwait_on_stack(tight_stack, epoll_fd, &ready, 30000, &empty_mask);
+  int handled = (int)epoll_raised;
+  int red_zone_changed = 0;
+  for (int i = low; i < 0; i++) {
+    red_zone_changed += tight_stack[i] != (unsigned char)(0xa5 ^ (i & 0xff));
+  }
+  close(fds[0]);
+  close(fds[1]);
+  close(epoll_fd);
+  printf(
+      "%-24s offset=%03ld result=%011ld handled=%01d red_zone_changed=%03d\n",
+      "epoll-pwait-raise-tight",
+      offset,
+      raw,
+      handled,
+      red_zone_changed);
+  if (raw != -EINTR || handled != 1 || red_zone_changed != 0) {
+    fprintf(stderr, "epoll-pwait-mask-raise-tight mismatch\n");
+    return 1;
+  }
+  return 0;
+}
+
+/* A masked epoll_pwait on a ready pipe with its events buffer in the red zone
+ * of a stack 128 bytes into its page. */
+static int epoll_pwait_mask_redzone_events(void) {
+  long page = sysconf(_SC_PAGESIZE);
+  unsigned char* area = mmap(
+      NULL, (size_t)page * 2, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (area == MAP_FAILED ||
+      mprotect(area + page, (size_t)page, PROT_READ | PROT_WRITE) != 0) {
+    perror("tight stack");
+    return 1;
+  }
+  int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+  int fds[2];
+  if (epoll_fd < 0 || pipe(fds) != 0) {
+    perror("setup");
+    return 1;
+  }
+  struct epoll_event watched = {.events = EPOLLIN, .data.u64 = 0x5eedULL};
+  if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fds[0], &watched) != 0 ||
+      write(fds[1], "x", 1) != 1) {
+    perror("epoll_ctl or write");
+    return 1;
+  }
+  static uint64_t empty_mask;
+  unsigned char* tight_stack = area + page + 128;
+  struct epoll_event* events =
+      (struct epoll_event*)(void*)(tight_stack - (long)sizeof(struct epoll_event));
+  memset(events, 0, sizeof(*events));
+  long raw = epoll_pwait_on_stack(tight_stack, epoll_fd, events, 30000, &empty_mask);
+  int intact = raw == 1 && (events->events & EPOLLIN) && events->data.u64 == 0x5eedULL;
+  close(fds[0]);
+  close(fds[1]);
+  close(epoll_fd);
+  printf(
+      "%-24s result=%011ld events=%08x data=%016llx\n",
+      "epoll-pwait-redzone-events",
+      raw,
+      (unsigned)events->events,
+      (unsigned long long)events->data.u64);
+  if (!intact) {
+    fprintf(stderr, "epoll-pwait-mask-redzone-events mismatch\n");
+    return 1;
+  }
+  return 0;
+}
+
+/* A masked epoll_pwait whose epoll descriptor is a pipe. */
+static int epoll_pwait_mask_pipe_epfd(void) {
+  int fds[2];
+  if (pipe(fds) != 0) {
+    perror("pipe");
+    return 1;
+  }
+  sigset_t empty;
+  sigemptyset(&empty);
+  struct epoll_event ready;
+  errno = 0;
+  int result = epoll_pwait(fds[0], &ready, 1, 1000, &empty);
+  int result_errno = errno;
+  close(fds[0]);
+  close(fds[1]);
+  printf(
+      "%-24s result=%011d errno=%011d\n",
+      "epoll-pwait-pipe-epfd",
+      result,
+      result < 0 ? result_errno : 0);
+  if (result != -1 || result_errno != EINVAL) {
+    fprintf(stderr, "epoll-pwait-mask-pipe-epfd mismatch\n");
+    return 1;
+  }
+  return 0;
+}
+
+static volatile uint64_t race_epoll_mask;
+static atomic_int race_epoll_announced;
+static pthread_t race_epoll_waiter;
+
+static void* zero_epoll_mask_then_signal(void* arg) {
+  (void)arg;
+  while (!atomic_load(&race_epoll_announced)) {
+    sched_yield();
+  }
+  race_epoll_mask = 0;
+  usleep(100000);
+  pthread_kill(race_epoll_waiter, SIGUSR1);
+  usleep(200000);
+  if (write(epoll_pipe_fds[1], "x", 1) != 1) {
+    perror("fill pipe");
+  }
+  return NULL;
+}
+
+static int epoll_pwait_mask_sibling_race(void) {
+  struct sigaction action;
+  memset(&action, 0, sizeof action);
+  action.sa_handler = count_epoll_raised;
+  sigset_t usr1;
+  sigemptyset(&usr1);
+  sigaddset(&usr1, SIGUSR1);
+  int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+  if (sigaction(SIGUSR1, &action, NULL) != 0 || epoll_fd < 0 ||
+      pipe(epoll_pipe_fds) != 0 || pthread_sigmask(SIG_BLOCK, &usr1, NULL) != 0) {
+    perror("setup");
+    return 1;
+  }
+  struct epoll_event watched = {.events = EPOLLIN, .data.u64 = 0x5eedULL};
+  if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, epoll_pipe_fds[0], &watched) != 0) {
+    perror("epoll_ctl");
+    return 1;
+  }
+  race_epoll_mask = UINT64_C(1) << (SIGUSR1 - 1);
+  race_epoll_waiter = pthread_self();
+  pthread_t racer;
+  if (pthread_create(&racer, NULL, zero_epoll_mask_then_signal, NULL) != 0) {
+    perror("pthread_create");
+    return 1;
+  }
+  struct epoll_event ready;
+  memset(&ready, 0, sizeof ready);
+  atomic_store(&race_epoll_announced, 1);
+  errno = 0;
+  long result = syscall(
+      SYS_epoll_pwait, epoll_fd, &ready, 1, 3000, &race_epoll_mask, (size_t)8);
+  int result_errno = errno;
+  int handled_at_return = (int)epoll_raised;
+  if (pthread_join(racer, NULL) != 0) {
+    perror("pthread_join");
+    return 1;
+  }
+  close(epoll_pipe_fds[0]);
+  close(epoll_pipe_fds[1]);
+  close(epoll_fd);
+  printf(
+      "%-24s result=%011ld errno=%011d handled_at_return=%01d\n",
+      "epoll-pwait-sibling-race",
+      result,
+      result < 0 ? result_errno : 0,
+      handled_at_return);
+  /* The kernel copied either the zeroed buffer (EINTR, handler run) or the
+   * original mask (the pipe's byte, handler after the call). */
+  int interrupted = result == -1 && result_errno == EINTR && handled_at_return == 1;
+  int ready_first = result == 1 && handled_at_return == 0;
+  if (!interrupted && !ready_first) {
+    fprintf(stderr, "epoll-pwait-mask-sibling-race mismatch\n");
+    return 1;
+  }
+  return 0;
+}
+
+/* epoll_pwait under an empty temporary mask with SIGUSR1 already pending. */
+static int epoll_pwait_mask_raise(void) {
+  struct sigaction action;
+  memset(&action, 0, sizeof action);
+  action.sa_handler = count_epoll_raised;
+  sigset_t usr1, empty;
+  sigemptyset(&usr1);
+  sigaddset(&usr1, SIGUSR1);
+  sigemptyset(&empty);
+  int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+  int fds[2];
+  if (sigaction(SIGUSR1, &action, NULL) != 0 || epoll_fd < 0 || pipe(fds) != 0 ||
+      pthread_sigmask(SIG_BLOCK, &usr1, NULL) != 0) {
+    perror("setup");
+    return 1;
+  }
+  struct epoll_event watched = {.events = EPOLLIN, .data.u64 = 0x5eedULL};
+  if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fds[0], &watched) != 0 || raise(SIGUSR1) != 0) {
+    perror("epoll_ctl or raise");
+    return 1;
+  }
+  struct epoll_event ready;
+  memset(&ready, 0, sizeof ready);
+  errno = 0;
+  int result = epoll_pwait(epoll_fd, &ready, 1, 30000, &empty);
+  int result_errno = errno;
+  int handled = (int)epoll_raised;
+  sigset_t pending;
+  sigpending(&pending);
+  int still_pending = sigismember(&pending, SIGUSR1);
+  close(fds[0]);
+  close(fds[1]);
+  close(epoll_fd);
+  printf(
+      "%-24s result=%011d errno=%011d handled=%01d pending=%01d\n",
+      "epoll-pwait-raise",
+      result,
+      result < 0 ? result_errno : 0,
+      handled,
+      still_pending);
+  if (result != -1 || result_errno != EINTR || handled != 1 || still_pending != 0) {
+    fprintf(stderr, "epoll-pwait-mask-raise mismatch\n");
+    return 1;
+  }
+  return 0;
+}
+
+/* epoll_pwait under a temporary mask while the timer's SIGALRM is due. */
+static int epoll_pwait_mask_alarm(int blocks) {
+  struct sigaction action;
+  memset(&action, 0, sizeof action);
+  action.sa_handler = count_masked_alarm;
+  sigset_t alarm_set, during;
+  sigemptyset(&alarm_set);
+  sigaddset(&alarm_set, SIGALRM);
+  if (blocks) {
+    during = alarm_set;
+  } else {
+    sigemptyset(&during);
+  }
+  int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+  if (sigaction(SIGALRM, &action, NULL) != 0 || epoll_fd < 0 ||
+      pipe(alarm_pipe_fds) != 0 ||
+      pthread_sigmask(SIG_BLOCK, &alarm_set, NULL) != 0) {
+    perror("setup");
+    return 1;
+  }
+  struct epoll_event watched = {.events = EPOLLIN, .data.u64 = 0x5eedULL};
+  if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, alarm_pipe_fds[0], &watched) != 0) {
+    perror("epoll_ctl");
+    return 1;
+  }
+  pthread_t writer;
+  if (blocks) {
+    if (pthread_create(&writer, NULL, fill_alarm_pipe_later, NULL) != 0 ||
+        pthread_sigmask(SIG_UNBLOCK, &alarm_set, NULL) != 0) {
+      perror("writer");
+      return 1;
+    }
+  }
+  struct itimerval alarm_in = {{0, 0}, {0, 100000}};
+  if (setitimer(ITIMER_REAL, &alarm_in, NULL) != 0) {
+    perror("setitimer");
+    return 1;
+  }
+  struct epoll_event ready;
+  memset(&ready, 0, sizeof ready);
+  errno = 0;
+  int result = epoll_pwait(epoll_fd, &ready, 1, 30000, &during);
+  int result_errno = errno;
+  if (blocks && pthread_join(writer, NULL) != 0) {
+    perror("pthread_join");
+    return 1;
+  }
+  int alarms = (int)masked_alarms;
+  close(alarm_pipe_fds[0]);
+  close(alarm_pipe_fds[1]);
+  close(epoll_fd);
+  printf(
+      "%-24s result=%011d errno=%011d alarms=%01d\n",
+      blocks ? "epoll-pwait-blocks" : "epoll-pwait-unblocks",
+      result,
+      result < 0 ? result_errno : 0,
+      alarms);
+  int expected = blocks ? result == 1 && alarms == 1
+                        : result == -1 && result_errno == EINTR && alarms == 1;
+  if (!expected) {
+    fprintf(stderr, "epoll-pwait-mask-%s-alarm mismatch\n", blocks ? "blocks" : "unblocks");
+    return 1;
+  }
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc != 2) {
     fprintf(
@@ -1406,7 +1881,13 @@ int main(int argc, char** argv) {
         "pselect-mask-unblocks-tight-stack|pselect-mask-zero-raise|"
         "ppoll-mask-zero-raise|ppoll-mask-blocks-alarm|"
         "ppoll-mask-unblocks-alarm|pselect-mask-zero-race|"
-        "ppoll-mask-zero-raise-tight|pselect-mask-hook-race]\n",
+        "ppoll-mask-zero-raise-tight|pselect-mask-hook-race|"
+        "epoll-pwait-ready|epoll-pwait-mask-ready|epoll-pwait-writer|"
+        "epoll-pwait-mask-blocks-alarm|epoll-pwait-mask-unblocks-alarm|"
+        "epoll-pwait-mask-raise|epoll-pwait-mask-sibling-race|"
+        "epoll-pwait-mask-raise-tight|epoll-pwait-mask-raise-tight24|"
+        "epoll-pwait-mask-redzone-events|epoll-pwait-mask-pipe-epfd|"
+        "pselect-mask-unblocks-tight-stack24]\n",
         argv[0]);
     return 2;
   }
@@ -1438,7 +1919,43 @@ int main(int argc, char** argv) {
     return pselect_mask_unblocks_alarm(1);
   }
   if (strcmp(argv[1], "pselect-mask-unblocks-tight-stack") == 0) {
-    return pselect_mask_unblocks_tight_stack();
+    return pselect_mask_unblocks_tight_stack(144);
+  }
+  if (strcmp(argv[1], "pselect-mask-unblocks-tight-stack24") == 0) {
+    return pselect_mask_unblocks_tight_stack(24);
+  }
+  if (strcmp(argv[1], "epoll-pwait-ready") == 0) {
+    return epoll_pwait_mode("epoll-pwait-ready", 0, 0);
+  }
+  if (strcmp(argv[1], "epoll-pwait-mask-ready") == 0) {
+    return epoll_pwait_mode("epoll-pwait-mask-ready", 1, 0);
+  }
+  if (strcmp(argv[1], "epoll-pwait-writer") == 0) {
+    return epoll_pwait_mode("epoll-pwait-writer", 0, 1);
+  }
+  if (strcmp(argv[1], "epoll-pwait-mask-blocks-alarm") == 0) {
+    return epoll_pwait_mask_alarm(1);
+  }
+  if (strcmp(argv[1], "epoll-pwait-mask-unblocks-alarm") == 0) {
+    return epoll_pwait_mask_alarm(0);
+  }
+  if (strcmp(argv[1], "epoll-pwait-mask-raise") == 0) {
+    return epoll_pwait_mask_raise();
+  }
+  if (strcmp(argv[1], "epoll-pwait-mask-sibling-race") == 0) {
+    return epoll_pwait_mask_sibling_race();
+  }
+  if (strcmp(argv[1], "epoll-pwait-mask-raise-tight") == 0) {
+    return epoll_pwait_mask_raise_tight(128);
+  }
+  if (strcmp(argv[1], "epoll-pwait-mask-raise-tight24") == 0) {
+    return epoll_pwait_mask_raise_tight(24);
+  }
+  if (strcmp(argv[1], "epoll-pwait-mask-redzone-events") == 0) {
+    return epoll_pwait_mask_redzone_events();
+  }
+  if (strcmp(argv[1], "epoll-pwait-mask-pipe-epfd") == 0) {
+    return epoll_pwait_mask_pipe_epfd();
   }
   if (strcmp(argv[1], "pselect-mask-zero-raise") == 0) {
     return zero_timeout_mask_raise(0);

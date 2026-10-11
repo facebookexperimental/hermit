@@ -10,6 +10,7 @@ use reverie::Errno;
 use reverie::Guest;
 use reverie::syscalls::Accept4;
 use reverie::syscalls::AddrMut;
+use reverie::syscalls::EpollPwait;
 use reverie::syscalls::EpollWait;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Poll;
@@ -20,6 +21,7 @@ use reverie::syscalls::Recvfrom;
 use reverie::syscalls::Recvmsg;
 use reverie::syscalls::Select;
 use reverie::syscalls::SockFlag;
+use reverie::syscalls::Syscall;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::family::SockOptFamily;
 
@@ -252,6 +254,40 @@ impl Replayer {
         guest: &mut G,
         syscall: EpollWait,
     ) -> Result<i64, Errno> {
+        self.replay_epoll_wait(
+            guest,
+            Syscall::EpollWait(syscall),
+            syscall.events().map(|events| events.as_raw()),
+            syscall.maxevents(),
+        )
+        .await
+    }
+
+    /// `epoll_pwait` replays the event `epoll_wait` records
+    /// (`Recorder::handle_epoll_pwait`).
+    pub(super) async fn handle_epoll_pwait<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: EpollPwait,
+    ) -> Result<i64, Errno> {
+        self.replay_epoll_wait(
+            guest,
+            Syscall::EpollPwait(syscall),
+            syscall.events().map(|events| events.as_raw()),
+            syscall.maxevents(),
+        )
+        .await
+    }
+
+    /// Serves an `epoll_wait`-family `syscall` from the recording, writing the
+    /// recorded events to `events`.
+    async fn replay_epoll_wait<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+        events: Option<usize>,
+        maxevents: libc::c_int,
+    ) -> Result<i64, Errno> {
         let event = next_event!(guest, EpollWait)?;
         if event.replay_kernel_side_effect {
             let actual = guest.inject(syscall).await;
@@ -265,12 +301,13 @@ impl Replayer {
             event.events.len(),
             event.updated * std::mem::size_of::<libc::epoll_event>()
         );
-        assert!(event.updated <= syscall.maxevents() as usize);
+        assert!(event.updated <= maxevents as usize);
 
         if !event.events.is_empty() {
-            guest
-                .memory()
-                .write_exact(syscall.events().ok_or(Errno::EFAULT)?.cast(), &event.events)?;
+            let address = events
+                .and_then(AddrMut::<u8>::from_raw)
+                .ok_or(Errno::EFAULT)?;
+            guest.memory().write_exact(address, &event.events)?;
         }
         Ok(event.updated as i64)
     }
