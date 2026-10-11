@@ -10,6 +10,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import os
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -340,23 +341,78 @@ class HostedAdapterTests(unittest.TestCase):
                 ledger_commit=captured,
                 validation_history_commit=history,
             )
+        ledger = self.root / "hermit_test_ledger"
         self.assertEqual(
             calls,
             [
                 [
                     "git",
                     "-C",
-                    self.root / "hermit_test_ledger",
+                    ledger,
                     "fetch",
                     "--no-tags",
                     "--no-recurse-submodules",
+                    "--depth",
+                    "1",
                     "origin",
                     captured,
-                ]
+                ],
+                # The parity summary is read at the captured commit; with no
+                # readable summary there is nothing to deepen toward.
+                ["git", "--no-replace-objects", "-C", ledger, "show",
+                 f"{captured}:scorecard/parity.json"],
             ],
         )
         publish.assert_not_called()
         self.assertFalse((self.root / "receipt.json").exists())
+
+    def test_ledger_fetch_is_shallow_and_deepens_only_to_the_parity_summary(self):
+        # https://github.com/rrnewton/hermit/actions/runs/38167459473: the
+        # full-history ledger clone ran past its step timeout. The builder
+        # reads one commit plus the parity summary's ancestry, so the fetch
+        # takes depth 1 and deepens only until that commit is an ancestor.
+        env = {**os.environ, "GIT_CONFIG_COUNT": "1",
+               "GIT_CONFIG_KEY_0": "protocol.file.allow", "GIT_CONFIG_VALUE_0": "always",
+               "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
+
+        def sh(cwd, *args):
+            return subprocess.run(["git", *args], cwd=cwd, env=env, check=True,
+                                  stdout=subprocess.PIPE).stdout.decode().strip()
+
+        origin = self.root / "origin"
+        origin.mkdir()
+        sh(origin, "init", "-q", "-b", "main")
+        commits = []
+        for index in range(120):
+            (origin / "series.jsonl").write_text(f"{index}\n" * (index + 1))
+            sh(origin, "add", "series.jsonl")
+            sh(origin, "commit", "-q", "-m", f"append {index}")
+            commits.append(sh(origin, "rev-parse", "HEAD"))
+        summarized = commits[-70]  # 69 commits before the head
+        (origin / "scorecard").mkdir()
+        (origin / "scorecard/parity.json").write_text(
+            json.dumps({"generated_from": {"series_commit": summarized}}))
+        sh(origin, "add", "scorecard/parity.json")
+        sh(origin, "commit", "-q", "-m", "generate scorecard")
+        head = sh(origin, "rev-parse", "HEAD")
+
+        ledger = self.root / "ledger"
+        sh(self.root, "clone", "-q", "--depth", "1", f"file://{origin}", str(ledger))
+        with patch.dict(os.environ, env):
+            depth = ADAPTER.fetch_ledger(ledger, head)
+        self.assertEqual(depth, 101)  # 1, then 51 (summary 70 back), then 101
+        self.assertEqual(sh(ledger, "rev-parse", "--is-shallow-repository"), "true")
+        sh(ledger, "merge-base", "--is-ancestor", summarized, head)
+        self.assertLess(int(sh(ledger, "rev-list", "--count", head)), len(commits) + 1)
+
+        # A summary of the head itself needs no history at all.
+        (origin / "scorecard/parity.json").write_text(
+            json.dumps({"generated_from": {"series_commit": None}}))
+        sh(origin, "commit", "-q", "-am", "scorecard of the head")
+        newest = sh(origin, "rev-parse", "HEAD")
+        with patch.dict(os.environ, env):
+            self.assertEqual(ADAPTER.fetch_ledger(ledger, newest), 1)
 
     def test_ledger_capture_is_exact_and_invocation_failures_refuse(self):
         captured = "a" * 40

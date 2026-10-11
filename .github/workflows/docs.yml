@@ -127,7 +127,14 @@ jobs:
         set -euo pipefail
         # H history is required for source ancestry/depth. Do not recursively
         # initialize unrelated Reverie, rr, backend, or parent submodules.
-        git -C _website_source submodule update --init -- hermit hermit_test_ledger
+        git -C _website_source submodule update --init -- hermit
+        # The builder reads the cell ledger at one commit, so it needs no
+        # ledger history here; the rebuild fetches the captured commit and
+        # deepens only as far as the parity summary's commit
+        # (.github/scripts/rebuild-compatibility-site.py, fetch_ledger). The
+        # full-history clone ran past this step's timeout on
+        # https://github.com/rrnewton/hermit/actions/runs/38167459473.
+        git -C _website_source submodule update --init --depth 1 -- hermit_test_ledger
         git -C _website_source/hermit submodule update --init --depth 1 -- agent-utils
         git -C _website_source/hermit fetch --no-tags origin main:refs/remotes/origin/main
         channel=$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("_website_source/hermit/rust-toolchain.toml").read_text())["toolchain"]["channel"])')

@@ -211,6 +211,60 @@ def require_sources(parent, config):
     return ledger
 
 
+# The builder reads the cell ledger at one commit (ls-tree and cat-file of that
+# tree) plus, for the parity panel, the commit its scorecard/parity.json
+# summarized and that commit's ancestry. It never walks older history, and the
+# full ledger history no longer fits the workflow's clone budget: on
+# https://github.com/rrnewton/hermit/actions/runs/38167459473 the full-history
+# submodule clone ran past its 15-minute step timeout (1,358 commits, 44 GB as
+# a local repository on 2026-10-11, 121 commits that day). So the ledger is
+# fetched at depth 1 and deepened only until the summarized commit is an
+# ancestor, a few commits in practice.
+LEDGER_FETCH_TIMEOUT = 1200
+LEDGER_DEEPEN_STEP = 50
+LEDGER_DEEPEN_LIMIT = 2000
+
+
+def _parity_summary_commit(ledger, ledger_commit):
+    """The series_commit scorecard/parity.json at ledger_commit names, if any."""
+    try:
+        text = run(
+            ["git", "--no-replace-objects", "-C", ledger, "show",
+             f"{ledger_commit}:scorecard/parity.json"]
+        )
+        value = json.loads(text)["generated_from"]["series_commit"]
+    except (subprocess.CalledProcessError, ValueError, KeyError, TypeError):
+        return None  # the builder reports a missing or malformed summary itself
+    return value if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value) else None
+
+
+def _is_ancestor(ledger, ancestor, descendant):
+    result = subprocess.run(
+        ["git", "--no-replace-objects", "-C", str(ledger), "merge-base",
+         "--is-ancestor", ancestor, descendant],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120,
+    )
+    return result.returncode == 0
+
+
+def fetch_ledger(ledger, ledger_commit):
+    """Fetch ledger_commit and only the history the builder reads."""
+    fetch = ["git", "-C", ledger, "fetch", "--no-tags", "--no-recurse-submodules"]
+    depth = 1
+    run([*fetch, "--depth", str(depth), "origin", ledger_commit], timeout=LEDGER_FETCH_TIMEOUT)
+    summarized = _parity_summary_commit(ledger, ledger_commit)
+    while (
+        summarized not in (None, ledger_commit)
+        and not _is_ancestor(ledger, summarized, ledger_commit)
+        and depth < LEDGER_DEEPEN_LIMIT
+    ):
+        # Past the limit the builder still refuses only the parity panel,
+        # naming the summarized commit it could not place.
+        depth += LEDGER_DEEPEN_STEP
+        run([*fetch, "--depth", str(depth), "origin", ledger_commit], timeout=LEDGER_FETCH_TIMEOUT)
+    return depth
+
+
 def published_registry(scratch):
     pages = json.loads(gh("api", f"repos/{REPOSITORY}/git/ref/heads/gh-pages"))[
         "object"
@@ -359,18 +413,7 @@ def rebuild(parent, scratch, receipt, *, ledger_commit, validation_history_commi
         )
     # Fetch objects/ref only: moving the ledger submodule HEAD would dirty the
     # immutable parent reader. Capture one commit for every subsequent read.
-    run(
-        [
-            "git",
-            "-C",
-            ledger,
-            "fetch",
-            "--no-tags",
-            "--no-recurse-submodules",
-            "origin",
-            ledger_commit,
-        ]
-    )
+    fetch_ledger(ledger, ledger_commit)
     if git(ledger, "rev-parse", ledger_commit + "^{commit}") != ledger_commit:
         raise ValueError(
             "fetched cell ledger differs from its captured commit; rerun the workflow capture steps"
