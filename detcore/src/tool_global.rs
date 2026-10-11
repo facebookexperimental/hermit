@@ -2612,7 +2612,7 @@ impl GlobalTool for GlobalState {
                 let scheduler = self.lock_rpc_scheduler(false).await;
                 R::ResolveKillTargets(
                     scheduler.process_signal_targets(dpid),
-                    scheduler.is_unreaped_exited_process(dpid),
+                    scheduler.exited_process_is_zombie(dpid),
                 )
             }
             GlobalRequest::NamesHermitTask(caller, tgid, tid) => {
@@ -2689,6 +2689,14 @@ impl GlobalTool for GlobalState {
                     .thread_tree
                     .process_of(dettid),
             ),
+            GlobalRequest::SetSigchldDisposition(process, ignored, nocldwait) => {
+                R::SetSigchldDisposition(
+                    self.lock_rpc_scheduler(false)
+                        .await
+                        .thread_tree
+                        .set_sigchld_disposition(process, ignored, nocldwait),
+                )
+            }
             GlobalRequest::SetChildSubreaper(process, on) => R::SetChildSubreaper(
                 self.lock_rpc_scheduler(false)
                     .await
@@ -4284,7 +4292,7 @@ pub enum GlobalRequest {
     /// Apply a successful setsid transition.
     CreateSession(DetPid),
     /// Query live threads before translating process-directed signal delivery,
-    /// and whether the process is an unreaped zombie.
+    /// and the process's exit state (`Scheduler::exited_process_is_zombie`).
     ResolveKillTargets(DetPid),
     /// Whether a pid or tid that a guest task named (with the thread group it
     /// named, if any) is one of Hermit's own tasks; see `hermit_task_named`.
@@ -4373,6 +4381,11 @@ pub enum GlobalRequest {
     /// a raw clone child with a non-SIGCHLD exit signal as its own process.
     /// Appended after `SetChildSubreaper`, for the same reason.
     RegisteredProcessOf(DetTid),
+    /// Mirror a successful `rt_sigaction(SIGCHLD, ...)` by this process:
+    /// whether the action is `SIG_IGN`, and whether it has `SA_NOCLDWAIT`
+    /// (`set_sigchld_disposition`). Appended after `RegisteredProcessOf`, for
+    /// the same reason.
+    SetSigchldDisposition(DetPid, bool, bool),
 }
 
 /// Responses from the global object
@@ -4439,7 +4452,7 @@ pub enum GlobalResponse {
     AlarmRemaining(ItimerSnapshot),
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
-    ResolveKillTargets(Vec<DetTid>, bool),
+    ResolveKillTargets(Vec<DetTid>, Option<bool>),
     NamesHermitTask(bool),
     NotifySignalPending(()),
     NotifyUnresolvedSigkill(()),
@@ -4475,6 +4488,8 @@ pub enum GlobalResponse {
     SetChildSubreaper(()),
     /// Appended after `SetChildSubreaper`, for the same reason.
     RegisteredProcessOf(Option<DetPid>),
+    /// Appended after `RegisteredProcessOf`, for the same reason.
+    SetSigchldDisposition(()),
 }
 
 /// `request`, carrying the number of records this guest thread produced for
@@ -5902,6 +5917,28 @@ where
     }
 }
 
+/// Mirror a successful `rt_sigaction(SIGCHLD, ...)` by `process` in the
+/// scheduler's thread tree, in the calling thread's turn.
+pub async fn set_sigchld_disposition<G, T>(
+    guest: &mut G,
+    process: DetPid,
+    ignored: bool,
+    nocldwait: bool,
+) where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(
+        guest,
+        GlobalRequest::SetSigchldDisposition(process, ignored, nocldwait),
+    )
+    .await;
+    match response.1 {
+        GlobalResponse::SetSigchldDisposition(()) => {}
+        _ => unreachable!(),
+    }
+}
+
 pub async fn create_session<G, T>(guest: &mut G, process: DetPid) -> bool
 where
     G: Guest<Detcore<T>>,
@@ -5936,19 +5973,19 @@ where
     resolve_kill_targets_and_exit(guest, detpid).await.0
 }
 
-/// The live threads of `detpid`, and whether it has exited logically without
-/// being reaped (a zombie: no live threads, still signalled successfully).
+/// The live threads of `detpid`, and its exit state
+/// (`Scheduler::exited_process_is_zombie`).
 pub async fn resolve_kill_targets_and_exit<G, T>(
     guest: &mut G,
     detpid: DetPid,
-) -> (Vec<DetTid>, bool)
+) -> (Vec<DetTid>, Option<bool>)
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
     let response = send_and_update_time(guest, GlobalRequest::ResolveKillTargets(detpid)).await;
     match response.1 {
-        GlobalResponse::ResolveKillTargets(targets, unreaped) => (targets, unreaped),
+        GlobalResponse::ResolveKillTargets(targets, zombie) => (targets, zombie),
         _ => unreachable!(),
     }
 }

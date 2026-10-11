@@ -275,11 +275,14 @@ impl RecordVersion {
 // (https://github.com/rrnewton/hermit/issues/4099). Replay recomputes
 // the schedule, so an older recording replayed here could be scheduled
 // differently, although no event shape changed.
-// 0x12e -> 0x12f: a kill to a zombie (exited, its status not yet reaped)
-// answers 0, as Linux's kill_pid_info does, where it answered ESRCH
-// (https://github.com/rrnewton/hermit/issues/4091). Replay recomputes the
-// answer, so an older recording replayed here could see another result and take
-// another branch, although no event shape changed.
+// 0x12e -> 0x12f: a kill to a zombie (exited, its parent can still wait for
+// it) answers 0, as Linux's kill_pid_info does, where it answered ESRCH; a
+// kill(pid, 0) to an exited process answers from the same model; and an
+// rt_sigaction(SIGCHLD) tells the scheduler whether the process now reaps its
+// children automatically (https://github.com/rrnewton/hermit/issues/4091).
+// Replay recomputes these answers and the schedule, so an older recording
+// replayed here could see another result and take another branch, although
+// no event shape changed.
 pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x12f);
 
 /// The highest RECORD_VERSION this project has ever shipped.

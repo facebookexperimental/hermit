@@ -45,8 +45,10 @@ use crate::tool_global::host_timed_signals;
 use crate::tool_global::notify_signal_pending;
 use crate::tool_global::refuse_sigalrm;
 use crate::tool_global::register_alarm;
+use crate::tool_global::registered_process_of;
 use crate::tool_global::resolve_kill_targets_and_exit;
 use crate::tool_global::resource_request;
+use crate::tool_global::set_sigchld_disposition;
 use crate::tool_global::sigalrm_refuses;
 use crate::tool_global::thread_observe_time;
 use crate::types::DetPid;
@@ -329,16 +331,17 @@ fn logical_time_to_alarm_seconds(value: LogicalTime) -> i64 {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#663)
-/// The thread a process-directed signal goes to. `Ok(None)` is a zombie: no
-/// live threads, but its exit status has not been reaped, so Linux still finds
+/// The thread a process-directed signal goes to. `zombie` is the process's
+/// exit state (`Scheduler::exited_process_is_zombie`). `Ok(None)` is a zombie:
+/// no live threads, but its parent can still wait for it, so Linux still finds
 /// the process and the send succeeds (https://github.com/rrnewton/hermit/issues/4091).
 fn deterministic_kill_target(
     targets: &[DetTid],
-    unreaped_exited: bool,
+    zombie: Option<bool>,
     sig: libc::c_int,
 ) -> Result<Option<DetTid>, Errno> {
     match targets {
-        [] if unreaped_exited => Ok(None),
+        [] if zombie == Some(true) => Ok(None),
         [] => Err(Errno::ESRCH),
         [target] => Ok(Some(*target)),
         [target, ..] if sig == 0 => Ok(Some(*target)),
@@ -775,6 +778,27 @@ impl<T: RecordOrReplay> Detcore<T> {
         if phase1 && (was_handled || (to_handler && result != Err(Errno::EPERM))) {
             self.publish_virtual_sigalrm(guest).await?;
         }
+        // Linux reaps a process's children automatically at exit when its
+        // SIGCHLD action is SIG_IGN or carries SA_NOCLDWAIT, and a signal to
+        // such a child then finds no zombie. Mirror the new action for the
+        // scheduler's exit model, with the same success rule as above
+        // (https://github.com/rrnewton/hermit/issues/4091).
+        if call.signum() == libc::SIGCHLD
+            && guest.config().sequentialize_threads
+            && let Some(action) = kernel_action
+            && matches!(result, Ok(_) | Err(Errno::EFAULT))
+        {
+            let dettid = guest.thread_state().dettid;
+            if let Some(process) = registered_process_of(guest, dettid).await {
+                set_sigchld_disposition(
+                    guest,
+                    process,
+                    action.handler == libc::SIG_IGN as u64,
+                    action.flags & libc::SA_NOCLDWAIT as u64 != 0,
+                )
+                .await;
+            }
+        }
         Ok(result?)
     }
 
@@ -997,6 +1021,22 @@ impl<T: RecordOrReplay> Detcore<T> {
         // anything else ("-INT_MIN is undefined"), so the kernel's answer is
         // deterministic and sends nothing; negating it here would overflow
         // (https://github.com/rrnewton/hermit/issues/4046).
+        if call.sig() == 0 && call.pid() > 0 {
+            // An existence check answers from the same model as a signal, so
+            // that one pid never answers 0 to one and ESRCH to the other: a
+            // process with no live threads is a zombie (0) or gone (ESRCH)
+            // whenever Detcore saw it exit, whatever the host has reaped by
+            // now (https://github.com/rrnewton/hermit/issues/4091).
+            let (targets, zombie) =
+                resolve_kill_targets_and_exit(guest, DetPid::from_raw(call.pid())).await;
+            if targets.is_empty() {
+                match zombie {
+                    Some(true) => return Ok(0),
+                    Some(false) => return Err(Errno::ESRCH.into()),
+                    None => {}
+                }
+            }
+        }
         if call.sig() == 0 || call.pid() == libc::pid_t::MIN {
             return Ok(self.record_or_replay(guest, call).await?);
         }
@@ -1052,14 +1092,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             .process_signal_target(guest, Sysno::kill, DetPid::from_raw(tgid), call.sig())
             .await?
         else {
-            // A zombie: exited, not yet reaped. Linux's kill_pid_info still
-            // finds it and the send succeeds, discarding the signal, so answer
-            // 0 without a system call: the host process may already be gone if
-            // a backend reaped it, and the logical answer must not depend on
-            // when (https://github.com/rrnewton/hermit/issues/4091). An invalid
-            // signal number is still the kernel's EINVAL.
+            // A zombie: exited, and its parent can still wait for it. Linux's
+            // kill_pid_info still finds it and the send succeeds, discarding
+            // the signal, so answer 0 without a system call: the host process
+            // may already be gone if a backend reaped it, and the logical
+            // answer must not depend on when
+            // (https://github.com/rrnewton/hermit/issues/4091). Linux checks
+            // the signal number after finding the task, so an invalid one is
+            // EINVAL.
             if !(1..=libc::SIGRTMAX()).contains(&call.sig()) {
-                return Ok(self.record_or_replay(guest, call).await?);
+                return Err(Errno::EINVAL.into());
             }
             return Ok(0);
         };
@@ -1189,8 +1231,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         tgid: DetPid,
         sig: libc::c_int,
     ) -> Result<Option<DetTid>, Error> {
-        let (targets, unreaped_exited) = resolve_kill_targets_and_exit(guest, tgid).await;
-        match deterministic_kill_target(&targets, unreaped_exited, sig) {
+        let (targets, zombie) = resolve_kill_targets_and_exit(guest, tgid).await;
+        match deterministic_kill_target(&targets, zombie, sig) {
             Err(Errno::ENOSYS) => {
                 tracing::error!(
                     "[detcore, dtid {}] process-directed signal {} to process {} by {} is not supported: \
@@ -1659,23 +1701,27 @@ mod tests {
         let first = DetTid::from_raw(42);
         let second = DetTid::from_raw(43);
         assert_eq!(
-            deterministic_kill_target(&[], false, libc::SIGUSR1),
+            deterministic_kill_target(&[], None, libc::SIGUSR1),
             Err(Errno::ESRCH)
         );
         assert_eq!(
-            deterministic_kill_target(&[], true, libc::SIGUSR1),
+            deterministic_kill_target(&[], Some(true), libc::SIGUSR1),
             Ok(None)
         );
         assert_eq!(
-            deterministic_kill_target(&[first], false, libc::SIGUSR1),
+            deterministic_kill_target(&[], Some(false), libc::SIGUSR1),
+            Err(Errno::ESRCH)
+        );
+        assert_eq!(
+            deterministic_kill_target(&[first], None, libc::SIGUSR1),
             Ok(Some(first))
         );
         assert_eq!(
-            deterministic_kill_target(&[first, second], false, libc::SIGUSR1),
+            deterministic_kill_target(&[first, second], None, libc::SIGUSR1),
             Err(Errno::ENOSYS)
         );
         assert_eq!(
-            deterministic_kill_target(&[first, second], false, 0),
+            deterministic_kill_target(&[first, second], None, 0),
             Ok(Some(first))
         );
 

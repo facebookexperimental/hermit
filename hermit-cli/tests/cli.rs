@@ -21205,6 +21205,9 @@ fn a_futex_wake_count_of_zero_or_negative_wakes_one_waiter() {
 /// `--allow-unsupported-syscalls` both calls return ENOSYS, as before. `kill`
 /// to a zombie child answers 0, as Linux does, and ESRCH once it is reaped;
 /// before https://github.com/rrnewton/hermit/issues/4091 the zombie was ESRCH.
+/// A child that is never a zombie stays ESRCH: one auto-reaped because its
+/// parent ignores SIGCHLD or sets SA_NOCLDWAIT, and an orphan that init reaps.
+/// Signal 0 answers as a signal does.
 #[test]
 fn a_process_directed_signal_to_several_threads_is_refused_by_name() {
     let guest = kill_multithreaded_process_guest()
@@ -21212,7 +21215,11 @@ fn a_process_directed_signal_to_several_threads_is_refused_by_name() {
         .unwrap()
         .to_owned();
     let one_thread = "one thread, kill: 0\none thread, rt_sigqueueinfo: 0\none thread, handled: 2\n\
-                      zombie, kill: 0\nreaped, kill: -1 ESRCH\n";
+                      zombie, kill: 0\nzombie, kill 0: 0\nzombie, kill 99: -1 EINVAL\n\
+                      reaped, kill: -1 ESRCH\nreaped, kill 0: -1 ESRCH\n\
+                      SIG_IGN child, kill: -1 ESRCH\nSIG_IGN child, kill 0: -1 ESRCH\n\
+                      SA_NOCLDWAIT child, kill: -1 ESRCH\nSA_NOCLDWAIT child, kill 0: -1 ESRCH\n\
+                      orphan, kill: -1 ESRCH\norphan, kill 0: -1 ESRCH\n";
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let (status, log) = run_with_deadline(
         hermit_command(&[

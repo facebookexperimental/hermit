@@ -1263,6 +1263,11 @@ pub struct Scheduler {
     /// Logically exited child processes whose terminal wait status has not been consumed.
     logically_exited_processes: BTreeSet<DetPid>,
 
+    /// Logically exited processes whose parent reaped them automatically at
+    /// exit (`ThreadTree::reaps_children_automatically`): no longer zombies,
+    /// although no wait consumed them.
+    autoreaped_exits: BTreeSet<DetPid>,
+
     /// Reporting-backend children whose final physical exit has been observed.
     completed_physical_process_exits: BTreeSet<DetPid>,
 
@@ -1448,6 +1453,15 @@ pub struct ThreadTree {
     /// init.
     init_orphans: HashSet<DetPid>,
 
+    /// Processes whose children Linux reaps automatically at exit, because the
+    /// process set SIGCHLD to `SIG_IGN` or set `SA_NOCLDWAIT` on it
+    /// (`do_notify_parent`'s autoreap test). The value is `(ignored,
+    /// nocldwait)`; a process with neither has no entry. A forked child
+    /// inherits it; exec keeps it only while SIGCHLD is ignored, because
+    /// `flush_signal_handlers` resets a caught or default action and clears its
+    /// flags (<https://github.com/rrnewton/hermit/issues/4091>).
+    sigchld_autoreap: HashMap<DetPid, (bool, bool)>,
+
     /// Processes whose exit the scheduler granted (`ResourceID::Exit` for the
     /// whole group, or for its last live thread), so that their logical exit
     /// is fixed between committed turns. A process that dies without one is
@@ -1632,6 +1646,17 @@ impl ThreadTree {
             self.child_subreapers.remove(&child_dettid);
             self.init_orphans.remove(&child_dettid);
             self.granted_exits.remove(&child_dettid);
+            // A forked child copies its creator's signal dispositions.
+            let inherited = self
+                .thread_to_leader
+                .get(&parent_dettid)
+                .filter(|_| parent_dettid != child_dettid)
+                .and_then(|creator| self.sigchld_autoreap.get(creator))
+                .copied();
+            match inherited {
+                Some(disposition) => self.sigchld_autoreap.insert(child_dettid, disposition),
+                None => self.sigchld_autoreap.remove(&child_dettid),
+            };
             // The child lives in its creator's PID namespace until
             // `enter_new_pid_namespace` says otherwise.
             let creator_depth = self
@@ -1752,6 +1777,13 @@ impl ThreadTree {
     /// it created before this exec into SIGCHLD (`notification_signal`).
     pub fn record_successful_exec(&mut self, process: DetPid) {
         *self.exec_generations.entry(process).or_insert(0) += 1;
+        if self
+            .sigchld_autoreap
+            .get(&process)
+            .is_some_and(|(ignored, _)| !ignored)
+        {
+            self.sigchld_autoreap.remove(&process);
+        }
         if let Some(metadata) = self.process_wait.get_mut(&process) {
             metadata.exit_signal = libc::SIGCHLD;
         }
@@ -1800,6 +1832,22 @@ impl ThreadTree {
     /// Whether `pid` is a child subreaper (`set_child_subreaper`).
     pub fn is_child_subreaper(&self, pid: DetPid) -> bool {
         self.child_subreapers.contains(&pid)
+    }
+
+    /// Mirror a successful `rt_sigaction(SIGCHLD, ...)` by `pid`: whether its
+    /// new action is `SIG_IGN`, and whether it carries `SA_NOCLDWAIT`.
+    pub fn set_sigchld_disposition(&mut self, pid: DetPid, ignored: bool, nocldwait: bool) {
+        if ignored || nocldwait {
+            self.sigchld_autoreap.insert(pid, (ignored, nocldwait));
+        } else {
+            self.sigchld_autoreap.remove(&pid);
+        }
+    }
+
+    /// Whether Linux reaps `pid`'s children automatically when they exit
+    /// (`set_sigchld_disposition`).
+    pub fn reaps_children_automatically(&self, pid: DetPid) -> bool {
+        self.sigchld_autoreap.contains_key(&pid)
     }
 
     /// Give `child` a new wait parent after its parent's process exited, as
@@ -2922,6 +2970,7 @@ impl Scheduler {
             deregistration_accounted: Default::default(),
             pending_physical_process_exits: Default::default(),
             logically_exited_processes: Default::default(),
+            autoreaped_exits: Default::default(),
             completed_physical_process_exits: Default::default(),
             child_exit_publications_pending: Default::default(),
             child_exit_publications_completed: Default::default(),
@@ -3686,6 +3735,18 @@ impl Scheduler {
             let _ = self.begin_physical_process_exit(*detpid);
             self.reparent_orphans(*detpid);
             self.logically_exited_processes.insert(*detpid);
+            // Linux decides at exit whether the parent reaps this child
+            // automatically (do_notify_parent); a later change of the parent's
+            // disposition does not bring the child back.
+            if self
+                .thread_tree
+                .parent_process(detpid)
+                .is_some_and(|parent| self.thread_tree.reaps_children_automatically(parent))
+            {
+                self.autoreaped_exits.insert(*detpid);
+            } else {
+                self.autoreaped_exits.remove(detpid);
+            }
             if let Some(parent) = self.thread_tree.parent_process(detpid) {
                 self.wake_child_waiters(parent, *detpid);
             }
@@ -5768,6 +5829,7 @@ impl Scheduler {
         self.thread_tree.child_subreapers.remove(&child);
         self.thread_tree.init_orphans.remove(&child);
         self.thread_tree.granted_exits.remove(&child);
+        self.autoreaped_exits.remove(&child);
         self.logically_exited_processes.remove(&child)
     }
 
@@ -5799,10 +5861,18 @@ impl Scheduler {
         }
     }
 
-    /// Whether `detpid` has exited logically and its terminal wait status has
-    /// not been consumed: a zombie, which Linux still signals successfully.
-    pub fn is_unreaped_exited_process(&self, detpid: DetPid) -> bool {
-        self.logically_exited_processes.contains(&detpid)
+    /// The exit state of `detpid` as a signal sees it: `Some(true)` for a
+    /// zombie, which has exited but whose status its parent can still wait
+    /// for, so Linux still finds it and a signal to it succeeds;
+    /// `Some(false)` for an exited process that is already gone (its parent
+    /// reaped it automatically at exit, or it went to the container's init,
+    /// which reaps it); `None` for a process not known to have exited
+    /// (<https://github.com/rrnewton/hermit/issues/4091>).
+    pub fn exited_process_is_zombie(&self, detpid: DetPid) -> Option<bool> {
+        if !self.logically_exited_processes.contains(&detpid) {
+            return None;
+        }
+        Some(!self.autoreaped_exits.contains(&detpid) && !self.thread_tree.is_init_orphan(detpid))
     }
 
     pub fn process_signal_targets(&self, detpid: DetPid) -> Vec<DetTid> {
