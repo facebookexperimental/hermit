@@ -1881,7 +1881,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (Codex review of https://github.com/rrnewton/hermit/pull/4053): 1347.
     // syscalls::threads::tests::futex_timeout_clamps_a_huge_valid_timespec_like_ktime
     // (Codex re-check of https://github.com/rrnewton/hermit/pull/4061) retains
-    // all 1342: 1348.
+    // all 1347: 1348.
     ("test.detcore_unit", 1348),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
@@ -2743,9 +2743,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.cli_on_host", 230),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
-    ("privileged-only-test.cli_kvm", 55),
+    // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
+    // (https://github.com/rrnewton/hermit/issues/4030) retains all 55: 56.
+    ("privileged-only-test.cli_kvm", 56),
     ("privileged-only-test.pmu_buck_chaos_cases_on_host", 6),
-    ("privileged-only-test.cli_kvm_on_host", 55),
+    // And the KVM unreadable futex word test: 56.
+    ("privileged-only-test.cli_kvm_on_host", 56),
     ("test.app_strict_verify_on_host", 8),
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),

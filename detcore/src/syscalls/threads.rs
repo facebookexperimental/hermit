@@ -1277,10 +1277,12 @@ fn parse_futex_timeout(futex_op: i32, timeout: Timespec) -> Result<FutexTimeout,
     }
     let seconds = timeout.tv_sec as u64;
     let nanoseconds = timeout.tv_nsec as u64;
-    let timeout_nanos = seconds
-        .saturating_mul(1_000_000_000)
-        .saturating_add(nanoseconds)
-        .min(FUTEX_KTIME_MAX_NANOS);
+    // `timespec64_to_ktime`: KTIME_MAX from KTIME_SEC_MAX seconds on.
+    let timeout_nanos = if seconds >= FUTEX_KTIME_MAX_NANOS / 1_000_000_000 {
+        FUTEX_KTIME_MAX_NANOS
+    } else {
+        seconds * 1_000_000_000 + nanoseconds
+    };
     // Mask off FUTEX_PRIVATE_FLAG / FUTEX_CLOCK_REALTIME before matching the
     // command: FUTEX_WAIT_BITSET measures its timeout as an *absolute* deadline,
     // whereas plain FUTEX_WAIT uses a *relative* one. A private-flagged
@@ -4012,7 +4014,8 @@ fn mapping_permissions(pid: i32, address: usize) -> Option<[u8; 4]> {
 /// A `struct timespec` copied from the guest as Linux's `get_timespec64`
 /// (`copy_from_user`) copies it: every byte must lie in a mapping user mode can
 /// read, which on x86 includes a write-only one, or the copy is EFAULT, with no
-/// partial result. The bytes are then read through the tracer, which is only
+/// partial result. On a backend whose guest is real host threads, the guest's
+/// host `/proc/<pid>/maps` decides; elsewhere the backend's user-access read. The bytes are then read through the tracer, which is only
 /// safe because every page they span was checked first: the tracer's own read
 /// would force its way through a PROT_NONE page.
 fn read_user_timespec<G: Guest<Detcore<T>>, T: RecordOrReplay>(
@@ -4023,6 +4026,30 @@ fn read_user_timespec<G: Guest<Detcore<T>>, T: RecordOrReplay>(
     let last = address.checked_add(size - 1).ok_or(Errno::EFAULT)?;
     if last > user_ptr_max() {
         return Err(Error::Errno(Errno::EFAULT));
+    }
+    if !guest
+        .config()
+        .backend_supports_blocked_wait_signal_interruption
+    {
+        // No host `/proc` describes this guest (KVM's guest pid is virtual), so
+        // the backend's own user-access read decides, all or nothing.
+        let mut bytes = [0u8; std::mem::size_of::<Timespec>()];
+        guest
+            .memory()
+            .read_exact_with_user_access(
+                Addr::<u8>::from_raw(address).ok_or(Errno::EFAULT)?,
+                &mut bytes,
+            )
+            .map_err(|_| Error::Errno(Errno::EFAULT))?;
+        let field = |at: usize| -> i64 {
+            let mut raw = [0u8; 8];
+            raw.copy_from_slice(&bytes[at..at + 8]);
+            i64::from_ne_bytes(raw)
+        };
+        return Ok(Timespec {
+            tv_sec: field(0) as libc::time_t,
+            tv_nsec: field(8) as libc::c_long,
+        });
     }
     // 4096 divides every page size, so probing each 4 KiB step checks every page.
     let page = 4096;
@@ -5053,6 +5080,24 @@ mod tests {
             Ok(FutexTimeout::Absolute(LogicalTime::from_nanos(
                 FUTEX_KTIME_MAX_NANOS
             )))
+        );
+        let at_ktime_sec_max = Timespec {
+            tv_sec: (FUTEX_KTIME_MAX_NANOS / 1_000_000_000) as libc::time_t,
+            tv_nsec: 0,
+        };
+        assert_eq!(
+            parse_futex_timeout(libc::FUTEX_WAIT, at_ktime_sec_max),
+            Ok(FutexTimeout::Relative(FUTEX_KTIME_MAX_NANOS))
+        );
+        let just_below = Timespec {
+            tv_sec: (FUTEX_KTIME_MAX_NANOS / 1_000_000_000 - 1) as libc::time_t,
+            tv_nsec: 999_999_999,
+        };
+        assert_eq!(
+            parse_futex_timeout(libc::FUTEX_WAIT, just_below),
+            Ok(FutexTimeout::Relative(
+                (FUTEX_KTIME_MAX_NANOS / 1_000_000_000) * 1_000_000_000 - 1
+            ))
         );
         for invalid in [(-1, 0), (0, -1), (0, 1_000_000_000)] {
             assert!(!futex_timespec_is_valid(Timespec {

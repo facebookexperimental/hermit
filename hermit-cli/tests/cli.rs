@@ -21769,6 +21769,7 @@ fn a_futex_wait_on_an_unreadable_word_is_efault() {
          wait, tv_nsec 1e9, readable word 7, expecting 1: -1 EINVAL\n\
          wait, {0,0} timeout in a write-only page, readable word 7, expecting 1: -1 EAGAIN\n\
          wait, timeout split onto a PROT_NONE page, readable word 7, expecting 1: -1 EFAULT\n\
+         wait, timeout readable then PROT_NONE across a page, readable word 7, expecting 1: -1 EFAULT\n\
          wait, {LONG_MAX,0} timeout, readable word 7, expecting 1: -1 EAGAIN\n",
         "stderr:\n{log}"
     );
@@ -21790,6 +21791,56 @@ fn a_futex_wait_on_an_unreadable_word_is_efault() {
     assert!(
         log.contains("Success: replay matched recording."),
         "the replay must match the recording:\nstderr:\n{log}"
+    );
+}
+
+/// The same futex-word and timeout answers on the KVM backend, whose guest pid
+/// is virtual, so no host `/proc` describes its memory: the backend's
+/// user-access read must decide (Codex re-check of
+/// https://github.com/rrnewton/hermit/pull/4061). KVM refuses `--timeout`, so
+/// the run is bounded by the harness deadline instead.
+#[test]
+fn run_kvm_futex_wait_on_an_unreadable_word_matches_linux() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+    let guest = futex_c_guest(
+        &FUTEX_WAIT_UNREADABLE_WORD_GUEST,
+        "futex_wait_unreadable_word",
+    )
+    .to_str()
+    .unwrap()
+    .to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&["--backend", "kvm", "run", "--strict", "--", guest.as_str()]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "the KVM run must finish and exit 0:\nstdout:\n{stdout}\nstderr:\n{log}"
+    );
+    assert_eq!(
+        stdout,
+        "wait, readable word 7, expecting 1: -1 EAGAIN\n\
+         wait, unmapped private word: -1 EFAULT\n\
+         wait, PROT_NONE private word: -1 EFAULT\n\
+         wait, unmapped shared word: -1 EFAULT\n\
+         wait_bitset, unmapped private word: -1 EFAULT\n\
+         wait_bitset, PROT_NONE private word: -1 EFAULT\n\
+         wait_bitset, mask 0, PROT_NONE private word: -1 EINVAL\n\
+         wait, tv_nsec 1e9, PROT_NONE private word: -1 EINVAL\n\
+         wait, tv_nsec 1e9, readable word 7, expecting 1: -1 EINVAL\n\
+         wait, {0,0} timeout in a write-only page, readable word 7, expecting 1: -1 EAGAIN\n\
+         wait, timeout split onto a PROT_NONE page, readable word 7, expecting 1: -1 EFAULT\n\
+         wait, timeout readable then PROT_NONE across a page, readable word 7, expecting 1: -1 EFAULT\n\
+         wait, {LONG_MAX,0} timeout, readable word 7, expecting 1: -1 EAGAIN\n",
+        "stderr:\n{log}"
     );
 }
 

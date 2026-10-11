@@ -100,6 +100,13 @@ int main(void) {
             FUTEX_WAIT_PRIVATE, write_only);
   report_at("wait, timeout split onto a PROT_NONE page, readable word 7, expecting 1",
             readable, FUTEX_WAIT_PRIVATE, split);
+  /* A timespec whose tv_sec is readable and whose tv_nsec is on a PROT_NONE page. */
+  char* seam_pages = mmap(NULL, 2 * pagesize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  struct timespec* seam = (struct timespec*)(seam_pages + pagesize - sizeof(long));
+  seam->tv_sec = 0;
+  mprotect(seam_pages + pagesize, pagesize, PROT_NONE);
+  report_at("wait, timeout readable then PROT_NONE across a page, readable word 7, expecting 1",
+            readable, FUTEX_WAIT_PRIVATE, seam);
   struct timespec huge = {LONG_MAX, 0};
   report_at("wait, {LONG_MAX,0} timeout, readable word 7, expecting 1", readable,
             FUTEX_WAIT_PRIVATE, &huge);
