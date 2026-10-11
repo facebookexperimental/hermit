@@ -3751,6 +3751,30 @@
       "why": "tests/helpers.bzl is owned by Meta Buck test targets: helpers.bzl defines Buck macros and target wiring for internal tests. Buck evaluates it during graph construction; it is build policy, not guest code runnable by the public manifest harness."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/isolation/backend_isolation.c",
+      "runner": "tests/isolation/conformance.rs through tests/isolation/driver.rs",
+      "why": "The conformance driver compiles and runs this raw observation probe with backend-specific launch arguments, retaining its bytes for the full isolation checker. The standalone reporter owns the assertion contract and row verdicts."
+    },
+    {
+      "disposition": "special-driver",
+      "path": "tests/isolation/conformance.rs",
+      "runner": "manual rust-script tests/isolation/conformance.rs",
+      "why": "This standalone reporter selects isolation cells, invokes the driver, retains full-checker assertion rows and publishes the complete required-cell ledger. Its diagnostic red verdict is collected explicitly by operators."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/isolation/driver.rs",
+      "runner": "tests/isolation/conformance.rs",
+      "why": "This included Rust module builds the probes, runs the bounded native executor and Hermit command, and retains input, output and cleanup evidence for the full isolation checker."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/isolation/native_launcher.c",
+      "runner": "tests/isolation/driver.rs",
+      "why": "The conformance driver builds this independent native executor and observer to retain host-baseline and CLI-descendant evidence, enforce observation limits and report executor failures separately from the Hermit command."
+    },
+    {
       "disposition": "special-driver",
       "path": "tests/manifest-cli.rs",
       "runner": "test-corpus operators",
