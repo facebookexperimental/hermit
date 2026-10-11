@@ -19,7 +19,10 @@
  * (https://github.com/rrnewton/hermit/issues/4091). A child that is never a
  * zombie is ESRCH once it exits: its parent ignores SIGCHLD or sets
  * SA_NOCLDWAIT, so Linux reaps it at exit, or it is an orphan, which the
- * container's init reaps.
+ * container's init reaps. Linux decides at exit (a later disposition change
+ * does not matter), only for a child whose exit signal is SIGCHLD, with the
+ * disposition a fork inherits and an exec keeps only while it is SIG_IGN; a
+ * zombie reparented to a subreaper that ignores SIGCHLD is reaped then.
  */
 
 #define _GNU_SOURCE
@@ -28,6 +31,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -75,6 +79,155 @@ static void autoreaped_child(const char* what, int nocldwait) {
   snprintf(label, sizeof(label), "%s, kill 0", what);
   report(label, kill(child, 0));
   sigaction(SIGCHLD, &saved, NULL);
+}
+
+static void set_sigchld(void (*handler)(int), int flags) {
+  struct sigaction action;
+  memset(&action, 0, sizeof(action));
+  action.sa_handler = handler;
+  action.sa_flags = flags;
+  sigaction(SIGCHLD, &action, NULL);
+}
+
+/* Fork a child that exits at once; return its pid once it has exited. */
+static pid_t exited_child(void) {
+  int done[2];
+  pipe(done);
+  pid_t child = fork();
+  if (child == 0) {
+    close(done[0]);
+    _exit(0);
+  }
+  close(done[1]);
+  wait_eof(done[0]);
+  close(done[0]);
+  nap();
+  return child;
+}
+
+static void report_kill_and_0(const char* what, pid_t pid) {
+  char label[96];
+  snprintf(label, sizeof(label), "%s, kill", what);
+  report(label, kill(pid, SIGTERM));
+  snprintf(label, sizeof(label), "%s, kill 0", what);
+  report(label, kill(pid, 0));
+}
+
+/* Linux decides at the child's exit whether its parent reaps it. */
+static void disposition_changed_after_exit(void) {
+  pid_t zombie = fork();
+  if (zombie == 0) {
+    _exit(0);
+  }
+  siginfo_t info;
+  waitid(P_PID, zombie, &info, WEXITED | WNOWAIT);
+  set_sigchld(SIG_IGN, 0);
+  report_kill_and_0("zombie then SIG_IGN", zombie);
+  set_sigchld(SIG_DFL, 0);
+  waitpid(zombie, NULL, 0);
+
+  set_sigchld(SIG_IGN, 0);
+  pid_t gone = exited_child();
+  set_sigchld(SIG_DFL, 0);
+  report_kill_and_0("auto-reaped then SIG_DFL", gone);
+}
+
+/* A forked child inherits SIG_IGN, so its own child is reaped at exit. */
+static void inherited_sig_ign(void) {
+  set_sigchld(SIG_IGN, 0);
+  int done[2];
+  pipe(done);
+  pid_t middle = fork();
+  if (middle == 0) {
+    close(done[0]);
+    report_kill_and_0("inherited SIG_IGN child", exited_child());
+    _exit(0);
+  }
+  close(done[1]);
+  wait_eof(done[0]);
+  close(done[0]);
+  set_sigchld(SIG_DFL, 0);
+}
+
+static int clone_exit(void* unused) {
+  (void)unused;
+  return 0;
+}
+
+/* A clone child whose exit signal is not SIGCHLD is never reaped
+ * automatically, whatever its parent's SIGCHLD disposition. */
+static void clone_exit_signal_0(void) {
+  static char stack[64 * 1024];
+  set_sigchld(SIG_IGN, 0);
+  pid_t child = clone(clone_exit, stack + sizeof(stack), 0, NULL);
+  siginfo_t info;
+  waitid(P_PID, child, &info, WEXITED | WNOWAIT | __WALL);
+  report_kill_and_0("exit signal 0, SIG_IGN", child);
+  waitpid(child, NULL, __WALL);
+  set_sigchld(SIG_DFL, 0);
+}
+
+/* After exec, SIG_IGN still reaps a child at exit; SA_NOCLDWAIT on the default
+ * action is cleared, so the child stays a zombie. Runs in the exec'd image. */
+static int exec_child_mode(const char* label) {
+  report_kill_and_0(label, exited_child());
+  return 0;
+}
+
+static void after_exec(const char* self, int nocldwait) {
+  if (nocldwait) {
+    set_sigchld(SIG_DFL, SA_NOCLDWAIT);
+  } else {
+    set_sigchld(SIG_IGN, 0);
+  }
+  int done[2];
+  pipe(done);
+  pid_t middle = fork();
+  if (middle == 0) {
+    close(done[0]);
+    char* args[] = {(char*)self, nocldwait ? "exec-nocldwait" : "exec-ign", NULL};
+    execv(self, args);
+    _exit(99);
+  }
+  close(done[1]);
+  wait_eof(done[0]);
+  close(done[0]);
+  set_sigchld(SIG_DFL, 0);
+}
+
+/* A zombie whose parent exits goes to the subreaper; one that ignores
+ * SIGCHLD reaps it at once. Sets the subreaper flag, so it runs last. */
+static void zombie_reparented_to_ignoring_subreaper(void) {
+  prctl(PR_SET_CHILD_SUBREAPER, 1);
+  int pid_pipe[2], ignoring[2];
+  pipe(pid_pipe);
+  pipe(ignoring);
+  pid_t middle = fork();
+  if (middle == 0) {
+    close(pid_pipe[0]);
+    close(ignoring[1]);
+    pid_t grandchild = fork();
+    if (grandchild == 0) {
+      _exit(0);
+    }
+    siginfo_t info;
+    waitid(P_PID, grandchild, &info, WEXITED | WNOWAIT);
+    write(pid_pipe[1], &grandchild, sizeof(grandchild));
+    /* Exit, orphaning the zombie, only once the subreaper ignores SIGCHLD. */
+    wait_eof(ignoring[0]);
+    _exit(0);
+  }
+  close(pid_pipe[1]);
+  close(ignoring[0]);
+  pid_t grandchild;
+  read(pid_pipe[0], &grandchild, sizeof(grandchild));
+  set_sigchld(SIG_IGN, 0);
+  close(ignoring[1]);
+  wait_eof(pid_pipe[0]);
+  close(pid_pipe[0]);
+  nap();
+  report_kill_and_0("zombie reparented to a SIG_IGN subreaper", grandchild);
+  set_sigchld(SIG_DFL, 0);
 }
 
 /* A grandchild orphaned by its parent's exit, with no subreaper: the
@@ -150,8 +303,14 @@ static void* pauser(void* unused) {
   return NULL;
 }
 
-int main(void) {
+int main(int argc, char** argv) {
   setvbuf(stdout, NULL, _IONBF, 0);
+  if (argc > 1 && strcmp(argv[1], "exec-ign") == 0) {
+    return exec_child_mode("after exec, SIG_IGN");
+  }
+  if (argc > 1 && strcmp(argv[1], "exec-nocldwait") == 0) {
+    return exec_child_mode("after exec, SA_NOCLDWAIT");
+  }
   struct sigaction action;
   memset(&action, 0, sizeof(action));
   action.sa_handler = on_usr1;
@@ -177,6 +336,12 @@ int main(void) {
   autoreaped_child("SIG_IGN child", 0);
   autoreaped_child("SA_NOCLDWAIT child", 1);
   orphaned_grandchild();
+  disposition_changed_after_exit();
+  inherited_sig_ign();
+  clone_exit_signal_0();
+  after_exec(argv[0], 0);
+  after_exec(argv[0], 1);
+  zombie_reparented_to_ignoring_subreaper();
 
   pthread_t thread;
   pthread_create(&thread, NULL, pauser, NULL);

@@ -3736,12 +3736,14 @@ impl Scheduler {
             self.reparent_orphans(*detpid);
             self.logically_exited_processes.insert(*detpid);
             // Linux decides at exit whether the parent reaps this child
-            // automatically (do_notify_parent); a later change of the parent's
+            // automatically (do_notify_parent), and only for a child whose
+            // exit signal is SIGCHLD; a later change of the parent's
             // disposition does not bring the child back.
-            if self
-                .thread_tree
-                .parent_process(detpid)
-                .is_some_and(|parent| self.thread_tree.reaps_children_automatically(parent))
+            if self.thread_tree.notification_signal(*detpid) == Some(libc::SIGCHLD)
+                && self
+                    .thread_tree
+                    .parent_process(detpid)
+                    .is_some_and(|parent| self.thread_tree.reaps_children_automatically(parent))
             {
                 self.autoreaped_exits.insert(*detpid);
             } else {
@@ -3823,6 +3825,13 @@ impl Scheduler {
                 child, exited, reaper
             );
             if self.logically_exited_processes.contains(&child) {
+                // Linux's reparent_leader makes the zombie's exit signal
+                // SIGCHLD and notifies its new parent, which reaps it at once
+                // if it reaps children automatically
+                // (https://github.com/rrnewton/hermit/issues/4091).
+                if self.thread_tree.reaps_children_automatically(reaper) {
+                    self.autoreaped_exits.insert(child);
+                }
                 self.wake_child_waiters(reaper, child);
             }
         }
