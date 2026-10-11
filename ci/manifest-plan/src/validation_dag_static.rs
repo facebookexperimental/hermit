@@ -1362,7 +1362,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (review of https://github.com/rrnewton/hermit/pull/4061): 1032.
     // And metadata::tests::record_version_rejects_streams_whose_pidfd_signals_woke_no_receiver
     // (https://github.com/rrnewton/hermit/issues/4099): 1033.
-    ("test.hermit_unit", 1033),
+    // only_a_group_kill_from_hermits_group_is_refused
+    // (https://github.com/rrnewton/hermit/issues/4065) retains all 1033: 1034.
+    ("test.hermit_unit", 1034),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2525,7 +2527,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_nested_pid_namespace_signals_its_own_tasks and
     // a_signal_to_a_newborn_thread_is_never_taken_for_hermits
     // (https://github.com/rrnewton/hermit/issues/4066) retain all 295: 298.
-    ("test.cli", 298),
+    // a_namespace_only_guests_kill_0_never_reaches_hermits_group and
+    // a_namespace_only_run_on_a_terminal_keeps_its_terminal_behaviour
+    // (https://github.com/rrnewton/hermit/issues/4065) retain all 298: 300.
+    ("test.cli", 300),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2766,7 +2771,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Nor does the unreadable futex word test: 230.
     // Nor does the pidfd multi-thread signal test: 231.
     // Nor do the three tests of signals to Hermit's own tasks: 234.
-    ("test.cli_on_host", 234),
+    // Nor do the two namespace-only kill(0) and terminal tests: 236.
+    ("test.cli_on_host", 236),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -3033,7 +3039,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the futex re-wait record-epoch test: 1031.
     // And the futex-wait record-epoch test: 1032.
     // And the pidfd wake record-epoch test: 1033.
-    ("test.hermit_unit_on_host", 1033),
+    // And the namespace-only group-kill unit test: 1034.
+    ("test.hermit_unit_on_host", 1034),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
