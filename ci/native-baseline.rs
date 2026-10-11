@@ -85,6 +85,8 @@ run options:
   --work-root DIR     Guest preparation scratch (default: <repo>/ignored/native-baseline)
   --repetitions N     Measured repetitions per pinning (default: 3)
   --pinning MODE      both | single | unpinned (default: both)
+  --pin-mechanism M   taskset (default, ~0 launch overhead) or cpuset-alloc
+                      (hard AllowedCPUs pin, ~1 s launch overhead here)
   --pin-cpu CPU       Single core to pin to (default: first allowed core)
   --timeout-seconds N Per-repetition native cap (default: 300)
 
@@ -94,10 +96,10 @@ stats options:
   --out PATH          Also write the machine-readable report as JSON
 
 Environment:
-  CPUSET_ALLOC        Path to cpuset-alloc; when set (or found on PATH) the
-                      single-core run uses `cpuset-alloc run --cores 1`
-                      (systemd AllowedCPUs hard pin). Otherwise `taskset`
-                      sets the affinity. The row records which mechanism ran.
+  CPUSET_ALLOC        Path to cpuset-alloc; used only with
+                      `--pin-mechanism cpuset-alloc` (systemd AllowedCPUs
+                      hard pin). The default timed pin is `taskset`.
+                      The row records which mechanism ran.
 ";
 
 fn usage_error(message: &str) -> ExitCode {
@@ -195,29 +197,85 @@ struct GuestRun {
     max_processes: u32,
 }
 
-/// Run one guest repetition, sampling the leader's thread count and direct
-/// child count while it runs. Sampling is observational only.
+/// Map every live pid to its parent, from one /proc scan.
+fn parent_map() -> BTreeMap<u32, u32> {
+    let mut parents = BTreeMap::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+                continue;
+            };
+            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            // Field 4 (ppid) follows the parenthesised comm.
+            if let Some((_, rest)) = stat.rsplit_once(')') {
+                if let Some(ppid) = rest
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|ppid| ppid.parse::<u32>().ok())
+                {
+                    parents.insert(pid, ppid);
+                }
+            }
+        }
+    }
+    parents
+}
+
+/// All descendants of `root` (including `root`) from a parent map.
+fn descendant_tree(parents: &BTreeMap<u32, u32>, root: u32) -> Vec<u32> {
+    let mut tree = vec![root];
+    let mut index = 0;
+    while index < tree.len() {
+        let parent = tree[index];
+        index += 1;
+        for (&pid, &ppid) in parents {
+            if ppid == parent && !tree.contains(&pid) {
+                tree.push(pid);
+            }
+        }
+    }
+    tree
+}
+
+fn thread_count(pid: u32) -> Option<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Threads:"))
+        .and_then(|value| value.trim().parse::<u32>().ok())
+}
+
+/// Run one guest repetition, sampling the whole descendant tree's thread
+/// and process counts while it runs. Sampling is observational only.
+///
+/// The timed single-core pin defaults to `taskset`: `cpuset-alloc run`
+/// measured 0.96 s of launch overhead on this host (cargo-runner cache
+/// check plus systemd scope creation), which would swamp sub-second
+/// guests. `--pin-mechanism cpuset-alloc` selects the hard
+/// `AllowedCPUs` pin instead; the row records which mechanism ran.
 fn run_guest_once(
     argv: &[String],
     cwd: &Path,
     pinning: &str,
     pin_cpu: usize,
+    pin_mechanism: &str,
     cpuset_alloc: Option<&Path>,
     timeout_seconds: u64,
 ) -> Result<GuestRun, String> {
-    let mut command = if pinning == "single" {
-        match cpuset_alloc {
-            Some(alloc) => {
-                let mut cmd = Command::new(alloc);
-                cmd.args(["run", "--cores", "1", "--"]).args(argv);
-                cmd
-            }
-            None => {
-                let mut cmd = Command::new("taskset");
-                cmd.args(["-c", &pin_cpu.to_string()]).args(argv);
-                cmd
-            }
-        }
+    let mut command = if pinning == "single" && pin_mechanism == "cpuset-alloc" {
+        let alloc = cpuset_alloc.ok_or_else(|| {
+            "--pin-mechanism cpuset-alloc requires cpuset-alloc on PATH or CPUSET_ALLOC set"
+                .to_string()
+        })?;
+        let mut cmd = Command::new(alloc);
+        cmd.args(["run", "--cores", "1", "--"]).args(argv);
+        cmd
+    } else if pinning == "single" {
+        let mut cmd = Command::new("taskset");
+        cmd.args(["-c", &pin_cpu.to_string()]).args(argv);
+        cmd
     } else {
         let mut cmd = Command::new(&argv[0]);
         cmd.args(&argv[1..]);
@@ -245,37 +303,17 @@ fn run_guest_once(
             let _ = child.kill();
             break;
         }
-        if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
-            if let Some(threads) = status
-                .lines()
-                .find_map(|line| line.strip_prefix("Threads:"))
-                .and_then(|value| value.trim().parse::<u32>().ok())
-            {
+        // Sample the whole descendant tree: the launched pid may be a
+        // wrapper (taskset, systemd-run, or a shell guest) whose own
+        // thread count says nothing about the guest.
+        let tree = descendant_tree(&parent_map(), pid);
+        max_processes = max_processes.max(tree.len() as u32);
+        for member in &tree {
+            if let Some(threads) = thread_count(*member) {
                 max_threads = max_threads.max(threads);
             }
         }
-        // Direct children only: a cheap /proc scan at sampling cadence.
-        if let Ok(entries) = std::fs::read_dir("/proc") {
-            let mut children = 0u32;
-            for entry in entries.flatten() {
-                let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
-                    continue;
-                };
-                // Field 4 (ppid) follows the parenthesised comm.
-                if let Some((_, rest)) = stat.rsplit_once(')') {
-                    if rest
-                        .split_whitespace()
-                        .nth(1)
-                        .and_then(|ppid| ppid.parse::<u32>().ok())
-                        == Some(pid)
-                    {
-                        children += 1;
-                    }
-                }
-            }
-            max_processes = max_processes.max(children + 1);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
     let status = child.wait().map_err(|error| error.to_string())?;
     Ok(GuestRun {
@@ -326,6 +364,7 @@ struct RunOptions {
     work_root: PathBuf,
     repetitions: usize,
     pinning: String,
+    pin_mechanism: String,
     pin_cpu: Option<usize>,
     timeout_seconds: u64,
 }
@@ -339,6 +378,7 @@ fn parse_run_options(args: &[String]) -> Result<RunOptions, String> {
     let mut work_root: Option<PathBuf> = None;
     let mut repetitions = 3usize;
     let mut pinning = "both".to_string();
+    let mut pin_mechanism = "taskset".to_string();
     let mut pin_cpu: Option<usize> = None;
     let mut timeout_seconds = 300u64;
     let mut i = 0;
@@ -378,6 +418,14 @@ fn parse_run_options(args: &[String]) -> Result<RunOptions, String> {
                 if !matches!(pinning.as_str(), "both" | "single" | "unpinned") {
                     return Err(format!(
                         "--pinning {pinning:?} is not both, single, or unpinned"
+                    ));
+                }
+            }
+            "--pin-mechanism" => {
+                pin_mechanism = take(args, &mut i, "--pin-mechanism")?;
+                if !matches!(pin_mechanism.as_str(), "taskset" | "cpuset-alloc") {
+                    return Err(format!(
+                        "--pin-mechanism {pin_mechanism:?} is not taskset or cpuset-alloc"
                     ));
                 }
             }
@@ -425,6 +473,7 @@ fn parse_run_options(args: &[String]) -> Result<RunOptions, String> {
         work_root,
         repetitions,
         pinning,
+        pin_mechanism,
         pin_cpu,
         timeout_seconds,
     })
@@ -554,6 +603,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
                     &options.repo_root,
                     pinning,
                     pin_cpu,
+                    &options.pin_mechanism,
                     cpuset_alloc.as_deref(),
                     options.timeout_seconds,
                 ) {
@@ -586,10 +636,10 @@ fn cmd_run(args: &[String]) -> ExitCode {
                 category: cell.category.clone(),
                 lane: cell.test.lane.clone(),
                 pinning: (*pinning).to_string(),
-                pin_mechanism: match (*pinning, &cpuset_alloc) {
-                    ("single", Some(_)) => "cpuset-alloc".into(),
-                    ("single", None) => "taskset".into(),
-                    _ => "none".into(),
+                pin_mechanism: if *pinning == "single" {
+                    options.pin_mechanism.clone()
+                } else {
+                    "none".into()
                 },
                 cpu_set: if *pinning == "single" {
                     vec![pin_cpu]
