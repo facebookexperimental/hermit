@@ -21631,6 +21631,260 @@ fn group_kills_never_reach_the_host_without_sequentialized_threads() {
     }
 }
 
+/// Under `--namespace-only` nothing intercepts the guest, and it shares
+/// Hermit's process group, so its `kill(0)` went to the kernel and reached
+/// Hermit's group: the guest's `kill(0, SIGUSR1)` killed Hermit (exit 138), and
+/// run without job control it would have reached the shell, make or test
+/// runner that started Hermit (https://github.com/rrnewton/hermit/issues/4065).
+/// Hermit now watches the guest's `kill` calls through a seccomp
+/// user-notification filter and refuses, with EPERM, a `kill(0, sig)` from a
+/// guest process still in Hermit's group ("group-only": the guest's handler
+/// never runs and Hermit exits 0). A guest process that leads a group of its
+/// own keeps its `kill(0)` ("lead-then-kill": the handler runs once). The guest
+/// stays in Hermit's group otherwise, so terminal and job control behave as
+/// before. Hermit runs in a session of its own, so even a regression cannot
+/// signal the test runner. The guest sees the filter, but not `no_new_privs`.
+#[test]
+fn a_namespace_only_guests_kill_0_never_reaches_hermits_group() {
+    use std::os::unix::process::CommandExt;
+    let guest = kill_process_group_guest().to_str().unwrap().to_owned();
+    for (mode, expected) in [
+        (
+            "group-only",
+            "own group: no\nkill(0): -1 EPERM, handled 0\n",
+        ),
+        ("lead-then-kill", "own group: yes\nkill(0): 0, handled 1\n"),
+        (
+            "other-routes",
+            "own group: no, parent: 0\n\
+             rt_sigqueueinfo(0): -1 ESRCH, handled 0\n\
+             rt_sigqueueinfo(-1): -1 ESRCH, handled 0\n\
+             tkill(0): -1 EINVAL, handled 0\n\
+             tgkill(0, 0): -1 EINVAL, handled 0\n\
+             pidfd_open(parent): -1 EINVAL, handled 0\n\
+             i386 getpid: ok\n\
+             i386 kill(0): -1 EPERM\n\
+             handled 0\n",
+        ),
+    ] {
+        let mut command = hermit_command(&[
+            "run",
+            "--namespace-only",
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+            mode,
+        ]);
+        // SAFETY: setsid is async-signal-safe and touches only the child.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let (status, log) =
+            run_with_deadline(command, directory.path(), Duration::from_secs(120), false);
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{mode}: {status:?}\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert_eq!(stdout, expected, "{mode}: stderr:\n{log}");
+        assert_eq!(
+            log.matches("refused the guest's kill(0, 10)").count(),
+            usize::from(mode != "lead-then-kill"),
+            "{mode}: stderr:\n{log}"
+        );
+    }
+    // The filter is visible to the guest (`Seccomp: 2`, documented), but
+    // Hermit sets no `no_new_privs` on it, which would change what an exec of
+    // a set-user-ID program does: the guest keeps the test's own setting.
+    let no_new_privs = fs::read_to_string("/proc/self/status")
+        .unwrap()
+        .lines()
+        .find(|line| line.starts_with("NoNewPrivs:"))
+        .unwrap()
+        .to_owned();
+    let output = hermit(&[
+        "run",
+        "--namespace-only",
+        "--",
+        "/bin/grep",
+        "-E",
+        "^(NoNewPrivs|Seccomp):",
+        "/proc/self/status",
+    ]);
+    assert_eq!(
+        stdout(&output),
+        format!("{no_new_privs}\nSeccomp:\t2\n"),
+        "unexpected output: {output:?}"
+    );
+    // A guest that cannot install the filter is not started: here a nested
+    // --namespace-only run, whose filter cannot add a second listener (EBUSY).
+    // The refusal is named (exit 122), and the outer run passes it on.
+    let output = hermit(&[
+        "run",
+        "--namespace-only",
+        "--",
+        env!("CARGO_BIN_EXE_hermit"),
+        "--unsafe-ignore-host-seccomp",
+        "run",
+        "--namespace-only",
+        "--",
+        "/bin/true",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "unexpected output: {output:?}"
+    );
+    assert!(
+        stderr(&output).contains(
+            "hermit could not install the --namespace-only kill filter in the guest: \
+             seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER) failed with EBUSY"
+        ),
+        "unexpected output: {output:?}"
+    );
+}
+
+/// A `--namespace-only` run on a terminal keeps the terminal behaviour Hermit
+/// had before it policed the guest's `kill(0)`: the guest stays in Hermit's
+/// process group, which owns the terminal, so the guest reads it, and Ctrl-C
+/// reaches Hermit and ends the run (https://github.com/rrnewton/hermit/issues/4065;
+/// the Claude review of https://github.com/rrnewton/hermit/pull/4079 found
+/// those broken by an earlier version that moved the guest to a group of its
+/// own). `TIOCSIG` on the guest's terminal, a slave, sends no signal. Hermit
+/// runs in a session of its own whose controlling terminal is a fresh pty, so
+/// nothing here reaches the test runner.
+#[test]
+fn a_namespace_only_run_on_a_terminal_keeps_its_terminal_behaviour() {
+    use std::io::Read;
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::process::CommandExt;
+    use std::os::unix::process::ExitStatusExt;
+    let guest = kill_process_group_guest().to_str().unwrap().to_owned();
+    let (mut master, slave) = {
+        let (mut master, mut slave) = (-1, -1);
+        // SAFETY: openpty writes two descriptors into the locals.
+        let opened = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(opened, 0, "openpty: {}", std::io::Error::last_os_error());
+        // SAFETY: the master was just opened and is owned here.
+        (unsafe { fs::File::from_raw_fd(master) }, slave)
+    };
+    let mut command = hermit_command(&[
+        "run",
+        "--namespace-only",
+        "--timeout",
+        "60",
+        "--",
+        &guest,
+        "tty",
+    ]);
+    // SAFETY: setsid, ioctl and dup2 are async-signal-safe and touch only
+    // the child's descriptors.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setsid() < 0
+                || libc::ioctl(slave, libc::TIOCSCTTY, 0) < 0
+                || libc::dup2(slave, 0) < 0
+                || libc::dup2(slave, 1) < 0
+                || libc::dup2(slave, 2) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().expect("failed to start hermit on a pty");
+    // SAFETY: the parent's copy of the slave is no longer needed.
+    unsafe { libc::close(slave) };
+    let mut transcript = String::new();
+    // Polls before each read, so a line that never comes fails at the deadline
+    // instead of blocking, and stops the run before failing.
+    let read_until = |master: &mut fs::File,
+                      child: &mut std::process::Child,
+                      transcript: &mut String,
+                      needle: &str| {
+        // Well inside nextest's per-test timeout, so a regression fails here,
+        // with its transcript.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut buffer = [0u8; 4096];
+        while !transcript.contains(needle) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let mut ready = libc::pollfd {
+                fd: master.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one pollfd that lives across the call.
+            let polled = unsafe { libc::poll(&mut ready, 1, left.as_millis() as i32) };
+            if polled <= 0 {
+                break;
+            }
+            match master.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => transcript.push_str(&String::from_utf8_lossy(&buffer[..read])),
+            }
+        }
+        if !transcript.contains(needle) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("no {needle:?} on the terminal:\n{transcript}");
+        }
+    };
+    // pgrp 0: the guest is still in Hermit's group, which lies outside its
+    // namespace.
+    read_until(
+        &mut master,
+        &mut child,
+        &mut transcript,
+        "ready isatty=1 pgrp=0",
+    );
+    master.write_all(b"hello\n").unwrap();
+    read_until(&mut master, &mut child, &mut transcript, "got hello");
+    read_until(&mut master, &mut child, &mut transcript, "waiting");
+    assert!(
+        transcript.contains("ioctl(TIOCSIG): -1 "),
+        "TIOCSIG on a pty slave must fail:\n{transcript}"
+    );
+    // Ctrl-C: the terminal's foreground group is Hermit's, guest included.
+    master.write_all(&[0x03]).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("Ctrl-C did not end the run:\n{transcript}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    // Hermit itself takes the terminal's SIGINT, with its default action.
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGINT),
+        "Ctrl-C must end the run as SIGINT: {status:?}\n{transcript}"
+    );
+}
+
 /// Runs the `signal_hermit_tasks` guest with `args` under Hermit `flags` in a
 /// session of its own, so even a regression cannot signal the test runner,
 /// and returns its stdout after checking that the run exited 0.

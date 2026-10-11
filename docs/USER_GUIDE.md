@@ -703,9 +703,20 @@ networking and disables Hermit's virtualized inputs, sequential scheduling,
 deterministic I/O, and RCB time. It is a compatibility diagnostic, not a run
 mode for reproducibility.
 
-`--namespace-only` runs the command in Hermit's namespaces without ptrace,
-seccomp interception, or determinization. It helps separate namespace setup
-failures from interception failures.
+`--namespace-only` runs the command in Hermit's namespaces without ptrace or
+determinization. It helps separate namespace setup failures from interception
+failures. One call is still watched, through a seccomp filter on `kill`: the
+guest shares Hermit's process group, so Hermit refuses with EPERM a
+`kill(0, sig)` from a guest process still in that group. Linux would deliver
+it to Hermit, to the processes that started it, and to the guest's own group
+members; none of them receives it, so a script ending with `trap "kill 0" EXIT`
+leaves its background children running until the guest exits. A guest process
+that first leads a group of its own (`setsid`, `setpgid(0, 0)`) keeps its
+`kill(0)`. The filter is visible inside the guest: `/proc/self/status` reports
+`Seccomp: 2`, a seccomp listener of the guest's own fails with EBUSY, and a
+Hermit run inside the guest refuses the inherited filter (exit 122) unless
+given `--unsafe-ignore-host-seccomp`; a nested `--namespace-only` run still
+refuses (exit 122), because its own filter cannot add a second listener.
 
 ## Run Configuration Files
 

@@ -780,15 +780,16 @@ fn validate_tracing_environment() -> Result<(), Error> {
             "Hermit cannot use ptrace in this environment: a child PTRACE_TRACEME probe was \
              denied. Allow same-UID parent-child ptrace in the container seccomp and host \
              Yama/LSM policy; CAP_SYS_PTRACE is normally not required. Use --namespace-only for \
-             a sandbox smoke test without syscall interception."
+             a sandbox smoke test without ptrace (it intercepts only kill, through a seccomp \
+             filter)."
         );
     }
     if !run_capability_probe(CapabilityProbe::Seccomp)? {
         anyhow::bail!(
             "Hermit cannot install its tracee seccomp filter: \
              seccomp(SECCOMP_SET_MODE_FILTER) was denied. Allow seccomp and \
-             prctl(PR_SET_NO_NEW_PRIVS) in the container policy, or use --namespace-only for a \
-             sandbox smoke test without syscall interception."
+             prctl(PR_SET_NO_NEW_PRIVS) in the container policy. --namespace-only also \
+             installs a seccomp filter (on kill), so it cannot run here either."
         );
     }
     Ok(())

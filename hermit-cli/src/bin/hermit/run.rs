@@ -19,6 +19,7 @@ use std::io::Seek;
 use std::io::Write;
 use std::num::NonZeroU64;
 use std::os::fd::AsRawFd;
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -1121,9 +1122,13 @@ pub struct RunOpts {
     )]
     replay_networking: Option<PathBuf>,
 
-    /// Run with namespaces but without ptrace, seccomp interception, or determinization. This is a
-    /// useful smoke test when diagnosing ptrace/seccomp policy failures; PID and `/tmp` isolation
-    /// still apply.
+    /// Run with namespaces but without ptrace or determinization. This is a useful smoke test
+    /// when diagnosing ptrace/seccomp policy failures; PID and `/tmp` isolation still apply. The
+    /// guest carries one seccomp filter, which stops only `kill`: a `kill(0, sig)` from Hermit's
+    /// own process group is refused with EPERM, unlike Linux, so it cannot reach Hermit and the
+    /// processes that started it. The guest can see the filter (`Seccomp: 2` in
+    /// /proc/self/status), its own seccomp listener fails with EBUSY, and a hermit run inside it
+    /// refuses the inherited filter unless given --unsafe-ignore-host-seccomp.
     #[clap(
         long,
         alias = "lite",
@@ -7228,6 +7233,37 @@ impl RunOpts {
                 Ok(())
             });
         }
+        // Every guest `kill` stops for Hermit, which refuses a `kill(0)` that
+        // would reach its own process group: nothing else intercepts the guest
+        // in this mode (https://github.com/rrnewton/hermit/issues/4065). The
+        // guest installs the filter last in its setup and sends the listener
+        // back over this socket (`install_group_kill_filter`).
+        let (listener_socket, guest_socket) = {
+            use std::os::fd::FromRawFd;
+            let mut pair = [-1; 2];
+            // SAFETY: socketpair writes two descriptors into `pair`.
+            if unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                    0,
+                    pair.as_mut_ptr(),
+                )
+            } < 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            // SAFETY: both descriptors were just opened and are owned here.
+            unsafe { (OwnedFd::from_raw_fd(pair[0]), OwnedFd::from_raw_fd(pair[1])) }
+        };
+        let filter = super::container::group_kill_filter();
+        let guest_end = guest_socket.as_raw_fd();
+        // SAFETY: `install_group_kill_filter` is async-signal-safe; the
+        // guest's end of the socket stays open in Hermit until `spawn` returns.
+        unsafe {
+            command
+                .pre_exec(move || super::container::install_group_kill_filter(&filter, guest_end));
+        }
         command
             .unshare(Namespace::PID)
             .map_root()
@@ -7243,9 +7279,60 @@ impl RunOpts {
             NetworkingMode::Host => {}
         }
 
-        let mut child = command.spawn()?;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                let Some(errno) = super::container::group_kill_filter_failure(&listener_socket)
+                else {
+                    return Err(error.into());
+                };
+                // Failing closed is deliberate: without the filter a guest's
+                // kill(0) reaches Hermit's group again.
+                return Err(Error::new(super::container::PolicyRefusal).context(format!(
+                    "hermit could not install the --namespace-only kill filter in the guest: \
+                     seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER) failed \
+                     with {:?}. The filter keeps a guest's kill(0) from reaching Hermit and the \
+                     processes that started it \
+                     (https://github.com/rrnewton/hermit/issues/4065), so hermit refuses to start \
+                     the guest without it. A host or container policy that denies seccomp, a \
+                     seccomp filter of the caller's that already has a listener (another \
+                     --namespace-only run, a seccomp-notify sandbox), or a kernel without \
+                     SECCOMP_FILTER_FLAG_NEW_LISTENER causes it. Run hermit where seccomp is \
+                     allowed and no other listener is installed.",
+                    reverie::Errno::new(errno)
+                )));
+            }
+        };
+        drop(guest_socket);
+        let listener = match super::container::receive_group_kill_listener(&listener_socket) {
+            Ok(listener) => listener,
+            Err(error) => {
+                // The guest runs, but unpoliced: stop it rather than let it.
+                let _ = child.signal(nix::sys::signal::Signal::SIGKILL);
+                let _ = child.wait_blocking();
+                return Err(error.into());
+            }
+        };
+        // The thread stops once the guest has exited: the listener does not
+        // always report that its last task is gone.
+        let (stopped, stop) = {
+            use std::os::fd::FromRawFd;
+            let mut pipe = [-1; 2];
+            // SAFETY: pipe2 writes two descriptors into `pipe`.
+            if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+                let _ = child.signal(nix::sys::signal::Signal::SIGKILL);
+                let _ = child.wait_blocking();
+                return Err(std::io::Error::last_os_error().into());
+            }
+            // SAFETY: both descriptors were just opened and are owned here.
+            unsafe { (OwnedFd::from_raw_fd(pipe[0]), OwnedFd::from_raw_fd(pipe[1])) }
+        };
+        let police =
+            std::thread::spawn(move || super::container::police_group_kills(listener, stopped));
 
         let exit_status = child.wait_blocking()?;
+        drop(stop);
+        let _ = police.join();
 
         Ok(exit_status)
     }

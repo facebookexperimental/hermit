@@ -14,6 +14,7 @@ use std::io;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
@@ -984,6 +985,302 @@ pub(super) fn arm_namespace_only_guest() -> Result<(), reverie::Errno> {
     // `exit_if_log_cap_already_crossed`.
     super::tracing::exit_if_log_cap_already_crossed();
     Ok(())
+}
+
+/// The i386 syscall number of `kill`, reached by `int $0x80` from any process.
+const I386_KILL: i32 = 37;
+/// `AUDIT_ARCH_I386`, the architecture seccomp reports for an i386 syscall.
+const AUDIT_ARCH_I386: u32 = 0x4000_0003;
+
+/// The seccomp filter for a `--namespace-only` guest: every `kill` stops for
+/// [`police_group_kills`], and so does every i386 syscall (the filter cannot
+/// single out the i386 `kill`; without a rule the filter would kill a process
+/// that makes one); every other syscall runs untouched. On a kernel with the
+/// x32 ABI enabled, an x32 `kill` is not seen.
+pub(super) fn group_kill_filter() -> reverie::process::seccomp::Filter {
+    use reverie::process::seccomp::Action;
+    use reverie::process::seccomp::TargetArch;
+    reverie::process::seccomp::FilterBuilder::new()
+        .default_action(Action::Allow)
+        .syscall(reverie::syscalls::Sysno::kill, Action::Notify)
+        .alternate_arch(TargetArch::x86, Action::Notify)
+        .build()
+}
+
+/// Whether a seccomp notification is a `kill`: the x86_64 one, or the i386 one.
+fn is_kill(nr: i32, arch: u32) -> bool {
+    if arch == AUDIT_ARCH_I386 {
+        nr == I386_KILL
+    } else {
+        nr == libc::SYS_kill as i32
+    }
+}
+
+/// Whether to refuse a guest's `kill` with these arguments: a signal to the
+/// caller's own process group (`pid` 0, `sig` a valid signal number; the
+/// kernel answers an invalid one with EINVAL) while that group is
+/// Hermit's (`caller_group`, read from `/proc`; `None` when it could not be).
+///
+/// Under `--namespace-only` the guest shares Hermit's process group, and
+/// nothing else intercepts it, so such a `kill(0, sig)` would reach Hermit, the
+/// rest of Hermit's pipeline and, run without job control, the shell, make or
+/// test runner that started it (https://github.com/rrnewton/hermit/issues/4065).
+/// No other form can reach outside: inside its PID namespace the guest cannot
+/// name Hermit's group (`getpgrp` reads 0 there), so `kill(-pgid)` and
+/// `kill(-1)` stay in the namespace. A guest process that leads a group of its
+/// own keeps its `kill(0)`.
+pub(super) fn refuses_group_kill(
+    args: [u64; 6],
+    caller_group: Option<i32>,
+    hermit_group: i32,
+) -> bool {
+    args[0] as i32 == 0
+        && (1..=libc::SIGRTMAX()).contains(&(args[1] as i32))
+        && caller_group.is_none_or(|group| group == hermit_group)
+}
+
+/// The process group of host `pid`, from `/proc/<pid>/stat`, or `None`.
+fn process_group(pid: u32) -> Option<i32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The command name may hold spaces and parentheses: fields resume after
+    // the last ')', as state, ppid, pgrp.
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(2)?
+        .parse()
+        .ok()
+}
+
+/// Install [`group_kill_filter`] in the forked `--namespace-only` guest and
+/// send its listener to Hermit over `socket` ([`receive_group_kill_listener`]).
+///
+/// Run from Reverie's `pre_exec`, after its mounts and `chdir`. Hermit
+/// installs the filter here, not through Reverie's own seccomp support, whose
+/// parent waits without end for a listener that a child failing earlier in its
+/// setup (a missing `--workdir`) never publishes. A child that fails before
+/// this point closes its end of `socket` as it exits, and Reverie reports its
+/// error. The guest's copy of the listener is closed before it returns, so the
+/// guest cannot answer its own notifications.
+///
+/// It sets no `no_new_privs`, which the guest would see: the guest is root of
+/// its own user namespace (`map_root`), and that capability is what installing
+/// a filter without `no_new_privs` requires. The filter is still visible to
+/// the guest (`Seccomp: 2` in `/proc/self/status`), a seccomp listener of its
+/// own fails with EBUSY, and a Hermit run inside it refuses the inherited
+/// filter; the `--namespace-only` help and the user guide say so.
+///
+/// It runs between fork and exec, so it must stay async-signal-safe:
+/// `seccomp`, `sendmsg` and `close`. The filter stops only `kill`, so these
+/// calls run untouched after it is installed.
+pub(super) fn install_group_kill_filter(
+    filter: &reverie::process::seccomp::Filter,
+    socket: i32,
+) -> Result<(), reverie::Errno> {
+    let listener = match filter.load_and_listen() {
+        Ok(listener) => listener,
+        Err(errno) => {
+            // Tell Hermit which step failed (`group_kill_filter_failure`):
+            // Reverie reports only that a `pre_exec` callback failed.
+            let raw = errno.into_raw().to_le_bytes();
+            let record = [GROUP_KILL_FILTER_FAILED, raw[0], raw[1], raw[2], raw[3]];
+            // SAFETY: `send` reads the five bytes of a local.
+            unsafe { libc::send(socket, record.as_ptr().cast(), record.len(), 0) };
+            return Err(errno);
+        }
+    };
+    let fd = listener.as_raw_fd();
+    let mut byte = 0u8;
+    let mut iov = libc::iovec {
+        iov_base: (&mut byte as *mut u8).cast(),
+        iov_len: 1,
+    };
+    let mut control = [0u64; 4];
+    // SAFETY: an all-zero msghdr is a valid empty message.
+    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+    message.msg_iov = &mut iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control.as_mut_ptr().cast();
+    // SAFETY: CMSG_SPACE only computes a size.
+    message.msg_controllen =
+        unsafe { libc::CMSG_SPACE(std::mem::size_of::<i32>() as u32) } as usize;
+    // SAFETY: the control buffer holds one header and one descriptor
+    // (CMSG_SPACE(4) is 24 of its 32 bytes), and the message points only at
+    // locals that outlive the call.
+    let sent = unsafe {
+        let header = libc::CMSG_FIRSTHDR(&message);
+        (*header).cmsg_level = libc::SOL_SOCKET;
+        (*header).cmsg_type = libc::SCM_RIGHTS;
+        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<i32>() as u32) as usize;
+        std::ptr::write(libc::CMSG_DATA(header).cast::<i32>(), fd);
+        libc::sendmsg(socket, &message, 0)
+    };
+    if sent != 1 {
+        return Err(reverie::Errno::last());
+    }
+    drop(listener);
+    Ok(())
+}
+
+/// The first byte of the record [`install_group_kill_filter`] sends when the
+/// filter cannot be installed, followed by the errno, little-endian.
+const GROUP_KILL_FILTER_FAILED: u8 = b'F';
+
+/// The errno with which the guest failed to install [`group_kill_filter`],
+/// when that is why its launch failed: read from the record
+/// [`install_group_kill_filter`] sent over `socket`. `None` when the launch
+/// failed for another reason, before the filter was attempted.
+pub(super) fn group_kill_filter_failure(socket: &OwnedFd) -> Option<i32> {
+    let mut record = [0u8; 8];
+    // SAFETY: `recv` writes at most the buffer's length into a local.
+    let received = unsafe {
+        libc::recv(
+            socket.as_raw_fd(),
+            record.as_mut_ptr().cast(),
+            record.len(),
+            libc::MSG_DONTWAIT,
+        )
+    };
+    (received == 5 && record[0] == GROUP_KILL_FILTER_FAILED)
+        .then(|| i32::from_le_bytes([record[1], record[2], record[3], record[4]]))
+}
+
+/// The listener [`install_group_kill_filter`] sent over `socket`, once the
+/// guest has started: the message is already queued, so this does not wait.
+pub(super) fn receive_group_kill_listener(socket: &OwnedFd) -> std::io::Result<OwnedFd> {
+    let mut byte = 0u8;
+    let mut iov = libc::iovec {
+        iov_base: (&mut byte as *mut u8).cast(),
+        iov_len: 1,
+    };
+    let mut control = [0u64; 4];
+    // SAFETY: as in `install_group_kill_filter`.
+    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+    message.msg_iov = &mut iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control.as_mut_ptr().cast();
+    message.msg_controllen = std::mem::size_of_val(&control);
+    // SAFETY: the message points only at locals that outlive the call.
+    let received = unsafe {
+        libc::recvmsg(
+            socket.as_raw_fd(),
+            &mut message,
+            libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC,
+        )
+    };
+    if received != 1 {
+        return Err(if received < 0 {
+            std::io::Error::last_os_error()
+        } else {
+            std::io::Error::other("the guest sent no seccomp listener")
+        });
+    }
+    // SAFETY: the kernel filled the control buffer; a header with SCM_RIGHTS
+    // carries one descriptor, now owned here.
+    unsafe {
+        let header = libc::CMSG_FIRSTHDR(&message);
+        if header.is_null()
+            || (*header).cmsg_level != libc::SOL_SOCKET
+            || (*header).cmsg_type != libc::SCM_RIGHTS
+        {
+            return Err(std::io::Error::other(
+                "the guest's message carried no seccomp listener",
+            ));
+        }
+        Ok(OwnedFd::from_raw_fd(std::ptr::read(
+            libc::CMSG_DATA(header).cast::<i32>(),
+        )))
+    }
+}
+
+/// Answer the `--namespace-only` guest's `kill` calls on `listener` until no
+/// task the filter covers is left ([`group_kill_filter`]) or `stop` becomes
+/// readable: refuse with EPERM the ones [`refuses_group_kill`] names, saying
+/// so on Hermit's stderr, and let every other one run as issued.
+pub(super) fn police_group_kills(listener: OwnedFd, stop: OwnedFd) {
+    use reverie::process::seccomp::SECCOMP_IOCTL_NOTIF_ID_VALID;
+    use reverie::process::seccomp::SECCOMP_IOCTL_NOTIF_RECV;
+    use reverie::process::seccomp::SECCOMP_IOCTL_NOTIF_SEND;
+    use reverie::process::seccomp::SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+    use reverie::process::seccomp::seccomp_notif;
+    use reverie::process::seccomp::seccomp_notif_resp;
+    // SAFETY: getpgrp reads no memory.
+    let hermit_group = unsafe { libc::getpgrp() };
+    let fd = listener.as_raw_fd();
+    loop {
+        let mut ready = [
+            libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stop.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: two pollfds that live across the call.
+        if unsafe { libc::poll(ready.as_mut_ptr(), 2, -1) } < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            // Every later guest `kill` then fails with ENOSYS.
+            tracing::warn!(
+                "hermit stopped answering the --namespace-only guest's kill calls: polling \
+                 their seccomp listener failed ({error}); each one now fails with ENOSYS \
+                 (https://github.com/rrnewton/hermit/issues/4065)"
+            );
+            return;
+        }
+        if ready[1].revents != 0 || ready[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            return;
+        }
+        if ready[0].revents & libc::POLLIN == 0 {
+            continue;
+        }
+        // SAFETY: the kernel requires a zeroed notification, which it fills.
+        let mut notification: seccomp_notif = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        if unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_RECV as _, &mut notification) } < 0 {
+            // ENOENT: the caller died after the listener became readable.
+            continue;
+        }
+        let args = notification.data.args;
+        let refuse = is_kill(notification.data.nr, notification.data.arch)
+            && refuses_group_kill(args, process_group(notification.pid), hermit_group);
+        // The caller may have died while its group was read.
+        // SAFETY: the ioctl reads the id it is given.
+        if unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_ID_VALID as _, &notification.id) } < 0 {
+            continue;
+        }
+        let response = if refuse {
+            tracing::warn!(
+                "hermit refused the guest's kill(0, {}) from pid {} under --namespace-only \
+                 with EPERM: its process group is Hermit's, so the signal would reach Hermit and \
+                 the processes that started it, where Linux would deliver it \
+                 (https://github.com/rrnewton/hermit/issues/4065)",
+                args[1] as i32,
+                notification.pid,
+            );
+            seccomp_notif_resp {
+                id: notification.id,
+                val: 0,
+                error: -libc::EPERM,
+                flags: 0,
+            }
+        } else {
+            seccomp_notif_resp {
+                id: notification.id,
+                val: 0,
+                error: 0,
+                flags: SECCOMP_USER_NOTIF_FLAG_CONTINUE,
+            }
+        };
+        // SAFETY: the ioctl reads the response it is given.
+        unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_SEND as _, &response) };
+    }
 }
 
 /// Where the most recent panic inside the container child happened.
@@ -2343,5 +2640,57 @@ mod tests {
     fn log_cap_crossed_before_the_namespace_only_guest_arms_stops_the_exec() {
         let outcome = arm_after_the_parent_crossed(|| arm_namespace_only_guest().is_ok());
         assert_stopped_by_the_crossing("arm_namespace_only_guest", outcome);
+    }
+
+    /// Hermit refuses a `--namespace-only` guest's `kill(0, sig)` only while
+    /// the caller is in Hermit's process group, or its group is unknown; a
+    /// signal 0, any other pid, and a caller that leads its own group pass
+    /// (https://github.com/rrnewton/hermit/issues/4065). The i386 `kill`
+    /// counts too.
+    #[test]
+    fn only_a_group_kill_from_hermits_group_is_refused() {
+        let args = |pid: i64, sig: i64| [pid as u64, sig as u64, 0, 0, 0, 0];
+        let hermit = 40;
+        assert!(refuses_group_kill(
+            args(0, libc::SIGUSR1 as i64),
+            Some(hermit),
+            hermit
+        ));
+        assert!(refuses_group_kill(
+            args(0, libc::SIGKILL as i64),
+            None,
+            hermit
+        ));
+        assert!(!refuses_group_kill(args(0, 0), Some(hermit), hermit));
+        // An invalid signal number is the kernel's EINVAL, not a refusal.
+        assert!(!refuses_group_kill(args(0, 100), Some(hermit), hermit));
+        // Real-time signals are refused too: SIGRTMIN and SIGRTMAX.
+        assert!(refuses_group_kill(args(0, 34), Some(hermit), hermit));
+        assert!(refuses_group_kill(args(0, 64), Some(hermit), hermit));
+        assert!(!refuses_group_kill(
+            args(0, libc::SIGUSR1 as i64),
+            Some(7),
+            hermit
+        ));
+        assert!(!refuses_group_kill(
+            args(-1, libc::SIGUSR1 as i64),
+            Some(hermit),
+            hermit
+        ));
+        assert!(!refuses_group_kill(
+            args(5, libc::SIGTERM as i64),
+            Some(hermit),
+            hermit
+        ));
+        // The register holds the pid in its low 32 bits.
+        assert!(refuses_group_kill(
+            args(1 << 32, libc::SIGUSR1 as i64),
+            Some(hermit),
+            hermit
+        ));
+        assert!(is_kill(libc::SYS_kill as i32, 0xc000_003e));
+        assert!(is_kill(I386_KILL, AUDIT_ARCH_I386));
+        assert!(!is_kill(I386_KILL, 0xc000_003e));
+        assert!(!is_kill(libc::SYS_getpid as i32, 0xc000_003e));
     }
 }
