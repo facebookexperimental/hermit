@@ -46,11 +46,14 @@ use crate::syscalls::threads::read_thread_wait_signal_state;
 use crate::tool_global::ResumeStatus;
 use crate::tool_global::SigalrmControl;
 use crate::tool_global::alarm_remaining;
+use crate::tool_global::commit_sigkill;
 use crate::tool_global::host_timed_signals;
 use crate::tool_global::notify_signal_pending;
 use crate::tool_global::refuse_sigalrm;
 use crate::tool_global::register_alarm;
 use crate::tool_global::registered_process_of;
+use crate::tool_global::reserve_sigkill;
+use crate::tool_global::reserve_sigkill_group;
 use crate::tool_global::resolve_kill_targets_and_exit;
 use crate::tool_global::resource_request;
 use crate::tool_global::set_sigchld_disposition;
@@ -342,6 +345,27 @@ fn logical_time_to_alarm_seconds(value: LogicalTime) -> i64 {
 /// any pid and then answer ESRCH, which is Linux's answer for a gone process
 /// (<https://github.com/rrnewton/hermit/issues/4124>).
 const NO_SUCH_PID: libc::pid_t = libc::pid_t::MAX;
+
+/// The 128 siginfo bytes at `info`. A page the kernel may write a siginfo to
+/// can lack read permission (`PROT_WRITE` alone), which `process_vm_readv`
+/// refuses; the tracer then reads it through `/proc/<tid>/mem`, as ptrace
+/// access does, which needs no read permission on the mapping.
+fn read_siginfo<T, G: Guest<Detcore<T>>>(
+    guest: &mut G,
+    info: AddrMut<libc::siginfo_t>,
+) -> Option<[u8; 128]>
+where
+    T: RecordOrReplay,
+{
+    if let Ok(bytes) = guest.memory().read_value(info.cast::<[u8; 128]>()) {
+        return Some(bytes);
+    }
+    use std::os::unix::fs::FileExt;
+    let mem = std::fs::File::open(format!("/proc/{}/mem", guest.tid().as_raw())).ok()?;
+    let mut bytes = [0u8; 128];
+    mem.read_exact_at(&mut bytes, info.as_raw() as u64).ok()?;
+    Some(bytes)
+}
 
 /// The thread a process-directed signal goes to. `zombie` is the process's
 /// exit state (`Scheduler::exited_process_is_zombie`). `Ok(None)` is a zombie:
@@ -973,7 +997,165 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut rsrc = Resources::new(dettid);
         rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
         rsrc.fyi("rt_sigtimedwait");
-        retry_nonblocking_syscall_with_timeout(guest, call, rsrc, maybe_timeout).await
+        // Linux writes the siginfo only for a signal it returns. A dropped
+        // copy's siginfo is replaced by what the buffer held before.
+        let before = match call.info() {
+            Some(info) if self.cfg.backend.reports_child_exit_publication => {
+                read_siginfo(guest, info)
+            }
+            _ => None,
+        };
+        loop {
+            let result =
+                retry_nonblocking_syscall_with_timeout(guest, call, rsrc.clone(), maybe_timeout)
+                    .await;
+            // A consumed child-exit copy that the notification ledger drops
+            // is not returned: the wait goes on, to the same deadline.
+            if self.synchronous_sigchld_stands(guest, call, &result).await {
+                return result;
+            }
+            if let (Some(info), Some(bytes)) = (call.info(), before.as_ref()) {
+                let _ = guest.memory().write_value(info.cast::<[u8; 128]>(), bytes);
+            }
+        }
+    }
+
+    /// The `signalfd_siginfo` records a successful signalfd `read` returned,
+    /// `len` bytes at `buf`, reconciled with the child-exit ledger
+    /// (`reconcile_signalfd_extents`). Returns the bytes kept.
+    pub(crate) async fn reconcile_signalfd_records<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        buf: AddrMut<'_, u8>,
+        len: usize,
+    ) -> usize {
+        self.reconcile_signalfd_extents(guest, &[(buf.as_raw(), len)], len)
+            .await
+    }
+
+    /// The `signalfd_siginfo` records a successful signalfd read returned:
+    /// the first `read` bytes of the guest buffers `extents` (address,
+    /// length), in order, as `read`, `readv`, `preadv` and `preadv2` scatter
+    /// them. They are reconciled with the child-exit ledger as a SIGCHLD
+    /// delivered to a handler (`Detcore::child_exit_sigchld_delivers`) or
+    /// consumed by `rt_sigtimedwait` (`synchronous_sigchld_stands`) is: the
+    /// scheduler's copy gets the siginfo Linux gives the parent, the kernel's
+    /// coalesced copy for a SIGKILL cohort names the cohort's lowest pid, and
+    /// a copy for an exit a SIGCHLD already stood for is dropped. Other
+    /// records are kept as read. The kept records are scattered back over the
+    /// same extents, in order, with zeros over the bytes of dropped ones.
+    /// Returns the bytes kept, a whole number of records.
+    pub(crate) async fn reconcile_signalfd_extents<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        extents: &[(usize, usize)],
+        read: usize,
+    ) -> usize {
+        let len = read - read % SIGNALFD_RECORD;
+        let pieces = signalfd_extent_pieces(extents, len);
+        let mut bytes = Vec::with_capacity(len);
+        for (address, length) in &pieces {
+            let mut piece = vec![0u8; *length];
+            let Some(address_mut) = AddrMut::<u8>::from_raw(*address) else {
+                return len;
+            };
+            if guest.memory().read_exact(address_mut, &mut piece).is_err() {
+                use std::os::unix::fs::FileExt;
+                let read = std::fs::File::open(format!("/proc/{}/mem", guest.tid().as_raw()))
+                    .and_then(|mem| mem.read_exact_at(&mut piece, *address as u64));
+                if read.is_err() {
+                    // The kernel has just written these bytes, so the buffer
+                    // is mapped and writable; `/proc/<tid>/mem` reads any
+                    // such page.
+                    return len;
+                }
+            }
+            bytes.extend_from_slice(&piece);
+        }
+        let controls = signalfd_record_controls(&bytes, std::process::id());
+        let mut answers = Vec::with_capacity(controls.len());
+        for control in controls {
+            answers.push(match control {
+                Some(control) => Some(crate::tool_global::child_exit_sigchld(guest, control).await),
+                None => None,
+            });
+        }
+        let Some(rewritten) = apply_signalfd_answers(&bytes, &answers) else {
+            return len;
+        };
+        let mut offset = 0;
+        for (address, length) in &pieces {
+            let written = AddrMut::<u8>::from_raw(*address).map(|address| {
+                guest
+                    .memory()
+                    .write_exact(address, &rewritten.bytes[offset..offset + length])
+            });
+            if !matches!(written, Some(Ok(()))) {
+                tracing::warn!(
+                    "[dtid {}] the signalfd records at {:#x} keep the kernel's siginfo",
+                    guest.thread_state().dettid,
+                    address,
+                );
+                return len;
+            }
+            offset += length;
+        }
+        rewritten.kept
+    }
+
+    /// A child-exit SIGCHLD that a synchronous wait consumed goes through the
+    /// same notification ledger as one delivered to a handler
+    /// (`Detcore::child_exit_sigchld_delivers`), on a backend where both the
+    /// kernel and the scheduler send it (`scheduler::child_exit_sigchld`).
+    /// The scheduler's copy is returned with the siginfo Linux gives the
+    /// parent, and a copy for an exit that a SIGCHLD already stood for is
+    /// dropped. Returns whether the consumed signal stands.
+    async fn synchronous_sigchld_stands<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::RtSigtimedwait,
+        result: &Result<i64, Error>,
+    ) -> bool {
+        use crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer;
+        use crate::scheduler::child_exit_sigchld::OwnCopy;
+        if !self.cfg.backend.reports_child_exit_publication
+            || !matches!(result, Ok(signal) if *signal == libc::SIGCHLD as i64)
+        {
+            return true;
+        }
+        // Without a siginfo buffer the guest sees only the signal number,
+        // which every copy shares.
+        let Some(info) = call.info() else {
+            return true;
+        };
+        let Some(bytes) = read_siginfo(guest, info) else {
+            return true;
+        };
+        let Some(control) =
+            crate::scheduler::child_exit_sigchld::control_for(&bytes, std::process::id())
+        else {
+            return true;
+        };
+        match crate::tool_global::child_exit_sigchld(guest, control).await {
+            ChildExitSigchldAnswer::Claimed(dropped) => !dropped,
+            ChildExitSigchldAnswer::OwnCopy(OwnCopy::Duplicate) => false,
+            ChildExitSigchldAnswer::OwnCopy(OwnCopy::Deliver(own))
+            | ChildExitSigchldAnswer::ClaimedFor(own) => {
+                if let Err(error) = guest
+                    .memory()
+                    .write_value(info.cast::<[u8; 128]>(), &own.to_bytes())
+                {
+                    tracing::warn!(
+                        "[dtid {}] the SIGCHLD for child {} keeps its siginfo: {}",
+                        guest.thread_state().dettid,
+                        own.pid,
+                        error
+                    );
+                }
+                true
+            }
+            _ => true,
+        }
     }
 
     /// Fence an exact self-SIGKILL at the scheduler-selected syscall turn.
@@ -1111,8 +1293,19 @@ impl<T: RecordOrReplay> Detcore<T> {
             // the kill, inside this committed turn: the sender may be in the
             // group and die before the call returns. A kill that then fails
             // only suppresses a deadlock report, which is the safe direction.
-            crate::tool_global::notify_unresolved_sigkill(guest, Some(DetPid::from_raw(-tgid)))
-                .await;
+            // `kill(INT_MIN)` names no group; Linux refuses it with ESRCH.
+            let group = tgid.checked_neg().map(DetPid::from_raw);
+            if group.is_some() {
+                crate::tool_global::notify_unresolved_sigkill(guest, group).await;
+            }
+            // Every member is retired at this turn
+            // (https://github.com/rrnewton/hermit/issues/3994).
+            if guest.config().sequentialize_threads
+                && let Some(group) = group
+                && let Some(reservation) = reserve_sigkill_group(guest, group).await
+            {
+                return self.send_reserved_sigkill(guest, reservation, call).await;
+            }
             return Ok(self.record_or_replay(guest, call).await?);
         }
         if tgid <= 0 {
@@ -1138,6 +1331,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await
         {
             return Ok(self.record_or_replay(guest, call).await?);
+        }
+        // A SIGKILL to another process retires every thread of it at this
+        // turn (https://github.com/rrnewton/hermit/issues/3994). It needs no
+        // recipient, so a multithreaded target is accepted.
+        if call.sig() == libc::SIGKILL
+            && let Some(reservation) = reserve_sigkill(guest, DetTid::from_raw(tgid)).await
+        {
+            return self.send_reserved_sigkill(guest, reservation, call).await;
         }
         let Some(tid) = self
             .process_signal_target(guest, Sysno::kill, DetPid::from_raw(process), call.sig())
@@ -1266,7 +1467,8 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/4034)
-    /// The thread that a process-directed signal `sig` to `tgid` is routed to.
+    /// The thread, of `tgid`'s live `targets`, that a process-directed signal
+    /// `sig` is routed to.
     ///
     /// With several live threads the call is refused by name: Linux's
     /// `complete_signal` (kernel/signal.c) gives the signal to any thread that
@@ -1336,6 +1538,21 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Some(DetTid::from_raw(call.tid())),
             )
             .await;
+        // A SIGKILL to a thread of another process ends that whole process,
+        // and is retired at this turn, like `kill`'s. Only a valid pair is
+        // reserved: Linux rejects a thread outside the named group (ESRCH) or a
+        // non-positive id (EINVAL) before anything happens, so such a send
+        // takes the ordinary path and gets the kernel's errno.
+        if call.sig() == libc::SIGKILL
+            && guest.config().sequentialize_threads
+            && call.tgid() > 0
+            && call.tid() > 0
+            && registered_process_of(guest, DetTid::from_raw(call.tid())).await
+                == Some(DetPid::from_raw(call.tgid()))
+            && let Some(reservation) = reserve_sigkill(guest, DetTid::from_raw(call.tid())).await
+        {
+            return self.send_reserved_sigkill(guest, reservation, call).await;
+        }
         let value = self.record_or_replay(guest, call).await?;
         // `pthread_kill` lowers to `tgkill`, so this is the ordinary way one
         // guest THREAD signals a sibling. Like `kill`, a successful cross-task
@@ -1374,12 +1591,69 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Some(DetTid::from_raw(call.tid())),
             )
             .await;
+        // A non-positive tid is EINVAL in Linux, before anything happens.
+        if call.sig() == libc::SIGKILL
+            && guest.config().sequentialize_threads
+            && call.tid() > 0
+            && let Some(reservation) = reserve_sigkill(guest, DetTid::from_raw(call.tid())).await
+        {
+            return self.send_reserved_sigkill(guest, reservation, call).await;
+        }
         let value = self.record_or_replay(guest, call).await?;
         // Same wakeup obligation as `tgkill`; `tkill` is the older two-argument
         // spelling of the same thread-directed send.
         self.notify_cross_task_signal(guest, DetTid::from_raw(call.tid()), call.sig(), None)
             .await;
         Ok(value)
+    }
+
+    /// Complete a reserved SIGKILL (https://github.com/rrnewton/hermit/issues/3994).
+    ///
+    /// A send whose victims exclude the caller's own process returns: it is
+    /// sent, and then committed with its real result. One that includes the
+    /// caller's process cannot return, because the kernel ends the caller:
+    /// the caller records its own exit status for its parent (`CLD_KILLED`,
+    /// `SIGKILL`), takes the `exit_group` grant for its own process, as
+    /// `exit_group` does, commits the other victims inside that exit turn, and
+    /// then sends. The commit comes after the grant: it installs the physical
+    /// fence, which waits for victims that only the send itself kills. The
+    /// reservation validated the target against the scheduler's record, so the
+    /// send cannot fail in a way the caller sees.
+    async fn send_reserved_sigkill<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        reservation: crate::scheduler::sigkill_retirement::SigkillReservation,
+        call: impl Into<syscalls::Syscall> + Copy,
+    ) -> Result<i64, Error> {
+        if !reservation.includes_sender {
+            let result = self.record_or_replay(guest, call).await;
+            commit_sigkill(guest, reservation.token, result.is_ok()).await;
+            return Ok(result?);
+        }
+        if self.cfg.backend.reports_child_exit_publication {
+            let uid = crate::syscalls::real_uid(guest.tid().as_raw())
+                .unwrap_or_else(|| unsafe { libc::getuid() });
+            crate::tool_global::child_exit_sigchld(
+                guest,
+                crate::scheduler::child_exit_sigchld::ChildExitSigchldControl::ExitStatus {
+                    code: libc::CLD_KILLED,
+                    status: libc::SIGKILL,
+                    uid,
+                },
+            )
+            .await;
+        }
+        let request = guest.thread_state().mk_request(
+            ResourceID::Exit {
+                group: true,
+                process: guest.thread_state().detpid.expect("detpid unset"),
+                mm: guest.thread_state().mm_id,
+            },
+            Permission::RW,
+        );
+        resource_request(guest, request).await;
+        commit_sigkill(guest, reservation.token, true).await;
+        Ok(self.record_or_replay(guest, call).await?)
     }
 
     /// Tell the scheduler that a successful thread-directed send left a signal
@@ -1765,6 +2039,261 @@ where
     } else {
         SleepSignal::None
     })
+}
+
+/// The size of a `struct signalfd_siginfo`, which has ssi_signo at 0,
+/// ssi_code at 8, ssi_pid at 12, ssi_uid at 16, ssi_status at 40, ssi_utime at
+/// 56 and ssi_stime at 64.
+const SIGNALFD_RECORD: usize = 128;
+
+fn signalfd_field(record: &[u8], at: usize) -> u32 {
+    u32::from_ne_bytes(record[at..at + 4].try_into().expect("four bytes"))
+}
+
+/// For each `signalfd_siginfo` record in `bytes`, the child-exit ledger
+/// question it raises (`Detcore::reconcile_signalfd_records`): a SIGCHLD with
+/// a child-exit code is the kernel's copy for that child, a SIGCHLD with
+/// `SI_USER` from `tracer` is the scheduler's copy, and any other record raises
+/// none.
+fn signalfd_record_controls(
+    bytes: &[u8],
+    tracer: u32,
+) -> Vec<Option<crate::scheduler::child_exit_sigchld::ChildExitSigchldControl>> {
+    use crate::scheduler::child_exit_sigchld::ChildExitSigchldControl;
+    bytes
+        .chunks(SIGNALFD_RECORD)
+        .map(|record| {
+            if signalfd_field(record, 0) != libc::SIGCHLD as u32 {
+                return None;
+            }
+            let code = signalfd_field(record, 8) as i32;
+            let pid = signalfd_field(record, 12);
+            if crate::scheduler::child_exit_sigchld::is_child_exit_code(code) {
+                Some(ChildExitSigchldControl::ClaimKernelCopy {
+                    child: DetPid::from_raw(pid as i32),
+                })
+            } else if code == libc::SI_USER && pid == tracer {
+                Some(ChildExitSigchldControl::TakeOwnCopy)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// The pieces of the guest buffers `extents` (address, length) that hold the
+/// first `len` bytes a vectored read scattered, in order; empty extents are
+/// skipped.
+pub(crate) fn signalfd_extent_pieces(
+    extents: &[(usize, usize)],
+    len: usize,
+) -> Vec<(usize, usize)> {
+    let mut left = len;
+    let mut pieces = Vec::new();
+    for (address, length) in extents {
+        if left == 0 {
+            break;
+        }
+        let take = (*length).min(left);
+        if take > 0 {
+            pieces.push((*address, take));
+            left -= take;
+        }
+    }
+    pieces
+}
+
+/// Signalfd records rewritten by the child-exit ledger's answers.
+#[derive(Debug, PartialEq, Eq)]
+struct RewrittenSignalfdRecords {
+    /// The buffer to write back: the kept records in order, then zeros over
+    /// the bytes of dropped ones, so no dropped record stays readable.
+    bytes: Vec<u8>,
+    /// How many bytes the read returns.
+    kept: usize,
+}
+
+/// Apply the ledger's `answers`, one per record of `bytes`
+/// (`signalfd_record_controls`): a claimed duplicate or a duplicate scheduler
+/// copy is dropped, a copy that stands for an owned child is given that
+/// child's siginfo with zero CPU times, and every other record is kept as read.
+/// `None` when no record changed.
+fn apply_signalfd_answers(
+    bytes: &[u8],
+    answers: &[Option<crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer>],
+) -> Option<RewrittenSignalfdRecords> {
+    use crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer;
+    use crate::scheduler::child_exit_sigchld::OwnCopy;
+    let mut kept = Vec::with_capacity(bytes.len());
+    let mut changed = false;
+    for (record, answer) in bytes.chunks(SIGNALFD_RECORD).zip(answers) {
+        let mut record = record.to_vec();
+        match answer {
+            Some(ChildExitSigchldAnswer::Claimed(true))
+            | Some(ChildExitSigchldAnswer::OwnCopy(OwnCopy::Duplicate)) => {
+                changed = true;
+                continue;
+            }
+            Some(ChildExitSigchldAnswer::OwnCopy(OwnCopy::Deliver(own)))
+            | Some(ChildExitSigchldAnswer::ClaimedFor(own)) => {
+                record[8..12].copy_from_slice(&own.code.to_ne_bytes());
+                record[12..16].copy_from_slice(&(own.pid as u32).to_ne_bytes());
+                record[16..20].copy_from_slice(&own.uid.to_ne_bytes());
+                record[40..44].copy_from_slice(&own.status.to_ne_bytes());
+                record[56..72].fill(0);
+                changed = true;
+            }
+            _ => {}
+        }
+        kept.extend_from_slice(&record);
+    }
+    if !changed {
+        return None;
+    }
+    let kept_len = kept.len();
+    kept.resize(bytes.len() - bytes.len() % SIGNALFD_RECORD, 0);
+    Some(RewrittenSignalfdRecords {
+        bytes: kept,
+        kept: kept_len,
+    })
+}
+
+#[cfg(test)]
+mod signalfd_record_tests {
+    use super::*;
+    use crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer;
+    use crate::scheduler::child_exit_sigchld::ChildExitSigchldControl;
+    use crate::scheduler::child_exit_sigchld::ChildExitSiginfo;
+    use crate::scheduler::child_exit_sigchld::OwnCopy;
+
+    const TRACER: u32 = 4242;
+
+    fn record(signo: i32, code: i32, pid: u32, status: i32) -> Vec<u8> {
+        let mut record = vec![0u8; SIGNALFD_RECORD];
+        record[0..4].copy_from_slice(&(signo as u32).to_ne_bytes());
+        record[8..12].copy_from_slice(&code.to_ne_bytes());
+        record[12..16].copy_from_slice(&pid.to_ne_bytes());
+        record[40..44].copy_from_slice(&status.to_ne_bytes());
+        record[56..72].fill(7);
+        record
+    }
+
+    /// A kernel child-exit copy asks the ledger about its child, the
+    /// scheduler's `SI_USER` copy asks for its own copy, and anything else,
+    /// including a guest's `SI_USER` SIGCHLD, asks nothing.
+    #[test]
+    fn each_record_asks_the_ledger_only_about_a_child_exit_copy() {
+        let bytes = [
+            record(libc::SIGCHLD, libc::CLD_KILLED, 31, libc::SIGKILL),
+            record(libc::SIGCHLD, libc::SI_USER, TRACER, 0),
+            record(libc::SIGCHLD, libc::SI_USER, 77, 0),
+            record(libc::SIGUSR1, libc::SI_USER, TRACER, 0),
+        ]
+        .concat();
+        assert_eq!(
+            signalfd_record_controls(&bytes, TRACER),
+            vec![
+                Some(ChildExitSigchldControl::ClaimKernelCopy {
+                    child: DetPid::from_raw(31)
+                }),
+                Some(ChildExitSigchldControl::TakeOwnCopy),
+                None,
+                None,
+            ]
+        );
+    }
+
+    /// A dropped record leaves the read, the records after it move up, and
+    /// zeros cover its old bytes; a standing copy gets its owned child's
+    /// siginfo, a cohort's lowest pid included (`ClaimedFor`), with zero CPU
+    /// times.
+    #[test]
+    fn dropped_records_leave_and_standing_ones_take_the_ledgers_siginfo() {
+        let own = |pid| ChildExitSiginfo {
+            code: libc::CLD_KILLED,
+            pid,
+            uid: 0,
+            status: libc::SIGKILL,
+        };
+        let first = record(libc::SIGCHLD, libc::CLD_KILLED, 31, libc::SIGKILL);
+        let second = record(libc::SIGCHLD, libc::SI_USER, TRACER, 0);
+        let third = record(libc::SIGCHLD, libc::CLD_KILLED, 33, libc::SIGKILL);
+        let bytes = [first, second, third].concat();
+        let rewritten = apply_signalfd_answers(
+            &bytes,
+            &[
+                Some(ChildExitSigchldAnswer::Claimed(true)),
+                Some(ChildExitSigchldAnswer::OwnCopy(OwnCopy::Deliver(own(32)))),
+                Some(ChildExitSigchldAnswer::ClaimedFor(own(30))),
+            ],
+        )
+        .expect("records changed");
+        assert_eq!(rewritten.kept, 2 * SIGNALFD_RECORD);
+        assert_eq!(rewritten.bytes.len(), 3 * SIGNALFD_RECORD);
+        let expect = |pid: u32| {
+            let mut wanted = record(libc::SIGCHLD, libc::CLD_KILLED, pid, libc::SIGKILL);
+            wanted[56..72].fill(0);
+            wanted
+        };
+        assert_eq!(&rewritten.bytes[..SIGNALFD_RECORD], &expect(32)[..]);
+        assert_eq!(
+            &rewritten.bytes[SIGNALFD_RECORD..2 * SIGNALFD_RECORD],
+            &expect(30)[..]
+        );
+        assert!(
+            rewritten.bytes[2 * SIGNALFD_RECORD..]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+    }
+
+    /// A vectored read's returned bytes are found across its buffers in
+    /// order, a record split between two buffers included, and only as far
+    /// as the read returned.
+    #[test]
+    fn a_vectored_reads_records_are_found_across_its_buffers() {
+        let extents = [(0x1000, 100), (0x2000, 0), (0x3000, 200), (0x4000, 128)];
+        assert_eq!(
+            signalfd_extent_pieces(&extents, 256),
+            vec![(0x1000, 100), (0x3000, 156)]
+        );
+        assert_eq!(
+            signalfd_extent_pieces(&extents, 428),
+            vec![(0x1000, 100), (0x3000, 200), (0x4000, 128)]
+        );
+        assert_eq!(signalfd_extent_pieces(&extents, 0), vec![]);
+    }
+
+    /// A read whose every record is dropped returns nothing and leaves only
+    /// zeros; a read the ledger leaves alone is not rewritten.
+    #[test]
+    fn a_fully_dropped_read_leaves_no_record_and_an_untouched_read_is_not_rewritten() {
+        let bytes = [
+            record(libc::SIGCHLD, libc::CLD_KILLED, 31, libc::SIGKILL),
+            record(libc::SIGCHLD, libc::SI_USER, TRACER, 0),
+        ]
+        .concat();
+        let rewritten = apply_signalfd_answers(
+            &bytes,
+            &[
+                Some(ChildExitSigchldAnswer::Claimed(true)),
+                Some(ChildExitSigchldAnswer::OwnCopy(OwnCopy::Duplicate)),
+            ],
+        )
+        .expect("records changed");
+        assert_eq!(rewritten.kept, 0);
+        assert!(rewritten.bytes.iter().all(|byte| *byte == 0));
+        assert_eq!(
+            apply_signalfd_answers(
+                &bytes,
+                &[
+                    Some(ChildExitSigchldAnswer::Claimed(false)),
+                    Some(ChildExitSigchldAnswer::OwnCopy(OwnCopy::Unowned)),
+                ],
+            ),
+            None
+        );
+    }
 }
 
 #[cfg(test)]

@@ -68,6 +68,11 @@ impl Replay {
         mounts: &[Mount],
     ) -> Result<Self, Error> {
         let metadata = Metadata::load(dir)?;
+        if let Some(reason) = &metadata.replay_refused {
+            return Err(anyhow::anyhow!(
+                "This recording cannot be replayed faithfully: {reason}"
+            ));
+        }
 
         let recording_version = &metadata.version;
         let replayer_version = &RECORD_VERSION;
@@ -581,6 +586,39 @@ mod tests {
         };
         assert!(
             error.contains("Version mismatch, recording version RecordVersion(290)"),
+            "unexpected refusal: {error}"
+        );
+    }
+
+    /// A recording whose run recorded a replay refusal is refused before the
+    /// guest starts, with the recorded reason
+    /// (https://github.com/rrnewton/hermit/issues/3994).
+    #[tokio::test]
+    async fn replay_refuses_a_recording_that_recorded_a_replay_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata = serde_json::json!({
+            "exe": "/bin/true",
+            "program": "true",
+            "arg0": "true",
+            "args": [],
+            "current_dir": "/",
+            "hostname": null,
+            "domainname": null,
+            "envs": {},
+            "version": serde_json::to_value(RECORD_VERSION).unwrap(),
+            "replay_refused": "a SIGKILL victim had a background operation outstanding",
+        });
+        fs::write(
+            dir.path().join(crate::consts::METADATA_NAME),
+            metadata.to_string(),
+        )
+        .unwrap();
+        let error = match Replay::spawn(dir.path(), false, None, &[]).await {
+            Ok(_) => panic!("replay accepted a recording that refuses replay"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("cannot be replayed faithfully: a SIGKILL victim had a background operation outstanding"),
             "unexpected refusal: {error}"
         );
     }

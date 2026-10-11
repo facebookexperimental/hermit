@@ -748,6 +748,26 @@ pub fn record_determinism_loss(reason: &str) {
     }
 }
 
+static REPLAY_REFUSAL: Mutex<Option<String>> = Mutex::new(None);
+
+/// Records that a recording made by this process cannot be replayed
+/// faithfully, for the recorder to persist in its metadata (`replay_refused`),
+/// so that replay refuses before it starts the guest. The first reason is
+/// kept. It also records a determinism loss.
+pub fn record_replay_refusal(reason: &str) {
+    write_loss_notice(reason);
+    let mut refusal = REPLAY_REFUSAL.lock().unwrap();
+    if refusal.is_none() {
+        *refusal = Some(reason.to_owned());
+    }
+}
+
+/// The first replay refusal [`record_replay_refusal`] recorded in this
+/// process, if any.
+pub fn replay_refusal() -> Option<String> {
+    REPLAY_REFUSAL.lock().unwrap().clone()
+}
+
 /// The first determinism loss [`record_determinism_loss`] recorded in this
 /// process, if any.
 pub fn determinism_loss() -> Option<String> {

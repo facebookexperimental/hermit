@@ -242,21 +242,40 @@ fn iovec_extents_from_slice(iovecs: &[libc::iovec], moved: i64) -> Vec<BufferExt
 /// log direction without also making its complete, return-value-bounded iovec
 /// prefix available to [`extents`].
 fn iovec_extent_arguments(call: &Syscall) -> Option<(usize, usize)> {
+    let count = |count: u64| linux_iovec_count(count);
     match call {
-        Syscall::Readv(call) => Some((call.iov().map_or(0, |p| p.as_raw()), call.len())),
-        Syscall::Preadv(call) => Some((call.iov().map_or(0, |p| p.as_raw()), call.iov_len())),
-        Syscall::Preadv2(call) => Some((
+        Syscall::Readv(call) => Some((
             call.iov().map_or(0, |p| p.as_raw()),
-            usize::try_from(call.iov_len()).unwrap_or(usize::MAX),
+            count(call.len() as u64),
         )),
-        Syscall::Writev(call) => Some((call.iov().map_or(0, |p| p.as_raw()), call.len())),
-        Syscall::Pwritev(call) => Some((call.iov().map_or(0, |p| p.as_raw()), call.iov_len())),
-        Syscall::Pwritev2(call) => Some((
+        Syscall::Preadv(call) => Some((
             call.iov().map_or(0, |p| p.as_raw()),
-            usize::try_from(call.iov_len()).unwrap_or(usize::MAX),
+            count(call.iov_len() as u64),
         )),
+        Syscall::Preadv2(call) => {
+            Some((call.iov().map_or(0, |p| p.as_raw()), count(call.iov_len())))
+        }
+        Syscall::Writev(call) => Some((
+            call.iov().map_or(0, |p| p.as_raw()),
+            count(call.len() as u64),
+        )),
+        Syscall::Pwritev(call) => Some((
+            call.iov().map_or(0, |p| p.as_raw()),
+            count(call.iov_len() as u64),
+        )),
+        Syscall::Pwritev2(call) => {
+            Some((call.iov().map_or(0, |p| p.as_raw()), count(call.iov_len())))
+        }
         _ => None,
     }
+}
+
+/// The iovec count Linux uses for a vectored read or write: the system calls
+/// pass it on to `import_iovec` as an `unsigned int` (`nr_segs`), so only its
+/// low 32 bits count (Codex re-check #7 of
+/// https://github.com/rrnewton/hermit/pull/4031).
+pub(crate) fn linux_iovec_count(count: u64) -> usize {
+    count as u32 as usize
 }
 
 /// Read a `msghdr` out of the guest and walk the iovecs it points at.
@@ -2834,6 +2853,82 @@ mod tests {
             assert!(extents(&memory, &call, 0).unwrap().is_empty());
             assert!(extents(&memory, &call, -1).unwrap().is_empty());
         }
+    }
+
+    /// Linux passes a vectored call's count on as an `unsigned int`, so a count
+    /// with high bits set names only its low 32 bits' entries (Codex re-check
+    /// #8 of https://github.com/rrnewton/hermit/pull/4031). The one `iovec`
+    /// here ends where an inaccessible page begins, so decoding the full
+    /// 64-bit count would read past it and fail.
+    #[test]
+    fn vectored_calls_decode_only_the_low_32_bits_of_their_iovec_count() {
+        let page = 4096;
+        // SAFETY: a fresh private anonymous mapping, unmapped below.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                2 * page,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(base, libc::MAP_FAILED);
+        // SAFETY: the second page lies inside the mapping.
+        let guard = unsafe { base.cast::<u8>().add(page) };
+        assert_eq!(
+            unsafe { libc::mprotect(guard.cast(), page, libc::PROT_NONE) },
+            0
+        );
+        let data = [0_u8; 8];
+        let slot = unsafe { guard.sub(std::mem::size_of::<libc::iovec>()) }.cast::<libc::iovec>();
+        // SAFETY: `slot` is the last `iovec` of the writable first page.
+        unsafe {
+            slot.write(libc::iovec {
+                iov_base: data.as_ptr() as *mut libc::c_void,
+                iov_len: data.len(),
+            })
+        };
+        let iov = Addr::from_ptr(slot.cast_const());
+        let count = (1_u64 << 32) | 1;
+        let calls = [
+            Syscall::Readv(
+                syscalls::Readv::new()
+                    .with_iov(iov)
+                    .with_len(count as usize),
+            ),
+            Syscall::Writev(
+                syscalls::Writev::new()
+                    .with_iov(iov)
+                    .with_len(count as usize),
+            ),
+            Syscall::Preadv(
+                syscalls::Preadv::new()
+                    .with_iov(iov)
+                    .with_iov_len(count as usize),
+            ),
+            Syscall::Pwritev(
+                syscalls::Pwritev::new()
+                    .with_iov(iov)
+                    .with_iov_len(count as usize),
+            ),
+            Syscall::Preadv2(syscalls::Preadv2::new().with_iov(iov).with_iov_len(count)),
+            Syscall::Pwritev2(syscalls::Pwritev2::new().with_iov(iov).with_iov_len(count)),
+        ];
+        let memory = LocalMemory::new();
+        for call in calls {
+            assert_eq!(iovec_extent_arguments(&call), Some((slot as usize, 1)));
+            assert_eq!(
+                extents(&memory, &call, 8).unwrap(),
+                vec![BufferExtent {
+                    addr: data.as_ptr() as u64,
+                    len: 8,
+                }]
+            );
+        }
+        // SAFETY: the mapping made above, no longer referenced.
+        assert_eq!(unsafe { libc::munmap(base, 2 * page) }, 0);
     }
 
     #[test]

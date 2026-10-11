@@ -880,10 +880,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         match tool_global::child_exit_sigchld(guest, control).await {
             ChildExitSigchldAnswer::Claimed(dropped) => !dropped,
             ChildExitSigchldAnswer::OwnCopy(OwnCopy::Duplicate) => false,
-            ChildExitSigchldAnswer::OwnCopy(OwnCopy::Deliver(own)) => {
+            ChildExitSigchldAnswer::OwnCopy(OwnCopy::Deliver(own))
+            | ChildExitSigchldAnswer::ClaimedFor(own) => {
                 if let Err(errno) = guest.set_signal_info(own.to_bytes()) {
                     warn!(
-                        "[dtid {}] the SIGCHLD for child {} keeps the tracer's siginfo: {}",
+                        "[dtid {}] the SIGCHLD for child {} keeps its siginfo: {}",
                         guest.thread_state().dettid,
                         own.pid,
                         errno
@@ -2052,11 +2053,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             tool_global::GlobalResponse::ChildExitSigchld(ChildExitSigchldAnswer::OwnCopy(
                 OwnCopy::Duplicate,
             )) => false,
-            tool_global::GlobalResponse::ChildExitSigchld(ChildExitSigchldAnswer::OwnCopy(
-                OwnCopy::Deliver(own),
-            )) => {
+            tool_global::GlobalResponse::ChildExitSigchld(
+                ChildExitSigchldAnswer::OwnCopy(OwnCopy::Deliver(own))
+                | ChildExitSigchldAnswer::ClaimedFor(own),
+            ) => {
                 warn!(
-                    "[dtid {}] the SIGCHLD for child {} passed on unreported keeps the tracer's siginfo",
+                    "[dtid {}] the SIGCHLD for child {} passed on unreported keeps its delivered siginfo",
                     tid, own.pid
                 );
                 true

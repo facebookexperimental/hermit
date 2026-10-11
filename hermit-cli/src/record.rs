@@ -96,6 +96,7 @@ impl Record {
             metadata.mountinfo_mount_ids_captured = true;
             metadata.mount_id_assignment_order = assignment_order;
         }
+        metadata.replay_refused = detcore::detlog::replay_refusal();
         // Also persist the proc mode observed after guest setup, even when no
         // mount-identity provenance was collected. Do this only after joining
         // the recording, so a metadata write failure cannot abandon a tracee.

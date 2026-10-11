@@ -1844,6 +1844,32 @@ impl GlobalTool for GlobalState {
             }
             _ => {}
         }
+        // A committed SIGKILL victim's requests that return before ordinary
+        // admission (https://github.com/rrnewton/hermit/issues/3994). Exec
+        // transfers above, the child-exit SIGCHLD control (sent in the
+        // sender's own turn, which a committed victim no longer gets, or by
+        // the tracer at a signal stop) and the consuming `SignalDequeued` keep
+        // their own answers. Shared open file control is in-guest LiteInst
+        // transport, never sent on ptrace, where alone a SIGKILL is retired
+        // at the commit. Observations and loss notices are still recorded,
+        // since dropping one only loses information, but not answered. A
+        // SIGALRM ledger change from a thread that is already logically dead
+        // would land at a host-chosen time: it is refused, and not answered
+        // either.
+        let early_victim_request = match &request {
+            GlobalRequest::RecordHostInput { .. }
+            | GlobalRequest::RecordHostMutation { .. }
+            | GlobalRequest::RecordDeterminismLoss(_)
+            | GlobalRequest::Sigalrm(_) => self
+                .sched
+                .lock()
+                .unwrap()
+                .is_unaccounted_sigkill_victim(dtid),
+            _ => false,
+        };
+        if early_victim_request && matches!(&request, GlobalRequest::Sigalrm(_)) {
+            return (None, R::Retired);
+        }
         // An observation for `hermit run --verify`, answered before any clock
         // or scheduler accounting: it carries no logical time, changes no
         // scheduler state, and its answer carries no time back.
@@ -1859,10 +1885,16 @@ impl GlobalTool for GlobalState {
                 syscall,
                 identity,
             });
+            if early_victim_request {
+                return (None, R::Retired);
+            }
             return (None, R::RecordHostInput(()));
         }
         if let GlobalRequest::RecordHostMutation { path } = request {
             self.host_mutations.lock().unwrap().insert(path);
+            if early_victim_request {
+                return (None, R::Retired);
+            }
             return (None, R::RecordHostMutation(()));
         }
         // A determinism loss is recorded where verification reads it, and,
@@ -1870,6 +1902,9 @@ impl GlobalTool for GlobalState {
         // a guest-side handler lose determinism must not change guest time.
         if let GlobalRequest::RecordDeterminismLoss(reason) = request {
             crate::detlog::write_loss_notice(&reason);
+            if early_victim_request {
+                return (None, R::Retired);
+            }
             return (None, R::RecordDeterminismLoss(()));
         }
         // Control traffic for a shared open file description: like the
@@ -1958,6 +1993,14 @@ impl GlobalTool for GlobalState {
         let is_deregister = matches!(&request, GlobalRequest::DeregisterThread(_));
         let consuming_cleanup =
             is_deregister || matches!(&request, GlobalRequest::RobustListWakes(_));
+        // What a committed SIGKILL victim may still send and be answered
+        // (`Scheduler::is_unaccounted_sigkill_victim`): its consuming cleanup,
+        // and the failure reports that end a run.
+        let answered_for_sigkill_victim = consuming_cleanup
+            || matches!(
+                &request,
+                GlobalRequest::ParkedProtocolFailure(_) | GlobalRequest::UnrecoverableShutdown
+            );
 
         let (exec_reconnect, is_exec_caller_after_local_mm_swap) = {
             let pending = self.pending_exec_states.lock().unwrap();
@@ -2030,6 +2073,13 @@ impl GlobalTool for GlobalState {
                 } else {
                     return (None, R::ThreadExited);
                 }
+            }
+            if !answered_for_sigkill_victim && sched.is_unaccounted_sigkill_victim(dtid) {
+                trace!(
+                    "[detcore, dtid {}] leaving a SIGKILLed thread's request unanswered",
+                    dtid
+                );
+                return (None, R::Retired);
             }
             if child.is_some_and(|child| sched.thread_is_logically_killed(child))
                 && exec_reconnect.is_none()
@@ -2490,7 +2540,7 @@ impl GlobalTool for GlobalState {
                 .await,
             ),
             GlobalRequest::RobustListWakes(wakes) => {
-                R::RobustListWakes(self.recv_robust_list_wakes(wakes))
+                R::RobustListWakes(self.recv_robust_list_wakes(dtid, wakes))
             }
             GlobalRequest::DeterminizeInode(ino, observed, sighting, procfs) => {
                 R::DeterminizeInode(
@@ -2634,6 +2684,53 @@ impl GlobalTool for GlobalState {
                     .await
                     .record_unresolved_sigkill(group);
                 R::NotifyUnresolvedSigkill(())
+            }
+            GlobalRequest::ReserveSigkill(sender, target, uid) => {
+                let mut scheduler = self.lock_rpc_scheduler(false).await;
+                let reserved = scheduler
+                    .registered_process(target)
+                    .ok_or(crate::scheduler::sigkill_retirement::SigkillRefusal::NoTarget)
+                    .and_then(|process| scheduler.reserve_sigkill(sender, process, uid));
+                R::ReserveSigkill(reserved.ok())
+            }
+            GlobalRequest::ReserveSigkillGroup(sender, pgid, uid) => R::ReserveSigkill(
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .reserve_sigkill_group(sender, pgid, uid)
+                    .ok(),
+            ),
+            GlobalRequest::CommitSigkill(token, sent) => {
+                // A send that includes the sender is committed at its Exit
+                // grant, before it is sent: its victims die only afterwards,
+                // and its sender never returns, so it does not wait.
+                let (victims, wait) = {
+                    let mut sched = self.lock_rpc_scheduler(false).await;
+                    let wait = sent && !sched.sigkill_reservation_includes_sender(token);
+                    (sched.commit_sigkill(token, sent), wait)
+                };
+                // The sender's `kill` returns only once every victim's exit is
+                // accounted and published to its parent. A parent that killed
+                // its own child then finds the kernel's SIGCHLD pending when
+                // `kill` returns, a point the schedule fixes, instead of
+                // receiving it at a host-chosen moment in its own code. The
+                // wait is bounded: past the valve the run is refused.
+                let since = std::time::Instant::now();
+                if wait {
+                    loop {
+                        {
+                            let mut sched = self.lock_rpc_scheduler(false).await;
+                            if sched.sigkill_settled(&victims) {
+                                break;
+                            }
+                            if since.elapsed() >= sched.sigkill_fence_valve {
+                                sched.refuse_unsettled_sigkill(since.elapsed());
+                                break;
+                            }
+                        }
+                        yield_once().await;
+                    }
+                }
+                R::CommitSigkill(())
             }
             GlobalRequest::ThreadIsLive(dtid) => {
                 R::ThreadIsLive(self.lock_rpc_scheduler(false).await.thread_is_live(dtid))
@@ -2794,14 +2891,22 @@ impl GlobalTool for GlobalState {
 
         // Awaited scheduler operations may have raced logical teardown. Never return their
         // operation-specific response after the sender acquired a permanent tombstone.
-        let sender_became_terminal =
+        // A SIGKILL committed meanwhile leaves the request unanswered, whatever
+        // its operation-specific response, ThreadExited included.
+        let (sender_became_terminal, sender_sigkill_retired) =
             if is_deregister || exec_reconnect.is_some() || is_exec_caller_after_local_mm_swap {
-                false
+                (false, false)
             } else {
                 let sched = self.lock_rpc_scheduler(consuming_cleanup).await;
-                sched.thread_is_logically_killed(dtid)
-                    || !sched.rpc_incarnation_matches(dtid, request_mm)
+                (
+                    sched.thread_is_logically_killed(dtid)
+                        || !sched.rpc_incarnation_matches(dtid, request_mm),
+                    !answered_for_sigkill_victim && sched.is_unaccounted_sigkill_victim(dtid),
+                )
             };
+        if sender_sigkill_retired {
+            return (None, R::Retired);
+        }
         if resp == R::ThreadExited || sender_became_terminal {
             return (None, R::ThreadExited);
         }
@@ -2838,6 +2943,12 @@ impl GlobalState {
             if sched.thread_is_logically_killed(dettid)
                 || request_mm.is_some_and(|mm| !sched.rpc_incarnation_matches(dettid, mm))
             {
+                return (SchedulerRpcResult::ThreadExited, None);
+            }
+            // A host-timed request (a background operation's rejoin) can pass
+            // admission just before a SIGKILL commit retires its thread. The
+            // handler's response exit turns this into an unanswered request.
+            if sched.is_unaccounted_sigkill_victim(dettid) {
                 return (SchedulerRpcResult::ThreadExited, None);
             }
             let Some(nextturn) = sched.next_turns.get(&dettid).cloned() else {
@@ -3105,6 +3216,7 @@ impl GlobalState {
                 flags.is_some_and(|flags| flags.contains(CloneFlags::CLONE_VM)),
             );
             sched.register_reused_transferred_exec_tid(child_dettid, child_mm);
+            sched.record_thread_mm(child_dettid, child_mm);
             // The guest's procfs paths name a task by its thread ID in the
             // guest's PID namespace, which is the raw value of its DetTid.
             self.inodes
@@ -3143,6 +3255,7 @@ impl GlobalState {
                     && flags.is_some_and(|flags| flags.contains(CloneFlags::CLONE_NEWPID))
                 {
                     sched.thread_tree.enter_new_pid_namespace(child_dettid);
+                    sched.thread_tree.mark_pid_namespace_init(child_dettid);
                 }
                 if is_group_leader && flags.is_some() {
                     sched.inherit_real_time_records(parent_detpid, child_dettid);
@@ -3490,7 +3603,12 @@ impl GlobalState {
             return;
         }
         self.post_exec_fd_blocking.lock().unwrap().remove(&dettid);
-        if !sched.note_deregistration_accounted(dettid) {
+        // A SIGKILL victim's cleanup is accounted exactly once
+        // (`scheduler::sigkill_retirement`), also on a backend that otherwise
+        // accepts a repeated callback.
+        if !sched.note_deregistration_accounted(dettid)
+            || sched.sigkill_receipt_already_counted(dettid)
+        {
             trace!(
                 "[detcore, dtid {}] acknowledging already-accounted deregistration",
                 dettid
@@ -3504,6 +3622,14 @@ impl GlobalState {
         }
         sched.record_timeslice_stats(dettid, timeslice_stats);
         sched.record_syscall_count(dettid, syscall_count);
+        // A SIGKILL victim is retired at its sender's turn, not here
+        // (`scheduler::sigkill_retirement`): its receipt is accounted above
+        // and only counted.
+        if sched.route_sigkill_receipt(dettid)
+            != crate::scheduler::sigkill_retirement::SigkillReceipt::Ordinary
+        {
+            return;
+        }
         if !sched.defer_exec_sibling_retirement(dettid, detpid, mm)
             && !sched.thread_is_logically_killed(dettid)
         {
@@ -3623,8 +3749,13 @@ impl GlobalState {
         }
     }
 
-    fn recv_robust_list_wakes(&self, wakes: Vec<(DetTid, FutexID)>) -> Vec<u64> {
+    fn recv_robust_list_wakes(&self, from: DetTid, wakes: Vec<(DetTid, FutexID)>) -> Vec<u64> {
         let mut sched = self.sched.lock().unwrap();
+        if sched.retain_sigkill_victim_wakes(from, &wakes) {
+            // A SIGKILL victim's batch runs with its cohort; the empty answer
+            // has no counts, so the victim logs nothing for it.
+            return Vec::new();
+        }
         sched.wake_futex_waiters_after_exit(&wakes)
     }
 
@@ -4432,6 +4563,18 @@ pub enum GlobalRequest {
     /// (`Scheduler::signal_target_process`). Appended after
     /// `SetSigchldDisposition`, for the same reason.
     SignalTargetProcess(DetPid),
+    /// Reserve the victims of a SIGKILL the sender is about to send to the
+    /// process of the given thread, before the physical send
+    /// (`scheduler::sigkill_retirement`). Appended after
+    /// `RegisteredProcessOf`, for the same reason.
+    ReserveSigkill(DetTid, DetTid, u32),
+    /// Commit (true: the send succeeded) or unwind a SIGKILL reservation.
+    /// Appended after `ReserveSigkill`, for the same reason.
+    CommitSigkill(u64, bool),
+    /// Reserve the victims of a `kill(-pgid, SIGKILL)`: every live process in
+    /// the recorded process group. Appended after `CommitSigkill`, for the
+    /// same reason.
+    ReserveSigkillGroup(DetTid, DetPid, u32),
 }
 
 /// Responses from the global object
@@ -4542,6 +4685,17 @@ pub enum GlobalResponse {
     SetSigchldDisposition(()),
     /// Appended after `SetSigchldDisposition`, for the same reason.
     SignalTargetProcess(Option<DetPid>),
+    /// The reservation token, or none when the send keeps the ordinary path.
+    /// Appended after `RegisteredProcessOf`, for the same reason.
+    ReserveSigkill(Option<crate::scheduler::sigkill_retirement::SigkillReservation>),
+    /// Appended after `ReserveSigkill`, for the same reason.
+    CommitSigkill(()),
+    /// The sender is a committed SIGKILL victim
+    /// (`Scheduler::is_unaccounted_sigkill_victim`): its request is never
+    /// answered, and the client waits for the kernel to end it. Unlike
+    /// `ThreadExited`, it never tail-injects an exit. Appended after
+    /// `CommitSigkill`, for the same reason.
+    Retired,
 }
 
 /// `request`, carrying the number of records this guest thread produced for
@@ -4779,6 +4933,16 @@ where
     let mytime = guest.thread_state().thread_logical_time.clone();
     let mm = guest.thread_state().mm_id;
     let resp = guest.send_rpc((mytime, mm, counted_request(request))).await;
+    if resp.1 == GlobalResponse::Retired {
+        // A committed SIGKILL victim (`Scheduler::is_unaccounted_sigkill_victim`):
+        // this callback never resumes. No error, errno or injection reaches
+        // the backend; its terminal owner consumes the real death.
+        trace!(
+            "[detcore, dtid {}] waiting for the kernel to end a SIGKILLed thread",
+            guest.thread_state().dettid
+        );
+        return std::future::pending().await;
+    }
     if resp.1 == GlobalResponse::ThreadExited {
         let dettid = guest.thread_state().dettid;
         trace!(
@@ -6040,6 +6204,35 @@ where
     }
 }
 
+/// Reserve the victims of the SIGKILL the calling thread is about to send to
+/// `target`'s process (`scheduler::sigkill_retirement`). `None` keeps the
+/// ordinary path.
+pub async fn reserve_sigkill<G, T>(
+    guest: &mut G,
+    target: DetTid,
+) -> Option<crate::scheduler::sigkill_retirement::SigkillReservation>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    // Backends that cannot retire at the kill turn send no extra RPC.
+    if !crate::scheduler::sigkill_retirement::retires_sigkill_at_the_kill_turn(
+        &guest.config().backend,
+    ) {
+        return None;
+    }
+    let sender = guest.thread_state().dettid;
+    // Read before the send, while the target certainly exists.
+    let uid =
+        crate::syscalls::real_uid(target.as_raw()).unwrap_or_else(|| unsafe { libc::getuid() });
+    let response =
+        send_and_update_time(guest, GlobalRequest::ReserveSigkill(sender, target, uid)).await;
+    match response.1 {
+        GlobalResponse::ReserveSigkill(token) => token,
+        _ => unreachable!(),
+    }
+}
+
 /// Mirror a successful `prctl(PR_SET_CHILD_SUBREAPER, on)` by `process` in
 /// the scheduler's thread tree, in the calling thread's turn.
 pub async fn set_child_subreaper<G, T>(guest: &mut G, process: DetPid, on: bool)
@@ -6087,6 +6280,47 @@ pub async fn set_sigchld_disposition<G, T>(
     .await;
     match response.1 {
         GlobalResponse::SetSigchldDisposition(()) => {}
+        _ => unreachable!(),
+    }
+}
+
+/// Reserve the victims of the `kill(-pgid, SIGKILL)` the calling thread is
+/// about to send (`Scheduler::reserve_sigkill_group`). Every guest process has
+/// the same credentials, so the members share the caller's real uid.
+pub async fn reserve_sigkill_group<G, T>(
+    guest: &mut G,
+    pgid: DetPid,
+) -> Option<crate::scheduler::sigkill_retirement::SigkillReservation>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    // Backends that cannot retire at the kill turn send no extra RPC.
+    if !crate::scheduler::sigkill_retirement::retires_sigkill_at_the_kill_turn(
+        &guest.config().backend,
+    ) {
+        return None;
+    }
+    let sender = guest.thread_state().dettid;
+    let uid = crate::syscalls::real_uid(guest.tid().as_raw())
+        .unwrap_or_else(|| unsafe { libc::getuid() });
+    let response =
+        send_and_update_time(guest, GlobalRequest::ReserveSigkillGroup(sender, pgid, uid)).await;
+    match response.1 {
+        GlobalResponse::ReserveSigkill(token) => token,
+        _ => unreachable!(),
+    }
+}
+
+/// Commit (`sent`) or unwind a SIGKILL reservation at the sending boundary.
+pub async fn commit_sigkill<G, T>(guest: &mut G, token: u64, sent: bool)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::CommitSigkill(token, sent)).await;
+    match response.1 {
+        GlobalResponse::CommitSigkill(()) => {}
         _ => unreachable!(),
     }
 }
@@ -7520,6 +7754,514 @@ mod tests {
             request,
             GlobalRequest::Sigalrm(super::SigalrmControl::ArmProducer)
         )));
+    }
+
+    /// A committed SIGKILL victim's late ordinary request is never answered
+    /// (https://github.com/rrnewton/hermit/issues/3994, design revision 4,
+    /// R1). The two late states are a background operation's rejoin posted
+    /// after the commit (`BlockedExternalContinue`, through
+    /// `resource_request`, as `helpers.rs` posts it once the operation's
+    /// outcome is in) and a plain request. In both, the callback stays
+    /// pending: no response, no injection (`RetirementGuest` panics on one),
+    /// and no `retire_current_thread`, so the backend's terminal owner
+    /// consumes the real death. Its consuming cleanup is still answered.
+    #[tokio::test]
+    async fn a_sigkilled_threads_late_ordinary_request_stays_unanswered() {
+        use std::sync::atomic::Ordering;
+
+        use reverie::Tool;
+
+        let config = Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        };
+        let [root, sender, victim] = [1, 2, 3].map(DetPid::from_raw);
+        let commit = |state: &GlobalState| {
+            let mut sched = state.sched.lock().unwrap();
+            let token = sched.reserve_sigkill(sender, victim, 0).unwrap().token;
+            assert_eq!(sched.commit_sigkill(token, true).len(), 1);
+            assert!(sched.is_unaccounted_sigkill_victim(victim));
+        };
+        // "filed": the rejoin is admitted and waiting for its turn when the
+        // commit happens. "rejoin" and "plain" arrive after the commit.
+        for late in ["filed", "rejoin", "plain"] {
+            let state = GlobalState::initialize(&config, false);
+            {
+                let mut sched = state.sched.lock().unwrap();
+                sched.thread_tree.add_child(root, root, true);
+                sched.thread_tree.add_child(root, sender, true);
+                sched.thread_tree.add_child(root, victim, true);
+            }
+            for tid in [root, sender, victim] {
+                install_test_registration(&state, tid, Ivar::new());
+                state
+                    .sched
+                    .lock()
+                    .unwrap()
+                    .record_thread_mm(tid, MmId::initial(tid));
+            }
+            if late != "filed" {
+                commit(&state);
+            }
+            let tool: Detcore = Detcore::new(Tid::from_raw(victim.as_raw()), &config);
+            let mut thread = tool.init_thread_state(Tid::from_raw(victim.as_raw()), None);
+            thread.detpid = Some(victim);
+            let mut guest = RetirementGuest {
+                global: &state,
+                config: &config,
+                thread,
+                requests: Mutex::new(Vec::new()),
+                retired: std::sync::atomic::AtomicBool::new(false),
+            };
+            {
+                let mut rejoin = Resources::new(victim);
+                rejoin.insert(
+                    ResourceID::BlockedExternalContinue(ExternalOpId::new(victim, 7)),
+                    Permission::RW,
+                );
+                let pending = if late == "plain" {
+                    let mut call = std::pin::pin!(super::send_and_update_time(
+                        &mut guest,
+                        GlobalRequest::GlobalTimeLowerBound
+                    ));
+                    futures::poll!(call.as_mut()).is_pending()
+                } else {
+                    let mut call = std::pin::pin!(super::resource_request(&mut guest, rejoin));
+                    let mut pending = futures::poll!(call.as_mut()).is_pending();
+                    if late == "filed" {
+                        commit(&state);
+                        for _ in 0..8 {
+                            tokio::task::yield_now().await;
+                            pending &= futures::poll!(call.as_mut()).is_pending();
+                        }
+                    }
+                    pending
+                };
+                assert!(pending, "{late}: the callback resumed");
+            }
+            assert!(
+                !guest.retired.load(Ordering::SeqCst),
+                "{late}: retire_current_thread tail-injects exit"
+            );
+            assert_eq!(guest.requests.lock().unwrap().len(), 1, "{late}");
+            // The consuming cleanup of the same victim is admitted and answered.
+            let (_, ack) = state
+                .receive_rpc(
+                    Tid::from_raw(victim.as_raw()),
+                    (
+                        guest.thread.thread_logical_time.clone(),
+                        guest.thread.mm_id,
+                        GlobalRequest::RobustListWakes(Vec::new()),
+                    ),
+                )
+                .await;
+            assert_eq!(ack, GlobalResponse::RobustListWakes(Vec::new()), "{late}");
+            // Requests answered before ordinary admission get no answer either:
+            // a SIGALRM ledger change is refused, and a loss notice is
+            // recorded but not answered.
+            for request in [
+                GlobalRequest::Sigalrm(super::SigalrmControl::ArmProducer),
+                GlobalRequest::RecordDeterminismLoss("victim notice".to_string()),
+            ] {
+                let (_, response) = state
+                    .receive_rpc(
+                        Tid::from_raw(victim.as_raw()),
+                        (
+                            guest.thread.thread_logical_time.clone(),
+                            guest.thread.mm_id,
+                            request,
+                        ),
+                    )
+                    .await;
+                assert_eq!(response, GlobalResponse::Retired, "{late}");
+            }
+        }
+    }
+
+    /// A victim's request admitted before the commit whose response is
+    /// granted, and observed by the handler, only after the commit reaches the
+    /// handler's single response exit, which must not answer it
+    /// (https://github.com/rrnewton/hermit/issues/3994, R1). Without that exit
+    /// guard the granted response would resume the callback.
+    #[tokio::test]
+    async fn a_victims_request_granted_across_the_commit_stays_unanswered() {
+        use reverie::Tool;
+
+        let config = Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        };
+        let [root, sender, victim] = [1, 2, 3].map(DetPid::from_raw);
+        let state = GlobalState::initialize(&config, false);
+        {
+            let mut sched = state.sched.lock().unwrap();
+            sched.thread_tree.add_child(root, root, true);
+            sched.thread_tree.add_child(root, sender, true);
+            sched.thread_tree.add_child(root, victim, true);
+        }
+        for tid in [root, sender, victim] {
+            install_test_registration(&state, tid, Ivar::new());
+            state
+                .sched
+                .lock()
+                .unwrap()
+                .record_thread_mm(tid, MmId::initial(tid));
+        }
+        let tool: Detcore = Detcore::new(Tid::from_raw(victim.as_raw()), &config);
+        let mut thread = tool.init_thread_state(Tid::from_raw(victim.as_raw()), None);
+        thread.detpid = Some(victim);
+        let mut guest = RetirementGuest {
+            global: &state,
+            config: &config,
+            thread,
+            requests: Mutex::new(Vec::new()),
+            retired: std::sync::atomic::AtomicBool::new(false),
+        };
+        let mut rejoin = Resources::new(victim);
+        rejoin.insert(
+            ResourceID::BlockedExternalContinue(ExternalOpId::new(victim, 7)),
+            Permission::RW,
+        );
+        let response = state.sched.lock().unwrap().next_turns[&victim].resp.clone();
+        {
+            let mut call = std::pin::pin!(super::resource_request(&mut guest, rejoin));
+            // Admitted and filed: the handler waits for the grant.
+            assert!(futures::poll!(call.as_mut()).is_pending());
+            // The scheduler grants it, and only then does the commit retire the
+            // victim, before the handler has looked at the grant.
+            response.put(SchedResponse::Go(None));
+            {
+                let mut sched = state.sched.lock().unwrap();
+                let token = sched.reserve_sigkill(sender, victim, 0).unwrap().token;
+                assert_eq!(sched.commit_sigkill(token, true).len(), 1);
+            }
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+                assert!(
+                    futures::poll!(call.as_mut()).is_pending(),
+                    "the granted response resumed a SIGKILLed thread's callback"
+                );
+            }
+        }
+        assert!(!guest.retired.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// A returning sender's wait for its victims is bounded by the valve: a
+    /// commit whose victim never dies returns once the valve expires and
+    /// refuses the run by name, instead of hanging the sender (shortened
+    /// valve; the 30 s production bound is the same field).
+    #[tokio::test]
+    async fn a_sigkill_commit_wait_past_its_valve_refuses_the_run() {
+        let config = Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config, false);
+        let [root, sender, target] = [1, 2, 3].map(DetPid::from_raw);
+        {
+            let mut sched = state.sched.lock().unwrap();
+            sched.thread_tree.add_child(root, root, true);
+            sched.thread_tree.add_child(root, sender, true);
+            sched.thread_tree.add_child(root, target, true);
+        }
+        for tid in [root, sender, target] {
+            install_test_registration(&state, tid, Ivar::new());
+            state
+                .sched
+                .lock()
+                .unwrap()
+                .record_thread_mm(tid, MmId::initial(tid));
+        }
+        let token = {
+            let mut sched = state.sched.lock().unwrap();
+            sched.sigkill_fence_valve = std::time::Duration::from_millis(20);
+            sched.reserve_sigkill(sender, target, 0).unwrap().token
+        };
+        let rpc = state.receive_rpc(
+            Tid::from_raw(sender.as_raw()),
+            (
+                crate::ThreadState::<()>::new(sender, &config, ())
+                    .thread_logical_time
+                    .clone(),
+                MmId::initial(sender),
+                GlobalRequest::CommitSigkill(token, true),
+            ),
+        );
+        let (_, response) = tokio::time::timeout(std::time::Duration::from_secs(10), rpc)
+            .await
+            .expect("the commit's wait outlived its valve");
+        assert_eq!(response, GlobalResponse::CommitSigkill(()));
+        let sched = state.sched.lock().unwrap();
+        let refusal = sched
+            .sigkill_fence_refusal_for_test()
+            .expect("no refusal recorded");
+        assert!(refusal.waited >= std::time::Duration::from_millis(20));
+        assert_eq!(refusal.unaccounted, [target]);
+    }
+
+    /// Two victims of one SIGKILL send their owner-death batches through this
+    /// real RPC handler, as authenticated registered victims, in either order,
+    /// with a step2 between the receipts (3994 design revision 4, R2). Each
+    /// batch is acknowledged with no counts and runs only when the cohort is
+    /// complete, so the waiters woken, the run-queue order and the fuzz arm's
+    /// next draw do not depend on the order, under FIFO and under the fuzz
+    /// arm. This covers the retention protocol, not a SIGKILL producer: a
+    /// SIGKILL victim stages no batch today
+    /// (<https://github.com/rrnewton/hermit/issues/2082>).
+    #[tokio::test]
+    async fn victims_owner_death_wakes_through_the_handler_do_not_depend_on_receipt_order() {
+        async fn run(fuzz: bool, reverse: bool) -> (Vec<Vec<DetTid>>, Vec<DetTid>, u64) {
+            let config = Config {
+                sequentialize_threads: true,
+                fuzz_futexes: fuzz,
+                ..Config::default()
+            };
+            let state = GlobalState::initialize(&config, false);
+            let [root, sender, target, worker] = [1, 2, 3, 4].map(DetPid::from_raw);
+            let mm = MmId::initial(target);
+            let futexes = [0x404100, 0x404200].map(|addr| FutexID::private(mm, addr));
+            {
+                let mut sched = state.sched.lock().unwrap();
+                sched.thread_tree.add_child(root, root, true);
+                sched.thread_tree.add_child(root, sender, true);
+                sched.thread_tree.add_child(root, target, true);
+                sched.thread_tree.add_child(target, worker, false);
+            }
+            for tid in [root, sender, target, worker] {
+                install_test_registration(&state, tid, Ivar::new());
+                state
+                    .sched
+                    .lock()
+                    .unwrap()
+                    .record_thread_mm(tid, MmId::initial(tid));
+            }
+            for (futex, waiters) in futexes.iter().zip([[11, 12, 13], [14, 15, 16]]) {
+                for raw in waiters {
+                    let tid = DetTid::from_raw(raw);
+                    let mut sched = state.sched.lock().unwrap();
+                    sched.thread_tree.add_child(root, tid, true);
+                    sched.next_turns.insert(
+                        tid,
+                        ThreadNextTurn {
+                            dettid: tid,
+                            child_tid_addr: 0,
+                            req: Ivar::new(),
+                            resp: Ivar::new(),
+                            protocol: Default::default(),
+                        },
+                    );
+                    sched.priorities.insert(tid, DEFAULT_PRIORITY);
+                    sched.sleep_futex_waiter(&tid, *futex, None, u32::MAX, None);
+                }
+            }
+            {
+                let mut sched = state.sched.lock().unwrap();
+                let token = sched.reserve_sigkill(sender, target, 0).unwrap().token;
+                assert_eq!(sched.commit_sigkill(token, true).len(), 2);
+            }
+            let mut receipts = [(target, futexes[0]), (worker, futexes[1])];
+            if reverse {
+                receipts.reverse();
+            }
+            for (victim, futex) in receipts {
+                let (_, ack) = state
+                    .receive_rpc(
+                        Tid::from_raw(victim.as_raw()),
+                        (
+                            crate::ThreadState::<()>::new(victim, &config, ())
+                                .thread_logical_time
+                                .clone(),
+                            MmId::initial(victim),
+                            GlobalRequest::RobustListWakes(vec![(victim, futex)]),
+                        ),
+                    )
+                    .await;
+                assert_eq!(
+                    ack,
+                    GlobalResponse::RobustListWakes(Vec::new()),
+                    "a victim's batch is retained, not run at receipt"
+                );
+                state.sched.lock().unwrap().step2_drain_prefix_for_test();
+                // The victim's real consuming deregistration, and a duplicate:
+                // the first is accounted once, the second changes nothing.
+                let deregistration = ThreadDeregistration {
+                    dettid: victim,
+                    detpid: target,
+                    mm: MmId::initial(victim),
+                    thread_start_entered: true,
+                    timeslice_stats: TimesliceStats {
+                        count: 1,
+                        sum_ns: 10,
+                        min_ns: 10,
+                        max_ns: 10,
+                    },
+                    syscall_count: 3,
+                    chaos_epochs: Vec::new(),
+                };
+                for _ in 0..2 {
+                    let (_, done) = state
+                        .receive_rpc(
+                            Tid::from_raw(victim.as_raw()),
+                            (
+                                crate::ThreadState::<()>::new(victim, &config, ())
+                                    .thread_logical_time
+                                    .clone(),
+                                MmId::initial(victim),
+                                GlobalRequest::DeregisterThread(deregistration.clone()),
+                            ),
+                        )
+                        .await;
+                    assert_eq!(done, GlobalResponse::DeregisterThread(()));
+                }
+                state.sched.lock().unwrap().step2_drain_prefix_for_test();
+            }
+            assert!(
+                state.sched.lock().unwrap().sigkill_fence_holds(),
+                "the victim's exit is not yet published to its parent"
+            );
+            <GlobalState as GlobalTool>::on_backend_process_exited(&state, target.as_raw());
+            state.sched.lock().unwrap().step2_drain_prefix_for_test();
+            {
+                let sched = state.sched.lock().unwrap();
+                assert!(
+                    !sched.sigkill_fence_holds(),
+                    "every victim is accounted and published"
+                );
+                for victim in [target, worker] {
+                    assert_eq!(
+                        sched
+                            .timeslice_stats_for_test(victim)
+                            .map(|stats| stats.count),
+                        Some(1),
+                        "victim {victim} accounted exactly once"
+                    );
+                }
+            }
+            let mut sched = state.sched.lock().unwrap();
+            let still_waiting = futexes
+                .iter()
+                .map(|futex| sched.futex_waiters_for_test(*futex))
+                .collect();
+            let queue = sched.run_queue_for_test();
+            (still_waiting, queue, sched.next_fuzz_draw_for_test())
+        }
+        for fuzz in [false, true] {
+            let forward = run(fuzz, false).await;
+            assert_eq!(forward.0.iter().map(Vec::len).collect::<Vec<_>>(), [2, 2]);
+            assert_eq!(forward, run(fuzz, true).await, "fuzz={fuzz}");
+        }
+    }
+
+    /// A victim with a filed request, whose real consuming deregistration
+    /// reaches the handler before the sender's commit (an early receipt, held)
+    /// or after it. Both readiness orders give the same retirement: the
+    /// callback stays pending with nothing injected (`RetirementGuest` panics
+    /// on an injection) and is not retired, the cleanup is accounted once, the
+    /// fence is released, and the victim's process is waitable
+    /// (https://github.com/rrnewton/hermit/issues/3994, R1).
+    #[tokio::test]
+    async fn a_victims_receipt_before_or_after_the_commit_retires_it_the_same_way() {
+        use reverie::Tool;
+
+        let config = Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        };
+        let [root, sender, victim] = [1, 2, 3].map(DetPid::from_raw);
+        for early in [true, false] {
+            let state = GlobalState::initialize(&config, false);
+            {
+                let mut sched = state.sched.lock().unwrap();
+                sched.thread_tree.add_child(root, root, true);
+                sched.thread_tree.add_child(root, sender, true);
+                sched.thread_tree.add_child(root, victim, true);
+            }
+            for tid in [root, sender, victim] {
+                install_test_registration(&state, tid, Ivar::new());
+                state
+                    .sched
+                    .lock()
+                    .unwrap()
+                    .record_thread_mm(tid, MmId::initial(tid));
+            }
+            let tool: Detcore = Detcore::new(Tid::from_raw(victim.as_raw()), &config);
+            let mut thread = tool.init_thread_state(Tid::from_raw(victim.as_raw()), None);
+            thread.detpid = Some(victim);
+            let clock = thread.thread_logical_time.clone();
+            let mut guest = RetirementGuest {
+                global: &state,
+                config: &config,
+                thread,
+                requests: Mutex::new(Vec::new()),
+                retired: std::sync::atomic::AtomicBool::new(false),
+            };
+            let token = state
+                .sched
+                .lock()
+                .unwrap()
+                .reserve_sigkill(sender, victim, 0)
+                .unwrap()
+                .token;
+            let deregister = || {
+                state.receive_rpc(
+                    Tid::from_raw(victim.as_raw()),
+                    (
+                        clock.clone(),
+                        MmId::initial(victim),
+                        GlobalRequest::DeregisterThread(ThreadDeregistration {
+                            dettid: victim,
+                            detpid: victim,
+                            mm: MmId::initial(victim),
+                            thread_start_entered: true,
+                            timeslice_stats: TimesliceStats {
+                                count: 1,
+                                sum_ns: 10,
+                                min_ns: 10,
+                                max_ns: 10,
+                            },
+                            syscall_count: 3,
+                            chaos_epochs: Vec::new(),
+                        }),
+                    ),
+                )
+            };
+            {
+                let mut rejoin = Resources::new(victim);
+                rejoin.insert(
+                    ResourceID::BlockedExternalContinue(ExternalOpId::new(victim, 7)),
+                    Permission::RW,
+                );
+                let mut call = std::pin::pin!(super::resource_request(&mut guest, rejoin));
+                assert!(futures::poll!(call.as_mut()).is_pending());
+                if early {
+                    assert_eq!(deregister().await.1, GlobalResponse::DeregisterThread(()));
+                }
+                state.sched.lock().unwrap().commit_sigkill(token, true);
+                if !early {
+                    assert_eq!(deregister().await.1, GlobalResponse::DeregisterThread(()));
+                }
+                for _ in 0..4 {
+                    tokio::task::yield_now().await;
+                    assert!(futures::poll!(call.as_mut()).is_pending(), "early={early}");
+                }
+            }
+            assert!(!guest.retired.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(
+                state.sched.lock().unwrap().sigkill_fence_holds(),
+                "early={early}: the exit is not yet published"
+            );
+            <GlobalState as GlobalTool>::on_backend_process_exited(&state, victim.as_raw());
+            let sched = state.sched.lock().unwrap();
+            assert!(!sched.sigkill_fence_holds(), "early={early}");
+            assert!(sched.process_is_unreaped_zombie(victim), "early={early}");
+            assert_eq!(
+                sched
+                    .timeslice_stats_for_test(victim)
+                    .map(|stats| stats.count),
+                Some(1),
+                "early={early}"
+            );
+        }
     }
 
     #[tokio::test]

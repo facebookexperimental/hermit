@@ -5748,7 +5748,7 @@ mod tests {
 }
 
 /// The real uid of thread `tid`, from `/proc/<tid>/status`.
-fn real_uid(tid: i32) -> Option<u32> {
+pub(crate) fn real_uid(tid: i32) -> Option<u32> {
     let status = std::fs::read_to_string(format!("/proc/{tid}/status")).ok()?;
     status
         .lines()

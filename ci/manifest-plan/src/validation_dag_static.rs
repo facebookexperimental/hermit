@@ -1380,7 +1380,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (Claude review of https://github.com/rrnewton/hermit/pull/4127): 1044.
     // And metadata::tests::record_version_rejects_streams_that_answered_a_gone_sigqueueinfo_before_its_siginfo
     // (https://github.com/rrnewton/hermit/issues/4124): 1045.
-    ("test.hermit_unit", 1045),
+    // The two SIGKILL-retirement metadata/replay tests (https://github.com/rrnewton/hermit/issues/3994) retain all 1045: 1047.
+    ("test.hermit_unit", 1047),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1922,7 +1923,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retain all 1360: 1384.
     // And scheduler::runqueue::tests::threads_queued_by_a_yield_are_not_work_a_background_call_waits_behind
     // (https://github.com/rrnewton/hermit/issues/4092): 1385.
-    ("test.detcore_unit", 1385),
+    // The 29 SIGKILL-retirement, signalfd-reconciliation and iovec tests (https://github.com/rrnewton/hermit/issues/3994) retain all 1385: 1414.
+    ("test.detcore_unit", 1414),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2595,7 +2597,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4065) retain all 298: 300.
     // a_pending_real_time_timer_expiration_is_refused_only_where_it_is_observed
     // (https://github.com/rrnewton/hermit/issues/4089) retains all 300: 301.
-    ("test.cli", 301),
+    // a_cross_process_sigkill_verifies_at_bitwise_parity and a_recorded_kill_of_a_victim_in_a_background_read_is_refused_at_replay (https://github.com/rrnewton/hermit/issues/3994) retain all 301: 303.
+    ("test.cli", 303),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2838,7 +2841,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Nor do the three tests of signals to Hermit's own tasks: 234.
     // Nor do the two namespace-only kill(0) and terminal tests: 236.
     // Nor does the pending real-time timer expiration test: 237.
-    ("test.cli_on_host", 237),
+    // Nor do the cross-process SIGKILL parity and record-refusal tests: 239.
+    ("test.cli_on_host", 239),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -2986,7 +2990,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the eleven real-time expiration fate tests: 1360.
     // And the chaos yield-epoch tests: 1384.
     // And the yielder harvest-gate unit test: 1385.
-    ("test.detcore_unit_on_host", 1385),
+    // And the 29 SIGKILL-retirement tests: 1414.
+    ("test.detcore_unit_on_host", 1414),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -3122,7 +3127,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And metadata::tests::pre_tight_stack_ppoll_recordings_are_refused_by_the_version_gate
     // (Claude review of https://github.com/rrnewton/hermit/pull/4127): 1044.
     // And the gone-sigqueueinfo record-epoch test: 1045.
-    ("test.hermit_unit_on_host", 1045),
+    // And the SIGKILL-retirement record-version and replay-refusal tests: 1047.
+    ("test.hermit_unit_on_host", 1047),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

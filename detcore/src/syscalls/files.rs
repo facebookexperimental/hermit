@@ -3055,7 +3055,28 @@ impl<T: RecordOrReplay> Detcore<T> {
                     Ok(self.record_or_replay(guest, call).await?)
                 }
             }
-            FdType::Signalfd | FdType::Eventfd | FdType::Timerfd | FdType::Inotify => {
+            FdType::Signalfd => loop {
+                trace!("Possibly blocking read call on signalfd {}", call.fd());
+                let result = self.execute_nonblockable_fd_syscall(guest, call).await;
+                // A SIGCHLD read here goes through the child-exit ledger as
+                // one delivered to a handler does. A read whose every record
+                // was a dropped duplicate reads again, as if those copies had
+                // never been queued.
+                match (result, call.buf()) {
+                    (Ok(read), Some(buf))
+                        if read > 0 && self.cfg.backend.reports_child_exit_publication =>
+                    {
+                        let kept = self
+                            .reconcile_signalfd_records(guest, buf, read as usize)
+                            .await;
+                        if kept > 0 {
+                            break Ok(kept as i64);
+                        }
+                    }
+                    (result, _) => break result,
+                }
+            },
+            FdType::Eventfd | FdType::Timerfd | FdType::Inotify => {
                 trace!(
                     "Possibly blocking read call on notification fd {}, type {:?}",
                     call.fd(),
@@ -3781,6 +3802,116 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#794)
+    /// A vectored read (`readv`, or `preadv2` at the current offset) of a
+    /// signalfd, whose
+    /// SIGCHLD records go through the child-exit ledger as `read`'s do
+    /// (`reconcile_signalfd_extents`).
+    ///
+    /// Linux imports the `count` iovecs at `address` before it writes any record,
+    /// and the records can overwrite the array itself, so the geometry is
+    /// captured here, before the read, and used for the reconciliation and
+    /// for the output observation (`observed`) alike (Codex re-check #6 of
+    /// https://github.com/rrnewton/hermit/pull/4031). A read whose every
+    /// record is dropped reads again, with the array's bytes put back first.
+    /// An array the tracer cannot read is a proven kernel failure (EINVAL, or
+    /// EFAULT with some byte outside every mapping: the kernel copies the whole
+    /// array), forwarded unchanged; a wholly mapped one it cannot read, or one
+    /// whose mappings cannot be listed, is refused by name, so no record is
+    /// returned unreconciled.
+    async fn vectored_signalfd_read<G: Guest<Self>, C>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+        call: C,
+        address: usize,
+        count: usize,
+        observed: &mut Option<Vec<crate::io_buffers::BufferExtent>>,
+    ) -> Result<i64, Error>
+    where
+        C: Into<Syscall> + Copy,
+    {
+        const IOVEC: usize = std::mem::size_of::<libc::iovec>();
+        // Linux passes the count on as an `unsigned int` (Codex re-check #7).
+        let count = crate::io_buffers::linux_iovec_count(count as u64);
+        if count > libc::UIO_MAXIOV as usize {
+            return self
+                .record_or_replay_preserving_tool_errors(guest, call)
+                .await;
+        }
+        let mut raw = vec![0u8; count * IOVEC];
+        if count > 0 {
+            let read = AddrMut::<u8>::from_raw(address)
+                .is_some_and(|at| guest.memory().read_exact(at, &mut raw).is_ok())
+                || {
+                    use std::os::unix::fs::FileExt;
+                    std::fs::File::open(format!("/proc/{}/mem", guest.tid().as_raw()))
+                        .and_then(|mem| mem.read_exact_at(&mut raw, address as u64))
+                        .is_ok()
+                };
+            if !read {
+                // A maps listing that cannot be read decides nothing: refuse.
+                let maps = std::fs::read_to_string(format!("/proc/{}/maps", guest.tid().as_raw()));
+                if let Ok(maps) = &maps
+                    && !signalfd_range_is_mapped(maps, address, raw.len())
+                {
+                    return self
+                        .record_or_replay_preserving_tool_errors(guest, call)
+                        .await;
+                }
+                tracing::error!(
+                    "[detcore, dtid {}] {} of a signalfd with its iovec array at {:#x} is not \
+                     supported: the memory is mapped, but Hermit cannot read it to reconcile \
+                     the SIGCHLD records (https://github.com/rrnewton/hermit/issues/3994)",
+                    guest.thread_state().dettid,
+                    sysno,
+                    address,
+                );
+                return self
+                    .refuse_unserviceable_operation(guest, sysno, Errno::ENOSYS)
+                    .await;
+            }
+        }
+        let extents: Vec<(usize, usize)> = raw
+            .chunks(IOVEC)
+            .map(|iovec| {
+                let word = |at: usize| {
+                    usize::from_ne_bytes(iovec[at..at + 8].try_into().expect("eight bytes"))
+                };
+                (word(0), word(8))
+            })
+            .collect();
+        loop {
+            let result = self
+                .record_or_replay_preserving_tool_errors(guest, call)
+                .await;
+            match result {
+                Ok(read) if read > 0 => {
+                    let kept = self
+                        .reconcile_signalfd_extents(guest, &extents, read as usize)
+                        .await;
+                    if kept > 0 {
+                        *observed = Some(
+                            crate::syscalls::signal::signalfd_extent_pieces(&extents, kept)
+                                .into_iter()
+                                .map(|(addr, len)| crate::io_buffers::BufferExtent {
+                                    addr: addr as u64,
+                                    len: len as u64,
+                                })
+                                .collect(),
+                        );
+                        break Ok(kept as i64);
+                    }
+                    if let Some(at) = AddrMut::<u8>::from_raw(address)
+                        && guest.memory().write_exact(at, &raw).is_err()
+                    {
+                        break Err(Errno::EFAULT.into());
+                    }
+                }
+                result => break result,
+            }
+        }
+    }
+
     /// SYS_readv system call: the vectored form of `read`.
     ///
     /// Mirrors [`Self::handle_writev`] for the read direction. Detcore adds
@@ -3887,6 +4018,18 @@ impl<T: RecordOrReplay> Detcore<T> {
             && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd)
         {
             self.execute_nonblockable_fd_syscall(guest, call).await
+        } else if fd_type == FdType::Signalfd && self.cfg.backend.reports_child_exit_publication {
+            // The SIGCHLD records a vectored read scatters go through the
+            // child-exit ledger as `read`'s do (`reconcile_signalfd_extents`).
+            self.vectored_signalfd_read(
+                guest,
+                Sysno::readv,
+                call,
+                call.iov().map_or(0, |iov| iov.as_raw()),
+                call.len(),
+                rng_output,
+            )
+            .await
         } else {
             self.record_or_replay_preserving_tool_errors(guest, call)
                 .await
@@ -4029,6 +4172,24 @@ impl<T: RecordOrReplay> Detcore<T> {
                 },
                 rng_output,
             )
+        } else if detfd.ty() == FdType::Signalfd
+            && offset == -1
+            && self.cfg.backend.reports_child_exit_publication
+        {
+            // At the current offset (-1) a signalfd reads as `readv` does,
+            // and its records go through the child-exit ledger
+            // (`reconcile_signalfd_extents`). At any other offset, as with
+            // `preadv`, the kernel fails with ESPIPE before it imports the
+            // array, so that call goes to it unchanged below.
+            self.vectored_signalfd_read(
+                guest,
+                Sysno::preadv2,
+                call,
+                call.iov().map_or(0, |iov| iov.as_raw()),
+                usize::try_from(call.iov_len()).unwrap_or(0),
+                rng_output,
+            )
+            .await
         } else {
             self.record_or_replay_preserving_tool_errors(guest, call)
                 .await
@@ -7664,6 +7825,55 @@ impl<'a> GetdentsCall<'a> {
             capacity: count as usize,
             format: self.format,
         }
+    }
+}
+
+/// Whether every byte of `[address, address + len)` lies in some mapping of a
+/// `/proc/<pid>/maps` listing (`Detcore::vectored_signalfd_read`).
+fn signalfd_range_is_mapped(maps: &str, address: usize, len: usize) -> bool {
+    let mut ranges: Vec<(usize, usize)> = maps
+        .lines()
+        .filter_map(|line| {
+            let (start, end) = line.split_whitespace().next()?.split_once('-')?;
+            Some((
+                usize::from_str_radix(start, 16).ok()?,
+                usize::from_str_radix(end, 16).ok()?,
+            ))
+        })
+        .collect();
+    ranges.sort();
+    let Some(end) = address.checked_add(len) else {
+        return false;
+    };
+    let mut next = address;
+    for (start, stop) in ranges {
+        if start <= next && next < stop {
+            next = stop;
+            if next >= end {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod signalfd_geometry_tests {
+    use super::signalfd_range_is_mapped;
+
+    /// A range is mapped only when contiguous mappings cover every byte.
+    #[test]
+    fn an_iovec_array_is_mapped_only_when_mappings_cover_every_byte() {
+        let maps =
+            "1000-2000 r--p 0 0:0 0\n2000-3000 ---p 0 0:0 0 [vvar]\n5000-6000 rw-p 0 0:0 0\n";
+        assert!(signalfd_range_is_mapped(maps, 0x1ff0, 32));
+        assert!(
+            !signalfd_range_is_mapped(maps, 0x2ff0, 32),
+            "runs into a hole"
+        );
+        assert!(!signalfd_range_is_mapped(maps, 0x4000, 16));
+        assert!(!signalfd_range_is_mapped(maps, usize::MAX - 4, 16));
+        assert!(!signalfd_range_is_mapped("", 0x1000, 16));
     }
 }
 

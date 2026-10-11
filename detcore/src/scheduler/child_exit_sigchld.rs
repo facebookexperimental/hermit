@@ -145,6 +145,9 @@ pub enum ChildExitSigchldAnswer {
     Recorded,
     Claimed(bool),
     OwnCopy(OwnCopy),
+    /// The kernel's copy is delivered, with this siginfo: it stands for
+    /// another member of its child's SIGKILL cohort.
+    ClaimedFor(ChildExitSiginfo),
 }
 
 /// Where an owned child's notification stands.
@@ -170,12 +173,15 @@ enum Notification {
 #[derive(Debug, Default)]
 pub(crate) struct ChildExitSigchldLedger {
     /// The exit status each exiting process reported, until its `Exit` grant.
-    exit_status: BTreeMap<DetPid, ChildExitSiginfo>,
+    pub(super) exit_status: BTreeMap<DetPid, ChildExitSiginfo>,
     /// For each parent process, its owned children's notifications.
     owned: BTreeMap<DetPid, BTreeMap<DetPid, Notification>>,
     /// For each parent process, the owned children whose copy the scheduler
     /// sent, in the order sent, until a `SIGCHLD` it sent is matched to them.
     sent: BTreeMap<DetPid, VecDeque<DetPid>>,
+    /// The owned children killed by one SIGKILL send of several processes,
+    /// by that send's token ([`ChildExitSigchldLedger::claim_for_cohort`]).
+    cohorts: BTreeMap<DetPid, u64>,
 }
 
 /// What the `ChildExit` timer of an owned child does.
@@ -211,6 +217,7 @@ impl ChildExitSigchldLedger {
     }
 
     fn forget(&mut self, parent: DetPid, child: DetPid) {
+        self.cohorts.remove(&child);
         if let Some(children) = self.owned.get_mut(&parent) {
             children.remove(&child);
             if children.is_empty() {
@@ -243,6 +250,40 @@ impl ChildExitSigchldLedger {
         if let Some(state) = self.state(parent, child) {
             *state = Notification::Delivered;
         }
+    }
+
+    /// Make owned `child` a member of the SIGKILL cohort `cohort`: the
+    /// processes one send killed together.
+    pub(crate) fn join_cohort(&mut self, child: DetPid, cohort: u64) {
+        self.cohorts.insert(child, cohort);
+    }
+
+    /// The kernel's copy naming `child`, a member of a SIGKILL cohort. Its
+    /// victims' exits were all published before the send returned, so the
+    /// kernel coalesced them into one pending `SIGCHLD`, naming whichever it
+    /// published first: a host-chosen member. The copy is delivered instead
+    /// for the cohort's lowest-pid member for which no `SIGCHLD` was delivered
+    /// yet, with that member's siginfo, as Linux could have published it
+    /// first. The others are notified by their own timers. Returns that
+    /// siginfo, or `None` (`child` is in no cohort, or every member's exit was
+    /// delivered for), leaving the copy to `claim`.
+    fn claim_for_cohort(&mut self, parent: DetPid, child: DetPid) -> Option<ChildExitSiginfo> {
+        let cohort = *self.cohorts.get(&child)?;
+        let (member, info) = self
+            .owned
+            .get(&parent)?
+            .iter()
+            .filter(|(member, _)| self.cohorts.get(member) == Some(&cohort))
+            .find_map(|(member, state)| match *state {
+                Notification::Unsent(info) | Notification::Sent(info) => Some((*member, info)),
+                _ => None,
+            })?;
+        let state = self.state(parent, member)?;
+        *state = match *state {
+            Notification::Unsent(_) => Notification::DeliveredBeforeSend,
+            _ => Notification::DeliveredWhileSent,
+        };
+        Some(info)
     }
 
     /// Whether the kernel's copy of `child`'s notification to `parent` is
@@ -360,6 +401,13 @@ impl Scheduler {
             }
             ChildExitSigchldControl::ClaimKernelCopy { child } => {
                 let parent = self.sigchld_process(dtid);
+                if let Some(info) = self.child_exit_sigchld.claim_for_cohort(parent, child) {
+                    debug!(
+                        "[dtid {}] the kernel's SIGCHLD for child {} stands for child {}, its cohort's first",
+                        dtid, child, info.pid
+                    );
+                    return ChildExitSigchldAnswer::ClaimedFor(info);
+                }
                 let claimed = self.child_exit_sigchld.claim(parent, child);
                 if claimed {
                     // Not an INFO record: whether the kernel's copy arrives at
@@ -443,6 +491,42 @@ mod tests {
             "another process"
         );
         assert!(!ledger.claim(PARENT, DetPid::from_raw(21)), "another child");
+    }
+
+    /// Two children killed by one send form a cohort. The kernel's coalesced
+    /// copy, whichever child it names, stands for the lower pid with that
+    /// child's siginfo, and the other is notified by its own timer, so the
+    /// parent sees the same notifications in the same order either way. A
+    /// child outside any cohort is left to `claim`.
+    #[test]
+    fn a_cohorts_kernel_copy_stands_for_its_lowest_pid_whichever_it_names() {
+        let [first, second, alone] = [20, 21, 30].map(DetPid::from_raw);
+        let killed = |pid: DetPid| ChildExitSiginfo {
+            code: libc::CLD_KILLED,
+            pid: pid.as_raw(),
+            uid: 1000,
+            status: libc::SIGKILL,
+        };
+        let outcome = |named: DetPid| {
+            let mut ledger = ChildExitSigchldLedger::default();
+            for child in [first, second, alone] {
+                ledger.exit_status.insert(child, killed(child));
+                assert!(ledger.own(PARENT, child));
+            }
+            ledger.join_cohort(first, 7);
+            ledger.join_cohort(second, 7);
+            assert_eq!(ledger.claim_for_cohort(PARENT, alone), None);
+            let kernel = ledger.claim_for_cohort(PARENT, named);
+            let timers = [first, second].map(|child| ledger.timer(PARENT, child));
+            (kernel, timers, ledger.take_own(PARENT))
+        };
+        let expected = (
+            Some(killed(first)),
+            [Some(TimerSend::Nothing), Some(TimerSend::Send)],
+            OwnCopy::Deliver(killed(second)),
+        );
+        assert_eq!(outcome(first), expected);
+        assert_eq!(outcome(second), expected);
     }
 
     /// The scheduler's copy delivered first stands for the exit, with

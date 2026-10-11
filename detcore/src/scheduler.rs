@@ -19,6 +19,7 @@ mod rejoin_log;
 mod replayer;
 pub mod runqueue;
 mod sigalrm;
+pub mod sigkill_retirement;
 pub(crate) mod signal_control;
 mod sleep_signal;
 pub mod timed_waiters;
@@ -1200,6 +1201,18 @@ pub struct Scheduler {
     /// Set when step2a's valve expires; `sched_loop_inner` ends the run with
     /// it (`exit_on_scheduler_refusal`).
     vfork_barrier_refusal: Option<VforkBarrierRefusal>,
+
+    /// When the SIGKILL fence started waiting for the current committed
+    /// victims, in host time (`sigkill_retirement`).
+    sigkill_fence_wait_since: Option<std::time::Instant>,
+
+    /// A SIGKILL fence that waited past `SIGKILL_FENCE_VALVE` for a death or
+    /// a publication that never arrived: the run is refused.
+    sigkill_fence_refusal: Option<sigkill_retirement::SigkillFenceRefusal>,
+
+    /// The bound on the SIGKILL fence and a sender's wait:
+    /// `SIGKILL_FENCE_VALVE`, shortened only by tests that expire it.
+    pub(crate) sigkill_fence_valve: Duration,
     /// `hermit record`: where `step2c_process_io_blockers` logs each
     /// readmission of a backgrounded call (see `rejoin_log`).
     rejoin_writer: Option<RejoinWriter>,
@@ -1234,12 +1247,27 @@ pub struct Scheduler {
     #[cfg(test)]
     determinism_losses: Vec<String>,
 
+    /// Every re-parenting this scheduler made, as (orphan, new parent), in
+    /// order (`reparent_orphans`).
+    #[cfg(test)]
+    reparentings: Vec<(DetPid, DetPid)>,
+
     /// Raw TIDs removed by logical teardown. Tombstones are permanent for the life of this
     /// scheduler: accepting Linux TID reuse would let delayed backend RPCs bind to a new thread.
     logically_killed_threads: BTreeSet<DetTid>,
 
     /// Accepted address-space incarnation for raw TIDs explicitly reused by exec.
     exec_incarnations: BTreeMap<DetTid, MmId>,
+
+    /// The address-space identity each registered thread was given, recorded
+    /// when it registers and replaced when an exec reconnects it. Unlike
+    /// `exec_incarnations`, it holds every thread, including a `CLONE_VM`
+    /// child that shares its creator's identity
+    /// (<https://github.com/rrnewton/hermit/issues/3994>).
+    thread_mms: BTreeMap<DetTid, MmId>,
+
+    /// SIGKILL retirement at the kill turn (`sigkill_retirement`).
+    sigkill: sigkill_retirement::SigkillRetirement,
 
     /// A transferred non-leader has no remaining incarnation under its former
     /// TID until an authenticated new child registration reuses it. This also
@@ -1510,6 +1538,10 @@ pub struct ThreadTree {
     /// looks for a subreaper only among ancestors at the exited process's
     /// own depth (`find_child_reaper`).
     pid_ns_depth: HashMap<DetPid, u32>,
+    /// Processes created with `CLONE_NEWPID`: each is the init of a PID
+    /// namespace, which Linux marks `SIGNAL_UNKILLABLE` against senders inside
+    /// it (`sigkill_retirement`).
+    pid_namespace_inits: HashSet<DetPid>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1704,6 +1736,8 @@ impl ThreadTree {
             } else {
                 self.pid_ns_depth.insert(child_dettid, creator_depth);
             }
+            // A reused pid is not a namespace init until registered as one.
+            self.pid_namespace_inits.remove(&child_dettid);
             if parent_dettid == child_dettid {
                 self.process_wait.insert(
                     child_dettid,
@@ -1944,6 +1978,16 @@ impl ThreadTree {
     /// Whether `pid` went to the container's init (`init_orphans`).
     fn is_init_orphan(&self, pid: DetPid) -> bool {
         self.init_orphans.contains(&pid)
+    }
+
+    /// `pid` was created with `CLONE_NEWPID` (`pid_namespace_inits`).
+    pub fn mark_pid_namespace_init(&mut self, pid: DetPid) {
+        self.pid_namespace_inits.insert(pid);
+    }
+
+    /// Whether `pid` is a PID namespace's init (`pid_namespace_inits`).
+    pub fn is_pid_namespace_init(&self, pid: DetPid) -> bool {
+        self.pid_namespace_inits.contains(&pid)
     }
 
     pub fn create_session(&mut self, pid: DetPid) -> bool {
@@ -2196,6 +2240,12 @@ async fn sched_loop_inner(
         // `step2_drain_prefix`.
         let vfork_refusal = sched.lock().unwrap().vfork_barrier_refusal.take();
         if let Some(refusal) = vfork_refusal {
+            exit_on_scheduler_refusal(&refusal);
+        }
+        // A SIGKILL whose victims' deaths or exit publications never arrived
+        // (`Scheduler::SIGKILL_FENCE_VALVE`).
+        let sigkill_refusal = sched.lock().unwrap().sigkill_fence_refusal.take();
+        if let Some(refusal) = sigkill_refusal {
             exit_on_scheduler_refusal(&refusal);
         }
 
@@ -3026,6 +3076,9 @@ impl Scheduler {
             signaled_background_refusal: None,
             vfork_barrier_wait_since: None,
             vfork_barrier_refusal: None,
+            sigkill_fence_wait_since: None,
+            sigkill_fence_refusal: None,
+            sigkill_fence_valve: Self::SIGKILL_FENCE_VALVE,
             rejoin_writer: match &cfg.replay_data {
                 Some(dir) if cfg.recordreplay_modes && !cfg.replaying => {
                     Some(RejoinWriter::create(dir).unwrap_or_else(|err| {
@@ -3056,8 +3109,12 @@ impl Scheduler {
             sigalrm: Default::default(),
             #[cfg(test)]
             determinism_losses: Vec::new(),
+            #[cfg(test)]
+            reparentings: Vec::new(),
             logically_killed_threads: Default::default(),
             exec_incarnations: Default::default(),
+            thread_mms: Default::default(),
+            sigkill: Default::default(),
             retired_transferred_exec_callers: Default::default(),
             exec_teardowns: Default::default(),
             deregistration_accounted: Default::default(),
@@ -3222,6 +3279,7 @@ impl Scheduler {
     /// A thread is being registered on `dettid`: any committed exit recorded
     /// for an earlier thread with that tid no longer applies.
     pub(crate) fn forget_committed_exit(&mut self, dettid: DetTid) {
+        self.forget_sigkill_receipt(dettid);
         self.committed_exits.remove(&dettid);
     }
 
@@ -3920,6 +3978,8 @@ impl Scheduler {
                 continue;
             };
             self.thread_tree.reparent_child(child, reaper, owner);
+            #[cfg(test)]
+            self.reparentings.push((child, reaper));
             info!(
                 "[scheduler] re-parenting orphan {} of exited process {} to subreaper {}",
                 child, exited, reaper
@@ -3935,6 +3995,50 @@ impl Scheduler {
                 self.wake_child_waiters(reaper, child);
             }
         }
+    }
+
+    /// Step2's drain prefix, for a test outside this module.
+    #[cfg(test)]
+    pub(crate) fn step2_drain_prefix_for_test(&mut self) {
+        let _ = self.step2_drain_prefix();
+    }
+
+    /// The fuzz arm's next draw, for a test outside this module.
+    #[cfg(test)]
+    pub(crate) fn next_fuzz_draw_for_test(&mut self) -> u64 {
+        rand::RngExt::random(&mut self.fuzz_prng)
+    }
+
+    /// The threads waiting on `futex`, in order, for a test outside this module.
+    #[cfg(test)]
+    pub(crate) fn futex_waiters_for_test(&self, futex: FutexID) -> Vec<DetTid> {
+        self.blocked
+            .futex_waiters
+            .get(&futex)
+            .map(|waiters| waiters.iter().map(|w| w.dettid).collect())
+            .unwrap_or_default()
+    }
+
+    /// A thread's accounted timeslice statistics, for a test outside this
+    /// module.
+    #[cfg(test)]
+    pub(crate) fn timeslice_stats_for_test(&self, dettid: DetTid) -> Option<TimesliceStats> {
+        self.per_thread_timeslice.get(&dettid).cloned()
+    }
+
+    /// The run queue, in order, for a test outside this module.
+    #[cfg(test)]
+    pub(crate) fn run_queue_for_test(&self) -> Vec<DetTid> {
+        self.run_queue.tids().copied().collect()
+    }
+
+    /// The SIGKILL fence refusal recorded for the run, for a test outside
+    /// this module.
+    #[cfg(test)]
+    pub(crate) fn sigkill_fence_refusal_for_test(
+        &self,
+    ) -> Option<&sigkill_retirement::SigkillFenceRefusal> {
+        self.sigkill_fence_refusal.as_ref()
     }
 
     /// Record a determinism loss for the run (`detlog::write_loss_notice`).
@@ -3966,7 +4070,11 @@ impl Scheduler {
             if self.thread_tree.pid_ns_depth(candidate) != depth {
                 return None;
             }
-            if self.thread_tree.is_child_subreaper(candidate) {
+            // A process killed by the SIGKILL being committed is dying, like a
+            // subreaper with no live thread: the search passes it by.
+            if self.thread_tree.is_child_subreaper(candidate)
+                && !self.is_dying_sigkill_victim(candidate)
+            {
                 let mut live: Vec<DetTid> = self
                     .thread_tree
                     .my_thread_group(&candidate)
@@ -4035,6 +4143,7 @@ impl Scheduler {
         assert!(group.contains(&caller));
         assert!(group.contains(&new_leader));
         self.exec_incarnations.insert(new_leader, post_exec_mm);
+        self.thread_mms.insert(new_leader, post_exec_mm);
         // Reloading backends enter thread-start before handle_post_exec. Cancel
         // old POSIX deadlines before admitting the replacement's first turn.
         self.blocked.timed_waiters.remove_posix_timers(detpid);
@@ -4323,6 +4432,17 @@ impl Scheduler {
             && !self.blocked.signaled_background.contains(&dettid)
     }
 
+    /// Record the address-space identity `dettid` registered with
+    /// (`thread_mms`).
+    pub(crate) fn record_thread_mm(&mut self, dettid: DetTid, mm: MmId) {
+        self.thread_mms.insert(dettid, mm);
+    }
+
+    /// The address-space identity recorded for `dettid` (`thread_mms`).
+    pub(crate) fn thread_mm(&self, dettid: DetTid) -> Option<MmId> {
+        self.thread_mms.get(&dettid).copied()
+    }
+
     pub(crate) fn rpc_incarnation_matches(&self, dettid: DetTid, mm: MmId) -> bool {
         !self.retired_transferred_exec_callers.contains(&dettid)
             && self
@@ -4455,6 +4575,7 @@ impl Scheduler {
     /// released.
     pub(crate) fn complete_child_exit_publication(&mut self, detpid: DetPid) -> bool {
         let released = self.child_exit_publications_pending.remove(&detpid);
+        self.note_sigkill_publication(detpid);
         if !released {
             // No hold yet: the process was consumed before its Exit request
             // was granted (or has none). Remember it, so a stale grant does
@@ -5064,6 +5185,27 @@ impl Scheduler {
         if self.terminal_deadlock.is_some() {
             return Err(SkipTurn);
         }
+        if self.sigkill_fence_holds() {
+            // A SIGKILLed process was retired at the kill turn: select no
+            // turn until its physical exit is accounted and published to its
+            // parent; host timing decides only how long this lasts
+            // (`sigkill_retirement`). Nothing is drained meanwhile either, so
+            // no admission enters the run queue in an order that depends on
+            // which victim's cleanup came first. Past the valve the run is
+            // refused instead of hanging.
+            let since = *self
+                .sigkill_fence_wait_since
+                .get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() >= self.sigkill_fence_valve {
+                self.refuse_unsettled_sigkill(since.elapsed());
+            }
+            std::thread::yield_now();
+            return Err(SkipTurn);
+        }
+        self.sigkill_fence_wait_since = None;
+        // The victims' owner-death wakes, held back until their cohort was
+        // complete, run before the drains below, in a fixed order.
+        self.run_retained_sigkill_wakes();
         // Apply run-queue mutations deferred by asynchronous global-request
         // handlers first, at this fixed deterministic point, before any early
         // return below and before step3 opens a tentative-pop window. Removals
@@ -5233,6 +5375,12 @@ impl Scheduler {
     /// `step2a_wait_for_vfork_barrier`). The same bound as the release
     /// barrier's.
     const VFORK_BARRIER_VALVE: Duration = Duration::from_secs(30);
+
+    /// How long, in host time, the SIGKILL fence and a sender's `kill` wait
+    /// for the victims' deaths and exit publications before the run is
+    /// refused. Like `VFORK_BARRIER_VALVE`, it bounds the wait without ever
+    /// deciding a turn: host timing decides only how long a pause lasts.
+    pub(crate) const SIGKILL_FENCE_VALVE: Duration = Duration::from_secs(30);
 
     /// Requeue, at a fixed point, the background-pool threads that a committed
     /// signal armed (`BlockedPool::signaled_background`, set by
@@ -5924,6 +6072,13 @@ impl Scheduler {
             .keys()
             .copied()
             .any(|child| self.child_matches_wait(parent, child, spec))
+    }
+
+    /// Whether `process` exited and no wait has consumed it yet: a zombie.
+    /// Linux still signals a zombie successfully, discarding the signal.
+    #[cfg(test)]
+    pub fn process_is_unreaped_zombie(&self, process: DetPid) -> bool {
+        self.logically_exited_processes.contains(&process)
     }
 
     pub fn consume_child_wait(&mut self, parent: DetPid, child: DetPid) -> bool {
@@ -9917,6 +10072,10 @@ mod test {
     /// request, without enqueuing it. Mirrors the state a global-request handler
     /// leaves behind for a freshly created child.
     #[cfg(test)]
+    pub(crate) fn register_known_thread_for(sched: &mut Scheduler, tid: DetTid) {
+        register_known_thread(sched, tid);
+    }
+
     fn register_known_thread(sched: &mut Scheduler, tid: DetTid) {
         sched.priorities.insert(tid, DEFAULT_PRIORITY);
         sched.next_turns.insert(
@@ -10082,6 +10241,52 @@ mod test {
             "{:?}",
             scheduler.determinism_losses
         );
+    }
+
+    /// One SIGKILL kills a subreaper (5) and, in the same send, its child (3),
+    /// whose own child (7) survives; the surviving subreaper root (1) sends.
+    /// The victims retire in tid order, so 3 goes first while 5 is still
+    /// registered. Its orphan must pass over the dying 5 to the root, and the
+    /// adoption happens at the committed send, so it is no determinism loss
+    /// (https://github.com/rrnewton/hermit/issues/3994).
+    #[test]
+    fn a_sigkill_cohort_subreaper_adopts_none_of_its_fellow_victims_orphans() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let [root, subreaper, middle, orphan] = [1, 5, 3, 7].map(DetPid::from_raw);
+        scheduler.thread_tree.add_child(root, root, true);
+        scheduler.thread_tree.add_child(root, subreaper, true);
+        scheduler.thread_tree.add_child(subreaper, middle, true);
+        scheduler.thread_tree.add_child(middle, orphan, true);
+        for pid in [root, subreaper, middle, orphan] {
+            register_known_thread(&mut scheduler, pid);
+            scheduler.record_thread_mm(pid, MmId::initial(pid));
+        }
+        scheduler.thread_tree.set_child_subreaper(root, true);
+        scheduler.thread_tree.set_child_subreaper(subreaper, true);
+        let group = DetPid::from_raw(77);
+        assert!(scheduler.thread_tree.set_process_group(subreaper, group));
+        assert!(scheduler.thread_tree.set_process_group(middle, group));
+
+        let reserved = scheduler.reserve_sigkill_group(root, group, 0).unwrap();
+        let victims = scheduler.commit_sigkill(reserved.token, true);
+
+        assert_eq!(
+            victims.iter().map(|v| v.tid.as_raw()).collect::<Vec<_>>(),
+            [3, 5]
+        );
+        // 7 goes straight to the root: the dying 5 never adopts it. Then 5's
+        // own exit gives the dead 3 to the root.
+        assert_eq!(scheduler.reparentings, [(orphan, root), (middle, root)]);
+        assert_eq!(
+            scheduler.thread_tree.process_wait[&orphan].wait_parent,
+            Some(root)
+        );
+        assert!(
+            scheduler.determinism_losses.is_empty(),
+            "{:?}",
+            scheduler.determinism_losses
+        );
+        assert!(!scheduler.is_dying_sigkill_victim(subreaper));
     }
 
     /// A subreaper outside a PID namespace never adopts from inside it: the
@@ -18176,6 +18381,93 @@ mod test {
         assert!(!scheduler.complete_child_exit_publication(child));
         scheduler.logically_kill_thread(&child, &child, MmId::initial(child));
         assert!(scheduler.child_exit_publications_completed.is_empty());
+    }
+
+    /// The victim of a committed SIGKILL has a parent that catches SIGCHLD, so
+    /// the kernel will send the parent its own copy. The commit installs the
+    /// publication hold and arms the scheduler's CLD_KILLED copy, and the
+    /// sender's `kill` is not settled once the victim's exit is accounted, only
+    /// once the kernel's publication is reported too
+    /// (https://github.com/rrnewton/hermit/issues/3994).
+    #[test]
+    fn a_delivered_sigkill_notification_waits_for_the_kernels_publication() {
+        let (mut scheduler, parent, child) = child_exit_fixture(
+            true,
+            libc::SIGCHLD,
+            Some("read"),
+            Some((false, true, false)),
+        );
+        scheduler.record_thread_mm(child, MmId::initial(child));
+        let token = scheduler
+            .reserve_sigkill(parent, child, 1000)
+            .unwrap()
+            .token;
+        let victims = scheduler.commit_sigkill(token, true);
+        assert!(
+            scheduler.child_exit_publications_pending.contains(&child),
+            "no publication hold"
+        );
+        assert!(
+            child_exit_timer_armed(&scheduler, child),
+            "no CLD_KILLED copy"
+        );
+
+        assert_eq!(
+            scheduler.route_sigkill_receipt(child),
+            sigkill_retirement::SigkillReceipt::Committed
+        );
+        assert!(
+            !scheduler.sigkill_settled(&victims),
+            "settled before the kernel's publication"
+        );
+        assert!(scheduler.step2_drain_prefix().is_err());
+        assert!(scheduler.complete_child_exit_publication(child));
+        assert!(scheduler.sigkill_settled(&victims));
+        // When its timer fires, the scheduler's copy is sent and, delivered,
+        // carries the siginfo Linux gives the parent.
+        assert_eq!(
+            scheduler.child_exit_sigchld.timer(parent, child),
+            Some(child_exit_sigchld::TimerSend::Send)
+        );
+        let answer = scheduler.child_exit_sigchld_control(
+            parent,
+            child_exit_sigchld::ChildExitSigchldControl::TakeOwnCopy,
+        );
+        assert!(
+            matches!(
+                answer,
+                child_exit_sigchld::ChildExitSigchldAnswer::OwnCopy(
+                    child_exit_sigchld::OwnCopy::Deliver(info)
+                ) if info == child_exit_sigchld::ChildExitSiginfo {
+                    code: libc::CLD_KILLED,
+                    pid: child.as_raw(),
+                    uid: 1000,
+                    status: libc::SIGKILL,
+                }
+            ),
+            "{answer:?}"
+        );
+    }
+
+    #[test]
+    fn a_publication_reported_before_a_sigkill_commit_installs_no_hold() {
+        let (mut scheduler, parent, child) = child_exit_fixture(
+            true,
+            libc::SIGCHLD,
+            Some("read"),
+            Some((false, false, false)),
+        );
+        scheduler.record_thread_mm(child, MmId::initial(child));
+        let token = scheduler.reserve_sigkill(parent, child, 0).unwrap().token;
+        assert_eq!(
+            scheduler.route_sigkill_receipt(child),
+            sigkill_retirement::SigkillReceipt::Held
+        );
+        assert!(!scheduler.complete_child_exit_publication(child));
+        scheduler.commit_sigkill(token, true);
+        assert!(!scheduler.sigkill_fence_holds());
+        assert!(scheduler.child_exit_publications_pending.is_empty());
+        assert!(scheduler.step2_drain_prefix().is_ok());
     }
 
     /// Only an internal polling probe or a child wait is classified; a parent
