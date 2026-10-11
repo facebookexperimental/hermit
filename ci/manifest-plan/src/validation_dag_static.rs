@@ -1381,7 +1381,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And metadata::tests::record_version_rejects_streams_that_answered_a_gone_sigqueueinfo_before_its_siginfo
     // (https://github.com/rrnewton/hermit/issues/4124): 1045.
     // The two SIGKILL-retirement metadata/replay tests (https://github.com/rrnewton/hermit/issues/3994) retain all 1045: 1047.
-    ("test.hermit_unit", 1047),
+    // And metadata::tests::pre_epoll_pwait2_recordings_are_refused_by_the_version_gate
+    // (https://github.com/rrnewton/hermit/issues/4088): 1048.
+    ("test.hermit_unit", 1048),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2238,7 +2240,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4112): 179.
     // And record_masked_ppoll_whose_timeout_is_in_the_red_zone (Claude review of
     // https://github.com/rrnewton/hermit/pull/4127): 180.
-    ("test.record_replay", 180),
+    // record_epoll_pwait2_on_a_ready_pipe, record_epoll_pwait2_woken_by_a_writer_thread,
+    // record_epoll_pwait2_whose_mask_unblocks_a_pending_signal,
+    // record_epoll_pwait2_whose_mask_unblocks_a_pending_signal_on_a_tight_stack
+    // and ..._24_bytes_into_its_stack (epoll_pwait2 recorded,
+    // https://github.com/rrnewton/hermit/issues/4088): 185.
+    ("test.record_replay", 185),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -3128,7 +3135,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (Claude review of https://github.com/rrnewton/hermit/pull/4127): 1044.
     // And the gone-sigqueueinfo record-epoch test: 1045.
     // And the SIGKILL-retirement record-version and replay-refusal tests: 1047.
-    ("test.hermit_unit_on_host", 1047),
+    // And metadata::tests::pre_epoll_pwait2_recordings_are_refused_by_the_version_gate
+    // (https://github.com/rrnewton/hermit/issues/4088): 1048.
+    ("test.hermit_unit_on_host", 1048),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

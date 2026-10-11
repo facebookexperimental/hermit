@@ -325,7 +325,10 @@ impl RecordVersion {
 // are not recorded; replay recomputes them, so an older recording replayed
 // under the new rule could run a different schedule. The metadata also gains
 // `replay_refused`, which an older replayer would not check.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x136);
+// 0x136 -> 0x137: `epoll_pwait2` is recorded with the event `epoll_wait`
+// records, and replay serves it from the recording; it ran live before
+// (https://github.com/rrnewton/hermit/issues/4088).
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x137);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -350,7 +353,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x136);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x136;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x137;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -750,6 +753,15 @@ mod tests {
         // reproduce: 0x133 (the previous epoch) and 0x132.
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x133)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x132)));
+    }
+
+    #[test]
+    fn pre_epoll_pwait2_recordings_are_refused_by_the_version_gate() {
+        // A recording from before this epoch ran epoll_pwait2 live and holds
+        // no event for it: 0x136 (the previous epoch), 0x135 and 0x134.
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x136)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x135)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x134)));
     }
 
     #[test]

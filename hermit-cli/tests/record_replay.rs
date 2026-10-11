@@ -3022,6 +3022,41 @@ fn recording_refuses_a_masked_pselect_8_bytes_into_its_stack() {
     );
 }
 
+/// epoll_pwait2 on a ready pipe: it ran live in record and replay alike, so
+/// replay saw an empty pipe and diverged.
+#[test]
+fn record_epoll_pwait2_on_a_ready_pipe() {
+    record_select_mode("epoll-pwait2-ready");
+}
+
+/// A blocking epoll_pwait2 that a second thread's write ends: it kept its
+/// scheduler turn, so the writer never ran and the recording timed out.
+#[test]
+fn record_epoll_pwait2_woken_by_a_writer_thread() {
+    record_select_mode("epoll-pwait2-writer");
+}
+
+/// A masked epoll_pwait2 entered with a signal its mask unblocks already
+/// pending: EINTR after the handler runs, and replay delivers the signal.
+#[test]
+fn record_epoll_pwait2_whose_mask_unblocks_a_pending_signal() {
+    record_select_mode("epoll-pwait2-mask-raise");
+}
+
+/// The same 128 and 24 bytes into its page, with no stack scratch below the
+/// red zone: the private mask copy goes in the red zone, where staging it on
+/// the stack returned EFAULT (https://github.com/rrnewton/hermit/issues/4113's
+/// shape, for epoll_pwait2).
+#[test]
+fn record_epoll_pwait2_whose_mask_unblocks_a_pending_signal_on_a_tight_stack() {
+    record_select_mode("epoll-pwait2-mask-raise-tight");
+}
+
+#[test]
+fn record_epoll_pwait2_whose_mask_unblocks_a_pending_signal_24_bytes_into_its_stack() {
+    record_select_mode("epoll-pwait2-mask-raise-tight24");
+}
+
 /// Replayer substitutes an eventfd for this proc descriptor. The Detcore
 /// procfs layer must bind the live task incarnation named by an absolute or
 /// AT_FDCWD-relative path rather than the placeholder inode. Zero-length

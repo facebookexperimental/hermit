@@ -26,6 +26,7 @@ use reverie::syscalls::AddrMut;
 use reverie::syscalls::Displayable;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallArgs;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
 use reverie::syscalls::Timespec;
@@ -2298,6 +2299,24 @@ impl<T: RecordOrReplay> Detcore<T> {
             args.arg5,
         )
         .await?;
+        // Under record and replay, a call that may wait does so outside the
+        // scheduler turn, as epoll_pwait's does: unmasked through the logged
+        // background path, masked as a kernel wait under a private copy of its
+        // mask (`record_or_replay_masked_epoll_pwait2`). A NULL timeout waits
+        // forever; a zero timespec cannot wait and keeps the turn.
+        if self.cfg.recordreplay_modes {
+            let zero_timeout = args.arg3 != 0
+                && Addr::<Timespec>::from_raw(args.arg3)
+                    .and_then(|timeout| guest.memory().read_value(timeout).ok())
+                    .is_some_and(|timeout: Timespec| timeout.tv_sec == 0 && timeout.tv_nsec == 0);
+            if !zero_timeout {
+                return if args.arg4 != 0 {
+                    self.record_or_replay_masked_epoll_pwait2(guest, args).await
+                } else {
+                    self.record_or_replay_blocking(guest, call).await
+                };
+            }
+        }
         let dettid = guest.thread_state().dettid;
         resource_request(guest, Resources::new(dettid)).await; // empty request
         Ok(self.record_or_replay(guest, call).await?)
@@ -2327,6 +2346,76 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(());
         };
         observe_under_mask(guest, mask).await
+    }
+
+    /// `record_or_replay_masked_epoll_pwait` for `epoll_pwait2`, whose mask
+    /// pointer and size are its fifth and sixth arguments.
+    async fn record_or_replay_masked_epoll_pwait2<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        args: SyscallArgs,
+    ) -> Result<i64, Error> {
+        if args.arg5 != KERNEL_SIGSET_SIZE {
+            return Err(Errno::EINVAL.into());
+        }
+        let mask_address = Addr::<libc::sigset_t>::from_raw(args.arg4).ok_or(Errno::EFAULT)?;
+        let mask = read_kernel_sigset(guest, mask_address).await?;
+        // The copy may go in the red zone on a stack with no scratch below it,
+        // clear of the events buffer the kernel writes and of the timeout it
+        // reads, as for epoll_pwait (`stage_private_cells`).
+        let events_len = usize::try_from((args.arg2 as i32).max(0)).unwrap_or(0)
+            * std::mem::size_of::<libc::epoll_event>();
+        let live: Vec<std::ops::Range<usize>> = [
+            (args.arg1, events_len),
+            (args.arg3, std::mem::size_of::<Timespec>()),
+        ]
+        .into_iter()
+        .filter(|&(start, _)| start != 0)
+        .map(|(start, len)| start..start.saturating_add(len))
+        .collect();
+        let Some(staged) = stage_private_cells(guest, PrivateCells::Mask(mask), &live).await?
+        else {
+            return self.refuse_unstageable_epoll_pwait2_mask(guest, args).await;
+        };
+        let mut private = args;
+        private.arg4 = staged.mask();
+        let result = self
+            .record_or_replay_blocking_with_unknown_mask(
+                guest,
+                Syscall::Other(Sysno::epoll_pwait2, private),
+            )
+            .await;
+        staged.release(guest);
+        if self.cfg.replaying && matches!(result, Err(Error::Errno(Errno::EINTR))) {
+            end_replayed_pselect6_under_its_temporary_mask(guest, mask).await;
+        }
+        result
+    }
+
+    /// `refuse_unstageable_epoll_pwait_mask` for `epoll_pwait2`, whose red
+    /// zone the events buffer and the timeout fill.
+    async fn refuse_unstageable_epoll_pwait2_mask<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        args: SyscallArgs,
+    ) -> Result<i64, Error> {
+        use std::io::Write as _;
+        let message = "unsupported: epoll_pwait2 with a temporary signal mask, on a stack \
+            with no room below its red zone whose red zone the call's events buffer and \
+            timeout fill: Hermit has nowhere to put the private copy of the mask \
+            (https://github.com/rrnewton/hermit/issues/4088)";
+        tracing::error!("[tid {}] {message}", guest.tid());
+        if self.cfg.panic_on_unsupported_syscalls {
+            let _ = writeln!(crate::util::RetryingStderr, "{message}");
+            return self
+                .refuse_unserviceable_operation(guest, Sysno::epoll_pwait2, Errno::EFAULT)
+                .await;
+        }
+        self.record_or_replay_blocking_with_unknown_mask(
+            guest,
+            Syscall::Other(Sysno::epoll_pwait2, args),
+        )
+        .await
     }
 
     /// epoll_wait syscall (MAYHANG)

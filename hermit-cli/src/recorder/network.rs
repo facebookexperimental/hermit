@@ -549,6 +549,22 @@ impl Recorder {
         .await
     }
 
+    /// `epoll_pwait2` is `epoll_pwait` with a timespec timeout. The pinned
+    /// Reverie has no typed variant, so it arrives as `Syscall::Other`; it
+    /// records the event `epoll_wait` records.
+    pub(super) async fn handle_epoll_pwait2<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Errno> {
+        let Syscall::Other(_, args) = syscall else {
+            unreachable!("handle_epoll_pwait2 called for {syscall:?}");
+        };
+        let events = (args.arg1 != 0).then_some(args.arg1);
+        self.record_epoll_wait(guest, syscall, args.arg0 as libc::c_int, events)
+            .await
+    }
+
     /// Runs an `epoll_wait`-family `syscall` and records the events it wrote
     /// to `events`.
     async fn record_epoll_wait<G: Guest<Self>>(

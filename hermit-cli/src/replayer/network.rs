@@ -279,6 +279,21 @@ impl Replayer {
         .await
     }
 
+    /// `epoll_pwait2` replays the event `epoll_wait` records
+    /// (`Recorder::handle_epoll_pwait2`).
+    pub(super) async fn handle_epoll_pwait2<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Errno> {
+        let Syscall::Other(_, args) = syscall else {
+            unreachable!("handle_epoll_pwait2 called for {syscall:?}");
+        };
+        let events = (args.arg1 != 0).then_some(args.arg1);
+        self.replay_epoll_wait(guest, syscall, events, args.arg2 as libc::c_int)
+            .await
+    }
+
     /// Serves an `epoll_wait`-family `syscall` from the recording, writing the
     /// recorded events to `events`.
     async fn replay_epoll_wait<G: Guest<Self>>(

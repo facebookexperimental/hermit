@@ -680,6 +680,9 @@ impl Tool for Replayer {
             Syscall::Pselect6(syscall) => self.handle_pselect6(guest, syscall).await,
             Syscall::EpollWait(syscall) => self.handle_epoll_wait(guest, syscall).await,
             Syscall::EpollPwait(syscall) => self.handle_epoll_pwait(guest, syscall).await,
+            Syscall::Other(Sysno::epoll_pwait2, _) => {
+                self.handle_epoll_pwait2(guest, syscall).await
+            }
             Syscall::Getsockopt(syscall) => self.handle_sockopt_family(guest, syscall.into()).await,
             Syscall::Getpeername(syscall) => {
                 self.handle_sockopt_family(guest, syscall.into()).await
