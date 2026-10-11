@@ -2086,8 +2086,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         let (_, args) = call.into_parts();
         self.observe_under_temporary_mask(
             guest,
-            Addr::<libc::sigset_t>::from_raw(args.arg4 as usize),
-            args.arg5 as usize,
+            Addr::<libc::sigset_t>::from_raw(args.arg4),
+            args.arg5,
         )
         .await?;
         let dettid = guest.thread_state().dettid;
