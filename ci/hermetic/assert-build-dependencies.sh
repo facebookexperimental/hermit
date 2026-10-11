@@ -22,8 +22,10 @@ build_dependencies=(
     git
     ld
     make
+    objdump
     pkg-config
     ranlib
+    readelf
     rustc
     strip
     xxd
@@ -166,32 +168,35 @@ self_test() {
         echo "$output" >&2
         return 1
     }
-    [[ $output == *"18/18 executable build dependencies are present"* ]] || {
+    [[ $output == *"20/20 executable build dependencies are present"* ]] || {
         echo "assert-build-dependencies --self-test: success count was not reported" >&2
         echo "$output" >&2
         return 1
     }
 
-    rm "$fixture/xxd"
-    set +e
-    output=$(check_build_dependencies "$fixture" 2>&1)
-    rc=$?
-    set -e
-    [[ $rc -eq 2 ]] || {
-        echo "assert-build-dependencies --self-test: missing xxd returned $rc, expected 2" >&2
-        echo "$output" >&2
-        return 1
-    }
-    [[ $output == *"missing required build dependency: xxd"* ]] || {
-        echo "assert-build-dependencies --self-test: missing xxd was not named" >&2
-        echo "$output" >&2
-        return 1
-    }
-    [[ $output == *"1 of 18 executable build dependencies are missing"* ]] || {
-        echo "assert-build-dependencies --self-test: refusal count was not reported" >&2
-        echo "$output" >&2
-        return 1
-    }
+    for tool in xxd readelf objdump; do
+        rm "$fixture/$tool"
+        set +e
+        output=$(check_build_dependencies "$fixture" 2>&1)
+        rc=$?
+        set -e
+        [[ $rc -eq 2 ]] || {
+            echo "assert-build-dependencies --self-test: missing $tool returned $rc, expected 2" >&2
+            echo "$output" >&2
+            return 1
+        }
+        [[ $output == *"missing required build dependency: $tool"* ]] || {
+            echo "assert-build-dependencies --self-test: missing $tool was not named" >&2
+            echo "$output" >&2
+            return 1
+        }
+        [[ $output == *"1 of 20 executable build dependencies are missing"* ]] || {
+            echo "assert-build-dependencies --self-test: refusal count was not reported" >&2
+            echo "$output" >&2
+            return 1
+        }
+        ln -s "$stub" "$fixture/$tool"
+    done
 
     mkdir -p "$fixture/include/elfutils" "$fixture/include/openssl" "$fixture/lib"
     touch "$fixture/include/libunwind.h" \
@@ -249,7 +254,7 @@ self_test() {
         return 1
     }
 
-    echo "PASS: assert-build-dependencies accepts 18/18 executables and 5/5 native libraries, and names xxd, libunwind and xz when required files are absent"
+    echo "PASS: assert-build-dependencies accepts 20/20 executables and 5/5 native libraries, and names xxd, readelf, objdump, libunwind and xz when required files are absent"
 
     local guest_root=$fixture/guest-root manifest path
     manifest=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/guest-paths.txt

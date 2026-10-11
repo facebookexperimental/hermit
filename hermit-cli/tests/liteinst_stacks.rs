@@ -178,7 +178,7 @@ fn qualify(bundle: &m1_bundle::Bundle, standalone: bool) -> Result<(Leaf, Runtim
             format!(
                 "git+https://github.com/rrnewton/reverie.git?rev={pin}#reverie-liteinst-preload@0.4.1"
             ),
-            "reverie_liteinst_initialize",
+            artifact::STANDALONE_ROOT,
         )
     } else {
         let manifest = artifact::real_file(&root.join("detcore-liteinst/Cargo.toml"))?;

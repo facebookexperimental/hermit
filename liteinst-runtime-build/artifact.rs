@@ -1,7 +1,76 @@
+use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
 use serde_json::Value;
+
+/// Bind the host proof implementation to the same Cargo-resolved checkout as
+/// the preload. No populated Hermit gitlink or installed helper is consulted.
+pub(crate) fn constructor_qualifier_source(
+    metadata: &Value,
+    preload_manifest: &Path,
+    revision: &str,
+) -> Result<PathBuf, String> {
+    let packages = metadata["packages"]
+        .as_array()
+        .ok_or("Cargo metadata has no packages")?;
+    let helpers: Vec<_> = packages
+        .iter()
+        .filter(|package| package["name"] == "reverie-liteinst-artifact")
+        .collect();
+    if helpers.len() != 1 {
+        return Err("expected one resolved standalone constructor qualifier".into());
+    }
+    let helper = helpers[0];
+    let version = helper["version"]
+        .as_str()
+        .ok_or("constructor qualifier has no version")?;
+    if helper["source"]
+        != format!("git+https://github.com/rrnewton/reverie.git?rev={revision}#{revision}")
+        || helper["id"]
+            != format!(
+                "git+https://github.com/rrnewton/reverie.git?rev={revision}#reverie-liteinst-artifact@{version}"
+            )
+    {
+        return Err("constructor qualifier differs from the exact preload Git source".into());
+    }
+    let preload_manifest = fs::canonicalize(preload_manifest)
+        .map_err(|error| format!("canonicalize preload manifest: {error}"))?;
+    let checkout = preload_manifest
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("preload manifest has no checkout root")?;
+    if preload_manifest != checkout.join("reverie-liteinst-preload/Cargo.toml") {
+        return Err("preload manifest is outside its expected checkout location".into());
+    }
+    let helper_manifest = helper["manifest_path"]
+        .as_str()
+        .ok_or("constructor qualifier has no manifest")?;
+    let helper_manifest = fs::canonicalize(helper_manifest)
+        .map_err(|error| format!("canonicalize qualifier manifest: {error}"))?;
+    if helper_manifest != checkout.join("reverie-liteinst-artifact/Cargo.toml") {
+        return Err("constructor qualifier is not in the preload's canonical checkout".into());
+    }
+    let targets = helper["targets"]
+        .as_array()
+        .ok_or("constructor qualifier has no targets")?;
+    if targets.len() != 1
+        || targets[0]["name"] != "reverie_liteinst_artifact"
+        || targets[0]["kind"] != serde_json::json!(["lib"])
+        || targets[0]["crate_types"] != serde_json::json!(["lib"])
+    {
+        return Err("constructor qualifier is not the exact host-only library target".into());
+    }
+    let source = targets[0]["src_path"]
+        .as_str()
+        .ok_or("constructor qualifier library has no source")?;
+    let source = fs::canonicalize(source)
+        .map_err(|error| format!("canonicalize qualifier source: {error}"))?;
+    if source != checkout.join("scripts/m1_artifact.rs") || !source.is_file() {
+        return Err("constructor qualifier does not compile the shared proof source".into());
+    }
+    Ok(source)
+}
 
 pub(crate) fn liteinst_cdylib_from_cargo_messages(
     messages: &str,
@@ -73,6 +142,115 @@ mod tests {
 
     const PACKAGE: &str = "git+https://github.com/rrnewton/reverie.git?rev=0123456789012345678901234567890123456789#reverie-liteinst-preload@0.4.1";
     const MANIFEST: &str = "/git/reverie/reverie-liteinst-preload/Cargo.toml";
+
+    #[test]
+    fn refuses_unbound_constructor_qualifier_packages_and_targets() {
+        const REVISION: &str = "0123456789012345678901234567890123456789";
+        struct Checkout(PathBuf);
+        impl Drop for Checkout {
+            fn drop(&mut self) {
+                fs::remove_dir_all(&self.0).expect("remove owned qualifier control checkout");
+            }
+        }
+        let serial = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "hermit-constructor-qualifier-{}-{serial}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let owned = Checkout(root);
+        for relative in [
+            "reverie-liteinst-preload",
+            "reverie-liteinst-artifact",
+            "scripts",
+            "other-checkout/reverie-liteinst-artifact",
+            "other-checkout/scripts",
+        ] {
+            fs::create_dir_all(owned.0.join(relative)).unwrap();
+        }
+        for relative in [
+            "reverie-liteinst-preload/Cargo.toml",
+            "reverie-liteinst-artifact/Cargo.toml",
+            "scripts/m1_artifact.rs",
+            "scripts/unrelated.rs",
+            "other-checkout/reverie-liteinst-artifact/Cargo.toml",
+            "other-checkout/scripts/m1_artifact.rs",
+        ] {
+            fs::write(owned.0.join(relative), b"source identity control").unwrap();
+        }
+        let root = fs::canonicalize(&owned.0).unwrap();
+        let preload = root.join("reverie-liteinst-preload/Cargo.toml");
+        let source = root.join("scripts/m1_artifact.rs");
+        let helper = serde_json::json!({
+            "name": "reverie-liteinst-artifact", "version": "0.4.1",
+            "source": format!("git+https://github.com/rrnewton/reverie.git?rev={REVISION}#{REVISION}"),
+            "id": format!("git+https://github.com/rrnewton/reverie.git?rev={REVISION}#reverie-liteinst-artifact@0.4.1"),
+            "manifest_path": root.join("reverie-liteinst-artifact/Cargo.toml"),
+            "targets": [{"name": "reverie_liteinst_artifact", "kind": ["lib"],
+                "crate_types": ["lib"], "src_path": source}],
+        });
+        let bind = |packages| {
+            constructor_qualifier_source(
+                &serde_json::json!({"packages": packages}),
+                &preload,
+                REVISION,
+            )
+        };
+        assert_eq!(bind(vec![helper.clone()]).unwrap(), source);
+        let mut alias = helper.clone();
+        alias["targets"][0]["src_path"] =
+            serde_json::json!(root.join("scripts/../scripts/m1_artifact.rs"));
+        assert_eq!(bind(vec![alias]).unwrap(), source);
+        assert!(bind(Vec::<Value>::new()).is_err());
+        assert!(bind(vec![helper.clone(), helper.clone()]).is_err());
+        for (field, value) in [
+            ("source", serde_json::json!(null)),
+            (
+                "source",
+                serde_json::json!(format!(
+                    "git+https://github.com/other/reverie.git?rev={REVISION}#{REVISION}"
+                )),
+            ),
+            (
+                "source",
+                serde_json::json!(format!(
+                    "git+https://github.com/rrnewton/reverie.git?rev={REVISION}#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                )),
+            ),
+            ("id", serde_json::json!(PACKAGE)),
+            (
+                "manifest_path",
+                serde_json::json!(root.join("other-checkout/reverie-liteinst-artifact/Cargo.toml")),
+            ),
+        ] {
+            let mut wrong = helper.clone();
+            wrong[field] = value;
+            assert!(bind(vec![wrong]).is_err(), "accepted wrong {field}");
+        }
+        for (field, value) in [
+            ("name", serde_json::json!("lookalike")),
+            ("kind", serde_json::json!(["bin"])),
+            ("crate_types", serde_json::json!(["rlib"])),
+            (
+                "src_path",
+                serde_json::json!(root.join("scripts/unrelated.rs")),
+            ),
+            (
+                "src_path",
+                serde_json::json!(root.join("other-checkout/scripts/m1_artifact.rs")),
+            ),
+        ] {
+            let mut wrong = helper.clone();
+            wrong["targets"][0][field] = value;
+            assert!(bind(vec![wrong]).is_err(), "accepted wrong target {field}");
+        }
+        let mut duplicate = helper.clone();
+        duplicate["targets"] = serde_json::json!([helper["targets"][0], helper["targets"][0]]);
+        assert!(bind(vec![duplicate]).is_err());
+    }
 
     fn artifact() -> Value {
         serde_json::json!({

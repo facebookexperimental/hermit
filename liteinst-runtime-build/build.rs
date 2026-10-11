@@ -6,65 +6,26 @@ use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
-use goblin::elf::Elf;
-use goblin::elf::header;
-use goblin::elf::section_header;
-use goblin::elf::sym;
+use reverie_liteinst_artifact as qualifier;
 use serde_json::Value;
 
 mod artifact;
 
-fn has_preload_constructor(path: &Path) -> io::Result<bool> {
-    let bytes = fs::read(path)?;
-    let elf =
-        Elf::parse(&bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    if elf.header.e_type != header::ET_DYN || elf.header.e_machine != header::EM_X86_64 {
-        return Ok(false);
-    }
-    let Some((initializer_index, initializer)) =
-        elf.dynsyms.iter().enumerate().find(|(_, symbol)| {
-            elf.dynstrtab.get_at(symbol.st_name) == Some("reverie_liteinst_initialize")
-        })
-    else {
-        return Ok(false);
-    };
-    if initializer.st_value == 0
-        || initializer.st_shndx == section_header::SHN_UNDEF as usize
-        || initializer.st_type() != sym::STT_FUNC
-    {
-        return Ok(false);
-    }
-    let Some(init_array) = elf
-        .section_headers
-        .iter()
-        .find(|section| section.sh_type == section_header::SHT_INIT_ARRAY)
-    else {
-        return Ok(false);
-    };
-    let init_start = init_array.sh_addr;
-    let init_end = init_start.saturating_add(init_array.sh_size);
-    let relocated = elf
-        .dynrelas
-        .iter()
-        .chain(elf.dynrels.iter())
-        .any(|relocation| {
-            (init_start..init_end).contains(&relocation.r_offset)
-                && relocation.r_sym == initializer_index
-        });
-    let direct = usize::try_from(init_array.sh_offset)
-        .ok()
-        .and_then(|start| {
-            usize::try_from(init_array.sh_size)
-                .ok()
-                .and_then(|size| bytes.get(start..start.checked_add(size)?))
-        })
-        .unwrap_or_default()
-        .as_chunks::<8>()
-        .0
-        .iter()
-        .any(|entry| u64::from_le_bytes(*entry) == initializer.st_value);
-    Ok(relocated || direct)
+fn constructor_evidence_directory(out_dir: &Path) -> PathBuf {
+    let serial = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("host clock precedes Unix epoch")
+        .as_nanos();
+    let directory = out_dir.join(format!(
+        "constructor-qualification-{}-{serial}",
+        std::process::id()
+    ));
+    fs::create_dir(&directory).expect("failed to create fresh constructor evidence directory");
+    directory
 }
 
 fn copy_into_protected_stage(source: &Path, destination: &Path) -> io::Result<()> {
@@ -184,6 +145,17 @@ fn main() {
             .as_str()
             .expect("preload leaf has no manifest"),
     );
+    let qualifier_source =
+        artifact::constructor_qualifier_source(&metadata, &package_manifest, revision)
+            .unwrap_or_else(|error| panic!("unbound standalone constructor qualifier: {error}"));
+    let qualifier_source_identity = qualifier::FileIdentity::read(&qualifier_source)
+        .expect("failed to identify the Cargo-resolved constructor proof source");
+    assert_eq!(
+        qualifier_source_identity.sha256,
+        qualifier::qualifier_source_sha256(),
+        "compiled constructor qualifier differs from the resolved shared proof source"
+    );
+    println!("cargo:rerun-if-changed={}", qualifier_source.display());
     let mut command = Command::new(&cargo);
     command
         .args([
@@ -236,14 +208,54 @@ fn main() {
         candidate.starts_with(&nested_target),
         "current preload output is outside the isolated target root"
     );
-    assert!(
-        has_preload_constructor(&candidate).unwrap_or_else(|error| panic!(
-            "failed to validate current LiteInst artifact {}: {error}",
-            candidate.display()
-        )),
-        "current LiteInst artifact lacks the preload constructor: {}",
-        candidate.display()
+    // Both feature modes require the same complete constructor proof. The
+    // diagnostic producer separately retains its mandatory M1 route checks.
+    let evidence = constructor_evidence_directory(&out_dir);
+    qualifier::write_new(
+        &evidence.join("cargo-metadata.json"),
+        &metadata_output.stdout,
+    )
+    .expect("failed to retain constructor package metadata");
+    qualifier::write_new(&evidence.join("cargo-build.stdout"), messages.as_bytes())
+        .expect("failed to retain current runtime Cargo artifact evidence");
+    qualifier::write_new(&evidence.join("cargo-build.stderr"), &output.stderr)
+        .expect("failed to retain runtime Cargo diagnostics");
+    let mut runner = qualifier::Runner::new(
+        evidence.join("logs"),
+        Duration::from_secs(60),
+        64 * 1024 * 1024,
+    )
+    .expect("failed to create bounded constructor proof runner");
+    let qualification = qualifier::qualify_constructor(&candidate, &mut runner)
+        .unwrap_or_else(|error| panic!("current LiteInst constructor is unqualified: {error}"));
+    assert_eq!(
+        qualification.artifact.path,
+        fs::canonicalize(&candidate).expect("failed to canonicalize current runtime artifact"),
+        "constructor proof identifies a different runtime artifact"
     );
+    qualifier::write_new(
+        &evidence.join("qualification.json"),
+        &serde_json::to_vec_pretty(&serde_json::json!({
+            "reverie_revision": revision,
+            "preload_package_id": package_id,
+            "qualifier_source": qualifier_source_identity,
+            "compiled_qualifier_source_sha256": qualifier::qualifier_source_sha256(),
+            "profile": profile,
+            "allocator_fixture": allocator_fixture,
+            "qualification": qualification,
+            "commands": runner.commands,
+            "executed_tests": 0,
+        }))
+        .expect("failed to serialize actual constructor qualification"),
+    )
+    .expect("failed to retain actual constructor qualification");
+    qualifier_source_identity
+        .verify()
+        .expect("constructor proof source changed during qualification");
+    qualification
+        .artifact
+        .verify()
+        .expect("qualified current artifact changed before staging");
     copy_into_protected_stage(&candidate, &destination).unwrap_or_else(|error| {
         panic!(
             "failed to stage {} as {}: {error}",
@@ -260,4 +272,19 @@ fn main() {
         "LiteInst runtime stage is missing or not a real file: {}",
         destination.display()
     );
+    let staged = qualifier::FileIdentity::read(&destination)
+        .expect("failed to identify the protected staged runtime");
+    assert_eq!(
+        staged.sha256, qualification.artifact.sha256,
+        "protected staged bytes differ from the qualified current artifact"
+    );
+    qualification
+        .artifact
+        .verify()
+        .expect("qualified current artifact changed during staging");
+    qualifier::write_new(
+        &evidence.join("staged.json"),
+        &serde_json::to_vec_pretty(&staged).expect("failed to serialize staged runtime identity"),
+    )
+    .expect("failed to retain protected staged runtime identity");
 }

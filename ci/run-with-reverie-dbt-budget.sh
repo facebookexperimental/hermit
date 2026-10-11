@@ -1356,7 +1356,17 @@ fi
 # CMAKE_GENERATOR and normalized SOURCE_DATE_EPOCH for the existing calibration.
 # Two regression fixtures raise the tracked DBT inventory from 939 to 941.
 # Keep the existing job clamp and timing budgets; this is not a new timing sample.
-expected_pin=6f7c2617e933cc4a9107e4a5d67aec1f146b5528
+# STANDALONE CONSTRUCTOR CARRY TO 20b4d1f81d5b5a78cc6bfe02c20db1038b916a6d (2026-10-10):
+# The published standalone constructor follows 6f7c2617. The DBT subtree,
+# build.rs, vendor/dynamorio, native/CMakeLists.txt, DBT Cargo.toml, third-party
+# and rust-toolchain.toml remain Git-object identical. Root Cargo.toml adds
+# the host qualification member; it is not a source_recipe_key input.
+# With unchanged CMAKE, CMAKE_GENERATOR and normalized SOURCE_DATE_EPOCH,
+# retain SDK key c941bff007f8dd7737312cc1c59824ca796cad1d4688a27f872a558c07fe7cae,
+# inventory 941, the 16-job clamp, 1050-job-second wrapper and 572-job-second
+# fallback. This carries the SDK budget, not a timing sample, runtime
+# identity or earlier validation evidence.
+expected_pin=20b4d1f81d5b5a78cc6bfe02c20db1038b916a6d
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

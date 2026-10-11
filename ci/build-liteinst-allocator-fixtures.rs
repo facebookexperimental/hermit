@@ -119,7 +119,7 @@ fn build_leaf(
         (
             "reverie-liteinst-preload",
             "reverie_liteinst_preload",
-            "reverie_liteinst_initialize",
+            m1_artifact::STANDALONE_ROOT,
             "libreverie_liteinst.so",
         )
     } else {
