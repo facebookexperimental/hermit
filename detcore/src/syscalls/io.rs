@@ -691,12 +691,12 @@ fn sanitize_ppoll_signal_mask(mask: u64) -> u64 {
     mask & !(1_u64 << signal_bit)
 }
 
-fn ppoll_uses_kernel_wait(
-    sequentialize_threads: bool,
-    recordreplay_modes: bool,
-    has_signal_mask: bool,
-) -> bool {
-    !sequentialize_threads || (recordreplay_modes && !has_signal_mask)
+/// Whether the kernel owns a ppoll's blocking wait: when threads are not
+/// sequentialized, and for every record/replay call, masked or not, as for a
+/// masked pselect6 (https://github.com/rrnewton/hermit/issues/4042). A masked
+/// sequentialized run-mode wait still takes the probe path.
+fn ppoll_uses_kernel_wait(sequentialize_threads: bool, recordreplay_modes: bool) -> bool {
+    !sequentialize_threads || recordreplay_modes
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
@@ -1563,17 +1563,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else if ppoll_uses_kernel_wait(
             self.cfg.sequentialize_threads,
             self.cfg.recordreplay_modes,
-            call.sigmask().is_some(),
         ) {
-            // The kernel owns the blocking wait when threads are not sequentialized and for
-            // unmasked record/replay calls. A masked sequentialized wait must use the probe
-            // below so a call that would block keeps the strict fail-closed behavior.
-            // Use scratch memory only for the signal mask so raw ppoll can still update the
-            // guest timeout.
+            // The kernel owns the blocking wait (`ppoll_uses_kernel_wait`). Use
+            // scratch memory only for the signal mask so raw ppoll can still
+            // update the guest timeout.
             let mut signal_mask_guard = None;
             // The mask the real call sleeps under, recorded for the scheduler's
             // SIGCHLD target choice (`Resources::blocked_signal_mask`).
             let mut blocked_signal_mask = None;
+            // The mask read at entry, for replay to deliver under.
+            let mut temporary_mask = None;
             let call = if let Some(signal_mask) = call.sigmask() {
                 if call.sigsetsize() != KERNEL_SIGSET_SIZE {
                     return Err(Errno::EINVAL.into());
@@ -1581,6 +1580,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let signal_mask = read_kernel_sigset(guest, signal_mask).await?;
                 let signal_mask = sanitize_ppoll_signal_mask(signal_mask);
                 blocked_signal_mask = Some(kernel_installed_signal_mask(signal_mask));
+                temporary_mask = Some(signal_mask);
                 let mut stack = guest.stack().await;
                 let signal_mask = stack.push(signal_mask).cast();
                 signal_mask_guard = Some(stack.commit()?);
@@ -1588,14 +1588,33 @@ impl<T: RecordOrReplay> Detcore<T> {
             } else {
                 call
             };
-            let result = Ok(self
-                .record_or_replay_blocking_with_mask(
-                    guest,
-                    Syscall::Ppoll(call),
-                    blocked_signal_mask,
-                )
-                .await?);
+            // A masked record/replay wait sleeps under a temporary mask the
+            // scheduler records as unknown, as a masked pselect6's does
+            // (`Resources::blocked_signal_mask_unknown`); this turn cannot
+            // vouch for when the kernel installs it. The result has no `?`: an
+            // interruption must reach the replay delivery below.
+            let result: Result<i64, Error> =
+                if self.cfg.recordreplay_modes && temporary_mask.is_some() {
+                    self.record_or_replay_blocking_with_unknown_mask(guest, Syscall::Ppoll(call))
+                        .await
+                } else {
+                    self.record_or_replay_blocking_with_mask(
+                        guest,
+                        Syscall::Ppoll(call),
+                        blocked_signal_mask,
+                    )
+                    .await
+                };
             drop(signal_mask_guard);
+            // Replay serves the call from the recording, so the kernel never
+            // installs its mask; deliver a recorded interruption under it
+            // (https://github.com/rrnewton/hermit/issues/3992).
+            if self.cfg.replaying
+                && let Some(mask) = temporary_mask
+                && matches!(result, Err(Error::Errno(Errno::ERESTARTNOHAND)))
+            {
+                end_replayed_pselect6_under_its_temporary_mask(guest, mask).await;
+            }
             result
         } else {
             self.handle_internal_ppoll(guest, call, timeout).await
@@ -2707,11 +2726,14 @@ mod tests {
     }
 
     #[test]
-    fn ppoll_record_replay_masked_waits_keep_fail_closed_probe() {
-        assert!(!ppoll_uses_kernel_wait(true, true, true));
-        assert!(ppoll_uses_kernel_wait(true, true, false));
-        assert!(!ppoll_uses_kernel_wait(true, false, true));
-        assert!(ppoll_uses_kernel_wait(false, true, true));
+    fn ppoll_record_replay_waits_are_kernel_waits_and_run_mode_masked_waits_probe() {
+        // Record/replay: the kernel owns the wait (issue 4042).
+        assert!(ppoll_uses_kernel_wait(true, true));
+        // A sequentialized run keeps the probe path.
+        assert!(!ppoll_uses_kernel_wait(true, false));
+        // Without sequentialization the kernel always owns it.
+        assert!(ppoll_uses_kernel_wait(false, false));
+        assert!(ppoll_uses_kernel_wait(false, true));
     }
 
     #[test]

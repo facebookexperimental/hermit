@@ -2793,6 +2793,23 @@ fn record_zero_timeout_ppoll_whose_mask_unblocks_a_pending_signal() {
     record_select_mode("ppoll-mask-zero-raise");
 }
 
+/// A masked ppoll that would block: its temporary mask blocks the timer's
+/// SIGALRM, and a writer's byte ends it with 1. Under sequentialization the
+/// call recorded ENOSYS; record/replay now lets the kernel own the wait
+/// (https://github.com/rrnewton/hermit/issues/4042).
+#[test]
+fn record_ppoll_whose_mask_blocks_the_scheduler_timer_signal() {
+    record_select_mode("ppoll-mask-blocks-alarm");
+}
+
+/// The same wait with an empty temporary mask, which lets the SIGALRM end it
+/// with EINTR after its handler runs; replay delivers the signal under that
+/// mask (https://github.com/rrnewton/hermit/issues/4042).
+#[test]
+fn record_ppoll_whose_mask_unblocks_the_scheduler_timer_signal() {
+    record_select_mode("ppoll-mask-unblocks-alarm");
+}
+
 /// Replayer substitutes an eventfd for this proc descriptor. The Detcore
 /// procfs layer must bind the live task incarnation named by an absolute or
 /// AT_FDCWD-relative path rather than the placeholder inode. Zero-length

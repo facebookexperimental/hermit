@@ -88,6 +88,17 @@
  *                after the handler runs. Replay serves the call from the
  *                recording and must deliver the signal under that mask
  *                (https://github.com/rrnewton/hermit/issues/4054)
+ *   ppoll-mask-blocks-alarm
+ *                the blocks-alarm wait as glibc ppoll() with no timeout and a
+ *                temporary mask that blocks SIGALRM: the writer's byte at
+ *                300 ms returns 1 and the handler runs after the call
+ *   ppoll-mask-unblocks-alarm
+ *                the unblocks-alarm wait as glibc ppoll() with a 30 s bound
+ *                and an empty temporary mask: the 100 ms SIGALRM ends it with
+ *                EINTR after its handler runs. Under sequentialization a
+ *                masked ppoll that would block recorded ENOSYS; record/replay
+ *                now lets the kernel own the wait
+ *                (https://github.com/rrnewton/hermit/issues/4042)
  *
  * The first three modes each run four shapes: a ready pipe with a 5 s timeout,
  * the same with a zero timeout, the same with nfds == FD_SETSIZE (larger than
@@ -1019,6 +1030,69 @@ static int pselect_mask_unblocks_tight_stack(void) {
   return 0;
 }
 
+/* A masked ppoll that waits for the timer's SIGALRM. With `blocks`, the
+ * temporary mask blocks SIGALRM and a writer fills the pipe at 300 ms; without
+ * it, the thread blocks SIGALRM itself and the empty temporary mask lets the
+ * 100 ms SIGALRM end the call. */
+static int ppoll_mask_alarm(int blocks) {
+  struct sigaction action;
+  memset(&action, 0, sizeof action);
+  action.sa_handler = count_masked_alarm;
+  sigset_t alarm_set, during;
+  sigemptyset(&alarm_set);
+  sigaddset(&alarm_set, SIGALRM);
+  if (blocks) {
+    during = alarm_set;
+  } else {
+    sigemptyset(&during);
+  }
+  if (sigaction(SIGALRM, &action, NULL) != 0 || pipe(alarm_pipe_fds) != 0 ||
+      pthread_sigmask(SIG_BLOCK, &alarm_set, NULL) != 0) {
+    perror("setup");
+    return 1;
+  }
+  pthread_t writer;
+  if (blocks) {
+    if (pthread_create(&writer, NULL, fill_alarm_pipe_later, NULL) != 0 ||
+        pthread_sigmask(SIG_UNBLOCK, &alarm_set, NULL) != 0) {
+      perror("writer");
+      return 1;
+    }
+  }
+  struct itimerval alarm_in = {{0, 0}, {0, 100000}};
+  if (setitimer(ITIMER_REAL, &alarm_in, NULL) != 0) {
+    perror("setitimer");
+    return 1;
+  }
+  struct pollfd watched = {alarm_pipe_fds[0], POLLIN, 0};
+  struct timespec bound = {30, 0};
+  errno = 0;
+  int result = ppoll(&watched, 1, blocks ? NULL : &bound, &during);
+  int result_errno = errno;
+  int read_ready = result > 0 && (watched.revents & POLLIN);
+  if (blocks && pthread_join(writer, NULL) != 0) {
+    perror("pthread_join");
+    return 1;
+  }
+  int alarms = (int)masked_alarms;
+  close(alarm_pipe_fds[0]);
+  close(alarm_pipe_fds[1]);
+  printf(
+      "%-24s result=%011d errno=%011d read_ready=%01d alarms=%01d\n",
+      blocks ? "ppoll-mask-blocks" : "ppoll-mask-unblocks",
+      result,
+      result < 0 ? result_errno : 0,
+      read_ready,
+      alarms);
+  int expected = blocks ? result == 1 && read_ready == 1 && alarms == 1
+                        : result == -1 && result_errno == EINTR && alarms == 1;
+  if (!expected) {
+    fprintf(stderr, "ppoll-mask-%s-alarm mismatch\n", blocks ? "blocks" : "unblocks");
+    return 1;
+  }
+  return 0;
+}
+
 static volatile sig_atomic_t raised_usr1;
 
 static void count_raised_usr1(int signo) {
@@ -1081,7 +1155,8 @@ int main(int argc, char** argv) {
         "pselect-mask-writeonly-wrapper|pselect-mask-sibling-rewrite|"
         "pselect-mask-unblocks-alarm|pselect-mask-unblocks-rewritten|"
         "pselect-mask-unblocks-tight-stack|pselect-mask-zero-raise|"
-        "ppoll-mask-zero-raise]\n",
+        "ppoll-mask-zero-raise|ppoll-mask-blocks-alarm|"
+        "ppoll-mask-unblocks-alarm]\n",
         argv[0]);
     return 2;
   }
@@ -1120,6 +1195,12 @@ int main(int argc, char** argv) {
   }
   if (strcmp(argv[1], "ppoll-mask-zero-raise") == 0) {
     return zero_timeout_mask_raise(1);
+  }
+  if (strcmp(argv[1], "ppoll-mask-blocks-alarm") == 0) {
+    return ppoll_mask_alarm(1);
+  }
+  if (strcmp(argv[1], "ppoll-mask-unblocks-alarm") == 0) {
+    return ppoll_mask_alarm(0);
   }
   if (strcmp(argv[1], "efault") == 0) {
     return efault();
