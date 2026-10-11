@@ -2812,6 +2812,16 @@ fn record_pselect_whose_mask_a_sibling_clears_before_the_grant() {
     record_select_mode("pselect-mask-hook-race");
 }
 
+/// Short pselect6 waits, masked and not, while a sibling spins on
+/// `sched_yield`. Under record the first wait finished in the background but
+/// was never readmitted, because the scheduler took the always-queued
+/// yielding sibling for runnable work it had to let go first, so the recording
+/// hung (https://github.com/rrnewton/hermit/issues/4092).
+#[test]
+fn record_pselect_beside_a_sibling_spinning_on_sched_yield() {
+    record_select_mode("pselect-beside-a-yielding-sibling");
+}
+
 /// The zero-timeout ppoll raise on a stack 160 bytes into its page, whose red
 /// zone the replayed delivery must leave as it found it (review of
 /// https://github.com/rrnewton/hermit/pull/4084).

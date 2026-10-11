@@ -148,6 +148,13 @@
  *                same sequence, which it did not when it read the buffer before
  *                the call's scheduler turn (review of
  *                https://github.com/rrnewton/hermit/pull/4084)
+ *   pselect-beside-a-yielding-sibling
+ *                ten raw pselect6 calls with a 1 ms timeout while a sibling
+ *                loops on sched_yield: the even ones have no mask and return 0,
+ *                the odd ones raise SIGUSR1, which the thread blocks, and wait
+ *                under an empty mask: EINTR with the handler run. Under record
+ *                the first finished call was never readmitted while the
+ *                sibling stayed queued (https://github.com/rrnewton/hermit/issues/4092)
  *   pselect-mask-hook-race
  *                a raw pselect6 with a 1 s timeout and a mask buffer holding
  *                SIGALRM, which the thread blocks, while a 100 ms ITIMER_REAL
@@ -1870,6 +1877,71 @@ static int epoll_pwait_mask_alarm(int blocks) {
   return 0;
 }
 
+static atomic_int yielding_sibling_done;
+
+static void* yield_until_done(void* arg) {
+  (void)arg;
+  while (!atomic_load(&yielding_sibling_done)) {
+    sched_yield();
+  }
+  return NULL;
+}
+
+static int pselect_beside_a_yielding_sibling(void) {
+  struct sigaction action;
+  memset(&action, 0, sizeof action);
+  action.sa_handler = count_raised_usr1;
+  sigset_t usr1;
+  sigemptyset(&usr1);
+  sigaddset(&usr1, SIGUSR1);
+  if (sigaction(SIGUSR1, &action, NULL) != 0 ||
+      pthread_sigmask(SIG_BLOCK, &usr1, NULL) != 0) {
+    perror("setup");
+    return 1;
+  }
+  raised_usr1 = 0;
+  pthread_t sibling;
+  if (pthread_create(&sibling, NULL, yield_until_done, NULL) != 0) {
+    perror("pthread_create");
+    return 1;
+  }
+  static uint64_t empty_mask;
+  static struct pselect_mask_wrapper wrapper = {
+      (const void*)&empty_mask, sizeof(uint64_t)};
+  int zeros = 0, interrupted = 0, other = 0;
+  for (int i = 0; i < 10; i++) {
+    struct timespec bound = {0, 1000000};
+    long raw;
+    if (i % 2 == 0) {
+      raw = syscall(SYS_pselect6, 0, NULL, NULL, NULL, &bound, NULL);
+    } else {
+      raise(SIGUSR1);
+      raw = syscall(SYS_pselect6, 0, NULL, NULL, NULL, &bound, &wrapper);
+    }
+    if (raw == 0) {
+      zeros++;
+    } else if (raw == -1 && errno == EINTR) {
+      interrupted++;
+    } else {
+      other++;
+    }
+  }
+  atomic_store(&yielding_sibling_done, 1);
+  pthread_join(sibling, NULL);
+  printf(
+      "%-24s zeros=%02d interrupted=%02d other=%02d handled=%02d\n",
+      "pselect-yielding-sibling",
+      zeros,
+      interrupted,
+      other,
+      (int)raised_usr1);
+  if (zeros != 5 || interrupted != 5 || other != 0 || raised_usr1 != 5) {
+    fprintf(stderr, "pselect-beside-a-yielding-sibling mismatch\n");
+    return 1;
+  }
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc != 2) {
     fprintf(
@@ -1887,7 +1959,8 @@ int main(int argc, char** argv) {
         "epoll-pwait-mask-raise|epoll-pwait-mask-sibling-race|"
         "epoll-pwait-mask-raise-tight|epoll-pwait-mask-raise-tight24|"
         "epoll-pwait-mask-redzone-events|epoll-pwait-mask-pipe-epfd|"
-        "pselect-mask-unblocks-tight-stack24]\n",
+        "pselect-mask-unblocks-tight-stack24|"
+        "pselect-beside-a-yielding-sibling]\n",
         argv[0]);
     return 2;
   }
@@ -1974,6 +2047,9 @@ int main(int argc, char** argv) {
   }
   if (strcmp(argv[1], "ppoll-mask-zero-raise-tight") == 0) {
     return ppoll_mask_zero_raise_tight();
+  }
+  if (strcmp(argv[1], "pselect-beside-a-yielding-sibling") == 0) {
+    return pselect_beside_a_yielding_sibling();
   }
   if (strcmp(argv[1], "pselect-mask-hook-race") == 0) {
     return pselect_mask_hook_race();

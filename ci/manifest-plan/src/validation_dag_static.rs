@@ -1914,7 +1914,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The chaos yield-epoch tests (scheduler::runqueue::tests, scheduler::test,
     // syscalls::threads::tests; https://github.com/rrnewton/hermit/issues/4068)
     // retain all 1360: 1384.
-    ("test.detcore_unit", 1384),
+    // And scheduler::runqueue::tests::threads_queued_by_a_yield_are_not_work_a_background_call_waits_behind
+    // (https://github.com/rrnewton/hermit/issues/4092): 1385.
+    ("test.detcore_unit", 1385),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2214,7 +2216,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // record_pselect_whose_mask_unblocks_the_timer_signal_24_bytes_into_its_stack
     // (epoll_pwait recorded, https://github.com/rrnewton/hermit/issues/4086, and
     // https://github.com/rrnewton/hermit/pull/4087's reviews): 171.
-    ("test.record_replay", 171),
+    // record_pselect_beside_a_sibling_spinning_on_sched_yield
+    // (https://github.com/rrnewton/hermit/issues/4092): 172.
+    ("test.record_replay", 172),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -2963,7 +2967,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the Hermit thread-group test: 1349.
     // And the eleven real-time expiration fate tests: 1360.
     // And the chaos yield-epoch tests: 1384.
-    ("test.detcore_unit_on_host", 1384),
+    // And the yielder harvest-gate unit test: 1385.
+    ("test.detcore_unit_on_host", 1385),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

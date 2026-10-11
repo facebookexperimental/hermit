@@ -332,6 +332,19 @@ impl RunQueue {
             .all(|(k, v)| v.counts_as_poller(k.priority))
     }
 
+    /// `only_pollers`, also counting the thread that has just yielded
+    /// (`push_yielded`) and is excluded from the next selection. A thread that
+    /// calls `sched_yield` asks for another thread to run first, so, like a
+    /// poller, it is not work that a finished background call must wait
+    /// behind. Counting it as such work starved the background call forever
+    /// whenever a sibling spun on `sched_yield`
+    /// (<https://github.com/rrnewton/hermit/issues/4092>). Read-only.
+    pub fn only_pollers_or_the_yielder(&self) -> bool {
+        self.queue
+            .iter()
+            .all(|(k, v)| v.counts_as_poller(k.priority) || self.yielded_skip == Some(v.tid))
+    }
+
     /// True while a `tentative_pop`/commit transaction is underway, i.e. the
     /// daemon has peeked a selection and may have released the scheduler lock
     /// across an await. Fatal backend publication uses this read-only query to
@@ -1488,6 +1501,29 @@ mod tests {
                 assert_eq!(take_turn(&mut queue), awaited, "{strategy:?} seed {seed}");
             }
         }
+    }
+
+    #[test]
+    fn the_thread_that_just_yielded_is_not_work_a_background_call_waits_behind() {
+        let yielding = DetTid::from_raw(1);
+        let peer = DetTid::from_raw(2);
+        let mut queue = RunQueue::default();
+
+        queue.push_back(yielding, DEFAULT_PRIORITY);
+        assert_eq!(queue.tentative_pop_next(), Some(yielding));
+        assert_eq!(queue.commit_tentative_pop_completed_turn(), yielding);
+        queue.push_yielded(yielding, DEFAULT_PRIORITY);
+        assert!(!queue.only_pollers());
+        assert!(queue.only_pollers_or_the_yielder());
+
+        // Ordinary work besides the yielder still counts.
+        queue.push_back(peer, DEFAULT_PRIORITY);
+        assert!(!queue.only_pollers_or_the_yielder());
+
+        // Once another thread has had its turn, the yield is spent.
+        assert_eq!(queue.tentative_pop_next(), Some(peer));
+        assert_eq!(queue.commit_tentative_pop_completed_turn(), peer);
+        assert!(!queue.only_pollers_or_the_yielder());
     }
 
     #[test]
