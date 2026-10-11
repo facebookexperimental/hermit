@@ -17,37 +17,51 @@ liteinst_stable_input=$2
 # A caller that already knows the pin it will compare the staged marker
 # against may supply it. The hermit-cli integration tests pass the pin embedded
 # in the Hermit binary under test (HERMIT_REVERIE_PIN), which is exactly the
-# value the loader will require of this marker. That also keeps staging working
-# in a source tree with no git metadata, such as the fbsource Buck import,
-# where the pin check below cannot list tracked files
-# (https://github.com/rrnewton/hermit/issues/3419). Pin uniformity is still
-# enforced by ci/run-reverie-pin-check.sh in the preflight node.
+# value the loader will require of this marker. Fixed runtime qualification
+# also checks the declared source contents and exact Cargo dependency identities,
+# including in copied sources without Git metadata
+# (https://github.com/rrnewton/hermit/issues/3419). Repository-wide pin uniformity
+# remains enforced by ci/run-reverie-pin-check.sh in the independent preflight.
 if [[ -n ${HERMIT_LITEINST_REVERIE_PIN:-} ]]; then
     if [[ ! $HERMIT_LITEINST_REVERIE_PIN =~ ^[0-9a-f]{40}$ ]]; then
         echo "HERMIT_LITEINST_REVERIE_PIN must be a 40-hex Reverie revision: $HERMIT_LITEINST_REVERIE_PIN" >&2
         exit 2
     fi
-    # The marker must name the revision the runtime is actually built from, so
-    # a supplied pin is only accepted when it is the one Reverie revision that
-    # liteinst-runtime-build's manifest and lockfile name. Read without git.
-    built_revisions=$(
+fi
+# Derive the marker from the actual nested build inputs, never the containing
+# worktree. Require both manifests and the lock to name the same full revision;
+# Cargo and the content qualifier independently check the resolved package graph.
+manifest_revisions=
+for manifest in "$root_dir/liteinst-runtime-build/Cargo.toml" \
+    "$root_dir/liteinst-runtime-build/runtime/Cargo.toml"; do
+    revisions=$(
         {
-            grep -h 'rrnewton/reverie' "$root_dir/liteinst-runtime-build/runtime/Cargo.toml" |
+            grep 'rrnewton/reverie' "$manifest" |
                 grep -oE 'rev = "[0-9a-f]{40}"' | grep -oE '[0-9a-f]{40}' || true
-            grep -h '^source = "git+https://github.com/rrnewton/reverie' \
-                "$root_dir/liteinst-runtime-build/Cargo.lock" |
-                grep -oE '#[0-9a-f]{40}' | grep -oE '[0-9a-f]{40}' || true
         } | sort -u
     )
-    if [[ $built_revisions != "$HERMIT_LITEINST_REVERIE_PIN" ]]; then
-        echo "HERMIT_LITEINST_REVERIE_PIN=$HERMIT_LITEINST_REVERIE_PIN, but liteinst-runtime-build builds Reverie at: ${built_revisions//$'\n'/ }" >&2
+    if [[ ! $revisions =~ ^[0-9a-f]{40}$ ||
+        ( -n $manifest_revisions && $revisions != "$manifest_revisions" ) ]]; then
+        echo "liteinst-runtime-build manifests must name one identical full Reverie revision" >&2
         exit 2
     fi
-    reverie_pin=$HERMIT_LITEINST_REVERIE_PIN
-else
-    reverie_pin=$(
-        "$root_dir/ci/run-reverie-pin-check.sh" --repo "$root_dir" --print-pin
-    )
+    manifest_revisions=$revisions
+done
+lock_revisions=$(
+    {
+        grep -h '^source = "git+https://github.com/rrnewton/reverie' \
+            "$root_dir/liteinst-runtime-build/Cargo.lock" |
+            grep -oE '[0-9a-f]{40}' || true
+    } | sort -u
+)
+if [[ ! $manifest_revisions =~ ^[0-9a-f]{40}$ || $lock_revisions != "$manifest_revisions" ]]; then
+    echo "liteinst-runtime-build manifests and lock must name one identical full Reverie revision" >&2
+    exit 2
+fi
+reverie_pin=$manifest_revisions
+if [[ -n ${HERMIT_LITEINST_REVERIE_PIN:-} && $reverie_pin != "$HERMIT_LITEINST_REVERIE_PIN" ]]; then
+    echo "HERMIT_LITEINST_REVERIE_PIN=$HERMIT_LITEINST_REVERIE_PIN, but liteinst-runtime-build builds Reverie at: $reverie_pin" >&2
+    exit 2
 fi
 liteinst_target_dir=$(realpath -m -- "$3-${reverie_pin:0:8}")
 liteinst_stage_dir=$(dirname -- "$liteinst_stable_input")

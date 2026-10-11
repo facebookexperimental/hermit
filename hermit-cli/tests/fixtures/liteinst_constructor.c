@@ -4,6 +4,19 @@
 #include "../../../reverie/reverie-liteinst/tests/fixtures/m2_stack_guest.c"
 #undef main
 
+/* A real executable export competes with the DSO's public constructor name.
+ * Protected local registration must reach the genuine constructor. This uses
+ * raw exit_group so an interposed entry cannot appear to pass the workload. */
+__attribute__((noreturn, noinline, used, visibility("default")))
+void detcore_liteinst_initialize(void) {
+    __asm__ volatile("mov $231, %%eax\n\t"
+                     "mov $93, %%edi\n\t"
+                     "syscall\n\t"
+                     "ud2"
+                     : : : "rax", "rdi", "rcx", "r11", "memory");
+    __builtin_unreachable();
+}
+
 struct constructor_stack_record {
     uint64_t layout_version, phase, owner_tid, extent_start, extent_end;
     uint64_t bottom, top, caller_rsp, adoption_entry, body_entry;

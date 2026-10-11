@@ -4400,7 +4400,7 @@ fn run_liteinst_rejects_an_inert_dso_before_dispatch() {
     assert!(!output.status.success(), "{output:?}");
     let stderr = stderr(&output);
     assert!(
-        stderr.contains("does not register detcore_liteinst_initialize as a preload constructor"),
+        stderr.contains("Detcore has no unique exact-root RELATIVE constructor slot"),
         "{stderr}"
     );
     assert!(!stderr.contains("activation verified"), "{stderr}");
@@ -4531,7 +4531,7 @@ fn run_liteinst_finds_the_runtime_staged_as_an_installed_resource() {
     assert!(!output.status.success(), "{output:?}");
     let stderr = stderr(&output);
     assert!(
-        stderr.contains("does not register detcore_liteinst_initialize as a preload constructor"),
+        stderr.contains("Detcore has no unique exact-root RELATIVE constructor slot"),
         "the packaged runtime must be consulted before the one beside Hermit: {stderr}"
     );
     assert_eq!(
@@ -13141,13 +13141,15 @@ fn log_file_that_cannot_be_opened_is_refused_by_path() {
 /// runs tests from such a tree, and `stage-liteinst-runtime.sh` used to derive
 /// the pin through `ci/run-reverie-pin-check.sh --print-pin`, which lists
 /// tracked files with git, so the LiteInst tests that staged the runtime
-/// failed with "fatal: not a git repository". The test helper now hands the script
-/// the pin embedded in the Hermit binary under test.
+/// failed with "fatal: not a git repository". The script derives the pin from
+/// the nested build's manifests and lock, and also checks an explicit pin such
+/// as the one embedded in the Hermit binary under test.
 ///
 /// This drives the helper's own staging command with git made unreachable (a
 /// stand-in `git` first on PATH, and `GIT_DIR` naming nothing) and a stand-in
-/// `cargo` that writes the runtime, so only the pin plumbing is under test. The control run without the supplied
-/// pin shows the premise: the git-based pin lookup fails here.
+/// `cargo` that writes the runtime, so only the pin plumbing is under test.
+/// Both explicit and derived pins must work without Git. Real copied-source
+/// qualification is covered by the allocator consumer and the Buck-stage node.
 #[test]
 fn liteinst_runtime_staging_does_not_require_a_git_checkout() {
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -13242,21 +13244,20 @@ fn liteinst_runtime_staging_does_not_require_a_git_checkout() {
         assert!(!refused_runtime.exists(), "{pin} staged a runtime");
     }
 
-    let control = stage(
-        &directory.path().join("control/libreverie_liteinst.so"),
-        Some(""),
-    );
+    let derived_runtime = directory.path().join("derived/libreverie_liteinst.so");
+    let control = stage(&derived_runtime, Some(""));
     assert!(
-        !control.status.success(),
-        "control: the git-based pin lookup unexpectedly worked without git:\n{}",
+        control.status.success(),
+        "deriving the pin from source contents failed without git:\n{}",
         stderr(&control)
     );
-    assert!(
-        // "fatal: not a git repository" from the stand-in git, or the
-        // uniformity checker's "not inside a git repository".
-        stderr(&control).contains("git repository"),
-        "control: {}",
-        stderr(&control)
+    assert_eq!(
+        fs::read_to_string(&derived_runtime).unwrap(),
+        "staged by a stand-in cargo\n"
+    );
+    assert_eq!(
+        fs::read_to_string(format!("{}.revision", derived_runtime.display())).unwrap(),
+        format!("{}\n", env!("HERMIT_REVERIE_PIN"))
     );
 }
 

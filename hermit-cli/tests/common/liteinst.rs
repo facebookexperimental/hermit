@@ -69,8 +69,8 @@ pub(super) fn liteinst_stage_command(runtime: &Path) -> Command {
         .current_dir(repository)
         // The marker must name the pin this Hermit binary was built with, which
         // is what `staged_runtime_matches_current_pin` and the loader compare it
-        // to. Handing it over also means staging needs no git checkout
-        // (https://github.com/rrnewton/hermit/issues/3419).
+        // to. Runtime qualification independently checks declared source bytes
+        // and the exact Cargo graph; this marker does not replace source identity.
         .env("HERMIT_LITEINST_REVERIE_PIN", env!("HERMIT_REVERIE_PIN"))
         .arg(cargo_profile)
         .arg(runtime)

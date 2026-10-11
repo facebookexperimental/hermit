@@ -26,9 +26,7 @@ use std::path::Path;
 // The preload leaf owns all Rust allocations, including constructor work
 // outside installation and dispatch scopes. The shared LiteInst rlib remains
 // allocator neutral.
-#[global_allocator]
-static TOOL_ALLOCATOR: reverie_liteinst::PrivateToolAllocator =
-    reverie_liteinst::PrivateToolAllocator;
+reverie_liteinst::declare_fixed_tool_allocator!();
 
 // Errors are printed without the C library's errno messages: strerror_r can
 // allocate through the guest's malloc (see describe_io_error).
@@ -101,6 +99,11 @@ pub unsafe extern "C" fn detcore_liteinst_initialize() {
         entry = sym reverie_inguest::guest::tool_region::constructor_entry,
     );
 }
+
+// Keep the exported ABI while binding this DSO's loader registration and
+// self-references locally. A competing executable export must not replace the
+// native constructor before it establishes its owned stack.
+core::arch::global_asm!(".protected detcore_liteinst_initialize");
 
 // The pre-switch RIP-relative address must resolve locally, without an
 // interposable body or a dynamic-loader resolver using the caller's stack.

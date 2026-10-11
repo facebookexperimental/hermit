@@ -272,9 +272,9 @@ pub(super) const PMU_MEMORY_FAILURE_FAMILY_MEMBERS: &[&str] = &[
 /// an empty or narrowed run refuse. Update these only after enumerating the
 /// corresponding shipped command and accounting for changed test identities.
 pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
-    // Two actual-leaf matrices and the five included shared qualifier controls.
-    // Confirm this seven-test population with the exact prepared listing.
-    ("test.liteinst_allocator", 7),
+    // Two actual-leaf matrices, five shared qualifier controls and the real
+    // Gitless source-copy factory regression; confirm with the prepared listing.
+    ("test.liteinst_allocator", 8),
     // Eleven unchanged M2 cases plus one constructor row and two refusal controls.
     ("test.liteinst_stacks", 14),
     // run_dbt_binds_in_a_user_namespace_of_its_own retains both prior
@@ -1369,7 +1369,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And metadata::tests::pre_epoll_pwait_recordings_are_refused_by_the_version_gate: 1036.
     // And metadata::tests::record_version_rejects_streams_that_answered_a_zombie_sigqueueinfo_with_esrch
     // (https://github.com/rrnewton/hermit/issues/4091): 1037.
-    ("test.hermit_unit", 1037),
+    // Three physical constructor-registration controls retain all prior cases.
+    ("test.hermit_unit", 1040),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3078,7 +3079,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the zombie-kill record-epoch test: 1035.
     // And metadata::tests::pre_epoll_pwait_recordings_are_refused_by_the_version_gate: 1036.
     // And the zombie-sigqueueinfo record-epoch test: 1037.
-    ("test.hermit_unit_on_host", 1037),
+    // Three physical constructor-registration controls retain all prior cases.
+    ("test.hermit_unit_on_host", 1040),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -5891,7 +5893,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"test"########,
         job: r########"liteinst_allocator"########,
         desc: r########"Require scope-free Rust allocation ownership in both actual preload leaves"########,
-        description: r########"Seven Nextest identities: two genuine leaf matrices and five shared artifact qualifier controls. Each completed leaf matrix requires fixed-input quiet/work pairs S,Z,G,O,R,E,A, actual constructor/launcher bootstrap, six allocation-route positive controls, zero scope depths, private membership and unchanged literal guest/next addresses, breaks and bytes. Only stdin differs. Missing producer/exports/placement or a failed pair fails; raw captures retain actual execution separately from selection. The standalone uses Reverie's public configure_command Strace API; Detcore uses the one prepared Hermit with in-guest-trap, strict settings, fixed epoch and disabled timeslice. libc internals, stacks/TLS/protection and RV's caller/guard controls are separate nonclaims. Existing per-test backstop remains unchanged."########,
+        description: r########"Eight Nextest identities: two genuine leaf matrices, five shared artifact qualifier controls and the real Gitless source-copy factory regression. Each completed leaf matrix requires fixed-input quiet/work pairs S,Z,G,O,R,E,A, actual constructor/launcher bootstrap, six allocation-route positive controls, zero scope depths, private membership and unchanged literal guest/next addresses, breaks and bytes. Only stdin differs. Missing producer/exports/placement or a failed pair fails; raw captures retain actual execution separately from selection. The standalone uses Reverie's public configure_command Strace API; Detcore uses the one prepared Hermit with in-guest-trap, strict settings, fixed epoch and disabled timeslice. libc internals, stacks/TLS/protection and RV's caller/guard controls are separate nonclaims. Existing per-test backstop remains unchanged."########,
         labels: &[r########"full"########, r########"portable"########],
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; export HERMIT_M1_ALLOCATOR_FIXTURE_BUNDLE="$PWD/target/ci/m1-allocator-fixtures.path"; REVERIE_LITEINST_PRELOAD=$(./ci/build-liteinst-allocator-fixtures.rs --print-standalone) && export REVERIE_LITEINST_PRELOAD && ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test liteinst_allocator -j 1"########,
         cmdtype: CmdType::Unknown,

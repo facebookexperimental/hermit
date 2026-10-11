@@ -3720,11 +3720,11 @@ fn assert_m1_allocator_gate(cfg: &DagConfig) -> Result<(), String> {
         .env
         .get("NEXTEST_EXPECTED_EXECUTED")
         .map(String::as_str)
-        != Some("7")
+        != Some("8")
         || consumer.integration_test_binaries.as_deref()
             != Some(&["liteinst_allocator".to_owned()][..])
     {
-        return Err("M1 consumer lost its seven-test target population".into());
+        return Err("M1 consumer lost its eight-test target population".into());
     }
     crate::nextest_build_selections::assert_command_selection(consumer)?;
     let command = crate::nextest_build_selections::execution_command(consumer)?;

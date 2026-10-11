@@ -35,13 +35,17 @@ use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use m1_artifact::CompiledSourceExpectation;
+use m1_artifact::CompiledSourceLayout;
 use m1_artifact::ConsumerExpectation;
 use m1_artifact::FileIdentity;
+use m1_artifact::FixedImageKind;
 use m1_artifact::GuestReceipt;
 use m1_artifact::Result;
 use m1_artifact::Runner;
 use m1_artifact::RuntimeReceipt;
 use m1_artifact::SourceIdentity;
+use m1_artifact::VerifiedCompiledSources;
 use m1_bundle::Bundle;
 use m1_bundle::Leaf;
 use serde_json::Value;
@@ -102,19 +106,37 @@ fn build_leaf(
         root.join("Cargo.lock")
     };
     let before = source(root, &lock, oracles, &mut runner)?;
-    let metadata: Value = serde_json::from_slice(&runner.run(
-        "cargo",
-        &[
-            "metadata".into(),
-            "--locked".into(),
-            "--offline".into(),
-            "--format-version=1".into(),
-            "--manifest-path".into(),
-            manifest.to_string_lossy().into_owned(),
-        ],
-        root,
-    )?)
-    .map_err(|e| e.to_string())?;
+    let pin = runner
+        .text("git", &["rev-parse", "HEAD:reverie"], root)?
+        .trim()
+        .to_owned();
+    let initialized_pin = runner
+        .text("git", &["rev-parse", "HEAD"], &root.join("reverie"))?
+        .trim()
+        .to_owned();
+    require(
+        initialized_pin == pin,
+        "initialized Reverie differs from the clean Hermit gitlink",
+    )?;
+    let source_manifest = if standalone {
+        root.join("liteinst-runtime-build/Cargo.toml")
+    } else {
+        manifest.clone()
+    };
+    let compiled_sources = VerifiedCompiledSources::resolve(
+        &CompiledSourceExpectation {
+            layout: CompiledSourceLayout::HermitGit,
+            image_kind: if standalone {
+                FixedImageKind::Standalone
+            } else {
+                FixedImageKind::Detcore
+            },
+            workspace_root: root,
+            manifest: &source_manifest,
+            reverie_pin: &pin,
+        },
+        &mut runner,
+    )?;
     let (package_name, target_name, initializer, filename) = if standalone {
         (
             "reverie-liteinst-preload",
@@ -130,37 +152,15 @@ fn build_leaf(
             "libdetcore_liteinst.so",
         )
     };
-    let pin = runner
-        .text("git", &["rev-parse", "HEAD"], &root.join("reverie"))?
-        .trim()
-        .to_owned();
     let expected_source = format!("git+https://github.com/rrnewton/reverie.git?rev={pin}#{pin}");
-    let package_manifest = if standalone {
-        let packages = metadata["packages"]
-            .as_array()
-            .ok_or("Cargo metadata packages missing")?;
-        let candidates: Vec<_> = packages
-            .iter()
-            .filter(|p| p["name"] == package_name)
-            .collect();
-        require(
-            candidates.len() == 1,
-            "one exact nested preload package required",
-        )?;
-        PathBuf::from(
-            candidates[0]["manifest_path"]
-                .as_str()
-                .ok_or("nested manifest missing")?,
-        )
-    } else {
-        root.join("detcore-liteinst/Cargo.toml")
-    };
-    let package = m1_artifact::select_package(
-        &metadata,
-        package_name,
-        target_name,
-        &package_manifest,
-        standalone.then_some(expected_source.as_str()),
+    let package = compiled_sources.package().clone();
+    require(
+        package.name == package_name
+            && package.target == target_name
+            && package.source.as_deref() == standalone.then_some(expected_source.as_str())
+            && package.kind == ["cdylib"]
+            && package.crate_types == ["cdylib"],
+        "fresh metadata did not select the exact runtime package/source/target",
     )?;
     let target = own.join("target");
     fs::create_dir(&target).map_err(|e| format!("new dedicated target: {e}"))?;
@@ -200,6 +200,7 @@ fn build_leaf(
         build_arguments.extend(["--features".into(), "allocator-fixture".into()]);
     }
     let output = runner.run("cargo", &build_arguments, root)?;
+    compiled_sources.verify_unchanged(&mut runner)?;
     let features: Vec<String> = FEATURES.into_iter().map(str::to_owned).collect();
     let cargo_artifact = m1_artifact::select_artifact(
         std::str::from_utf8(&output).map_err(|e| e.to_string())?,
@@ -217,7 +218,9 @@ fn build_leaf(
         artifact.sha256 == current.sha256,
         "staged/current runtime bytes differ",
     )?;
-    let qualification = m1_artifact::qualify_elf(&stage, initializer, &mut runner)?;
+    let qualification =
+        m1_artifact::qualify_elf_with_sources(&stage, initializer, &mut runner, &compiled_sources)?;
+    compiled_sources.verify_unchanged(&mut runner)?;
     // Preserve canonical name and the standalone loader's sidecar contract:
     // immutable unique DSO is present and qualified before the marker appears.
     if standalone {
@@ -238,6 +241,7 @@ fn build_leaf(
         profile_name: profile_name.into(),
         artifact,
         qualification,
+        compiled_sources: Some(compiled_sources.record().clone()),
         rustc_verbose,
         cargo_version,
         readelf_version,
@@ -261,7 +265,7 @@ fn build_leaf(
         .map(|name| (name.to_owned(), std::env::var(name).ok()))
         .collect(),
         target_directory: target,
-        commands: runner.commands,
+        commands: runner.commands.clone(),
         executed_tests: 0,
         full_m1_pass_claimed: false,
     };
@@ -290,7 +294,17 @@ fn build_leaf(
             source_tree: &before.tree,
             source_lock_sha256: &before.lock.sha256,
             oracle_sha256: &oracle_sha256,
+            compiled_sources: Some(&compiled_sources),
         },
+    )?;
+    compiled_sources.verify_unchanged(&mut runner)?;
+    m1_artifact::write_new(
+        &own.join("compiled-sources-readback.json"),
+        &serde_json::to_vec_pretty(&json!({
+            "compiled_sources": compiled_sources.record(),
+            "commands": runner.commands,
+        }))
+        .map_err(|e| e.to_string())?,
     )?;
     Ok(Leaf {
         runtime: stage,

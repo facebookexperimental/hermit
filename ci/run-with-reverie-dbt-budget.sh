@@ -1385,7 +1385,21 @@ fi
 # Preserve inventory 941, the 16-job clamp, 1050-job-second wrapper and
 # 572-job-second fallback. This carries the SDK budget only, not runtime
 # validation evidence. Main's versioned DBT consumer behavior is retained.
-expected_pin=1dae09ef151f88d0d6a0cb7e3c1f06e05f324181
+# LOCAL FIXED DETCORE EMISSION PREPARATION (2026-10-11):
+# Advance the private source pair from 1dae09ef151f88d0d6a0cb7e3c1f06e05f324181
+# to 366dd0a42c9a6f456d7122fba8934a4b52258883. All seven recorded SDK inputs
+# are identical by Git object: reverie-dbt build.rs, vendor/dynamorio,
+# Cargo.toml and native/CMakeLists.txt; third-party; root Cargo.toml; toolchain.
+# Preserve inventory 941, SDK key 75c3067d4692cd8aa168d6791e718f21e6535e672b957291142070a0edc27234,
+# the 16-job clamp, 1050-job-second wrapper and 572-job-second fallback.
+# This carries the SDK budget only; optimized emission and qualification are pending.
+# COPIED-SOURCE QUALIFIER PIN CARRY (2026-10-11):
+# Advance from 347e802e861094bbf827c4fc1bb067c18de7d8dd to
+# a29aa1c85b08717fc0e2e181333acac42e5261ef. Only the host qualifier and its
+# proof document change; all seven recorded SDK input Git objects are equal.
+# Preserve SDK key, inventory 941 and the existing budgets. This carries no
+# runtime qualification or test evidence.
+expected_pin=a29aa1c85b08717fc0e2e181333acac42e5261ef
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

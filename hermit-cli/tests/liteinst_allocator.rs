@@ -13,6 +13,8 @@ mod contract;
 mod hermit_binary;
 #[path = "common/m1_bundle.rs"]
 mod m1_bundle;
+#[path = "common/liteinst_source_copy.rs"]
+mod source_copy;
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -20,12 +22,18 @@ use std::fs;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 
+use artifact::CompiledSourceExpectation;
+use artifact::CompiledSourceLayout;
 use artifact::ConsumerExpectation;
 use artifact::FileIdentity;
+use artifact::FixedImageKind;
 use artifact::PackageIdentity;
 use artifact::Result;
+use artifact::Runner;
 use artifact::RuntimeReceipt;
+use artifact::VerifiedCompiledSources;
 use contract::CapturedRun;
 use contract::HeldInputs;
 use contract::Mode;
@@ -94,7 +102,12 @@ fn required_bundle() -> Result<Bundle> {
     Ok(bundle)
 }
 
-fn qualify(bundle: &Bundle, standalone: bool) -> Result<(Leaf, RuntimeReceipt)> {
+fn qualify(
+    bundle: &Bundle,
+    standalone: bool,
+    evidence: &Path,
+    phase: &str,
+) -> Result<(Leaf, RuntimeReceipt)> {
     let leaf = if standalone {
         &bundle.standalone
     } else {
@@ -103,11 +116,35 @@ fn qualify(bundle: &Bundle, standalone: bool) -> Result<(Leaf, RuntimeReceipt)> 
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .ok_or("H root absent")?;
+    let pin = env!("HERMIT_REVERIE_PIN");
+    let source_manifest = if standalone {
+        root.join("liteinst-runtime-build/Cargo.toml")
+    } else {
+        root.join("Cargo.toml")
+    };
+    let mut runner = Runner::new(
+        evidence.join(format!("{phase}-compiled-sources-logs")),
+        Duration::from_secs(60),
+        64 * 1024 * 1024,
+    )?;
+    let compiled_sources = VerifiedCompiledSources::resolve(
+        &CompiledSourceExpectation {
+            layout: CompiledSourceLayout::HermitGit,
+            image_kind: if standalone {
+                FixedImageKind::Standalone
+            } else {
+                FixedImageKind::Detcore
+            },
+            workspace_root: root,
+            manifest: &source_manifest,
+            reverie_pin: pin,
+        },
+        &mut runner,
+    )?;
     let receipt: RuntimeReceipt = serde_json::from_slice(
         &fs::read(artifact::real_file(&leaf.receipt)?).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    let pin = env!("HERMIT_REVERIE_PIN");
     let source = format!("git+https://github.com/rrnewton/reverie.git?rev={pin}#{pin}");
     let (name, target, manifest, package_source, id, initializer) = if standalone {
         require(
@@ -121,7 +158,7 @@ fn qualify(bundle: &Bundle, standalone: bool) -> Result<(Leaf, RuntimeReceipt)> 
             receipt.cargo_artifact.package.source.as_deref() == Some(source.as_str()),
             "standalone exact Git source differs",
         )?;
-        let manifest = artifact::real_file(&receipt.cargo_artifact.package.manifest)?;
+        let manifest = artifact::real_file(&compiled_sources.package().manifest)?;
         require(
             manifest.file_name().is_some_and(|n| n == "Cargo.toml")
                 && manifest
@@ -169,6 +206,10 @@ fn qualify(bundle: &Bundle, standalone: bool) -> Result<(Leaf, RuntimeReceipt)> 
                 .join("src/lib.rs"),
         )?,
     };
+    require(
+        compiled_sources.package() == &package,
+        "fresh metadata package differs from the independent leaf expectations",
+    )?;
     let expected_profile = json!({"opt_level":"3", "debuginfo":0, "debug_assertions":!standalone,
         "overflow_checks":!standalone, "test":false});
     let profile_name = if standalone { "release" } else { "validate" };
@@ -177,24 +218,62 @@ fn qualify(bundle: &Bundle, standalone: bool) -> Result<(Leaf, RuntimeReceipt)> 
         "leaf profile differs from required diagnostic producer",
     )?;
     let features = vec!["allocator-fixture".into()];
-    let receipt = artifact::verify_runtime_receipt(
-        &leaf.receipt,
-        &leaf.runtime,
-        &ConsumerExpectation {
-            package: &package,
-            features: &features,
-            profile_name,
-            profile: &expected_profile,
-            initializer,
-            source_head: &bundle.hermit_head,
-            source_tree: &bundle.hermit_tree,
-            source_lock_sha256: if standalone {
-                &bundle.nested_lock_sha256
-            } else {
-                &bundle.hermit_lock_sha256
-            },
-            oracle_sha256: &bundle.oracle_sha256,
+    let expected = ConsumerExpectation {
+        package: &package,
+        features: &features,
+        profile_name,
+        profile: &expected_profile,
+        initializer,
+        source_head: &bundle.hermit_head,
+        source_tree: &bundle.hermit_tree,
+        source_lock_sha256: if standalone {
+            &bundle.nested_lock_sha256
+        } else {
+            &bundle.hermit_lock_sha256
         },
+        oracle_sha256: &bundle.oracle_sha256,
+        compiled_sources: Some(&compiled_sources),
+    };
+    let intact_receipt = FileIdentity::read(&leaf.receipt)?;
+    let receipt = artifact::verify_runtime_receipt(&leaf.receipt, &leaf.runtime, &expected)?;
+    // Receipt fields are evidence, not source authority. Start from the real
+    // qualifying receipt and change exactly its recorded full pin, while
+    // retaining the independently resolved expectation and actual runtime.
+    let mut changed = serde_json::to_value(&receipt).map_err(|e| e.to_string())?;
+    let actual_pin = changed["compiled_sources"]["reverie_pin"]
+        .as_str()
+        .ok_or("qualified receipt lacks its source pin")?;
+    let mut wrong_pin = actual_pin.to_owned();
+    wrong_pin.replace_range(
+        ..1,
+        if actual_pin.starts_with('0') {
+            "1"
+        } else {
+            "0"
+        },
+    );
+    changed["compiled_sources"]["reverie_pin"] = json!(wrong_pin);
+    let changed_path = evidence.join(format!("{phase}-wrong-compiled-source-receipt.json"));
+    artifact::write_new(
+        &changed_path,
+        &serde_json::to_vec_pretty(&changed).map_err(|e| e.to_string())?,
+    )?;
+    let error = artifact::verify_runtime_receipt(&changed_path, &leaf.runtime, &expected)
+        .err()
+        .ok_or("receipt-authored source pin unexpectedly authorized the runtime")?;
+    require(
+        error == "runtime independently resolved compiled source identities differ",
+        &format!("tampered source receipt failed for an unrelated reason: {error}"),
+    )?;
+    intact_receipt.verify()?;
+    compiled_sources.verify_unchanged(&mut runner)?;
+    artifact::write_new(
+        &evidence.join(format!("{phase}-compiled-sources.json")),
+        &serde_json::to_vec_pretty(&json!({
+            "compiled_sources": compiled_sources.record(),
+            "commands": runner.commands,
+        }))
+        .map_err(|e| e.to_string())?,
     )?;
     Ok((leaf.clone(), receipt))
 }
@@ -319,7 +398,7 @@ fn matrix(standalone: bool) -> Result<()> {
         .keep();
     eprintln!("M1 {label} evidence {}", evidence.display());
     source_guard(&bundle, root, &evidence, "before")?;
-    let (leaf, receipt) = qualify(&bundle, standalone)?;
+    let (leaf, receipt) = qualify(&bundle, standalone, &evidence, "before")?;
     let guest = FileIdentity::read(&bundle.guest)?;
     let cwd = bundle.guest.parent().ok_or("guest directory absent")?;
     let mut base = Command::new(if standalone {
@@ -448,7 +527,7 @@ fn matrix(standalone: bool) -> Result<()> {
     guest.verify()?;
     executable.verify()?;
     receipt.artifact.verify()?;
-    qualify(&bundle, standalone)?;
+    qualify(&bundle, standalone, &evidence, "after")?;
     source_guard(&bundle, root, &evidence, "after")?;
     artifact::write_new(&evidence.join("matrix.json"), &serde_json::to_vec_pretty(&json!({
         "quiet_controls":counts.quiet_controls,"completed_work_runs":counts.completed_work_runs,

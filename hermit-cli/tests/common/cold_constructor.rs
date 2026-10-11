@@ -74,6 +74,94 @@ fn symbol_address(bytes: &[u8], name: &str, bias: u64) -> Result<u64> {
         .ok_or_else(|| "cold entry address overflow".into())
 }
 
+fn competing_constructor_export(bytes: &[u8]) -> Result<artifact::SymbolEvidence> {
+    use goblin::elf::header;
+    use goblin::elf::program_header;
+    use goblin::elf::section_header;
+    use goblin::elf::sym;
+
+    let elf = goblin::elf::Elf::parse(bytes).map_err(|e| e.to_string())?;
+    require(
+        elf.is_64
+            && elf.little_endian
+            && elf.header.e_machine == header::EM_X86_64
+            && matches!(elf.header.e_type, header::ET_EXEC | header::ET_DYN),
+        "competing constructor guest is not an x86-64 executable",
+    )?;
+    let mut definitions = elf.dynsyms.iter().filter(|symbol| {
+        elf.dynstrtab.get_at(symbol.st_name) == Some("detcore_liteinst_initialize")
+    });
+    let symbol = definitions
+        .next()
+        .ok_or("actual cold guest has no competing dynamic constructor export")?;
+    require(
+        definitions.next().is_none()
+            && symbol.st_bind() == sym::STB_GLOBAL
+            && symbol.st_type() == sym::STT_FUNC
+            && symbol.st_visibility() == sym::STV_DEFAULT
+            && symbol.st_shndx != section_header::SHN_UNDEF as usize
+            && symbol.st_size != 0,
+        "actual competing constructor export is not unique defined GLOBAL/DEFAULT FUNC",
+    )?;
+    let section = elf
+        .section_headers
+        .get(symbol.st_shndx)
+        .ok_or("actual competing constructor section is absent")?;
+    let end = symbol
+        .st_value
+        .checked_add(symbol.st_size)
+        .ok_or("actual competing constructor extent overflow")?;
+    require(
+        section.sh_type == section_header::SHT_PROGBITS
+            && section.sh_flags & u64::from(section_header::SHF_EXECINSTR) != 0
+            && symbol.st_value >= section.sh_addr
+            && section
+                .sh_addr
+                .checked_add(section.sh_size)
+                .is_some_and(|top| end <= top),
+        "actual competing constructor has no complete executable section",
+    )?;
+    let section_offset = section
+        .sh_offset
+        .checked_add(symbol.st_value - section.sh_addr)
+        .ok_or("actual competing constructor file offset overflow")?;
+    let mut mappings = elf.program_headers.iter().filter(|segment| {
+        segment.p_type == program_header::PT_LOAD
+            && segment.is_executable()
+            && symbol.st_value >= segment.p_vaddr
+            && segment
+                .p_vaddr
+                .checked_add(segment.p_filesz)
+                .is_some_and(|top| end <= top)
+    });
+    let mapping = mappings
+        .next()
+        .ok_or("actual competing constructor has no executable file backing")?;
+    let offset = mapping
+        .p_offset
+        .checked_add(symbol.st_value - mapping.p_vaddr)
+        .ok_or("actual competing constructor loaded offset overflow")?;
+    let file_end = offset
+        .checked_add(symbol.st_size)
+        .ok_or("actual competing constructor file extent overflow")?;
+    require(
+        mappings.next().is_none()
+            && offset == section_offset
+            && usize::try_from(offset)
+                .ok()
+                .zip(usize::try_from(file_end).ok())
+                .is_some_and(|(start, end)| bytes.get(start..end).is_some()),
+        "actual competing constructor file identity is ambiguous or truncated",
+    )?;
+    Ok(artifact::SymbolEvidence {
+        name: "detcore_liteinst_initialize".into(),
+        address: symbol.st_value,
+        size: symbol.st_size,
+        binding: symbol.st_bind(),
+        visibility: symbol.st_visibility(),
+    })
+}
+
 fn verify_record(record: &Record, stacks: &stack_observation::Query) -> Result<()> {
     use stack_observation::CALLBACK_BYTES;
     use stack_observation::CONTROL_BYTES;
@@ -199,8 +287,50 @@ fn genuine_detcore_constructor_uses_retained_disjoint_bootstrap_stack() -> Resul
     );
     source_guard(&bundle.stacks.allocator, root, &evidence, "before")?;
     let result = (|| -> Result<()> {
-        let (leaf, receipt) = qualify(&bundle.stacks.allocator, false)?;
+        let (leaf, receipt) = qualify(&bundle.stacks.allocator, false, &evidence, "before")?;
         let guest = FileIdentity::read(&bundle.guest)?;
+        let guest_bytes = fs::read(&guest.path).map_err(|e| e.to_string())?;
+        require(
+            artifact::sha256(&guest_bytes) == guest.sha256,
+            "competing export was not read from the held actual guest",
+        )?;
+        let competing_export = competing_constructor_export(&guest_bytes)?;
+        let detcore = receipt
+            .qualification
+            .detcore_constructor
+            .as_ref()
+            .ok_or("qualified cold Detcore runtime lacks actual constructor evidence")?;
+        let runtime_bytes = fs::read(&leaf.runtime).map_err(|e| e.to_string())?;
+        require(
+            artifact::sha256(&runtime_bytes) == receipt.artifact.sha256
+                && detcore.protected_initializer.size == 16
+                && detcore.protected_initializer.binding == goblin::elf::sym::STB_GLOBAL
+                && detcore.protected_initializer.visibility == goblin::elf::sym::STV_PROTECTED,
+            "cold Detcore evidence is not bound to the actual protected image",
+        )?;
+        for (role, name) in [
+            (
+                &detcore.protected_initializer,
+                "detcore_liteinst_initialize",
+            ),
+            (&detcore.body, "detcore_liteinst_initialize_body"),
+            (&detcore.bridge, "reverie_inguest_constructor_entry"),
+            (&detcore.prepare, "reverie_inguest_constructor_adopt_entry"),
+        ] {
+            require(
+                role.name == name && role.address == symbol_address(&runtime_bytes, name, 0)?,
+                "cold Detcore evidence does not identify its actual root/body/bridge/adoption",
+            )?;
+        }
+        artifact::write_new(
+            &evidence.join("constructor-preconditions.json"),
+            &serde_json::to_vec_pretty(&json!({
+                "guest_sha256":guest.sha256,"competing_export":competing_export,
+                "runtime_sha256":receipt.artifact.sha256,"detcore_constructor":detcore,
+                "execution_claimed":false,
+            }))
+            .map_err(|e| e.to_string())?,
+        )?;
         let executable = FileIdentity::read(hermit_binary::hermit_binary())?;
         let cwd = bundle.guest.parent().ok_or("cold guest directory absent")?;
         let mut command = Command::new(&executable.path);
@@ -304,7 +434,7 @@ fn genuine_detcore_constructor_uses_retained_disjoint_bootstrap_stack() -> Resul
         guest.verify()?;
         executable.verify()?;
         receipt.artifact.verify()?;
-        qualify(&bundle.stacks.allocator, false)?;
+        qualify(&bundle.stacks.allocator, false, &evidence, "after")?;
         required_cold_bundle(root)?;
         artifact::write_new(&evidence.join("placement.json"), &serde_json::to_vec_pretty(&json!({
             "actual_child_exit":0,"sampled_placement_passed":true,"nonaliasing_passed":true,

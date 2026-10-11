@@ -79,20 +79,60 @@ fn main() {
     let manifest_dir = PathBuf::from(
         env::var_os("CARGO_MANIFEST_DIR").expect("Cargo did not set CARGO_MANIFEST_DIR"),
     );
+    let trusted_manifest_dir = fs::canonicalize(env!("CARGO_MANIFEST_DIR"))
+        .expect("failed to identify the compiled nested workspace");
+    let manifest_dir =
+        fs::canonicalize(&manifest_dir).expect("failed to identify the current nested workspace");
+    assert_eq!(
+        manifest_dir, trusted_manifest_dir,
+        "current nested workspace differs from the compiled source root"
+    );
+    let source_root = trusted_manifest_dir
+        .parent()
+        .expect("nested workspace has no trusted Hermit root");
+    let source_manifest = source_root.join("liteinst-runtime-build/Cargo.toml");
+    let requested_pin = env::var("HERMIT_LITEINST_REVERIE_PIN")
+        .expect("HERMIT_LITEINST_REVERIE_PIN must supply the independently expected full revision");
+    assert!(
+        requested_pin.len() == 40
+            && requested_pin
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "HERMIT_LITEINST_REVERIE_PIN must be a full lowercase 40-hex revision"
+    );
+    let evidence = constructor_evidence_directory(&out_dir);
+    let mut source_runner = qualifier::Runner::new(
+        evidence.join("source-logs"),
+        Duration::from_secs(60),
+        64 * 1024 * 1024,
+    )
+    .expect("failed to create bounded compiled-source runner");
+    let compiled_sources = qualifier::VerifiedCompiledSources::resolve_content(
+        &qualifier::CompiledSourceExpectation {
+            layout: qualifier::CompiledSourceLayout::HermitGit,
+            image_kind: qualifier::FixedImageKind::Standalone,
+            workspace_root: source_root,
+            manifest: &source_manifest,
+            reverie_pin: &requested_pin,
+        },
+        &mut source_runner,
+    )
+    .unwrap_or_else(|error| panic!("unbound standalone compiler sources: {error}"));
     let nested_target = out_dir.join("runtime-target");
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let metadata_output = Command::new(&cargo)
-        .args(["metadata", "--locked", "--format-version", "1"])
-        .current_dir(&manifest_dir)
-        .env_remove("HERMIT_LITEINST_STAGE")
-        .output()
+    let metadata_output = source_runner
+        .run(
+            cargo.to_str().expect("Cargo path is not UTF-8"),
+            &[
+                "metadata".into(),
+                "--locked".into(),
+                "--offline".into(),
+                "--format-version=1".into(),
+            ],
+            &manifest_dir,
+        )
         .expect("failed to resolve the locked standalone preload package");
-    assert!(
-        metadata_output.status.success(),
-        "standalone preload metadata failed: {}",
-        String::from_utf8_lossy(&metadata_output.stderr)
-    );
-    let metadata: Value = serde_json::from_slice(&metadata_output.stdout)
+    let metadata: Value = serde_json::from_slice(&metadata_output)
         .expect("standalone preload metadata was not Cargo JSON");
     let packages: Vec<_> = metadata["packages"]
         .as_array()
@@ -121,13 +161,10 @@ fn main() {
         })
         .map(|(pin, _)| pin)
         .expect("preload leaf must resolve the exact full Reverie revision");
-    if let Some(requested) = env::var_os("HERMIT_LITEINST_REVERIE_PIN") {
-        assert_eq!(
-            requested.to_str(),
-            Some(revision),
-            "staged revision differs from the resolved leaf"
-        );
-    }
+    assert_eq!(
+        requested_pin, revision,
+        "staged revision differs from the resolved leaf"
+    );
     let package_id = package["id"]
         .as_str()
         .expect("preload leaf has no package ID");
@@ -144,6 +181,19 @@ fn main() {
         package["manifest_path"]
             .as_str()
             .expect("preload leaf has no manifest"),
+    );
+    assert_eq!(
+        package_id,
+        compiled_sources.package().id.as_str(),
+        "constructor metadata differs from the independently verified package"
+    );
+    assert_eq!(
+        package_manifest.as_os_str(),
+        compiled_sources
+            .compiler_manifest_path()
+            .expect("compiled source root changed before metadata readback")
+            .as_os_str(),
+        "constructor metadata differs from the independently verified manifest"
     );
     let qualifier_source =
         artifact::constructor_qualifier_source(&metadata, &package_manifest, revision)
@@ -210,12 +260,8 @@ fn main() {
     );
     // Both feature modes require the same complete constructor proof. The
     // diagnostic producer separately retains its mandatory M1 route checks.
-    let evidence = constructor_evidence_directory(&out_dir);
-    qualifier::write_new(
-        &evidence.join("cargo-metadata.json"),
-        &metadata_output.stdout,
-    )
-    .expect("failed to retain constructor package metadata");
+    qualifier::write_new(&evidence.join("cargo-metadata.json"), &metadata_output)
+        .expect("failed to retain constructor package metadata");
     qualifier::write_new(&evidence.join("cargo-build.stdout"), messages.as_bytes())
         .expect("failed to retain current runtime Cargo artifact evidence");
     qualifier::write_new(&evidence.join("cargo-build.stderr"), &output.stderr)
@@ -226,8 +272,15 @@ fn main() {
         64 * 1024 * 1024,
     )
     .expect("failed to create bounded constructor proof runner");
-    let qualification = qualifier::qualify_constructor(&candidate, &mut runner)
-        .unwrap_or_else(|error| panic!("current LiteInst constructor is unqualified: {error}"));
+    compiled_sources
+        .verify_unchanged(&mut runner)
+        .expect("compiled sources changed during the runtime build");
+    let qualification =
+        qualifier::qualify_constructor_with_sources(&candidate, &mut runner, &compiled_sources)
+            .unwrap_or_else(|error| panic!("current LiteInst constructor is unqualified: {error}"));
+    compiled_sources
+        .verify_unchanged(&mut runner)
+        .expect("compiled sources changed during constructor qualification");
     assert_eq!(
         qualification.artifact.path,
         fs::canonicalize(&candidate).expect("failed to canonicalize current runtime artifact"),
@@ -243,6 +296,8 @@ fn main() {
             "profile": profile,
             "allocator_fixture": allocator_fixture,
             "qualification": qualification,
+            "compiled_sources": Some(compiled_sources.record()),
+            "compiled_source_commands": source_runner.commands,
             "commands": runner.commands,
             "executed_tests": 0,
         }))
@@ -282,6 +337,21 @@ fn main() {
         .artifact
         .verify()
         .expect("qualified current artifact changed during staging");
+    compiled_sources
+        .verify_unchanged(&mut runner)
+        .expect("compiled sources changed during protected staging");
+    qualifier_source_identity
+        .verify()
+        .expect("constructor proof source changed during protected staging");
+    qualifier::write_new(
+        &evidence.join("compiled-sources-readback.json"),
+        &serde_json::to_vec_pretty(&serde_json::json!({
+            "compiled_sources": compiled_sources.record(),
+            "commands": runner.commands,
+        }))
+        .expect("failed to serialize final compiled-source readback"),
+    )
+    .expect("failed to retain final compiled-source readback");
     qualifier::write_new(
         &evidence.join("staged.json"),
         &serde_json::to_vec_pretty(&staged).expect("failed to serialize staged runtime identity"),

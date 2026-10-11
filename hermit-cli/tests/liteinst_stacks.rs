@@ -26,12 +26,18 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 
+use artifact::CompiledSourceExpectation;
+use artifact::CompiledSourceLayout;
 use artifact::ConsumerExpectation;
 use artifact::FileIdentity;
+use artifact::FixedImageKind;
 use artifact::PackageIdentity;
 use artifact::Result;
+use artifact::Runner;
 use artifact::RuntimeReceipt;
+use artifact::VerifiedCompiledSources;
 use contract::CapturedRun;
 use contract::HeldInputs;
 use m1_bundle::Leaf;
@@ -134,7 +140,12 @@ fn required_bundle() -> Result<m2_bundle::Bundle> {
     Ok(bundle)
 }
 
-fn qualify(bundle: &m1_bundle::Bundle, standalone: bool) -> Result<(Leaf, RuntimeReceipt)> {
+fn qualify(
+    bundle: &m1_bundle::Bundle,
+    standalone: bool,
+    evidence: &Path,
+    phase: &str,
+) -> Result<(Leaf, RuntimeReceipt)> {
     let leaf = if standalone {
         &bundle.standalone
     } else {
@@ -143,11 +154,35 @@ fn qualify(bundle: &m1_bundle::Bundle, standalone: bool) -> Result<(Leaf, Runtim
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .ok_or("H root absent")?;
+    let pin = env!("HERMIT_REVERIE_PIN");
+    let source_manifest = if standalone {
+        root.join("liteinst-runtime-build/Cargo.toml")
+    } else {
+        root.join("Cargo.toml")
+    };
+    let mut runner = Runner::new(
+        evidence.join(format!("{phase}-compiled-sources-logs")),
+        Duration::from_secs(60),
+        64 * 1024 * 1024,
+    )?;
+    let compiled_sources = VerifiedCompiledSources::resolve(
+        &CompiledSourceExpectation {
+            layout: CompiledSourceLayout::HermitGit,
+            image_kind: if standalone {
+                FixedImageKind::Standalone
+            } else {
+                FixedImageKind::Detcore
+            },
+            workspace_root: root,
+            manifest: &source_manifest,
+            reverie_pin: pin,
+        },
+        &mut runner,
+    )?;
     let receipt: RuntimeReceipt = serde_json::from_slice(
         &fs::read(artifact::real_file(&leaf.receipt)?).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    let pin = env!("HERMIT_REVERIE_PIN");
     let source = format!("git+https://github.com/rrnewton/reverie.git?rev={pin}#{pin}");
     let (name, target, manifest, package_source, id, initializer) = if standalone {
         require(
@@ -161,7 +196,7 @@ fn qualify(bundle: &m1_bundle::Bundle, standalone: bool) -> Result<(Leaf, Runtim
             receipt.cargo_artifact.package.source.as_deref() == Some(source.as_str()),
             "standalone exact Git source differs",
         )?;
-        let manifest = artifact::real_file(&receipt.cargo_artifact.package.manifest)?;
+        let manifest = artifact::real_file(&compiled_sources.package().manifest)?;
         require(
             manifest.file_name().is_some_and(|n| n == "Cargo.toml")
                 && manifest
@@ -209,6 +244,10 @@ fn qualify(bundle: &m1_bundle::Bundle, standalone: bool) -> Result<(Leaf, Runtim
                 .join("src/lib.rs"),
         )?,
     };
+    require(
+        compiled_sources.package() == &package,
+        "fresh metadata package differs from the independent leaf expectations",
+    )?;
     let expected_profile = json!({"opt_level":"3", "debuginfo":0, "debug_assertions":!standalone,
         "overflow_checks":!standalone, "test":false});
     let profile_name = if standalone { "release" } else { "validate" };
@@ -234,7 +273,17 @@ fn qualify(bundle: &m1_bundle::Bundle, standalone: bool) -> Result<(Leaf, Runtim
                 &bundle.hermit_lock_sha256
             },
             oracle_sha256: &bundle.oracle_sha256,
+            compiled_sources: Some(&compiled_sources),
         },
+    )?;
+    compiled_sources.verify_unchanged(&mut runner)?;
+    artifact::write_new(
+        &evidence.join(format!("{phase}-compiled-sources.json")),
+        &serde_json::to_vec_pretty(&json!({
+            "compiled_sources": compiled_sources.record(),
+            "commands": runner.commands,
+        }))
+        .map_err(|e| e.to_string())?,
     )?;
     Ok((leaf.clone(), receipt))
 }
@@ -371,7 +420,7 @@ fn actual_stack(case: Case) -> Result<()> {
     let mut placement_evaluated = false;
     let mut completed_report = None;
     let result = (|| -> Result<()> {
-        let (leaf, receipt) = qualify(&bundle.allocator, case.standalone)?;
+        let (leaf, receipt) = qualify(&bundle.allocator, case.standalone, &evidence, "before")?;
         let guest = FileIdentity::read(&bundle.guest)?;
         let cwd = bundle.guest.parent().ok_or("M2 guest directory absent")?;
         let mut command = Command::new(if case.standalone {
@@ -518,7 +567,7 @@ fn actual_stack(case: Case) -> Result<()> {
         guest.verify()?;
         executable.verify()?;
         receipt.artifact.verify()?;
-        qualify(&bundle.allocator, case.standalone)?;
+        qualify(&bundle.allocator, case.standalone, &evidence, "after")?;
         artifact::verify_guest_receipt(
             &bundle.guest_receipt,
             &bundle.guest,

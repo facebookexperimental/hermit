@@ -11,6 +11,12 @@
 #![deny(clippy::all)]
 #![allow(clippy::uninlined_format_args)]
 
+// This host library retains LiteInst code without becoming an in-guest Tool
+// image. Declare its historical backing explicitly and keep the host allocator;
+// LiteInst's allocation preflight still refuses non-Tool allocations.
+#[cfg(feature = "liteinst")]
+reverie_liteinst::declare_legacy_tool_backing!();
+
 mod backend_stats;
 pub mod build_info;
 pub mod canonical_verdict;
@@ -32,6 +38,7 @@ mod in_guest_exits;
 pub mod instruction_map;
 mod interp;
 pub mod liteinst_bootstrap;
+mod liteinst_constructor;
 pub mod liteinst_record;
 mod metadata;
 /// Diagnostic writes that never wait for a reader; they live in detcore, whose
@@ -847,6 +854,8 @@ fn dbt_runtime_unavailable_reason_from(runtime: io::Result<PathBuf>) -> Option<S
 /// `required` and registers `initializer_name` in its constructor array, so
 /// that preloading it runs that initializer. `label` names the library in every
 /// error message. Returns the canonical path.
+/// Detcore requires its protected root and sole local RELATIVE registration;
+/// this is minimal discovery, separate from complete artifact qualification.
 fn validate_preload_constructor_library(
     path: &Path,
     label: &str,
@@ -886,6 +895,18 @@ fn validate_preload_constructor_library(
                 ),
             ));
         }
+    }
+    if initializer_name == liteinst_constructor::ROOT {
+        liteinst_constructor::validate(&bytes, &elf).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "{label} {} has invalid Detcore constructor binding: {error}",
+                    path.display()
+                ),
+            )
+        })?;
+        return path.canonicalize();
     }
     let (initializer_index, initializer) = elf
         .dynsyms
@@ -6551,6 +6572,15 @@ mod tests {
         );
         #[cfg(feature = "liteinst")]
         {
+            // SAFETY: the strong immutable declaration above has the public
+            // repr(C), two-u64 descriptor ABI. This reads the real linked
+            // object, so changing the host declaration to Fixed fails here.
+            let backing = unsafe {
+                std::ptr::addr_of!(super::reverie_liteinst_allocator_backing_v1)
+                    .cast::<[u64; 2]>()
+                    .read_volatile()
+            };
+            assert_eq!(backing, [1, 1], "host Hermit must declare Legacy backing");
             assert_eq!(
                 super::backend_capabilities(Backend::Liteinst),
                 <reverie_liteinst::LiteinstBackend as reverie::Backend>::capabilities()
