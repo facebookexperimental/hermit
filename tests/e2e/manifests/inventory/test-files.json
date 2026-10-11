@@ -1873,6 +1873,12 @@
       "why": "tests/c/signal_disposition.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: Direct C guest for signal disposition inheritance (SIG_DFL, SIG_IGN and pending-signal state), verified with an exact stdout golden"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/signal_hermit_tasks.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/signal_hermit_tasks.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration tests signals_to_hermits_own_tasks_are_dropped_in_every_mode, a_nested_pid_namespace_signals_its_own_tasks and a_signal_to_a_newborn_thread_is_never_taken_for_hermits compile this guest, which signals Hermit's own container init (PID 1) and one of its threads through kill, rt_sigqueueinfo, tkill, tgkill and rt_tgsigqueueinfo and requires each to return 0 with Hermit surviving, requires pidfd_open(1) to fail with EPERM, then signals itself, a child, a sibling thread, its own tasks in a nested PID namespace and just-created threads, each of which must be delivered (https://github.com/rrnewton/hermit/issues/4066); it remains a guest fixture because a generic manifest cannot start Hermit in its own session or compare the per-call answers."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/signal_waitstatus_identity.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

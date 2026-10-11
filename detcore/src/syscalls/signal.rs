@@ -976,6 +976,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .refuse_group_signal(guest, call.pid(), call.sig())
                     .await;
             }
+            if self
+                .drop_signal_to_hermit(guest, Sysno::kill, None, call.pid(), call.sig())
+                .await
+            {
+                return Ok(0);
+            }
             return Ok(self.record_or_replay(guest, call).await?);
         }
 
@@ -991,6 +997,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         // A process-group or broadcast SIGALRM is refused by name below.
         if call.sig() == libc::SIGALRM && tgid > 0 {
             refuse_sigalrm(guest, SigalrmControl::SendTo(DetTid::from_raw(tgid))).await?;
+        }
+        if self
+            .drop_signal_to_hermit(guest, Sysno::kill, None, tgid, call.sig())
+            .await
+        {
+            return Ok(0);
         }
         if can_forward_process_group_signal(
             tgid,
@@ -1098,6 +1110,47 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await
     }
 
+    /// Whether to drop, answering 0 and sending nothing, a signal `sig` the
+    /// guest addresses to `target` (a pid, or a tid in thread group `tgid` for
+    /// the calls that name one) that is one of Hermit's own tasks: its container
+    /// init, PID 1 of the guest's PID namespace, or another thread of that
+    /// process. A forwarded SIGTERM ended Hermit's run
+    /// (https://github.com/rrnewton/hermit/issues/4066).
+    ///
+    /// This is what Linux does for a signal sent from inside a PID namespace to
+    /// its init when the init has no handler for it: `sig_task_ignored` drops
+    /// it (the init is `SIGNAL_UNKILLABLE`, and a sender in its own namespace
+    /// does not force it), SIGKILL included, and the call returns 0. To the
+    /// guest Hermit is such an init; the handlers Hermit installs are for
+    /// supervisors outside the namespace. Signal 0, an invalid signal number
+    /// and a nonpositive target go to the caller's own path, as do targets
+    /// that are guest tasks ([`crate::tool_global::hermit_task_named`]).
+    async fn drop_signal_to_hermit<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+        tgid: Option<libc::pid_t>,
+        target: libc::pid_t,
+        sig: libc::c_int,
+    ) -> bool {
+        if !(1..=libc::SIGRTMAX()).contains(&sig) || target <= 0 {
+            return false;
+        }
+        if !crate::tool_global::names_hermit_task(guest, tgid, target).await {
+            return false;
+        }
+        tracing::info!(
+            "[detcore, dtid {}] {} of signal {} to task {}, one of Hermit's own: dropped and \
+             answered 0, as Linux drops a signal from inside a PID namespace to its init \
+             (https://github.com/rrnewton/hermit/issues/4066)",
+            guest.thread_state().dettid,
+            sysno,
+            sig,
+            target,
+        );
+        true
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/4034)
     /// The thread that a process-directed signal `sig` to `tgid` is routed to.
@@ -1150,6 +1203,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         if call.sig() == libc::SIGALRM {
             refuse_sigalrm(guest, SigalrmControl::SendTo(DetTid::from_raw(call.tid()))).await?;
         }
+        if self
+            .drop_signal_to_hermit(
+                guest,
+                Sysno::tgkill,
+                Some(call.tgid()),
+                call.tid(),
+                call.sig(),
+            )
+            .await
+        {
+            return Ok(0);
+        }
         let _reserved = self
             .reserve_controlled_self_sigkill_exit(
                 guest,
@@ -1181,6 +1246,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         if call.sig() == libc::SIGALRM {
             refuse_sigalrm(guest, SigalrmControl::SendTo(DetTid::from_raw(call.tid()))).await?;
+        }
+        if self
+            .drop_signal_to_hermit(guest, Sysno::tkill, None, call.tid(), call.sig())
+            .await
+        {
+            return Ok(0);
         }
         let _reserved = self
             .reserve_controlled_self_sigkill_exit(
@@ -1241,6 +1312,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         if call.sig() == libc::SIGALRM {
             refuse_sigalrm(guest, SigalrmControl::SendTo(DetTid::from_raw(call.tid()))).await?;
         }
+        if self
+            .drop_signal_to_hermit(
+                guest,
+                Sysno::rt_tgsigqueueinfo,
+                Some(call.tgid()),
+                call.tid(),
+                call.sig(),
+            )
+            .await
+        {
+            return Ok(0);
+        }
         let value = self.record_or_replay(guest, call).await?;
         // Thread-directed like `tgkill`, so it carries the same wakeup
         // obligation. `sigqueue`/`pthread_sigqueue` reach a parked sibling
@@ -1263,6 +1346,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::RtSigqueueinfo,
     ) -> Result<i64, Error> {
         if !guest.config().sequentialize_threads {
+            if self
+                .drop_signal_to_hermit(guest, Sysno::rt_sigqueueinfo, None, call.tgid(), call.sig())
+                .await
+            {
+                return Ok(0);
+            }
             return Ok(self.record_or_replay(guest, call).await?);
         }
 
@@ -1283,6 +1372,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         if call.sig() == libc::SIGALRM {
             refuse_sigalrm(guest, SigalrmControl::SendTo(DetTid::from_raw(tgid))).await?;
+        }
+        if self
+            .drop_signal_to_hermit(guest, Sysno::rt_sigqueueinfo, None, tgid, call.sig())
+            .await
+        {
+            return Ok(0);
         }
         let tid = self
             .process_signal_target(

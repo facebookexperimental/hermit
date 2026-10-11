@@ -2613,6 +2613,9 @@ impl GlobalTool for GlobalState {
                     .await
                     .process_signal_targets(dpid),
             ),
+            GlobalRequest::NamesHermitTask(caller, tgid, tid) => {
+                R::NamesHermitTask(hermit_task_named(caller, tgid, tid))
+            }
             GlobalRequest::NotifySignalPending(dettid, SigWrapper(signal), target_process) => {
                 let mut scheduler = self.lock_rpc_scheduler(false).await;
                 scheduler.notify_signal_pending(dettid, SigWrapper(signal));
@@ -4280,6 +4283,9 @@ pub enum GlobalRequest {
     CreateSession(DetPid),
     /// Query live threads before translating process-directed signal delivery.
     ResolveKillTargets(DetPid),
+    /// Whether a pid or tid that a guest task named (with the thread group it
+    /// named, if any) is one of Hermit's own tasks; see `hermit_task_named`.
+    NamesHermitTask(DetTid, Option<i32>, i32),
     /// A successful kill(2) queued a physical signal for this sole target.
     NotifySignalPending(DetTid, SigWrapper, Option<DetPid>),
     /// A successful SIGKILL whose victims the scheduler is not told one by
@@ -4431,6 +4437,7 @@ pub enum GlobalResponse {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     ResolveKillTargets(Vec<DetTid>),
+    NamesHermitTask(bool),
     NotifySignalPending(()),
     NotifyUnresolvedSigkill(()),
     ThreadIsLive(bool),
@@ -5930,6 +5937,91 @@ where
     }
 }
 
+/// Whether `tid`, a pid or tid the calling guest task named (in thread group
+/// `tgid`, for the calls that name one), is one of Hermit's own tasks; see
+/// [`hermit_task_named`].
+pub async fn names_hermit_task<G, T>(guest: &mut G, tgid: Option<i32>, tid: i32) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let caller = guest.thread_state().dettid;
+    let response =
+        send_and_update_time(guest, GlobalRequest::NamesHermitTask(caller, tgid, tid)).await;
+    match response.1 {
+        GlobalResponse::NamesHermitTask(named) => named,
+        _ => unreachable!(),
+    }
+}
+
+/// Whether guest task `caller`, naming `tid` (and thread group `tgid`, for the
+/// calls that name one), names one of Hermit's own tasks: a thread of the
+/// process this runs in, Hermit's, which is the container init, PID 1 of the
+/// guest's PID namespace (<https://github.com/rrnewton/hermit/issues/4066>).
+///
+/// Hermit's tasks are identified directly, as its own thread group, not as
+/// "not a registered guest task": a guest task Detcore has not registered yet
+/// (a newborn, before its parent's `clone` returns) is not Hermit's. The
+/// thread-group test is `tgkill(hermit, tid, 0)`, which sends nothing.
+///
+/// Only a caller that is a host process descended from Hermit, in Hermit's
+/// own PID namespace, can name Hermit's tasks:
+/// - a caller in a nested PID namespace names tasks by that namespace's ids,
+///   where Hermit's tasks are not visible;
+/// - a backend whose guest tasks are not host tasks (KVM, whose guest ids may
+///   equal the ids of Hermit's own threads) never reaches Hermit by a pid;
+/// - a caller that is one of Hermit's threads, or whose `/proc` entry cannot
+///   be read, is not such a host task: a guest task in a system call is alive.
+pub fn hermit_task_named(caller: DetTid, tgid: Option<i32>, tid: i32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let hermit = std::process::id() as i32;
+    if tid <= 0 || tgid.is_some_and(|tgid| tgid != hermit) {
+        return false;
+    }
+    // SAFETY: signal 0 to a thread of this process only checks it exists.
+    let in_hermits_group =
+        tid == hermit || unsafe { libc::syscall(libc::SYS_tgkill, hermit, tid, 0) } == 0;
+    if !in_hermits_group || !descends_from(caller.as_raw(), hermit) {
+        return false;
+    }
+    let namespace = |path: String| fs::metadata(path).map(|meta| (meta.dev(), meta.ino()));
+    match (
+        namespace(format!("/proc/{}/ns/pid", caller.as_raw())),
+        namespace("/proc/self/ns/pid".to_owned()),
+    ) {
+        (Ok(callers), Ok(hermits)) => callers == hermits,
+        _ => false,
+    }
+}
+
+/// Whether host task `task`'s process is a descendant of process `ancestor`,
+/// following parent pids in `/proc` (field 4 of `stat`, the process's parent
+/// for any of its threads). A task that cannot be read is not.
+fn descends_from(task: i32, ancestor: i32) -> bool {
+    let parent = |pid: i32| -> Option<i32> {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // The command name may hold spaces and parentheses: fields resume
+        // after the last ')', as state, ppid.
+        stat.rsplit_once(')')?
+            .1
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()
+    };
+    let mut pid = task;
+    // Bounded by the depth of any real process tree; a reparenting race
+    // cannot make it loop.
+    for _ in 0..4096 {
+        match parent(pid) {
+            Some(next) if next == ancestor => return true,
+            Some(next) if next > 0 => pid = next,
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// Tell the scheduler that a SIGKILL it is not told about one victim at a time
 /// succeeded: a process-group kill (`Some(group)`), or a pidfd with no recorded
 /// process (`None`). See `Scheduler::record_unresolved_sigkill`.
@@ -6035,6 +6127,55 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// Hermit's tasks are exactly its own thread group, named from its own PID
+    /// namespace (<https://github.com/rrnewton/hermit/issues/4066>). The test
+    /// process stands in for Hermit.
+    #[test]
+    fn only_hermits_own_thread_group_is_hermits() {
+        use super::hermit_task_named;
+        use crate::types::DetTid;
+        let me = std::process::id() as i32;
+        // A child process stands in for a guest task.
+        let mut guest = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let caller = DetTid::from_raw(guest.id() as i32);
+        assert!(hermit_task_named(caller, None, me));
+        assert!(hermit_task_named(caller, Some(me), me));
+        // One of Hermit's own threads is not a guest task, and names nothing
+        // of Hermit's (KVM guest ids can equal them).
+        // SAFETY: gettid has no preconditions.
+        let own_thread = DetTid::from_raw(unsafe { libc::gettid() });
+        assert!(!hermit_task_named(own_thread, None, me));
+        let (send, receive) = std::sync::mpsc::channel();
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            // SAFETY: as above.
+            send.send(unsafe { libc::gettid() }).unwrap();
+            let _ = stopped.recv();
+        });
+        let other_thread = receive.recv().unwrap();
+        assert!(hermit_task_named(caller, None, other_thread));
+        assert!(hermit_task_named(caller, Some(me), other_thread));
+        let guest_pid = guest.id() as i32;
+        assert!(!hermit_task_named(caller, None, guest_pid));
+        assert!(!hermit_task_named(caller, Some(guest_pid), guest_pid));
+        assert!(!hermit_task_named(caller, Some(guest_pid), other_thread));
+        assert!(!hermit_task_named(caller, None, 0));
+        assert!(!hermit_task_named(caller, None, -1));
+        // A caller that is not a host task descended from Hermit names nothing
+        // of Hermit's: one that cannot be read, or Hermit's own parent.
+        assert!(!hermit_task_named(DetTid::from_raw(i32::MAX), None, me));
+        // SAFETY: getppid has no preconditions.
+        let parent = DetTid::from_raw(unsafe { libc::getppid() });
+        assert!(!hermit_task_named(parent, None, me));
+        guest.kill().unwrap();
+        guest.wait().unwrap();
+        stop.send(()).unwrap();
+        thread.join().unwrap();
+    }
+
     /// DBT publishes READY_IMAGE between creating the scheduler future and
     /// polling it, so the announcement must already be logged when
     /// `run_external_scheduler` returns:

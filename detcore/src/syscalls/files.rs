@@ -6347,6 +6347,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         if call.flags() & !allowed_flags != 0 {
             return Err(Errno::EINVAL.into());
         }
+        // A pidfd for Hermit's own process, PID 1 of the guest's namespace,
+        // would let `pidfd_send_signal` signal it and `pidfd_getfd` take its
+        // descriptors (https://github.com/rrnewton/hermit/issues/4066). Linux
+        // would open it; refusing it with EPERM is a policy, the answer the
+        // guest already gets for `ptrace` and `process_vm_readv` on that process.
+        let pid = call.pid() as i32;
+        if pid > 0 && crate::tool_global::names_hermit_task(guest, Some(pid), pid).await {
+            tracing::info!(
+                "[detcore, dtid {}] pidfd_open of {}, Hermit's own process: refused with EPERM \
+                 (https://github.com/rrnewton/hermit/issues/4066)",
+                guest.thread_state().dettid,
+                pid,
+            );
+            return Err(Errno::EPERM.into());
+        }
 
         let fd = self.record_or_replay(guest, call).await? as RawFd;
         let flags = OFlag::O_CLOEXEC | OFlag::from_bits_truncate(call.flags() as libc::c_int);

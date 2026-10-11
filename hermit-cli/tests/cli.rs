@@ -119,6 +119,7 @@ static HB_SPAWN_ECHO_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_RELATIVE_ANCHOR_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_CHILD_WAIT_CYCLE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_KILL_HELD_CHILD_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SIGNAL_HERMIT_TASKS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_POSTHOOK_FUTEX_INTERRUPT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_PIPE_READ_HELD_WRITER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_TIMEOUT_VS_SPINNER_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -981,6 +982,31 @@ fn kill_multithreaded_process_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "kill-multithreaded-process guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn signal_hermit_tasks_guest() -> &'static Path {
+    SIGNAL_HERMIT_TASKS_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("signal-hermit-tasks");
+        fs::create_dir_all(&build_root).expect("failed to create signal-hermit-tasks directory");
+        let guest = build_root.join("signal_hermit_tasks");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/signal_hermit_tasks.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile signal-hermit-tasks guest");
+        assert!(
+            output.status.success(),
+            "signal-hermit-tasks guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -21598,6 +21624,130 @@ fn group_kills_never_reach_the_host_without_sequentialized_threads() {
             "{case}: the SIGKILL group kill:\nstderr:\n{log}"
         );
     }
+}
+
+/// Runs the `signal_hermit_tasks` guest with `args` under Hermit `flags` in a
+/// session of its own, so even a regression cannot signal the test runner,
+/// and returns its stdout after checking that the run exited 0.
+fn run_signal_hermit_tasks(flags: &[&str], args: &[&str]) -> String {
+    use std::os::unix::process::CommandExt;
+    let guest = signal_hermit_tasks_guest().to_str().unwrap().to_owned();
+    let mut argv = vec!["run"];
+    argv.extend_from_slice(flags);
+    argv.extend(["--timeout", "60", "--", guest.as_str()]);
+    argv.extend_from_slice(args);
+    let mut command = hermit_command(&argv);
+    // SAFETY: setsid is async-signal-safe and touches only the child.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) =
+        run_with_deadline(command, directory.path(), Duration::from_secs(120), false);
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "{flags:?} {args:?}: {status:?}\nstdout:\n{stdout}\nstderr:\n{log}"
+    );
+    stdout
+}
+
+/// A guest's signal to one of Hermit's own tasks in its PID namespace (the
+/// container init, PID 1, which is the guest's parent, and another thread of
+/// that process) is dropped and answered 0, with threads sequentialized or
+/// not, through `kill` (SIGKILL included), `rt_sigqueueinfo`, `tkill`,
+/// `tgkill` and `rt_tgsigqueueinfo`: Linux drops a signal sent from inside a
+/// PID namespace to its init when the init has no handler. Under
+/// `--no-sequentialize-threads` a forwarded `kill(1, SIGTERM)` ended Hermit's
+/// run (exit 143), and with threads sequentialized `tkill(1, SIGTERM)` and the
+/// thread-directed sends were forwarded too
+/// (https://github.com/rrnewton/hermit/issues/4066). `pidfd_open(1)` is
+/// refused with EPERM, so no pidfd reaches Hermit. Signal 0 to PID 1 answers
+/// as Linux does, and signals to the guest itself, a child and a sibling
+/// thread are still delivered.
+#[test]
+fn signals_to_hermits_own_tasks_are_dropped_in_every_mode() {
+    let expected = "parent is 1: yes, another hermit thread: yes\n\
+                    kill(1, 0): 0\n\
+                    kill(1, SIGTERM): 0\n\
+                    kill(1, SIGKILL): 0\n\
+                    rt_sigqueueinfo(1, SIGTERM): 0\n\
+                    tkill(1, SIGTERM): 0\n\
+                    tgkill(1, 1, SIGTERM): 0\n\
+                    rt_tgsigqueueinfo(1, 1, SIGTERM): 0\n\
+                    kill(thread, SIGTERM): 0\n\
+                    rt_sigqueueinfo(thread, SIGTERM): 0\n\
+                    tkill(thread, SIGTERM): 0\n\
+                    tgkill(1, thread, SIGTERM): 0\n\
+                    rt_tgsigqueueinfo(1, thread, SIGTERM): 0\n\
+                    pidfd_open(1): -1 EPERM\n\
+                    kill(self, SIGUSR1): 0\n\
+                    handled 1\n\
+                    kill(child, SIGTERM): 0\n\
+                    child: killed by SIGTERM\n\
+                    pthread_kill(sibling, SIGUSR1): 0\n\
+                    handled 2\n";
+    for mode in ["--strict", "--no-sequentialize-threads"] {
+        assert_eq!(run_signal_hermit_tasks(&[mode], &[]), expected, "{mode}");
+    }
+}
+
+/// A guest task in a nested PID namespace names tasks by that namespace's
+/// ids, where Hermit's tasks are not visible: its PID 1 and PID 2 signalling
+/// themselves are delivered, through `tkill`, `tgkill` and `raise`, in every
+/// mode, and through `kill` without sequentialized threads. An earlier fix for
+/// https://github.com/rrnewton/hermit/issues/4066 read those ids as ids in
+/// Hermit's namespace and answered ESRCH. (A sequentialized `kill` from a
+/// nested namespace does not resolve its target, so it is not run there.)
+#[test]
+fn a_nested_pid_namespace_signals_its_own_tasks() {
+    let expected = "nested pid 1, tid 1\n\
+                    tkill(self, SIGUSR1): 0\n\
+                    tgkill(self, self, SIGUSR1): 0\n\
+                    handled 2\n\
+                    nested child pid 2\n\
+                    raise(SIGUSR1): 0\n\
+                    handled 3\n\
+                    nested exit 0\n";
+    for mode in ["--strict", "--no-sequentialize-threads"] {
+        assert_eq!(
+            run_signal_hermit_tasks(&[mode], &["nested"]),
+            expected,
+            "{mode}"
+        );
+    }
+    assert_eq!(
+        run_signal_hermit_tasks(&["--no-sequentialize-threads"], &["nested-kill"]),
+        "nested pid 1, tid 1\n\
+         kill(self, SIGUSR1): 0\n\
+         handled 1\n\
+         nested exit 0\n"
+    );
+}
+
+/// Without sequentialized threads a new thread's tid is visible (through
+/// `CLONE_PARENT_SETTID`) before Detcore registers it, and a sibling's
+/// `tgkill` of it in that window must be delivered, not taken for a signal to
+/// Hermit. An earlier fix for https://github.com/rrnewton/hermit/issues/4066
+/// answered about 10 of 200 such sends ESRCH. Each of 200 sends must succeed.
+/// The guest's threads spin, so PMU preemption is off: a late timer interrupt
+/// would refuse the run, and nothing here needs one.
+#[test]
+fn a_signal_to_a_newborn_thread_is_never_taken_for_hermits() {
+    assert_eq!(
+        run_signal_hermit_tasks(
+            &["--no-sequentialize-threads", "--max-timeslice=disabled"],
+            &["newborn", "200"],
+        ),
+        "tgkill(newborn): sent 200, ESRCH 0, other 0\n"
+    );
 }
 
 /// A POSIX timer that notifies with a real-time signal
