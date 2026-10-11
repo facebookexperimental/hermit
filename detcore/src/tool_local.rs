@@ -803,7 +803,9 @@ impl FileMetadata {
             flags.insert(OFlag::O_CLOEXEC);
         }
         self.add_fd(owner, fd, flags, ty, Some(raw_stat.into()))?;
-        self.with_detfd(fd, |detfd| detfd.forget_flock_mode())?;
+        // This newly discovered description predates our observation. Its
+        // kernel lock may be held, but no cached lock claim existed to go stale.
+        self.with_detfd(fd, |detfd| detfd.mark_flock_mode_unobserved())?;
         if let Some(resource) = stdio_resource(fd) {
             self.with_detfd(fd, |detfd| detfd.set_resource(resource.clone()))?;
         }
@@ -1085,8 +1087,9 @@ mod file_metadata_tests {
     #[test]
     fn on_demand_discovery_finds_a_live_descriptor() {
         let owner = DetTid::from_raw(9);
-        let file = std::fs::File::open("/dev/null").expect("open test descriptor");
+        let file = tempfile::NamedTempFile::new().expect("create test descriptor");
         let fd = file.as_raw_fd();
+        assert_eq!(unsafe { libc::flock(fd, libc::LOCK_SH | libc::LOCK_NB) }, 0);
         let mut metadata = FileMetadata::new(owner);
 
         assert_eq!(metadata.with_detfd(fd, |_| ()), Err(Errno::EBADF));
@@ -1106,6 +1109,68 @@ mod file_metadata_tests {
             None,
             "a live descriptor may already hold a flock that Detcore did not observe"
         );
+        assert!(
+            !metadata
+                .with_detfd(fd, |detfd| detfd.flock_mode_may_be_stale())
+                .expect("discovered descriptor should be tracked"),
+            "first discovery must not invent a previously known lock state"
+        );
+        assert!(
+            !metadata.has_unsafe_vfork_flock_state(),
+            "never-observed history is distinct from a held or invalidated cached claim"
+        );
+
+        // The metadata repair must not query by converting or dropping the
+        // inherited lock. A separate open must still be excluded by it.
+        let separate = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(file.path())
+            .expect("open an independent file description");
+        assert_eq!(
+            unsafe { libc::flock(separate.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            -1
+        );
+        assert_eq!(Errno::last(), Errno::EWOULDBLOCK);
+
+        metadata
+            .with_detfd(fd, |detfd| detfd.set_flock_mode(None))
+            .expect("discovered descriptor should remain tracked");
+        assert_eq!(metadata.file_handles[&fd].known_flock_mode(), None);
+        assert!(!metadata.file_handles[&fd].flock_mode_may_be_stale());
+    }
+
+    #[test]
+    fn rediscovery_preserves_known_and_invalidated_flock_history() {
+        let owner = DetTid::from_raw(9);
+        let file = tempfile::tempfile().expect("create test descriptor");
+        let fd = file.as_raw_fd();
+        let mut metadata = FileMetadata::new(owner);
+        metadata
+            .add_fd(owner, fd, OFlag::O_RDWR, FdType::Regular, None)
+            .expect("register an observed open");
+        let description = metadata.file_handles[&fd].open_file_id();
+        assert_eq!(metadata.file_handles[&fd].known_flock_mode(), Some(None));
+        metadata.file_handles[&fd].set_flock_mode(Some(libc::LOCK_SH));
+
+        metadata
+            .discover_fd_from_current_process(owner, fd)
+            .expect("rediscover an existing descriptor");
+        assert_eq!(metadata.file_handles[&fd].open_file_id(), description);
+        assert_eq!(
+            metadata.file_handles[&fd].known_flock_mode(),
+            Some(Some(libc::LOCK_SH))
+        );
+        assert!(metadata.has_unsafe_vfork_flock_state());
+
+        metadata.file_handles[&fd].forget_flock_mode();
+        metadata
+            .discover_fd_from_current_process(owner, fd)
+            .expect("rediscover an invalidated descriptor");
+        assert_eq!(metadata.file_handles[&fd].open_file_id(), description);
+        assert_eq!(metadata.file_handles[&fd].known_flock_mode(), None);
+        assert!(metadata.file_handles[&fd].flock_mode_may_be_stale());
+        assert!(metadata.has_unsafe_vfork_flock_state());
     }
 
     /// A table carried through serialization (in-guest LiteInst's fork) keeps
