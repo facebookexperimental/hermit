@@ -5786,14 +5786,7 @@ impl RunOpts {
     /// that runtime even with `--namespace-only`: only `main` dispatches the
     /// flag to `run_with_namespace_only`.
     fn backend_arms_reverie_ptrace_pmu_timer(&self) -> bool {
-        match self.selected_backend() {
-            Backend::Ptrace | Backend::E9patch => true,
-            Backend::Liteinst
-            | Backend::InGuestTrap
-            | Backend::Dbt
-            | Backend::Sabre
-            | Backend::Kvm => false,
-        }
+        hermit::backend_delivers_preemption_timer(self.selected_backend())
     }
 
     /// [`Self::validate_args_with_timer_support`] for tests, with a missing

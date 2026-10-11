@@ -47,6 +47,7 @@
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fmt::Display;
 
@@ -93,6 +94,15 @@ pub fn entropy_to_priority(entropy: u64) -> Priority {
     let offset = entropy % range;
     FIRST_PRIORITY + offset
 }
+
+/// How many chaos `sched_yield` turns that pass another runnable thread over
+/// a thread may take, since the yield epoch last ended, before its next one
+/// joins the epoch ([`RunQueue::push_yielded_into_epoch`]). One plain yield
+/// keeps the schedules in which a yielder runs again before a thread that
+/// just became runnable (a futex waiter woken for a signal, for example);
+/// joining the epoch at the second bounds how long a spinner can hold a later
+/// band off (<https://github.com/rrnewton/hermit/issues/4068>).
+pub const PLAIN_YIELDS_BEFORE_EPOCH: u32 = 1;
 
 /// The round robin turn of threads within a given priority level. Lowest runs
 /// first. Both negative and positive values are used to allow insertion of a
@@ -172,6 +182,13 @@ impl QueueValue {
     fn counts_as_poller(&self, priority: Priority) -> bool {
         priority >= LAST_PRIORITY || self.deadline_restored
     }
+
+    /// Whether this entry is a polling thread whose backoff has reached the
+    /// last band ([`RunQueue::push_poller`]): only then does it stop holding a
+    /// yield epoch open.
+    fn is_fully_backed_off_poller(&self, priority: Priority) -> bool {
+        self.poll_upgrade.is_some() && priority >= LAST_PRIORITY
+    }
 }
 
 /// One suspended queue entry. Global yield/random-selection state stays live.
@@ -210,6 +227,27 @@ pub struct RunQueue {
     /// A thread that explicitly yielded must not be selected again until some
     /// other runnable thread receives a turn.
     yielded_skip: Option<DetTid>,
+
+    /// The threads whose chaos `sched_yield` streak passed
+    /// [`PLAIN_YIELDS_BEFORE_EPOCH`] since the last turn of a thread that did
+    /// not yield ([`Self::push_yielded_into_epoch`]). While any queued thread
+    /// outside the set is not a fully backed-off poller, selection skips its
+    /// members. A turn
+    /// in which a thread that did not yield ran empties it
+    /// ([`Self::end_yield_epoch`]): a completed guest turn (a SaBRe loopback
+    /// poll's yield included), a background grant and a priority change point.
+    /// A poller's non-committing backoff does not. Covering every queued
+    /// thread empties it too, as does leaving only fully backed-off pollers
+    /// outside it, and a
+    /// thread leaves it when it leaves the queue. Bands and queue keys are
+    /// untouched.
+    yield_epoch: Option<BTreeSet<DetTid>>,
+    /// Per thread, the chaos `sched_yield` turns since the yield epoch last
+    /// ended that were taken while another thread was queued, so that the
+    /// yield passed it over. The first
+    /// [`PLAIN_YIELDS_BEFORE_EPOCH`] are plain requeues; the next joins the
+    /// epoch.
+    yield_streaks: BTreeMap<DetTid, u32>,
 
     // TODO: The following fields need to be properly abstracted into separate types of run queues.
     /// Which scheduling strategy shall we use.
@@ -250,6 +288,8 @@ impl RunQueue {
             tentative_selection: None,
             tentative_selection_is_exact: false,
             yielded_skip: None,
+            yield_epoch: None,
+            yield_streaks: BTreeMap::new(),
             prng: Pcg64Mcg::seed_from_u64(seed),
             sticky_random_param: srp,
             sticky_random_selection: None,
@@ -323,6 +363,34 @@ impl RunQueue {
     pub fn push_yielded(&mut self, tid: DetTid, priority: Priority) -> PrioritizedOrder {
         assert!(self.yielded_skip.is_none());
         self.yielded_skip = Some(tid);
+        self.push_back(tid, priority)
+    }
+
+    /// Requeue a thread that called `sched_yield` under chaos at its own
+    /// priority. If another thread is queued, the yield passes it over and
+    /// counts toward the thread's streak; once the streak
+    /// exceeds [`PLAIN_YIELDS_BEFORE_EPOCH`], the thread joins the epoch,
+    /// beginning one if none is open. A yield made with no one else to run
+    /// does not count, so a thread that spins alone has no streak when another
+    /// becomes runnable. Its turn must have been committed with
+    /// [`Self::commit_tentative_pop_yield`]. Unlike [`Self::push_yielded`], the
+    /// epoch lasts until a thread that did not yield has a turn, however many
+    /// yielders take turns in between, and it changes neither the thread's
+    /// band nor its queue key.
+    pub fn push_yielded_into_epoch(&mut self, tid: DetTid, priority: Priority) -> PrioritizedOrder {
+        // Any other queued thread counts, an epoch member included: a thread
+        // left outside an epoch of yielders must be able to join it, or it
+        // would spin ahead of them forever.
+        let skipped_someone = self.queue.values().any(|value| value.tid != tid);
+        if skipped_someone {
+            let streak = self.yield_streaks.entry(tid).or_insert(0);
+            *streak += 1;
+            if *streak > PLAIN_YIELDS_BEFORE_EPOCH {
+                self.yield_epoch
+                    .get_or_insert_with(BTreeSet::new)
+                    .insert(tid);
+            }
+        }
         self.push_back(tid, priority)
     }
 
@@ -481,6 +549,10 @@ impl RunQueue {
         if self.yielded_skip == Some(tid) {
             self.yielded_skip = None;
         }
+        if let Some(epoch) = &mut self.yield_epoch {
+            epoch.remove(&tid);
+        }
+        self.yield_streaks.remove(&tid);
         // A successful nonleader exec can remove one thread incarnation and
         // admit its replacement under the same raw TID in a single scheduler
         // drain. Do not let the replacement inherit the destroyed leader's
@@ -511,11 +583,42 @@ impl RunQueue {
         let skip = self
             .yielded_skip
             .filter(|tid| self.queue.len() > 1 && self.contains_tid(*tid));
+        // A yield epoch is over when it covers every queued thread, or when
+        // every queued thread outside it is a poller backed off all the way:
+        // a poller's backoff turns do not commit, so do not end the epoch, and
+        // one waiting on a yielder must not hold the yielders off forever. A
+        // thread merely in the last band (as `--chaos-target-races` places
+        // half of all new threads) is not a poller.
+        if self.yield_epoch.as_ref().is_some_and(|epoch| {
+            self.queue.iter().all(|(key, value)| {
+                epoch.contains(&value.tid) || value.is_fully_backed_off_poller(key.priority)
+            })
+        }) {
+            self.end_yield_epoch();
+        }
+        let mut excluded: BTreeSet<DetTid> = skip.into_iter().collect();
+        if let Some(epoch) = &self.yield_epoch {
+            let with_epoch: BTreeSet<DetTid> = excluded.union(epoch).copied().collect();
+            // The epoch never covers every queued thread here, but a one-turn
+            // skip outside it could make up the rest: then only the skip holds.
+            if self
+                .queue
+                .values()
+                .any(|value| !with_epoch.contains(&value.tid))
+            {
+                excluded = with_epoch;
+            }
+        }
+        let excluded_count = self
+            .queue
+            .values()
+            .filter(|value| excluded.contains(&value.tid))
+            .count();
         self.tentative_selection = match self.sched_strategy {
             SchedHeuristic::None | SchedHeuristic::ConnectBind => self
                 .queue
                 .values()
-                .find(|value| Some(value.tid) != skip)
+                .find(|value| !excluded.contains(&value.tid))
                 .map(|value| value.tid),
             SchedHeuristic::Random => {
                 if self.queue.is_empty() {
@@ -524,12 +627,12 @@ impl RunQueue {
 
                 // If there is not Tid picked from a previous operation, let's pick one now.
                 if self.tentative_selection.is_none() {
-                    let eligible = self.queue.len() - usize::from(skip.is_some());
+                    let eligible = self.queue.len() - excluded_count;
                     let random_idx = self.random_range(0, eligible);
                     self.tentative_selection = self
                         .queue
                         .values()
-                        .filter(|value| Some(value.tid) != skip)
+                        .filter(|value| !excluded.contains(&value.tid))
                         .nth(random_idx)
                         .map(|value| value.tid);
                 };
@@ -541,18 +644,21 @@ impl RunQueue {
                     return None;
                 }
 
-                if self.sticky_random_selection == skip {
+                if self
+                    .sticky_random_selection
+                    .is_some_and(|tid| excluded.contains(&tid))
+                {
                     self.sticky_random_selection = None;
                 }
                 if self.sticky_random_selection.is_none()
                     || !self.contains_tid(self.sticky_random_selection.unwrap())
                 {
-                    let eligible = self.queue.len() - usize::from(skip.is_some());
+                    let eligible = self.queue.len() - excluded_count;
                     let random_idx = self.random_range(0, eligible);
                     self.sticky_random_selection = self
                         .queue
                         .values()
-                        .filter(|value| Some(value.tid) != skip)
+                        .filter(|value| !excluded.contains(&value.tid))
                         .nth(random_idx)
                         .map(|value| value.tid);
                 }
@@ -579,7 +685,29 @@ impl RunQueue {
     /// Complete the tentative pop operation, readying the RunQueue for future operations.  This
     /// operation is only permissible when the queue is locked, i.e. the tentative_pop has
     /// previously returned `Some`.
+    /// Commit the queue transaction alone. It neither consumes the one-turn
+    /// exclusion nor ends the yield epoch: a poller's non-committing backoff
+    /// uses it, and a priority change point ends the epoch itself.
     pub fn commit_tentative_pop(&mut self) -> DetTid {
+        self.commit_selection()
+    }
+
+    /// End the yield epoch: a thread that did not yield has had a turn.
+    pub fn end_yield_epoch(&mut self) {
+        self.yield_epoch = None;
+        self.yield_streaks.clear();
+    }
+
+    /// Commit the turn of a thread that called `sched_yield` under chaos,
+    /// keeping the yield epoch it is about to join
+    /// ([`Self::push_yielded_into_epoch`]).
+    pub fn commit_tentative_pop_yield(&mut self) -> DetTid {
+        let tid = self.commit_selection();
+        self.consume_yield_exclusion();
+        tid
+    }
+
+    fn commit_selection(&mut self) -> DetTid {
         // Check that queue is locked and unlock it.
         let tentative_selection = self
             .tentative_selection
@@ -639,6 +767,12 @@ impl RunQueue {
     pub fn commit_tentative_pop_completed_turn(&mut self) -> DetTid {
         let tid = self.commit_tentative_pop();
         self.consume_yield_exclusion();
+        // A completed guest turn that was not a chaos `sched_yield` (those use
+        // `commit_tentative_pop_yield`) ends the yield epoch. That includes a
+        // SaBRe loopback poll's yield: its count is host-timed, but a loopback
+        // poller may be waiting on a yielder, so it must not be held behind
+        // the epoch.
+        self.end_yield_epoch();
         tid
     }
 
@@ -1050,6 +1184,310 @@ mod tests {
         assert_eq!(queue.tentative_pop_next(), Some(peer));
         assert_eq!(queue.commit_tentative_pop_completed_turn(), peer);
         assert_eq!(queue.yielded_skip, None);
+    }
+
+    /// Pop the next selection and commit it as a completed turn.
+    fn take_turn(queue: &mut RunQueue) -> DetTid {
+        queue.tentative_pop_next().expect("a runnable thread");
+        queue.commit_tentative_pop_completed_turn()
+    }
+
+    /// Give `tid` a chaos `sched_yield` turn: commit it and requeue it into
+    /// the yield epoch at `priority`.
+    fn yield_turn(queue: &mut RunQueue, tid: DetTid, priority: Priority) {
+        assert_eq!(queue.tentative_pop_tid(tid), Some(tid));
+        assert_eq!(queue.commit_tentative_pop_yield(), tid);
+        queue.push_yielded_into_epoch(tid, priority);
+    }
+
+    /// Yield `tid` until it joins the yield epoch: its plain yields, then
+    /// the one that joins. Another thread must be queued.
+    fn yield_into_epoch(queue: &mut RunQueue, tid: DetTid, priority: Priority) {
+        for _ in 0..=PLAIN_YIELDS_BEFORE_EPOCH {
+            yield_turn(queue, tid, priority);
+        }
+        assert!(
+            queue
+                .yield_epoch
+                .as_ref()
+                .is_some_and(|epoch| epoch.contains(&tid))
+        );
+    }
+
+    /// The first chaos yield that passes another runnable thread over is a
+    /// plain requeue, so the yielder in the earlier band runs again; the next
+    /// one joins the epoch, and the other thread runs.
+    #[test]
+    fn a_yielder_is_reselected_once_before_it_joins_the_epoch() {
+        let yielder = DetTid::from_raw(1);
+        let awaited = DetTid::from_raw(2);
+        let mut queue = RunQueue::default();
+        queue.push_back(yielder, FIRST_PRIORITY);
+        queue.push_back(awaited, LAST_PRIORITY);
+
+        yield_turn(&mut queue, yielder, FIRST_PRIORITY);
+        assert_eq!(queue.yield_epoch, None);
+        assert_eq!(queue.tentative_pop_next(), Some(yielder));
+        queue.undo_tentative_pop();
+        yield_turn(&mut queue, yielder, FIRST_PRIORITY);
+        assert_eq!(take_turn(&mut queue), awaited);
+        assert!(queue.yield_streaks.is_empty());
+    }
+
+    /// Consecutive yields made with no other thread queued build no streak,
+    /// so when a thread becomes runnable (a futex waiter woken for a signal,
+    /// say) the spinner's next yield is still a plain one and it may run
+    /// first. The yields follow one another with no other turn between them,
+    /// so nothing else can have emptied the streak (review round 3 of
+    /// https://github.com/rrnewton/hermit/pull/4080).
+    #[test]
+    fn consecutive_lone_yields_build_no_streak() {
+        let spinner = DetTid::from_raw(1);
+        let woken = DetTid::from_raw(2);
+        let mut queue = RunQueue::default();
+        queue.push_back(spinner, FIRST_PRIORITY);
+        for _ in 0..5 {
+            yield_turn(&mut queue, spinner, FIRST_PRIORITY);
+        }
+        assert!(queue.yield_streaks.is_empty());
+        assert_eq!(queue.yield_epoch, None);
+        queue.push_back(woken, LAST_PRIORITY);
+        yield_turn(&mut queue, spinner, FIRST_PRIORITY);
+        assert_eq!(queue.yield_epoch, None);
+        assert_eq!(queue.tentative_pop_next(), Some(spinner));
+    }
+
+    /// A thread left as the only one outside an epoch of yielders joins it
+    /// by yielding, so the epoch covers the queue and ends, instead of that
+    /// thread spinning ahead of the others forever.
+    #[test]
+    fn the_last_thread_outside_an_epoch_joins_it_by_yielding() {
+        let first = DetTid::from_raw(1);
+        let last = DetTid::from_raw(2);
+        let mut queue = RunQueue::default();
+        queue.push_back(first, FIRST_PRIORITY);
+        queue.push_back(last, LAST_PRIORITY);
+
+        yield_into_epoch(&mut queue, first, FIRST_PRIORITY);
+        assert_eq!(queue.tentative_pop_next(), Some(last));
+        queue.undo_tentative_pop();
+        yield_into_epoch(&mut queue, last, LAST_PRIORITY);
+        assert_eq!(queue.tentative_pop_next(), Some(first));
+        assert_eq!(queue.yield_epoch, None);
+    }
+
+    /// Two threads that keep yielding cannot take turns ahead of a third in a
+    /// later band, as a one-turn exclusion lets them
+    /// (https://github.com/rrnewton/hermit/issues/4068).
+    #[test]
+    fn two_yielders_cannot_shut_out_a_thread_in_a_later_band() {
+        let first = DetTid::from_raw(1);
+        let second = DetTid::from_raw(2);
+        let awaited = DetTid::from_raw(3);
+        let mut queue = RunQueue::default();
+        queue.push_back(first, FIRST_PRIORITY);
+        queue.push_back(second, FIRST_PRIORITY + 1);
+        queue.push_back(awaited, LAST_PRIORITY);
+
+        yield_into_epoch(&mut queue, first, FIRST_PRIORITY);
+        assert_eq!(queue.tentative_pop_next(), Some(second));
+        queue.undo_tentative_pop();
+        yield_into_epoch(&mut queue, second, FIRST_PRIORITY + 1);
+        assert_eq!(take_turn(&mut queue), awaited);
+    }
+
+    /// The exclusion lasts only until a thread that did not yield has had a
+    /// completed turn; then the bands decide again, so a yielder is never held
+    /// behind later turns of a thread in an earlier band.
+    #[test]
+    fn a_turn_by_a_thread_that_did_not_yield_ends_the_yield_epoch() {
+        let yielder = DetTid::from_raw(1);
+        let early = DetTid::from_raw(2);
+        let late = DetTid::from_raw(3);
+        let mut queue = RunQueue::default();
+        queue.push_back(yielder, FIRST_PRIORITY + 1);
+        queue.push_back(early, FIRST_PRIORITY);
+        queue.push_back(late, LAST_PRIORITY);
+
+        yield_into_epoch(&mut queue, yielder, FIRST_PRIORITY + 1);
+        assert_eq!(take_turn(&mut queue), early);
+        assert_eq!(queue.yield_epoch, None);
+        queue.push_back(early, FIRST_PRIORITY);
+        assert_eq!(take_turn(&mut queue), early);
+        queue.push_back(early, FIRST_PRIORITY);
+        // A bare queue commit, as a poller's non-committing backoff makes,
+        // keeps the epoch; the scheduler ends it explicitly where a thread that
+        // did not yield ran (a priority change point, a background grant).
+        yield_into_epoch(&mut queue, yielder, FIRST_PRIORITY + 1);
+        queue.tentative_pop_next();
+        assert_eq!(queue.commit_tentative_pop(), early);
+        queue.push_back(early, FIRST_PRIORITY);
+        assert!(
+            queue
+                .yield_epoch
+                .as_ref()
+                .is_some_and(|epoch| epoch.contains(&yielder))
+        );
+        queue.end_yield_epoch();
+        assert_eq!(queue.yield_epoch, None);
+        assert!(queue.yield_streaks.is_empty());
+        assert_eq!(
+            queue.tids().copied().collect::<Vec<_>>(),
+            [early, yielder, late]
+        );
+    }
+
+    /// An epoch that covers every queued thread is over, so yielders that
+    /// wait on each other alternate instead of the first one running forever.
+    #[test]
+    fn a_yield_epoch_covering_every_queued_thread_ends() {
+        let first = DetTid::from_raw(1);
+        let second = DetTid::from_raw(2);
+        let mut queue = RunQueue::default();
+        queue.push_back(first, FIRST_PRIORITY);
+        queue.push_back(second, LAST_PRIORITY);
+
+        yield_into_epoch(&mut queue, first, FIRST_PRIORITY);
+        assert_eq!(queue.tentative_pop_next(), Some(second));
+        queue.undo_tentative_pop();
+        yield_into_epoch(&mut queue, second, LAST_PRIORITY);
+        assert_eq!(queue.tentative_pop_next(), Some(first));
+        assert_eq!(queue.yield_epoch, None);
+        queue.undo_tentative_pop();
+        yield_into_epoch(&mut queue, first, FIRST_PRIORITY);
+        assert_eq!(queue.tentative_pop_next(), Some(second));
+    }
+
+    /// A yielder keeps its queue key: it does not join the last band, so it
+    /// is not counted as a poller by the deterministic-work-first gates.
+    #[test]
+    fn a_yield_epoch_keeps_the_yielders_band_and_poller_status() {
+        let yielder = DetTid::from_raw(1);
+        let awaited = DetTid::from_raw(2);
+        let mut queue = RunQueue::default();
+        queue.push_back(yielder, FIRST_PRIORITY);
+        queue.push_back(awaited, LAST_PRIORITY);
+
+        yield_into_epoch(&mut queue, yielder, FIRST_PRIORITY);
+        assert!(!queue.only_pollers());
+        assert!(queue.has_runnable_besides(awaited));
+        assert_eq!(
+            queue.tids().copied().collect::<Vec<_>>(),
+            [yielder, awaited]
+        );
+        assert_eq!(take_turn(&mut queue), awaited);
+    }
+
+    /// A thread that leaves the queue leaves the yield epoch, so a yielder
+    /// readmitted at once, as a signal's forced unblock does, is not skipped.
+    #[test]
+    fn leaving_the_queue_leaves_the_yield_epoch() {
+        let yielder = DetTid::from_raw(1);
+        let other = DetTid::from_raw(2);
+        let mut queue = RunQueue::default();
+        queue.push_back(yielder, FIRST_PRIORITY);
+        queue.push_back(other, LAST_PRIORITY);
+
+        yield_into_epoch(&mut queue, yielder, FIRST_PRIORITY);
+        assert!(queue.remove_tid(yielder));
+        queue.push_front(yielder, FIRST_PRIORITY);
+        assert_eq!(take_turn(&mut queue), yielder);
+    }
+
+    /// A poller backed off all the way to the last band does not hold a yield
+    /// epoch open: its retries do not commit, so a yielder it waits on would
+    /// otherwise never run. A thread that is merely in the last band, as
+    /// `--chaos-target-races` places half of all new threads, does hold it.
+    #[test]
+    fn only_a_fully_backed_off_poller_releases_a_yield_epoch() {
+        let yielder = DetTid::from_raw(1);
+        let other = DetTid::from_raw(2);
+        for poller in [false, true] {
+            let mut queue = RunQueue::default();
+            queue.push_back(yielder, FIRST_PRIORITY);
+            if poller {
+                queue.push_poller(other, DEFAULT_PRIORITY, 20);
+            } else {
+                queue.push_back(other, LAST_PRIORITY);
+            }
+            yield_into_epoch(&mut queue, yielder, FIRST_PRIORITY);
+            let expected = if poller { yielder } else { other };
+            assert_eq!(
+                queue.tentative_pop_next(),
+                Some(expected),
+                "poller={poller}"
+            );
+        }
+    }
+
+    /// A thread that leaves the queue loses its streak too, so after it is
+    /// readmitted its next yield past another thread is a plain one again.
+    #[test]
+    fn leaving_the_queue_resets_the_yield_streak() {
+        let yielder = DetTid::from_raw(1);
+        let other = DetTid::from_raw(2);
+        let mut queue = RunQueue::default();
+        queue.push_back(yielder, FIRST_PRIORITY);
+        queue.push_back(other, LAST_PRIORITY);
+
+        yield_turn(&mut queue, yielder, FIRST_PRIORITY);
+        assert!(queue.remove_tid(yielder));
+        queue.push_front(yielder, FIRST_PRIORITY);
+        yield_turn(&mut queue, yielder, FIRST_PRIORITY);
+        assert_eq!(queue.yield_epoch, None);
+        assert_eq!(queue.tentative_pop_next(), Some(yielder));
+    }
+
+    /// A one-turn skip (a loopback poll's yield) and the yield epoch together
+    /// never exclude every queued thread: the skip alone then holds.
+    #[test]
+    fn a_one_turn_skip_and_a_yield_epoch_never_exclude_everyone() {
+        let yielder = DetTid::from_raw(1);
+        let poller = DetTid::from_raw(2);
+        let mut queue = RunQueue::default();
+        queue.push_back(yielder, FIRST_PRIORITY);
+        queue.push_back(poller, DEFAULT_PRIORITY);
+
+        yield_into_epoch(&mut queue, yielder, FIRST_PRIORITY);
+        assert_eq!(queue.tentative_pop_tid(poller), Some(poller));
+        assert_eq!(queue.commit_tentative_pop_yield(), poller);
+        queue.push_yielded(poller, DEFAULT_PRIORITY);
+        // The epoch holds the yielder; the skip holds the poller; together they
+        // would cover the queue, so only the skip applies.
+        assert_eq!(queue.tentative_pop_next(), Some(yielder));
+    }
+
+    /// A yielder alone in the queue runs again, and the epoch ends.
+    #[test]
+    fn a_lone_yielder_runs_again() {
+        let yielder = DetTid::from_raw(1);
+        let mut queue = RunQueue::default();
+        queue.push_back(yielder, DEFAULT_PRIORITY);
+
+        yield_turn(&mut queue, yielder, DEFAULT_PRIORITY);
+        assert_eq!(take_turn(&mut queue), yielder);
+        assert_eq!(queue.yield_epoch, None);
+        assert!(queue.yield_streaks.is_empty());
+    }
+
+    /// The epoch holds under the random heuristics too: after two yielders,
+    /// the third thread runs.
+    #[test]
+    fn a_yield_epoch_holds_under_the_random_heuristics() {
+        for strategy in [SchedHeuristic::Random, SchedHeuristic::StickyRandom] {
+            for seed in 0..16 {
+                let yielders = [DetTid::from_raw(1), DetTid::from_raw(2)];
+                let awaited = DetTid::from_raw(3);
+                let mut queue = RunQueue::new(strategy, seed, 1.0);
+                for tid in [yielders[0], yielders[1], awaited] {
+                    queue.push_back(tid, DEFAULT_PRIORITY);
+                }
+                for tid in yielders {
+                    yield_into_epoch(&mut queue, tid, DEFAULT_PRIORITY);
+                }
+                assert_eq!(take_turn(&mut queue), awaited, "{strategy:?} seed {seed}");
+            }
+        }
     }
 
     #[test]

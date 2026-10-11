@@ -35,6 +35,7 @@ use tracing::trace;
 
 use crate::SharedMemoryObjectId;
 use crate::config::BlockingMode;
+use crate::config::Config;
 use crate::memory::MemoryMetadata;
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::ExternalOpId;
@@ -1325,6 +1326,60 @@ pub(crate) enum FutexDeadline {
     Restart(Option<LogicalTime>),
 }
 
+/// How a sequentialized `sched_yield` yields to the scheduler
+/// ([`sched_yield_route`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchedYieldRoute {
+    /// A recorded chaos priority change point with a fresh random priority.
+    ChaosReprioritize,
+    /// A one-turn `SchedYield`, with the timeslice statistics reset.
+    ReplayStrongYield,
+    /// A `SchedYield` that the scheduler turns into a yield epoch.
+    ChaosYieldEpoch,
+    /// A `SleepUntil(0)` yield, granted at once.
+    WeakYield,
+    /// The end of the caller's timeslice, as at a timer expiry.
+    EndTimeslice,
+}
+
+/// Choose how a sequentialized `sched_yield` yields; it reads only the
+/// configuration, so a record and its replay choose alike.
+///
+/// - In chaos mode, thread-interleaving diversity (and thus fairness) comes
+///   from re-randomizing thread priorities at preemption-timer expirations.
+///   When timer preemption is disabled (`--max-timeslice disabled`),
+///   priorities are fixed at thread creation and never change, so a thread
+///   that spins on sched_yield while holding the numerically-lowest priority
+///   would starve every thread it waits on (GH #81). There sched_yield is an
+///   explicit chaos reprioritization point, recorded for chaos replay.
+/// - With the timer on, chaos still redraws a priority only when a slice
+///   expires, which a sched_yield loop may never reach
+///   (https://github.com/rrnewton/hermit/issues/4068). There sched_yield is a
+///   `SchedYield`, which the scheduler turns into a yield epoch
+///   (`Scheduler::requeue_after`): the caller keeps its band, and once it has
+///   passed another runnable thread over more than
+///   `PLAIN_YIELDS_BEFORE_EPOCH` times it is not selected again until a thread
+///   that did not yield has had a turn. It changes no
+///   priority, draws nothing from the chaos PRNG and consumes no recorded
+///   preemption point, so a preemption replay under `--chaos` makes the same
+///   decision. A schedule replay keeps the weak yield it always had, and so
+///   does a backend that does not deliver the preemption timer
+///   (`Config::backend_delivers_timer_events`): there a thread handed the
+///   turn that never makes a syscall would never give it back.
+fn sched_yield_route(cfg: &Config) -> SchedYieldRoute {
+    if cfg.chaos && cfg.max_timeslice.is_none() {
+        SchedYieldRoute::ChaosReprioritize
+    } else if !cfg.chaos && cfg.replay_preemptions_from.is_some() {
+        SchedYieldRoute::ReplayStrongYield
+    } else if cfg.chaos && cfg.replay_schedule_from.is_none() && cfg.backend_delivers_timer_events {
+        SchedYieldRoute::ChaosYieldEpoch
+    } else if cfg.chaos || cfg.replay_schedule_from.is_some() {
+        SchedYieldRoute::WeakYield
+    } else {
+        SchedYieldRoute::EndTimeslice
+    }
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     async fn futex_timeout_deadline<G: Guest<Self>>(
         &self,
@@ -2579,36 +2634,30 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::SchedYield,
     ) -> Result<i64, Error> {
         if self.cfg.sequentialize_threads {
-            // In chaos mode, thread-interleaving diversity (and thus fairness)
-            // comes entirely from re-randomizing thread priorities at
-            // preemption-timer expirations. When timer preemption is disabled
-            // (`--max-timeslice disabled`), priorities are fixed at thread
-            // creation and never change. A plain yield only re-enqueues the
-            // caller at the back of its own (fixed) priority level, so a thread
-            // that spins on sched_yield while holding the numerically-lowest
-            // priority is always reselected first and starves every thread it is
-            // waiting on (GH #81). Treat sched_yield as an explicit chaos
-            // reprioritization point: draw a fresh random priority for the
-            // caller so it cedes the CPU and other runnable threads can make
-            // progress. This mirrors what `end_timeslice` does at a timer-driven
-            // preemption point, and is recorded for chaos replay.
-            if self.cfg.chaos && self.cfg.max_timeslice.is_none() {
-                let change_time = guest.thread_state().thread_logical_time.as_nanos();
-                let request = Self::random_priority_changepoint_request(guest, change_time);
-                resource_request(guest, request).await;
-            } else if !self.cfg.chaos && self.cfg.replay_preemptions_from.is_some() {
-                if self.cfg.max_timeslice.is_some() {
-                    guest
-                        .thread_state_mut()
-                        .reset_timeslice_for_explicit_yield();
+            match sched_yield_route(&self.cfg) {
+                SchedYieldRoute::ChaosReprioritize => {
+                    let change_time = guest.thread_state().thread_logical_time.as_nanos();
+                    let request = Self::random_priority_changepoint_request(guest, change_time);
+                    resource_request(guest, request).await;
                 }
-                let request = Self::sched_yield_request(guest);
-                resource_request(guest, request).await;
-            } else if self.cfg.chaos || self.cfg.replay_schedule_from.is_some() {
-                let request = Self::yield_request(guest);
-                resource_request(guest, request).await;
-            } else {
-                self.end_timeslice_for_sched_yield(guest).await;
+                SchedYieldRoute::ReplayStrongYield => {
+                    if self.cfg.max_timeslice.is_some() {
+                        guest
+                            .thread_state_mut()
+                            .reset_timeslice_for_explicit_yield();
+                    }
+                    let request = Self::sched_yield_request(guest);
+                    resource_request(guest, request).await;
+                }
+                SchedYieldRoute::ChaosYieldEpoch => {
+                    let request = Self::sched_yield_request(guest);
+                    resource_request(guest, request).await;
+                }
+                SchedYieldRoute::WeakYield => {
+                    let request = Self::yield_request(guest);
+                    resource_request(guest, request).await;
+                }
+                SchedYieldRoute::EndTimeslice => self.end_timeslice_for_sched_yield(guest).await,
             }
             trace!("sched_yield yielded to the scheduler; NOT performing actual syscall");
             Ok(0)
@@ -4180,6 +4229,101 @@ mod tests {
     use reverie::Tool;
 
     use super::*;
+
+    /// Each configuration takes its own `sched_yield` route; only chaos with
+    /// the timer on and delivered, and no schedule replay, takes the yield
+    /// epoch, and an ordinary run still ends its timeslice
+    /// (https://github.com/rrnewton/hermit/issues/4068).
+    #[test]
+    fn each_configuration_takes_its_sched_yield_route() {
+        let path = || Some(std::path::PathBuf::from("record.json"));
+        let cases = [
+            (Config::default(), SchedYieldRoute::EndTimeslice),
+            // The ordinary ptrace run: timers delivered, no chaos.
+            (
+                Config {
+                    backend_delivers_timer_events: true,
+                    ..Config::default()
+                },
+                SchedYieldRoute::EndTimeslice,
+            ),
+            (
+                Config {
+                    chaos: true,
+                    backend_delivers_timer_events: true,
+                    replay_schedule_from: path(),
+                    ..Config::default()
+                },
+                SchedYieldRoute::WeakYield,
+            ),
+            (
+                Config {
+                    chaos: true,
+                    backend_delivers_timer_events: true,
+                    ..Config::default()
+                },
+                SchedYieldRoute::ChaosYieldEpoch,
+            ),
+            (
+                Config {
+                    chaos: true,
+                    ..Config::default()
+                },
+                SchedYieldRoute::WeakYield,
+            ),
+            (
+                Config {
+                    chaos: true,
+                    max_timeslice: None,
+                    ..Config::default()
+                },
+                SchedYieldRoute::ChaosReprioritize,
+            ),
+            (
+                Config {
+                    chaos: true,
+                    backend_delivers_timer_events: true,
+                    replay_preemptions_from: path(),
+                    ..Config::default()
+                },
+                SchedYieldRoute::ChaosYieldEpoch,
+            ),
+            (
+                Config {
+                    chaos: true,
+                    replay_schedule_from: path(),
+                    ..Config::default()
+                },
+                SchedYieldRoute::WeakYield,
+            ),
+            (
+                Config {
+                    replay_schedule_from: path(),
+                    ..Config::default()
+                },
+                SchedYieldRoute::WeakYield,
+            ),
+            (
+                Config {
+                    replay_preemptions_from: path(),
+                    ..Config::default()
+                },
+                SchedYieldRoute::ReplayStrongYield,
+            ),
+        ];
+        for (cfg, route) in cases {
+            assert_eq!(
+                sched_yield_route(&cfg),
+                route,
+                "chaos={} timer delivered={} max_timeslice={:?} preemptions={:?} schedule={:?}",
+                cfg.chaos,
+                cfg.backend_delivers_timer_events,
+                cfg.max_timeslice,
+                cfg.replay_preemptions_from,
+                cfg.replay_schedule_from
+            );
+        }
+    }
 
     /// A thread whose reported pid is not its thread group, as Reverie
     /// reports for a process that a raw `clone` without `CLONE_THREAD` made,

@@ -178,6 +178,17 @@ pub struct Config {
     #[clap(skip)]
     pub backend_supports_blocked_wait_signal_interruption: bool,
 
+    /// The backend delivers the preemption timer `--max-timeslice` arms, so a
+    /// thread that never makes a syscall still ends its slice. Under chaos, a
+    /// `sched_yield` may then hand its turn to such a thread
+    /// (<https://github.com/rrnewton/hermit/issues/4068>); without delivery the
+    /// thread would never give it back. Off by default; the host sets it from
+    /// the backend's name, because `reverie::BackendCapabilities` has no field
+    /// for this fact yet. Like the field above it has no legacy key.
+    #[serde(default)]
+    #[clap(skip)]
+    pub backend_delivers_timer_events: bool,
+
     /// The guest may start with a terminal: one of the launcher's standard
     /// descriptors is a terminal, the launcher has a controlling terminal that
     /// the guest inherits with its session, or the launcher could not tell.
@@ -1752,8 +1763,9 @@ impl Default for Config {
 /// computed from `config`. [`Config::record_host_inputs`], which the legacy
 /// form never had, is left out too, and reads back as false: this form serves
 /// only DBT, whose launcher collects no host inputs. So is
-/// [`Config::backend_supports_blocked_wait_signal_interruption`], which
-/// is false for DBT, and [`Config::guest_may_inherit_a_terminal`], which only
+/// [`Config::backend_supports_blocked_wait_signal_interruption`] and
+/// [`Config::backend_delivers_timer_events`], which are false for DBT, and
+/// [`Config::guest_may_inherit_a_terminal`], which only
 /// that capability reads, and [`Config::in_guest_detlog_forward_policy`] and
 /// [`Config::in_guest_site_patching_off`], which are unset for DBT. So is [`Config::target_timeslice_syscalls_only`],
 /// added after this form froze; DBT runs without a PMU maximum, where the
@@ -2145,8 +2157,9 @@ mod legacy_backend_json {
     /// `record_host_inputs` has no legacy key and no legacy value: the legacy
     /// form serves only DBT, whose launcher collects no host inputs, so it is
     /// never written and always reads as false.
-    /// `backend_supports_blocked_wait_signal_interruption` is the same: it is
-    /// false for DBT, so it is never written and always reads as false.
+    /// `backend_supports_blocked_wait_signal_interruption` and
+    /// `backend_delivers_timer_events` are the same: they are false for DBT,
+    /// so they are never written and always read as false.
     /// So is `guest_may_inherit_a_terminal`, which only that capability reads.
     /// `target_timeslice_syscalls_only` came after the legacy form froze; the
     /// legacy form never carried it, so it is never written and reads as false,
@@ -2161,10 +2174,11 @@ mod legacy_backend_json {
     /// in-guest LiteInst), so it is never written and reads as false.
     /// `inherited_seccomp` came after the legacy form froze too. It is never
     /// written and reads as unknown.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 11] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 12] = [
         "backend",
         "record_host_inputs",
         "backend_supports_blocked_wait_signal_interruption",
+        "backend_delivers_timer_events",
         "guest_may_inherit_a_terminal",
         "in_guest_detlog_forward_policy",
         "in_guest_site_patching_off",
@@ -2263,6 +2277,7 @@ mod legacy_backend_json {
     /// elements as the legacy backend keys, and neither the field it asks for
     /// there nor [`Config::record_host_inputs`],
     /// [`Config::backend_supports_blocked_wait_signal_interruption`],
+    /// [`Config::backend_delivers_timer_events`],
     /// [`Config::guest_may_inherit_a_terminal`],
     /// [`Config::in_guest_detlog_forward_policy`],
     /// [`Config::in_guest_site_patching_off`],
@@ -2302,6 +2317,7 @@ mod legacy_backend_json {
                 Some(
                     "record_host_inputs"
                     | "backend_supports_blocked_wait_signal_interruption"
+                    | "backend_delivers_timer_events"
                     | "guest_may_inherit_a_terminal"
                     | "in_guest_site_patching_off"
                     | "target_timeslice_syscalls_only"
@@ -2562,6 +2578,7 @@ mod legacy_backend_json {
                 // No legacy key; see FIELDS_WITHOUT_A_LEGACY_KEY.
                 "record_host_inputs"
                 | "backend_supports_blocked_wait_signal_interruption"
+                | "backend_delivers_timer_events"
                 | "guest_may_inherit_a_terminal"
                 | "in_guest_detlog_forward_policy"
                 | "in_guest_site_patching_off"
@@ -2635,6 +2652,7 @@ mod tests {
             "the default configuration must not write a controlled-run legacy key"
         );
         assert!(!config.backend_supports_blocked_wait_signal_interruption);
+        assert!(!config.backend_delivers_timer_events);
         assert!(!config.guest_may_inherit_a_terminal);
         assert!(config.in_guest_detlog_forward_policy.is_none());
         assert!(!config.in_guest_site_patching_off);
@@ -3153,9 +3171,10 @@ mod tests {
     /// The legacy form's positions are `Config`'s fields in declaration order
     /// with the fifteen legacy keys where `backend` stands and no
     /// `record_host_inputs`, `backend_supports_blocked_wait_signal_interruption`,
-    /// `guest_may_inherit_a_terminal`, `in_guest_detlog_forward_policy`,
-    /// `in_guest_site_patching_off`, `target_timeslice_syscalls_only`,
-    /// `futex_wake_yields`, `replaying`, `scheduler_turn_cost` or
+    /// `backend_delivers_timer_events`, `guest_may_inherit_a_terminal`,
+    /// `in_guest_detlog_forward_policy`, `in_guest_site_patching_off`,
+    /// `target_timeslice_syscalls_only`, `futex_wake_yields`, `replaying`,
+    /// `scheduler_turn_cost` or
     /// `inherited_seccomp`, which is the
     /// key order the encoder writes.
     #[test]
@@ -3174,6 +3193,7 @@ mod tests {
                 "backend" => expected.extend(names.map(str::to_owned)),
                 "record_host_inputs"
                 | "backend_supports_blocked_wait_signal_interruption"
+                | "backend_delivers_timer_events"
                 | "guest_may_inherit_a_terminal"
                 | "in_guest_detlog_forward_policy"
                 | "in_guest_site_patching_off"
@@ -3193,12 +3213,12 @@ mod tests {
         assert_eq!(keys, expected);
         // `backend` becomes fifteen keys; `record_host_inputs`,
         // `backend_supports_blocked_wait_signal_interruption`,
-        // `guest_may_inherit_a_terminal`, `in_guest_detlog_forward_policy`,
-        // `in_guest_site_patching_off`, `target_timeslice_syscalls_only`,
-        // `futex_wake_yields`, `replaying`, `scheduler_turn_cost` and
-        // `inherited_seccomp` none.
+        // `backend_delivers_timer_events`, `guest_may_inherit_a_terminal`,
+        // `in_guest_detlog_forward_policy`, `in_guest_site_patching_off`,
+        // `target_timeslice_syscalls_only`, `futex_wake_yields`, `replaying`,
+        // `scheduler_turn_cost` and `inherited_seccomp` none.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len() + 4, keys.len());
+        assert_eq!(fields.len() + 3, keys.len());
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -3273,6 +3293,7 @@ mod tests {
         };
         let on = Config {
             backend_supports_blocked_wait_signal_interruption: true,
+            backend_delivers_timer_events: false,
             ..off.clone()
         };
         let json = to_legacy_backend_json(&on).unwrap();

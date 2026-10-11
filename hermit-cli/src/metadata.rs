@@ -550,6 +550,7 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         // pop the next timer, or report a terminal deadlock, before the thread's
         // continuation posted (https://github.com/rrnewton/hermit/issues/3963).
         backend_supports_blocked_wait_signal_interruption: true,
+        backend_delivers_timer_events: false,
         // A constant, unlike `hermit run`: replay rebuilds this configuration
         // and must decide which signals end a wait exactly as the recording did,
         // whatever terminal replay itself runs under. `false` keeps Linux's rule

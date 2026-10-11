@@ -91,6 +91,7 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     // These test configs run detcore under the ptrace backend.
     backend: <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities(),
     backend_supports_blocked_wait_signal_interruption: false,
+    backend_delivers_timer_events: false,
     guest_may_inherit_a_terminal: false,
     in_guest_detlog_forward_policy: None,
     in_guest_site_patching_off: false,
@@ -178,6 +179,7 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     // These test configs run detcore under the ptrace backend.
     backend: <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities(),
     backend_supports_blocked_wait_signal_interruption: false,
+    backend_delivers_timer_events: false,
     guest_may_inherit_a_terminal: false,
     in_guest_detlog_forward_policy: None,
     in_guest_site_patching_off: false,
@@ -265,6 +267,7 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     // These test configs run detcore under the ptrace backend.
     backend: <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities(),
     backend_supports_blocked_wait_signal_interruption: false,
+    backend_delivers_timer_events: false,
     guest_may_inherit_a_terminal: false,
     in_guest_detlog_forward_policy: None,
     in_guest_site_patching_off: false,

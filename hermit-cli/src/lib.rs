@@ -3703,6 +3703,10 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     // fact yet, and no combination of its fields selects ptrace alone (its
     // `E9PATCH` constant is `PTRACE`), so it is set here from the backend's name.
     config.backend_supports_blocked_wait_signal_interruption = backend == Backend::Ptrace;
+    // A chaos `sched_yield` may hand its turn to a thread that never makes a
+    // syscall only when that thread's slice can end
+    // (https://github.com/rrnewton/hermit/issues/4068).
+    config.backend_delivers_timer_events = backend_delivers_preemption_timer(backend);
     // Only those waits read it (`Config::guest_may_inherit_a_terminal`), so the
     // host is asked only for them.
     config.guest_may_inherit_a_terminal =
@@ -3771,6 +3775,20 @@ pub fn backend_capabilities(backend: Backend) -> reverie::BackendCapabilities {
         Backend::Liteinst | Backend::InGuestTrap => reverie::BackendCapabilities::LITEINST_IN_GUEST,
         Backend::Sabre => reverie::BackendCapabilities::SABRE,
         Backend::Dbt => reverie::BackendCapabilities::DBT,
+    }
+}
+
+/// Whether `backend`'s runtime arms Reverie ptrace's PMU timer and delivers its
+/// events, so `--max-timeslice` really preempts a thread that makes no syscall.
+/// Only ptrace does (e9patch preprocessing runs on it). SaBRe and KVM accept a
+/// timer request and deliver nothing; DBT and in-guest LiteInst refuse it.
+/// `reverie::BackendCapabilities` has no field for this fact yet.
+pub fn backend_delivers_preemption_timer(backend: Backend) -> bool {
+    match backend {
+        Backend::Ptrace | Backend::E9patch => true,
+        Backend::Liteinst | Backend::InGuestTrap | Backend::Dbt | Backend::Sabre | Backend::Kvm => {
+            false
+        }
     }
 }
 
@@ -6791,6 +6809,28 @@ mod tests {
             assert_eq!(
                 config.backend.supports_parked_write_signal_interruption, supports_interruption,
                 "unexpected parked-write signal support for {backend:?}"
+            );
+        }
+    }
+
+    /// Only ptrace delivers the preemption timer, so only it lets a chaos
+    /// `sched_yield` hand its turn to a thread that may never make a syscall
+    /// (https://github.com/rrnewton/hermit/issues/4068).
+    #[test]
+    fn backend_timer_delivery_is_explicit() {
+        for (backend, delivers) in [
+            (Backend::Ptrace, true),
+            (Backend::Dbt, false),
+            (Backend::Kvm, false),
+            (Backend::Sabre, false),
+            (Backend::Liteinst, false),
+            (Backend::InGuestTrap, false),
+            (Backend::E9patch, true),
+        ] {
+            let config = prepare_backend_config(super::DetConfig::default(), backend);
+            assert_eq!(
+                config.backend_delivers_timer_events, delivers,
+                "unexpected timer delivery for {backend:?}"
             );
         }
     }

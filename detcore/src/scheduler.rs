@@ -1426,6 +1426,9 @@ pub struct Scheduler {
     /// meaningful in chaos mode) the scheduler biases its nondeterminism points
     /// toward known race patterns rather than exploring uniformly.
     chaos_target_races: bool,
+    /// A cached copy of the same (immutable) field in Config. Under chaos a
+    /// `sched_yield` opens or joins a yield epoch ([`Self::requeue_after`]).
+    chaos: bool,
 
     /// Happens-before enforcement state, present only when the run carries a
     /// `HappensBeforeProgram`. Holds AFTER anchors until their BEFORE anchors
@@ -2815,12 +2818,26 @@ pub(crate) async fn finish_selected_turn(
     // The logical COMMIT point for the turn is during step4:
     mg.step4_resource_block(next_dtid, &rsrcs, &resp)?;
     mg.step5_guest_unblock(next_dtid, &rsrcs, &resp)?;
-    let sched_yield = rsrcs.resources.contains_key(&ResourceID::SchedYield);
-    mg.step6_reenquue(next_dtid, sched_yield);
+    let requeue = mg.requeue_after(&rsrcs);
+    mg.step6_reenquue(next_dtid, requeue);
     if let Some(call) = rsrcs.as_exit_syscall() {
         mg.step7_simulate_exit_posthook(next_dtid, call, &global_time);
     }
     Ok(rsrcs)
+}
+
+/// How [`Scheduler::step6_reenquue`] requeues the thread whose turn it was
+/// ([`Scheduler::requeue_after`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Requeue {
+    /// At the back of its band.
+    Back,
+    /// At the back of its band, excluded from the next selection
+    /// ([`RunQueue::push_yielded`]).
+    OneTurnYield,
+    /// At the back of its band, in the yield epoch
+    /// ([`RunQueue::push_yielded_into_epoch`]).
+    YieldEpoch,
 }
 
 // A futex request contains only one resource request, for FutexWait.
@@ -3068,6 +3085,7 @@ impl Scheduler {
             transferred_exec_syscall_offsets: Default::default(),
             fuzz_futexes: cfg.fuzz_futexes,
             chaos_target_races: cfg.chaos_target_races,
+            chaos: cfg.chaos,
             fuzz_prng: Pcg64Mcg::seed_from_u64(cfg.fuzz_seed()),
             post_fork_prng: Pcg64Mcg::seed_from_u64(cfg.sched_seed() ^ 0x706f_7374_666f_726b),
             happens_before: cfg.happens_before.clone().map(HbRuntime::new),
@@ -8073,7 +8091,10 @@ impl Scheduler {
                     .then_some(blocked_signal_mask)
                     .flatten()
                     .filter(|temporary| own_mask != Some(*temporary));
+                // A background grant is this thread's turn: it ends the
+                // one-turn exclusion and the yield epoch alike.
                 self.run_queue.consume_yield_exclusion();
+                self.run_queue.end_yield_epoch();
                 self.unblock_guest(dettid, resp)?;
 
                 // Only once the ivars are cleared and the guest is ready to issue
@@ -8475,6 +8496,12 @@ impl Scheduler {
         }
 
         let popped = self.run_queue.commit_tentative_pop(); // Begun in step3.
+        // A change point ends any yield epoch. At a timer expiry the thread ran
+        // the slice that just ended: a turn of a thread that did not yield. The
+        // other source, a chaos `sched_yield` with the timer disabled (GH #81),
+        // takes the change-point route instead of the epoch, so no epoch it
+        // could end is open on its account.
+        self.run_queue.end_yield_epoch();
         assert_eq!(dettid, popped);
         self.runqueue_push_back(dettid); // Repush with new priority
         trace!(
@@ -8839,19 +8866,50 @@ impl Scheduler {
         Ok(())
     }
 
+    /// How [`Self::step6_reenquue`] requeues the thread whose granted request
+    /// is `rsrcs`. A `SchedYield` turn is excluded from the next selection.
+    /// Under chaos, a `sched_yield`'s `SchedYield` instead counts toward the
+    /// yielder's streak, and after [`runqueue::PLAIN_YIELDS_BEFORE_EPOCH`]
+    /// plain yields it opens or joins a yield epoch, so the yielder is not
+    /// selected again until a thread that did not yield has had a turn
+    /// ([`RunQueue::push_yielded_into_epoch`]): chaos keeps each thread in its random band
+    /// until its slice ends, which a `sched_yield` loop never reaches, so a
+    /// one-turn exclusion lets two yielders take turns ahead of a thread in a
+    /// later band forever (https://github.com/rrnewton/hermit/issues/4068). The
+    /// zero-timeout loopback poll's `SchedYield` keeps the one-turn exclusion:
+    /// how many of those a SaBRe task makes is host-timed.
+    fn requeue_after(&self, rsrcs: &Resources) -> Requeue {
+        if !rsrcs.resources.contains_key(&ResourceID::SchedYield) {
+            Requeue::Back
+        } else if self.chaos && !self.is_loopback_poll_yield_turn(rsrcs) {
+            Requeue::YieldEpoch
+        } else {
+            Requeue::OneTurnYield
+        }
+    }
+
     /// Step: reenqueue the thread that just had a turn.
-    fn step6_reenquue(&mut self, next_dtid: DetTid, sched_yield: bool) {
+    fn step6_reenquue(&mut self, next_dtid: DetTid, requeue: Requeue) {
         // We delay popping till here, so while holding the lock we "atomically" move the
         // thread from the front to the back of the queue.
-        let dt2 = self.run_queue.commit_tentative_pop_completed_turn();
-        assert_eq!(next_dtid, dt2);
-        // SchedYield is emitted in normal execution and non-chaos preemption replay. Its
-        // queue placement is transient, so persistent priorities remain unchanged.
-        let pos = if sched_yield {
-            let priority = self.get_priority(next_dtid);
-            self.run_queue.push_yielded(next_dtid, priority)
+        let dt2 = if requeue == Requeue::YieldEpoch {
+            self.run_queue.commit_tentative_pop_yield()
         } else {
-            self.runqueue_push_back(next_dtid)
+            self.run_queue.commit_tentative_pop_completed_turn()
+        };
+        assert_eq!(next_dtid, dt2);
+        // A yield's queue placement is transient: the thread keeps its persistent priority
+        // and its band.
+        let pos = match requeue {
+            Requeue::Back => self.runqueue_push_back(next_dtid),
+            Requeue::OneTurnYield => {
+                let priority = self.get_priority(next_dtid);
+                self.run_queue.push_yielded(next_dtid, priority)
+            }
+            Requeue::YieldEpoch => {
+                let priority = self.get_priority(next_dtid);
+                self.run_queue.push_yielded_into_epoch(next_dtid, priority)
+            }
         };
         debug!(
             "[sched-step6] dettid {} going back into queue at position {}.",
@@ -13518,6 +13576,491 @@ mod test {
         }
     }
 
+    /// A chaos scheduler with three threads in consecutive bands, the first
+    /// two put into the yield epoch through real `SchedYield` turns.
+    fn scheduler_with_two_yielders_in_the_epoch() -> (Scheduler, [DetTid; 3]) {
+        let mut scheduler = Scheduler::new(&Config {
+            chaos: true,
+            ..Config::default()
+        });
+        let tids = [
+            DetTid::from_raw(100),
+            DetTid::from_raw(101),
+            DetTid::from_raw(102),
+        ];
+        for (index, tid) in tids.into_iter().enumerate() {
+            register_known_thread(&mut scheduler, tid);
+            scheduler
+                .priorities
+                .insert(tid, runqueue::FIRST_PRIORITY + index as u64);
+            scheduler.runqueue_push_back(tid);
+        }
+        for yielder in [tids[0], tids[1]] {
+            for _ in 0..=runqueue::PLAIN_YIELDS_BEFORE_EPOCH {
+                let mut request = Resources::new(yielder);
+                request.insert(ResourceID::SchedYield, Permission::W);
+                let next = scheduler.next_turns.get(&yielder).unwrap();
+                next.req.put(Ok(request.clone()));
+                let response = next.resp.clone();
+                assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(yielder));
+                assert!(
+                    scheduler
+                        .step4_resource_block(yielder, &request, &response)
+                        .is_ok()
+                );
+                assert!(
+                    scheduler
+                        .step5_guest_unblock(yielder, &request, &response)
+                        .is_ok()
+                );
+                assert!(matches!(response.try_read(), Some(SchedResponse::Go(_))));
+                let requeue = scheduler.requeue_after(&request);
+                assert_eq!(requeue, Requeue::YieldEpoch);
+                scheduler.step6_reenquue(yielder, requeue);
+            }
+        }
+        (scheduler, tids)
+    }
+
+    /// A poller's non-committing backoff grants no turn, so the yielders stay
+    /// excluded and the poller, in a later band, is selected again. Written by
+    /// the Codex reviewer of https://github.com/rrnewton/hermit/pull/4080
+    /// (round 2), as are the next two tests.
+    #[test]
+    fn a_noncommitting_poll_backoff_keeps_the_yield_epoch() {
+        let (mut scheduler, tids) = scheduler_with_two_yielders_in_the_epoch();
+        let poller = tids[2];
+        let mut request = Resources::new(poller);
+        request.insert(ResourceID::InternalIOPolling, Permission::W);
+        request.poll_attempt = 1;
+        let next = scheduler.next_turns.get(&poller).unwrap();
+        next.req.put(Ok(request.clone()));
+        let response = next.resp.clone();
+        let committed_time = scheduler.committed_time;
+        assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(poller));
+        assert!(
+            scheduler
+                .step4_resource_block(poller, &request, &response)
+                .is_err()
+        );
+        assert!(
+            response.try_read().is_none(),
+            "NONCOMMIT cannot grant this retry"
+        );
+        assert_eq!(scheduler.committed_time, committed_time);
+        assert_eq!(
+            scheduler
+                .next_turns
+                .get(&poller)
+                .unwrap()
+                .req
+                .try_read()
+                .unwrap()
+                .unwrap()
+                .poll_attempt,
+            0,
+            "the real backoff path must remake its pending request as runnable"
+        );
+        assert_eq!(
+            scheduler.run_queue.queued_priority(poller),
+            Some(2 * (runqueue::FIRST_PRIORITY + 2))
+        );
+        assert_eq!(
+            scheduler.run_queue.tentative_pop_next(),
+            Some(poller),
+            "poll bookkeeping grants no non-yield turn, so the earlier yielders must remain excluded"
+        );
+    }
+
+    /// A completed guest turn of a thread that did not yield ends the epoch.
+    #[test]
+    fn a_completed_non_yield_turn_ends_the_yield_epoch() {
+        let (mut scheduler, tids) = scheduler_with_two_yielders_in_the_epoch();
+        let worker = tids[2];
+        let request = Resources::new(worker);
+        let next = scheduler.next_turns.get(&worker).unwrap();
+        next.req.put(Ok(request.clone()));
+        let response = next.resp.clone();
+        assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(worker));
+        assert!(
+            scheduler
+                .step4_resource_block(worker, &request, &response)
+                .is_ok()
+        );
+        assert!(
+            scheduler
+                .step5_guest_unblock(worker, &request, &response)
+                .is_ok()
+        );
+        assert!(matches!(response.try_read(), Some(SchedResponse::Go(_))));
+        let requeue = scheduler.requeue_after(&request);
+        assert_eq!(requeue, Requeue::Back);
+        scheduler.step6_reenquue(worker, requeue);
+        assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(tids[0]));
+    }
+
+    /// When the last thread outside the epoch yields too, the epoch covers the
+    /// queue and ends, and the bands decide again.
+    #[test]
+    fn the_last_thread_outside_yielding_ends_the_yield_epoch() {
+        let (mut scheduler, tids) = scheduler_with_two_yielders_in_the_epoch();
+        let last = tids[2];
+        // Its plain yield, then the one that joins the epoch and covers it.
+        for _ in 0..=runqueue::PLAIN_YIELDS_BEFORE_EPOCH {
+            let mut request = Resources::new(last);
+            request.insert(ResourceID::SchedYield, Permission::W);
+            let next = scheduler.next_turns.get(&last).unwrap();
+            next.req.put(Ok(request.clone()));
+            let response = next.resp.clone();
+            assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(last));
+            assert!(
+                scheduler
+                    .step4_resource_block(last, &request, &response)
+                    .is_ok()
+            );
+            assert!(
+                scheduler
+                    .step5_guest_unblock(last, &request, &response)
+                    .is_ok()
+            );
+            assert!(matches!(response.try_read(), Some(SchedResponse::Go(_))));
+            let requeue = scheduler.requeue_after(&request);
+            assert_eq!(requeue, Requeue::YieldEpoch);
+            scheduler.step6_reenquue(last, requeue);
+        }
+        assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(tids[0]));
+    }
+
+    /// A `SchedYield` turn opens or joins a yield epoch only under `--chaos`,
+    /// and only when it is a `sched_yield`: the zero-timeout loopback poll's
+    /// yield, whose count is host-timed, keeps the one-turn exclusion
+    /// (https://github.com/rrnewton/hermit/issues/4068).
+    #[test]
+    fn only_a_chaos_sched_yield_opens_a_yield_epoch() {
+        let tid = DetTid::from_raw(100);
+        let mut sched_yield = Resources::new(tid);
+        sched_yield.insert(ResourceID::SchedYield, Permission::W);
+        let mut loopback = sched_yield.clone();
+        loopback.fyi(LOOPBACK_POLL_YIELD_FYI);
+        let other = Resources::new(tid);
+        for chaos in [false, true] {
+            let scheduler = Scheduler::new(&Config {
+                chaos,
+                ..Config::default()
+            });
+            let expected = if chaos {
+                Requeue::YieldEpoch
+            } else {
+                Requeue::OneTurnYield
+            };
+            assert_eq!(scheduler.requeue_after(&sched_yield), expected);
+            assert_eq!(scheduler.requeue_after(&loopback), Requeue::OneTurnYield);
+            assert_eq!(scheduler.requeue_after(&other), Requeue::Back);
+        }
+    }
+
+    /// Through `step6_reenquue`, two chaos `sched_yield` callers cannot take
+    /// turns ahead of a thread in a later band, and both keep their persistent
+    /// priorities. Without chaos the one-turn exclusion lets the first yielder
+    /// run again after the second.
+    #[test]
+    fn two_chaos_yielders_cannot_shut_out_a_thread_in_a_later_band() {
+        for chaos in [false, true] {
+            let mut scheduler = Scheduler::new(&Config {
+                chaos,
+                ..Config::default()
+            });
+            let first = DetTid::from_raw(100);
+            let second = DetTid::from_raw(101);
+            let awaited = DetTid::from_raw(102);
+            for tid in [first, second, awaited] {
+                register_known_thread(&mut scheduler, tid);
+            }
+            scheduler.priorities.insert(first, runqueue::FIRST_PRIORITY);
+            scheduler
+                .priorities
+                .insert(second, runqueue::FIRST_PRIORITY + 1);
+            scheduler
+                .priorities
+                .insert(awaited, runqueue::LAST_PRIORITY);
+            for tid in [first, second, awaited] {
+                scheduler.runqueue_push_back(tid);
+            }
+            // Under chaos each yielder's first yield is a plain one; its second
+            // joins the epoch.
+            let yields_each = if chaos {
+                runqueue::PLAIN_YIELDS_BEFORE_EPOCH + 1
+            } else {
+                1
+            };
+            for yielder in [first, second] {
+                let mut request = Resources::new(yielder);
+                request.insert(ResourceID::SchedYield, Permission::W);
+                let requeue = scheduler.requeue_after(&request);
+                for _ in 0..yields_each {
+                    assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(yielder));
+                    scheduler.step6_reenquue(yielder, requeue);
+                }
+            }
+            let expected = if chaos { awaited } else { first };
+            assert_eq!(
+                scheduler.run_queue.tentative_pop_next(),
+                Some(expected),
+                "chaos={chaos}"
+            );
+            assert_eq!(scheduler.get_priority(first), runqueue::FIRST_PRIORITY);
+            assert_eq!(scheduler.get_priority(second), runqueue::FIRST_PRIORITY + 1);
+        }
+    }
+
+    /// Put `yielder` into a yield epoch through `step6_reenquue`, with the
+    /// chaos `sched_yield` turns that take it there: its plain yields, then
+    /// the one that joins.
+    fn chaos_yield_turn(scheduler: &mut Scheduler, yielder: DetTid) {
+        let mut request = Resources::new(yielder);
+        request.insert(ResourceID::SchedYield, Permission::W);
+        let requeue = scheduler.requeue_after(&request);
+        assert_eq!(requeue, Requeue::YieldEpoch);
+        for _ in 0..=runqueue::PLAIN_YIELDS_BEFORE_EPOCH {
+            assert_eq!(
+                scheduler.run_queue.tentative_pop_tid(yielder),
+                Some(yielder)
+            );
+            scheduler.step6_reenquue(yielder, requeue);
+        }
+    }
+
+    /// A priority change point is a turn of a thread that did not yield, so,
+    /// through the scheduler's own change-point path, it ends the yield epoch:
+    /// the yielder in the first band runs next, not the third thread.
+    #[test]
+    fn a_priority_change_point_ends_the_yield_epoch() {
+        let mut scheduler = Scheduler::new(&Config {
+            chaos: true,
+            ..Config::default()
+        });
+        let yielder = DetTid::from_raw(100);
+        let preempted = DetTid::from_raw(101);
+        let third = DetTid::from_raw(102);
+        for tid in [yielder, preempted, third] {
+            register_known_thread(&mut scheduler, tid);
+        }
+        scheduler
+            .priorities
+            .insert(yielder, runqueue::FIRST_PRIORITY);
+        scheduler.priorities.insert(third, runqueue::LAST_PRIORITY);
+        for tid in [yielder, preempted, third] {
+            scheduler.runqueue_push_back(tid);
+        }
+        chaos_yield_turn(&mut scheduler, yielder);
+
+        assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(preempted));
+        // A change point never commits the turn: it always reports a skip.
+        assert!(
+            scheduler
+                .perform_priority_changepoint(
+                    preempted,
+                    DEFAULT_PRIORITY,
+                    LogicalTime::from_nanos(1),
+                    1,
+                    &[]
+                )
+                .is_err()
+        );
+        assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(yielder));
+    }
+
+    /// A background grant (here `BlockingExternalIO`) is a turn of a thread
+    /// that did not yield, so it ends the yield epoch as well as the one-turn
+    /// exclusion: the yielder in the first band runs next.
+    #[test]
+    fn a_background_grant_ends_the_yield_epoch() {
+        let mut scheduler = Scheduler::new(&Config {
+            chaos: true,
+            ..Config::default()
+        });
+        let yielder = DetTid::from_raw(100);
+        let background = DetTid::from_raw(101);
+        let third = DetTid::from_raw(102);
+        for tid in [yielder, background, third] {
+            register_known_thread(&mut scheduler, tid);
+        }
+        scheduler
+            .priorities
+            .insert(yielder, runqueue::FIRST_PRIORITY);
+        scheduler.priorities.insert(third, runqueue::LAST_PRIORITY);
+        scheduler.runqueue_push_back(yielder);
+        scheduler.runqueue_push_back(third);
+        chaos_yield_turn(&mut scheduler, yielder);
+
+        commit_out_of_scheduler_call(
+            &mut scheduler,
+            background,
+            ResourceID::BlockingExternalIO(ExternalOpId::new(background, 1)),
+            None,
+        );
+        assert!(!scheduler.run_queue.contains_tid(background));
+        assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(yielder));
+    }
+
+    /// A chaos `sched_yield` keeps the yielder ordinary work: the
+    /// deterministic-work-first gate stays closed to an external continuation
+    /// whose readiness is host-timed while it is runnable. A first version of
+    /// the hermit#4068 fix moved the yielder into the last band, where it
+    /// counted as a poller (review of https://github.com/rrnewton/hermit/pull/4080,
+    /// whose Codex reviewer wrote this test).
+    #[test]
+    fn a_chaos_yield_keeps_ordinary_work_ahead_of_host_ready_io() {
+        for finished in [false, true] {
+            let mut scheduler = Scheduler::new(&Config {
+                chaos: true,
+                ..Config::default()
+            });
+            let yielder = DetTid::from_raw(100);
+            let poller = DetTid::from_raw(101);
+            let background = DetTid::from_raw(102);
+            for tid in [yielder, poller, background] {
+                register_known_thread(&mut scheduler, tid);
+            }
+            scheduler
+                .priorities
+                .insert(yielder, runqueue::FIRST_PRIORITY);
+            scheduler.runqueue_push_back(yielder);
+            scheduler
+                .run_queue
+                .push_poller(poller, DEFAULT_PRIORITY, u32::MAX);
+            let op = ExternalOpId::new(background, 7);
+            scheduler
+                .blocked
+                .external_io_blockers
+                .insert(background, op);
+            if finished {
+                let mut continuation = Resources::new(background);
+                continuation.insert(ResourceID::BlockedExternalContinue(op), Permission::RW);
+                scheduler
+                    .next_turns
+                    .get(&background)
+                    .unwrap()
+                    .req
+                    .put(Ok(continuation));
+            }
+            assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(yielder));
+            scheduler.step6_reenquue(yielder, Requeue::YieldEpoch);
+            assert!(scheduler.step2c_process_io_blockers().is_ok());
+            assert_eq!(
+                scheduler.blocked.external_io_blockers.get(&background),
+                Some(&op),
+                "ordinary yielding work must defer host-ready admission; finished={finished}"
+            );
+            assert!(!scheduler.run_queue.contains_tid(background));
+
+            // Adjacent positive: with the ordinary yielder gone, a real all-poller
+            // queue admits exactly a posted continuation, preserving useful IO progress.
+            assert!(scheduler.run_queue.remove_tid(yielder));
+            assert!(scheduler.step2c_process_io_blockers().is_ok());
+            assert_eq!(scheduler.run_queue.contains_tid(background), finished);
+        }
+    }
+
+    /// The `InboundSignal` branch defers a host-asynchronous `SIGCHLD` behind
+    /// ordinary work, and a chaos `sched_yield` must not turn that work into a
+    /// poller and release the signal (same review and author as above).
+    #[test]
+    fn a_chaos_yield_keeps_ordinary_work_ahead_of_a_deferred_sigchld() {
+        let mut scheduler = Scheduler::new(&Config {
+            chaos: true,
+            ..Config::default()
+        });
+        let yielder = DetTid::from_raw(100);
+        let poller = DetTid::from_raw(101);
+        let signaled = DetTid::from_raw(102);
+        for tid in [yielder, poller, signaled] {
+            register_known_thread(&mut scheduler, tid);
+        }
+        scheduler
+            .priorities
+            .insert(yielder, runqueue::FIRST_PRIORITY);
+        scheduler.runqueue_push_back(yielder);
+        scheduler
+            .run_queue
+            .push_poller(poller, DEFAULT_PRIORITY, u32::MAX);
+        scheduler.runqueue_push_back(signaled);
+        let inbound = ResourceID::InboundSignal(SigWrapper(libc::SIGCHLD));
+        assert_eq!(
+            scheduler.run_queue.tentative_pop_tid(signaled),
+            Some(signaled)
+        );
+        assert!(
+            scheduler
+                .block_for_one_resource(
+                    signaled,
+                    &inbound,
+                    &Permission::W,
+                    None,
+                    None,
+                    &Ivar::new()
+                )
+                .is_err()
+        );
+        assert!(scheduler.blocked.sigchld_deferred.contains(&signaled));
+        assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(yielder));
+        scheduler.step6_reenquue(yielder, Requeue::YieldEpoch);
+        scheduler.step2e_process_signal_deferred();
+        assert!(
+            scheduler.blocked.sigchld_deferred.contains(&signaled),
+            "ordinary yielding work must defer host-async SIGCHLD admission"
+        );
+        assert!(!scheduler.run_queue.contains_tid(signaled));
+
+        // Adjacent positive: removing the only ordinary thread leaves real
+        // pollers and makes the same deferred signal eligible for readmission.
+        assert!(scheduler.run_queue.remove_tid(yielder));
+        scheduler.step2e_process_signal_deferred();
+        assert!(!scheduler.blocked.sigchld_deferred.contains(&signaled));
+        assert!(scheduler.run_queue.contains_tid(signaled));
+    }
+
+    /// The control for the two tests above: a queue of real pollers alone still
+    /// admits ready IO and a deferred signal, as the progress policy needs.
+    #[test]
+    fn a_poller_only_queue_still_admits_ready_io_and_a_deferred_sigchld() {
+        let mut scheduler = Scheduler::new(&Config {
+            chaos: true,
+            ..Config::default()
+        });
+        let poller = DetTid::from_raw(101);
+        let background = DetTid::from_raw(102);
+        let signaled = DetTid::from_raw(103);
+        for tid in [poller, background, signaled] {
+            register_known_thread(&mut scheduler, tid);
+        }
+        scheduler
+            .run_queue
+            .push_poller(poller, DEFAULT_PRIORITY, u32::MAX);
+        assert!(scheduler.run_queue.only_pollers());
+        scheduler.blocked.sigchld_deferred.insert(signaled);
+        scheduler.step2e_process_signal_deferred();
+        assert!(scheduler.blocked.sigchld_deferred.is_empty());
+        assert!(scheduler.run_queue.contains_tid(signaled));
+        assert!(scheduler.run_queue.remove_tid(signaled));
+        let op = ExternalOpId::new(background, 7);
+        scheduler
+            .blocked
+            .external_io_blockers
+            .insert(background, op);
+        let mut continuation = Resources::new(background);
+        continuation.insert(ResourceID::BlockedExternalContinue(op), Permission::RW);
+        scheduler
+            .next_turns
+            .get(&background)
+            .unwrap()
+            .req
+            .put(Ok(continuation));
+        assert!(scheduler.step2c_process_io_blockers().is_ok());
+        assert!(scheduler.blocked.external_io_blockers.is_empty());
+        assert!(scheduler.run_queue.contains_tid(background));
+    }
+
     /// The scheduler under the condition that turns on its model of which thread
     /// a signal reaches (`models_signal_targets`): serialized threads and a
     /// backend that decides blocked-wait interruption from the kernel's signal
@@ -13526,6 +14069,7 @@ mod test {
         let scheduler = Scheduler::new(&Config {
             sequentialize_threads: true,
             backend_supports_blocked_wait_signal_interruption: true,
+            backend_delivers_timer_events: false,
             ..Config::default()
         });
         assert!(scheduler.models_signal_targets);
@@ -13712,6 +14256,7 @@ mod test {
         let gated = |guest_may_inherit_a_terminal| Config {
             sequentialize_threads: true,
             backend_supports_blocked_wait_signal_interruption: true,
+            backend_delivers_timer_events: false,
             guest_may_inherit_a_terminal,
             ..Config::default()
         };

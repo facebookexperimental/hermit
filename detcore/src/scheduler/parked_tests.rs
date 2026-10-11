@@ -3341,7 +3341,7 @@ fn child_wait_repark_after_legacy_signal_keeps_shared_alarm_eligible() {
         assert!(
             matches!(response.try_read(), Some(SchedResponse::Signaled(Some(signals))) if signals == vec![SigWrapper::from(Signal::SIGURG)])
         );
-        s.step6_reenquue(tid, false);
+        s.step6_reenquue(tid, Requeue::Back);
         // The actual helper rechecks an ignored/blocked legacy signal and asks
         // for the same ChildWait again. Drive its normal request/park here.
         s.install_resource_origin(
