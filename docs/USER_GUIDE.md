@@ -773,6 +773,31 @@ args: [-c, echo $FOO$BAR]
 - `hermit oci run`, `hermit analyze` and `hermit bisect` do not load run
   configs.
 
+## Signals To Hermit's Own Process
+
+In a run with interception (the default ptrace backend), Hermit's container
+process is PID 1 of the guest's PID namespace, the guest's parent. To the
+guest it is the namespace's init, and Hermit keeps it out of the guest's
+reach (https://github.com/rrnewton/hermit/issues/4066,
+https://github.com/rrnewton/hermit/issues/4083):
+
+- A signal the guest sends to PID 1 or one of its threads (`kill`, `tkill`,
+  `tgkill`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`), SIGKILL included, is
+  dropped and the call returns 0, as Linux does for a signal sent from inside
+  a PID namespace to its init when the init has no handler. Signal 0 still
+  answers whether the task exists.
+- `pidfd_open(1)` fails with EPERM, so no pidfd reaches Hermit. Linux would
+  open it.
+- Making one of Hermit's tasks the owner of a descriptor's signals fails
+  with EPERM: `fcntl` `F_SETOWN` or `F_SETOWN_EX`, and `ioctl` `FIOSETOWN` or
+  `SIOCSPGRP`. Linux would accept the owner and later signal it when the
+  descriptor is ready.
+
+A guest in a nested PID namespace (created with `clone(CLONE_NEWPID)`) is
+unaffected: its ids name its own tasks. The EPERM answers are a deliberate
+policy, the same answer the guest already gets for `ptrace` and
+`process_vm_readv` on that process.
+
 ## Inherited Seccomp Filters
 
 A seccomp filter installed by whatever launched Hermit, such as a container

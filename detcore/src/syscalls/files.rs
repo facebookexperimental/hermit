@@ -4749,6 +4749,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Fcntl,
     ) -> Result<i64, Error> {
         let fd = call.fd();
+        // Before anything else, so a refused call has no other effect.
+        let (call, _owner_copy) = self.screen_fcntl_owner(guest, call).await?;
         // The owner of an asynchronous-I/O descriptor may be any process or
         // process group, and Linux signals it when data arrives, at a moment
         // set by host timing. Record the signals in this turn, before the call
@@ -4876,6 +4878,108 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Refuse with EPERM a call that would make one of Hermit's tasks the
+    /// owner of a descriptor's signals (https://github.com/rrnewton/hermit/issues/4083).
+    /// Linux would accept it and later signal Hermit whenever the descriptor is
+    /// ready; with `F_SETSIG(SIGTERM)` that ended Hermit's run. Refusing is a
+    /// policy, the answer `pidfd_open` of Hermit's process gets.
+    async fn refuse_hermit_owner<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        command: &str,
+        owner: libc::c_int,
+    ) -> Result<(), Error> {
+        if owner <= 0 || !crate::tool_global::names_hermit_task(guest, None, owner).await {
+            return Ok(());
+        }
+        tracing::info!(
+            "[detcore, dtid {}] {command} on fd {fd} names task {owner}, one of Hermit's own, \
+             as the owner of its signals: refused with EPERM \
+             (https://github.com/rrnewton/hermit/issues/4083)",
+            guest.thread_state().dettid,
+        );
+        Err(Errno::EPERM.into())
+    }
+
+    /// `call`, unless it is an `fcntl` that sets a descriptor's signal owner
+    /// to one of Hermit's tasks ([`Self::refuse_hermit_owner`]): `F_SETOWN`
+    /// with a positive pid, or `F_SETOWN_EX` naming a thread (`F_OWNER_TID`)
+    /// or a process (`F_OWNER_PID`).
+    ///
+    /// `F_SETOWN` passes the owner by value; it is read from the raw argument,
+    /// because the pinned Reverie's typed `FcntlCmd::F_SETOWN` carries none.
+    /// `F_SETOWN_EX` passes it through guest memory, which another guest
+    /// thread could change between this check and the kernel's own read, so
+    /// the `f_owner_ex` is read once and the kernel is handed Detcore's copy,
+    /// on this thread's scratch stack. An `f_owner_ex` that cannot be read is
+    /// EFAULT here, as the kernel would answer, rather than a pointer passed
+    /// on for the kernel to read later. The returned guard keeps the copy
+    /// alive (SaBRe's scratch stack is an arena it owns) and must be held
+    /// until the call has run.
+    async fn screen_fcntl_owner<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Fcntl,
+    ) -> Result<(syscalls::Fcntl, Option<<G::Stack as Stack>::StackGuard>), Error> {
+        // Linux's include/uapi/asm-generic/fcntl.h; the pinned libc lacks them.
+        const F_OWNER_TID: libc::c_int = 0;
+        const F_OWNER_PID: libc::c_int = 1;
+        match call.cmd() {
+            F_SETOWN => {
+                let (_, args) = call.into_parts();
+                self.refuse_hermit_owner(guest, call.fd(), "F_SETOWN", args.arg2 as libc::c_int)
+                    .await?;
+                Ok((call, None))
+            }
+            F_SETOWN_EX(owner) => {
+                let owner: Addr<[libc::c_int; 2]> = owner.ok_or(Errno::EFAULT)?.cast();
+                let copy = guest.memory().read_value(owner)?;
+                if matches!(copy[0], F_OWNER_TID | F_OWNER_PID) {
+                    self.refuse_hermit_owner(guest, call.fd(), "F_SETOWN_EX", copy[1])
+                        .await?;
+                }
+                let mut stack = guest.stack().await;
+                let copied: Addr<[libc::c_int; 2]> = stack.push(copy);
+                let guard = stack.commit()?;
+                Ok((call.with_cmd(F_SETOWN_EX(Some(copied.cast()))), Some(guard)))
+            }
+            _ => Ok((call, None)),
+        }
+    }
+
+    /// `call`, unless it is an `ioctl` that sets a descriptor's signal owner
+    /// to one of Hermit's tasks ([`Self::refuse_hermit_owner`]): `FIOSETOWN`
+    /// or `SIOCSPGRP` with a positive pid, which set the owner as `F_SETOWN`
+    /// does. The owner is passed through guest memory, so, as for
+    /// `F_SETOWN_EX` ([`Self::screen_fcntl_owner`]), it is read once and the
+    /// kernel is handed Detcore's copy, kept alive by the returned guard;
+    /// an unreadable one is EFAULT.
+    async fn screen_ioctl_owner<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Ioctl,
+    ) -> Result<(syscalls::Ioctl, Option<<G::Stack as Stack>::StackGuard>), Error> {
+        let (command, owner) = match call.request() {
+            syscalls::ioctl::Request::FIOSETOWN(owner) => ("FIOSETOWN", owner),
+            syscalls::ioctl::Request::SIOCSPGRP(owner) => ("SIOCSPGRP", owner),
+            _ => return Ok((call, None)),
+        };
+        let copy: libc::c_int = guest.memory().read_value(owner.ok_or(Errno::EFAULT)?)?;
+        self.refuse_hermit_owner(guest, call.fd(), command, copy)
+            .await?;
+        let mut stack = guest.stack().await;
+        let copied = stack.push(copy);
+        let guard = stack.commit()?;
+        let request = match call.request() {
+            syscalls::ioctl::Request::FIOSETOWN(_) => {
+                syscalls::ioctl::Request::FIOSETOWN(Some(copied))
+            }
+            _ => syscalls::ioctl::Request::SIOCSPGRP(Some(copied)),
+        };
+        Ok((call.with_request(request), Some(guard)))
+    }
+
     /// ioctl system call
     pub async fn handle_ioctl<G: Guest<Self>>(
         &self,
@@ -4883,6 +4987,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Ioctl,
     ) -> Result<i64, Error> {
         let fd = call.fd();
+        // Before anything else, so a refused call has no other effect.
+        let (call, _owner_copy) = self.screen_ioctl_owner(guest, call).await?;
         // As in `handle_fcntl`: an asynchronous-I/O owner, and a session whose
         // controlling terminal hangs up, are signalled at a moment set by host
         // timing, so hold their signals in every process.

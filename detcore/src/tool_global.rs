@@ -6009,8 +6009,11 @@ where
 
 /// Whether guest task `caller`, naming `tid` (and thread group `tgid`, for the
 /// calls that name one), names one of Hermit's own tasks: a thread of the
-/// process this runs in, Hermit's, which is the container init, PID 1 of the
-/// guest's PID namespace (<https://github.com/rrnewton/hermit/issues/4066>).
+/// process Detcore's global state runs in (<https://github.com/rrnewton/hermit/issues/4066>).
+/// Under ptrace that is Hermit's, the container init, PID 1 of the guest's PID
+/// namespace. Under DBT the global state runs in the root guest process, whose
+/// guest ids are virtual and are not host tasks descended from it, so the
+/// answer there is always no, as for KVM below.
 ///
 /// Hermit's tasks are identified directly, as its own thread group, not as
 /// "not a registered guest task": a guest task Detcore has not registered yet

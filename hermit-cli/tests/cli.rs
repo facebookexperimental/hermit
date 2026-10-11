@@ -21952,7 +21952,10 @@ fn run_signal_hermit_tasks(flags: &[&str], args: &[&str]) -> String {
 /// run (exit 143), and with threads sequentialized `tkill(1, SIGTERM)` and the
 /// thread-directed sends were forwarded too
 /// (https://github.com/rrnewton/hermit/issues/4066). `pidfd_open(1)` is
-/// refused with EPERM, so no pidfd reaches Hermit. Signal 0 to PID 1 answers
+/// refused with EPERM, so no pidfd reaches Hermit, and so is naming Hermit's
+/// tasks as a descriptor's signal owner (`F_SETOWN`, `F_SETOWN_EX`, and the
+/// ioctls `FIOSETOWN` and `SIOCSPGRP`:
+/// https://github.com/rrnewton/hermit/issues/4083). Signal 0 to PID 1 answers
 /// as Linux does, and signals to the guest itself, a child and a sibling
 /// thread are still delivered.
 #[test]
@@ -21971,6 +21974,15 @@ fn signals_to_hermits_own_tasks_are_dropped_in_every_mode() {
                     tgkill(1, thread, SIGTERM): 0\n\
                     rt_tgsigqueueinfo(1, thread, SIGTERM): 0\n\
                     pidfd_open(1): -1 EPERM\n\
+                    F_SETOWN(1): -1 EPERM\n\
+                    F_SETOWN_EX(PID 1): -1 EPERM\n\
+                    F_SETOWN_EX(TID thread): -1 EPERM\n\
+                    F_SETOWN(self): 0\n\
+                    ioctl(FIOSETOWN, 1): -1 EPERM\n\
+                    ioctl(SIOCSPGRP, 1): -1 EPERM\n\
+                    ioctl(FIOSETOWN, thread): -1 EPERM\n\
+                    ioctl(FIOSETOWN, self): 0\n\
+                    async signal to self: delivered\n\
                     kill(self, SIGUSR1): 0\n\
                     handled 1\n\
                     kill(child, SIGTERM): 0\n\
@@ -21980,6 +21992,18 @@ fn signals_to_hermits_own_tasks_are_dropped_in_every_mode() {
     for mode in ["--strict", "--no-sequentialize-threads"] {
         assert_eq!(run_signal_hermit_tasks(&[mode], &[]), expected, "{mode}");
     }
+    // F_SETOWN_EX and FIOSETOWN pass their owner through memory a sibling
+    // thread can change after Detcore checked it; Detcore hands the kernel its
+    // own copy, so PID 1 never becomes the owner. Without threads sequentialized, the swap won
+    // within a few attempts before that copy.
+    assert_eq!(
+        run_signal_hermit_tasks(
+            &["--no-sequentialize-threads", "--max-timeslice=disabled"],
+            &["owner-race", "2000"]
+        ),
+        "F_SETOWN_EX race: owner PID 1 0 times, other errors 0\n\
+         FIOSETOWN race: owner PID 1 0 times, other errors 0\n"
+    );
 }
 
 /// A guest task in a nested PID namespace names tasks by that namespace's
