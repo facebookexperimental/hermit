@@ -2822,6 +2822,15 @@ fn record_pselect_beside_a_sibling_spinning_on_sched_yield() {
     record_select_mode("pselect-beside-a-yielding-sibling");
 }
 
+/// The same with two siblings spinning on `sched_yield`. Each yield replaced
+/// the other's one-turn exclusion, so counting only the latest yielder as
+/// such left the gate shut and the recording hung (Claude review of
+/// https://github.com/rrnewton/hermit/pull/4120).
+#[test]
+fn record_pselect_beside_two_siblings_spinning_on_sched_yield() {
+    record_select_mode("pselect-beside-two-yielding-siblings");
+}
+
 /// The zero-timeout ppoll raise on a stack 160 bytes into its page, whose red
 /// zone the replayed delivery must leave as it found it (review of
 /// https://github.com/rrnewton/hermit/pull/4084).

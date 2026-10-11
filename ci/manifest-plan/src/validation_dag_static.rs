@@ -2218,7 +2218,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/pull/4087's reviews): 171.
     // record_pselect_beside_a_sibling_spinning_on_sched_yield
     // (https://github.com/rrnewton/hermit/issues/4092): 172.
-    ("test.record_replay", 172),
+    // And record_pselect_beside_two_siblings_spinning_on_sched_yield (Claude
+    // review of https://github.com/rrnewton/hermit/pull/4120): 173.
+    ("test.record_replay", 173),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.

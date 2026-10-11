@@ -248,6 +248,11 @@ pub struct RunQueue {
     /// [`PLAIN_YIELDS_BEFORE_EPOCH`] are plain requeues; the next joins the
     /// epoch.
     yield_streaks: BTreeMap<DetTid, u32>,
+    /// Every queued thread that is queued because it yielded (`push_yielded`)
+    /// and has not run since. Unlike `yielded_skip`, which only the latest
+    /// yielder holds, this keeps every one of several threads spinning on
+    /// `sched_yield` (`only_pollers_or_yielders`).
+    queued_by_yield: BTreeSet<DetTid>,
 
     // TODO: The following fields need to be properly abstracted into separate types of run queues.
     /// Which scheduling strategy shall we use.
@@ -290,6 +295,7 @@ impl RunQueue {
             yielded_skip: None,
             yield_epoch: None,
             yield_streaks: BTreeMap::new(),
+            queued_by_yield: BTreeSet::new(),
             prng: Pcg64Mcg::seed_from_u64(seed),
             sticky_random_param: srp,
             sticky_random_selection: None,
@@ -332,17 +338,20 @@ impl RunQueue {
             .all(|(k, v)| v.counts_as_poller(k.priority))
     }
 
-    /// `only_pollers`, also counting the thread that has just yielded
-    /// (`push_yielded`) and is excluded from the next selection. A thread that
-    /// calls `sched_yield` asks for another thread to run first, so, like a
-    /// poller, it is not work that a finished background call must wait
-    /// behind. Counting it as such work starved the background call forever
-    /// whenever a sibling spun on `sched_yield`
-    /// (<https://github.com/rrnewton/hermit/issues/4092>). Read-only.
-    pub fn only_pollers_or_the_yielder(&self) -> bool {
+    /// `only_pollers`, also counting every thread queued because it yielded
+    /// and not run since (`queued_by_yield`). A thread that calls
+    /// `sched_yield` asks for another thread to run first, so, like a poller,
+    /// it is not work that a finished background call must wait behind.
+    /// Counting it as such work starved the background call forever whenever
+    /// a sibling spun on `sched_yield`
+    /// (<https://github.com/rrnewton/hermit/issues/4092>), and counting all but
+    /// the latest yielder did the same for two spinners, which keep clearing
+    /// each other's `yielded_skip` (Claude review of
+    /// <https://github.com/rrnewton/hermit/pull/4120>). Read-only.
+    pub fn only_pollers_or_yielders(&self) -> bool {
         self.queue
             .iter()
-            .all(|(k, v)| v.counts_as_poller(k.priority) || self.yielded_skip == Some(v.tid))
+            .all(|(k, v)| v.counts_as_poller(k.priority) || self.queued_by_yield.contains(&v.tid))
     }
 
     /// True while a `tentative_pop`/commit transaction is underway, i.e. the
@@ -376,6 +385,7 @@ impl RunQueue {
     pub fn push_yielded(&mut self, tid: DetTid, priority: Priority) -> PrioritizedOrder {
         assert!(self.yielded_skip.is_none());
         self.yielded_skip = Some(tid);
+        self.queued_by_yield.insert(tid);
         self.push_back(tid, priority)
     }
 
@@ -566,6 +576,7 @@ impl RunQueue {
             epoch.remove(&tid);
         }
         self.yield_streaks.remove(&tid);
+        self.queued_by_yield.remove(&tid);
         // A successful nonleader exec can remove one thread incarnation and
         // admit its replacement under the same raw TID in a single scheduler
         // drain. Do not let the replacement inherit the destroyed leader's
@@ -771,6 +782,7 @@ impl RunQueue {
         // If this invariant is violated, then it's a bug, or the queue is modified
         // between the peek and tentative_pop and commit_tentative_pop.
         debug_assert!(ret == tentative_selection);
+        self.queued_by_yield.remove(&ret);
         ret
     }
 
@@ -1504,26 +1516,43 @@ mod tests {
     }
 
     #[test]
-    fn the_thread_that_just_yielded_is_not_work_a_background_call_waits_behind() {
-        let yielding = DetTid::from_raw(1);
-        let peer = DetTid::from_raw(2);
+    fn threads_queued_by_a_yield_are_not_work_a_background_call_waits_behind() {
+        let first = DetTid::from_raw(1);
+        let second = DetTid::from_raw(2);
+        let worker = DetTid::from_raw(3);
         let mut queue = RunQueue::default();
 
-        queue.push_back(yielding, DEFAULT_PRIORITY);
-        assert_eq!(queue.tentative_pop_next(), Some(yielding));
-        assert_eq!(queue.commit_tentative_pop_completed_turn(), yielding);
-        queue.push_yielded(yielding, DEFAULT_PRIORITY);
+        queue.push_back(first, DEFAULT_PRIORITY);
+        queue.push_back(second, DEFAULT_PRIORITY);
+        assert!(!queue.only_pollers_or_yielders());
+
+        // Two spinners take turns: each yield replaces the other's
+        // `yielded_skip`, and both still count as yielders.
+        assert_eq!(queue.tentative_pop_next(), Some(first));
+        assert_eq!(queue.commit_tentative_pop_completed_turn(), first);
+        queue.push_yielded(first, DEFAULT_PRIORITY);
+        assert!(
+            !queue.only_pollers_or_yielders(),
+            "second has not yielded yet"
+        );
+        assert_eq!(queue.tentative_pop_next(), Some(second));
+        assert_eq!(queue.commit_tentative_pop_completed_turn(), second);
+        queue.push_yielded(second, DEFAULT_PRIORITY);
+        assert_eq!(queue.yielded_skip, Some(second));
         assert!(!queue.only_pollers());
-        assert!(queue.only_pollers_or_the_yielder());
+        assert!(queue.only_pollers_or_yielders());
 
-        // Ordinary work besides the yielder still counts.
-        queue.push_back(peer, DEFAULT_PRIORITY);
-        assert!(!queue.only_pollers_or_the_yielder());
+        // Ordinary work besides them still counts.
+        queue.push_back(worker, DEFAULT_PRIORITY);
+        assert!(!queue.only_pollers_or_yielders());
+        assert!(queue.remove_tid(worker));
+        assert!(queue.only_pollers_or_yielders());
 
-        // Once another thread has had its turn, the yield is spent.
-        assert_eq!(queue.tentative_pop_next(), Some(peer));
-        assert_eq!(queue.commit_tentative_pop_completed_turn(), peer);
-        assert!(!queue.only_pollers_or_the_yielder());
+        // A yielder that runs again and is queued without yielding is work.
+        assert_eq!(queue.tentative_pop_next(), Some(first));
+        assert_eq!(queue.commit_tentative_pop_completed_turn(), first);
+        queue.push_back(first, DEFAULT_PRIORITY);
+        assert!(!queue.only_pollers_or_yielders());
     }
 
     #[test]

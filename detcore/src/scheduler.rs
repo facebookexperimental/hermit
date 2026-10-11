@@ -6927,10 +6927,12 @@ impl Scheduler {
                 // its peer is backgrounded on BlockingExternalIO). Treat a run queue
                 // that holds only pollers as "no deterministic work" so we still harvest
                 // completed IO below; a queued poller must not starve a ready blocker.
-                // Nor must a thread that has just yielded: a sibling spinning on
-                // `sched_yield` is always queued, and it starved a finished
+                // Nor must a thread queued because it yielded: a sibling spinning
+                // on `sched_yield` is always queued, and it starved a finished
                 // background pselect6 forever (https://github.com/rrnewton/hermit/issues/4092).
-                let only_pollers = self.run_queue.only_pollers_or_the_yielder();
+                // Whether the call has finished is host-timed, as for a poller;
+                // `log_rejoin` records the turn of the readmission for replay.
+                let only_pollers = self.run_queue.only_pollers_or_yielders();
 
                 // Deterministic work is runnable: let it proceed. Waiting here while such
                 // work exists can deadlock thread creation -- the parent and new child
@@ -7016,9 +7018,8 @@ impl Scheduler {
             // Use the same deterministic-work-first policy as record/replay. Host
             // completion timing must not decide whether a ready continuation overtakes
             // guest work that was already runnable. Pollers are excluded because they
-            // commonly wait for the completed operation and would otherwise starve it,
-            // and so is a thread that has just yielded, for the same reason.
-            let only_pollers = self.run_queue.only_pollers_or_the_yielder();
+            // commonly wait for the completed operation and would otherwise starve it.
+            let only_pollers = self.run_queue.only_pollers();
             if !self.run_queue.is_empty() && !only_pollers {
                 return Ok(());
             }

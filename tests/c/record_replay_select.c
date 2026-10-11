@@ -155,6 +155,9 @@
  *                under an empty mask: EINTR with the handler run. Under record
  *                the first finished call was never readmitted while the
  *                sibling stayed queued (https://github.com/rrnewton/hermit/issues/4092)
+ *   pselect-beside-two-yielding-siblings
+ *                the same with two spinning siblings, which keep replacing
+ *                each other's one-turn yield exclusion
  *   pselect-mask-hook-race
  *                a raw pselect6 with a 1 s timeout and a mask buffer holding
  *                SIGALRM, which the thread blocks, while a 100 ms ITIMER_REAL
@@ -1887,7 +1890,10 @@ static void* yield_until_done(void* arg) {
   return NULL;
 }
 
-static int pselect_beside_a_yielding_sibling(void) {
+/* With `yielders` siblings: two spinners keep replacing each other's
+ * one-turn yield exclusion (Claude review of
+ * https://github.com/rrnewton/hermit/pull/4120). */
+static int pselect_beside_yielding_siblings(const char* name, int yielders) {
   struct sigaction action;
   memset(&action, 0, sizeof action);
   action.sa_handler = count_raised_usr1;
@@ -1900,10 +1906,12 @@ static int pselect_beside_a_yielding_sibling(void) {
     return 1;
   }
   raised_usr1 = 0;
-  pthread_t sibling;
-  if (pthread_create(&sibling, NULL, yield_until_done, NULL) != 0) {
-    perror("pthread_create");
-    return 1;
+  pthread_t siblings[2];
+  for (int i = 0; i < yielders; i++) {
+    if (pthread_create(&siblings[i], NULL, yield_until_done, NULL) != 0) {
+      perror("pthread_create");
+      return 1;
+    }
   }
   static uint64_t empty_mask;
   static struct pselect_mask_wrapper wrapper = {
@@ -1927,16 +1935,19 @@ static int pselect_beside_a_yielding_sibling(void) {
     }
   }
   atomic_store(&yielding_sibling_done, 1);
-  pthread_join(sibling, NULL);
+  for (int i = 0; i < yielders; i++) {
+    pthread_join(siblings[i], NULL);
+  }
   printf(
-      "%-24s zeros=%02d interrupted=%02d other=%02d handled=%02d\n",
+      "%-24s yielders=%01d zeros=%02d interrupted=%02d other=%02d handled=%02d\n",
       "pselect-yielding-sibling",
+      yielders,
       zeros,
       interrupted,
       other,
       (int)raised_usr1);
   if (zeros != 5 || interrupted != 5 || other != 0 || raised_usr1 != 5) {
-    fprintf(stderr, "pselect-beside-a-yielding-sibling mismatch\n");
+    fprintf(stderr, "%s mismatch\n", name);
     return 1;
   }
   return 0;
@@ -1960,7 +1971,8 @@ int main(int argc, char** argv) {
         "epoll-pwait-mask-raise-tight|epoll-pwait-mask-raise-tight24|"
         "epoll-pwait-mask-redzone-events|epoll-pwait-mask-pipe-epfd|"
         "pselect-mask-unblocks-tight-stack24|"
-        "pselect-beside-a-yielding-sibling]\n",
+        "pselect-beside-a-yielding-sibling|"
+        "pselect-beside-two-yielding-siblings]\n",
         argv[0]);
     return 2;
   }
@@ -2049,7 +2061,10 @@ int main(int argc, char** argv) {
     return ppoll_mask_zero_raise_tight();
   }
   if (strcmp(argv[1], "pselect-beside-a-yielding-sibling") == 0) {
-    return pselect_beside_a_yielding_sibling();
+    return pselect_beside_yielding_siblings(argv[1], 1);
+  }
+  if (strcmp(argv[1], "pselect-beside-two-yielding-siblings") == 0) {
+    return pselect_beside_yielding_siblings(argv[1], 2);
   }
   if (strcmp(argv[1], "pselect-mask-hook-race") == 0) {
     return pselect_mask_hook_race();
