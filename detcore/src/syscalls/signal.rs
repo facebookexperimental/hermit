@@ -33,7 +33,9 @@ use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::resources::SigalrmSleepDisposition;
 use crate::syscalls::helpers::REAL_TIME_SIGNALS;
-use crate::syscalls::helpers::observe_pending_real_time_expirations;
+use crate::syscalls::helpers::act_on_pending_real_time;
+use crate::syscalls::helpers::observe_under_mask;
+use crate::syscalls::helpers::pending_real_time_among;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::syscalls::helpers::unblocked_by;
 use crate::syscalls::threads::KERNEL_SIGSET_SIZE;
@@ -642,9 +644,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // The temporary mask lets the kernel take a pending real-time timer
         // expiration that every thread blocked when it expired
         // (https://github.com/rrnewton/hermit/issues/4089).
-        let state = read_thread_wait_signal_state(guest.pid(), guest.tid())?;
-        let (observable, discarded) = unblocked_by(&state, temporary_mask);
-        observe_pending_real_time_expirations(guest, observable, discarded).await;
+        observe_under_mask(guest, temporary_mask).await?;
         // The real call sleeps under a private copy of the mask read here, not
         // under the guest's buffer. The scheduler decides from this copy which
         // signals can end the call (`Resources::blocked_signal_mask`), and
@@ -815,7 +815,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             && kernel_action.is_some_and(|action| action.handler == libc::SIG_IGN as u64)
             && (1..=64).contains(&call.signum())
         {
-            observe_pending_real_time_expirations(guest, 0, kernel_sigset_bit(call.signum())).await;
+            let bit = kernel_sigset_bit(call.signum());
+            let pending = pending_real_time_among(guest, bit).await;
+            act_on_pending_real_time(guest, pending, 0, bit).await;
         }
         Ok(result?)
     }
@@ -888,12 +890,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             // delivers (https://github.com/rrnewton/hermit/issues/4089). Whatever
             // the call returned: an EFAULT copying the old set out comes after
             // the change. A mask that cannot be read could unblock any of them.
-            let (observable, discarded) =
-                match read_thread_wait_signal_state(guest.pid(), guest.tid()) {
-                    Ok(state) => unblocked_by(&state, state.blocked),
-                    Err(_) => (REAL_TIME_SIGNALS, 0),
-                };
-            observe_pending_real_time_expirations(guest, observable, discarded).await;
+            let pending = pending_real_time_among(guest, REAL_TIME_SIGNALS).await;
+            if pending != 0 {
+                let (observable, discarded) =
+                    match read_thread_wait_signal_state(guest.pid(), guest.tid()) {
+                        Ok(state) => unblocked_by(&state, state.blocked),
+                        Err(_) => (REAL_TIME_SIGNALS, 0),
+                    };
+                act_on_pending_real_time(guest, pending, observable, discarded).await;
+            }
         }
         if self.cfg.backend.virtualizes_guest_sigalrm && guest.thread_state().sigalrm_handled {
             // Signal phase 1: the scheduler's blocked bit follows the virtual
@@ -1516,10 +1521,85 @@ impl<T: RecordOrReplay> Detcore<T> {
         // shown here. The pending set would show a real-time timer expiration
         // that every thread blocked when it expired, which the kernel never
         // queued (https://github.com/rrnewton/hermit/issues/4089).
-        observe_pending_real_time_expirations(guest, REAL_TIME_SIGNALS, 0).await;
+        let pending = pending_real_time_among(guest, REAL_TIME_SIGNALS).await;
+        act_on_pending_real_time(guest, pending, REAL_TIME_SIGNALS, 0).await;
         Ok(self.record_or_replay(guest, call).await?)
     }
+
+    /// Before a caught signal is delivered, the thread's mask is the one its
+    /// handler's return restores, through an `rt_sigreturn` that ptrace does
+    /// not stop at. Record the real-time signals that mask leaves unblocked, so
+    /// an expiration of one, while the handler's `sa_mask` blocks it, is never
+    /// kept pending (`Scheduler::real_time_expiration_fate`,
+    /// https://github.com/rrnewton/hermit/issues/4089). Only where real-time
+    /// expirations are kept pending at all (`models_signal_targets`), and only
+    /// what this thread has not recorded yet. A state that cannot be read
+    /// records every real-time signal.
+    pub(crate) async fn record_handler_restore_mask<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: Signal,
+    ) {
+        if !(self.cfg.sequentialize_threads
+            && self.cfg.backend_supports_blocked_wait_signal_interruption)
+        {
+            return;
+        }
+        let reported = guest.thread_state().handler_restore_rt_reported;
+        if reported == REAL_TIME_SIGNALS {
+            return;
+        }
+        let unblocked = match read_thread_wait_signal_state(guest.pid(), guest.tid()) {
+            Ok(state) if state.caught & kernel_sigset_bit(signal as i32) == 0 => {
+                return;
+            }
+            Ok(state) => !state.blocked & REAL_TIME_SIGNALS,
+            Err(_) => REAL_TIME_SIGNALS,
+        } & !reported;
+        if unblocked == 0 {
+            return;
+        }
+        let Some(detpid) = guest.thread_state().detpid else {
+            return;
+        };
+        crate::tool_global::record_handler_restore_mask(guest, detpid, unblocked).await;
+        guest.thread_state_mut().handler_restore_rt_reported |= unblocked;
+    }
+
+    /// rt_sigreturn: the mask it restores, from the frame's `uc_sigmask`, may
+    /// unblock a pending real-time timer expiration that every thread blocked
+    /// when it expired, which the kernel then delivers as the call returns
+    /// (https://github.com/rrnewton/hermit/issues/4089). The call itself
+    /// passes through.
+    pub(crate) async fn observe_sigreturn_mask<G: Guest<Self>>(&self, guest: &mut G) {
+        let pending = pending_real_time_among(guest, REAL_TIME_SIGNALS).await;
+        if pending == 0 {
+            return;
+        }
+        // x86-64 `rt_sigreturn` reads `frame = sp - sizeof(long)` and restores
+        // `frame->uc.uc_sigmask`; `uc` starts at `sp`.
+        let sp = guest.regs().await.rsp as usize;
+        let restored = Addr::<u64>::from_raw(sp.wrapping_add(UC_SIGMASK_OFFSET))
+            .and_then(|addr| guest.memory().read_value(addr).ok());
+        let (observable, discarded) = match (
+            restored,
+            read_thread_wait_signal_state(guest.pid(), guest.tid()),
+        ) {
+            (Some(mask), Ok(state)) => unblocked_by(&state, mask),
+            // A frame the kernel cannot read either kills the guest with
+            // SIGSEGV, which delivers nothing pending.
+            (None, _) => (0, 0),
+            // A state that cannot be read could hide any delivery.
+            (Some(_), Err(_)) => (REAL_TIME_SIGNALS, 0),
+        };
+        act_on_pending_real_time(guest, pending, observable, discarded).await;
+    }
 }
+
+/// The offset of `uc_sigmask` in the x86-64 kernel `ucontext` that
+/// `rt_sigreturn` restores: after uc_flags (8), uc_link (8), uc_stack (24) and
+/// uc_mcontext (256 bytes).
+const UC_SIGMASK_OFFSET: usize = 8 + 8 + 24 + 256;
 
 fn should_notify_cross_task_signal(sender: DetTid, target: DetTid, raw_signal: i32) -> bool {
     raw_signal != 0 && target != sender

@@ -2110,6 +2110,12 @@ pub struct ThreadState<T> {
     /// virtual bit with this one and publishes a change.
     pub(crate) sigalrm_blocked_published: bool,
 
+    /// The real-time signals this thread's process has already recorded as
+    /// unblocked by a handler's restored mask
+    /// (`Scheduler::handler_restore_unblocked`), so a delivery adds nothing
+    /// new without asking the kernel or the scheduler.
+    pub(crate) handler_restore_rt_reported: u64,
+
     /// While Detcore runs its signal pipeline for a SIGALRM it delivers at a
     /// syscall's completion: the registers as that completion leaves them
     /// (`completed_syscall_projection`), which the pipeline reads instead of
@@ -2674,6 +2680,7 @@ impl<T> ThreadState<T> {
             restart_block: None,
             sigalrm_handled: false,
             sigalrm_blocked_published: false,
+            handler_restore_rt_reported: 0,
             signal_register_projection: None,
             last_accounted_user_time,
             last_accounted_system_time,

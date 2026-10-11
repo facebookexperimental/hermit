@@ -1310,6 +1310,19 @@ pub struct Scheduler {
     /// does. Exec keeps it, as exec keeps pending signals.
     pending_real_time_expirations: BTreeMap<DetPid, u64>,
 
+    /// The signals (a kernel sigset) of each signalfd a process created, by
+    /// process; a real-time timer expiration such a descriptor could read is
+    /// never kept pending (`real_time_expiration_fate`).
+    signalfd_masks: BTreeMap<DetPid, u64>,
+
+    /// The real-time signals (a kernel sigset) that the mask a signal handler's
+    /// return restores leaves unblocked, by process: the thread's mask when a
+    /// caught signal was delivered to it, which `rt_sigreturn` restores without
+    /// a stop that Detcore sees. While a handler runs, its `sa_mask` may block
+    /// a signal its return unblocks, so an expiration of one of these is never
+    /// kept pending (`real_time_expiration_fate`). Never cleared.
+    handler_restore_unblocked: BTreeMap<DetPid, u64>,
+
     /// Test-only stand-in for the /proc signal-mask fields, keyed by
     /// (process, thread, field). Unit tests use small fake pids that can name
     /// real host processes, so tests never read /proc: an absent entry reads
@@ -2423,6 +2436,39 @@ pub(crate) fn exit_on_scheduler_refusal(refusal: &dyn std::fmt::Display) -> ! {
 /// which Detcore cannot deliver (https://github.com/rrnewton/hermit/issues/3893):
 /// at the expiration itself, or later, where a pending one becomes observable
 /// (https://github.com/rrnewton/hermit/issues/4089).
+/// What Linux does with a real-time POSIX timer expiration, as far as the
+/// guest could tell (`Scheduler::real_time_expiration_fate`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RealTimeFate {
+    /// Nothing can see it.
+    Discarded,
+    /// Queued where nothing can observe it yet: kept pending.
+    Queued,
+    /// The guest would see it now: the run refuses.
+    Deliverable,
+}
+
+/// Set, and never cleared, the first time a real-time timer expiration is
+/// kept pending (`Scheduler::pending_real_time_expirations`). Until then no
+/// call needs to ask the scheduler about pending ones, which keeps that
+/// question off every signal-mask change and wait of a program that arms no
+/// such timer. Only a backend that models signal targets keeps any pending,
+/// and on it, ptrace, the tool and the scheduler share this process. It is set
+/// at a timed pop and read by a thread in its own turn, so the schedule orders
+/// the two.
+static REAL_TIME_EXPIRATION_KEPT_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn note_real_time_expiration_kept_pending() {
+    REAL_TIME_EXPIRATION_KEPT_PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether any real-time timer expiration has been kept pending in this run;
+/// see [`REAL_TIME_EXPIRATION_KEPT_PENDING`].
+pub(crate) fn real_time_expiration_kept_pending() -> bool {
+    REAL_TIME_EXPIRATION_KEPT_PENDING.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 pub(crate) fn refuse_real_time_expiration(signo: i32) -> ! {
     exit_on_scheduler_refusal(&format_args!(
         "hermit: a POSIX timer expired that notifies with real-time signal {signo}, which Detcore cannot deliver; refusing the run rather than dropping the expiration (https://github.com/rrnewton/hermit/issues/3893)"
@@ -2999,6 +3045,8 @@ impl Scheduler {
             child_exit_sigchld: Default::default(),
             saved_guest_sigmasks: Default::default(),
             pending_real_time_expirations: Default::default(),
+            signalfd_masks: Default::default(),
+            handler_restore_unblocked: Default::default(),
             #[cfg(test)]
             test_signal_masks: Default::default(),
             resources: Default::default(),
@@ -15140,11 +15188,14 @@ mod test {
         assert!(scheduler.run_queue.contains_tid(creator));
     }
 
-    /// A real-time POSIX timer expiration that every live thread of its process
-    /// blocks is kept pending instead of refused
-    /// (https://github.com/rrnewton/hermit/issues/4089), and only then.
+    /// What happens to a real-time POSIX timer expiration
+    /// (https://github.com/rrnewton/hermit/issues/4089): kept pending only
+    /// when every live thread blocks it by a mask the schedule fixes and
+    /// nothing can observe it, discarded where Linux discards it, and refused
+    /// otherwise.
     fn real_time_family() -> (Scheduler, DetPid, DetTid, DetTid, u64) {
         let (mut scheduler, parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+        assert!(scheduler.models_signal_targets);
         let rt = kernel_signal_bit(35);
         for thread in [parent, creator] {
             scheduler.test_kernel_signal_states.insert(
@@ -15167,86 +15218,190 @@ mod test {
     #[test]
     fn a_real_time_expiration_every_thread_blocks_is_kept_pending() {
         let (mut scheduler, process, parent, _creator, rt) = real_time_family();
-        assert!(scheduler.real_time_expiration_is_queued(process, 35));
-        scheduler.dispatch_timed_signal(
-            LogicalTime::from_nanos(1),
-            timed_waiters::SignalTimerId::Posix(process, 0),
-            parent,
-            timed_waiters::TimerSignal::RefuseRealTime(35),
-            true,
-            scheduler.committed_time,
+        assert_eq!(
+            scheduler.real_time_expiration_fate(process, parent, 35),
+            RealTimeFate::Queued
         );
-        assert_eq!(scheduler.pending_real_time_expirations(process), rt);
-        // A second expiration of the same signal coalesces into the same bit,
-        // as the pending set reports it.
-        scheduler.dispatch_timed_signal(
-            LogicalTime::from_nanos(2),
-            timed_waiters::SignalTimerId::Posix(process, 0),
-            parent,
-            timed_waiters::TimerSignal::RefuseRealTime(35),
-            true,
-            scheduler.committed_time,
-        );
+        for at in [1, 2] {
+            scheduler.dispatch_timed_signal(
+                LogicalTime::from_nanos(at),
+                timed_waiters::SignalTimerId::Posix(process, 0),
+                parent,
+                timed_waiters::TimerSignal::RefuseRealTime(35),
+                true,
+                scheduler.committed_time,
+            );
+        }
+        // A second expiration of the same signal coalesces into the same bit.
         assert_eq!(scheduler.pending_real_time_expirations(process), rt);
         assert_eq!(
             scheduler.pending_real_time_expirations(DetPid::from_raw(200)),
             0
         );
+        assert!(real_time_expiration_kept_pending());
     }
 
     #[test]
     fn a_real_time_expiration_one_thread_unblocks_is_deliverable() {
-        let (mut scheduler, process, _parent, creator, _rt) = real_time_family();
+        let (mut scheduler, process, parent, creator, _rt) = real_time_family();
         scheduler
             .test_kernel_signal_states
             .insert(creator, signal_state(0, 0));
-        assert!(!scheduler.real_time_expiration_is_queued(process, 35));
+        assert_eq!(
+            scheduler.real_time_expiration_fate(process, parent, 35),
+            RealTimeFate::Deliverable
+        );
     }
 
     #[test]
     fn a_real_time_expiration_is_judged_by_a_held_threads_own_mask() {
         // Detcore holds the creator under a private mask that blocks every
         // signal; its own mask does not block the timer's signal.
-        let (mut scheduler, process, _parent, creator, _rt) = real_time_family();
+        let (mut scheduler, process, parent, creator, _rt) = real_time_family();
         scheduler.saved_guest_sigmasks.insert(creator, 0);
-        assert!(!scheduler.real_time_expiration_is_queued(process, 35));
+        assert_eq!(
+            scheduler.real_time_expiration_fate(process, parent, 35),
+            RealTimeFate::Deliverable
+        );
         // And one whose own mask blocks it, while the kernel shows nothing blocked.
-        let (mut scheduler, process, _parent, creator, rt) = real_time_family();
+        let (mut scheduler, process, parent, creator, rt) = real_time_family();
         scheduler
             .test_kernel_signal_states
             .insert(creator, signal_state(0, 0));
         scheduler.saved_guest_sigmasks.insert(creator, rt);
-        assert!(scheduler.real_time_expiration_is_queued(process, 35));
+        assert_eq!(
+            scheduler.real_time_expiration_fate(process, parent, 35),
+            RealTimeFate::Queued
+        );
+    }
+
+    #[test]
+    fn a_real_time_expiration_with_a_thread_outside_the_schedule_is_deliverable() {
+        // Its recorded mask is its call's temporary one, which blocks the
+        // signal; the mask restored as the call returns may not.
+        let (mut scheduler, process, parent, creator, rt) = real_time_family();
+        scheduler
+            .blocked
+            .out_of_scheduler_masks
+            .insert(creator, Some(rt));
+        assert_eq!(
+            scheduler.real_time_expiration_fate(process, parent, 35),
+            RealTimeFate::Deliverable
+        );
     }
 
     #[test]
     fn a_real_time_expiration_with_an_unreadable_thread_is_deliverable() {
-        let (mut scheduler, process, _parent, creator, _rt) = real_time_family();
+        let (mut scheduler, process, parent, creator, _rt) = real_time_family();
         scheduler.test_kernel_signal_states.remove(&creator);
         scheduler.test_sleeper_read_failures.insert(
             creator,
             sleep_signal::SleeperStateUnreadable::Unreadable(reverie::Errno::EIO),
         );
-        assert!(!scheduler.real_time_expiration_is_queued(process, 35));
+        assert_eq!(
+            scheduler.real_time_expiration_fate(process, parent, 35),
+            RealTimeFate::Deliverable
+        );
     }
 
     #[test]
-    fn a_real_time_expiration_skips_a_thread_that_is_gone() {
-        let (mut scheduler, process, _parent, creator, _rt) = real_time_family();
-        scheduler.test_kernel_signal_states.remove(&creator);
-        scheduler
-            .test_sleeper_read_failures
-            .insert(creator, sleep_signal::SleeperStateUnreadable::Gone);
-        assert!(scheduler.real_time_expiration_is_queued(process, 35));
-        // With every thread gone there is nobody to queue it for.
-        let (mut scheduler, process, parent, creator, _rt) = real_time_family();
+    fn an_ignored_real_time_expiration_is_discarded_where_a_thread_takes_it() {
+        let (mut scheduler, process, parent, creator, rt) = real_time_family();
         for thread in [parent, creator] {
-            scheduler.test_kernel_signal_states.remove(&thread);
-            scheduler
-                .test_sleeper_read_failures
-                .insert(thread, sleep_signal::SleeperStateUnreadable::Gone);
+            scheduler.test_kernel_signal_states.insert(
+                thread,
+                KernelSignalState {
+                    blocked: rt,
+                    ..signal_state(0, rt)
+                },
+            );
         }
-        assert!(!scheduler.real_time_expiration_is_queued(process, 35));
+        // Every thread blocks it: Linux queues it, ignored or not.
+        assert_eq!(
+            scheduler.real_time_expiration_fate(process, parent, 35),
+            RealTimeFate::Queued
+        );
+        // A thread that does not block it takes it, and discards it.
+        scheduler
+            .test_kernel_signal_states
+            .insert(creator, signal_state(0, rt));
+        assert_eq!(
+            scheduler.real_time_expiration_fate(process, parent, 35),
+            RealTimeFate::Discarded
+        );
+    }
+
+    #[test]
+    fn a_real_time_expiration_a_signalfd_or_a_handler_return_could_see_is_deliverable() {
+        let (mut scheduler, process, parent, _creator, rt) = real_time_family();
+        scheduler.register_signalfd(process, rt);
+        assert_eq!(
+            scheduler.real_time_expiration_fate(process, parent, 35),
+            RealTimeFate::Deliverable
+        );
+        let (mut scheduler, process, parent, _creator, rt) = real_time_family();
+        scheduler.record_handler_restore_unblocked(process, rt);
+        assert_eq!(
+            scheduler.real_time_expiration_fate(process, parent, 35),
+            RealTimeFate::Deliverable
+        );
+        // Another signal's records change nothing.
+        let (mut scheduler, process, parent, _creator, _rt) = real_time_family();
+        scheduler.register_signalfd(process, kernel_signal_bit(40));
+        scheduler.record_handler_restore_unblocked(process, kernel_signal_bit(41));
+        assert_eq!(
+            scheduler.real_time_expiration_fate(process, parent, 35),
+            RealTimeFate::Queued
+        );
+        // A record of an ancestor counts: a fork copies its descriptors.
+        let (mut scheduler, _parent_process, _parent, _creator, rt) = real_time_family();
+        let child = DetTid::from_raw(200);
+        let child_process = DetPid::from_raw(200);
+        scheduler.test_kernel_signal_states.insert(
+            child,
+            KernelSignalState {
+                blocked: rt,
+                ..signal_state(0, 0)
+            },
+        );
+        assert_eq!(
+            scheduler.real_time_expiration_fate(child_process, child, 35),
+            RealTimeFate::Queued
+        );
+        scheduler.register_signalfd(DetPid::from_raw(100), rt);
+        assert_eq!(
+            scheduler.real_time_expiration_fate(child_process, child, 35),
+            RealTimeFate::Deliverable
+        );
+    }
+
+    #[test]
+    fn a_real_time_expiration_of_a_process_without_live_threads_is_discarded() {
+        let (mut scheduler, process, parent, creator, _rt) = real_time_family();
+        scheduler.next_turns.remove(&parent);
+        scheduler.next_turns.remove(&creator);
+        assert_eq!(
+            scheduler.real_time_expiration_fate(process, parent, 35),
+            RealTimeFate::Discarded
+        );
+    }
+
+    #[test]
+    fn without_signal_target_modelling_the_arming_thread_decides_as_before() {
+        let (mut scheduler, process, parent, creator, rt) = real_time_family();
+        scheduler.models_signal_targets = false;
+        // Every thread blocks it, but nothing is kept pending.
+        assert_eq!(
+            scheduler.real_time_expiration_fate(process, parent, 35),
+            RealTimeFate::Deliverable
+        );
+        scheduler
+            .test_kernel_signal_states
+            .insert(creator, signal_state(0, rt));
+        assert_eq!(
+            scheduler.real_time_expiration_fate(process, creator, 35),
+            RealTimeFate::Discarded
+        );
     }
 
     #[test]

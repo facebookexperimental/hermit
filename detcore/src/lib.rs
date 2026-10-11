@@ -2005,6 +2005,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 "[dtid {}] finish delivering signal (#{}) {}",
                 dettid, mycount, signal
             );
+            self.record_handler_restore_mask(guest, signal).await;
 
             self.post_handler_hook(guest, CheckIn::Event).await;
             Ok(Some(signal))
@@ -2190,6 +2191,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     // A fork child inherits its parent's signal dispositions.
                     sigalrm_handled: pts.1.sigalrm_handled,
                     sigalrm_blocked_published: pts.1.sigalrm_blocked_published,
+                    handler_restore_rt_reported: pts.1.handler_restore_rt_reported,
                     signal_register_projection: None,
                     last_accounted_user_time,
                     last_accounted_system_time,
@@ -3630,6 +3632,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // PassThrough syscall, through the blanket arm below.
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-644): Keep dispatch aligned with the reviewed classification.
+            // A pass-through whose restored mask may deliver a pending real-time
+            // timer expiration (https://github.com/rrnewton/hermit/issues/4089).
+            SyscallClassification::PassThrough if call.number() == Sysno::rt_sigreturn => {
+                self.observe_sigreturn_mask(guest).await;
+                self.passthrough(guest, call).await
+            }
             SyscallClassification::PassThrough => self.passthrough(guest, call).await,
             // The kernel's restart of a wait Detcore emulates resumes it; any other
             // `restart_syscall` keeps the unsupported-syscall policy below.

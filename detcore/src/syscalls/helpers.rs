@@ -43,6 +43,7 @@ use crate::syscalls::threads::WaitSignalDisposition;
 use crate::syscalls::threads::block_signals_for_disposition;
 use crate::syscalls::threads::blocked_signal_mask;
 use crate::syscalls::threads::kernel_sigset_bit;
+use crate::syscalls::threads::read_thread_wait_signal_state;
 use crate::syscalls::threads::read_wait_signal_state;
 use crate::syscalls::threads::restore_signals_after_disposition;
 use crate::syscalls::threads::wait_signal_disposition;
@@ -1905,7 +1906,8 @@ where
         }
         // A pending real-time timer expiration in the set this wait takes
         // (https://github.com/rrnewton/hermit/issues/4089).
-        observe_pending_real_time_expirations(guest, consumed, 0).await;
+        let pending = pending_real_time_among(guest, consumed).await;
+        act_on_pending_real_time(guest, pending, consumed, 0).await;
         // Route through the record/replay subtool for internal pipes so each poll (an
         // EAGAIN, or the final data-bearing read) becomes one recorded event that replay
         // reproduces deterministically; otherwise execute the syscall directly.
@@ -2047,9 +2049,12 @@ where
         signals.admit_committed(committed_signals(&resumed) & kernel_sigset_bit(libc::SIGCHLD));
         // A pending real-time timer expiration that this wait would consume or
         // be ended by (https://github.com/rrnewton/hermit/issues/4089).
-        match signals.observable_now() {
-            Ok(observable) => observe_pending_real_time_expirations(guest, observable, 0).await,
-            Err(error) => break Err(error),
+        let pending = pending_real_time_among(guest, REAL_TIME_SIGNALS).await;
+        if pending != 0 {
+            match signals.observable_now() {
+                Ok(observable) => act_on_pending_real_time(guest, pending, observable, 0).await,
+                Err(error) => break Err(error),
+            }
         }
         let first = std::mem::take(&mut first_turn);
         // Never `inject_with_retry`: see `KernelSignalWait`.
@@ -2319,36 +2324,48 @@ pub(crate) fn unblocked_by(
     (unblocked & !state.ignored, unblocked & state.ignored)
 }
 
-/// Where a call lets the guest observe some pending signals (`observable`:
-/// deliver, dequeue or report them), refuse the run by name if one of them is
-/// a real-time POSIX timer expiration that every thread of the process blocked
-/// when it expired, which Detcore keeps pending instead of refusing at once
-/// (`Scheduler::pending_real_time_expirations`,
-/// https://github.com/rrnewton/hermit/issues/4089). Discard the pending ones in
-/// `discarded`, which Linux discards there. Asks the scheduler only when one of
-/// the sets holds a real-time signal, in the calling thread's turn.
-pub(crate) async fn observe_pending_real_time_expirations<T, G>(
+/// The real-time timer expirations among `candidates` (a kernel sigset) that
+/// are pending for the calling thread's process because every thread blocked
+/// them when they expired (`Scheduler::pending_real_time_expirations`,
+/// https://github.com/rrnewton/hermit/issues/4089). 0 without asking the
+/// scheduler until one has been kept pending in this run
+/// (`scheduler::real_time_expiration_kept_pending`), or when `candidates`
+/// holds no real-time signal. Asked in the calling thread's turn.
+pub(crate) async fn pending_real_time_among<T, G>(guest: &mut G, candidates: KernelSigset) -> u64
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let candidates = candidates & REAL_TIME_SIGNALS;
+    if candidates == 0 || !crate::scheduler::real_time_expiration_kept_pending() {
+        return 0;
+    }
+    let Some(detpid) = guest.thread_state().detpid else {
+        return 0;
+    };
+    crate::tool_global::pending_real_time_expirations(guest, detpid).await & candidates
+}
+
+/// Where a call lets the guest observe the signals in `observable` (deliver,
+/// dequeue or report them), refuse the run by name if one of the `pending`
+/// real-time timer expirations (`pending_real_time_among`) is among them, and
+/// discard the pending ones in `discarded`, which Linux discards there.
+pub(crate) async fn act_on_pending_real_time<T, G>(
     guest: &mut G,
+    pending: KernelSigset,
     observable: KernelSigset,
     discarded: KernelSigset,
 ) where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
-    let candidates = (observable | discarded) & REAL_TIME_SIGNALS;
-    if candidates == 0 {
-        return;
-    }
-    let Some(detpid) = guest.thread_state().detpid else {
-        return;
-    };
-    let pending =
-        crate::tool_global::pending_real_time_expirations(guest, detpid).await & candidates;
     let observed = pending & observable;
     if observed != 0 {
         crate::scheduler::refuse_real_time_expiration(observed.trailing_zeros() as i32 + 1);
     }
-    if pending & discarded != 0 {
+    if pending & discarded != 0
+        && let Some(detpid) = guest.thread_state().detpid
+    {
         crate::tool_global::discard_pending_real_time_expirations(
             guest,
             detpid,
@@ -2356,6 +2373,24 @@ pub(crate) async fn observe_pending_real_time_expirations<T, G>(
         )
         .await;
     }
+}
+
+/// For a call that runs under the temporary mask `mask`: refuse by name for a
+/// pending real-time timer expiration the mask lets the kernel deliver, and
+/// discard one it lets the kernel discard. Reads the thread's dispositions
+/// only when one is pending.
+pub(crate) async fn observe_under_mask<T, G>(guest: &mut G, mask: KernelSigset) -> Result<(), Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let pending = pending_real_time_among(guest, !mask).await;
+    if pending != 0 {
+        let state = read_thread_wait_signal_state(guest.pid(), guest.tid())?;
+        let (observable, discarded) = unblocked_by(&state, mask);
+        act_on_pending_real_time(guest, pending, observable, discarded).await;
+    }
+    Ok(())
 }
 
 pub(crate) struct KernelSignalWait {

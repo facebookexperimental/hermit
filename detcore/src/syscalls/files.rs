@@ -6328,12 +6328,26 @@ impl<T: RecordOrReplay> Detcore<T> {
         // blocked when it expired would be readable at once
         // (https://github.com/rrnewton/hermit/issues/4089). A mask the kernel
         // cannot read fails the call below.
-        if let Some(mask) = call.mask().and_then(|mask| Addr::from_raw(mask.as_raw()))
-            && let Ok(mask) = crate::syscalls::signal::read_kernel_sigset(guest, mask).await
-        {
-            crate::syscalls::helpers::observe_pending_real_time_expirations(guest, mask, 0).await;
+        let mask = match call.mask().and_then(|mask| Addr::from_raw(mask.as_raw())) {
+            Some(mask) => crate::syscalls::signal::read_kernel_sigset(guest, mask)
+                .await
+                .ok(),
+            None => None,
+        };
+        if let Some(mask) = mask {
+            let pending = crate::syscalls::helpers::pending_real_time_among(guest, mask).await;
+            crate::syscalls::helpers::act_on_pending_real_time(guest, pending, mask, 0).await;
         }
         let signalfd = self.record_or_replay(guest, call).await? as RawFd;
+        // A real-time timer expiration this descriptor, or a copy a fork
+        // inherits, could read is never kept pending
+        // (`Scheduler::real_time_expiration_fate`).
+        if let Some(mask) = mask
+            && mask & crate::syscalls::helpers::REAL_TIME_SIGNALS != 0
+            && let Some(detpid) = guest.thread_state().detpid
+        {
+            crate::tool_global::register_signalfd(guest, detpid, mask).await;
+        }
         self.add_fd(
             guest,
             signalfd,

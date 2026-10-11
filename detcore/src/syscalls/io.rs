@@ -42,11 +42,14 @@ use crate::resources::Resources;
 use crate::scheduler::runqueue::FIRST_PRIORITY;
 use crate::syscalls::helpers::KernelSignalWait;
 use crate::syscalls::helpers::NonblockableSyscall;
+use crate::syscalls::helpers::REAL_TIME_SIGNALS;
 use crate::syscalls::helpers::RestartCall;
+use crate::syscalls::helpers::act_on_pending_real_time;
 use crate::syscalls::helpers::is_accepted_connection;
 use crate::syscalls::helpers::keep_restart_block;
 use crate::syscalls::helpers::millis_duration_to_absolute_timeout;
-use crate::syscalls::helpers::observe_pending_real_time_expirations;
+use crate::syscalls::helpers::observe_under_mask;
+use crate::syscalls::helpers::pending_real_time_among;
 use crate::syscalls::helpers::poll_deadline_for;
 use crate::syscalls::helpers::record_retry_event;
 use crate::syscalls::helpers::refuse_held_signal_loss;
@@ -1124,15 +1127,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                     // A pending real-time timer expiration that this wait would
                     // be ended by, under the guest's mask or the call's temporary
                     // one (https://github.com/rrnewton/hermit/issues/4089).
-                    let (observable, discarded) = match (signals.as_ref(), sigmask) {
-                        (Some(signals), _) => (signals.observable_now()?, 0),
-                        (None, Some(mask)) => unblocked_by(
-                            &read_thread_wait_signal_state(guest.pid(), guest.tid())?,
-                            mask,
-                        ),
-                        (None, None) => (0, 0),
-                    };
-                    observe_pending_real_time_expirations(guest, observable, discarded).await;
+                    let pending = pending_real_time_among(guest, REAL_TIME_SIGNALS).await;
+                    if pending != 0 {
+                        let (observable, discarded) = match (signals.as_ref(), sigmask) {
+                            (Some(signals), _) => (signals.observable_now()?, 0),
+                            (None, Some(mask)) => unblocked_by(
+                                &read_thread_wait_signal_state(guest.pid(), guest.tid())?,
+                                mask,
+                            ),
+                            (None, None) => (0, 0),
+                        };
+                        act_on_pending_real_time(guest, pending, observable, discarded).await;
+                    }
                     // Every turn probes before it looks at pending signals, as Linux
                     // does: do_select polls every descriptor on each pass and returns
                     // the count of ready ones before it tests signal_pending, and at
@@ -1415,9 +1421,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                     );
                     // A pending real-time timer expiration that this wait would
                     // be ended by (https://github.com/rrnewton/hermit/issues/4089).
-                    if let Some(signals) = signals.as_ref() {
+                    let pending = pending_real_time_among(guest, REAL_TIME_SIGNALS).await;
+                    if pending != 0
+                        && let Some(signals) = signals.as_ref()
+                    {
                         let observable = signals.observable_now()?;
-                        observe_pending_real_time_expirations(guest, observable, 0).await;
+                        act_on_pending_real_time(guest, pending, observable, 0).await;
                     }
                     // Every turn probes before it looks at pending signals, as Linux
                     // does: do_select polls every descriptor on each pass and returns
@@ -1689,9 +1698,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // The probe's temporary mask lets the kernel take a pending
                 // real-time timer expiration that every thread blocked when it
                 // expired (https://github.com/rrnewton/hermit/issues/4089).
-                let state = read_thread_wait_signal_state(guest.pid(), guest.tid())?;
-                let (observable, discarded) = unblocked_by(&state, signal_mask);
-                observe_pending_real_time_expirations(guest, observable, discarded).await;
+                observe_under_mask(guest, signal_mask).await?;
                 Some(sanitize_ppoll_signal_mask(signal_mask))
             }
             None => None,
@@ -2110,16 +2117,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         let Some(mask) = mask else {
             return Ok(());
         };
-        if sigsetsize != KERNEL_SIGSET_SIZE {
+        if sigsetsize != KERNEL_SIGSET_SIZE
+            || !crate::scheduler::real_time_expiration_kept_pending()
+        {
             return Ok(());
         }
         let Ok(mask) = read_kernel_sigset(guest, mask).await else {
             return Ok(());
         };
-        let state = read_thread_wait_signal_state(guest.pid(), guest.tid())?;
-        let (observable, discarded) = unblocked_by(&state, mask);
-        observe_pending_real_time_expirations(guest, observable, discarded).await;
-        Ok(())
+        observe_under_mask(guest, mask).await
     }
 
     /// epoll_wait syscall (MAYHANG)

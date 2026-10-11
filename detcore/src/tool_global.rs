@@ -2643,6 +2643,18 @@ impl GlobalTool for GlobalState {
                     .await
                     .pending_real_time_expirations(detpid),
             ),
+            GlobalRequest::RecordHandlerRestoreMask(detpid, unblocked) => {
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .record_handler_restore_unblocked(detpid, unblocked);
+                R::RecordHandlerRestoreMask(())
+            }
+            GlobalRequest::RegisterSignalfd(detpid, mask) => {
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .register_signalfd(detpid, mask);
+                R::RegisterSignalfd(())
+            }
             GlobalRequest::DiscardPendingRealTimeExpirations(detpid, signals) => {
                 self.lock_rpc_scheduler(false)
                     .await
@@ -4322,6 +4334,11 @@ pub enum GlobalRequest {
     /// Discard pending real-time timer expirations of a process (a kernel
     /// sigset) whose disposition became `SIG_IGN`.
     DiscardPendingRealTimeExpirations(DetPid, u64),
+    /// A process created a signalfd for these signals (a kernel sigset).
+    RegisterSignalfd(DetPid, u64),
+    /// A handler's return in a process restores a mask leaving these
+    /// real-time signals (a kernel sigset) unblocked.
+    RecordHandlerRestoreMask(DetPid, u64),
     /// Scheduler-owned lifecycle state for a direct child process.
     ExactChildWaitState(DetPid, DetPid),
 
@@ -4476,6 +4493,8 @@ pub enum GlobalResponse {
     ThreadIsLive(bool),
     PendingRealTimeExpirations(u64),
     DiscardPendingRealTimeExpirations(()),
+    RegisterSignalfd(()),
+    RecordHandlerRestoreMask(()),
     ExactChildWaitState(ExactChildWaitState),
     // TODO: use void_send_rpc, and remove this bogus response:
     UnrecoverableShutdown(()),
@@ -5743,6 +5762,47 @@ where
         GlobalResponse::ThreadExited => 0,
         other => unreachable!("unexpected response to PendingRealTimeExpirations: {other:?}"),
     }
+}
+
+/// Record that a handler's return in `detpid` restores a mask leaving
+/// `unblocked` (real-time signals) unblocked; see
+/// `Scheduler::record_handler_restore_unblocked`.
+pub(crate) async fn record_handler_restore_mask<G, T>(guest: &mut G, detpid: DetPid, unblocked: u64)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(
+        guest,
+        GlobalRequest::RecordHandlerRestoreMask(detpid, unblocked),
+    )
+    .await;
+    assert!(
+        matches!(
+            response.1,
+            GlobalResponse::RecordHandlerRestoreMask(()) | GlobalResponse::ThreadExited
+        ),
+        "unexpected response to RecordHandlerRestoreMask: {:?}",
+        response.1
+    );
+}
+
+/// Record that `detpid` created a signalfd for `mask` (a kernel sigset with a
+/// real-time signal); see `Scheduler::register_signalfd`.
+pub(crate) async fn register_signalfd<G, T>(guest: &mut G, detpid: DetPid, mask: u64)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::RegisterSignalfd(detpid, mask)).await;
+    assert!(
+        matches!(
+            response.1,
+            GlobalResponse::RegisterSignalfd(()) | GlobalResponse::ThreadExited
+        ),
+        "unexpected response to RegisterSignalfd: {:?}",
+        response.1
+    );
 }
 
 /// Discard `signals` from `detpid`'s pending real-time timer expirations, as

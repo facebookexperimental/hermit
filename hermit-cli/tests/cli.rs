@@ -22084,19 +22084,36 @@ fn a_signal_to_a_newborn_thread_is_never_taken_for_hermits() {
     );
 }
 
-/// A real-time POSIX timer expiration that every thread blocks
-/// (https://github.com/rrnewton/hermit/issues/4089): Linux queues the signal,
-/// and nothing changes until the process could observe it. Detcore keeps it
-/// pending and refuses by name exactly where it becomes observable: a mask
-/// change, a temporary mask, a wait or a descriptor that would take it, and
-/// the pending set. Ignoring the signal or exiting discards it, and exec keeps
-/// it. Each case runs with the PMU timeslice and without it.
+/// A real-time POSIX timer expiration (https://github.com/rrnewton/hermit/issues/4089).
+/// One that a thread can take at once, through a mask, a signalfd, a call
+/// outside the schedule, or a handler's return, is refused at the expiry, the
+/// same way every time. One that every thread blocks is queued by Linux, and
+/// nothing changes until the process could observe it: Detcore keeps it pending
+/// and refuses by name exactly where it becomes observable (a mask change, a
+/// temporary mask, a wait or a descriptor that would take it, and the pending
+/// set). Ignoring the signal or exiting discards it, and exec keeps it. Each
+/// case runs with the PMU timeslice and without it.
 #[test]
 fn a_pending_real_time_timer_expiration_is_refused_only_where_it_is_observed() {
     let guest = timer_rt_signal_pending_observed_guest()
         .to_str()
         .unwrap()
         .to_owned();
+    // Delivered at the expiry itself, as on Linux: the run stops before the
+    // guest prints anything. A case named twice is run twice, so a refusal
+    // that depended on host timing would show as a mismatch.
+    let at_once: &[&str] = &[
+        "unblocked-at-expiry",
+        "thread-unblocked",
+        "signalfd-before",
+        "pselect-big",
+        "pselect-big-blocked-peer",
+        "pselect-race",
+        "pselect-race",
+        "pselect-race",
+        "arm-exit-thread",
+        "handler-sigreturn",
+    ];
     let cases: &[(&str, bool)] = &[
         ("unblock", true),
         ("setmask-empty", true),
@@ -22114,6 +22131,29 @@ fn a_pending_real_time_timer_expiration_is_refused_only_where_it_is_observed() {
         ("exec-exit", false),
     ];
     for timeslice in [&[][..], &["--max-timeslice=disabled"][..]] {
+        for &case in at_once {
+            let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+            let mut arguments = vec!["run", "--strict"];
+            arguments.extend_from_slice(timeslice);
+            arguments.extend(["--timeout", "60", "--", guest.as_str(), case]);
+            let (status, log) = run_with_deadline(
+                hermit_command(&arguments),
+                directory.path(),
+                Duration::from_secs(120),
+                false,
+            );
+            let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+                .expect("failed to read the guest's stdout");
+            assert_eq!(
+                (
+                    status.and_then(|status| status.code()),
+                    log.contains("a POSIX timer expired that notifies with real-time signal 35"),
+                    stdout.as_str()
+                ),
+                (Some(HERMIT_POLICY_REFUSAL_EXIT), true, ""),
+                "{case} {timeslice:?}: an expiration Linux delivers at once must be refused by name at once:\nstderr:\n{log}"
+            );
+        }
         for &(case, observed) in cases {
             let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
             let mut arguments = vec!["run", "--strict"];

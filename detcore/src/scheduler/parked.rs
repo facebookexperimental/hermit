@@ -25,6 +25,7 @@ use reverie::SignalTarget;
 use serde::Deserialize;
 use serde::Serialize;
 
+use super::RealTimeFate;
 use super::SchedRequest;
 use super::SchedResponse;
 use super::Scheduler;
@@ -654,46 +655,31 @@ impl Scheduler {
     ) {
         let signal = match signal {
             timed_waiters::TimerSignal::Send(signal) => signal,
-            // Linux discards a signal generated while it is ignored and unblocked
-            // (`sig_ignored`), so such an expiration changes nothing and the run
-            // goes on, as it does natively; a target already gone has nobody to
-            // deliver to. A blocked one would be queued (glibc's SIGEV_THREAD
-            // helper blocks its signal and collects it with sigwaitinfo).
-            timed_waiters::TimerSignal::RefuseRealTime(signo)
-                if match self.read_sleeper_signal_state(tid) {
-                    Ok(state) => state.discarded_at_generation() & kernel_signal_bit(signo) != 0,
-                    Err(SleeperStateUnreadable::Gone) => true,
-                    Err(SleeperStateUnreadable::Unreadable(_)) => false,
-                } =>
-            {
-                return;
-            }
-            // Linux queues a signal that every thread of its process blocks,
-            // and a queued signal changes nothing until the process could
-            // observe it. Keep the expiration as pending instead of refusing,
-            // and refuse where it would become observable
-            // (https://github.com/rrnewton/hermit/issues/4089). Under the
-            // 500x clock of a run without retired-branch time, a timer armed
-            // just before its process exits can expire in the turn that ends
-            // with the exit request.
-            timed_waiters::TimerSignal::RefuseRealTime(signo)
-                if self.real_time_expiration_is_queued(id.process(), signo) =>
-            {
-                *self
-                    .pending_real_time_expirations
-                    .entry(id.process())
-                    .or_default() |= kernel_signal_bit(signo);
-                tracing::debug!(
-                    "[scheduler] real-time signal {} of a timer of process {} expired while every thread blocked it; pending",
-                    signo,
-                    id.process()
-                );
-                return;
-            }
-            // Only a fail-closed run registers such an expiration
-            // (`Detcore::handle_timer_settime`); a permissive one never arms it.
+            // Detcore cannot deliver real-time signals. An expiration Linux
+            // discards, or queues where nothing can yet observe it, changes
+            // nothing, and the run goes on; any other stops it by name
+            // (https://github.com/rrnewton/hermit/issues/3893,
+            // https://github.com/rrnewton/hermit/issues/4089). Only a fail-closed
+            // run registers such an expiration (`Detcore::handle_timer_settime`);
+            // a permissive one never arms it.
             timed_waiters::TimerSignal::RefuseRealTime(signo) => {
-                super::refuse_real_time_expiration(signo)
+                match self.real_time_expiration_fate(id.process(), tid, signo) {
+                    RealTimeFate::Discarded => return,
+                    RealTimeFate::Queued => {
+                        *self
+                            .pending_real_time_expirations
+                            .entry(id.process())
+                            .or_default() |= kernel_signal_bit(signo);
+                        super::note_real_time_expiration_kept_pending();
+                        tracing::debug!(
+                            "[scheduler] real-time signal {} of a timer of process {} expired while every thread blocked it; pending",
+                            signo,
+                            id.process()
+                        );
+                        return;
+                    }
+                    RealTimeFate::Deliverable => super::refuse_real_time_expiration(signo),
+                }
             }
         };
         if self.signal_control_installed() && matches!(id, SignalTimerId::Alarm(_)) {
@@ -741,38 +727,132 @@ impl Scheduler {
         }
     }
 
-    /// Whether an expiration of a real-time-signal timer of `process` is
-    /// queued by Linux rather than delivered: every live thread of the process
-    /// blocks `signo`. A thread Detcore holds under a private mask
-    /// (`saved_guest_sigmasks`) is judged by the guest's own mask. A thread in
-    /// a `KernelSignalWait` shows every signal blocked; its wait refuses at its
-    /// next turn if its own mask does not block the signal
-    /// (`KernelSignalWait::observable`). A thread whose state cannot be read
-    /// makes the expiration deliverable, so the run refuses as before.
+    /// What Linux does with an expiration of a timer of `process` (armed by
+    /// `tid`) that notifies with real-time signal `signo`, as far as the guest
+    /// could tell (https://github.com/rrnewton/hermit/issues/4089):
     ///
-    /// Read at the same points as the ignored-signal check above, where no
-    /// guest thread holds the turn.
-    pub(super) fn real_time_expiration_is_queued(&self, process: DetPid, signo: i32) -> bool {
+    /// - [`RealTimeFate::Discarded`]: nobody can see it. The process has no
+    ///   live thread, or the signal is ignored and a thread that does not block
+    ///   it takes it, which discards it at delivery (or at generation,
+    ///   `sig_ignored`).
+    /// - [`RealTimeFate::Queued`]: every live thread blocks it, so Linux queues
+    ///   it, and nothing can observe it yet: no signalfd of the process or of an
+    ///   ancestor it inherited descriptors from reads it
+    ///   (`signalfd_masks`). Kept in `pending_real_time_expirations`.
+    /// - [`RealTimeFate::Deliverable`]: anything else, including whatever this
+    ///   cannot decide; the run refuses as before.
+    ///
+    /// Each mask is the one the schedule fixes (`thread_signal_mask`, or the
+    /// guest's own mask for a thread Detcore holds under a private one,
+    /// `saved_guest_sigmasks`). A thread in a call outside the schedule makes
+    /// the expiration deliverable: its live mask is host-timed, and its
+    /// recorded one is the call's temporary mask, while the mask restored
+    /// when the call returns may not block the signal. The dispositions are
+    /// read from a thread stopped at a request. Called only at the two timed
+    /// pops, where no guest thread holds the turn.
+    ///
+    /// Without signal-target modelling (`models_signal_targets`) none of those
+    /// masks is recorded, and the arming thread's state decides as before.
+    pub(super) fn real_time_expiration_fate(
+        &self,
+        process: DetPid,
+        tid: DetTid,
+        signo: i32,
+    ) -> RealTimeFate {
         let bit = kernel_signal_bit(signo);
-        let mut blocking = 0_usize;
-        for thread in self.thread_tree.my_thread_group(&process) {
-            if !self.next_turns.contains_key(&thread) {
+        if !self.models_signal_targets {
+            return match self.read_sleeper_signal_state(tid) {
+                Ok(state) if state.discarded_at_generation() & bit != 0 => RealTimeFate::Discarded,
+                Err(SleeperStateUnreadable::Gone) => RealTimeFate::Discarded,
+                _ => RealTimeFate::Deliverable,
+            };
+        }
+        let threads = self.process_signal_targets(process);
+        if threads.is_empty() {
+            return RealTimeFate::Discarded;
+        }
+        let mut every_thread_blocks = true;
+        let mut outside_the_schedule = false;
+        let mut ignored = None;
+        for &thread in &threads {
+            if self.blocked.out_of_scheduler_masks.contains_key(&thread) {
+                outside_the_schedule = true;
                 continue;
             }
-            let blocked = match self.saved_guest_sigmasks.get(&thread) {
+            let mask = match self.saved_guest_sigmasks.get(&thread) {
                 Some(mask) => *mask,
-                None => match self.read_sleeper_signal_state(thread) {
-                    Ok(state) => state.blocked,
-                    Err(SleeperStateUnreadable::Gone) => continue,
-                    Err(SleeperStateUnreadable::Unreadable(_)) => return false,
+                None => match self.thread_signal_mask(thread) {
+                    Some(mask) => mask,
+                    None => return RealTimeFate::Deliverable,
                 },
             };
-            if blocked & bit == 0 {
-                return false;
+            if mask & bit == 0 {
+                every_thread_blocks = false;
             }
-            blocking += 1;
+            if ignored.is_none() {
+                match self.read_sleeper_signal_state(thread) {
+                    Ok(state) => ignored = Some(state.ignored & bit != 0),
+                    Err(_) => return RealTimeFate::Deliverable,
+                }
+            }
         }
-        blocking > 0
+        let Some(ignored) = ignored else {
+            // Every thread is outside the schedule.
+            return RealTimeFate::Deliverable;
+        };
+        if ignored && !every_thread_blocks {
+            return RealTimeFate::Discarded;
+        }
+        if outside_the_schedule
+            || !every_thread_blocks
+            || self.process_or_ancestor_has(&self.signalfd_masks, process, bit)
+            || self.process_or_ancestor_has(&self.handler_restore_unblocked, process, bit)
+        {
+            return RealTimeFate::Deliverable;
+        }
+        RealTimeFate::Queued
+    }
+
+    /// Whether `process`, or an ancestor whose state a fork copied into it,
+    /// has `bit` in `map`: a signalfd that may read it (`signalfd_masks`; a
+    /// fork copies descriptors, and closing one does not remove it), or a
+    /// handler whose return may unblock it (`handler_restore_unblocked`; a fork
+    /// inside a handler returns from it in the child too).
+    fn process_or_ancestor_has(
+        &self,
+        map: &BTreeMap<DetPid, u64>,
+        process: DetPid,
+        bit: u64,
+    ) -> bool {
+        let mut current = Some(process);
+        let mut steps = 0;
+        while let Some(pid) = current {
+            if map.get(&pid).is_some_and(|mask| mask & bit != 0) {
+                return true;
+            }
+            steps += 1;
+            if steps > 4096 {
+                // A parent chain this long is a cycle; decide as the run did
+                // before.
+                return true;
+            }
+            current = self.thread_tree.parent_process(&pid);
+        }
+        false
+    }
+
+    /// Record that a handler's return in `process` restores a mask leaving
+    /// `unblocked` (real-time signals, a kernel sigset) unblocked
+    /// (`handler_restore_unblocked`).
+    pub(crate) fn record_handler_restore_unblocked(&mut self, process: DetPid, unblocked: u64) {
+        *self.handler_restore_unblocked.entry(process).or_default() |= unblocked;
+    }
+
+    /// Record that `process` created a signalfd for `mask` (a kernel sigset),
+    /// so a real-time timer expiration it could read is never kept pending
+    /// (`real_time_expiration_fate`).
+    pub(crate) fn register_signalfd(&mut self, process: DetPid, mask: u64) {
+        *self.signalfd_masks.entry(process).or_default() |= mask;
     }
 
     /// The real-time signals pending for `process` from timer expirations
