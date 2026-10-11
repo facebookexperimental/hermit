@@ -2253,10 +2253,17 @@ fn ptrace_futex_wait_of_the_thread_that_forked_the_child_takes_its_sigchld() {
 /// sibling took the SIGCHLD there too. Precise mode only; see the module
 /// documentation for polling mode.
 ///
-/// - Untimed (`timed` is false): the sibling then wakes the futex, and the
-///   wait returns 0 within `SPIN_WAKE_BOUND_MS` for every death: at 456-457 ms
+/// - Untimed (`timed` is false): the sibling then stores 1 to the futex word
+///   and wakes it, within `SPIN_WAKE_BOUND_MS` for every death: at 456-457 ms
 ///   when the child calls `exit_group` or its only thread calls `exit`, and at
 ///   254 ms when it sends itself SIGKILL (measured on 2026-10-05).
+///   - After the `exit` and SIGKILL deaths, the main thread's wait, woken for
+///     the SIGCHLD, has parked again by then, and the wake ends it: 0.
+///   - After the `exit_group` death it has not run again yet, so it is off the
+///     waiter list and the wake finds no waiter. It then re-reads its changed
+///     word, as Linux's retry does, and returns EAGAIN
+///     (https://github.com/rrnewton/hermit/issues/4033). Before that fix it
+///     returned 0, which a waiter the wake never reached cannot answer.
 /// - Timed (`timed`, a 10 s timeout): the sibling does not wake the futex, so
 ///   the held SIGCHLD neither ends nor restarts the wait, and the wait returns
 ///   ETIMEDOUT at its original deadline, within `QUIET_OVERSHOOT_MS` of
@@ -2284,7 +2291,13 @@ fn assert_waiting_forker_leaves_the_sigchld_to_the_sibling(backend: &str, timed:
         } else {
             (
                 untimed_args.as_slice(),
-                "RESULT call=futex ret=0 errno=none handler=1",
+                // Only after an `exit_group` death is the woken wait still off
+                // the waiter list when the sibling's wake comes (see above).
+                if death == "spin" {
+                    "RESULT call=futex ret=-1 errno=EAGAIN handler=1"
+                } else {
+                    "RESULT call=futex ret=0 errno=none handler=1"
+                },
                 EXIT_WAKE_FLOOR_MS..SPIN_WAKE_BOUND_MS,
             )
         };
