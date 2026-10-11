@@ -6381,11 +6381,14 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// kernel descriptor rather than a numeric PID. Unlike `kill(2)`, there is
     /// therefore no host-PID/virtual-PID ambiguity for Detcore to resolve: the
     /// pidfd was bound to one specific process at `pidfd_open` time. Signal
-    /// generation runs inside this thread's serialized scheduler turn, exactly
-    /// like `tgkill`/`tkill`/`rt_tgsigqueueinfo` (which also just forward through
-    /// record/replay), so forwarding the kernel call is deterministic by
-    /// construction. This handler adds deterministic argument validation ahead of
-    /// the forward: a descriptor that Detcore does not model as a pidfd fails
+    /// generation runs inside this thread's serialized scheduler turn, as for
+    /// `tgkill`/`tkill`/`rt_tgsigqueueinfo`, which forward through record/replay
+    /// and then tell the scheduler that the signal is pending for its receiver
+    /// (`notify_cross_task_signal`), so that a receiver parked in a blocking call
+    /// is woken. This handler does the same for a process with one live thread
+    /// (<https://github.com/rrnewton/hermit/issues/4099>). It also adds
+    /// deterministic argument validation ahead of the forward: a descriptor
+    /// that Detcore does not model as a pidfd fails
     /// closed with `EBADF`, and the flags field the current kernel reserves is
     /// required to be zero (`EINVAL` otherwise), so the guest-visible errno is
     /// fixed and host-independent. A process-directed signal to a process with
@@ -6433,8 +6436,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         // does not model (https://github.com/rrnewton/hermit/issues/4047).
         // Everything else is forwarded and the kernel answers: signal 0, which
         // only checks that the process exists; SIGKILL, which kills the whole
-        // group whichever thread it reaches; and a process with one thread or
-        // none (a zombie, which Linux still signals successfully).
+        // group whichever thread it reaches (the scheduler is told below); a
+        // process with one live thread, whose receiver the scheduler is then
+        // told about, as `kill` does; and a process with none (a zombie, which
+        // Linux still signals successfully).
         let mut receiver = None;
         if signal != 0
             && signal != libc::SIGKILL
