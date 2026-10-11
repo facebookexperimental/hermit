@@ -736,9 +736,11 @@ impl Scheduler {
     ///   it takes it, which discards it at delivery (or at generation,
     ///   `sig_ignored`).
     /// - [`RealTimeFate::Queued`]: every live thread blocks it, so Linux queues
-    ///   it, and nothing can observe it yet: no signalfd of the process or of an
-    ///   ancestor it inherited descriptors from reads it
-    ///   (`signalfd_masks`). Kept in `pending_real_time_expirations`.
+    ///   it, and nothing can observe it yet: no signalfd the process created or
+    ///   inherited reads it (`signalfd_masks`), no handler return may unblock it
+    ///   (`handler_restore_unblocked`), and no thread of the process has made a
+    ///   call outside the schedule (`background_call_processes`). Kept in
+    ///   `pending_real_time_expirations`.
     /// - [`RealTimeFate::Deliverable`]: anything else, including whatever this
     ///   cannot decide; the run refuses as before.
     ///
@@ -803,42 +805,33 @@ impl Scheduler {
         if ignored && !every_thread_blocks {
             return RealTimeFate::Discarded;
         }
+        let recorded =
+            |map: &BTreeMap<DetPid, u64>| map.get(&process).is_some_and(|mask| mask & bit != 0);
         if outside_the_schedule
             || !every_thread_blocks
-            || self.process_or_ancestor_has(&self.signalfd_masks, process, bit)
-            || self.process_or_ancestor_has(&self.handler_restore_unblocked, process, bit)
+            || self.background_call_processes.contains(&process)
+            || recorded(&self.signalfd_masks)
+            || recorded(&self.handler_restore_unblocked)
         {
             return RealTimeFate::Deliverable;
         }
         RealTimeFate::Queued
     }
 
-    /// Whether `process`, or an ancestor whose state a fork copied into it,
-    /// has `bit` in `map`: a signalfd that may read it (`signalfd_masks`; a
-    /// fork copies descriptors, and closing one does not remove it), or a
-    /// handler whose return may unblock it (`handler_restore_unblocked`; a fork
-    /// inside a handler returns from it in the child too).
-    fn process_or_ancestor_has(
-        &self,
-        map: &BTreeMap<DetPid, u64>,
-        process: DetPid,
-        bit: u64,
-    ) -> bool {
-        let mut current = Some(process);
-        let mut steps = 0;
-        while let Some(pid) = current {
-            if map.get(&pid).is_some_and(|mask| mask & bit != 0) {
-                return true;
+    /// A new process inherits what its creator recorded about signalfds and
+    /// handler returns (`signalfd_masks`, `handler_restore_unblocked`): a fork
+    /// copies the descriptor table, and a fork inside a handler returns from it
+    /// in the child too. Copied at creation, so a later re-parenting changes
+    /// nothing.
+    pub(crate) fn inherit_real_time_records(&mut self, creator: DetPid, child: DetPid) {
+        for map in [
+            &mut self.signalfd_masks,
+            &mut self.handler_restore_unblocked,
+        ] {
+            if let Some(mask) = map.get(&creator).copied() {
+                *map.entry(child).or_default() |= mask;
             }
-            steps += 1;
-            if steps > 4096 {
-                // A parent chain this long is a cycle; decide as the run did
-                // before.
-                return true;
-            }
-            current = self.thread_tree.parent_process(&pid);
         }
-        false
     }
 
     /// Record that a handler's return in `process` restores a mask leaving

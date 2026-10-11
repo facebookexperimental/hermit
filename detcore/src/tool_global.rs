@@ -3139,6 +3139,9 @@ impl GlobalState {
                 {
                     sched.thread_tree.enter_new_pid_namespace(child_dettid);
                 }
+                if is_group_leader && flags.is_some() {
+                    sched.inherit_real_time_records(parent_detpid, child_dettid);
+                }
             }
 
             if let Some((physical_pid, physical_tid)) = physical_ids {

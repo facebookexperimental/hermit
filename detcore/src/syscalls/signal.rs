@@ -1526,44 +1526,32 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(self.record_or_replay(guest, call).await?)
     }
 
-    /// Before a caught signal is delivered, the thread's mask is the one its
-    /// handler's return restores, through an `rt_sigreturn` that ptrace does
-    /// not stop at. Record the real-time signals that mask leaves unblocked, so
-    /// an expiration of one, while the handler's `sa_mask` blocks it, is never
-    /// kept pending (`Scheduler::real_time_expiration_fate`,
-    /// https://github.com/rrnewton/hermit/issues/4089). Only where real-time
-    /// expirations are kept pending at all (`models_signal_targets`), and only
-    /// what this thread has not recorded yet. A state that cannot be read
-    /// records every real-time signal.
+    /// A delivered signal may run a handler, whose return restores, through an
+    /// `rt_sigreturn` that ptrace does not stop at, a mask Detcore cannot read
+    /// here: the thread's own mask, or for a handler that interrupts a call
+    /// with a temporary mask, the mask saved before the call. So every
+    /// delivery records every real-time signal as possibly unblocked by a
+    /// handler's return (`Scheduler::handler_restore_unblocked`), and a
+    /// real-time timer expiration of the process is never kept pending after
+    /// it (https://github.com/rrnewton/hermit/issues/4089). Only where real-time
+    /// expirations are kept pending at all (`models_signal_targets`), and once
+    /// per thread.
     pub(crate) async fn record_handler_restore_mask<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        signal: Signal,
+        _signal: Signal,
     ) {
         if !(self.cfg.sequentialize_threads
             && self.cfg.backend_supports_blocked_wait_signal_interruption)
+            || guest.thread_state().handler_restore_rt_reported == REAL_TIME_SIGNALS
         {
-            return;
-        }
-        let reported = guest.thread_state().handler_restore_rt_reported;
-        if reported == REAL_TIME_SIGNALS {
-            return;
-        }
-        let unblocked = match read_thread_wait_signal_state(guest.pid(), guest.tid()) {
-            Ok(state) if state.caught & kernel_sigset_bit(signal as i32) == 0 => {
-                return;
-            }
-            Ok(state) => !state.blocked & REAL_TIME_SIGNALS,
-            Err(_) => REAL_TIME_SIGNALS,
-        } & !reported;
-        if unblocked == 0 {
             return;
         }
         let Some(detpid) = guest.thread_state().detpid else {
             return;
         };
-        crate::tool_global::record_handler_restore_mask(guest, detpid, unblocked).await;
-        guest.thread_state_mut().handler_restore_rt_reported |= unblocked;
+        crate::tool_global::record_handler_restore_mask(guest, detpid, REAL_TIME_SIGNALS).await;
+        guest.thread_state_mut().handler_restore_rt_reported = REAL_TIME_SIGNALS;
     }
 
     /// rt_sigreturn: the mask it restores, from the frame's `uc_sigmask`, may

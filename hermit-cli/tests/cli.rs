@@ -22113,7 +22113,15 @@ fn a_pending_real_time_timer_expiration_is_refused_only_where_it_is_observed() {
         "pselect-race",
         "arm-exit-thread",
         "handler-sigreturn",
+        "sigsuspend-handler",
+        "subreaper-signalfd",
     ];
+    // Linux queues these (every thread blocks the signal), but a thread of the
+    // process ran a call outside the schedule and rejoined at a moment host
+    // timing chose, so the schedule cannot fix whether the expiration found it
+    // outside. They are refused at the expiry, as before this change, the same
+    // way every time; whichever side of the expiry the call returns on.
+    let refused_for_determinism: &[&str] = &["rejoin-short", "rejoin-long", "rejoin-long"];
     let cases: &[(&str, bool)] = &[
         ("unblock", true),
         ("setmask-empty", true),
@@ -22131,7 +22139,7 @@ fn a_pending_real_time_timer_expiration_is_refused_only_where_it_is_observed() {
         ("exec-exit", false),
     ];
     for timeslice in [&[][..], &["--max-timeslice=disabled"][..]] {
-        for &case in at_once {
+        for &case in at_once.iter().chain(refused_for_determinism) {
             let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
             let mut arguments = vec!["run", "--strict"];
             arguments.extend_from_slice(timeslice);

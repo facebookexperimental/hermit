@@ -2278,7 +2278,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/timer_rt_signal_pending_observed.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/timer_rt_signal_pending_observed.c is owned by hermit-cli/tests/cli.rs: a real-time POSIX timer expiration that every thread blocks stays pending, and a run --strict refuses it by name exactly where it becomes observable (a mask change or temporary mask that unblocks it, rt_sigtimedwait, signalfd, sigpending), while SIG_IGN and exit discard it and exec keeps it, with the PMU timeslice and without it (https://github.com/rrnewton/hermit/issues/4089). It stays a fixture because each case ends a run with a refusal exit that the generic manifest cannot express."
+      "why": "tests/c/timer_rt_signal_pending_observed.c is owned by hermit-cli/tests/cli.rs: a real-time POSIX timer expiration that a thread can take at once (an unblocking mask, a signalfd, a call outside the schedule, a handler's return) ends a run --strict with a named refusal at the expiry, the same way every time; one that every thread blocks stays pending and is refused exactly where it becomes observable (a mask change or temporary mask that unblocks it, rt_sigtimedwait, signalfd, sigpending), while SIG_IGN and exit discard it and exec keeps it, with the PMU timeslice and without it (https://github.com/rrnewton/hermit/issues/4089). It stays a fixture because each case ends a run with a refusal exit that the generic manifest cannot express."
     },
     {
       "disposition": "guest-fixture",

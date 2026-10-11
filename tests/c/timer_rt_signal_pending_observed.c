@@ -31,6 +31,9 @@
 #include <poll.h>
 #include <pthread.h>
 #include <sched.h>
+#include <stdlib.h>
+#include <sys/prctl.h>
+#include <sys/wait.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
@@ -88,6 +91,37 @@ static void* yielder(void* arg) {
   for (int i = 0; i < 300; i++) {
     sched_yield();
   }
+  return NULL;
+}
+
+static pthread_t leader;
+
+static void on_usr1_plain(int signo) {
+  (void)signo;
+  /* Entered from sigsuspend's temporary mask, which blocks the timer's
+   * signal; the mask its return restores does not. */
+  struct timespec nap = {0, 100 * 1000 * 1000};
+  nanosleep(&nap, NULL);
+  printf("handler returning\n");
+}
+
+static void* kicker(void* arg) {
+  (void)arg;
+  sigset_t all;
+  sigfillset(&all);
+  pthread_sigmask(SIG_BLOCK, &all, NULL);
+  struct timespec nap = {0, 10 * 1000 * 1000};
+  nanosleep(&nap, NULL);
+  pthread_kill(leader, SIGUSR1);
+  return NULL;
+}
+
+static int idle_pipe[2];
+
+static void* idle_poller(void* arg) {
+  (void)arg;
+  struct pollfd fds = {.fd = idle_pipe[0], .events = POLLIN};
+  poll(&fds, 1, 300);
   return NULL;
 }
 
@@ -168,6 +202,87 @@ static int delivered_at_once(const char* which) {
     struct timespec wait = {0, 5200 * 1000};
     pselect(101, NULL, NULL, NULL, &wait, &rt_only);
     sleep_past_the_deadline();
+    pthread_join(thread, NULL);
+  } else if (strcmp(which, "sigsuspend-handler") == 0) {
+    /* A handler entered from sigsuspend: the timer expires while every
+     * signal is blocked, and the handler's return restores a mask that lets
+     * it through. */
+    struct sigaction action;
+    memset(&action, 0, sizeof action);
+    action.sa_handler = on_usr1_plain;
+    sigaction(SIGUSR1, &action, NULL);
+    sigset_t usr1;
+    sigemptyset(&usr1);
+    sigaddset(&usr1, SIGUSR1);
+    sigprocmask(SIG_BLOCK, &usr1, NULL);
+    leader = pthread_self();
+    pthread_t thread;
+    pthread_create(&thread, NULL, kicker, NULL);
+    struct sigevent event;
+    memset(&event, 0, sizeof event);
+    event.sigev_notify = SIGEV_SIGNAL;
+    event.sigev_signo = rt;
+    timer_t timer;
+    timer_create(CLOCK_MONOTONIC, &event, &timer);
+    struct itimerspec at;
+    memset(&at, 0, sizeof at);
+    at.it_value.tv_nsec = 50 * 1000 * 1000;
+    timer_settime(timer, 0, &at, NULL);
+    sigset_t temporary;
+    sigfillset(&temporary);
+    sigdelset(&temporary, SIGUSR1);
+    sigsuspend(&temporary);
+    printf("after sigsuspend\n");
+    pthread_join(thread, NULL);
+  } else if (strcmp(which, "subreaper-signalfd") == 0) {
+    /* A signalfd inherited from a creator that exits before the expiry, so
+     * that its child belongs to a subreaper by then. */
+    prctl(PR_SET_CHILD_SUBREAPER, 1);
+    pid_t middle = fork();
+    if (middle == 0) {
+      int fd = signalfd(-1, &rt_only, SFD_NONBLOCK);
+      if (fork() == 0) {
+        struct timespec nap = {0, 100 * 1000 * 1000};
+        nanosleep(&nap, NULL);
+        sigprocmask(SIG_BLOCK, &rt_only, NULL);
+        arm_soon(rt);
+        sleep_past_the_deadline();
+        struct signalfd_siginfo info;
+        printf("read %zd\n", read(fd, &info, sizeof info));
+        _exit(0);
+      }
+      _exit(0);
+    }
+    int status;
+    while (wait(&status) > 0) {
+    }
+  } else if (strncmp(which, "rejoin-", 7) == 0) {
+    /* Every thread blocks the signal; the leader's pselect runs outside the
+     * schedule and returns before (rejoin-short) or after (rejoin-long) the
+     * 100 ms expiry, at a moment host timing chooses. */
+    long usec = strcmp(which, "rejoin-short") == 0 ? 1000 : 120000;
+    sigprocmask(SIG_BLOCK, &rt_only, NULL);
+    pipe(idle_pipe);
+    int busy[2];
+    pipe(busy);
+    dup2(busy[0], 100);
+    pthread_t thread;
+    pthread_create(&thread, NULL, idle_poller, NULL);
+    struct sigevent event;
+    memset(&event, 0, sizeof event);
+    event.sigev_notify = SIGEV_SIGNAL;
+    event.sigev_signo = rt;
+    timer_t timer;
+    timer_create(CLOCK_MONOTONIC, &event, &timer);
+    struct itimerspec at;
+    memset(&at, 0, sizeof at);
+    at.it_value.tv_nsec = 100 * 1000 * 1000;
+    timer_settime(timer, 0, &at, NULL);
+    fd_set readable;
+    FD_ZERO(&readable);
+    FD_SET(100, &readable);
+    struct timespec wait = {usec / 1000000, (usec % 1000000) * 1000};
+    pselect(101, &readable, NULL, NULL, &wait, NULL);
     pthread_join(thread, NULL);
   } else if (strcmp(which, "handler-sigreturn") == 0) {
     struct sigaction action;

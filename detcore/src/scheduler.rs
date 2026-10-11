@@ -1323,6 +1323,14 @@ pub struct Scheduler {
     /// kept pending (`real_time_expiration_fate`). Never cleared.
     handler_restore_unblocked: BTreeMap<DetPid, u64>,
 
+    /// Processes one of whose threads has entered a call outside the schedule
+    /// (`external_io_blockers`, `rt_sigsuspend_blockers`). Such a thread rejoins
+    /// at a moment host timing chooses, so whether it is still outside when a
+    /// timer expires is not fixed by the schedule; a real-time expiration of
+    /// such a process is never kept pending (`real_time_expiration_fate`).
+    /// Recorded in the thread's own turn; never cleared.
+    background_call_processes: BTreeSet<DetPid>,
+
     /// Test-only stand-in for the /proc signal-mask fields, keyed by
     /// (process, thread, field). Unit tests use small fake pids that can name
     /// real host processes, so tests never read /proc: an absent entry reads
@@ -3047,6 +3055,7 @@ impl Scheduler {
             pending_real_time_expirations: Default::default(),
             signalfd_masks: Default::default(),
             handler_restore_unblocked: Default::default(),
+            background_call_processes: Default::default(),
             #[cfg(test)]
             test_signal_masks: Default::default(),
             resources: Default::default(),
@@ -8075,6 +8084,8 @@ impl Scheduler {
                     self.blocked.external_io_blockers.insert(dettid, *op_id)
                 };
                 assert!(old.is_none(), "thread started a second external operation");
+                self.background_call_processes
+                    .insert(self.sigchld_process(dettid));
                 if let Some(mask) = sleeping_mask {
                     self.blocked.out_of_scheduler_masks.insert(dettid, mask);
                 }
@@ -15353,7 +15364,8 @@ mod test {
             scheduler.real_time_expiration_fate(process, parent, 35),
             RealTimeFate::Queued
         );
-        // A record of an ancestor counts: a fork copies its descriptors.
+        // A child process inherits its creator's records at creation, so a
+        // later re-parenting changes nothing.
         let (mut scheduler, _parent_process, _parent, _creator, rt) = real_time_family();
         let child = DetTid::from_raw(200);
         let child_process = DetPid::from_raw(200);
@@ -15369,8 +15381,26 @@ mod test {
             RealTimeFate::Queued
         );
         scheduler.register_signalfd(DetPid::from_raw(100), rt);
+        // Recorded after the child was created: not the child's.
         assert_eq!(
             scheduler.real_time_expiration_fate(child_process, child, 35),
+            RealTimeFate::Queued
+        );
+        scheduler.inherit_real_time_records(DetPid::from_raw(100), child_process);
+        assert_eq!(
+            scheduler.real_time_expiration_fate(child_process, child, 35),
+            RealTimeFate::Deliverable
+        );
+    }
+
+    #[test]
+    fn a_real_time_expiration_after_a_call_outside_the_schedule_is_deliverable() {
+        // The call's thread has rejoined, at a host-timed moment; the process
+        // keeps the record.
+        let (mut scheduler, process, parent, _creator, _rt) = real_time_family();
+        scheduler.background_call_processes.insert(process);
+        assert_eq!(
+            scheduler.real_time_expiration_fate(process, parent, 35),
             RealTimeFate::Deliverable
         );
     }
