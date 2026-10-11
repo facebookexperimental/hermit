@@ -25,11 +25,11 @@ use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-use detcore::logdiff::CANON_ADDRESS_ORDINAL_V1;
-use detcore::logdiff::STRIP_WALL_CLOCK_PREFIX_V1;
-use hermit::canonical_verdict::ComparedLogScope;
-use hermit::canonical_verdict::Verdict as VerificationVerdict;
-use hermit::canonical_verdict::VerificationReport;
+use detcore_model::logdiff_policy::CANON_ADDRESS_ORDINAL_V1;
+use detcore_model::logdiff_policy::STRIP_WALL_CLOCK_PREFIX_V1;
+use hermit_manifest_plan::canonical_verdict::ComparedLogScope;
+use hermit_manifest_plan::canonical_verdict::Verdict as VerificationVerdict;
+use hermit_manifest_plan::canonical_verdict::VerificationReport;
 
 #[path = "../../hermit-cli/tests/common/backend_isolation.rs"]
 pub mod conformance;
@@ -46,17 +46,23 @@ pub const LAUNCH_MIGRATION_ASSERTIONS: [&str; 4] = [
     "pid.private_init",
 ];
 
-// These are source inputs to the existing parser and the standalone's new
-// local library dependencies, not proof of any physical guest generation.
+// These are source inputs to the shared parser, policy tokens and local
+// library dependencies, not proof of any physical guest generation.
 const VERIFICATION_INPUTS: &[(&str, &str)] = &[
     ("verify-parser.rs", "hermit-cli/src/canonical_verdict.rs"),
+    ("verify-parser-export.rs", "ci/manifest-plan/src/lib.rs"),
     ("verify-policy.rs", "hermit-cli/src/bin/hermit/verify.rs"),
-    ("verify-policy-tokens.rs", "detcore/src/logdiff.rs"),
+    (
+        "verify-policy-tokens.rs",
+        "detcore-model/src/logdiff_policy.rs",
+    ),
+    ("verify-policy-token-export.rs", "detcore/src/logdiff.rs"),
+    ("verify-model-export.rs", "detcore-model/src/lib.rs"),
     ("standalone-entry.rs", "tests/isolation/conformance.rs"),
     ("workspace-Cargo.toml", "Cargo.toml"),
     ("workspace-Cargo.lock", "Cargo.lock"),
-    ("hermit-Cargo.toml", "hermit-cli/Cargo.toml"),
-    ("detcore-Cargo.toml", "detcore/Cargo.toml"),
+    ("manifest-plan-Cargo.toml", "ci/manifest-plan/Cargo.toml"),
+    ("model-Cargo.toml", "detcore-model/Cargo.toml"),
 ];
 const VERIFY_REPORT_LIMIT: u64 = 16_777_216;
 

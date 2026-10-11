@@ -3,8 +3,8 @@
 //! [package]
 //! edition = "2024"
 //! [dependencies]
-//! hermit = { path = "../../hermit-cli" }
-//! detcore = { package = "hermit-detcore", path = "../../detcore" }
+//! hermit-manifest-plan = { path = "../../ci/manifest-plan" }
+//! detcore-model = { path = "../../detcore-model" }
 //! ```
 
 /*

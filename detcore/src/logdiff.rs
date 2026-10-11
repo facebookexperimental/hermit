@@ -60,11 +60,8 @@ pub const TRUNCATION_MARKER: &str = "=== HERMIT LOG TRUNCATED: reached the confi
 /// [`log_was_truncated`], which binds the two texts.
 pub const LOG_CAP_STOP_LINE: &str = "HERMIT_LOG_CAP class=log-cap";
 
-/// Versioned policy token for the only prefix removed by `BitwiseInfoV1`.
-pub const STRIP_WALL_CLOCK_PREFIX_V1: &str = "real-wall-clock-prefix/v1";
-
-/// Versioned policy token for lossless host-address ordinalization.
-pub const CANON_ADDRESS_ORDINAL_V1: &str = "host-address-to-first-appearance-ordinal/v1";
+pub use detcore_model::logdiff_policy::CANON_ADDRESS_ORDINAL_V1;
+pub use detcore_model::logdiff_policy::STRIP_WALL_CLOCK_PREFIX_V1;
 
 /// Whether `log_text` is the output of a writer that hit its size bound.
 ///
