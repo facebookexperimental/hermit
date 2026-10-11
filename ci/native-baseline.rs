@@ -89,6 +89,15 @@ run options:
                       (hard AllowedCPUs pin, ~1 s launch overhead here)
   --pin-cpu CPU       Single core to pin to (default: first allowed core)
   --timeout-seconds N Per-repetition native cap (default: 300)
+  --prepare-compat-fixtures
+                      Materialize validate's compat fixtures once (the
+                      compatprep step: tests/compat/prepare_real_compat_
+                      fixtures.sh into <run-state>/strict-compat/real-
+                      compat-fixtures) and point VALIDATE_RUN_STATE at it,
+                      so compat guests whose argv names that state can be
+                      timed. Ignored when VALIDATE_RUN_STATE is already set.
+  --run-state DIR     Use DIR as VALIDATE_RUN_STATE without preparing
+                      fixtures (ignored when the variable is already set)
 
 stats options:
   --native PATH       native-baseline/v1 JSONL from `run` (required)
@@ -367,6 +376,27 @@ struct RunOptions {
     pin_mechanism: String,
     pin_cpu: Option<usize>,
     timeout_seconds: u64,
+    prepare_compat_fixtures: bool,
+    run_state: Option<PathBuf>,
+}
+
+/// The `VALIDATE_RUN_STATE` a run should use, or `None` to leave the
+/// environment untouched: an already-set variable wins, then an explicit
+/// `--run-state`, then the `--prepare-compat-fixtures` default under the
+/// work root.
+fn resolve_run_state(
+    prepare_compat_fixtures: bool,
+    explicit: Option<&Path>,
+    work_root: &Path,
+    env_set: bool,
+) -> Option<PathBuf> {
+    if env_set {
+        return None;
+    }
+    if let Some(dir) = explicit {
+        return Some(dir.to_path_buf());
+    }
+    prepare_compat_fixtures.then(|| work_root.join("run-state"))
 }
 
 fn parse_run_options(args: &[String]) -> Result<RunOptions, String> {
@@ -381,6 +411,8 @@ fn parse_run_options(args: &[String]) -> Result<RunOptions, String> {
     let mut pin_mechanism = "taskset".to_string();
     let mut pin_cpu: Option<usize> = None;
     let mut timeout_seconds = 300u64;
+    let mut prepare_compat_fixtures = false;
+    let mut run_state: Option<PathBuf> = None;
     let mut i = 0;
     let take = |args: &[String], i: &mut usize, flag: &str| -> Result<String, String> {
         *i += 1;
@@ -445,6 +477,8 @@ fn parse_run_options(args: &[String]) -> Result<RunOptions, String> {
                     return Err("--timeout-seconds must be at least 1".into());
                 }
             }
+            "--prepare-compat-fixtures" => prepare_compat_fixtures = true,
+            "--run-state" => run_state = Some(PathBuf::from(take(args, &mut i, "--run-state")?)),
             other => return Err(format!("unknown run option {other:?}; see --help")),
         }
         i += 1;
@@ -476,6 +510,8 @@ fn parse_run_options(args: &[String]) -> Result<RunOptions, String> {
         pin_mechanism,
         pin_cpu,
         timeout_seconds,
+        prepare_compat_fixtures,
+        run_state,
     })
 }
 
@@ -484,6 +520,47 @@ fn cmd_run(args: &[String]) -> ExitCode {
         Ok(options) => options,
         Err(error) => return usage_error(&error),
     };
+    // Compat guests name validate's run state in their argv; materialize
+    // it with validate's own compatprep command when asked to.
+    if let Some(state_dir) = resolve_run_state(
+        options.prepare_compat_fixtures,
+        options.run_state.as_deref(),
+        &options.work_root,
+        std::env::var_os("VALIDATE_RUN_STATE").is_some(),
+    ) {
+        if options.prepare_compat_fixtures {
+            let fixtures = state_dir.join("strict-compat").join("real-compat-fixtures");
+            if !fixtures.is_dir() {
+                let script = options
+                    .repo_root
+                    .join("tests/compat/prepare_real_compat_fixtures.sh");
+                let status = Command::new("bash")
+                    .arg(&script)
+                    .arg(&fixtures)
+                    .current_dir(&options.repo_root)
+                    .status();
+                match status {
+                    Ok(status) if status.success() => {}
+                    Ok(status) => {
+                        return fail(&format!(
+                            "compat fixture preparation exited {status}; run {} {} manually to see why",
+                            script.display(),
+                            fixtures.display()
+                        ));
+                    }
+                    Err(error) => {
+                        return fail(&format!(
+                            "cannot run compat fixture preparation {}: {error}",
+                            script.display()
+                        ));
+                    }
+                }
+            }
+        }
+        // SAFETY: set before any guest preparation reads the variable;
+        // this process has spawned no threads yet at this point.
+        unsafe { std::env::set_var("VALIDATE_RUN_STATE", &state_dir) };
+    }
     let manifests = match ManifestSet::load(&options.repo_root) {
         Ok(manifests) => manifests,
         Err(error) => {
@@ -890,6 +967,24 @@ fn cmd_self_test(args: &[String]) -> ExitCode {
             failures += 1;
         }
     };
+    check(
+        "run-state env wins",
+        resolve_run_state(true, Some(Path::new("/x")), Path::new("/w"), true).is_none(),
+    );
+    check(
+        "run-state explicit",
+        resolve_run_state(false, Some(Path::new("/x")), Path::new("/w"), false)
+            == Some(PathBuf::from("/x")),
+    );
+    check(
+        "run-state prepared default",
+        resolve_run_state(true, None, Path::new("/w"), false)
+            == Some(PathBuf::from("/w/run-state")),
+    );
+    check(
+        "run-state untouched",
+        resolve_run_state(false, None, Path::new("/w"), false).is_none(),
+    );
     check("median odd", median(&[3.0, 1.0, 2.0]) == 2.0);
     check("median even", median(&[1.0, 2.0, 3.0, 4.0]) == 2.5);
     check(
