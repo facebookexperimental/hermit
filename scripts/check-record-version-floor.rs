@@ -103,8 +103,9 @@
 //! bump also adds a changelog comment above `RECORD_VERSION`: two bumps of the
 //! constants alone, to the same value, rebase cleanly, and neither this checker
 //! nor the compile-time assertion can see that two stream changes now share one
-//! version. That case is caught only by the land-time check that the version is
-//! exactly main's plus one.
+//! version. No automated check catches that case: it rests on the landing
+//! convention that whoever lands a version bump confirms by hand that the
+//! version is exactly main's plus one.
 //!
 //! # What this does NOT assert
 //!
@@ -644,6 +645,35 @@ const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x10e;
             2
         );
         assert_eq!(run(&["--base-ref", &old, "--allow-missing-history"]), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Rewrite the fixture tree's two constants, as an uncommitted change.
+    fn set_constants(root: &Path, version: u32, floor: u32) {
+        std::fs::write(
+            root.join(METADATA),
+            format!("{VERSION_KEY}{version:#x});\n{FLOOR_KEY}{floor:#x};\n"),
+        )
+        .unwrap();
+    }
+
+    /// Against the recorded base the floor is still enforced both ways: a
+    /// version bump that leaves the floor behind, and a floor above anything
+    /// ever shipped, are refused (1); only the exact maximum passes.
+    #[test]
+    fn a_recorded_base_still_refuses_a_floor_that_is_not_the_maximum() {
+        let (root, old, _new) = moved_main_fixture("floor");
+        let run = || run_in(&root, &strings(&["--base-ref", &old]));
+        set_constants(&root, 0x12a, 0x129);
+        assert_eq!(
+            run(),
+            1,
+            "the tree bumped to 0x12a and left the floor at 0x129"
+        );
+        set_constants(&root, 0x129, 0x12b);
+        assert_eq!(run(), 1, "0x12b was never shipped and is not in the tree");
+        set_constants(&root, 0x12a, 0x12a);
+        assert_eq!(run(), 0, "a bump that raises the floor with it");
         let _ = std::fs::remove_dir_all(&root);
     }
 }
