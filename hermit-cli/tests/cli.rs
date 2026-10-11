@@ -9767,6 +9767,12 @@ fn hb_relative_spec(directory: &Path, name: &str, base_fd: i32, nth: u64, extra:
 /// worker's write, then that getppid completing. A spec silently ignored
 /// would leave the ungated order; a gate at a later getppid would still let
 /// the first two through before the hold.
+///
+/// PMU REQUIRED: its version-2 spec bounds every hold by `max_hold_ns`, which
+/// only the PMU preemption timer can charge, so without perf counters Hermit
+/// refuses the run with `HERMIT_HB_HOLD_WITHOUT_PREEMPTION` before the guest
+/// starts. test.cli and test.cli_on_host skip it by exact name;
+/// privileged-test.pmu_cli_cases runs it.
 #[test]
 fn happens_before_relative_anchor_holds_the_first_call_after_its_base() {
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -9842,6 +9848,12 @@ fn happens_before_relative_anchor_holds_the_first_call_after_its_base() {
 /// yield and exit 0; one that inherited its counters as well would never reach
 /// its own 'wb' (its write count would already be past 1), so the report would
 /// name 'wb' instead. The exact report text catches both.
+///
+/// PMU REQUIRED: its version-2 spec bounds every hold by `max_hold_ns`, which
+/// only the PMU preemption timer can charge, so without perf counters Hermit
+/// refuses the run with `HERMIT_HB_HOLD_WITHOUT_PREEMPTION` before the guest
+/// starts. test.cli and test.cli_on_host skip it by exact name;
+/// privileged-test.pmu_cli_cases runs it.
 #[test]
 fn happens_before_relative_anchor_state_is_not_inherited_by_a_new_thread() {
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -9884,6 +9896,12 @@ fn happens_before_relative_anchor_state_is_not_inherited_by_a_new_thread() {
 /// An unfired relative anchor is refused by name after the guest finishes:
 /// one that points past the last getppid (the 4th of 3), and one whose base
 /// (a write to fd 77) never happens, which names the missing base as well.
+///
+/// PMU REQUIRED: its version-2 spec bounds every hold by `max_hold_ns`, which
+/// only the PMU preemption timer can charge, so without perf counters Hermit
+/// refuses the run with `HERMIT_HB_HOLD_WITHOUT_PREEMPTION` before the guest
+/// starts. test.cli and test.cli_on_host skip it by exact name;
+/// privileged-test.pmu_cli_cases runs it.
 #[test]
 fn happens_before_unfired_relative_anchor_is_refused_with_its_base() {
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -9936,6 +9954,12 @@ fn happens_before_unfired_relative_anchor_is_refused_with_its_base() {
 /// budget, by name, instead of spinning until an outside deadline. With a
 /// budget too large to reach, the same run does spin until `--timeout`, so it
 /// is the budget that ends the first run.
+///
+/// PMU REQUIRED: its version-2 spec bounds every hold by `max_hold_ns`, which
+/// only the PMU preemption timer can charge, so without perf counters Hermit
+/// refuses the run with `HERMIT_HB_HOLD_WITHOUT_PREEMPTION` before the guest
+/// starts. test.cli and test.cli_on_host skip it by exact name;
+/// privileged-test.pmu_cli_cases runs it.
 #[test]
 fn happens_before_hold_budget_ends_a_hold_a_spinner_never_releases() {
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -10798,6 +10822,12 @@ fn happens_before_posthook_edge_passes_strict_verify() {
 /// end in `HERMIT_HB_POSTHOOK_INTERRUPTED` rather than a guessed firing. The
 /// wait is the guest's one shared `FUTEX_WAIT` (operation 0); glibc's own
 /// waits are private.
+///
+/// PMU REQUIRED: its version-2 spec bounds every hold by `max_hold_ns`, which
+/// only the PMU preemption timer can charge, so without perf counters Hermit
+/// refuses the run with `HERMIT_HB_HOLD_WITHOUT_PREEMPTION` before the guest
+/// starts. test.cli and test.cli_on_host skip it by exact name;
+/// privileged-test.pmu_cli_cases runs it.
 #[test]
 fn happens_before_posthook_anchor_on_an_interrupted_call_is_refused_by_name() {
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -11178,6 +11208,12 @@ fn happens_before_posthook_anchor_with_replay_schedule_is_refused() {
 /// The child of `posix_spawn` calls dup2 before execve; a spec holding it there
 /// must be refused by name with the policy-refusal status, not spin until an
 /// outside timeout.
+///
+/// PMU REQUIRED: its version-2 spec bounds every hold by `max_hold_ns`, which
+/// only the PMU preemption timer can charge, so without perf counters Hermit
+/// refuses the run with `HERMIT_HB_HOLD_WITHOUT_PREEMPTION` before the guest
+/// starts. test.cli and test.cli_on_host skip it by exact name;
+/// privileged-test.pmu_cli_cases runs it.
 #[test]
 fn happens_before_hold_in_a_vfork_child_is_refused_by_name() {
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
