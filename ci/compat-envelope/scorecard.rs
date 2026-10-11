@@ -8430,6 +8430,17 @@ fn load_self_test_corpus(
 /// Retired cells remain in the ledger's existing Git history, never an
 /// uncommitted projection that a later writer could overwrite.
 fn reconcile_history_catalogue(root: &Path, history: &mut TrackedCells) -> Result<(), String> {
+    reconcile_history_catalogue_with(root, history, true)
+}
+
+/// reconcile_history_catalogue, printing its retention notice only when
+/// ANNOUNCE: a write-back that reconciles the same history again to rebuild a
+/// copy of it must not print the notice twice.
+fn reconcile_history_catalogue_with(
+    root: &Path,
+    history: &mut TrackedCells,
+    announce: bool,
+) -> Result<(), String> {
     // A renamed cell is a join, not a retirement: re-key it before comparing.
     resolve_retired_history(history)?;
     let catalogue = load_catalogue(root)?.ok_or("the source catalogue is unavailable")?;
@@ -8458,10 +8469,12 @@ fn reconcile_history_catalogue(root: &Path, history: &mut TrackedCells) -> Resul
         if !committed.status.success() || committed.stdout != current {
             return Err("catalogue reconciliation refuses to retire uncommitted history; publish the exact existing detailed document first".into());
         }
-        println!(
-            "compatibility scorecard: retaining {retired} retired cell(s) in ledger commit {}",
-            git_head(&ledger)?
-        );
+        if announce {
+            println!(
+                "compatibility scorecard: retaining {retired} retired cell(s) in ledger commit {}",
+                git_head(&ledger)?
+            );
+        }
         archive_retiring_catalogue_comparisons(history, &current_ids)?;
     }
     let unchanged = history.cells.len() == catalogue.cells.len()
@@ -11206,18 +11219,58 @@ fn verify_combined_write_state(
             "HEAD moved from {expected_head} to {current_head} during combined scorecard write-back"
         ));
     }
-    let current = read_history_files(root)?;
-    if current.scorecard != expected_scorecard {
+    // Compared in chunks, not by reading the files: cells.json is 1.27 GB, and
+    // a whole copy of it per check, beside the original and the generated
+    // bytes, set the write-back's peak
+    // (https://github.com/rrnewton/dev-hermit/issues/554). The parity file is
+    // still read, as before, so an unreadable one still refuses.
+    let (scorecard, cells) = history_files(root, false)?;
+    let parity = history_parity_file(root, false)?;
+    if !file_holds_exactly(&scorecard, expected_scorecard)? {
         return Err(format!(
             "{SCORECARD} changed during combined scorecard write-back"
         ));
     }
-    if current.cells != expected_cells {
+    if !file_holds_exactly(&cells, expected_cells)? {
         return Err(format!(
             "{CELLS} changed during combined scorecard write-back"
         ));
     }
+    match fs::read(&parity) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "history unavailable at {}: {error}",
+                parity.display()
+            ));
+        }
+    }
     snapshot.verify()
+}
+
+/// Whether the file at PATH holds exactly EXPECTED, read in 1 MiB chunks.
+fn file_holds_exactly(path: &Path, expected: &[u8]) -> Result<bool, String> {
+    let unavailable =
+        |error: std::io::Error| format!("history unavailable at {}: {error}", path.display());
+    let mut file = File::open(path).map_err(unavailable)?;
+    let mut buffer = vec![0u8; 1 << 20];
+    let mut offset = 0usize;
+    loop {
+        let read = match std::io::Read::read(&mut file, &mut buffer) {
+            Ok(read) => read,
+            // As fs::read does, which the comparison replaced.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(unavailable(error)),
+        };
+        if read == 0 {
+            return Ok(offset == expected.len());
+        }
+        if expected.len() - offset < read || buffer[..read] != expected[offset..offset + read] {
+            return Ok(false);
+        }
+        offset += read;
+    }
 }
 
 fn project_and_observe_results(
@@ -11889,10 +11942,18 @@ where
         );
     }
 
-    let mut tracked: TrackedCells = serde_json::from_slice(&original.cells)
-        .map_err(|error| format!("cannot parse tracked {CELLS}: {error}"))?;
-    reconcile_history_catalogue(root, &mut tracked)?;
-    let before = tracked.clone();
+    // The reconciled history as read, rebuilt from the held bytes whenever a
+    // fresh copy of it is needed, instead of keeping a 2.7 GB clone (`before`)
+    // from here to the end (https://github.com/rrnewton/dev-hermit/issues/554).
+    // Parsing and reconciling the same bytes against the same checkout gives
+    // the same history; only the first reconciliation announces retirements.
+    let reconciled_history = |announce: bool| -> Result<TrackedCells, String> {
+        let mut history: TrackedCells = serde_json::from_slice(&original.cells)
+            .map_err(|error| format!("cannot parse tracked {CELLS}: {error}"))?;
+        reconcile_history_catalogue_with(root, &mut history, announce)?;
+        Ok(history)
+    };
+    let tracked = reconciled_history(true)?;
     let custom_retention = retain_selected_custom_results(
         &tracked,
         &derived.selected_custom,
@@ -11910,10 +11971,8 @@ where
     // encounter the old compact run matcher. Reconcile the complete snapshot
     // first; only exactly represented events may be suppressed. Existing
     // projected events still undergo their full-source ownership check.
-    // TRACKED is still exactly BEFORE here, so the preview takes TRACKED itself
-    // and TRACKED is cloned back from BEFORE once the preview is gone: one copy
-    // of the history fewer at this peak, 2.7 GB on 2026-10-11
-    // (https://github.com/rrnewton/dev-hermit/issues/554).
+    // TRACKED is still exactly the reconciled history here, so the preview
+    // takes TRACKED itself, and TRACKED is rebuilt once the preview is gone.
     let mut preview = tracked;
     apply_validate_results_from(
         &mut preview,
@@ -11940,7 +11999,7 @@ where
     // Both results above are owned. Release the preview, a whole copy of the
     // history, before the projection below starts from a fresh copy of it.
     drop(preview);
-    let mut tracked = before.clone();
+    let mut tracked = reconciled_history(false)?;
     remove_replaceable_projected_observations(
         &mut tracked,
         &snapshot.rows,
@@ -11976,7 +12035,10 @@ where
         pre_series_corpus: true,
         comparison_attempt_bindings_v1: comparison_attempt_bindings(&tracked).cloned(),
     });
-    enforce_projection_preserves_evidence(&before, &tracked, rows_read)?;
+    // It reads BEFORE only when no row was read; it returns at once otherwise.
+    if rows_read == 0 {
+        enforce_projection_preserves_evidence(&reconciled_history(false)?, &tracked, rows_read)?;
+    }
     let projected_stamps = tracked
         .cells
         .iter()
@@ -12088,6 +12150,7 @@ where
     // and written (https://github.com/rrnewton/dev-hermit/issues/554). After
     // here the snapshot is read only for its held identity (verify).
     snapshot.rows = Vec::new();
+    let before = reconciled_history(false)?;
     enforce_projection_preserves_evidence(&before, &tracked, rows_read)?;
     refresh_measurement(&mut tracked);
     enforce_writer_boundary(&before, &tracked, Writer::Observations)?;
@@ -16439,7 +16502,13 @@ fn read_series_rows(snapshot: &SeriesSourceSnapshot) -> Result<Vec<SeriesRow>, S
     // by keeping every row's JsonValue: about 12 GB of a 23.7 GB render for the
     // 1,140,698 rows of 2026-10-11. A Value serializes with its object keys in
     // order, so two Values are equal exactly when their serializations are, and
-    // the digest of that serialization is what is kept.
+    // the digest of that serialization is what is kept. One difference from
+    // comparing Values: a Value compares floats numerically, so 0.0 equals
+    // -0.0, while their serializations ("0.0", "-0.0") differ. Two copies of
+    // an event that differ only in the sign of a zero were collapsed before and
+    // are refused as conflicting now. That is the safe direction: the two
+    // copies were not written from the same bytes, and nothing writes a
+    // negative zero into a series row on purpose.
     let mut canonical: BTreeMap<String, ([u8; 32], SeriesRow, String)> = BTreeMap::new();
     for shard in &snapshot.shards {
         if !shard.bytes.is_empty() && !shard.bytes.ends_with(b"\n") {
@@ -24457,6 +24526,13 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
             ));
         }
 
+        // The write-back's preview changes the history here: the baseline holds
+        // no representation of the current result, so the preview's
+        // apply_validate_results_from adds one. The projection must still start
+        // from the unchanged history (rebuilt from the held bytes), so the
+        // result is represented exactly once below, not once from the preview
+        // and once from the fold.
+        let baseline_history: TrackedCells = read_json(&fixture_ledger.join(LEDGER_CELLS))?;
         project_and_observe_results(
             &result_command_root,
             &empty_snapshot_path,
@@ -24495,6 +24571,12 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
                 "fixture-combined-current-result",
             )
         };
+        if count_current_result(&baseline_history) != 0 {
+            return Err(
+                "the combined write-back's preview would not change the history: the baseline already represents the current result"
+                    .into(),
+            );
+        }
         if count_current_result(&before_publication) != 1
             || before_publication
                 .projection
