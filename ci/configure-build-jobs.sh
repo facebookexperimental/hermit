@@ -1439,7 +1439,7 @@ fi
 # and rust-toolchain.toml remain Git-object identical. Root Cargo.toml adds
 # the host qualification member; it is not a source_recipe_key input.
 # With unchanged CMAKE, CMAKE_GENERATOR and normalized SOURCE_DATE_EPOCH,
-# retain SDK key c941bff007f8dd7737312cc1c59824ca796cad1d4688a27f872a558c07fe7cae,
+# retain SDK key 75c3067d4692cd8aa168d6791e718f21e6535e672b957291142070a0edc27234,
 # inventory 941, the 16-job clamp, 1050-job-second wrapper and 572-job-second
 # fallback. This carries the SDK budget, not a timing sample, runtime
 # identity or earlier validation evidence.
@@ -1452,8 +1452,18 @@ fi
 # CMAKE/CMAKE_GENERATOR and normalized SOURCE_DATE_EPOCH, carry the existing
 # 16-job clamp and 1050/572-job-second SDK budgets only. This is not a new
 # timing sample or a claim that earlier native/runtime evidence applies.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 15374907e7359d639ce62b7e67179736707af332 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 15374907e7359d639ce62b7e67179736707af332 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# NATIVE DISPATCH CARRY TO 1dae09ef151f88d0d6a0cb7e3c1f06e05f324181 (2026-10-10):
+# From 15374907e7359d639ce62b7e67179736707af332, native constructor dispatch
+# and test stream capture change. The seven measured SDK build inputs
+# (build.rs, vendor/dynamorio, native/CMakeLists.txt, DBT Cargo.toml,
+# third-party, root Cargo.toml and rust-toolchain.toml) are Git-object equal.
+# Preserve CMAKE, CMAKE_GENERATOR and normalized SOURCE_DATE_EPOCH; the actual
+# SDK key is 75c3067d4692cd8aa168d6791e718f21e6535e672b957291142070a0edc27234.
+# Preserve inventory 941, the 16-job clamp, 1050-job-second wrapper and
+# 572-job-second fallback. This carries the SDK budget only, not runtime
+# validation evidence. Main's versioned DBT consumer behavior is retained.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 1dae09ef151f88d0d6a0cb7e3c1f06e05f324181 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 1dae09ef151f88d0d6a0cb7e3c1f06e05f324181 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
