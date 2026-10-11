@@ -2105,7 +2105,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (Codex re-check of https://github.com/rrnewton/hermit/pull/4053): 277.
     // And the four targeted-chaos sched_yield tests in chaos_sched_yield_progress
     // (https://github.com/rrnewton/hermit/issues/4068): 281.
-    ("test.hermit_integration", 281),
+    // And external_signal_interrupt::ptrace_ppoll_on_a_stack_with_no_scratch_behaves_as_natively
+    // (https://github.com/rrnewton/hermit/issues/4113): 282.
+    ("test.hermit_integration", 282),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -2222,7 +2224,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4092): 172.
     // And record_pselect_beside_two_siblings_spinning_on_sched_yield (Claude
     // review of https://github.com/rrnewton/hermit/pull/4120): 173.
-    ("test.record_replay", 173),
+    // The five ppoll tight-stack tests (record_*_24_bytes_into_its_page,
+    // record_*_128_bytes_into_its_page, record_unmasked_zero_timeout_ppoll_16_bytes_into_its_page
+    // and record_masked_ppoll_whose_pollfd_is_in_the_red_zone,
+    // https://github.com/rrnewton/hermit/issues/4113): 178.
+    ("test.record_replay", 178),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -3006,7 +3012,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the large-pselect6 mutable-mask test: 276.
     // And the large-pselect6 tight-stack test: 277.
     // And the four targeted-chaos sched_yield tests: 281.
-    ("test.hermit_integration_on_host", 281),
+    // And the ppoll tight-stack test: 282.
+    ("test.hermit_integration_on_host", 282),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

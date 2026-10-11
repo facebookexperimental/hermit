@@ -2839,6 +2839,47 @@ fn record_zero_timeout_ppoll_whose_mask_unblocks_a_pending_signal_on_a_tight_sta
     record_select_mode("ppoll-mask-zero-raise-tight");
 }
 
+/// The same raise on a stack 24 bytes into its page, which has no stack
+/// scratch below the red zone: Hermit stages the probe's private zero timeout
+/// and mask copy in the red zone, where it returned EFAULT before
+/// (https://github.com/rrnewton/hermit/issues/4113).
+#[test]
+fn record_zero_timeout_ppoll_whose_mask_unblocks_a_pending_signal_24_bytes_into_its_page() {
+    record_select_mode("ppoll-mask-zero-raise-tight24");
+}
+
+/// A masked ppoll with a 30 s timeout that the kernel waits in, 24 bytes into
+/// its page: its private mask copy goes in the red zone, and the pending
+/// signal its mask unblocks ends it with EINTR, which replay delivers in the
+/// same 24 bytes (https://github.com/rrnewton/hermit/issues/4113).
+#[test]
+fn record_ppoll_whose_mask_unblocks_a_pending_signal_24_bytes_into_its_page() {
+    record_select_mode("ppoll-mask-raise-tight24");
+}
+
+/// The same 128 bytes into the page, where the copy cannot go below the red
+/// zone either (https://github.com/rrnewton/hermit/issues/4113).
+#[test]
+fn record_ppoll_whose_mask_unblocks_a_pending_signal_128_bytes_into_its_page() {
+    record_select_mode("ppoll-mask-raise-tight128");
+}
+
+/// An unmasked zero-timeout ppoll 16 bytes into its page returns 0: its
+/// private zero timeout goes in the red zone
+/// (https://github.com/rrnewton/hermit/issues/4113).
+#[test]
+fn record_unmasked_zero_timeout_ppoll_16_bytes_into_its_page() {
+    record_select_mode("ppoll-zero-tight16");
+}
+
+/// A masked ppoll on a ready pipe 128 bytes into its page, whose pollfd sits
+/// at the top of the red zone: the kernel writes its revents there, so the
+/// private mask copy must go below it, and the call returns 1 with POLLIN.
+#[test]
+fn record_masked_ppoll_whose_pollfd_is_in_the_red_zone() {
+    record_select_mode("ppoll-mask-redzone-pollfd");
+}
+
 /// A masked ppoll that would block: its temporary mask blocks the timer's
 /// SIGALRM, and a writer's byte ends it with 1. Under sequentialization the
 /// call recorded ENOSYS; record/replay now lets the kernel own the wait

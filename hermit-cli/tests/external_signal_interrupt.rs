@@ -2156,7 +2156,7 @@ fn ptrace_large_pselect6_sleeps_under_its_entry_mask_while_a_sibling_rewrites_it
 
 /// A pselect6 with more than 64 descriptors and a temporary mask is valid on a
 /// stack with no writable memory below its red zone, and Hermit stages its
-/// private copy of the mask (`stage_pselect6_mask_copy`) somewhere else there.
+/// private copy of the mask (`stage_private_cells`) somewhere else there.
 /// tests/c/pselect_tight_stack.c makes a ready call, a call ended by a SIGALRM
 /// that only the temporary mask unblocks, a call the kernel restarts for an
 /// ignored SIGCONT (re-reading its mask), a ready call again, and a ready call
@@ -2276,6 +2276,116 @@ fn ptrace_large_pselect6_on_a_stack_with_no_scratch_behaves_as_natively() {
         "crowded with --allow-unsupported-syscalls: expected Linux's answer; got {}\nstdout:\n{allowed_stdout}\nstderr:\n{}",
         allowed.status,
         String::from_utf8_lossy(&allowed.stderr)
+    );
+    let _ = fs::remove_file(&witness);
+}
+
+/// A ppoll on a stack with no writable memory below its red zone is valid,
+/// and Hermit stages its private zero timeout and mask copy in the red zone,
+/// clear of the pollfd array and, for a call the kernel waits in, the timeout
+/// (`stage_private_cells`). Each mode of tests/c/record_replay_select.c below
+/// must print what Linux prints, under strict verification, with the pattern
+/// it keeps in the red zone intact. These calls returned EFAULT before
+/// (https://github.com/rrnewton/hermit/issues/4113). At 8 bytes no 24-byte
+/// window is writable, and a fail-closed run refuses the call by name.
+#[test]
+fn ptrace_ppoll_on_a_stack_with_no_scratch_behaves_as_natively() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let root = build_root();
+    fs::create_dir_all(&root).expect("failed to create guest build directory");
+    let witness = root.join(format!("ppoll_tight_stack.{}", std::process::id()));
+    let compiled = Command::new("cc")
+        .args(["-O2", "-Wall", "-Wextra", "-Werror", "-pthread"])
+        .arg(repository.join("tests/c/record_replay_select.c"))
+        .arg("-o")
+        .arg(&witness)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to start the witness's compiler");
+    assert!(
+        compiled.status.success(),
+        "failed to compile the witness: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    for (mode, expected) in [
+        (
+            "ppoll-mask-zero-raise-tight24",
+            "result=-0000000004 handled=1 revents=00",
+        ),
+        (
+            "ppoll-mask-raise-tight24",
+            "result=-0000000004 handled=1 revents=00",
+        ),
+        (
+            "ppoll-mask-raise-tight128",
+            "result=-0000000004 handled=1 revents=00",
+        ),
+        (
+            "ppoll-zero-tight16",
+            "result=00000000000 handled=0 revents=00",
+        ),
+        (
+            "ppoll-mask-redzone-pollfd",
+            "result=00000000001 handled=0 revents=01",
+        ),
+    ] {
+        let trial = tempfile::Builder::new()
+            .prefix("trial-")
+            .tempdir_in(&root)
+            .expect("failed to create trial directory");
+        let report = trial.path().join("verify.json");
+        let output = Command::new("timeout")
+            .args(["--kill-after=5s", "120s"])
+            .arg(hermit_binary::hermit_binary())
+            .env_remove("LD_LIBRARY_PATH")
+            .arg("--log=info")
+            .args(cell_run_args("ptrace"))
+            .args(["--verify", "--verify-strict", "--verify-json"])
+            .arg(&report)
+            .arg("--")
+            .arg(&witness)
+            .arg(mode)
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run hermit");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let expected = format!("{expected} red_zone_changed=000");
+        assert!(
+            output.status.success() && stdout.contains(&expected),
+            "{mode}: expected `{expected}`, as natively, with exit 0; got {}\nstdout:\n{stdout}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let verdict: serde_json::Value = serde_json::from_slice(
+            &fs::read(&report).expect("strict verification wrote no verdict"),
+        )
+        .expect("strict verification verdict is valid JSON");
+        if let Some(gap) = strict_verification_gap(&verdict) {
+            panic!("{mode}: strict verification is not determinism evidence: {gap}");
+        }
+    }
+    let refused = Command::new("timeout")
+        .args(["--kill-after=5s", "120s"])
+        .arg(hermit_binary::hermit_binary())
+        .env_remove("LD_LIBRARY_PATH")
+        .args(cell_run_args("ptrace"))
+        .arg("--")
+        .arg(&witness)
+        .arg("ppoll-mask-raise-tight8")
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run hermit");
+    let refused_stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        refused.status.code() == Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
+            && refused_stderr
+                .contains("unsupported: ppoll on a stack with no room below its red zone")
+            && !String::from_utf8_lossy(&refused.stdout).contains("ppoll-mask-raise-tight8"),
+        "ppoll-mask-raise-tight8: expected the named policy refusal; got {}\nstdout:\n{}\nstderr:\n{refused_stderr}",
+        refused.status,
+        String::from_utf8_lossy(&refused.stdout)
     );
     let _ = fs::remove_file(&witness);
 }

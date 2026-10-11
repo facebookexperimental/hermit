@@ -173,6 +173,21 @@
  *                writable page with an inaccessible page below it, with the
  *                handler on an alternate stack and a pattern in the red zone
  *                that must survive the replayed delivery
+ *   ppoll-mask-zero-raise-tight24, ppoll-mask-raise-tight24,
+ *   ppoll-mask-raise-tight128
+ *                the same at 24 and 128 bytes, with a zero timeout or a 30 s
+ *                one: no stack scratch below the red zone, so Hermit stages
+ *                its private zero timeout and mask copy in the red zone
+ *                (https://github.com/rrnewton/hermit/issues/4113)
+ *   ppoll-zero-tight16
+ *                an unmasked zero-timeout ppoll at 16 bytes: 0
+ *   ppoll-mask-redzone-pollfd
+ *                a masked ppoll at 128 bytes on a ready pipe whose pollfd sits
+ *                at the top of the red zone, where the kernel writes revents:
+ *                1 with POLLIN, so the private copy must go below it
+ *   ppoll-mask-raise-tight8
+ *                at 8 bytes no 24-byte window is writable; a fail-closed run
+ *                refuses the call by name
  *   ppoll-mask-blocks-alarm
  *                the blocks-alarm wait as glibc ppoll() with no timeout and a
  *                temporary mask that blocks SIGALRM: the writer's byte at
@@ -1400,8 +1415,20 @@ static int zero_timeout_mask_raise(int use_ppoll) {
 
 static unsigned char tight_alternate[65536];
 
-/* The zero-timeout ppoll raise on a stack 160 bytes into its page. */
-static int ppoll_mask_zero_raise_tight(void) {
+/* A ppoll on a stack `offset` bytes into a writable page with an inaccessible
+ * page below it. With `masked`, SIGUSR1 is pending, blocked by the thread and
+ * unblocked by the call's empty mask, so Linux returns EINTR with the handler
+ * run (on an alternate stack); without, the call returns 0. `wait` gives a
+ * 30 s timeout, a zero one otherwise. With `ready_pollfd_in_red_zone` no
+ * signal is raised, a byte is waiting in the pipe, and the pollfd sits at the
+ * top of the red zone, where the kernel writes its revents: Linux returns 1
+ * with POLLIN. The pattern in the rest of the writable red zone must survive. */
+static int ppoll_tight(
+    const char* name,
+    long offset,
+    int masked,
+    int wait,
+    int ready_pollfd_in_red_zone) {
   long page = sysconf(_SC_PAGESIZE);
   unsigned char* area = mmap(
       NULL, (size_t)page * 2, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -1422,38 +1449,54 @@ static int ppoll_mask_zero_raise_tight(void) {
   int fds[2];
   if (sigaltstack(&alternate, NULL) != 0 ||
       sigaction(SIGUSR1, &action, NULL) != 0 ||
-      pthread_sigmask(SIG_BLOCK, &usr1, NULL) != 0 || pipe(fds) != 0 ||
-      raise(SIGUSR1) != 0) {
+      pthread_sigmask(SIG_BLOCK, &usr1, NULL) != 0 || pipe(fds) != 0) {
     perror("setup");
     return 1;
   }
-  static struct pollfd watched;
-  watched.fd = fds[0];
-  watched.events = POLLIN;
-  static struct timespec zero = {0, 0};
-  static uint64_t empty_mask;
-  unsigned char* tight_stack = area + page + 160;
-  for (int i = -128; i < 0; i++) {
+  if (ready_pollfd_in_red_zone ? write(fds[1], "x", 1) != 1 : raise(SIGUSR1) != 0) {
+    perror("write or raise");
+    return 1;
+  }
+  raised_usr1 = 0;
+  unsigned char* tight_stack = area + page + offset;
+  static struct pollfd static_watched;
+  struct pollfd* watched = ready_pollfd_in_red_zone
+      ? (struct pollfd*)(tight_stack - sizeof(struct pollfd))
+      : &static_watched;
+  int low = offset < 128 ? (int)-offset : -128;
+  int high = ready_pollfd_in_red_zone ? -(int)sizeof(struct pollfd) : 0;
+  for (int i = low; i < high; i++) {
     tight_stack[i] = (unsigned char)(0xa5 ^ (i & 0xff));
   }
+  watched->fd = fds[0];
+  watched->events = POLLIN;
+  watched->revents = 0;
+  static struct timespec timeout;
+  timeout.tv_sec = wait ? 30 : 0;
+  timeout.tv_nsec = 0;
+  static uint64_t empty_mask;
   const long args[5] = {
-      (long)&watched, 1, (long)&zero, (long)&empty_mask, 8};
+      (long)watched, 1, (long)&timeout, masked ? (long)&empty_mask : 0, 8};
   long raw = syscall5_on_stack(tight_stack, SYS_ppoll, args);
   int handled = (int)raised_usr1;
+  int revents = watched->revents;
   int red_zone_changed = 0;
-  for (int i = -128; i < 0; i++) {
+  for (int i = low; i < high; i++) {
     red_zone_changed += tight_stack[i] != (unsigned char)(0xa5 ^ (i & 0xff));
   }
   close(fds[0]);
   close(fds[1]);
   printf(
-      "%-24s result=%011ld handled=%01d red_zone_changed=%03d\n",
-      "ppoll-zero-raise-tight",
+      "%-30s result=%011ld handled=%01d revents=%02x red_zone_changed=%03d\n",
+      name,
       raw,
       handled,
+      revents,
       red_zone_changed);
-  if (raw != -EINTR || handled != 1 || red_zone_changed != 0) {
-    fprintf(stderr, "ppoll-mask-zero-raise-tight mismatch\n");
+  long expected = ready_pollfd_in_red_zone ? 1 : masked ? -EINTR : 0;
+  if (raw != expected || handled != (masked && !ready_pollfd_in_red_zone) ||
+      revents != (ready_pollfd_in_red_zone ? POLLIN : 0) || red_zone_changed != 0) {
+    fprintf(stderr, "%s mismatch\n", name);
     return 1;
   }
   return 0;
@@ -1964,7 +2007,10 @@ int main(int argc, char** argv) {
         "pselect-mask-unblocks-tight-stack|pselect-mask-zero-raise|"
         "ppoll-mask-zero-raise|ppoll-mask-blocks-alarm|"
         "ppoll-mask-unblocks-alarm|pselect-mask-zero-race|"
-        "ppoll-mask-zero-raise-tight|pselect-mask-hook-race|"
+        "ppoll-mask-zero-raise-tight|ppoll-mask-zero-raise-tight24|"
+        "ppoll-mask-raise-tight24|ppoll-mask-raise-tight128|"
+        "ppoll-zero-tight16|ppoll-mask-redzone-pollfd|"
+        "ppoll-mask-raise-tight8|pselect-mask-hook-race|"
         "epoll-pwait-ready|epoll-pwait-mask-ready|epoll-pwait-writer|"
         "epoll-pwait-mask-blocks-alarm|epoll-pwait-mask-unblocks-alarm|"
         "epoll-pwait-mask-raise|epoll-pwait-mask-sibling-race|"
@@ -2058,7 +2104,25 @@ int main(int argc, char** argv) {
     return pselect_mask_zero_race();
   }
   if (strcmp(argv[1], "ppoll-mask-zero-raise-tight") == 0) {
-    return ppoll_mask_zero_raise_tight();
+    return ppoll_tight(argv[1], 160, 1, 0, 0);
+  }
+  if (strcmp(argv[1], "ppoll-mask-zero-raise-tight24") == 0) {
+    return ppoll_tight(argv[1], 24, 1, 0, 0);
+  }
+  if (strcmp(argv[1], "ppoll-mask-raise-tight24") == 0) {
+    return ppoll_tight(argv[1], 24, 1, 1, 0);
+  }
+  if (strcmp(argv[1], "ppoll-mask-raise-tight128") == 0) {
+    return ppoll_tight(argv[1], 128, 1, 1, 0);
+  }
+  if (strcmp(argv[1], "ppoll-zero-tight16") == 0) {
+    return ppoll_tight(argv[1], 16, 0, 0, 0);
+  }
+  if (strcmp(argv[1], "ppoll-mask-redzone-pollfd") == 0) {
+    return ppoll_tight(argv[1], 128, 1, 1, 1);
+  }
+  if (strcmp(argv[1], "ppoll-mask-raise-tight8") == 0) {
+    return ppoll_tight(argv[1], 8, 1, 1, 0);
   }
   if (strcmp(argv[1], "pselect-beside-a-yielding-sibling") == 0) {
     return pselect_beside_yielding_siblings(argv[1], 1);

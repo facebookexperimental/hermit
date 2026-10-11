@@ -122,34 +122,100 @@ pub(super) struct Pselect6SigmaskArg {
     pub(super) sigsetsize: usize,
 }
 
-/// Where a private copy of a pselect6 temporary mask lives while the kernel
-/// reads it (`stage_pselect6_mask_copy`).
-enum StagedMaskStorage<Guard> {
+/// Where a call's private cells (`PrivateCells`) live while the kernel reads
+/// them (`stage_private_cells`).
+enum StagedCellsStorage<Guard> {
     /// The guest stack scratch below the red zone, checked out by the guard.
     Stack(Guard),
-    /// The top of the guest's red zone, whose bytes `saved` holds until
-    /// `StagedMask::release` writes them back.
+    /// Part of the guest's red zone, whose first `len` bytes `saved` holds
+    /// until `StagedCells::release` writes them back.
     RedZone {
         at: usize,
-        saved: [u8; STAGED_MASK_LEN],
+        len: usize,
+        saved: [u8; MAX_PRIVATE_CELLS_LEN],
     },
 }
 
-/// A private, kernel-readable copy of a pselect6 temporary mask, as the
-/// `{ sigmask, sigsetsize }` wrapper a pselect6 passes (`wrapper`).
-struct StagedMask<Guard> {
-    wrapper: usize,
-    /// The mask copy itself, for a call that takes the mask without a wrapper
-    /// (`epoll_pwait`).
-    mask: usize,
-    storage: StagedMaskStorage<Guard>,
+/// What a call hands the kernel in place of the guest's own memory: a
+/// temporary signal mask, which a sibling could rewrite while the call waits
+/// and which Hermit sanitizes, and the cell that goes with it. The mask comes
+/// first.
+///
+/// Every layout with a mask takes 24 bytes, the size of replay's signal
+/// delivery for an interrupted call (`end_replayed_pselect6_under_its_temporary_mask`),
+/// so replay can deliver wherever recording found room for the call (Claude
+/// re-review of https://github.com/rrnewton/hermit/pull/4087).
+#[derive(Clone, Copy)]
+enum PrivateCells {
+    /// A pselect6 temporary mask and the `{ sigmask, sigsetsize }` wrapper
+    /// that names it.
+    Pselect6Mask(KernelSigset),
+    /// A temporary mask for a call that takes the mask without a wrapper
+    /// (`epoll_pwait`, a ppoll the kernel waits in), and 16 unused bytes.
+    Mask(KernelSigset),
+    /// A temporary mask and a zero timeout (a zero-timeout ppoll probe, and
+    /// the replayed signal delivery).
+    MaskAndZeroTimeout(KernelSigset),
+    /// A zero timeout alone (a zero-timeout ppoll probe with no mask).
+    ZeroTimeout,
 }
 
-/// The mask and its `{ sigmask, sigsetsize }` wrapper, in that order.
-const STAGED_MASK_LEN: usize =
-    std::mem::size_of::<KernelSigset>() + std::mem::size_of::<Pselect6SigmaskArg>();
+const MASK_LEN: usize = std::mem::size_of::<KernelSigset>();
 
-impl<Guard> StagedMask<Guard> {
+/// The most any `PrivateCells` takes: a mask and a 16-byte cell.
+const MAX_PRIVATE_CELLS_LEN: usize = MASK_LEN + std::mem::size_of::<Timespec>();
+
+// The wrapper and the timeout share the cell after the mask.
+const _: () = assert!(std::mem::size_of::<Pselect6SigmaskArg>() == std::mem::size_of::<Timespec>());
+
+impl PrivateCells {
+    fn len(self) -> usize {
+        match self {
+            Self::Pselect6Mask(_) | Self::Mask(_) | Self::MaskAndZeroTimeout(_) => {
+                MAX_PRIVATE_CELLS_LEN
+            }
+            Self::ZeroTimeout => std::mem::size_of::<Timespec>(),
+        }
+    }
+
+    /// The cells' bytes when they start at `at`. Only the first `len` count,
+    /// and a zero timeout is all zeroes.
+    fn bytes(self, at: usize) -> [u8; MAX_PRIVATE_CELLS_LEN] {
+        let mut cells = [0u8; MAX_PRIVATE_CELLS_LEN];
+        match self {
+            Self::Pselect6Mask(mask) => {
+                cells[..MASK_LEN].copy_from_slice(&mask.to_ne_bytes());
+                cells[MASK_LEN..MASK_LEN + 8].copy_from_slice(&at.to_ne_bytes());
+                cells[MASK_LEN + 8..].copy_from_slice(&KERNEL_SIGSET_SIZE.to_ne_bytes());
+            }
+            Self::Mask(mask) | Self::MaskAndZeroTimeout(mask) => {
+                cells[..MASK_LEN].copy_from_slice(&mask.to_ne_bytes());
+            }
+            Self::ZeroTimeout => {}
+        }
+        cells
+    }
+}
+
+/// A call's private cells in guest memory (`stage_private_cells`).
+struct StagedCells<Guard> {
+    /// The first cell: the mask, or the zero timeout of
+    /// `PrivateCells::ZeroTimeout`.
+    at: usize,
+    storage: StagedCellsStorage<Guard>,
+}
+
+impl<Guard> StagedCells<Guard> {
+    /// The mask copy.
+    fn mask(&self) -> usize {
+        self.at
+    }
+
+    /// The cell after the mask: a pselect6 wrapper, or a zero timeout.
+    fn after_mask(&self) -> usize {
+        self.at + MASK_LEN
+    }
+
     /// Gives the storage back once the call has returned: drops the stack
     /// guard, or writes the guest's red-zone bytes back. That is a write to
     /// guest memory, not an injected syscall, so a call that ended with a
@@ -159,75 +225,78 @@ impl<Guard> StagedMask<Guard> {
         G: Guest<Detcore<T>>,
         T: RecordOrReplay,
     {
-        if let StagedMaskStorage::RedZone { at, saved } = self.storage
+        if let StagedCellsStorage::RedZone { at, len, saved } = self.storage
             && let Err(errno) = AddrMut::<u8>::from_raw(at)
                 .ok_or(Errno::EFAULT)
-                .and_then(|bytes| guest.memory().write_exact(bytes, &saved))
+                .and_then(|bytes| guest.memory().write_exact(bytes, &saved[..len]))
         {
             // Not expected: the same bytes were written before the call.
-            tracing::warn!("[detcore] could not restore the red zone after a pselect6: {errno}");
+            tracing::warn!("[detcore] could not restore the red zone after a syscall: {errno}");
         }
     }
 }
 
-/// Stages a private copy of `mask` that the kernel can read as a pselect6
-/// `{ sigmask, sigsetsize }` wrapper.
+/// Stages `cells` where the kernel can read them in place of the guest's own
+/// memory.
 ///
-/// The copy goes in the guest stack scratch below the red zone when that is
+/// The cells go in the guest stack scratch below the red zone when that is
 /// writable. A thread may run with no writable memory there, on a stack it
-/// placed near the start of a page, and a pselect6 on such a stack is valid
+/// placed near the start of a page, and a call on such a stack is valid
 /// (Codex re-check of https://github.com/rrnewton/hermit/pull/4053). Then the
-/// copy goes in 24 bytes of the red zone, whose bytes are saved here and
-/// written back by `StagedMask::release` when the call returns. The red zone
-/// may hold the call's own buffers, which Linux reads and writes, so the copy
-/// takes the highest 8-aligned window that overlaps none of `live` (Codex
-/// re-check #3). The guest's own wrapper and mask may be overwritten: Linux
-/// reads neither, as the call is redirected to the copy, and both are
-/// restored. When no window is free and writable, this returns `None`, and
-/// the caller refuses the call (`refuse_unstageable_pselect6_mask`). The guest
-/// runs no code in between: the call holds the thread in the kernel, a signal
-/// frame is built below the red zone, and a call the kernel restarts comes
-/// back as a new syscall with the guest's own arguments, which is staged
-/// again. Nothing is mapped, so the guest's address space is unchanged (Codex
-/// re-check of the earlier per-thread page).
+/// cells go in the red zone, whose bytes are saved here and written back by
+/// `StagedCells::release` when the call returns. The red zone may hold the
+/// call's own buffers, which Linux reads and writes, so the cells take the
+/// highest 8-aligned window that overlaps none of `live` (Codex re-check #3).
+/// The guest's own copies of the cells (its mask, wrapper or timeout) may be
+/// overwritten: Linux reads none of them, as the call is redirected to the
+/// private cells, and all are restored. When no window is free and writable,
+/// this returns `None`, and the caller refuses the call
+/// (`refuse_unstageable_pselect6_mask`). The guest runs no code in between:
+/// the call holds the thread in the kernel, a signal frame is built below the
+/// red zone, and a call the kernel restarts comes back as a new syscall with
+/// the guest's own arguments, which is staged again. Nothing is mapped, so the
+/// guest's address space is unchanged (Codex re-check of the earlier
+/// per-thread page).
 ///
 /// Whether the scratch faults is a function of the guest's own stack, so the
 /// choice is deterministic.
-async fn stage_pselect6_mask_copy<G, T>(
+async fn stage_private_cells<G, T>(
     guest: &mut G,
-    mask: KernelSigset,
+    cells: PrivateCells,
     live: &[std::ops::Range<usize>],
-) -> Result<Option<StagedMask<<G::Stack as Stack>::StackGuard>>, Errno>
+) -> Result<Option<StagedCells<<G::Stack as Stack>::StackGuard>>, Errno>
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
+    let len = cells.len();
     let mut stack = guest.stack().await;
-    let mask_copy = stack.push(mask);
-    let wrapper = stack.push(Pselect6SigmaskArg {
-        sigmask: mask_copy.as_raw(),
-        sigsetsize: KERNEL_SIGSET_SIZE,
-    });
+    let at = match cells {
+        PrivateCells::ZeroTimeout => stack.reserve::<Timespec>().as_raw(),
+        _ => stack.reserve::<[u64; 3]>().as_raw(),
+    };
     match stack.commit() {
         Ok(guard) => {
-            return Ok(Some(StagedMask {
-                wrapper: wrapper.as_raw(),
-                mask: mask_copy.as_raw(),
-                storage: StagedMaskStorage::Stack(guard),
+            let bytes = AddrMut::<u8>::from_raw(at).ok_or(Errno::EFAULT)?;
+            // The commit wrote zeroes, which the cells' address fills in.
+            guest.memory().write_exact(bytes, &cells.bytes(at)[..len])?;
+            return Ok(Some(StagedCells {
+                at,
+                storage: StagedCellsStorage::Stack(guard),
             }));
         }
         Err(Errno::EFAULT) => {}
         Err(errno) => return Err(errno),
     }
     let rsp = guest.regs().await.rsp as usize;
-    let Some(top) = rsp.checked_sub(STAGED_MASK_LEN).map(|top| top & !7) else {
+    let Some(top) = rsp.checked_sub(len).map(|top| top & !7) else {
         return Ok(None);
     };
     let bottom = rsp.saturating_sub(STACK_RED_ZONE);
-    let mut saved = [0u8; STAGED_MASK_LEN];
+    let mut saved = [0u8; MAX_PRIVATE_CELLS_LEN];
     let mut found = None;
     for at in (bottom..=top).rev().step_by(8) {
-        let window = at..at + STAGED_MASK_LEN;
+        let window = at..at + len;
         if live
             .iter()
             .any(|range| range.start < window.end && window.start < range.end)
@@ -237,7 +306,7 @@ where
         let Some(bytes) = AddrMut::<u8>::from_raw(at) else {
             continue;
         };
-        if guest.memory().read_exact(bytes, &mut saved).is_ok() {
+        if guest.memory().read_exact(bytes, &mut saved[..len]).is_ok() {
             found = Some((at, bytes));
             break;
         }
@@ -245,17 +314,15 @@ where
     let Some((at, bytes)) = found else {
         return Ok(None);
     };
-    let mut cells = [0u8; STAGED_MASK_LEN];
-    let mask_len = std::mem::size_of::<KernelSigset>();
-    cells[..mask_len].copy_from_slice(&mask.to_ne_bytes());
-    cells[mask_len..mask_len + 8].copy_from_slice(&at.to_ne_bytes());
-    cells[mask_len + 8..].copy_from_slice(&KERNEL_SIGSET_SIZE.to_ne_bytes());
-    let staged = StagedMask {
-        wrapper: at + mask_len,
-        mask: at,
-        storage: StagedMaskStorage::RedZone { at, saved },
+    let staged = StagedCells {
+        at,
+        storage: StagedCellsStorage::RedZone { at, len, saved },
     };
-    if guest.memory().write_exact(bytes, &cells).is_err() {
+    if guest
+        .memory()
+        .write_exact(bytes, &cells.bytes(at)[..len])
+        .is_err()
+    {
         // A read-only stack page. A write that failed partway may have changed
         // some bytes, so put them back.
         staged.release(guest);
@@ -332,60 +399,24 @@ async fn end_replayed_pselect6_under_its_temporary_mask<G, T>(
     {
         return;
     }
-    let mut stack = guest.stack().await;
-    let mask_copy = stack.push(temporary_mask);
-    // A reserved cell is staged as zeroes, which `commit` writes: a zero
-    // timeout.
-    let zero_timeout = stack.reserve::<Timespec>();
-    match stack.commit() {
-        Ok(_guard) => {
-            inject_signal_delivery(guest, mask_copy.as_raw(), zero_timeout.as_raw()).await;
-            return;
-        }
-        Err(Errno::EFAULT) => {}
-        Err(_) => return,
-    }
-    // The stack scratch below the red zone is not writable: the thread runs on
-    // a stack it placed near the start of a page, which is valid. Stage the
-    // two cells at the top of the red zone instead, and put the guest's bytes
-    // back once the injected call has returned. The kernel builds a signal
-    // frame below the red zone, and the guest runs no code before the bytes
-    // are back, so it never sees them change. Nothing is mapped, so the
-    // replayed address space stays the recording's. The 24 bytes fit wherever
-    // recording staged its own 24-byte mask copy (`stage_pselect6_mask_copy`;
-    // Claude re-review of https://github.com/rrnewton/hermit/pull/4087).
-    let Some(staged) = (guest.regs().await.rsp as usize)
-        .checked_sub(SIGNAL_DELIVERY_LEN)
-        .map(|at| at & !7)
+    // The cells go in the stack scratch, or at the top of the red zone when
+    // the thread runs on a stack it placed near the start of a page, which is
+    // valid. The guest's red-zone bytes go back once the injected call has
+    // returned. The kernel builds a signal frame below the red zone, and the
+    // guest runs no code before the bytes are back, so it never sees them
+    // change. Nothing is mapped, so the replayed address space stays the
+    // recording's. No window is excluded: the call has returned, and Linux
+    // touches only the cells. The 24 bytes fit wherever recording staged its
+    // own 24-byte mask copy (Claude re-review of
+    // https://github.com/rrnewton/hermit/pull/4087).
+    let Ok(Some(staged)) =
+        stage_private_cells(guest, PrivateCells::MaskAndZeroTimeout(temporary_mask), &[]).await
     else {
         return;
     };
-    let mut saved = [0u8; SIGNAL_DELIVERY_LEN];
-    let Some(staged_bytes) = AddrMut::<u8>::from_raw(staged) else {
-        return;
-    };
-    if guest.memory().read_exact(staged_bytes, &mut saved).is_err() {
-        return;
-    }
-    let mut cells = Vec::with_capacity(SIGNAL_DELIVERY_LEN);
-    cells.extend_from_slice(&temporary_mask.to_ne_bytes());
-    cells.extend_from_slice(&[0u8; std::mem::size_of::<Timespec>()]);
-    if guest.memory().write_exact(staged_bytes, &cells).is_err() {
-        return;
-    }
-    let mask_size = std::mem::size_of::<KernelSigset>();
-    inject_signal_delivery(guest, staged, staged + mask_size).await;
-    if let Err(errno) = guest.memory().write_exact(staged_bytes, &saved) {
-        // Not expected: the same bytes were written just before the call.
-        tracing::warn!("[detcore] could not restore the red zone after a signal delivery: {errno}");
-    }
+    inject_signal_delivery(guest, staged.mask(), staged.after_mask()).await;
+    staged.release(guest);
 }
-
-/// The mask and the zero timeout that
-/// `end_replayed_pselect6_under_its_temporary_mask` stages, in that order:
-/// 24 bytes, no more than recording stages for its own mask copy.
-const SIGNAL_DELIVERY_LEN: usize =
-    std::mem::size_of::<KernelSigset>() + std::mem::size_of::<Timespec>();
 
 /// Injects the zero-timeout ppoll with no descriptors that delivers a
 /// replayed call's signal under its temporary mask (`mask`), as recording ran
@@ -697,6 +728,17 @@ fn sanitize_ppoll_signal_mask(mask: u64) -> u64 {
     mask & !(1_u64 << signal_bit)
 }
 
+/// The pollfd array a ppoll reads and writes, if it has one.
+fn ppoll_fds_range(call: syscalls::Ppoll) -> Option<std::ops::Range<usize>> {
+    call.fds().map(|fds| {
+        let start = fds.as_raw();
+        let len = usize::try_from(call.nfds())
+            .unwrap_or(usize::MAX)
+            .saturating_mul(std::mem::size_of::<libc::pollfd>());
+        start..start.saturating_add(len)
+    })
+}
+
 /// Whether the kernel owns a ppoll's blocking wait: when threads are not
 /// sequentialized, and for every record/replay call, masked or not, as for a
 /// masked pselect6 (https://github.com/rrnewton/hermit/issues/4042). A masked
@@ -762,7 +804,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Refuses a large-nfds pselect6 with a temporary mask whose private copy
     /// has nowhere to go: the stack has no writable scratch below its red zone,
     /// and every red-zone window overlaps one of the call's own buffers
-    /// (`stage_pselect6_mask_copy`). Forwarding the guest's wrapper instead
+    /// (`stage_private_cells`). Forwarding the guest's wrapper instead
     /// would let a sibling change the mask the kernel installs after the
     /// scheduler has recorded the one it waits for, so the call could time out
     /// with a wrong answer (Codex re-check #4 of
@@ -979,13 +1021,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             .flatten()
             .map(|(start, len)| start..start.saturating_add(len))
             .collect();
-            let Some(staged) = stage_pselect6_mask_copy(guest, mask, &live).await? else {
+            let Some(staged) =
+                stage_private_cells(guest, PrivateCells::Pselect6Mask(mask), &live).await?
+            else {
                 return self.refuse_unstageable_pselect6_mask(guest, call).await;
             };
             let result = self
                 .record_or_replay_blocking_with_mask(
                     guest,
-                    Syscall::Pselect6(call.with_sigmask(Addr::from_raw(staged.wrapper))),
+                    Syscall::Pselect6(call.with_sigmask(Addr::from_raw(staged.after_mask()))),
                     Some(kernel_installed_signal_mask(mask)),
                 )
                 .await;
@@ -1582,7 +1626,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             if self.cfg.recordreplay_modes {
                 resource_request(guest, Resources::new(guest.thread_state().dettid)).await;
             }
-            let (probe, probe_guard) = self.prepare_ppoll_probe(guest, call).await?;
+            let (probe, staged) = match self.prepare_ppoll_probe(guest, call).await? {
+                Some((probe, staged)) => (probe, Some(staged)),
+                None => {
+                    if let Some(refused) = self.refuse_unstageable_ppoll_copy(guest).await {
+                        return refused;
+                    }
+                    // Runs on with the guest's own zero timeout and mask.
+                    (call, None)
+                }
+            };
             // The mask the probe installs, read at entry, for replay to deliver
             // under (https://github.com/rrnewton/hermit/issues/4054).
             let temporary_mask = if self.cfg.replaying {
@@ -1605,7 +1658,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             } else {
                 guest.inject_with_retry(probe).await.map_err(Into::into)
             };
-            drop(probe_guard);
+            if let Some(staged) = staged {
+                staged.release(guest);
+            }
             // Replay serves the probe from the recording, so the kernel never
             // installs its mask; deliver a recorded interruption under it, as
             // for pselect6.
@@ -1623,9 +1678,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             self.cfg.recordreplay_modes,
         ) {
             // The kernel owns the blocking wait (`ppoll_uses_kernel_wait`). Use
-            // scratch memory only for the signal mask so raw ppoll can still
+            // a private copy only for the signal mask so raw ppoll can still
             // update the guest timeout.
-            let mut signal_mask_guard = None;
+            let mut staged = None;
             // The mask the real call sleeps under, recorded for the scheduler's
             // SIGCHLD target choice (`Resources::blocked_signal_mask`).
             let mut blocked_signal_mask = None;
@@ -1639,10 +1694,32 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let signal_mask = sanitize_ppoll_signal_mask(signal_mask);
                 blocked_signal_mask = Some(kernel_installed_signal_mask(signal_mask));
                 temporary_mask = Some(signal_mask);
-                let mut stack = guest.stack().await;
-                let signal_mask = stack.push(signal_mask).cast();
-                signal_mask_guard = Some(stack.commit()?);
-                call.with_sigmask(Some(signal_mask))
+                // Linux writes revents into the pollfd array and the time left
+                // into the timeout, so the copy overlaps neither.
+                let live: Vec<std::ops::Range<usize>> = ppoll_fds_range(call)
+                    .into_iter()
+                    .chain(call.timeout().map(|timeout| {
+                        let start = timeout.as_raw();
+                        start..start.saturating_add(std::mem::size_of::<Timespec>())
+                    }))
+                    .collect();
+                match stage_private_cells(guest, PrivateCells::Mask(signal_mask), &live).await? {
+                    Some(cells) => {
+                        let mask = cells.mask();
+                        staged = Some(cells);
+                        call.with_sigmask(Addr::from_raw(mask))
+                    }
+                    None => {
+                        if let Some(refused) = self.refuse_unstageable_ppoll_copy(guest).await {
+                            return refused;
+                        }
+                        // Runs on with the guest's own mask. A sibling may
+                        // change it while the call waits, which a masked
+                        // record/replay wait already allows for: its sleeping
+                        // mask is recorded as unknown.
+                        call
+                    }
+                }
             } else {
                 call
             };
@@ -1666,7 +1743,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     )
                     .await
                 };
-            drop(signal_mask_guard);
+            if let Some(staged) = staged {
+                staged.release(guest);
+            }
             // Replay serves the call from the recording, so the kernel never
             // installs its mask; deliver a recorded interruption under it
             // (https://github.com/rrnewton/hermit/issues/3992).
@@ -1684,11 +1763,23 @@ impl<T: RecordOrReplay> Detcore<T> {
         result
     }
 
+    /// The zero-timeout probe for `call`: it reads a private zero timeout,
+    /// and a private, sanitized copy of the call's mask, staged by
+    /// `stage_private_cells` clear of the pollfd array that Linux writes. So
+    /// neither a sibling's write nor the guest's own mask can make the probe
+    /// sleep or block Hermit's timer signal. `None` when the copies have
+    /// nowhere to go (`refuse_unstageable_ppoll_copy`).
     async fn prepare_ppoll_probe<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Ppoll,
-    ) -> Result<(syscalls::Ppoll, <G::Stack as Stack>::StackGuard), Error> {
+    ) -> Result<
+        Option<(
+            syscalls::Ppoll,
+            StagedCells<<G::Stack as Stack>::StackGuard>,
+        )>,
+        Error,
+    > {
         let signal_mask = match call.sigmask() {
             Some(signal_mask) => {
                 if call.sigsetsize() != KERNEL_SIGSET_SIZE {
@@ -1703,17 +1794,50 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             None => None,
         };
+        let cells = match signal_mask {
+            Some(signal_mask) => PrivateCells::MaskAndZeroTimeout(signal_mask),
+            None => PrivateCells::ZeroTimeout,
+        };
+        let live: Vec<std::ops::Range<usize>> = ppoll_fds_range(call).into_iter().collect();
+        let Some(staged) = stage_private_cells(guest, cells, &live).await? else {
+            return Ok(None);
+        };
+        let probe = match signal_mask {
+            Some(_) => call
+                .with_timeout(AddrMut::from_raw(staged.after_mask()))
+                .with_sigmask(Addr::from_raw(staged.mask())),
+            None => call.with_timeout(AddrMut::from_raw(staged.at)),
+        };
+        Ok(Some((probe, staged)))
+    }
 
-        let mut stack = guest.stack().await;
-        let timeout = stack.push(timespec_from_duration(Duration::ZERO));
-        // The scratch stack guard outlives the injected syscall, so the pointee is writable.
-        let timeout = unsafe { timeout.into_mut() };
-        let mut probe = call.with_timeout(Some(timeout));
-        if let Some(signal_mask) = signal_mask {
-            probe = probe.with_sigmask(Some(stack.push(signal_mask).cast()));
+    /// Refuses a ppoll whose private copies have nowhere to go
+    /// (`stage_private_cells`): a zero-timeout probe's zero timeout and mask,
+    /// or the mask of a call the kernel waits in. The stack has no writable
+    /// scratch below its red zone, and every red-zone window overlaps the
+    /// pollfd array or, for a kernel wait, the timeout
+    /// (https://github.com/rrnewton/hermit/issues/4113). A fail-closed run
+    /// stops with the policy refusal and this message, whose result this
+    /// returns. A run started with `--allow-unsupported-syscalls` runs on with
+    /// the guest's own timeout and mask, and this returns `None`.
+    async fn refuse_unstageable_ppoll_copy<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+    ) -> Option<Result<i64, Error>> {
+        use std::io::Write as _;
+        let message = "unsupported: ppoll on a stack with no room below its red zone whose \
+            red zone the call's pollfd array and timeout fill: Hermit has nowhere to put its \
+            private copy of the timeout and the signal mask \
+            (https://github.com/rrnewton/hermit/issues/4113)";
+        tracing::error!("[tid {}] {message}", guest.tid());
+        if !self.cfg.panic_on_unsupported_syscalls {
+            return None;
         }
-        let guard = stack.commit()?;
-        Ok((probe, guard))
+        let _ = writeln!(crate::util::RetryingStderr, "{message}");
+        Some(
+            self.refuse_unserviceable_operation(guest, Sysno::ppoll, Errno::EFAULT)
+                .await,
+        )
     }
 
     /// Handle a guest-internal `ppoll` using zero-time kernel probes.
@@ -1740,12 +1864,23 @@ impl<T: RecordOrReplay> Detcore<T> {
         // active while parked would require scheduler-level pending-signal state, so fail
         // closed rather than letting a masked signal interrupt a simulated wait.
         if call.sigmask().is_some() {
-            let (probe, _probe_guard) = self.prepare_ppoll_probe(guest, call).await?;
+            let Some((probe, staged)) = self.prepare_ppoll_probe(guest, call).await? else {
+                // The guest's own mask could block Hermit's timer signal while
+                // the call is parked, so a run that allows unsupported
+                // operations gets the same answer as a mask it cannot honor.
+                return match self.refuse_unstageable_ppoll_copy(guest).await {
+                    Some(refused) => refused,
+                    None => Err(Errno::ENOSYS.into()),
+                };
+            };
             let result = if self.cfg.recordreplay_modes {
                 self.record_or_replay(guest, probe).await
             } else {
                 guest.inject_with_retry(probe).await
             };
+            // Before the time left is written: the copies' red-zone window may
+            // cover the guest's timeout, which Linux never sees.
+            staged.release(guest);
             if probe.syscall_would_have_blocked(result) {
                 return Err(Errno::ENOSYS.into());
             }
@@ -1982,7 +2117,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mask_address = call.sigmask().ok_or(Errno::EFAULT)?;
         let mask = read_kernel_sigset(guest, mask_address.cast()).await?;
         // The copy may go in the red zone on a stack with no scratch below it,
-        // clear of the events buffer the kernel writes (`stage_pselect6_mask_copy`;
+        // clear of the events buffer the kernel writes (`stage_private_cells`;
         // re-review of https://github.com/rrnewton/hermit/pull/4087).
         let live: Vec<std::ops::Range<usize>> = call
             .events()
@@ -1994,13 +2129,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             })
             .into_iter()
             .collect();
-        let Some(staged) = stage_pselect6_mask_copy(guest, mask, &live).await? else {
+        let Some(staged) = stage_private_cells(guest, PrivateCells::Mask(mask), &live).await?
+        else {
             return self.refuse_unstageable_epoll_pwait_mask(guest, call).await;
         };
         let result = self
             .record_or_replay_blocking_with_unknown_mask(
                 guest,
-                Syscall::EpollPwait(call.with_sigmask(Addr::from_raw(staged.mask))),
+                Syscall::EpollPwait(call.with_sigmask(Addr::from_raw(staged.mask()))),
             )
             .await;
         staged.release(guest);

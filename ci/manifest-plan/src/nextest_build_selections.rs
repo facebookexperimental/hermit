@@ -639,8 +639,9 @@ mod tests {
             // queued-signal counterpart, plus the large-pselect6 mutable-mask
             // and tight-stack tests (https://github.com/rrnewton/hermit/pull/4053),
             // plus the four targeted-chaos sched_yield tests
-            // (https://github.com/rrnewton/hermit/issues/4068).
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "281");
+            // (https://github.com/rrnewton/hermit/issues/4068), plus the ppoll
+            // tight-stack test (https://github.com/rrnewton/hermit/issues/4113).
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "282");
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(
