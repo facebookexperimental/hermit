@@ -1378,7 +1378,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (Codex review of https://github.com/rrnewton/hermit/pull/4120): 1043.
     // And metadata::tests::pre_tight_stack_ppoll_recordings_are_refused_by_the_version_gate
     // (Claude review of https://github.com/rrnewton/hermit/pull/4127): 1044.
-    ("test.hermit_unit", 1044),
+    // And metadata::tests::record_version_rejects_streams_that_answered_a_gone_sigqueueinfo_before_its_siginfo
+    // (https://github.com/rrnewton/hermit/issues/4124): 1045.
+    ("test.hermit_unit", 1045),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3119,7 +3121,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (Codex review of https://github.com/rrnewton/hermit/pull/4120): 1043.
     // And metadata::tests::pre_tight_stack_ppoll_recordings_are_refused_by_the_version_gate
     // (Claude review of https://github.com/rrnewton/hermit/pull/4127): 1044.
-    ("test.hermit_unit_on_host", 1044),
+    // And the gone-sigqueueinfo record-epoch test: 1045.
+    ("test.hermit_unit_on_host", 1045),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

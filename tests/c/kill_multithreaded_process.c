@@ -42,6 +42,7 @@
 static volatile sig_atomic_t handled;
 
 static void report(const char* what, long ret);
+static long queue_to(pid_t pid, int code);
 
 /* Let the reaper Linux chose (the kernel itself, or init) finish natively. */
 static void nap(void) {
@@ -80,6 +81,8 @@ static void autoreaped_child(const char* what, int nocldwait) {
   report(label, kill(child, SIGTERM));
   snprintf(label, sizeof(label), "%s, kill 0", what);
   report(label, kill(child, 0));
+  snprintf(label, sizeof(label), "%s, rt_sigqueueinfo SI_USER", what);
+  report(label, queue_to(child, SI_USER));
   sigaction(SIGCHLD, &saved, NULL);
 }
 
@@ -290,14 +293,22 @@ static long queue_to_self(void) {
 
 /* rt_sigqueueinfo to another process; SI_USER from a process other than the
  * target is a forged code, which Linux refuses with EPERM. */
-static long queue_to(pid_t pid, int code) {
+static long queue_sig_to(pid_t pid, int sig, int code, int padded) {
   siginfo_t info;
   memset(&info, 0, sizeof(info));
-  info.si_signo = SIGTERM;
+  info.si_signo = sig;
   info.si_code = code;
   info.si_pid = getpid();
   info.si_uid = getuid();
-  return syscall(SYS_rt_sigqueueinfo, pid, SIGTERM, &info);
+  /* A nonzero byte in the padding: an unknown code with it is E2BIG. */
+  if (padded) {
+    ((unsigned char*)&info)[100] = 0xff;
+  }
+  return syscall(SYS_rt_sigqueueinfo, pid, sig, &info);
+}
+
+static long queue_to(pid_t pid, int code) {
+  return queue_sig_to(pid, SIGTERM, code, 0);
 }
 
 static volatile int stop;
@@ -366,6 +377,12 @@ int main(int argc, char** argv) {
   report("reaped, kill", kill(zombie, SIGTERM));
   report("reaped, kill 0", kill(zombie, 0));
   report("reaped, rt_sigqueueinfo", queue_to(zombie, SI_QUEUE));
+  /* Linux checks the siginfo before it looks a gone pid up
+   * (https://github.com/rrnewton/hermit/issues/4124). */
+  report("reaped, rt_sigqueueinfo SI_USER", queue_to(zombie, SI_USER));
+  report("reaped, rt_sigqueueinfo unknown code with padding", queue_sig_to(zombie, SIGTERM, -100, 1));
+  report("reaped, rt_sigqueueinfo bad pointer", syscall(SYS_rt_sigqueueinfo, zombie, SIGTERM, (void*)8));
+  report("reaped, rt_sigqueueinfo 0", queue_sig_to(zombie, 0, SI_QUEUE, 0));
 
   autoreaped_child("SIG_IGN child", 0);
   autoreaped_child("SA_NOCLDWAIT child", 1);

@@ -21243,7 +21243,9 @@ fn a_futex_wake_count_of_zero_or_negative_wakes_one_waiter() {
 /// A live non-leader thread's id names its whole process, so a signal to it
 /// is refused by name as well, where it was ESRCH before
 /// https://github.com/rrnewton/hermit/issues/4094; an exited thread's id names
-/// nothing (ESRCH).
+/// nothing (ESRCH). `rt_sigqueueinfo` to a gone pid checks the siginfo first
+/// (EPERM, E2BIG, EFAULT), as Linux does, before its ESRCH
+/// (https://github.com/rrnewton/hermit/issues/4124).
 #[test]
 fn a_process_directed_signal_to_several_threads_is_refused_by_name() {
     let guest = kill_multithreaded_process_guest()
@@ -21257,11 +21259,17 @@ fn a_process_directed_signal_to_several_threads_is_refused_by_name() {
                       zombie, rt_sigqueueinfo: 0\n\
                       zombie, rt_sigqueueinfo SI_USER: -1 EPERM\nreaped, kill: -1 ESRCH\n\
                       reaped, kill 0: -1 ESRCH\nreaped, rt_sigqueueinfo: -1 ESRCH\n\
-                      SIG_IGN child, kill: -1 ESRCH\nSIG_IGN child, kill 0: -1 ESRCH\n\
+                      reaped, rt_sigqueueinfo SI_USER: -1 EPERM\n\
+                      reaped, rt_sigqueueinfo unknown code with padding: -1 E2BIG\n\
+                      reaped, rt_sigqueueinfo bad pointer: -1 EFAULT\n\
+                      reaped, rt_sigqueueinfo 0: -1 ESRCH\nSIG_IGN child, kill: -1 ESRCH\n\
+                      SIG_IGN child, kill 0: -1 ESRCH\n\
+                      SIG_IGN child, rt_sigqueueinfo SI_USER: -1 EPERM\n\
                       SA_NOCLDWAIT child, kill: -1 ESRCH\n\
-                      SA_NOCLDWAIT child, kill 0: -1 ESRCH\norphan, kill: -1 ESRCH\n\
-                      orphan, kill 0: -1 ESRCH\nzombie then SIG_IGN, kill: 0\n\
-                      zombie then SIG_IGN, kill 0: 0\n\
+                      SA_NOCLDWAIT child, kill 0: -1 ESRCH\n\
+                      SA_NOCLDWAIT child, rt_sigqueueinfo SI_USER: -1 EPERM\n\
+                      orphan, kill: -1 ESRCH\norphan, kill 0: -1 ESRCH\n\
+                      zombie then SIG_IGN, kill: 0\nzombie then SIG_IGN, kill 0: 0\n\
                       auto-reaped then SIG_DFL, kill: -1 ESRCH\n\
                       auto-reaped then SIG_DFL, kill 0: -1 ESRCH\n\
                       inherited SIG_IGN child, kill: -1 ESRCH\n\

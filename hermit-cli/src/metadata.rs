@@ -313,7 +313,13 @@ impl RecordVersion {
 // https://github.com/rrnewton/hermit/issues/4112). An older recording of such a
 // ppoll holds no event for the call, so this replayer would desynchronize at it
 // (Claude review of https://github.com/rrnewton/hermit/pull/4127).
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x134);
+// 0x134 -> 0x135: an rt_sigqueueinfo to a gone process makes the kernel check
+// its siginfo (EFAULT, E2BIG, EPERM) before answering ESRCH, where Detcore
+// answered ESRCH first; an rt_sigqueueinfo existence check (signal 0) answers
+// from the same exit model (https://github.com/rrnewton/hermit/issues/4124).
+// Replay recomputes the answer, so an older recording replayed here could see
+// another result and take another branch, although no event shape changed.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x135);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -338,7 +344,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x134);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x134;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x135;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1013,6 +1019,11 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_that_answered_a_thread_id_kill_with_esrch() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x131)));
+    }
+
+    #[test]
+    fn record_version_rejects_streams_that_answered_a_gone_sigqueueinfo_before_its_siginfo() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x134)));
     }
 
     /// Record and replay run under ptrace with serialized threads, so their

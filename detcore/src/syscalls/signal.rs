@@ -337,6 +337,12 @@ fn logical_time_to_alarm_seconds(value: LogicalTime) -> i64 {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#663)
+/// A pid no task can have: above the largest `pid_max` Linux allows (2^22).
+/// `rt_sigqueueinfo` to it makes the kernel check the siginfo exactly as for
+/// any pid and then answer ESRCH, which is Linux's answer for a gone process
+/// (<https://github.com/rrnewton/hermit/issues/4124>).
+const NO_SUCH_PID: libc::pid_t = libc::pid_t::MAX;
+
 /// The thread a process-directed signal goes to. `zombie` is the process's
 /// exit state (`Scheduler::exited_process_is_zombie`). `Ok(None)` is a zombie:
 /// no live threads, but its parent can still wait for it, so Linux still finds
@@ -1462,10 +1468,6 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(self.record_or_replay(guest, call).await?);
         }
 
-        if call.sig() == 0 {
-            return Ok(self.record_or_replay(guest, call).await?);
-        }
-
         let tgid = call.tgid();
         if tgid <= 0 {
             // POSIX.1b has no process groups: Linux's `do_rt_sigqueueinfo` looks
@@ -1475,6 +1477,20 @@ impl<T: RecordOrReplay> Detcore<T> {
             // `si_code` with nonzero expansion bytes, otherwise ESRCH) and
             // sends nothing. The kernel's own answer is therefore deterministic
             // (https://github.com/rrnewton/hermit/issues/4046).
+            return Ok(self.record_or_replay(guest, call).await?);
+        }
+        if call.sig() == 0 {
+            // An existence check answers from the same exit model as a signal
+            // (https://github.com/rrnewton/hermit/issues/4124): a process
+            // Detcore saw exit and that is gone is ESRCH after the siginfo
+            // checks, whatever the host has reaped by now.
+            let (targets, zombie) =
+                resolve_kill_targets_and_exit(guest, DetPid::from_raw(tgid)).await;
+            if targets.is_empty() && zombie == Some(false) {
+                return Ok(self
+                    .record_or_replay(guest, call.with_tgid(NO_SUCH_PID))
+                    .await?);
+            }
             return Ok(self.record_or_replay(guest, call).await?);
         }
         if call.sig() == libc::SIGALRM {
@@ -1491,15 +1507,29 @@ impl<T: RecordOrReplay> Detcore<T> {
         let process = signal_target_process(guest, DetPid::from_raw(tgid))
             .await
             .map_or(tgid, |process| process.as_raw());
-        let Some(tid) = self
+        let target = match self
             .process_signal_target(
                 guest,
                 Sysno::rt_sigqueueinfo,
                 DetPid::from_raw(process),
                 call.sig(),
             )
-            .await?
-        else {
+            .await
+        {
+            // Gone: Linux checks the siginfo before it looks the process up
+            // (EFAULT, then E2BIG for an unknown code with padding, then EPERM
+            // for a forged code), and only then answers ESRCH. Let the kernel
+            // make those checks against a pid no task can have, so its answer
+            // cannot depend on whether the host has reaped the real one yet
+            // (https://github.com/rrnewton/hermit/issues/4124).
+            Err(Error::Errno(Errno::ESRCH)) => {
+                return Ok(self
+                    .record_or_replay(guest, call.with_tgid(NO_SUCH_PID))
+                    .await?);
+            }
+            target => target?,
+        };
+        let Some(tid) = target else {
             // A zombie: its parent can still wait for it, so Linux still
             // finds it. Unlike kill, the kernel checks the siginfo first
             // (EFAULT, EPERM for a forged si_code, E2BIG), so let it answer:
