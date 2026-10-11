@@ -2722,6 +2722,21 @@ fn record_sigtimedwait_ends_for_a_caught_sigchld_from_a_child_exit() {
     }
 }
 
+/// A timer's SIGALRM must not reach a thread on its way into a background
+/// rt_sigsuspend whose mask blocks it: the scheduler commits nothing until the
+/// kernel has installed the call's mask. Before, the SIGALRM reached the
+/// sleeper under its own mask in some rounds, the call never ran, and replay
+/// refused 8 of 8 recordings (https://github.com/rrnewton/hermit/issues/3993).
+#[test]
+fn record_sigsuspend_while_a_timer_signal_is_due() {
+    let _guard = hermit_record_lock();
+    canonical_record_replay_command(
+        "sigsuspend timer signal",
+        &workload("c_record_replay_sigsuspend_timer_signal").path,
+        &[],
+    );
+}
+
 #[test]
 fn record_pselect_whose_mask_blocks_a_signal_a_sibling_takes() {
     record_select_mode("pselect-mask-shared-alarm");

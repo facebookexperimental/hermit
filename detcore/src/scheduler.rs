@@ -99,6 +99,7 @@ use crate::scheduler::replayer::events_match;
 #[cfg(test)]
 use crate::syscalls::KernelSignalState;
 use crate::syscalls::read_kernel_signal_state;
+use crate::syscalls::thread_is_gone;
 use crate::types::ChildWaitExitClass;
 use crate::types::ChildWaitSelector;
 use crate::types::ChildWaitSpec;
@@ -937,6 +938,16 @@ enum WaitidSignalRequest {
     Pending(Vec<SigWrapper>),
 }
 
+/// A thread released into a background call that sleeps under `mask`, a
+/// temporary mask other than its own, whose entry the scheduler has not yet
+/// seen (`Scheduler::background_entry_barriers`), and when it was released,
+/// which bounds the wait (`Scheduler::background_entry_valve`).
+#[derive(Debug, Clone, Copy)]
+struct BackgroundEntry {
+    mask: u64,
+    since: std::time::Instant,
+}
+
 /// The state for the deterministic scheduler.
 #[derive(Debug)]
 pub struct Scheduler {
@@ -1024,6 +1035,23 @@ pub struct Scheduler {
     /// no recorded process): from then on no child wait counts as part of a
     /// deadlock ([`Scheduler::record_unresolved_sigkill`]).
     unresolved_sigkill: bool,
+
+    /// Threads released into a background call that sleeps under a temporary
+    /// mask other than their own (`rt_sigsuspend`, or a `ppoll` or `pselect6`
+    /// whose mask the call's turn read), with that mask, until the kernel is
+    /// seen to have installed it or the call has ended. Until then the thread
+    /// still runs under its own mask on its way into the kernel, and a
+    /// process-directed signal that its own mask leaves unblocked, such as the
+    /// `SIGALRM` of an `ITIMER_REAL` that a timer wake sends, could be taken by
+    /// it there or not, as host timing decides. So step2 commits no turn and
+    /// pops no timer while an entry is pending
+    /// (`step2a_wait_for_background_entry`,
+    /// <https://github.com/rrnewton/hermit/issues/3993>).
+    background_entry_barriers: BTreeMap<DetTid, BackgroundEntry>,
+    /// How long a `background_entry_barriers` entry may stay unproved, neither
+    /// entered nor left, before the run ends with a named refusal
+    /// (`step2a_wait_for_background_entry`).
+    background_entry_valve: Duration,
 
     /// Threads whose run-queue admission was recorded by a global-request
     /// handler while a `tentative_pop` transaction was live, deferred to the
@@ -2822,6 +2850,8 @@ impl Scheduler {
             committed_time: Default::default(),
             blocked: Default::default(),
             vfork_barriers: Default::default(),
+            background_entry_barriers: Default::default(),
+            background_entry_valve: Duration::from_secs(30),
             vfork_registration_origins: Default::default(),
             dead_vfork_parents: Default::default(),
             dead_parent_vfork_barriers: Default::default(),
@@ -4491,6 +4521,7 @@ impl Scheduler {
         self.blocked.replay_log_served.remove(dtid);
         let _ = self.blocked.rt_sigsuspend_blockers.remove(dtid);
         let _ = self.blocked.out_of_scheduler_masks.remove(dtid);
+        let _ = self.background_entry_barriers.remove(dtid);
         self.blocked.timed_out_futex_waiters.remove(dtid);
         self.blocked.sigchld_deferred.remove(dtid);
         self.blocked.sigchld_ready.remove(dtid);
@@ -4912,7 +4943,91 @@ impl Scheduler {
             return Err(SkipTurn);
         }
         self.step2a_wait_for_vfork_barrier()?;
+        self.step2a_wait_for_background_entry()?;
         Ok(())
+    }
+
+    /// Waits, committing no turn, until every thread released into a
+    /// background call with a temporary mask (`background_entry_barriers`) has
+    /// entered it, which its kernel mask shows, or has left it: its
+    /// continuation is posted, or it is gone. When the kernel installed the
+    /// mask is host-timed; waiting for it decides only how long the scheduler
+    /// spins, never which turn comes next or which thread a later signal can
+    /// reach (https://github.com/rrnewton/hermit/issues/3993).
+    fn step2a_wait_for_background_entry(&mut self) -> Result<(), SkipTurn> {
+        if self.background_entry_barriers.is_empty() {
+            return Ok(());
+        }
+        let settled: Vec<DetTid> =
+            self.background_entry_barriers
+                .iter()
+                .filter(|(thread, _)| {
+                    let left = match self
+                        .next_turns
+                        .get(thread)
+                        .and_then(|turn| turn.req.try_read())
+                    {
+                        Some(Err(ThreadExited)) => true,
+                        Some(Ok(resources)) => resources.resources.keys().any(|resource| {
+                            matches!(resource, ResourceID::BlockedExternalContinue(_))
+                        }),
+                        _ => false,
+                    };
+                    left || !(self.blocked.rt_sigsuspend_blockers.contains_key(thread)
+                        || self.blocked.external_io_blockers.contains_key(thread))
+                })
+                .map(|(thread, _)| *thread)
+                .collect();
+        for thread in settled {
+            self.background_entry_barriers.remove(&thread);
+        }
+        // Otherwise the kernel's mask decides. A failed read proves nothing
+        // about entry: only a thread confirmed gone releases its entry then
+        // (Codex review of https://github.com/rrnewton/hermit/pull/4053).
+        let mut entered = Vec::new();
+        let mut unproved = None;
+        for (thread, entry) in &self.background_entry_barriers {
+            let observed = match self.read_thread_blocked_mask_result(*thread) {
+                Ok(blocked) if blocked == entry.mask => {
+                    entered.push(*thread);
+                    continue;
+                }
+                Ok(blocked) => format!("its mask is {blocked:#x}"),
+                Err(errno) => {
+                    let process = self.sigchld_process(*thread);
+                    if thread_is_gone(
+                        reverie::Pid::from_raw(process.as_raw()),
+                        reverie::Pid::from_raw(thread.as_raw()),
+                    ) {
+                        entered.push(*thread);
+                        continue;
+                    }
+                    format!("its mask cannot be read ({errno}) although it is alive")
+                }
+            };
+            if unproved.is_none() && entry.since.elapsed() >= self.background_entry_valve {
+                unproved = Some(format!(
+                    "HERMIT_DEADLOCK: dettid {thread} was released into a background call \
+                     that sleeps under mask {:#x}, and after {:?} it has neither entered it \
+                     nor left it: {observed}",
+                    entry.mask, self.background_entry_valve
+                ));
+            }
+        }
+        for thread in entered {
+            self.background_entry_barriers.remove(&thread);
+        }
+        if let Some(reason) = unproved {
+            tracing::error!("[step2] {reason}");
+            self.terminal_deadlock.get_or_insert(reason);
+            return Err(SkipTurn);
+        }
+        if self.background_entry_barriers.is_empty() {
+            Ok(())
+        } else {
+            std::thread::yield_now();
+            Err(SkipTurn)
+        }
     }
 
     fn step2_process_blocked(
@@ -6375,19 +6490,8 @@ impl Scheduler {
     /// when it cannot be read. Ordered by the schedule only while `thread` is
     /// stopped at a request (`kernel_sigchld_target`).
     fn read_thread_blocked_mask(&self, thread: DetTid) -> Option<u64> {
-        #[cfg(test)]
-        self.test_kernel_mask_reads
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        #[cfg(test)]
-        if let Some(state) = self.test_kernel_signal_states.get(&thread) {
-            return Some(state.blocked);
-        }
-        let process = self.sigchld_process(thread);
-        match read_kernel_signal_state(
-            reverie::Pid::from_raw(process.as_raw()),
-            reverie::Pid::from_raw(thread.as_raw()),
-        ) {
-            Ok(state) => Some(state.blocked),
+        match self.read_thread_blocked_mask_result(thread) {
+            Ok(blocked) => Some(blocked),
             Err(errno) => {
                 debug!(
                     "[dtid {}] cannot read its signal mask ({}); it is not a SIGCHLD target.",
@@ -6396,6 +6500,24 @@ impl Scheduler {
                 None
             }
         }
+    }
+
+    /// `read_thread_blocked_mask`, keeping the error, which says nothing about
+    /// whether the thread still exists (`thread_is_gone` does).
+    fn read_thread_blocked_mask_result(&self, thread: DetTid) -> Result<u64, Errno> {
+        #[cfg(test)]
+        self.test_kernel_mask_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        if let Some(state) = self.test_kernel_signal_states.get(&thread) {
+            return Ok(state.blocked);
+        }
+        let process = self.sigchld_process(thread);
+        read_kernel_signal_state(
+            reverie::Pid::from_raw(process.as_raw()),
+            reverie::Pid::from_raw(thread.as_raw()),
+        )
+        .map(|state| state.blocked)
     }
 
     /// Record an unambiguous cross-task signal that was physically queued while
@@ -7766,9 +7888,24 @@ impl Scheduler {
                 // `hermit-cli/src/lib.rs`). On a backend whose IDs are
                 // guest-virtual, a `/proc` read of `dettid` would name an
                 // unrelated host thread or none at all.
+                let own_mask = self
+                    .models_signal_targets
+                    .then(|| self.read_thread_blocked_mask(dettid))
+                    .flatten();
                 let sleeping_mask = self
                     .models_signal_targets
-                    .then(|| blocked_signal_mask.or_else(|| self.read_thread_blocked_mask(dettid)));
+                    .then_some(blocked_signal_mask.or(own_mask));
+                // A call that will sleep under a temporary mask other than the
+                // thread's own makes step2 wait until the kernel has installed
+                // it (`background_entry_barriers`).
+                // An unreadable own mask is not proof that the masks agree, so
+                // it arms the barrier too (Codex review of
+                // https://github.com/rrnewton/hermit/pull/4053).
+                let entry_barrier = self
+                    .models_signal_targets
+                    .then_some(blocked_signal_mask)
+                    .flatten()
+                    .filter(|temporary| own_mask != Some(*temporary));
                 self.run_queue.consume_yield_exclusion();
                 self.unblock_guest(dettid, resp)?;
 
@@ -7782,6 +7919,15 @@ impl Scheduler {
                 assert!(old.is_none(), "thread started a second external operation");
                 if let Some(mask) = sleeping_mask {
                     self.blocked.out_of_scheduler_masks.insert(dettid, mask);
+                }
+                if let Some(mask) = entry_barrier {
+                    self.background_entry_barriers.insert(
+                        dettid,
+                        BackgroundEntry {
+                            mask,
+                            since: std::time::Instant::now(),
+                        },
+                    );
                 }
                 if let Some(signal) = self.blocked.signaled_sigsuspend_requests.remove(&dettid) {
                     self.arm_signaled_background(dettid, signal);
@@ -13868,6 +14014,191 @@ mod test {
         }
     }
 
+    /// A thread released into a background `rt_sigsuspend` whose temporary
+    /// mask differs from its own holds every later turn and timer pop until
+    /// its kernel mask shows the temporary one, or its call has left the
+    /// blocked pool. Before, the scheduler went on at once, and the
+    /// process-directed `SIGALRM` of a timer wake, which the thread's own mask
+    /// leaves unblocked, could reach it on its way into the kernel or not, as
+    /// host timing decided (https://github.com/rrnewton/hermit/issues/3993).
+    /// A call that sleeps under the thread's own mask needs no barrier.
+    #[test]
+    fn a_background_call_with_a_temporary_mask_holds_the_schedule_until_the_kernel_installs_it() {
+        let alrm = kernel_signal_bit(libc::SIGALRM);
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        let masked = |blocked: u64| KernelSignalState {
+            blocked,
+            ..signal_state(0, 0)
+        };
+        for (own, installed_then_left) in [(alrm, None), (usr1, Some(true)), (usr1, Some(false))] {
+            let (mut scheduler, _parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+            scheduler.models_signal_targets = true;
+            scheduler
+                .test_kernel_signal_states
+                .insert(creator, masked(own));
+            let op = ExternalOpId::new(creator, 1);
+            commit_out_of_scheduler_call(
+                &mut scheduler,
+                creator,
+                ResourceID::BlockingRtSigsuspend(op),
+                Some(alrm),
+            );
+            let case = format!("own={own:#x} installed_then_left={installed_then_left:?}");
+            let Some(installed) = installed_then_left else {
+                assert!(scheduler.background_entry_barriers.is_empty(), "{case}");
+                assert!(scheduler.step2_drain_prefix().is_ok(), "{case}");
+                continue;
+            };
+            // Still on its way into the kernel, under its own mask.
+            assert!(scheduler.step2_drain_prefix().is_err(), "{case}");
+            assert!(scheduler.step2_drain_prefix().is_err(), "{case}");
+            if installed {
+                scheduler
+                    .test_kernel_signal_states
+                    .insert(creator, masked(alrm));
+            } else {
+                // The call ended before the mask was seen, as when a pending
+                // signal ended it at once and its continuation was granted.
+                scheduler.blocked.rt_sigsuspend_blockers.remove(&creator);
+            }
+            assert!(scheduler.step2_drain_prefix().is_ok(), "{case}");
+            assert!(scheduler.background_entry_barriers.is_empty(), "{case}");
+        }
+    }
+
+    /// A live thread released into a background call whose kernel mask cannot
+    /// be read has not proved its entry, and holds its barrier: a read error
+    /// is not evidence that the thread is gone (Codex review of
+    /// https://github.com/rrnewton/hermit/pull/4053, whose regression this is).
+    /// The test thread is a real, live identity; one read returns EIO through
+    /// the read seam.
+    #[test]
+    fn a_live_thread_whose_mask_cannot_be_read_holds_its_background_entry() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        use crate::syscalls::signal_state_read_seam;
+
+        let (mut scheduler, thread, own, temporary) = live_background_entry_scheduler(None);
+        assert_eq!(
+            scheduler
+                .background_entry_barriers
+                .get(&thread)
+                .map(|entry| entry.mask),
+            Some(temporary)
+        );
+        let pid = reverie::Pid::from_raw(std::process::id() as i32);
+        let tid = reverie::Pid::from_raw(thread.as_raw());
+        let reads = Rc::new(Cell::new(0));
+        let observed = reads.clone();
+        let seam = signal_state_read_seam::install(move |_, _| {
+            observed.set(observed.get() + 1);
+            Some(Err(reverie::Errno::EIO))
+        });
+        let result = scheduler.step2_drain_prefix();
+        drop(seam);
+        assert_eq!(
+            reads.get(),
+            1,
+            "the entry proof read takes the injected error"
+        );
+        assert!(!thread_is_gone(pid, tid));
+        assert_eq!(read_kernel_signal_state(pid, tid).unwrap().blocked, own);
+        assert!(
+            result.is_err(),
+            "a live thread with no observed temporary mask keeps the barrier"
+        );
+        assert!(scheduler.background_entry_barriers.contains_key(&thread));
+        assert!(scheduler.terminal_deadlock.is_none());
+    }
+
+    /// An own mask that cannot be read when the scheduler grants the call is no
+    /// proof that it equals the temporary mask, so the barrier is armed (Codex
+    /// review of https://github.com/rrnewton/hermit/pull/4053).
+    #[test]
+    fn an_unreadable_own_mask_at_the_grant_still_arms_the_entry_barrier() {
+        let (scheduler, thread, _own, temporary) =
+            live_background_entry_scheduler(Some(reverie::Errno::EIO));
+        assert_eq!(
+            scheduler
+                .background_entry_barriers
+                .get(&thread)
+                .map(|entry| entry.mask),
+            Some(temporary)
+        );
+    }
+
+    /// An entry that stays unproved, neither entered nor left, past
+    /// `background_entry_valve` ends the run with a named refusal instead of
+    /// holding every turn forever (Codex review of
+    /// https://github.com/rrnewton/hermit/pull/4053).
+    #[test]
+    fn an_unproved_background_entry_ends_the_run_by_name_after_the_valve() {
+        let alrm = kernel_signal_bit(libc::SIGALRM);
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        let (mut scheduler, _parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+        scheduler.models_signal_targets = true;
+        scheduler.background_entry_valve = Duration::ZERO;
+        scheduler.test_kernel_signal_states.insert(
+            creator,
+            KernelSignalState {
+                blocked: usr1,
+                ..signal_state(0, 0)
+            },
+        );
+        commit_out_of_scheduler_call(
+            &mut scheduler,
+            creator,
+            ResourceID::BlockingRtSigsuspend(ExternalOpId::new(creator, 1)),
+            Some(alrm),
+        );
+        assert!(scheduler.step2_drain_prefix().is_err());
+        let reason = scheduler
+            .terminal_deadlock
+            .clone()
+            .expect("the unproved entry ends the run");
+        assert!(reason.starts_with("HERMIT_DEADLOCK:"), "{reason}");
+        assert!(reason.contains("neither entered it"), "{reason}");
+    }
+
+    /// A scheduler with the calling test thread, a real and live identity,
+    /// granted a background `rt_sigsuspend` under a temporary mask that differs
+    /// from its actual one. `own_read_error` makes the grant's own-mask read
+    /// fail. Returns the scheduler, the thread, its actual mask and the
+    /// temporary mask.
+    fn live_background_entry_scheduler(
+        own_read_error: Option<reverie::Errno>,
+    ) -> (Scheduler, DetTid, u64, u64) {
+        use crate::syscalls::signal_state_read_seam;
+
+        let pid = reverie::Pid::from_raw(std::process::id() as i32);
+        // SAFETY: gettid takes no arguments and changes nothing.
+        let tid = reverie::Pid::from_raw(unsafe { libc::syscall(libc::SYS_gettid) as i32 });
+        assert!(!thread_is_gone(pid, tid));
+        let own = read_kernel_signal_state(pid, tid)
+            .expect("the test thread's signal state is readable")
+            .blocked;
+        let temporary = own ^ kernel_signal_bit(libc::SIGALRM);
+        let leader = DetTid::from_raw(pid.as_raw());
+        let thread = DetTid::from_raw(tid.as_raw());
+        let mut scheduler = gated_scheduler();
+        scheduler.thread_tree.add_child(leader, leader, true);
+        if thread != leader {
+            scheduler.thread_tree.add_child(leader, thread, false);
+        }
+        register_known_thread(&mut scheduler, thread);
+        let seam = own_read_error
+            .map(|errno| signal_state_read_seam::install(move |_, _| Some(Err(errno))));
+        commit_out_of_scheduler_call(
+            &mut scheduler,
+            thread,
+            ResourceID::BlockingRtSigsuspend(ExternalOpId::new(thread, 1)),
+            Some(temporary),
+        );
+        drop(seam);
+        (scheduler, thread, own, temporary)
+    }
+
     #[test]
     fn a_scheduler_that_does_not_model_signal_targets_reads_and_records_no_sleeping_mask() {
         use std::sync::atomic::Ordering;
@@ -13904,7 +14235,10 @@ mod test {
                 let recorded = scheduler.blocked.out_of_scheduler_masks.get(&creator);
                 if models {
                     assert_eq!(recorded, Some(&Some(call_mask.unwrap_or(chld))), "{case}");
-                    assert_eq!(reads, usize::from(call_mask.is_none()), "{case}");
+                    // The thread's own mask, read once: it is the sleeping mask
+                    // of a call without one, and decides whether a call with
+                    // one needs an entry barrier.
+                    assert_eq!(reads, 1, "{case}");
                 } else {
                     assert_eq!(recorded, None, "{case}");
                     assert!(

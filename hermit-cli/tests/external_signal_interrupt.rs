@@ -2084,6 +2084,202 @@ fn ptrace_rt_sigtimedwait_takes_a_queued_signal_before_the_sigchld_of_an_exiting
     let _ = fs::remove_file(&witness);
 }
 
+/// A pselect6 with nfds=65 sleeps outside the scheduler, and a sibling
+/// rewrites its mask buffer before the call reaches the kernel
+/// (tests/c/pselect_large_mutating_mask.c). The call must sleep under the mask
+/// it was entered with and return 1 when the sibling writes the pipe after its
+/// 20 ms sleep, as natively. The scheduler waited for a mask the kernel never
+/// installed, withheld the sibling's timer, and the call returned 0 at its 2 s
+/// timeout (Codex review of https://github.com/rrnewton/hermit/pull/4053).
+#[test]
+fn ptrace_large_pselect6_sleeps_under_its_entry_mask_while_a_sibling_rewrites_it() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let root = build_root();
+    fs::create_dir_all(&root).expect("failed to create guest build directory");
+    let witness = root.join(format!(
+        "pselect_large_mutating_mask.{}",
+        std::process::id()
+    ));
+    let compiled = Command::new("cc")
+        .args(["-O2", "-Wall", "-Wextra", "-Werror", "-pthread"])
+        .arg(repository.join("tests/c/pselect_large_mutating_mask.c"))
+        .arg("-o")
+        .arg(&witness)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to start the witness's compiler");
+    assert!(
+        compiled.status.success(),
+        "failed to compile the witness: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    for mode in ["stable", "mutable"] {
+        let trial = tempfile::Builder::new()
+            .prefix("trial-")
+            .tempdir_in(&root)
+            .expect("failed to create trial directory");
+        let report = trial.path().join("verify.json");
+        let output = Command::new("timeout")
+            .args(["--kill-after=5s", "120s"])
+            .arg(hermit_binary::hermit_binary())
+            .env_remove("LD_LIBRARY_PATH")
+            .arg("--log=info")
+            .args(cell_run_args("ptrace"))
+            .args(["--verify", "--verify-strict", "--verify-json"])
+            .arg(&report)
+            .arg("--")
+            .arg(&witness)
+            .arg(mode)
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run hermit");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let expected = format!("mode={mode} result=1 errno=0 ready=1 writer_ok=1 oracle=1");
+        assert!(
+            output.status.success() && stdout.contains(&expected),
+            "{mode}: expected `{expected}`, as natively, with exit 0; got {}\nstdout:\n{stdout}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let verdict: serde_json::Value = serde_json::from_slice(
+            &fs::read(&report).expect("strict verification wrote no verdict"),
+        )
+        .expect("strict verification verdict is valid JSON");
+        if let Some(gap) = strict_verification_gap(&verdict) {
+            panic!("{mode}: strict verification is not determinism evidence: {gap}");
+        }
+    }
+    let _ = fs::remove_file(&witness);
+}
+
+/// A pselect6 with more than 64 descriptors and a temporary mask is valid on a
+/// stack with no writable memory below its red zone, and Hermit stages its
+/// private copy of the mask (`stage_pselect6_mask_copy`) somewhere else there.
+/// tests/c/pselect_tight_stack.c makes a ready call, a call ended by a SIGALRM
+/// that only the temporary mask unblocks, a call the kernel restarts for an
+/// ignored SIGCONT (re-reading its mask), a ready call again, and a ready call
+/// whose fd set and timeout sit in the red zone, and (at the adjacent and ample
+/// depths) one whose fd set fills it, on a stack
+/// 144, 160 and 1024 bytes into its page, then two batches of four threads
+/// make the ready call on stacks of their own, and the bytes mapped must not
+/// change; a pattern in the red zone below each call's stack must survive it.
+/// It must print what Linux prints. Staging the copy on the stack
+/// returned EFAULT in the tight mode; unmapping a transient page after the
+/// call restarted the signal-ended call forever; a per-thread page left a
+/// mapping behind for every thread that used it; staging at the top of the
+/// red zone corrupted an fd set the guest kept there (Codex re-checks of
+/// https://github.com/rrnewton/hermit/pull/4053). A call whose fd set fills
+/// the red zone leaves no room for the copy and is refused by name.
+#[test]
+fn ptrace_large_pselect6_on_a_stack_with_no_scratch_behaves_as_natively() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let root = build_root();
+    fs::create_dir_all(&root).expect("failed to create guest build directory");
+    let witness = root.join(format!("pselect_tight_stack.{}", std::process::id()));
+    let compiled = Command::new("cc")
+        .args(["-O2", "-Wall", "-Wextra", "-Werror", "-pthread"])
+        .arg(repository.join("tests/c/pselect_tight_stack.c"))
+        .arg("-o")
+        .arg(&witness)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to start the witness's compiler");
+    assert!(
+        compiled.status.success(),
+        "failed to compile the witness: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    for mode in ["tight", "adjacent", "ample"] {
+        let trial = tempfile::Builder::new()
+            .prefix("trial-")
+            .tempdir_in(&root)
+            .expect("failed to create trial directory");
+        let report = trial.path().join("verify.json");
+        let output = Command::new("timeout")
+            .args(["--kill-after=5s", "120s"])
+            .arg(hermit_binary::hermit_binary())
+            .env_remove("LD_LIBRARY_PATH")
+            .arg("--log=info")
+            .args(cell_run_args("ptrace"))
+            .args(["--verify", "--verify-strict", "--verify-json"])
+            .arg(&report)
+            .arg("--")
+            .arg(&witness)
+            .arg(mode)
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run hermit");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // The crowded call leaves no red-zone window on the tight stack, so
+        // only adjacent and ample make it here; mode crowded covers tight.
+        let crowded = if mode == "tight" { "none" } else { "1" };
+        let expected = format!(
+            "mode={mode} ready=1 signal=-4 alarms=1 restart=0 again=1 aliased=1 crowded={crowded} maps=1 threads=1 red_zone=1 oracle=1"
+        );
+        assert!(
+            output.status.success() && stdout.contains(&expected),
+            "{mode}: expected `{expected}`, as natively, with exit 0; got {}\nstdout:\n{stdout}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let verdict: serde_json::Value = serde_json::from_slice(
+            &fs::read(&report).expect("strict verification wrote no verdict"),
+        )
+        .expect("strict verification verdict is valid JSON");
+        if let Some(gap) = strict_verification_gap(&verdict) {
+            panic!("{mode}: strict verification is not determinism evidence: {gap}");
+        }
+    }
+    // Mode crowded: nfds 1024 and an fd set filling the red zone leave no room
+    // for the private copy. A fail-closed run refuses the call by name, never
+    // forwarding a mask the scheduler did not record (Codex re-check #4); a
+    // run that allows unsupported operations gets Linux's answer.
+    let refused = Command::new("timeout")
+        .args(["--kill-after=5s", "120s"])
+        .arg(hermit_binary::hermit_binary())
+        .env_remove("LD_LIBRARY_PATH")
+        .args(cell_run_args("ptrace"))
+        .arg("--")
+        .arg(&witness)
+        .arg("crowded")
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run hermit");
+    let refused_stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        refused.status.code() == Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
+            && refused_stderr
+                .contains("unsupported: pselect6 with more than 64 descriptors and a temporary")
+            && !String::from_utf8_lossy(&refused.stdout).contains("mode=crowded"),
+        "crowded: expected the named policy refusal; got {}\nstdout:\n{}\nstderr:\n{refused_stderr}",
+        refused.status,
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    let allowed = Command::new("timeout")
+        .args(["--kill-after=5s", "120s"])
+        .arg(hermit_binary::hermit_binary())
+        .env_remove("LD_LIBRARY_PATH")
+        .args(["--backend", "ptrace", "run", "--allow-unsupported-syscalls"])
+        .args(["--base-env=minimal", "--"])
+        .arg(&witness)
+        .arg("crowded")
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run hermit");
+    let allowed_stdout = String::from_utf8_lossy(&allowed.stdout);
+    assert!(
+        allowed.status.success() && allowed_stdout.contains("mode=crowded crowded=1 oracle=1"),
+        "crowded with --allow-unsupported-syscalls: expected Linux's answer; got {}\nstdout:\n{allowed_stdout}\nstderr:\n{}",
+        allowed.status,
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+    let _ = fs::remove_file(&witness);
+}
+
 #[test]
 fn ptrace_poll_and_epoll_are_ended_by_the_sigchld_of_an_exiting_child() {
     assert_child_exit_sigchld_ends_readiness_waits("ptrace");

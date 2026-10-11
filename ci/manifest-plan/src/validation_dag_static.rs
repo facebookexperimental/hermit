@@ -1872,7 +1872,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (run_failed with deadlock) retains all 1341: 1342.
     // tool_local::file_metadata_tests::rediscovery_preserves_known_and_invalidated_flock_history
     // retains all 1342 prior cases: 1343.
-    ("test.detcore_unit", 1343),
+    // And a_background_call_with_a_temporary_mask_holds_the_schedule_until_the_kernel_installs_it (https://github.com/rrnewton/hermit/issues/3993): 1344.
+    // And a_live_thread_whose_mask_cannot_be_read_holds_its_background_entry,
+    // an_unreadable_own_mask_at_the_grant_still_arms_the_entry_barrier and
+    // an_unproved_background_entry_ends_the_run_by_name_after_the_valve
+    // (Codex review of https://github.com/rrnewton/hermit/pull/4053): 1347.
+    ("test.detcore_unit", 1347),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2053,7 +2058,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4005): 274.
     // And external_signal_interrupt::ptrace_rt_sigtimedwait_takes_a_queued_signal_before_the_sigchld_of_an_exiting_child
     // (review of https://github.com/rrnewton/hermit/pull/4039): 275.
-    ("test.hermit_integration", 275),
+    // And external_signal_interrupt::ptrace_large_pselect6_sleeps_under_its_entry_mask_while_a_sibling_rewrites_it
+    // (Codex review of https://github.com/rrnewton/hermit/pull/4053): 276.
+    // And external_signal_interrupt::ptrace_large_pselect6_on_a_stack_with_no_scratch_behaves_as_natively
+    // (Codex re-check of https://github.com/rrnewton/hermit/pull/4053): 277.
+    ("test.hermit_integration", 277),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -2139,7 +2148,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and retain all 148 (`cargo nextest list` lists 150).
     // record_pselect_whose_mask_unblocks_the_timer_signal_on_a_tight_stack
     // (follow-up to https://github.com/rrnewton/hermit/pull/4052): 151.
-    ("test.record_replay", 151),
+    // record_sigsuspend_while_a_timer_signal_is_due
+    // (https://github.com/rrnewton/hermit/issues/3993) adds one and retains all
+    // 151 (`cargo nextest list` lists 152).
+    ("test.record_replay", 152),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -2858,7 +2870,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the interrupted shared-key probe test: 1341.
     // And the terminal-deadlock hook test: 1342.
     // And the same descriptor rediscovery history test: 1343.
-    ("test.detcore_unit_on_host", 1343),
+    // And a_background_call_with_a_temporary_mask_holds_the_schedule_until_the_kernel_installs_it (https://github.com/rrnewton/hermit/issues/3993): 1344.
+    // And the three background-entry proof tests: 1347.
+    ("test.detcore_unit_on_host", 1347),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -2889,7 +2903,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the robust-futex exec no-wake test: 273.
     // And the run-mode rt_sigtimedwait SIGCHLD test: 274.
     // And the queued-signal rt_sigtimedwait test: 275.
-    ("test.hermit_integration_on_host", 275),
+    // And the large-pselect6 mutable-mask test: 276.
+    // And the large-pselect6 tight-stack test: 277.
+    ("test.hermit_integration_on_host", 277),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

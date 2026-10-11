@@ -157,7 +157,7 @@ fn without_perf_event_signal(mask: KernelSigset) -> KernelSigset {
 /// then read the already-validated word while the guest is stopped.
 /// The x86-64 System V red zone below the stack pointer, which a leaf function
 /// may use and an injected call therefore must not.
-const STACK_RED_ZONE: usize = 128;
+pub(super) const STACK_RED_ZONE: usize = 128;
 
 /// The two eight-byte scratch cells `handle_rt_sigsuspend` places below the
 /// red zone: the rt_sigpending result and the copy of the call's mask.

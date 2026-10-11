@@ -52,6 +52,7 @@ use crate::syscalls::helpers::refuse_held_signal_loss;
 use crate::syscalls::helpers::result_after_restore;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::syscalls::network_trace::received_descriptors;
+use crate::syscalls::signal::STACK_RED_ZONE;
 use crate::syscalls::signal::kernel_installed_signal_mask;
 use crate::syscalls::signal::read_kernel_sigset;
 use crate::syscalls::threads::KernelSigset;
@@ -113,6 +114,143 @@ pub(super) const PSELECT6_INTERNAL_MAX_NFDS: i32 =
 pub(super) struct Pselect6SigmaskArg {
     pub(super) sigmask: usize,
     pub(super) sigsetsize: usize,
+}
+
+/// Where a private copy of a pselect6 temporary mask lives while the kernel
+/// reads it (`stage_pselect6_mask_copy`).
+enum StagedMaskStorage<Guard> {
+    /// The guest stack scratch below the red zone, checked out by the guard.
+    Stack(Guard),
+    /// The top of the guest's red zone, whose bytes `saved` holds until
+    /// `StagedMask::release` writes them back.
+    RedZone {
+        at: usize,
+        saved: [u8; STAGED_MASK_LEN],
+    },
+}
+
+/// A private, kernel-readable copy of a pselect6 temporary mask, as the
+/// `{ sigmask, sigsetsize }` wrapper a pselect6 passes (`wrapper`).
+struct StagedMask<Guard> {
+    wrapper: usize,
+    storage: StagedMaskStorage<Guard>,
+}
+
+/// The mask and its `{ sigmask, sigsetsize }` wrapper, in that order.
+const STAGED_MASK_LEN: usize =
+    std::mem::size_of::<KernelSigset>() + std::mem::size_of::<Pselect6SigmaskArg>();
+
+impl<Guard> StagedMask<Guard> {
+    /// Gives the storage back once the call has returned: drops the stack
+    /// guard, or writes the guest's red-zone bytes back. That is a write to
+    /// guest memory, not an injected syscall, so a call that ended with a
+    /// restart code goes back to the kernel untouched.
+    fn release<G, T>(self, guest: &mut G)
+    where
+        G: Guest<Detcore<T>>,
+        T: RecordOrReplay,
+    {
+        if let StagedMaskStorage::RedZone { at, saved } = self.storage
+            && let Err(errno) = AddrMut::<u8>::from_raw(at)
+                .ok_or(Errno::EFAULT)
+                .and_then(|bytes| guest.memory().write_exact(bytes, &saved))
+        {
+            // Not expected: the same bytes were written before the call.
+            tracing::warn!("[detcore] could not restore the red zone after a pselect6: {errno}");
+        }
+    }
+}
+
+/// Stages a private copy of `mask` that the kernel can read as a pselect6
+/// `{ sigmask, sigsetsize }` wrapper.
+///
+/// The copy goes in the guest stack scratch below the red zone when that is
+/// writable. A thread may run with no writable memory there, on a stack it
+/// placed near the start of a page, and a pselect6 on such a stack is valid
+/// (Codex re-check of https://github.com/rrnewton/hermit/pull/4053). Then the
+/// copy goes in 24 bytes of the red zone, whose bytes are saved here and
+/// written back by `StagedMask::release` when the call returns. The red zone
+/// may hold the call's own buffers, which Linux reads and writes, so the copy
+/// takes the highest 8-aligned window that overlaps none of `live` (Codex
+/// re-check #3). The guest's own wrapper and mask may be overwritten: Linux
+/// reads neither, as the call is redirected to the copy, and both are
+/// restored. When no window is free and writable, this returns `None`, and
+/// the caller refuses the call (`refuse_unstageable_pselect6_mask`). The guest
+/// runs no code in between: the call holds the thread in the kernel, a signal
+/// frame is built below the red zone, and a call the kernel restarts comes
+/// back as a new syscall with the guest's own arguments, which is staged
+/// again. Nothing is mapped, so the guest's address space is unchanged (Codex
+/// re-check of the earlier per-thread page).
+///
+/// Whether the scratch faults is a function of the guest's own stack, so the
+/// choice is deterministic.
+async fn stage_pselect6_mask_copy<G, T>(
+    guest: &mut G,
+    mask: KernelSigset,
+    live: &[std::ops::Range<usize>],
+) -> Result<Option<StagedMask<<G::Stack as Stack>::StackGuard>>, Errno>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let mut stack = guest.stack().await;
+    let mask_copy = stack.push(mask);
+    let wrapper = stack.push(Pselect6SigmaskArg {
+        sigmask: mask_copy.as_raw(),
+        sigsetsize: KERNEL_SIGSET_SIZE,
+    });
+    match stack.commit() {
+        Ok(guard) => {
+            return Ok(Some(StagedMask {
+                wrapper: wrapper.as_raw(),
+                storage: StagedMaskStorage::Stack(guard),
+            }));
+        }
+        Err(Errno::EFAULT) => {}
+        Err(errno) => return Err(errno),
+    }
+    let rsp = guest.regs().await.rsp as usize;
+    let Some(top) = rsp.checked_sub(STAGED_MASK_LEN).map(|top| top & !7) else {
+        return Ok(None);
+    };
+    let bottom = rsp.saturating_sub(STACK_RED_ZONE);
+    let mut saved = [0u8; STAGED_MASK_LEN];
+    let mut found = None;
+    for at in (bottom..=top).rev().step_by(8) {
+        let window = at..at + STAGED_MASK_LEN;
+        if live
+            .iter()
+            .any(|range| range.start < window.end && window.start < range.end)
+        {
+            continue;
+        }
+        let Some(bytes) = AddrMut::<u8>::from_raw(at) else {
+            continue;
+        };
+        if guest.memory().read_exact(bytes, &mut saved).is_ok() {
+            found = Some((at, bytes));
+            break;
+        }
+    }
+    let Some((at, bytes)) = found else {
+        return Ok(None);
+    };
+    let mut cells = [0u8; STAGED_MASK_LEN];
+    let mask_len = std::mem::size_of::<KernelSigset>();
+    cells[..mask_len].copy_from_slice(&mask.to_ne_bytes());
+    cells[mask_len..mask_len + 8].copy_from_slice(&at.to_ne_bytes());
+    cells[mask_len + 8..].copy_from_slice(&KERNEL_SIGSET_SIZE.to_ne_bytes());
+    let staged = StagedMask {
+        wrapper: at + mask_len,
+        storage: StagedMaskStorage::RedZone { at, saved },
+    };
+    if guest.memory().write_exact(bytes, &cells).is_err() {
+        // A read-only stack page. A write that failed partway may have changed
+        // some bytes, so put them back.
+        staged.release(guest);
+        return Ok(None);
+    }
+    Ok(Some(staged))
 }
 
 /// The temporary mask a replayed pselect6 sleeps under, read from guest
@@ -610,6 +748,41 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Refuses a large-nfds pselect6 with a temporary mask whose private copy
+    /// has nowhere to go: the stack has no writable scratch below its red zone,
+    /// and every red-zone window overlaps one of the call's own buffers
+    /// (`stage_pselect6_mask_copy`). Forwarding the guest's wrapper instead
+    /// would let a sibling change the mask the kernel installs after the
+    /// scheduler has recorded the one it waits for, so the call could time out
+    /// with a wrong answer (Codex re-check #4 of
+    /// https://github.com/rrnewton/hermit/pull/4053). A fail-closed run stops
+    /// with the policy refusal and this message. A run started with
+    /// `--allow-unsupported-syscalls` runs on: the call keeps the guest's
+    /// wrapper, whose mask a sibling may still change, so the scheduler records
+    /// its sleeping mask as unknown (`Resources::blocked_signal_mask_unknown`),
+    /// not the thread's own, and arms no entry barrier for it (Codex re-check
+    /// #5).
+    async fn refuse_unstageable_pselect6_mask<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Pselect6,
+    ) -> Result<i64, Error> {
+        use std::io::Write as _;
+        let message = "unsupported: pselect6 with more than 64 descriptors and a temporary \
+            signal mask, on a stack with no room below its red zone whose red zone the \
+            call's own buffers fill: Hermit has nowhere to put the private copy of the mask \
+            the kernel must install (https://github.com/rrnewton/hermit/pull/4053)";
+        tracing::error!("[tid {}] {message}", guest.tid());
+        if self.cfg.panic_on_unsupported_syscalls {
+            let _ = writeln!(crate::util::RetryingStderr, "{message}");
+            return self
+                .refuse_unserviceable_operation(guest, Sysno::pselect6, Errno::EFAULT)
+                .await;
+        }
+        self.record_or_replay_blocking_with_unknown_mask(guest, Syscall::Pselect6(call))
+            .await
+    }
+
     /// pselect6 syscall (MAYHANG).
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#686): Review scratch fd sets and scheduler polling.
@@ -727,27 +900,56 @@ impl<T: RecordOrReplay> Detcore<T> {
             // A mask the kernel would reject (wrong size, or a pointer it cannot
             // read) fails the real call before it sleeps or installs anything, so
             // the thread's own mask is the right record there (`None`).
-            let blocked_signal_mask = match sigmask_argument {
+            let snapshot = match sigmask_argument {
                 Some(argument)
                     if argument.sigmask != 0 && argument.sigsetsize == KERNEL_SIGSET_SIZE =>
                 {
                     match Addr::<libc::sigset_t>::from_raw(argument.sigmask) {
-                        Some(mask_addr) => read_kernel_sigset(guest, mask_addr)
-                            .await
-                            .ok()
-                            .map(kernel_installed_signal_mask),
+                        Some(mask_addr) => read_kernel_sigset(guest, mask_addr).await.ok(),
                         None => None,
                     }
                 }
                 _ => None,
             };
-            return self
+            let Some(mask) = snapshot else {
+                return self
+                    .record_or_replay_blocking_with_mask(guest, Syscall::Pselect6(call), None)
+                    .await;
+            };
+            // The call sleeps under a private copy of the mask read here, not the
+            // guest's wrapper: a sibling may rewrite the guest's buffer before the
+            // released call reaches the kernel, and the scheduler waits for the
+            // kernel to install exactly this mask (`background_entry_barriers`,
+            // Codex review of https://github.com/rrnewton/hermit/pull/4053). The
+            // wrapper and the mask were validated above, in Linux's order. The
+            // copy stays readable until the call has rejoined.
+            // The buffers Linux reads and writes, which the copy must not
+            // overlap. The fd sets span at most their nominal length; Linux
+            // may copy less.
+            let set_len = pselect6_fd_set_len(call.nfds())?;
+            let live: Vec<std::ops::Range<usize>> = [
+                call.readfds().map(|set| (set.as_raw(), set_len)),
+                call.writefds().map(|set| (set.as_raw(), set_len)),
+                call.exceptfds().map(|set| (set.as_raw(), set_len)),
+                call.timeout()
+                    .map(|timeout| (timeout.as_raw(), std::mem::size_of::<Timespec>())),
+            ]
+            .into_iter()
+            .flatten()
+            .map(|(start, len)| start..start.saturating_add(len))
+            .collect();
+            let Some(staged) = stage_pselect6_mask_copy(guest, mask, &live).await? else {
+                return self.refuse_unstageable_pselect6_mask(guest, call).await;
+            };
+            let result = self
                 .record_or_replay_blocking_with_mask(
                     guest,
-                    Syscall::Pselect6(call),
-                    blocked_signal_mask,
+                    Syscall::Pselect6(call.with_sigmask(Addr::from_raw(staged.wrapper))),
+                    Some(kernel_installed_signal_mask(mask)),
                 )
                 .await;
+            staged.release(guest);
+            return result;
         }
 
         // Linux wraps pselect6's temporary mask in { pointer, size }. Glibc supplies
