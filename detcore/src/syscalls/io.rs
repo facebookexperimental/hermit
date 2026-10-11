@@ -295,6 +295,11 @@ where
 /// sleeps, and Linux writes no remaining time back for it, so neither host
 /// timing nor host time reaches the guest.
 ///
+/// A zero-timeout masked pselect6 and a zero-timeout masked ppoll end the same
+/// way when a signal their mask unblocks is already pending, and replay serves
+/// them the same way, so both end through this too
+/// (https://github.com/rrnewton/hermit/issues/4054).
+///
 /// Every value this reads (guest memory, and the kernel's pending set, mask
 /// and dispositions in this thread's turn) is a function of the replayed
 /// schedule. When no such signal is pending, the call returns as before.
@@ -809,28 +814,30 @@ impl<T: RecordOrReplay> Detcore<T> {
             // scheduler records no mask for such a call
             // (`Resources::blocked_signal_mask_unknown`). Without a wrapper the
             // call sleeps under the thread's own mask, which the scheduler reads.
-            return if call.sigmask().is_some() && !zero_timeout {
-                // Replay reads the temporary mask here, at the call's entry, as
-                // Linux copies it; a sibling may rewrite the buffer while the
-                // call is served (review of https://github.com/rrnewton/hermit/pull/4052).
-                let temporary_mask = if self.cfg.replaying {
-                    replayed_pselect6_temporary_mask(guest, call)
-                } else {
-                    None
-                };
-                let result = self
-                    .record_or_replay_blocking_with_unknown_mask(guest, Syscall::Pselect6(call))
-                    .await;
-                if let Some(mask) = temporary_mask
-                    && matches!(result, Err(Error::Errno(Errno::ERESTARTNOHAND)))
-                {
-                    end_replayed_pselect6_under_its_temporary_mask(guest, mask).await;
-                }
-                result
+            // Replay reads the temporary mask here, at the call's entry, as
+            // Linux copies it; a sibling may rewrite the buffer while the
+            // call is served (review of https://github.com/rrnewton/hermit/pull/4052).
+            // A zero timeout does not change that: Linux still installs the
+            // mask and ends the call with ERESTARTNOHAND for a pending signal
+            // it unblocks (https://github.com/rrnewton/hermit/issues/4054).
+            let temporary_mask = if self.cfg.replaying && call.sigmask().is_some() {
+                replayed_pselect6_temporary_mask(guest, call)
+            } else {
+                None
+            };
+            let result = if call.sigmask().is_some() && !zero_timeout {
+                self.record_or_replay_blocking_with_unknown_mask(guest, Syscall::Pselect6(call))
+                    .await
             } else {
                 self.record_or_replay_select_family(guest, Syscall::Pselect6(call), zero_timeout)
                     .await
             };
+            if let Some(mask) = temporary_mask
+                && matches!(result, Err(Error::Errno(Errno::ERESTARTNOHAND)))
+            {
+                end_replayed_pselect6_under_its_temporary_mask(guest, mask).await;
+            }
+            return result;
         }
         if !self.cfg.sequentialize_threads {
             return Ok(guest.inject(call).await?);
@@ -1517,12 +1524,38 @@ impl<T: RecordOrReplay> Detcore<T> {
             if self.cfg.recordreplay_modes {
                 resource_request(guest, Resources::new(guest.thread_state().dettid)).await;
             }
-            let (probe, _probe_guard) = self.prepare_ppoll_probe(guest, call).await?;
-            let result = if self.cfg.recordreplay_modes {
-                Ok(self.record_or_replay(guest, probe).await?)
+            let (probe, probe_guard) = self.prepare_ppoll_probe(guest, call).await?;
+            // The mask the probe installs, read at entry, for replay to deliver
+            // under (https://github.com/rrnewton/hermit/issues/4054).
+            let temporary_mask = if self.cfg.replaying {
+                match call.sigmask() {
+                    Some(signal_mask) => read_kernel_sigset(guest, signal_mask)
+                        .await
+                        .ok()
+                        .map(sanitize_ppoll_signal_mask),
+                    None => None,
+                }
             } else {
-                Ok(guest.inject_with_retry(probe).await?)
+                None
             };
+            // No `?` on the call's own result: an interruption must reach the
+            // replay delivery below.
+            let result: Result<i64, Error> = if self.cfg.recordreplay_modes {
+                self.record_or_replay(guest, probe)
+                    .await
+                    .map_err(Into::into)
+            } else {
+                guest.inject_with_retry(probe).await.map_err(Into::into)
+            };
+            drop(probe_guard);
+            // Replay serves the probe from the recording, so the kernel never
+            // installs its mask; deliver a recorded interruption under it, as
+            // for pselect6.
+            if let Some(mask) = temporary_mask
+                && matches!(result, Err(Error::Errno(Errno::ERESTARTNOHAND)))
+            {
+                end_replayed_pselect6_under_its_temporary_mask(guest, mask).await;
+            }
             // Linux does not write back an initially zero timeout. Besides matching the
             // kernel, omitting this write matters when the timeout aliases the pollfd array:
             // the injected probe may have just stored revents in those same bytes.

@@ -2777,6 +2777,22 @@ fn record_pselect_whose_mask_unblocks_the_timer_signal_on_a_tight_stack() {
     record_select_mode("pselect-mask-unblocks-tight-stack");
 }
 
+/// A zero-timeout pselect6 whose temporary mask unblocks a pending signal ends
+/// with EINTR after the handler runs, as Linux installs the mask even for a
+/// zero timeout. Replay served the call from the recording without the mask,
+/// the kernel restarted it, and replay stopped at the restarted call
+/// (https://github.com/rrnewton/hermit/issues/4054).
+#[test]
+fn record_zero_timeout_pselect_whose_mask_unblocks_a_pending_signal() {
+    record_select_mode("pselect-mask-zero-raise");
+}
+
+/// The same with ppoll (https://github.com/rrnewton/hermit/issues/4054).
+#[test]
+fn record_zero_timeout_ppoll_whose_mask_unblocks_a_pending_signal() {
+    record_select_mode("ppoll-mask-zero-raise");
+}
+
 /// Replayer substitutes an eventfd for this proc descriptor. The Detcore
 /// procfs layer must bind the live task incarnation named by an absolute or
 /// AT_FDCWD-relative path rather than the placeholder inode. Zero-length

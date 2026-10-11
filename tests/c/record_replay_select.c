@@ -79,6 +79,15 @@
  *                filled with a pattern before the call, must hold it after
  *                (follow-up to https://github.com/rrnewton/hermit/pull/4052,
  *                and its re-check)
+ *   pselect-mask-zero-raise
+ *   ppoll-mask-zero-raise
+ *                the thread catches and blocks SIGUSR1, raises it, then calls
+ *                glibc pselect() or ppoll() with a zero timeout and an empty
+ *                temporary mask. Linux installs the mask even for a zero
+ *                timeout, finds SIGUSR1 pending, and ends the call with EINTR
+ *                after the handler runs. Replay serves the call from the
+ *                recording and must deliver the signal under that mask
+ *                (https://github.com/rrnewton/hermit/issues/4054)
  *
  * The first three modes each run four shapes: a ready pipe with a 5 s timeout,
  * the same with a zero timeout, the same with nfds == FD_SETSIZE (larger than
@@ -1010,6 +1019,59 @@ static int pselect_mask_unblocks_tight_stack(void) {
   return 0;
 }
 
+static volatile sig_atomic_t raised_usr1;
+
+static void count_raised_usr1(int signo) {
+  (void)signo;
+  raised_usr1++;
+}
+
+/* The zero-timeout idiom: SIGUSR1 is pending and blocked when the call starts,
+ * and only the call's empty temporary mask unblocks it. */
+static int zero_timeout_mask_raise(int use_ppoll) {
+  struct sigaction action;
+  memset(&action, 0, sizeof action);
+  action.sa_handler = count_raised_usr1;
+  sigset_t usr1, empty;
+  sigemptyset(&usr1);
+  sigaddset(&usr1, SIGUSR1);
+  sigemptyset(&empty);
+  int fds[2];
+  if (sigaction(SIGUSR1, &action, NULL) != 0 ||
+      pthread_sigmask(SIG_BLOCK, &usr1, NULL) != 0 || pipe(fds) != 0 ||
+      raise(SIGUSR1) != 0) {
+    perror("setup");
+    return 1;
+  }
+  struct timespec zero = {0, 0};
+  errno = 0;
+  int result;
+  if (use_ppoll) {
+    struct pollfd watched = {fds[0], POLLIN, 0};
+    result = ppoll(&watched, 1, &zero, &empty);
+  } else {
+    fd_set read_set;
+    FD_ZERO(&read_set);
+    FD_SET(fds[0], &read_set);
+    result = pselect(fds[0] + 1, &read_set, NULL, NULL, &zero, &empty);
+  }
+  int result_errno = errno;
+  int handled = (int)raised_usr1;
+  close(fds[0]);
+  close(fds[1]);
+  printf(
+      "%-24s result=%011d errno=%011d handled=%01d\n",
+      use_ppoll ? "ppoll-zero-raise" : "pselect-zero-raise",
+      result,
+      result < 0 ? result_errno : 0,
+      handled);
+  if (result != -1 || result_errno != EINTR || handled != 1) {
+    fprintf(stderr, "zero-timeout masked raise mismatch\n");
+    return 1;
+  }
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc != 2) {
     fprintf(
@@ -1018,7 +1080,8 @@ int main(int argc, char** argv) {
         "pselect-mask-blocks-alarm|pselect-mask-shared-alarm|"
         "pselect-mask-writeonly-wrapper|pselect-mask-sibling-rewrite|"
         "pselect-mask-unblocks-alarm|pselect-mask-unblocks-rewritten|"
-        "pselect-mask-unblocks-tight-stack]\n",
+        "pselect-mask-unblocks-tight-stack|pselect-mask-zero-raise|"
+        "ppoll-mask-zero-raise]\n",
         argv[0]);
     return 2;
   }
@@ -1051,6 +1114,12 @@ int main(int argc, char** argv) {
   }
   if (strcmp(argv[1], "pselect-mask-unblocks-tight-stack") == 0) {
     return pselect_mask_unblocks_tight_stack();
+  }
+  if (strcmp(argv[1], "pselect-mask-zero-raise") == 0) {
+    return zero_timeout_mask_raise(0);
+  }
+  if (strcmp(argv[1], "ppoll-mask-zero-raise") == 0) {
+    return zero_timeout_mask_raise(1);
   }
   if (strcmp(argv[1], "efault") == 0) {
     return efault();
