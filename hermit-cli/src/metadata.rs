@@ -297,7 +297,14 @@ impl RecordVersion {
 // answered ESRCH (https://github.com/rrnewton/hermit/issues/4094). Replay
 // recomputes the answer, so an older recording replayed here could see another
 // result and take another branch, although no event shape changed.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x132);
+// 0x132 -> 0x133: record readmits a finished background call while the only
+// runnable work queued is threads that yielded and pollers, where it used to
+// wait for every yielder to stop (https://github.com/rrnewton/hermit/issues/4092).
+// Replay follows the logged readmission turn only once its gate opens, and an
+// older replayer's gate stays shut in that state, so it could not consume the
+// readmission: it would refuse, or hang behind a yielder that never stops
+// (Codex review of https://github.com/rrnewton/hermit/pull/4120).
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x133);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -322,7 +329,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x132);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x132;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x133;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -699,6 +706,14 @@ mod tests {
         // Already off: stays off.
         disable_timeslice_without_a_timer(&mut config, "again");
         assert_eq!(config.max_timeslice, None);
+    }
+
+    #[test]
+    fn pre_yield_readmission_recordings_are_refused_by_the_version_gate() {
+        // A 0x132 recording never readmitted a background call while a
+        // yielder was queued, and its replayer cannot follow one that did.
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x132)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x131)));
     }
 
     #[test]
