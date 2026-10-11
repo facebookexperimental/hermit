@@ -1539,11 +1539,20 @@ impl<T: RecordOrReplay> Detcore<T> {
     pub(crate) async fn record_handler_restore_mask<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        _signal: Signal,
+        signal: Signal,
     ) {
         if !(self.cfg.sequentialize_threads
             && self.cfg.backend_supports_blocked_wait_signal_interruption)
             || guest.thread_state().handler_restore_rt_reported == REAL_TIME_SIGNALS
+        {
+            return;
+        }
+        // Only a caught signal runs a handler that returns. The dispositions
+        // are the process's, so they say that whatever mask the delivery
+        // interrupted; a signal acted on by default (the teardown's own
+        // termination signals among them) records nothing.
+        if let Ok(state) = read_thread_wait_signal_state(guest.pid(), guest.tid())
+            && state.caught & kernel_sigset_bit(signal as i32) == 0
         {
             return;
         }
