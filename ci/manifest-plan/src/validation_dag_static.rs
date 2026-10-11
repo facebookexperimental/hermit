@@ -1891,7 +1891,20 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // all 1347: 1348.
     // tool_global::tests::only_hermits_own_thread_group_is_hermits
     // (https://github.com/rrnewton/hermit/issues/4066) retains all 1348: 1349.
-    ("test.detcore_unit", 1349),
+    // The eleven real-time expiration fate tests of scheduler::tests
+    // (a_real_time_expiration_every_thread_blocks_is_kept_pending,
+    // a_real_time_expiration_one_thread_unblocks_is_deliverable,
+    // a_real_time_expiration_is_judged_by_a_held_threads_own_mask,
+    // a_real_time_expiration_with_a_thread_outside_the_schedule_is_deliverable,
+    // a_real_time_expiration_with_an_unreadable_thread_is_deliverable,
+    // an_ignored_real_time_expiration_is_discarded_where_a_thread_takes_it,
+    // a_real_time_expiration_a_signalfd_or_a_handler_return_could_see_is_deliverable,
+    // a_real_time_expiration_after_a_call_outside_the_schedule_is_deliverable,
+    // a_real_time_expiration_of_a_process_without_live_threads_is_discarded,
+    // without_signal_target_modelling_the_arming_thread_decides_as_before and
+    // a_pending_real_time_expiration_is_discarded_by_ignore_and_by_exit;
+    // https://github.com/rrnewton/hermit/issues/4089) retain all 1349: 1360.
+    ("test.detcore_unit", 1360),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2546,7 +2559,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_namespace_only_guests_kill_0_never_reaches_hermits_group and
     // a_namespace_only_run_on_a_terminal_keeps_its_terminal_behaviour
     // (https://github.com/rrnewton/hermit/issues/4065) retain all 298: 300.
-    ("test.cli", 300),
+    // a_pending_real_time_timer_expiration_is_refused_only_where_it_is_observed
+    // (https://github.com/rrnewton/hermit/issues/4089) retains all 300: 301.
+    ("test.cli", 301),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2788,7 +2803,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Nor does the pidfd multi-thread signal test: 231.
     // Nor do the three tests of signals to Hermit's own tasks: 234.
     // Nor do the two namespace-only kill(0) and terminal tests: 236.
-    ("test.cli_on_host", 236),
+    // Nor does the pending real-time timer expiration test: 237.
+    ("test.cli_on_host", 237),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -2933,7 +2949,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the three background-entry proof tests: 1347.
     // And the futex timeout clamp test: 1348.
     // And the Hermit thread-group test: 1349.
-    ("test.detcore_unit_on_host", 1349),
+    // And the eleven real-time expiration fate tests: 1360.
+    ("test.detcore_unit_on_host", 1360),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

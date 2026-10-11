@@ -1301,7 +1301,7 @@ pub struct Scheduler {
 
     /// The real-time signals of POSIX timers that expired while every live
     /// thread of their process blocked them, by process
-    /// (https://github.com/rrnewton/hermit/issues/4089). Linux queues such a
+    /// (<https://github.com/rrnewton/hermit/issues/4089>). Linux queues such a
     /// signal, which then changes nothing until the process could observe it:
     /// a thread unblocks it, waits for it, or reads its pending set. Detcore
     /// cannot deliver real-time signals, so each of those points refuses the
