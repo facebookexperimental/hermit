@@ -17763,7 +17763,7 @@ mod nextest_timeout_tests {
             "privileged-only-test.cli_kvm_on_host",
         ] {
             let step = config.steps.iter().find(|step| step.tag() == tag).unwrap();
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "55");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "56");
             // Unwrap the pinned-root shell argument when present, then exercise
             // the actual committed jq predicate without opening /dev/kvm.
             let mut words = shell_words::split(&step.cmd).unwrap();
@@ -17789,7 +17789,7 @@ mod nextest_timeout_tests {
             .collect::<Vec<_>>();
         assert_eq!(
             names.len(),
-            54,
+            55,
             "update the exact CI inventory with new KVM tests"
         );
         let required_cases = [
@@ -17799,6 +17799,7 @@ mod nextest_timeout_tests {
             "run_kvm_root_exit_reparents_live_child_and_grandchild",
             "run_kvm_exec_deletes_posix_timers_and_preserves_itimer",
             "run_kvm_nonleader_exec_is_policy_refusal",
+            "run_kvm_futex_wait_on_an_unreadable_word_matches_linux",
         ];
         for required in required_cases {
             assert!(names.iter().any(|name| name == required));
@@ -18822,7 +18823,10 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // retirement and six-mode reparenting tests each count as one
         // selected test. run_kvm_numbers_guest_tasks_as_the_ptrace_backend
         // makes 53 declarations, 54 selected.
-        ("privileged-only-test.cli_kvm", 55usize),
+        // run_kvm_names_the_execve_filename_in_at_execfn_as_ptrace_does and
+        // run_kvm_futex_wait_on_an_unreadable_word_matches_linux make 55
+        // declarations, 56 selected.
+        ("privileged-only-test.cli_kvm", 56usize),
     ] {
         let step = privileged
             .steps
