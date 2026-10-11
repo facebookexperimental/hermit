@@ -8433,13 +8433,16 @@ fn reconcile_history_catalogue(root: &Path, history: &mut TrackedCells) -> Resul
     reconcile_history_catalogue_with(root, history, true)
 }
 
-/// reconcile_history_catalogue, printing its retention notice only when
-/// ANNOUNCE: a write-back that reconciles the same history again to rebuild a
-/// copy of it must not print the notice twice.
+/// reconcile_history_catalogue, with the committed-history check and the
+/// retention notice only on the FIRST reconciliation of a history. A write-back
+/// that reconciles the same held bytes again to rebuild a copy of them must not
+/// print the notice twice, and need not re-read the 1.27 GB committed document
+/// twice more each time: its write guards compare the file with those bytes
+/// before anything is written.
 fn reconcile_history_catalogue_with(
     root: &Path,
     history: &mut TrackedCells,
-    announce: bool,
+    first: bool,
 ) -> Result<(), String> {
     // A renamed cell is a join, not a retirement: re-key it before comparing.
     resolve_retired_history(history)?;
@@ -8458,7 +8461,7 @@ fn reconcile_history_catalogue_with(
         return Err("catalogue reconciliation refuses duplicate cell identities".into());
     }
     let retired = previous_ids.difference(&current_ids).count();
-    if retired != 0 {
+    if retired != 0 && first {
         let ledger = ledger_root(root, true)?;
         let current = fs::read(ledger.join(LEDGER_CELLS)).map_err(|error| error.to_string())?;
         let committed = Command::new("git")
@@ -8469,12 +8472,12 @@ fn reconcile_history_catalogue_with(
         if !committed.status.success() || committed.stdout != current {
             return Err("catalogue reconciliation refuses to retire uncommitted history; publish the exact existing detailed document first".into());
         }
-        if announce {
-            println!(
-                "compatibility scorecard: retaining {retired} retired cell(s) in ledger commit {}",
-                git_head(&ledger)?
-            );
-        }
+        println!(
+            "compatibility scorecard: retaining {retired} retired cell(s) in ledger commit {}",
+            git_head(&ledger)?
+        );
+    }
+    if retired != 0 {
         archive_retiring_catalogue_comparisons(history, &current_ids)?;
     }
     let unchanged = history.cells.len() == catalogue.cells.len()
@@ -11946,11 +11949,12 @@ where
     // fresh copy of it is needed, instead of keeping a 2.7 GB clone (`before`)
     // from here to the end (https://github.com/rrnewton/dev-hermit/issues/554).
     // Parsing and reconciling the same bytes against the same checkout gives
-    // the same history; only the first reconciliation announces retirements.
-    let reconciled_history = |announce: bool| -> Result<TrackedCells, String> {
+    // the same history; only the first reconciliation checks the committed
+    // document and announces retirements.
+    let reconciled_history = |first: bool| -> Result<TrackedCells, String> {
         let mut history: TrackedCells = serde_json::from_slice(&original.cells)
             .map_err(|error| format!("cannot parse tracked {CELLS}: {error}"))?;
-        reconcile_history_catalogue_with(root, &mut history, announce)?;
+        reconcile_history_catalogue_with(root, &mut history, first)?;
         Ok(history)
     };
     let tracked = reconciled_history(true)?;
@@ -24528,10 +24532,11 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
 
         // The write-back's preview changes the history here: the baseline holds
         // no representation of the current result, so the preview's
-        // apply_validate_results_from adds one. The projection must still start
-        // from the unchanged history (rebuilt from the held bytes), so the
-        // result is represented exactly once below, not once from the preview
-        // and once from the fold.
+        // apply_validate_results_from adds one. The write-back must represent
+        // it exactly once. That count alone does not catch a projection that
+        // starts from the preview's changed history, since applying the same
+        // results twice gives the same observations; the unproven-stamp step
+        // after it does.
         let baseline_history: TrackedCells = read_json(&fixture_ledger.join(LEDGER_CELLS))?;
         project_and_observe_results(
             &result_command_root,
@@ -24588,6 +24593,59 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
                 .into(),
         );
         }
+
+        // A projection that started from the preview's changed history would be
+        // invisible above, because applying the same results twice gives the
+        // same observations. It is visible in a stamp: only proven ancestry may
+        // advance a cell's last_tested, and the preview advances it without that
+        // proof. Give the current result's cell a stamp whose source commit
+        // does not exist; the write-back must keep it. A projection that started
+        // from the preview replaced it with the measured commit (on the
+        // 2026-10-11 ledger, 1,978 cells,
+        // https://github.com/rrnewton/hermit/pull/4098#issuecomment-6107027208).
+        let after_first_write = fs::read(fixture_ledger.join(LEDGER_CELLS))
+            .map_err(|error| format!("cannot read the combined fixture history: {error}"))?;
+        let mut unproven = before_publication.clone();
+        let unproven_stamp = {
+            let cell = unproven
+                .cells
+                .iter_mut()
+                .find(|cell| cell.id == replay_id)
+                .ok_or("the combined fixture has no current-result cell")?;
+            let mut stamp = cell
+                .last_tested
+                .clone()
+                .ok_or("the combined fixture's current result left no stamp")?;
+            stamp.hermit_sha = "0".repeat(40);
+            cell.last_tested = Some(stamp.clone());
+            stamp
+        };
+        fs::write(
+            fixture_ledger.join(LEDGER_CELLS),
+            encoded_cells(&unproven)?.into_bytes(),
+        )
+        .map_err(|error| format!("cannot write the unproven-stamp fixture: {error}"))?;
+        project_and_observe_results(
+            &result_command_root,
+            &empty_snapshot_path,
+            &empty_snapshot_sha,
+            &result_root,
+            &fixture_head,
+            "fixture-refresh",
+        )?;
+        let kept: TrackedCells = read_json(&fixture_ledger.join(LEDGER_CELLS))?;
+        let kept_stamp = kept
+            .cells
+            .iter()
+            .find(|cell| cell.id == replay_id)
+            .and_then(|cell| cell.last_tested.as_ref());
+        if kept_stamp != Some(&unproven_stamp) {
+            return Err(format!(
+                "the write-back replaced a stamp whose source is not a proven ancestor: {kept_stamp:?}"
+            ));
+        }
+        fs::write(fixture_ledger.join(LEDGER_CELLS), &after_first_write)
+            .map_err(|error| format!("cannot restore the combined fixture history: {error}"))?;
 
         project_and_observe_results(
             &result_command_root,
