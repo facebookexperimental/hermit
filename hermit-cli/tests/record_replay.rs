@@ -2996,6 +2996,23 @@ fn record_pselect_whose_mask_unblocks_the_timer_signal_24_bytes_into_its_stack()
     record_select_mode("pselect-mask-unblocks-tight-stack24");
 }
 
+/// The same 8 bytes into its stack, where replay has nowhere to put the 24
+/// bytes of its delivery: recording refuses the call by name rather than
+/// record a wait whose interruption replay cannot reproduce
+/// (https://github.com/rrnewton/hermit/issues/4112).
+#[test]
+fn recording_refuses_a_masked_pselect_8_bytes_into_its_stack() {
+    let _guard = hermit_record_lock();
+    assert_recording_refuses(
+        "pselect-mask-unblocks-tight-stack8",
+        &workload("c_record_replay_select").path,
+        &["pselect-mask-unblocks-tight-stack8"],
+        &|_| {},
+        &[],
+        "unsupported: pselect6 with a temporary signal mask on a stack less than 24 bytes",
+    );
+}
+
 /// Replayer substitutes an eventfd for this proc descriptor. The Detcore
 /// procfs layer must bind the live task incarnation named by an absolute or
 /// AT_FDCWD-relative path rather than the placeholder inode. Zero-length

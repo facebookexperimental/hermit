@@ -2228,7 +2228,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // record_*_128_bytes_into_its_page, record_unmasked_zero_timeout_ppoll_16_bytes_into_its_page
     // and record_masked_ppoll_whose_pollfd_is_in_the_red_zone,
     // https://github.com/rrnewton/hermit/issues/4113): 178.
-    ("test.record_replay", 178),
+    // And recording_refuses_a_masked_pselect_8_bytes_into_its_stack
+    // (https://github.com/rrnewton/hermit/issues/4112): 179.
+    ("test.record_replay", 179),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.

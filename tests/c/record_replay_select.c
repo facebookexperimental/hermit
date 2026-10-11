@@ -71,6 +71,7 @@
  *                https://github.com/rrnewton/hermit/pull/4052)
  *   pselect-mask-unblocks-tight-stack
  *   pselect-mask-unblocks-tight-stack24
+ *   pselect-mask-unblocks-tight-stack8
  *                the unblocks wait as a raw pselect6 made on a stack 144 (or 24) bytes
  *                into a writable page with an inaccessible page below it, so
  *                there is no writable memory below the red zone; the handler
@@ -2018,7 +2019,8 @@ int main(int argc, char** argv) {
         "epoll-pwait-mask-redzone-events|epoll-pwait-mask-pipe-epfd|"
         "pselect-mask-unblocks-tight-stack24|"
         "pselect-beside-a-yielding-sibling|"
-        "pselect-beside-two-yielding-siblings]\n",
+        "pselect-beside-two-yielding-siblings|"
+        "pselect-mask-unblocks-tight-stack8]\n",
         argv[0]);
     return 2;
   }
@@ -2051,6 +2053,9 @@ int main(int argc, char** argv) {
   }
   if (strcmp(argv[1], "pselect-mask-unblocks-tight-stack") == 0) {
     return pselect_mask_unblocks_tight_stack(144);
+  }
+  if (strcmp(argv[1], "pselect-mask-unblocks-tight-stack8") == 0) {
+    return pselect_mask_unblocks_tight_stack(8);
   }
   if (strcmp(argv[1], "pselect-mask-unblocks-tight-stack24") == 0) {
     return pselect_mask_unblocks_tight_stack(24);

@@ -353,6 +353,39 @@ where
     guest.memory().read_value(mask_addr).ok()
 }
 
+/// Whether replay could deliver a signal that interrupts this record/replay
+/// pselect6 (`end_replayed_pselect6_under_its_temporary_mask`), whose 24 bytes
+/// go in the stack scratch or at the top of the red zone. Recording passes the
+/// guest's own wrapper to the kernel, so it accepts the call on any stack, and
+/// a call whose stack pointer is less than 24 bytes above unwritable memory
+/// left replay nowhere to deliver: the kernel restarted the served call and
+/// replay stopped at the next syscall
+/// (https://github.com/rrnewton/hermit/issues/4112). The top 24 bytes of the
+/// red zone are readable exactly when the stack pointer is at least 24 bytes
+/// above unwritable memory, and the stack scratch lies below them, so this
+/// reads them. `true` for a call with no mask to deliver under, and for one
+/// whose wrapper Linux cannot read, which it fails before it waits. A function
+/// of the guest's stack and memory, which replay reproduces.
+async fn replayed_pselect6_delivery_fits<G, T>(guest: &mut G, call: syscalls::Pselect6) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let Some(wrapper) = call.sigmask() else {
+        return true;
+    };
+    let argument: Result<Pselect6SigmaskArg, _> = guest.memory().read_value(wrapper.cast());
+    match argument {
+        Ok(argument) if argument.sigmask != 0 => {}
+        _ => return true,
+    }
+    let rsp = guest.regs().await.rsp as usize;
+    let mut cells = [0u8; MAX_PRIVATE_CELLS_LEN];
+    rsp.checked_sub(MAX_PRIVATE_CELLS_LEN)
+        .and_then(|top| AddrMut::<u8>::from_raw(top & !7))
+        .is_some_and(|top| guest.memory().read_exact(top, &mut cells).is_ok())
+}
+
 /// Ends a replayed pselect6 that the recording says a signal interrupted
 /// (`ERESTARTNOHAND`), when the signal is one that only the call's temporary
 /// mask unblocks.
@@ -836,6 +869,33 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await
     }
 
+    /// Refuses a record/replay pselect6 with a temporary mask on a stack less
+    /// than 24 bytes above unwritable memory, where replay could not deliver a
+    /// signal that interrupts it (`replayed_pselect6_delivery_fits`). Recording
+    /// and replay refuse it alike. A fail-closed run stops with the policy
+    /// refusal and this message, whose result this returns. A run started
+    /// with `--allow-unsupported-syscalls` records the call as before, and a
+    /// replay of an interrupted one stops at the next syscall; this returns
+    /// `None` for it.
+    async fn refuse_undeliverable_pselect6_mask<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+    ) -> Option<Result<i64, Error>> {
+        use std::io::Write as _;
+        let message = "unsupported: pselect6 with a temporary signal mask on a stack less than \
+            24 bytes above unwritable memory: replay has nowhere to deliver a signal that \
+            interrupts it (https://github.com/rrnewton/hermit/issues/4112)";
+        tracing::error!("[tid {}] {message}", guest.tid());
+        if !self.cfg.panic_on_unsupported_syscalls {
+            return None;
+        }
+        let _ = writeln!(crate::util::RetryingStderr, "{message}");
+        Some(
+            self.refuse_unserviceable_operation(guest, Sysno::pselect6, Errno::EFAULT)
+                .await,
+        )
+    }
+
     /// pselect6 syscall (MAYHANG).
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#686): Review scratch fd sets and scheduler polling.
@@ -873,6 +933,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             // timeout does not change that: Linux still installs the mask and
             // ends the call with ERESTARTNOHAND for a pending signal it
             // unblocks (https://github.com/rrnewton/hermit/issues/4054).
+            if !replayed_pselect6_delivery_fits(guest, call).await
+                && let Some(refused) = self.refuse_undeliverable_pselect6_mask(guest).await
+            {
+                return refused;
+            }
             let read_mask = self.cfg.replaying && call.sigmask().is_some();
             let mut temporary_mask = None;
             let result = if call.sigmask().is_some() && !zero_timeout {
