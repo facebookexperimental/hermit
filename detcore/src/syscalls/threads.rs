@@ -3920,7 +3920,14 @@ fn read_futex_word<G: Guest<Detcore<T>>, T: RecordOrReplay>(
     {
         return Ok(i32::from_ne_bytes(bytes));
     }
-    if !mapping_is_writable(guest.pid().as_raw(), address) {
+    // Only a backend that runs the guest as real host threads has a host
+    // `/proc/<pid>/maps` describing the guest; elsewhere (KVM's guest pid is
+    // virtual) the user-access read above is the backend's whole answer.
+    if !guest
+        .config()
+        .backend_supports_blocked_wait_signal_interruption
+        || !mapping_is_writable(guest.pid().as_raw(), address)
+    {
         return Err(Error::Errno(Errno::EFAULT));
     }
     let aligned = address & !(std::mem::size_of::<u64>() - 1);

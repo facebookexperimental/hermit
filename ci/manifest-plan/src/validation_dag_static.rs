@@ -1357,8 +1357,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retain all 1025 prior cases: 1029. Historical-byte and legacy-projection
     // test renames preserve their cases and do not add to this count.
     // And metadata::tests::record_version_rejects_streams_that_answered_a_futex_rewait_as_woken
-    // (https://github.com/rrnewton/hermit/issues/4033): 1024.
-    ("test.hermit_unit", 1030),
+    // (https://github.com/rrnewton/hermit/issues/4033): 1031.
+    ("test.hermit_unit", 1031),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2955,8 +2955,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the raw-clone-process record-version test: 1026.
     // And the same four DBT config transport tests: 1029; two historical-test
     // renames preserve existing cases without changing this count.
-    // And the futex re-wait record-epoch test: 1024.
-    ("test.hermit_unit_on_host", 1030),
+    // And the futex re-wait record-epoch test: 1031.
+    ("test.hermit_unit_on_host", 1031),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
