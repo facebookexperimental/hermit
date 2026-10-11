@@ -3057,6 +3057,40 @@ fn record_epoll_pwait2_whose_mask_unblocks_a_pending_signal_24_bytes_into_its_st
     record_select_mode("epoll-pwait2-mask-raise-tight24");
 }
 
+/// A masked epoll_pwait2 whose mask buffer a sibling zeroes while it waits:
+/// the call must sleep under the private copy of the mask it read (Claude
+/// review of https://github.com/rrnewton/hermit/pull/4128).
+#[test]
+fn record_epoll_pwait2_whose_mask_a_sibling_zeroes() {
+    record_select_mode("epoll-pwait2-mask-sibling-race");
+}
+
+/// A masked epoll_pwait2 48 bytes into its page whose timespec sits at the top
+/// of the red zone: the mask copy must stay clear of the timespec the kernel
+/// reads (Claude review of https://github.com/rrnewton/hermit/pull/4128).
+#[test]
+fn record_masked_epoll_pwait2_whose_timeout_is_in_the_red_zone() {
+    record_select_mode("epoll-pwait2-timeout-in-red-zone");
+}
+
+/// A masked zero-timespec epoll_pwait2 beside a sibling that loops without a
+/// system call: the call keeps its turn. In the background it would wait
+/// behind the always-runnable sibling forever (Claude review of
+/// https://github.com/rrnewton/hermit/pull/4128).
+#[test]
+fn record_zero_timeout_epoll_pwait2_beside_a_busy_sibling() {
+    record_select_mode("epoll-pwait2-zero-beside-busy-sibling");
+}
+
+/// epoll_pwait2 checks its timespec before its mask, as Linux does: an
+/// unreadable timespec with a wrong sigsetsize is EFAULT, and an invalid one
+/// with an unreadable mask EINVAL (Claude review of
+/// https://github.com/rrnewton/hermit/pull/4128).
+#[test]
+fn record_epoll_pwait2_checks_its_timeout_before_its_mask() {
+    record_select_mode("epoll-pwait2-error-order");
+}
+
 /// Replayer substitutes an eventfd for this proc descriptor. The Detcore
 /// procfs layer must bind the live task incarnation named by an absolute or
 /// AT_FDCWD-relative path rather than the placeholder inode. Zero-length

@@ -2355,6 +2355,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         args: SyscallArgs,
     ) -> Result<i64, Error> {
+        // Linux copies and checks the timespec before the mask, so an
+        // unreadable timeout is EFAULT and an invalid one EINVAL whatever the
+        // mask and its size (Claude review of
+        // https://github.com/rrnewton/hermit/pull/4128).
+        if let Some(timeout) = Addr::<Timespec>::from_raw(args.arg3) {
+            let timeout: Timespec = guest.memory().read_value(timeout)?;
+            ppoll_timeout_duration(timeout)?;
+        }
         if args.arg5 != KERNEL_SIGSET_SIZE {
             return Err(Errno::EINVAL.into());
         }

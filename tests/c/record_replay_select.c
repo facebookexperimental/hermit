@@ -128,14 +128,32 @@
  *   epoll-pwait2-ready
  *   epoll-pwait2-writer
  *   epoll-pwait2-mask-raise
- *   epoll-pwait2-mask-raise-tight, epoll-pwait2-mask-raise-tight24
- *                epoll-pwait-mask-raise-tight and -tight24 through
- *                epoll_pwait2: its private mask copy must go in the red zone,
- *                clear of the events buffer and the timespec
  *                the same shapes as raw epoll_pwait2, which takes a timespec
  *                timeout (2 s): a ready pipe, a pipe a thread fills at 300 ms,
  *                and an empty mask with SIGUSR1 pending at entry (EINTR,
  *                handler run). epoll_pwait2 ran live in record and replay alike
+ *   epoll-pwait2-mask-raise-tight, epoll-pwait2-mask-raise-tight24
+ *                epoll-pwait-mask-raise-tight and -tight24 through
+ *                epoll_pwait2: its private mask copy must go in the red zone,
+ *                clear of the events buffer and the timespec
+ *   epoll-pwait2-mask-sibling-race
+ *                epoll-pwait-mask-sibling-race through epoll_pwait2 (3 s
+ *                timespec): the call must sleep under a private copy of the
+ *                mask it read
+ *   epoll-pwait2-timeout-in-red-zone
+ *                a masked epoll_pwait2 48 bytes into its page whose 30 s
+ *                timespec sits at the top of the red zone, ended by a writer
+ *                at 300 ms: 1, so the mask copy must stay clear of the
+ *                timespec the kernel reads
+ *   epoll-pwait2-zero-beside-busy-sibling
+ *                a masked zero-timespec epoll_pwait2 on a ready pipe while a
+ *                sibling loops without a system call: 1. A call with a zero
+ *                timeout keeps its turn; run in the background, it would wait
+ *                behind the sibling forever
+ *   epoll-pwait2-error-order
+ *                an unreadable timespec with sigsetsize 4 (EFAULT), and an
+ *                invalid tv_nsec with an unreadable mask (EINVAL): Linux checks
+ *                the timespec before the mask
  *   epoll-pwait-mask-raise
  *                the thread catches and blocks SIGUSR1, raises it, then waits in
  *                epoll_pwait with a 30 s timeout and an empty temporary mask:
@@ -241,6 +259,10 @@
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifndef SYS_epoll_pwait2
+#define SYS_epoll_pwait2 441
+#endif
 
 enum call_kind { RAW_SELECT, GLIBC_SELECT, GLIBC_PSELECT_MASKED };
 
@@ -1872,7 +1894,8 @@ static void* zero_epoll_mask_then_signal(void* arg) {
   return NULL;
 }
 
-static int epoll_pwait_mask_sibling_race(void) {
+/* With `pwait2`, the same wait through epoll_pwait2 with a 3 s timespec. */
+static int epoll_pwait_mask_sibling_race(int pwait2) {
   struct sigaction action;
   memset(&action, 0, sizeof action);
   action.sa_handler = count_epoll_raised;
@@ -1901,8 +1924,11 @@ static int epoll_pwait_mask_sibling_race(void) {
   memset(&ready, 0, sizeof ready);
   atomic_store(&race_epoll_announced, 1);
   errno = 0;
-  long result = syscall(
-      SYS_epoll_pwait, epoll_fd, &ready, 1, 3000, &race_epoll_mask, (size_t)8);
+  static struct timespec three_seconds = {3, 0};
+  long result = pwait2 ? syscall(SYS_epoll_pwait2, epoll_fd, &ready, 1,
+                                 &three_seconds, &race_epoll_mask, (size_t)8)
+                       : syscall(SYS_epoll_pwait, epoll_fd, &ready, 1, 3000,
+                                 &race_epoll_mask, (size_t)8);
   int result_errno = errno;
   int handled_at_return = (int)epoll_raised;
   if (pthread_join(racer, NULL) != 0) {
@@ -1914,7 +1940,7 @@ static int epoll_pwait_mask_sibling_race(void) {
   close(epoll_fd);
   printf(
       "%-24s result=%011ld errno=%011d handled_at_return=%01d\n",
-      "epoll-pwait-sibling-race",
+      pwait2 ? "epoll-pwait2-sibling-race" : "epoll-pwait-sibling-race",
       result,
       result < 0 ? result_errno : 0,
       handled_at_return);
@@ -1975,10 +2001,6 @@ static int epoll_pwait_mask_raise(void) {
   }
   return 0;
 }
-
-#ifndef SYS_epoll_pwait2
-#define SYS_epoll_pwait2 441
-#endif
 
 /* Raw epoll_pwait2 on a pipe: `mode` 0 a ready pipe, 1 a pipe a thread fills,
  * 2 an empty mask with SIGUSR1 pending at entry. */
@@ -2045,6 +2067,153 @@ static int epoll_pwait2_mode(const char* name, int mode) {
                                  ready.data.u64 == 0x5eedULL;
   if (!expected) {
     fprintf(stderr, "%s mismatch\n", name);
+    return 1;
+  }
+  return 0;
+}
+
+/* A masked epoll_pwait2 with a 30 s timespec on a stack 48 bytes into a
+ * writable page above an inaccessible one, the timespec in the top 16 bytes of
+ * the red zone, and a writer at 300 ms (Claude review of
+ * https://github.com/rrnewton/hermit/pull/4128). */
+static int epoll_pwait2_timeout_in_red_zone(void) {
+  long page = sysconf(_SC_PAGESIZE);
+  unsigned char* area = mmap(
+      NULL, (size_t)page * 2, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+  if (area == MAP_FAILED ||
+      mprotect(area + page, (size_t)page, PROT_READ | PROT_WRITE) != 0 ||
+      epoll_fd < 0 || pipe(epoll_pipe_fds) != 0) {
+    perror("setup");
+    return 1;
+  }
+  struct epoll_event watched = {.events = EPOLLIN, .data.u64 = 0x5eedULL};
+  if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, epoll_pipe_fds[0], &watched) != 0) {
+    perror("epoll_ctl");
+    return 1;
+  }
+  unsigned char* tight_stack = area + page + 48;
+  struct timespec* timeout = (struct timespec*)(tight_stack - sizeof(struct timespec));
+  for (int i = -48; i < -(int)sizeof(struct timespec); i++) {
+    tight_stack[i] = (unsigned char)(0xa5 ^ (i & 0xff));
+  }
+  timeout->tv_sec = 30;
+  timeout->tv_nsec = 0;
+  static struct epoll_event ready;
+  static uint64_t empty_mask;
+  pthread_t filler;
+  if (pthread_create(&filler, NULL, fill_epoll_pipe_later, NULL) != 0) {
+    perror("pthread_create");
+    return 1;
+  }
+  const long args[6] = {
+      epoll_fd, (long)&ready, 1, (long)timeout, (long)&empty_mask, 8};
+  long raw = syscall6_on_stack(tight_stack, SYS_epoll_pwait2, args);
+  int red_zone_changed = 0;
+  for (int i = -48; i < -(int)sizeof(struct timespec); i++) {
+    red_zone_changed += tight_stack[i] != (unsigned char)(0xa5 ^ (i & 0xff));
+  }
+  pthread_join(filler, NULL);
+  close(epoll_pipe_fds[0]);
+  close(epoll_pipe_fds[1]);
+  close(epoll_fd);
+  printf(
+      "%-30s result=%011ld events=%08x red_zone_changed=%03d\n",
+      "epoll-pwait2-timeout-in-red-zone",
+      raw,
+      raw > 0 ? ready.events : 0,
+      red_zone_changed);
+  if (raw != 1 || !(ready.events & EPOLLIN) || red_zone_changed != 0) {
+    fprintf(stderr, "epoll-pwait2-timeout-in-red-zone mismatch\n");
+    return 1;
+  }
+  return 0;
+}
+
+static atomic_int busy_sibling_done;
+
+static void* loop_without_syscalls(void* arg) {
+  (void)arg;
+  volatile unsigned long spins = 0;
+  while (!atomic_load(&busy_sibling_done)) {
+    spins++;
+  }
+  return NULL;
+}
+
+/* A masked zero-timespec epoll_pwait2 on a ready pipe beside a sibling that
+ * loops without a system call (Claude review of
+ * https://github.com/rrnewton/hermit/pull/4128). */
+static int epoll_pwait2_zero_beside_busy_sibling(void) {
+  int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+  if (epoll_fd < 0 || pipe(epoll_pipe_fds) != 0 ||
+      write(epoll_pipe_fds[1], "x", 1) != 1) {
+    perror("setup");
+    return 1;
+  }
+  struct epoll_event watched = {.events = EPOLLIN, .data.u64 = 0x5eedULL};
+  if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, epoll_pipe_fds[0], &watched) != 0) {
+    perror("epoll_ctl");
+    return 1;
+  }
+  pthread_t sibling;
+  if (pthread_create(&sibling, NULL, loop_without_syscalls, NULL) != 0) {
+    perror("pthread_create");
+    return 1;
+  }
+  static uint64_t empty_mask;
+  static struct timespec zero = {0, 0};
+  struct epoll_event ready;
+  memset(&ready, 0, sizeof ready);
+  long result =
+      syscall(SYS_epoll_pwait2, epoll_fd, &ready, 1, &zero, &empty_mask, (size_t)8);
+  atomic_store(&busy_sibling_done, 1);
+  pthread_join(sibling, NULL);
+  close(epoll_pipe_fds[0]);
+  close(epoll_pipe_fds[1]);
+  close(epoll_fd);
+  printf(
+      "%-30s result=%011ld events=%08x\n",
+      "epoll-pwait2-zero-busy-sibling",
+      result,
+      result > 0 ? ready.events : 0);
+  if (result != 1 || !(ready.events & EPOLLIN)) {
+    fprintf(stderr, "epoll-pwait2-zero-beside-busy-sibling mismatch\n");
+    return 1;
+  }
+  return 0;
+}
+
+/* Linux copies and checks epoll_pwait2's timespec before its mask (Claude
+ * review of https://github.com/rrnewton/hermit/pull/4128). */
+static int epoll_pwait2_error_order(void) {
+  int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+  if (epoll_fd < 0) {
+    perror("epoll_create1");
+    return 1;
+  }
+  static uint64_t empty_mask;
+  struct epoll_event ready;
+  errno = 0;
+  long unreadable_timeout = syscall(
+      SYS_epoll_pwait2, epoll_fd, &ready, 1, (void*)8, &empty_mask, (size_t)4);
+  int unreadable_timeout_errno = errno;
+  static struct timespec invalid = {0, 2000000000};
+  errno = 0;
+  long invalid_timeout = syscall(
+      SYS_epoll_pwait2, epoll_fd, &ready, 1, &invalid, (void*)8, (size_t)8);
+  int invalid_timeout_errno = errno;
+  close(epoll_fd);
+  printf(
+      "%-30s unreadable_timeout=%ld/%d invalid_timeout=%ld/%d\n",
+      "epoll-pwait2-error-order",
+      unreadable_timeout,
+      unreadable_timeout_errno,
+      invalid_timeout,
+      invalid_timeout_errno);
+  if (unreadable_timeout != -1 || unreadable_timeout_errno != EFAULT ||
+      invalid_timeout != -1 || invalid_timeout_errno != EINVAL) {
+    fprintf(stderr, "epoll-pwait2-error-order mismatch\n");
     return 1;
   }
   return 0;
@@ -2215,7 +2384,9 @@ int main(int argc, char** argv) {
         "pselect-beside-two-yielding-siblings|"
         "pselect-mask-unblocks-tight-stack8|epoll-pwait2-ready|"
         "epoll-pwait2-writer|epoll-pwait2-mask-raise|"
-        "epoll-pwait2-mask-raise-tight|epoll-pwait2-mask-raise-tight24]\n",
+        "epoll-pwait2-mask-raise-tight|epoll-pwait2-mask-raise-tight24|"
+        "epoll-pwait2-mask-sibling-race|epoll-pwait2-timeout-in-red-zone|"
+        "epoll-pwait2-zero-beside-busy-sibling|epoll-pwait2-error-order]\n",
         argv[0]);
     return 2;
   }
@@ -2274,7 +2445,10 @@ int main(int argc, char** argv) {
     return epoll_pwait_mask_raise();
   }
   if (strcmp(argv[1], "epoll-pwait-mask-sibling-race") == 0) {
-    return epoll_pwait_mask_sibling_race();
+    return epoll_pwait_mask_sibling_race(0);
+  }
+  if (strcmp(argv[1], "epoll-pwait2-mask-sibling-race") == 0) {
+    return epoll_pwait_mask_sibling_race(1);
   }
   if (strcmp(argv[1], "epoll-pwait-mask-raise-tight") == 0) {
     return epoll_pwait_mask_raise_tight(128, 0);
@@ -2341,6 +2515,15 @@ int main(int argc, char** argv) {
   }
   if (strcmp(argv[1], "pselect-mask-hook-race") == 0) {
     return pselect_mask_hook_race();
+  }
+  if (strcmp(argv[1], "epoll-pwait2-timeout-in-red-zone") == 0) {
+    return epoll_pwait2_timeout_in_red_zone();
+  }
+  if (strcmp(argv[1], "epoll-pwait2-zero-beside-busy-sibling") == 0) {
+    return epoll_pwait2_zero_beside_busy_sibling();
+  }
+  if (strcmp(argv[1], "epoll-pwait2-error-order") == 0) {
+    return epoll_pwait2_error_order();
   }
   if (strcmp(argv[1], "epoll-pwait2-ready") == 0) {
     return epoll_pwait2_mode("epoll-pwait2-ready", 0);

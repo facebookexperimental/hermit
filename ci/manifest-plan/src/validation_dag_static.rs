@@ -2245,7 +2245,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // record_epoll_pwait2_whose_mask_unblocks_a_pending_signal_on_a_tight_stack
     // and ..._24_bytes_into_its_stack (epoll_pwait2 recorded,
     // https://github.com/rrnewton/hermit/issues/4088): 185.
-    ("test.record_replay", 185),
+    // And record_epoll_pwait2_whose_mask_a_sibling_zeroes,
+    // record_masked_epoll_pwait2_whose_timeout_is_in_the_red_zone,
+    // record_zero_timeout_epoll_pwait2_beside_a_busy_sibling and
+    // record_epoll_pwait2_checks_its_timeout_before_its_mask (Claude review of
+    // https://github.com/rrnewton/hermit/pull/4128): 189.
+    ("test.record_replay", 189),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
