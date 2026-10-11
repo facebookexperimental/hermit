@@ -21234,9 +21234,11 @@ fn a_futex_wake_count_of_zero_or_negative_wakes_one_waiter() {
 /// before https://github.com/rrnewton/hermit/issues/4091 the zombie was ESRCH.
 /// A child that is never a zombie stays ESRCH: one auto-reaped because its
 /// parent ignores SIGCHLD or sets SA_NOCLDWAIT, and an orphan that init reaps.
-/// Signal 0 answers as a signal does. Linux decides at exit, only for an exit
-/// signal of SIGCHLD, with the disposition a fork inherits and an exec keeps
-/// only while ignored; a zombie reparented to an ignoring subreaper is reaped.
+/// Signal 0 answers as a signal does, and `rt_sigqueueinfo` to a zombie is
+/// the kernel's answer after it checks the siginfo. Linux decides at exit,
+/// only for an exit signal of SIGCHLD, with the disposition a fork inherits
+/// and an exec keeps only while ignored; a zombie reparented to an ignoring
+/// subreaper is reaped.
 #[test]
 fn a_process_directed_signal_to_several_threads_is_refused_by_name() {
     let guest = kill_multithreaded_process_guest()
@@ -21245,9 +21247,11 @@ fn a_process_directed_signal_to_several_threads_is_refused_by_name() {
         .to_owned();
     let one_thread = "one thread, kill: 0\none thread, rt_sigqueueinfo: 0\n\
                       one thread, handled: 2\nzombie, kill: 0\nzombie, kill 0: 0\n\
-                      zombie, kill 99: -1 EINVAL\nreaped, kill: -1 ESRCH\n\
-                      reaped, kill 0: -1 ESRCH\nSIG_IGN child, kill: -1 ESRCH\n\
-                      SIG_IGN child, kill 0: -1 ESRCH\nSA_NOCLDWAIT child, kill: -1 ESRCH\n\
+                      zombie, kill 99: -1 EINVAL\nzombie, rt_sigqueueinfo: 0\n\
+                      zombie, rt_sigqueueinfo SI_USER: -1 EPERM\nreaped, kill: -1 ESRCH\n\
+                      reaped, kill 0: -1 ESRCH\nreaped, rt_sigqueueinfo: -1 ESRCH\n\
+                      SIG_IGN child, kill: -1 ESRCH\nSIG_IGN child, kill 0: -1 ESRCH\n\
+                      SA_NOCLDWAIT child, kill: -1 ESRCH\n\
                       SA_NOCLDWAIT child, kill 0: -1 ESRCH\norphan, kill: -1 ESRCH\n\
                       orphan, kill 0: -1 ESRCH\nzombie then SIG_IGN, kill: 0\n\
                       zombie then SIG_IGN, kill 0: 0\n\

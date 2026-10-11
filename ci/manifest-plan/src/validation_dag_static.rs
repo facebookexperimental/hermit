@@ -1367,7 +1367,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And metadata::tests::record_version_rejects_streams_that_answered_a_zombie_kill_with_esrch
     // (https://github.com/rrnewton/hermit/issues/4091): 1035.
     // And metadata::tests::pre_epoll_pwait_recordings_are_refused_by_the_version_gate: 1036.
-    ("test.hermit_unit", 1036),
+    // And metadata::tests::record_version_rejects_streams_that_answered_a_zombie_sigqueueinfo_with_esrch
+    // (https://github.com/rrnewton/hermit/issues/4091): 1037.
+    ("test.hermit_unit", 1037),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3075,7 +3077,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the namespace-only group-kill unit test: 1034.
     // And the zombie-kill record-epoch test: 1035.
     // And metadata::tests::pre_epoll_pwait_recordings_are_refused_by_the_version_gate: 1036.
-    ("test.hermit_unit_on_host", 1036),
+    // And the zombie-sigqueueinfo record-epoch test: 1037.
+    ("test.hermit_unit_on_host", 1037),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

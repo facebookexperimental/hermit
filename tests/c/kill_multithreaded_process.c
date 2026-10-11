@@ -286,6 +286,18 @@ static long queue_to_self(void) {
   return syscall(SYS_rt_sigqueueinfo, getpid(), SIGUSR1, &info);
 }
 
+/* rt_sigqueueinfo to another process; SI_USER from a process other than the
+ * target is a forged code, which Linux refuses with EPERM. */
+static long queue_to(pid_t pid, int code) {
+  siginfo_t info;
+  memset(&info, 0, sizeof(info));
+  info.si_signo = SIGTERM;
+  info.si_code = code;
+  info.si_pid = getpid();
+  info.si_uid = getuid();
+  return syscall(SYS_rt_sigqueueinfo, pid, SIGTERM, &info);
+}
+
 static volatile int stop;
 
 /* The second thread waits with SIGUSR1 blocked except inside sigsuspend, so
@@ -329,9 +341,12 @@ int main(int argc, char** argv) {
   report("zombie, kill", kill(zombie, SIGTERM));
   report("zombie, kill 0", kill(zombie, 0));
   report("zombie, kill 99", kill(zombie, 99));
+  report("zombie, rt_sigqueueinfo", queue_to(zombie, SI_QUEUE));
+  report("zombie, rt_sigqueueinfo SI_USER", queue_to(zombie, SI_USER));
   waitpid(zombie, NULL, 0);
   report("reaped, kill", kill(zombie, SIGTERM));
   report("reaped, kill 0", kill(zombie, 0));
+  report("reaped, rt_sigqueueinfo", queue_to(zombie, SI_QUEUE));
 
   autoreaped_child("SIG_IGN child", 0);
   autoreaped_child("SA_NOCLDWAIT child", 1);

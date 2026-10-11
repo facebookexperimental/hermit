@@ -287,7 +287,12 @@ impl RecordVersion {
 // records, and replay serves it from the recording. It used to run live in
 // record and replay alike, so an older recording holds no event for it and this
 // replayer would desynchronize at the first one.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x130);
+// 0x130 -> 0x131: an rt_sigqueueinfo to a zombie is forwarded to the kernel,
+// which checks the siginfo and then finds the zombie (0), where it answered
+// ESRCH (https://github.com/rrnewton/hermit/issues/4091). Replay recomputes
+// the answer, so an older recording replayed here could see another result
+// and take another branch, although no event shape changed.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x131);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -312,7 +317,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x130);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x130;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x131;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -959,6 +964,11 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_that_answered_a_zombie_kill_with_esrch() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x12e)));
+    }
+
+    #[test]
+    fn record_version_rejects_streams_that_answered_a_zombie_sigqueueinfo_with_esrch() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x130)));
     }
 
     /// Record and replay run under ptrace with serialized threads, so their

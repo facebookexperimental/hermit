@@ -1477,9 +1477,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return Ok(0);
         }
-        // A zombie keeps its old answer here, ESRCH: unlike kill, the kernel
-        // checks the siginfo before it looks the process up.
-        let tid = self
+        let Some(tid) = self
             .process_signal_target(
                 guest,
                 Sysno::rt_sigqueueinfo,
@@ -1487,7 +1485,22 @@ impl<T: RecordOrReplay> Detcore<T> {
                 call.sig(),
             )
             .await?
-            .ok_or(Errno::ESRCH)?;
+        else {
+            // A zombie: its parent can still wait for it, so Linux still
+            // finds it. Unlike kill, the kernel checks the siginfo first
+            // (EFAULT, EPERM for a forged si_code, E2BIG), so let it answer:
+            // it validates, finds the zombie, and returns 0. A backend that
+            // must name a receiving thread has none to name, and keeps ESRCH
+            // (https://github.com/rrnewton/hermit/issues/4091).
+            if guest
+                .config()
+                .backend
+                .requires_thread_directed_process_signals
+            {
+                return Err(Errno::ESRCH.into());
+            }
+            return Ok(self.record_or_replay(guest, call).await?);
+        };
         let value = if !guest
             .config()
             .backend
