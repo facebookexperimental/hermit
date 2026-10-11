@@ -1087,6 +1087,19 @@ jobs:
         env:
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
         run: ./ci/run-hosted-node.sh portable "${{ matrix.nodes }}"
+      # strict-compat requires the success of exactly the legs that own its
+      # constructed predecessors (ci/debug-shard-success.sh), not of every leg.
+      - name: Record debug shard success
+        if: success()
+        run: ./ci/debug-shard-success.sh record "${{ matrix.slug }}" "${{ matrix.nodes }}"
+      - name: Upload debug shard success record
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-shard-ok-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.slug }}
+          path: ignored/debug-shard-ok/${{ matrix.slug }}.json
+          if-no-files-found: error
+          retention-days: 1
       - name: Upload debug shard node performance report
         if: always()
         uses: actions/upload-artifact@v4
@@ -1099,10 +1112,23 @@ jobs:
   # The strict compatibility bucket and its fixture producer depend on results
   # from several debug shards. Keep them in a later job so the hosted grouping
   # preserves those constructed edges.
+  #
+  # GitHub reports one result for the whole test-debug matrix, so with the
+  # default success() condition the failure of any leg skipped this job, also
+  # one that runs none of its predecessors. Its parity archive was then missing
+  # and the reducer failed with "expected 13 parity archives, found 12" rather
+  # than naming the failed leg (runs 38106386550 and 38110887257: the
+  # integration leg failed). The job now runs once both builds succeeded, and
+  # its first step requires the success records of exactly the legs that own a
+  # node in its dependency closure, so a real predecessor failure still fails it.
   strict-compat:
     name: Portable strict compatibility
     needs: [select, build-debug, build-complete, test-debug]
-    if: needs.select.outputs.run_strict_compat != 'false'
+    if: >-
+      !cancelled()
+      && needs.select.outputs.run_strict_compat != 'false'
+      && needs.build-debug.result == 'success'
+      && needs.build-complete.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # e2e.manifest_compat_on_host is a manifest bucket with portable cells, so
@@ -1112,6 +1138,14 @@ jobs:
       E2E_RESULT_ROOT: /results/compat
     steps:
       - uses: actions/checkout@v4
+      - name: Download debug shard success records
+        uses: actions/download-artifact@v4
+        with:
+          pattern: debug-shard-ok-${{ github.run_id }}-${{ github.run_attempt }}-*
+          path: ignored/debug-shard-ok
+          merge-multiple: true
+      - name: Require the debug shards this job depends on
+        run: ./ci/debug-shard-success.sh require ignored/debug-shard-ok "$(jq -r '.strict_compat_nodes|join(",")' ci/portable-shards.json)"
       - name: Initialize submodules
         run: git submodule update --init --recursive
       - uses: Swatinem/rust-cache@v2
@@ -1614,6 +1648,15 @@ jobs:
           actual=$(find ignored/transport -maxdepth 1 -name '*.tar.zst' -type f | wc -l)
           [[ "$EXPECTED" =~ ^[0-9]+$ && "$actual" -eq "$EXPECTED" ]] || {
             echo "expected $EXPECTED parity archives, found $actual" >&2
+            # Name each absent archive: e2e matrix slugs keep _on_host, the
+            # strict-compat buckets' do not (ci/pack-parity-transport.sh calls).
+            jq -r '(.e2e_nodes[] | sub("^e2e\\.manifest_"; "")),
+                   (.strict_compat_nodes[] | select(startswith("e2e.manifest_"))
+                    | sub("^e2e\\.manifest_"; "") | sub("_on_host$"; ""))' ci/portable-shards.json |
+              while IFS= read -r slug; do
+                archive="ignored/transport/parity-v1-${{ github.run_id }}-${{ github.run_attempt }}-portable-$slug.tar.zst"
+                [[ -f "$archive" ]] || echo "missing parity archive: $archive" >&2
+              done
             exit 1
           }
 

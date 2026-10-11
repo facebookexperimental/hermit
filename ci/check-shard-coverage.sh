@@ -766,6 +766,30 @@ LINE
         grep -Fqx '          if [[ "$run_e2e" == "true" && "$run_strict" != "true" ]]; then' <<<"$workflow_text"
 }
 
+# GitHub reports one result for the whole test-debug matrix, so a strict-compat
+# job left on the default success() condition is skipped when any leg fails,
+# also one that runs none of its predecessors, and its parity archives never
+# reach the reducer (runs 38106386550 and 38110887257). Each leg records its
+# success and strict-compat, run under !cancelled() once both builds succeeded,
+# requires the records of exactly the legs its dependency closure needs
+# (ci/debug-shard-success.sh).
+workflow_strict_compat_dependency_contract() {
+    local workflow_text=$1 debug_body strict_body
+    debug_body=$(workflow_job_body test-debug "$workflow_text") || return 1
+    strict_body=$(workflow_job_body strict-compat "$workflow_text") || return 1
+    grep -Fqx '        run: ./ci/debug-shard-success.sh record "${{ matrix.slug }}" "${{ matrix.nodes }}"' \
+        <<<"$debug_body" &&
+        workflow_artifact_edge test-debug name \
+            'debug-shard-ok-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.slug }}' \
+            strict-compat pattern 'debug-shard-ok-${{ github.run_id }}-${{ github.run_attempt }}-*' \
+            "$workflow_text" &&
+        grep -Fqx '      !cancelled()' <<<"$strict_body" &&
+        grep -Fqx "      && needs.build-debug.result == 'success'" <<<"$strict_body" &&
+        grep -Fqx "      && needs.build-complete.result == 'success'" <<<"$strict_body" &&
+        grep -Fqx "        run: ./ci/debug-shard-success.sh require ignored/debug-shard-ok \"\$(jq -r '.strict_compat_nodes|join(\",\")' ci/portable-shards.json)\"" \
+            <<<"$strict_body"
+}
+
 workflow_wiring_contract() {
     local workflow_text=$1
 
@@ -1104,6 +1128,29 @@ for mutation in pack count; do
         status=1
     fi
 done
+
+if ! workflow_strict_compat_dependency_contract "$workflow_text"; then
+    echo "check-shard-coverage.sh: FAIL — strict-compat must run whenever its own debug predecessors succeeded: each test-debug leg records its success, and strict-compat runs under !cancelled() and requires the records of its predecessors' legs (ci/debug-shard-success.sh)" >&2
+    status=1
+fi
+for mutation in record require condition; do
+    case $mutation in
+    record) planted=${workflow_text/$'        run: ./ci/debug-shard-success.sh record "${{ matrix.slug }}" "${{ matrix.nodes }}"\n'/} ;;
+    require) planted=${workflow_text/$'        run: ./ci/debug-shard-success.sh require ignored/debug-shard-ok'/$'        run: true ignored/debug-shard-ok'} ;;
+    condition) planted=${workflow_text/$'      !cancelled()\n      && needs.select.outputs.run_strict_compat != \'false\''/$'      needs.select.outputs.run_strict_compat != \'false\''} ;;
+    esac
+    if [[ $planted == "$workflow_text" ]]; then
+        echo "check-shard-coverage.sh: FAIL — strict-compat dependency $mutation mutation did not change the workflow fixture" >&2
+        status=1
+    elif workflow_strict_compat_dependency_contract "$planted"; then
+        echo "check-shard-coverage.sh: FAIL — strict-compat dependency guard accepted a planted $mutation defect" >&2
+        status=1
+    fi
+done
+if ! "$ROOT_DIR/ci/debug-shard-success.sh" self-test; then
+    echo "check-shard-coverage.sh: FAIL — ci/debug-shard-success.sh self-test" >&2
+    status=1
+fi
 
 for step_name in 'Run constructed E2E node (${{ matrix.node }})' 'Run constructed E2E verdict'; do
     original="      - name: $step_name"
