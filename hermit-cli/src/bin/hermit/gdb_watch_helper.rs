@@ -12,6 +12,7 @@ use std::io::Read;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::net::TcpStream;
+use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
@@ -333,6 +334,8 @@ fn run(control_fd: RawFd, parent_fd: RawFd) -> Result<(), Error> {
             return Err(io::Error::last_os_error()).context("protect GDB helper descriptors");
         }
     }
+    super::retire_inherited_descriptors(&[stream.as_fd(), parent.as_fd()])
+        .context("retire unsolicited GDB helper descriptors; use a Linux environment that allows close_range")?;
     let spec = ClientCommand::receive(&mut stream)?;
     if parent_exited(parent.as_raw_fd())? {
         return Ok(());
@@ -433,7 +436,7 @@ mod tests {
         match run(control, parent) {
             Ok(()) => std::process::exit(0),
             Err(error) => {
-                eprintln!("GDB helper failed: {error:#}");
+                super::super::display_entry_error("GDB helper failed", &error);
                 std::process::exit(125);
             }
         }

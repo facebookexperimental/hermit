@@ -50,6 +50,8 @@ mod verify;
 mod version;
 use std::fs::File;
 use std::io;
+use std::os::fd::AsRawFd;
+use std::os::fd::BorrowedFd;
 use std::os::fd::FromRawFd;
 use std::path::Path;
 use std::sync::atomic::AtomicI32;
@@ -92,6 +94,43 @@ fn startup_stdin() -> io::Result<Option<File>> {
         Ok(None)
     } else {
         Err(io::Error::from_raw_os_error(errno))
+    }
+}
+
+/// Retire unsolicited caller descriptors before this exec image starts workers
+/// or creates its own resources. Private exec roles supply only borrowed handles
+/// from their already adopted owners; ordinary CLI entry supplies none.
+fn retire_inherited_descriptors(owned: &[BorrowedFd<'_>]) -> io::Result<()> {
+    let saved_stdin = STARTUP_STDIN.load(Ordering::Acquire);
+    if saved_stdin == STDIN_UNCAPTURED || saved_stdin == STDIN_TAKEN {
+        return Err(io::Error::other(
+            "startup stdin reservation is unavailable at CLI entry",
+        ));
+    }
+    // Negative capture results own no descriptor. Keep their encoding untouched:
+    // startup_stdin still interprets EBADF as closed input and propagates every
+    // other original error at the existing point that consumes the reservation.
+    let stdin_owner = (saved_stdin >= 3).then_some(saved_stdin as u32);
+    let mut first = 3;
+    loop {
+        let next_owner = stdin_owner
+            .into_iter()
+            .chain(owned.iter().map(|fd| fd.as_raw_fd() as u32))
+            .filter(|fd| *fd >= first)
+            .min();
+        let last = next_owner.map_or(u32::MAX, |fd| fd - 1);
+        if first <= last {
+            // SAFETY: close_range accesses this process's descriptor table, not
+            // memory. Entry is before workers; the retained owners remain alive
+            // throughout the call. Flags0 actually removes the other entries.
+            if unsafe { libc::syscall(libc::SYS_close_range, first, last, 0u32) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        match next_owner {
+            Some(fd) => first = fd + 1,
+            None => return Ok(()),
+        }
     }
 }
 
@@ -557,10 +596,14 @@ fn main() {
         match result {
             Ok(()) => return,
             Err(error) => {
-                eprintln!("GDB helper failed: {error:#}");
+                display_entry_error("GDB helper failed", &error);
                 std::process::exit(125);
             }
         }
+    }
+    if let Err(error) = retire_inherited_descriptors(&[]) {
+        let argv = std::env::args_os().collect::<Vec<_>>();
+        std::process::exit(refuse_entry_descriptor_failure(error, &argv));
     }
     // ⚠️ BEFORE ANYTHING THAT CAN FORK. The stderr diagnostic deadline is a total
     // for the INVOCATION, and the origin every hermit process measures from is a
@@ -663,6 +706,42 @@ fn main() {
     // Last, so that nothing hermit must say waits behind it.
     verify::write_queued_signal_reports();
     status.raise_or_exit();
+}
+
+fn stamp_entry_descriptor_failure(argv: &[std::ffi::OsString]) -> Result<(), Error> {
+    let expanded = run_config::expand_argv(&Args::command(), argv)?;
+    let argv = expanded.as_deref().unwrap_or(argv);
+    let matches = Args::command().try_get_matches_from(argv)?;
+    let args = args_from_matches_with_clock(&matches, std::time::SystemTime::now)?;
+    if let Some(path) = args.command.verification_json_path() {
+        write_pending_verification_json(path)?;
+    }
+    Ok(())
+}
+
+fn refuse_entry_descriptor_failure(error: io::Error, argv: &[std::ffi::OsString]) -> i32 {
+    block_write_signals_until_exit();
+    // Stamp before diagnostic output. Parsing serves only this pending record:
+    // neither clap's help/error exit nor a secondary failure replaces the saved
+    // cleanup errno and125. No normal CLI setup or guest execution follows.
+    let stamp = stamp_entry_descriptor_failure(argv);
+    display_entry_error(
+        "Inherited descriptor cleanup failed; use a Linux environment that allows close_range",
+        &error.into(),
+    );
+    if let Err(secondary) = stamp {
+        display_entry_error("Entry-failure verification stamp failed", &secondary);
+    }
+    HERMIT_INTERNAL_FAILURE_EXIT
+}
+
+fn display_entry_error(context: &str, error: &Error) {
+    block_write_signals_until_exit();
+    // This entry failure must terminate even if inherited stderr is full,
+    // blocking or broken. The existing one-attempt writer neither panics nor
+    // waits for a reader, changes shared stream flags or renews a deadline.
+    let report = format!("{context}: {error:#}\n");
+    hermit::nonwaiting_write::write_without_waiting(libc::STDERR_FILENO, report.as_bytes());
 }
 
 /// Block `SIGXFSZ` and `SIGPIPE` for the rest of the process. A write of
@@ -895,6 +974,417 @@ mod tests {
     use super::args_from_matches_with_clock;
     use super::classify_failure;
     use super::failure_exit_code;
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct EntryFdSnapshot {
+        device: libc::dev_t,
+        inode: libc::ino_t,
+        mode: libc::mode_t,
+        descriptor_flags: i32,
+        file_flags: i32,
+        offset: libc::off_t,
+    }
+
+    // Only stack values and async-signal-safe syscalls are used in the forked
+    // entry checks. No allocation, panic/unwind or libtest work runs there.
+    fn entry_fd_snapshot(fd: i32) -> Option<EntryFdSnapshot> {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: fstat writes exactly this valid stat buffer; fcntl/lseek access
+        // only the supplied descriptor. SEEK_CUR with offset0 changes no offset.
+        unsafe {
+            if libc::fstat(fd, stat.as_mut_ptr()) < 0 {
+                return None;
+            }
+            let stat = stat.assume_init();
+            let descriptor_flags = libc::fcntl(fd, libc::F_GETFD);
+            let file_flags = libc::fcntl(fd, libc::F_GETFL);
+            if descriptor_flags < 0 || file_flags < 0 {
+                return None;
+            }
+            Some(EntryFdSnapshot {
+                device: stat.st_dev,
+                inode: stat.st_ino,
+                mode: stat.st_mode,
+                descriptor_flags,
+                file_flags,
+                offset: libc::lseek(fd, 0, libc::SEEK_CUR),
+            })
+        }
+    }
+
+    fn entry_fd_is_closed(fd: i32) -> bool {
+        // SAFETY: fcntl touches no memory; its errno is read immediately.
+        (unsafe { libc::fcntl(fd, libc::F_GETFD) }) < 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::EBADF)
+    }
+
+    fn check_single_threaded_entry_child(check: impl FnOnce() -> i32) {
+        // SAFETY: the child has its own fdtable and only one surviving thread.
+        // Its callback uses stack operations/syscalls only, then _exit; it never
+        // unwinds or enters the multithreaded parent test runner.
+        let pid = unsafe { libc::fork() };
+        assert!(
+            pid >= 0,
+            "fork entry check: {}",
+            std::io::Error::last_os_error()
+        );
+        if pid == 0 {
+            let status = check();
+            // SAFETY: terminate only this owned child without Rust destructors.
+            unsafe { libc::_exit(status) };
+        }
+        let mut status = 0;
+        loop {
+            // SAFETY: wait only for this exact owned child, with valid output.
+            let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+            if waited < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            assert_eq!(waited, pid);
+            break;
+        }
+        assert_eq!(status, 0, "entry check child returned raw status {status}");
+    }
+
+    #[test]
+    fn entry_retires_unsolicited_fds_and_preserves_owned_streams() {
+        use std::io::Seek;
+        use std::os::fd::AsFd;
+        use std::os::fd::AsRawFd;
+        use std::os::fd::FromRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let mut streams = [
+            tempfile::tempfile().unwrap(),
+            tempfile::tempfile().unwrap(),
+            tempfile::tempfile().unwrap(),
+        ];
+        for (index, file) in streams.iter_mut().enumerate() {
+            file.seek(std::io::SeekFrom::Start(7 + index as u64))
+                .unwrap();
+        }
+        let (control, peer) = UnixStream::pair().unwrap();
+        // SAFETY: pidfd_open names this live process and returns an owned fd.
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0u32) } as i32;
+        assert!(
+            pidfd >= 0,
+            "pidfd_open: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: this successful syscall transfers ownership exactly once.
+        let parent = unsafe { std::os::fd::OwnedFd::from_raw_fd(pidfd) };
+        let unsolicited = [tempfile::tempfile().unwrap(), tempfile::tempfile().unwrap()];
+        let parent_fds = [
+            streams[0].as_raw_fd(),
+            streams[1].as_raw_fd(),
+            streams[2].as_raw_fd(),
+            control.as_raw_fd(),
+            peer.as_raw_fd(),
+            parent.as_raw_fd(),
+            unsolicited[0].as_raw_fd(),
+            unsolicited[1].as_raw_fd(),
+        ];
+        let parent_before = parent_fds.map(entry_fd_snapshot);
+        assert!(parent_before.iter().all(Option::is_some));
+        check_single_threaded_entry_child(|| {
+            for (fd, file) in streams.iter().enumerate() {
+                // SAFETY: dup2 changes only the child's table. The three distinct
+                // owned files give positions unaffected by parent harness output.
+                if unsafe { libc::dup2(file.as_raw_fd(), fd as i32) } < 0 {
+                    return 1;
+                }
+                // Include different descriptor flags in the preserved stdio.
+                if unsafe {
+                    libc::fcntl(
+                        fd as i32,
+                        libc::F_SETFD,
+                        if fd == 1 { libc::FD_CLOEXEC } else { 0 },
+                    )
+                } < 0
+                {
+                    return 2;
+                }
+            }
+            // SAFETY: this child is single-threaded and fd0 now names its own
+            // controlled input; execute the actual preinit capture operation.
+            unsafe { super::capture_startup_stdin() };
+            let saved = super::STARTUP_STDIN.load(std::sync::atomic::Ordering::Acquire);
+            if saved < 3 {
+                return 3;
+            }
+            let stdio_before = [0, 1, 2].map(entry_fd_snapshot);
+            let kept = [saved, control.as_raw_fd(), parent.as_raw_fd()];
+            let kept_before = kept.map(entry_fd_snapshot);
+            if kept_before.iter().any(Option::is_none) {
+                return 4;
+            }
+            // Deliberately reverse the two typed helper owners; range closure
+            // must not assume their numeric order or exempt a broad fd range.
+            if super::retire_inherited_descriptors(&[parent.as_fd(), control.as_fd()]).is_err() {
+                return 5;
+            }
+            if super::STARTUP_STDIN.load(std::sync::atomic::Ordering::Acquire) != saved
+                || [0, 1, 2].map(entry_fd_snapshot) != stdio_before
+                || kept.map(entry_fd_snapshot) != kept_before
+            {
+                return 6;
+            }
+            let removed = [
+                streams[0].as_raw_fd(),
+                streams[1].as_raw_fd(),
+                streams[2].as_raw_fd(),
+                peer.as_raw_fd(),
+                unsolicited[0].as_raw_fd(),
+                unsolicited[1].as_raw_fd(),
+            ];
+            if removed.into_iter().any(|fd| !entry_fd_is_closed(fd)) {
+                return 7;
+            }
+            match super::startup_stdin() {
+                Ok(Some(file))
+                    if file.as_raw_fd() == saved && entry_fd_snapshot(saved) == kept_before[0] =>
+                {
+                    0
+                }
+                _ => 8,
+            }
+        });
+        // The child neither closed the calling process's entries nor changed
+        // the retained file descriptions' flags or controlled positions.
+        assert_eq!(parent_fds.map(entry_fd_snapshot), parent_before);
+    }
+
+    #[test]
+    fn entry_leaves_captured_stdin_errors_for_the_original_consumer() {
+        use std::os::fd::AsRawFd;
+
+        let unsolicited = tempfile::tempfile().unwrap();
+        for closed in [true, false] {
+            check_single_threaded_entry_child(|| {
+                // SAFETY: this changes only the child's stdin or fd limit. A
+                // limit of3 makes the actual F_DUPFD_CLOEXEC(min3) return EINVAL.
+                let changed = unsafe {
+                    if libc::dup2(unsolicited.as_raw_fd(), 0) < 0 {
+                        return 1;
+                    }
+                    if closed {
+                        libc::close(0)
+                    } else {
+                        let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+                        if libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) < 0 {
+                            return 1;
+                        }
+                        let mut limit = limit.assume_init();
+                        limit.rlim_cur = 3;
+                        libc::setrlimit(libc::RLIMIT_NOFILE, &limit)
+                    }
+                };
+                if changed < 0 {
+                    return 2;
+                }
+                // SAFETY: same single-threaded actual capture as at CLI entry.
+                unsafe { super::capture_startup_stdin() };
+                let saved = super::STARTUP_STDIN.load(std::sync::atomic::Ordering::Acquire);
+                let expected_errno = if closed { libc::EBADF } else { libc::EINVAL };
+                if saved != -expected_errno - 1 {
+                    return 3;
+                }
+                if super::retire_inherited_descriptors(&[]).is_err()
+                    || super::STARTUP_STDIN.load(std::sync::atomic::Ordering::Acquire) != saved
+                    || !entry_fd_is_closed(unsolicited.as_raw_fd())
+                    || (closed && !entry_fd_is_closed(0))
+                {
+                    return 4;
+                }
+                match super::startup_stdin() {
+                    Ok(None) if closed => 0,
+                    Err(error) if !closed && error.raw_os_error() == Some(expected_errno) => 0,
+                    _ => 5,
+                }
+            });
+        }
+        assert!(entry_fd_snapshot(unsolicited.as_raw_fd()).is_some());
+    }
+
+    #[test]
+    fn entry_descriptor_failure_can_stamp_no_result_without_running_a_guest() {
+        use std::os::fd::AsRawFd;
+        use std::os::fd::FromRawFd;
+        use std::os::fd::OwnedFd;
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+        use std::process::Stdio;
+        use std::time::Duration;
+        use std::time::Instant;
+
+        const REPORT: &str = "HERMIT_TEST_ENTRY_DESCRIPTOR_REPORT";
+        const MODE: &str = "HERMIT_TEST_ENTRY_DESCRIPTOR_MODE";
+        if let Some(report) = std::env::var_os(REPORT) {
+            // A fresh exec image permits allocation/parsing without entering a
+            // forked copy of the multithreaded parent runner. The actual syscall
+            // is denied by its test-owned pre-exec filter below.
+            let error = super::retire_inherited_descriptors(&[]).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+            let argv = if std::env::var(MODE).unwrap() == "help" {
+                vec!["hermit".into(), "--help".into()]
+            } else {
+                vec![
+                    "hermit".into(),
+                    "run".into(),
+                    "--verify".into(),
+                    "--verify-json".into(),
+                    report,
+                    "--".into(),
+                    "/bin/true".into(),
+                ]
+            };
+            // Exercise the shared production refusal handler, not production
+            // main's private-role dispatch or a guest. Never return to libtest.
+            std::process::exit(super::refuse_entry_descriptor_failure(error, &argv));
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let report = directory.path().join("verification.json");
+        for mode in ["verify", "help"] {
+            std::fs::write(&report, b"{\"verified\":true}").unwrap();
+            let mut pipe = [-1; 2];
+            // SAFETY: a valid two-fd buffer; both successful outputs are owned.
+            assert_eq!(
+                unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+                0
+            );
+            let reader = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+            let writer = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+            let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
+            assert!(flags >= 0);
+            if mode == "verify" {
+                // Fill stderr, then restore its original blocking state before
+                // exec. Keep the reader alive without draining it. A plain
+                // diagnostic write here would hang; mutating O_NONBLOCK in the
+                // child would change this parent's retained description.
+                assert_eq!(
+                    unsafe {
+                        libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)
+                    },
+                    0
+                );
+                let bytes = [0u8; 4096];
+                loop {
+                    let result = unsafe {
+                        libc::write(writer.as_raw_fd(), bytes.as_ptr().cast(), bytes.len())
+                    };
+                    if result < 0 {
+                        assert_eq!(
+                            std::io::Error::last_os_error().raw_os_error(),
+                            Some(libc::EAGAIN)
+                        );
+                        break;
+                    }
+                }
+                assert_eq!(
+                    unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags) },
+                    0
+                );
+            } else {
+                // Broken stderr and clap help still cannot replace cleanup's
+                //125 with a write signal, panic or clap's successful exit.
+                drop(reader);
+            }
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "tests::entry_descriptor_failure_can_stamp_no_result_without_running_a_guest",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(REPORT, &report)
+                .env(MODE, mode)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::from(writer.try_clone().unwrap()));
+            // SAFETY: only stack BPF records and prctl run in the pre-exec
+            // child. No parent policy changes; the kernel copies the filter.
+            unsafe {
+                command.pre_exec(|| {
+                    let mut filter = [
+                        libc::sock_filter {
+                            code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+                            jt: 0,
+                            jf: 0,
+                            k: 0,
+                        },
+                        libc::sock_filter {
+                            code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+                            jt: 0,
+                            jf: 1,
+                            k: libc::SYS_close_range as u32,
+                        },
+                        libc::sock_filter {
+                            code: (libc::BPF_RET | libc::BPF_K) as u16,
+                            jt: 0,
+                            jf: 0,
+                            k: libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+                        },
+                        libc::sock_filter {
+                            code: (libc::BPF_RET | libc::BPF_K) as u16,
+                            jt: 0,
+                            jf: 0,
+                            k: libc::SECCOMP_RET_ALLOW,
+                        },
+                    ];
+                    let program = libc::sock_fprog {
+                        len: filter.len() as u16,
+                        filter: filter.as_mut_ptr(),
+                    };
+                    if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0
+                        || libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program)
+                            < 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let mut child = command.spawn().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let outcome = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break Ok(status),
+                    Ok(None) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    Ok(None) => {
+                        break Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "entry refusal did not terminate",
+                        ));
+                    }
+                    Err(error) => break Err(error),
+                }
+            };
+            let status = outcome.unwrap_or_else(|error| {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("entry refusal: {error}");
+            });
+            assert_eq!(status.code(), Some(hermit::HERMIT_INTERNAL_FAILURE_EXIT));
+            assert_eq!(
+                unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) },
+                flags
+            );
+            let actual: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+            if mode == "verify" {
+                assert_eq!(actual["verdict"], "no_result");
+                assert_eq!(actual["verified"], false);
+            } else {
+                // Help requests no verification destination; its parse result
+                // is secondary to125, not authority for this unrelated file.
+                assert_eq!(actual, serde_json::json!({"verified": true}));
+            }
+        }
+    }
 
     #[test]
     fn clap_configuration_is_valid() {

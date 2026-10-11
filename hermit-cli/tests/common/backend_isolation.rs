@@ -160,6 +160,373 @@ impl Record {
     }
 }
 
+pub const DESCRIPTOR_REQUEST_LIMIT: usize = 4096;
+pub const DESCRIPTOR_ARGUMENT_LIMIT: usize = 65_536;
+
+fn descriptor_decimal(value: &str, positive: bool) -> Result<u32, String> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("invalid descriptor identity {value:?}"));
+    }
+    let number: u32 = value.parse().map_err(|_| "descriptor identity overflow")?;
+    if number > i32::MAX as u32 || (positive && number == 0) || value != number.to_string() {
+        return Err(format!("noncanonical descriptor identity {value:?}"));
+    }
+    Ok(number)
+}
+
+fn descriptor_role(role: &str) -> Result<(), String> {
+    if matches!(role, "self" | "pid1") {
+        return Ok(());
+    }
+    let tid = role
+        .strip_prefix("pid1_task/")
+        .ok_or("unknown descriptor role")?;
+    descriptor_decimal(tid, true)?;
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct DescriptorKey {
+    role: String,
+    fd: u32,
+}
+
+impl DescriptorKey {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let (role, fd) = value.rsplit_once('/').ok_or("descriptor key lacks an FD")?;
+        descriptor_role(role)?;
+        Ok(Self {
+            role: role.to_owned(),
+            fd: descriptor_decimal(fd, false)?,
+        })
+    }
+
+    pub fn role(&self) -> &str {
+        &self.role
+    }
+    pub fn fd(&self) -> u32 {
+        self.fd
+    }
+    pub fn name(&self) -> String {
+        format!("{}/{}", self.role, self.fd)
+    }
+}
+
+/* Host-held requirements come from authenticated complete capture bytes. A
+ * captured unavailable view is retained as unavailable, not an empty proof. */
+#[derive(Clone, Debug)]
+pub struct DescriptorRequirements {
+    keys: BTreeSet<DescriptorKey>,
+    roles: BTreeSet<String>,
+    complete_views: BTreeSet<String>,
+    tasks_complete: bool,
+    unavailable: Vec<String>,
+}
+
+impl DescriptorRequirements {
+    pub fn from_prior(prior: &Observation) -> Result<Self, String> {
+        let mut roles: BTreeSet<String> = ["self", "pid1", "pid1_task/1"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        for record in &prior.records {
+            if matches!(
+                record.kind.as_str(),
+                "FD_DIRECTORY" | "FD_ENTRY" | "FD_SCAN_COMPLETE"
+            ) {
+                descriptor_role(&record.tag)?;
+                roles.insert(record.tag.clone());
+            }
+            if record.kind == "ENTRY" && record.tag == "pid1_tasks" {
+                let bytes = decode_hex(record.field("bytes")?)?;
+                let task = std::str::from_utf8(&bytes).map_err(|_| "non-ASCII prior task")?;
+                descriptor_decimal(task, true)?;
+                roles.insert(format!("pid1_task/{task}"));
+            }
+        }
+        let mut keys = BTreeSet::new();
+        for entry in prior
+            .records
+            .iter()
+            .filter(|record| record.kind == "FD_ENTRY")
+        {
+            if entry.fields.len() != 1 {
+                return Err("prior FD_ENTRY has unknown fields".to_owned());
+            }
+            let key = DescriptorKey::parse(&format!("{}/{}", entry.tag, entry.field("fd")?))?;
+            if !keys.insert(key) {
+                return Err("repeated prior FD_ENTRY".to_owned());
+            }
+        }
+        let mut complete_views = BTreeSet::new();
+        let mut unavailable = Vec::new();
+        let tasks_complete = match descriptor_tasks(prior) {
+            Ok(_) => true,
+            Err(error) => {
+                unavailable.push(error);
+                false
+            }
+        };
+        for role in &roles {
+            match prior.descriptor_inventory(role) {
+                Ok(_) => {
+                    complete_views.insert(role.clone());
+                }
+                Err(error) => unavailable.push(error),
+            }
+        }
+        let requirements = Self {
+            keys,
+            roles,
+            complete_views,
+            tasks_complete,
+            unavailable,
+        };
+        requirements.arguments()?;
+        Ok(requirements)
+    }
+
+    pub fn keys(&self) -> &BTreeSet<DescriptorKey> {
+        &self.keys
+    }
+    pub fn roles(&self) -> &BTreeSet<String> {
+        &self.roles
+    }
+    pub fn tasks_complete(&self) -> bool {
+        self.tasks_complete
+    }
+    pub fn view_complete(&self, role: &str) -> bool {
+        self.complete_views.contains(role)
+    }
+
+    pub fn arguments(&self) -> Result<Vec<String>, String> {
+        let mut keys = self.keys.clone();
+        // A controlled key also carries a prior unavailable role with no keys.
+        // It is a real operation request, never a fabricated FD_ENTRY.
+        for role in &self.roles {
+            for fd in 42..=44 {
+                keys.insert(DescriptorKey {
+                    role: role.clone(),
+                    fd,
+                });
+            }
+        }
+        let arguments: Vec<_> = keys.into_iter().map(|key| key.name()).collect();
+        if arguments.len() > DESCRIPTOR_REQUEST_LIMIT
+            || arguments.iter().map(|value| value.len() + 1).sum::<usize>()
+                > DESCRIPTOR_ARGUMENT_LIMIT
+        {
+            return Err("complete descriptor request set exceeds the guest bound".to_owned());
+        }
+        Ok(arguments)
+    }
+}
+
+fn descriptor_tasks(guest: &Observation) -> Result<BTreeSet<String>, String> {
+    let directory = guest.one("DIRECTORY", "pid1_tasks")?;
+    if directory.number("errno")? != 0 {
+        return Err("PID1 task directory is unavailable".to_owned());
+    }
+    let tasks = guest.directory("pid1_tasks")?;
+    if tasks.is_empty() {
+        return Err("PID1 has no observed task".to_owned());
+    }
+    let roles: BTreeSet<_> = tasks
+        .into_iter()
+        .map(|bytes| {
+            let value = std::str::from_utf8(&bytes).map_err(|_| "non-ASCII PID1 task")?;
+            descriptor_decimal(value, true)?;
+            Ok(format!("pid1_task/{value}"))
+        })
+        .collect::<Result<_, String>>()?;
+    if !roles.contains("pid1_task/1") {
+        return Err("required PID1 leader task is absent from the current list".to_owned());
+    }
+    Ok(roles)
+}
+
+fn descriptor_metadata_keys(
+    guest: Option<&Observation>,
+    role: &str,
+    requirements: Option<&DescriptorRequirements>,
+) -> Result<BTreeSet<i128>, String> {
+    let mut keys: BTreeSet<_> = requirements
+        .into_iter()
+        .flat_map(|required| required.keys.iter())
+        .filter(|key| key.role == role)
+        .map(|key| i128::from(key.fd))
+        .collect();
+    if let Some(guest) = guest {
+        for record in guest
+            .records
+            .iter()
+            .filter(|record| record.kind == "FD_ENTRY" && record.tag == role)
+        {
+            keys.insert(record.number("fd")?);
+        }
+    }
+    Ok(keys)
+}
+
+fn descriptor_capabilities(
+    guest: Option<&Observation>,
+    roles: &BTreeSet<String>,
+    requirements: Option<&DescriptorRequirements>,
+) -> BTreeSet<(String, String)> {
+    let mut required: BTreeSet<_> = ["self_fd42", "pid1_fd42", "pid1_thread_fd42"]
+        .into_iter()
+        .map(|tag| ("CAPABILITY".to_owned(), tag.to_owned()))
+        .collect();
+    for role in roles {
+        let mut keys: BTreeSet<_> = (42..=44).map(i128::from).collect();
+        // A malformed current entry cannot erase validated host-held names.
+        // Its numeric-view error is still retained by the checker below.
+        keys.extend(
+            descriptor_metadata_keys(None, role, requirements)
+                .expect("host requirements are validated"),
+        );
+        if let Some(guest) = guest {
+            for record in guest
+                .records
+                .iter()
+                .filter(|record| record.kind == "FD_ENTRY" && record.tag == *role)
+            {
+                if let Ok(fd) = record.number("fd") {
+                    keys.insert(fd);
+                }
+            }
+        }
+        for fd in keys {
+            let tag = format!("{role}/{fd}");
+            required.insert(("CAPABILITY".to_owned(), tag.clone()));
+            if role == "self" {
+                required.insert(("FD_OPENAT".to_owned(), tag));
+            }
+        }
+    }
+    if let Some(guest) = guest {
+        for record in &guest.records {
+            if matches!(record.kind.as_str(), "CAPABILITY" | "FD_OPENAT") {
+                required.insert((record.kind.clone(), record.tag.clone()));
+            }
+        }
+    }
+    required
+}
+
+fn unsigned_token(value: &str) -> Result<u64, String> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("invalid unsigned object token {value:?}"));
+    }
+    value
+        .parse()
+        .map_err(|_| format!("unsigned object token overflows u64: {value:?}"))
+}
+
+fn original_descriptor_objects(guest: &Observation) -> Result<BTreeSet<(u64, u64)>, String> {
+    let mut objects = BTreeSet::new();
+    for kind in ["HOST_DIRECTORY", "HOST_FILE", "HOST_SOCKET"] {
+        let record = guest.one(kind, "sentinel")?;
+        if record.fields.len() != 2 {
+            return Err(format!("{kind} has unknown or missing identity fields"));
+        }
+        objects.insert((
+            unsigned_token(record.field("dev")?)?,
+            unsigned_token(record.field("ino")?)?,
+        ));
+    }
+    Ok(objects)
+}
+
+struct DescriptorObject {
+    object: Option<(u64, u64)>,
+    error: u32,
+    mode: u32,
+}
+
+fn descriptor_object_record(record: &Record) -> Result<DescriptorObject, String> {
+    if record.fields.len() != 5 {
+        return Err(format!(
+            "{} {} has unknown or missing fields",
+            record.kind, record.tag
+        ));
+    }
+    let rc = record.field("rc")?;
+    let error = unsigned_token(record.field("errno")?)?;
+    let error: u32 = error.try_into().map_err(|_| "object errno exceeds u32")?;
+    let object = (
+        unsigned_token(record.field("dev")?)?,
+        unsigned_token(record.field("ino")?)?,
+    );
+    let mode = record.field("mode")?;
+    if mode.is_empty() || !mode.bytes().all(|byte| matches!(byte, b'0'..=b'7')) {
+        return Err("object mode is not unsigned octal".to_owned());
+    }
+    let mode = u32::from_str_radix(mode, 8).map_err(|_| "object mode overflow")?;
+    match (rc, error) {
+        ("0", 0) => Ok(DescriptorObject {
+            object: Some(object),
+            error,
+            mode,
+        }),
+        ("-1", error) if error > 0 => Ok(DescriptorObject {
+            object: None,
+            error,
+            mode,
+        }),
+        _ => Err(format!(
+            "{} {} has inconsistent return/errno",
+            record.kind, record.tag
+        )),
+    }
+}
+
+fn controlled_object(
+    guest: &Observation,
+    kind: &str,
+    role: &str,
+    fd: u32,
+) -> Result<(bool, String), String> {
+    let forbidden = original_descriptor_objects(guest)?;
+    let tag = format!("{role}/{fd}");
+    let observed = descriptor_object_record(guest.one(kind, &tag)?)?;
+    if let Some(object) = observed.object {
+        return Ok((
+            !forbidden.contains(&object),
+            format!(
+                "raw route/time object={object:?}; forbidden originals={forbidden:?}; a different object is not descriptor closure or whole-view authority"
+            ),
+        ));
+    }
+    if kind == "FD_SELF_OBJECT" && observed.error == 9 {
+        return Ok((true, "actual direct fstat returned EBADF at this slot/time; old marker and metadata predicates are unchanged".to_owned()));
+    }
+    if kind == "FD_PROC_OBJECT" && observed.error == 2 {
+        if role.starts_with("pid1_task/") && !descriptor_tasks(guest)?.contains(role) {
+            return Err(format!("{role} is not in the complete current task list"));
+        }
+        let parent = descriptor_object_record(guest.one("FD_PARENT", role)?)?;
+        if parent.object.is_none() || parent.mode & 0o170000 != 0o040000 {
+            return Err(format!(
+                "{role} FD parent is unavailable or not a directory"
+            ));
+        }
+        let numbers = guest.descriptor_inventory(role)?;
+        if numbers.contains(&i128::from(fd)) {
+            return Err(format!(
+                "{tag} ENOENT conflicts with the current numeric view"
+            ));
+        }
+        return Ok((
+            true,
+            format!(
+                "actual proc stat ENOENT plus separately observed same-role FD parent and complete numeric exclusion for {tag}; no atomic generation/native custody claim"
+            ),
+        ));
+    }
+    Err(format!("{kind} {tag} unavailable errno={}", observed.error))
+}
+
 #[derive(Clone, Debug)]
 pub struct Observation {
     records: Vec<Record>,
@@ -319,6 +686,24 @@ impl Observation {
         Ok(descriptors)
     }
 
+    fn descriptor_inventory(&self, role: &str) -> Result<BTreeSet<i128>, String> {
+        descriptor_role(role)?;
+        let numbers = self.descriptor_numbers(role)?;
+        if self.one("FD_DIRECTORY", role)?.number("errno")? != 0
+            || self.one("FD_SCAN_COMPLETE", role)?.number("errno")? != 0
+        {
+            return Err(format!("{role} inventory/scan has an error"));
+        }
+        for entry in self
+            .records
+            .iter()
+            .filter(|record| record.kind == "FD_ENTRY" && record.tag == role)
+        {
+            descriptor_decimal(entry.field("fd")?, false)?;
+        }
+        Ok(numbers)
+    }
+
     fn descriptor(&self, process: &str, fd: i128) -> Result<(i128, i128), String> {
         let tag = format!("{process}/{fd}");
         let object = self.object("STAT", &tag)?;
@@ -452,11 +837,30 @@ pub fn check_isolation(
     policy: NamespacePolicy,
     expected_cwd: &[u8],
 ) -> Vec<Assertion> {
+    check_isolation_with_descriptor_requirements(guest, native, policy, expected_cwd, None)
+}
+
+pub fn check_isolation_with_descriptor_requirements(
+    guest: Result<&Observation, String>,
+    native: Result<&Observation, String>,
+    policy: NamespacePolicy,
+    expected_cwd: &[u8],
+    requirements: Option<&DescriptorRequirements>,
+) -> Vec<Assertion> {
     let mut rows = Vec::new();
     let mut required_processes: BTreeSet<String> = ["self", "pid1", "pid1_task/1"]
         .into_iter()
         .map(str::to_owned)
         .collect();
+    if let Some(required) = requirements {
+        required_processes.extend(required.roles.iter().cloned());
+    }
+    // This separate state prevents an incomplete task list from making a
+    // subset-wide descriptor aggregate Match; known leaks still win below.
+    let current_tasks = guest
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|guest| descriptor_tasks(guest));
     assertion(
         &mut rows,
         "processes.pid1_tasks.complete",
@@ -804,6 +1208,15 @@ pub fn check_isolation(
             let mut leaked = Vec::new();
             let mut unavailable = Vec::new();
             let mut forbidden = Vec::new();
+            if let Err(error) = original_descriptor_objects(guest) {
+                unavailable.push(error);
+            }
+            if let Err(error) = &current_tasks {
+                unavailable.push(error.clone());
+            }
+            if let Some(required) = requirements {
+                unavailable.extend(required.unavailable.iter().cloned());
+            }
             for kind in ["HOST_DIRECTORY", "HOST_FILE", "HOST_SOCKET"] {
                 match guest.object(kind, "sentinel") {
                     Ok(object) => forbidden.push(object),
@@ -818,9 +1231,29 @@ pub fn check_isolation(
                         BTreeSet::new()
                     }
                 };
-                for fd in descriptors {
+                let metadata = match descriptor_metadata_keys(Some(guest), process, requirements) {
+                    Ok(keys) => keys,
+                    Err(error) => {
+                        unavailable.push(error);
+                        descriptors
+                    }
+                };
+                for fd in metadata {
                     if let Err(error) = guest.descriptor(process, fd) {
                         unavailable.push(error);
+                    }
+                }
+                for fd in 42..=44 {
+                    for kind in if process == "self" {
+                        &["FD_PROC_OBJECT", "FD_SELF_OBJECT"][..]
+                    } else {
+                        &["FD_PROC_OBJECT"][..]
+                    } {
+                        match controlled_object(guest, kind, process, fd) {
+                            Ok((false, _)) => leaked.push(format!("{kind} {process}/{fd}")),
+                            Ok((true, _)) => {}
+                            Err(error) => unavailable.push(error),
+                        }
                     }
                 }
                 let prefix = format!("{process}/");
@@ -867,25 +1300,20 @@ pub fn check_isolation(
         (|| {
             let guest = guest.as_ref().map_err(Clone::clone)?;
             let expected_marker = guest.object("HOST_FILE", "sentinel")?;
-            let mut required = BTreeSet::new();
+            let required = descriptor_capabilities(Some(guest), &required_processes, requirements);
             let mut unavailable = Vec::new();
-            for tag in ["self_fd42", "pid1_fd42", "pid1_thread_fd42"] {
-                required.insert(("CAPABILITY", tag.to_owned()));
+            if let Err(error) = &current_tasks {
+                unavailable.push(error.clone());
+            }
+            if let Some(required) = requirements {
+                unavailable.extend(required.unavailable.iter().cloned());
             }
             for process in &required_processes {
-                let descriptors = match guest.descriptor_numbers(process) {
-                    Ok(descriptors) => descriptors,
-                    Err(error) => {
-                        unavailable.push(error);
-                        BTreeSet::new()
-                    }
-                };
-                for fd in descriptors {
-                    let tag = format!("{process}/{fd}");
-                    required.insert(("CAPABILITY", tag.clone()));
-                    if process == "self" {
-                        required.insert(("FD_OPENAT", tag));
-                    }
+                if let Err(error) = guest.descriptor_numbers(process) {
+                    unavailable.push(error);
+                }
+                if let Err(error) = descriptor_metadata_keys(Some(guest), process, requirements) {
+                    unavailable.push(error);
                 }
             }
             let mut leaked = Vec::new();
@@ -927,29 +1355,42 @@ pub fn check_isolation(
             ))
         })(),
     );
-    if let Ok(guest) = guest.as_ref() {
-        let mut capabilities: BTreeSet<_> = ["self_fd42", "pid1_fd42", "pid1_thread_fd42"]
-            .into_iter()
-            .map(|tag| ("CAPABILITY".to_owned(), tag.to_owned()))
-            .collect();
-        for record in &guest.records {
-            if matches!(record.kind.as_str(), "CAPABILITY" | "FD_OPENAT") {
-                capabilities.insert((record.kind.clone(), record.tag.clone()));
+    let capabilities = descriptor_capabilities(
+        guest.as_ref().ok().copied(),
+        &required_processes,
+        requirements,
+    );
+    for (kind, tag) in capabilities {
+        assertion(
+            &mut rows,
+            format!("descriptors.capability.{kind}.{tag}"),
+            (|| {
+                let guest = guest.as_ref().map_err(Clone::clone)?;
+                let expected = guest.object("HOST_FILE", "sentinel")?;
+                let object = guest.one(&kind, &tag)?.marker_object()?;
+                Ok((
+                    object != Some(expected),
+                    format!("opened_marker={object:?}, original_marker={expected:?}"),
+                ))
+            })(),
+        );
+    }
+    for process in &required_processes {
+        for fd in 42..=44 {
+            for kind in if process == "self" {
+                &["FD_PROC_OBJECT", "FD_SELF_OBJECT"][..]
+            } else {
+                &["FD_PROC_OBJECT"][..]
+            } {
+                assertion(
+                    &mut rows,
+                    format!("descriptors.original_objects.{kind}.{process}/{fd}"),
+                    guest
+                        .as_ref()
+                        .map_err(Clone::clone)
+                        .and_then(|guest| controlled_object(guest, kind, process, fd)),
+                );
             }
-        }
-        for (kind, tag) in capabilities {
-            assertion(
-                &mut rows,
-                format!("descriptors.capability.{kind}.{tag}"),
-                (|| {
-                    let expected = guest.object("HOST_FILE", "sentinel")?;
-                    let object = guest.one(&kind, &tag)?.marker_object()?;
-                    Ok((
-                        object != Some(expected),
-                        format!("opened_marker={object:?}, original_marker={expected:?}"),
-                    ))
-                })(),
-            );
         }
     }
     for process in &required_processes {
@@ -959,7 +1400,8 @@ pub fn check_isolation(
             (|| {
                 let guest = guest.as_ref().map_err(Clone::clone)?;
                 let descriptors = guest.descriptor_numbers(process)?;
-                for fd in &descriptors {
+                let required = descriptor_metadata_keys(Some(guest), process, requirements)?;
+                for fd in &required {
                     guest.descriptor(process, *fd)?;
                 }
                 Ok((
@@ -988,37 +1430,34 @@ pub fn check_isolation(
             );
         }
     }
-    if let Ok(guest) = guest.as_ref() {
-        for process in &required_processes {
-            let numbers = guest
-                .records
-                .iter()
-                .filter(|record| record.kind == "FD_ENTRY" && record.tag == *process)
-                .map(|record| record.number("fd"))
-                .collect::<Result<BTreeSet<_>, _>>();
-            match numbers {
-                Ok(numbers) => {
-                    for fd in numbers {
-                        assertion(
-                            &mut rows,
-                            format!("descriptors.{process}.fd{fd}.complete"),
-                            (|| {
-                                let object = guest.descriptor(process, fd)?;
-                                Ok((
-                                    true,
-                                    format!(
-                                        "literal fd={fd}, complete object={object:?}; flags, target, fdinfo and capability retained"
-                                    ),
-                                ))
-                            })(),
-                        );
-                    }
-                }
-                Err(error) => rows.push(Assertion::unavailable(
+    for process in &required_processes {
+        let keys = descriptor_metadata_keys(guest.as_ref().ok().copied(), process, requirements);
+        let numbers = match keys {
+            Ok(keys) => keys,
+            Err(error) => {
+                rows.push(Assertion::unavailable(
                     format!("descriptors.{process}.numeric_entries"),
                     error,
-                )),
+                ));
+                descriptor_metadata_keys(None, process, requirements)
+                    .expect("host requirements are validated")
             }
+        };
+        for fd in numbers {
+            assertion(
+                &mut rows,
+                format!("descriptors.{process}.fd{fd}.complete"),
+                (|| {
+                    let guest = guest.as_ref().map_err(Clone::clone)?;
+                    let object = guest.descriptor(process, fd)?;
+                    Ok((
+                        true,
+                        format!(
+                            "literal fd={fd}, complete object={object:?}; flags, target, fdinfo and capability retained"
+                        ),
+                    ))
+                })(),
+            );
         }
     }
     rows
@@ -1258,5 +1697,249 @@ mod tests {
         let observation =
             Observation::parse(b"FILE value rc=2 errno=0 complete=1 bytes=78\n").unwrap();
         assert!(observation.file("value").is_err());
+    }
+    fn controlled_fixture(probe: &str) -> String {
+        format!(
+            "HOST_DIRECTORY sentinel dev=17 ino=22\nHOST_FILE sentinel dev=17 ino=23\nHOST_SOCKET sentinel dev=17 ino=24\n{probe}"
+        )
+    }
+
+    #[test]
+    fn closed_or_reused_controlled_slot_has_only_scoped_object_evidence() {
+        for probe in [
+            "FD_SELF_OBJECT self/42 rc=-1 errno=9 dev=0 ino=0 mode=0\n",
+            "FD_SELF_OBJECT self/42 rc=0 errno=0 dev=19 ino=20 mode=100644\n",
+        ] {
+            let guest = Observation::parse(controlled_fixture(probe).as_bytes()).unwrap();
+            assert!(
+                controlled_object(&guest, "FD_SELF_OBJECT", "self", 42)
+                    .unwrap()
+                    .0
+            );
+        }
+        let old = Observation::parse(
+            b"FD_OPENAT self/42 reachable=0 errno=9 stat_rc=-1 stat_errno=9 dev=0 ino=0\n",
+        )
+        .unwrap();
+        assert!(
+            old.one("FD_OPENAT", "self/42")
+                .unwrap()
+                .marker_object()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn controlled_slot_swap_cannot_hide_any_original_object() {
+        for ino in [22, 23, 24] {
+            let source = controlled_fixture(&format!(
+                "FD_SELF_OBJECT self/43 rc=0 errno=0 dev=17 ino={ino} mode=100644\n",
+            ));
+            let guest = Observation::parse(source.as_bytes()).unwrap();
+            assert!(
+                !controlled_object(&guest, "FD_SELF_OBJECT", "self", 43)
+                    .unwrap()
+                    .0
+            );
+            let rows = check_isolation(
+                Ok(&guest),
+                Err("no native authority".to_owned()),
+                NamespacePolicy::Private,
+                b"/fixture",
+            );
+            assert!(
+                rows.iter()
+                    .any(|row| row.name == "descriptors.inherited_objects"
+                        && row.verdict == Verdict::Mismatch)
+            );
+        }
+    }
+
+    #[test]
+    fn controlled_object_requires_unique_unsigned_references_and_actual_probe() {
+        let source =
+            controlled_fixture("FD_SELF_OBJECT self/42 rc=0 errno=0 dev=19 ino=20 mode=100644\n");
+        for changed in [
+            source.replace(
+                "HOST_DIRECTORY sentinel dev=17",
+                "HOST_DIRECTORY sentinel dev=-17",
+            ),
+            source.replace(
+                "HOST_SOCKET sentinel dev=17",
+                "HOST_SOCKET sentinel dev=18446744073709551616",
+            ),
+            format!("{source}HOST_FILE sentinel dev=17 ino=23\n"),
+            source.replace(
+                "FD_SELF_OBJECT self/42 rc=0",
+                "FD_SELF_OBJECT self/42 rc=-1",
+            ),
+            source.replace(
+                "FD_SELF_OBJECT self/42 rc=0 errno=0 dev=19 ino=20 mode=100644\n",
+                "",
+            ),
+            format!("{source}FD_SELF_OBJECT self/42 rc=0 errno=0 dev=19 ino=20 mode=100644\n"),
+        ] {
+            let guest = Observation::parse(changed.as_bytes()).unwrap();
+            assert!(controlled_object(&guest, "FD_SELF_OBJECT", "self", 42).is_err());
+        }
+        assert!(
+            Observation::parse(
+                source
+                    .replace("dev=19 ino=20", "dev=19 dev=17 ino=20")
+                    .as_bytes()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn proc_enoent_requires_the_same_role_parent_and_complete_numeric_view() {
+        let source = controlled_fixture(
+            "FD_PROC_OBJECT self/42 rc=-1 errno=2 dev=0 ino=0 mode=0\nFD_PARENT self rc=0 errno=0 dev=3 ino=4 mode=40500\nFD_DIRECTORY self rc=3 errno=0\nFD_ENTRY self fd=3\nFD_SCAN_COMPLETE self rc=0 errno=0\n",
+        );
+        let guest = Observation::parse(source.as_bytes()).unwrap();
+        assert!(
+            controlled_object(&guest, "FD_PROC_OBJECT", "self", 42)
+                .unwrap()
+                .0
+        );
+        for changed in [
+            source.replace("FD_PARENT self rc=0 errno=0 dev=3 ino=4 mode=40500\n", ""),
+            source.replace(
+                "FD_PARENT self rc=0 errno=0",
+                "FD_PARENT self rc=-1 errno=13",
+            ),
+            source.replace("FD_ENTRY self fd=3\n", ""),
+            source.replace("FD_ENTRY self fd=3", "FD_ENTRY self fd=42"),
+            source.replace(
+                "FD_SCAN_COMPLETE self rc=0 errno=0",
+                "FD_SCAN_COMPLETE self rc=-1 errno=9",
+            ),
+        ] {
+            let guest = Observation::parse(changed.as_bytes()).unwrap();
+            assert!(controlled_object(&guest, "FD_PROC_OBJECT", "self", 42).is_err());
+        }
+        let task = source.replace("self", "pid1_task/4");
+        let guest = Observation::parse(
+            format!("{task}DIRECTORY pid1_tasks rc=3 errno=0\nENTRY pid1_tasks bytes=31\n")
+                .as_bytes(),
+        )
+        .unwrap();
+        assert!(controlled_object(&guest, "FD_PROC_OBJECT", "pid1_task/4", 42).is_err());
+    }
+
+    #[test]
+    fn incomplete_or_duplicate_task_list_cannot_shrink_descriptor_aggregate() {
+        for tasks in [
+            "DIRECTORY pid1_tasks rc=-1 errno=13\n",
+            "DIRECTORY pid1_tasks rc=4 errno=0\nENTRY pid1_tasks bytes=31\nENTRY pid1_tasks bytes=31\n",
+            "DIRECTORY pid1_tasks rc=4 errno=0\nENTRY pid1_tasks bytes=31\n",
+        ] {
+            let guest = Observation::parse(tasks.as_bytes()).unwrap();
+            let prior = DescriptorRequirements::from_prior(&guest).unwrap();
+            assert!(!prior.tasks_complete());
+            assert!(prior.roles().contains("pid1_task/1"));
+            let rows = check_isolation_with_descriptor_requirements(
+                Ok(&guest),
+                Err("no native authority".to_owned()),
+                NamespacePolicy::Private,
+                b"/fixture",
+                Some(&prior),
+            );
+            for name in [
+                "descriptors.inherited_objects",
+                "descriptors.proc_and_direct_capabilities",
+            ] {
+                assert!(
+                    rows.iter()
+                        .any(|row| row.name == name && row.verdict == Verdict::NoResult)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vanished_prior_key_keeps_original_named_operations_and_errors() {
+        let before = Observation::parse(descriptor_fixture().as_bytes()).unwrap();
+        let required = DescriptorRequirements::from_prior(&before).unwrap();
+        let after = controlled_fixture(
+            "FD_DIRECTORY self rc=2 errno=0\nFD_SCAN_COMPLETE self rc=0 errno=0\nSTAT self/42 rc=-1 errno=2 dev=0 ino=0 mode=0 nlink=0\nLINK self/42 rc=-1 errno=2 complete=1 bytes=\nFILE self/42 rc=-1 errno=2 complete=0 bytes=\nFD_FLAGS self/42 flags=-1 flags_errno=9 mode=-1 mode_errno=9\nFD_OPENAT self/42 reachable=0 errno=9 stat_rc=-1 stat_errno=9 dev=0 ino=0\nCAPABILITY self/42 reachable=0 errno=2 stat_rc=-1 stat_errno=2 dev=0 ino=0\nFD_SELF_OBJECT self/42 rc=-1 errno=9 dev=0 ino=0 mode=0\n",
+        );
+        let guest = Observation::parse(after.as_bytes()).unwrap();
+        let rows = check_isolation_with_descriptor_requirements(
+            Ok(&guest),
+            Err("no native authority".to_owned()),
+            NamespacePolicy::Private,
+            b"/fixture",
+            Some(&required),
+        );
+        for (name, expected) in [
+            ("descriptors.self.fd42.complete", Verdict::NoResult),
+            ("descriptors.capability.CAPABILITY.self/42", Verdict::Match),
+            (
+                "descriptors.capability.FD_OPENAT.self/42",
+                Verdict::NoResult,
+            ),
+            (
+                "descriptors.original_objects.FD_SELF_OBJECT.self/42",
+                Verdict::Match,
+            ),
+        ] {
+            let actual: Vec<_> = rows.iter().filter(|row| row.name == name).collect();
+            assert_eq!(actual.len(), 1);
+            assert_eq!(actual[0].verdict, expected);
+        }
+        assert!(
+            required
+                .arguments()
+                .unwrap()
+                .contains(&"pid1_task/1/42".to_owned())
+        );
+    }
+
+    #[test]
+    fn malformed_current_entries_do_not_remove_prior_required_names() {
+        let before = Observation::parse(b"FD_DIRECTORY self rc=3 errno=0\nFD_ENTRY self fd=5\nFD_SCAN_COMPLETE self rc=0 errno=0\n").unwrap();
+        let required = DescriptorRequirements::from_prior(&before).unwrap();
+        let current = Observation::parse(controlled_fixture(
+            "FD_DIRECTORY self rc=4 errno=0\nFD_ENTRY self fd=bad\nFD_ENTRY self fd=7\nFD_SCAN_COMPLETE self rc=0 errno=0\n",
+        ).as_bytes()).unwrap();
+        let current_rows = check_isolation_with_descriptor_requirements(
+            Ok(&current),
+            Err("no native authority".to_owned()),
+            NamespacePolicy::Private,
+            b"/fixture",
+            Some(&required),
+        );
+        for name in [
+            "descriptors.capability.CAPABILITY.self/7",
+            "descriptors.capability.FD_OPENAT.self/7",
+            "descriptors.self.numeric_entries",
+        ] {
+            let matching: Vec<_> = current_rows.iter().filter(|row| row.name == name).collect();
+            assert_eq!(matching.len(), 1);
+            assert_eq!(matching[0].verdict, Verdict::NoResult);
+        }
+        let parse_error = Observation::parse(b"FD_ENTRY self fd=5 fd=bad\n")
+            .err()
+            .unwrap();
+        for guest in [Ok(&current), Err(parse_error)] {
+            let rows = check_isolation_with_descriptor_requirements(
+                guest,
+                Err("no native authority".to_owned()),
+                NamespacePolicy::Private,
+                b"/fixture",
+                Some(&required),
+            );
+            for name in [
+                "descriptors.capability.CAPABILITY.self/5",
+                "descriptors.capability.FD_OPENAT.self/5",
+                "descriptors.self.fd5.complete",
+            ] {
+                let matching: Vec<_> = rows.iter().filter(|row| row.name == name).collect();
+                assert_eq!(matching.len(), 1);
+                assert_eq!(matching[0].verdict, Verdict::NoResult);
+            }
+        }
     }
 }

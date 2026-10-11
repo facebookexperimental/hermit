@@ -144,13 +144,176 @@ static void capability(const char *tag, const char *path) {
     if (fd >= 0) close(fd);
 }
 
-static void descriptors(const char *tag, const char *base) {
+#define DESCRIPTOR_REQUEST_LIMIT 4096U
+#define DESCRIPTOR_ARGUMENT_LIMIT 65536U
+
+struct descriptor_request {
+    char role[32];
+    int fd;
+    int attempted;
+};
+static struct descriptor_request descriptor_requests[DESCRIPTOR_REQUEST_LIMIT];
+static size_t descriptor_request_count;
+static int task_one_probed;
+
+static int decimal(const char *value, int positive, int *number) {
+    if (!value[0] || (value[0] == '0' && value[1])) return -1;
+    unsigned int result = 0;
+    for (const unsigned char *p = (const unsigned char *)value; *p; ++p) {
+        if (*p < '0' || *p > '9' || result > (INT_MAX - (*p - '0')) / 10U) return -1;
+        result = result * 10U + (*p - '0');
+    }
+    if (positive && !result) return -1;
+    *number = (int)result;
+    return 0;
+}
+
+/* The host authenticates the complete prior capture. These argv keys only
+ * request real operations; they do not certify a process or inventory. */
+static int descriptor_arguments(int argc, char **argv) {
+    size_t bytes = 0;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--descriptor-obligation")) continue;
+        if (++i == argc) return -1;
+        const char *value = argv[i];
+        const char *slash = strrchr(value, '/');
+        if (!slash || slash == value || !slash[1]) return -1;
+        size_t length = (size_t)(slash - value);
+        if (length >= sizeof(descriptor_requests[0].role)) return -1;
+        char role[32] = {0};
+        memcpy(role, value, length);
+        if (strcmp(role, "self") && strcmp(role, "pid1")) {
+            int tid;
+            if (strncmp(role, "pid1_task/", 10) || decimal(role + 10, 1, &tid)) return -1;
+        }
+        int fd;
+        if (decimal(slash + 1, 0, &fd)) return -1;
+        if (descriptor_request_count == DESCRIPTOR_REQUEST_LIMIT ||
+            strlen(value) + 1 > DESCRIPTOR_ARGUMENT_LIMIT - bytes) return -1;
+        bytes += strlen(value) + 1;
+        for (size_t n = 0; n < descriptor_request_count; ++n) {
+            if (descriptor_requests[n].fd == fd && !strcmp(descriptor_requests[n].role, role)) return -1;
+        }
+        struct descriptor_request *request = &descriptor_requests[descriptor_request_count++];
+        memcpy(request->role, role, length + 1);
+        request->fd = fd;
+    }
+    return 0;
+}
+
+static void descriptor_objects(const char *tag, const char *base) {
     char path[PATH_MAX], key[128];
+    struct stat st = {0};
+    snprintf(path, sizeof(path), "%s/fd", base);
+    errno = 0;
+    int rc = stat(path, &st);
+    int error = rc < 0 ? errno : 0;
+    printf("FD_PARENT %s rc=%d errno=%d dev=%llu ino=%llu mode=%o\n",
+           tag, rc, error, (unsigned long long)st.st_dev,
+           (unsigned long long)st.st_ino, st.st_mode);
+    for (int fd = 42; fd <= 44; ++fd) {
+        snprintf(key, sizeof(key), "%s/%d", tag, fd);
+        snprintf(path, sizeof(path), "%s/fd/%d", base, fd);
+        memset(&st, 0, sizeof(st));
+        errno = 0;
+        rc = stat(path, &st);
+        error = rc < 0 ? errno : 0;
+        printf("FD_PROC_OBJECT %s rc=%d errno=%d dev=%llu ino=%llu mode=%o\n",
+               key, rc, error, (unsigned long long)st.st_dev,
+               (unsigned long long)st.st_ino, st.st_mode);
+        if (!strcmp(tag, "self")) {
+            memset(&st, 0, sizeof(st));
+            errno = 0;
+            rc = fstat(fd, &st);
+            error = rc < 0 ? errno : 0;
+            printf("FD_SELF_OBJECT %s rc=%d errno=%d dev=%llu ino=%llu mode=%o\n",
+                   key, rc, error, (unsigned long long)st.st_dev,
+                   (unsigned long long)st.st_ino, st.st_mode);
+        }
+    }
+}
+
+static void descriptor_marker(const char *tag, const char *base, long fd) {
+    char path[PATH_MAX], key[128];
+    snprintf(key, sizeof(key), "%s/%ld", tag, fd);
+    if (!strcmp(tag, "self")) {
+        errno = 0;
+        int marker = openat((int)fd, "descriptor-marker", O_RDONLY | O_CLOEXEC);
+        int marker_error = marker < 0 ? errno : 0;
+        struct stat marker_object = {0};
+        errno = 0;
+        int marker_stat = marker < 0 ? -1 : fstat(marker, &marker_object);
+        int marker_stat_error = marker_stat < 0 ? (marker < 0 ? marker_error : errno) : 0;
+        printf("FD_OPENAT %s reachable=%d errno=%d stat_rc=%d stat_errno=%d dev=%llu ino=%llu\n",
+               key, marker >= 0, marker_error, marker_stat, marker_stat_error,
+               (unsigned long long)marker_object.st_dev, (unsigned long long)marker_object.st_ino);
+        if (marker >= 0) close(marker);
+    }
+    snprintf(path, sizeof(path), "%s/fd/%ld/descriptor-marker", base, fd);
+    capability(key, path);
+}
+
+static void descriptor_probe(const char *tag, const char *base, long fd) {
+    char path[PATH_MAX], key[128];
+    snprintf(key, sizeof(key), "%s/%ld", tag, fd);
+    snprintf(path, sizeof(path), "%s/fd/%ld", base, fd);
+    stat_path(key, path);
+    link_path(key, path);
+    snprintf(path, sizeof(path), "%s/fdinfo/%ld", base, fd);
+    file(key, path);
+    if (!strcmp(tag, "self")) {
+        errno = 0;
+        int flags = fcntl((int)fd, F_GETFD);
+        int flags_error = flags < 0 ? errno : 0;
+        errno = 0;
+        int mode = fcntl((int)fd, F_GETFL);
+        int mode_error = mode < 0 ? errno : 0;
+        printf("FD_FLAGS %s flags=%d flags_errno=%d mode=%d mode_errno=%d\n",
+               key, flags, flags_error, mode, mode_error);
+    }
+    descriptor_marker(tag, base, fd);
+    for (size_t n = 0; n < descriptor_request_count; ++n) {
+        if (descriptor_requests[n].fd == fd && !strcmp(descriptor_requests[n].role, tag))
+            descriptor_requests[n].attempted = 1;
+    }
+}
+
+static int listed_descriptor(const long *numbers, size_t used, long fd) {
+    for (size_t n = 0; n < used; ++n) if (numbers[n] == fd) return 1;
+    return 0;
+}
+
+static void additional_descriptors(const char *tag, const char *base,
+                                   const long *numbers, size_t used) {
+    for (size_t n = 0; n < descriptor_request_count; ++n) {
+        struct descriptor_request *request = &descriptor_requests[n];
+        if (!strcmp(request->role, tag) && !request->attempted)
+            descriptor_probe(tag, base, request->fd);
+    }
+    for (int fd = 42; fd <= 44; ++fd) {
+        int requested = 0;
+        for (size_t n = 0; n < descriptor_request_count; ++n) {
+            if (descriptor_requests[n].fd == fd && !strcmp(descriptor_requests[n].role, tag))
+                requested = 1;
+        }
+        if (!requested && !listed_descriptor(numbers, used, fd))
+            descriptor_marker(tag, base, fd);
+    }
+}
+
+static void descriptors(const char *tag, const char *base) {
+    char path[PATH_MAX];
+    if (!strcmp(tag, "pid1_task/1")) task_one_probed = 1;
+    descriptor_objects(tag, base);
     snprintf(path, sizeof(path), "%s/fd", base);
     errno = 0;
     DIR *stream = opendir(path);
     int error = stream ? 0 : errno;
-    if (!stream) { printf("FD_DIRECTORY %s rc=-1 errno=%d\n", tag, error); return; }
+    if (!stream) {
+        printf("FD_DIRECTORY %s rc=-1 errno=%d\n", tag, error);
+        additional_descriptors(tag, base, NULL, 0);
+        return;
+    }
     long numbers[4096];
     size_t used = 0;
     int count = 0;
@@ -169,7 +332,11 @@ static void descriptors(const char *tag, const char *base) {
     }
     printf("FD_DIRECTORY %s rc=%d errno=%d\n", tag, error ? -1 : count, error);
     printf("FD_SCANNER %s fd=%d\n", tag, dirfd(stream));
-    if (error) { closedir(stream); return; }
+    if (error) {
+        closedir(stream);
+        additional_descriptors(tag, base, NULL, 0);
+        return;
+    }
     /* Keep the scanner alive until every listed descriptor is probed. Its
      * actual descriptor number and object remain part of the full surface. */
     for (size_t i = 0; i < used; ++i) {
@@ -177,37 +344,11 @@ static void descriptors(const char *tag, const char *base) {
         printf("FD_ENTRY %s fd=%ld\n", tag, fd);
     }
     for (size_t i = 0; i < used; ++i) {
-            long fd = numbers[i];
-            snprintf(key, sizeof(key), "%s/%ld", tag, fd);
-            snprintf(path, sizeof(path), "%s/fd/%ld", base, fd);
-            stat_path(key, path);
-            link_path(key, path);
-            snprintf(path, sizeof(path), "%s/fdinfo/%ld", base, fd);
-            file(key, path);
-            if (!strcmp(tag, "self")) {
-                errno = 0;
-                int flags = fcntl((int)fd, F_GETFD);
-                int flags_error = flags < 0 ? errno : 0;
-                errno = 0;
-                int mode = fcntl((int)fd, F_GETFL);
-                int mode_error = mode < 0 ? errno : 0;
-                printf("FD_FLAGS %s flags=%d flags_errno=%d mode=%d mode_errno=%d\n",
-                       key, flags, flags_error, mode, mode_error);
-                errno = 0;
-                int marker = openat((int)fd, "descriptor-marker", O_RDONLY | O_CLOEXEC);
-                int marker_error = marker < 0 ? errno : 0;
-                struct stat marker_object = {0};
-                errno = 0;
-                int marker_stat = marker < 0 ? -1 : fstat(marker, &marker_object);
-                int marker_stat_error = marker_stat < 0 ? (marker < 0 ? marker_error : errno) : 0;
-                printf("FD_OPENAT %s reachable=%d errno=%d stat_rc=%d stat_errno=%d dev=%llu ino=%llu\n",
-                       key, marker >= 0, marker_error, marker_stat, marker_stat_error,
-                       (unsigned long long)marker_object.st_dev, (unsigned long long)marker_object.st_ino);
-                if (marker >= 0) close(marker);
-            }
-            snprintf(path, sizeof(path), "%s/fd/%ld/descriptor-marker", base, fd);
-            capability(key, path);
+        if (!listed_descriptor(numbers, i, numbers[i]))
+            descriptor_probe(tag, base, numbers[i]);
     }
+    /* A missing numeric entry never suppresses a requested operation. */
+    additional_descriptors(tag, base, numbers, used);
     errno = 0;
     int closed = closedir(stream);
     printf("FD_SCAN_COMPLETE %s rc=%d errno=%d\n", tag, closed, closed < 0 ? errno : 0);
@@ -235,6 +376,7 @@ static void process(const char *tag, const char *base) {
 }
 
 int main(int argc, char **argv) {
+    if (descriptor_arguments(argc, argv)) return 2;
     int barrier = 0;
     const char *metadata_mode = "raw";
     for (int i = 1; i < argc; ++i) {
@@ -298,6 +440,18 @@ int main(int argc, char **argv) {
             free(tasks[i]);
         }
         free(tasks);
+    }
+    /* Seeded task1 and prior tasks remain attempted when today's task list is
+     * unavailable or different. Canonical paths are operations, not role proof. */
+    if (!task_one_probed) descriptors("pid1_task/1", "/proc/1/task/1");
+    for (size_t n = 0; n < descriptor_request_count; ++n) {
+        struct descriptor_request *request = &descriptor_requests[n];
+        if (request->attempted) continue;
+        char path[128];
+        if (!strcmp(request->role, "self")) snprintf(path, sizeof(path), "/proc/self");
+        else if (!strcmp(request->role, "pid1")) snprintf(path, sizeof(path), "/proc/1");
+        else snprintf(path, sizeof(path), "/proc/1/task/%s", request->role + 10);
+        descriptors(request->role, path);
     }
     const char *const names[] = {"root", "tmp", "proc", "sys", "dev", "cwd", "shm", "devpts", "cgroup"};
     const char *const paths[] = {"/", "/tmp", "/proc", "/sys", "/dev", ".", "/dev/shm", "/dev/pts", "/sys/fs/cgroup"};

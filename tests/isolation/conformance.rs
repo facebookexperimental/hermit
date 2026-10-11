@@ -215,6 +215,8 @@ fn run() -> Result<bool, String> {
     let mut safehermit = None;
     let mut artifacts = None;
     let mut installation = None;
+    let mut descriptor_obligations = None;
+    let mut descriptor_obligations_sha256 = None;
     let mut backends = None;
     let mut roots = None;
     let mut paths = None;
@@ -229,7 +231,7 @@ fn run() -> Result<bool, String> {
             println!("Usage: conformance.rs --hermit PATH --artifacts DIR [OPTIONS]");
             println!("Defaults to every required backend, root, path, and namespace policy.");
             println!(
-                "Options: --repository DIR --safehermit PATH --installation DIR --backends LIST --roots LIST --paths LIST --policies LIST --assert-scope full|launch-migration --list"
+                "Options: --repository DIR --safehermit PATH --installation DIR --backends LIST --roots LIST --paths LIST --policies LIST --descriptor-obligations FILE --descriptor-obligations-sha256 HEX --assert-scope full|launch-migration --list"
             );
             println!(
                 "Missing resources and incomplete observations fail requested cells. A selected scope makes no broader parity claim."
@@ -262,6 +264,22 @@ fn run() -> Result<bool, String> {
             "--safehermit" => safehermit = Some(PathBuf::from(value)),
             "--artifacts" => artifacts = Some(PathBuf::from(value)),
             "--installation" => installation = Some(PathBuf::from(value)),
+            "--descriptor-obligations" => {
+                if descriptor_obligations
+                    .replace(PathBuf::from(value))
+                    .is_some()
+                {
+                    return Err("--descriptor-obligations is repeated".to_owned());
+                }
+            }
+            "--descriptor-obligations-sha256" => {
+                if descriptor_obligations_sha256
+                    .replace(value.to_owned())
+                    .is_some()
+                {
+                    return Err("--descriptor-obligations-sha256 is repeated".to_owned());
+                }
+            }
             "--backends" => backends = Some(value.to_owned()),
             "--roots" => roots = Some(value.to_owned()),
             "--paths" => paths = Some(value.to_owned()),
@@ -334,6 +352,11 @@ fn run() -> Result<bool, String> {
             "launch-migration scope requires an explicit host/run-raw/private selection".to_owned(),
         );
     }
+    let descriptor_registry = match (descriptor_obligations, descriptor_obligations_sha256) {
+        (None, None) => None,
+        (Some(path), Some(expected)) => Some(driver::load_descriptor_registry(&path, &expected, &cells)?),
+        _ => return Err("--descriptor-obligations and --descriptor-obligations-sha256 must be supplied together".to_owned()),
+    };
     if list {
         for cell in cells {
             println!("{}", cell.name());
@@ -344,12 +367,13 @@ fn run() -> Result<bool, String> {
     let artifacts = artifacts
         .ok_or("--artifacts is required and must name a fresh ignored/ or target/ directory")?;
     let safehermit = safehermit.map_or_else(|| driver::find_safehermit(&repository), Ok)?;
-    let prepared = driver::Prepared::build_with_installation(
+    let prepared = driver::Prepared::build_with_installation_and_registry(
         &repository,
         &hermit,
         &safehermit,
         &artifacts,
         installation.as_deref(),
+        descriptor_registry,
     )?;
     let mut matches = true;
     let mut collected = Vec::new();

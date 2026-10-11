@@ -10,11 +10,13 @@
 //! The native collector's exit is recorded separately from the actual CLI exit.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
 use std::fs::File;
 use std::io::Read;
 use std::io::Write;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -163,6 +165,580 @@ pub fn required_cells() -> Vec<Cell> {
     cells
 }
 
+const DESCRIPTOR_INPUT_LIMIT: u64 = 16 * 1024 * 1024;
+
+#[derive(Debug)]
+struct DescriptorInputRecord<'a> {
+    kind: &'a str,
+    tag: &'a str,
+    fields: BTreeMap<&'a str, &'a str>,
+}
+
+impl<'a> DescriptorInputRecord<'a> {
+    fn field(&self, name: &str) -> Result<&'a str, String> {
+        self.fields
+            .get(name)
+            .copied()
+            .ok_or_else(|| format!("{} {} lacks {name}", self.kind, self.tag))
+    }
+
+    fn fields_are(&self, names: &[&str]) -> Result<(), String> {
+        if self.fields.keys().copied().collect::<BTreeSet<_>>() != names.iter().copied().collect() {
+            return Err(format!(
+                "{} {} has missing or unknown fields",
+                self.kind, self.tag
+            ));
+        }
+        Ok(())
+    }
+
+    fn count(&self, name: &str) -> Result<usize, String> {
+        descriptor_input_number(self.field(name)?)
+    }
+}
+
+fn descriptor_input_records(bytes: &[u8]) -> Result<Vec<DescriptorInputRecord<'_>>, String> {
+    let text = std::str::from_utf8(bytes).map_err(|_| "descriptor input is not ASCII")?;
+    if !text.is_ascii() || !text.ends_with('\n') {
+        return Err("descriptor input is non-ASCII or incomplete".to_owned());
+    }
+    text.lines()
+        .enumerate()
+        .map(|(index, line)| {
+            let mut words = line.split_ascii_whitespace();
+            let kind = words
+                .next()
+                .ok_or_else(|| format!("empty descriptor record {}", index + 1))?;
+            let tag = words.next().ok_or("descriptor record lacks tag")?;
+            let mut fields = BTreeMap::new();
+            for word in words {
+                let (key, value) = word
+                    .split_once('=')
+                    .ok_or("untyped descriptor input field")?;
+                if key.is_empty() || fields.insert(key, value).is_some() {
+                    return Err("empty or duplicate descriptor input field".to_owned());
+                }
+            }
+            Ok(DescriptorInputRecord { kind, tag, fields })
+        })
+        .collect()
+}
+
+fn descriptor_input_number(value: &str) -> Result<usize, String> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("invalid descriptor input index/count".to_owned());
+    }
+    let number: usize = value
+        .parse()
+        .map_err(|_| "descriptor input count overflow")?;
+    if value != number.to_string() {
+        return Err("noncanonical descriptor input index/count".to_owned());
+    }
+    Ok(number)
+}
+
+fn descriptor_hash(value: &str, length: usize) -> Result<(), String> {
+    if value.len() != length
+        || !value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(format!(
+            "descriptor input requires a {length}-digit lowercase hash"
+        ));
+    }
+    Ok(())
+}
+
+fn descriptor_input_hex(value: &str) -> Result<Vec<u8>, String> {
+    if !value.len().is_multiple_of(2) {
+        return Err("odd descriptor input hex".to_owned());
+    }
+    value
+        .as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| {
+            let digit = |byte| match byte {
+                b'0'..=b'9' => Ok(byte - b'0'),
+                b'a'..=b'f' => Ok(byte - b'a' + 10),
+                _ => Err("invalid descriptor input hex".to_owned()),
+            };
+            Ok((digit(pair[0])? << 4) | digit(pair[1])?)
+        })
+        .collect()
+}
+
+fn descriptor_input_one<'a, 'b>(
+    records: &'a [DescriptorInputRecord<'b>],
+    kind: &str,
+    tag: &str,
+) -> Result<&'a DescriptorInputRecord<'b>, String> {
+    let mut matching = records
+        .iter()
+        .filter(|record| record.kind == kind && record.tag == tag);
+    let one = matching
+        .next()
+        .ok_or_else(|| format!("missing descriptor input {kind} {tag}"))?;
+    if matching.next().is_some() {
+        return Err(format!("duplicate descriptor input {kind} {tag}"));
+    }
+    Ok(one)
+}
+
+fn descriptor_raw_reference(
+    records: &[DescriptorInputRecord<'_>],
+    kind: &str,
+    tag: &str,
+    fd: Option<u32>,
+) -> Result<Option<usize>, String> {
+    let mut matching = Vec::new();
+    for (index, record) in records.iter().enumerate() {
+        if record.kind == kind
+            && record.tag == tag
+            && fd.is_none_or(|fd| record.fields.get("fd").copied() == Some(fd.to_string().as_str()))
+        {
+            matching.push(index + 1);
+        }
+    }
+    match matching.as_slice() {
+        [] => Ok(None),
+        [index] => Ok(Some(*index)),
+        _ => Err(format!("ambiguous prior operation {kind} {tag}")),
+    }
+}
+
+fn descriptor_reference(value: &str, actual: Option<usize>) -> Result<(), String> {
+    let requested = if value == "-" {
+        None
+    } else {
+        Some(descriptor_input_number(value)?)
+    };
+    if requested != actual {
+        return Err(format!(
+            "prior reference mismatch: requested={requested:?}, actual={actual:?}"
+        ));
+    }
+    Ok(())
+}
+
+type DescriptorPriorRows = BTreeMap<String, Vec<(String, String)>>;
+
+fn descriptor_prior_rows(bytes: &[u8]) -> Result<DescriptorPriorRows, String> {
+    let text = std::str::from_utf8(bytes).map_err(|_| "prior assertion table is not ASCII")?;
+    if !text.is_ascii() || !text.ends_with('\n') {
+        return Err("prior assertion table is incomplete".to_owned());
+    }
+    let mut rows = DescriptorPriorRows::new();
+    let allowed: BTreeSet<_> = required_cells().iter().map(Cell::name).collect();
+    let mut header = false;
+    for line in text.lines().filter(|line| !line.starts_with('#')) {
+        if line == "cell\trow_index\tname_hex\tverdict\tdetail_hex" && !header {
+            header = true;
+            continue;
+        }
+        if !header {
+            return Err("prior assertion table lacks its exact header".to_owned());
+        }
+        let fields: Vec<_> = line.split('\t').collect();
+        let [cell, index, name, verdict, detail] = fields.as_slice() else {
+            return Err("prior assertion table has an untyped row".to_owned());
+        };
+        if !allowed.contains(*cell) || !matches!(*verdict, "match" | "mismatch" | "no_result") {
+            return Err("prior assertion table has an unknown cell or verdict".to_owned());
+        }
+        let name = String::from_utf8(descriptor_input_hex(name)?)
+            .map_err(|_| "prior assertion name is not UTF-8")?;
+        String::from_utf8(descriptor_input_hex(detail)?)
+            .map_err(|_| "prior assertion detail is not UTF-8")?;
+        let cell_rows = rows.entry((*cell).to_owned()).or_default();
+        if descriptor_input_number(index)? != cell_rows.len() {
+            return Err("prior assertion index is missing or repeated".to_owned());
+        }
+        cell_rows.push((name, (*verdict).to_owned()));
+    }
+    if !header || rows.is_empty() {
+        return Err("empty prior assertion table".to_owned());
+    }
+    Ok(rows)
+}
+
+fn descriptor_assertion_reference(
+    rows: &[(String, String)],
+    name: &str,
+) -> Result<Option<usize>, String> {
+    let indices: Vec<_> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.0 == name)
+        .map(|(index, _)| index)
+        .collect();
+    match indices.as_slice() {
+        [] => Ok(None),
+        [index] => Ok(Some(*index)),
+        _ => Err(format!("ambiguous prior assertion name {name}")),
+    }
+}
+
+pub struct DescriptorRegistry {
+    bytes: Vec<u8>,
+    references: BTreeMap<PathBuf, String>,
+    cells: BTreeMap<String, conformance::DescriptorRequirements>,
+}
+
+fn descriptor_bound_file(
+    record: &DescriptorInputRecord<'_>,
+    path_field: &str,
+    hash_field: &str,
+    references: &mut BTreeMap<PathBuf, String>,
+) -> Result<Vec<u8>, String> {
+    let expected = record.field(hash_field)?;
+    descriptor_hash(expected, 64)?;
+    let raw_path = descriptor_input_hex(record.field(path_field)?)?;
+    if raw_path.contains(&0) {
+        return Err("descriptor input path contains NUL".to_owned());
+    }
+    let path = PathBuf::from(OsString::from_vec(raw_path));
+    if !path.is_absolute()
+        || !fs::metadata(&path)
+            .map_err(|error| format!("descriptor evidence: {error}"))?
+            .is_file()
+    {
+        return Err("descriptor evidence must be a named absolute regular file".to_owned());
+    }
+    let bytes = read_bounded(&path, 64 * 1024 * 1024)?;
+    if digest_bytes(&bytes)? != expected {
+        return Err(format!(
+            "descriptor evidence content changed: {}",
+            path.display()
+        ));
+    }
+    if references
+        .insert(path.clone(), expected.to_owned())
+        .is_some_and(|prior| prior != expected)
+    {
+        return Err(format!(
+            "conflicting descriptor evidence hashes: {}",
+            path.display()
+        ));
+    }
+    Ok(bytes)
+}
+
+fn validate_descriptor_cell(
+    cell: &str,
+    records: &[DescriptorInputRecord<'_>],
+    raw: &[u8],
+    rows: &[(String, String)],
+) -> Result<conformance::DescriptorRequirements, String> {
+    let observation = Observation::parse(raw)?;
+    let prior = conformance::DescriptorRequirements::from_prior(&observation)?;
+    let raw_records = descriptor_input_records(raw)?;
+    let declaration = descriptor_input_one(records, "CELL", cell)?;
+    for (field, name) in [
+        ("guest_complete", "guest.complete"),
+        ("native_complete", "native.complete"),
+    ] {
+        let index = descriptor_assertion_reference(rows, name)?
+            .ok_or("prior completeness row is missing")?;
+        if declaration.field(field)? != rows[index].1
+            || !matches!(declaration.field(field)?, "match" | "no_result")
+        {
+            return Err(format!(
+                "prior {field} declaration does not match its retained row"
+            ));
+        }
+    }
+    let tasks = descriptor_input_one(records, "TASKS", cell)?;
+    let task_state = if prior.tasks_complete() {
+        "complete_numeric"
+    } else {
+        "unavailable_numeric"
+    };
+    if tasks.field("state")? != task_state || tasks.count("required_roles")? != prior.roles().len()
+    {
+        return Err("prior task coverage declaration mismatch".to_owned());
+    }
+    descriptor_reference(
+        tasks.field("directory_line")?,
+        descriptor_raw_reference(&raw_records, "DIRECTORY", "pid1_tasks", None)?,
+    )?;
+    let mut views = BTreeSet::new();
+    let mut keys = BTreeSet::new();
+    for record in records.iter().filter(|record| {
+        matches!(record.kind, "VIEW" | "KEY") && record.fields.get("cell").copied() == Some(cell)
+    }) {
+        let role = record.field("role")?;
+        if !prior.roles().contains(role) {
+            return Err(format!("unobserved prior descriptor role {role}"));
+        }
+        if record.kind == "VIEW" {
+            if record.tag != format!("{cell}/{role}") || !views.insert(role.to_owned()) {
+                return Err("noncanonical or duplicate prior view".to_owned());
+            }
+            let state = if prior.view_complete(role) {
+                "complete_numeric"
+            } else {
+                "unavailable_numeric"
+            };
+            if record.field("state")? != state
+                || record.count("key_count")?
+                    != prior.keys().iter().filter(|key| key.role() == role).count()
+            {
+                return Err("prior numeric view declaration mismatch".to_owned());
+            }
+            descriptor_reference(
+                record.field("fd_directory_line")?,
+                descriptor_raw_reference(&raw_records, "FD_DIRECTORY", role, None)?,
+            )?;
+            descriptor_reference(
+                record.field("fd_scan_line")?,
+                descriptor_raw_reference(&raw_records, "FD_SCAN_COMPLETE", role, None)?,
+            )?;
+        } else {
+            let key =
+                conformance::DescriptorKey::parse(&format!("{role}/{}", record.field("fd")?))?;
+            if record.tag != format!("{cell}/{}", key.name()) || !keys.insert(key.clone()) {
+                return Err("noncanonical or duplicate prior key".to_owned());
+            }
+            descriptor_reference(
+                record.field("fd_entry_line")?,
+                descriptor_raw_reference(&raw_records, "FD_ENTRY", role, Some(key.fd()))?,
+            )?;
+            for (field, kind) in [
+                ("stat_line", "STAT"),
+                ("link_line", "LINK"),
+                ("fdinfo_line", "FILE"),
+                ("capability_line", "CAPABILITY"),
+                ("flags_line", "FD_FLAGS"),
+                ("openat_line", "FD_OPENAT"),
+            ] {
+                descriptor_reference(
+                    record.field(field)?,
+                    descriptor_raw_reference(&raw_records, kind, &key.name(), None)?,
+                )?;
+            }
+            for (field, name) in [
+                (
+                    "metadata_index",
+                    format!("descriptors.{role}.fd{}.complete", key.fd()),
+                ),
+                (
+                    "capability_index",
+                    format!("descriptors.capability.CAPABILITY.{}", key.name()),
+                ),
+                (
+                    "openat_index",
+                    format!("descriptors.capability.FD_OPENAT.{}", key.name()),
+                ),
+            ] {
+                descriptor_reference(
+                    record.field(field)?,
+                    descriptor_assertion_reference(rows, &name)?,
+                )?;
+            }
+        }
+    }
+    if views != *prior.roles() || keys != *prior.keys() {
+        return Err("descriptor input must retain the complete prior role/FD keysets".to_owned());
+    }
+    Ok(prior)
+}
+
+fn descriptor_registry_shape<'a>(records: &[DescriptorInputRecord<'a>]) -> Result<(), String> {
+    let Some(first) = records.first() else {
+        return Err("empty descriptor registry".to_owned());
+    };
+    let Some(last) = records.last() else {
+        return Err("empty descriptor registry".to_owned());
+    };
+    if first.kind != "SCHEMA"
+        || first.tag != "descriptor-obligations-v1"
+        || first.field("version")? != "1"
+        || last.kind != "END"
+        || last.tag != "descriptor-obligations-v1"
+    {
+        return Err("descriptor registry schema or final boundary is missing".to_owned());
+    }
+    for record in records {
+        let fields: &[&str] = match record.kind {
+            "SCHEMA" => &["version"],
+            "SOURCE" => &[
+                "head",
+                "tree",
+                "reverie",
+                "observer_sha256",
+                "cli_sha256",
+                "bundle",
+            ],
+            "EVIDENCE" => &["sha256", "path_hex"],
+            "CELL" => &[
+                "stdout_sha256",
+                "stdout_path_hex",
+                "assertions_sha256",
+                "assertions_path_hex",
+                "guest_complete",
+                "native_complete",
+            ],
+            "TASKS" => &["state", "directory_line", "required_roles"],
+            "VIEW" => &[
+                "cell",
+                "role",
+                "state",
+                "fd_directory_line",
+                "fd_scan_line",
+                "key_count",
+            ],
+            "KEY" => &[
+                "cell",
+                "role",
+                "fd",
+                "fd_entry_line",
+                "stat_line",
+                "link_line",
+                "fdinfo_line",
+                "capability_line",
+                "flags_line",
+                "openat_line",
+                "metadata_index",
+                "capability_index",
+                "openat_index",
+            ],
+            "END" => &["cells", "views", "keys"],
+            _ => {
+                return Err(format!(
+                    "unknown descriptor registry record {}",
+                    record.kind
+                ));
+            }
+        };
+        record.fields_are(fields)?;
+    }
+    for (kind, tag) in [
+        ("SCHEMA", "descriptor-obligations-v1"),
+        ("SOURCE", "before"),
+        ("END", "descriptor-obligations-v1"),
+    ] {
+        descriptor_input_one(records, kind, tag)?;
+        if records.iter().filter(|record| record.kind == kind).count() != 1 {
+            return Err(format!("unexpected descriptor registry {kind} tag"));
+        }
+    }
+    Ok(())
+}
+
+/// The caller's frozen expected digest admits the source/observer custody tuple.
+/// Every named byte reference and the full prior keyset is checked independently;
+/// an unavailable semantic observation is not malformed registry input.
+pub fn load_descriptor_registry(
+    path: &Path,
+    expected_sha256: &str,
+    selected_cells: &[Cell],
+) -> Result<DescriptorRegistry, String> {
+    descriptor_hash(expected_sha256, 64)?;
+    let path = path
+        .canonicalize()
+        .map_err(|error| format!("descriptor registry: {error}"))?;
+    if !fs::metadata(&path)
+        .map_err(|error| format!("descriptor registry: {error}"))?
+        .is_file()
+    {
+        return Err("descriptor registry must be a regular file".to_owned());
+    }
+    let bytes = read_bounded(&path, DESCRIPTOR_INPUT_LIMIT)?;
+    if digest_bytes(&bytes)? != expected_sha256 {
+        return Err("descriptor registry does not match the admitted whole-input hash".to_owned());
+    }
+    let records = descriptor_input_records(&bytes)?;
+    descriptor_registry_shape(&records)?;
+    let source = descriptor_input_one(&records, "SOURCE", "before")?;
+    for name in ["head", "tree", "reverie"] {
+        descriptor_hash(source.field(name)?, 40)?;
+    }
+    for name in ["observer_sha256", "cli_sha256", "bundle"] {
+        descriptor_hash(source.field(name)?, 64)?;
+    }
+    let mut references = BTreeMap::from([(path, expected_sha256.to_owned())]);
+    let mut evidence = BTreeMap::new();
+    for record in records.iter().filter(|record| record.kind == "EVIDENCE") {
+        let bytes = descriptor_bound_file(record, "path_hex", "sha256", &mut references)?;
+        if evidence.insert(record.tag, bytes).is_some() {
+            return Err("duplicate descriptor custody evidence".to_owned());
+        }
+    }
+    let labels: BTreeSet<_> = [
+        "operands",
+        "recipe",
+        "sequence",
+        "controller",
+        "before_job",
+        "before_observations",
+        "before_assertions",
+        "before_product",
+        "observer_product",
+    ]
+    .into_iter()
+    .collect();
+    if evidence.keys().copied().collect::<BTreeSet<_>>() != labels {
+        return Err("descriptor registry lacks its exact custody evidence".to_owned());
+    }
+    let rows = descriptor_prior_rows(&evidence["before_assertions"])?;
+    let allowed: BTreeSet<_> = required_cells().iter().map(Cell::name).collect();
+    let mut cells = BTreeMap::new();
+    for record in records.iter().filter(|record| record.kind == "CELL") {
+        if !allowed.contains(record.tag) || cells.contains_key(record.tag) {
+            return Err("unknown or duplicate descriptor registry cell".to_owned());
+        }
+        let raw =
+            descriptor_bound_file(record, "stdout_path_hex", "stdout_sha256", &mut references)?;
+        descriptor_bound_file(
+            record,
+            "assertions_path_hex",
+            "assertions_sha256",
+            &mut references,
+        )?;
+        let prior_rows = rows
+            .get(record.tag)
+            .ok_or("prior assertion cell is missing")?;
+        cells.insert(
+            record.tag.to_owned(),
+            validate_descriptor_cell(record.tag, &records, &raw, prior_rows)?,
+        );
+    }
+    if cells.is_empty()
+        || selected_cells
+            .iter()
+            .any(|cell| !cells.contains_key(&cell.name()))
+    {
+        return Err("descriptor registry does not cover every selected cell".to_owned());
+    }
+    for record in records
+        .iter()
+        .filter(|record| matches!(record.kind, "TASKS" | "VIEW" | "KEY"))
+    {
+        let cell = if record.kind == "TASKS" {
+            record.tag
+        } else {
+            record.field("cell")?
+        };
+        if !cells.contains_key(cell) {
+            return Err("orphan descriptor registry record".to_owned());
+        }
+    }
+    let end = descriptor_input_one(&records, "END", "descriptor-obligations-v1")?;
+    for (field, kind) in [("cells", "CELL"), ("views", "VIEW"), ("keys", "KEY")] {
+        if end.count(field)? != records.iter().filter(|record| record.kind == kind).count() {
+            return Err("descriptor registry final count mismatch".to_owned());
+        }
+    }
+    Ok(DescriptorRegistry {
+        bytes,
+        references,
+        cells,
+    })
+}
+
 pub struct Prepared {
     pub repository: PathBuf,
     pub hermit: PathBuf,
@@ -173,6 +749,7 @@ pub struct Prepared {
     executor: Executor,
     input_inventory: String,
     cohort_inputs: BTreeMap<String, CohortInput>,
+    descriptor_registry: Option<DescriptorRegistry>,
 }
 
 // Only ordinary host routes adopt this fixture. Named, covered-root and replay
@@ -721,6 +1298,21 @@ fn input_inventory(prepared: &Prepared) -> Result<String, String> {
             digest(&prepared.repository.join(source))?
         ));
     }
+    if let Some(registry) = &prepared.descriptor_registry {
+        for (path, expected) in &registry.references {
+            let actual = digest(path)?;
+            if actual != *expected {
+                return Err(format!(
+                    "authenticated descriptor evidence changed: {}",
+                    path.display()
+                ));
+            }
+            rows.push(format!(
+                "DESCRIPTOR_INPUT reference sha256={actual} path_hex={}\n",
+                hex_bytes(path.as_os_str().as_encoded_bytes())
+            ));
+        }
+    }
     inventory_tree(&prepared.installation, &prepared.installation, &mut rows)?;
     Ok(rows.concat())
 }
@@ -1250,6 +1842,24 @@ impl Prepared {
         artifacts: &Path,
         installation: Option<&Path>,
     ) -> Result<Self, String> {
+        Self::build_with_installation_and_registry(
+            repository,
+            hermit,
+            safehermit,
+            artifacts,
+            installation,
+            None,
+        )
+    }
+
+    pub fn build_with_installation_and_registry(
+        repository: &Path,
+        hermit: &Path,
+        safehermit: &Path,
+        artifacts: &Path,
+        installation: Option<&Path>,
+        descriptor_registry: Option<DescriptorRegistry>,
+    ) -> Result<Self, String> {
         let safehermit = safehermit
             .canonicalize()
             .map_err(|error| format!("safehermit: {error}"))?;
@@ -1259,6 +1869,7 @@ impl Prepared {
             Executor::SafeHermit(safehermit),
             artifacts,
             installation,
+            descriptor_registry,
         )
     }
 
@@ -1291,6 +1902,7 @@ impl Prepared {
             },
             artifacts,
             None,
+            None,
         )
     }
 
@@ -1300,6 +1912,7 @@ impl Prepared {
         executor: Executor,
         artifacts: &Path,
         installation: Option<&Path>,
+        descriptor_registry: Option<DescriptorRegistry>,
     ) -> Result<Self, String> {
         let repository = repository
             .canonicalize()
@@ -1395,6 +2008,21 @@ impl Prepared {
             std::env::current_exe()
                 .map_err(|error| format!("Rust collector executable: {error}"))?,
         ];
+        if let Some(registry) = &descriptor_registry {
+            let snapshot = artifacts.join("descriptor-obligations.tsv");
+            fs::write(&snapshot, &registry.bytes)
+                .map_err(|error| format!("descriptor input snapshot: {error}"))?;
+            producers.push(snapshot);
+            for (path, expected) in &registry.references {
+                if digest(path)? != *expected {
+                    return Err(format!(
+                        "descriptor evidence changed before preparation: {}",
+                        path.display()
+                    ));
+                }
+                producers.push(path.clone());
+            }
+        }
         for (snapshot, source) in VERIFICATION_INPUTS {
             let path = artifacts.join(snapshot);
             fs::copy(repository.join(source), &path)
@@ -1431,6 +2059,7 @@ impl Prepared {
             executor,
             input_inventory: String::new(),
             cohort_inputs,
+            descriptor_registry,
         };
         fs::write(
             prepared.artifacts.join("installation-root.hex"),
@@ -1603,11 +2232,16 @@ impl Prepared {
             .cohort_inputs
             .get(&cohort_key(&cell))
             .map_or_else(|| directory.join("workdir"), CohortInput::workdir);
-        let mut assertions = conformance::check_isolation(
+        let requirements = self
+            .descriptor_registry
+            .as_ref()
+            .and_then(|registry| registry.cells.get(&cell.name()));
+        let mut assertions = conformance::check_isolation_with_descriptor_requirements(
             guest.as_ref().map_err(Clone::clone),
             native.as_ref().map_err(Clone::clone),
             cell.policy,
             expected_cwd.as_os_str().as_encoded_bytes(),
+            requirements,
         );
         let cli_exit = native
             .as_ref()
@@ -1773,6 +2407,16 @@ impl Prepared {
         ]);
         if cell.path == "verify-normal" {
             arguments.push("--normal-metadata".into());
+        }
+        if let Some(registry) = &self.descriptor_registry {
+            let required = registry
+                .cells
+                .get(&cell.name())
+                .ok_or("descriptor registry lacks this exact cell")?;
+            for key in required.arguments()? {
+                arguments.push("--descriptor-obligation".into());
+                arguments.push(key.into());
+            }
         }
         let invocation = arguments
             .iter()
@@ -2072,5 +2716,131 @@ mod executor_controls {
         assert!(native_outcome(cli.as_bytes()).is_err());
         assert!(native_outcome(format!("{cli}{footer}{footer}").as_bytes()).is_err());
         assert!(native_outcome(format!("{cli}{}", footer.trim_end()).as_bytes()).is_err());
+    }
+    fn prior_descriptor_fixture() -> (String, String, Vec<(String, String)>) {
+        let cell = "ptrace:host:run-raw:private";
+        let raw = String::from(
+            "FD_DIRECTORY self rc=3 errno=0\nFD_ENTRY self fd=42\nFD_SCAN_COMPLETE self rc=0 errno=0\nSTAT self/42 rc=0 errno=0 dev=17 ino=22 mode=100644 nlink=1\nLINK self/42 rc=1 errno=0 complete=1 bytes=78\nFILE self/42 rc=-1 errno=13 complete=0 bytes=\nCAPABILITY self/42 reachable=0 errno=20\nFD_FLAGS self/42 flags=0 flags_errno=0 mode=0 mode_errno=0\nFD_OPENAT self/42 reachable=0 errno=20\nDIRECTORY pid1_tasks rc=3 errno=0\nENTRY pid1_tasks bytes=31\nFD_DIRECTORY pid1 rc=-1 errno=13\nFD_DIRECTORY pid1_task/1 rc=-1 errno=13\n",
+        );
+        let declarations = format!(
+            "CELL {cell} guest_complete=no_result native_complete=no_result\nTASKS {cell} state=complete_numeric directory_line=10 required_roles=3\nVIEW {cell}/self cell={cell} role=self state=complete_numeric fd_directory_line=1 fd_scan_line=3 key_count=1\nVIEW {cell}/pid1 cell={cell} role=pid1 state=unavailable_numeric fd_directory_line=12 fd_scan_line=- key_count=0\nVIEW {cell}/pid1_task/1 cell={cell} role=pid1_task/1 state=unavailable_numeric fd_directory_line=13 fd_scan_line=- key_count=0\nKEY {cell}/self/42 cell={cell} role=self fd=42 fd_entry_line=2 stat_line=4 link_line=5 fdinfo_line=6 capability_line=7 flags_line=8 openat_line=9 metadata_index=2 capability_index=3 openat_index=4\n",
+        );
+        let rows = [
+            ("guest.complete", "no_result"),
+            ("native.complete", "no_result"),
+            ("descriptors.self.fd42.complete", "no_result"),
+            ("descriptors.capability.CAPABILITY.self/42", "match"),
+            ("descriptors.capability.FD_OPENAT.self/42", "match"),
+        ]
+        .into_iter()
+        .map(|(name, verdict)| (name.to_owned(), verdict.to_owned()))
+        .collect();
+        (raw, declarations, rows)
+    }
+
+    #[test]
+    fn complete_prior_registry_keeps_unavailable_views_without_selecting_a_subset() {
+        let (raw, declarations, rows) = prior_descriptor_fixture();
+        let records = descriptor_input_records(declarations.as_bytes()).unwrap();
+        let required = validate_descriptor_cell(
+            "ptrace:host:run-raw:private",
+            &records,
+            raw.as_bytes(),
+            &rows,
+        )
+        .unwrap();
+        assert_eq!(required.keys().len(), 1);
+        assert_eq!(required.roles().len(), 3);
+        assert!(required.view_complete("self"));
+        assert!(!required.view_complete("pid1"));
+        for omitted in [
+            declarations
+                .lines()
+                .filter(|line| !line.starts_with("KEY "))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+            declarations
+                .lines()
+                .filter(|line| !line.contains("role=pid1 "))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        ] {
+            let records = descriptor_input_records(omitted.as_bytes()).unwrap();
+            assert!(
+                validate_descriptor_cell(
+                    "ptrace:host:run-raw:private",
+                    &records,
+                    raw.as_bytes(),
+                    &rows
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn prior_registry_refuses_changed_raw_references_duplicates_and_cell_roles() {
+        let (raw, declarations, rows) = prior_descriptor_fixture();
+        let key = declarations
+            .lines()
+            .find(|line| line.starts_with("KEY "))
+            .unwrap();
+        for changed in [
+            format!("{declarations}{key}\n"),
+            declarations.replace("fd_entry_line=2", "fd_entry_line=1"),
+            declarations.replace("metadata_index=2", "metadata_index=3"),
+            declarations.replace("fd=42", "fd=042"),
+            declarations.replace("role=self", "role=pid1_task/0"),
+            declarations.replace("state=unavailable_numeric", "state=complete_numeric"),
+        ] {
+            let records = descriptor_input_records(changed.as_bytes()).unwrap();
+            assert!(
+                validate_descriptor_cell(
+                    "ptrace:host:run-raw:private",
+                    &records,
+                    raw.as_bytes(),
+                    &rows
+                )
+                .is_err()
+            );
+        }
+        let duplicate_raw = format!("{raw}FD_ENTRY self fd=42\n");
+        let records = descriptor_input_records(declarations.as_bytes()).unwrap();
+        assert!(
+            validate_descriptor_cell(
+                "ptrace:host:run-raw:private",
+                &records,
+                duplicate_raw.as_bytes(),
+                &rows
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn registry_grammar_refuses_partial_duplicate_and_unknown_fields() {
+        assert!(descriptor_input_records(b"KEY cell role=self role=pid1\n").is_err());
+        assert!(descriptor_input_records(b"SCHEMA descriptor-obligations-v1 version=1").is_err());
+        assert!(descriptor_hash(&"A".repeat(64), 64).is_err());
+        assert!(conformance::DescriptorKey::parse("pid1_task/01/42").is_err());
+        assert!(conformance::DescriptorKey::parse("self/2147483648").is_err());
+        let valid = format!(
+            "SCHEMA descriptor-obligations-v1 version=1\nSOURCE before head={} tree={} reverie={} observer_sha256={} cli_sha256={} bundle={}\nEND descriptor-obligations-v1 cells=0 views=0 keys=0\n",
+            "a".repeat(40),
+            "a".repeat(40),
+            "a".repeat(40),
+            "b".repeat(64),
+            "b".repeat(64),
+            "b".repeat(64)
+        );
+        let records = descriptor_input_records(valid.as_bytes()).unwrap();
+        assert!(descriptor_registry_shape(&records).is_ok());
+        let changed = valid.replace("version=1", "version=1 selected_keys=1");
+        assert!(
+            descriptor_registry_shape(&descriptor_input_records(changed.as_bytes()).unwrap())
+                .is_err()
+        );
     }
 }

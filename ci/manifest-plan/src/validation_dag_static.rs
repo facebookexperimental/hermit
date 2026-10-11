@@ -1385,7 +1385,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4088): 1048.
     // And metadata::tests::record_version_rejects_streams_whose_stop_signals_armed_no_orphaned_group_record
     // (https://github.com/rrnewton/hermit/issues/4111): 1049.
-    ("test.hermit_unit", 1049),
+    // Three CLI-entry descriptor-keeper controls retain all 1045 prior IDs.
+    // The current lib+bins Nextest inventory measured 1048 selected cases.
+    ("test.hermit_unit", 1052),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3155,7 +3157,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And metadata::tests::pre_epoll_pwait2_recordings_are_refused_by_the_version_gate
     // (https://github.com/rrnewton/hermit/issues/4088): 1048.
     // And the orphaned-group record-epoch test: 1049.
-    ("test.hermit_unit_on_host", 1049),
+    // The identical lib+bins selection includes the three descriptor controls.
+    ("test.hermit_unit_on_host", 1052),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

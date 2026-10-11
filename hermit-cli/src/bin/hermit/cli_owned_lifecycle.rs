@@ -671,6 +671,13 @@ pub(super) fn maybe_run() -> Option<i32> {
         (4..=5).contains(&args.len()),
         "exact private lifecycle role arguments"
     );
+    if let Err(error) = super::retire_inherited_descriptors(&[]) {
+        super::display_entry_error(
+            "CLI lifecycle descriptor entry failed; use a Linux environment that allows close_range",
+            &error.into(),
+        );
+        return Some(125);
+    }
     assert_eq!(
         std::fs::read_dir("/proc/self/task").unwrap().count(),
         1,

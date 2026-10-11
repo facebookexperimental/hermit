@@ -30,6 +30,11 @@ behaves the same as the `--strict` form above. The `--strict` flag is retained
 for command-line compatibility and does not make the default any stricter. See
 [USER_GUIDE.md](USER_GUIDE.md) for the full set of mode-selection options.
 
+Hermit preserves standard input, output and error at CLI entry and closes other
+unsolicited file descriptors inherited from its caller. Pass guest inputs through
+the documented file, mount and standard-stream options. An operating system that
+cannot perform this descriptor cleanup is refused before a guest starts.
+
 ## Further reading
 
 * Find hermit [CLI examples here](https://fb.workplace.com/notes/hermetic-infra-fyi/hermit-tech-preview-a-linux-reproducibility-tool/244656753248444/)
