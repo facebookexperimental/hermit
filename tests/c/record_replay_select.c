@@ -88,6 +88,19 @@
  *                after the handler runs. Replay serves the call from the
  *                recording and must deliver the signal under that mask
  *                (https://github.com/rrnewton/hermit/issues/4054)
+ *   pselect-mask-zero-race
+ *                300 rounds of raise(SIGUSR1) and a raw zero-timeout pselect6
+ *                whose mask buffer a sibling toggles between blocking SIGUSR1
+ *                and empty. Linux copies the mask when the call enters the
+ *                kernel, so each round returns EINTR or 0; replay must get the
+ *                same sequence, which it did not when it read the buffer before
+ *                the call's scheduler turn (review of
+ *                https://github.com/rrnewton/hermit/pull/4084)
+ *   ppoll-mask-zero-raise-tight
+ *                the ppoll zero-timeout raise on a stack 160 bytes into a
+ *                writable page with an inaccessible page below it, with the
+ *                handler on an alternate stack and a pattern in the red zone
+ *                that must survive the replayed delivery
  *   ppoll-mask-blocks-alarm
  *                the blocks-alarm wait as glibc ppoll() with no timeout and a
  *                temporary mask that blocks SIGALRM: the writer's byte at
@@ -1093,6 +1106,111 @@ static int ppoll_mask_alarm(int blocks) {
   return 0;
 }
 
+/* Six-argument syscall on a switched stack: `args` holds the five arguments.
+ * No instruction between the stack switch and its restoration touches the
+ * stack. */
+extern long syscall5_on_stack(void* new_sp, long number, const long* args);
+__asm__(
+    ".text\n"
+    ".globl syscall5_on_stack\n"
+    ".type syscall5_on_stack,@function\n"
+    "syscall5_on_stack:\n"
+    "push %r12\n"
+    "mov %rsp,%r12\n"
+    "mov %rsi,%rax\n"
+    "mov %rdi,%rcx\n"
+    "mov %rdx,%r11\n"
+    "mov 0(%r11),%rdi\n"
+    "mov 8(%r11),%rsi\n"
+    "mov 16(%r11),%rdx\n"
+    "mov 24(%r11),%r10\n"
+    "mov 32(%r11),%r8\n"
+    "mov %rcx,%rsp\n"
+    "syscall\n"
+    "mov %r12,%rsp\n"
+    "pop %r12\n"
+    "ret\n"
+    ".size syscall5_on_stack,.-syscall5_on_stack\n");
+
+static volatile uint64_t race_mask;
+static struct pselect_mask_wrapper race_wrapper = {(const void*)&race_mask, 8};
+static atomic_int race_done;
+static volatile sig_atomic_t race_handled;
+
+static void count_race_usr1(int signo) {
+  (void)signo;
+  race_handled++;
+}
+
+static void* toggle_race_mask(void* arg) {
+  (void)arg;
+  while (!atomic_load(&race_done)) {
+    race_mask = 0;
+    sched_yield();
+    race_mask = UINT64_C(1) << (SIGUSR1 - 1);
+    sched_yield();
+  }
+  return NULL;
+}
+
+static int pselect_mask_zero_race(void) {
+  struct sigaction action;
+  memset(&action, 0, sizeof action);
+  action.sa_handler = count_race_usr1;
+  sigset_t usr1;
+  sigemptyset(&usr1);
+  sigaddset(&usr1, SIGUSR1);
+  if (sigaction(SIGUSR1, &action, NULL) != 0 ||
+      pthread_sigmask(SIG_BLOCK, &usr1, NULL) != 0) {
+    perror("setup");
+    return 1;
+  }
+  race_mask = UINT64_C(1) << (SIGUSR1 - 1);
+  pthread_t toggler;
+  if (pthread_create(&toggler, NULL, toggle_race_mask, NULL) != 0) {
+    perror("pthread_create");
+    return 1;
+  }
+  struct timespec zero = {0, 0};
+  int eintr = 0, zeros = 0, other = 0;
+  unsigned long long trace = 0;
+  for (int i = 0; i < 300; i++) {
+    raise(SIGUSR1);
+    long result = syscall(SYS_pselect6, 0, NULL, NULL, NULL, &zero, &race_wrapper);
+    if (result == -1 && errno == EINTR) {
+      eintr++;
+      trace = trace * 3 + 1;
+    } else if (result == 0) {
+      zeros++;
+      trace = trace * 3 + 2;
+    } else {
+      other++;
+      trace = trace * 3;
+    }
+  }
+  atomic_store(&race_done, 1);
+  if (pthread_join(toggler, NULL) != 0) {
+    perror("pthread_join");
+    return 1;
+  }
+  /* Each SIGUSR1 left pending by a round that returned 0 is taken by a later
+   * round that returns EINTR, or stays pending at the end. */
+  int handled = (int)race_handled;
+  printf(
+      "%-24s eintr=%03d zero=%03d other=%03d handled=%03d trace=%016llx\n",
+      "pselect-zero-race",
+      eintr,
+      zeros,
+      other,
+      handled,
+      trace);
+  if (other != 0 || eintr + zeros != 300 || handled != eintr) {
+    fprintf(stderr, "pselect-mask-zero-race mismatch\n");
+    return 1;
+  }
+  return 0;
+}
+
 static volatile sig_atomic_t raised_usr1;
 
 static void count_raised_usr1(int signo) {
@@ -1146,6 +1264,67 @@ static int zero_timeout_mask_raise(int use_ppoll) {
   return 0;
 }
 
+static unsigned char tight_alternate[65536];
+
+/* The zero-timeout ppoll raise on a stack 160 bytes into its page. */
+static int ppoll_mask_zero_raise_tight(void) {
+  long page = sysconf(_SC_PAGESIZE);
+  unsigned char* area = mmap(
+      NULL, (size_t)page * 2, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (area == MAP_FAILED ||
+      mprotect(area + page, (size_t)page, PROT_READ | PROT_WRITE) != 0) {
+    perror("tight stack");
+    return 1;
+  }
+  stack_t alternate = {
+      .ss_sp = tight_alternate, .ss_size = sizeof tight_alternate, .ss_flags = 0};
+  struct sigaction action;
+  memset(&action, 0, sizeof action);
+  action.sa_handler = count_raised_usr1;
+  action.sa_flags = SA_ONSTACK;
+  sigset_t usr1;
+  sigemptyset(&usr1);
+  sigaddset(&usr1, SIGUSR1);
+  int fds[2];
+  if (sigaltstack(&alternate, NULL) != 0 ||
+      sigaction(SIGUSR1, &action, NULL) != 0 ||
+      pthread_sigmask(SIG_BLOCK, &usr1, NULL) != 0 || pipe(fds) != 0 ||
+      raise(SIGUSR1) != 0) {
+    perror("setup");
+    return 1;
+  }
+  static struct pollfd watched;
+  watched.fd = fds[0];
+  watched.events = POLLIN;
+  static struct timespec zero = {0, 0};
+  static uint64_t empty_mask;
+  unsigned char* tight_stack = area + page + 160;
+  for (int i = -128; i < 0; i++) {
+    tight_stack[i] = (unsigned char)(0xa5 ^ (i & 0xff));
+  }
+  const long args[5] = {
+      (long)&watched, 1, (long)&zero, (long)&empty_mask, 8};
+  long raw = syscall5_on_stack(tight_stack, SYS_ppoll, args);
+  int handled = (int)raised_usr1;
+  int red_zone_changed = 0;
+  for (int i = -128; i < 0; i++) {
+    red_zone_changed += tight_stack[i] != (unsigned char)(0xa5 ^ (i & 0xff));
+  }
+  close(fds[0]);
+  close(fds[1]);
+  printf(
+      "%-24s result=%011ld handled=%01d red_zone_changed=%03d\n",
+      "ppoll-zero-raise-tight",
+      raw,
+      handled,
+      red_zone_changed);
+  if (raw != -EINTR || handled != 1 || red_zone_changed != 0) {
+    fprintf(stderr, "ppoll-mask-zero-raise-tight mismatch\n");
+    return 1;
+  }
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc != 2) {
     fprintf(
@@ -1156,7 +1335,8 @@ int main(int argc, char** argv) {
         "pselect-mask-unblocks-alarm|pselect-mask-unblocks-rewritten|"
         "pselect-mask-unblocks-tight-stack|pselect-mask-zero-raise|"
         "ppoll-mask-zero-raise|ppoll-mask-blocks-alarm|"
-        "ppoll-mask-unblocks-alarm]\n",
+        "ppoll-mask-unblocks-alarm|pselect-mask-zero-race|"
+        "ppoll-mask-zero-raise-tight]\n",
         argv[0]);
     return 2;
   }
@@ -1201,6 +1381,12 @@ int main(int argc, char** argv) {
   }
   if (strcmp(argv[1], "ppoll-mask-unblocks-alarm") == 0) {
     return ppoll_mask_alarm(0);
+  }
+  if (strcmp(argv[1], "pselect-mask-zero-race") == 0) {
+    return pselect_mask_zero_race();
+  }
+  if (strcmp(argv[1], "ppoll-mask-zero-raise-tight") == 0) {
+    return ppoll_mask_zero_raise_tight();
   }
   if (strcmp(argv[1], "efault") == 0) {
     return efault();

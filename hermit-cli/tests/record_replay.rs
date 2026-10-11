@@ -2793,6 +2793,23 @@ fn record_zero_timeout_ppoll_whose_mask_unblocks_a_pending_signal() {
     record_select_mode("ppoll-mask-zero-raise");
 }
 
+/// A zero-timeout pselect6 whose mask buffer a sibling toggles: the kernel
+/// copied the mask after the call's scheduler turn was granted, and replay
+/// read it before, so replay delivered under a stale mask (review of
+/// https://github.com/rrnewton/hermit/pull/4084).
+#[test]
+fn record_zero_timeout_pselect_whose_mask_a_sibling_toggles() {
+    record_select_mode("pselect-mask-zero-race");
+}
+
+/// The zero-timeout ppoll raise on a stack 160 bytes into its page, whose red
+/// zone the replayed delivery must leave as it found it (review of
+/// https://github.com/rrnewton/hermit/pull/4084).
+#[test]
+fn record_zero_timeout_ppoll_whose_mask_unblocks_a_pending_signal_on_a_tight_stack() {
+    record_select_mode("ppoll-mask-zero-raise-tight");
+}
+
 /// A masked ppoll that would block: its temporary mask blocks the timer's
 /// SIGALRM, and a writer's byte ends it with 1. Under sequentialization the
 /// call recorded ENOSYS; record/replay now lets the kernel own the wait

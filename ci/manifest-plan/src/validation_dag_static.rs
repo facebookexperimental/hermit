@@ -2165,7 +2165,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // record_ppoll_whose_mask_blocks_the_scheduler_timer_signal and
     // record_ppoll_whose_mask_unblocks_the_scheduler_timer_signal
     // (https://github.com/rrnewton/hermit/issues/4042): 156.
-    ("test.record_replay", 156),
+    // (https://github.com/rrnewton/hermit/issues/4042): 155.
+    // record_zero_timeout_pselect_whose_mask_a_sibling_toggles and
+    // record_zero_timeout_ppoll_whose_mask_unblocks_a_pending_signal_on_a_tight_stack
+    // (review of https://github.com/rrnewton/hermit/pull/4084): 158.
+    ("test.record_replay", 158),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.

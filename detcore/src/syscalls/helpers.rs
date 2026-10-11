@@ -146,14 +146,29 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: Syscall,
     ) -> Result<i64, Error> {
+        self.record_or_replay_blocking_with_unknown_mask_then(guest, call, |_| {})
+            .await
+    }
+
+    /// `record_or_replay_blocking_with_unknown_mask`, running `after_grant` once
+    /// the scheduler has granted the call and before it runs: the point at
+    /// which a recorded call entered the kernel, after any sibling that ran
+    /// while the request waited.
+    pub async fn record_or_replay_blocking_with_unknown_mask_then<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+        after_grant: impl FnOnce(&mut G),
+    ) -> Result<i64, Error> {
         let dettid = guest.thread_state().dettid;
         let op_id = ExternalOpId::new(dettid, guest.thread_state().stats.syscall_count);
-        self.record_or_replay_blocking_resource(
+        self.record_or_replay_blocking_resource_then(
             guest,
             call,
             ResourceID::BlockingExternalIO(op_id),
             None,
             true,
+            after_grant,
         )
         .await
     }
@@ -187,6 +202,28 @@ impl<T: RecordOrReplay> Detcore<T> {
         blocking_resource: ResourceID,
         blocked_signal_mask: Option<u64>,
         blocked_signal_mask_unknown: bool,
+    ) -> Result<i64, Error> {
+        self.record_or_replay_blocking_resource_then(
+            guest,
+            call,
+            blocking_resource,
+            blocked_signal_mask,
+            blocked_signal_mask_unknown,
+            |_| {},
+        )
+        .await
+    }
+
+    /// `record_or_replay_blocking_resource`, running `after_grant` between the
+    /// grant and the call.
+    async fn record_or_replay_blocking_resource_then<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+        blocking_resource: ResourceID,
+        blocked_signal_mask: Option<u64>,
+        blocked_signal_mask_unknown: bool,
+        after_grant: impl FnOnce(&mut G),
     ) -> Result<i64, Error> {
         let dettid = guest.thread_state().dettid;
         let op_id = match &blocking_resource {
@@ -236,6 +273,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             rsrcs.replay_served_from_log = replay_served_from_log;
             resource_request(guest, rsrcs).await;
         }
+        after_grant(guest);
         tracing::trace!(
             "Guest proceeding to execute potentially blocking call {}...",
             call.name()

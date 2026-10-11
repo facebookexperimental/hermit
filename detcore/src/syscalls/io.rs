@@ -254,7 +254,8 @@ where
 }
 
 /// The temporary mask a replayed pselect6 sleeps under, read from guest
-/// memory at the call's entry, as Linux copies it once at entry; `None` when the
+/// memory where the recorded call entered the kernel, as Linux copies it once
+/// then (after the scheduler grants the call); `None` when the
 /// call has no mask or the wrapper or the mask cannot be read
 /// (`end_replayed_pselect6_under_its_temporary_mask`).
 fn replayed_pselect6_temporary_mask<G, T>(
@@ -814,22 +815,38 @@ impl<T: RecordOrReplay> Detcore<T> {
             // scheduler records no mask for such a call
             // (`Resources::blocked_signal_mask_unknown`). Without a wrapper the
             // call sleeps under the thread's own mask, which the scheduler reads.
-            // Replay reads the temporary mask here, at the call's entry, as
-            // Linux copies it; a sibling may rewrite the buffer while the
-            // call is served (review of https://github.com/rrnewton/hermit/pull/4052).
-            // A zero timeout does not change that: Linux still installs the
-            // mask and ends the call with ERESTARTNOHAND for a pending signal
-            // it unblocks (https://github.com/rrnewton/hermit/issues/4054).
-            let temporary_mask = if self.cfg.replaying && call.sigmask().is_some() {
-                replayed_pselect6_temporary_mask(guest, call)
-            } else {
-                None
-            };
+            // Replay reads the temporary mask where the recorded call entered
+            // the kernel and copied it: once the scheduler has granted the
+            // call, after any sibling that ran while the request waited, and
+            // before the served call, while which a sibling may rewrite the
+            // buffer (review of https://github.com/rrnewton/hermit/pull/4052;
+            // review of https://github.com/rrnewton/hermit/pull/4084). A zero
+            // timeout does not change that: Linux still installs the mask and
+            // ends the call with ERESTARTNOHAND for a pending signal it
+            // unblocks (https://github.com/rrnewton/hermit/issues/4054).
+            let read_mask = self.cfg.replaying && call.sigmask().is_some();
+            let mut temporary_mask = None;
             let result = if call.sigmask().is_some() && !zero_timeout {
-                self.record_or_replay_blocking_with_unknown_mask(guest, Syscall::Pselect6(call))
+                self.record_or_replay_blocking_with_unknown_mask_then(
+                    guest,
+                    Syscall::Pselect6(call),
+                    |guest| {
+                        if read_mask {
+                            temporary_mask = replayed_pselect6_temporary_mask(guest, call);
+                        }
+                    },
+                )
+                .await
+            } else if zero_timeout {
+                resource_request(guest, Resources::new(guest.thread_state().dettid)).await;
+                if read_mask {
+                    temporary_mask = replayed_pselect6_temporary_mask(guest, call);
+                }
+                self.record_or_replay(guest, Syscall::Pselect6(call))
                     .await
+                    .map_err(Into::into)
             } else {
-                self.record_or_replay_select_family(guest, Syscall::Pselect6(call), zero_timeout)
+                self.record_or_replay_blocking(guest, Syscall::Pselect6(call))
                     .await
             };
             if let Some(mask) = temporary_mask
