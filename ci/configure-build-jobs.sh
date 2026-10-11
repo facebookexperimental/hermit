@@ -1476,8 +1476,15 @@ fi
 # proof document change; all seven recorded SDK input Git objects are equal.
 # Preserve SDK key, inventory 941 and the existing budgets. This carries no
 # runtime qualification or test evidence.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != a29aa1c85b08717fc0e2e181333acac42e5261ef ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie a29aa1c85b08717fc0e2e181333acac42e5261ef (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# MAPPING, DIRECT-EVENT AND NORMAL RETURN-CONTRACT PIN CARRY (2026-10-11):
+# Advance the consumer from a29aa1c85b08717fc0e2e181333acac42e5261ef to
+# 0f7cdd3232d3216637bc076aaa7517a981d6fdec. Mapping guards, direct event dispatch
+# and finite whole-body normal return qualification change. All seven recorded
+# native SDK input Git objects are equal. Preserve SDK key, inventory 941,
+# the 16-job clamp and 1050/572-job-second budgets. This carries the SDK budget
+# only; runtime qualification, test and timing evidence must be measured anew.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 0f7cdd3232d3216637bc076aaa7517a981d6fdec ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 0f7cdd3232d3216637bc076aaa7517a981d6fdec (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
