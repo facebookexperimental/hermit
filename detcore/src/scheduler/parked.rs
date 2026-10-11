@@ -655,7 +655,7 @@ impl Scheduler {
     ) {
         let signal = match signal {
             timed_waiters::TimerSignal::Send(signal) => signal,
-            // Detcore cannot deliver real-time signals. An expiration Linux
+            // Detcore does not deliver a timer's real-time signal. An expiration Linux
             // discards, or queues where nothing can yet observe it, changes
             // nothing, and the run goes on; any other stops it by name
             // (https://github.com/rrnewton/hermit/issues/3893,

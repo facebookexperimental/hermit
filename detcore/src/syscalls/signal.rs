@@ -87,9 +87,10 @@ use crate::types::LogicalTime;
 ///                   behaved differently from native, which no cell can catch.
 ///
 /// Everything else in 1..31 matches native exactly; 9/19 and 32/33 refuse
-/// `sigaction` natively too and are not hermit's. Realtime 34..64 fail by a
-/// different mechanism (they cannot be represented at the reverie ptrace
-/// boundary) and are tracked separately -- they are not appropriation.
+/// `sigaction` natively too and are not hermit's. Realtime 34..64 are
+/// delivered and handled like any other signal under ptrace
+/// (<https://github.com/rrnewton/reverie/issues/207>); they are not
+/// appropriation.
 const APPROPRIATED_SIGNALS: [(i32, &str); 2] = [
     (
         libc::SIGTRAP,
@@ -2162,7 +2163,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     pub(crate) async fn record_handler_restore_mask<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        signal: Signal,
+        signal: SigWrapper,
     ) {
         if !(self.cfg.sequentialize_threads
             && self.cfg.backend_supports_blocked_wait_signal_interruption)
@@ -2175,7 +2176,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // interrupted; a signal acted on by default (the teardown's own
         // termination signals among them) records nothing.
         if let Ok(state) = read_thread_wait_signal_state(guest.pid(), guest.tid())
-            && state.caught & kernel_sigset_bit(signal as i32) == 0
+            && state.caught & kernel_sigset_bit(signal.raw()) == 0
         {
             return;
         }

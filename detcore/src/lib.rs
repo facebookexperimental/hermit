@@ -860,6 +860,100 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Detcore's handling of an inbound signal, for both of Reverie's signal
+    /// hooks (`Tool::handle_signal_event`, and `Tool::handle_raw_signal_event`
+    /// for a realtime signal): the signal takes its turn in the schedule
+    /// before it is delivered. Returns the signal to deliver, or `None` to
+    /// suppress it.
+    async fn handle_inbound_signal<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: SigWrapper,
+    ) -> Result<Option<SigWrapper>, Errno> {
+        if signal.signal() == Some(Signal::SIGINT) && self.cfg.sigint_instakill {
+            warn!("Fatal: Exiting hermit container immediately upon SIGINT");
+            // ⚠️ NOT A REFUSAL. The operator interrupted the run; hermit examined
+            // nothing and decided nothing. Reporting `128 + SIGINT` is what every
+            // other tool reports for this, and it keeps 122 meaning one thing.
+            unrecoverable_shutdown(guest, detcore_model::HERMIT_SIGINT_DEATH_EXIT).await
+        } else {
+            if signal.signal() == Some(Signal::SIGCHLD)
+                && self.cfg.backend.reports_child_exit_publication
+                && !self.child_exit_sigchld_delivers(guest).await
+            {
+                return Ok(None);
+            }
+            // The kernel dequeued `signal` before this stop: a hold for it ends
+            // here, and this stop's hooks may end the slice
+            // (`own_signal_turn_hold`).
+            if guest.thread_state().own_signal_turn_hold == Some(signal.raw()) {
+                guest.thread_state_mut().own_signal_turn_hold = None;
+            }
+            self.pre_handler_hook(guest, false, CheckIn::Event).await;
+
+            // For `hermit run --verify`: a guest that faulted on an illegal
+            // instruction may have run code that made syscalls Detcore never
+            // saw. On ptrace that is the one way past the tracer: a syscall
+            // issued from the untraced stub of Reverie's private page is let
+            // through, and the instruction after it is `ud2`. So the run
+            // reports `/`, the ancestor of every path, and names no host input
+            // change. A false alarm only withholds a name. A guest that first
+            // rewrites or replaces that code is reported when it does so
+            // (`record_untraced_code_change`).
+            if signal.signal() == Some(Signal::SIGILL) && self.cfg.record_host_inputs {
+                tool_global::record_host_mutation(guest, String::from("/")).await;
+            }
+
+            let dettid = guest.thread_state().dettid;
+            let mycount = guest.thread_state().stats.signal_count;
+            info!(
+                "[dtid {}] handling inbound signal (#{}) {}",
+                dettid, mycount, signal
+            );
+            guest.thread_state_mut().stats.count_signal();
+            let time = &guest.thread_state().thread_logical_time;
+            let nanos = time.as_nanos();
+
+            if self.cfg.sequentialize_threads && self.cfg.should_trace_schedevent() {
+                trace_schedevent(
+                    guest,
+                    SchedEvent {
+                        dettid,
+                        op: Op::SignalReceived(signal),
+                        count: 1,
+                        start_rip: None,
+                        end_rip: None,
+                        end_time: Some(nanos),
+                    },
+                    true,
+                )
+                .await;
+            }
+
+            let request = guest
+                .thread_state_mut()
+                .mk_request(ResourceID::InboundSignal(signal), Permission::RW);
+            resource_request(guest, request).await;
+            // A delivered signal may be caught, ignored, or terminate the
+            // thread group. Reading the lists is harmless; the collected
+            // wakes remain inert unless the ptrace exit callback later reports
+            // that this exact signal caused physical exit.
+            self.stage_thread_group_robust_list_wakes(
+                guest,
+                tool_local::RobustListExit::Signal(signal.raw()),
+            )
+            .await;
+            info!(
+                "[dtid {}] finish delivering signal (#{}) {}",
+                dettid, mycount, signal
+            );
+            self.record_handler_restore_mask(guest, signal).await;
+
+            self.post_handler_hook(guest, CheckIn::Event).await;
+            Ok(Some(signal))
+        }
+    }
+
     /// Whether a `SIGCHLD` that stopped this thread is delivered, on a backend
     /// that reports child-exit publication, where both the kernel and the
     /// scheduler send a child's exit `SIGCHLD` (`scheduler::child_exit_sigchld`).
@@ -1960,89 +2054,24 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         guest: &mut G,
         signal: Signal,
     ) -> Result<Option<Signal>, Errno> {
-        if signal == Signal::SIGINT && self.cfg.sigint_instakill {
-            warn!("Fatal: Exiting hermit container immediately upon SIGINT");
-            // ⚠️ NOT A REFUSAL. The operator interrupted the run; hermit examined
-            // nothing and decided nothing. Reporting `128 + SIGINT` is what every
-            // other tool reports for this, and it keeps 122 meaning one thing.
-            unrecoverable_shutdown(guest, detcore_model::HERMIT_SIGINT_DEATH_EXIT).await
-        } else {
-            if signal == Signal::SIGCHLD
-                && self.cfg.backend.reports_child_exit_publication
-                && !self.child_exit_sigchld_delivers(guest).await
-            {
-                return Ok(None);
-            }
-            // The kernel dequeued `signal` before this stop: a hold for it ends
-            // here, and this stop's hooks may end the slice
-            // (`own_signal_turn_hold`).
-            if guest.thread_state().own_signal_turn_hold == Some(signal as libc::c_int) {
-                guest.thread_state_mut().own_signal_turn_hold = None;
-            }
-            self.pre_handler_hook(guest, false, CheckIn::Event).await;
+        let delivered = self
+            .handle_inbound_signal(guest, SigWrapper::from(signal))
+            .await?;
+        Ok(delivered.map(|_| signal))
+    }
 
-            // For `hermit run --verify`: a guest that faulted on an illegal
-            // instruction may have run code that made syscalls Detcore never
-            // saw. On ptrace that is the one way past the tracer: a syscall
-            // issued from the untraced stub of Reverie's private page is let
-            // through, and the instruction after it is `ud2`. So the run
-            // reports `/`, the ancestor of every path, and names no host input
-            // change. A false alarm only withholds a name. A guest that first
-            // rewrites or replaces that code is reported when it does so
-            // (`record_untraced_code_change`).
-            if signal == Signal::SIGILL && self.cfg.record_host_inputs {
-                tool_global::record_host_mutation(guest, String::from("/")).await;
-            }
-
-            let dettid = guest.thread_state().dettid;
-            let mycount = guest.thread_state().stats.signal_count;
-            info!(
-                "[dtid {}] handling inbound signal (#{}) {}",
-                dettid, mycount, signal
-            );
-            guest.thread_state_mut().stats.count_signal();
-            let time = &guest.thread_state().thread_logical_time;
-            let nanos = time.as_nanos();
-
-            if self.cfg.sequentialize_threads && self.cfg.should_trace_schedevent() {
-                trace_schedevent(
-                    guest,
-                    SchedEvent {
-                        dettid,
-                        op: Op::SignalReceived(signal.into()),
-                        count: 1,
-                        start_rip: None,
-                        end_rip: None,
-                        end_time: Some(nanos),
-                    },
-                    true,
-                )
-                .await;
-            }
-
-            let request = guest.thread_state_mut().mk_request(
-                ResourceID::InboundSignal(SigWrapper::from(signal)),
-                Permission::RW,
-            );
-            resource_request(guest, request).await;
-            // A delivered signal may be caught, ignored, or terminate the
-            // thread group. Reading the lists is harmless; the collected
-            // wakes remain inert unless the ptrace exit callback later reports
-            // that this exact signal caused physical exit.
-            self.stage_thread_group_robust_list_wakes(
-                guest,
-                tool_local::RobustListExit::Signal(signal as i32),
-            )
-            .await;
-            info!(
-                "[dtid {}] finish delivering signal (#{}) {}",
-                dettid, mycount, signal
-            );
-            self.record_handler_restore_mask(guest, signal).await;
-
-            self.post_handler_hook(guest, CheckIn::Event).await;
-            Ok(Some(signal))
-        }
+    /// A realtime signal (32 to 64), which `Signal` cannot name: handled as
+    /// any other (`handle_inbound_signal`), so it takes its turn in the
+    /// schedule (<https://github.com/rrnewton/reverie/issues/207>).
+    async fn handle_raw_signal_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: i32,
+    ) -> Result<Option<i32>, Errno> {
+        let delivered = self
+            .handle_inbound_signal(guest, SigWrapper(signal))
+            .await?;
+        Ok(delivered.map(|signal| signal.raw()))
     }
 
     /// A `SIGCHLD` the backend passes on without reporting it is dropped when

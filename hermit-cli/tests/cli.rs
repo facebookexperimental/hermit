@@ -142,6 +142,7 @@ static FUTEX_WAIT_UNREADABLE_WORD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PIDFD_SEND_SIGNAL_MULTITHREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PIDFD_SEND_SIGNAL_FLAGS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_MULTITHREADED_PROCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static REALTIME_SIGNALS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static OWN_PROCESS_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VDSO_SYMBOL_VERSIONS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_PROCESS_GROUP_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1072,6 +1073,31 @@ fn own_process_signal_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "own-process-signal guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn realtime_signals_guest() -> &'static Path {
+    REALTIME_SIGNALS_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("realtime-signals");
+        fs::create_dir_all(&build_root).expect("failed to create realtime-signals guest directory");
+        let guest = build_root.join("realtime_signals");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/realtime_signals.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile realtime-signals guest");
+        assert!(
+            output.status.success(),
+            "realtime-signals guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -21685,6 +21711,71 @@ fn a_process_directed_signal_to_several_threads_is_refused_by_name() {
     );
 }
 
+/// Realtime signals (32 to 64) reach the guest under ptrace and verify at
+/// bitwise parity: sigqueue values and SI_QUEUE, the order Linux runs the
+/// handlers of queued realtime signals in, a SIGRTMIN+1 that wakes a
+/// thread asleep in sigsuspend, and glibc's pthread_cancel, which sends
+/// signal 32; and each realtime signal takes a scheduler turn. Before
+/// https://github.com/rrnewton/reverie/issues/207 the run failed at the first
+/// realtime signal stop (EINVAL, exit 125).
+#[test]
+fn realtime_signals_are_delivered_with_their_values_and_verify() {
+    let guest = realtime_signals_guest().to_str().unwrap().to_owned();
+    let args = [
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--",
+        guest.as_str(),
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(
+        stdout(&output),
+        "queued, delivered while blocked: 0\n\
+         delivered SIGRTMIN+3 value 30 SI_QUEUE from this pid\n\
+         delivered SIGRTMIN+2 value 20 SI_QUEUE from this pid\n\
+         delivered SIGRTMIN+2 value 21 SI_QUEUE from this pid\n\
+         tgkill SIGRTMIN+1 to the sleeper: 0\n\
+         sleeper woken: 1\n\
+         pthread_cancel: 0, canceled: 1\n\
+         failures=0\n"
+    );
+    let log = stderr(&output);
+    assert!(
+        log.contains(":: comparison=BitwiseInfoV1 relaxations=none"),
+        "realtime-signal comparison was not canonical:\n{log}"
+    );
+    assert!(
+        log.contains(":: Success: deterministic. Determinism verified."),
+        "realtime-signal verification failed:\n{log}"
+    );
+
+    // Each realtime signal takes its turn in Detcore's schedule, as a
+    // standard signal does (`handle_raw_signal_event` and its
+    // `InboundSignal` request): 32 from pthread_cancel, SIGRTMIN+1 (35) for
+    // the sleeper, SIGRTMIN+2 (36) twice and SIGRTMIN+3 (37). Without the
+    // override, Reverie's default delivers them with no turn and none of
+    // these commits appears.
+    let args = ["--log=info", "run", "--strict", "--", guest.as_str()];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    let log = stderr(&output);
+    for (signal, turns) in [(32, 1), (35, 1), (36, 2), (37, 1)] {
+        let resource = format!("using resources {{InboundSignal(SigWrapper({signal})): RW}}");
+        let committed = log
+            .lines()
+            .filter(|line| line.contains(" COMMIT turn ") && line.contains(&resource))
+            .count();
+        assert_eq!(
+            committed, turns,
+            "InboundSignal commits for signal {signal}:\n{log}"
+        );
+    }
+}
+
 /// A process-directed signal a thread sends to its own multi-threaded process
 /// goes to the sender, before `kill` returns, exactly as Linux delivers it,
 /// when the schedule fixes the kernel's choice and the sender's dequeue
@@ -23508,8 +23599,8 @@ fn a_pending_real_time_timer_expiration_is_refused_only_where_it_is_observed() {
 }
 
 /// A POSIX timer that notifies with a real-time signal
-/// (https://github.com/rrnewton/hermit/issues/3893). Detcore cannot deliver
-/// real-time signals, and such a timer used to be armed and then silently never
+/// (https://github.com/rrnewton/hermit/issues/3893). Detcore does not deliver
+/// a timer's real-time signal, and such a timer used to be armed and then silently never
 /// fire. Creating, arming, reading and deleting one before it expires behave as
 /// on Linux, as do one in a process that exits or execs and one whose signal is
 /// ignored and unblocked (Linux discards it); when one expires, a fail-closed
@@ -23591,7 +23682,9 @@ fn a_real_time_signal_timer_is_refused_by_name_when_it_expires() {
         "stderr:\n{log}"
     );
     assert!(
-        log.contains("which Detcore cannot deliver; it is armed but will never fire"),
+        log.contains(
+            "which Detcore does not deliver from a timer; it is armed but will never fire"
+        ),
         "the permissive run must say the timer will never fire:\nstderr:\n{log}"
     );
 }

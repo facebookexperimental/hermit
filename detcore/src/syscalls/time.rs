@@ -1012,7 +1012,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await;
             } else if deadline.is_some() {
                 tracing::error!(
-                    "[detcore, dtid {}] POSIX timer {} notifies with real-time signal {}, which Detcore cannot deliver; it is armed but will never fire",
+                    "[detcore, dtid {}] POSIX timer {} notifies with real-time signal {}, which Detcore does not deliver from a timer; it is armed but will never fire",
                     guest.thread_state().dettid,
                     id,
                     signo,

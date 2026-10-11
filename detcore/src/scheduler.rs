@@ -1373,8 +1373,11 @@ pub struct Scheduler {
     /// (<https://github.com/rrnewton/hermit/issues/4089>). Linux queues such a
     /// signal, which then changes nothing until the process could observe it:
     /// a thread unblocks it, waits for it, or reads its pending set. Detcore
-    /// cannot deliver real-time signals, so each of those points refuses the
-    /// run by name (`pending_real_time_expirations`), and the process's exit or
+    /// does not deliver a real-time signal from a POSIX timer (it delivers one
+    /// a thread or process sends since
+    /// <https://github.com/rrnewton/reverie/issues/207>), so each of those
+    /// points refuses the run by name (`pending_real_time_expirations`), and
+    /// the process's exit or
     /// a change of the signal's disposition to `SIG_IGN` discards it, as Linux
     /// does. Exec keeps it, as exec keeps pending signals.
     pending_real_time_expirations: BTreeMap<DetPid, u64>,
@@ -2584,7 +2587,7 @@ pub(crate) fn exit_on_scheduler_refusal(refusal: &dyn std::fmt::Display) -> ! {
 
 /// Refuse a fail-closed run at the point where the guest would observe an
 /// expiration of a POSIX timer that notifies with real-time signal `signo`,
-/// which Detcore cannot deliver (https://github.com/rrnewton/hermit/issues/3893):
+/// which Detcore does not deliver from a timer (https://github.com/rrnewton/hermit/issues/3893):
 /// at the expiration itself, or later, where a pending one becomes observable
 /// (https://github.com/rrnewton/hermit/issues/4089).
 /// What Linux does with a real-time POSIX timer expiration, as far as the
@@ -2622,7 +2625,7 @@ pub(crate) fn real_time_expiration_kept_pending() -> bool {
 
 pub(crate) fn refuse_real_time_expiration(signo: i32) -> ! {
     exit_on_scheduler_refusal(&format_args!(
-        "hermit: a POSIX timer expired that notifies with real-time signal {signo}, which Detcore cannot deliver; refusing the run rather than dropping the expiration (https://github.com/rrnewton/hermit/issues/3893)"
+        "hermit: a POSIX timer expired that notifies with real-time signal {signo}, which Detcore does not deliver from a timer; refusing the run rather than dropping the expiration (https://github.com/rrnewton/hermit/issues/3893)"
     ))
 }
 

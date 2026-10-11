@@ -75,7 +75,7 @@ pub enum TimerSignal {
     /// Send this signal.
     Send(Signal),
     /// End the run with a named refusal. The POSIX timer notifies with this
-    /// real-time signal, which Detcore cannot deliver; the timer could be
+    /// real-time signal, which Detcore does not deliver from a timer; the timer could be
     /// created and armed as on Linux, and only its expiration is unserviceable
     /// (<https://github.com/rrnewton/hermit/issues/3893>).
     RefuseRealTime(i32),

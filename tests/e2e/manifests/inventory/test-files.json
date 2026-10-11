@@ -1483,6 +1483,12 @@
       "why": "tests/c/readdir_order_identity.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): pins directory-enumeration order across a double strict run, asserting via --require-small-determinized and --require-large-determinized that both the small (single-buffer) and large (multi-buffer) cases enumerate identically across creation orders, the large one as a single globally sorted stream; it runs under the default 22s CPU and 57s wall bounds (ci/manifest-plan/src/timeouts.rs), not the 90s budget it had before timeouts became manifest-driven, and measured walls are 7.56-17.13s over nine verify runs across ptrace, kvm and liteinst at 2d9b43c4 and 5.1s (4.3s CPU) for one ptrace run at 064da669; the liteinst calibration p90 is 9.5s CPU and 12.4s wall"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/realtime_signals.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/realtime_signals.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test realtime_signals_are_delivered_with_their_values_and_verify compiles this guest, which queues realtime signals to itself with sigqueue values and wakes a thread asleep in sigsuspend with SIGRTMIN+1, then cancels a thread with glibc pthread_cancel (signal 32), and requires the exact handler order, values and SI_QUEUE codes Linux gives together with --verify-strict bitwise parity (https://github.com/rrnewton/reverie/issues/207); it remains a guest fixture because a generic manifest cannot assert this exact output."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/record_lock.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
