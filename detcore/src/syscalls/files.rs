@@ -6373,7 +6373,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// the forward: a descriptor that Detcore does not model as a pidfd fails
     /// closed with `EBADF`, and the flags field the current kernel reserves is
     /// required to be zero (`EINVAL` otherwise), so the guest-visible errno is
-    /// fixed and host-independent.
+    /// fixed and host-independent. A process-directed signal to a process with
+    /// several live threads is refused by name, as `kill` refuses it
+    /// (`Detcore::process_signal_target`).
     ///
     /// `call` is the raw `Syscall::Other`; `pidfd`/`flags` are pre-extracted from
     /// its arguments by the dispatcher.
@@ -6408,6 +6410,26 @@ impl<T: RecordOrReplay> Detcore<T> {
                 None => SigalrmControl::SendToUnnamed,
             };
             refuse_sigalrm(guest, control).await?;
+        }
+        // A pidfd names a whole process (Detcore's pidfd_open accepts no
+        // PIDFD_THREAD), so this is a process-directed signal, and with several
+        // live threads it is refused by name as `kill` refuses it: Linux's
+        // complete_signal picks the receiving thread, which Detcore does not
+        // model (https://github.com/rrnewton/hermit/issues/4047). Signal 0
+        // only checks that the process exists.
+        if signal != 0
+            && guest.config().sequentialize_threads
+            && let Some(target) = guest
+                .thread_state()
+                .with_detfd(pidfd, |detfd| detfd.pidfd_target())?
+        {
+            self.process_signal_target(
+                guest,
+                reverie::syscalls::Sysno::pidfd_send_signal,
+                target,
+                signal,
+            )
+            .await?;
         }
         let value = self.record_or_replay(guest, call).await?;
         if signal == libc::SIGKILL {

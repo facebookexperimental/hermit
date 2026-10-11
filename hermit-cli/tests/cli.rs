@@ -131,6 +131,7 @@ static FUTEX_KEYED_ACCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_WAKE_OP_FILE_SHARED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_REWAIT_CHANGED_WORD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_WAIT_UNREADABLE_WORD_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static PIDFD_SEND_SIGNAL_MULTITHREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_MULTITHREADED_PROCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_PROCESS_GROUP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_CREATE_RT_SIGNAL_REFUSED_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -21244,6 +21245,85 @@ fn a_process_directed_signal_to_several_threads_is_refused_by_name() {
     assert!(
         log.contains("by rt_sigqueueinfo is not supported"),
         "the compatibility run must still name each refusal:\nstderr:\n{log}"
+    );
+}
+
+/// pidfd_send_signal to a process with two live threads is refused by name,
+/// as `kill` is (https://github.com/rrnewton/hermit/issues/4047). A pidfd names
+/// a whole process, so the signal is process-directed, and Linux's
+/// complete_signal would pick the receiving thread, which Detcore does not
+/// model. Before the change the call was forwarded to the kernel, which chose
+/// the thread. A fail-closed run stops with the policy-refusal status after the
+/// one-thread block, which still delivers; signal 0 is still answered with two
+/// threads; with `--allow-unsupported-syscalls` the two-thread call returns
+/// ENOSYS.
+#[test]
+fn a_pidfd_signal_to_several_threads_is_refused_by_name() {
+    let guest = futex_c_guest(
+        &PIDFD_SEND_SIGNAL_MULTITHREAD_GUEST,
+        "pidfd_send_signal_multithread",
+    )
+    .to_str()
+    .unwrap()
+    .to_owned();
+    let answered = "one thread, pidfd_send_signal: 0\n\
+                    one thread, handled: 1\n\
+                    two threads, pidfd_send_signal 0: 0\n";
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "--log=error",
+            "run",
+            "--strict",
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+        ]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "a fail-closed run must stop with the policy-refusal status:\nstdout:\n{stdout}\nstderr:\n{log}"
+    );
+    assert!(
+        log.contains("process-directed signal 10 to process")
+            && log
+                .contains("by pidfd_send_signal is not supported: the process has 2 live threads"),
+        "the refusal must name the call and the reason:\nstderr:\n{log}"
+    );
+    assert_eq!(stdout, answered, "stderr:\n{log}");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        // `--strict` refuses the opt-out, so the compatibility run is not strict.
+        hermit_command(&[
+            "run",
+            "--allow-unsupported-syscalls",
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+        ]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "stdout:\n{stdout}\nstderr:\n{log}"
+    );
+    assert_eq!(
+        stdout,
+        format!("{answered}two threads, pidfd_send_signal: -1 ENOSYS\n"),
+        "stderr:\n{log}"
     );
 }
 

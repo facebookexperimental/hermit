@@ -1109,7 +1109,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// does not model that choice. The refusal goes through the
     /// unsupported-operation policy, so a fail-closed run stops with the
     /// policy-refusal status and `--allow-unsupported-syscalls` returns ENOSYS.
-    async fn process_signal_target<G: Guest<Self>>(
+    pub(crate) async fn process_signal_target<G: Guest<Self>>(
         &self,
         guest: &mut G,
         sysno: Sysno,

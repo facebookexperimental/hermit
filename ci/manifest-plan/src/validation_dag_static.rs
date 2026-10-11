@@ -2504,7 +2504,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 293, listed with this node's arguments.
     // a_futex_wait_on_an_unreadable_word_is_efault
     // (https://github.com/rrnewton/hermit/issues/4030) retains all 293: 294.
-    ("test.cli", 294),
+    // a_pidfd_signal_to_several_threads_is_refused_by_name
+    // (https://github.com/rrnewton/hermit/issues/4047) retains all 294: 295.
+    ("test.cli", 295),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2743,7 +2745,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // skipped by exact name here and run in privileged-test.pmu_cli_cases:
     // 235 - 6 = 229, listed with this node's arguments.
     // Nor does the unreadable futex word test: 230.
-    ("test.cli_on_host", 230),
+    // Nor does the pidfd multi-thread signal test: 231.
+    ("test.cli_on_host", 231),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
