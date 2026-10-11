@@ -1147,7 +1147,7 @@ for mutation in record require condition; do
         status=1
     fi
 done
-if ! "$ROOT_DIR/ci/debug-shard-success.sh" self-test; then
+if ! bash "$ROOT_DIR/ci/debug-shard-success.sh" self-test; then
     echo "check-shard-coverage.sh: FAIL — ci/debug-shard-success.sh self-test" >&2
     status=1
 fi

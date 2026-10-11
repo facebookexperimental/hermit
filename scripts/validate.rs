@@ -29934,6 +29934,8 @@ mod committed_selection_preservation_tests {
             "ci/hermetic/run-split-validate.sh",
             "ci/hermetic/retry-fetch.sh",
             "ci/check-shard-coverage.sh",
+            "ci/debug-shard-success.sh",
+            "ci/dag/validate.json",
             "ci/run-hosted-node.sh",
             "ci/expected-e2e-plan.json",
             ".github/workflows/ci-portable.yml",
