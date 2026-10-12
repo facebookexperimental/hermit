@@ -220,7 +220,17 @@ def require_sources(parent, config):
 # a local repository on 2026-10-11, 121 commits that day). So the ledger is
 # fetched at depth 1 and deepened only until the summarized commit is an
 # ancestor, a few commits in practice.
-LEDGER_FETCH_TIMEOUT = 1200
+# 2,700 s since 2026-10-12. The depth-1 fetch of the published commit was
+# done in the workflow's prepare step until hermit afa00a30, and took 527,
+# 592 and 793 s there on the runs that finished (it then timed out at 900 s on
+# three runs); fetched here it ran past the old 1,200 s on
+# https://github.com/rrnewton/hermit/actions/runs/38256949845. The fetch moves
+# about 711 MiB at a GitHub serving rate near 1 MB/s; its bytes shrink by the
+# scorecard history parts (265.9 MiB of the pack at ledger f8361f72) once
+# those leave the ledger's main branch (dev-hermit option (a),
+# https://github.com/rrnewton/dev-hermit/issues/558). The rebuild step's own
+# 101-minute bound still holds the fetch plus the 36-42 minute build.
+LEDGER_FETCH_TIMEOUT = 2700
 LEDGER_DEEPEN_STEP = 50
 LEDGER_DEEPEN_LIMIT = 2000
 
