@@ -1096,17 +1096,19 @@ impl AdmissionEvidence {
             Self::V2(e) => &e.context.authority,
         }
     }
-    /// Ordinary validation authority is canonical whether the target was the
-    /// observed main (`current-main`), a commit that main already contained
-    /// (`main-ancestor`), or a target built on an earlier main that the observed
-    /// main moved past by a disjoint delta (`disjoint-main`); only frozen
-    /// validation is noncanonical.
+    /// Ordinary validation authority is canonical from the record alone when
+    /// the target was the observed main (`current-main`) or a commit that main
+    /// already contained (`main-ancestor`). Frozen validation is noncanonical.
+    ///
+    /// A `disjoint-main` floor (a target built on an earlier main E that the
+    /// observed main M moved past) is NOT canonical here. Its claim holds only
+    /// if [`super::disjoint_main_proof`] passes in a repository holding E, M
+    /// and the target, with the floor-sensitive list read from the target's
+    /// tree. This reader has no Git, so it cannot run that proof, and a shape
+    /// check is not the proof. A caller that has Git runs the proof itself.
     pub fn is_canonical(&self) -> bool {
         self.validate().is_ok()
-            && matches!(
-                self.floor().kind.as_str(),
-                "current-main" | "main-ancestor" | "disjoint-main"
-            )
+            && matches!(self.floor().kind.as_str(), "current-main" | "main-ancestor")
     }
     pub fn log_identity(&self) -> Option<&WorkspaceLocatorV2> {
         match self {
@@ -1292,7 +1294,10 @@ mod tests {
             assert!(!bytes.ends_with(b"\n"));
             let e = AdmissionEvidence::V2(evidence_v2(c));
             assert_eq!(e.context_bytes().unwrap(), bytes);
-            assert_eq!(e.is_canonical(), name != "frozen");
+            assert_eq!(
+                e.is_canonical(),
+                !matches!(name, "frozen" | "disjoint-main")
+            );
             assert_eq!(e.artifact_sha256(), admission_sha256(&bytes));
             assert_eq!(e.artifact_bytes(), bytes.len() as u64);
             e.artifact_locator()
@@ -1648,13 +1653,12 @@ mod tests {
         c
     }
 
-    /// A disjoint-main floor is canonical with a bounded delta to a later
+    /// A disjoint-main floor is well formed with a bounded delta to a later
     /// main the target does not equal, and every pin binding on the floor E.
     #[test]
-    fn disjoint_main_floor_is_canonical_only_with_a_bounded_main_delta() {
+    fn disjoint_main_floor_is_well_formed_only_with_a_bounded_main_delta() {
         let disjoint = disjoint_main_context();
         disjoint.validate().unwrap();
-        assert!(AdmissionEvidence::V2(evidence_v2(disjoint.clone())).is_canonical());
         // The bound is inclusive at both ends.
         for n in [1, DISJOINT_MAIN_MAX_DELTA_COMMITS] {
             let mut edge = disjoint.clone();
@@ -1710,6 +1714,31 @@ mod tests {
 
     /// The count is the only optional floor field: absent from every other
     /// kind's canonical bytes, an integer when present, and never `null`.
+    /// A well-formed disjoint-main record is never canonical from the record
+    /// alone: whether main's move since E is disjoint is a Git fact this
+    /// reader cannot check. The same record re-labelled current-main (with the
+    /// observed main as its floor) is canonical, so the refusal is the kind's.
+    #[test]
+    fn disjoint_main_floor_is_not_canonical_without_the_git_proof() {
+        let disjoint = disjoint_main_context();
+        disjoint.validate().unwrap();
+        let evidence = AdmissionEvidence::V2(evidence_v2(disjoint.clone()));
+        assert_eq!(evidence.floor().kind, "disjoint-main");
+        assert!(!evidence.is_canonical());
+        for n in [1, DISJOINT_MAIN_MAX_DELTA_COMMITS] {
+            let mut edge = disjoint.clone();
+            edge.floor.main_delta_commits = Some(n);
+            edge.validate().unwrap();
+            assert!(
+                !AdmissionEvidence::V2(evidence_v2(edge)).is_canonical(),
+                "{n}"
+            );
+        }
+        let current = context_v2();
+        current.validate().unwrap();
+        assert!(AdmissionEvidence::V2(evidence_v2(current)).is_canonical());
+    }
+
     #[test]
     fn disjoint_main_delta_field_is_strict_on_the_wire() {
         let current = admission_context_v2_bytes(&context_v2()).unwrap();

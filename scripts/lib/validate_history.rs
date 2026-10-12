@@ -641,10 +641,23 @@ fn has_blocking_failure(rows: &[serde_json::Value], key: &CacheKey<'_>) -> bool 
 /// Dispatched on `producer`; an unrecognized producer is REFUSED rather than
 /// guessed at, so a future third writer cannot be silently cached under
 /// whichever field name happens to be present.
+///
+/// A row admitted on a `disjoint-main` floor is never reused, as a cache hit or
+/// as a `--selective` baseline. Its claim (main's move from E to M is disjoint
+/// from the target and touches no floor-sensitive path) holds only while
+/// `disjoint_main_proof` passes, and the parent's two-hour bound on E is not in
+/// the record at all. [`admission_cache_row`] decodes the claim but does not
+/// prove it, so refusing the kind here is what keeps a by-tree reuse from
+/// carrying an unproven floor. The cost is one real run in the rare case of an
+/// identical tree.
 fn pass_row_qualifies(row: &serde_json::Value) -> bool {
     if row.get("admission_floor_evidence").is_some()
         && !serde_json::from_value::<hermit_manifest_plan::ledger::HistoryRow>(row.clone())
-            .is_ok_and(|original| original.admission_evidence().is_ok_and(|e| e.is_some()))
+            .is_ok_and(|original| {
+                original.admission_evidence().is_ok_and(|e| {
+                    e.is_some_and(|evidence| evidence.floor().kind != "disjoint-main")
+                })
+            })
     {
         return false;
     }

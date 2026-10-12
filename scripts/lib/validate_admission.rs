@@ -1692,6 +1692,83 @@ for entry in Path('/proc/self/fd').iterdir():
         );
     }
 
+    /// A passing row admitted on a disjoint-main floor is never reused by
+    /// tree, neither as a cache hit nor as a `--selective` baseline, even when
+    /// its evidence decodes and matches the admission that would reuse it.
+    /// The same row on a current-main floor is a hit, so the refusal is the
+    /// floor kind's and nothing else.
+    #[test]
+    fn disjoint_main_rows_are_never_reused_by_tree() {
+        let f = Fixture::new();
+        std::fs::write(f.0.join(".gitignore"), "ignored/\n").unwrap();
+        f.command(&["add", ".gitignore"]);
+        let queued = f.commit_files("queued main E", &["README"]);
+        let moved = f.commit_files("main moves on docs only", &["docs/a.md"]);
+        f.checkout(&queued);
+        let target = f.commit_files("target change", &["src/lib.rs"]);
+        let mut disjoint = f.authority(&target, &queued);
+        disjoint["admission_floor"]["kind"] = "disjoint-main".into();
+        disjoint["admission_floor"]["observed_main_sha"] = moved.as_str().into();
+        disjoint["admission_floor"]["main_delta_commits"] = 1.into();
+        let current = f.authority(&target, &queued);
+        let canonical = crate::validate_plan::validation_config(&source_root()).unwrap();
+        let state = VerifiedStateRoot::fixture(&f.0);
+        let key_tree = f.command(&["rev-parse", &format!("{target}^{{tree}}")]);
+        let key = crate::validate_history::CacheKey {
+            tree: &key_tree,
+            profile: "full",
+            host: "fixture-host",
+            toolchain: "rustc fixture",
+            release_builder: crate::RELEASE_BUILDER_CARGO,
+        };
+        let row_for = |status: &Value, name: &str| {
+            let proof = f.admit(status, &target).unwrap();
+            let view = BoundExecutionPlan::bind(&canonical, None, Some(&proof)).unwrap();
+            let log_path = f.0.join(format!("ignored/validate/{name}.log"));
+            let log = state.create(&state.locator(&log_path).unwrap()).unwrap();
+            log.write_exact(b"driver log\n").unwrap();
+            let retained = view
+                .retain(&proof, &f.0, &state, name, "2026-10-12T15:00:00Z", &log)
+                .unwrap();
+            assert!(view.cache_matches(&proof, &retained.evidence), "{name}");
+            let AdmissionEvidence::V2(v2) = &retained.evidence else {
+                panic!("new emission must be v2")
+            };
+            let row = serde_json::json!({"result":"pass","commit":target,"tree":key_tree,
+                "host":"fixture-host","profile":"full","toolchain":"rustc fixture",
+                "selection_mode":"full","commit_anchored":true,"tree_dirty":false,
+                "failures":0,"finished_at":"2026-10-12T15:20:00Z","schema_version":10,
+                "producer":"hermit-validate-rs","executed_nodes":76,"executed_tests":2129,
+                "passed_tests":2129,"gates_expected":76,"gates_run":76,
+                "coverage":{"planned_test_nodes":20,"executed_test_nodes":20,"absent_nodes":[]},
+                "release_builder":crate::RELEASE_BUILDER_CARGO,
+                "e2e_payload":crate::e2e_payload_identity(crate::RELEASE_BUILDER_CARGO),
+                "run_id":v2.context.run_id,"started_at":v2.context.started_at,
+                "log_file":log_path,"log_identity":log.locator,
+                "admission_floor_evidence":retained.evidence,
+                "cell_results":{"run_id":v2.context.run_id}});
+            // The claim decodes: the refusal below is not a malformed row.
+            crate::validate_history::admission_cache_row(&row.to_string()).unwrap()
+        };
+        let current_row = row_for(&current, "current-run");
+        let disjoint_row = row_for(&disjoint, "disjoint-run");
+        let hit = |row: &Value| {
+            crate::validate_history::cache_lookup(std::slice::from_ref(row), "pass", &key)
+        };
+        let baseline = |row: &Value| {
+            crate::validate_history::selective_baseline(
+                std::slice::from_ref(row),
+                None,
+                "",
+                &|_| true,
+            )
+        };
+        assert_eq!(hit(&current_row).unwrap().commit, target);
+        assert_eq!(baseline(&current_row).as_deref(), Some(target.as_str()));
+        assert!(hit(&disjoint_row).is_none());
+        assert_eq!(baseline(&disjoint_row), None);
+    }
+
     /// Every file a floor-based check (pre.reverie_pin, pre.reverie_pin_on_host,
     /// check.lint_checks) reads from its base commit, and the code that hands
     /// those checks the floor, is on the floor-sensitive list.
