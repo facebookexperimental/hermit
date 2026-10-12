@@ -56,45 +56,55 @@ jobs:
     if: >-
       github.repository == 'rrnewton/hermit' && github.ref == 'refs/heads/main' &&
       (github.event_name != 'schedule' || vars.COMPATIBILITY_NIGHTLY_ENABLED == 'true')
-    # A ledger rebuild runs on the self-hosted `gate` runner; every other Docs
-    # run stays on ubuntu-latest. The rebuild outgrew the hosted runner's 16 GB
-    # of memory: the builder's own process peaked at 23.2 GiB in stage1.export
-    # (24.9 GB reported by the builder, ledger 1d2bb9dc, 2026-10-12, measured
-    # locally), and both hosted rebuilds that day ended "cancelled" about 42
-    # minutes into the rebuild step, with the always() steps after it skipped:
+    # A ledger rebuild runs on the self-hosted `gate` runner,
+    # hermit-gate-newton; every other Docs run stays on ubuntu-latest. The
+    # rebuild outgrew the hosted runner's 16 GB of memory: the builder's own
+    # process peaked at 23.2 GiB in stage1.export (24.9 GB reported by the
+    # builder, ledger 1d2bb9dc, 2026-10-12, measured locally), and both hosted
+    # rebuilds that day ended "cancelled" about 42 minutes into the rebuild
+    # step, with the always() steps after it skipped:
     # https://github.com/rrnewton/hermit/actions/runs/38266575630 and
     # https://github.com/rrnewton/hermit/actions/runs/38276042351. The `gate`
-    # runner is a native service on a large shared host with no memory limit
-    # of its own. The `pmu` runners are containers started with a 16 GB
-    # default limit (dev-hermit ci-hub/runners/init-runner.sh), so they would
-    # not help. "Keep a self-hosted run off the host's shared state" and the
-    # runner.environment conditions below keep the job from changing that
-    # host. Return the rebuild to ubuntu-latest once the builder streams the
-    # ledger instead of holding it (https://github.com/rrnewton/dev-hermit/issues/515).
-    runs-on: ${{ (github.event_name == 'schedule' || inputs.rebuild_compatibility) && fromJSON('["self-hosted", "gate"]') || 'ubuntu-latest' }}
+    # runner is a native service on a large shared host with no memory limit of
+    # its own. The `pmu` runners are containers started with a 16 GB default
+    # limit (dev-hermit ci-hub/runners/init-runner.sh), so they would not help.
+    # The `gate` label alone does not select hermit-gate-newton: the pmu runner
+    # hermit-ci-newton-3 carries it too and took
+    # https://github.com/rrnewton/hermit/actions/runs/38285455905. So the job
+    # also asks for `docs-rebuild`, a label only hermit-gate-newton carries;
+    # until a runner has it, a rebuild run waits in the queue rather than
+    # starting on a runner too small for it. "Keep a self-hosted run off the
+    # host's shared state" and the runner.environment conditions below keep the
+    # job from changing that host. Return the rebuild to ubuntu-latest once the
+    # builder streams the ledger instead of holding it
+    # (https://github.com/rrnewton/dev-hermit/issues/515).
+    runs-on: ${{ (github.event_name == 'schedule' || inputs.rebuild_compatibility) && fromJSON('["self-hosted", "gate", "docs-rebuild"]') || 'ubuntu-latest' }}
     # Room for the 101-minute rebuild step below plus the steps around it
     # (about 10 minutes on 2026-09-27, with an 11-minute public-byte check cap).
     timeout-minutes: 150
 
     steps:
     # Before any git command: the runner's user has git URL rewrites in its
-    # global configuration that serve some GitHub URLs from stale local
-    # mirrors, and its PATH lacks the user's Rust toolchain. The rebuild's
-    # scratch and temporary files go in one job-owned directory, removed by
-    # the job's last step, never in the shared host's /tmp. That directory is
-    # outside the runner's work folder because the `gate` runner's work folder
-    # lies inside a dev-hermit checkout, and the builder refuses a website
-    # output root inside any checkout that contains its own source
-    # (build_and_serve.py, _output_location).
+    # global configuration that serve some GitHub URLs from stale local mirrors,
+    # so git reads an empty global configuration file instead (not /dev/null,
+    # which git rejected as "bad config line 1" on hermit-ci-newton-3), and its
+    # PATH lacks the user's Rust toolchain. The rebuild's scratch and temporary
+    # files go in one job-owned directory, removed by the job's last step, never
+    # in the shared host's /tmp. That directory is outside the runner's work
+    # folder because the `gate` runner's work folder lies inside a dev-hermit
+    # checkout, and the builder refuses a website output root inside any
+    # checkout that contains its own source (build_and_serve.py,
+    # _output_location).
     - name: Keep a self-hosted run off the host's shared state
       if: runner.environment == 'self-hosted'
       run: |
         set -euo pipefail
-        printf 'GIT_CONFIG_GLOBAL=/dev/null\n' >> "$GITHUB_ENV"
         printf '%s\n' "$HOME/.cargo/bin" >> "$GITHUB_PATH"
         mkdir -p "$HOME/.cache"
         scratch=$(mktemp -d "$HOME/.cache/hermit-docs-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.XXXXXX")
         mkdir "$scratch/tmp"
+        : > "$scratch/gitconfig"
+        printf 'GIT_CONFIG_GLOBAL=%s\n' "$scratch/gitconfig" >> "$GITHUB_ENV"
         printf 'COMPATIBILITY_SCRATCH_PARENT=%s\n' "$scratch" >> "$GITHUB_ENV"
         printf 'TMPDIR=%s\n' "$scratch/tmp" >> "$GITHUB_ENV"
     - uses: actions/checkout@v4
