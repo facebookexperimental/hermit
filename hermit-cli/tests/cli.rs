@@ -21826,6 +21826,51 @@ fn realtime_signals_are_delivered_with_their_values_and_verify() {
     }
 }
 
+/// A guest that a realtime signal kills ends Hermit by that signal, as
+/// Hermit propagates the guest's status, and a guest whose child a realtime
+/// signal kills sees that signal from waitpid and verifies at bitwise
+/// parity. The tracer panicked decoding such a status before
+/// https://github.com/rrnewton/reverie/issues/997.
+#[test]
+fn a_guest_or_child_killed_by_a_realtime_signal_reports_it() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let guest = realtime_signals_guest().to_str().unwrap().to_owned();
+    let rt1 = libc::SIGRTMIN() + 1;
+
+    let args = ["run", "--strict", "--", guest.as_str(), "die"];
+    let output = hermit(&args);
+    assert_eq!(
+        output.status.signal(),
+        Some(rt1),
+        "hermit {args:?} ended with {}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let args = [
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--",
+        guest.as_str(),
+        "child-dies",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "child signaled: 1, by SIGRTMIN+1\n");
+    let log = stderr(&output);
+    assert!(
+        log.contains(":: comparison=BitwiseInfoV1 relaxations=none"),
+        "comparison was not canonical:\n{log}"
+    );
+    assert!(
+        log.contains(":: Success: deterministic. Determinism verified."),
+        "verification failed:\n{log}"
+    );
+}
+
 /// A process-directed signal a thread sends to its own multi-threaded process
 /// goes to the sender, before `kill` returns, exactly as Linux delivers it,
 /// when the schedule fixes the kernel's choice and the sender's dequeue

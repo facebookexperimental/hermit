@@ -2661,7 +2661,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And a_sigev_thread_id_timer_notifies_exactly_its_thread_at_bitwise_parity and
     // a_sigev_thread_id_expiration_beside_a_pending_copy_is_refused_by_name
     // (https://github.com/rrnewton/hermit/issues/4164): 318.
-    ("test.cli", 318),
+    // And a_guest_or_child_killed_by_a_realtime_signal_reports_it
+    // (https://github.com/rrnewton/reverie/issues/997): 319.
+    ("test.cli", 319),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2918,7 +2920,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Nor does the vDSO symbol-version test: 251.
     // The realtime-signal delivery test runs on the host too: 252.
     // Nor do the two SIGEV_THREAD_ID timer tests: 254.
-    ("test.cli_on_host", 254),
+    // And the realtime-termination test: 255.
+    ("test.cli_on_host", 255),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux

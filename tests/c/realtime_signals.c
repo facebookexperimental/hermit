@@ -25,6 +25,11 @@
  *
  * Part 1 runs before the thread exists: a process-directed signal is sent
  * only while the process has one thread.
+ *
+ * With an argument the guest instead ends by a realtime signal
+ * (https://github.com/rrnewton/reverie/issues/997): "die" raises SIGRTMIN+1
+ * with its default action, and "child-dies" forks a child that does and
+ * prints what waitpid reports for it.
  */
 
 #define _GNU_SOURCE
@@ -32,6 +37,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -197,8 +203,41 @@ static int cancel_pauser(void) {
   return sent != 0 || !canceled;
 }
 
-int main(void) {
+static int die_by_realtime_signal(void) {
+  raise(SIGRTMIN + 1);
+  return 3;
+}
+
+static int reap_child_killed_by_realtime_signal(void) {
+  pid_t child = fork();
+  if (child < 0) {
+    perror("fork");
+    return 1;
+  }
+  if (child == 0) {
+    raise(SIGRTMIN + 1);
+    _exit(3);
+  }
+  int status = 0;
+  if (waitpid(child, &status, 0) != child) {
+    perror("waitpid");
+    return 1;
+  }
+  printf(
+      "child signaled: %d, by SIGRTMIN+%d\n",
+      WIFSIGNALED(status),
+      WIFSIGNALED(status) ? WTERMSIG(status) - SIGRTMIN : -1);
+  return !(WIFSIGNALED(status) && WTERMSIG(status) == SIGRTMIN + 1);
+}
+
+int main(int argc, char** argv) {
   setvbuf(stdout, NULL, _IONBF, 0);
+  if (argc > 1 && strcmp(argv[1], "die") == 0) {
+    return die_by_realtime_signal();
+  }
+  if (argc > 1 && strcmp(argv[1], "child-dies") == 0) {
+    return reap_child_killed_by_realtime_signal();
+  }
   int failures = queued_in_order();
   failures += sigsuspend_wake();
   failures += cancel_pauser();
