@@ -29,11 +29,14 @@
 
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;
+#[path = "common/skid_overshoot.rs"]
+mod skid_overshoot;
 
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::process::Output;
 use std::sync::OnceLock;
 
 /// Chaos seeds that deterministically starved the sched_yield loop before the
@@ -59,12 +62,22 @@ const TWO_SPINNERS_SEEDS: [u64; 4] = [0, 17, 22, 28];
 /// (review of https://github.com/rrnewton/hermit/pull/4080).
 const YIELD_THEN_WRITE_SEEDS: [u64; 4] = [0, 4, 7, 9];
 
+/// Seeds for the random-heuristic progress check: the union of the seeds that
+/// starved some mode of the guest under the default heuristic above.
+const RANDOM_HEURISTIC_SEEDS: [u64; 11] = [0, 4, 5, 6, 7, 8, 9, 12, 17, 22, 28];
+
 /// Chaos seeds for the schedule-diversity check, and the fewest distinct
 /// outcomes they must give. Over seeds 0-15, `thread_contention epoll` under
 /// `--chaos` gave 16 distinct outcomes on main 5e558a6a, and only 4 with the
 /// first version of the fix, whose yields overrode the chaos priority draw.
 const DIVERSITY_SEEDS: std::ops::Range<u64> = 0..16;
 const MIN_DISTINCT_OUTCOMES: usize = 12;
+
+/// Attempts per run where a typed PMU skid-overshoot refusal, a host property
+/// (https://github.com/rrnewton/hermit/issues/1845), is retried. The
+/// random-heuristic checks make 66 runs, and about 1 in 100 short chaos runs
+/// is refused on some hosts.
+const SKID_ATTEMPTS: u32 = 3;
 
 /// Generous per-run timeout. A healthy run finishes in well under a second; a
 /// starved run would otherwise spin forever.
@@ -124,11 +137,43 @@ fn run_seed(seed: u64, chaos_args: &[&str], guest_args: &[&str]) {
 /// Run `guest` under `--chaos` with `seed`, require a clean exit within the
 /// timeout, and return its stdout.
 fn run_chaos(guest: &Path, seed: u64, chaos_args: &[&str], guest_args: &[&str]) -> String {
+    let (output, rendered) = chaos_output(guest, seed, &[], chaos_args, guest_args);
+    let output = checked_chaos_output(output, seed, &rendered);
+    String::from_utf8(output.stdout).expect("guest stdout should be UTF-8")
+}
+
+/// [`run_chaos`] with `hermit_args` before `run`, running again only after a
+/// typed PMU skid-overshoot refusal, and returning the whole output.
+fn run_chaos_retrying_skid(
+    guest: &Path,
+    seed: u64,
+    hermit_args: &[&str],
+    chaos_args: &[&str],
+    guest_args: &[&str],
+) -> Output {
+    let name = format!("seed {seed} {chaos_args:?} {guest_args:?}");
+    let (_, output, rendered) =
+        skid_overshoot::retry_typed_skid_refusal(&name, SKID_ATTEMPTS, || {
+            chaos_output(guest, seed, hermit_args, chaos_args, guest_args)
+        });
+    checked_chaos_output(output, seed, &rendered)
+}
+
+/// Run `guest` once under `--chaos` with `seed`, and return its output with
+/// the rendered command.
+fn chaos_output(
+    guest: &Path,
+    seed: u64,
+    hermit_args: &[&str],
+    chaos_args: &[&str],
+    guest_args: &[&str],
+) -> (Output, String) {
     let mut command = Command::new("timeout");
     command
         .arg("--kill-after=2s")
         .arg(format!("{TIMEOUT_SECONDS}s"))
         .arg(hermit_test::hermit_binary())
+        .args(hermit_args)
         .args([
             "run",
             "--base-env=minimal",
@@ -146,7 +191,11 @@ fn run_chaos(guest: &Path, seed: u64, chaos_args: &[&str], guest_args: &[&str]) 
     let output = command
         .output()
         .unwrap_or_else(|error| panic!("failed to start guest (seed {seed}): {rendered}: {error}"));
+    (output, rendered)
+}
 
+/// Require that a chaos run exited cleanly within the timeout.
+fn checked_chaos_output(output: Output, seed: u64, rendered: &str) -> Output {
     // `timeout` exits 124 when it has to kill the child; that is exactly the
     // starvation symptom this test guards against.
     assert_ne!(
@@ -161,8 +210,7 @@ fn run_chaos(guest: &Path, seed: u64, chaos_args: &[&str], guest_args: &[&str]) 
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
-
-    String::from_utf8(output.stdout).expect("guest stdout should be UTF-8")
+    output
 }
 
 #[test]
@@ -188,6 +236,80 @@ fn targeted_chaos_sched_yield_makes_progress_with_timer_preemption() {
 fn targeted_chaos_does_not_starve_a_yielder_that_is_waited_on() {
     for seed in YIELD_THEN_WRITE_SEEDS {
         run_seed(seed, &["--chaos-target-races"], &["--yield-then-write"]);
+    }
+}
+
+/// Under `--sched-heuristic=random`, the heuristic every chaos cell of the E2E
+/// manifest uses, a `sched_yield` stays a weak yield rather than opening an
+/// epoch (https://github.com/rrnewton/hermit/issues/4150). The uniform pick at
+/// each turn must still reach the thread a spinner waits on, in every mode of
+/// the guest and with or without `--chaos-target-races`.
+#[test]
+fn random_chaos_sched_yield_makes_progress_with_timer_preemption() {
+    for chaos_args in [
+        &["--sched-heuristic=random"][..],
+        &["--sched-heuristic=random", "--chaos-target-races"],
+    ] {
+        for guest_args in [&[][..], &["--two-spinners"], &["--yield-then-write"]] {
+            for seed in RANDOM_HEURISTIC_SEEDS {
+                let output = run_chaos_retrying_skid(guest(), seed, &[], chaos_args, guest_args);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert!(
+                    stdout.contains("sched-yield-progress-ok"),
+                    "missing progress marker under chaos {chaos_args:?} with seed {seed}; stdout:\n{stdout}"
+                );
+            }
+        }
+    }
+}
+
+/// The scheduler commits in an INFO log whose resources begin with `resource`.
+fn commits_of(log: &str, resource: &str) -> usize {
+    let needle = format!("using resources {{{resource}");
+    log.lines()
+        .filter(|line| line.contains("COMMIT turn") && line.contains(&needle))
+        .count()
+}
+
+/// The route a chaos `sched_yield` takes, read from the scheduler's commits.
+/// Under `--sched-heuristic=random` the yield is the weak `SleepUntil(0)`
+/// yield (https://github.com/rrnewton/hermit/issues/4150); under the default
+/// heuristic it is still a `SchedYield`, which opens a yield epoch
+/// (https://github.com/rrnewton/hermit/issues/4068). The `--yield-then-write`
+/// guest's main thread yields exactly once whatever the schedule; the
+/// `--two-spinners` guest yields only while its worker has not finished, which
+/// at a fixed seed differed between this host's build and the validation root.
+#[test]
+fn chaos_sched_yield_route_depends_on_the_heuristic() {
+    for (chaos_args, weak) in [(&["--sched-heuristic=random"][..], true), (&[][..], false)] {
+        let output = run_chaos_retrying_skid(
+            guest(),
+            4,
+            &["--log=info"],
+            chaos_args,
+            &["--yield-then-write"],
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let log = String::from_utf8_lossy(&output.stderr);
+        let commits: Vec<&str> = log
+            .lines()
+            .filter(|line| line.contains("COMMIT turn"))
+            .collect();
+        let yields = log.matches("inbound syscall: sched_yield").count();
+        let weak_yields = commits_of(&log, "SleepUntil(LogicalTime(0))");
+        let sched_yields = commits_of(&log, "SchedYield");
+        assert!(
+            stdout.contains("yielded") && stdout.contains("sched-yield-progress-ok"),
+            "the guest did not yield and finish under chaos {chaos_args:?}; stdout:\n{stdout}"
+        );
+        let expected = if weak { (1, 1, 0) } else { (1, 0, 1) };
+        assert_eq!(
+            (yields, weak_yields, sched_yields),
+            expected,
+            "under chaos {chaos_args:?}: (sched_yield calls, SleepUntil(0) commits, \
+             SchedYield commits); the run's commits:\n{}",
+            commits.join("\n")
+        );
     }
 }
 

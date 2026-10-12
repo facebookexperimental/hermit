@@ -36,6 +36,7 @@ use tracing::trace;
 use crate::SharedMemoryObjectId;
 use crate::config::BlockingMode;
 use crate::config::Config;
+use crate::config::SchedHeuristic;
 use crate::memory::MemoryMetadata;
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::ExternalOpId;
@@ -1366,12 +1367,23 @@ enum SchedYieldRoute {
 ///   does a backend that does not deliver the preemption timer
 ///   (`Config::backend_delivers_timer_events`): there a thread handed the
 ///   turn that never makes a syscall would never give it back.
+/// - `--sched-heuristic=random` also keeps the weak yield. It draws a uniform
+///   pick among the queued threads at every turn, so a yielder cannot hold
+///   the CPU from the thread it waits on, and an epoch would only force the
+///   yielders into near-equal shares: on the fp-reduction chaos cell
+///   (https://github.com/rrnewton/hermit/issues/4150) it cut the outcomes
+///   over 32 seeds to fewer than the 7 of 8 classes the cell requires.
+///   `StickyRandom` keeps its pick across turns, so it keeps the epoch.
 fn sched_yield_route(cfg: &Config) -> SchedYieldRoute {
     if cfg.chaos && cfg.max_timeslice.is_none() {
         SchedYieldRoute::ChaosReprioritize
     } else if !cfg.chaos && cfg.replay_preemptions_from.is_some() {
         SchedYieldRoute::ReplayStrongYield
-    } else if cfg.chaos && cfg.replay_schedule_from.is_none() && cfg.backend_delivers_timer_events {
+    } else if cfg.chaos
+        && cfg.replay_schedule_from.is_none()
+        && cfg.backend_delivers_timer_events
+        && cfg.sched_heuristic != SchedHeuristic::Random
+    {
         SchedYieldRoute::ChaosYieldEpoch
     } else if cfg.chaos || cfg.replay_schedule_from.is_some() {
         SchedYieldRoute::WeakYield
@@ -4231,9 +4243,10 @@ mod tests {
     use super::*;
 
     /// Each configuration takes its own `sched_yield` route; only chaos with
-    /// the timer on and delivered, and no schedule replay, takes the yield
-    /// epoch, and an ordinary run still ends its timeslice
-    /// (https://github.com/rrnewton/hermit/issues/4068).
+    /// the timer on and delivered, no schedule replay, and a heuristic other
+    /// than `Random` takes the yield epoch, and an ordinary run still ends its
+    /// timeslice (https://github.com/rrnewton/hermit/issues/4068,
+    /// https://github.com/rrnewton/hermit/issues/4150).
     #[test]
     fn each_configuration_takes_its_sched_yield_route() {
         let path = || Some(std::path::PathBuf::from("record.json"));
@@ -4263,6 +4276,42 @@ mod tests {
                     ..Config::default()
                 },
                 SchedYieldRoute::ChaosYieldEpoch,
+            ),
+            (
+                Config {
+                    chaos: true,
+                    backend_delivers_timer_events: true,
+                    sched_heuristic: SchedHeuristic::Random,
+                    ..Config::default()
+                },
+                SchedYieldRoute::WeakYield,
+            ),
+            (
+                Config {
+                    chaos: true,
+                    backend_delivers_timer_events: true,
+                    sched_heuristic: SchedHeuristic::StickyRandom,
+                    ..Config::default()
+                },
+                SchedYieldRoute::ChaosYieldEpoch,
+            ),
+            (
+                Config {
+                    chaos: true,
+                    backend_delivers_timer_events: true,
+                    sched_heuristic: SchedHeuristic::ConnectBind,
+                    ..Config::default()
+                },
+                SchedYieldRoute::ChaosYieldEpoch,
+            ),
+            (
+                Config {
+                    chaos: true,
+                    max_timeslice: None,
+                    sched_heuristic: SchedHeuristic::Random,
+                    ..Config::default()
+                },
+                SchedYieldRoute::ChaosReprioritize,
             ),
             (
                 Config {
@@ -4315,9 +4364,10 @@ mod tests {
             assert_eq!(
                 sched_yield_route(&cfg),
                 route,
-                "chaos={} timer delivered={} max_timeslice={:?} preemptions={:?} schedule={:?}",
+                "chaos={} timer delivered={} heuristic={:?} max_timeslice={:?} preemptions={:?} schedule={:?}",
                 cfg.chaos,
                 cfg.backend_delivers_timer_events,
+                cfg.sched_heuristic,
                 cfg.max_timeslice,
                 cfg.replay_preemptions_from,
                 cfg.replay_schedule_from
