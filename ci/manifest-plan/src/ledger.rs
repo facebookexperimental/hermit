@@ -24,6 +24,9 @@ pub use schema10::*;
 mod admission;
 pub use admission::*;
 
+mod disjoint_main;
+pub use disjoint_main::*;
+
 mod framework_retries;
 pub use framework_retries::*;
 

@@ -18,6 +18,10 @@ pub const ADMISSION_CONTEXT_CONTRACT: &str = "ci-hub-admission-floor/v1";
 pub const ADMISSION_CONTEXT_V2_CONTRACT: &str = "ci-hub-admission-floor/v2";
 pub const ADMISSION_CONTEXT_MAX_BYTES: usize = 1024 * 1024;
 
+/// The most first-parent main commits a `disjoint-main` floor may lag the main
+/// observed at admission by.
+pub const DISJOINT_MAIN_MAX_DELTA_COMMITS: u64 = 12;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdmissionFloorV1 {
@@ -25,6 +29,20 @@ pub struct AdmissionFloorV1 {
     pub sha: String,
     pub tree: String,
     pub observed_main_sha: String,
+    /// The first-parent commit count of `sha..observed_main_sha`. Present if
+    /// and only if `kind` is `disjoint-main`; every other kind keeps exactly
+    /// the four fields above, byte for byte. An explicit `null` is refused.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_u64"
+    )]
+    pub main_delta_commits: Option<u64>,
+}
+
+/// An optional field that, when present, must be an unsigned integer.
+fn present_u64<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<u64>, D::Error> {
+    u64::deserialize(deserializer).map(Some)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -742,6 +760,8 @@ struct AdmissionIdentity<'a> {
     run_id: &'a str,
     started_at: &'a str,
     log_valid: bool,
+    /// Only the V2 contract carries a `disjoint-main` floor.
+    v2_contract: bool,
     authority: &'a AdmissionAuthorityV1,
     floor: &'a AdmissionFloorV1,
     canonical_plan_sha256: &'a str,
@@ -794,8 +814,31 @@ impl AdmissionIdentity<'_> {
         {
             return Err("admission context has inconsistent run/owner identity".into());
         }
+        if f.kind == "disjoint-main" && !self.v2_contract {
+            return Err("a disjoint-main floor requires the v2 admission context contract".into());
+        }
+        if (f.kind == "disjoint-main") != f.main_delta_commits.is_some() {
+            return Err(
+                "admission floor carries main_delta_commits if and only if it is disjoint-main"
+                    .into(),
+            );
+        }
         match (a.kind.as_str(), f.kind.as_str()) {
             ("validate", "current-main") if f.sha == f.observed_main_sha => {}
+            // A run admitted against the main E it entered the queue with,
+            // after main moved to M by a path-disjoint delta. The driver
+            // re-proves the ancestry, count, disjointness and floor-sensitive
+            // paths from Git; without Git this reader keeps what is decidable
+            // from the identities: E and M differ, the target is neither M (M
+            // is never contained in the target) nor E (that is a main-ancestor
+            // run), and the delta count is bounded. That E is on M's
+            // first-parent line needs Git, so only the proof checks it.
+            ("validate", "disjoint-main")
+                if f.sha != f.observed_main_sha
+                    && f.observed_main_sha != self.target_sha
+                    && f.sha != self.target_sha
+                    && f.main_delta_commits
+                        .is_some_and(|n| (1..=DISJOINT_MAIN_MAX_DELTA_COMMITS).contains(&n)) => {}
             // A post-landing run of a commit that a later observed main
             // contains: the floor is the target itself, the same floor a
             // current-main run of that commit had while it was the tip.
@@ -843,6 +886,7 @@ impl AdmissionContextV1 {
             execution_plan_sha256: &self.execution_plan_sha256,
             pin_bindings: &self.pin_bindings,
             log_valid: self.log_file.starts_with('/') && !self.log_file.contains('\0'),
+            v2_contract: false,
         }
         .validate()
     }
@@ -872,6 +916,7 @@ impl AdmissionContextV2 {
             execution_plan_sha256: &self.execution_plan_sha256,
             pin_bindings: &self.pin_bindings,
             log_valid: true,
+            v2_contract: true,
         }
         .validate()
     }
@@ -1052,11 +1097,16 @@ impl AdmissionEvidence {
         }
     }
     /// Ordinary validation authority is canonical whether the target was the
-    /// observed main (`current-main`) or a commit that main already contained
-    /// (`main-ancestor`); only frozen validation is noncanonical.
+    /// observed main (`current-main`), a commit that main already contained
+    /// (`main-ancestor`), or a target built on an earlier main that the observed
+    /// main moved past by a disjoint delta (`disjoint-main`); only frozen
+    /// validation is noncanonical.
     pub fn is_canonical(&self) -> bool {
         self.validate().is_ok()
-            && matches!(self.floor().kind.as_str(), "current-main" | "main-ancestor")
+            && matches!(
+                self.floor().kind.as_str(),
+                "current-main" | "main-ancestor" | "disjoint-main"
+            )
     }
     pub fn log_identity(&self) -> Option<&WorkspaceLocatorV2> {
         match self {
@@ -1150,6 +1200,7 @@ mod tests {
                 sha: "4".repeat(40),
                 tree: "5".repeat(40),
                 observed_main_sha: "4".repeat(40),
+                main_delta_commits: None,
             },
             canonical_plan_sha256: "6".repeat(64),
             execution_plan_sha256: "7".repeat(64),
@@ -1227,12 +1278,14 @@ mod tests {
         ancestor.floor.sha = ancestor.target_sha.clone();
         ancestor.floor.tree = ancestor.target_tree.clone();
         ancestor.pin_bindings[0].base_sha = ancestor.target_sha.clone();
+        let disjoint = disjoint_main_context();
         for (name, c) in [
             ("basic", basic),
             ("escaped", escaped),
             ("large-u64", large),
             ("frozen", frozen),
             ("main-ancestor", ancestor),
+            ("disjoint-main", disjoint),
         ] {
             let bytes = admission_context_v2_bytes(&c).unwrap();
             assert_eq!(admission_context_v2_from_bytes(&bytes).unwrap(), c);
@@ -1582,6 +1635,141 @@ mod tests {
         let mut pin = ancestor;
         pin.pin_bindings[0].base_sha = pin.floor.observed_main_sha.clone();
         assert!(refused(pin).contains("pin binding"));
+    }
+
+    /// A disjoint-main context: the target contains the main E it queued
+    /// with (the floor and every pin base), and admission observed a later
+    /// main M three first-parent commits on.
+    fn disjoint_main_context() -> AdmissionContextV2 {
+        let mut c = context_v2();
+        c.floor.kind = "disjoint-main".into();
+        c.floor.observed_main_sha = "a".repeat(40);
+        c.floor.main_delta_commits = Some(3);
+        c
+    }
+
+    /// A disjoint-main floor is canonical with a bounded delta to a later
+    /// main the target does not equal, and every pin binding on the floor E.
+    #[test]
+    fn disjoint_main_floor_is_canonical_only_with_a_bounded_main_delta() {
+        let disjoint = disjoint_main_context();
+        disjoint.validate().unwrap();
+        assert!(AdmissionEvidence::V2(evidence_v2(disjoint.clone())).is_canonical());
+        // The bound is inclusive at both ends.
+        for n in [1, DISJOINT_MAIN_MAX_DELTA_COMMITS] {
+            let mut edge = disjoint.clone();
+            edge.floor.main_delta_commits = Some(n);
+            edge.validate().unwrap();
+        }
+
+        let refused = |c: AdmissionContextV2| c.validate().unwrap_err();
+        // E == M is a current-main run.
+        let mut same = disjoint.clone();
+        same.floor.observed_main_sha = same.floor.sha.clone();
+        assert!(refused(same).contains("floor disagrees"));
+        // The target is never M: M is not contained in the target.
+        let mut tip = disjoint.clone();
+        tip.floor.observed_main_sha = tip.target_sha.clone();
+        assert!(refused(tip).contains("floor disagrees"));
+        // A target that is E itself is a main-ancestor run.
+        let mut own = disjoint.clone();
+        own.floor.sha = own.target_sha.clone();
+        own.floor.tree = own.target_tree.clone();
+        own.pin_bindings[0].base_sha = own.target_sha.clone();
+        assert!(refused(own).contains("floor disagrees"));
+        // The count is 1..=12 and is required.
+        for n in [0, DISJOINT_MAIN_MAX_DELTA_COMMITS + 1, u64::MAX] {
+            let mut count = disjoint.clone();
+            count.floor.main_delta_commits = Some(n);
+            assert!(refused(count).contains("floor disagrees"), "{n}");
+        }
+        let mut absent = disjoint.clone();
+        absent.floor.main_delta_commits = None;
+        assert!(refused(absent).contains("if and only if"));
+        // Only ordinary validation authority selects it.
+        let mut frozen = disjoint.clone();
+        frozen.authority.kind = "frozen-validate".into();
+        assert!(refused(frozen).contains("floor disagrees"));
+        // Pin bindings stay on E, never on the observed main.
+        let mut pin = disjoint.clone();
+        pin.pin_bindings[0].base_sha = pin.floor.observed_main_sha.clone();
+        assert!(refused(pin).contains("pin binding"));
+        // No other kind carries the count.
+        let mut current = context_v2();
+        current.floor.main_delta_commits = Some(1);
+        assert!(refused(current).contains("if and only if"));
+        let mut ancestor = context_v2();
+        ancestor.floor.kind = "main-ancestor".into();
+        ancestor.floor.sha = ancestor.target_sha.clone();
+        ancestor.floor.tree = ancestor.target_tree.clone();
+        ancestor.pin_bindings[0].base_sha = ancestor.target_sha.clone();
+        ancestor.validate().unwrap();
+        ancestor.floor.main_delta_commits = Some(1);
+        assert!(refused(ancestor).contains("if and only if"));
+    }
+
+    /// The count is the only optional floor field: absent from every other
+    /// kind's canonical bytes, an integer when present, and never `null`.
+    #[test]
+    fn disjoint_main_delta_field_is_strict_on_the_wire() {
+        let current = admission_context_v2_bytes(&context_v2()).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&current).contains("main_delta_commits"),
+            "a current-main floor keeps exactly its four fields"
+        );
+        let disjoint = admission_context_v2_bytes(&disjoint_main_context()).unwrap();
+        let text = String::from_utf8(disjoint.clone()).unwrap();
+        assert!(text.contains(r#""main_delta_commits":3,"observed_main_sha":"#));
+        assert_eq!(
+            admission_context_v2_from_bytes(&disjoint).unwrap(),
+            disjoint_main_context()
+        );
+        let swap = |from: &str, to: &str| {
+            assert!(text.contains(from), "{from}");
+            admission_context_v2_from_bytes(text.replacen(from, to, 1).as_bytes()).unwrap_err()
+        };
+        assert!(
+            swap(r#""main_delta_commits":3"#, r#""main_delta_commits":null"#)
+                .contains("invalid type: null")
+        );
+        assert!(
+            swap(r#""main_delta_commits":3"#, r#""main_delta_commits":"3""#)
+                .contains("invalid type")
+        );
+        assert!(
+            swap(r#""main_delta_commits":3"#, r#""main_delta_commits":-1"#)
+                .contains("invalid value")
+        );
+        // A current-main floor that grows the field is refused, not ignored.
+        let current = String::from_utf8(current).unwrap();
+        let grown = current.replacen(
+            r#""observed_main_sha":"#,
+            r#""main_delta_commits":1,"observed_main_sha":"#,
+            1,
+        );
+        assert_ne!(grown, current);
+        assert!(
+            admission_context_v2_from_bytes(grown.as_bytes())
+                .unwrap_err()
+                .contains("if and only if")
+        );
+    }
+
+    /// The v1 contract predates the kind: its contexts may not carry it.
+    #[test]
+    fn disjoint_main_floor_is_refused_under_the_v1_contract() {
+        let v2 = disjoint_main_context();
+        v2.validate().unwrap();
+        let mut v1 = context();
+        v1.floor = v2.floor.clone();
+        let e = v1.validate().unwrap_err();
+        assert!(
+            e.contains("requires the v2 admission context contract"),
+            "{e}"
+        );
+        assert!(admission_context_bytes(&v1).is_err());
+        // The other kinds are unchanged under v1.
+        context().validate().unwrap();
     }
 
     #[test]

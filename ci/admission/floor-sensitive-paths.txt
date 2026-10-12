@@ -1,0 +1,95 @@
+# Floor-sensitive paths for the `disjoint-main` validation admission floor.
+#
+# A run whose target contains main E may be admitted after main moved to M only
+# if no commit in E..M touched a path matching a pattern below (every commit,
+# not just the E-to-M tree difference: the RECORD_VERSION check reads the
+# floor's history), E..M and E..target change disjoint paths, and E..target
+# changes no pin file. The proof is hermit_manifest_plan::ledger::
+# disjoint_main_proof, which the driver and the parent both run. The parent's
+# 2-hour age bound on E is not in the floor record, so no reader re-checks it.
+# Two kinds of path are listed:
+#   1. files whose content AT THE FLOOR decides the verdict of a floor-based
+#      check (pre.reverie_pin, pre.reverie_pin_on_host, check.lint_checks);
+#   2. the code that defines what validation does and how the floor reaches
+#      those checks (the validation DAG and its planner, admission, the pin-node
+#      wrappers and comparators).
+# While none of them changed, those checks reach the same verdict against M as
+# against E. Any other path main changed is covered by the disjoint-paths rule:
+# the target is validated with its own copy, which is the same risk already
+# accepted when main moves while an admitted run is running.
+#
+# The test validate_admission::tests::floor_sensitive_list_covers_every_file_a_floor_based_check_reads_from_its_base
+# fails if a pin node's command, wrapper, compiled script, `#[path]` include or
+# floor consumer names a path that is not matched here, or if a path the floor
+# comparators declare they read at the floor (FLOOR_READ_PATHSPECS in
+# scripts/check-reverie-pin.rs and scripts/check-record-version-floor.rs) is
+# not covered. Each checker has a TRIPWIRE test, not a proof: it fails on a new,
+# changed or duplicated call handed the floor (check-reverie-pin: calls naming
+# `base_ref`; check-record-version-floor: every Git call) and on any new
+# Command::new. It does not see a pathspec built with format! from a variable,
+# a widened filter in check-reverie-pin's base_pin (same call text, more files
+# read), or a copy of the floor under another name. A reviewer of any change
+# to a floor read must check it by hand. Also hand-maintained: hermit-cli/BUCK
+# and **/Cargo.lock (read from the target, not the floor), the planner and DAG
+# entries, and the driver entries (scripts/validate.rs, scripts/lib/validate*);
+# the test names each of them explicitly.
+#
+# scripts/lib/validate_admission.rs embeds this file and owns the matcher; the
+# parent's admission reads the same file from the target's tree. Keep the
+# format this simple. One pattern per line; a line whose first non-blank
+# character is `#` is a comment. Exactly four forms:
+#   dir/        a directory prefix (ends with `/`)
+#   prefix*     a path prefix (ends with `*`, no other `*`)
+#   **/NAME     any path whose final component is NAME
+#   path        an exact path
+# Paths are repository-relative, with no leading `/`.
+
+# What validation does: the validation DAG, including the pin nodes' canonical
+# commands and the per-node count pins.
+ci/dag/
+# The planner that generates the DAG and renders the admitted pin commands
+# (validation_dag.rs admitted_pin_command, validation_dag_static.rs).
+ci/manifest-plan/
+# This list.
+ci/admission/
+# The validation driver: its entry, which binds the floor into the pin
+# commands and runs them, and its admission, plan and receipt modules. Its
+# other includes (scripts/lib/exec_safe_fs.rs, scripts/lib/safe_ci_scope.rs)
+# do not touch the floor and are left to the disjoint-paths rule.
+scripts/validate.rs
+scripts/lib/validate*
+# Included with #[path] by all three comparators and by the driver.
+scripts/lib/rust_script_prelude.rs
+
+# The pin nodes' wrappers: pre.reverie_pin* runs run-reverie-pin-check.sh with
+# --base-ref; check.lint_checks runs lint-checks-node.sh with
+# --reverie-pin-base-ref, whose recipes run under lint-checks-recipe-shell.sh.
+ci/run-reverie-pin-check.sh
+ci/lint-checks-node.sh
+ci/lint-checks-recipe-shell.sh
+# Both pin commands put ci/rust-script-bin first on PATH; the floor comparators
+# run through its rust-script.
+ci/rust-script-bin/
+
+# check-reverie-pin.rs base_pin() reads every file named Cargo.toml in the
+# floor's tree (`git ls-tree` + `git cat-file blob {floor}:{name}`) for the
+# Reverie pin the target may not regress below (its FLOOR_READ_PATHSPECS).
+**/Cargo.toml
+# The lockfiles carry the same pins (check-reverie-pin.rs read_pins()).
+**/Cargo.lock
+# RECORD_VERSION: check-record-version-floor.rs walks
+# `git log {floor} -- hermit-cli/src/metadata.rs` and reads every
+# RECORD_VERSION in that history (its FLOOR_READ_PATHSPECS).
+hermit-cli/src/metadata.rs
+# Derived pin binding: the Buck build's Reverie pin
+# (check-reverie-pin.rs BUCK_BUILD_PIN_SITE).
+hermit-cli/BUCK
+
+# The floor comparators themselves, the pin-uniformity check the reverie-pin
+# wrapper also compiles, and the Makefile recipes that hand the comparators the
+# floor (_VALIDATE_PIN_ARG in lint-check-reverie-pin and
+# lint-check-record-version-floor).
+scripts/check-reverie-pin.rs
+scripts/check-record-version-floor.rs
+scripts/check-git-pin-uniformity.rs
+Makefile

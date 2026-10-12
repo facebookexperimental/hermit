@@ -992,7 +992,16 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (detcore-dbt), retain all 1058 prior cases: 1064.
     // stress_series::tests::failed_match_pressure_evidence_is_a_non_canonical_failed_attempt
     // retains all 1058: 1059.
-    ("test.regular_crates", 1065),
+    // ledger::admission::tests::{disjoint_main_floor_is_canonical_only_with_a_bounded_main_delta,
+    // disjoint_main_delta_field_is_strict_on_the_wire,
+    // disjoint_main_floor_is_refused_under_the_v1_contract} and
+    // ledger::disjoint_main::tests::{floor_sensitive_matcher_accepts_exactly_four_pattern_forms,
+    // disjoint_main_proof_admits_only_a_disjoint_bounded_main_delta,
+    // disjoint_main_proof_reads_every_commit_of_the_main_delta,
+    // disjoint_main_proof_refuses_a_floor_off_mains_first_parent_line,
+    // disjoint_main_proof_refuses_a_target_that_changes_a_pin_file}
+    // (hermit-manifest-plan) retain all 1065: 1073.
+    ("test.regular_crates", 1073),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -3322,7 +3331,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the run_failed runner test: 1049.
     // And the same six model/runtime config transport tests: 1064.
     // And the failed-match pressure evidence test: 1059.
-    ("test.regular_crates_on_host", 1065),
+    // And the same eight disjoint-main floor admission tests: 1073.
+    ("test.regular_crates_on_host", 1073),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).

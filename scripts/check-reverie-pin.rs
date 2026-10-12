@@ -777,6 +777,32 @@ fn is_ancestor(graph: &GuardedGitRepo, ancestor: &str, descendant: &str) -> Resu
     }
 }
 
+/// Every repository path this checker reads AT THE FLOOR (`--base-ref`), in the
+/// pattern forms of `ci/admission/floor-sensitive-paths.txt` (only `**/NAME`
+/// and exact paths here). [`base_pin`] selects the floor files it reads with
+/// exactly these patterns. The `disjoint-main` admission test in
+/// `scripts/lib/validate_admission.rs` reads this constant and requires the
+/// floor-sensitive list to cover each entry.
+///
+/// The test `every_call_given_the_floor_is_registered` is a TRIPWIRE, not a
+/// proof that this list is complete. It catches a new or duplicated call
+/// that names `base_ref`, and any new `Command::new`. It does not catch a
+/// pathspec built with `format!` from a variable it cannot see, a widened
+/// filter inside [`base_pin`] (the call text stays the same while more files
+/// are read), or a copy of the floor under another name. A reviewer of any
+/// change to floor reads must check them by hand.
+pub const FLOOR_READ_PATHSPECS: &[&str] = &["**/Cargo.toml"];
+
+/// Whether a path in the floor's tree is one [`FLOOR_READ_PATHSPECS`] names.
+fn floor_read_selects(name: &str) -> bool {
+    FLOOR_READ_PATHSPECS
+        .iter()
+        .any(|spec| match spec.strip_prefix("**/") {
+            Some(file) => name.rsplit('/').next() == Some(file),
+            None => name == *spec,
+        })
+}
+
 /// The pin recorded on the base this change would land on, for the monotonicity
 /// comparison. `None` when there is no base to compare against (a fresh repo, a
 /// detached probe, an unavailable ref) -- in which case monotonicity is not
@@ -796,7 +822,7 @@ fn base_pin(root: &Path, base_ref: &str) -> Option<String> {
     let mut found: BTreeSet<String> = BTreeSet::new();
     for name in String::from_utf8_lossy(&listed.stdout)
         .split('\0')
-        .filter(|name| !name.is_empty() && name.ends_with("Cargo.toml"))
+        .filter(|name| !name.is_empty() && floor_read_selects(name))
     {
         let blob =
             authority_git_in(root, &["cat-file", "blob", &format!("{base_ref}:{name}")]).ok()?;
@@ -2721,6 +2747,363 @@ mod tests {
     use std::time::UNIX_EPOCH;
 
     use super::*;
+
+    /// Each call outside the tests that is handed the floor (`base_ref`), as
+    /// [`source_calls`] spells it, and the [`FLOOR_READ_PATHSPECS`] entry it
+    /// reads at the floor (`None`: it reads no floor path), one entry per
+    /// call: the tripwire compares multisets.
+    const FLOOR_CALLS: &[(&str, Option<&str>)] = &[
+        // base_pin(): list the floor's tree; floor_read_selects keeps only the
+        // FLOOR_READ_PATHSPECS names.
+        (
+            r#"authority_git_in(root,&["ls-tree","-r","-z","--name-only",base_ref])"#,
+            Some("**/Cargo.toml"),
+        ),
+        // base_pin(): read each selected manifest at the floor.
+        (
+            r#"authority_git_in(root,&["cat-file","blob",&format!("{base_ref}:{name}")])"#,
+            Some("**/Cargo.toml"),
+        ),
+        // Whether the default base ref exists before fetching it: no path.
+        (
+            r#"git_in(&root,&["rev-parse","--verify","--quiet",base_ref])"#,
+            None,
+        ),
+        // The floor read itself; its Git calls are the two above.
+        ("base_pin(&root,base_ref)", None),
+        // Binds the configured floor to `base_ref`.
+        ("config.base_ref.as_str()", None),
+    ];
+
+    /// Every `Command::new` outside the tests (any path prefix), as
+    /// [`source_calls`] spells it, one entry per call: each Git command must
+    /// go through the helpers whose floor calls FLOOR_CALLS registers.
+    const COMMAND_CALLS: &[&str] = &[
+        // local_env_vars(): `git rev-parse --local-env-vars`; no floor.
+        r#"Command::new("git")"#,
+        // isolated_git_command(): behind git_in and isolated_git_in.
+        r#"Command::new("git")"#,
+        // The post-bump build checks; no Git.
+        r#"Command::new("cargo")"#,
+        "Command::new(cargo_program)",
+    ];
+
+    /// The final `::`/`.` segment of a callee.
+    fn last_segment(callee: &str) -> &str {
+        callee.rsplit([':', '.']).next().unwrap_or(callee)
+    }
+
+    fn sorted(texts: impl IntoIterator<Item = String>) -> Vec<String> {
+        let mut texts: Vec<String> = texts.into_iter().collect();
+        texts.sort();
+        texts
+    }
+
+    /// The floor tripwire over `source`, comparing as multisets so a
+    /// duplicated call is caught: every call naming `base_ref` must be one of
+    /// FLOOR_CALLS (`Err`/`Ok`/`Some` only wrap a message or value; calls
+    /// inside them are scanned on their own), and every `Command::new` one of
+    /// COMMAND_CALLS.
+    fn floor_tripwire(source: &str) -> Result<(), String> {
+        let calls = source_calls(source);
+        let floor = sorted(
+            calls
+                .iter()
+                .filter(|(callee, text)| {
+                    !matches!(last_segment(callee), "Err" | "Ok" | "Some")
+                        && names(text, "base_ref")
+                })
+                .map(|(_, text)| text.clone()),
+        );
+        let registered = sorted(FLOOR_CALLS.iter().map(|(text, _)| text.to_string()));
+        if floor != registered {
+            return Err(format!(
+                "the calls handed the floor changed; register each in FLOOR_CALLS with the path \
+                 it reads: found {floor:#?}, registered {registered:#?}"
+            ));
+        }
+        let commands = sorted(
+            calls
+                .iter()
+                .filter(|(callee, _)| callee.ends_with("Command::new"))
+                .map(|(_, text)| text.clone()),
+        );
+        let registered = sorted(COMMAND_CALLS.iter().map(|text| text.to_string()));
+        if commands != registered {
+            return Err(format!(
+                "the Command::new calls changed; a Git command must use the registered \
+                 helpers: found {commands:#?}, registered {registered:#?}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// The floor TRIPWIRE over this file (see FLOOR_READ_PATHSPECS for what it
+    /// cannot catch): it passes, and the paths the registered calls read are
+    /// exactly FLOOR_READ_PATHSPECS.
+    #[test]
+    fn every_call_given_the_floor_is_registered() {
+        floor_tripwire(include_str!("check-reverie-pin.rs")).unwrap();
+        let read: std::collections::BTreeSet<&str> =
+            FLOOR_CALLS.iter().filter_map(|(_, read)| *read).collect();
+        let declared: std::collections::BTreeSet<&str> =
+            FLOOR_READ_PATHSPECS.iter().copied().collect();
+        assert_eq!(read, declared);
+        for spec in FLOOR_READ_PATHSPECS {
+            let name = spec.strip_prefix("**/").unwrap_or(spec);
+            assert!(!name.is_empty() && !name.contains('*'), "{spec}");
+        }
+    }
+
+    /// This file with `line` added at the top of base_pin.
+    fn with_line_in_base_pin(line: &str) -> String {
+        let source = include_str!("check-reverie-pin.rs");
+        let anchor = "fn base_pin(root: &Path, base_ref: &str) -> Option<String> {\n";
+        assert_eq!(source.matches(anchor).count(), 1, "the base_pin definition");
+        source.replacen(anchor, &format!("{anchor}    {line}\n"), 1)
+    }
+
+    /// A second copy of a registered floor call is caught.
+    #[test]
+    fn floor_tripwire_counts_duplicate_calls() {
+        let duplicated = with_line_in_base_pin(
+            r#"let _ = authority_git_in(root, &["ls-tree", "-r", "-z", "--name-only", base_ref]);"#,
+        );
+        let e = floor_tripwire(&duplicated).unwrap_err();
+        assert!(e.contains("handed the floor"), "{e}");
+    }
+
+    /// A Git command that bypasses the registered helpers is caught, under
+    /// any path prefix and whatever its arguments.
+    #[test]
+    fn floor_tripwire_refuses_a_direct_command() {
+        for line in [
+            r#"let _ = std::process::Command::new("git");"#,
+            r#"let _ = Command::new("git").arg("show");"#,
+        ] {
+            let e = floor_tripwire(&with_line_in_base_pin(line)).unwrap_err();
+            assert!(e.contains("Command::new"), "{line}: {e}");
+        }
+    }
+
+    /// base_pin reads a manifest at the floor only by its exact file name,
+    /// which is what the floor-sensitive list's `**/Cargo.toml` matches.
+    #[test]
+    fn floor_reads_select_exact_file_names() {
+        for name in ["Cargo.toml", "hermit-cli/Cargo.toml", "a/b/Cargo.toml"] {
+            assert!(floor_read_selects(name), "{name}");
+        }
+        for name in [
+            "fooCargo.toml",
+            "x/fooCargo.toml",
+            "Cargo.toml.orig",
+            "Cargo.toml/x",
+            "Cargo.lock",
+        ] {
+            assert!(!floor_read_selects(name), "{name}");
+        }
+    }
+
+    /// base_pin reads only files named exactly Cargo.toml at the floor: a
+    /// `fooCargo.toml` carrying a different Reverie rev is not read, so the
+    /// floor's pin stays defined (the old suffix match saw two pins).
+    #[test]
+    fn base_pin_ignores_names_that_only_end_in_cargo_toml() {
+        let root = temp_path("base-pin-exact-name");
+        init_fixture_repo(&root);
+        let manifest = |rev: &str| {
+            format!(
+                "[dependencies]\nreverie = {{ git = \"https://github.com/rrnewton/reverie.git\", rev = \"{rev}\" }}\n"
+            )
+        };
+        let (pin, other) = ("a".repeat(40), "b".repeat(40));
+        fs::create_dir_all(root.join("x")).unwrap();
+        fs::write(root.join("Cargo.toml"), manifest(&pin)).unwrap();
+        fs::write(root.join("x/fooCargo.toml"), manifest(&other)).unwrap();
+        for args in [&["add", "-A"][..], &["commit", "-qm", "floor"]] {
+            assert!(git_in(&root, args).unwrap().status.success());
+        }
+        assert_eq!(base_pin(&root, "HEAD"), Some(pin));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The scanner sees calls through literals, chains and comments.
+    #[test]
+    fn source_calls_reads_code_not_literals() {
+        let source = concat!(
+            "fn helper(base_ref: &str) {}\n",
+            "fn run() {\n",
+            "    // git_in(root, &[\"commented\", base_ref]);\n",
+            "    let a = \"git_in(root, base_ref)\";\n",
+            "    let c = '(';\n",
+            "    let d = r#\"x(\"y\")\"#;\n",
+            "    if base_ref == x {\n",
+            "    git_command(root)\n        .args([\"log\", base_ref,])\n        .output();\n",
+            "    }\n",
+            "}\n",
+            "\n#[cfg(test)]\nmod tests {\n    git_in(base_ref);\n}\n",
+        );
+        let calls = source_calls(source);
+        // Every call site is listed, including each chained method call on
+        // its own; a call's text also carries its chained `.args(..)`.
+        let calls: Vec<(&str, &str)> = calls
+            .iter()
+            .map(|(callee, text)| (callee.as_str(), text.as_str()))
+            .collect();
+        assert_eq!(
+            calls,
+            [
+                ("git_command", r#"git_command(root).args(["log",base_ref])"#),
+                (".args", r#".args(["log",base_ref])"#),
+                (".output", ".output()"),
+            ]
+        );
+        assert!(names("x(base_ref)", "base_ref"));
+        assert!(!names("config_base_ref", "base_ref"));
+        assert!(!names("base_refs", "base_ref"));
+    }
+
+    /// Every call expression in this file outside its tests, as (callee, the
+    /// call's text with all whitespace removed). A call runs from its callee
+    /// through its balanced argument list, plus any chained `.arg(..)` or
+    /// `.args(..)`. Macros (`name!(..)`), `fn` signatures and keywords are not
+    /// calls. Whole-line comments are dropped, and string, raw-string and
+    /// character literals are never read as code.
+    fn source_calls(source: &str) -> Vec<(String, String)> {
+        let end = source
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("the test module marker");
+        let code: String = source[..end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        let bytes = code.as_bytes();
+        let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        // Mark which bytes are code rather than literal contents.
+        let mut is_code = vec![true; bytes.len()];
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'"' => {
+                    let mut hashes = 0;
+                    while i > hashes && bytes[i - 1 - hashes] == b'#' {
+                        hashes += 1;
+                    }
+                    let raw = i > hashes
+                        && bytes[i - 1 - hashes] == b'r'
+                        && (i == hashes + 1 || !ident(bytes[i - 2 - hashes]));
+                    let start = i;
+                    i += 1;
+                    loop {
+                        assert!(i < bytes.len(), "unterminated string literal");
+                        if raw {
+                            if bytes[i] == b'"'
+                                && bytes[i + 1..].iter().take(hashes).all(|b| *b == b'#')
+                            {
+                                i += 1 + hashes;
+                                break;
+                            }
+                            i += 1;
+                        } else if bytes[i] == b'\\' {
+                            i += 2;
+                        } else if bytes[i] == b'"' {
+                            i += 1;
+                            break;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    for flag in &mut is_code[start..i] {
+                        *flag = false;
+                    }
+                }
+                b'\'' if i + 2 < bytes.len() && bytes[i + 1] == b'\\' => {
+                    let close = i + 3 + code[i + 3..].find('\'').expect("character literal");
+                    for flag in &mut is_code[i..=close] {
+                        *flag = false;
+                    }
+                    i = close + 1;
+                }
+                b'\'' if i + 2 < bytes.len() && bytes[i + 2] == b'\'' => {
+                    for flag in &mut is_code[i..i + 3] {
+                        *flag = false;
+                    }
+                    i += 3;
+                }
+                _ => i += 1,
+            }
+        }
+        let close_of = |open: usize| -> usize {
+            let mut depth = 0usize;
+            for (at, byte) in bytes.iter().enumerate().skip(open) {
+                if !is_code[at] {
+                    continue;
+                }
+                match byte {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return at + 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("unbalanced call at byte {open}")
+        };
+        let mut calls = Vec::new();
+        for open in 1..bytes.len() {
+            if bytes[open] != b'(' || !is_code[open] || !ident(bytes[open - 1]) {
+                continue;
+            }
+            let mut start = open;
+            while start > 0
+                && is_code[start - 1]
+                && (ident(bytes[start - 1]) || bytes[start - 1] == b':' || bytes[start - 1] == b'.')
+            {
+                start -= 1;
+            }
+            let callee = &code[start..open];
+            let bare = callee.rsplit(['.', ':']).next().unwrap_or(callee);
+            if matches!(bare, "if" | "while" | "match" | "for" | "return" | "in")
+                || code[..start].trim_end().ends_with("fn")
+            {
+                continue;
+            }
+            let mut end = close_of(open);
+            loop {
+                let rest = code[end..].trim_start();
+                let skipped = code.len() - end - rest.len();
+                let chained = [".args(", ".arg("]
+                    .iter()
+                    .find(|method| rest.starts_with(**method));
+                match chained {
+                    Some(method) => end = close_of(end + skipped + method.len() - 1),
+                    None => break,
+                }
+            }
+            let text: String = code[start..end]
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            calls.push((
+                callee.to_string(),
+                text.replace(",]", "]").replace(",)", ")"),
+            ));
+        }
+        calls
+    }
+
+    /// Whether `text` names the identifier `word`.
+    fn names(text: &str, word: &str) -> bool {
+        let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        text.match_indices(word).any(|(at, _)| {
+            !text[..at].chars().next_back().is_some_and(ident)
+                && !text[at + word.len()..].chars().next().is_some_and(ident)
+        })
+    }
 
     /// A raw `git` for fixture setup and for the deliberately unisolated
     /// brackets below. It keeps every other inherited setting, but never lets

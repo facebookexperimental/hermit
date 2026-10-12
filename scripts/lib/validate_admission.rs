@@ -650,7 +650,9 @@ impl BoundExecutionPlan {
     }
 }
 
-fn git(root: &Path, args: &[&str]) -> Result<String, String> {
+/// One Git query over the admitted objects: no inherited repository
+/// redirection, replace refs or grafts.
+fn git_output(root: &Path, args: &[&str]) -> Result<std::process::Output, String> {
     let mut command = Command::new("git");
     for key in [
         "GIT_DIR",
@@ -664,13 +666,17 @@ fn git(root: &Path, args: &[&str]) -> Result<String, String> {
     ] {
         command.env_remove(key);
     }
-    let out = command
+    command
         .arg("--no-replace-objects")
         .env("GIT_GRAFT_FILE", "/dev/null")
         .args(args)
         .current_dir(root)
         .output()
-        .map_err(|e| format!("cannot query admitted Git objects: {e}"))?;
+        .map_err(|e| format!("cannot query admitted Git objects: {e}"))
+}
+
+fn git(root: &Path, args: &[&str]) -> Result<String, String> {
+    let out = git_output(root, args)?;
     if !out.status.success() {
         return Err(format!(
             "admitted Git query {args:?} failed ({}): {}",
@@ -682,6 +688,13 @@ fn git(root: &Path, args: &[&str]) -> Result<String, String> {
         .map(|s| s.trim().to_string())
         .map_err(|e| format!("admitted Git query returned invalid UTF-8: {e}"))
 }
+
+/// The one list of floor-sensitive paths, as this driver was built with it.
+/// The parent's admission reads the same file from the target's tree; both
+/// parse it with `hermit_manifest_plan::ledger::FloorSensitivePaths`.
+#[cfg(test)]
+pub(crate) const FLOOR_SENSITIVE_PATHS_FILE: &str = "ci/admission/floor-sensitive-paths.txt";
+const FLOOR_SENSITIVE_PATHS: &str = include_str!("../../ci/admission/floor-sensitive-paths.txt");
 
 fn commit_tree(root: &Path, sha: &str) -> Result<String, String> {
     if !admission_hex(sha, 40) {
@@ -866,6 +879,12 @@ impl AuthenticatedValidationAdmission {
         }
         // It is a separately named observation, never a mutable reference.
         commit_tree(root, &self.floor.observed_main_sha)?;
+        if (self.floor.kind == "disjoint-main") != self.floor.main_delta_commits.is_some() {
+            return Err(
+                "selected floor carries main_delta_commits if and only if it is disjoint-main"
+                    .into(),
+            );
+        }
         match (self.authority.kind.as_str(), self.floor.kind.as_str()) {
             ("validate", "current-main") if self.floor.sha == self.floor.observed_main_sha => {
                 git(
@@ -899,12 +918,55 @@ impl AuthenticatedValidationAdmission {
                     ],
                 )?;
             }
+            // A target built on the main E it entered the queue with, admitted
+            // after main moved to M. The floor and every pin base stay E; this
+            // re-proves from Git that the move is one a straightforward rebase
+            // absorbs and that leaves every floor-based check's verdict alone.
+            ("validate", "disjoint-main")
+                if self.floor.sha != self.floor.observed_main_sha
+                    && self.floor.observed_main_sha != self.authority.target =>
+            {
+                self.verify_disjoint_main(root)?;
+            }
             ("frozen-validate", "frozen-target") if self.floor.sha == self.authority.target => {}
             _ => {
                 return Err(
                     "selected floor does not match its authenticated authority kind".into(),
                 );
             }
+        }
+        Ok(())
+    }
+
+    /// Every condition of a `disjoint-main` floor, each from Git, failing
+    /// closed on any error. The proof itself is the crate's
+    /// `disjoint_main_proof`, the same code the parent's admission and receipt
+    /// finalization run; this adds only the floor's claimed count. The parent's
+    /// 2-hour age bound on the floor is not in the record, so it cannot be
+    /// re-checked here.
+    fn verify_disjoint_main(&self, root: &Path) -> Result<(), String> {
+        use hermit_manifest_plan::ledger::DISJOINT_MAIN_MAX_DELTA_COMMITS;
+        let claimed = self
+            .floor
+            .main_delta_commits
+            .ok_or("disjoint-main floor lacks main_delta_commits")?;
+        if !(1..=DISJOINT_MAIN_MAX_DELTA_COMMITS).contains(&claimed) {
+            return Err(format!(
+                "disjoint-main delta of {claimed} commits is outside 1..={DISJOINT_MAIN_MAX_DELTA_COMMITS}"
+            ));
+        }
+        let proof = hermit_manifest_plan::ledger::disjoint_main_proof(
+            root,
+            &self.floor.sha,
+            &self.floor.observed_main_sha,
+            &self.authority.target,
+            FLOOR_SENSITIVE_PATHS,
+        )?;
+        if proof.main_delta_commits != claimed {
+            return Err(format!(
+                "disjoint-main floor claims {claimed} first-parent main commits but Git counts {}",
+                proof.main_delta_commits
+            ));
         }
         Ok(())
     }
@@ -1448,6 +1510,434 @@ for entry in Path('/proc/self/fd').iterdir():
         frozen["admissible"] = false.into();
         frozen["reason_code"] = "canonical-holder-kind-not-validate".into();
         assert!(f.admit(&frozen, &target).is_err());
+    }
+
+    impl Fixture {
+        /// Commit `files` (created with `name` as content) and return the SHA.
+        fn commit_files(&self, name: &str, files: &[&str]) -> String {
+            for path in files {
+                let full = self.0.join(path);
+                std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+                std::fs::write(&full, name).unwrap();
+                self.command(&["add", "--", path]);
+            }
+            self.command(&["commit", "--quiet", "-m", name]);
+            self.command(&["rev-parse", "HEAD"])
+        }
+        fn checkout(&self, commit: &str) {
+            self.command(&["checkout", "--quiet", "--detach", commit]);
+        }
+    }
+
+    /// A target built on the main E it queued with is admitted after main
+    /// moved to M only when E..M is a bounded, path-disjoint delta that touches
+    /// no floor-sensitive path; the floor and pin base stay E.
+    #[test]
+    fn disjoint_main_floor_admits_only_a_disjoint_bounded_main_delta() {
+        let f = Fixture::new();
+        let before = f.commit_files(
+            "before the queued main",
+            &[
+                "src/lib.rs",
+                "docs/a.md",
+                "ci/dag/x",
+                "ci/other.sh",
+                "Cargo.lock",
+                "hermit-cli/src/metadata.rs",
+                "README",
+            ],
+        );
+        let queued = f.commit_files("queued main E", &["README"]);
+        let moved = f.commit_files("main moves on docs only", &["docs/a.md"]);
+        let moved2 = f.commit_files("main moves again", &["docs/b.md"]);
+        let main_from = |base: &str, name: &str, files: &[&str]| {
+            f.checkout(base);
+            f.commit_files(name, files)
+        };
+        let target = main_from(&queued, "target change", &["src/lib.rs"]);
+        let disjoint = |target: &str, observed: &str, n: u64| {
+            let mut status = f.authority(target, &queued);
+            status["admission_floor"]["kind"] = "disjoint-main".into();
+            status["admission_floor"]["observed_main_sha"] = observed.into();
+            status["admission_floor"]["main_delta_commits"] = n.into();
+            status
+        };
+        let admit_at = |status: &Value, target: &str| {
+            f.checkout(target);
+            f.admit(status, target)
+        };
+        let refused = |status: Value, target: &str| admit_at(&status, target).unwrap_err();
+
+        let admitted = admit_at(&disjoint(&target, &moved, 1), &target).unwrap();
+        assert_eq!(admitted.floor().kind, "disjoint-main");
+        assert_eq!(admitted.floor().sha, queued);
+        assert_eq!(admitted.floor().main_delta_commits, Some(1));
+        assert!(admitted.canonical());
+        admitted.verify_source(&f.0).unwrap();
+        admit_at(&disjoint(&target, &moved2, 2), &target).unwrap();
+
+        // Main and the target changed the same path.
+        let overlap = main_from(&queued, "main edits the target's file", &["src/lib.rs"]);
+        let e = refused(disjoint(&target, &overlap, 1), &target);
+        assert!(e.contains("both changed 1 path"), "{e}");
+        // A ci/ path outside what defines validation is covered by the
+        // disjoint-paths rule alone.
+        let other_ci = main_from(&queued, "main edits another ci script", &["ci/other.sh"]);
+        admit_at(&disjoint(&target, &other_ci, 1), &target).unwrap();
+        // Main changed a floor-sensitive path: the DAG, the planner, a
+        // pin-node wrapper, and lockfiles.
+        for (name, path) in [
+            ("dag", "ci/dag/x"),
+            ("planner", "ci/manifest-plan/src/lib.rs"),
+            ("wrapper", "ci/run-reverie-pin-check.sh"),
+            ("lockfile", "Cargo.lock"),
+            ("nested", "sub/Cargo.lock"),
+        ] {
+            let sensitive = main_from(&queued, name, &[path]);
+            let e = refused(disjoint(&target, &sensitive, 1), &target);
+            assert!(
+                e.contains("floor-sensitive") && e.contains(path),
+                "{name}: {e}"
+            );
+        }
+        // A floor-sensitive file changed and restored inside E..M: the trees
+        // of E and M agree there, but the RECORD_VERSION check reads the
+        // floor's history.
+        let bumped = main_from(&queued, "bump", &["hermit-cli/src/metadata.rs"]);
+        let restored = main_from(
+            &bumped,
+            "before the queued main",
+            &["hermit-cli/src/metadata.rs"],
+        );
+        let e = refused(disjoint(&target, &restored, 2), &target);
+        assert!(
+            e.contains("floor-sensitive") && e.contains("hermit-cli/src/metadata.rs"),
+            "{e}"
+        );
+        // A target that changes a pin file is validated against current main.
+        let bumps_pin = main_from(&queued, "target bumps the lockfile", &["Cargo.lock"]);
+        let e = refused(disjoint(&bumps_pin, &moved, 1), &bumps_pin);
+        assert!(e.contains("pin file") && e.contains("Cargo.lock"), "{e}");
+        // A target that is E itself is a main-ancestor run.
+        let e = refused(disjoint(&queued, &moved, 1), &queued);
+        assert!(e.contains("main-ancestor"), "{e}");
+        // A floor main contains only through a merged side branch is not on
+        // main's first-parent line.
+        let side = main_from(&queued, "side floor", &["docs/side.md"]);
+        f.checkout(&moved);
+        f.command(&["merge", "--quiet", "--no-ff", "--no-edit", &side]);
+        let merged = f.command(&["rev-parse", "HEAD"]);
+        let on_side = main_from(&side, "target on the side floor", &["src/lib.rs"]);
+        let mut off_line = f.authority(&on_side, &side);
+        off_line["admission_floor"]["kind"] = "disjoint-main".into();
+        off_line["admission_floor"]["observed_main_sha"] = merged.as_str().into();
+        off_line["admission_floor"]["main_delta_commits"] = 2.into();
+        let e = refused(off_line, &on_side);
+        assert!(e.contains("first-parent line"), "{e}");
+        admit_at(&disjoint(&target, &merged, 2), &target).unwrap();
+        // A target that contains M is a current-main run.
+        let on_main = main_from(&moved, "target rebased onto M", &["src/lib.rs"]);
+        let e = refused(disjoint(&on_main, &moved, 1), &on_main);
+        assert!(e.contains("current-main"), "{e}");
+        // A target that does not contain E.
+        let stale = main_from(&before, "target built before E", &["src/lib.rs"]);
+        let e = refused(disjoint(&stale, &moved, 1), &stale);
+        assert!(e.contains("not an ancestor of the target"), "{e}");
+        // An observed main that does not contain E (main was rewritten).
+        let rewritten = main_from(&before, "rewritten main", &["docs/c.md"]);
+        let e = refused(disjoint(&target, &rewritten, 1), &target);
+        assert!(e.contains("not an ancestor of the observed main"), "{e}");
+        // The claimed first-parent count must be Git's.
+        let e = refused(disjoint(&target, &moved, 2), &target);
+        assert!(e.contains("claims 2") && e.contains("Git counts 1"), "{e}");
+        let e = refused(disjoint(&target, &moved2, 1), &target);
+        assert!(e.contains("claims 1") && e.contains("Git counts 2"), "{e}");
+        // ... and within 1..=12.
+        for n in [0, 13] {
+            let e = refused(disjoint(&target, &moved, n), &target);
+            assert!(e.contains("outside 1..=12"), "{n}: {e}");
+        }
+        // E == M is not this kind.
+        let e = refused(disjoint(&target, &queued, 1), &target);
+        assert!(
+            e.contains("does not match its authenticated authority kind"),
+            "{e}"
+        );
+        // The count is required on disjoint-main, and never null.
+        let mut absent = disjoint(&target, &moved, 1);
+        absent["admission_floor"]
+            .as_object_mut()
+            .unwrap()
+            .remove("main_delta_commits");
+        let e = refused(absent.clone(), &target);
+        assert!(e.contains("if and only if"), "{e}");
+        absent["admission_floor"]["main_delta_commits"] = Value::Null;
+        let e = refused(absent, &target);
+        assert!(e.contains("invalid selected admission floor"), "{e}");
+        // No other kind carries the count.
+        let mut current = f.authority(&on_main, &moved);
+        admit_at(&current, &on_main).unwrap();
+        current["admission_floor"]["main_delta_commits"] = 1.into();
+        let e = refused(current, &on_main);
+        assert!(e.contains("if and only if"), "{e}");
+        // Only ordinary validation authority may select it.
+        let mut frozen = disjoint(&target, &moved, 1);
+        frozen["holder"]["kind"] = "frozen-validate".into();
+        frozen["admissible"] = false.into();
+        frozen["reason_code"] = "canonical-holder-kind-not-validate".into();
+        let e = refused(frozen, &target);
+        assert!(
+            e.contains("does not match its authenticated authority kind"),
+            "{e}"
+        );
+    }
+
+    /// Every file a floor-based check (pre.reverie_pin, pre.reverie_pin_on_host,
+    /// check.lint_checks) reads from its base commit, and the code that hands
+    /// those checks the floor, is on the floor-sensitive list.
+    #[test]
+    fn floor_sensitive_list_covers_every_file_a_floor_based_check_reads_from_its_base() {
+        let root = source_root();
+        let list = hermit_manifest_plan::ledger::FloorSensitivePaths::parse(FLOOR_SENSITIVE_PATHS)
+            .unwrap();
+        let read = |path: &str| std::fs::read_to_string(root.join(path)).unwrap();
+
+        // The pin nodes' admitted commands are the two wrappers below.
+        let floor = "0".repeat(40);
+        for (tag, wrapper) in [
+            ("pre.reverie_pin", "./ci/run-reverie-pin-check.sh"),
+            ("pre.reverie_pin_on_host", "./ci/run-reverie-pin-check.sh"),
+            ("check.lint_checks", "./ci/lint-checks-node.sh"),
+        ] {
+            let command =
+                hermit_manifest_plan::validation_dag::admitted_pin_command(tag, Some(&floor))
+                    .unwrap()
+                    .unwrap();
+            assert!(
+                command.contains(wrapper) && command.contains(&floor),
+                "{tag}: {command}"
+            );
+        }
+        // Every repository path a pin node's admitted command names (the
+        // wrapper it runs, and ci/rust-script-bin on PATH), every script the
+        // reverie-pin wrapper compiles, and the recipe shell the lint-checks
+        // wrapper installs must be on the list. A pin node that starts reading
+        // another path fails here until the list is reviewed.
+        let mut pin_node_paths = std::collections::BTreeSet::new();
+        let path_tokens = |text: &str, prefixes: &[&str]| -> Vec<String> {
+            let mut found = Vec::new();
+            for prefix in prefixes {
+                let mut rest = text;
+                while let Some(at) = rest.find(prefix) {
+                    let tail = &rest[at + prefix.len()..];
+                    let end = tail
+                        .find(|c: char| !(c.is_ascii_alphanumeric() || "_./-".contains(c)))
+                        .unwrap_or(tail.len());
+                    let path = tail[..end].trim_end_matches('/');
+                    if path.starts_with("ci/") || path.starts_with("scripts/") {
+                        found.push(path.to_string());
+                    }
+                    rest = &tail[end..];
+                }
+            }
+            found
+        };
+        for tag in [
+            "pre.reverie_pin",
+            "pre.reverie_pin_on_host",
+            "check.lint_checks",
+        ] {
+            let command =
+                hermit_manifest_plan::validation_dag::admitted_pin_command(tag, Some(&floor))
+                    .unwrap()
+                    .unwrap();
+            pin_node_paths.extend(path_tokens(&command, &["$PWD/", "./"]));
+        }
+        let pin_wrapper = read("ci/run-reverie-pin-check.sh");
+        for line in pin_wrapper
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+        {
+            pin_node_paths.extend(
+                path_tokens(line, &[" "])
+                    .into_iter()
+                    .filter(|path| path.ends_with(".rs")),
+            );
+        }
+        let recipe_shell = read("ci/lint-checks-node.sh")
+            .lines()
+            .find(|line| line.starts_with("_recipe_shell="))
+            .and_then(|line| line.split('/').next_back())
+            .map(|name| format!("ci/{}", name.trim_end_matches('"')))
+            .unwrap();
+        pin_node_paths.insert(recipe_shell);
+        for must in [
+            "ci/rust-script-bin",
+            "ci/run-reverie-pin-check.sh",
+            "ci/lint-checks-node.sh",
+            "ci/lint-checks-recipe-shell.sh",
+            "scripts/check-reverie-pin.rs",
+            "scripts/check-git-pin-uniformity.rs",
+        ] {
+            assert!(
+                pin_node_paths.contains(must),
+                "{must} not found in {pin_node_paths:?}"
+            );
+        }
+        for path in &pin_node_paths {
+            assert!(
+                root.join(path).exists(),
+                "{path} named by a pin node does not exist"
+            );
+            let probe = if root.join(path).is_dir() {
+                format!("{path}/x")
+            } else {
+                path.clone()
+            };
+            assert!(
+                list.matches(&probe),
+                "{path} is read by a pin node but is not on {FLOOR_SENSITIVE_PATHS_FILE}"
+            );
+        }
+
+        // check.lint_checks hands the floor to exactly two Makefile recipes.
+        let makefile = read("Makefile");
+        let consumers: std::collections::BTreeSet<&str> = makefile
+            .lines()
+            .filter(|line| line.starts_with('\t') && line.contains("$(_VALIDATE_PIN_ARG)"))
+            .filter_map(|line| line.split_whitespace().find(|word| word.starts_with("./")))
+            .collect();
+        assert_eq!(
+            consumers,
+            [
+                "./ci/run-reverie-pin-check.sh",
+                "./scripts/check-record-version-floor.rs"
+            ]
+            .into(),
+            "a new floor consumer must be reviewed against {FLOOR_SENSITIVE_PATHS_FILE}"
+        );
+
+        // What the floor comparators read AT THE FLOOR is declared by each
+        // as FLOOR_READ_PATHSPECS. Each checker's own tripwire test fails on a
+        // new or duplicated call handed the floor that is not registered
+        // against that constant; it is not a completeness proof (see the list
+        // header for what escapes it). Every declared pathspec must be
+        // covered by the list.
+        for checker in [
+            "scripts/check-reverie-pin.rs",
+            "scripts/check-record-version-floor.rs",
+        ] {
+            let source = read(checker);
+            let prefix = "pub const FLOOR_READ_PATHSPECS: &[&str] = &[";
+            let start = source
+                .find(prefix)
+                .unwrap_or_else(|| panic!("{checker} declares no FLOOR_READ_PATHSPECS"))
+                + prefix.len();
+            let body = &source[start..start + source[start..].find("];").unwrap()];
+            let specs: Vec<&str> = body.split('"').skip(1).step_by(2).collect();
+            assert!(!specs.is_empty(), "{checker}: {body:?}");
+            for spec in specs {
+                assert!(
+                    list.covers(spec).unwrap(),
+                    "{checker} reads {spec} at the floor, which {FLOOR_SENSITIVE_PATHS_FILE} does not cover"
+                );
+            }
+        }
+        // Every file a floor comparator or a script the pin nodes compile
+        // includes with #[path] is on the list.
+        let mut compiled: Vec<String> = pin_node_paths
+            .iter()
+            .filter(|path| path.ends_with(".rs"))
+            .cloned()
+            .collect();
+        compiled.push("scripts/check-record-version-floor.rs".into());
+        for script in &compiled {
+            let dir = Path::new(script).parent().unwrap();
+            for line in read(script).lines() {
+                let Some(rest) = line.trim().strip_prefix("#[path = \"") else {
+                    continue;
+                };
+                let included = dir.join(rest.split('"').next().unwrap());
+                let included = included.to_str().unwrap();
+                assert!(
+                    root.join(included).is_file(),
+                    "{script} includes {included}"
+                );
+                assert!(
+                    list.matches(included),
+                    "{script} includes {included}, which is not on {FLOOR_SENSITIVE_PATHS_FILE}"
+                );
+            }
+        }
+        assert!(
+            compiled
+                .iter()
+                .any(|p| p == "scripts/check-git-pin-uniformity.rs")
+        );
+
+        for (path, reader) in [
+            (
+                "Cargo.toml",
+                "check-reverie-pin.rs base_pin(): the workspace manifest's pin at the floor",
+            ),
+            (
+                "hermit-cli/Cargo.toml",
+                "check-reverie-pin.rs base_pin(): the CLI manifest's pin at the floor",
+            ),
+            (
+                "hermit-cli/src/metadata.rs",
+                "check-record-version-floor.rs: RECORD_VERSION history at the floor",
+            ),
+            (
+                "Cargo.lock",
+                "check-reverie-pin.rs read_pins(): the lockfile carries the pin",
+            ),
+            (
+                "hermit-cli/BUCK",
+                "check-reverie-pin.rs BUCK_BUILD_PIN_SITE: the Buck build's pin",
+            ),
+            (
+                "scripts/check-reverie-pin.rs",
+                "the floor comparator of pre.reverie_pin*",
+            ),
+            (
+                "scripts/check-record-version-floor.rs",
+                "the RECORD_VERSION floor comparator",
+            ),
+            (
+                "Makefile",
+                "_VALIDATE_PIN_ARG hands the floor to both comparators",
+            ),
+            (
+                "ci/run-reverie-pin-check.sh",
+                "pre.reverie_pin* wrapper that forwards --base-ref",
+            ),
+            (
+                "ci/lint-checks-node.sh",
+                "check.lint_checks wrapper that forwards the floor",
+            ),
+            (
+                "ci/manifest-plan/src/validation_dag.rs",
+                "admitted_pin_command renders the floor",
+            ),
+            ("ci/dag/validate.json", "the pin nodes' canonical commands"),
+            ("scripts/lib/validate_admission.rs", "this admission proof"),
+            (
+                "scripts/validate.rs",
+                "the driver that binds the floor into the pin commands",
+            ),
+            (
+                "scripts/lib/rust_script_prelude.rs",
+                "included by every floor comparator",
+            ),
+            (FLOOR_SENSITIVE_PATHS_FILE, "this list"),
+        ] {
+            assert!(root.join(path).is_file(), "{path} ({reader}) is not a file");
+            assert!(
+                list.matches(path),
+                "{path} ({reader}) is not floor-sensitive"
+            );
+        }
     }
 
     #[test]
