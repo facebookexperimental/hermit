@@ -7452,6 +7452,40 @@ impl Scheduler {
         }
     }
 
+    /// The backgrounded vfork child that must be readmitted for step 3 to select
+    /// anything, if queued work is all excluded by the vfork gate.
+    ///
+    /// While a vfork barrier is in place, step 3 selects only a registered
+    /// barrier child that is in the run queue. A child can instead be in the
+    /// background pool: a vfork child that vforks again, as a double-spawning
+    /// helper does, is backgrounded in its own `vfork` until its child execs.
+    /// Then the queued threads (that grandchild among them) can never be
+    /// selected, and step 2c, seeing queued work, would never readmit the
+    /// finished child either: a livelock
+    /// (<https://github.com/rrnewton/hermit/issues/4163>).
+    ///
+    /// Returns `None` when step 3 can select queued work, or when no barrier
+    /// child is backgrounded. Otherwise returns the child of the first barrier
+    /// in parent order, the order step 3 uses, whose child is backgrounded.
+    /// The choice does not depend on which background calls have finished, so
+    /// waiting for that one child and readmitting it alone keeps the schedule
+    /// independent of host timing: no turn can commit until it is readmitted.
+    fn vfork_gated_background_child(&self) -> Option<DetTid> {
+        if self.vfork_barriers.is_empty() {
+            return None;
+        }
+        let mut children = self.vfork_barriers.values().flatten();
+        if children
+            .clone()
+            .any(|child| self.run_queue.contains_tid(*child))
+        {
+            return None;
+        }
+        children
+            .find(|child| self.blocked.external_io_blockers.contains_key(*child))
+            .copied()
+    }
+
     /// Check on threads executing blocking syscalls outside the runnable set.
     fn step2c_process_io_blockers(&mut self) -> Result<(), SkipTurn> {
         if !self.blocked.external_io_blockers.is_empty()
@@ -7553,6 +7587,12 @@ impl Scheduler {
                 // cannot complete clone while an existing worker blocks indefinitely in
                 // epoll_wait.
                 if !self.run_queue.is_empty() && !only_pollers {
+                    if let Some(child) = self.vfork_gated_background_child()
+                        && ready.contains(&child)
+                    {
+                        self.log_rejoin(&blockers, &[child]);
+                        requeue_ready(self, &[child]);
+                    }
                     return Ok(());
                 }
 
@@ -7635,6 +7675,11 @@ impl Scheduler {
             // commonly wait for the completed operation and would otherwise starve it.
             let only_pollers = self.run_queue.only_pollers();
             if !self.run_queue.is_empty() && !only_pollers {
+                if let Some(child) = self.vfork_gated_background_child()
+                    && ready.contains(&child)
+                {
+                    requeue_ready(self, &[child]);
+                }
                 return Ok(());
             }
 
@@ -12958,6 +13003,61 @@ mod test {
     /// the valve expires, and the barrier stays, so no other thread is
     /// selected at a moment the host chose
     /// (https://github.com/rrnewton/hermit/issues/3999).
+    /// A vfork child that vforks again is backgrounded in its own `vfork`
+    /// while its child, queued, cannot be selected behind the outer barrier.
+    /// Step 2c must name that backgrounded child for readmission instead of
+    /// deferring to the queued work forever
+    /// (<https://github.com/rrnewton/hermit/issues/4163>).
+    #[test]
+    fn a_backgrounded_vfork_child_is_named_when_the_gate_excludes_queued_work() {
+        let parent = DetTid::from_raw(7);
+        let child = DetTid::from_raw(25);
+        let grandchild = DetTid::from_raw(27);
+        let queue = |scheduler: &mut Scheduler, tid: DetTid| {
+            scheduler.priorities.insert(tid, DEFAULT_PRIORITY);
+            scheduler.runqueue_push_back(tid);
+        };
+
+        let mut scheduler = Scheduler::new(&Config::default());
+        // No barrier: nothing is gated.
+        queue(&mut scheduler, grandchild);
+        assert_eq!(scheduler.vfork_gated_background_child(), None);
+
+        // The outer barrier's child is backgrounded and the grandchild queued.
+        scheduler.vfork_barriers.insert(parent, Some(child));
+        scheduler
+            .blocked
+            .external_io_blockers
+            .insert(child, ExternalOpId::new(child, 1));
+        assert_eq!(scheduler.vfork_gated_background_child(), Some(child));
+
+        // Once the child is queued, step 3 can select it: nothing to readmit.
+        queue(&mut scheduler, child);
+        assert_eq!(scheduler.vfork_gated_background_child(), None);
+
+        // A barrier child that is neither queued nor backgrounded is not named.
+        let mut blocked_elsewhere = Scheduler::new(&Config::default());
+        blocked_elsewhere.vfork_barriers.insert(parent, Some(child));
+        queue(&mut blocked_elsewhere, grandchild);
+        assert_eq!(blocked_elsewhere.vfork_gated_background_child(), None);
+
+        // With two gated barriers the first in parent order is named, however
+        // the blockers were inserted, as step 3 selects in that order.
+        let mut two = Scheduler::new(&Config::default());
+        let (low, low_child) = (DetTid::from_raw(3), DetTid::from_raw(5));
+        let (high, high_child) = (DetTid::from_raw(9), DetTid::from_raw(11));
+        two.vfork_barriers.insert(high, Some(high_child));
+        two.vfork_barriers.insert(low, Some(low_child));
+        two.blocked
+            .external_io_blockers
+            .insert(high_child, ExternalOpId::new(high_child, 1));
+        two.blocked
+            .external_io_blockers
+            .insert(low_child, ExternalOpId::new(low_child, 1));
+        queue(&mut two, grandchild);
+        assert_eq!(two.vfork_gated_background_child(), Some(low_child));
+    }
+
     #[test]
     fn a_pending_vfork_barrier_past_its_valve_refuses_the_run_and_stays() {
         let mut scheduler = Scheduler::new(&Config::default());

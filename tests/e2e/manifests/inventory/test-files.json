@@ -1033,6 +1033,12 @@
       "why": "tests/c/nanosleep-par.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/nested_vfork.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/nested_vfork.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_nested_vfork_child_that_exits_completes_at_bitwise_parity compiles this guest, whose vfork child vforks and execs a grandchild and then exits, and requires it to finish with its exact output at bitwise parity under hermit run --strict --verify --verify-strict (https://github.com/rrnewton/hermit/issues/4163: the outer vfork child was never readmitted, so the run spun until its timeout); it remains a guest fixture because a generic manifest cannot assert this exact output."
+    },
+    {
       "disposition": "support-data",
       "path": "tests/c/netlink_autobind_common.h",
       "runner": "C guests that include netlink_autobind_common.h",

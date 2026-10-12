@@ -1955,7 +1955,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/issues/4160): 1445.
     // And the cpu0-topology and node0 single-CPU test (https://github.com/rrnewton/hermit/issues/4160): 1446.
     // And the four SIGEV_THREAD_ID timer tests (https://github.com/rrnewton/hermit/issues/4164): 1450.
-    ("test.detcore_unit", 1450),
+    // And the nested-vfork background readmission test (https://github.com/rrnewton/hermit/issues/4163): 1451.
+    ("test.detcore_unit", 1451),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2665,7 +2666,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4164): 318.
     // And a_guest_or_child_killed_by_a_realtime_signal_reports_it
     // (https://github.com/rrnewton/reverie/issues/997): 319.
-    ("test.cli", 319),
+    // And a_nested_vfork_child_that_exits_completes_at_bitwise_parity
+    // (https://github.com/rrnewton/hermit/issues/4163): 320.
+    ("test.cli", 320),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2926,7 +2929,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The realtime-signal delivery test runs on the host too: 252.
     // Nor do the two SIGEV_THREAD_ID timer tests: 254.
     // And the realtime-termination test: 255.
-    ("test.cli_on_host", 255),
+    // Nor does the nested-vfork test: 256.
+    ("test.cli_on_host", 256),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -3084,7 +3088,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the three single-virtual-CPU procfs tests: 1445.
     // And the cpu0-topology and node0 single-CPU test: 1446.
     // And the four SIGEV_THREAD_ID timer tests: 1450.
-    ("test.detcore_unit_on_host", 1450),
+    // And the nested-vfork background readmission test: 1451.
+    ("test.detcore_unit_on_host", 1451),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
