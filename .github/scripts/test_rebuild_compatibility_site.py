@@ -259,7 +259,8 @@ class HostedAdapterTests(unittest.TestCase):
         args = request.call_args.args
         self.assertEqual(args[:3], ("release", "create", pin["tag"]))
         self.assertIn("--latest=false", args)
-        self.assertEqual(args[args.index("--target") + 1], self.config["hermit_commit"])
+        self.assertEqual(args[args.index("--target") + 1], "main")
+        self.assertIn(self.config["hermit_commit"], args[args.index("--notes") + 1])
         for forbidden in ("--draft", "--prerelease", "--clobber"):
             self.assertNotIn(forbidden, args)
         with (

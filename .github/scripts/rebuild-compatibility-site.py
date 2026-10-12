@@ -426,6 +426,19 @@ def upload_asset(release, pin, path, sha, size):
     )
 
 
+# The release's tag is made on the default branch's head, not on the builder's
+# Hermit commit. GitHub refuses the workflow token (GITHUB_TOKEN, which can
+# never hold the workflows permission) a new tag whose commit's
+# .github/workflows differ from the default branch's: `gh release create
+# --target <builder Hermit commit>` got "HTTP 403: Resource not accessible by
+# integration" on https://github.com/rrnewton/hermit/actions/runs/38300990871,
+# where docs.yml had changed after that commit (2a258a17 against main
+# f1e2a1b1, 2026-10-12), while the 10-11 releases, whose target commits had
+# main's workflows, were made. The builder's Hermit commit is named in the
+# release notes instead, and stays in the registry entry.
+RELEASE_TARGET = "main"
+
+
 def publish_release(pin, archive, registry, ledger_commit, hermit_commit):
     """Create stable data assets without replacing any existing published bytes.
 
@@ -446,13 +459,15 @@ def publish_release(pin, archive, registry, ledger_commit, hermit_commit):
                 "--repo",
                 REPOSITORY,
                 "--target",
-                hermit_commit,
+                RELEASE_TARGET,
                 "--latest=false",
                 "--title",
                 pin["release_title"],
                 "--notes",
                 "Website rebuilt from existing cell ledger "
                 + ledger_commit
+                + " by the website builder at Hermit "
+                + hermit_commit
                 + ". This rebuild did not run Hermit tests or refresh measurement dates.",
             )
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
