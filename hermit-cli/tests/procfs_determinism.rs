@@ -440,8 +440,38 @@ fn sys_cpu_lists_report_one_virtual_cpu() {
         "/sys/devices/system/cpu/online",
         "/sys/devices/system/cpu/possible",
         "/sys/devices/system/cpu/present",
+        "/sys/devices/system/cpu/cpu0/topology/thread_siblings_list",
+        "/sys/devices/system/cpu/cpu0/topology/package_cpus_list",
+        "/sys/devices/system/node/node0/cpulist",
+        "/sys/devices/system/cpu/cpu0/cache/index0/shared_cpu_list",
     ] {
         assert_deterministic(path, |contents| assert_eq!(contents, b"0\n", "{path}"));
+    }
+    for path in [
+        "/sys/devices/system/cpu/cpu0/topology/thread_siblings",
+        "/sys/devices/system/node/node0/cpumap",
+    ] {
+        assert_deterministic(path, |contents| assert_eq!(contents, b"1\n", "{path}"));
+    }
+    for path in ["/proc/interrupts", "/proc/softirqs"] {
+        assert_deterministic(path, |contents| {
+            let text = std::str::from_utf8(contents).expect("interrupt table should be UTF-8");
+            let header = text.lines().next().expect("interrupt table has a header");
+            assert_eq!(
+                header.split_whitespace().collect::<Vec<_>>(),
+                ["CPU0"],
+                "{path}"
+            );
+            // One counter per row, at the kernel's `" %10u"` width.
+            for row in text.lines().skip(1) {
+                let (_, counters) = row.split_once(':').expect("interrupt row has a label");
+                assert!(counters.starts_with("          0"), "{path}: {row}");
+                assert!(
+                    !counters[11..].starts_with(char::is_numeric),
+                    "{path}: {row}"
+                );
+            }
+        });
     }
 }
 

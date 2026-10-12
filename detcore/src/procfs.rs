@@ -150,6 +150,9 @@ enum ProcfsKind {
     /// `/sys/devices/system/cpu/{online,possible,present}`: the host's CPU
     /// list, reported as Hermit's single virtual CPU.
     CpuList,
+    /// A CPU-mask file describing Hermit's single virtual CPU: `cpu0`'s
+    /// topology masks and `node0/cpumap`.
+    CpuMask,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-957): Review Btrfs reservation normalization.
     BtrfsBytesMayUse,
@@ -745,6 +748,8 @@ impl ProcfsFile {
             "/sys/devices/system/cpu/online"
             | "/sys/devices/system/cpu/possible"
             | "/sys/devices/system/cpu/present" => ProcfsKind::CpuList,
+            other if is_virtual_cpu_list_path(other) => ProcfsKind::CpuList,
+            other if is_virtual_cpu_mask_path(other) => ProcfsKind::CpuMask,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-939): Review NUMA node VM accounting normalization.
             other if is_node_vmstat_path(other) => ProcfsKind::NodeVmstat,
@@ -997,6 +1002,7 @@ impl ProcfsFile {
             ProcfsKind::Vmstat => sanitize_vmstat(&contents),
             ProcfsKind::UeventSeqnum => sanitize_uevent_seqnum(&contents),
             ProcfsKind::CpuList => sanitize_cpu_list(&contents),
+            ProcfsKind::CpuMask => sanitize_cpu_mask(&contents),
             ProcfsKind::BtrfsBytesMayUse => sanitize_btrfs_bytes_may_use(&contents),
             ProcfsKind::BlockInflight => sanitize_block_inflight(&contents),
             ProcfsKind::IrqPerCpuCount => sanitize_irq_per_cpu_count(&contents),
@@ -1338,6 +1344,50 @@ fn is_block_stat_path(path: &str) -> bool {
         .is_some_and(|device| !device.is_empty() && !device.contains('/'))
 }
 
+/// The topology attributes Linux prints as CPU lists and as masks.
+const CPU_TOPOLOGY_ATTRIBUTES: [&str; 6] = [
+    "thread_siblings",
+    "core_cpus",
+    "core_siblings",
+    "cluster_cpus",
+    "die_cpus",
+    "package_cpus",
+];
+
+/// CPU lists that describe the CPUs sharing something with Hermit's single
+/// virtual CPU: `cpu0`'s topology lists, the CPUs sharing each of `cpu0`'s
+/// caches, and `node0`'s CPU list. Other CPUs'
+/// and nodes' files are left to the directory listing, which should not show
+/// them at all.
+fn is_virtual_cpu_list_path(path: &str) -> bool {
+    path == "/sys/devices/system/node/node0/cpulist"
+        || is_cpu0_cache_file(path, "shared_cpu_list")
+        || path
+            .strip_prefix("/sys/devices/system/cpu/cpu0/topology/")
+            .and_then(|attribute| attribute.strip_suffix("_list"))
+            .is_some_and(|attribute| CPU_TOPOLOGY_ATTRIBUTES.contains(&attribute))
+}
+
+/// `cpu0/cache/index<N>/<attribute>`: the CPUs sharing one of cpu0's caches.
+fn is_cpu0_cache_file(path: &str, attribute: &str) -> bool {
+    path.strip_prefix("/sys/devices/system/cpu/cpu0/cache/index")
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(index, leaf)| {
+            !index.is_empty()
+                && index.bytes().all(|byte| byte.is_ascii_digit())
+                && leaf == attribute
+        })
+}
+
+/// The mask forms of [`is_virtual_cpu_list_path`]'s files.
+fn is_virtual_cpu_mask_path(path: &str) -> bool {
+    path == "/sys/devices/system/node/node0/cpumap"
+        || is_cpu0_cache_file(path, "shared_cpu_map")
+        || path
+            .strip_prefix("/sys/devices/system/cpu/cpu0/topology/")
+            .is_some_and(|attribute| CPU_TOPOLOGY_ATTRIBUTES.contains(&attribute))
+}
+
 fn is_numa_node_file(path: &str, filename: &str) -> bool {
     path.strip_prefix("/sys/devices/system/node/node")
         .and_then(|path| path.split_once('/'))
@@ -1558,6 +1608,24 @@ fn sanitize_cpuinfo(contents: &[u8]) -> Vec<u8> {
         }
     }
     normalized
+}
+
+/// Reports a kernel CPU mask (comma-separated groups of hex digits, as in
+/// `cpu0/topology/thread_siblings` or `node0/cpumap`) as Hermit's single
+/// virtual CPU, `1`. Anything that is not a newline-terminated hex mask is
+/// returned unchanged.
+fn sanitize_cpu_mask(contents: &[u8]) -> Vec<u8> {
+    let Some(mask) = contents.strip_suffix(b"\n") else {
+        return contents.to_vec();
+    };
+    if mask.is_empty()
+        || !mask
+            .iter()
+            .all(|byte| byte.is_ascii_hexdigit() || *byte == b',')
+    {
+        return contents.to_vec();
+    }
+    b"1\n".to_vec()
 }
 
 /// Reports a kernel CPU list (`/sys/devices/system/cpu/online` and its
@@ -3433,13 +3501,35 @@ fn sanitize_zoneinfo(contents: &[u8]) -> Vec<u8> {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-883): Review synthetic interrupt and module accounting values.
+/// `/proc/interrupts` and `/proc/softirqs` have one counter column per CPU.
+/// Hermit has one virtual CPU, so the header names only `CPU0` (as the
+/// kernel's `CPU%-8d`) and each row keeps one zeroed counter at the kernel's
+/// `" %10u"` width, which `lsirq` and other column-cutting readers rely on.
+/// The columns after the counters (chip, hardware IRQ, action) are kept.
+/// The set of rows is still the host's: per-queue device interrupts (NVMe,
+/// network) scale with the host CPU count, and the label width follows the
+/// host's interrupt count (https://github.com/rrnewton/hermit/issues/4160).
 fn sanitize_interrupt_counters(contents: &[u8]) -> Vec<u8> {
     let mut normalized = Vec::with_capacity(contents.len());
     for line in contents.split_inclusive(|byte| *byte == b'\n') {
         let has_newline = line.last() == Some(&b'\n');
         let body = line.strip_suffix(b"\n").unwrap_or(line);
         let Some(colon) = body.iter().position(|byte| *byte == b':') else {
-            normalized.extend_from_slice(line);
+            let names = body
+                .split(u8::is_ascii_whitespace)
+                .filter(|field| !field.is_empty())
+                .collect::<Vec<_>>();
+            if !names.is_empty() && names.iter().all(|name| name.starts_with(b"CPU")) {
+                let indent = body.iter().take_while(|byte| **byte == b' ').count();
+                normalized.extend_from_slice(&body[..indent]);
+                // The kernel prints each CPU as `CPU%-8d`.
+                normalized.extend_from_slice(b"CPU0       ");
+                if has_newline {
+                    normalized.push(b'\n');
+                }
+            } else {
+                normalized.extend_from_slice(line);
+            }
             continue;
         };
         let fields = body[colon + 1..]
@@ -3456,9 +3546,11 @@ fn sanitize_interrupt_counters(contents: &[u8]) -> Vec<u8> {
         }
 
         normalized.extend_from_slice(&body[..=colon]);
-        for (index, field) in fields.iter().enumerate() {
+        // The kernel prints each counter as `" %10u"`.
+        normalized.extend_from_slice(b"          0");
+        for field in &fields[counter_count..] {
             normalized.push(b' ');
-            normalized.extend_from_slice(if index < counter_count { b"0" } else { field });
+            normalized.extend_from_slice(field);
         }
         if has_newline {
             normalized.push(b'\n');
@@ -5822,6 +5914,70 @@ Rss:                   4 kB\n" as &[u8];
     }
 
     #[test]
+    fn cpu0_topology_and_node0_report_one_virtual_cpu() {
+        for path in [
+            "/sys/devices/system/cpu/cpu0/topology/thread_siblings_list",
+            "/sys/devices/system/cpu/cpu0/topology/core_cpus_list",
+            "/sys/devices/system/cpu/cpu0/topology/package_cpus_list",
+            "/sys/devices/system/node/node0/cpulist",
+        ] {
+            assert_eq!(
+                ProcfsFile::from_path(Path::new(path)).unwrap().kind,
+                ProcfsKind::CpuList,
+                "{path}"
+            );
+        }
+        for path in [
+            "/sys/devices/system/cpu/cpu0/topology/thread_siblings",
+            "/sys/devices/system/cpu/cpu0/topology/package_cpus",
+            "/sys/devices/system/node/node0/cpumap",
+        ] {
+            assert_eq!(
+                ProcfsFile::from_path(Path::new(path)).unwrap().kind,
+                ProcfsKind::CpuMask,
+                "{path}"
+            );
+        }
+        assert_eq!(
+            ProcfsFile::from_path(Path::new(
+                "/sys/devices/system/cpu/cpu0/cache/index3/shared_cpu_list"
+            ))
+            .unwrap()
+            .kind,
+            ProcfsKind::CpuList
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new(
+                "/sys/devices/system/cpu/cpu0/cache/index0/shared_cpu_map"
+            ))
+            .unwrap()
+            .kind,
+            ProcfsKind::CpuMask
+        );
+        // Other CPUs and nodes, and other topology attributes, are untouched.
+        for path in [
+            "/sys/devices/system/cpu/cpu1/topology/thread_siblings_list",
+            "/sys/devices/system/cpu/cpu0/topology/core_id",
+            "/sys/devices/system/node/node1/cpulist",
+            "/sys/devices/system/cpu/cpu1/cache/index3/shared_cpu_list",
+            "/sys/devices/system/cpu/cpu0/cache/index3/size",
+        ] {
+            assert!(ProcfsFile::from_path(Path::new(path)).is_none(), "{path}");
+        }
+        assert_eq!(sanitize_cpu_list(b"0,158\n"), b"0\n");
+        assert_eq!(sanitize_cpu_list(b"0-15,158-173\n"), b"0\n");
+        assert_eq!(
+            sanitize_cpu_mask(b"00000000,00000000,00000000,00000001,00000000,00000001\n"),
+            b"1\n"
+        );
+        assert_eq!(sanitize_cpu_mask(b"ffffffff,ffffffff\n"), b"1\n");
+        // Not a mask: left alone.
+        assert_eq!(sanitize_cpu_mask(b"ff"), b"ff");
+        assert_eq!(sanitize_cpu_mask(b"0-3\n"), b"0-3\n");
+        assert_eq!(sanitize_cpu_mask(b"\n"), b"\n");
+    }
+
+    #[test]
     fn system_stat_reports_one_virtual_cpu() {
         assert_eq!(
             sanitize_system_stat(
@@ -6004,7 +6160,12 @@ RAW: inuse 5\n"
         let interrupts = b"           CPU0       CPU1\n  9:        123          4 IR-PCI-MSI 0-edge acpi\nNMI:          8          9 Non-maskable interrupts\nERR:          5\n";
         assert_eq!(
             sanitize_interrupt_counters(interrupts),
-            b"           CPU0       CPU1\n  9: 0 0 IR-PCI-MSI 0-edge acpi\nNMI: 0 0 Non-maskable interrupts\nERR: 0\n"
+            b"           CPU0       \n  9:          0 IR-PCI-MSI 0-edge acpi\nNMI:          0 Non-maskable interrupts\nERR:          0\n"
+        );
+        // /proc/softirqs: an indented header and rows with no trailing columns.
+        assert_eq!(
+            sanitize_interrupt_counters(b"                    CPU0       CPU1       CPU2\n          HI:          1          2          3\n"),
+            b"                    CPU0       \n          HI:          0\n"
         );
         assert_eq!(
             sanitize_interrupt_counters(b"  9: 9 99 IR-PCI-MSI 0-edge acpi\nERR: 999999\n"),

@@ -1942,7 +1942,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/issues/4121) retain all 1431: 1442.
     // And the three single-virtual-CPU procfs tests (cpuinfo, sysfs CPU lists, /proc/stat;
     // https://github.com/rrnewton/hermit/issues/4160): 1445.
-    ("test.detcore_unit", 1445),
+    // And the cpu0-topology and node0 single-CPU test (https://github.com/rrnewton/hermit/issues/4160): 1446.
+    ("test.detcore_unit", 1446),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3052,7 +3053,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two pidfd_send_signal scope and descriptor tests: 1431.
     // And the 11 deadline-cap tests: 1442.
     // And the three single-virtual-CPU procfs tests: 1445.
-    ("test.detcore_unit_on_host", 1445),
+    // And the cpu0-topology and node0 single-CPU test: 1446.
+    ("test.detcore_unit_on_host", 1446),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
