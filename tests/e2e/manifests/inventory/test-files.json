@@ -1036,7 +1036,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/nested_vfork.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/nested_vfork.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_nested_vfork_child_that_exits_completes_at_bitwise_parity compiles this guest, whose vfork child vforks and execs a grandchild and then exits, and requires it to finish with its exact output at bitwise parity under hermit run --strict --verify --verify-strict (https://github.com/rrnewton/hermit/issues/4163: the outer vfork child was never readmitted, so the run spun until its timeout); it remains a guest fixture because a generic manifest cannot assert this exact output."
+      "why": "tests/c/nested_vfork.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_nested_vfork_child_that_exits_completes_at_bitwise_parity compiles this guest, a chain of DEPTH vfork children (each vforks the next, the last execs, the others exit), and requires depths 2 and 3 to finish with their exact output at bitwise parity under hermit run --strict --verify --verify-strict; hermit-cli/tests/record_replay.rs record_nested_vfork_chains also records and replays both depths at bitwise parity (https://github.com/rrnewton/hermit/issues/4163: the outer vfork child was never readmitted, so the run spun until its timeout); it remains a guest fixture because a generic manifest cannot assert this exact output."
     },
     {
       "disposition": "support-data",

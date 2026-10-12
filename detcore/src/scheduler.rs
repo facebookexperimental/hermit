@@ -7465,8 +7465,13 @@ impl Scheduler {
     /// (<https://github.com/rrnewton/hermit/issues/4163>).
     ///
     /// Returns `None` when step 3 can select queued work, or when no barrier
-    /// child is backgrounded. Otherwise returns the child of the first barrier
-    /// in parent order, the order step 3 uses, whose child is backgrounded.
+    /// child is backgrounded. Otherwise returns the innermost such child: the
+    /// first backgrounded barrier child, in parent order (the order step 3
+    /// uses), that holds no barrier of its own. A child that does hold one is
+    /// still inside its own `vfork`, so it cannot finish before its child
+    /// does: with three levels (P vforks C, C vforks G, G vforks a child that
+    /// execs), C waits for G, and only G, whose child has execed, can run.
+    ///
     /// The choice does not depend on which background calls have finished, so
     /// waiting for that one child and readmitting it alone keeps the schedule
     /// independent of host timing: no turn can commit until it is readmitted.
@@ -7482,7 +7487,10 @@ impl Scheduler {
             return None;
         }
         children
-            .find(|child| self.blocked.external_io_blockers.contains_key(*child))
+            .find(|child| {
+                self.blocked.external_io_blockers.contains_key(*child)
+                    && !self.vfork_barriers.contains_key(*child)
+            })
             .copied()
     }
 
@@ -7586,11 +7594,15 @@ impl Scheduler {
                 // work exists can deadlock thread creation -- the parent and new child
                 // cannot complete clone while an existing worker blocks indefinitely in
                 // epoll_wait.
+                //
+                // The vfork-gated child is readmitted here in replay too, and
+                // not logged: until it is readmitted no turn can commit (step 3
+                // selects nothing), so the turn of its readmission does not
+                // depend on when its call finished.
                 if !self.run_queue.is_empty() && !only_pollers {
                     if let Some(child) = self.vfork_gated_background_child()
                         && ready.contains(&child)
                     {
-                        self.log_rejoin(&blockers, &[child]);
                         requeue_ready(self, &[child]);
                     }
                     return Ok(());
@@ -12999,10 +13011,6 @@ mod test {
         );
     }
 
-    /// A pending barrier whose child never registers is refused by name once
-    /// the valve expires, and the barrier stays, so no other thread is
-    /// selected at a moment the host chose
-    /// (https://github.com/rrnewton/hermit/issues/3999).
     /// A vfork child that vforks again is backgrounded in its own `vfork`
     /// while its child, queued, cannot be selected behind the outer barrier.
     /// Step 2c must name that backgrounded child for readmission instead of
@@ -13056,8 +13064,31 @@ mod test {
             .insert(low_child, ExternalOpId::new(low_child, 1));
         queue(&mut two, grandchild);
         assert_eq!(two.vfork_gated_background_child(), Some(low_child));
+
+        // Three levels: P vforks C, C vforks G, G's child has execed. C, still
+        // inside its own vfork, cannot finish before G, so the innermost
+        // backgrounded child, G, is named although C's barrier comes first.
+        let mut three = Scheduler::new(&Config::default());
+        let great_grandchild = DetTid::from_raw(29);
+        three.vfork_barriers.insert(parent, Some(child));
+        three.vfork_barriers.insert(child, Some(grandchild));
+        for backgrounded in [child, grandchild] {
+            three
+                .blocked
+                .external_io_blockers
+                .insert(backgrounded, ExternalOpId::new(backgrounded, 1));
+        }
+        queue(&mut three, great_grandchild);
+        assert_eq!(three.vfork_gated_background_child(), Some(grandchild));
+        // A child that holds a barrier is never named, even alone.
+        three.blocked.external_io_blockers.remove(&grandchild);
+        assert_eq!(three.vfork_gated_background_child(), None);
     }
 
+    /// A pending barrier whose child never registers is refused by name once
+    /// the valve expires, and the barrier stays, so no other thread is
+    /// selected at a moment the host chose
+    /// (https://github.com/rrnewton/hermit/issues/3999).
     #[test]
     fn a_pending_vfork_barrier_past_its_valve_refuses_the_run_and_stays() {
         let mut scheduler = Scheduler::new(&Config::default());

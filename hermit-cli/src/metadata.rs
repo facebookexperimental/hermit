@@ -353,7 +353,14 @@ impl RecordVersion {
 // dropped once it has exited, where they went to the whole process
 // (https://github.com/rrnewton/hermit/issues/4164). Replay recomputes both, so
 // an older recording replayed here could see different answers and deliveries.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x13d);
+// 0x13d -> 0x13e: a vfork child that Detcore backgrounded, and that the vfork
+// gate waits for while every queued thread is excluded, is readmitted as soon
+// as its call finishes, without a rejoin entry: before it, no turn can commit
+// (https://github.com/rrnewton/hermit/issues/4163). An older recorder spun
+// forever in that state, and replay recomputes the schedule, so an older
+// recording replayed here could see the readmission where its recorder did
+// not.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x13e);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -378,7 +385,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x13d);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x13d;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x13e;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1133,6 +1140,14 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_whose_sigev_thread_id_timers_notified_the_process() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x13c)));
+    }
+
+    /// A recording older than 0x13e was made by a recorder that never
+    /// readmitted a vfork-gated backgrounded child
+    /// (https://github.com/rrnewton/hermit/issues/4163).
+    #[test]
+    fn record_version_rejects_streams_from_before_the_vfork_gate_readmission() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x13d)));
     }
 
     #[test]

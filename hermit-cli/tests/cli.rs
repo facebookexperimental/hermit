@@ -22471,54 +22471,60 @@ fn the_vdso_versions_its_exports_as_linux_does_at_bitwise_parity() {
     assert_eq!(report["bitwise_parity"], true, "{report}");
 }
 
-/// A vfork child that vforks and execs a grandchild, then exits, completes at
-/// bitwise parity (https://github.com/rrnewton/hermit/issues/4163). The
+/// Chains of vfork children, each vforking the next until the last execs and
+/// the others exit, complete at bitwise parity
+/// (https://github.com/rrnewton/hermit/issues/4163). With two levels, the
 /// grandchild's exec released only the inner vfork; the outer one still named
 /// the child, which Detcore had moved to background I/O. Queued work kept the
 /// scheduler from readmitting it, and the vfork gate let it select nothing
 /// else, so the run spun until its timeout. A git wrapper that spawned its
-/// helper this way hung every Linux kernel build that ran git.
+/// helper this way hung every Linux kernel build that ran git. With three
+/// levels, only the innermost backgrounded child can finish first.
 #[test]
 fn a_nested_vfork_child_that_exits_completes_at_bitwise_parity() {
     let guest = futex_c_guest(&NESTED_VFORK_GUEST, "nested_vfork")
         .to_str()
         .unwrap()
         .to_owned();
-    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let verdict = directory.path().join("verify.json");
-    let (status, log) = run_with_deadline(
-        hermit_command(&[
-            "--log=info",
-            "run",
-            "--strict",
-            "--verify",
-            "--verify-strict",
-            "--verify-json",
-            verdict.to_str().unwrap(),
-            "--timeout",
-            "60",
-            "--",
-            guest.as_str(),
-        ]),
-        directory.path(),
-        Duration::from_secs(180),
-        false,
-    );
-    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
-        .expect("failed to read the guest's stdout");
-    assert_eq!(
-        status.and_then(|status| status.code()),
-        Some(0),
-        "stdout:\n{stdout}\nstderr:\n{log}"
-    );
-    assert_eq!(
-        stdout, "nested vfork done, child status 0\n",
-        "stderr:\n{log}"
-    );
-    let report: serde_json::Value =
-        serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
-            .expect("the verdict must be JSON");
-    assert_eq!(report["bitwise_parity"], true, "{report}");
+    for depth in ["2", "3"] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let verdict = directory.path().join("verify.json");
+        let (status, log) = run_with_deadline(
+            hermit_command(&[
+                "--log=info",
+                "run",
+                "--strict",
+                "--verify",
+                "--verify-strict",
+                "--verify-json",
+                verdict.to_str().unwrap(),
+                "--timeout",
+                "60",
+                "--",
+                guest.as_str(),
+                depth,
+            ]),
+            directory.path(),
+            Duration::from_secs(180),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "depth {depth}\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert_eq!(
+            stdout,
+            format!("nested vfork depth {depth} done, child status 0\n"),
+            "stderr:\n{log}"
+        );
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
+                .expect("the verdict must be JSON");
+        assert_eq!(report["bitwise_parity"], true, "depth {depth}: {report}");
+    }
 }
 
 /// pidfd_send_signal's flags and descriptors answer as Linux answers them

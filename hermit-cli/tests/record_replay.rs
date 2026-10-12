@@ -2503,6 +2503,43 @@ fn record_pidfd_send_signal_scope_flags() {
     }
 }
 
+/// Chains of vfork children, each vforking the next until the last execs and
+/// the others exit, record and replay at bitwise parity
+/// (https://github.com/rrnewton/hermit/issues/4163). Readmitting the
+/// backgrounded child the vfork gate waits for is not logged as a rejoin, as
+/// no turn can commit before it, so replay readmits it the same way.
+#[test]
+fn record_nested_vfork_chains() {
+    let _guard = hermit_record_lock();
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest build directory");
+    let guest = build.path().join("nested_vfork");
+    let output = Command::new("cc")
+        .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+        .arg(repository.join("tests/c/nested_vfork.c"))
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile the nested_vfork guest");
+    assert!(
+        output.status.success(),
+        "guest compilation failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for depth in ["2", "3"] {
+        let output = canonical_record_replay_command(
+            &format!("nested vfork depth {depth}"),
+            &guest,
+            &[OsStr::new(depth)],
+        );
+        let line = format!("nested vfork depth {depth} done, child status 0\n");
+        assert!(output.contains(&line), "missing {line:?} in:\n{output}");
+    }
+}
+
 #[test]
 fn record_poll_partial_revents_copyout() {
     let _guard = hermit_record_lock();
