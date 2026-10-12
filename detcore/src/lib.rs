@@ -3929,6 +3929,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         let mm_id = thread_state.mm_id;
         let exit_signal = match &exit_status {
             ExitStatus::Signaled(signal, _) => Some(*signal as i32),
+            ExitStatus::SignaledRaw(signal, _) => Some(*signal),
             ExitStatus::Exited(_) => None,
         };
         // Publish each owner's final clock under its own RPC identity before

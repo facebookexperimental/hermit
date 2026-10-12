@@ -1632,6 +1632,10 @@ fn describe_exit_status(status: ExitStatus) -> String {
             let core = if core_dumped { " (core dumped)" } else { "" };
             format!("terminated by signal {} ({signal:?}){core}", signal as i32)
         }
+        ExitStatus::SignaledRaw(signal, core_dumped) => {
+            let core = if core_dumped { " (core dumped)" } else { "" };
+            format!("terminated by signal {signal} (SIG{signal}){core}")
+        }
     }
 }
 

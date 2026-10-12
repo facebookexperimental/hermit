@@ -1494,8 +1494,43 @@ fi
 # Preserve SDK key, inventory 941, the 16-job clamp and 1050/572-job-second
 # budgets. This carries the SDK budget only; runtime qualification, test and
 # timing evidence must be measured anew.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 19cdd8f59d2c69621f42b789169b0907e68f7144 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 19cdd8f59d2c69621f42b789169b0907e68f7144 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# BOUND TO ab8cd5171e502e0332a9b3b0a536c12438670995 (2026-10-12): from
+# 19cdd8f59d2c69621f42b789169b0907e68f7144. Of the 14 intervening Reverie commits
+# (11 to cdb8ed61), 47f8fe755 ("Route DBT signals through shared Tool
+# admission") changes the vendored DynamoRIO tree, so the DynamoRIO SDK recipe
+# key changes; the other six recorded inputs are byte-identical:
+# reverie-dbt/Cargo.toml: 0e24d047d544a3daae2d6350270b26ceb74139d1
+# reverie-dbt/build.rs: ff1eeb32b140ae477894126af21296723c1ba582
+# reverie-dbt/native/CMakeLists.txt: bcfb298a4f87ed190d7fdc52393e01d1245a8fe3
+# reverie-dbt/vendor/dynamorio: ec2cc0a9bca71c9a6fad3dc39e713f77a8cccf50 -> 3be3524be8355bacf65d4a5296be7cfe30fdd9ce
+# third-party: fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a
+# Cargo.toml: 293992554d9966678cc161d8bcd65bc26b9faea7
+# rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
+# 47f8fe755 also raises the native/runtime ABI 6 -> 7, which detcore-dbt
+# implements (reverie_dbt_runtime_signal_event), and adds six
+# signal_admission_state test files, so the reverie-dbt inventory is 947, not
+# 941 (scripts/lib/reverie_dbt_inventory.rs); neither is a recipe input.
+# The cmake options and job-count rule are unchanged. The other commits
+# change Reverie's realtime-signal and vDSO handling, its validation script
+# and reverie-ptrace's injected mask-swapping syscalls
+# (https://github.com/rrnewton/reverie/pull/996), none a recipe input.
+# ab8cd517 is cdb8ed61 plus the three commits of
+# https://github.com/rrnewton/reverie/pull/1010 (reverie-ptrace and the Guest
+# trait), none a recipe input: all seven inputs above are byte-identical at
+# cdb8ed61 and ab8cd517 (git ls-tree), so the observation below carries.
+# BOUNDED COLD SDK OBSERVATION AT cdb8ed61: two cold
+# `cargo check -p reverie-dbt --offline` runs (CARGO_BUILD_JOBS=16
+# NUM_JOBS=16, each in a fresh target directory) on a 316-CPU host at load
+# averages ~103 and ~156 each reported MISS, then "completed in 15.93s
+# (jobs=16, 254.87 job-seconds; NUM_JOBS=16, available CPUs=316)" and
+# "completed in 19.42s (jobs=16, 310.73 job-seconds ...)", and PUBLISHED for
+#     key=sha256:ff4576416a64218bcbccb4528cee86e5fc4da7119267d963751b37c39f68e542
+# Both are below 1050. Retain the conservative 1050 effective-job-second
+# threshold and the 16-job clamp. These local samples do not replace the
+# original n=3 hosted calibration or satisfy the >=5-sample replacement rule;
+# fresh validation is required.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != ab8cd5171e502e0332a9b3b0a536c12438670995 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie ab8cd5171e502e0332a9b3b0a536c12438670995 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

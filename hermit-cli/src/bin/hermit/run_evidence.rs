@@ -662,10 +662,14 @@ fn guest_disposition(backend: Backend, status: ExitStatus) -> Option<GuestDispos
             code,
             limitation: DispositionLimitation::KvmExitCodeOnly,
         }),
-        (Backend::Kvm, ExitStatus::Signaled(_, _)) => None,
+        (Backend::Kvm, ExitStatus::Signaled(_, _) | ExitStatus::SignaledRaw(_, _)) => None,
         (_, ExitStatus::Exited(code)) => Some(GuestDisposition::Exited { code }),
         (_, ExitStatus::Signaled(signal, core_dumped)) => Some(GuestDisposition::Signaled {
             signal: signal as i32,
+            core_dumped,
+        }),
+        (_, ExitStatus::SignaledRaw(signal, core_dumped)) => Some(GuestDisposition::Signaled {
+            signal,
             core_dumped,
         }),
     }

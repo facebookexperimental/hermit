@@ -3865,7 +3865,7 @@ async fn settle_in_guest_exits(
 fn liteinst_requires_forced_shutdown(status: ExitStatus) -> bool {
     match status {
         // A real signal death: the process never chose a status at all.
-        ExitStatus::Signaled(_, _) => true,
+        ExitStatus::Signaled(_, _) | ExitStatus::SignaledRaw(_, _) => true,
         ExitStatus::Exited(code) => {
             // The 122..=127 reserved band, plus any status hermit emits to mean
             // "killed by signal N".

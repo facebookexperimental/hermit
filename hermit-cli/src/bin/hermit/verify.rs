@@ -911,6 +911,10 @@ pub(crate) fn run_verification_execution<T>(
                 signal: signal as i32,
                 core_dumped,
             },
+            ExitStatus::SignaledRaw(signal, core_dumped) => ContainerDisposition::Signaled {
+                signal,
+                core_dumped,
+            },
         };
         let mut report = VerificationReport::no_result();
         report.no_result_reason = Some(NoResultReason::ContainerFailed(ContainerFailure {
@@ -1333,14 +1337,19 @@ pub(crate) fn signal_termination_report(
     status: ExitStatus,
     log: &Path,
 ) -> Option<String> {
-    let ExitStatus::Signaled(signal, core_dumped) = status else {
-        return None;
+    let (number, name, core_dumped) = match status {
+        ExitStatus::Signaled(signal, core_dumped) => {
+            (signal as i32, format!("{signal:?}"), core_dumped)
+        }
+        // A realtime signal, which nix's Signal cannot name
+        // (https://github.com/rrnewton/reverie/issues/997).
+        ExitStatus::SignaledRaw(signal, core_dumped) => {
+            (signal, format!("SIG{signal}"), core_dumped)
+        }
+        ExitStatus::Exited(_) => return None,
     };
     let core = if core_dumped { ", core dumped" } else { "" };
-    let heading = format!(
-        ":: The {label} guest was terminated by signal {} ({signal:?}{core}).",
-        signal as i32
-    );
+    let heading = format!(":: The {label} guest was terminated by signal {number} ({name}{core}).");
     let tail = match read_log_tail(log, SIGNAL_REPORT_TAIL_BYTES) {
         Ok(tail) => tail,
         Err(error) => {

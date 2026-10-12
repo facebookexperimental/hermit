@@ -514,12 +514,16 @@ fn guest_disposition(backend: Backend, status: ExitStatus) -> Result<GuestDispos
             code,
             limitation: DispositionLimitation::KvmExitCodeOnly,
         }),
-        (Backend::Kvm, ExitStatus::Signaled(_, _)) => {
+        (Backend::Kvm, ExitStatus::Signaled(_, _) | ExitStatus::SignaledRaw(_, _)) => {
             anyhow::bail!("KVM guest capture cannot represent a signal disposition")
         }
         (_, ExitStatus::Exited(code)) => Ok(GuestDisposition::Exited { code }),
         (_, ExitStatus::Signaled(signal, core_dumped)) => Ok(GuestDisposition::Signaled {
             signal: signal as i32,
+            core_dumped,
+        }),
+        (_, ExitStatus::SignaledRaw(signal, core_dumped)) => Ok(GuestDisposition::Signaled {
+            signal,
             core_dumped,
         }),
     }
