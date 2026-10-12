@@ -119,6 +119,24 @@ jobs:
         printf '%s\n' "$history" > "$RUNNER_TEMP/website-validation-history.txt"
     - name: Dependencies
       run: sudo apt-get install -y libunwind-dev liblzma-dev
+    # The published ledger as an earlier run left it, so this run's fetch of the
+    # published commit (fetch_ledger) downloads only what changed since then:
+    # the restored repository holds the commit an earlier run built from
+    # (refs/cache/published), which the fetch offers as already present. A
+    # cold fetch moves a pack of about 711 MiB at a GitHub serving rate near
+    # 1 MB/s (2026-10-12), and ran past fetch_ledger's old 1,200 s limit on
+    # https://github.com/rrnewton/hermit/actions/runs/38256949845. Objects are
+    # named by their content and the captured commit is checked, so an
+    # outdated or foreign cache can cost a fetch, never a wrong byte.
+    - name: Restore the published cell ledger from an earlier run
+      id: website-ledger-cache
+      if: github.event_name == 'schedule' || inputs.rebuild_compatibility
+      uses: actions/cache/restore@v4
+      with:
+        path: _website_source/hermit_test_ledger/.git
+        key: compatibility-ledger-${{ runner.os }}-${{ steps.website-source.outputs.ledger_commit }}
+        restore-keys: |
+          compatibility-ledger-${{ runner.os }}-
     - name: Prepare only the builder's public source dependencies
       id: website-deps
       if: github.event_name == 'schedule' || inputs.rebuild_compatibility
@@ -147,8 +165,13 @@ jobs:
         ledger_commit=$(git -C _website_source rev-parse HEAD:hermit_test_ledger)
         ledger_url=$(git -C _website_source config -f .gitmodules --get submodule.hermit_test_ledger.url)
         git -C _website_source submodule init -- hermit_test_ledger
+        # Reinitializing keeps a repository the cache step restored.
         git init --quiet _website_source/hermit_test_ledger
-        git -C _website_source/hermit_test_ledger remote add origin "$ledger_url"
+        if git -C _website_source/hermit_test_ledger remote get-url origin >/dev/null 2>&1; then
+          git -C _website_source/hermit_test_ledger remote set-url origin "$ledger_url"
+        else
+          git -C _website_source/hermit_test_ledger remote add origin "$ledger_url"
+        fi
         git -C _website_source/hermit_test_ledger fetch --quiet --no-tags --depth 1 origin "$ledger_commit"
         git -C _website_source/hermit_test_ledger checkout --quiet --detach "$ledger_commit"
         git -C _website_source/hermit submodule update --init --depth 1 -- agent-utils
@@ -278,6 +301,30 @@ jobs:
           jq -r '"Cell ledger: `" + .ledger_commit + "`", "Built identity: `" + .identity + "`", "Canonical validation history: `" + .validation_history_commit + "`"' "$RUNNER_TEMP/compatibility-rebuild.json"
           echo 'No Hermit tests ran. Measurement timestamps and unavailable evidence remain unchanged. Pages byte verification follows deployment.'
         } >> "$GITHUB_STEP_SUMMARY"
+    # Keep only what the next run's fetch can use: the commit this run fetched
+    # (refs/cache/published, written by fetch_ledger) and the checked-out
+    # commit the parent records. Older published commits' objects are dropped,
+    # so the cached repository stays about one published tree.
+    - name: Prepare the published cell ledger for the next run
+      id: website-ledger-keep
+      if: >-
+        always() &&
+        (github.event_name == 'schedule' || inputs.rebuild_compatibility) &&
+        steps.website-ledger-cache.outputs.cache-hit != 'true'
+      run: |
+        set -euo pipefail
+        ledger=_website_source/hermit_test_ledger
+        if git -C "$ledger" rev-parse --quiet --verify refs/cache/published >/dev/null; then
+          git -C "$ledger" repack -a -d -q
+          git -C "$ledger" count-objects -vH
+          echo 'ready=true' >> "$GITHUB_OUTPUT"
+        fi
+    - name: Save the published cell ledger for the next run
+      if: always() && steps.website-ledger-keep.outputs.ready == 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: _website_source/hermit_test_ledger/.git
+        key: ${{ steps.website-ledger-cache.outputs.cache-primary-key }}
     - name: Save the website builder's Rust build outputs
       if: >-
         (github.event_name == 'schedule' || inputs.rebuild_compatibility) &&

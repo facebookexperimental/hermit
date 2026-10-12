@@ -233,6 +233,9 @@ def require_sources(parent, config):
 LEDGER_FETCH_TIMEOUT = 2700
 LEDGER_DEEPEN_STEP = 50
 LEDGER_DEEPEN_LIMIT = 2000
+# The ref naming the published commit this run fetched, kept for the next run
+# (docs.yml caches the ledger repository across runs).
+LEDGER_CACHE_REF = "refs/cache/published"
 
 
 def _parity_summary_commit(ledger, ledger_commit):
@@ -272,6 +275,9 @@ def fetch_ledger(ledger, ledger_commit):
         # naming the summarized commit it could not place.
         depth += LEDGER_DEEPEN_STEP
         run([*fetch, "--depth", str(depth), "origin", ledger_commit], timeout=LEDGER_FETCH_TIMEOUT)
+    # The workflow caches this repository; the next run's fetch offers this
+    # commit as already present and downloads only what changed since.
+    run(["git", "-C", ledger, "update-ref", LEDGER_CACHE_REF, ledger_commit])
     return depth
 
 

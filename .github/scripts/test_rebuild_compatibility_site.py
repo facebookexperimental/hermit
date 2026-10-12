@@ -361,6 +361,8 @@ class HostedAdapterTests(unittest.TestCase):
                 # readable summary there is nothing to deepen toward.
                 ["git", "--no-replace-objects", "-C", ledger, "show",
                  f"{captured}:scorecard/parity.json"],
+                # The fetched commit is kept for the next run's cached fetch.
+                ["git", "-C", ledger, "update-ref", "refs/cache/published", captured],
             ],
         )
         publish.assert_not_called()
@@ -403,6 +405,8 @@ class HostedAdapterTests(unittest.TestCase):
             depth = ADAPTER.fetch_ledger(ledger, head)
         self.assertEqual(depth, 101)  # 1, then 51 (summary 70 back), then 101
         self.assertEqual(sh(ledger, "rev-parse", "--is-shallow-repository"), "true")
+        # The workflow caches the ledger; the next run's fetch offers this commit.
+        self.assertEqual(sh(ledger, "rev-parse", "refs/cache/published"), head)
         sh(ledger, "merge-base", "--is-ancestor", summarized, head)
         self.assertLess(int(sh(ledger, "rev-list", "--count", head)), len(commits) + 1)
 
