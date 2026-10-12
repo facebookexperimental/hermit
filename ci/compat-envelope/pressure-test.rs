@@ -18,6 +18,9 @@ mod rust_script_prelude;
 #[path = "../../scripts/lib/safe_ci_scope.rs"]
 mod safe_ci_scope;
 
+#[path = "pressure_log_tail.rs"]
+mod log_tail;
+
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::env;
@@ -2743,7 +2746,8 @@ fn run() -> Result<(), String> {
             );
         }
         "run" => {
-            let (results, output, selection) = result_options(&root, &mut args, true, true)?;
+            let (log_tail_options, mut remaining) = log_tail_options(&mut args)?;
+            let (results, output, selection) = result_options(&root, &mut remaining, true, true)?;
             if output.is_some() {
                 return Err(
                     "run does not accept --output; its plan is always RESULTS/dag.json".into(),
@@ -2789,6 +2793,10 @@ fn run() -> Result<(), String> {
                 if exact_cell {
                     print_exact_manifest_command(&dag, &metadata)?;
                 }
+                // --log-tail-bytes: bound and sample every cell run beside the scheduler.
+                let warden = log_tail_options
+                    .clone()
+                    .map(|options| log_tail::Warden::start(&results, options));
                 let execution = with_runner_log_dir(&results, || {
                     with_execution_root(execution_root, || {
                         execute_typed_dag(
@@ -2799,7 +2807,11 @@ fn run() -> Result<(), String> {
                             metadata.run_timeout_seconds,
                         )
                     })
-                })?;
+                });
+                if let Some(warden) = warden {
+                    warden.finish();
+                }
+                let execution = execution?;
                 let runner_evidence = retain_execution_evidence(&results, &execution)?;
                 require_runner_outcomes_for_planned_cells(&metadata, &runner_evidence)?;
                 println!(
@@ -3350,6 +3362,48 @@ fn print_unavailable(metadata: &RunMetadata) {
             metadata.unavailable_cells
         );
     }
+}
+
+/// The evidence error of a comparison whose retained logs `--log-tail-bytes` punched.
+const LOG_TRUNCATED_EVIDENCE: &str =
+    "guest logs were truncated by --log-tail-bytes, so the verify comparison is not evidence";
+
+/// Take `run`'s `--log-tail-bytes BYTES` and `--stall-sample-seconds N` out
+/// of ARGS; the rest go to [`result_options`].
+fn log_tail_options(
+    args: &mut impl Iterator<Item = String>,
+) -> Result<(Option<log_tail::Options>, std::vec::IntoIter<String>), String> {
+    let mut remaining = Vec::new();
+    let mut tail_bytes = None;
+    let mut seconds = None;
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--log-tail-bytes" => {
+                let value = args
+                    .next()
+                    .ok_or("--log-tail-bytes requires a byte count")?;
+                tail_bytes = Some(log_tail::parse_tail_bytes(&value)?);
+            }
+            "--stall-sample-seconds" => {
+                let value = args
+                    .next()
+                    .ok_or("--stall-sample-seconds requires seconds")?;
+                seconds = Some(log_tail::parse_sample_seconds(&value)?);
+            }
+            _ => remaining.push(argument),
+        }
+    }
+    let options = match (tail_bytes, seconds) {
+        (None, Some(_)) => {
+            return Err("--stall-sample-seconds requires --log-tail-bytes".into());
+        }
+        (None, None) => None,
+        (Some(tail_bytes), seconds) => Some(log_tail::Options {
+            tail_bytes,
+            interval: Duration::from_secs(seconds.unwrap_or(log_tail::DEFAULT_SAMPLE_SECONDS)),
+        }),
+    };
+    Ok((options, remaining.into_iter()))
 }
 
 fn result_options(
@@ -9888,6 +9942,24 @@ fn summarize(
             if invocation.is_none() {
                 evidence_errors.push("selected result has no complete recorded invocation".into());
             }
+            // --log-tail-bytes (pressure_log_tail.rs): a comparison read logs
+            // whose heads were punched, so it is not evidence. A run with no
+            // comparison (a timeout) keeps its result.
+            let stall = match log_tail::read_record(results, &evidence_run_id) {
+                Ok(record) => record,
+                Err(error) => {
+                    evidence_errors.push(error);
+                    None
+                }
+            };
+            if stall.as_ref().is_some_and(|record| record.log_truncated)
+                && matches!(verification_verdict, Some("matched" | "diverged"))
+            {
+                evidence_errors.push(format!(
+                    "{LOG_TRUNCATED_EVIDENCE}: {} byte(s) of the retained logs were punched",
+                    stall.as_ref().map_or(0, |record| record.punched_bytes)
+                ));
+            }
             let derived_result = classify_result(
                 runner,
                 harness_status,
@@ -10225,6 +10297,7 @@ fn summarize(
                 "runner_output_log": runner_output_log,
                 "oom_proven_by_runner_and_attempt_marker": proven_oom,
                 "timeout_proven_by_runner_and_attempt_marker": proven_timeout,
+                "stall": stall.as_ref().map(|record| log_tail::summary_value(record, result == "timeout")),
                 }),
                 is_reference,
             ));
@@ -14443,6 +14516,46 @@ fn flake_verdict_self_test() -> Result<(), String> {
     Ok(())
 }
 
+/// `run --log-tail-bytes`: option parsing here, the warden in pressure_log_tail.rs.
+fn log_tail_self_test() -> Result<(), String> {
+    let parse = |items: &[&str]| {
+        let mut args = items.iter().map(|item| item.to_string());
+        log_tail_options(&mut args).map(|(options, rest)| (options, rest.collect::<Vec<_>>()))
+    };
+    let (options, rest) = parse(&[
+        "--test",
+        "t",
+        "--log-tail-bytes",
+        "67108864",
+        "--mode",
+        "verify",
+    ])?;
+    let options = options.ok_or("--log-tail-bytes was not taken")?;
+    if options.tail_bytes != 64 << 20
+        || options.interval != Duration::from_secs(log_tail::DEFAULT_SAMPLE_SECONDS)
+        || rest != ["--test", "t", "--mode", "verify"]
+    {
+        return Err(format!(
+            "--log-tail-bytes parsed wrongly: {options:?} {rest:?}"
+        ));
+    }
+    if parse(&["--stall-sample-seconds", "10"]).is_ok()
+        || parse(&["--log-tail-bytes", "1024"]).is_ok()
+        || parse(&["--log-tail-bytes"]).is_ok()
+        || !parse(&["--test", "t"]).is_ok_and(|(options, _)| options.is_none())
+    {
+        return Err("log-tail option refusals are wrong".into());
+    }
+    let scratch = env::temp_dir().join(format!(
+        "pressure-log-tail-self-test-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&scratch);
+    let outcome = log_tail::self_test(&scratch);
+    let _ = fs::remove_dir_all(&scratch);
+    outcome
+}
+
 fn self_test(root: &Path) -> Result<(), String> {
     // Read the real checked-in scorecard before building synthetic fixtures.
     // A scorecard schema bump must take this consumer offline immediately and
@@ -14452,6 +14565,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         return Err("tracked cells are empty".into());
     }
     safe_ci_scope::self_test()?;
+    log_tail_self_test()?;
     pressure_timeout_self_test()?;
     flake_verdict_self_test()?;
     if series_run_index("a-cell-repetition-0004") != 4
