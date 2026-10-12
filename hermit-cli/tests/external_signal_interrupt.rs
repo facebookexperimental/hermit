@@ -2255,7 +2255,7 @@ fn ptrace_large_pselect6_on_a_stack_with_no_scratch_behaves_as_natively() {
     assert!(
         refused.status.code() == Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
             && refused_stderr
-                .contains("unsupported: pselect6 with more than 64 descriptors and a temporary")
+                .contains("unsupported: pselect6 with a temporary signal mask, on a stack")
             && !String::from_utf8_lossy(&refused.stdout).contains("mode=crowded"),
         "crowded: expected the named policy refusal; got {}\nstdout:\n{}\nstderr:\n{refused_stderr}",
         refused.status,
@@ -2278,6 +2278,62 @@ fn ptrace_large_pselect6_on_a_stack_with_no_scratch_behaves_as_natively() {
         "crowded with --allow-unsupported-syscalls: expected Linux's answer; got {}\nstdout:\n{allowed_stdout}\nstderr:\n{}",
         allowed.status,
         String::from_utf8_lossy(&allowed.stderr)
+    );
+    let _ = fs::remove_file(&witness);
+}
+
+/// Under `hermit record`, a pselect6 with a temporary mask that may wait runs
+/// on a private copy of the mask (https://github.com/rrnewton/hermit/issues/4095).
+/// Mode crowded's call, on a stack with no scratch below its red zone and a
+/// fd set filling the red zone, leaves no room for the copy, so a fail-closed
+/// recording refuses it by name rather than handing the kernel the guest's
+/// wrapper (Claude review of https://github.com/rrnewton/hermit/pull/4166).
+#[test]
+fn ptrace_record_refuses_a_crowded_pselect6_on_a_tight_stack_by_name() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let root = build_root();
+    fs::create_dir_all(&root).expect("failed to create guest build directory");
+    let witness = root.join(format!("pselect_tight_stack_record.{}", std::process::id()));
+    let compiled = Command::new("cc")
+        .args(["-O2", "-Wall", "-Wextra", "-Werror", "-pthread"])
+        .arg(repository.join("tests/c/pselect_tight_stack.c"))
+        .arg("-o")
+        .arg(&witness)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to start the witness's compiler");
+    assert!(
+        compiled.status.success(),
+        "failed to compile the witness: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let data = tempfile::Builder::new()
+        .prefix("record-")
+        .tempdir_in(&root)
+        .expect("failed to create recording directory");
+    let refused = Command::new("timeout")
+        .args(["--kill-after=5s", "120s"])
+        .arg(hermit_binary::hermit_binary())
+        .env_remove("LD_LIBRARY_PATH")
+        .args(["--backend", "ptrace", "record", "start", "--strict"])
+        .arg(format!("--data-dir={}", data.path().display()))
+        .arg("--")
+        .arg(&witness)
+        .arg("crowded")
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run hermit");
+    let refused_stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        refused.status.code() == Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
+            && refused_stderr
+                .contains("unsupported: pselect6 with a temporary signal mask, on a stack")
+            && !String::from_utf8_lossy(&refused.stdout).contains("mode=crowded"),
+        "record crowded: expected the named policy refusal; got {}\nstdout:\n{}\nstderr:\n{refused_stderr}",
+        refused.status,
+        String::from_utf8_lossy(&refused.stdout)
     );
     let _ = fs::remove_file(&witness);
 }

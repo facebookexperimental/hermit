@@ -58,6 +58,18 @@
  *                the shared-alarm rounds through ppoll and epoll_pwait, whose
  *                recordings wait on a private copy of the mask
  *                (https://github.com/rrnewton/hermit/issues/4149)
+ *   pselect-mask-toggled-by-a-sibling
+ *                100 rounds of raise(SIGUSR1) with SIGUSR1 blocked, then a raw
+ *                pselect6 with a 1 ms timeout whose mask buffer a sibling
+ *                toggles between "blocks SIGUSR1" and "empty" between
+ *                sched_yield calls; each round is EINTR or 0 depending on the
+ *                mask the kernel copied, and replay must reproduce every one
+ *                (https://github.com/rrnewton/hermit/issues/4095)
+ *   pselect-mask-protnone
+ *                a pselect6 with a 1 ms timeout whose wrapper is readable but
+ *                whose mask is on a PROT_NONE page: Linux's copy faults and the
+ *                call returns EFAULT before it waits; the recording must not
+ *                wait on a copy of a mask a tracer read could still see
  *   pselect-mask-unblocks-alarm
  *                the opposite idiom: the main thread blocks SIGALRM, which it
  *                catches, and waits in glibc pselect() with a 30 s bound and
@@ -881,6 +893,143 @@ static int mask_shared_alarm(
       fprintf(stderr, "%s mismatch\n", mode);
       return 1;
     }
+  }
+  return 0;
+}
+
+static volatile sig_atomic_t toggled_usr1s;
+static volatile uint64_t toggled_mask;
+static atomic_int toggling_done;
+
+static void count_toggled_usr1(int signal) {
+  (void)signal;
+  toggled_usr1s++;
+}
+
+static void* toggle_pselect_mask(void* arg) {
+  (void)arg;
+  while (!atomic_load(&toggling_done)) {
+    toggled_mask = 0;
+    sched_yield();
+    toggled_mask = 1ull << (SIGUSR1 - 1);
+    sched_yield();
+  }
+  return NULL;
+}
+
+/*
+ * Linux copies a pselect6's temporary mask when the call enters the kernel.
+ * Recording handed the kernel the guest's mask buffer, which the kernel read
+ * after the scheduler granted the call, by which time a sibling turn could
+ * have rewritten it at a point host timing chose; replay read the buffer at
+ * the grant and could disagree, re-issuing the call where the recording had
+ * the next one (https://github.com/rrnewton/hermit/issues/4095). Each round
+ * repeats the chance; the outcome counts and their order are compared.
+ */
+static int pselect_mask_toggled_by_a_sibling(void) {
+  struct sigaction action;
+  memset(&action, 0, sizeof action);
+  action.sa_handler = count_toggled_usr1;
+  if (sigaction(SIGUSR1, &action, NULL) != 0) {
+    perror("sigaction");
+    return 1;
+  }
+  sigset_t usr1;
+  sigemptyset(&usr1);
+  sigaddset(&usr1, SIGUSR1);
+  if (pthread_sigmask(SIG_BLOCK, &usr1, NULL) != 0) {
+    perror("pthread_sigmask");
+    return 1;
+  }
+  toggled_mask = 1ull << (SIGUSR1 - 1);
+  struct {
+    volatile uint64_t* mask;
+    size_t size;
+  } wrapper = {&toggled_mask, 8};
+  pthread_t toggler;
+  if (pthread_create(&toggler, NULL, toggle_pselect_mask, NULL) != 0) {
+    perror("pthread_create");
+    return 1;
+  }
+  int eintr = 0;
+  int timeouts = 0;
+  int other = 0;
+  unsigned long long trace = 0;
+  for (int round = 0; round < 100; round++) {
+    raise(SIGUSR1);
+    struct timespec wait = {0, 1000000};
+    errno = 0;
+    long result = syscall(SYS_pselect6, 0, NULL, NULL, NULL, &wait, &wrapper);
+    int result_errno = errno;
+    if (result == -1 && result_errno == EINTR) {
+      eintr++;
+      trace = trace * 3 + 1;
+    } else if (result == 0) {
+      timeouts++;
+      trace = trace * 3 + 2;
+    } else {
+      other++;
+      trace = trace * 3;
+    }
+  }
+  atomic_store(&toggling_done, 1);
+  if (pthread_join(toggler, NULL) != 0) {
+    perror("pthread_join");
+    return 1;
+  }
+  /* The last round's signal may still be pending; take it. */
+  if (pthread_sigmask(SIG_UNBLOCK, &usr1, NULL) != 0) {
+    perror("pthread_sigmask");
+    return 1;
+  }
+  printf(
+      "pselect-mask-toggled eintr=%03d timeouts=%03d other=%03d handled=%03d "
+      "trace=%016llx\n",
+      eintr,
+      timeouts,
+      other,
+      (int)toggled_usr1s,
+      trace);
+  if (other != 0 || eintr + timeouts != 100) {
+    fprintf(stderr, "pselect-mask-toggled-by-a-sibling mismatch\n");
+    return 1;
+  }
+  return 0;
+}
+
+/*
+ * Claude review of https://github.com/rrnewton/hermit/pull/4166: recording
+ * read the mask with a tracer read, which returns a PROT_NONE page, waited on
+ * a private copy of it and returned 0 where Linux gives EFAULT.
+ */
+static int pselect_mask_protnone(void) {
+  long page = sysconf(_SC_PAGESIZE);
+  uint64_t* mask = mmap(
+      NULL, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (mask == MAP_FAILED) {
+    perror("mmap");
+    return 1;
+  }
+  *mask = 0;
+  if (mprotect(mask, page, PROT_NONE) != 0) {
+    perror("mprotect");
+    return 1;
+  }
+  struct {
+    uint64_t* mask;
+    size_t size;
+  } wrapper = {mask, 8};
+  struct timespec wait = {0, 1000000};
+  errno = 0;
+  long result = syscall(SYS_pselect6, 0, NULL, NULL, NULL, &wait, &wrapper);
+  int result_errno = errno;
+  printf(
+      "pselect-mask-protnone result=%011ld errno=%011d\n",
+      result,
+      result < 0 ? result_errno : 0);
+  if (result != -1 || result_errno != EFAULT) {
+    fprintf(stderr, "pselect-mask-protnone mismatch\n");
+    return 1;
   }
   return 0;
 }
@@ -2441,7 +2590,8 @@ int main(int argc, char** argv) {
         "epoll-pwait2-mask-raise-tight|epoll-pwait2-mask-raise-tight24|"
         "epoll-pwait2-mask-sibling-race|epoll-pwait2-timeout-in-red-zone|"
         "epoll-pwait2-zero-beside-busy-sibling|epoll-pwait2-error-order|"
-        "ppoll-mask-shared-alarm|epoll-pwait-mask-shared-alarm]\n",
+        "ppoll-mask-shared-alarm|epoll-pwait-mask-shared-alarm|"
+        "pselect-mask-toggled-by-a-sibling|pselect-mask-protnone]\n",
         argv[0]);
     return 2;
   }
@@ -2468,6 +2618,12 @@ int main(int argc, char** argv) {
         SHARED_ALARM_PSELECT,
         "pselect-mask-shared",
         "pselect-mask-shared-alarm");
+  }
+  if (strcmp(argv[1], "pselect-mask-protnone") == 0) {
+    return pselect_mask_protnone();
+  }
+  if (strcmp(argv[1], "pselect-mask-toggled-by-a-sibling") == 0) {
+    return pselect_mask_toggled_by_a_sibling();
   }
   if (strcmp(argv[1], "ppoll-mask-shared-alarm") == 0) {
     return mask_shared_alarm(

@@ -463,15 +463,15 @@ pub struct Resources {
     #[serde(default)]
     pub(crate) blocked_signal_mask: Option<u64>,
     /// Set on a `BlockingExternalIO` request whose call installs a temporary
-    /// signal mask that the thread's turn cannot vouch for: a pselect6 in
-    /// record and replay, whose `{ sigmask, sigsetsize }` wrapper may sit in
-    /// memory a tracer read cannot reach though the kernel can, and whose mask
-    /// a sibling may rewrite between this turn and the kernel's copy of it.
-    /// A masked record/replay ppoll or epoll_pwait sleeps under a private copy
-    /// Hermit knows, and sets it too, so that recording and replay, which
-    /// serves the call from the log without the kernel installing anything,
-    /// schedule the call alike. The
-    /// scheduler then records no sleeping mask for the thread
+    /// signal mask that the thread's turn cannot vouch for: a record/replay
+    /// pselect6 whose mask Hermit could not read through the kernel at entry,
+    /// which keeps the guest's `{ sigmask, sigsetsize }` wrapper. A masked
+    /// record/replay pselect6, ppoll or epoll_pwait that may wait sleeps under
+    /// a private copy Hermit read at entry
+    /// (<https://github.com/rrnewton/hermit/issues/4095>), and sets it too, so
+    /// that recording and replay, which serves the call from the log without
+    /// the kernel installing anything, schedule the call alike. The scheduler
+    /// then records no sleeping mask for the thread
     /// (`BlockedPool::out_of_scheduler_masks` holds `None`), so it neither arms
     /// the thread for a committed signal nor chooses it as a `SIGCHLD` target,
     /// as for every call outside the schedule before the scheduler modelled

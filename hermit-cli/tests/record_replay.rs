@@ -2973,6 +2973,28 @@ fn record_epoll_pwait_whose_mask_blocks_a_signal_a_sibling_takes() {
     record_select_mode("epoll-pwait-mask-shared-alarm");
 }
 
+/// A sibling toggles a waiting pselect6's mask buffer between rounds of
+/// raise-then-wait. Recording handed the kernel the guest's buffer, which it
+/// copied after the grant, possibly after a sibling turn rewrote it; replay
+/// read it at the grant and re-issued the call where the recording had the
+/// next one. The recording now waits on a private copy read at the call's
+/// entry, where Linux copies it, and replay reads it there too
+/// (https://github.com/rrnewton/hermit/issues/4095).
+#[test]
+fn record_pselect_whose_mask_a_sibling_toggles() {
+    record_select_mode("pselect-mask-toggled-by-a-sibling");
+}
+
+/// A pselect6 whose mask is on a PROT_NONE page fails with EFAULT at entry,
+/// as on Linux. Recording reads the mask through the kernel, so it keeps the
+/// guest's wrapper for the kernel to fail; a tracer read of the page would
+/// have returned it, the recording would have waited on a private copy, and
+/// the call returned 0 (Claude review of https://github.com/rrnewton/hermit/pull/4166).
+#[test]
+fn record_pselect_whose_mask_is_inaccessible_fails_with_efault() {
+    record_select_mode("pselect-mask-protnone");
+}
+
 /// The opposite idiom: the thread blocks SIGALRM and waits in pselect6 under a
 /// temporary mask that unblocks it, so the timer's SIGALRM ends the wait with
 /// EINTR and its handler runs before the call returns. Replay serves the call

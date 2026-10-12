@@ -1410,7 +1410,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4163): 1056.
     // And metadata::tests::record_version_rejects_streams_made_before_nested_pid_translation
     // (https://github.com/rrnewton/hermit/issues/4155): 1057.
-    ("test.hermit_unit", 1057),
+    // And metadata::tests::record_version_rejects_streams_that_read_the_pselect6_mask_after_the_grant
+    // (https://github.com/rrnewton/hermit/issues/4095): 1058.
+    ("test.hermit_unit", 1058),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2168,7 +2170,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4150): 286.
     // That test split into six, one per chaos setting and guest mode, each with
     // its own CPU budget (review of https://github.com/rrnewton/hermit/pull/4201): 291.
-    ("test.hermit_integration", 291),
+    // And external_signal_interrupt::ptrace_record_refuses_a_crowded_pselect6_on_a_tight_stack_by_name
+    // (Claude review of https://github.com/rrnewton/hermit/pull/4166): 292.
+    ("test.hermit_integration", 292),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -2314,7 +2318,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4149): 194.
     // And record_nested_pid_namespace
     // (https://github.com/rrnewton/hermit/issues/4155): 195.
-    ("test.record_replay", 195),
+    // And record_pselect_whose_mask_a_sibling_toggles
+    // (https://github.com/rrnewton/hermit/issues/4095): 196.
+    // And record_pselect_whose_mask_is_inaccessible_fails_with_efault
+    // (Claude review of https://github.com/rrnewton/hermit/pull/4166): 197.
+    ("test.record_replay", 197),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -3160,7 +3168,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two single-virtual-CPU procfs tests: 285.
     // And the random-heuristic sched_yield progress test: 286.
     // That test split into six: 291.
-    ("test.hermit_integration_on_host", 291),
+    // And the crowded-stack pselect6 record refusal test: 292.
+    ("test.hermit_integration_on_host", 292),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
@@ -3271,7 +3280,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the SIGEV_THREAD_ID record-epoch test: 1055.
     // And the vfork-gate readmission record-epoch test: 1056.
     // And the nested-PID-namespace record-epoch test: 1057.
-    ("test.hermit_unit_on_host", 1057),
+    // And the pselect6 entry-mask record-epoch test: 1058.
+    ("test.hermit_unit_on_host", 1058),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

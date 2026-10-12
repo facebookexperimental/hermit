@@ -332,10 +332,35 @@ where
     Ok(Some(staged))
 }
 
-/// The temporary mask a replayed pselect6 sleeps under, read from guest
-/// memory where the recorded call entered the kernel, as Linux copies it once
-/// then (after the scheduler grants the call); `None` when the
-/// call has no mask or the wrapper or the mask cannot be read
+/// The temporary mask a record/replay pselect6 that may wait sleeps under,
+/// read at the call's entry, where Linux copies it (recording waits on a
+/// private copy of it, `handle_pselect6`). The mask is read through the kernel
+/// (`read_kernel_sigset`), so a mask the kernel's copy faults on, such as one
+/// on a `PROT_NONE` page that a tracer read would still return, gives `None`:
+/// the call then keeps the guest's wrapper and the kernel fails it with EFAULT
+/// in Linux's order (Claude review of
+/// https://github.com/rrnewton/hermit/pull/4166). `None` too when the call
+/// has no mask, its wrapper cannot be read, or the size is not the kernel's.
+async fn entry_pselect6_temporary_mask<G, T>(
+    guest: &mut G,
+    call: syscalls::Pselect6,
+) -> Option<KernelSigset>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let wrapper = call.sigmask()?;
+    let argument: Pselect6SigmaskArg = guest.memory().read_value(wrapper.cast()).ok()?;
+    if argument.sigsetsize != KERNEL_SIGSET_SIZE {
+        return None;
+    }
+    let mask_addr = Addr::<libc::sigset_t>::from_raw(argument.sigmask)?;
+    read_kernel_sigset(guest, mask_addr).await.ok()
+}
+
+/// The temporary mask a replayed zero-timeout pselect6 sleeps under, read
+/// once the scheduler grants the call, which keeps its turn until it returns;
+/// `None` when the call has no mask or the wrapper or the mask cannot be read
 /// (`end_replayed_pselect6_under_its_temporary_mask`).
 fn replayed_pselect6_temporary_mask<G, T>(
     guest: &mut G,
@@ -356,11 +381,11 @@ where
 
 /// Whether replay could deliver a signal that interrupts this record/replay
 /// pselect6 (`end_replayed_pselect6_under_its_temporary_mask`), whose 24 bytes
-/// go in the stack scratch or at the top of the red zone. Recording passes the
-/// guest's own wrapper to the kernel, so it accepts the call on any stack, and
-/// a call whose stack pointer is less than 24 bytes above unwritable memory
-/// left replay nowhere to deliver: the kernel restarted the served call and
-/// replay stopped at the next syscall
+/// go in the stack scratch or at the top of the red zone. Recording a
+/// zero-timeout call passes the guest's own wrapper to the kernel, so it
+/// accepts the call on any stack, and a call whose stack pointer is less than
+/// 24 bytes above unwritable memory left replay nowhere to deliver: the kernel
+/// restarted the served call and replay stopped at the next syscall
 /// (https://github.com/rrnewton/hermit/issues/4112). The top 24 bytes of the
 /// red zone are readable exactly when the stack pointer is at least 24 bytes
 /// above unwritable memory, and the stack scratch lies below them, so this
@@ -835,8 +860,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
-    /// Refuses a large-nfds pselect6 with a temporary mask whose private copy
-    /// has nowhere to go: the stack has no writable scratch below its red zone,
+    /// Refuses a large-nfds pselect6 with a temporary mask, or a record/replay
+    /// one that may wait (`record_or_replay_pselect6_under_a_private_mask`),
+    /// whose private copy has nowhere to go: the stack has no writable scratch below its red zone,
     /// and every red-zone window overlaps one of the call's own buffers
     /// (`stage_private_cells`). Forwarding the guest's wrapper instead
     /// would let a sibling change the mask the kernel installs after the
@@ -855,10 +881,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Pselect6,
     ) -> Result<i64, Error> {
         use std::io::Write as _;
-        let message = "unsupported: pselect6 with more than 64 descriptors and a temporary \
-            signal mask, on a stack with no room below its red zone whose red zone the \
-            call's own buffers fill: Hermit has nowhere to put the private copy of the mask \
-            the kernel must install (https://github.com/rrnewton/hermit/pull/4053)";
+        let message = "unsupported: pselect6 with a temporary signal mask, on a stack with \
+            no room below its red zone whose red zone the call's own buffers fill: Hermit \
+            has nowhere to put the private copy of the mask the kernel must install \
+            (https://github.com/rrnewton/hermit/pull/4053)";
         tracing::error!("[tid {}] {message}", guest.tid());
         if self.cfg.panic_on_unsupported_syscalls {
             let _ = writeln!(crate::util::RetryingStderr, "{message}");
@@ -897,6 +923,44 @@ impl<T: RecordOrReplay> Detcore<T> {
         )
     }
 
+    /// Records or replays a masked pselect6 that may wait, under a private
+    /// copy of the mask read at its entry (`mask`), staged clear of the fd
+    /// sets and timeout the kernel reads and writes (`stage_private_cells`).
+    /// The outer `Err` is a staging failure; a call with no room for the copy
+    /// is refused (`refuse_unstageable_pselect6_mask`).
+    async fn record_or_replay_pselect6_under_a_private_mask<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Pselect6,
+        mask: KernelSigset,
+    ) -> Result<Result<i64, Error>, Error> {
+        let set_len = pselect6_fd_set_len(call.nfds()).unwrap_or(0);
+        let live: Vec<std::ops::Range<usize>> = [
+            call.readfds().map(|set| (set.as_raw(), set_len)),
+            call.writefds().map(|set| (set.as_raw(), set_len)),
+            call.exceptfds().map(|set| (set.as_raw(), set_len)),
+            call.timeout()
+                .map(|timeout| (timeout.as_raw(), std::mem::size_of::<Timespec>())),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|(start, len)| start..start.saturating_add(len))
+        .collect();
+        let Some(staged) =
+            stage_private_cells(guest, PrivateCells::Pselect6Mask(mask), &live).await?
+        else {
+            return Ok(self.refuse_unstageable_pselect6_mask(guest, call).await);
+        };
+        let result = self
+            .record_or_replay_blocking_with_unknown_mask(
+                guest,
+                Syscall::Pselect6(call.with_sigmask(Addr::from_raw(staged.after_mask()))),
+            )
+            .await;
+        staged.release(guest);
+        Ok(result)
+    }
+
     /// pselect6 syscall (MAYHANG).
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#686): Review scratch fd sets and scheduler polling.
@@ -923,17 +987,19 @@ impl<T: RecordOrReplay> Detcore<T> {
             // scheduler records no mask for such a call
             // (`Resources::blocked_signal_mask_unknown`). Without a wrapper the
             // call sleeps under the thread's own mask, which the scheduler reads.
-            // Replay reads the temporary mask once the scheduler has granted
-            // the call: after any sibling that ran while the request waited,
-            // and before the served call, during which a sibling may rewrite
-            // the buffer (review of https://github.com/rrnewton/hermit/pull/4052;
-            // review of https://github.com/rrnewton/hermit/pull/4084). That is
-            // the mask recording's kernel copied when no sibling turn ran
-            // between the grant and the call's entry into the kernel; a
-            // recorded call that a sibling raced there is not reproduced. A zero
-            // timeout does not change that: Linux still installs the mask and
-            // ends the call with ERESTARTNOHAND for a pending signal it
-            // unblocks (https://github.com/rrnewton/hermit/issues/4054).
+            // A call that may wait sleeps under a private copy of its mask,
+            // read here, at its entry, where Linux copies it. Handing the kernel
+            // the guest's wrapper let a sibling turn that ran after the grant
+            // change the mask the kernel copied, at a point host timing chose,
+            // and replay could not tell (https://github.com/rrnewton/hermit/issues/4095).
+            // Replay reads the mask at the same point and delivers a recorded
+            // interruption under it. A zero-timeout call holds its turn until
+            // it returns, so no sibling runs before the kernel copies the mask,
+            // and replay reads it once the call is granted (review of
+            // https://github.com/rrnewton/hermit/pull/4084). A zero timeout still
+            // installs the mask and ends the call with ERESTARTNOHAND for a
+            // pending signal it unblocks
+            // (https://github.com/rrnewton/hermit/issues/4054).
             if !replayed_pselect6_delivery_fits(guest, call).await
                 && let Some(refused) = self.refuse_undeliverable_pselect6_mask(guest).await
             {
@@ -942,16 +1008,26 @@ impl<T: RecordOrReplay> Detcore<T> {
             let read_mask = self.cfg.replaying && call.sigmask().is_some();
             let mut temporary_mask = None;
             let result = if call.sigmask().is_some() && !zero_timeout {
-                self.record_or_replay_blocking_with_unknown_mask_then(
-                    guest,
-                    Syscall::Pselect6(call),
-                    |guest| {
-                        if read_mask {
-                            temporary_mask = replayed_pselect6_temporary_mask(guest, call);
-                        }
-                    },
-                )
-                .await
+                // `None` when the call names no mask, or one the kernel rejects
+                // or the tracer cannot read, though the kernel can: such a call
+                // keeps the guest's own wrapper.
+                let entry_mask = entry_pselect6_temporary_mask(guest, call).await;
+                if read_mask {
+                    temporary_mask = entry_mask;
+                }
+                match entry_mask {
+                    Some(mask) => {
+                        self.record_or_replay_pselect6_under_a_private_mask(guest, call, mask)
+                            .await?
+                    }
+                    None => {
+                        self.record_or_replay_blocking_with_unknown_mask(
+                            guest,
+                            Syscall::Pselect6(call),
+                        )
+                        .await
+                    }
+                }
             } else if zero_timeout {
                 resource_request(guest, Resources::new(guest.thread_state().dettid)).await;
                 if read_mask {

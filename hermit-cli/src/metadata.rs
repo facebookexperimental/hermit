@@ -367,7 +367,12 @@ impl RecordVersion {
 // where they answered ECHILD, the init's own default signals are dropped, and
 // orphans go to the nested init. Replay recomputes these, so an older
 // recording of such a guest could diverge.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x13f);
+// 0x13f -> 0x140: a record/replay pselect6 that may wait reads its temporary
+// mask at the call's entry, where Linux copies it, and recording waits on a
+// private copy; replay read it after the grant
+// (https://github.com/rrnewton/hermit/issues/4095). An older recording whose
+// sibling rewrote the mask between the two can replay differently here.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x140);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -392,7 +397,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x13f);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x13f;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x140;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1163,6 +1168,16 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_made_before_nested_pid_translation() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x13e)));
+    }
+
+    /// A 0x13f or older recording read a waiting pselect6's temporary mask
+    /// after the scheduler's grant, where this replayer reads it at the call's
+    /// entry (https://github.com/rrnewton/hermit/issues/4095).
+    #[test]
+    fn record_version_rejects_streams_that_read_the_pselect6_mask_after_the_grant() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x13f)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x13e)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x13d)));
     }
 
     #[test]

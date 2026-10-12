@@ -649,8 +649,10 @@ mod tests {
             // (https://github.com/rrnewton/hermit/issues/4160), plus the
             // random-heuristic sched_yield progress tests, one per chaos setting
             // and guest mode (https://github.com/rrnewton/hermit/issues/4150,
-            // https://github.com/rrnewton/hermit/pull/4201).
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "291");
+            // https://github.com/rrnewton/hermit/pull/4201), plus the
+            // crowded-stack pselect6 record refusal test (Claude review of
+            // https://github.com/rrnewton/hermit/pull/4166).
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "292");
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(
