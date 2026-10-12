@@ -401,7 +401,13 @@ impl RecordVersion {
 // F_OFD_GETLK; the write-hint queries) records the bytes it wrote, and replay
 // writes them back (https://github.com/rrnewton/hermit/issues/2289). An older
 // recording has no such event.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x145);
+// 0x145 -> 0x146: a successful exec takes back the POSIX timer signals
+// Detcore sent that are still queued, as Linux discards them
+// (flush_itimer_signals; https://github.com/rrnewton/hermit/issues/4184),
+// where they survived the exec and reached the new image. Replay recomputes
+// this, so an older recording replayed here could see a delivery its recorder
+// saw and this replayer drops.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x146);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -426,7 +432,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x145);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x145;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x146;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1258,6 +1264,14 @@ mod tests {
     fn record_version_rejects_streams_without_epoll_ctl_events() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x142)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x141)));
+    }
+
+    /// A 0x145 or older recording was made when a POSIX timer's queued signal
+    /// survived exec, which this replayer takes back
+    /// (https://github.com/rrnewton/hermit/issues/4184).
+    #[test]
+    fn record_version_rejects_streams_whose_timer_signals_survived_exec() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x145)));
     }
 
     #[test]

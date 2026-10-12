@@ -316,7 +316,9 @@ int main(int argc, char** argv) {
 
   if (strcmp(which, "after-exec-sigpending") == 0 ||
       strcmp(which, "after-exec-exit") == 0) {
-    /* The new image: the pending signal and the blocked mask survived exec. */
+    /* The new image: the blocked mask survived exec, and the timer's queued
+       signal did not (flush_itimer_signals;
+       https://github.com/rrnewton/hermit/issues/4184). */
     if (strcmp(which, "after-exec-sigpending") == 0) {
       sigset_t pending;
       sigpending(&pending);

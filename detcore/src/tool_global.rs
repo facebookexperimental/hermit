@@ -2890,6 +2890,11 @@ impl GlobalState {
                     .forget_thread_timer_copies(process, signo);
                 R::ForgetThreadTimerCopies(())
             }
+            GlobalRequest::ExecTimerFlush(process) => R::ExecTimerFlush(
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .take_exec_timer_flush(dtid, process),
+            ),
             GlobalRequest::GuestPid(caller, pid) => {
                 let sched = self.lock_rpc_scheduler(false).await;
                 R::GuestPid(sched.guest_pid(caller, pid))
@@ -4741,6 +4746,10 @@ pub enum GlobalRequest {
     /// (`PidNamespaces::localize_for`). Appended after `GuestPid`, for the
     /// same reason.
     LocalPid(DetTid, DetTid),
+    /// The POSIX timer copies a successful exec of this process flushes
+    /// (`Scheduler::take_exec_timer_flush`), asked by its surviving thread.
+    /// Appended after `LocalPid`, for the same reason.
+    ExecTimerFlush(DetPid),
 }
 
 /// Responses from the global object
@@ -4878,6 +4887,8 @@ pub enum GlobalResponse {
     GuestPid(crate::scheduler::pid_namespaces::GuestPidAnswer),
     /// Appended after `GuestPid`, for the same reason.
     LocalPid(Result<Option<i32>, String>),
+    /// Appended after `LocalPid`, for the same reason.
+    ExecTimerFlush(Result<crate::scheduler::ExecTimerFlush, String>),
 }
 
 /// `request`, carrying the number of records this guest thread produced for
@@ -6569,6 +6580,24 @@ where
     .await;
     match response.1 {
         GlobalResponse::ForgetThreadTimerCopies(()) => {}
+        _ => unreachable!(),
+    }
+}
+
+/// The POSIX timer copies the calling thread's successful exec flushes
+/// (`Scheduler::take_exec_timer_flush`). Asked in the exec's turn, only in a
+/// run that has recorded a timer copy or kept a real-time expiration pending.
+pub async fn exec_timer_flush<G, T>(
+    guest: &mut G,
+) -> Result<crate::scheduler::ExecTimerFlush, String>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let process = guest.thread_state().detpid.expect("detpid unset");
+    let response = send_and_update_time(guest, GlobalRequest::ExecTimerFlush(process)).await;
+    match response.1 {
+        GlobalResponse::ExecTimerFlush(answer) => answer,
         _ => unreachable!(),
     }
 }

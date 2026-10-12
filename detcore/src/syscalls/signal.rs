@@ -268,6 +268,38 @@ where
     })
 }
 
+/// Take one pending copy of `signo` from the calling thread's queues, its own
+/// first and then its process's shared one, as Linux dequeues it, with a
+/// zero-timeout `rt_sigtimedwait` injected while the thread holds its turn.
+/// Returns the signal taken, or the call's error (EAGAIN: none was pending).
+pub(crate) async fn take_pending_signal<G, T>(guest: &mut G, signo: i32) -> Result<i64, Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let mut stack = guest.stack().await;
+    let set = stack.push(kernel_sigset_bit(signo));
+    let timeout = stack.push(Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    });
+    let stack_guard = stack.commit()?;
+    // SAFETY: the kernel only reads the set; Reverie types the argument as
+    // mutable.
+    let set = unsafe { set.cast::<libc::sigset_t>().into_mut() };
+    let taken = guest
+        .inject(
+            syscalls::RtSigtimedwait::new()
+                .with_set(Some(set))
+                .with_info(None)
+                .with_timeout(Some(timeout))
+                .with_sigsetsize(KERNEL_SIGSET_SIZE),
+        )
+        .await;
+    drop(stack_guard);
+    Ok(taken?)
+}
+
 /// The guest's virtual SIGALRM blocked bit, read from the runtime (which
 /// answers the query from its virtual state).
 pub(crate) async fn virtual_sigalrm_blocked<G, T>(guest: &mut G) -> Result<bool, Error>
@@ -891,7 +923,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if (result.is_ok() || matches!(result, Err(Errno::EFAULT)))
             && kernel_action.is_some_and(|action| ignored(action.handler))
             && (1..32).contains(&call.signum())
-            && crate::scheduler::thread_timer_copies_recorded()
+            && crate::scheduler::timer_copies_recorded()
         {
             crate::tool_global::forget_thread_timer_copies(guest, call.signum()).await;
         }

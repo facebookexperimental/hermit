@@ -149,6 +149,7 @@ static PIPE_READ_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static OWN_PROCESS_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VDSO_SYMBOL_VERSIONS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_SIGEV_THREAD_ID_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static TIMER_EXEC_FLUSH_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static NESTED_VFORK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PID_NAMESPACE_NESTED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KERNEL_MAX_AFFINITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1156,6 +1157,31 @@ fn timer_sigev_thread_id_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "timer-sigev-thread-id guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn timer_exec_flush_guest() -> &'static Path {
+    TIMER_EXEC_FLUSH_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("timer-exec-flush");
+        fs::create_dir_all(&build_root).expect("failed to create timer-exec-flush directory");
+        let guest = build_root.join("timer_exec_flush");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/timer_exec_flush.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile timer-exec-flush guest");
+        assert!(
+            output.status.success(),
+            "timer-exec-flush guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -24639,7 +24665,9 @@ fn a_signal_to_a_newborn_thread_is_never_taken_for_hermits() {
 /// nothing changes until the process could observe it: Detcore keeps it pending
 /// and refuses by name exactly where it becomes observable (a mask change, a
 /// temporary mask, a wait or a descriptor that would take it, and the pending
-/// set). Ignoring the signal or exiting discards it, and exec keeps it. Each
+/// set). Ignoring the signal, exiting or exec discards it (exec flushes a
+/// queued timer signal, https://github.com/rrnewton/hermit/issues/4184; native
+/// `exec-sigpending` prints `expired`, `survived` and exits 0, 5 runs). Each
 /// case runs with the PMU timeslice and without it.
 #[test]
 fn a_pending_real_time_timer_expiration_is_refused_only_where_it_is_observed() {
@@ -24683,7 +24711,7 @@ fn a_pending_real_time_timer_expiration_is_refused_only_where_it_is_observed() {
         ("epoll_pwait", true),
         ("ignore-then-unblock", false),
         ("exit", false),
-        ("exec-sigpending", true),
+        ("exec-sigpending", false),
         ("exec-exit", false),
     ];
     for timeslice in [&[][..], &["--max-timeslice=disabled"][..]] {
@@ -24828,6 +24856,168 @@ fn a_sigev_thread_id_timer_notifies_exactly_its_thread_at_bitwise_parity() {
             serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
                 .expect("the verdict must be JSON");
         assert_eq!(report["bitwise_parity"], true, "{mode}: {report}");
+    }
+}
+
+/// Exec discards a POSIX timer's queued signal and keeps every other pending
+/// signal (`flush_itimer_signals`; https://github.com/rrnewton/hermit/issues/4184).
+/// Each mode of `tests/c/timer_exec_flush.c` leaves a copy of a blocked signal
+/// pending, execs itself, and reports it from the new image; each is
+/// strict-verified at bitwise parity and must print what Linux printed (5
+/// native runs of each, identical, 2026-10-12). A `SIGEV_THREAD_ID` timer's
+/// copy, a `SIGEV_SIGNAL` timer's and a real-time `SIGEV_SIGNAL` timer's are
+/// gone after exec; the process's own kill copy is kept, also when a timer
+/// expired on top of it (an overrun) and when it follows a timer copy a
+/// handler took. A worker's own timer copy is gone after the worker execs (a
+/// non-leader exec, whose survivor takes the leader's tid), and the leader's
+/// is no reason to take the worker's own tgkill copy; a copy sigtimedwait took
+/// is no reason to take the thread's later tgkill copy (the last three from
+/// the Claude review of https://github.com/rrnewton/hermit/pull/4203). A
+/// `SIGEV_SIGNAL` timer whose arming thread exited before it expired is still
+/// the process's, and its copy is gone after exec (the guest first checks the
+/// armer is gone with the signal not yet pending, then that the copy is
+/// pending before exec); a kill copy beside a
+/// signalfd a child re-pointed is kept (the Codex review). Before
+/// (main 0d52184a), the standard timer copies survived exec and were
+/// delivered to the new image (`pending_after_exec=1 hits=1`).
+#[test]
+fn exec_discards_a_posix_timers_pending_signal_at_bitwise_parity() {
+    let guest = timer_exec_flush_guest().to_str().unwrap().to_owned();
+    let cases = [
+        ("thread", "thread pending_after_exec=0 hits=0\n"),
+        ("process", "process pending_after_exec=0 hits=0\n"),
+        ("kill", "kill pending_after_exec=1 hits=1\n"),
+        ("both", "both pending_after_exec=1 hits=1\n"),
+        (
+            "taken_then_kill",
+            "taken_then_kill before_exec hits=1\ntaken_then_kill pending_after_exec=1 hits=1\n",
+        ),
+        ("rt_process", "rt_process pending_after_exec=0 hits=0\n"),
+        ("worker_timer", "worker_timer pending_after_exec=0 hits=0\n"),
+        ("leader_exec", "leader_exec pending_after_exec=1 hits=1\n"),
+        (
+            "stw_taken",
+            "stw_taken took=1\nstw_taken pending_after_exec=1 hits=1\n",
+        ),
+        (
+            "dead_armer",
+            "dead_armer retired=1 pending_at_retirement=0 pending_before_exec=1\n\
+             dead_armer pending_after_exec=0 hits=0\n",
+        ),
+        (
+            "shared_sfd_no_timer",
+            "shared_sfd_no_timer pending_after_exec=1 hits=1\n",
+        ),
+    ];
+    for (mode, expected) in cases {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let verdict = directory.path().join("verify.json");
+        let (status, log) = run_with_deadline(
+            hermit_command(&[
+                "--log=info",
+                "run",
+                "--strict",
+                "--verify",
+                "--verify-strict",
+                "--verify-json",
+                verdict.to_str().unwrap(),
+                "--timeout",
+                "60",
+                "--",
+                guest.as_str(),
+                mode,
+            ]),
+            directory.path(),
+            Duration::from_secs(180),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{mode}:\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert_eq!(stdout, expected, "{mode}: stderr:\n{log}");
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
+                .expect("the verdict must be JSON");
+        assert_eq!(report["bitwise_parity"], true, "{mode}: {report}");
+    }
+}
+
+/// A timer's copy whose consumption could have gone unseen cannot be told,
+/// at exec, from another sender's copy of the same signal, so an exec with
+/// that signal pending is refused by name
+/// (https://github.com/rrnewton/hermit/issues/4184): a `SIGEV_SIGNAL` copy
+/// under an open signalfd (native discards it: `pending_after_exec=0
+/// hits=0`); a `SIGEV_THREAD_ID` copy a signalfd opened later read, then the
+/// thread's own tgkill copy, and a `SIGEV_THREAD_ID` SIGTSTP copy the
+/// process's SIGCONT flushed, then its own tgkill SIGTSTP (native keeps the
+/// tgkill copy: `pending_after_exec=1 hits=1`; the last two from the Claude
+/// review of https://github.com/rrnewton/hermit/pull/4203); and a
+/// `SIGEV_THREAD_ID` SIGUSR2 copy left pending by a sigtimedwait for SIGUSR1
+/// or SIGUSR2 that took the thread's own SIGUSR1 (native discards it); and a
+/// `SIGEV_SIGNAL` SIGTSTP copy the process's SIGCONT flushed, then its own
+/// kill(SIGTSTP) (native keeps the kill copy; Claude re-check of
+/// https://github.com/rrnewton/hermit/pull/4203); and a `SIGEV_SIGNAL` copy
+/// read through a signalfd a child re-pointed to its signal (a shared open
+/// description), then the process's own kill copy (native keeps it; Codex
+/// review). 5 native runs each.
+#[test]
+fn an_exec_with_an_unprovable_timer_copy_pending_is_refused_by_name() {
+    let guest = timer_exec_flush_guest().to_str().unwrap().to_owned();
+    for (mode, reason) in [
+        (
+            "sfd_process",
+            "a SIGEV_SIGNAL timer's copy of it may have been taken unobserved",
+        ),
+        (
+            "sfd_thread",
+            "a SIGEV_THREAD_ID timer's copy of it may have been taken unobserved",
+        ),
+        (
+            "cont_flush",
+            "a SIGEV_THREAD_ID timer's copy of it may have been taken unobserved",
+        ),
+        (
+            "stw_other",
+            "a SIGEV_THREAD_ID timer's copy of it may have been taken unobserved",
+        ),
+        (
+            "cont_flush_process",
+            "a SIGEV_SIGNAL timer's copy of it may have been taken unobserved",
+        ),
+        (
+            "shared_sfd",
+            "a SIGEV_SIGNAL timer's copy of it may have been taken unobserved",
+        ),
+    ] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let (status, log) = run_with_deadline(
+            hermit_command(&[
+                "run",
+                "--strict",
+                "--timeout",
+                "60",
+                "--",
+                guest.as_str(),
+                mode,
+            ]),
+            directory.path(),
+            Duration::from_secs(180),
+            false,
+        );
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{mode}: {log}"
+        );
+        assert!(
+            log.contains("exec'd with a POSIX timer's signal possibly pending")
+                && log.contains(reason),
+            "{mode}: {log}"
+        );
     }
 }
 

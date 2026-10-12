@@ -957,6 +957,53 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Take back the POSIX timer copies a successful exec flushes
+    /// (`Scheduler::take_exec_timer_flush`), one zero-timeout
+    /// `rt_sigtimedwait` each, before the new image runs. Linux discards a
+    /// queued timer signal at exec (`flush_itimer_signals`) and keeps every
+    /// other pending signal; Hermit sends a timer's expiration as an ordinary
+    /// signal, which exec would keep
+    /// (<https://github.com/rrnewton/hermit/issues/4184>). A copy that cannot
+    /// be singled out refuses the run by name.
+    async fn flush_exec_timer_copies<G: Guest<Self>>(&self, guest: &mut G) {
+        let dettid = guest.thread_state().dettid;
+        let refusal = match tool_global::exec_timer_flush(guest).await {
+            Err(reason) => Some(reason),
+            Ok(flush) => {
+                let mut refusal = None;
+                // The thread's own queue is dequeued first, as Linux does.
+                for set in [flush.own, flush.shared] {
+                    for signo in
+                        (1..=64).filter(|signo| set & scheduler::kernel_signal_bit(*signo) != 0)
+                    {
+                        match syscalls::take_pending_signal(guest, signo).await {
+                            Ok(taken) if taken == signo as i64 => info!(
+                                "[detcore, dtid {}] exec flushed a POSIX timer's pending signal {}",
+                                dettid, signo
+                            ),
+                            other => {
+                                refusal = Some(format!(
+                                    "taking back a POSIX timer's pending signal {signo} at exec answered {other:?}"
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                }
+                refusal
+            }
+        };
+        if let Some(reason) = refusal {
+            let message = format!(
+                "hermit: thread {dettid} exec'd with a POSIX timer's signal possibly pending: {reason}; Linux discards a queued timer signal at exec, and Detcore cannot single this one out, so the run is refused (https://github.com/rrnewton/hermit/issues/4184)"
+            );
+            error!("{message}");
+            let _ = writeln!(crate::util::RetryingStderr, "{message}");
+            tool_global::unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
+                .await;
+        }
+    }
+
     /// Whether a `SIGCHLD` that stopped this thread is delivered, on a backend
     /// that reports child-exit publication, where both the kernel and the
     /// scheduler send a child's exit `SIGCHLD` (`scheduler::child_exit_sigchld`).
@@ -2492,6 +2539,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
 
         tool_global::mark_past_first_execve(guest).await;
+        // Linux discards every queued POSIX timer signal at exec
+        // (`flush_itimer_signals`), and Hermit's are ordinary signals it sent:
+        // take them back before the new image runs
+        // (https://github.com/rrnewton/hermit/issues/4184).
+        if scheduler::timer_copies_recorded() || scheduler::real_time_expiration_kept_pending() {
+            self.flush_exec_timer_copies(guest).await;
+        }
         self.pre_handler_hook(guest, false, CheckIn::Event).await;
 
         let auxv = guest.auxv();

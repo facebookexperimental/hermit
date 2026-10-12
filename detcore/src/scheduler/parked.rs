@@ -741,7 +741,11 @@ impl Scheduler {
                 }
             }
         } else if !self.divert_in_guest_fatal_alarm(deadline, id, tid, signal, observed_now) {
-            self.fire_alarm(id.process(), tid, signal);
+            if matches!(id, SignalTimerId::Posix(..)) {
+                self.fire_process_timer(id.process(), tid, signal);
+            } else {
+                self.fire_alarm(id.process(), tid, signal);
+            }
         }
     }
 
@@ -875,6 +879,23 @@ impl Scheduler {
     /// (`real_time_expiration_fate`).
     pub(crate) fn register_signalfd(&mut self, process: DetPid, mask: u64) {
         *self.signalfd_masks.entry(process).or_default() |= mask;
+        // Its reads are not observed (`process_timer_copies`,
+        // `thread_timer_copies`), and its description may be shared with any
+        // process (`signalfd_may_read`), so every process's records of a
+        // covered signal become unproven.
+        for ((_, signo), observed) in self.process_timer_copies.iter_mut() {
+            if mask & super::kernel_signal_bit(*signo) != 0 {
+                *observed = false;
+            }
+        }
+        let unproven = &mut self.unproven_thread_timer_copies;
+        self.thread_timer_copies.retain(|(thread, signo), _| {
+            let covered = mask & super::kernel_signal_bit(*signo) != 0;
+            if covered {
+                unproven.insert((*thread, *signo));
+            }
+            !covered
+        });
     }
 
     /// The real-time signals pending for `process` from timer expirations

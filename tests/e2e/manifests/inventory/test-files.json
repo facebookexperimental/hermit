@@ -2359,6 +2359,12 @@
       "why": "tests/c/timer_create_rt_signal_refused.c is owned by hermit-cli/tests/cli.rs: POSIX timers that notify with a real-time signal (SIGEV_SIGNAL SIGRTMIN+1, and glibc SIGEV_THREAD, which uses SIGEV_THREAD_ID with an internal real-time signal) are created, armed, read and deleted as on Linux, and an expiration Detcore cannot deliver ends a run --strict with a named policy refusal; under --allow-unsupported-syscalls the expiration stays undelivered and is logged (https://github.com/rrnewton/hermit/issues/3893). It stays a fixture because the generic manifest cannot express a refusal exit plus a second permissive run."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/timer_exec_flush.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/timer_exec_flush.c is owned by hermit-cli/tests/cli.rs: exec_discards_a_posix_timers_pending_signal_at_bitwise_parity runs each mode (a SIGEV_THREAD_ID, a SIGEV_SIGNAL and a real-time SIGEV_SIGNAL timer copy pending at exec, discarded; a kill copy, kept, also beside an overrun and after a taken timer copy) and requires Linux's output at bitwise parity, and an_exec_with_an_unprovable_timer_copy_pending_is_refused_by_name requires the named refusal (https://github.com/rrnewton/hermit/issues/4184). It stays a fixture because a generic manifest cannot assert these per-mode outputs and a refusal."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/timer_family_identity.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
