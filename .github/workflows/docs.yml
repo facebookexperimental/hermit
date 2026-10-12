@@ -220,7 +220,13 @@ jobs:
           git -C _website_source/hermit_test_ledger remote add origin "$ledger_url"
         fi
         git -C _website_source/hermit_test_ledger fetch --quiet --no-tags --depth 1 origin "$ledger_commit"
-        git -C _website_source/hermit_test_ledger checkout --quiet --detach "$ledger_commit"
+        # --force: a restored repository's index already names this commit's
+        # files, so a plain checkout of the same commit leaves the restored,
+        # empty working tree as deletions, and the rebuild then refuses
+        # "website builder sources have local changes"; that refusal ended
+        # https://github.com/rrnewton/hermit/actions/runs/38288071928 one
+        # second into the rebuild step, on the first restored repository.
+        git -C _website_source/hermit_test_ledger checkout --quiet --force --detach "$ledger_commit"
         git -C _website_source/hermit submodule update --init --depth 1 -- agent-utils
         git -C _website_source/hermit fetch --no-tags origin main:refs/remotes/origin/main
         channel=$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("_website_source/hermit/rust-toolchain.toml").read_text())["toolchain"]["channel"])')
@@ -605,4 +611,10 @@ jobs:
         exit 1
     - name: Remove the self-hosted run's scratch directory
       if: always() && runner.environment == 'self-hosted' && env.COMPATIBILITY_SCRATCH_PARENT != ''
-      run: rm -rf -- "${COMPATIBILITY_SCRATCH_PARENT:?}"
+      # The built website is read-only (directories 0555, files 0444), so a
+      # bare rm -rf removed only the writable part and failed on
+      # https://github.com/rrnewton/hermit/actions/runs/38287816650.
+      run: |
+        set -euo pipefail
+        chmod -R u+w -- "${COMPATIBILITY_SCRATCH_PARENT:?}"
+        rm -rf -- "${COMPATIBILITY_SCRATCH_PARENT:?}"
