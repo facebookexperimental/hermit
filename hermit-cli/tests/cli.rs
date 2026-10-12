@@ -21620,7 +21620,16 @@ fn a_process_directed_signal_to_several_threads_is_refused_by_name() {
 ///   `/proc/<tid>/mem` would force-read it; the page's protection decides);
 /// - an armed host-timed source (an `F_SETOWN_EX` thread owner, an `F_SETOWN`
 ///   pid owner, a sibling's armed and disarmed parent-death signal, a sent
-///   SIGTSTP) whose signals the sender blocks.
+///   SIGTSTP) whose signals the sender blocks;
+/// - SIGTERM after a thread took the SIGHUP of an expired POSIX timer (the
+///   scheduler's copy); after a child's SIGHUP was already pending when the
+///   timer expired (Hermit emulates the timer with `kill()`, so its copy merges
+///   and one SIGHUP with the child's siginfo is delivered; Linux queues the
+///   timer's own and delivers two, which the output does not show); and after
+///   `sigtimedwait` took it with no delivery stop. The scheduler's copy
+///   is outstanding only while its signal is in the process's shared queue
+///   (https://github.com/rrnewton/hermit/issues/4122); before, the merged and
+///   taken-by-sigtimedwait copies refused every later send.
 #[test]
 fn a_signal_to_the_senders_own_process_goes_to_the_sender_at_bitwise_parity() {
     let guest = own_process_signal_guest().to_str().unwrap().to_owned();
@@ -21655,6 +21664,9 @@ fn a_signal_to_the_senders_own_process_goes_to_the_sender_at_bitwise_parity() {
         (vec!["owner_pid", "blocked"], delivered("owner_pid", 10)),
         (vec!["pdeathsig", "blocked"], delivered("pdeathsig", 10)),
         (vec!["stop", "blocked"], delivered("stop", 10)),
+        (vec!["timer_taken"], delivered("timer_taken", 15)),
+        (vec!["merged"], delivered("merged", 15)),
+        (vec!["sigwaited"], delivered("sigwaited", 15)),
     ];
     for (args, expected) in cases {
         let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -21840,6 +21852,89 @@ fn a_signal_pending_on_the_sender_refuses_its_send_to_its_own_process() {
             "signal {signal}: the refusal must name the pending signal:\n{log}"
         );
     }
+}
+
+/// A scheduler signal still in the shared queue refuses a send to the sender's
+/// own process even after a thread took another copy of the same number, in a
+/// forced order (https://github.com/rrnewton/hermit/issues/4122). The guest's
+/// `stolen` mode arms a POSIX timer for SIGHUP and sends `kill(getpid(),
+/// SIGTERM)`, while a worker that blocks SIGHUP spins past the expiry, queues
+/// its own SIGHUP with `tgkill` and unblocks it: it takes its private copy
+/// first, and its handler sleeps with SIGHUP blocked. A hard happens-before
+/// edge, at counts a calibration run finds under an inert spec, holds the
+/// `kill` until that sleep, so the timer's copy (the scheduler's) is still in
+/// the shared queue and Linux would dequeue it before SIGTERM. The send must
+/// refuse by name. Before, the worker's delivery of its own copy cleared the
+/// record and the send was admitted.
+#[test]
+fn a_scheduler_signal_left_in_the_shared_queue_refuses_a_send_after_another_copy_is_taken() {
+    let guest = own_process_signal_guest().to_str().unwrap().to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let inert = directory.path().join("inert.json");
+    fs::write(
+        &inert,
+        r#"{"version": 1, "events": {"inert": {"thread": "3", "syscalls": 1000000000}}, "edges": []}"#,
+    )
+    .unwrap();
+    let run = |spec: &Path| {
+        hermit(&[
+            "--log",
+            "info",
+            "run",
+            "--allow-unsupported-syscalls",
+            "--happens-before",
+            spec.to_str().unwrap(),
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+            "stolen",
+        ])
+    };
+    let calibration = run(&inert);
+    let log = stderr(&calibration);
+    // `[syscall][detcore, dtid T] finish syscall #N: NAME(`, the first on
+    // `thread` if given.
+    let count = |name: &str, thread: Option<&str>| {
+        log.lines()
+            .find_map(|line| {
+                let after = line.split_once("[syscall][detcore, dtid ")?.1;
+                let (dettid, rest) = after.split_once(']')?;
+                let (count, rest) = rest.split_once("finish syscall #")?.1.split_once(": ")?;
+                (rest.starts_with(name) && thread.is_none_or(|thread| dettid.trim() == thread))
+                    .then(|| (dettid.trim().to_owned(), count.parse::<u64>().ok()))
+            })
+            .and_then(|(dettid, count)| Some((dettid, count?)))
+            .unwrap_or_else(|| panic!("no {name} in the calibration log:\n{log}"))
+    };
+    let (sender, kill_count) = count("kill(", None);
+    let (worker, _) = count("tgkill(", None);
+    let (_, sleep_count) = count("nanosleep(", Some(&worker));
+    let spec = directory.path().join("stolen.json");
+    fs::write(
+        &spec,
+        format!(
+            r#"{{"version": 1,
+                "events": {{"worker_sleeps": {{"thread": "{worker}", "syscalls": {sleep_count}}},
+                            "sender_kills": {{"thread": "{sender}", "syscalls": {kill_count}}}}},
+                "edges": [{{"before": "worker_sleeps", "after": "sender_kills", "strength": "hard"}}]}}"#
+        ),
+    )
+    .unwrap();
+    let forced = run(&spec);
+    let log = stderr(&forced);
+    assert!(forced.status.success(), "{log}");
+    assert_eq!(
+        String::from_utf8_lossy(&forced.stdout),
+        "stolen rc=-1 ENOSYS\n",
+        "{log}"
+    );
+    assert!(
+        log.contains(
+            "by kill is not supported: the scheduler sent signals 0x1 that no thread has taken yet"
+        ),
+        "the refusal must name the scheduler's signal:\n{log}"
+    );
 }
 
 /// Every process-directed signal to the sender's own multi-threaded process

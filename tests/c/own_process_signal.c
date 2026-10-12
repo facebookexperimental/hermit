@@ -42,6 +42,18 @@
  *             Prints one line counting the sends whose handler ran on the main
  *             thread before kill returned; Linux gives each to the main thread,
  *             which the call names and which is running.
+ *   timer_taken: a one-shot POSIX timer for SIGHUP expires and a thread
+ *             takes its signal (the scheduler's copy), then the main thread
+ *             sends kill(getpid(), SIGTERM), which it catches.
+ *   merged:   with SIGHUP blocked, a child's kill(getppid(), SIGHUP) waits in
+ *             the shared queue, then a POSIX timer for SIGHUP expires. Under
+ *             Hermit, which emulates the timer with kill(), its copy merges
+ *             into the child's (one delivery, with the child's siginfo); Linux
+ *             queues the timer's own siginfo and delivers both. SIGHUP is
+ *             unblocked, then the main thread sends kill(getpid(), SIGTERM);
+ *             only that send is printed.
+ *   sigwaited: as merged without the child, but sigtimedwait takes the
+ *             timer's SIGHUP, so it never reaches a delivery stop.
  *
  * Refused modes send once and print `<mode> rc=<r> <errno>`; under
  * --allow-unsupported-syscalls a refused send returns -1 ENOSYS.
@@ -127,6 +139,14 @@ static void on_signal(int sig, siginfo_t *info, void *context) {
   ran_uid = (sig_atomic_t)info->si_uid;
   ran_value = info->si_value.sival_int;
   ran_before_return = !returned;
+}
+
+/* `stolen` mode: a worker's SIGHUP handler sleeps (with SIGHUP blocked), the
+ * happens-before point the CLI test holds the main thread's send behind. */
+static void on_stolen_hup(int sig) {
+  (void)sig;
+  struct timespec nap = {0, 1000000};
+  syscall(SYS_nanosleep, &nap, NULL);
 }
 
 static void catch_signal(int sig) {
@@ -322,6 +342,24 @@ static void *pending_worker(void *unused) {
 }
 
 static const int admitted[] = {SIGHUP, SIGINT, SIGQUIT, SIGUSR1, SIGUSR2, SIGPIPE, SIGTERM};
+
+static int stolen_armed;
+
+/* `stolen` mode's worker starts with SIGHUP blocked, waits until the main
+ * thread has armed the timer, spins past its expiry, queues its own SIGHUP
+ * with tgkill and unblocks it: it takes its own copy, from its private queue,
+ * first, and its handler (SIGHUP blocked again) sleeps. */
+static void *stolen_worker(void *unused) {
+  (void)unused;
+  pthread_mutex_lock(&lock);
+  while (!stolen_armed) pthread_cond_wait(&cond, &lock);
+  pthread_mutex_unlock(&lock);
+  for (volatile int spin = 0; spin < 5000000; spin++) {
+  }
+  syscall(SYS_tgkill, getpid(), (pid_t)syscall(SYS_gettid), SIGHUP);
+  set_blocked(SIG_UNBLOCK, SIGHUP, 0, 0);
+  return NULL;
+}
 
 int main(int argc, char **argv) {
   setvbuf(stdout, NULL, _IONBF, 0);
@@ -530,6 +568,118 @@ int main(int argc, char **argv) {
     long rc = send_kill(sig);
     report_refused(mode, rc);
     release_idler();
+    timer_delete(timer);
+    return 0;
+  } else if (!strcmp(mode, "timer_taken")) {
+    catch_signal(SIGTERM);
+    catch_signal(SIGHUP);
+    timer_t timer;
+    struct sigevent event;
+    memset(&event, 0, sizeof event);
+    event.sigev_notify = SIGEV_SIGNAL;
+    event.sigev_signo = SIGHUP;
+    if (timer_create(CLOCK_MONOTONIC, &event, &timer) != 0) return 78;
+    struct itimerspec spec;
+    memset(&spec, 0, sizeof spec);
+    spec.it_value.tv_nsec = 1000;
+    start_idler();
+    if (timer_settime(timer, 0, &spec, NULL) != 0) return 78;
+    /* Wait until a thread has taken the timer's SIGHUP. */
+    while (!ran) {
+      struct timespec nap = {0, 1000000};
+      nanosleep(&nap, NULL);
+    }
+    timer_delete(timer);
+    ran = ran_code = ran_pid = ran_uid = ran_before_return = 0;
+    ran_thread = 0;
+    report_send(mode, SIGTERM, send_kill(SIGTERM));
+    release_idler();
+    return 0;
+  } else if (!strcmp(mode, "merged") || !strcmp(mode, "sigwaited")) {
+    catch_signal(SIGTERM);
+    catch_signal(SIGHUP);
+    set_blocked(SIG_BLOCK, SIGHUP, 0, 0);
+    if (!strcmp(mode, "merged")) {
+      /* A child's SIGHUP waits in the shared queue first. */
+      pid_t parent = getpid();
+      pid_t child = fork();
+      if (child == 0) _exit(kill(parent, SIGHUP) != 0);
+      int status;
+      if (waitpid(child, &status, 0) != child || status != 0) return 79;
+    }
+    timer_t timer;
+    struct sigevent event;
+    memset(&event, 0, sizeof event);
+    event.sigev_notify = SIGEV_SIGNAL;
+    event.sigev_signo = SIGHUP;
+    if (timer_create(CLOCK_MONOTONIC, &event, &timer) != 0) return 78;
+    struct itimerspec spec;
+    memset(&spec, 0, sizeof spec);
+    spec.it_value.tv_nsec = 1000;
+    if (timer_settime(timer, 0, &spec, NULL) != 0) return 78;
+    /* Sleep well past the expiry: Hermit's kill() copy for the timer merges
+     * into the child's (Linux queues the timer's separately), or waits
+     * alone. */
+    for (int i = 0; i < 20; i++) {
+      struct timespec nap = {0, 1000000};
+      nanosleep(&nap, NULL);
+    }
+    if (!strcmp(mode, "sigwaited")) {
+      /* sigtimedwait takes the scheduler's copy; no delivery stop. */
+      sigset_t set;
+      sigemptyset(&set);
+      sigaddset(&set, SIGHUP);
+      struct timespec zero = {0, 0};
+      if (sigtimedwait(&set, NULL, &zero) != SIGHUP) return 80;
+    }
+    start_idler();
+    /* Under Hermit one SIGHUP is delivered here (Linux delivers the timer's
+     * as well in merged mode); either way the handler takes them before
+     * the send. */
+    set_blocked(SIG_UNBLOCK, SIGHUP, 0, 0);
+    ran = ran_code = ran_pid = ran_uid = ran_before_return = 0;
+    ran_thread = 0;
+    report_send(mode, SIGTERM, send_kill(SIGTERM));
+    release_idler();
+    /* Deleted last: Linux flushes a deleted timer's pending signal. */
+    timer_delete(timer);
+    return 0;
+  } else if (!strcmp(mode, "stolen")) {
+    /* The timer's SIGHUP (the scheduler's copy) reaches the shared queue
+     * while the main thread is held at its kill; the worker takes its own
+     * tgkill copy of SIGHUP first, so the scheduler's is still pending when
+     * the kill is decided (the CLI test holds the kill behind the worker's
+     * handler). */
+    catch_signal(SIGTERM);
+    struct sigaction action;
+    memset(&action, 0, sizeof action);
+    action.sa_handler = on_stolen_hup;
+    if (sigaction(SIGHUP, &action, NULL) != 0) return 70;
+    timer_t timer;
+    struct sigevent event;
+    memset(&event, 0, sizeof event);
+    event.sigev_notify = SIGEV_SIGNAL;
+    event.sigev_signo = SIGHUP;
+    if (timer_create(CLOCK_MONOTONIC, &event, &timer) != 0) return 78;
+    sigset_t hup;
+    sigemptyset(&hup);
+    sigaddset(&hup, SIGHUP);
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setsigmask_np(&attr, &hup);
+    pthread_t worker;
+    if (pthread_create(&worker, &attr, stolen_worker, NULL) != 0) return 72;
+    struct itimerspec spec;
+    memset(&spec, 0, sizeof spec);
+    spec.it_value.tv_nsec = 500000;
+    if (timer_settime(timer, 0, &spec, NULL) != 0) return 78;
+    pthread_mutex_lock(&lock);
+    stolen_armed = 1;
+    pthread_cond_broadcast(&cond);
+    pthread_mutex_unlock(&lock);
+    long rc = send_kill(SIGTERM);
+    report_refused(mode, rc);
+    pthread_join(worker, NULL);
     timer_delete(timer);
     return 0;
   } else if (!strcmp(mode, "wo_queue")) {

@@ -2626,7 +2626,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_cross_process_sigkill_verifies_at_bitwise_parity and a_recorded_kill_of_a_victim_in_a_background_read_is_refused_at_replay (https://github.com/rrnewton/hermit/issues/3994) retain all 301: 303.
     // The four own-process signal CLI tests (https://github.com/rrnewton/hermit/issues/4034) retain all 303: 307.
     // And the four pidfd_send_signal flag, process-group, Hermit-directory and sibling tests (https://github.com/rrnewton/hermit/issues/4108): 311.
-    ("test.cli", 311),
+    // And a_scheduler_signal_left_in_the_shared_queue_refuses_a_send_after_another_copy_is_taken (https://github.com/rrnewton/hermit/issues/4122): 312.
+    ("test.cli", 312),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2872,7 +2873,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Nor do the cross-process SIGKILL parity and record-refusal tests: 239.
     // Nor do the four own-process signal CLI tests: 243.
     // Nor do the four pidfd_send_signal tests: 247.
-    ("test.cli_on_host", 247),
+    // Nor does the shared-queue forced-order test: 248.
+    ("test.cli_on_host", 248),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux

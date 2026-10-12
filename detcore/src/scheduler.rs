@@ -320,8 +320,8 @@ pub struct OwnProcessSignalInputs {
     /// The exit signals, other than 0 and SIGCHLD, of the process's unreaped
     /// children, which the kernel sends itself at a host-timed moment.
     pub foreign_exit_signals: u64,
-    /// Signals the scheduler sent to a thread of the process
-    /// (`signal_guest`) that no thread of the process has taken yet.
+    /// Signals the scheduler sent to the process (`signal_guest`) that are
+    /// still in its shared queue (`ShdPnd`), so no thread has taken them yet.
     pub undelivered_scheduler_signals: u64,
     /// Whether an exec is in flight in the process (`exec_teardowns`).
     pub exec_in_flight: bool,
@@ -1406,9 +1406,19 @@ pub struct Scheduler {
     /// (`own_process_signal_inputs`).
     sigtimedwait_sets: BTreeMap<DetTid, u64>,
 
-    /// For each process, the signals the scheduler sent to one of its threads
-    /// (`signal_guest`) that no thread of the process has taken yet. A
-    /// standard signal coalesces, so one delivery clears its bit.
+    /// For each process, the signals the scheduler has sent to it
+    /// (`signal_guest`). On ptrace the scheduler's copy is process-directed
+    /// (`kill(pid)`), so it is outstanding exactly while its signal is in the
+    /// process's shared queue; an admission counts only those
+    /// (`own_process_signal_inputs`), whoever takes or merges the copy
+    /// (<https://github.com/rrnewton/hermit/issues/4122>).
+    ///
+    /// The record is never cleared. That is correct only because no other
+    /// copy of a recorded signal that the sender does not block can sit in the
+    /// shared queue at the sender's turn: such a copy would have been taken at
+    /// the sender's last return to user mode, so one still there is the
+    /// scheduler's, sent while the sender was stopped. The bit then names
+    /// exactly the copy the kernel would dequeue before the send.
     undelivered_scheduler_signals: BTreeMap<DetPid, u64>,
 
     /// Whether any guest has sent SIGSTKFLT, Reverie's timer marker
@@ -4724,11 +4734,18 @@ impl Scheduler {
             siblings,
             host_timed: self.host_timed_signals(sender),
             foreign_exit_signals,
+            // Only a copy still in the process's shared queue can be dequeued
+            // before the send; one taken by sigtimedwait, discarded by
+            // SIG_IGN, or merged into an earlier copy of the same standard
+            // signal (Hermit emulates a POSIX timer with kill(), so its copy
+            // merges where Linux would queue the timer's own) is gone
+            // (https://github.com/rrnewton/hermit/issues/4122).
             undelivered_scheduler_signals: self
                 .undelivered_scheduler_signals
                 .get(&process)
                 .copied()
-                .unwrap_or(0),
+                .unwrap_or(0)
+                & self.read_shared_pending(sender).unwrap_or(u64::MAX),
             exec_in_flight: self.exec_teardowns.contains_key(&process),
             guest_marker_signal: self.guest_sent_marker_signal,
         }
@@ -4743,23 +4760,14 @@ impl Scheduler {
         self.guest_sent_marker_signal = true;
     }
 
-    /// The scheduler sent `signal` to `dettid` (`signal_guest`): no thread of
-    /// its process has taken it yet (`undelivered_scheduler_signals`).
+    /// The scheduler sent `signal` to `dettid`'s process (`signal_guest`;
+    /// `undelivered_scheduler_signals`).
     fn note_scheduler_signal_sent(&mut self, dettid: DetTid, signal: libc::c_int) {
         let process = self.sigchld_process(dettid);
         *self
             .undelivered_scheduler_signals
             .entry(process)
             .or_default() |= kernel_signal_bit(signal);
-    }
-
-    /// `dettid` took `signal` at its delivery stop: a standard signal the
-    /// scheduler sent to its process coalesced into this one.
-    fn note_signal_taken(&mut self, dettid: DetTid, signal: libc::c_int) {
-        let process = self.sigchld_process(dettid);
-        if let Some(undelivered) = self.undelivered_scheduler_signals.get_mut(&process) {
-            *undelivered &= !kernel_signal_bit(signal);
-        }
     }
 
     /// `thread`'s state for `own_process_signal_inputs`.
@@ -7031,6 +7039,26 @@ impl Scheduler {
         }
     }
 
+    /// The signals pending in the shared queue of `thread`'s process
+    /// (`ShdPnd`), or `None` when it cannot be read.
+    fn read_shared_pending(&self, thread: DetTid) -> Option<u64> {
+        // Unit tests script the queue; they never read a host task's.
+        if cfg!(test) {
+            #[cfg(test)]
+            return self
+                .test_kernel_signal_states
+                .get(&thread)
+                .map(|state| state.shared_pending);
+        }
+        let process = self.sigchld_process(thread);
+        read_kernel_signal_state(
+            reverie::Pid::from_raw(process.as_raw()),
+            reverie::Pid::from_raw(thread.as_raw()),
+        )
+        .ok()
+        .map(|state| state.shared_pending)
+    }
+
     /// `read_thread_blocked_mask`, keeping the error, which says nothing about
     /// whether the thread still exists (`thread_is_gone` does).
     fn read_thread_blocked_mask_result(&self, thread: DetTid) -> Result<u64, Errno> {
@@ -8728,7 +8756,6 @@ impl Scheduler {
             // `fire_alarm`) are never SIGCHLD and are unaffected.
             ResourceID::WaitidSignals(_) => Ok(()),
             ResourceID::InboundSignal(sig) => {
-                self.note_signal_taken(dettid, sig.raw());
                 // `sigchld_ready` marks a parent step2e has already re-admitted,
                 // or a delivery the scheduler already placed; grant it now rather
                 // than deferring it (a second time).
@@ -14824,25 +14851,42 @@ mod test {
         );
     }
 
-    /// A signal the scheduler sends to any thread of a process stays in the
-    /// process's undelivered set until a thread of that process takes one of
-    /// that number; another process's delivery, or another number, leaves it.
+    /// A signal the scheduler sent to a process counts for its own-process
+    /// admission only while it is in the process's shared queue, where its
+    /// process-directed copy waits: a guest's copy of the same number taken
+    /// from a thread's own queue does not settle it, and a copy merged into an
+    /// earlier one (Hermit's `kill()` copy for a POSIX timer merges with a
+    /// pending standard signal), taken by sigtimedwait or discarded by
+    /// SIG_IGN, gone from the queue, refuses nothing. An unreadable queue keeps the record
+    /// (https://github.com/rrnewton/hermit/issues/4122).
     #[test]
-    fn a_scheduler_sent_signal_is_undelivered_until_its_process_takes_it() {
+    fn a_scheduler_sent_signal_counts_while_it_is_in_the_shared_queue() {
         let hup = kernel_signal_bit(libc::SIGHUP);
-        let (mut scheduler, parent, creator, child) = sigchld_family(libc::SIGCHLD);
+        let (mut scheduler, parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+        let shared = |scheduler: &mut Scheduler, pending: u64| {
+            scheduler.test_kernel_signal_states.insert(
+                parent,
+                KernelSignalState {
+                    shared_pending: pending,
+                    ..Default::default()
+                },
+            );
+        };
         let undelivered = |scheduler: &Scheduler| {
             scheduler
                 .own_process_signal_inputs(parent)
                 .undelivered_scheduler_signals
         };
+        shared(&mut scheduler, hup);
+        assert_eq!(undelivered(&scheduler), 0, "nothing sent yet");
         scheduler.note_scheduler_signal_sent(creator, libc::SIGHUP);
         assert_eq!(undelivered(&scheduler), hup);
-        scheduler.note_signal_taken(child, libc::SIGHUP);
-        scheduler.note_signal_taken(parent, libc::SIGUSR1);
-        assert_eq!(undelivered(&scheduler), hup);
-        scheduler.note_signal_taken(parent, libc::SIGHUP);
-        assert_eq!(undelivered(&scheduler), 0);
+        shared(&mut scheduler, kernel_signal_bit(libc::SIGUSR1) | hup);
+        assert_eq!(undelivered(&scheduler), hup, "only what the scheduler sent");
+        shared(&mut scheduler, 0);
+        assert_eq!(undelivered(&scheduler), 0, "gone from the shared queue");
+        scheduler.test_kernel_signal_states.clear();
+        assert_eq!(undelivered(&scheduler), hup, "an unreadable queue keeps it");
     }
 
     /// A guest's send of SIGSTKFLT, Reverie's timer marker, is recorded for
