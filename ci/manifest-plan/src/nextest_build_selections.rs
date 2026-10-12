@@ -647,9 +647,10 @@ mod tests {
             // (https://github.com/rrnewton/hermit/issues/4111), plus the two
             // single-virtual-CPU procfs tests in procfs_determinism
             // (https://github.com/rrnewton/hermit/issues/4160), plus the
-            // random-heuristic sched_yield progress test
-            // (https://github.com/rrnewton/hermit/issues/4150).
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "286");
+            // random-heuristic sched_yield progress tests, one per chaos setting
+            // and guest mode (https://github.com/rrnewton/hermit/issues/4150,
+            // https://github.com/rrnewton/hermit/pull/4201).
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "291");
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

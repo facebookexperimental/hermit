@@ -2166,7 +2166,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4160): 285.
     // And chaos_sched_yield_progress::random_chaos_sched_yield_makes_progress_with_timer_preemption
     // (https://github.com/rrnewton/hermit/issues/4150): 286.
-    ("test.hermit_integration", 286),
+    // That test split into six, one per chaos setting and guest mode, each with
+    // its own CPU budget (review of https://github.com/rrnewton/hermit/pull/4201): 291.
+    ("test.hermit_integration", 291),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -3157,7 +3159,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the stop-signal SIGHUP poll test: 283.
     // And the two single-virtual-CPU procfs tests: 285.
     // And the random-heuristic sched_yield progress test: 286.
-    ("test.hermit_integration_on_host", 286),
+    // That test split into six: 291.
+    ("test.hermit_integration_on_host", 291),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

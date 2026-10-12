@@ -62,8 +62,10 @@ const TWO_SPINNERS_SEEDS: [u64; 4] = [0, 17, 22, 28];
 /// (review of https://github.com/rrnewton/hermit/pull/4080).
 const YIELD_THEN_WRITE_SEEDS: [u64; 4] = [0, 4, 7, 9];
 
-/// Seeds for the random-heuristic progress check: the union of the seeds that
-/// starved some mode of the guest under the default heuristic above.
+/// Seeds for the random-heuristic progress checks: the union of the seeds
+/// above. Under `--sched-heuristic=random` they have no special meaning; they
+/// are a fixed sample, and a starvation under random hung at several of them
+/// in each mode (review of https://github.com/rrnewton/hermit/pull/4201).
 const RANDOM_HEURISTIC_SEEDS: [u64; 11] = [0, 4, 5, 6, 7, 8, 9, 12, 17, 22, 28];
 
 /// Chaos seeds for the schedule-diversity check, and the fewest distinct
@@ -74,14 +76,22 @@ const DIVERSITY_SEEDS: std::ops::Range<u64> = 0..16;
 const MIN_DISTINCT_OUTCOMES: usize = 12;
 
 /// Attempts per run where a typed PMU skid-overshoot refusal, a host property
-/// (https://github.com/rrnewton/hermit/issues/1845), is retried. The
-/// random-heuristic checks make 66 runs, and about 1 in 100 short chaos runs
-/// is refused on some hosts.
+/// (https://github.com/rrnewton/hermit/issues/1845), is retried.
+///
+/// Validation runs each test under one CPU budget for the test and its Hermit
+/// children (22 CPU-s, `nextest-cpu-wrapper`), and every attempt draws on it.
+/// The random-heuristic checks are therefore six tests of 11 runs each, one per
+/// chaos setting and guest mode, rather than one test of 66 runs: the 66 runs
+/// used 16.3-20.7 CPU-s in 13 validations, and one validation ended at the
+/// budget (exit 124) at run 33 of 66, after a skid-refused attempt at seed 28.
+/// The costliest group of 11 measured about 10.3 CPU-s.
 const SKID_ATTEMPTS: u32 = 3;
 
-/// Generous per-run timeout. A healthy run finishes in well under a second; a
-/// starved run would otherwise spin forever.
-const TIMEOUT_SECONDS: u64 = 30;
+/// Per-run timeout. A healthy run finishes in well under a second; a starved
+/// run would otherwise spin forever. It stays well inside validation's 22 CPU-s
+/// per-test budget, so a hang fails with this test's message naming the seed
+/// rather than with the budget's bare exit 124.
+const TIMEOUT_SECONDS: u64 = 10;
 
 static GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CONTENTION_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -242,25 +252,51 @@ fn targeted_chaos_does_not_starve_a_yielder_that_is_waited_on() {
 /// Under `--sched-heuristic=random`, the heuristic every chaos cell of the E2E
 /// manifest uses, a `sched_yield` stays a weak yield rather than opening an
 /// epoch (https://github.com/rrnewton/hermit/issues/4150). The uniform pick at
-/// each turn must still reach the thread a spinner waits on, in every mode of
-/// the guest and with or without `--chaos-target-races`.
-#[test]
-fn random_chaos_sched_yield_makes_progress_with_timer_preemption() {
-    for chaos_args in [
-        &["--sched-heuristic=random"][..],
-        &["--sched-heuristic=random", "--chaos-target-races"],
-    ] {
-        for guest_args in [&[][..], &["--two-spinners"], &["--yield-then-write"]] {
-            for seed in RANDOM_HEURISTIC_SEEDS {
-                let output = run_chaos_retrying_skid(guest(), seed, &[], chaos_args, guest_args);
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                assert!(
-                    stdout.contains("sched-yield-progress-ok"),
-                    "missing progress marker under chaos {chaos_args:?} with seed {seed}; stdout:\n{stdout}"
-                );
-            }
-        }
+/// each turn must still reach the thread a spinner waits on, at every seed in
+/// [`RANDOM_HEURISTIC_SEEDS`]. The six tests below are one per chaos setting
+/// and guest mode, so each has its own CPU budget ([`SKID_ATTEMPTS`]).
+fn random_chaos_makes_progress(chaos_args: &[&str], guest_args: &[&str]) {
+    for seed in RANDOM_HEURISTIC_SEEDS {
+        let output = run_chaos_retrying_skid(guest(), seed, &[], chaos_args, guest_args);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("sched-yield-progress-ok"),
+            "missing progress marker under chaos {chaos_args:?} {guest_args:?} with seed {seed}; stdout:\n{stdout}"
+        );
     }
+}
+
+const RANDOM: &[&str] = &["--sched-heuristic=random"];
+const TARGETED_RANDOM: &[&str] = &["--sched-heuristic=random", "--chaos-target-races"];
+
+#[test]
+fn random_chaos_sched_yield_lets_the_worker_run() {
+    random_chaos_makes_progress(RANDOM, &[]);
+}
+
+#[test]
+fn random_chaos_sched_yield_lets_the_worker_run_past_two_spinners() {
+    random_chaos_makes_progress(RANDOM, &["--two-spinners"]);
+}
+
+#[test]
+fn random_chaos_runs_a_yielder_that_is_waited_on() {
+    random_chaos_makes_progress(RANDOM, &["--yield-then-write"]);
+}
+
+#[test]
+fn targeted_random_chaos_sched_yield_lets_the_worker_run() {
+    random_chaos_makes_progress(TARGETED_RANDOM, &[]);
+}
+
+#[test]
+fn targeted_random_chaos_sched_yield_lets_the_worker_run_past_two_spinners() {
+    random_chaos_makes_progress(TARGETED_RANDOM, &["--two-spinners"]);
+}
+
+#[test]
+fn targeted_random_chaos_runs_a_yielder_that_is_waited_on() {
+    random_chaos_makes_progress(TARGETED_RANDOM, &["--yield-then-write"]);
 }
 
 /// The scheduler commits in an INFO log whose resources begin with `resource`.
