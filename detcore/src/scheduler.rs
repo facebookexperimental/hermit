@@ -7237,6 +7237,58 @@ impl Scheduler {
         }
     }
 
+    /// The signals that would interrupt the restartable internal IO poll of
+    /// `dettid` (`restartable_internal_io_signals`), read from the thread the
+    /// request names for `/proc` (`Resources::signal_state_task`; with none,
+    /// no signal is filtered out). A poll that decides for itself
+    /// (`Resources::decides_signal_interruption_itself`, a parked pipe
+    /// `writev`, which polls with every ordinary signal blocked) is not
+    /// passed here. The signals kept are those unblocked under its mask,
+    /// and caught or acted on by default, as the kernel holds them now, at the
+    /// step2 drain, with no guest thread holding the turn. `SIGCHLD` and the
+    /// signals a host-timed source can post are held, as for a futex waiter
+    /// (`futex_wait_held_signals`). A blocked signal must not end the poll:
+    /// the call would return `ERESTARTSYS` with no signal for the kernel to
+    /// deliver, and the guest would see the restart code itself
+    /// (<https://github.com/rrnewton/hermit/issues/4187>). When the state
+    /// cannot be read, every signal it does not hold is treated as
+    /// interrupting, as before this filter.
+    fn restartable_internal_io_interrupting_signals(
+        &self,
+        dettid: DetTid,
+        task: Option<(i32, i32)>,
+    ) -> u64 {
+        let held = self.futex_wait_held_signals(dettid);
+        // Unit tests script a thread's state; one with none scripted keeps
+        // the unfiltered behaviour and never reads a host task's.
+        #[cfg(test)]
+        {
+            let _ = task;
+            match self.test_kernel_signal_states.get(&dettid) {
+                Some(state) => state.interrupting_wait(state.blocked, false) & !held,
+                None => !held,
+            }
+        }
+        #[cfg(not(test))]
+        {
+            let Some((pid, tid)) = task else {
+                return !held;
+            };
+            match read_kernel_signal_state(reverie::Pid::from_raw(pid), reverie::Pid::from_raw(tid))
+            {
+                Ok(state) => state.interrupting_wait(state.blocked, false) & !held,
+                Err(errno) => {
+                    debug!(
+                        "[dtid {}] cannot read the signal state of its internal IO poll ({}); \
+                         treating every signal it does not hold as interrupting.",
+                        dettid, errno
+                    );
+                    !held
+                }
+            }
+        }
+    }
+
     /// The signals a parked precise-mode futex waiter holds until its call
     /// returns, whatever its mask and dispositions: `SIGCHLD`, whoever sent it,
     /// and every signal a host-timed source armed by a guest can post to its
@@ -10212,22 +10264,45 @@ impl Scheduler {
                         continue;
                     };
                     // ERESTARTSYS is the existing contract by which the kernel
-                    // decides whether this physically pending signal is
-                    // blocked, ignored, restarts the syscall, or interrupts it
-                    // for a handler. Replace the polling request rather than
-                    // adding a second resource; step4 accepts exactly one.
+                    // decides whether this physically pending signal restarts
+                    // the syscall or interrupts it for a handler. Only a
+                    // signal the kernel would deliver now ends the poll: a
+                    // blocked, ignored or held one leaves it polling, with
+                    // its request and place in the run queue unchanged.
+                    let (task, decides_itself) = self
+                        .next_turns
+                        .get(&dettid)
+                        .and_then(|next_turn| next_turn.req.try_read())
+                        .and_then(Result::ok)
+                        .map(|resources| {
+                            (
+                                resources.signal_state_task,
+                                resources.decides_signal_interruption_itself,
+                            )
+                        })
+                        .unwrap_or((None, false));
+                    // A poll that checks the disposition itself after the
+                    // wake (a parked pipe `writev`) keeps every signal.
+                    let interrupting = if decides_itself {
+                        !0
+                    } else {
+                        self.restartable_internal_io_interrupting_signals(dettid, task)
+                    };
+                    signals.retain(|signal| interrupting & kernel_signal_bit(signal.raw()) != 0);
+                    signals.extend(existing);
+                    signals.sort_by_key(SigWrapper::raw);
+                    signals.dedup();
+                    if signals.is_empty() {
+                        continue;
+                    }
+                    // Replace the polling request rather than adding a second
+                    // resource; step4 accepts exactly one.
                     if self.run_queue.contains_tid(dettid) {
                         let removed = self.run_queue.remove_tid(dettid);
                         debug_assert!(
                             removed,
                             "run_queue.contains_tid disagreed with remove_tid for {dettid}"
                         );
-                    }
-                    signals.extend(existing);
-                    signals.sort_by_key(SigWrapper::raw);
-                    signals.dedup();
-                    if signals.is_empty() {
-                        continue;
                     }
                     let mut resources = Resources::new(dettid);
                     // `WaitidSignals` is already the scheduler's one-resource
@@ -10236,6 +10311,10 @@ impl Scheduler {
                     // waitid request and survives later notification batches.
                     resources.insert(ResourceID::WaitidSignals(signals), Permission::W);
                     resources.set_signal_interrupt_errno(Errno::ERESTARTSYS);
+                    // A later batch merging into this wake is filtered by the
+                    // same thread's state.
+                    resources.signal_state_task = task;
+                    resources.decides_signal_interruption_itself = decides_itself;
                     self.force_unblock_thread(dettid, resources);
                 }
             }
@@ -18025,6 +18104,140 @@ mod test {
                 .resources
                 .contains_key(&ResourceID::InternalIOPolling)
         );
+        assert_eq!(
+            resources.signal_interrupt_errno(),
+            Some(Errno::ERESTARTSYS.into_raw())
+        );
+    }
+
+    /// A restartable internal read poller, as `retry_nonblocking_syscall_helper`
+    /// marks one, with SIGUSR1 blocked and SIGUSR2 caught.
+    fn restartable_read_poller(scheduler: &mut Scheduler) -> DetTid {
+        let target = DetTid::from_raw(100);
+        register_known_thread(scheduler, target);
+        let mut polling = Resources::new(target);
+        polling.insert(ResourceID::InternalIOPolling, Permission::W);
+        polling.set_signal_interrupt_errno(Errno::ERESTARTSYS);
+        polling.fyi("read");
+        scheduler.next_turns.get_mut(&target).unwrap().req = Ivar::full(Ok(polling));
+        scheduler.runqueue_push_back(target);
+        scheduler.test_kernel_signal_states.insert(
+            target,
+            KernelSignalState {
+                caught: kernel_signal_bit(libc::SIGUSR1) | kernel_signal_bit(libc::SIGUSR2),
+                blocked: kernel_signal_bit(libc::SIGUSR1),
+                ..Default::default()
+            },
+        );
+        target
+    }
+
+    /// Only a signal the kernel would deliver ends a restartable internal
+    /// read poll: the blocked SIGUSR1 is dropped, and the caught SIGUSR2
+    /// rewrites the request to its `ERESTARTSYS` wake
+    /// (https://github.com/rrnewton/hermit/issues/4187).
+    #[test]
+    fn a_blocked_signal_does_not_end_a_restartable_internal_read_poll() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let target = restartable_read_poller(&mut scheduler);
+
+        scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR1));
+        scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR2));
+        scheduler.drain_pending_cross_task_signals();
+
+        assert!(scheduler.run_queue.contains_tid(target));
+        assert_eq!(
+            scheduler.inbound_signals(target),
+            vec![SigWrapper::from(Signal::SIGUSR2)]
+        );
+        let resources = scheduler
+            .next_turns
+            .get(&target)
+            .and_then(|next_turn| next_turn.req.try_read())
+            .and_then(Result::ok)
+            .expect("the target should hold its signal interruption request");
+        assert!(
+            resources
+                .resources
+                .contains_key(&ResourceID::WaitidSignals(vec![SigWrapper::from(
+                    Signal::SIGUSR2
+                )]))
+        );
+        assert_eq!(
+            resources.signal_interrupt_errno(),
+            Some(Errno::ERESTARTSYS.into_raw())
+        );
+    }
+
+    /// With only a blocked signal pending, the poller keeps its polling
+    /// request and its place in the run queue: the guest would otherwise see
+    /// `ERESTARTSYS` with no signal to deliver, or never run again.
+    #[test]
+    fn a_restartable_internal_read_poll_with_only_a_blocked_signal_keeps_polling() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let target = restartable_read_poller(&mut scheduler);
+
+        scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR1));
+        scheduler.drain_pending_cross_task_signals();
+
+        assert!(scheduler.run_queue.contains_tid(target));
+        assert!(scheduler.inbound_signals(target).is_empty());
+        let resources = scheduler
+            .next_turns
+            .get(&target)
+            .and_then(|next_turn| next_turn.req.try_read())
+            .and_then(Result::ok)
+            .expect("the target should retain its polling request");
+        assert_eq!(resources.resources.len(), 1);
+        assert!(
+            resources
+                .resources
+                .contains_key(&ResourceID::InternalIOPolling)
+        );
+    }
+
+    /// A poll that decides for itself whether a signal interrupts it (a
+    /// parked pipe `writev`, which polls with every ordinary signal blocked)
+    /// is not filtered by the drain: with its scripted kernel state blocking
+    /// SIGUSR1, the caught SIGUSR1 still wakes it, and the rewritten request
+    /// keeps the marker for a later batch
+    /// (https://github.com/rrnewton/hermit/issues/4187).
+    #[test]
+    fn the_drain_does_not_filter_a_poll_that_decides_signal_interruption_itself() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let target = DetTid::from_raw(100);
+        register_known_thread(&mut scheduler, target);
+        let mut polling = Resources::new(target);
+        polling.insert(ResourceID::InternalIOPolling, Permission::W);
+        polling.set_signal_interrupt_errno(Errno::ERESTARTSYS);
+        polling.decides_signal_interruption_itself = true;
+        polling.fyi("writev");
+        scheduler.next_turns.get_mut(&target).unwrap().req = Ivar::full(Ok(polling));
+        scheduler.runqueue_push_back(target);
+        scheduler.test_kernel_signal_states.insert(
+            target,
+            KernelSignalState {
+                caught: kernel_signal_bit(libc::SIGUSR1),
+                blocked: kernel_signal_bit(libc::SIGUSR1),
+                ..Default::default()
+            },
+        );
+
+        scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR1));
+        scheduler.drain_pending_cross_task_signals();
+
+        assert!(scheduler.run_queue.contains_tid(target));
+        assert_eq!(
+            scheduler.inbound_signals(target),
+            vec![SigWrapper::from(Signal::SIGUSR1)]
+        );
+        let resources = scheduler
+            .next_turns
+            .get(&target)
+            .and_then(|next_turn| next_turn.req.try_read())
+            .and_then(Result::ok)
+            .expect("the target should hold its signal interruption request");
+        assert!(resources.decides_signal_interruption_itself);
         assert_eq!(
             resources.signal_interrupt_errno(),
             Some(Errno::ERESTARTSYS.into_raw())

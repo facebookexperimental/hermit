@@ -502,6 +502,26 @@ pub struct Resources {
     /// Only its singleton SleepUntil request may use this snapshot.
     #[serde(default)]
     pub(crate) in_guest_sleep_sigalrm: Option<InGuestSleepSigalrm>,
+    /// The filing thread's process and thread as the backend names them for
+    /// `/proc` (`guest.pid()`, `guest.tid()`, as a futex wait's
+    /// `FutexSignalWatch` records them), on a restartable internal IO poll
+    /// (`retry_nonblocking_syscall_helper`, `execute_blocking_pipe_write`).
+    /// The scheduler reads that thread's live signal state there to decide
+    /// which pending signals end the poll
+    /// (`Scheduler::restartable_internal_io_interrupting_signals`). `None`
+    /// for every other request; a marked poll without it is not filtered.
+    #[serde(default)]
+    pub(crate) signal_state_task: Option<(i32, i32)>,
+    /// Set on a restartable internal IO poll that decides for itself whether
+    /// a `Signaled` wake interrupts it: a parked pipe `writev`
+    /// (`pipe_writev_resources`) polls with every ordinary signal blocked and
+    /// reads the target's disposition after the wake
+    /// (`wait_signal_disposition`). The scheduler's drain therefore does not
+    /// filter its signals by the thread's kernel state, whose mask it would
+    /// read as all-blocked, dropping every signal
+    /// (<https://github.com/rrnewton/hermit/issues/4187>).
+    #[serde(default)]
+    pub(crate) decides_signal_interruption_itself: bool,
 }
 
 impl fmt::Debug for Resources {
@@ -533,6 +553,12 @@ impl fmt::Debug for Resources {
         if let Some(snapshot) = self.in_guest_sleep_sigalrm {
             debug.field("in_guest_sleep_sigalrm", &snapshot);
         }
+        if let Some(task) = self.signal_state_task {
+            debug.field("signal_state_task", &task);
+        }
+        if self.decides_signal_interruption_itself {
+            debug.field("decides_signal_interruption_itself", &true);
+        }
         debug.finish()
     }
 }
@@ -552,6 +578,8 @@ impl Resources {
             replay_served_from_log: false,
             poll_deadline: None,
             in_guest_sleep_sigalrm: None,
+            signal_state_task: None,
+            decides_signal_interruption_itself: false,
         }
     }
 
@@ -586,6 +614,10 @@ impl Resources {
             (Some(_), None) => {}
         }
         self.blocked_signal_mask_unknown |= other.blocked_signal_mask_unknown;
+        if self.signal_state_task.is_none() {
+            self.signal_state_task = other.signal_state_task;
+        }
+        self.decides_signal_interruption_itself |= other.decides_signal_interruption_itself;
         self.replay_served_from_log |= other.replay_served_from_log;
         // A merged request waits for the earlier of two deadlines.
         self.poll_deadline = match (self.poll_deadline, other.poll_deadline) {

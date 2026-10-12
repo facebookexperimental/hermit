@@ -1285,6 +1285,12 @@
       "why": "tests/c/pipe_multiwriter_ordering.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: canonical ptrace strict verification compares the guest-visible order of writes from five concurrent pipe writers and the corresponding wait order"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/pipe_read_signal.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/pipe_read_signal.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_signal_to_a_guest_blocked_in_a_polled_call_acts_as_on_linux compiles this guest, which signals a thread or a forked child blocked in read() on an empty pipe under each disposition (EINTR without SA_RESTART, a restart with it, ignored, blocked), cancels such a reader with glibc pthread_cancel, and signals a thread blocked writing to a full pipe or in waitpid(WUNTRACED), and requires the exact native output together with --verify-strict bitwise parity (https://github.com/rrnewton/hermit/issues/4187); it remains a guest fixture because a generic manifest cannot assert this exact output."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/poll_readiness.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

@@ -143,6 +143,7 @@ static PIDFD_SEND_SIGNAL_MULTITHREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PIDFD_SEND_SIGNAL_FLAGS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_MULTITHREADED_PROCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static REALTIME_SIGNALS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static PIPE_READ_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static OWN_PROCESS_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VDSO_SYMBOL_VERSIONS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_SIGEV_THREAD_ID_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1103,6 +1104,31 @@ fn realtime_signals_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "realtime-signals guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn pipe_read_signal_guest() -> &'static Path {
+    PIPE_READ_SIGNAL_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("pipe-read-signal");
+        fs::create_dir_all(&build_root).expect("failed to create pipe-read-signal guest directory");
+        let guest = build_root.join("pipe_read_signal");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/pipe_read_signal.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile pipe-read-signal guest");
+        assert!(
+            output.status.success(),
+            "pipe-read-signal guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -21898,6 +21924,123 @@ fn a_guest_or_child_killed_by_a_realtime_signal_reports_it() {
         log.contains(":: Success: deterministic. Determinism verified."),
         "verification failed:\n{log}"
     );
+}
+
+/// A signal sent to a guest blocked in a call Detcore polls internally (a
+/// `read` of an empty pipe, a `write` to a full one, a `waitpid`) acts as it
+/// does on Linux, under each disposition, and verifies at bitwise parity
+/// (https://github.com/rrnewton/hermit/issues/4187). Before the fix, the poll
+/// never saw the signal: the read waited forever, so `pthread_cancel` of a
+/// reader never took effect. A blocked signal must leave the read waiting
+/// rather than return the kernel's restart code to the guest, and a byte or
+/// end of file that is ready before the signal is read first (Codex review of
+/// https://github.com/rrnewton/hermit/pull/4198). The expected lines are the
+/// native run's.
+#[test]
+fn a_signal_to_a_guest_blocked_in_a_polled_call_acts_as_on_linux() {
+    let guest = pipe_read_signal_guest().to_str().unwrap().to_owned();
+    for (mode, expected) in [
+        (
+            "eintr",
+            "thread read: -1 Interrupted system call, handled 1\n",
+        ),
+        ("restart", "thread read: 1 byte 'x', handled 1\n"),
+        ("ignored", "thread read: 1 byte 'x', handled 0\n"),
+        ("blocked", "thread read: 1 byte 'x', handled 0\n"),
+        ("ready", "thread read: 1 byte 'x'\n"),
+        ("eof", "thread read: 0 byte '-'\n"),
+        ("cancel", "cancel: 0\njoined, canceled 1\n"),
+        (
+            "process",
+            "child read: -1 Interrupted system call, handled 1\nchild exited 0\n",
+        ),
+        (
+            "write-zero",
+            "write: -1 Interrupted system call, handled 1\n",
+        ),
+        ("write-room", "write: 1\n"),
+        ("write-partial", "write: one pipe capacity, handled 1\n"),
+        (
+            "waitpid",
+            "waitpid: -1 Interrupted system call, handled 1\nchild exited 0\n",
+        ),
+    ] {
+        let args = [
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--",
+            guest.as_str(),
+            mode,
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "mode {mode}");
+        let log = stderr(&output);
+        assert!(
+            log.contains(":: comparison=BitwiseInfoV1 relaxations=none"),
+            "mode {mode}: comparison was not canonical:\n{log}"
+        );
+        assert!(
+            log.contains(":: Success: deterministic. Determinism verified."),
+            "mode {mode}: verification failed:\n{log}"
+        );
+    }
+    // Under record and replay a signal interrupts the blocked read as in a
+    // plain run. (A byte, end of file or room that is ready before the signal
+    // is not taken first there: the attempt after the signal is a plain
+    // injection that the pending signal stops, and making it again could lose
+    // a second signal, https://github.com/rrnewton/reverie/issues/1012, so
+    // `ready`, `eof` and `write-room` are run-mode cases.)
+    let args = [
+        "record",
+        "start",
+        "--verify",
+        "--verify-strict",
+        "--",
+        guest.as_str(),
+        "eintr",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(
+        stdout(&output),
+        "thread read: -1 Interrupted system call, handled 1\n",
+        "recorded mode eintr"
+    );
+    let log = stderr(&output);
+    assert!(
+        log.contains("Success: replay matched recording."),
+        "recorded mode eintr: the replay must match the recording:\n{log}"
+    );
+    // Two caught signals at once (`ready2`): the recording and its replay must
+    // lose neither (an attempt made again after the first could, as the
+    // backend holds one signal at a time,
+    // https://github.com/rrnewton/reverie/issues/1012). The read returns EINTR
+    // where Linux returns the byte, as on main. Run mode, which retries in
+    // `inject_with_retry`, still loses SIGUSR1 (1012), so it is not run here.
+    // Record and replay are compared by their output: they deliver the two
+    // signals in a different order, as on main, so `record --verify` does not
+    // apply.
+    let data = tempfile::tempdir().unwrap();
+    let directory = data.path().to_str().unwrap();
+    let expected = "thread read: -1 Interrupted system call, usr1 1, usr2 1\n";
+    let record_args = [
+        "record",
+        "--data-dir",
+        directory,
+        "--",
+        guest.as_str(),
+        "ready2",
+    ];
+    let record = hermit(&record_args);
+    assert_success(&record, &record_args);
+    assert_eq!(stdout(&record), expected, "recorded ready2 lost a signal");
+    let replay_args = ["replay", "--autopilot", "--data-dir", directory];
+    let replay = hermit(&replay_args);
+    assert_success(&replay, &replay_args);
+    assert_eq!(stdout(&replay), expected, "replayed ready2 lost a signal");
 }
 
 /// A process-directed signal a thread sends to its own multi-threaded process

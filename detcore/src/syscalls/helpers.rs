@@ -614,23 +614,28 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut resources = Resources::new(guest.thread_state().dettid);
         resources.insert(ResourceID::InternalIOPolling, Permission::W);
         resources.fyi(call.name());
+        // Interruptible by a cross-task signal the kernel would deliver, as a
+        // polled read is (`retry_nonblocking_syscall_helper`): the scheduler
+        // answers the next request `Signaled`, and the write returns the
+        // bytes it wrote, or ERESTARTSYS before any
+        // (<https://github.com/rrnewton/hermit/issues/4187>).
+        resources.set_signal_interrupt_errno(call.signal_interrupt_errno());
+        resources.signal_state_task = Some((guest.pid().as_raw(), guest.tid().as_raw()));
         let subtool = self.cfg.recordreplay_modes.then_some(self);
         let mut current = call;
         let mut written_total = 0usize;
 
         loop {
-            if resources.poll_attempt > 0
+            // A signal ends the write only if it would still wait for room:
+            // the attempt below runs first, as Linux's `pipe_write` checks
+            // for a pending signal only when it must wait. After the signal,
+            // the bytes written so far are returned, or the restart errno if
+            // there are none.
+            let signaled = resources.poll_attempt > 0
                 && matches!(
                     resource_request(guest, resources.clone()).await,
                     ResumeStatus::Signaled(_)
-                )
-            {
-                break if written_total > 0 {
-                    Ok(written_total as i64)
-                } else {
-                    Err(call.signal_interrupt_errno().into())
-                };
-            }
+                );
 
             if resources.poll_attempt > 0
                 && !guest
@@ -656,6 +661,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
                 None => guest.inject_with_retry(current).await.map_err(Error::from),
             };
+            // As in `retry_nonblocking_syscall_helper`, an attempt that the
+            // pending signal stopped under record and replay is not made again.
             match result {
                 Ok(written) if written > 0 => {
                     let written = usize::try_from(written).map_err(|_| Errno::EIO)?;
@@ -664,7 +671,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         break Err(Errno::EIO.into());
                     }
                     written_total = written_total.checked_add(written).ok_or(Errno::EIO)?;
-                    if written_total == target {
+                    if written_total == target || signaled {
                         break Ok(written_total as i64);
                     }
                     let Some(buffer) = call.buf() else {
@@ -685,6 +692,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .with_len(target - written_total);
                 }
                 Ok(0) => break Ok(written_total as i64),
+                Err(Error::Errno(Errno::EAGAIN)) if signaled => {
+                    break if written_total > 0 {
+                        Ok(written_total as i64)
+                    } else {
+                        Err(call.signal_interrupt_errno().into())
+                    };
+                }
                 Err(Error::Errno(Errno::EAGAIN)) => {}
                 Err(error) => {
                     break finish_partial_record_or_replay_write(written_total as i64, error);
@@ -1218,6 +1232,10 @@ fn pipe_writev_resources(dettid: DetTid, call: reverie::syscalls::Writev) -> Res
     resources.insert(ResourceID::InternalIOPolling, Permission::W);
     resources.fyi(call.name());
     resources.set_signal_interrupt_errno(call.signal_interrupt_errno());
+    // Polls with every ordinary signal blocked and checks the target's
+    // disposition itself after a `Signaled` wake, so the scheduler's drain
+    // must not filter by the kernel mask (`execute_blocking_pipe_writev`).
+    resources.decides_signal_interruption_itself = true;
     resources
 }
 
@@ -1887,6 +1905,23 @@ where
     let (call, _maybe_stackguard) = call0.into_nonblocking(guest).await;
     let mut rsrc = rsrc.clone();
     rsrc.poll_deadline = poll_deadline_for(guest, maybe_timeout.map(|(deadline, _)| deadline));
+    // A restartable call parked in internal IO polling, such as a `read` of an
+    // empty pipe, is interrupted by a signal another task sends, as a parked
+    // pipe write is (`pipe_writev_resources`). The marker lets the scheduler
+    // record the signal for it (`Scheduler::notify_signal_pending`) and answer
+    // its next turn `Signaled`; the call then returns `ERESTARTSYS`, and the
+    // kernel applies the guest's disposition when it resumes: a handler runs
+    // and the call fails with `EINTR` or restarts under `SA_RESTART`. Without
+    // it, the poll never saw the signal and waited forever
+    // (<https://github.com/rrnewton/hermit/issues/4187>).
+    if rsrc.signal_interrupt_errno().is_none()
+        && rsrc.resources.len() == 1
+        && rsrc.resources.contains_key(&ResourceID::InternalIOPolling)
+        && call.signal_interrupt_errno() == Errno::ERESTARTSYS
+    {
+        rsrc.set_signal_interrupt_errno(Errno::ERESTARTSYS);
+        rsrc.signal_state_task = Some((guest.pid().as_raw(), guest.tid().as_raw()));
+    }
 
     loop {
         let resumed = match call.into() {
@@ -1895,15 +1930,13 @@ where
             }
             _ => resource_request(guest, rsrc.clone()).await,
         };
-        if matches!(resumed, ResumeStatus::Signaled(_)) {
-            let errno = call.signal_interrupt_errno();
-            tracing::trace!(
-                "retry_nonblocking_syscall: interrupted by signal before retrying {}: {:?}",
-                call.display(&guest.memory()),
-                errno
-            );
-            return Err(errno.into());
-        }
+        // A signal ends the call only if it would still block, as Linux
+        // checks for a pending signal only when the call must wait: a byte
+        // written, or the last writer closed, before the signal is read
+        // first. The probe below goes through the record/replay path like
+        // every attempt (Codex review of
+        // https://github.com/rrnewton/hermit/pull/4198).
+        let signaled = matches!(resumed, ResumeStatus::Signaled(_));
         // A pending real-time timer expiration in the set this wait takes
         // (https://github.com/rrnewton/hermit/issues/4089).
         let pending = pending_real_time_among(guest, consumed).await;
@@ -1919,11 +1952,27 @@ where
             }
             None => guest.inject_with_retry(call).await.map_err(Error::from),
         };
+        // Under record and replay the attempt is a plain injection, which the
+        // signal that woke this call, still pending, stops before it runs
+        // (ERESTARTSYS, not run): the call then returns that restart errno,
+        // as on main, though a byte, end of file or room may have been ready.
+        // Making the attempt again would replace the held signal with any
+        // other pending one (https://github.com/rrnewton/reverie/issues/1012),
+        // and record and replay could not agree on when it is safe.
         let syscall_result = match res {
             Ok(value) => Ok(value),
             Err(Error::Errno(error)) => Err(error),
             Err(error) => return Err(error),
         };
+        if signaled && call.syscall_would_have_blocked(syscall_result) {
+            let errno = call.signal_interrupt_errno();
+            tracing::trace!(
+                "retry_nonblocking_syscall: interrupted by signal while {} would block: {:?}",
+                call.display(&guest.memory()),
+                errno
+            );
+            return Err(errno.into());
+        }
         if call.syscall_would_have_blocked(syscall_result) {
             rsrc.poll_attempt += 1;
             if let Some((timeout, timeout_result)) = maybe_timeout {
@@ -3872,6 +3921,7 @@ mod tests {
             request.signal_interrupt_errno(),
             Some(Errno::ERESTARTSYS.into_raw())
         );
+        assert!(request.decides_signal_interruption_itself);
         assert_eq!(request.resources.len(), 1);
     }
 }

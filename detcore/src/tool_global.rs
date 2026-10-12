@@ -3549,6 +3549,8 @@ impl GlobalState {
                     replay_served_from_log: false,
                     poll_deadline: None,
                     in_guest_sleep_sigalrm: None,
+                    signal_state_task: None,
+                    decides_signal_interruption_itself: false,
                 }
             };
             let nextturn = match sched.next_turns.entry(dettid) {

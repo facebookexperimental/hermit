@@ -377,7 +377,14 @@ impl RecordVersion {
 // min(len, 16), where it answered EINVAL below 16 bytes
 // (https://github.com/rrnewton/hermit/issues/4160). Replay answers the call
 // itself, so an older recording that saw EINVAL would see success here.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x141);
+// 0x141 -> 0x142: a signal that another task sends ends a restartable call
+// that Detcore polls internally (a blocking pipe read or write, readv, recv,
+// send, accept4, connect, and the legacy wait4 polling) when the kernel would
+// deliver it, where the poll ignored it and retried
+// (https://github.com/rrnewton/hermit/issues/4187). The recorder logs each
+// polled EAGAIN but not the scheduler's signaled answer, so recordings made
+// before and after this change do not replay on each other's replayer.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x142);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -402,7 +409,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x141);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x141;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x142;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1192,6 +1199,14 @@ mod tests {
     fn record_version_rejects_streams_whose_short_affinity_sets_were_refused() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x13f)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x140)));
+    }
+
+    /// A recording older than 0x142 was made by a recorder whose internally
+    /// polled restartable calls ignored a cross-task signal
+    /// (https://github.com/rrnewton/hermit/issues/4187).
+    #[test]
+    fn record_version_rejects_streams_from_before_signals_ended_polled_calls() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x141)));
     }
 
     #[test]

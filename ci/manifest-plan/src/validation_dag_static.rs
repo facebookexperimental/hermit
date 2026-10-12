@@ -1414,7 +1414,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4095): 1058.
     // And metadata::tests::record_version_rejects_streams_whose_short_affinity_sets_were_refused
     // (https://github.com/rrnewton/hermit/issues/4160): 1059.
-    ("test.hermit_unit", 1059),
+    // And metadata::tests::record_version_rejects_streams_from_before_signals_ended_polled_calls
+    // (https://github.com/rrnewton/hermit/issues/4187): 1060.
+    ("test.hermit_unit", 1060),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1978,7 +1980,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4160): 1461.
     // And the absent-CPU directory entry test (https://github.com/rrnewton/hermit/issues/4160): 1462.
     // And a_signal_the_temporary_mask_blocks_is_held_not_ended: 1463.
-    ("test.detcore_unit", 1463),
+    // And the three restartable internal IO poll signal-filter tests (https://github.com/rrnewton/hermit/issues/4187): 1466.
+    ("test.detcore_unit", 1466),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2717,7 +2720,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4160): 324.
     // And cpu_directory_reads_list_only_cpu0_on_every_path
     // (https://github.com/rrnewton/hermit/issues/4160): 325.
-    ("test.cli", 325),
+    // And a_signal_to_a_guest_blocked_in_a_polled_call_acts_as_on_linux
+    // (https://github.com/rrnewton/hermit/issues/4187): 326.
+    ("test.cli", 326),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2983,7 +2988,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // So does the own-copy mark refusal test: 259.
     // Nor does the kernel_max affinity test: 260.
     // Nor does the CPU directory reads test: 261.
-    ("test.cli_on_host", 261),
+    // And the polled-call signal test: 262.
+    ("test.cli_on_host", 262),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -3148,7 +3154,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the kernel_max, SMT, topology-ID and node single-CPU test: 1461.
     // And the absent-CPU directory entry test: 1462.
     // And the pselect6 temporary-mask hold test: 1463.
-    ("test.detcore_unit_on_host", 1463),
+    // And the three internal IO poll signal-filter tests: 1466.
+    ("test.detcore_unit_on_host", 1466),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -3303,7 +3310,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the nested-PID-namespace record-epoch test: 1057.
     // And the pselect6 entry-mask record-epoch test: 1058.
     // And the short-affinity-set record-epoch test: 1059.
-    ("test.hermit_unit_on_host", 1059),
+    // And the polled-call signal record-epoch test: 1060.
+    ("test.hermit_unit_on_host", 1060),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

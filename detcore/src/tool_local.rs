@@ -3024,6 +3024,8 @@ impl<T> ThreadState<T> {
             replay_served_from_log: false,
             poll_deadline: None,
             in_guest_sleep_sigalrm: None,
+            signal_state_task: None,
+            decides_signal_interruption_itself: false,
         }
     }
 
