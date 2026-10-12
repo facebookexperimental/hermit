@@ -107,6 +107,7 @@ static DBT_PRLIMIT_SELF_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KVM_EXACT_CHILD_WAITS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KVM_GETTIMEOFDAY_EFAULT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static KVM_DEADLINE_SPIN_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KVM_TASK_IDS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_UNSUPPORTED_SYSCALL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static GETTIMEOFDAY_UNREADABLE_BUFFER_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1616,6 +1617,33 @@ fn kvm_gettimeofday_efault_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "KVM gettimeofday EFAULT guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+/// `tests/fixtures/deadline_spin_wait.c`, the timed-wait guest of
+/// `deadline_slice_cap.rs`, built for the KVM test.
+fn kvm_deadline_spin_wait_guest() -> &'static Path {
+    KVM_DEADLINE_SPIN_WAIT_GUEST.get_or_init(|| {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/deadline_spin_wait.c");
+        let build_root = process_build_root("kvm-deadline-spin-wait");
+        fs::create_dir_all(&build_root).expect("failed to create KVM deadline guest directory");
+        let guest = build_root.join("deadline_spin_wait");
+        let output = Command::new("cc")
+            .args(["-std=c11", "-O2", "-g", "-pthread", "-D_GNU_SOURCE"])
+            .args(["-Wall", "-Wextra", "-Werror"])
+            .arg(&fixture)
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile KVM deadline guest");
+        assert!(
+            output.status.success(),
+            "KVM deadline guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -5616,6 +5644,47 @@ fn run_kvm_names_the_execve_filename_in_at_execfn_as_ptrace_does() {
         "{execfns:?}"
     );
     assert_eq!(execfns[3], "./sub/inner.sh");
+}
+
+/// On KVM a 5 ms sleep requested while a sibling spins on getppid is a
+/// parked request, and its grant's reply carries the deadline cap of
+/// https://github.com/rrnewton/hermit/issues/4121: the sleep ends near 5 ms,
+/// where without the cap it waits out the spinner's 200 ms slice. This is the
+/// oracle for the `ParkedRequest` reply
+/// (https://github.com/rrnewton/hermit/issues/4156).
+#[test]
+fn run_kvm_a_parked_sleep_carries_the_deadline_cap() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+    let guest = kvm_deadline_spin_wait_guest()
+        .to_str()
+        .expect("KVM deadline guest path should be UTF-8");
+    let args = [
+        "--backend",
+        "kvm",
+        "run",
+        "--strict",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--",
+        guest,
+        "nanosleep",
+        "getppid",
+        "late",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    let out = stdout(&output);
+    let waited: i64 = out
+        .split("waited_us=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("no waited_us in stdout:\n{out}"));
+    assert!(
+        (5_000..20_000).contains(&waited),
+        "a 5 ms sleep took {waited} us on KVM:\n{out}"
+    );
 }
 
 #[test]
