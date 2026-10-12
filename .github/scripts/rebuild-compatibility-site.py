@@ -229,7 +229,7 @@ def require_sources(parent, config):
 # scorecard history parts (265.9 MiB of the pack at ledger f8361f72) once
 # those leave the ledger's main branch (dev-hermit option (a),
 # https://github.com/rrnewton/dev-hermit/issues/558). The rebuild step's own
-# 101-minute bound still holds the fetch plus the 36-42 minute build.
+# 180-minute bound holds the fetch, the 36-42 minute build and the upload.
 LEDGER_FETCH_TIMEOUT = 2700
 LEDGER_DEEPEN_STEP = 50
 LEDGER_DEEPEN_LIMIT = 2000
@@ -376,36 +376,97 @@ def asset_id(release, pin, name, sha, size):
     return assets[0]["id"]
 
 
+# A release asset upload is bounded by the asset's size, not by run()'s 120 s
+# default. The self-hosted rebuild of
+# https://github.com/rrnewton/hermit/actions/runs/38287816650 built the whole
+# website and then lost it to `gh release create` with both assets attached,
+# killed at 120 s while uploading the archive (hundreds of MB, at an egress
+# rate near 20 MB/min that afternoon). Each attempt gets 300 s plus the time
+# the asset takes at 200 kB/s.
+UPLOAD_FLOOR_BYTES_PER_SECOND = 200_000
+UPLOAD_ATTEMPTS = 3
+
+
+def upload_timeout(size):
+    return 300 + size // UPLOAD_FLOOR_BYTES_PER_SECOND
+
+
+def upload_asset(release, pin, path, sha, size):
+    """Upload one asset until the release holds exactly these bytes.
+
+    An asset already uploaded is never replaced: different bytes are refused
+    by asset_id. Only an asset an interrupted upload left in another state is
+    replaced (--clobber). A failed or timed-out attempt is judged by the
+    release it leaves, read back, not by gh's exit status.
+    """
+    for attempt in range(UPLOAD_ATTEMPTS + 1):
+        present = [item for item in release.get("assets", []) if item["name"] == path.name]
+        if present and all(item.get("state") == "uploaded" for item in present):
+            asset_id(release, pin, path.name, sha, size)
+            return release
+        if attempt == UPLOAD_ATTEMPTS:
+            break
+        args = ["release", "upload", pin["tag"], path, "--repo", REPOSITORY]
+        if present:
+            args.append("--clobber")
+        try:
+            run(["gh", *args], timeout=upload_timeout(size))
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+            print(
+                f"release asset {path.name} upload attempt {attempt + 1} of "
+                f"{UPLOAD_ATTEMPTS} failed: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
+        release = release_by_tag(pin["tag"])
+        if release is None:
+            raise ValueError("release disappeared while its assets were uploaded")
+    raise ValueError(
+        f"release asset {path.name} did not upload in {UPLOAD_ATTEMPTS} attempts"
+    )
+
+
 def publish_release(pin, archive, registry, ledger_commit, hermit_commit):
-    """Create stable data assets without replacing any existing published bytes."""
+    """Create stable data assets without replacing any existing published bytes.
+
+    The release is created without assets, which takes seconds, and each asset
+    is uploaded on its own (upload_asset), so a run that stops part way leaves
+    a release the next run with the same build completes instead of refusing.
+    """
     tag = pin["tag"]
     registry_bytes = registry.read_bytes()
     registry_sha = hashlib.sha256(registry_bytes).hexdigest()
     release = release_by_tag(tag)
     if release is None:
-        gh(
-            "release",
-            "create",
-            tag,
-            "--repo",
-            REPOSITORY,
-            "--target",
-            hermit_commit,
-            "--latest=false",
-            "--title",
-            pin["release_title"],
-            "--notes",
-            "Website rebuilt from existing cell ledger "
-            + ledger_commit
-            + ". This rebuild did not run Hermit tests or refresh measurement dates.",
-            archive,
-            registry,
-        )
+        try:
+            gh(
+                "release",
+                "create",
+                tag,
+                "--repo",
+                REPOSITORY,
+                "--target",
+                hermit_commit,
+                "--latest=false",
+                "--title",
+                pin["release_title"],
+                "--notes",
+                "Website rebuilt from existing cell ledger "
+                + ledger_commit
+                + ". This rebuild did not run Hermit tests or refresh measurement dates.",
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+            # A create that failed may still have made the release; the
+            # lookup below decides.
+            print(f"release create failed: {error}", file=sys.stderr, flush=True)
         release = release_by_tag(tag)
+        if release is None:
+            raise ValueError("release creation failed; no release exists for its tag")
+    release = upload_asset(
+        release, pin, archive, pin["archive_sha256"], pin["archive_bytes"]
+    )
+    release = upload_asset(release, pin, registry, registry_sha, len(registry_bytes))
     asset_id(release, pin, archive.name, pin["archive_sha256"], pin["archive_bytes"])
-    if not any(item["name"] == registry.name for item in release["assets"]):
-        gh("release", "upload", tag, registry, "--repo", REPOSITORY)
-        release = release_by_tag(tag)
     return asset_id(release, pin, registry.name, registry_sha, len(registry_bytes))
 
 

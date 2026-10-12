@@ -79,9 +79,9 @@ jobs:
     # builder streams the ledger instead of holding it
     # (https://github.com/rrnewton/dev-hermit/issues/515).
     runs-on: ${{ (github.event_name == 'schedule' || inputs.rebuild_compatibility) && fromJSON('["self-hosted", "gate", "docs-rebuild"]') || 'ubuntu-latest' }}
-    # Room for the 101-minute rebuild step below plus the steps around it
+    # Room for the 180-minute rebuild step below plus the steps around it
     # (about 10 minutes on 2026-09-27, with an 11-minute public-byte check cap).
-    timeout-minutes: 150
+    timeout-minutes: 240
 
     steps:
     # Before any git command: the runner's user has git URL rewrites in its
@@ -330,7 +330,13 @@ jobs:
       # (2026-09-23), 31.4, 36.9, 44.0, 49.5 min (2026-09-27). It grows with
       # the ledger, and the old 60-minute cap would have ended the build
       # within days. Keep a finite cap; the step still fails if it is reached.
-      timeout-minutes: 101
+      # On the self-hosted runner on 2026-10-12 the step took 51.7 min to the
+      # end of the build (about 22 of them the ledger fetch) and then needs the
+      # release upload, which each attempt bounds by the archive's size
+      # (rebuild-compatibility-site.py, upload_timeout): about 44 minutes for
+      # a 471 MB archive. 101 minutes would not hold a slow fetch, the build
+      # and one slow upload.
+      timeout-minutes: 180
       env:
         GH_TOKEN: ${{ github.token }}
         CARGO_TARGET_DIR: ${{ runner.temp }}/compatibility-target
@@ -352,7 +358,7 @@ jobs:
         VALIDATION_HISTORY_COMMIT: ${{ steps.website-history.outputs.validation_history_commit }}
       run: |
         set -euo pipefail
-        timeout --signal=TERM --kill-after=30s 6000s \
+        timeout --signal=TERM --kill-after=30s 10500s \
           python3 -B .github/scripts/rebuild-compatibility-site.py rebuild \
           --builder-parent "$GITHUB_WORKSPACE/_website_source" \
           --scratch "${COMPATIBILITY_SCRATCH_PARENT:-$RUNNER_TEMP}/compatibility-nightly-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \

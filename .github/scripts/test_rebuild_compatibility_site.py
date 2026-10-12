@@ -284,6 +284,135 @@ class HostedAdapterTests(unittest.TestCase):
             )
         request.assert_not_called()
 
+    def _release_fixture(self):
+        archive, registry = self.root / self.pin["asset"], self.root / "registry.json"
+        archive.write_bytes(b"archive")
+        registry.write_bytes(b"registry")
+        pin = {
+            **self.pin,
+            "archive_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+            "archive_bytes": archive.stat().st_size,
+        }
+
+        def asset(path, ident, state="uploaded"):
+            return {
+                "name": path.name,
+                "size": path.stat().st_size,
+                "state": state,
+                "id": ident,
+                "digest": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+
+        def release(*assets):
+            return {
+                "tag_name": pin["tag"],
+                "name": pin["release_title"],
+                "draft": False,
+                "prerelease": False,
+                "assets": list(assets),
+            }
+
+        return pin, archive, registry, asset, release
+
+    def test_release_upload_timeout_grows_with_the_asset(self):
+        self.assertEqual(ADAPTER.upload_timeout(0), 300)
+        # The archive the self-hosted run lost to the 120 s bound was hundreds
+        # of MB; 590 MB gets 300 s plus 2,950 s.
+        self.assertEqual(ADAPTER.upload_timeout(590_000_000), 3250)
+
+    def test_timed_out_create_then_assets_upload_separately_with_sized_timeouts(self):
+        pin, archive, registry, asset, release = self._release_fixture()
+        lookups = [
+            None,
+            release(),
+            release(asset(archive, 20)),
+            release(asset(archive, 20), asset(registry, 21)),
+        ]
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append((argv, kwargs))
+            if argv[1:3] == ["release", "create"]:
+                raise subprocess.TimeoutExpired(argv, 120)
+            return b""
+
+        with (
+            patch.object(ADAPTER, "release_by_tag", side_effect=lookups),
+            patch.object(ADAPTER, "run", side_effect=run),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(
+                ADAPTER.publish_release(
+                    pin, archive, registry, "a" * 40, self.config["hermit_commit"]
+                ),
+                21,
+            )
+        create, upload_archive, upload_registry = (argv for argv, _ in calls)
+        self.assertEqual(create[1:4], ["release", "create", pin["tag"]])
+        self.assertNotIn(archive, create)
+        self.assertNotIn(registry, create)
+        self.assertEqual(upload_archive[1:4], ["release", "upload", pin["tag"]])
+        self.assertIn(archive, upload_archive)
+        self.assertIn(registry, upload_registry)
+        for argv in (upload_archive, upload_registry):
+            self.assertNotIn("--clobber", argv)
+        self.assertEqual(
+            calls[1][1]["timeout"], ADAPTER.upload_timeout(archive.stat().st_size)
+        )
+
+    def test_only_an_interrupted_asset_is_replaced(self):
+        pin, archive, registry, asset, release = self._release_fixture()
+        lookups = [
+            release(asset(archive, 20, state="open"), asset(registry, 21)),
+            release(asset(archive, 22), asset(registry, 21)),
+        ]
+        with (
+            patch.object(ADAPTER, "release_by_tag", side_effect=lookups),
+            patch.object(ADAPTER, "run", return_value=b"") as request,
+        ):
+            self.assertEqual(
+                ADAPTER.publish_release(
+                    pin, archive, registry, "a" * 40, self.config["hermit_commit"]
+                ),
+                21,
+            )
+        (argv,), _ = request.call_args
+        self.assertIn("--clobber", argv)
+        self.assertIn(archive, argv)
+        self.assertEqual(request.call_count, 1)
+
+    def test_upload_that_never_lands_is_refused_after_bounded_attempts(self):
+        pin, archive, registry, asset, release = self._release_fixture()
+        with (
+            patch.object(ADAPTER, "release_by_tag", return_value=release()),
+            patch.object(
+                ADAPTER, "run", side_effect=subprocess.TimeoutExpired(["gh"], 1)
+            ) as request,
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaisesRegex(ValueError, "did not upload"),
+        ):
+            ADAPTER.publish_release(
+                pin, archive, registry, "a" * 40, self.config["hermit_commit"]
+            )
+        self.assertEqual(request.call_count, ADAPTER.UPLOAD_ATTEMPTS)
+
+    def test_failed_create_with_no_release_is_refused(self):
+        pin, archive, registry, asset, release = self._release_fixture()
+        with (
+            patch.object(ADAPTER, "release_by_tag", return_value=None),
+            patch.object(
+                ADAPTER,
+                "run",
+                side_effect=subprocess.CalledProcessError(1, ["gh"]),
+            ) as request,
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaisesRegex(ValueError, "release creation failed"),
+        ):
+            ADAPTER.publish_release(
+                pin, archive, registry, "a" * 40, self.config["hermit_commit"]
+            )
+        self.assertEqual(request.call_count, 1)
+
     def test_runtime_fetch_is_captured_once_and_builder_failure_cannot_reuse_old_archive(
         self,
     ):
