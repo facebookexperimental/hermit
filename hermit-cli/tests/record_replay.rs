@@ -2915,6 +2915,23 @@ fn record_pselect_whose_mask_blocks_a_signal_a_sibling_takes() {
     record_select_mode("pselect-mask-shared-alarm");
 }
 
+/// The shared-alarm rounds through ppoll, whose recording waits on a private
+/// copy of the mask. The injected call left the private page under the
+/// waiter's own mask, so the SIGALRM stopped it before the syscall and the
+/// recording got EINTR where Linux gives 1, in 6 of 8 rounds; replay refused
+/// it (https://github.com/rrnewton/hermit/issues/4149).
+#[test]
+fn record_ppoll_whose_mask_blocks_a_signal_a_sibling_takes() {
+    record_select_mode("ppoll-mask-shared-alarm");
+}
+
+/// `record_ppoll_whose_mask_blocks_a_signal_a_sibling_takes` for epoll_pwait,
+/// which got EINTR in 7 of 8 rounds.
+#[test]
+fn record_epoll_pwait_whose_mask_blocks_a_signal_a_sibling_takes() {
+    record_select_mode("epoll-pwait-mask-shared-alarm");
+}
+
 /// The opposite idiom: the thread blocks SIGALRM and waits in pselect6 under a
 /// temporary mask that unblocks it, so the timer's SIGALRM ends the wait with
 /// EINTR and its handler runs before the call returns. Replay serves the call

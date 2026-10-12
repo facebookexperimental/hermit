@@ -53,6 +53,11 @@
  *                SIGALRM unblocked, so the kernel gives the process-directed
  *                SIGALRM to the writer while the main thread's pselect6 blocks
  *                it; replay must deliver it to the same thread
+ *   ppoll-mask-shared-alarm
+ *   epoll-pwait-mask-shared-alarm
+ *                the shared-alarm rounds through ppoll and epoll_pwait, whose
+ *                recordings wait on a private copy of the mask
+ *                (https://github.com/rrnewton/hermit/issues/4149)
  *   pselect-mask-unblocks-alarm
  *                the opposite idiom: the main thread blocks SIGALRM, which it
  *                catches, and waits in glibc pselect() with a 30 s bound and
@@ -774,7 +779,61 @@ static void* fill_shared_alarm_pipe_later(void* arg) {
  * recording (review of https://github.com/rrnewton/hermit/pull/3989). Each
  * round repeats the chance.
  */
-static int pselect_mask_shared_alarm(void) {
+enum shared_alarm_wait {
+  SHARED_ALARM_PSELECT,
+  SHARED_ALARM_PPOLL,
+  SHARED_ALARM_EPOLL_PWAIT,
+};
+
+/*
+ * Waits under `during` for the alarm pipe to become readable. Sets
+ * `*read_ready` when the call reports the pipe readable.
+ */
+static int shared_alarm_wait(
+    enum shared_alarm_wait call,
+    const sigset_t* during,
+    int* read_ready) {
+  int fd = alarm_pipe_fds[0];
+  int result = -1;
+  int result_errno = 0;
+  *read_ready = 0;
+  if (call == SHARED_ALARM_PPOLL) {
+    struct pollfd watched = {.fd = fd, .events = POLLIN};
+    errno = 0;
+    result = ppoll(&watched, 1, NULL, during);
+    result_errno = errno;
+    *read_ready = result > 0 && (watched.revents & POLLIN) != 0;
+  } else if (call == SHARED_ALARM_EPOLL_PWAIT) {
+    int epfd = epoll_create1(0);
+    struct epoll_event watched = {.events = EPOLLIN, .data.fd = fd};
+    if (epfd < 0 || epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &watched) != 0) {
+      perror("epoll");
+      exit(1);
+    }
+    struct epoll_event ready;
+    memset(&ready, 0, sizeof ready);
+    errno = 0;
+    result = epoll_pwait(epfd, &ready, 1, -1, during);
+    result_errno = errno;
+    *read_ready = result > 0 && ready.data.fd == fd;
+    close(epfd);
+  } else {
+    fd_set read_set;
+    FD_ZERO(&read_set);
+    FD_SET(fd, &read_set);
+    errno = 0;
+    result = pselect(fd + 1, &read_set, NULL, NULL, NULL, during);
+    result_errno = errno;
+    *read_ready = result > 0 && FD_ISSET(fd, &read_set);
+  }
+  errno = result_errno;
+  return result;
+}
+
+static int mask_shared_alarm(
+    enum shared_alarm_wait call,
+    const char* label,
+    const char* mode) {
   struct sigaction action;
   memset(&action, 0, sizeof action);
   action.sa_handler = count_masked_alarm;
@@ -801,14 +860,9 @@ static int pselect_mask_shared_alarm(void) {
       perror("pthread_create");
       return 1;
     }
-    fd_set read_set;
-    FD_ZERO(&read_set);
-    FD_SET(alarm_pipe_fds[0], &read_set);
-    errno = 0;
-    int result =
-        pselect(alarm_pipe_fds[0] + 1, &read_set, NULL, NULL, NULL, &during);
+    int read_ready = 0;
+    int result = shared_alarm_wait(call, &during, &read_ready);
     int result_errno = errno;
-    int read_ready = result > 0 && FD_ISSET(alarm_pipe_fds[0], &read_set);
     if (pthread_join(writer, NULL) != 0) {
       perror("pthread_join");
       return 1;
@@ -817,14 +871,14 @@ static int pselect_mask_shared_alarm(void) {
     close(alarm_pipe_fds[1]);
     printf(
         "%-24s round=%01d result=%011d errno=%011d read_ready=%01d alarms=%01d\n",
-        "pselect-mask-shared",
+        label,
         round,
         result,
         result < 0 ? result_errno : 0,
         read_ready,
         (int)masked_alarms);
     if (result != 1 || read_ready != 1 || masked_alarms != 1) {
-      fprintf(stderr, "pselect-mask-shared-alarm mismatch\n");
+      fprintf(stderr, "%s mismatch\n", mode);
       return 1;
     }
   }
@@ -2386,7 +2440,8 @@ int main(int argc, char** argv) {
         "epoll-pwait2-writer|epoll-pwait2-mask-raise|"
         "epoll-pwait2-mask-raise-tight|epoll-pwait2-mask-raise-tight24|"
         "epoll-pwait2-mask-sibling-race|epoll-pwait2-timeout-in-red-zone|"
-        "epoll-pwait2-zero-beside-busy-sibling|epoll-pwait2-error-order]\n",
+        "epoll-pwait2-zero-beside-busy-sibling|epoll-pwait2-error-order|"
+        "ppoll-mask-shared-alarm|epoll-pwait-mask-shared-alarm]\n",
         argv[0]);
     return 2;
   }
@@ -2409,7 +2464,20 @@ int main(int argc, char** argv) {
     return pselect_mask_sibling_rewrite();
   }
   if (strcmp(argv[1], "pselect-mask-shared-alarm") == 0) {
-    return pselect_mask_shared_alarm();
+    return mask_shared_alarm(
+        SHARED_ALARM_PSELECT,
+        "pselect-mask-shared",
+        "pselect-mask-shared-alarm");
+  }
+  if (strcmp(argv[1], "ppoll-mask-shared-alarm") == 0) {
+    return mask_shared_alarm(
+        SHARED_ALARM_PPOLL, "ppoll-mask-shared", "ppoll-mask-shared-alarm");
+  }
+  if (strcmp(argv[1], "epoll-pwait-mask-shared-alarm") == 0) {
+    return mask_shared_alarm(
+        SHARED_ALARM_EPOLL_PWAIT,
+        "epoll-pwait-mask-shared",
+        "epoll-pwait-mask-shared-alarm");
   }
   if (strcmp(argv[1], "pselect-mask-unblocks-alarm") == 0) {
     return pselect_mask_unblocks_alarm(0);

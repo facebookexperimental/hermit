@@ -2295,7 +2295,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4164): 191.
     // And record_nested_vfork_chains
     // (https://github.com/rrnewton/hermit/issues/4163): 192.
-    ("test.record_replay", 192),
+    // And record_ppoll_whose_mask_blocks_a_signal_a_sibling_takes and
+    // record_epoll_pwait_whose_mask_blocks_a_signal_a_sibling_takes
+    // (https://github.com/rrnewton/hermit/issues/4149): 194.
+    ("test.record_replay", 194),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
