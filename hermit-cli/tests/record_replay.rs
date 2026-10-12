@@ -27,6 +27,10 @@ use std::time::Instant;
 
 use hermit::HERMIT_INTERNAL_FAILURE_EXIT;
 use reverie::process::Command as ReverieCommand;
+use skid_overshoot::retry_typed_skid_refusal;
+
+#[path = "common/skid_overshoot.rs"]
+mod skid_overshoot;
 use reverie::process::Mount;
 use reverie::process::Namespace;
 
@@ -734,35 +738,65 @@ fn record_replay_command_with_policy(
 }
 
 fn canonical_record_replay_command(name: &str, program: &Path, args: &[&OsStr]) -> String {
-    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
-    let verdict_dir = tempfile::tempdir().expect("failed to create verification directory");
-    let verdict_path = verdict_dir.path().join("verify.json");
-    let mut command = Command::new("timeout");
-    command
-        .env("HERMIT_MODE", "record")
-        .args(["--kill-after=5s", "45s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args([
-            "--log=info",
-            "--backend=ptrace",
-            "record",
-            "start",
-            "--strict",
-            "--verify",
-            "--verify-strict",
-            "--record-timeout=30",
-        ])
-        .arg(format!("--verify-json={}", verdict_path.display()))
-        .arg(format!("--data-dir={}", data_dir.path().display()))
-        .arg("--")
-        .arg(program)
-        .args(args);
-    let output = command_output(command, &format!("canonical record/replay for {name}"));
-    let combined_output = format!(
-        "{}{}",
+    canonical_record_replay_command_retrying_skid(name, program, args, 1)
+}
+
+/// `canonical_record_replay_command`, repeated only when an attempt ends in a
+/// typed PMU skid-overshoot refusal (`skid_overshoot_refusal`), at most
+/// `max_attempts` times in all (https://github.com/rrnewton/hermit/issues/1845).
+/// Such a refusal measures the host's PMU interrupt latency, not the guest
+/// (https://github.com/rrnewton/reverie/issues/990), so a fresh recording and
+/// replay is a new measurement. Every retried attempt prints a `SKID-RETRY`
+/// line with its refusal to the test's stderr; any other outcome, and the
+/// last attempt, is checked as `canonical_record_replay_command` checks it.
+fn canonical_record_replay_command_retrying_skid(
+    name: &str,
+    program: &Path,
+    args: &[&OsStr],
+    max_attempts: u32,
+) -> String {
+    let label = format!("canonical record/replay for {name}");
+    let (attempt, output, (rendered, verdict_path, _dirs)) =
+        retry_typed_skid_refusal(name, max_attempts, || {
+            let data_dir =
+                tempfile::tempdir().expect("failed to create Hermit recording directory");
+            let verdict_dir = tempfile::tempdir().expect("failed to create verification directory");
+            let verdict_path = verdict_dir.path().join("verify.json");
+            let mut command = Command::new("timeout");
+            command
+                .env("HERMIT_MODE", "record")
+                .args(["--kill-after=5s", "45s"])
+                .arg(env!("CARGO_BIN_EXE_hermit"))
+                .args([
+                    "--log=info",
+                    "--backend=ptrace",
+                    "record",
+                    "start",
+                    "--strict",
+                    "--verify",
+                    "--verify-strict",
+                    "--record-timeout=30",
+                ])
+                .arg(format!("--verify-json={}", verdict_path.display()))
+                .arg(format!("--data-dir={}", data_dir.path().display()))
+                .arg("--")
+                .arg(program)
+                .args(args);
+            let rendered = format!("{command:?}");
+            let output = command
+                .output()
+                .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
+            (output, (rendered, verdict_path, (data_dir, verdict_dir)))
+        });
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "{label} failed (attempt {attempt} of at most {max_attempts}): {rendered}\nstatus: \
+         {}\nstdout:\n{}\nstderr:\n{stderr}",
+        output.status,
         String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
     );
+    let combined_output = format!("{}{stderr}", String::from_utf8_lossy(&output.stdout));
     assert!(
         combined_output.contains("Success: replay matched recording."),
         "Hermit did not report deterministic replay for {name}:\n{combined_output}"
@@ -2568,11 +2602,18 @@ fn record_refuses_a_removed_working_directory() {
 /// https://github.com/rrnewton/hermit/issues/3569 a pipe that held data while
 /// recording was reported ready at record time and not ready at replay.
 fn record_select_mode(mode: &str) {
+    record_select_mode_retrying_skid(mode, 1);
+}
+
+/// `record_select_mode`, retrying a typed skid-overshoot refusal
+/// (`canonical_record_replay_command_retrying_skid`).
+fn record_select_mode_retrying_skid(mode: &str, max_attempts: u32) {
     let _guard = hermit_record_lock();
-    canonical_record_replay_command(
+    canonical_record_replay_command_retrying_skid(
         &format!("select {mode}"),
         &workload("c_record_replay_select").path,
         &[OsStr::new(mode)],
+        max_attempts,
     );
 }
 
@@ -3122,13 +3163,40 @@ fn record_masked_epoll_pwait2_whose_timeout_is_in_the_red_zone() {
     record_select_mode("epoll-pwait2-timeout-in-red-zone");
 }
 
+/// The most attempts `record_zero_timeout_epoll_pwait2_beside_a_busy_sibling`
+/// makes when each earlier one ends in a typed skid-overshoot refusal.
+///
+/// Its sibling must loop without a system call, so the PMU timer preempts it
+/// at least once, and a late PMU interrupt there refuses the replay. The
+/// retained exact-head full validation logs of 2026-10-11 and 2026-10-12 show
+/// 22 runs of this test, 2 of them refused, with overshoots of 122 and 78,116
+/// retired conditional branches (https://github.com/rrnewton/hermit/issues/4165):
+/// p = 0.09. 102 local runs on the AMD EPYC development host (30 sequential,
+/// 72 under 12-way parallel load) drew none. At p = 0.09, five independent
+/// attempts all refuse about 6 times in a million; even at the highest rate
+/// measured for a PMU-preempted spinner (p = 0.40, `SKID_RETRY_MAX_ATTEMPTS`
+/// in cli.rs), 1.0% of the time. One attempt costs about 2.8 CPU-s and 3 s of
+/// wall time there, so five fit the record_replay node's default per-test
+/// budgets (22 CPU-s, 57 s).
+///
+/// A retried attempt's `SKID-RETRY` line goes to the test's stderr, which
+/// nextest discards when the test passes (`success-output = "never"` in
+/// .config/nextest.toml). So retries are visible only when the test fails,
+/// and a rise in the refusal rate would show only as more failures at the
+/// bound, as for the cli.rs PMU spinner cases.
+const BUSY_SIBLING_SKID_MAX_ATTEMPTS: u32 = 5;
+
 /// A masked zero-timespec epoll_pwait2 beside a sibling that loops without a
 /// system call: the call keeps its turn. In the background it would wait
 /// behind the always-runnable sibling forever (Claude review of
-/// https://github.com/rrnewton/hermit/pull/4128).
+/// https://github.com/rrnewton/hermit/pull/4128). A typed skid-overshoot
+/// refusal is retried (`BUSY_SIBLING_SKID_MAX_ATTEMPTS`).
 #[test]
 fn record_zero_timeout_epoll_pwait2_beside_a_busy_sibling() {
-    record_select_mode("epoll-pwait2-zero-beside-busy-sibling");
+    record_select_mode_retrying_skid(
+        "epoll-pwait2-zero-beside-busy-sibling",
+        BUSY_SIBLING_SKID_MAX_ATTEMPTS,
+    );
 }
 
 /// epoll_pwait2 checks its timespec before its mask, as Linux does: an
