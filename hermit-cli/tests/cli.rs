@@ -24500,7 +24500,7 @@ fn signals_to_hermits_own_tasks_are_dropped_in_every_mode() {
     assert_eq!(
         run_signal_hermit_tasks(
             &["--no-sequentialize-threads", "--max-timeslice=disabled"],
-            &["owner-race", "2000"]
+            &["owner-race", "20000"]
         ),
         "F_SETOWN_EX race: owner PID 1 0 times, other errors 0\n\
          FIOSETOWN race: owner PID 1 0 times, other errors 0\n"
