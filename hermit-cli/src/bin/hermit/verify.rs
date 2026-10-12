@@ -3168,18 +3168,18 @@ mod tests {
         static CWD: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = CWD.lock().unwrap_or_else(|e| e.into_inner());
 
-        // Root the working directory in the SOURCE TREE, not in TMPDIR. A
-        // plain `tempdir()` lands beside the staged file and the cross-
-        // filesystem rename never happens, so the test would pass against the
-        // defect -- measured: it did. On this host the checkout and /tmp are
-        // distinct btrfs subvolumes (st_dev 46 vs 47), and cross-subvolume
-        // rename(2) is EXDEV, which is what makes this end-to-end rather than
-        // decorative.
+        // Root the working directory where the process already runs, not in
+        // TMPDIR. A plain `tempdir()` lands beside the staged file and the
+        // cross-filesystem rename never happens, so the test would pass
+        // against the defect -- measured: it did. Where the run directory and
+        // /tmp are distinct filesystems, as a checkout beside a tmpfs /tmp
+        // ordinarily is, cross-filesystem rename(2) is EXDEV, which is what
+        // makes this end-to-end rather than decorative.
+        let previous = std::env::current_dir().unwrap();
         let dir = tempfile::Builder::new()
             .prefix("verify-json-bare-")
-            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .tempdir_in(&previous)
             .unwrap();
-        let previous = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
 
         let outcome = (|| {
