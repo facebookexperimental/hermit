@@ -21774,6 +21774,30 @@ fn realtime_signals_are_delivered_with_their_values_and_verify() {
             "InboundSignal commits for signal {signal}:\n{log}"
         );
     }
+    // And each is counted in its thread's signal statistics
+    // (`ThreadStats::count_signal`): Detcore numbers a thread's inbound
+    // signals 0, 1, 2, ..., so a realtime signal that skipped the count would
+    // repeat an index.
+    let mut indices: std::collections::BTreeMap<&str, Vec<usize>> = Default::default();
+    for line in log.lines() {
+        let Some((head, tail)) = line.split_once("] handling inbound signal (#") else {
+            continue;
+        };
+        let dtid = head.rsplit("[dtid ").next().unwrap_or(head);
+        let index = tail.split(')').next().unwrap().parse::<usize>().unwrap();
+        indices.entry(dtid).or_default().push(index);
+    }
+    assert!(
+        !indices.is_empty(),
+        "no inbound signals were handled:\n{log}"
+    );
+    for (dtid, seen) in &indices {
+        let expected: Vec<usize> = (0..seen.len()).collect();
+        assert_eq!(
+            seen, &expected,
+            "thread {dtid}'s inbound signals were not counted one by one:\n{log}"
+        );
+    }
 }
 
 /// A process-directed signal a thread sends to its own multi-threaded process
