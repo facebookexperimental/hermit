@@ -56,8 +56,8 @@ jobs:
     if: >-
       github.repository == 'rrnewton/hermit' && github.ref == 'refs/heads/main' &&
       (github.event_name != 'schedule' || vars.COMPATIBILITY_NIGHTLY_ENABLED == 'true')
-    # A ledger rebuild runs on the self-hosted `gate` runner,
-    # hermit-gate-newton; every other Docs run stays on ubuntu-latest. The
+    # A ledger rebuild runs on the self-hosted `gate` runner; every other Docs
+    # run stays on ubuntu-latest. The
     # rebuild outgrew the hosted runner's 16 GB of memory: the builder's own
     # process peaked at 23.2 GiB in stage1.export (24.9 GB reported by the
     # builder, ledger 1d2bb9dc, 2026-10-12, measured locally), and both hosted
@@ -68,10 +68,10 @@ jobs:
     # runner is a native service on a large shared host with no memory limit of
     # its own. The `pmu` runners are containers started with a 16 GB default
     # limit (dev-hermit ci-hub/runners/init-runner.sh), so they would not help.
-    # The `gate` label alone does not select hermit-gate-newton: the pmu runner
-    # hermit-ci-newton-3 carries it too and took
+    # The `gate` label alone does not select that runner: a `pmu` runner
+    # carries it too and took
     # https://github.com/rrnewton/hermit/actions/runs/38285455905. So the job
-    # also asks for `docs-rebuild`, a label only hermit-gate-newton carries;
+    # also asks for `docs-rebuild`, a label only the `gate` runner carries;
     # until a runner has it, a rebuild run waits in the queue rather than
     # starting on a runner too small for it. "Keep a self-hosted run off the
     # host's shared state" and the runner.environment conditions below keep the
@@ -87,7 +87,7 @@ jobs:
     # Before any git command: the runner's user has git URL rewrites in its
     # global configuration that serve some GitHub URLs from stale local mirrors,
     # so git reads an empty global configuration file instead (not /dev/null,
-    # which git rejected as "bad config line 1" on hermit-ci-newton-3), and its
+    # which git rejected as "bad config line 1" on a `pmu` runner), and its
     # PATH lacks the user's Rust toolchain. The rebuild's scratch and temporary
     # files go in one job-owned directory, removed by the job's last step, never
     # in the shared host's /tmp. That directory is outside the runner's work
