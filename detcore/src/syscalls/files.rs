@@ -423,6 +423,23 @@ fn resolved_at_fdcwd_path(pid: i32, path: &Path) -> Option<PathBuf> {
     Some(Path::new("/").join(guest_cwd).join(path))
 }
 
+/// Re-spell a refused timer-slack open as the read-only inode witness it is.
+///
+/// A timer-slack descriptor never carries guest I/O: reads, writes and seeks
+/// are served from the virtual thread state, and the host descriptor only
+/// witnesses the task incarnation that was open at bind time. A read-only
+/// `/proc` mount (reverie's fallback when a fresh `proc` mount is refused)
+/// therefore rejects an access mode Detcore never exercises, which would make
+/// a guest's virtual timer slack depend on the host's mount flags.
+fn timer_slack_witness_open(path: &Path, call: syscalls::Openat) -> Option<syscalls::Openat> {
+    if !ProcfsFile::from_path(path).is_some_and(|procfs| procfs.is_timer_slack()) {
+        return None;
+    }
+    let flags = call.flags();
+    (flags.bits() & libc::O_ACCMODE != libc::O_RDONLY)
+        .then(|| call.with_flags(flags & !OFlag::from_bits_truncate(libc::O_ACCMODE)))
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     async fn observe_timer_slack_identity<G: Guest<Self>>(
         &self,
@@ -959,7 +976,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Ask for permission to resolve this path into a file:
         let request = guest.thread_state().mk_request(resource, Permission::R);
         resource_request(guest, request).await;
-        let res = self.record_or_replay(guest, Syscall::Openat(call)).await;
+        let mut res = self.record_or_replay(guest, Syscall::Openat(call)).await;
+        if matches!(res, Err(Errno::EROFS))
+            && let Some(witness) = timer_slack_witness_open(&observed_path, call)
+        {
+            res = self.record_or_replay(guest, Syscall::Openat(witness)).await;
+        }
 
         match res {
             Ok(fd) => {

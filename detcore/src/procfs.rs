@@ -1012,6 +1012,12 @@ impl ProcfsFile {
         Some(bytes)
     }
 
+    /// Whether this is a timer-slack procfs file, including the `self` alias
+    /// whose target is still unbound.
+    pub(crate) fn is_timer_slack(&self) -> bool {
+        matches!(self.kind, ProcfsKind::TimerSlack(_))
+    }
+
     /// Return the task id bound to a top-level timer-slack procfs file.
     pub(crate) fn timer_slack_target(&self) -> Option<i32> {
         match self.kind {
