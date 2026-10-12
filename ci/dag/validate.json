@@ -7238,6 +7238,13 @@
           "category": "c-programs",
           "test": "c-programs/prodcons-determinism",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/prodcons-determinism",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -10403,6 +10410,13 @@
           "test": "c-programs/thread-sync-determinism",
           "mode": "chaos",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/thread-sync-determinism",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -50131,6 +50145,13 @@
           "category": "c-programs",
           "test": "c-programs/prodcons-determinism",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/prodcons-determinism",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -53296,6 +53317,13 @@
           "test": "c-programs/thread-sync-determinism",
           "mode": "chaos",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/thread-sync-determinism",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",

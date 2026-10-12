@@ -43,7 +43,6 @@ c-programs/pipe2-errno-precedence verify dbt
 c-programs/ppoll-simulation verify sabre
 c-programs/printf-with-threads verify sabre
 c-programs/process-mrelease-enosys verify dbt
-c-programs/prodcons-determinism verify kvm
 c-programs/prodcons-determinism verify sabre
 c-programs/pthread-lifecycle verify sabre
 c-programs/ptrace-eperm verify dbt
@@ -67,7 +66,6 @@ c-programs/sysv-sem-enosys verify dbt
 c-programs/sysv-shm-enosys verify dbt
 c-programs/tee-enosys verify dbt
 c-programs/thread-self-procfs-handoff verify sabre
-c-programs/thread-sync-determinism verify kvm
 c-programs/threadexhaustion verify sabre
 c-programs/timer-family-identity verify ptrace
 c-programs/userfaultfd-self-service verify ptrace
