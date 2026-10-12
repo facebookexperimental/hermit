@@ -1940,7 +1940,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two pidfd_send_signal scope and descriptor tests (https://github.com/rrnewton/hermit/issues/4108): 1431.
     // The 11 deadline-cap tests (scheduler::test, tool_local::timeslice_tests;
     // https://github.com/rrnewton/hermit/issues/4121) retain all 1431: 1442.
-    ("test.detcore_unit", 1442),
+    // And the three single-virtual-CPU procfs tests (cpuinfo, sysfs CPU lists, /proc/stat;
+    // https://github.com/rrnewton/hermit/issues/4160): 1445.
+    ("test.detcore_unit", 1445),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2131,7 +2133,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4113): 282.
     // And external_signal_interrupt::ptrace_a_stop_signal_send_keeps_a_sighup_poll_to_its_deadline
     // (https://github.com/rrnewton/hermit/issues/4111): 283.
-    ("test.hermit_integration", 283),
+    // And procfs_determinism::sys_cpu_lists_report_one_virtual_cpu and
+    // procfs_determinism::cpu_count_queries_agree_on_one_virtual_cpu
+    // (https://github.com/rrnewton/hermit/issues/4160): 285.
+    ("test.hermit_integration", 285),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -3034,7 +3039,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the 14 own-process signal tests: 1429.
     // And the two pidfd_send_signal scope and descriptor tests: 1431.
     // And the 11 deadline-cap tests: 1442.
-    ("test.detcore_unit_on_host", 1442),
+    // And the three single-virtual-CPU procfs tests: 1445.
+    ("test.detcore_unit_on_host", 1445),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -3070,7 +3076,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the four targeted-chaos sched_yield tests: 281.
     // And the ppoll tight-stack test: 282.
     // And the stop-signal SIGHUP poll test: 283.
-    ("test.hermit_integration_on_host", 283),
+    // And the two single-virtual-CPU procfs tests: 285.
+    ("test.hermit_integration_on_host", 285),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

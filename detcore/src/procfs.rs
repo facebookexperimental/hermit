@@ -147,6 +147,9 @@ enum ProcfsKind {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-958): Review host-global uevent sequence normalization.
     UeventSeqnum,
+    /// `/sys/devices/system/cpu/{online,possible,present}`: the host's CPU
+    /// list, reported as Hermit's single virtual CPU.
+    CpuList,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-957): Review Btrfs reservation normalization.
     BtrfsBytesMayUse,
@@ -739,6 +742,9 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-958): Review host-global uevent sequence normalization.
             "/sys/kernel/uevent_seqnum" => ProcfsKind::UeventSeqnum,
+            "/sys/devices/system/cpu/online"
+            | "/sys/devices/system/cpu/possible"
+            | "/sys/devices/system/cpu/present" => ProcfsKind::CpuList,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-939): Review NUMA node VM accounting normalization.
             other if is_node_vmstat_path(other) => ProcfsKind::NodeVmstat,
@@ -990,6 +996,7 @@ impl ProcfsFile {
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
             ProcfsKind::Vmstat => sanitize_vmstat(&contents),
             ProcfsKind::UeventSeqnum => sanitize_uevent_seqnum(&contents),
+            ProcfsKind::CpuList => sanitize_cpu_list(&contents),
             ProcfsKind::BtrfsBytesMayUse => sanitize_btrfs_bytes_may_use(&contents),
             ProcfsKind::BlockInflight => sanitize_block_inflight(&contents),
             ProcfsKind::IrqPerCpuCount => sanitize_irq_per_cpu_count(&contents),
@@ -1508,23 +1515,69 @@ fn sanitize_status(contents: &[u8], virtual_identity: Option<(i32, i32, i32)>) -
     normalized
 }
 
+/// Reports `/proc/cpuinfo` for Hermit's single virtual CPU, the one
+/// `sched_getaffinity` returns. The kernel prints one block per online CPU,
+/// separated by blank lines; only the first block is kept, so the processor
+/// count no longer follows the host's. Its topology fields describe a
+/// one-core, one-thread package, and its frequency is the virtual 1 GHz.
 fn sanitize_cpuinfo(contents: &[u8]) -> Vec<u8> {
-    const CPU_MHZ: &[u8] = b"cpu MHz";
+    const TOPOLOGY: &[(&[u8], &[u8])] = &[
+        (b"cpu MHz", b"cpu MHz\t\t: 1000.000"),
+        (b"physical id", b"physical id\t: 0"),
+        (b"siblings", b"siblings\t: 1"),
+        (b"core id", b"core id\t\t: 0"),
+        (b"cpu cores", b"cpu cores\t: 1"),
+        (b"apicid", b"apicid\t\t: 0"),
+        (b"initial apicid", b"initial apicid\t: 0"),
+    ];
 
     let mut normalized = Vec::with_capacity(contents.len());
+    let mut seen_processor = false;
     for line in contents.split_inclusive(|byte| *byte == b'\n') {
         let has_newline = line.last() == Some(&b'\n');
         let body = line.strip_suffix(b"\n").unwrap_or(line);
-        if body.starts_with(CPU_MHZ) {
-            normalized.extend_from_slice(b"cpu MHz\t\t: 1000.000");
-        } else {
-            normalized.extend_from_slice(body);
+        if body.starts_with(b"processor") {
+            if seen_processor {
+                // The second CPU's block: the blank line that ended the first
+                // one has already been copied, as the kernel's file ends.
+                break;
+            }
+            seen_processor = true;
+        }
+        let key = body
+            .split(|byte| *byte == b':')
+            .next()
+            .unwrap_or_default()
+            .trim_ascii_end();
+        match TOPOLOGY.iter().find(|(name, _)| key == *name) {
+            Some((_, replacement)) => normalized.extend_from_slice(replacement),
+            None => normalized.extend_from_slice(body),
         }
         if has_newline {
             normalized.push(b'\n');
         }
     }
     normalized
+}
+
+/// Reports a kernel CPU list (`/sys/devices/system/cpu/online` and its
+/// `possible` and `present` siblings) as Hermit's single virtual CPU. glibc's
+/// `get_nprocs`, and so `sysconf(_SC_NPROCESSORS_ONLN)`, `getconf` and
+/// Python's `os.cpu_count`, read `online`; reported raw, they count the host's
+/// CPUs while `sched_getaffinity` reports one. Anything that is not a cpulist
+/// of digits, commas and ranges is returned unchanged.
+fn sanitize_cpu_list(contents: &[u8]) -> Vec<u8> {
+    let Some(list) = contents.strip_suffix(b"\n") else {
+        return contents.to_vec();
+    };
+    if list.is_empty()
+        || !list
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || *byte == b',' || *byte == b'-')
+    {
+        return contents.to_vec();
+    }
+    b"0\n".to_vec()
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1885,20 +1938,29 @@ fn sanitize_system_stat(
         b"softirq",
     ];
 
-    let cpu_count = contents
-        .split(|byte| *byte == b'\n')
-        .filter_map(|line| line.split(|byte| byte.is_ascii_whitespace()).next())
-        .filter(|name| name.starts_with(b"cpu") && *name != b"cpu")
-        .count() as u64;
-    let per_cpu_idle_ticks = virtual_uptime_seconds.saturating_mul(100);
+    // Hermit has one virtual CPU, so only the aggregate `cpu` line and the
+    // `cpu0` line are kept; the host's other per-CPU lines would report its
+    // CPU count (glibc's `get_nprocs` falls back to counting them).
+    let single_cpu = contents
+        .split_inclusive(|byte| *byte == b'\n')
+        .filter(|line| {
+            let name = line
+                .split(|byte| byte.is_ascii_whitespace())
+                .next()
+                .unwrap_or_default();
+            !name.starts_with(b"cpu") || name == b"cpu" || name == b"cpu0"
+        })
+        .flatten()
+        .copied()
+        .collect::<Vec<u8>>();
+    // With one CPU the aggregate line and `cpu0` both report its idle time.
+    let idle_ticks = virtual_uptime_seconds.saturating_mul(100);
     let counters = sanitize_named_counters(
-        contents,
+        &single_cpu,
         |name| name.starts_with(b"cpu") || VOLATILE_FIELDS.contains(&name),
         |name, index| {
-            if index == 0 && name == b"cpu" {
-                per_cpu_idle_ticks.saturating_mul(cpu_count)
-            } else if index == 0 && name.starts_with(b"cpu") {
-                per_cpu_idle_ticks
+            if index == 0 && name.starts_with(b"cpu") {
+                idle_ticks
             } else {
                 0
             }
@@ -5712,6 +5774,62 @@ Rss:                   4 kB\n" as &[u8];
         assert_eq!(
             sanitize_cpuinfo(input),
             b"processor\t: 0\ncpu MHz\t\t: 1000.000\ncache size\t: 1024 KB\n"
+        );
+    }
+
+    #[test]
+    fn cpuinfo_reports_one_virtual_cpu() {
+        let block = |n: u32| {
+            format!(
+                "processor\t: {n}\nmodel name\t: Example CPU\ncpu MHz\t\t: 2994.183\n\
+                 physical id\t: 1\nsiblings\t: 8\ncore id\t\t: {n}\ncpu cores\t: 4\n\
+                 apicid\t\t: {n}\ninitial apicid\t: {n}\nflags\t\t: fpu sse2\n\n"
+            )
+        };
+        let host = format!("{}{}{}", block(0), block(1), block(2));
+        assert_eq!(
+            String::from_utf8(sanitize_cpuinfo(host.as_bytes())).unwrap(),
+            "processor\t: 0\nmodel name\t: Example CPU\ncpu MHz\t\t: 1000.000\n\
+             physical id\t: 0\nsiblings\t: 1\ncore id\t\t: 0\ncpu cores\t: 1\n\
+             apicid\t\t: 0\ninitial apicid\t: 0\nflags\t\t: fpu sse2\n\n"
+        );
+        // A single-CPU host's file is already the virtual shape.
+        assert_eq!(
+            sanitize_cpuinfo(b"processor\t: 0\ncpu cores\t: 1\n\n"),
+            b"processor\t: 0\ncpu cores\t: 1\n\n"
+        );
+    }
+
+    #[test]
+    fn cpu_list_reports_one_virtual_cpu() {
+        assert_eq!(sanitize_cpu_list(b"0-315\n"), b"0\n");
+        assert_eq!(sanitize_cpu_list(b"0-3,8,10-11\n"), b"0\n");
+        assert_eq!(sanitize_cpu_list(b"0\n"), b"0\n");
+        // Not the kernel's cpulist format: left alone.
+        assert_eq!(sanitize_cpu_list(b"0-3"), b"0-3");
+        assert_eq!(sanitize_cpu_list(b"\n"), b"\n");
+        assert_eq!(sanitize_cpu_list(b"all\n"), b"all\n");
+        for path in ["online", "possible", "present"] {
+            assert_eq!(
+                ProcfsFile::from_path(Path::new(&format!("/sys/devices/system/cpu/{path}")))
+                    .unwrap()
+                    .kind,
+                ProcfsKind::CpuList,
+                "{path}"
+            );
+        }
+        assert!(ProcfsFile::from_path(Path::new("/sys/devices/system/cpu/offline")).is_none());
+    }
+
+    #[test]
+    fn system_stat_reports_one_virtual_cpu() {
+        assert_eq!(
+            sanitize_system_stat(
+                b"cpu  1 2 3\ncpu0 1 2 3\ncpu1 4 5 6\ncpu315 7 8 9\nintr 9 8 7\nbtime 1234\n",
+                120,
+                1_767_225_480,
+            ),
+            b"cpu 12000 0 0\ncpu0 12000 0 0\nintr 0 0 0\nbtime 1767225480\n"
         );
     }
 

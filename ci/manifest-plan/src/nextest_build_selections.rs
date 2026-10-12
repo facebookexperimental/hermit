@@ -644,8 +644,10 @@ mod tests {
             // (https://github.com/rrnewton/hermit/issues/4068), plus the ppoll
             // tight-stack test (https://github.com/rrnewton/hermit/issues/4113),
             // plus the stop-signal SIGHUP poll test
-            // (https://github.com/rrnewton/hermit/issues/4111).
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "283");
+            // (https://github.com/rrnewton/hermit/issues/4111), plus the two
+            // single-virtual-CPU procfs tests in procfs_determinism
+            // (https://github.com/rrnewton/hermit/issues/4160).
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "285");
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

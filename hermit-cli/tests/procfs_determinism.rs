@@ -313,6 +313,7 @@ fn proc_system_cpu_accounting_is_deterministic() {
             .filter(|line| line.starts_with("cpu"))
             .collect::<Vec<_>>();
         let cpu_count = cpu_lines.len() - 1;
+        assert_eq!(cpu_count, 1, "/proc/stat should list one virtual CPU");
         for line in &cpu_lines {
             let mut fields = line.split_whitespace();
             let name = fields.next().expect("CPU line has no name");
@@ -411,6 +412,15 @@ fn proc_cpuinfo_is_deterministic() {
     assert_deterministic("/proc/cpuinfo", |contents| {
         let text = std::str::from_utf8(contents).expect("cpuinfo should be UTF-8");
         assert!(text.contains("processor\t:"));
+        let processors = text
+            .lines()
+            .filter(|line| line.starts_with("processor"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            processors,
+            ["processor\t: 0"],
+            "cpuinfo should describe Hermit's one virtual CPU"
+        );
         let frequencies = text
             .lines()
             .filter(|line| line.starts_with("cpu MHz"))
@@ -422,6 +432,48 @@ fn proc_cpuinfo_is_deterministic() {
             "cpuinfo contains a volatile frequency"
         );
     });
+}
+
+#[test]
+fn sys_cpu_lists_report_one_virtual_cpu() {
+    for path in [
+        "/sys/devices/system/cpu/online",
+        "/sys/devices/system/cpu/possible",
+        "/sys/devices/system/cpu/present",
+    ] {
+        assert_deterministic(path, |contents| assert_eq!(contents, b"0\n", "{path}"));
+    }
+}
+
+/// `nproc` asks `sched_getaffinity`; `getconf _NPROCESSORS_ONLN` asks glibc's
+/// `get_nprocs`, which reads `/sys/devices/system/cpu/online`. A build that
+/// sizes its parallelism from either must see the same single CPU, or its
+/// behaviour follows the host it ran on.
+#[test]
+fn cpu_count_queries_agree_on_one_virtual_cpu() {
+    let _guard = hermit_run_lock();
+    let mut command = Command::new(hermit_test::hermit_binary());
+    command.args([
+        "--log=error",
+        "run",
+        "--base-env=minimal",
+        "--",
+        "/bin/sh",
+        "-c",
+        "nproc; getconf _NPROCESSORS_ONLN",
+    ]);
+    hermit_test::configure_guest_execution(&mut command);
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+    assert!(
+        output.status.success(),
+        "CPU-count probe failed: {rendered}\nstatus: {}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "1\n1\n");
 }
 
 #[test]
