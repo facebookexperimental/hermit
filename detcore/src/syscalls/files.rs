@@ -730,6 +730,33 @@ pub(crate) fn pidfd_signal_scope(flags: u32) -> Result<PidfdSignalScope, Errno> 
     }
 }
 
+/// `pidfd_send_signal`'s sentinel for the calling thread (Linux 6.15 and later).
+const PIDFD_SELF_THREAD: RawFd = -10000;
+/// `pidfd_send_signal`'s sentinel for the calling thread's thread group.
+const PIDFD_SELF_THREAD_GROUP: RawFd = -10001;
+
+/// The task a `PIDFD_SELF_*` sentinel names, and the scope Linux gives it when
+/// no flag is set: the calling thread (thread-directed) or its thread group
+/// (process-directed); `None` for any other descriptor
+/// (https://github.com/rrnewton/hermit/issues/4147).
+fn pidfd_self_target<T, G: Guest<Detcore<T>>>(
+    guest: &mut G,
+    pidfd: RawFd,
+) -> Option<(DetPid, PidfdSignalScope)>
+where
+    T: RecordOrReplay,
+{
+    let state = guest.thread_state();
+    match pidfd {
+        PIDFD_SELF_THREAD => Some((
+            DetPid::from_raw(state.dettid.as_raw()),
+            PidfdSignalScope::Thread,
+        )),
+        PIDFD_SELF_THREAD_GROUP => Some((state.detpid?, PidfdSignalScope::Process)),
+        _ => None,
+    }
+}
+
 /// What a descriptor that is not a modeled pidfd names for `pidfd_send_signal`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ProcessDirectoryDescriptor {
@@ -6846,77 +6873,92 @@ impl<T: RecordOrReplay> Detcore<T> {
         flags: u32,
     ) -> Result<i64, Error> {
         // Linux checks the flags before it looks at the descriptor.
-        let scope = pidfd_signal_scope(flags)?;
-        // An unknown or closed descriptor is EBADF, and so is any file that is
-        // neither a pidfd nor an opened path (a pipe, a socket, an eventfd...).
-        // Linux's fdget skips an O_PATH descriptor, so it is EBADF too.
-        let kind = guest
-            .thread_state()
-            .with_detfd(pidfd, |detfd| match detfd.ty() {
-                FdType::Pidfd => Some(Some(detfd.pidfd_target())),
-                FdType::Regular if detfd.status_flags() & libc::O_PATH == 0 => Some(None),
-                _ => None,
-            })?;
-        let Some(kind) = kind else {
-            return Err(Errno::EBADF.into());
-        };
-        // `named` is the pid the descriptor names. A pidfd from `pidfd_open`
-        // names a process leader; a `/proc/<tid>` directory may name any thread,
-        // whose process is its leader's (https://github.com/rrnewton/hermit/issues/4094).
-        let named = match kind {
-            Some(target) => target,
-            None => {
-                let descriptor = if self.cfg.recordreplay_modes {
-                    // Replay holds a placeholder for a reopened file, so the
-                    // descriptor cannot be read the same way in both.
-                    ProcessDirectoryDescriptor::Unknown(
-                        "record and replay do not read what a descriptor names",
-                    )
-                } else if !guest
-                    .config()
-                    .backend_supports_blocked_wait_signal_interruption
-                {
-                    // Only on ptrace are the guest's thread ids the host's, so
-                    // that its descriptors can be read through /proc/<tid>.
-                    ProcessDirectoryDescriptor::Unknown(
-                        "this backend's guest thread ids are not host thread ids",
-                    )
-                } else {
-                    process_directory_descriptor(guest.tid().as_raw(), pidfd)
-                };
-                match descriptor {
-                    ProcessDirectoryDescriptor::Process(task)
-                        if crate::tool_global::names_hermit_task(guest, None, task.as_raw())
-                            .await =>
+        let mut scope = pidfd_signal_scope(flags)?;
+        // The two sentinels name the caller without a descriptor: its thread
+        // (`PIDFD_SELF_THREAD`, thread-directed unless a flag says otherwise)
+        // or its thread group (`PIDFD_SELF_THREAD_GROUP`)
+        // (https://github.com/rrnewton/hermit/issues/4147).
+        let named = if let Some((target, default)) = pidfd_self_target(guest, pidfd) {
+            if flags == 0 {
+                scope = default;
+            }
+            Some(target)
+        } else {
+            // An unknown or closed descriptor is EBADF, and so is any file that is
+            // neither a pidfd nor an opened path (a pipe, a socket, an eventfd...).
+            // Linux's fdget skips an O_PATH descriptor, so it is EBADF too.
+            let kind = guest
+                .thread_state()
+                .with_detfd(pidfd, |detfd| match detfd.ty() {
+                    FdType::Pidfd => Some(Some(detfd.pidfd_target())),
+                    FdType::Regular if detfd.status_flags() & libc::O_PATH == 0 => Some(None),
+                    _ => None,
+                })?;
+            let Some(kind) = kind else {
+                return Err(Errno::EBADF.into());
+            };
+            // `named` is the pid the descriptor names. A pidfd from `pidfd_open`
+            // names a process leader; a `/proc/<tid>` directory may name any thread,
+            // whose process is its leader's (https://github.com/rrnewton/hermit/issues/4094).
+            match kind {
+                Some(target) => target,
+                None => {
+                    let descriptor = if self.cfg.recordreplay_modes {
+                        // Replay holds a placeholder for a reopened file, so the
+                        // descriptor cannot be read the same way in both.
+                        ProcessDirectoryDescriptor::Unknown(
+                            "record and replay do not read what a descriptor names",
+                        )
+                    } else if !guest
+                        .config()
+                        .backend_supports_blocked_wait_signal_interruption
                     {
-                        // Any of Hermit's threads, as a `kill` naming one is
-                        // dropped and `pidfd_open` of Hermit's process is refused
-                        // (https://github.com/rrnewton/hermit/issues/4066).
-                        tracing::info!(
-                            "[detcore, dtid {}] pidfd_send_signal through /proc/{}, one of \
-                             Hermit's own threads: refused with EPERM",
-                            guest.thread_state().dettid,
-                            task,
-                        );
-                        return Err(Errno::EPERM.into());
-                    }
-                    ProcessDirectoryDescriptor::Process(task) => Some(task),
-                    ProcessDirectoryDescriptor::NotAProcess => return Err(Errno::EBADF.into()),
-                    ProcessDirectoryDescriptor::Unknown(reason) => {
-                        tracing::error!(
-                            "[detcore, dtid {}] pidfd_send_signal through descriptor {} is not \
-                             supported: {} (https://github.com/rrnewton/hermit/issues/4108)",
-                            guest.thread_state().dettid,
-                            pidfd,
-                            reason,
-                        );
-                        return self
-                            .refuse_unserviceable_operation(
+                        // Only on ptrace are the guest's thread ids the host's, so
+                        // that its descriptors can be read through /proc/<tid>.
+                        ProcessDirectoryDescriptor::Unknown(
+                            "this backend's guest thread ids are not host thread ids",
+                        )
+                    } else {
+                        process_directory_descriptor(guest.tid().as_raw(), pidfd)
+                    };
+                    match descriptor {
+                        ProcessDirectoryDescriptor::Process(task)
+                            if crate::tool_global::names_hermit_task(
                                 guest,
-                                Sysno::pidfd_send_signal,
-                                Errno::ENOSYS,
+                                None,
+                                task.as_raw(),
                             )
-                            .await;
+                            .await =>
+                        {
+                            // Any of Hermit's threads, as a `kill` naming one is
+                            // dropped and `pidfd_open` of Hermit's process is refused
+                            // (https://github.com/rrnewton/hermit/issues/4066).
+                            tracing::info!(
+                                "[detcore, dtid {}] pidfd_send_signal through /proc/{}, one of \
+                                 Hermit's own threads: refused with EPERM",
+                                guest.thread_state().dettid,
+                                task,
+                            );
+                            return Err(Errno::EPERM.into());
+                        }
+                        ProcessDirectoryDescriptor::Process(task) => Some(task),
+                        ProcessDirectoryDescriptor::NotAProcess => return Err(Errno::EBADF.into()),
+                        ProcessDirectoryDescriptor::Unknown(reason) => {
+                            tracing::error!(
+                                "[detcore, dtid {}] pidfd_send_signal through descriptor {} is not \
+                                 supported: {} (https://github.com/rrnewton/hermit/issues/4108)",
+                                guest.thread_state().dettid,
+                                pidfd,
+                                reason,
+                            );
+                            return self
+                                .refuse_unserviceable_operation(
+                                    guest,
+                                    Sysno::pidfd_send_signal,
+                                    Errno::ENOSYS,
+                                )
+                                .await;
+                        }
                     }
                 }
             }

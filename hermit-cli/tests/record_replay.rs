@@ -2412,6 +2412,9 @@ fn record_pidfd_send_signal_scope_flags() {
         "two scopes rc=-1 EINVAL ran=0\n",
         "unknown flag rc=-1 EINVAL ran=0\n",
         "pipe rc=-1 EBADF ran=0\n",
+        "PIDFD_SELF_THREAD rc=0 - ran=1\n",
+        "PIDFD_SELF_THREAD_GROUP rc=0 - ran=1\n",
+        "PIDFD_SELF_THREAD_GROUP, two scopes rc=-1 EINVAL ran=0\n",
     ] {
         assert!(
             output.contains(line),

@@ -32,9 +32,12 @@
  *         only under Hermit.
  *   sibling: prints `process <pid>`, then sends with no flag through
  *         /proc/<tid> of a sibling thread, which names this two-thread
- *         process; Hermit refuses it by name, naming the process.
- *   record: the flag cases through the pidfd, and a pipe, under record and
- *         replay (which refuse a /proc descriptor by name).
+ *         process, and through PIDFD_SELF_THREAD_GROUP; then a worker sends
+ *         with PIDFD_SELF_THREAD and PIDFD_SIGNAL_THREAD_GROUP. Hermit refuses
+ *         each by name, naming the process.
+ *   record: the flag cases through the pidfd, a pipe and the PIDFD_SELF
+ *         sentinels, under record and replay (which refuse a /proc descriptor
+ *         by name).
  *   pgrp: PIDFD_SIGNAL_PROCESS_GROUP with signal 0, then with SIGUSR1. Hermit
  *         refuses both by name: the guest's process group is Hermit's, so even
  *         the existence check would answer for processes outside the guest.
@@ -54,6 +57,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef PIDFD_SELF_THREAD
+#define PIDFD_SELF_THREAD -10000
+#define PIDFD_SELF_THREAD_GROUP -10001
+#endif
 #ifndef PIDFD_SIGNAL_THREAD
 #define PIDFD_SIGNAL_THREAD (1U << 0)
 #define PIDFD_SIGNAL_THREAD_GROUP (1U << 1)
@@ -218,6 +225,34 @@ static pid_t another_hermit_thread(void) {
   return 0;
 }
 
+/* A worker sends with PIDFD_SELF_THREAD: it takes the signal itself. */
+static void *self_thread_sender(void *unused) {
+  (void)unused;
+  long rc = send(PIDFD_SELF_THREAD, SIGUSR1, 0);
+  printf("worker, PIDFD_SELF_THREAD rc=%ld %s\n", rc, rc < 0 ? strerrorname_np(errno) : "-");
+  return NULL;
+}
+
+/* A worker sends with PIDFD_SELF_THREAD_GROUP and PIDFD_SIGNAL_THREAD: the
+ * flag makes it thread-directed to the leader, so the main thread (waiting in
+ * pthread_join) takes it, not the worker. */
+static void *group_thread_sender(void *unused) {
+  (void)unused;
+  long rc = send(PIDFD_SELF_THREAD_GROUP, SIGUSR1, PIDFD_SIGNAL_THREAD);
+  printf("worker, PIDFD_SELF_THREAD_GROUP, thread rc=%ld %s\n", rc,
+         rc < 0 ? strerrorname_np(errno) : "-");
+  return NULL;
+}
+
+/* A worker sends with PIDFD_SELF_THREAD and PIDFD_SIGNAL_THREAD_GROUP: the
+ * flag makes it process-directed, to this two-thread process. */
+static void *thread_group_sender(void *unused) {
+  (void)unused;
+  report("worker, PIDFD_SELF_THREAD, thread group",
+         send(PIDFD_SELF_THREAD, SIGUSR1, PIDFD_SIGNAL_THREAD_GROUP));
+  return NULL;
+}
+
 int main(int argc, char **argv) {
   setvbuf(stdout, NULL, _IONBF, 0);
   main_thread = pthread_self();
@@ -245,7 +280,11 @@ int main(int argc, char **argv) {
     pthread_t idler = start_idler();
     int sibling = open_dir("/proc/%d", idler_tid, 0);
     report("/proc/<sibling tid>", send(sibling, SIGUSR1, 0));
+    report("PIDFD_SELF_THREAD_GROUP", send(PIDFD_SELF_THREAD_GROUP, SIGUSR1, 0));
     release_idler(idler);
+    pthread_t sender;
+    if (pthread_create(&sender, NULL, thread_group_sender, NULL) != 0) return 14;
+    pthread_join(sender, NULL);
     return 0;
   }
   if (!strcmp(mode, "record")) {
@@ -257,6 +296,9 @@ int main(int argc, char **argv) {
     int pipe_fds[2];
     if (pipe(pipe_fds) != 0) return 9;
     report("pipe", send(pipe_fds[0], SIGUSR1, 0));
+    report("PIDFD_SELF_THREAD", send(PIDFD_SELF_THREAD, SIGUSR1, 0));
+    report("PIDFD_SELF_THREAD_GROUP", send(PIDFD_SELF_THREAD_GROUP, SIGUSR1, 0));
+    report("PIDFD_SELF_THREAD_GROUP, two scopes", send(PIDFD_SELF_THREAD_GROUP, SIGUSR1, 3));
     return 0;
   }
   if (!strcmp(mode, "pgrp")) {
@@ -270,6 +312,13 @@ int main(int argc, char **argv) {
   report("thread group", send(pidfd, SIGUSR1, PIDFD_SIGNAL_THREAD_GROUP));
   report("two scopes", send(pidfd, SIGUSR1, PIDFD_SIGNAL_THREAD | PIDFD_SIGNAL_THREAD_GROUP));
   report("unknown flag", send(pidfd, SIGUSR1, 1U << 3));
+  /* The sentinels name the caller without a descriptor. */
+  report("PIDFD_SELF_THREAD", send(PIDFD_SELF_THREAD, SIGUSR1, 0));
+  report("PIDFD_SELF_THREAD, signal 0", send(PIDFD_SELF_THREAD, 0, 0));
+  report("PIDFD_SELF_THREAD, thread group", send(PIDFD_SELF_THREAD, SIGUSR1, PIDFD_SIGNAL_THREAD_GROUP));
+  report("PIDFD_SELF_THREAD_GROUP", send(PIDFD_SELF_THREAD_GROUP, SIGUSR1, 0));
+  report("PIDFD_SELF_THREAD_GROUP, thread", send(PIDFD_SELF_THREAD_GROUP, SIGUSR1, PIDFD_SIGNAL_THREAD));
+  report("PIDFD_SELF_THREAD_GROUP, two scopes", send(PIDFD_SELF_THREAD_GROUP, SIGUSR1, 3));
 
   int process = open_dir("/proc/%d", getpid(), 0);
   report("/proc/<pid>", send(process, SIGUSR1, 0));
@@ -398,6 +447,20 @@ int main(int argc, char **argv) {
   report("/proc/<sibling tid>, thread", send(sibling, SIGUSR1, PIDFD_SIGNAL_THREAD));
   release_idler(idler);
   printf("sibling ran=%d\n", (int)worker_ran);
+  worker_ran = 0;
+  pthread_t self_sender;
+  if (pthread_create(&self_sender, NULL, self_thread_sender, NULL) != 0) return 12;
+  pthread_join(self_sender, NULL);
+  printf("worker, PIDFD_SELF_THREAD ran=%d main ran=%d\n", (int)worker_ran, (int)ran);
+  ran = 0;
+  worker_ran = 0;
+  pthread_t group_sender;
+  if (pthread_create(&group_sender, NULL, group_thread_sender, NULL) != 0) return 13;
+  pthread_join(group_sender, NULL);
+  printf("worker, PIDFD_SELF_THREAD_GROUP, thread: main ran=%d worker ran=%d\n", (int)ran,
+         (int)worker_ran);
+  ran = 0;
+  worker_ran = 0;
 
   /* A SIGKILL through an O_PATH descriptor of this two-thread process is
    * EBADF, and kills nothing. */

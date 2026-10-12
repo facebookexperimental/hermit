@@ -22157,6 +22157,11 @@ fn each_unscheduled_signal_to_the_senders_own_process_is_refused_by_name() {
 /// what Linux prints (measured natively) at bitwise parity:
 /// - `PIDFD_SIGNAL_THREAD` and `PIDFD_SIGNAL_THREAD_GROUP` deliver; two scope
 ///   flags or an unknown bit are EINVAL;
+/// - the sentinels `PIDFD_SELF_THREAD` and `PIDFD_SELF_THREAD_GROUP` name the
+///   caller's thread and thread group, with and without a scope flag, and a
+///   worker's `PIDFD_SELF_THREAD` send reaches the worker, while its
+///   `PIDFD_SELF_THREAD_GROUP` send with `PIDFD_SIGNAL_THREAD` reaches the
+///   main thread, which the flag names (https://github.com/rrnewton/hermit/issues/4147);
 /// - a `/proc/<pid>` directory, also opened as `/proc/self`, names the process,
 ///   with or without a flag; a task directory, a procfs file, `/`, a closed
 ///   descriptor and an `O_PATH` `/proc/self` are EBADF (Linux's `fdget` skips
@@ -22192,6 +22197,12 @@ fn pidfd_send_signal_flags_and_proc_descriptors_answer_as_linux_does_at_bitwise_
                     thread group rc=0 - ran=1\n\
                     two scopes rc=-1 EINVAL ran=0\n\
                     unknown flag rc=-1 EINVAL ran=0\n\
+                    PIDFD_SELF_THREAD rc=0 - ran=1\n\
+                    PIDFD_SELF_THREAD, signal 0 rc=0 - ran=0\n\
+                    PIDFD_SELF_THREAD, thread group rc=0 - ran=1\n\
+                    PIDFD_SELF_THREAD_GROUP rc=0 - ran=1\n\
+                    PIDFD_SELF_THREAD_GROUP, thread rc=0 - ran=1\n\
+                    PIDFD_SELF_THREAD_GROUP, two scopes rc=-1 EINVAL ran=0\n\
                     /proc/<pid> rc=0 - ran=1\n\
                     /proc/<pid>, signal 0 rc=0 - ran=0\n\
                     /proc/<pid>, thread rc=0 - ran=1\n\
@@ -22223,6 +22234,10 @@ fn pidfd_send_signal_flags_and_proc_descriptors_answer_as_linux_does_at_bitwise_
                     blocked child: exited 42\n\
                     /proc/<sibling tid>, thread rc=0 - ran=0\n\
                     sibling ran=1\n\
+                    worker, PIDFD_SELF_THREAD rc=0 -\n\
+                    worker, PIDFD_SELF_THREAD ran=1 main ran=0\n\
+                    worker, PIDFD_SELF_THREAD_GROUP, thread rc=0 -\n\
+                    worker, PIDFD_SELF_THREAD_GROUP, thread: main ran=1 worker ran=0\n\
                     SIGKILL, /proc/self, O_PATH rc=-1 EBADF ran=0\n\
                     /proc/<paused child> rc=0 - ran=0\n\
                     /proc/<paused child>: exited 42\n\
@@ -22318,9 +22333,13 @@ fn a_pidfd_signal_through_hermits_own_proc_directories_is_eperm() {
 
 /// A send with no flag through `/proc/<tid>` of a sibling thread names the
 /// sender's own two-thread process (https://github.com/rrnewton/hermit/issues/4094),
-/// so it is refused by name as `kill(getpid())` is there: a fail-closed run
-/// stops with the policy-refusal status, and with
-/// `--allow-unsupported-syscalls` the send returns ENOSYS.
+/// so it is refused by name as `kill(getpid())` is there, and so is a send
+/// through `PIDFD_SELF_THREAD_GROUP`, and a worker's send through
+/// `PIDFD_SELF_THREAD` with `PIDFD_SIGNAL_THREAD_GROUP`, which name the same
+/// process (https://github.com/rrnewton/hermit/issues/4147). Each refusal names
+/// the process, not the sender's thread id. A fail-closed run stops with the
+/// policy-refusal status at the first, and with
+/// `--allow-unsupported-syscalls` each send returns ENOSYS.
 #[test]
 fn a_pidfd_signal_through_a_siblings_proc_directory_names_the_process() {
     let guest = futex_c_guest(&PIDFD_SEND_SIGNAL_FLAGS_GUEST, "pidfd_send_signal_flags")
@@ -22393,12 +22412,17 @@ fn a_pidfd_signal_through_a_siblings_proc_directory_names_the_process() {
     let (pid, text) = refusal(&stdout);
     assert_eq!(
         stdout,
-        format!("process {pid}\n/proc/<sibling tid> rc=-1 ENOSYS ran=0\n"),
+        format!(
+            "process {pid}\n/proc/<sibling tid> rc=-1 ENOSYS ran=0\n\
+             PIDFD_SELF_THREAD_GROUP rc=-1 ENOSYS ran=0\n\
+             worker, PIDFD_SELF_THREAD, thread group rc=-1 ENOSYS ran=0\n"
+        ),
         "stderr:\n{log}"
     );
-    assert!(
-        log.contains(&text),
-        "the refusal must name the process:\n{log}"
+    assert_eq!(
+        log.matches(&text).count(),
+        3,
+        "each of the three refusals must name the process, not a thread id:\n{log}"
     );
 }
 

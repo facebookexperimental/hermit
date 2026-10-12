@@ -1389,7 +1389,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The current lib+bins Nextest inventory measured 1048 selected cases.
     // And metadata::tests::record_version_rejects_streams_that_answered_pidfd_scope_flags_without_an_event
     // (https://github.com/rrnewton/hermit/issues/4108): 1053.
-    ("test.hermit_unit", 1053),
+    // And metadata::tests::record_version_rejects_streams_that_answered_pidfd_self_sentinels_without_an_event
+    // (https://github.com/rrnewton/hermit/issues/4147): 1054.
+    ("test.hermit_unit", 1054),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3175,7 +3177,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the orphaned-group record-epoch test: 1049.
     // The identical lib+bins selection includes the three descriptor controls.
     // And the pidfd scope-flag record-epoch test: 1053.
-    ("test.hermit_unit_on_host", 1053),
+    // And the PIDFD_SELF record-epoch test: 1054.
+    ("test.hermit_unit_on_host", 1054),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

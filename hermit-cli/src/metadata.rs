@@ -342,7 +342,12 @@ impl RecordVersion {
 // forwarded, where Detcore answered EINVAL or EBADF without an event
 // (https://github.com/rrnewton/hermit/issues/4108). An older recording holds no
 // event for such a call, so this replayer would desynchronize at it.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x139);
+// 0x13b -> 0x13c: pidfd_send_signal through the PIDFD_SELF_THREAD or
+// PIDFD_SELF_THREAD_GROUP sentinel is forwarded, where Detcore answered EBADF
+// without an event (https://github.com/rrnewton/hermit/issues/4147). An older
+// recording holds no event for such a call, so this replayer would
+// desynchronize at it.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x13c);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -367,7 +372,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x139);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x139;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x13c;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1106,6 +1111,14 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_that_answered_pidfd_scope_flags_without_an_event() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x138)));
+    }
+
+    /// A 0x13b recording holds no event for a pidfd_send_signal through a
+    /// PIDFD_SELF sentinel, which this replayer forwards
+    /// (https://github.com/rrnewton/hermit/issues/4147).
+    #[test]
+    fn record_version_rejects_streams_that_answered_pidfd_self_sentinels_without_an_event() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x13b)));
     }
 
     #[test]
