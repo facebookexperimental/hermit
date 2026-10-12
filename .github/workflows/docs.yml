@@ -134,7 +134,23 @@ jobs:
         # (.github/scripts/rebuild-compatibility-site.py, fetch_ledger). The
         # full-history clone ran past this step's timeout on
         # https://github.com/rrnewton/hermit/actions/runs/38167459473.
-        git -C _website_source submodule update --init --depth 1 -- hermit_test_ledger
+        #
+        # Only the commit the parent records is fetched here, never the
+        # ledger's main tip: `submodule update --init --depth 1` clones the
+        # default branch tip first, a tree of about 11 GiB that GitHub packs
+        # without its stored deltas, and this step then ran 527-913 s against
+        # its 900 s bound and timed out on
+        # https://github.com/rrnewton/hermit/actions/runs/38171598701 and
+        # https://github.com/rrnewton/hermit/actions/runs/38252248551 (2026-10-12),
+        # while the recorded commit is 9 files. The tip is fetched once, by
+        # fetch_ledger in the rebuild step, under its own timeout.
+        ledger_commit=$(git -C _website_source rev-parse HEAD:hermit_test_ledger)
+        ledger_url=$(git -C _website_source config -f .gitmodules --get submodule.hermit_test_ledger.url)
+        git -C _website_source submodule init -- hermit_test_ledger
+        git init --quiet _website_source/hermit_test_ledger
+        git -C _website_source/hermit_test_ledger remote add origin "$ledger_url"
+        git -C _website_source/hermit_test_ledger fetch --quiet --no-tags --depth 1 origin "$ledger_commit"
+        git -C _website_source/hermit_test_ledger checkout --quiet --detach "$ledger_commit"
         git -C _website_source/hermit submodule update --init --depth 1 -- agent-utils
         git -C _website_source/hermit fetch --no-tags origin main:refs/remotes/origin/main
         channel=$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("_website_source/hermit/rust-toolchain.toml").read_text())["toolchain"]["channel"])')
