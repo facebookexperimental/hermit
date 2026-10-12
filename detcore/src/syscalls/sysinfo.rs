@@ -12,6 +12,7 @@ use reverie::Guest;
 use reverie::syscalls;
 use reverie::syscalls::Errno;
 use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::Sysno;
 
 use crate::Detcore;
 use crate::RecordOrReplay;
@@ -262,7 +263,31 @@ impl<T: RecordOrReplay> Detcore<T> {
             None
         };
 
-        let pid = call.pid();
+        // A nested caller names its process by its own namespace's pid
+        // (https://github.com/rrnewton/hermit/issues/4155); a pid no task of
+        // that namespace has is ESRCH, as Linux's `find_task_by_vpid` answers.
+        let pid = if call.pid() > 0 && guest.thread_state().nested_pid_namespace {
+            match crate::tool_global::guest_pid(guest, call.pid()).await {
+                crate::scheduler::pid_namespaces::GuestPidAnswer::Task { task, .. } => {
+                    task.as_raw()
+                }
+                crate::scheduler::pid_namespaces::GuestPidAnswer::NoSuchPid => {
+                    return Err(Errno::ESRCH.into());
+                }
+                crate::scheduler::pid_namespaces::GuestPidAnswer::Untranslatable(reason) => {
+                    tracing::error!(
+                        "[detcore, dtid {}] prlimit64 from a nested PID namespace is not supported: {} (https://github.com/rrnewton/hermit/issues/4155)",
+                        guest.thread_state().dettid,
+                        reason,
+                    );
+                    return self
+                        .refuse_unserviceable_operation(guest, Sysno::prlimit64, Errno::ENOSYS)
+                        .await;
+                }
+            }
+        } else {
+            call.pid()
+        };
         let deterministic_pid = guest.thread_state().detpid.map(|detpid| detpid.as_raw());
         if !prlimit_targets_current_process(pid, deterministic_pid, guest.pid().as_raw()) {
             return Err(Errno::EPERM.into());

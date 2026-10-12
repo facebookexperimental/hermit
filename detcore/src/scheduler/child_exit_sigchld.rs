@@ -86,6 +86,36 @@ pub fn siginfo_code_and_pid(bytes: &[u8; 128]) -> (i32, i32) {
     (field(8), field(16))
 }
 
+/// The `si_value` the scheduler's own copy carries when its receiver lives in
+/// a nested PID namespace (<https://github.com/rrnewton/hermit/issues/4155>).
+/// Linux zeroes `si_pid` for a sender outside the receiver's namespace, so
+/// such a receiver cannot tell the tracer's `SI_USER` from an ancestor
+/// guest's. The copy is sent instead with `SI_QUEUE` and this value, which no
+/// guest can send with a `SIGCHLD` (`is_own_sigchld_mark`).
+pub const OWN_SIGCHLD_MARK: i32 = 0x4843_4c44;
+
+/// The raw `siginfo_t` of the scheduler's own copy to a receiver in a nested
+/// PID namespace: `SI_QUEUE` from `tracer` (which Linux reports as pid 0
+/// there), with [`OWN_SIGCHLD_MARK`].
+pub fn marked_own_copy(tracer: u32, uid: u32) -> [u8; 128] {
+    let mut bytes = [0; 128];
+    bytes[0..4].copy_from_slice(&libc::SIGCHLD.to_ne_bytes());
+    bytes[8..12].copy_from_slice(&libc::SI_QUEUE.to_ne_bytes());
+    bytes[16..20].copy_from_slice(&tracer.to_ne_bytes());
+    bytes[20..24].copy_from_slice(&uid.to_ne_bytes());
+    bytes[24..28].copy_from_slice(&OWN_SIGCHLD_MARK.to_ne_bytes());
+    bytes
+}
+
+/// Whether a `SIGCHLD` with `si_code` `code`, `si_pid` `pid` and `si_int`
+/// `value` is the scheduler's own copy: `SI_USER` from `tracer`, the tracer's
+/// process, which is never a guest process; or, at a receiver in a nested PID
+/// namespace, the marked `SI_QUEUE` copy from outside it (pid 0).
+pub fn is_own_sigchld_mark(code: i32, pid: i32, value: i32, tracer: u32) -> bool {
+    (code == libc::SI_USER && pid as u32 == tracer)
+        || (code == libc::SI_QUEUE && pid == 0 && value == OWN_SIGCHLD_MARK)
+}
+
 /// Whether `code` is a child-exit `si_code` (`CLD_EXITED`, `CLD_KILLED`,
 /// `CLD_DUMPED`), as opposed to a job-control one or a sender's.
 pub fn is_child_exit_code(code: i32) -> bool {
@@ -94,16 +124,15 @@ pub fn is_child_exit_code(code: i32) -> bool {
 
 /// The control message for a `SIGCHLD` with siginfo `info`: the kernel's
 /// copy of a child's exit notification (a child-exit `si_code`), or a copy
-/// the scheduler sent (`SI_USER` from `tracer`, the tracer's process, which
-/// is never a guest process; tracer and guests share a PID namespace).
-/// `None` for any other.
+/// the scheduler sent ([`is_own_sigchld_mark`]). `None` for any other.
 pub fn control_for(info: &[u8; 128], tracer: u32) -> Option<ChildExitSigchldControl> {
     let (code, pid) = siginfo_code_and_pid(info);
+    let value = i32::from_ne_bytes(info[24..28].try_into().expect("four bytes"));
     if is_child_exit_code(code) {
         Some(ChildExitSigchldControl::ClaimKernelCopy {
             child: DetPid::from_raw(pid),
         })
-    } else if code == libc::SI_USER && pid as u32 == tracer {
+    } else if is_own_sigchld_mark(code, pid, value, tracer) {
         Some(ChildExitSigchldControl::TakeOwnCopy)
     } else {
         None
@@ -373,13 +402,74 @@ impl Scheduler {
                 true
             }
             Some(TimerSend::Send) => {
-                self.fire_alarm(parent, target, nix::sys::signal::Signal::SIGCHLD);
+                // A receiver in a nested PID namespace sees the tracer as pid
+                // 0, as it sees any sender outside it: its copy is marked.
+                let marked = self
+                    .thread_tree
+                    .pid_namespaces
+                    .namespace_of(DetTid::from_raw(parent.as_raw()))
+                    .is_some()
+                    .then(|| marked_own_copy(std::process::id(), nix::unistd::getuid().as_raw()));
+                self.fire_alarm_with(parent, target, nix::sys::signal::Signal::SIGCHLD, marked);
                 true
             }
         }
     }
 
     /// Answer a [`ChildExitSigchldControl`] from `dtid`.
+    /// [`Self::child_exit_sigchld_control`] for a receiver `dtid` that may
+    /// live in a nested PID namespace (https://github.com/rrnewton/hermit/issues/4155).
+    /// The kernel writes `si_pid` in the receiver's namespace, so a claim of
+    /// the kernel's copy names the child by that pid: it is translated first,
+    /// and a pid that names no task there claims nothing (the copy is
+    /// delivered as it is). The siginfo of the scheduler's own copy names the
+    /// child by its DetPid, which is localized for the receiver. Neither
+    /// fallback below is reachable from a guest: an untranslatable receiver's
+    /// first fork is refused at the clone return, so it has no child, and a
+    /// child lives in its receiver's namespace or a deeper one, so it is
+    /// always visible there.
+    pub(crate) fn child_exit_sigchld_control_for_receiver(
+        &mut self,
+        dtid: DetTid,
+        control: ChildExitSigchldControl,
+    ) -> ChildExitSigchldAnswer {
+        let Some(namespace) = self.thread_tree.pid_namespaces.namespace_of(dtid) else {
+            return self.child_exit_sigchld_control(dtid, control);
+        };
+        let control = match control {
+            ChildExitSigchldControl::ClaimKernelCopy { child } => {
+                match self
+                    .thread_tree
+                    .pid_namespaces
+                    .resolve(Some(namespace), child.as_raw())
+                {
+                    Some(task) => ChildExitSigchldControl::ClaimKernelCopy { child: task },
+                    None => return ChildExitSigchldAnswer::Claimed(false),
+                }
+            }
+            other => other,
+        };
+        let localize = |scheduler: &Self, mut info: ChildExitSiginfo| {
+            if let Some(local) = scheduler
+                .thread_tree
+                .pid_namespaces
+                .localize(Some(namespace), DetTid::from_raw(info.pid))
+            {
+                info.pid = local;
+            }
+            info
+        };
+        match self.child_exit_sigchld_control(dtid, control) {
+            ChildExitSigchldAnswer::OwnCopy(OwnCopy::Deliver(info)) => {
+                ChildExitSigchldAnswer::OwnCopy(OwnCopy::Deliver(localize(self, info)))
+            }
+            ChildExitSigchldAnswer::ClaimedFor(info) => {
+                ChildExitSigchldAnswer::ClaimedFor(localize(self, info))
+            }
+            answer => answer,
+        }
+    }
+
     pub(crate) fn child_exit_sigchld_control(
         &mut self,
         dtid: DetTid,
@@ -622,6 +712,33 @@ mod tests {
         assert_eq!(control_for(&siginfo(libc::SI_USER, 30), tracer), None);
         assert_eq!(control_for(&siginfo(libc::SI_TKILL, 1), tracer), None);
         assert_eq!(control_for(&siginfo(libc::CLD_STOPPED, 20), tracer), None);
+    }
+
+    /// At a receiver in a nested PID namespace the scheduler's copy arrives
+    /// from pid 0, as Linux reports any sender outside it: the marked
+    /// `SI_QUEUE` copy is the scheduler's, and an ancestor's plain `SI_USER`,
+    /// an unmarked `SI_QUEUE`, or a marked one with a pid is not
+    /// (<https://github.com/rrnewton/hermit/issues/4155>).
+    #[test]
+    fn a_nested_receivers_own_copy_is_told_by_its_mark() {
+        let tracer = 1;
+        let mut marked = marked_own_copy(tracer, 0);
+        // What the receiver reads: Linux zeroed si_pid.
+        marked[16..20].copy_from_slice(&0i32.to_ne_bytes());
+        assert_eq!(
+            control_for(&marked, tracer),
+            Some(ChildExitSigchldControl::TakeOwnCopy)
+        );
+        let mut unmarked = marked;
+        unmarked[24..28].copy_from_slice(&7i32.to_ne_bytes());
+        assert_eq!(control_for(&unmarked, tracer), None);
+        let mut with_pid = marked;
+        with_pid[16..20].copy_from_slice(&30i32.to_ne_bytes());
+        assert_eq!(control_for(&with_pid, tracer), None);
+        let mut ancestor = [0u8; 128];
+        ancestor[0..4].copy_from_slice(&libc::SIGCHLD.to_ne_bytes());
+        ancestor[8..12].copy_from_slice(&libc::SI_USER.to_ne_bytes());
+        assert_eq!(control_for(&ancestor, tracer), None);
     }
 
     #[test]

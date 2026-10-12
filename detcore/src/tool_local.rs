@@ -2080,6 +2080,13 @@ pub struct ThreadState<T> {
     #[serde(default = "default_timer_slack_ns")]
     pub(crate) default_timer_slack_ns: u64,
 
+    /// This thread lives below the container's PID namespace: it, or an
+    /// ancestor, was created with `CLONE_NEWPID`. Its pids are those of its
+    /// own namespace, which Detcore translates
+    /// (`scheduler::pid_namespaces`); at depth 0 nothing is asked.
+    #[serde(default)]
+    pub(crate) nested_pid_namespace: bool,
+
     /// POSIX per-process timers created via `timer_create(2)`. Shared among the
     /// threads of a process (`CLONE_THREAD`) and not inherited across `fork`.
     pub(crate) posix_timers: Arc<Mutex<PosixTimers>>,
@@ -2694,6 +2701,7 @@ impl<T> ThreadState<T> {
             tool_shares_guest_descriptor_table: cfg.backend.tool_shares_guest_descriptor_table,
             timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
             default_timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
+            nested_pid_namespace: false,
             posix_timers: Arc::new(Mutex::new(PosixTimers::default())),
             resource_limits: Arc::new(Mutex::new(ResourceLimits::default())),
             process_cpu_time: Arc::new(Mutex::new(ProcessCpuTime::default())),

@@ -2207,6 +2207,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     // into both fields of every new task (thread or process).
                     timer_slack_ns: pts.1.timer_slack_ns,
                     default_timer_slack_ns: pts.1.timer_slack_ns,
+                    // A new process created with CLONE_NEWPID is the init of
+                    // a namespace below its creator's; everything else lives
+                    // in its creator's.
+                    nested_pid_namespace: pts.1.nested_pid_namespace
+                        || (clone_flags.contains(CloneFlags::CLONE_NEWPID)
+                            && !clone_flags.contains(CloneFlags::CLONE_THREAD)),
                     // POSIX timers are shared among threads of a process but are
                     // NOT inherited across fork(2). Share the table for a new
                     // thread (CLONE_THREAD); give a new process a fresh, empty

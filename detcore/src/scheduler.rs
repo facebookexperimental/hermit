@@ -14,6 +14,7 @@ pub(crate) mod exec_teardown_tests;
 pub(crate) mod parked;
 #[cfg(test)]
 mod parked_tests;
+pub(crate) mod pid_namespaces;
 pub(crate) mod real_timer;
 mod rejoin_log;
 mod replayer;
@@ -1635,6 +1636,9 @@ pub struct ThreadTree {
     /// namespace, which Linux marks `SIGNAL_UNKILLABLE` against senders inside
     /// it (`sigkill_retirement`).
     pid_namespace_inits: HashSet<DetPid>,
+    /// Each nested task's pid in each namespace it belongs to, recorded at its
+    /// creation (`pid_namespaces`).
+    pub(crate) pid_namespaces: pid_namespaces::PidNamespaces,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4209,7 +4213,7 @@ impl Scheduler {
         let mut ancestor = self.thread_tree.parent_process(&exited);
         while let Some(candidate) = ancestor {
             if self.thread_tree.pid_ns_depth(candidate) != depth {
-                return None;
+                return self.namespace_reaper(exited);
             }
             // A process killed by the SIGKILL being committed is dying, like a
             // subreaper with no live thread: the search passes it by.
@@ -4232,7 +4236,58 @@ impl Scheduler {
             }
             ancestor = self.thread_tree.parent_process(&candidate);
         }
-        None
+        self.namespace_reaper(exited)
+    }
+
+    /// `exiting`'s exit was just granted. If it is a PID namespace's init, its
+    /// namespace ends with it: Linux's `zap_pid_namespace` sends SIGKILL to
+    /// every live process left in it, which then die at host-timed moments
+    /// Detcore does not order, so that is a determinism loss, named here
+    /// (https://github.com/rrnewton/hermit/issues/4155). Every other thread is
+    /// stopped at a request or parked at this grant, so which members are
+    /// live is fixed by the schedule. A zombie is already dead.
+    fn note_pid_namespace_end(&mut self, exiting: DetPid) {
+        if self.thread_tree.pid_namespaces.namespace_of(exiting) != Some(exiting) {
+            return;
+        }
+        let mut live: Vec<DetPid> = self
+            .thread_tree
+            .pid_namespaces
+            .members(exiting)
+            .into_iter()
+            .filter(|task| self.next_turns.contains_key(task))
+            .filter_map(|task| self.thread_tree.process_of(task))
+            .filter(|process| *process != exiting)
+            .collect();
+        live.sort();
+        live.dedup();
+        if !live.is_empty() {
+            self.note_determinism_loss(format!(
+                "PID namespace init {exiting} exited while its namespace still held live processes {live:?}; Linux kills them at host-timed moments (https://github.com/rrnewton/hermit/issues/4155)"
+            ));
+        }
+    }
+
+    /// The reaper Linux's `find_new_reaper` falls back to when no subreaper
+    /// adopts: the init of `exited`'s own PID namespace
+    /// (`pid_namespace::child_reaper`), with its first live thread, leader
+    /// first (https://github.com/rrnewton/hermit/issues/4090). `None` in the
+    /// container's namespace, whose init is Hermit (the orphan goes to it,
+    /// `orphan_to_init`), and for the namespace's init itself, whose
+    /// namespace ends with it.
+    fn namespace_reaper(&self, exited: DetPid) -> Option<(DetPid, DetTid)> {
+        let init = self.thread_tree.pid_namespaces.namespace_of(exited)?;
+        if init == exited {
+            return None;
+        }
+        let mut live: Vec<DetTid> = self
+            .thread_tree
+            .my_thread_group(&init)
+            .into_iter()
+            .filter(|tid| self.next_turns.contains_key(tid))
+            .collect();
+        live.sort_by_key(|tid| (*tid != init, *tid));
+        live.first().map(|owner| (init, *owner))
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -5970,6 +6025,18 @@ impl Scheduler {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     fn fire_alarm(&mut self, dpid: DetPid, dtid: DetTid, sig: Signal) {
+        self.fire_alarm_with(dpid, dtid, sig, None)
+    }
+
+    /// [`Self::fire_alarm`], sending the raw siginfo `info` when there is one
+    /// (it must carry a negative `si_code`, as Linux requires of a sender's).
+    fn fire_alarm_with(
+        &mut self,
+        dpid: DetPid,
+        dtid: DetTid,
+        sig: Signal,
+        info: Option<[u8; 128]>,
+    ) {
         // A guest-handled SIGALRM goes to the process's ledger, not the kernel.
         if self.divert_sigalrm(dpid, sig) {
             return;
@@ -5989,7 +6056,7 @@ impl Scheduler {
             "[dtid {}] Alarm fired, delivering signal {} to guest.",
             target, sig
         );
-        self.signal_guest(target, sig);
+        self.signal_guest(target, sig, info);
     }
 
     /// Deliver an expiration of a `SIGEV_THREAD_ID` POSIX timer of `process`
@@ -6046,7 +6113,7 @@ impl Scheduler {
         } else {
             self.thread_timer_copies.remove(&(thread, signo));
         }
-        self.send_guest_signal(thread, sig, Some(process));
+        self.send_guest_signal(thread, sig, Some(process), None);
     }
 
     /// Whether timer `id`'s expiration can be sent to `thread` as signal
@@ -6567,6 +6634,42 @@ impl Scheduler {
         }
     }
 
+    /// What the positive `pid`, named by the nested thread `caller` in its own
+    /// PID namespace, names (`PidNamespaces::resolve_for`). For a task of the
+    /// caller's own namespace's init, the answer carries the signals that init
+    /// catches, read from a live thread of it in the caller's turn. The init's
+    /// dispositions change only through its own scheduled `rt_sigaction`
+    /// calls, with one exception: an `SA_RESETHAND` handler's reset at a
+    /// delivery to a thread blocked outside the schedule (external I/O, a real
+    /// `rt_sigsuspend`) happens at a host-timed moment.
+    pub fn guest_pid(&self, caller: DetTid, pid: i32) -> pid_namespaces::GuestPidAnswer {
+        use pid_namespaces::GuestPidAnswer;
+        let answer = self.thread_tree.pid_namespaces.resolve_for(caller, pid);
+        let GuestPidAnswer::Task { task, .. } = answer else {
+            return answer;
+        };
+        let process = self.thread_tree.process_of(task).unwrap_or(task);
+        let own_namespace = self.thread_tree.pid_namespaces.namespace_of(caller);
+        if own_namespace != Some(process) || !self.thread_tree.is_pid_namespace_init(process) {
+            return answer;
+        }
+        let Some(thread) = self.process_signal_targets(process).into_iter().next() else {
+            return answer;
+        };
+        match crate::syscalls::read_kernel_signal_state(
+            reverie::Pid::from_raw(process.as_raw()),
+            reverie::Pid::from_raw(thread.as_raw()),
+        ) {
+            Ok(state) => GuestPidAnswer::Task {
+                task,
+                own_init_caught: Some(state.caught),
+            },
+            Err(errno) => GuestPidAnswer::Untranslatable(format!(
+                "cannot read the dispositions of PID namespace init {process}: {errno}"
+            )),
+        }
+    }
+
     pub fn process_signal_targets(&self, detpid: DetPid) -> Vec<DetTid> {
         let Some(leader) = self.signal_target_process(detpid) else {
             return Vec::new();
@@ -6609,8 +6712,10 @@ impl Scheduler {
     /// Send a signal to the guest. A scheduler-parked thread is made runnable immediately. SaBRe
     /// external syscalls remain blocked until the signal interrupts them and their real
     /// continuation RPC becomes visible; other backends retain their existing immediate requeue.
-    fn signal_guest(&mut self, dettid: DetTid, signal: Signal) {
-        self.send_guest_signal(dettid, signal, None);
+    /// `info`, when there is one, is the raw siginfo sent in place of the
+    /// kernel's `SI_USER` (it must carry a negative `si_code`).
+    fn signal_guest(&mut self, dettid: DetTid, signal: Signal, info: Option<[u8; 128]>) {
+        self.send_guest_signal(dettid, signal, None, info);
     }
 
     /// [`Self::signal_guest`], or with `thread_of: Some(process)` a
@@ -6622,18 +6727,27 @@ impl Scheduler {
     /// left in the shared queue (`undelivered_scheduler_signals`): a
     /// thread-directed one waits in its thread's own queue, where the sender's
     /// check of its own pending set sees it.
-    fn send_guest_signal(&mut self, dettid: DetTid, signal: Signal, thread_of: Option<DetPid>) {
+    fn send_guest_signal(
+        &mut self,
+        dettid: DetTid,
+        signal: Signal,
+        thread_of: Option<DetPid>,
+        info: Option<[u8; 128]>,
+    ) {
         debug!(
             "[dtid {}] deliver signal {} physically to guest thread.",
             dettid, signal
         );
+        let info_ptr = info.as_ref().map_or(std::ptr::null(), |bytes| {
+            bytes.as_ptr().cast::<libc::siginfo_t>()
+        });
         let result = if let Some((_, _, _, pidfd)) = self.physical_thread_pidfds.get(&dettid) {
             let rc = unsafe {
                 libc::syscall(
                     libc::SYS_pidfd_send_signal,
                     pidfd.as_raw_fd(),
                     signal as libc::c_int,
-                    std::ptr::null::<libc::siginfo_t>(),
+                    info_ptr,
                     0,
                 )
             };
@@ -6657,6 +6771,20 @@ impl Scheduler {
                     process.as_raw(),
                     dettid.as_raw(),
                     signal as libc::c_int,
+                )
+            };
+            if rc < 0 {
+                Err(nix::errno::Errno::last())
+            } else {
+                Ok(())
+            }
+        } else if info.is_some() {
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_rt_sigqueueinfo,
+                    dettid.as_raw(),
+                    signal as libc::c_int,
+                    info_ptr,
                 )
             };
             if rc < 0 {
@@ -8918,6 +9046,7 @@ impl Scheduler {
                             .any(|tid| tid != dettid && self.next_turns.contains_key(&tid)))
                 {
                     self.thread_tree.granted_exits.insert(exiting);
+                    self.note_pid_namespace_end(exiting);
                 }
                 // The grant is a vfork child's release edge: a barrier whose
                 // parent has died ends here, inside this committed turn.
@@ -10809,7 +10938,7 @@ mod test {
         });
         let mut scheduler = Scheduler::new(&config);
 
-        scheduler.signal_guest(DetTid::from_raw(37), Signal::SIGUSR1);
+        scheduler.signal_guest(DetTid::from_raw(37), Signal::SIGUSR1, None);
 
         let report = scheduler
             .take_terminal_deadlock()
@@ -17729,6 +17858,70 @@ mod test {
                 u64::from(!kernel_copy_first),
                 "kernel copy first: {kernel_copy_first}"
             );
+        }
+    }
+
+    /// A nested parent names its children by its own namespace's pids
+    /// (https://github.com/rrnewton/hermit/issues/4155). The kernel's copy of
+    /// a child's exit `SIGCHLD` carries the child's nested pid, which claims
+    /// that child's exit, so its `ChildExit` timer then sends nothing. The
+    /// scheduler's own copy is delivered with the nested pid, not the DetPid.
+    #[test]
+    fn a_nested_parents_child_exit_sigchld_is_answered_in_its_namespace() {
+        use child_exit_sigchld::ChildExitSigchldAnswer;
+        use child_exit_sigchld::ChildExitSigchldControl;
+        use child_exit_sigchld::OwnCopy;
+        use child_exit_sigchld::TimerSend;
+        for kernel_copy_first in [false, true] {
+            let mut scheduler = Scheduler::new(&Config::default());
+            let parent = DetPid::from_raw(100);
+            let child = DetPid::from_raw(200);
+            register_known_thread(&mut scheduler, parent);
+            let namespaces = &mut scheduler.thread_tree.pid_namespaces;
+            namespaces.record(parent, &[parent], &[100, 1]).unwrap();
+            namespaces.record(child, &[parent], &[200, 2]).unwrap();
+            assert_eq!(
+                scheduler.child_exit_sigchld_control(
+                    child,
+                    ChildExitSigchldControl::ExitStatus {
+                        code: libc::CLD_EXITED,
+                        status: 7,
+                        uid: 0,
+                    },
+                ),
+                ChildExitSigchldAnswer::Recorded
+            );
+            assert!(scheduler.child_exit_sigchld.own(parent, child));
+            if kernel_copy_first {
+                assert_eq!(
+                    scheduler.child_exit_sigchld_control_for_receiver(
+                        parent,
+                        ChildExitSigchldControl::ClaimKernelCopy {
+                            child: DetPid::from_raw(2),
+                        },
+                    ),
+                    ChildExitSigchldAnswer::Claimed(false)
+                );
+                assert_eq!(
+                    scheduler.child_exit_sigchld.timer(parent, child),
+                    Some(TimerSend::Nothing),
+                    "the nested pid claimed the child's exit"
+                );
+            } else {
+                assert_eq!(
+                    scheduler.child_exit_sigchld.timer(parent, child),
+                    Some(TimerSend::Send)
+                );
+                match scheduler.child_exit_sigchld_control_for_receiver(
+                    parent,
+                    ChildExitSigchldControl::TakeOwnCopy,
+                ) {
+                    ChildExitSigchldAnswer::OwnCopy(OwnCopy::Deliver(info)) => {
+                        assert_eq!(info.pid, 2, "the own copy names the child's nested pid")
+                    }
+                    other => panic!("the own copy is delivered, not {other:?}"),
+                }
+            }
         }
     }
 

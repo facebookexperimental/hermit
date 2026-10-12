@@ -2455,6 +2455,47 @@ fn record_sigev_thread_id_timers() {
     }
 }
 
+/// A guest in a nested PID namespace gets its own namespace's pids from fork
+/// and waitpid, and its kill of a nested sibling by that pid, identically in
+/// record and replay (https://github.com/rrnewton/hermit/issues/4155,
+/// https://github.com/rrnewton/hermit/issues/4090).
+#[test]
+fn record_nested_pid_namespace() {
+    let _guard = hermit_record_lock();
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest build directory");
+    let guest = build.path().join("pid_namespace_nested");
+    let output = Command::new("cc")
+        .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+        .arg(repository.join("tests/c/pid_namespace_nested.c"))
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile the pid_namespace_nested guest");
+    assert!(
+        output.status.success(),
+        "guest compilation failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for (mode, line) in [
+        ("fork_wait", "fork_wait fork=2 waitpid=2 status=5\n"),
+        ("sibling", "sibling a=2 b=3 kill3=0 waited=3 status=7\n"),
+    ] {
+        let output = canonical_record_replay_command(
+            &format!("nested PID namespace, {mode}"),
+            &guest,
+            &[OsStr::new(mode)],
+        );
+        assert!(
+            output.contains(line),
+            "the guest must print {line:?}:\n{output}"
+        );
+    }
+}
+
 /// pidfd_send_signal's scope flags are forwarded and recorded, and an unknown
 /// bit, two scopes and a pipe descriptor are answered EINVAL and EBADF without
 /// an event, identically in record and replay

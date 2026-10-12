@@ -20,6 +20,7 @@ use reverie::syscalls::AddrMut;
 use reverie::syscalls::ArchPrctlCmd;
 use reverie::syscalls::Errno;
 use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::Sysno;
 
 use crate::consts::DEFAULT_HOSTNAME;
 use crate::detlog;
@@ -684,18 +685,60 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let res = guest.inject(call).await?;
         let caller = guest.thread_state().detpid.expect("detpid unset");
+        // A nested caller's ids are its own PID namespace's; the kernel took
+        // them so, and the model records the tasks they name
+        // (https://github.com/rrnewton/hermit/issues/4155).
         let process = if call.pid() == 0 {
             caller
         } else {
-            DetPid::from_raw(call.pid())
+            self.task_named_after_success(guest, Sysno::setpgid, call.pid())
+                .await?
         };
         let group = if call.pgid() == 0 {
             process
         } else {
-            DetPid::from_raw(call.pgid())
+            self.task_named_after_success(guest, Sysno::setpgid, call.pgid())
+                .await?
         };
         let _ = set_process_group(guest, process, group).await;
         Ok(res)
+    }
+
+    /// The task a positive id the calling thread passed names, after the
+    /// kernel accepted it: the id itself at depth 0, translated from the
+    /// caller's PID namespace below that. An id the record cannot name is
+    /// refused by name; the kernel found it, so the record is incomplete.
+    async fn task_named_after_success<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+        id: libc::pid_t,
+    ) -> Result<DetPid, Error> {
+        if !guest.thread_state().nested_pid_namespace {
+            return Ok(DetPid::from_raw(id));
+        }
+        let reason = match crate::tool_global::guest_pid(guest, id).await {
+            crate::scheduler::pid_namespaces::GuestPidAnswer::Task { task, .. } => return Ok(task),
+            crate::scheduler::pid_namespaces::GuestPidAnswer::NoSuchPid => {
+                format!(
+                    "the kernel accepted id {id}, which no recorded task of the caller's namespace has"
+                )
+            }
+            crate::scheduler::pid_namespaces::GuestPidAnswer::Untranslatable(reason) => reason,
+        };
+        tracing::error!(
+            "[detcore, dtid {}] {} from a nested PID namespace is not supported: {} (https://github.com/rrnewton/hermit/issues/4155)",
+            guest.thread_state().dettid,
+            sysno,
+            reason,
+        );
+        match self
+            .refuse_unserviceable_operation(guest, sysno, Errno::ENOSYS)
+            .await
+        {
+            Err(error) => Err(error),
+            Ok(_) => Err(Errno::ENOSYS.into()),
+        }
     }
 
     /// membarrier (system call).

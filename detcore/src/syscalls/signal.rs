@@ -35,6 +35,7 @@ use crate::resources::SigalrmSleepDisposition;
 use crate::scheduler::HostTimedSignalScope;
 use crate::scheduler::OwnProcessSignalInputs;
 use crate::scheduler::SiblingSignalState;
+use crate::scheduler::pid_namespaces::GuestPidAnswer;
 use crate::syscalls::helpers::REAL_TIME_SIGNALS;
 use crate::syscalls::helpers::act_on_pending_real_time;
 use crate::syscalls::helpers::observe_under_mask;
@@ -1265,6 +1266,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Kill,
     ) -> Result<i64, Error> {
         self.record_orphaned_group_signals(guest, call.sig()).await;
+        // A thread below the container's PID namespace names pids of its own
+        // namespace, where none of Hermit's tasks is visible
+        // (https://github.com/rrnewton/hermit/issues/4155).
+        let nested = guest.thread_state().nested_pid_namespace;
         if !guest.config().sequentialize_threads {
             // Without sequentialization every other kill goes to the kernel as
             // is, but never one to a process group or to every process: the
@@ -1277,12 +1282,36 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .refuse_group_signal(guest, call.pid(), call.sig())
                     .await;
             }
-            if self
-                .drop_signal_to_hermit(guest, Sysno::kill, None, call.pid(), call.sig())
-                .await
+            if !nested
+                && self
+                    .drop_signal_to_hermit(guest, Sysno::kill, None, call.pid(), call.sig())
+                    .await
             {
                 return Ok(0);
             }
+            return Ok(self.record_or_replay(guest, call).await?);
+        }
+
+        // A nested caller's process-group ids are its namespace's, which
+        // Detcore does not translate yet; a SIGKILL to one would otherwise be
+        // reserved for the container's group of that number.
+        if nested && call.pid() <= 0 && call.pid() != libc::pid_t::MIN && call.sig() != 0 {
+            return self
+                .refuse_group_signal(guest, call.pid(), call.sig())
+                .await;
+        }
+        let (named, own_init_caught) = if call.pid() > 0 {
+            match self.name_guest_pid(guest, Sysno::kill, call.pid()).await {
+                NamedGuestPid::Task {
+                    task,
+                    own_init_caught,
+                } => (task.as_raw(), own_init_caught),
+                NamedGuestPid::Answer(answer) => return answer,
+            }
+        } else {
+            (call.pid(), None)
+        };
+        if Self::own_namespace_init_drops(own_init_caught, call.sig()) {
             return Ok(self.record_or_replay(guest, call).await?);
         }
 
@@ -1297,7 +1326,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // whenever Detcore saw it exit, whatever the host has reaped by
             // now (https://github.com/rrnewton/hermit/issues/4091).
             let (targets, zombie) =
-                resolve_kill_targets_and_exit(guest, DetPid::from_raw(call.pid())).await;
+                resolve_kill_targets_and_exit(guest, DetPid::from_raw(named)).await;
             if targets.is_empty() {
                 match zombie {
                     Some(true) => return Ok(0),
@@ -1310,7 +1339,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(self.record_or_replay(guest, call).await?);
         }
 
-        let tgid = call.pid();
+        let tgid = named;
         // A process-group or broadcast SIGALRM is refused by name below. The
         // scheduler resolves a thread id to its process itself.
         if call.sig() == libc::SIGALRM && tgid > 0 {
@@ -1703,6 +1732,80 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// supervisors outside the namespace. Signal 0, an invalid signal number
     /// and a nonpositive target go to the caller's own path, as do targets
     /// that are guest tasks ([`crate::tool_global::hermit_task_named`]).
+    /// The task a positive pid the calling thread names refers to. At depth 0
+    /// the pid is the DetTid. In a nested PID namespace it is a pid of that
+    /// namespace, translated through the scheduler's record
+    /// (`scheduler::pid_namespaces`, https://github.com/rrnewton/hermit/issues/4155);
+    /// a pid no task of the namespace has is ESRCH, as Linux's `find_vpid`
+    /// answers. Detcore's own bookkeeping uses the translated task; a call
+    /// forwarded to the kernel keeps the guest's number, which the kernel reads
+    /// in the caller's namespace. On a backend that rewrites a process signal
+    /// into a thread-directed one with Detcore's ids, a nested caller is
+    /// refused by name.
+    async fn name_guest_pid<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+        pid: libc::pid_t,
+    ) -> NamedGuestPid {
+        if !guest.thread_state().nested_pid_namespace {
+            return NamedGuestPid::Task {
+                task: DetTid::from_raw(pid),
+                own_init_caught: None,
+            };
+        }
+        let refusal = if guest
+            .config()
+            .backend
+            .requires_thread_directed_process_signals
+        {
+            "this backend sends process signals with Detcore's container-namespace ids".to_owned()
+        } else {
+            match crate::tool_global::guest_pid(guest, pid).await {
+                GuestPidAnswer::Task {
+                    task,
+                    own_init_caught,
+                } => {
+                    return NamedGuestPid::Task {
+                        task,
+                        own_init_caught,
+                    };
+                }
+                GuestPidAnswer::NoSuchPid => {
+                    return NamedGuestPid::Answer(Err(Errno::ESRCH.into()));
+                }
+                GuestPidAnswer::Untranslatable(reason) => reason,
+            }
+        };
+        tracing::error!(
+            "[detcore, dtid {}] {} naming pid {} from a nested PID namespace is not supported: {} (https://github.com/rrnewton/hermit/issues/4155)",
+            guest.thread_state().dettid,
+            sysno,
+            pid,
+            refusal,
+        );
+        NamedGuestPid::Answer(
+            self.refuse_unserviceable_operation(guest, sysno, Errno::ENOSYS)
+                .await,
+        )
+    }
+
+    /// Whether the kernel drops `sig` sent to a task of the caller's own PID
+    /// namespace's init (`own_init_caught`, `name_guest_pid`): Linux drops it
+    /// unless the init has a handler for it, and SIGKILL and SIGSTOP always
+    /// (`SIGNAL_UNKILLABLE`, `sig_task_ignored`). Such a call is forwarded
+    /// unchanged: the kernel makes its own checks (signal number, siginfo),
+    /// then drops the signal and answers 0, and nothing reaches a task, so
+    /// Detcore has nothing to schedule or record.
+    pub(crate) fn own_namespace_init_drops(own_init_caught: Option<u64>, sig: libc::c_int) -> bool {
+        own_init_caught.is_some_and(|caught| {
+            (1..=libc::SIGRTMAX()).contains(&sig)
+                && (sig == libc::SIGKILL
+                    || sig == libc::SIGSTOP
+                    || caught & kernel_sigset_bit(sig) == 0)
+        })
+    }
+
     async fn drop_signal_to_hermit<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1780,18 +1883,38 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Tgkill,
     ) -> Result<i64, Error> {
         self.record_orphaned_group_signals(guest, call.sig()).await;
+        // A nested caller names its own namespace's ids; Detcore's model uses
+        // the tasks they name, and the forwarded call keeps them
+        // (https://github.com/rrnewton/hermit/issues/4155). Non-positive ids
+        // are EINVAL in Linux before any lookup.
+        let nested = guest.thread_state().nested_pid_namespace;
+        let (tgid, tid) = if nested && call.tgid() > 0 && call.tid() > 0 {
+            let (tid, own_init_caught) =
+                match self.name_guest_pid(guest, Sysno::tgkill, call.tid()).await {
+                    NamedGuestPid::Task {
+                        task,
+                        own_init_caught,
+                    } => (task, own_init_caught),
+                    NamedGuestPid::Answer(answer) => return answer,
+                };
+            let tgid = match self.name_guest_pid(guest, Sysno::tgkill, call.tgid()).await {
+                NamedGuestPid::Task { task, .. } => task,
+                NamedGuestPid::Answer(answer) => return answer,
+            };
+            if Self::own_namespace_init_drops(own_init_caught, call.sig()) {
+                return Ok(self.record_or_replay(guest, call).await?);
+            }
+            (tgid.as_raw(), tid.as_raw())
+        } else {
+            (call.tgid(), call.tid())
+        };
         if call.sig() == libc::SIGALRM {
-            refuse_sigalrm(guest, SigalrmControl::SendTo(DetTid::from_raw(call.tid()))).await?;
+            refuse_sigalrm(guest, SigalrmControl::SendTo(DetTid::from_raw(tid))).await?;
         }
-        if self
-            .drop_signal_to_hermit(
-                guest,
-                Sysno::tgkill,
-                Some(call.tgid()),
-                call.tid(),
-                call.sig(),
-            )
-            .await
+        if !nested
+            && self
+                .drop_signal_to_hermit(guest, Sysno::tgkill, Some(tgid), tid, call.sig())
+                .await
         {
             return Ok(0);
         }
@@ -1799,8 +1922,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             .reserve_controlled_self_sigkill_exit(
                 guest,
                 call.sig(),
-                Some(DetPid::from_raw(call.tgid())),
-                Some(DetTid::from_raw(call.tid())),
+                Some(DetPid::from_raw(tgid)),
+                Some(DetTid::from_raw(tid)),
             )
             .await;
         // A SIGKILL to a thread of another process ends that whole process,
@@ -1810,11 +1933,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         // takes the ordinary path and gets the kernel's errno.
         if call.sig() == libc::SIGKILL
             && guest.config().sequentialize_threads
-            && call.tgid() > 0
-            && call.tid() > 0
-            && registered_process_of(guest, DetTid::from_raw(call.tid())).await
-                == Some(DetPid::from_raw(call.tgid()))
-            && let Some(reservation) = reserve_sigkill(guest, DetTid::from_raw(call.tid())).await
+            && tgid > 0
+            && tid > 0
+            && registered_process_of(guest, DetTid::from_raw(tid)).await
+                == Some(DetPid::from_raw(tgid))
+            && let Some(reservation) = reserve_sigkill(guest, DetTid::from_raw(tid)).await
         {
             return self.send_reserved_sigkill(guest, reservation, call).await;
         }
@@ -1823,7 +1946,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // guest THREAD signals a sibling. Like `kill`, a successful cross-task
         // send must tell the scheduler, or a target parked in a child wait is
         // never woken and the wait hangs.
-        self.notify_cross_task_signal(guest, DetTid::from_raw(call.tid()), call.sig(), None)
+        self.notify_cross_task_signal(guest, DetTid::from_raw(tid), call.sig(), None)
             .await;
         Ok(value)
     }
@@ -1840,12 +1963,32 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Tkill,
     ) -> Result<i64, Error> {
         self.record_orphaned_group_signals(guest, call.sig()).await;
+        // A nested caller names its own namespace's tid
+        // (https://github.com/rrnewton/hermit/issues/4155).
+        let nested = guest.thread_state().nested_pid_namespace;
+        let tid = if nested && call.tid() > 0 {
+            match self.name_guest_pid(guest, Sysno::tkill, call.tid()).await {
+                NamedGuestPid::Task {
+                    task,
+                    own_init_caught,
+                } => {
+                    if Self::own_namespace_init_drops(own_init_caught, call.sig()) {
+                        return Ok(self.record_or_replay(guest, call).await?);
+                    }
+                    task.as_raw()
+                }
+                NamedGuestPid::Answer(answer) => return answer,
+            }
+        } else {
+            call.tid()
+        };
         if call.sig() == libc::SIGALRM {
-            refuse_sigalrm(guest, SigalrmControl::SendTo(DetTid::from_raw(call.tid()))).await?;
+            refuse_sigalrm(guest, SigalrmControl::SendTo(DetTid::from_raw(tid))).await?;
         }
-        if self
-            .drop_signal_to_hermit(guest, Sysno::tkill, None, call.tid(), call.sig())
-            .await
+        if !nested
+            && self
+                .drop_signal_to_hermit(guest, Sysno::tkill, None, tid, call.sig())
+                .await
         {
             return Ok(0);
         }
@@ -1854,21 +1997,21 @@ impl<T: RecordOrReplay> Detcore<T> {
                 guest,
                 call.sig(),
                 None,
-                Some(DetTid::from_raw(call.tid())),
+                Some(DetTid::from_raw(tid)),
             )
             .await;
         // A non-positive tid is EINVAL in Linux, before anything happens.
         if call.sig() == libc::SIGKILL
             && guest.config().sequentialize_threads
-            && call.tid() > 0
-            && let Some(reservation) = reserve_sigkill(guest, DetTid::from_raw(call.tid())).await
+            && tid > 0
+            && let Some(reservation) = reserve_sigkill(guest, DetTid::from_raw(tid)).await
         {
             return self.send_reserved_sigkill(guest, reservation, call).await;
         }
         let value = self.record_or_replay(guest, call).await?;
         // Same wakeup obligation as `tgkill`; `tkill` is the older two-argument
         // spelling of the same thread-directed send.
-        self.notify_cross_task_signal(guest, DetTid::from_raw(call.tid()), call.sig(), None)
+        self.notify_cross_task_signal(guest, DetTid::from_raw(tid), call.sig(), None)
             .await;
         Ok(value)
     }
@@ -1951,6 +2094,40 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Refuse by name a guest's `SIGCHLD` that carries the scheduler's own-copy
+    /// mark (`SI_QUEUE` with `OWN_SIGCHLD_MARK`), which a receiver in a nested
+    /// PID namespace would take for the scheduler's copy
+    /// (<https://github.com/rrnewton/hermit/issues/4155>). `None` for any other
+    /// call; an unreadable siginfo is left to the kernel's EFAULT.
+    pub(crate) async fn refuse_forged_own_sigchld<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+        signal: i32,
+        info: Option<AddrMut<'_, libc::siginfo_t>>,
+    ) -> Option<Result<i64, Error>> {
+        if signal != libc::SIGCHLD {
+            return None;
+        }
+        let bytes = read_siginfo(guest, info?)?;
+        let (code, _) = crate::scheduler::child_exit_sigchld::siginfo_code_and_pid(&bytes);
+        let value = i32::from_ne_bytes(bytes[24..28].try_into().expect("four bytes"));
+        if code != libc::SI_QUEUE || value != crate::scheduler::child_exit_sigchld::OWN_SIGCHLD_MARK
+        {
+            return None;
+        }
+        tracing::error!(
+            "[detcore, dtid {}] {} sends a SIGCHLD carrying the scheduler's own-copy mark {:#x}, which a nested PID namespace's receiver could not tell from the scheduler's (https://github.com/rrnewton/hermit/issues/4155)",
+            guest.thread_state().dettid,
+            sysno,
+            crate::scheduler::child_exit_sigchld::OWN_SIGCHLD_MARK,
+        );
+        Some(
+            self.refuse_unserviceable_operation(guest, sysno, Errno::EPERM)
+                .await,
+        )
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#812)
     /// Queue a thread-directed signal with an accompanying `siginfo_t`. Like
@@ -1962,19 +2139,53 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::RtTgsigqueueinfo,
     ) -> Result<i64, Error> {
-        self.record_orphaned_group_signals(guest, call.sig()).await;
-        if call.sig() == libc::SIGALRM {
-            refuse_sigalrm(guest, SigalrmControl::SendTo(DetTid::from_raw(call.tid()))).await?;
-        }
-        if self
-            .drop_signal_to_hermit(
-                guest,
-                Sysno::rt_tgsigqueueinfo,
-                Some(call.tgid()),
-                call.tid(),
-                call.sig(),
-            )
+        if let Some(refused) = self
+            .refuse_forged_own_sigchld(guest, Sysno::rt_tgsigqueueinfo, call.sig(), call.siginfo())
             .await
+        {
+            return refused;
+        }
+        self.record_orphaned_group_signals(guest, call.sig()).await;
+        // A nested caller names its own namespace's tid
+        // (https://github.com/rrnewton/hermit/issues/4155); a tid no task of
+        // that namespace has goes to the kernel, which checks the siginfo
+        // first and then answers ESRCH.
+        let nested = guest.thread_state().nested_pid_namespace;
+        let tid = if nested && call.tgid() > 0 && call.tid() > 0 {
+            match self
+                .name_guest_pid(guest, Sysno::rt_tgsigqueueinfo, call.tid())
+                .await
+            {
+                NamedGuestPid::Task {
+                    task,
+                    own_init_caught,
+                } => {
+                    if Self::own_namespace_init_drops(own_init_caught, call.sig()) {
+                        return Ok(self.record_or_replay(guest, call).await?);
+                    }
+                    task.as_raw()
+                }
+                NamedGuestPid::Answer(Err(Error::Errno(Errno::ESRCH))) => {
+                    return Ok(self.record_or_replay(guest, call).await?);
+                }
+                NamedGuestPid::Answer(answer) => return answer,
+            }
+        } else {
+            call.tid()
+        };
+        if call.sig() == libc::SIGALRM {
+            refuse_sigalrm(guest, SigalrmControl::SendTo(DetTid::from_raw(tid))).await?;
+        }
+        if !nested
+            && self
+                .drop_signal_to_hermit(
+                    guest,
+                    Sysno::rt_tgsigqueueinfo,
+                    Some(call.tgid()),
+                    tid,
+                    call.sig(),
+                )
+                .await
         {
             return Ok(0);
         }
@@ -1982,7 +2193,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Thread-directed like `tgkill`, so it carries the same wakeup
         // obligation. `sigqueue`/`pthread_sigqueue` reach a parked sibling
         // through here.
-        self.notify_cross_task_signal(guest, DetTid::from_raw(call.tid()), call.sig(), None)
+        self.notify_cross_task_signal(guest, DetTid::from_raw(tid), call.sig(), None)
             .await;
         Ok(value)
     }
@@ -1999,18 +2210,57 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::RtSigqueueinfo,
     ) -> Result<i64, Error> {
+        if let Some(refused) = self
+            .refuse_forged_own_sigchld(guest, Sysno::rt_sigqueueinfo, call.sig(), call.siginfo())
+            .await
+        {
+            return refused;
+        }
         self.record_orphaned_group_signals(guest, call.sig()).await;
+        let nested = guest.thread_state().nested_pid_namespace;
         if !guest.config().sequentialize_threads {
-            if self
-                .drop_signal_to_hermit(guest, Sysno::rt_sigqueueinfo, None, call.tgid(), call.sig())
-                .await
+            if !nested
+                && self
+                    .drop_signal_to_hermit(
+                        guest,
+                        Sysno::rt_sigqueueinfo,
+                        None,
+                        call.tgid(),
+                        call.sig(),
+                    )
+                    .await
             {
                 return Ok(0);
             }
             return Ok(self.record_or_replay(guest, call).await?);
         }
 
-        let tgid = call.tgid();
+        // A nested caller names its own namespace's pid
+        // (https://github.com/rrnewton/hermit/issues/4155); a pid no task of
+        // that namespace has goes to the kernel, which checks the siginfo
+        // first and then answers ESRCH.
+        let tgid = if nested && call.tgid() > 0 {
+            match self
+                .name_guest_pid(guest, Sysno::rt_sigqueueinfo, call.tgid())
+                .await
+            {
+                NamedGuestPid::Task {
+                    task,
+                    own_init_caught,
+                } => {
+                    if Self::own_namespace_init_drops(own_init_caught, call.sig()) {
+                        return Ok(self.record_or_replay(guest, call).await?);
+                    }
+                    task.as_raw()
+                }
+                NamedGuestPid::Answer(Err(Error::Errno(Errno::ESRCH))) => {
+                    return Ok(self.record_or_replay(guest, call).await?);
+                }
+                NamedGuestPid::Answer(answer) => return answer,
+            }
+        } else {
+            call.tgid()
+        };
         if tgid <= 0 {
             // POSIX.1b has no process groups: Linux's `do_rt_sigqueueinfo` looks
             // the pid up with `find_vpid`, which finds no process for 0 or a
@@ -2355,8 +2605,8 @@ where
 }
 
 /// The size of a `struct signalfd_siginfo`, which has ssi_signo at 0,
-/// ssi_code at 8, ssi_pid at 12, ssi_uid at 16, ssi_status at 40, ssi_utime at
-/// 56 and ssi_stime at 64.
+/// ssi_code at 8, ssi_pid at 12, ssi_uid at 16, ssi_status at 40, ssi_int at
+/// 44, ssi_utime at 56 and ssi_stime at 64.
 const SIGNALFD_RECORD: usize = 128;
 
 fn signalfd_field(record: &[u8], at: usize) -> u32 {
@@ -2365,9 +2615,9 @@ fn signalfd_field(record: &[u8], at: usize) -> u32 {
 
 /// For each `signalfd_siginfo` record in `bytes`, the child-exit ledger
 /// question it raises (`Detcore::reconcile_signalfd_records`): a SIGCHLD with
-/// a child-exit code is the kernel's copy for that child, a SIGCHLD with
-/// `SI_USER` from `tracer` is the scheduler's copy, and any other record raises
-/// none.
+/// a child-exit code is the kernel's copy for that child, a SIGCHLD the
+/// scheduler sent (`is_own_sigchld_mark`) is its copy, and any other record
+/// raises none.
 fn signalfd_record_controls(
     bytes: &[u8],
     tracer: u32,
@@ -2381,11 +2631,14 @@ fn signalfd_record_controls(
             }
             let code = signalfd_field(record, 8) as i32;
             let pid = signalfd_field(record, 12);
+            let value = signalfd_field(record, 44) as i32;
             if crate::scheduler::child_exit_sigchld::is_child_exit_code(code) {
                 Some(ChildExitSigchldControl::ClaimKernelCopy {
                     child: DetPid::from_raw(pid as i32),
                 })
-            } else if code == libc::SI_USER && pid == tracer {
+            } else if crate::scheduler::child_exit_sigchld::is_own_sigchld_mark(
+                code, pid as i32, value, tracer,
+            ) {
                 Some(ChildExitSigchldControl::TakeOwnCopy)
             } else {
                 None
@@ -2449,11 +2702,17 @@ fn apply_signalfd_answers(
             }
             Some(ChildExitSigchldAnswer::OwnCopy(OwnCopy::Deliver(own)))
             | Some(ChildExitSigchldAnswer::ClaimedFor(own)) => {
+                // The record Linux writes for a child exit (SIL_CHLD) starts
+                // zeroed and fills in only these: nothing of the copy it
+                // replaces is kept, such as the own copy's SI_QUEUE mark in
+                // ssi_int and ssi_ptr. CPU times are 0 (natively, host time).
+                let signo = signalfd_field(&record, 0);
+                record.fill(0);
+                record[0..4].copy_from_slice(&signo.to_ne_bytes());
                 record[8..12].copy_from_slice(&own.code.to_ne_bytes());
                 record[12..16].copy_from_slice(&(own.pid as u32).to_ne_bytes());
                 record[16..20].copy_from_slice(&own.uid.to_ne_bytes());
                 record[40..44].copy_from_slice(&own.status.to_ne_bytes());
-                record[56..72].fill(0);
                 changed = true;
             }
             _ => {}
@@ -2489,6 +2748,29 @@ mod signalfd_record_tests {
         record[40..44].copy_from_slice(&status.to_ne_bytes());
         record[56..72].fill(7);
         record
+    }
+
+    /// At a receiver in a nested PID namespace, a record of the scheduler's
+    /// marked `SI_QUEUE` copy (pid 0, `ssi_int` the mark) asks for its own
+    /// copy; an ancestor's `SI_USER` from pid 0 and an unmarked `SI_QUEUE` ask
+    /// nothing (<https://github.com/rrnewton/hermit/issues/4155>).
+    #[test]
+    fn a_nested_receivers_marked_record_asks_for_the_own_copy() {
+        let marked = |value: i32| {
+            let mut record = record(libc::SIGCHLD, libc::SI_QUEUE, 0, 0);
+            record[44..48].copy_from_slice(&value.to_ne_bytes());
+            record
+        };
+        let bytes = [
+            marked(crate::scheduler::child_exit_sigchld::OWN_SIGCHLD_MARK),
+            marked(7),
+            record(libc::SIGCHLD, libc::SI_USER, 0, 0),
+        ]
+        .concat();
+        assert_eq!(
+            signalfd_record_controls(&bytes, TRACER),
+            vec![Some(ChildExitSigchldControl::TakeOwnCopy), None, None]
+        );
     }
 
     /// A kernel child-exit copy asks the ledger about its child, the
@@ -2558,6 +2840,40 @@ mod signalfd_record_tests {
                 .iter()
                 .all(|byte| *byte == 0)
         );
+    }
+
+    /// The marked own copy a nested receiver reads is rewritten to the
+    /// record Linux writes for a child exit, which keeps nothing of the
+    /// copy: `ssi_int` and `ssi_ptr` (bytes 44..56), where the mark was, are
+    /// 0, like every field a child exit does not fill in (Codex re-check #2
+    /// of https://github.com/rrnewton/hermit/pull/4172).
+    #[test]
+    fn a_rewritten_own_copy_keeps_none_of_its_marked_record() {
+        let mut marked = record(libc::SIGCHLD, libc::SI_QUEUE, 0, 0);
+        marked[44..48]
+            .copy_from_slice(&crate::scheduler::child_exit_sigchld::OWN_SIGCHLD_MARK.to_ne_bytes());
+        marked[48..56].fill(9);
+        marked[20..40].fill(5);
+        marked[72..].fill(6);
+        let rewritten = apply_signalfd_answers(
+            &marked,
+            &[Some(ChildExitSigchldAnswer::OwnCopy(OwnCopy::Deliver(
+                ChildExitSiginfo {
+                    code: libc::CLD_KILLED,
+                    pid: 3,
+                    uid: 0,
+                    status: libc::SIGKILL,
+                },
+            )))],
+        )
+        .expect("records changed");
+        let mut wanted = vec![0u8; SIGNALFD_RECORD];
+        wanted[0..4].copy_from_slice(&(libc::SIGCHLD as u32).to_ne_bytes());
+        wanted[8..12].copy_from_slice(&libc::CLD_KILLED.to_ne_bytes());
+        wanted[12..16].copy_from_slice(&3u32.to_ne_bytes());
+        wanted[40..44].copy_from_slice(&libc::SIGKILL.to_ne_bytes());
+        assert_eq!(rewritten.bytes, wanted);
+        assert!(rewritten.bytes[44..56].iter().all(|byte| *byte == 0));
     }
 
     /// A vectored read's returned bytes are found across its buffers in
@@ -2832,6 +3148,20 @@ pub(crate) fn own_process_signal_refusal(
 
 /// How a process-directed signal the calling thread sends goes on
 /// (`Detcore::own_process_signal`).
+/// What a positive pid the calling thread names refers to
+/// (`Detcore::name_guest_pid`).
+enum NamedGuestPid {
+    /// This task, by its DetTid. `own_init_caught` is set when it belongs to
+    /// the caller's own PID namespace's init, to the signals that init catches.
+    Task {
+        task: DetTid,
+        own_init_caught: Option<u64>,
+    },
+    /// The call's answer, decided here: ESRCH for a pid no task of the
+    /// caller's namespace has, or a refusal by name.
+    Answer(Result<i64, Error>),
+}
+
 enum OwnProcessSend {
     /// The call does not name the sender's own multi-threaded process: the
     /// ordinary path decides.

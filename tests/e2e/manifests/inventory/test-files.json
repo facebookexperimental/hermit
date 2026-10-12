@@ -1189,6 +1189,12 @@
       "why": "tests/c/personality_domain.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): The fail-closed query/toggle/query/restore/query contract is calibrated for blocking ptrace verification; DBT and KVM remain explicit typed-verdict and execution gaps"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/pid_namespace_nested.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/pid_namespace_nested.c is owned by hermit-cli/tests/cli.rs and hermit-cli/tests/record_replay.rs: the CLI test a_nested_pid_namespace_names_its_own_pids_at_bitwise_parity runs each mode in a clone(CLONE_NEWPID) namespace (the init's self-kill, fork and waitpid, waitpid(-1), a kill of a nested sibling whose pid a container process also has, the init's dropped SIGKILL and SIGTERM, orphan adoption by the nested init, a container-only pid, tgkill of a nested thread) and requires Linux's output at bitwise parity, and record_nested_pid_namespace repeats two modes under record (https://github.com/rrnewton/hermit/issues/4155, https://github.com/rrnewton/hermit/issues/4090). It stays a fixture because a generic manifest cannot assert these per-mode outputs, and natively it needs a user namespace."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/pid_probe.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

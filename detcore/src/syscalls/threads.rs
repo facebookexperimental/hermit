@@ -46,6 +46,7 @@ use crate::resources::Resources;
 use crate::scheduler::FutexSignalWatch;
 use crate::scheduler::HostTimedSignalScope;
 use crate::scheduler::SchedValue;
+use crate::scheduler::pid_namespaces::GuestPidAnswer;
 use crate::syscalls::helpers::NonblockableSyscall;
 use crate::syscalls::helpers::RestartCall;
 use crate::syscalls::helpers::keep_restart_block;
@@ -457,11 +458,13 @@ fn canonicalize_waitid_siginfo(info: &mut libc::siginfo_t) {
     sigchld.stime = 0;
 }
 
+/// `child` is the task `info_value.si_pid` names (`Detcore::task_of_guest_pid`).
 fn finish_waitid_result<T, G>(
     guest: &mut G,
     call: syscalls::Waitid,
     value: i64,
     mut info_value: libc::siginfo_t,
+    child: DetPid,
 ) -> Result<i64, Error>
 where
     T: RecordOrReplay,
@@ -477,9 +480,7 @@ where
             &info_value,
         )?;
         if call.options() & libc::WNOWAIT == 0 && waitid_code_is_termination(info_value.si_code) {
-            guest
-                .thread_state_mut()
-                .reap_child_process_cpu_time(DetPid::from_raw(child_pid));
+            guest.thread_state_mut().reap_child_process_cpu_time(child);
         }
         if let Some(rusage) = call.rusage() {
             // Host CPU and scheduling counters are not deterministic.
@@ -1630,6 +1631,30 @@ impl<T: RecordOrReplay> Detcore<T> {
             );
         }
 
+        // A nested creator sees its child's pid in its own PID namespace, as
+        // the kernel returned it; Reverie reports the container's
+        // (https://github.com/rrnewton/hermit/issues/4090).
+        if guest.thread_state().nested_pid_namespace {
+            let refusal = match crate::tool_global::local_pid(guest, child_dettid).await {
+                Ok(Some(local)) => return Ok(local as i64),
+                Ok(None) => {
+                    format!("child {child_dettid} has no pid recorded in its creator's namespace")
+                }
+                Err(reason) => reason,
+            };
+            tracing::error!(
+                "[detcore, dtid {}] the pid a clone in a nested PID namespace returns cannot be translated: {} (https://github.com/rrnewton/hermit/issues/4090)",
+                parent_dettid,
+                refusal,
+            );
+            return self
+                .refuse_unserviceable_operation(
+                    guest,
+                    reverie::syscalls::Sysno::clone,
+                    Errno::ENOSYS,
+                )
+                .await;
+        }
         Ok(child_dettid.as_raw() as i64)
     }
 
@@ -2678,6 +2703,74 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// `child`'s pid as the calling thread names it: its DetTid at depth 0,
+    /// its pid in the caller's namespace below that
+    /// (https://github.com/rrnewton/hermit/issues/4090). Detcore picks the
+    /// child of a wait itself and injects the exact wait, which the kernel
+    /// reads in the caller's namespace.
+    async fn guest_visible_pid<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: reverie::syscalls::Sysno,
+        child: DetPid,
+    ) -> Result<i32, Error> {
+        if !guest.thread_state().nested_pid_namespace {
+            return Ok(child.as_raw());
+        }
+        let refusal = match crate::tool_global::local_pid(guest, child).await {
+            Ok(Some(local)) => return Ok(local),
+            Ok(None) => format!("child {child} is not visible in the caller's namespace"),
+            Err(reason) => reason,
+        };
+        Err(self.refuse_nested_pid(guest, sysno, &refusal).await)
+    }
+
+    /// The task a pid the kernel answered the calling thread with names: the
+    /// pid itself at depth 0, translated from the caller's namespace below
+    /// that, before it enters Detcore's bookkeeping
+    /// (https://github.com/rrnewton/hermit/issues/4090).
+    async fn task_of_guest_pid<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: reverie::syscalls::Sysno,
+        pid: i32,
+    ) -> Result<DetPid, Error> {
+        if !guest.thread_state().nested_pid_namespace || pid <= 0 {
+            return Ok(DetPid::from_raw(pid));
+        }
+        let refusal = match crate::tool_global::guest_pid(guest, pid).await {
+            GuestPidAnswer::Task { task, .. } => return Ok(task),
+            GuestPidAnswer::NoSuchPid => {
+                format!("the kernel answered pid {pid}, which no recorded task has")
+            }
+            GuestPidAnswer::Untranslatable(reason) => reason,
+        };
+        Err(self.refuse_nested_pid(guest, sysno, &refusal).await)
+    }
+
+    /// Refuse by name a call from a nested PID namespace whose pids Detcore
+    /// cannot translate (https://github.com/rrnewton/hermit/issues/4155).
+    async fn refuse_nested_pid<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: reverie::syscalls::Sysno,
+        reason: &str,
+    ) -> Error {
+        tracing::error!(
+            "[detcore, dtid {}] {} from a nested PID namespace is not supported: {} (https://github.com/rrnewton/hermit/issues/4155)",
+            guest.thread_state().dettid,
+            sysno,
+            reason,
+        );
+        match self
+            .refuse_unserviceable_operation(guest, sysno, Errno::ENOSYS)
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => Errno::ENOSYS.into(),
+        }
+    }
+
     /// wait4 system call
     /// This is handled by the scheduler and not passed to the record/replay layer.
     // TODO-HUMAN-REVIEW(PR-587): Confirm wait4 rusage canonicalization boundaries.
@@ -2697,6 +2790,34 @@ impl<T: RecordOrReplay> Detcore<T> {
         validate_wait4_arguments(call.pid(), call.options())?;
 
         let parent = guest.thread_state().detpid.expect("detpid unset");
+        // A nested caller names its children by its own namespace's pids
+        // (https://github.com/rrnewton/hermit/issues/4090). Its process-group
+        // ids are not translated yet, nor are emulated waits.
+        let nested = guest.thread_state().nested_pid_namespace;
+        if nested && (call.pid() == 0 || call.pid() < -1 || serial_emulated_wait) {
+            return Err(self
+                .refuse_nested_pid(
+                    guest,
+                    reverie::syscalls::Sysno::wait4,
+                    "a process-group wait, or a wait on a backend that emulates child waits",
+                )
+                .await);
+        }
+        let named_child = if call.pid() > 0 && nested {
+            match crate::tool_global::guest_pid(guest, call.pid()).await {
+                GuestPidAnswer::Task { task, .. } => task,
+                // No task of the caller's namespace has that pid, so it is
+                // not a child: Linux answers ECHILD.
+                GuestPidAnswer::NoSuchPid => return Err(Errno::ECHILD.into()),
+                GuestPidAnswer::Untranslatable(reason) => {
+                    return Err(self
+                        .refuse_nested_pid(guest, reverie::syscalls::Sysno::wait4, &reason)
+                        .await);
+                }
+            }
+        } else {
+            DetPid::from_raw(call.pid())
+        };
         // Stop/continue events need a backend waitability callback. Non-SIGCHLD
         // process clones also remain legacy until backends distinguish
         // PTRACE_EVENT_CLONE from CLONE_THREAD. The common matcher already
@@ -2705,7 +2826,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             None
         } else {
             match call.pid() {
-                pid if pid > 0 => Some(ChildWaitSelector::Exact(DetPid::from_raw(pid))),
+                pid if pid > 0 => Some(ChildWaitSelector::Exact(named_child)),
                 -1 => Some(ChildWaitSelector::Any),
                 0 => process_group(guest, parent)
                     .await
@@ -2743,7 +2864,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                         };
                     };
                     let _ = await_exact_child_physical_exit(guest, child).await;
-                    let exact_call = call.with_pid(child.as_raw());
+                    let exact_call = call.with_pid(
+                        self.guest_visible_pid(guest, reverie::syscalls::Sysno::wait4, child)
+                            .await?,
+                    );
                     loop {
                         let result = if serial_emulated_wait {
                             complete_selected_emulated_wait4(guest, exact_call, child).await
@@ -2812,10 +2936,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                         let result = if serial_emulated_wait {
                             complete_selected_emulated_wait4(guest, call, child).await
                         } else {
-                            guest
-                                .inject_with_retry(call.with_pid(child.as_raw()))
+                            match self
+                                .guest_visible_pid(guest, reverie::syscalls::Sysno::wait4, child)
                                 .await
-                                .map_err(Error::from)
+                            {
+                                Ok(pid) => guest
+                                    .inject_with_retry(call.with_pid(pid))
+                                    .await
+                                    .map_err(Error::from),
+                                Err(error) => Err(error),
+                            }
                         };
                         emulated_wait_consumed =
                             serial_emulated_wait && matches!(result, Ok(value) if value > 0);
@@ -2877,6 +3007,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             // so it is not routed through the record/replay subtool.
             retry_nonblocking_syscall(guest, call, rsrc, None).await?
         };
+        // The kernel answered in the caller's namespace; the guest gets that
+        // pid, and Detcore's bookkeeping the task it names.
+        let reaped = if value > 0 {
+            self.task_of_guest_pid(guest, reverie::syscalls::Sysno::wait4, value as i32)
+                .await?
+        } else {
+            DetPid::from_raw(value as i32)
+        };
         let consumed_termination = if emulated_wait_consumed || value <= 0 {
             false
         } else if let Some(status) = call.wstatus() {
@@ -2884,13 +3022,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             guest
                 .thread_state()
-                .has_exited_child_process_cpu_time(DetPid::from_raw(value as i32))
+                .has_exited_child_process_cpu_time(reaped)
         };
         if consumed_termination {
-            guest
-                .thread_state_mut()
-                .reap_child_process_cpu_time(DetPid::from_raw(value as i32));
-            let _ = consume_child_wait(guest, DetPid::from_raw(value as i32)).await;
+            guest.thread_state_mut().reap_child_process_cpu_time(reaped);
+            let _ = consume_child_wait(guest, reaped).await;
         }
         if value > 0
             && let Some(rusage) = call.rusage()
@@ -2917,8 +3053,46 @@ impl<T: RecordOrReplay> Detcore<T> {
         // NULL rejection and whole-siginfo writes; ptrace, DBT and
         // nonsequential execution retain their existing path.
         if guest.config().backend.emulates_child_waits && guest.config().sequentialize_threads {
+            // Its selector reads the guest's pid as a DetPid
+            // (`kvm_waitid::handle`), so a nested caller is refused by name
+            // (https://github.com/rrnewton/hermit/issues/4155).
+            if guest.thread_state().nested_pid_namespace {
+                return Err(self
+                    .refuse_nested_pid(
+                        guest,
+                        reverie::syscalls::Sysno::waitid,
+                        "a wait on a backend that emulates child waits",
+                    )
+                    .await);
+            }
             return kvm_waitid::handle(guest, call).await;
         }
+        // A nested caller names its children by its own namespace's pids
+        // (https://github.com/rrnewton/hermit/issues/4090); its process-group
+        // ids are not translated yet.
+        let nested = guest.thread_state().nested_pid_namespace;
+        if nested && call.which() == libc::P_PGID as i32 {
+            return Err(self
+                .refuse_nested_pid(
+                    guest,
+                    reverie::syscalls::Sysno::waitid,
+                    "a process-group wait",
+                )
+                .await);
+        }
+        let named_child = if nested && call.which() == libc::P_PID as i32 && call.pid() > 0 {
+            match crate::tool_global::guest_pid(guest, call.pid()).await {
+                GuestPidAnswer::Task { task, .. } => task,
+                GuestPidAnswer::NoSuchPid => return Err(Errno::ECHILD.into()),
+                GuestPidAnswer::Untranslatable(reason) => {
+                    return Err(self
+                        .refuse_nested_pid(guest, reverie::syscalls::Sysno::waitid, &reason)
+                        .await);
+                }
+            }
+        } else {
+            DetPid::from_raw(call.pid())
+        };
         let dettid = guest.thread_state().dettid;
         let mut rsrc = Resources::new(dettid);
         rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
@@ -2991,9 +3165,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // state remain on the legacy kernel-polling path.
         let terminal_spec = if terminal_events_only {
             let selector = match call.which() {
-                which if which == libc::P_PID as i32 => {
-                    Some(ChildWaitSelector::Exact(DetPid::from_raw(call.pid())))
-                }
+                which if which == libc::P_PID as i32 => Some(ChildWaitSelector::Exact(named_child)),
                 which if which == libc::P_ALL as i32 => Some(ChildWaitSelector::Any),
                 which if which == libc::P_PGID as i32 => {
                     let group = if call.pid() == 0 {
@@ -3043,9 +3215,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                 if let Some(child) = selected {
                     let _ = await_exact_child_physical_exit(guest, child).await;
                 }
-                let effective_call = selected.map_or(call, |child| {
-                    call.with_which(libc::P_PID as i32).with_pid(child.as_raw())
-                });
+                let effective_call = match selected {
+                    Some(child) => call.with_which(libc::P_PID as i32).with_pid(
+                        self.guest_visible_pid(guest, reverie::syscalls::Sysno::waitid, child)
+                            .await?,
+                    ),
+                    None => call,
+                };
                 loop {
                     guest.memory().write_value(info, &empty_info)?;
                     let value = match guest.inject_with_retry(effective_call).await {
@@ -3069,9 +3245,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                     let consumed = child_pid != 0
                         && call.options() & libc::WNOWAIT == 0
                         && waitid_code_is_termination(info_value.si_code);
-                    let result = finish_waitid_result(guest, call, value, info_value)?;
+                    let child = self
+                        .task_of_guest_pid(guest, reverie::syscalls::Sysno::waitid, child_pid)
+                        .await?;
+                    let result = finish_waitid_result(guest, call, value, info_value, child)?;
                     if consumed {
-                        let _ = consume_child_wait(guest, DetPid::from_raw(child_pid)).await;
+                        let _ = consume_child_wait(guest, child).await;
                     }
                     return Ok(result);
                 }
@@ -3141,14 +3320,33 @@ impl<T: RecordOrReplay> Detcore<T> {
                     if let Err(error) = guest.memory().write_value(info, &empty_info) {
                         break Err(error.into());
                     }
-                    let exact_call = call.with_which(libc::P_PID as i32).with_pid(child.as_raw());
+                    let pid = match self
+                        .guest_visible_pid(guest, reverie::syscalls::Sysno::waitid, child)
+                        .await
+                    {
+                        Ok(pid) => pid,
+                        Err(error) => break Err(error),
+                    };
+                    let exact_call = call.with_which(libc::P_PID as i32).with_pid(pid);
                     match guest.inject_with_retry(exact_call).await {
                         Ok(value) => {
-                            let info_value = match guest.memory().read_value(info) {
+                            let info_value: libc::siginfo_t = match guest.memory().read_value(info)
+                            {
                                 Ok(value) => value,
                                 Err(error) => break Err(error.into()),
                             };
-                            break finish_waitid_result(guest, call, value, info_value);
+                            let reported = match self
+                                .task_of_guest_pid(
+                                    guest,
+                                    reverie::syscalls::Sysno::waitid,
+                                    unsafe { info_value.si_pid() },
+                                )
+                                .await
+                            {
+                                Ok(task) => task,
+                                Err(error) => break Err(error),
+                            };
+                            break finish_waitid_result(guest, call, value, info_value, reported);
                         }
                         Err(Errno::ECHILD) => {
                             let _ = consume_child_wait(guest, child).await;
@@ -3197,7 +3395,20 @@ impl<T: RecordOrReplay> Detcore<T> {
                             None,
                         ) {
                             ExactWaitPollDecision::ChildReady => {
-                                break finish_waitid_result(guest, call, value, info_value);
+                                let reported = match self
+                                    .task_of_guest_pid(
+                                        guest,
+                                        reverie::syscalls::Sysno::waitid,
+                                        child_pid,
+                                    )
+                                    .await
+                                {
+                                    Ok(task) => task,
+                                    Err(error) => break Err(error),
+                                };
+                                break finish_waitid_result(
+                                    guest, call, value, info_value, reported,
+                                );
                             }
                             ExactWaitPollDecision::Interrupted => {
                                 break interrupted_child_wait_result(
@@ -3236,7 +3447,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let info_value: libc::siginfo_t = guest.memory().read_value(info)?;
                 let child_pid = unsafe { info_value.si_pid() };
                 if child_pid != 0 && waitid_code_is_termination(info_value.si_code) {
-                    let _ = consume_child_wait(guest, DetPid::from_raw(child_pid)).await;
+                    let child = self
+                        .task_of_guest_pid(guest, reverie::syscalls::Sysno::waitid, child_pid)
+                        .await?;
+                    let _ = consume_child_wait(guest, child).await;
                 }
             }
             result
@@ -3555,8 +3769,26 @@ impl<T: RecordOrReplay> Detcore<T> {
         // leader. The kill-target resolver is the wrong question here: it
         // models `kill(2)`, whose first act is to refuse anything that is not a
         // leader, so a perfectly live non-leader thread's tid reported ESRCH.
-        if call.pid() != 0 && !thread_is_live(guest, DetTid::from_raw(call.pid())).await {
-            return Err(Errno::ESRCH.into());
+        // A nested caller names the thread by its own namespace's tid
+        // (https://github.com/rrnewton/hermit/issues/4155).
+        let named = if call.pid() > 0 && guest.thread_state().nested_pid_namespace {
+            match crate::tool_global::guest_pid(guest, call.pid()).await {
+                GuestPidAnswer::Task { task, .. } => Some(task),
+                GuestPidAnswer::NoSuchPid => None,
+                GuestPidAnswer::Untranslatable(reason) => {
+                    return Err(self
+                        .refuse_nested_pid(guest, reverie::syscalls::Sysno::sched_setattr, &reason)
+                        .await);
+                }
+            }
+        } else {
+            Some(DetTid::from_raw(call.pid()))
+        };
+        if call.pid() != 0 {
+            match named {
+                Some(task) if thread_is_live(guest, task).await => {}
+                _ => return Err(Errno::ESRCH.into()),
+            }
         }
 
         // And everything `__sched_setscheduler` decides after it.

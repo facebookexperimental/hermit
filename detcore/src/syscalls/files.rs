@@ -6813,6 +6813,36 @@ impl<T: RecordOrReplay> Detcore<T> {
         // would open it; refusing it with EPERM is a policy, the answer the
         // guest already gets for `ptrace` and `process_vm_readv` on that process.
         let pid = call.pid() as i32;
+        // A nested caller names its own namespace's pid, where none of
+        // Hermit's tasks is visible; the pidfd records the task it names
+        // (https://github.com/rrnewton/hermit/issues/4155). A pid no task of
+        // that namespace has goes to the kernel, which answers ESRCH.
+        if pid > 0 && guest.thread_state().nested_pid_namespace {
+            let target = match crate::tool_global::guest_pid(guest, pid).await {
+                crate::scheduler::pid_namespaces::GuestPidAnswer::Task { task, .. } => Some(task),
+                crate::scheduler::pid_namespaces::GuestPidAnswer::NoSuchPid => None,
+                crate::scheduler::pid_namespaces::GuestPidAnswer::Untranslatable(reason) => {
+                    tracing::error!(
+                        "[detcore, dtid {}] pidfd_open of pid {} from a nested PID namespace is not supported: {} (https://github.com/rrnewton/hermit/issues/4155)",
+                        guest.thread_state().dettid,
+                        pid,
+                        reason,
+                    );
+                    return self
+                        .refuse_unserviceable_operation(guest, Sysno::pidfd_open, Errno::ENOSYS)
+                        .await;
+                }
+            };
+            let fd = self.record_or_replay(guest, call).await? as RawFd;
+            let flags = OFlag::O_CLOEXEC | OFlag::from_bits_truncate(call.flags() as libc::c_int);
+            self.add_fd(guest, fd, flags, FdType::Pidfd).await?;
+            if let Some(target) = target {
+                guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| detfd.set_pidfd_target(target))?;
+            }
+            return Ok(fd as i64);
+        }
         if pid > 0 && crate::tool_global::names_hermit_task(guest, Some(pid), pid).await {
             tracing::info!(
                 "[detcore, dtid {}] pidfd_open of {}, Hermit's own process: refused with EPERM \
@@ -6876,6 +6906,13 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         // Linux checks the flags before it looks at the descriptor.
         let mut scope = pidfd_signal_scope(flags)?;
+        let info = AddrMut::<libc::siginfo_t>::from_raw(call.into_parts().1.arg2);
+        if let Some(refused) = self
+            .refuse_forged_own_sigchld(guest, Sysno::pidfd_send_signal, signal, info)
+            .await
+        {
+            return refused;
+        }
         // The two sentinels name the caller without a descriptor: its thread
         // (`PIDFD_SELF_THREAD`, thread-directed unless a flag says otherwise)
         // or its thread group (`PIDFD_SELF_THREAD_GROUP`)
@@ -6982,6 +7019,21 @@ impl<T: RecordOrReplay> Detcore<T> {
             Some(named) => Some(signal_target_process(guest, named).await.unwrap_or(named)),
             None => None,
         };
+        // A nested caller's signal to its own PID namespace's init is dropped
+        // by the kernel unless the init catches it, SIGKILL always
+        // (`Detcore::own_namespace_init_drops`): forward it unchanged, with
+        // nothing to retire or record
+        // (https://github.com/rrnewton/hermit/issues/4155).
+        if guest.thread_state().nested_pid_namespace
+            && let Some(process) = process
+            && let Ok(Some(local)) = crate::tool_global::local_pid(guest, process).await
+            && let crate::scheduler::pid_namespaces::GuestPidAnswer::Task {
+                own_init_caught, ..
+            } = crate::tool_global::guest_pid(guest, local).await
+            && Self::own_namespace_init_drops(own_init_caught, signal)
+        {
+            return Ok(self.record_or_replay(guest, call).await?);
+        }
         // A process Detcore saw exit and that is gone is ESRCH, as Linux
         // answers once it is reaped, whatever the host has reaped by now
         // (https://github.com/rrnewton/hermit/issues/4091).
@@ -7218,8 +7270,19 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await;
         }
 
-        let current_tgid = DetPid::from_raw(guest.inject(syscalls::Getpid::new()).await? as i32);
-        let current_tid = DetTid::from_raw(guest.inject(syscalls::Gettid::new()).await? as i32);
+        // A nested caller's own getpid and gettid are its namespace's ids,
+        // while a pidfd records the task in the container's: compare the
+        // caller's own DetPid and DetTid then
+        // (https://github.com/rrnewton/hermit/issues/4155).
+        let (current_tgid, current_tid) = match guest.thread_state().detpid {
+            Some(detpid) if guest.thread_state().nested_pid_namespace => {
+                (detpid, guest.thread_state().dettid)
+            }
+            _ => (
+                DetPid::from_raw(guest.inject(syscalls::Getpid::new()).await? as i32),
+                DetTid::from_raw(guest.inject(syscalls::Gettid::new()).await? as i32),
+            ),
+        };
         let source = guest.thread_state().capture_pidfd_getfd_source(
             pidfd,
             targetfd,

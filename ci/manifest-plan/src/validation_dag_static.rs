@@ -1404,7 +1404,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4164): 1055.
     // And metadata::tests::record_version_rejects_streams_from_before_the_vfork_gate_readmission
     // (https://github.com/rrnewton/hermit/issues/4163): 1056.
-    ("test.hermit_unit", 1056),
+    // And metadata::tests::record_version_rejects_streams_made_before_nested_pid_translation
+    // (https://github.com/rrnewton/hermit/issues/4155): 1057.
+    ("test.hermit_unit", 1057),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1958,7 +1960,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the cpu0-topology and node0 single-CPU test (https://github.com/rrnewton/hermit/issues/4160): 1446.
     // And the four SIGEV_THREAD_ID timer tests (https://github.com/rrnewton/hermit/issues/4164): 1450.
     // And the nested-vfork background readmission test (https://github.com/rrnewton/hermit/issues/4163): 1451.
-    ("test.detcore_unit", 1451),
+    // And the five scheduler::pid_namespaces tests and
+    // a_nested_parents_child_exit_sigchld_is_answered_in_its_namespace
+    // (https://github.com/rrnewton/hermit/issues/4155): 1457.
+    // And a_nested_receivers_own_copy_is_told_by_its_mark and
+    // a_nested_receivers_marked_record_asks_for_the_own_copy: 1459.
+    // And a_rewritten_own_copy_keeps_none_of_its_marked_record: 1460.
+    ("test.detcore_unit", 1460),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2298,7 +2306,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And record_ppoll_whose_mask_blocks_a_signal_a_sibling_takes and
     // record_epoll_pwait_whose_mask_blocks_a_signal_a_sibling_takes
     // (https://github.com/rrnewton/hermit/issues/4149): 194.
-    ("test.record_replay", 194),
+    // And record_nested_pid_namespace
+    // (https://github.com/rrnewton/hermit/issues/4155): 195.
+    ("test.record_replay", 195),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -2675,7 +2685,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/reverie/issues/997): 319.
     // And a_nested_vfork_child_that_exits_completes_at_bitwise_parity
     // (https://github.com/rrnewton/hermit/issues/4163): 320.
-    ("test.cli", 320),
+    // And a_nested_pid_namespace_names_its_own_pids_at_bitwise_parity and
+    // a_nested_namespace_init_exiting_beside_a_live_process_is_a_named_determinism_loss
+    // (https://github.com/rrnewton/hermit/issues/4155): 322.
+    // And a_sigchld_forging_the_own_copy_mark_is_refused_by_name: 323.
+    ("test.cli", 323),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2937,7 +2951,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Nor do the two SIGEV_THREAD_ID timer tests: 254.
     // And the realtime-termination test: 255.
     // Nor does the nested-vfork test: 256.
-    ("test.cli_on_host", 256),
+    // So do the two nested-PID-namespace tests: 258.
+    // So does the own-copy mark refusal test: 259.
+    ("test.cli_on_host", 259),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -3096,7 +3112,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the cpu0-topology and node0 single-CPU test: 1446.
     // And the four SIGEV_THREAD_ID timer tests: 1450.
     // And the nested-vfork background readmission test: 1451.
-    ("test.detcore_unit_on_host", 1451),
+    // And the six nested-PID-namespace scheduler tests: 1457.
+    // And the two own-copy mark tests: 1459.
+    // And the own-copy signalfd rewrite test: 1460.
+    ("test.detcore_unit_on_host", 1460),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -3244,7 +3263,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the PIDFD_SELF record-epoch test: 1054.
     // And the SIGEV_THREAD_ID record-epoch test: 1055.
     // And the vfork-gate readmission record-epoch test: 1056.
-    ("test.hermit_unit_on_host", 1056),
+    // And the nested-PID-namespace record-epoch test: 1057.
+    ("test.hermit_unit_on_host", 1057),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
