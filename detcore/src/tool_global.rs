@@ -30,6 +30,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU16;
 use std::sync::atomic::Ordering::SeqCst;
 use std::task::Poll;
+use std::time::Duration;
 use std::time::SystemTime;
 
 use anyhow::bail;
@@ -1808,6 +1809,43 @@ impl GlobalTool for GlobalState {
     }
 
     async fn receive_rpc(&self, from: Tid, gr: Self::Request) -> Self::Response {
+        // The deadline hint of https://github.com/rrnewton/hermit/issues/4121
+        // rides on whichever reply resumes the thread after its grant: an
+        // ordinary or parked resource grant, a futex wake, a parent's
+        // continuation, thread start, the exec continuation. Clearing on
+        // arrival means a reply carries only a hint recorded while its own
+        // request was pending (a grant, or a timer the request armed).
+        // Only a request whose reply resumes the thread from a grant, or arms
+        // a timer, touches the hint: control messages sent on another task's
+        // behalf must neither consume nor carry it.
+        if !resumes_from_grant(&gr.2) {
+            return self.dispatch_rpc(from, gr).await;
+        }
+        let dtid = DetTid::from_raw(from.as_raw());
+        self.sched.lock().unwrap().take_deadline_hint(dtid);
+        let (time, response) = self.dispatch_rpc(from, gr).await;
+        let hint = self.sched.lock().unwrap().take_deadline_hint(dtid);
+        match hint {
+            Some(remaining)
+                if response != GlobalResponse::ThreadExited
+                    && response != GlobalResponse::Retired =>
+            {
+                (
+                    time,
+                    GlobalResponse::WithDeadline(remaining, Box::new(response)),
+                )
+            }
+            _ => (time, response),
+        }
+    }
+}
+
+impl GlobalState {
+    async fn dispatch_rpc(
+        &self,
+        from: Tid,
+        gr: <Self as GlobalTool>::Request,
+    ) -> <Self as GlobalTool>::Response {
         // Records an in-guest Tool forwarded before sending this request are queued,
         // and the sender's are written now if it runs alone (the order rule at
         // `detlog::set_forwarded_source`).
@@ -2627,7 +2665,7 @@ impl GlobalTool for GlobalState {
             // TODO-HUMAN-REVIEW(#869)
             GlobalRequest::RegisterAlarm(dpid, dtid, duration, interval, sig) => {
                 let now = self.global_time.lock().unwrap().as_nanos();
-                match self
+                let response = match self
                     .recv_register_alarm(
                         dpid,
                         RpcIncarnation {
@@ -2643,7 +2681,9 @@ impl GlobalTool for GlobalState {
                 {
                     SchedulerRpcResult::Continue(remaining) => R::RegisterAlarm(remaining),
                     SchedulerRpcResult::ThreadExited => R::ThreadExited,
-                }
+                };
+                self.sched.lock().unwrap().note_arming_hint(dtid, now);
+                response
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-841): Review logical alarm query RPC.
@@ -2661,7 +2701,8 @@ impl GlobalTool for GlobalState {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#869)
             GlobalRequest::RegisterPosixTimer(dpid, dtid, timer_id, deadline, interval, sig) => {
-                match self
+                let now = self.global_time.lock().unwrap().as_nanos();
+                let response = match self
                     .recv_register_posix_timer(
                         dpid,
                         RpcIncarnation {
@@ -2677,7 +2718,9 @@ impl GlobalTool for GlobalState {
                 {
                     SchedulerRpcResult::Continue(()) => R::RegisterPosixTimer(()),
                     SchedulerRpcResult::ThreadExited => R::ThreadExited,
-                }
+                };
+                self.sched.lock().unwrap().note_arming_hint(dtid, now);
+                response
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#663)
@@ -2947,9 +2990,7 @@ impl GlobalTool for GlobalState {
         };
         (time_update, resp)
     }
-}
 
-impl GlobalState {
     async fn recv_resources_with_origin(
         &self,
         from: Tid,
@@ -4618,6 +4659,11 @@ pub enum GlobalResponse {
     /// The scheduler permanently removed this raw TID. Guest-side RPC handling retires
     /// this task without cancelling a live group-exit issuer or resuming the operation.
     ThreadExited,
+    /// A reply, with the virtual time that remained before the earliest
+    /// pending deadline when the thread was granted the turn it resumes, or
+    /// armed a timer (`Scheduler::deadline_remaining_from`). Unwrapped by
+    /// [`send_and_update_time`], which caps the thread's slice there.
+    WithDeadline(Duration, Box<GlobalResponse>),
     RequestResources(ResumeStatus),
     ParkedRequest(ResourceReply),
     ResumeParkedRequest(ResourceReply),
@@ -5016,7 +5062,16 @@ where
     );
     let mytime = guest.thread_state().thread_logical_time.clone();
     let mm = guest.thread_state().mm_id;
-    let resp = guest.send_rpc((mytime, mm, counted_request(request))).await;
+    let mut resp = guest.send_rpc((mytime, mm, counted_request(request))).await;
+    let deadline = match resp.1 {
+        GlobalResponse::WithDeadline(remaining, response) => {
+            resp.1 = *response;
+            Some(remaining)
+        }
+        _ => None,
+    };
+    guest.thread_state_mut().last_grant_deadline = deadline;
+    cap_timeslice_at_deadline(guest, deadline);
     if resp.1 == GlobalResponse::Retired {
         // A committed SIGKILL victim (`Scheduler::is_unaccounted_sigkill_victim`):
         // this callback never resumes. No error, errno or injection reaches
@@ -5066,6 +5121,57 @@ pub enum ResumeStatus {
 enum SchedulerRpcResult<T> {
     Continue(T),
     ThreadExited,
+}
+
+/// Whether the reply to `request` can resume its thread from a scheduler grant
+/// (`Scheduler::unblock_guest`), or answers a timer it armed: the requests
+/// whose replies carry a deadline hint
+/// (<https://github.com/rrnewton/hermit/issues/4121>). Every handler that
+/// awaits a grant is reached from one of these.
+fn resumes_from_grant(request: &GlobalRequest) -> bool {
+    match request {
+        GlobalRequest::WithForwardedCount(_, request) => resumes_from_grant(request),
+        GlobalRequest::RequestResources(..)
+        | GlobalRequest::ParkedRequest(..)
+        | GlobalRequest::ResumeParkedRequest { .. }
+        | GlobalRequest::ResumeExec(..)
+        | GlobalRequest::CreateChildThread(..)
+        | GlobalRequest::CreateVforkChildThread(..)
+        | GlobalRequest::StartNewThread(..)
+        | GlobalRequest::FutexAction(..)
+        | GlobalRequest::TraceSchedEvent(..)
+        | GlobalRequest::RegisterAlarm(..)
+        | GlobalRequest::RegisterPosixTimer(..) => true,
+        _ => false,
+    }
+}
+
+/// End this thread's slice no later than the earliest deadline that was
+/// pending when it was granted the turn it resumes
+/// (<https://github.com/rrnewton/hermit/issues/4121>).
+///
+/// A deadline is acted on only at a scheduler turn, and a thread running a
+/// long slice of cheap syscalls takes none, so without this a sleeper's
+/// wake-up waits for the whole slice.
+pub(crate) fn cap_timeslice_at_deadline<G, T>(guest: &mut G, deadline: Option<Duration>)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let Some(remaining) = deadline else {
+        return;
+    };
+    let clock_multiplier = guest.config().clock_multiplier.unwrap_or(1.0);
+    let schedule_replay = guest.config().replay_schedule_from.is_some();
+    // A configuration with an invalid turn cost is refused before any guest
+    // runs; zero here only drops the floor.
+    let min_slice = Duration::from_nanos(guest.config().scheduler_turn_charge().unwrap_or(0));
+    guest.thread_state_mut().cap_timeslice_at_deadline(
+        remaining,
+        clock_multiplier,
+        min_slice,
+        schedule_replay,
+    );
 }
 
 /// Global method RPC to request to control a resource.

@@ -2250,6 +2250,12 @@ pub struct ThreadState<T> {
     /// `end_of_timeslice` so syscall-heavy workloads can use a shorter, cheap target deadline.
     pub max_timeslice_end: Option<LogicalTime>,
 
+    /// The deadline hint carried by the last scheduler reply this thread
+    /// received (`ThreadState::cap_timeslice_at_deadline`). Applied when the
+    /// reply arrives, and again by the two paths that then install a fresh
+    /// slice end: thread start and the exec continuation.
+    pub last_grant_deadline: Option<Duration>,
+
     /// Track what our last timer was set for, just to double check that RCB timers are behaving
     /// as expected and see if we went over.  (For exmaple, this behaves badly if threads are not
     /// pinned and our we migrate between cores.)
@@ -2715,6 +2721,7 @@ impl<T> ThreadState<T> {
             chaos_slowdown_active: false,
             pending_chaos_epochs: Vec::new(),
             max_timeslice_end: None,
+            last_grant_deadline: None,
             last_rcb_timer: None,
             last_rcb_timer_is_max: false,
             record_or_replay,
@@ -3249,6 +3256,62 @@ impl<T> ThreadState<T> {
                 self.thread_logical_time.as_nanos() >= max_end
             }
             _ => self.timeslice_expired(),
+        }
+    }
+
+    /// End the current slice no later than `remaining` from now: the virtual
+    /// time that was left before the earliest pending deadline when this
+    /// thread was granted its turn.
+    ///
+    /// Global time advances exactly as this thread's clock does while it runs
+    /// alone, so its slice then ends, and it takes a turn, once global time has
+    /// passed that deadline.
+    ///
+    /// The slice keeps at least `min_slice`, one scheduler turn charge, and
+    /// at least one RCB's worth of time. Every cap-induced slice end is a turn
+    /// charged that much, so a thread runs at least as long as the turn it
+    /// pays for: the virtual time the cap adds is at most the thread's own
+    /// work. With a shorter floor, a sibling sleeping just over one turn
+    /// charge made each slice about 1 us of work per 1-1.5 ms of virtual time.
+    ///
+    /// Only the software slice end moves, which takes effect at the thread's
+    /// next check-in: a syscall, signal or timer event. The PMU maximum keeps
+    /// its value, so a thread that makes no syscalls still runs to it: a
+    /// precise PMU stop at every deadline costs about 70 ms of host time each,
+    /// and a fast timer would make them constant
+    /// (<https://github.com/rrnewton/hermit/issues/4121>). A schedule replay follows
+    /// its recorded turns, and a preemption replay its recorded slice ends,
+    /// neither capped. Past the last recorded point a replay's slice end is
+    /// `LogicalTime::MAX` (its PMU maximum stays bounded), and the cap may
+    /// lower it; that need not reproduce the record's own slice ends.
+    pub(crate) fn cap_timeslice_at_deadline(
+        &mut self,
+        remaining: Duration,
+        clock_multiplier: f64,
+        min_slice: Duration,
+        schedule_replay: bool,
+    ) {
+        let recorded_slice =
+            self.preemption_points.is_some() && self.stats.last_recorded_slice.is_none();
+        if recorded_slice || schedule_replay {
+            return;
+        }
+        let Some(end) = self.end_of_timeslice else {
+            return;
+        };
+        let one_rcb =
+            (NANOS_PER_RCB * clock_multiplier * self.rcb_time_multiplier().as_f64()).ceil() as u64;
+        let current = self.thread_logical_time.as_nanos();
+        let cap = current
+            + remaining
+                .max(min_slice)
+                .max(Duration::from_nanos(one_rcb + 1));
+        if cap < end {
+            debug!(
+                "[dtid {}] end of slice moved from {} to {}, the earliest pending deadline (current {})",
+                self.dettid, end, cap, current
+            );
+            self.end_of_timeslice = Some(cap);
         }
     }
 
@@ -4113,6 +4176,83 @@ mod timeslice_tests {
         NonZeroU64::new(value)
     }
 
+    /// The cap of hermit#4121 only lowers the software slice end, keeps one
+    /// RCB of room (10 ns at the default clock) plus one nanosecond, and
+    /// leaves the PMU maximum alone.
+    #[test]
+    fn a_deadline_cap_lowers_the_slice_end_and_keeps_one_rcb() {
+        let config = Config {
+            max_timeslice: nz(200_000_000),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(3), &config, ());
+        state.next_timeslice(&config);
+        let now = state.thread_logical_time.as_nanos();
+        let end = state.end_of_timeslice.unwrap();
+        assert_eq!(end, now + Duration::from_nanos(200_000_000));
+        assert_eq!(state.max_timeslice_end, Some(end));
+
+        state.cap_timeslice_at_deadline(
+            Duration::from_nanos(5_000_000),
+            1.0,
+            Duration::ZERO,
+            false,
+        );
+        let capped = now + Duration::from_nanos(5_000_000);
+        assert_eq!(state.end_of_timeslice, Some(capped));
+        assert_eq!(state.max_timeslice_end, Some(end));
+
+        // A later deadline never raises the end.
+        state.cap_timeslice_at_deadline(
+            Duration::from_nanos(9_000_000),
+            1.0,
+            Duration::ZERO,
+            false,
+        );
+        assert_eq!(state.end_of_timeslice, Some(capped));
+
+        // A deadline already due leaves one RCB and a nanosecond.
+        state.cap_timeslice_at_deadline(Duration::ZERO, 1.0, Duration::ZERO, false);
+        assert_eq!(state.end_of_timeslice, Some(now + Duration::from_nanos(11)));
+        assert_eq!(state.max_timeslice_end, Some(end));
+    }
+
+    /// The cap never ends a slice sooner than one scheduler turn charge
+    /// (`min_slice`) after it is applied, so the turn it causes costs no more
+    /// virtual time than the work the thread did.
+    #[test]
+    fn a_deadline_cap_keeps_at_least_one_turn_charge() {
+        let config = Config {
+            max_timeslice: nz(200_000_000),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(3), &config, ());
+        state.next_timeslice(&config);
+        let now = state.thread_logical_time.as_nanos();
+        let turn = Duration::from_nanos(500_000);
+        state.cap_timeslice_at_deadline(Duration::from_nanos(1_000), 1.0, turn, false);
+        assert_eq!(state.end_of_timeslice, Some(now + turn));
+        state.cap_timeslice_at_deadline(Duration::ZERO, 1.0, turn, false);
+        assert_eq!(state.end_of_timeslice, Some(now + turn));
+        state.cap_timeslice_at_deadline(Duration::from_nanos(700_000), 1.0, turn, false);
+        assert_eq!(state.end_of_timeslice, Some(now + turn));
+    }
+
+    /// Schedule replay follows its recorded turns: the cap leaves its slices
+    /// alone.
+    #[test]
+    fn schedule_replay_takes_no_deadline_cap() {
+        let config = Config {
+            max_timeslice: nz(200_000_000),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(3), &config, ());
+        state.next_timeslice(&config);
+        let end = state.end_of_timeslice;
+        state.cap_timeslice_at_deadline(Duration::from_nanos(5_000), 1.0, Duration::ZERO, true);
+        assert_eq!(state.end_of_timeslice, end);
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1151)
     #[test]
@@ -4410,6 +4550,45 @@ mod timeslice_tests {
         let bounded_end = Some(now + Duration::from_nanos(100_000));
         assert_eq!(state.end_of_timeslice, bounded_end);
         assert_eq!(state.max_timeslice_end, bounded_end);
+    }
+
+    /// A preemption replay keeps a recorded slice end uncapped. Once the
+    /// recording runs out its slice end is `LogicalTime::MAX`, which the cap
+    /// may lower.
+    #[test]
+    fn preemption_replay_caps_only_past_its_recording() {
+        let config = Config {
+            max_timeslice: nz(100_000),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(3), &config, ());
+        let now = state.thread_logical_time.as_nanos();
+        let recorded_end = now + Duration::from_nanos(50_000);
+        let history = ThreadHistory::new()
+            .with_prio_changes(vec![(recorded_end, DEFAULT_PRIORITY)])
+            .with_preemption_rcbs(vec![5_000]);
+        state.preemption_points = Some(history.into_iter());
+
+        state.next_timeslice(&config);
+        assert_eq!(state.end_of_timeslice, Some(recorded_end));
+        state.cap_timeslice_at_deadline(Duration::from_nanos(1_000), 1.0, Duration::ZERO, false);
+        assert_eq!(state.end_of_timeslice, Some(recorded_end));
+
+        let mut exhausted = ThreadState::new(DetPid::from_raw(3), &config, ());
+        exhausted.preemption_points = Some(ThreadHistory::new().into_iter());
+        exhausted.next_timeslice(&config);
+        exhausted.cap_timeslice_at_deadline(
+            Duration::from_nanos(1_000),
+            1.0,
+            Duration::ZERO,
+            false,
+        );
+        let capped = Some(now + Duration::from_nanos(1_000));
+        assert_eq!(exhausted.end_of_timeslice, capped);
+        assert_eq!(
+            exhausted.max_timeslice_end,
+            Some(now + Duration::from_nanos(100_000))
+        );
     }
 
     #[test]

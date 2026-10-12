@@ -594,6 +594,19 @@ impl Resources {
         };
     }
 
+    /// The deadline at which this request, still queued for a turn, would
+    /// time out: a sleep's wake-up time or a backed-off poll's timeout.
+    pub(crate) fn queued_deadline(&self) -> Option<LogicalTime> {
+        let sleep = self.resources.keys().find_map(|resource| match resource {
+            ResourceID::SleepUntil(deadline) if !deadline.is_indefinite() => Some(*deadline),
+            _ => None,
+        });
+        match (sleep, self.poll_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
     /// Return the owner snapshot only for an unmodified singleton sleep.
     pub(crate) fn in_guest_sigalrm_sleep(&self) -> Option<(InGuestSleepSigalrm, LogicalTime)> {
         if self.resources.len() != 1

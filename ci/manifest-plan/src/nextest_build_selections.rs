@@ -77,6 +77,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "cpufreq_avg_determinism",
             "--test",
+            "deadline_slice_cap",
+            "--test",
             "dispatch_stats",
             "--test",
             "epoll_determinism",

@@ -414,6 +414,14 @@ impl TimedEvents {
     /// Callers that decide whether virtual time may be fast-forwarded need to
     /// inspect the deadline *before* committing to popping it; a
     /// [`LogicalTime::is_indefinite`] deadline is not a real deadline.
+    /// The period of signal timer `id`, if it is armed and periodic.
+    pub(crate) fn signal_timer_period(&self, id: SignalTimerId) -> Option<LogicalTime> {
+        self.signal_timers
+            .get(&id)
+            .map(|state| state.interval)
+            .filter(|interval| *interval != LogicalTime::ZERO)
+    }
+
     pub fn next_deadline(&self) -> Option<LogicalTime> {
         self.map.first_key_value().map(|(time_ns, _)| *time_ns)
     }

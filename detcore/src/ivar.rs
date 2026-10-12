@@ -157,6 +157,16 @@ impl<T: Debug + Clone> Ivar<T> {
         let shared = self.inner.lock().expect("Ivar try_read could not lock.");
         shared.contents.clone()
     }
+
+    /// [`Ivar::try_read`] without the clone: apply `f` to the contents, if
+    /// filled. The same caveat applies.
+    pub fn try_read_with<R>(&self, f: impl FnOnce(&T) -> R) -> Option<R> {
+        let shared = self
+            .inner
+            .lock()
+            .expect("Ivar try_read_with could not lock.");
+        shared.contents.as_ref().map(f)
+    }
     /// This has the same effect as calling .await directly on the ivar, however it is provided for
     /// two reasons:
     ///

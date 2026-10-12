@@ -2272,6 +2272,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     chaos_slowdown_active: false,
                     pending_chaos_epochs: Vec::new(),
                     max_timeslice_end: None,
+                    last_grant_deadline: None,
                     last_rcb_timer: None,
                     last_rcb_timer_is_max: false,
 
@@ -2358,6 +2359,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             ts.preemption_points = th.map(|x| x.into_iter());
             ts.next_timeslice(&self.cfg); // Must be after preemption_points is set.
         }
+        // The start grant's deadline hint arrived before the first slice
+        // existed; cap the slice now.
+        let deadline = guest.thread_state_mut().last_grant_deadline.take();
+        tool_global::cap_timeslice_at_deadline(guest, deadline);
 
         // The prehook is a noop for a thread just starting.  Can't end the timeslice.  There's no
         // RCB progress to record.  However, we call it for consistency with all the other handlers.

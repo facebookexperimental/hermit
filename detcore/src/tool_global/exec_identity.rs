@@ -238,6 +238,11 @@ where
                 thread.max_timeslice_end = Some(deadline);
             }
         }
+        // The continuation's slice end, just installed, takes the grant's
+        // deadline cap like any other
+        // (<https://github.com/rrnewton/hermit/issues/4121>).
+        let deadline = guest.thread_state_mut().last_grant_deadline.take();
+        super::cap_timeslice_at_deadline(guest, deadline);
     }
     Ok(())
 }
