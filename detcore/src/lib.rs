@@ -930,6 +930,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await;
             }
 
+            // Read-write marks this as the delivery itself, which the
+            // scheduler's write-only wakes of a signaled sleeper are not
+            // (`Scheduler::thread_timer_copies`).
             let request = guest
                 .thread_state_mut()
                 .mk_request(ResourceID::InboundSignal(signal), Permission::RW);

@@ -2306,6 +2306,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/timer_sigev_thread_id.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/timer_sigev_thread_id.c is owned by hermit-cli/tests/cli.rs and hermit-cli/tests/record_replay.rs: the CLI test a_sigev_thread_id_timer_notifies_exactly_its_thread_at_bitwise_parity runs each mode (timer_create's answers per good_sigevent, an expiration reaching the named worker, one the worker blocks staying pending on it, one naming an exited thread dropped while the timer stays armed, one naming the caller, a real-time one the worker blocks and never observes) and requires Linux's output at bitwise parity, and record_sigev_thread_id_timers repeats three modes under record (https://github.com/rrnewton/hermit/issues/4164). It stays a fixture because a generic manifest cannot assert these per-mode outputs."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/timerslack_proc_record_replay.c",
       "runner": "hermit-cli/tests/record_replay.rs",
       "why": "tests/c/timerslack_proc_record_replay.c is owned by hermit-cli/tests/record_replay.rs: The Rust integration test compiles this guest and runs its strict record/replay contract, asserting that one timer-slack value composes across relative and absolute procfs reads/writes, prctl access, zero-length I/O, seek behavior, and replay. It remains a test-owned guest fixture because that phase-spanning contract is asserted by the dedicated record/replay test rather than a generic manifest cell."

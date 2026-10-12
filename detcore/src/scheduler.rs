@@ -70,6 +70,7 @@ use runqueue::RunQueue;
 pub use runqueue::entropy_to_priority;
 use serde::Deserialize;
 use serde::Serialize;
+use timed_waiters::SignalTarget;
 use timed_waiters::TimedEvent;
 use timed_waiters::TimedEvents;
 use tracing::Level;
@@ -111,6 +112,7 @@ use crate::types::FutexID;
 use crate::types::GlobalTime;
 use crate::types::LogicalTime;
 use crate::types::MmId;
+use crate::types::PosixTimerThread;
 use crate::types::SchedEvent;
 use crate::types::SigWrapper;
 use crate::types::SyscallPhase;
@@ -1424,6 +1426,17 @@ pub struct Scheduler {
     /// exactly the copy the kernel would dequeue before the send.
     undelivered_scheduler_signals: BTreeMap<DetPid, u64>,
 
+    /// For each thread and standard signal, the `SIGEV_THREAD_ID` timer whose
+    /// expiration the scheduler sent it and that the thread has not consumed
+    /// since (`fire_thread_timer`). While the entry stands, the pending copy of
+    /// that signal on the thread is the timer's own queued signal, which Linux
+    /// does not queue twice (an overrun). The entry goes when the copy is
+    /// consumed: delivered (the thread's `InboundSignal` request), or taken by
+    /// `rt_sigtimedwait` (`set_sigtimedwait_set`). A signalfd's reads are not
+    /// observed, so a signal a signalfd of the process covers never counts as
+    /// the timer's own (<https://github.com/rrnewton/hermit/issues/4164>).
+    thread_timer_copies: BTreeMap<(DetTid, i32), timed_waiters::SignalTimerId>,
+
     /// Whether any guest has sent SIGSTKFLT, Reverie's timer marker
     /// (`record_guest_marker_signal`). Set in the sending call's turn and
     /// never cleared.
@@ -2590,6 +2603,20 @@ pub(crate) fn exit_on_scheduler_refusal(refusal: &dyn std::fmt::Display) -> ! {
 /// which Detcore does not deliver from a timer (https://github.com/rrnewton/hermit/issues/3893):
 /// at the expiration itself, or later, where a pending one becomes observable
 /// (https://github.com/rrnewton/hermit/issues/4089).
+/// What `Scheduler::fire_thread_timer` does with a `SIGEV_THREAD_ID` timer's
+/// expiration of a standard signal (`Scheduler::thread_timer_send`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ThreadTimerSend {
+    /// The signal is not pending on the thread: send it.
+    Send,
+    /// This timer's own earlier expiration is still pending there: Linux
+    /// counts an overrun and queues nothing.
+    Overrun,
+    /// Another copy is pending there, which a send would merge into: refuse,
+    /// naming why.
+    Refuse(String),
+}
+
 /// What Linux does with a real-time POSIX timer expiration, as far as the
 /// guest could tell (`Scheduler::real_time_expiration_fate`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2615,6 +2642,19 @@ static REAL_TIME_EXPIRATION_KEPT_PENDING: std::sync::atomic::AtomicBool =
 
 fn note_real_time_expiration_kept_pending() {
     REAL_TIME_EXPIRATION_KEPT_PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Set once the scheduler records a `SIGEV_THREAD_ID` timer's copy
+/// (`Scheduler::thread_timer_copies`), so a disposition change that flushes a
+/// signal asks the scheduler to forget the copies only in a run that has some
+/// (`thread_timer_copies_recorded`).
+static THREAD_TIMER_COPIES_RECORDED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a `SIGEV_THREAD_ID` timer's copy has been recorded in this run; see
+/// [`THREAD_TIMER_COPIES_RECORDED`].
+pub(crate) fn thread_timer_copies_recorded() -> bool {
+    THREAD_TIMER_COPIES_RECORDED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Whether any real-time timer expiration has been kept pending in this run;
@@ -3228,6 +3268,7 @@ impl Scheduler {
             background_call_processes: Default::default(),
             sigtimedwait_sets: Default::default(),
             undelivered_scheduler_signals: Default::default(),
+            thread_timer_copies: Default::default(),
             guest_sent_marker_signal: false,
             #[cfg(test)]
             test_signal_masks: Default::default(),
@@ -4718,10 +4759,18 @@ impl Scheduler {
         if !self.next_turns.contains_key(&dettid) {
             return false;
         }
-        match set {
-            Some(set) => self.sigtimedwait_sets.insert(dettid, set),
-            None => self.sigtimedwait_sets.remove(&dettid),
+        // A poll of the set takes a pending copy of any signal in it, so a
+        // timer's copy of one may be consumed from here until the call ends.
+        let covered = match set {
+            Some(set) => {
+                self.sigtimedwait_sets.insert(dettid, set);
+                set
+            }
+            None => self.sigtimedwait_sets.remove(&dettid).unwrap_or(0),
         };
+        self.thread_timer_copies.retain(|(thread, signo), _| {
+            *thread != dettid || covered & kernel_signal_bit(*signo) == 0
+        });
         true
     }
 
@@ -5943,6 +5992,144 @@ impl Scheduler {
         self.signal_guest(target, sig);
     }
 
+    /// Deliver an expiration of a `SIGEV_THREAD_ID` POSIX timer of `process`
+    /// to exactly `thread`, as Linux queues it on that thread's own queue
+    /// (<https://github.com/rrnewton/hermit/issues/4164>). Unlike
+    /// [`Self::fire_alarm`], no other thread stands in: once `thread` has
+    /// exited, the expiration is dropped and the timer stays armed, as on
+    /// Linux. Nothing goes through the in-guest SIGALRM ledger, which is
+    /// process-wide: a POSIX timer notifying SIGALRM is refused while a
+    /// handler is published (`SigalrmControl::ArmProducer`), and once armed it
+    /// refuses a later handler, so the two never meet.
+    ///
+    /// A standard signal already pending on the thread
+    /// (`thread_timer_send`): Linux queues the timer's own preallocated signal
+    /// beside it (`posixtimer_send_sigqueue` skips `legacy_queue`), so the
+    /// thread takes the signal twice, while a send from here merges into the
+    /// pending copy. The run is refused by name rather than lose a delivery,
+    /// unless the pending copy is this timer's own earlier expiration, which
+    /// Linux counts as an overrun and does not queue again.
+    fn fire_thread_timer(&mut self, id: timed_waiters::SignalTimerId, thread: DetTid, sig: Signal) {
+        let process = id.process();
+        if !self.process_signal_targets(process).contains(&thread) {
+            info!(
+                "[dpid {}] Timer expired after its thread {} exited; dropped.",
+                process, thread
+            );
+            return;
+        }
+        match self.thread_timer_send(id, thread, sig) {
+            ThreadTimerSend::Send => {}
+            ThreadTimerSend::Overrun => {
+                info!(
+                    "[dtid {}] Thread-directed timer fired while its own signal {} is still pending there; an overrun, nothing sent.",
+                    thread, sig
+                );
+                return;
+            }
+            ThreadTimerSend::Refuse(reason) => exit_on_scheduler_refusal(&format_args!(
+                "hermit: a SIGEV_THREAD_ID timer of process {process} expired for thread {thread} while signal {sig} was already pending there {reason}; Linux queues the timer's own signal beside it, a second delivery Detcore cannot produce, so the run is refused rather than lose it (https://github.com/rrnewton/hermit/issues/4164, https://github.com/rrnewton/hermit/issues/4157)"
+            )),
+        }
+        #[cfg(test)]
+        {
+            self.host_signal_attempts += 1;
+        }
+        info!(
+            "[dtid {}] Thread-directed timer fired, delivering signal {} to it.",
+            thread, sig
+        );
+        let signo = sig as libc::c_int;
+        if self.thread_timer_copy_is_observable(process, thread, kernel_signal_bit(signo)) {
+            THREAD_TIMER_COPIES_RECORDED.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.thread_timer_copies.insert((thread, signo), id);
+        } else {
+            self.thread_timer_copies.remove(&(thread, signo));
+        }
+        self.send_guest_signal(thread, sig, Some(process));
+    }
+
+    /// Whether timer `id`'s expiration can be sent to `thread` as signal
+    /// `sig` (`fire_thread_timer`). It reads the thread's private pending
+    /// set (`SigPnd`): the thread is stopped at a request, parked, or in a call
+    /// outside the schedule, and no guest thread holds the turn at a timed
+    /// dispatch, so only a host-timed signal could change it. A real-time
+    /// signal queues every copy, so only a standard one can merge.
+    fn thread_timer_send(
+        &mut self,
+        id: timed_waiters::SignalTimerId,
+        thread: DetTid,
+        sig: Signal,
+    ) -> ThreadTimerSend {
+        let signo = sig as libc::c_int;
+        let pending = match self.read_sleeper_signal_state(thread) {
+            Ok(state) => state.thread_pending,
+            Err(_) => {
+                return ThreadTimerSend::Refuse(
+                    "(its pending signals could not be read)".to_owned(),
+                );
+            }
+        };
+        let bit = kernel_signal_bit(signo);
+        if pending & bit == 0 {
+            // The timer's own earlier copy, if any, has been taken.
+            self.thread_timer_copies.remove(&(thread, signo));
+            return ThreadTimerSend::Send;
+        }
+        // Generating SIGCONT flushes every pending stop signal, and generating
+        // a stop signal flushes SIGCONT, from every thread, whoever sends it,
+        // the terminal and the host included (`prepare_signal`): a pending
+        // copy of one can never be proven the timer's own.
+        if [
+            libc::SIGCONT,
+            libc::SIGSTOP,
+            libc::SIGTSTP,
+            libc::SIGTTIN,
+            libc::SIGTTOU,
+        ]
+        .contains(&signo)
+        {
+            return ThreadTimerSend::Refuse(
+                "(a job-control signal, which any sender's SIGCONT or stop signal may have flushed unobserved)"
+                    .to_owned(),
+            );
+        }
+        if !self.thread_timer_copy_is_observable(id.process(), thread, bit) {
+            return ThreadTimerSend::Refuse(
+                "(a signalfd or an rt_sigtimedwait of the thread may have taken this timer's copy unobserved)"
+                    .to_owned(),
+            );
+        }
+        match self.thread_timer_copies.get(&(thread, signo)) {
+            Some(sender) if *sender == id => ThreadTimerSend::Overrun,
+            Some(sender) => ThreadTimerSend::Refuse(format!("(sent by another timer, {sender:?})")),
+            None => ThreadTimerSend::Refuse("(not sent by this timer)".to_owned()),
+        }
+    }
+
+    /// The disposition of `signo` in `process` became one that ignores it:
+    /// Linux flushes its pending copies from every thread (`do_sigaction`), so
+    /// no timer's copy of it is pending anywhere in the process.
+    pub(crate) fn forget_thread_timer_copies(&mut self, process: DetPid, signo: i32) {
+        let threads: Vec<DetTid> = self.thread_tree.my_thread_group(&process);
+        self.thread_timer_copies
+            .retain(|(thread, signal), _| *signal != signo || !threads.contains(thread));
+    }
+
+    /// Whether every consumption of a copy of the signal `bit` on `thread` is
+    /// observed (`thread_timer_copies`): not while the thread polls a
+    /// `rt_sigtimedwait` set holding it, nor while a signalfd of `process`
+    /// covers it.
+    fn thread_timer_copy_is_observable(&self, process: DetPid, thread: DetTid, bit: u64) -> bool {
+        self.sigtimedwait_sets
+            .get(&thread)
+            .is_none_or(|set| set & bit == 0)
+            && self
+                .signalfd_masks
+                .get(&process)
+                .is_none_or(|mask| mask & bit == 0)
+    }
+
     /// Snapshot eligibility is local to the exact outstanding sleep request.
     fn in_guest_sleep_sigalrm(
         &self,
@@ -6358,6 +6545,28 @@ impl Scheduler {
         self.thread_tree.thread_to_leader.get(&detpid).copied()
     }
 
+    /// What the `sigev_notify_thread_id` `named` of a `timer_create` in
+    /// `process` names. Linux's `good_sigevent` accepts only a task of the
+    /// caller's thread group, found by its pid in the caller's namespace, so
+    /// anything else (no such task, another process, one of Hermit's own
+    /// threads, which no guest group holds) is EINVAL
+    /// (<https://github.com/rrnewton/hermit/issues/4164>). A caller in a nested
+    /// PID namespace names a pid of that namespace, which is not a DetTid.
+    pub fn posix_timer_thread(&self, process: DetPid, named: i32) -> PosixTimerThread {
+        if self.thread_tree.pid_ns_depth(process) > 0 {
+            return PosixTimerThread::NestedNamespace;
+        }
+        if named <= 0 {
+            return PosixTimerThread::NotInGroup;
+        }
+        let thread = DetTid::from_raw(named);
+        if self.signal_target_process(thread) == Some(process) {
+            PosixTimerThread::Thread(thread)
+        } else {
+            PosixTimerThread::NotInGroup
+        }
+    }
+
     pub fn process_signal_targets(&self, detpid: DetPid) -> Vec<DetTid> {
         let Some(leader) = self.signal_target_process(detpid) else {
             return Vec::new();
@@ -6401,6 +6610,19 @@ impl Scheduler {
     /// external syscalls remain blocked until the signal interrupts them and their real
     /// continuation RPC becomes visible; other backends retain their existing immediate requeue.
     fn signal_guest(&mut self, dettid: DetTid, signal: Signal) {
+        self.send_guest_signal(dettid, signal, None);
+    }
+
+    /// [`Self::signal_guest`], or with `thread_of: Some(process)` a
+    /// thread-directed send to `dettid` of `process`. A thread's pidfd
+    /// (PIDFD_THREAD) sends thread-directed either way; without one,
+    /// `kill(2)` would queue the signal for the whole process even when it
+    /// names a non-leader thread, so a thread-directed send uses `tgkill(2)`.
+    /// Only a process-directed copy enters the record of scheduler signals
+    /// left in the shared queue (`undelivered_scheduler_signals`): a
+    /// thread-directed one waits in its thread's own queue, where the sender's
+    /// check of its own pending set sees it.
+    fn send_guest_signal(&mut self, dettid: DetTid, signal: Signal, thread_of: Option<DetPid>) {
         debug!(
             "[dtid {}] deliver signal {} physically to guest thread.",
             dettid, signal
@@ -6428,12 +6650,29 @@ impl Scheduler {
                 )
             });
             return;
+        } else if let Some(process) = thread_of {
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_tgkill,
+                    process.as_raw(),
+                    dettid.as_raw(),
+                    signal as libc::c_int,
+                )
+            };
+            if rc < 0 {
+                Err(nix::errno::Errno::last())
+            } else {
+                Ok(())
+            }
         } else {
             let pid = Pid::from_raw(dettid.as_raw()); // TODO(T78538674): virtualize pid/tid:
             signal::kill(pid, signal)
         };
         match result {
-            Ok(()) => self.note_scheduler_signal_sent(dettid, signal as libc::c_int),
+            Ok(()) if thread_of.is_none() => {
+                self.note_scheduler_signal_sent(dettid, signal as libc::c_int)
+            }
+            Ok(()) => {}
             // ⚠️ ESRCH IS AN EXPECTED OUTCOME HERE, NOT AN ERROR. The target
             // chose to exit between the moment it was selected and the moment
             // the signal was sent; that window is inherent and cannot be closed
@@ -8381,7 +8620,7 @@ impl Scheduler {
         &mut self,
         dettid: DetTid,
         rid: &ResourceID,
-        _perm: &Permission,
+        perm: &Permission,
         signal_interrupt_errno: Option<i32>,
         blocked_signal_mask: Option<u64>,
         resp: &Ivar<SchedResponse>,
@@ -8774,6 +9013,14 @@ impl Scheduler {
             // `fire_alarm`) are never SIGCHLD and are unaffected.
             ResourceID::WaitidSignals(_) => Ok(()),
             ResourceID::InboundSignal(sig) => {
+                // The thread's own request at a delivery stop
+                // (`handle_signal_event`, read-write) follows the kernel's
+                // dequeue of this signal for it: a timer's copy of it there is
+                // consumed. The scheduler's wakes of a signaled sleeper ask
+                // for the same resource write-only, and deliver nothing.
+                if *perm == Permission::RW {
+                    self.thread_timer_copies.remove(&(dettid, sig.raw()));
+                }
                 // `sigchld_ready` marks a parent step2e has already re-admitted,
                 // or a delivery the scheduler already placed; grant it now rather
                 // than deferring it (a second time).
@@ -9288,7 +9535,8 @@ impl Scheduler {
                 ahead(deadline)
                     && !fast_periodic(event)
                     && acts(match event {
-                        TimedEvent::ThreadEvt(tid) | TimedEvent::SignalEvt(_, tid, _) => *tid,
+                        TimedEvent::ThreadEvt(tid) => *tid,
+                        TimedEvent::SignalEvt(_, target, _) => target.tid(),
                     })
             })
             .map(|(deadline, _)| deadline);
@@ -10278,7 +10526,7 @@ impl Scheduler {
     pub fn register_posix_timer(
         &mut self,
         detpid: DetPid,
-        dettid: DetTid,
+        target: SignalTarget,
         timer_id: i32,
         deadline: Option<LogicalTime>,
         interval: LogicalTime,
@@ -10287,7 +10535,7 @@ impl Scheduler {
         if let Some(deadline) = deadline {
             self.blocked
                 .timed_waiters
-                .insert_posix_timer(deadline, detpid, dettid, timer_id, sig, interval);
+                .insert_posix_timer(deadline, detpid, target, timer_id, sig, interval);
         } else {
             self.blocked
                 .timed_waiters
@@ -11449,7 +11697,7 @@ mod test {
             );
             sched.register_posix_timer(
                 detpid,
-                sibling,
+                SignalTarget::Process(sibling),
                 0,
                 Some(deadline),
                 deadline,
@@ -11476,7 +11724,7 @@ mod test {
                     deadline,
                     TimedEvent::SignalEvt(
                         timed_waiters::SignalTimerId::Alarm(detpid),
-                        leader,
+                        SignalTarget::Process(leader),
                         Signal::SIGALRM.into()
                     )
                 ),]
@@ -16732,7 +16980,7 @@ mod test {
         scheduler.dispatch_timed_signal(
             LogicalTime::from_nanos(1),
             timed_waiters::SignalTimerId::ChildExit { child, parent },
-            creator,
+            SignalTarget::Process(creator),
             Signal::SIGCHLD.into(),
             true,
             scheduler.committed_time,
@@ -16775,14 +17023,14 @@ mod test {
     fn a_real_time_expiration_every_thread_blocks_is_kept_pending() {
         let (mut scheduler, process, parent, _creator, rt) = real_time_family();
         assert_eq!(
-            scheduler.real_time_expiration_fate(process, parent, 35),
+            scheduler.real_time_expiration_fate(process, SignalTarget::Process(parent), 35),
             RealTimeFate::Queued
         );
         for at in [1, 2] {
             scheduler.dispatch_timed_signal(
                 LogicalTime::from_nanos(at),
                 timed_waiters::SignalTimerId::Posix(process, 0),
-                parent,
+                SignalTarget::Process(parent),
                 timed_waiters::TimerSignal::RefuseRealTime(35),
                 true,
                 scheduler.committed_time,
@@ -16804,8 +17052,175 @@ mod test {
             .test_kernel_signal_states
             .insert(creator, signal_state(0, 0));
         assert_eq!(
-            scheduler.real_time_expiration_fate(process, parent, 35),
+            scheduler.real_time_expiration_fate(process, SignalTarget::Process(parent), 35),
             RealTimeFate::Deliverable
+        );
+    }
+
+    /// A thread-directed real-time expiration
+    /// (https://github.com/rrnewton/hermit/issues/4164) is judged by its named
+    /// thread alone: kept pending while that thread blocks it, whatever its
+    /// siblings do; deliverable when it does not; discarded once it is gone.
+    #[test]
+    fn a_thread_directed_real_time_expiration_is_judged_by_its_thread_alone() {
+        let (mut scheduler, process, parent, creator, _rt) = real_time_family();
+        scheduler
+            .test_kernel_signal_states
+            .insert(parent, signal_state(0, 0));
+        let fate = |scheduler: &Scheduler, target| {
+            scheduler.real_time_expiration_fate(process, target, 35)
+        };
+        assert_eq!(
+            fate(&scheduler, SignalTarget::Process(creator)),
+            RealTimeFate::Deliverable
+        );
+        assert_eq!(
+            fate(&scheduler, SignalTarget::Thread(creator)),
+            RealTimeFate::Queued
+        );
+        assert_eq!(
+            fate(&scheduler, SignalTarget::Thread(parent)),
+            RealTimeFate::Deliverable
+        );
+        scheduler.next_turns.remove(&creator);
+        assert_eq!(
+            fate(&scheduler, SignalTarget::Thread(creator)),
+            RealTimeFate::Discarded
+        );
+    }
+
+    /// `timer_create`'s `sigev_notify_thread_id` must name a live thread of the
+    /// caller's process, as Linux's `good_sigevent` requires; a caller in a
+    /// nested PID namespace is answered apart, since its ids are not DetTids
+    /// (https://github.com/rrnewton/hermit/issues/4164).
+    #[test]
+    fn a_sigev_thread_id_timer_names_only_a_live_thread_of_its_process() {
+        let (mut scheduler, parent, creator, child) = sigchld_family(libc::SIGCHLD);
+        let process = DetPid::from_raw(parent.as_raw());
+        assert_eq!(
+            scheduler.posix_timer_thread(process, creator.as_raw()),
+            PosixTimerThread::Thread(creator)
+        );
+        assert_eq!(
+            scheduler.posix_timer_thread(process, parent.as_raw()),
+            PosixTimerThread::Thread(parent)
+        );
+        for named in [child.as_raw(), 0, -1, 999] {
+            assert_eq!(
+                scheduler.posix_timer_thread(process, named),
+                PosixTimerThread::NotInGroup,
+                "{named}"
+            );
+        }
+        scheduler.next_turns.remove(&creator);
+        assert_eq!(
+            scheduler.posix_timer_thread(process, creator.as_raw()),
+            PosixTimerThread::NotInGroup
+        );
+        scheduler.thread_tree.enter_new_pid_namespace(process);
+        assert_eq!(
+            scheduler.posix_timer_thread(process, parent.as_raw()),
+            PosixTimerThread::NestedNamespace
+        );
+    }
+
+    /// A `SIGEV_THREAD_ID` expiration of a standard signal pending on its
+    /// thread: an overrun when the pending copy is this timer's own and not
+    /// consumed since, a refusal when it is another source's (another timer,
+    /// no record) or a poll of the signal may have consumed it unobserved
+    /// (an `rt_sigtimedwait` set, which also clears the record), and a send
+    /// once the copy has been taken
+    /// (https://github.com/rrnewton/hermit/issues/4164).
+    #[test]
+    fn a_thread_timer_expiration_beside_a_pending_copy_is_an_overrun_or_a_refusal() {
+        let (mut scheduler, parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+        let process = DetPid::from_raw(parent.as_raw());
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        let timer = timed_waiters::SignalTimerId::Posix(process, 0);
+        let other = timed_waiters::SignalTimerId::Posix(process, 1);
+        let pending = |scheduler: &mut Scheduler, bits: u64| {
+            scheduler.test_kernel_signal_states.insert(
+                creator,
+                KernelSignalState {
+                    thread_pending: bits,
+                    ..signal_state(0, 0)
+                },
+            );
+        };
+        pending(&mut scheduler, 0);
+        assert_eq!(
+            scheduler.thread_timer_send(timer, creator, Signal::SIGUSR1),
+            ThreadTimerSend::Send
+        );
+        scheduler
+            .thread_timer_copies
+            .insert((creator, libc::SIGUSR1), timer);
+        pending(&mut scheduler, usr1);
+        assert_eq!(
+            scheduler.thread_timer_send(timer, creator, Signal::SIGUSR1),
+            ThreadTimerSend::Overrun
+        );
+        assert!(matches!(
+            scheduler.thread_timer_send(other, creator, Signal::SIGUSR1),
+            ThreadTimerSend::Refuse(reason) if reason.contains("another timer")
+        ));
+        scheduler.set_sigtimedwait_set(creator, Some(usr1));
+        assert!(matches!(
+            scheduler.thread_timer_send(timer, creator, Signal::SIGUSR1),
+            ThreadTimerSend::Refuse(reason) if reason.contains("rt_sigtimedwait")
+        ));
+        scheduler.set_sigtimedwait_set(creator, None);
+        assert!(matches!(
+            scheduler.thread_timer_send(timer, creator, Signal::SIGUSR1),
+            ThreadTimerSend::Refuse(reason) if reason.contains("not sent by this timer")
+        ));
+        scheduler
+            .thread_timer_copies
+            .insert((creator, libc::SIGUSR1), timer);
+        pending(&mut scheduler, 0);
+        assert_eq!(
+            scheduler.thread_timer_send(timer, creator, Signal::SIGUSR1),
+            ThreadTimerSend::Send
+        );
+        assert!(scheduler.thread_timer_copies.is_empty());
+    }
+
+    /// An expiration of a `SIGEV_THREAD_ID` timer whose thread has exited is
+    /// dropped, with no signal sent to any other thread and nothing recorded
+    /// as left in the shared queue, and the periodic timer stays armed, as on
+    /// Linux (https://github.com/rrnewton/hermit/issues/4164).
+    #[test]
+    fn a_sigev_thread_id_expiration_after_its_thread_exited_is_dropped() {
+        let (mut scheduler, parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+        let process = DetPid::from_raw(parent.as_raw());
+        scheduler.next_turns.remove(&creator);
+        let period = LogicalTime::from_nanos(10);
+        scheduler.register_posix_timer(
+            process,
+            SignalTarget::Thread(creator),
+            0,
+            Some(period),
+            period,
+            Signal::SIGUSR1.into(),
+        );
+        let (at, event) = scheduler
+            .blocked
+            .timed_waiters
+            .pop_if_before(period)
+            .expect("the timer is due");
+        let TimedEvent::SignalEvt(id, target, signal) = event else {
+            panic!("a timer event, not {event}");
+        };
+        assert_eq!(target, SignalTarget::Thread(creator));
+        scheduler.dispatch_timed_signal(at, id, target, signal, true, at);
+        assert_eq!(scheduler.host_signal_attempts, 0);
+        assert!(scheduler.undelivered_scheduler_signals.is_empty());
+        assert_eq!(
+            scheduler.blocked.timed_waiters.iter().collect::<Vec<_>>(),
+            vec![(
+                LogicalTime::from_nanos(20),
+                TimedEvent::SignalEvt(id, SignalTarget::Thread(creator), signal)
+            )]
         );
     }
 
@@ -16816,7 +17231,7 @@ mod test {
         let (mut scheduler, process, parent, creator, _rt) = real_time_family();
         scheduler.saved_guest_sigmasks.insert(creator, 0);
         assert_eq!(
-            scheduler.real_time_expiration_fate(process, parent, 35),
+            scheduler.real_time_expiration_fate(process, SignalTarget::Process(parent), 35),
             RealTimeFate::Deliverable
         );
         // And one whose own mask blocks it, while the kernel shows nothing blocked.
@@ -16826,7 +17241,7 @@ mod test {
             .insert(creator, signal_state(0, 0));
         scheduler.saved_guest_sigmasks.insert(creator, rt);
         assert_eq!(
-            scheduler.real_time_expiration_fate(process, parent, 35),
+            scheduler.real_time_expiration_fate(process, SignalTarget::Process(parent), 35),
             RealTimeFate::Queued
         );
     }
@@ -16841,7 +17256,7 @@ mod test {
             .out_of_scheduler_masks
             .insert(creator, Some(rt));
         assert_eq!(
-            scheduler.real_time_expiration_fate(process, parent, 35),
+            scheduler.real_time_expiration_fate(process, SignalTarget::Process(parent), 35),
             RealTimeFate::Deliverable
         );
     }
@@ -16855,7 +17270,7 @@ mod test {
             sleep_signal::SleeperStateUnreadable::Unreadable(reverie::Errno::EIO),
         );
         assert_eq!(
-            scheduler.real_time_expiration_fate(process, parent, 35),
+            scheduler.real_time_expiration_fate(process, SignalTarget::Process(parent), 35),
             RealTimeFate::Deliverable
         );
     }
@@ -16874,7 +17289,7 @@ mod test {
         }
         // Every thread blocks it: Linux queues it, ignored or not.
         assert_eq!(
-            scheduler.real_time_expiration_fate(process, parent, 35),
+            scheduler.real_time_expiration_fate(process, SignalTarget::Process(parent), 35),
             RealTimeFate::Queued
         );
         // A thread that does not block it takes it, and discards it.
@@ -16882,7 +17297,7 @@ mod test {
             .test_kernel_signal_states
             .insert(creator, signal_state(0, rt));
         assert_eq!(
-            scheduler.real_time_expiration_fate(process, parent, 35),
+            scheduler.real_time_expiration_fate(process, SignalTarget::Process(parent), 35),
             RealTimeFate::Discarded
         );
     }
@@ -16892,13 +17307,13 @@ mod test {
         let (mut scheduler, process, parent, _creator, rt) = real_time_family();
         scheduler.register_signalfd(process, rt);
         assert_eq!(
-            scheduler.real_time_expiration_fate(process, parent, 35),
+            scheduler.real_time_expiration_fate(process, SignalTarget::Process(parent), 35),
             RealTimeFate::Deliverable
         );
         let (mut scheduler, process, parent, _creator, rt) = real_time_family();
         scheduler.record_handler_restore_unblocked(process, rt);
         assert_eq!(
-            scheduler.real_time_expiration_fate(process, parent, 35),
+            scheduler.real_time_expiration_fate(process, SignalTarget::Process(parent), 35),
             RealTimeFate::Deliverable
         );
         // Another signal's records change nothing.
@@ -16906,7 +17321,7 @@ mod test {
         scheduler.register_signalfd(process, kernel_signal_bit(40));
         scheduler.record_handler_restore_unblocked(process, kernel_signal_bit(41));
         assert_eq!(
-            scheduler.real_time_expiration_fate(process, parent, 35),
+            scheduler.real_time_expiration_fate(process, SignalTarget::Process(parent), 35),
             RealTimeFate::Queued
         );
         // A child process inherits its creator's records at creation, so a
@@ -16922,18 +17337,18 @@ mod test {
             },
         );
         assert_eq!(
-            scheduler.real_time_expiration_fate(child_process, child, 35),
+            scheduler.real_time_expiration_fate(child_process, SignalTarget::Process(child), 35),
             RealTimeFate::Queued
         );
         scheduler.register_signalfd(DetPid::from_raw(100), rt);
         // Recorded after the child was created: not the child's.
         assert_eq!(
-            scheduler.real_time_expiration_fate(child_process, child, 35),
+            scheduler.real_time_expiration_fate(child_process, SignalTarget::Process(child), 35),
             RealTimeFate::Queued
         );
         scheduler.inherit_real_time_records(DetPid::from_raw(100), child_process);
         assert_eq!(
-            scheduler.real_time_expiration_fate(child_process, child, 35),
+            scheduler.real_time_expiration_fate(child_process, SignalTarget::Process(child), 35),
             RealTimeFate::Deliverable
         );
     }
@@ -16945,7 +17360,7 @@ mod test {
         let (mut scheduler, process, parent, _creator, _rt) = real_time_family();
         scheduler.background_call_processes.insert(process);
         assert_eq!(
-            scheduler.real_time_expiration_fate(process, parent, 35),
+            scheduler.real_time_expiration_fate(process, SignalTarget::Process(parent), 35),
             RealTimeFate::Deliverable
         );
     }
@@ -16956,7 +17371,7 @@ mod test {
         scheduler.next_turns.remove(&parent);
         scheduler.next_turns.remove(&creator);
         assert_eq!(
-            scheduler.real_time_expiration_fate(process, parent, 35),
+            scheduler.real_time_expiration_fate(process, SignalTarget::Process(parent), 35),
             RealTimeFate::Discarded
         );
     }
@@ -16967,14 +17382,14 @@ mod test {
         scheduler.models_signal_targets = false;
         // Every thread blocks it, but nothing is kept pending.
         assert_eq!(
-            scheduler.real_time_expiration_fate(process, parent, 35),
+            scheduler.real_time_expiration_fate(process, SignalTarget::Process(parent), 35),
             RealTimeFate::Deliverable
         );
         scheduler
             .test_kernel_signal_states
             .insert(creator, signal_state(0, rt));
         assert_eq!(
-            scheduler.real_time_expiration_fate(process, creator, 35),
+            scheduler.real_time_expiration_fate(process, SignalTarget::Process(creator), 35),
             RealTimeFate::Discarded
         );
     }
@@ -17127,7 +17542,7 @@ mod test {
                         child: child_process,
                         parent,
                     },
-                    creator,
+                    SignalTarget::Process(creator),
                     Signal::SIGCHLD.into(),
                 ),
             )]
@@ -17173,7 +17588,7 @@ mod test {
             scheduler.dispatch_timed_signal(
                 scheduler.committed_time,
                 timed_waiters::SignalTimerId::ChildExit { child, parent },
-                parent,
+                SignalTarget::Process(parent),
                 Signal::SIGCHLD.into(),
                 true,
                 scheduler.committed_time,
@@ -17892,7 +18307,7 @@ mod test {
                 LogicalTime::from_nanos(1_250),
                 TimedEvent::SignalEvt(
                     timed_waiters::SignalTimerId::Alarm(detpid),
-                    dettid,
+                    SignalTarget::Process(dettid),
                     Signal::SIGALRM.into(),
                 )
             )]
@@ -18523,7 +18938,7 @@ mod test {
         // produces. No `pause`, no `ThreadEvt`.
         scheduler.register_posix_timer(
             process,
-            process,
+            SignalTarget::Process(process),
             7,
             Some(LogicalTime::MAX - LogicalTime::from_nanos(0)),
             LogicalTime::ZERO,
@@ -18568,7 +18983,7 @@ mod test {
             .push(futex_waiter(3, u32::MAX));
         scheduler.register_posix_timer(
             DetPid::from_raw(100),
-            DetPid::from_raw(100),
+            SignalTarget::Process(DetPid::from_raw(100)),
             7,
             Some(LogicalTime::INDEFINITE),
             LogicalTime::ZERO,
@@ -21046,7 +21461,7 @@ mod test {
                 assert!(scheduler.divert_in_guest_fatal_alarm(
                     event_ns,
                     id,
-                    tid,
+                    tid.tid(),
                     match signal {
                         timed_waiters::TimerSignal::Send(signal) => signal,
                         other => panic!("an alarm sends a deliverable signal, not {other}"),

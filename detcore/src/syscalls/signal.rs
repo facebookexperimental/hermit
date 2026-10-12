@@ -857,6 +857,26 @@ impl<T: RecordOrReplay> Detcore<T> {
             let pending = pending_real_time_among(guest, bit).await;
             act_on_pending_real_time(guest, pending, 0, bit).await;
         }
+        // The same flush takes a `SIGEV_THREAD_ID` timer's pending copy of a
+        // standard signal, for SIG_IGN or for SIG_DFL on a signal whose
+        // default is to ignore it (`sig_handler_ignored`), so it no longer
+        // counts as the timer's own (https://github.com/rrnewton/hermit/issues/4164).
+        let ignored = |handler: u64| {
+            handler == libc::SIG_IGN as u64
+                || (handler == libc::SIG_DFL as u64
+                    && [libc::SIGCONT, libc::SIGCHLD, libc::SIGWINCH, libc::SIGURG]
+                        .contains(&call.signum()))
+        };
+        // The kernel reads the new action from Detcore's sanitized copy, so an
+        // EFAULT can only come from writing `old_action`, after the new action
+        // is installed.
+        if (result.is_ok() || matches!(result, Err(Errno::EFAULT)))
+            && kernel_action.is_some_and(|action| ignored(action.handler))
+            && (1..32).contains(&call.signum())
+            && crate::scheduler::thread_timer_copies_recorded()
+        {
+            crate::tool_global::forget_thread_timer_copies(guest, call.signum()).await;
+        }
         Ok(result?)
     }
 

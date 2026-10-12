@@ -19,6 +19,7 @@ use reverie::syscalls::ClockId;
 use reverie::syscalls::Errno;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
+use reverie::syscalls::Sysno;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::Timeval;
 use reverie::syscalls::family::NanosleepFamily;
@@ -37,11 +38,13 @@ use crate::scheduler::Priority;
 use crate::scheduler::entropy_to_priority;
 use crate::tool_global::ResumeStatus;
 use crate::tool_global::SigalrmControl;
+use crate::tool_global::posix_timer_thread;
 use crate::tool_global::refuse_sigalrm;
 use crate::tool_global::register_posix_timer;
 use crate::tool_global::thread_observe_time;
 use crate::tool_local::Detcore;
 use crate::types::LogicalTime;
+use crate::types::PosixTimerThread;
 
 fn time_from_resources(rsrcs: &Resources) -> Option<LogicalTime> {
     if rsrcs.resources.len() > 1 {
@@ -910,7 +913,13 @@ impl<T: RecordOrReplay> Detcore<T> {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#869)
     /// timer_create: allocate a per-process POSIX timer and hand back a
-    /// deterministic id, retaining any scheduler-deliverable signal.
+    /// deterministic id, retaining any scheduler-deliverable signal and, for
+    /// `SIGEV_THREAD_ID`, the thread it notifies. The notification is checked
+    /// as Linux's `good_sigevent` does: `SIGEV_SIGNAL` and `SIGEV_THREAD` (which
+    /// the kernel treats alike; libc implements the thread itself) need a
+    /// signal from 1 to 64; `SIGEV_THREAD_ID` needs, first, a thread of the
+    /// caller's own process (<https://github.com/rrnewton/hermit/issues/4164>);
+    /// any other value is EINVAL.
     pub async fn handle_timer_create<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -919,22 +928,48 @@ impl<T: RecordOrReplay> Detcore<T> {
         // The kernel writes the new timer id here; a null pointer is EFAULT.
         let timerid_ptr = call.timerid().ok_or(Errno::EFAULT)?;
         let clockid = call.clockid();
-        let signo = if let Some(event_ptr) = call.sevp() {
-            let event: libc::sigevent = guest.memory().read_value(event_ptr)?;
-            match event.sigev_notify {
+        let (signo, thread) = if let Some(event_ptr) = call.sevp() {
+            // Only the plain fields: `sigevent` holds a pointer, which must not
+            // be kept across the query below.
+            let (notify, signo, named) = {
+                let event: libc::sigevent = guest.memory().read_value(event_ptr)?;
+                (
+                    event.sigev_notify,
+                    event.sigev_signo,
+                    event.sigev_notify_thread_id,
+                )
+            };
+            let thread = match notify {
                 libc::SIGEV_NONE => None,
-                // Linux uses 4 for SIGEV_THREAD_ID. Treat it as process-directed
-                // until Detcore tracks per-timer thread targeting.
-                libc::SIGEV_SIGNAL | 4 => {
-                    if !(1..=64).contains(&event.sigev_signo) {
-                        return Err(Errno::EINVAL.into());
+                libc::SIGEV_SIGNAL | libc::SIGEV_THREAD => None,
+                libc::SIGEV_THREAD_ID => match posix_timer_thread(guest, named).await {
+                    PosixTimerThread::Thread(thread) => Some(thread),
+                    PosixTimerThread::NotInGroup => return Err(Errno::EINVAL.into()),
+                    PosixTimerThread::NestedNamespace => {
+                        tracing::error!(
+                            "[detcore, dtid {}] timer_create with SIGEV_THREAD_ID is not supported in a nested PID namespace: the thread id is a pid of that namespace, which Detcore does not translate (https://github.com/rrnewton/hermit/issues/4155)",
+                            guest.thread_state().dettid,
+                        );
+                        return self
+                            .refuse_unserviceable_operation(
+                                guest,
+                                Sysno::timer_create,
+                                Errno::ENOSYS,
+                            )
+                            .await;
                     }
-                    Some(event.sigev_signo)
-                }
-                _ => return Err(Errno::ENOSYS.into()),
+                },
+                _ => return Err(Errno::EINVAL.into()),
+            };
+            if notify == libc::SIGEV_NONE {
+                (None, None)
+            } else if !(1..=64).contains(&signo) {
+                return Err(Errno::EINVAL.into());
+            } else {
+                (Some(signo), thread)
             }
         } else {
-            Some(libc::SIGALRM)
+            (Some(libc::SIGALRM), None)
         };
         // `None` for a real-time signal (32 to 64): see `handle_timer_settime`.
         let signal = signo.and_then(|signo| Signal::try_from(signo).ok());
@@ -943,17 +978,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let id = {
             let mut timers = guest.thread_state().posix_timers.lock().unwrap();
-            timers.create(signo)
+            timers.create(signo, thread)
         };
         guest
             .memory()
             .write_value(timerid_ptr, &(id as libc::c_int))?;
         detlog!(
-            "[dtid {}] timer_create(clockid={:?}) => deterministic timer id {}, signal {:?}",
+            "[dtid {}] timer_create(clockid={:?}) => deterministic timer id {}, signal {:?}, thread {:?}",
             guest.thread_state().dettid,
             clockid,
             id,
             signal,
+            thread,
         );
         Ok(0)
     }
@@ -983,11 +1019,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             Some(now + Duration::from_nanos(value_ns))
         };
 
-        let (old, signal_number) = {
+        let (old, signal_number, thread) = {
             let mut timers = guest.thread_state().posix_timers.lock().unwrap();
             let old = timers.settime(id, interval_ns, deadline, now);
             let signal = timers.signal(id);
-            (old, signal)
+            (old, signal, timers.thread(id))
         };
         let (old_remaining_ns, old_interval_ns) = old.ok_or(Errno::EINVAL)?;
         let signal_number = signal_number.ok_or(Errno::EINVAL)?;
@@ -1008,6 +1044,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     deadline,
                     LogicalTime::from_nanos(interval_ns),
                     signo,
+                    thread,
                 )
                 .await;
             } else if deadline.is_some() {
@@ -1098,7 +1135,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             if let Some(signo) = signal_number
                 && self.posix_timer_expiry_is_registered(signo)
             {
-                register_posix_timer(guest, id, None, LogicalTime::ZERO, signo).await;
+                register_posix_timer(guest, id, None, LogicalTime::ZERO, signo, None).await;
             }
             detlog!(
                 "[dtid {}] timer_delete(id={})",

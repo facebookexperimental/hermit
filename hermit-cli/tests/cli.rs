@@ -145,6 +145,7 @@ static KILL_MULTITHREADED_PROCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static REALTIME_SIGNALS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static OWN_PROCESS_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VDSO_SYMBOL_VERSIONS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static TIMER_SIGEV_THREAD_ID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_PROCESS_GROUP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_CREATE_RT_SIGNAL_REFUSED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_RT_SIGNAL_PENDING_OBSERVED_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1098,6 +1099,31 @@ fn realtime_signals_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "realtime-signals guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn timer_sigev_thread_id_guest() -> &'static Path {
+    TIMER_SIGEV_THREAD_ID_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("timer-sigev-thread-id");
+        fs::create_dir_all(&build_root).expect("failed to create timer-sigev-thread-id directory");
+        let guest = build_root.join("timer_sigev_thread_id");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/timer_sigev_thread_id.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile timer-sigev-thread-id guest");
+        assert!(
+            output.status.success(),
+            "timer-sigev-thread-id guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -23619,6 +23645,169 @@ fn a_pending_real_time_timer_expiration_is_refused_only_where_it_is_observed() {
                 );
             }
         }
+    }
+}
+
+/// A POSIX timer created with `SIGEV_THREAD_ID` notifies exactly the thread it
+/// names (https://github.com/rrnewton/hermit/issues/4164). Each mode of
+/// `tests/c/timer_sigev_thread_id.c` is strict-verified at bitwise parity and
+/// must print what Linux printed (5 native runs of each, identical, 2026-10-12):
+/// timer_create answers EINVAL for a thread of another process, an exited
+/// thread, ids 0 and -1, signal 0, and notify values 3, 6 and 7, and accepts
+/// SIGEV_THREAD; an expiration runs the handler on the named worker, even
+/// while the main thread, which armed it, has the signal unblocked; one the
+/// worker blocks stays pending on the worker; one naming an exited thread is
+/// dropped while the timer stays armed; a real-time one the worker blocks and
+/// never looks at is discarded with it. Before (the same calls, measured at
+/// main 1b4674f7), a thread of another process or an exited thread was
+/// accepted, SIGEV_THREAD and the invalid values answered ENOSYS, and a timer
+/// naming an exited worker delivered to the main thread. With `kill(2)` in
+/// place of the thread-directed send, the `self` mode's expiration goes to the
+/// worker (mutant, 2026-10-12). `napping_main` keeps the main thread running
+/// with the signal unblocked while the worker blocks it, so a process-directed
+/// send would reach the main thread; `overrun` lets a periodic timer expire
+/// while its own signal is pending, which Linux delivers once.
+#[test]
+fn a_sigev_thread_id_timer_notifies_exactly_its_thread_at_bitwise_parity() {
+    let guest = timer_sigev_thread_id_guest().to_str().unwrap().to_owned();
+    let cases = [
+        (
+            "answers",
+            "answers foreign=EINVAL exited=EINVAL zero=EINVAL minus_one=EINVAL signo0=EINVAL \
+             thread=0 notify3=EINVAL notify6=EINVAL notify7=EINVAL\n",
+        ),
+        ("worker", "worker hits=1 on_worker=1\n"),
+        (
+            "blocked_worker",
+            "blocked_worker hits=1 on_worker=1 pending_on_worker=1\n",
+        ),
+        ("exited", "exited hits=0 armed=1\n"),
+        ("self", "self hits=1 on_main=1\n"),
+        ("rt_blocked_worker", "rt_blocked_worker hits=0\n"),
+        (
+            "napping_main",
+            "napping_main hits=1 on_worker=1 main_took=0 pending_on_worker=1\n",
+        ),
+        ("overrun", "overrun hits=1\n"),
+        ("pending_then_raise", "pending_then_raise hits=1\n"),
+        ("ign_flush_noraise", "ign_flush_noraise hits=1\n"),
+    ];
+    for (mode, expected) in cases {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let verdict = directory.path().join("verify.json");
+        let (status, log) = run_with_deadline(
+            hermit_command(&[
+                "--log=info",
+                "run",
+                "--strict",
+                "--verify",
+                "--verify-strict",
+                "--verify-json",
+                verdict.to_str().unwrap(),
+                "--timeout",
+                "60",
+                "--",
+                guest.as_str(),
+                mode,
+            ]),
+            directory.path(),
+            Duration::from_secs(180),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{mode}:\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert_eq!(stdout, expected, "{mode}: stderr:\n{log}");
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
+                .expect("the verdict must be JSON");
+        assert_eq!(report["bitwise_parity"], true, "{mode}: {report}");
+    }
+}
+
+/// A `SIGEV_THREAD_ID` expiration of a standard signal already pending on its
+/// thread from another source (a tgkill, or another timer) is one Linux
+/// queues beside the pending copy, so the thread takes the signal twice
+/// (native: `hits=2`, 5 runs each); a send from the scheduler would merge into
+/// the pending copy, so the run is refused by name instead
+/// (https://github.com/rrnewton/hermit/issues/4164,
+/// https://github.com/rrnewton/hermit/issues/4157). Before the refusal, both
+/// modes printed `hits=1`. The last three put the second copy there after the
+/// thread had taken the timer's first one (native `hits=3`): its own tgkill,
+/// another thread's tgkill, a pidfd thread-scope send. A record of the timer's
+/// copy that outlived the delivery made them an overrun (`hits=2`). The next
+/// four take the timer's copy away without a delivery (an ignore flush with
+/// SIG_IGN, also when rt_sigaction then fails writing the old action, or
+/// SIG_DFL on SIGURG, or a zero-timeout sigtimedwait) before the thread sends
+/// its own (native `hits=2`). `cont_flush` and `tstp_flush` time a job-control
+/// signal, which SIGCONT and the stop signals flush from any sender (native
+/// `hits=3` and `hits=2`). `signalfd_overrun` is refused
+/// because a signalfd's reads are not observed, where Linux counts an overrun
+/// (native `hits=1`).
+#[test]
+fn a_sigev_thread_id_expiration_beside_a_pending_copy_is_refused_by_name() {
+    let guest = timer_sigev_thread_id_guest().to_str().unwrap().to_owned();
+    for (mode, source) in [
+        ("coalesce_self", "(not sent by this timer)"),
+        ("two_timers_self", "(sent by another timer"),
+        ("raise_rearm", "(not sent by this timer)"),
+        ("tgkill_cross", "(not sent by this timer)"),
+        ("pidfd_leader", "(not sent by this timer)"),
+        ("ign_flush", "(not sent by this timer)"),
+        ("ign_flush_efault", "(not sent by this timer)"),
+        ("dfl_flush", "(not sent by this timer)"),
+        ("stw_zero", "(not sent by this timer)"),
+        (
+            "cont_flush",
+            "(a job-control signal, which any sender's SIGCONT or stop signal may have flushed unobserved)",
+        ),
+        (
+            "tstp_flush",
+            "(a job-control signal, which any sender's SIGCONT or stop signal may have flushed unobserved)",
+        ),
+        (
+            "signalfd_overrun",
+            "(a signalfd or an rt_sigtimedwait of the thread may have taken this timer's copy unobserved)",
+        ),
+    ] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let (status, log) = run_with_deadline(
+            hermit_command(&[
+                "run",
+                "--strict",
+                "--timeout",
+                "60",
+                "--",
+                guest.as_str(),
+                mode,
+            ]),
+            directory.path(),
+            Duration::from_secs(180),
+            false,
+        );
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{mode}: {log}"
+        );
+        assert!(
+            log.contains("a SIGEV_THREAD_ID timer of process")
+                && log.contains(&format!(
+                    "while signal {} was already pending there",
+                    match mode {
+                        "dfl_flush" => "SIGURG",
+                        "cont_flush" => "SIGTSTP",
+                        "tstp_flush" => "SIGCONT",
+                        _ => "SIGUSR1",
+                    }
+                ))
+                && log.contains(source),
+            "{mode}: {log}"
+        );
     }
 }
 

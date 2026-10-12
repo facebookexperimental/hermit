@@ -2248,7 +2248,7 @@ fn controlled_exit_mode_never_enqueues_legacy_timed_sigchld() {
                     child: child_process,
                     parent,
                 },
-                parent,
+                SignalTarget::Process(parent),
                 Signal::SIGCHLD.into(),
             ),
         )]

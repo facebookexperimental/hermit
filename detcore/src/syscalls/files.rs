@@ -6670,9 +6670,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         let signalfd = self.record_or_replay(guest, call).await? as RawFd;
         // A real-time timer expiration this descriptor, or a copy a fork
         // inherits, could read is never kept pending
-        // (`Scheduler::real_time_expiration_fate`).
+        // (`Scheduler::real_time_expiration_fate`), and a `SIGEV_THREAD_ID`
+        // timer's copy of a signal it covers may be taken unobserved
+        // (`Scheduler::thread_timer_copy_is_observable`).
         if let Some(mask) = mask
-            && mask & crate::syscalls::helpers::REAL_TIME_SIGNALS != 0
+            && mask != 0
             && let Some(detpid) = guest.thread_state().detpid
         {
             crate::tool_global::register_signalfd(guest, detpid, mask).await;

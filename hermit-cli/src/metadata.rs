@@ -347,7 +347,13 @@ impl RecordVersion {
 // without an event (https://github.com/rrnewton/hermit/issues/4147). An older
 // recording holds no event for such a call, so this replayer would
 // desynchronize at it.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x13c);
+// 0x13c -> 0x13d: timer_create with SIGEV_THREAD_ID answers EINVAL for a
+// thread outside the caller's process (and for an invalid notify value, where
+// it answered ENOSYS), and the timer's expirations go to that thread alone,
+// dropped once it has exited, where they went to the whole process
+// (https://github.com/rrnewton/hermit/issues/4164). Replay recomputes both, so
+// an older recording replayed here could see different answers and deliveries.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x13d);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -372,7 +378,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x13c);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x13c;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x13d;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1119,6 +1125,14 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_that_answered_pidfd_self_sentinels_without_an_event() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x13b)));
+    }
+
+    /// A 0x13c recording was made when a SIGEV_THREAD_ID timer notified its
+    /// whole process, which this replayer no longer does
+    /// (https://github.com/rrnewton/hermit/issues/4164).
+    #[test]
+    fn record_version_rejects_streams_whose_sigev_thread_id_timers_notified_the_process() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x13c)));
     }
 
     #[test]

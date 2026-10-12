@@ -111,6 +111,7 @@ use crate::scheduler::runqueue::REPLAY_FOREGROUND_PRIORITY;
 use crate::scheduler::runqueue::is_ordinary_priority;
 use crate::scheduler::sched_loop;
 use crate::scheduler::sched_loop_external;
+use crate::scheduler::timed_waiters::SignalTarget;
 use crate::shared_open_files::OpenFileControl;
 use crate::shared_open_files::OpenFileControlReply;
 use crate::shared_open_files::SharedOpenFileStore;
@@ -2700,7 +2701,15 @@ impl GlobalState {
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#869)
-            GlobalRequest::RegisterPosixTimer(dpid, dtid, timer_id, deadline, interval, sig) => {
+            GlobalRequest::RegisterPosixTimer(
+                dpid,
+                dtid,
+                timer_id,
+                deadline,
+                interval,
+                sig,
+                thread,
+            ) => {
                 let now = self.global_time.lock().unwrap().as_nanos();
                 let response = match self
                     .recv_register_posix_timer(
@@ -2712,7 +2721,7 @@ impl GlobalState {
                         timer_id,
                         deadline,
                         interval,
-                        sig,
+                        (sig, thread),
                     )
                     .await
                 {
@@ -2875,10 +2884,21 @@ impl GlobalState {
                     .thread_tree
                     .process_of(dettid),
             ),
+            GlobalRequest::ForgetThreadTimerCopies(process, signo) => {
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .forget_thread_timer_copies(process, signo);
+                R::ForgetThreadTimerCopies(())
+            }
             GlobalRequest::SignalTargetProcess(named) => R::SignalTargetProcess(
                 self.lock_rpc_scheduler(false)
                     .await
                     .signal_target_process(named),
+            ),
+            GlobalRequest::PosixTimerThread(process, named) => R::PosixTimerThread(
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .posix_timer_thread(process, named),
             ),
             GlobalRequest::SetSigchldDisposition(process, ignored, nocldwait) => {
                 R::SetSigchldDisposition(
@@ -4190,6 +4210,8 @@ impl GlobalState {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#869)
     /// Register, re-arm, or disarm a POSIX timer in the global scheduler.
+    /// `notification` is the timer's signal and, for a `SIGEV_THREAD_ID`
+    /// timer, the thread it notifies.
     async fn recv_register_posix_timer(
         &self,
         detpid: DetPid,
@@ -4197,16 +4219,22 @@ impl GlobalState {
         timer_id: i32,
         deadline: Option<LogicalTime>,
         interval: LogicalTime,
-        sig: SigWrapper,
+        notification: (SigWrapper, Option<DetTid>),
     ) -> SchedulerRpcResult<()> {
+        let (sig, thread) = notification;
         let RpcIncarnation { dettid, mm } = caller;
         let mut sched = self.lock_rpc_scheduler(false).await;
         if sched.thread_is_logically_killed(dettid) || !sched.rpc_incarnation_matches(dettid, mm) {
             return SchedulerRpcResult::ThreadExited;
         }
+        // A process-directed timer prefers the thread that armed it.
+        let target = match thread {
+            Some(thread) => SignalTarget::Thread(thread),
+            None => SignalTarget::Process(dettid),
+        };
         sched.register_posix_timer(
             detpid,
-            dettid,
+            target,
             timer_id,
             deadline,
             interval,
@@ -4501,7 +4529,9 @@ pub enum GlobalRequest {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#869)
-    /// Register, re-arm, or disarm one POSIX timer.
+    /// Register, re-arm, or disarm one POSIX timer. The last field is the
+    /// thread a `SIGEV_THREAD_ID` timer notifies, or `None` for a
+    /// process-directed one.
     RegisterPosixTimer(
         DetPid,
         DetTid,
@@ -4509,6 +4539,7 @@ pub enum GlobalRequest {
         Option<LogicalTime>,
         LogicalTime,
         SigWrapper,
+        Option<DetTid>,
     ),
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -4650,6 +4681,14 @@ pub enum GlobalRequest {
     /// the recorded process group. Appended after `CommitSigkill`, for the
     /// same reason.
     ReserveSigkillGroup(DetTid, DetPid, u32),
+    /// The thread a `SIGEV_THREAD_ID` timer of this process names by this id
+    /// (`Scheduler::posix_timer_thread`). Appended after
+    /// `ReserveSigkillGroup`, for the same reason.
+    PosixTimerThread(DetPid, i32),
+    /// A disposition change in this process flushed this signal from every
+    /// thread (`Scheduler::forget_thread_timer_copies`). Appended after
+    /// `PosixTimerThread`, for the same reason.
+    ForgetThreadTimerCopies(DetPid, i32),
 }
 
 /// Responses from the global object
@@ -4779,6 +4818,10 @@ pub enum GlobalResponse {
     /// `ThreadExited`, it never tail-injects an exit. Appended after
     /// `CommitSigkill`, for the same reason.
     Retired,
+    /// Appended after `Retired`, for the same reason.
+    PosixTimerThread(PosixTimerThread),
+    /// Appended after `PosixTimerThread`, for the same reason.
+    ForgetThreadTimerCopies(()),
 }
 
 /// `request`, carrying the number of records this guest thread produced for
@@ -6068,6 +6111,7 @@ pub async fn register_posix_timer<G, T>(
     deadline: Option<LogicalTime>,
     interval: LogicalTime,
     signo: i32,
+    thread: Option<DetTid>,
 ) where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -6083,6 +6127,7 @@ pub async fn register_posix_timer<G, T>(
             deadline,
             interval,
             SigWrapper(signo),
+            thread,
         ),
     )
     .await;
@@ -6433,6 +6478,41 @@ where
     let response = send_and_update_time(guest, GlobalRequest::SetChildSubreaper(process, on)).await;
     match response.1 {
         GlobalResponse::SetChildSubreaper(()) => {}
+        _ => unreachable!(),
+    }
+}
+
+/// What the `sigev_notify_thread_id` `named` of a `timer_create` by the
+/// calling thread names (`Scheduler::posix_timer_thread`).
+pub async fn posix_timer_thread<G, T>(guest: &mut G, named: i32) -> PosixTimerThread
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let process = guest.thread_state().detpid.expect("detpid unset");
+    let response =
+        send_and_update_time(guest, GlobalRequest::PosixTimerThread(process, named)).await;
+    match response.1 {
+        GlobalResponse::PosixTimerThread(answer) => answer,
+        _ => unreachable!(),
+    }
+}
+
+/// A disposition change in the calling thread's process flushed `signo` from
+/// every thread (`Scheduler::forget_thread_timer_copies`).
+pub async fn forget_thread_timer_copies<G, T>(guest: &mut G, signo: i32)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let process = guest.thread_state().detpid.expect("detpid unset");
+    let response = send_and_update_time(
+        guest,
+        GlobalRequest::ForgetThreadTimerCopies(process, signo),
+    )
+    .await;
+    match response.1 {
+        GlobalResponse::ForgetThreadTimerCopies(()) => {}
         _ => unreachable!(),
     }
 }
@@ -9706,9 +9786,9 @@ mod tests {
         let t = LogicalTime::from_nanos;
         let [periodic, disarmed, silent] = {
             let mut timers = guest.thread.posix_timers.lock().unwrap();
-            let periodic = timers.create(Some(libc::SIGUSR2));
-            let disarmed = timers.create(Some(libc::SIGALRM));
-            let silent = timers.create(None);
+            let periodic = timers.create(Some(libc::SIGUSR2), None);
+            let disarmed = timers.create(Some(libc::SIGALRM), None);
+            let silent = timers.create(None, None);
             timers.settime(periodic, 50, Some(t(100)), t(0));
             timers.settime(silent, 0, Some(t(200)), t(0));
             [periodic, disarmed, silent]
@@ -9741,7 +9821,7 @@ mod tests {
             }
         }
         let mut timers = guest.thread.posix_timers.lock().unwrap();
-        let new = timers.create(Some(libc::SIGUSR1));
+        let new = timers.create(Some(libc::SIGUSR1), None);
         assert_eq!(new, 3);
         assert_eq!(timers.settime(new, 0, Some(t(300)), t(10)), Some((0, 0)));
         assert_eq!(timers.gettime(new, t(20)), Some((280, 0)));
@@ -9766,7 +9846,7 @@ mod tests {
             );
             sched.register_posix_timer(
                 detpid,
-                leader,
+                crate::scheduler::timed_waiters::SignalTarget::Process(leader),
                 0,
                 Some(deadline),
                 deadline,
@@ -10511,7 +10591,7 @@ mod tests {
                 1,
                 Some(now + LogicalTime::from_nanos(10)),
                 LogicalTime::ZERO,
-                SigWrapper::from(Signal::SIGALRM),
+                (SigWrapper::from(Signal::SIGALRM), None),
             )
             .await;
         assert_eq!(posix, SchedulerRpcResult::ThreadExited);

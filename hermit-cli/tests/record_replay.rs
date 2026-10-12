@@ -2409,6 +2409,52 @@ fn record_pidfd_open_modeled_descriptor_ops() {
     record_replay(workload("c_pidfd_poll_self"));
 }
 
+/// A SIGEV_THREAD_ID timer's expiration reaches its named thread alone, and is
+/// dropped once that thread has exited, identically in record and replay; a
+/// thread outside the process is answered EINVAL
+/// (https://github.com/rrnewton/hermit/issues/4164).
+#[test]
+fn record_sigev_thread_id_timers() {
+    let _guard = hermit_record_lock();
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest build directory");
+    let guest = build.path().join("timer_sigev_thread_id");
+    let output = Command::new("cc")
+        .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+        .arg(repository.join("tests/c/timer_sigev_thread_id.c"))
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile the timer_sigev_thread_id guest");
+    assert!(
+        output.status.success(),
+        "guest compilation failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for (mode, line) in [
+        (
+            "answers",
+            "answers foreign=EINVAL exited=EINVAL zero=EINVAL minus_one=EINVAL signo0=EINVAL \
+             thread=0 notify3=EINVAL notify6=EINVAL notify7=EINVAL\n",
+        ),
+        ("worker", "worker hits=1 on_worker=1\n"),
+        ("exited", "exited hits=0 armed=1\n"),
+    ] {
+        let output = canonical_record_replay_command(
+            &format!("SIGEV_THREAD_ID timer, {mode}"),
+            &guest,
+            &[OsStr::new(mode)],
+        );
+        assert!(
+            output.contains(line),
+            "the guest must print {line:?}:\n{output}"
+        );
+    }
+}
+
 /// pidfd_send_signal's scope flags are forwarded and recorded, and an unknown
 /// bit, two scopes and a pipe descriptor are answered EINVAL and EBADF without
 /// an event, identically in record and replay

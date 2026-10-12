@@ -1400,7 +1400,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4108): 1053.
     // And metadata::tests::record_version_rejects_streams_that_answered_pidfd_self_sentinels_without_an_event
     // (https://github.com/rrnewton/hermit/issues/4147): 1054.
-    ("test.hermit_unit", 1054),
+    // And metadata::tests::record_version_rejects_streams_whose_sigev_thread_id_timers_notified_the_process
+    // (https://github.com/rrnewton/hermit/issues/4164): 1055.
+    ("test.hermit_unit", 1055),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1952,7 +1954,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the three single-virtual-CPU procfs tests (cpuinfo, sysfs CPU lists, /proc/stat;
     // https://github.com/rrnewton/hermit/issues/4160): 1445.
     // And the cpu0-topology and node0 single-CPU test (https://github.com/rrnewton/hermit/issues/4160): 1446.
-    ("test.detcore_unit", 1446),
+    // And the four SIGEV_THREAD_ID timer tests (https://github.com/rrnewton/hermit/issues/4164): 1450.
+    ("test.detcore_unit", 1450),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2283,7 +2286,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/pull/4128): 189.
     // And record_pidfd_send_signal_scope_flags
     // (https://github.com/rrnewton/hermit/issues/4108): 190.
-    ("test.record_replay", 190),
+    // And record_sigev_thread_id_timers
+    // (https://github.com/rrnewton/hermit/issues/4164): 191.
+    ("test.record_replay", 191),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -2653,7 +2658,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/reverie/issues/1001): 315.
     // And realtime_signals_are_delivered_with_their_values_and_verify
     // (https://github.com/rrnewton/reverie/issues/207): 316.
-    ("test.cli", 316),
+    // And a_sigev_thread_id_timer_notifies_exactly_its_thread_at_bitwise_parity and
+    // a_sigev_thread_id_expiration_beside_a_pending_copy_is_refused_by_name
+    // (https://github.com/rrnewton/hermit/issues/4164): 318.
+    ("test.cli", 318),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2909,7 +2917,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two skid-retry loop unit tests, which run here too: 250.
     // Nor does the vDSO symbol-version test: 251.
     // The realtime-signal delivery test runs on the host too: 252.
-    ("test.cli_on_host", 252),
+    // Nor do the two SIGEV_THREAD_ID timer tests: 254.
+    ("test.cli_on_host", 254),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -3066,7 +3075,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the 11 deadline-cap tests: 1442.
     // And the three single-virtual-CPU procfs tests: 1445.
     // And the cpu0-topology and node0 single-CPU test: 1446.
-    ("test.detcore_unit_on_host", 1446),
+    // And the four SIGEV_THREAD_ID timer tests: 1450.
+    ("test.detcore_unit_on_host", 1450),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -3211,7 +3221,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The identical lib+bins selection includes the three descriptor controls.
     // And the pidfd scope-flag record-epoch test: 1053.
     // And the PIDFD_SELF record-epoch test: 1054.
-    ("test.hermit_unit_on_host", 1054),
+    // And the SIGEV_THREAD_ID record-epoch test: 1055.
+    ("test.hermit_unit_on_host", 1055),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

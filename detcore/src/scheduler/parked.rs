@@ -648,11 +648,12 @@ impl Scheduler {
         &mut self,
         deadline: LogicalTime,
         id: SignalTimerId,
-        tid: DetTid,
+        target: timed_waiters::SignalTarget,
         signal: timed_waiters::TimerSignal,
         normal_due: bool,
         observed_now: LogicalTime,
     ) {
+        let tid = target.tid();
         let signal = match signal {
             timed_waiters::TimerSignal::Send(signal) => signal,
             // Detcore does not deliver a timer's real-time signal. An expiration Linux
@@ -663,7 +664,7 @@ impl Scheduler {
             // run registers such an expiration (`Detcore::handle_timer_settime`);
             // a permissive one never arms it.
             timed_waiters::TimerSignal::RefuseRealTime(signo) => {
-                match self.real_time_expiration_fate(id.process(), tid, signo) {
+                match self.real_time_expiration_fate(id.process(), target, signo) {
                     RealTimeFate::Discarded => return,
                     RealTimeFate::Queued => {
                         *self
@@ -682,7 +683,9 @@ impl Scheduler {
                 }
             }
         };
-        if self.signal_control_installed() && matches!(id, SignalTimerId::Alarm(_)) {
+        if let timed_waiters::SignalTarget::Thread(thread) = target {
+            self.fire_thread_timer(id, thread, signal);
+        } else if self.signal_control_installed() && matches!(id, SignalTimerId::Alarm(_)) {
             if let Err(failure) = self.publish_real_expiry(id.process(), deadline) {
                 self.fail_parked(tid, failure);
             }
@@ -727,9 +730,17 @@ impl Scheduler {
         }
     }
 
-    /// What Linux does with an expiration of a timer of `process` (armed by
-    /// `tid`) that notifies with real-time signal `signo`, as far as the guest
-    /// could tell (https://github.com/rrnewton/hermit/issues/4089):
+    /// What Linux does with an expiration of a timer of `process` that
+    /// notifies with real-time signal `signo` (`target`: armed by this thread,
+    /// or notifying exactly this one), as far as the guest could tell
+    /// (https://github.com/rrnewton/hermit/issues/4089). The threads below are
+    /// the process's live threads, or for a thread-directed timer only its
+    /// named thread, if live: Linux queues that expiration on the thread's own
+    /// queue and drops it once the thread is gone
+    /// (https://github.com/rrnewton/hermit/issues/4164). A thread-directed
+    /// expiration kept pending is recorded for the whole process, so a call of
+    /// any thread that could observe it refuses: more refusals than Linux
+    /// would justify, never a silent difference.
     ///
     /// - [`RealTimeFate::Discarded`]: nobody can see it. The process has no
     ///   live thread, or the signal is ignored and a thread that does not block
@@ -758,18 +769,21 @@ impl Scheduler {
     pub(super) fn real_time_expiration_fate(
         &self,
         process: DetPid,
-        tid: DetTid,
+        target: timed_waiters::SignalTarget,
         signo: i32,
     ) -> RealTimeFate {
         let bit = kernel_signal_bit(signo);
         if !self.models_signal_targets {
-            return match self.read_sleeper_signal_state(tid) {
+            return match self.read_sleeper_signal_state(target.tid()) {
                 Ok(state) if state.discarded_at_generation() & bit != 0 => RealTimeFate::Discarded,
                 Err(SleeperStateUnreadable::Gone) => RealTimeFate::Discarded,
                 _ => RealTimeFate::Deliverable,
             };
         }
-        let threads = self.process_signal_targets(process);
+        let mut threads = self.process_signal_targets(process);
+        if let timed_waiters::SignalTarget::Thread(named) = target {
+            threads.retain(|thread| *thread == named);
+        }
         if threads.is_empty() {
             return RealTimeFate::Discarded;
         }
