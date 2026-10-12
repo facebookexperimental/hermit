@@ -22,8 +22,13 @@ use super::admission_hex;
 /// LiteInst cache keys that check-reverie-pin.rs greps the whole tree for)
 /// could have been added by E..M. Such a target is validated against the real
 /// current main instead. Same pattern forms as the floor-sensitive list.
-pub const TARGET_PIN_FILE_PATTERNS: &str =
-    "**/Cargo.toml\n**/Cargo.lock\nhermit-cli/src/metadata.rs\nhermit-cli/BUCK\n";
+///
+/// The floor-sensitive list itself is one of these. The parent reads the list
+/// from the target's tree, the one input the target controls, so a target that
+/// rewrote it (to `README`, say) could have the proof accept an E..M that edits
+/// the validation DAG. A target that touches the list is validated against the
+/// real current main instead.
+pub const TARGET_PIN_FILE_PATTERNS: &str = "**/Cargo.toml\n**/Cargo.lock\nhermit-cli/src/metadata.rs\nhermit-cli/BUCK\nci/admission/floor-sensitive-paths.txt\n";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum FloorSensitivePattern {
@@ -433,8 +438,9 @@ mod tests {
         }
     }
 
-    const LIST: &str =
-        "ci/dag/\n**/Cargo.toml\n**/Cargo.lock\nhermit-cli/src/metadata.rs\nhermit-cli/BUCK\n";
+    // A subset of the real ci/admission/floor-sensitive-paths.txt, which lists
+    // ci/admission/ (the list itself) as well.
+    const LIST: &str = "ci/dag/\nci/admission/\n**/Cargo.toml\n**/Cargo.lock\nhermit-cli/src/metadata.rs\nhermit-cli/BUCK\n";
 
     /// E with the files the cases below edit, M one docs-only commit later,
     /// and a target that changes one source file on E.
@@ -643,6 +649,7 @@ mod tests {
             "Cargo.lock",
             "hermit-cli/src/metadata.rs",
             "hermit-cli/BUCK",
+            "ci/admission/floor-sensitive-paths.txt",
         ] {
             let target = repo.commit_on(&queued, &format!("target bumps {pin}"), &[pin]);
             let e = disjoint_main_proof(&repo.0, &queued, &observed, &target, LIST).unwrap_err();
@@ -650,5 +657,22 @@ mod tests {
         }
         let fine = repo.commit_on(&queued, "target edits a non-pin manifest", &["xCargo.toml"]);
         disjoint_main_proof(&repo.0, &queued, &observed, &fine, LIST).unwrap();
+
+        // The review's attack: the target rewrites the list to name only
+        // README, the parent reads that list from the target's tree, and E..M
+        // edits the validation DAG. Refused on the target side, whatever list
+        // text the caller passes.
+        let dag_main = repo.commit_on(&queued, "main edits the DAG", &["ci/dag/x"]);
+        let rewrites = repo.commit_on(
+            &queued,
+            "README",
+            &["ci/admission/floor-sensitive-paths.txt"],
+        );
+        let e =
+            disjoint_main_proof(&repo.0, &queued, &dag_main, &rewrites, "README\n").unwrap_err();
+        assert!(
+            e.contains("pin file") && e.contains("ci/admission/floor-sensitive-paths.txt"),
+            "{e}"
+        );
     }
 }
