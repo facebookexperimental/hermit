@@ -143,6 +143,7 @@ static PIDFD_SEND_SIGNAL_MULTITHREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PIDFD_SEND_SIGNAL_FLAGS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_MULTITHREADED_PROCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static OWN_PROCESS_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static VDSO_SYMBOL_VERSIONS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_PROCESS_GROUP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_CREATE_RT_SIGNAL_REFUSED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_RT_SIGNAL_PENDING_OBSERVED_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -22231,6 +22232,56 @@ fn each_unscheduled_signal_to_the_senders_own_process_is_refused_by_name() {
         log.contains("the run replays a recorded schedule"),
         "the refusal must name the schedule replay:\nstderr:\n{log}"
     );
+}
+
+/// The vDSO a guest sees versions its exports as Linux's does: glibc finds
+/// `__vdso_clock_gettime@LINUX_2.6`, refuses `LINUX_2.5`, and the image named by
+/// `AT_SYSINFO_EHDR` carries `DT_VERDEF`. Reverie's canonical vDSO had no
+/// version tables until https://github.com/rrnewton/reverie/pull/1002, so the
+/// older lookup succeeded and Go's runtime, which walks the version
+/// definitions unconditionally, crashed every Go program at startup
+/// (https://github.com/rrnewton/reverie/issues/1001).
+#[test]
+fn the_vdso_versions_its_exports_as_linux_does_at_bitwise_parity() {
+    let guest = futex_c_guest(&VDSO_SYMBOL_VERSIONS_GUEST, "vdso_symbol_versions")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let verdict = directory.path().join("verify.json");
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "--log=info",
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            verdict.to_str().unwrap(),
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+        ]),
+        directory.path(),
+        Duration::from_secs(180),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "stdout:\n{stdout}\nstderr:\n{log}"
+    );
+    assert_eq!(
+        stdout, "LINUX_2.6=found LINUX_2.5=refused DT_VERDEF=present\n",
+        "stderr:\n{log}"
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
+            .expect("the verdict must be JSON");
+    assert_eq!(report["bitwise_parity"], true, "{report}");
 }
 
 /// pidfd_send_signal's flags and descriptors answer as Linux answers them

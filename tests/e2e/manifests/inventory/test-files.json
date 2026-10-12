@@ -2389,6 +2389,12 @@
       "why": "tests/c/utimensat_rename_race.c is owned by hermit-cli/tests/utimensat_mtime.rs: Two-thread guest in which one thread sets an explicit mtime on a name through utimensat while the other renames prepared, hard-linked files over that name; it reports which files it sees with the explicit mtime. The Rust integration test runs it natively and under hermit run with and without --no-sequentialize-threads: sequentialized, every file the guest sees with the explicit mtime must really have it on the host and the final call must reach the last file; relaxed, Hermit leaves every virtual mtime alone, so the guest sees none while the last file's real mtime is set. Driven only by its own integration test and nondeterministic by design, so it is a test-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/vdso_symbol_versions.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/vdso_symbol_versions.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test the_vdso_versions_its_exports_as_linux_does_at_bitwise_parity compiles this guest, which reports whether glibc finds __vdso_clock_gettime@LINUX_2.6, refuses LINUX_2.5, and whether the AT_SYSINFO_EHDR image carries DT_VERDEF, and requires Linux's answer at bitwise parity (https://github.com/rrnewton/reverie/issues/1001: without version tables every Go program crashed at startup); it remains a guest fixture because a generic manifest cannot assert this exact output."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/vectored_file_io.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

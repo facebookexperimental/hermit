@@ -144,7 +144,9 @@ fn copied_source_checks(case: &Path, original: &Path, runner: &mut Runner) -> Re
             .as_array()
             .unwrap()
             .len(),
-        14
+        // Reverie 74de8cf2 adds reverie-inguest/src/guest/tool_region_keyed.rs
+        // to the standalone runtime's declared sources: 15.
+        15
     );
     let alias = case.join("cargo-alias");
     let private_home = case.join("cargo-home");
