@@ -26006,7 +26006,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
             .cells
             .iter()
             .find(|cell| cell.id == import_id && cell.status != CellStatus::NotApplicable);
-        let pre_fold_observations = match (raw_import, resolved_import) {
+        let (pre_fold_observations, capped_pre_fold) = match (raw_import, resolved_import) {
             (Some(raw), Some(resolved))
                 if resolved.status == raw.status
                     && resolved.observations == raw.observations
@@ -26019,7 +26019,19 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
                         .iter()
                         .any(|cell| cell.id.category == retired_import_id.category) =>
             {
-                raw.observations.clone()
+                // Every writer caps the document it writes back (cap 1,
+                // https://github.com/rrnewton/dev-hermit/issues/563), so the
+                // live cell holds only what the cap keeps of the resolved cell.
+                let mut capped = TrackedCells {
+                    schema: SCHEMA,
+                    projection: None,
+                    cells: vec![resolved.clone()],
+                };
+                cap_observations(&mut capped);
+                (
+                    raw.observations.clone(),
+                    capped.cells.remove(0).observations,
+                )
             }
             _ => {
                 return Err(format!(
@@ -26037,11 +26049,18 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
         // observations that command owns no right to drop: a front door that
         // re-keyed only the rows it imported, or wrote the raw pre-fold document
         // back, would split one test across two cells. observe-results keeps every
-        // existing observation. import-results rebuilds the ordinary
-        // canonical-comparison projection (validate observations holding
-        // canonical comparisons) from the retained rows it was given, so only
-        // those observations may leave the cell; everything else, here the
+        // existing observation the cap keeps. import-results rebuilds the
+        // ordinary canonical-comparison projection (validate observations
+        // holding canonical comparisons) from the retained rows it was given, so
+        // only those observations may leave the cell; everything else, here the
         // pressure-test observation, must survive byte-for-byte.
+        //
+        // A carried observation the live cell no longer holds is accounted for
+        // only through its aggregate (cell_accounts_for), and the absent ones
+        // must be exactly those the cap drops from the resolved pre-fold cell,
+        // by identity, order and count: a front door that kept an older
+        // observation than the one the cap picks also leaves the aggregate
+        // holding everything, so only this comparison sees it.
         let joined_pre_fold_history = |command: &str, cells: &TrackedCells| -> Result<(), String> {
             if let Some(cell) = cells
                 .cells
@@ -26090,6 +26109,33 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
                     "{command} front door lost {missing} of {} pre-fold observation(s) of {} (neither kept nor folded into its aggregate)",
                     carried.len(),
                     display_id(&import_id)
+                ));
+            }
+            let absent = carried
+                .iter()
+                .copied()
+                .filter(|observation| !live.observations.contains(observation))
+                .collect::<Vec<_>>();
+            let folded = carried
+                .iter()
+                .copied()
+                .filter(|observation| !capped_pre_fold.contains(observation))
+                .collect::<Vec<_>>();
+            if absent != folded {
+                return Err(format!(
+                    "{command} front door no longer holds {} of {} pre-fold observation(s) of {} (Hermit {:?}), but the cap folds exactly {} (Hermit {:?})",
+                    absent.len(),
+                    carried.len(),
+                    display_id(&import_id),
+                    absent
+                        .iter()
+                        .map(|observation| &observation.hermit_shas)
+                        .collect::<Vec<_>>(),
+                    folded.len(),
+                    folded
+                        .iter()
+                        .map(|observation| &observation.hermit_shas)
+                        .collect::<Vec<_>>()
                 ));
             }
             Ok(())
