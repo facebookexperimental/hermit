@@ -1,2 +1,2 @@
-RUN: %hermit run --no-sequentialize-threads --no-deterministic-io -- %me | FileCheck %s
+RUN: %hermit run --env=TMPDIR=/tmp --no-sequentialize-threads --no-deterministic-io -- %me | FileCheck %s
 CHECK: {{([12]{20})}}

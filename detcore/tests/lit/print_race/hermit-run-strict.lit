@@ -1,4 +1,11 @@
-// We see a precise alternating behavior with round-robin scheduling:
+// We see a precise alternating behavior with round-robin scheduling. Which
+// thread writes first depends on which side of the clone runs first
+// (--runs-post-fork), not on this test, so the default run accepts either;
+// a parent-first run pins its order. Determinism is checked by
+// hermit-run-strict-verify.lit.
 RUN: %hermit --log=error run -- %me | FileCheck %s
-CHECK: {{((ba){200})}}
+RUN: %hermit --log=error run --runs-post-fork=parent -- %me | FileCheck --check-prefix=PARENT %s
+CHECK: {{^((ab){200}|(ba){200})$}}
 CHECK-EMPTY:
+PARENT: {{^(ba){200}$}}
+PARENT-EMPTY:

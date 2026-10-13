@@ -1,4 +1,4 @@
-RUN: %hermit run --epoch=2026-01-01T00:00:00Z --no-sequentialize-threads --no-deterministic-io -- %me | FileCheck %s
+RUN: %hermit run --env=TMPDIR=/tmp --epoch=2026-01-01T00:00:00Z --no-sequentialize-threads --no-deterministic-io -- %me | FileCheck %s
 CHECK: stat1: stat {
 CHECK-NEXT:     st_dev: [[ST_DEV:[0-9]+]],
 CHECK-NEXT:     st_ino: [[ST_INO:[0-9]+]],
