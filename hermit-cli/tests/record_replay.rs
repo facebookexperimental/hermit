@@ -2409,6 +2409,47 @@ fn record_pidfd_open_modeled_descriptor_ops() {
     record_replay(workload("c_pidfd_poll_self"));
 }
 
+/// epoll_ctl answers EPERM for a regular file, which cannot be polled. Replay
+/// stands in for a regular file the guest opened with an eventfd placeholder,
+/// which epoll accepts, so a replay that asked the kernel again answered 0, and
+/// the guest, like Go's os.Open, took another branch and replay diverged
+/// (https://github.com/rrnewton/hermit/issues/31).
+#[test]
+fn record_epoll_ctl_on_a_regular_file_replays_its_answer() {
+    let _guard = hermit_record_lock();
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest build directory");
+    let source = repository.join("tests/c/record_replay_epoll_regular_file.c");
+    let guest = build.path().join("record_replay_epoll_regular_file");
+    let output = Command::new("cc")
+        .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile the record_replay_epoll_regular_file guest");
+    assert!(
+        output.status.success(),
+        "guest compilation failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The guest opens its own source, a regular file that exists before the
+    // run and that it does not create.
+    let output = canonical_record_replay_command(
+        "epoll_ctl on a regular file",
+        &guest,
+        &[source.as_os_str()],
+    );
+    let line = "add file=EPERM branch=0 add pipe=0 again=EEXIST del pipe=0 del file=EPERM\n";
+    assert!(
+        output.contains(line),
+        "the guest must print {line:?}:\n{output}"
+    );
+}
+
 /// A SIGEV_THREAD_ID timer's expiration reaches its named thread alone, and is
 /// dropped once that thread has exited, identically in record and replay; a
 /// thread outside the process is answered EINVAL

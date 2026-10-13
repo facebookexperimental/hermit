@@ -1550,6 +1550,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/record_replay_epoll_regular_file.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/record_replay_epoll_regular_file.c is owned by hermit-cli/tests/record_replay.rs: record_epoll_ctl_on_a_regular_file_replays_its_answer compiles it and runs it under record start --strict --verify --verify-strict on its own source file, requiring Linux's epoll_ctl answers (EPERM for the regular file, as Go's os.Open meets it) to replay as recorded (https://github.com/rrnewton/hermit/issues/31). It stays a fixture because it needs an existing regular file argument and a record/replay command that a generic manifest does not express."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/record_replay_execveat_paths.c",
       "runner": "hermit-cli/tests/record_replay.rs",
       "why": "tests/c/record_replay_execveat_paths.c is owned by hermit-cli/tests/record_replay.rs: The record/replay integration suite compiles this workload and asserts path handling across execveat image changes under caller-controlled recording and replay phases."

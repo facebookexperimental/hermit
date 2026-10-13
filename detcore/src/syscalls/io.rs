@@ -2232,7 +2232,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///
     /// Determinism: strict execution serializes this mutation, so its result depends only on the
     /// operation, event payload, and deterministically reconstructed epoll/file-descriptor state.
-    /// Record/replay rebuilds that state by reinjecting the same control operations.
+    /// Record/replay records each answer and replays it; replay reapplies only the recorded
+    /// successes, so its epoll sets hold what the recording's held
+    /// (<https://github.com/rrnewton/hermit/issues/31>).
     pub async fn handle_epoll_ctl<G: Guest<Self>>(
         &self,
         guest: &mut G,

@@ -601,6 +601,7 @@ impl Tool for Recorder {
             Sysno::time,
             Sysno::setsockopt,
             Sysno::fcntl,
+            Sysno::epoll_ctl,
             Sysno::connect,
             Sysno::bind,
             Sysno::listen,
@@ -795,6 +796,10 @@ impl Tool for Recorder {
             Syscall::Setsockopt(_) => self.handle_simple(guest, syscall).await,
             // FIXME: Not all fcntl cases are simple.
             Syscall::Fcntl(_) => self.handle_simple(guest, syscall).await,
+            // epoll_ctl's answer depends on the kind of its target, which
+            // replay may stand in for with an eventfd placeholder, so the
+            // answer is recorded (https://github.com/rrnewton/hermit/issues/31).
+            Syscall::EpollCtl(_) => self.handle_simple(guest, syscall).await,
             Syscall::Connect(_) => self.handle_simple(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-3871): Replay does not recreate a connection's

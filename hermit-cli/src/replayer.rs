@@ -663,6 +663,11 @@ impl Tool for Replayer {
                     .await
             }
             Syscall::Fcntl(_) => self.handle_simple(guest, syscall).await,
+            // A regular file the guest opened but did not create is usually an
+            // eventfd placeholder here, which epoll accepts where the recording
+            // got EPERM, so the recorded answer stands
+            // (https://github.com/rrnewton/hermit/issues/31).
+            Syscall::EpollCtl(_) => self.handle_epoll_ctl(guest, syscall).await,
             Syscall::Connect(_) => self.handle_simple(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-3871): Replay does not recreate a connection's
@@ -2439,6 +2444,38 @@ impl Replayer {
         _syscall: Syscall,
     ) -> Result<i64, Errno> {
         next_event!(guest, Return)
+    }
+
+    /// Replays epoll_ctl's recorded answer. A recorded success is reapplied
+    /// in the kernel, so the replay's epoll set holds what the recording's
+    /// held for the epoll_wait calls that replay in the kernel
+    /// (`replay_kernel_side_effect`); a recorded failure changed nothing and
+    /// is not reissued. A reapplied success can still fail where the
+    /// descriptor is another kind of object during replay: a standard stream
+    /// that `hermit replay` inherited from a file instead of a terminal, or an
+    /// epoll descriptor received over `SCM_RIGHTS`, which is a placeholder
+    /// here. The recorded answer is returned all the same, with a warning, so
+    /// the guest sees what it saw while recording. A set holding a terminal,
+    /// pipe or socket is never one whose waits replay in the kernel
+    /// (`epoll_requires_replay_kernel_side_effect`).
+    async fn handle_epoll_ctl<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Errno> {
+        let recorded = next_event!(guest, Return);
+        if recorded.is_ok() {
+            let actual = guest.inject_with_retry(syscall).await;
+            if actual != recorded {
+                tracing::warn!(
+                    ?syscall,
+                    ?actual,
+                    ?recorded,
+                    "replay could not reapply a recorded epoll_ctl; returning the recorded answer"
+                );
+            }
+        }
+        recorded
     }
 
     async fn handle_dup2<G: Guest<Self>>(

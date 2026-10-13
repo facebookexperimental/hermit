@@ -1417,7 +1417,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4160): 1059.
     // And metadata::tests::record_version_rejects_streams_from_before_signals_ended_polled_calls
     // (https://github.com/rrnewton/hermit/issues/4187): 1060.
-    ("test.hermit_unit", 1060),
+    // And metadata::tests::record_version_rejects_streams_without_epoll_ctl_events
+    // (https://github.com/rrnewton/hermit/issues/31): 1061.
+    ("test.hermit_unit", 1061),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2336,7 +2338,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4095): 196.
     // And record_pselect_whose_mask_is_inaccessible_fails_with_efault
     // (Claude review of https://github.com/rrnewton/hermit/pull/4166): 197.
-    ("test.record_replay", 197),
+    // And record_epoll_ctl_on_a_regular_file_replays_its_answer
+    // (https://github.com/rrnewton/hermit/issues/31): 198.
+    ("test.record_replay", 198),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -3315,7 +3319,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the pselect6 entry-mask record-epoch test: 1058.
     // And the short-affinity-set record-epoch test: 1059.
     // And the polled-call signal record-epoch test: 1060.
-    ("test.hermit_unit_on_host", 1060),
+    // And the epoll_ctl record-epoch test: 1061.
+    ("test.hermit_unit_on_host", 1061),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

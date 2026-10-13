@@ -384,7 +384,10 @@ impl RecordVersion {
 // (https://github.com/rrnewton/hermit/issues/4187). The recorder logs each
 // polled EAGAIN but not the scheduler's signaled answer, so recordings made
 // before and after this change do not replay on each other's replayer.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x142);
+// 0x142 -> 0x143: epoll_ctl is recorded, and replay answers it from the
+// recording (https://github.com/rrnewton/hermit/issues/31). An older recording
+// has no event for it.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x143);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -409,7 +412,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x142);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x142;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x143;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1206,6 +1209,15 @@ mod tests {
     /// (https://github.com/rrnewton/hermit/issues/4187).
     #[test]
     fn record_version_rejects_streams_from_before_signals_ended_polled_calls() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x141)));
+    }
+
+    /// A recording older than 0x143 has no event for epoll_ctl, which this
+    /// replayer reads from the recording
+    /// (https://github.com/rrnewton/hermit/issues/31).
+    #[test]
+    fn record_version_rejects_streams_without_epoll_ctl_events() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x142)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x141)));
     }
 
