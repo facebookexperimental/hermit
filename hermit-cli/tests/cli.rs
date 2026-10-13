@@ -127,6 +127,8 @@ static HB_RELATIVE_ANCHOR_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_CHILD_WAIT_CYCLE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_KILL_HELD_CHILD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGNAL_HERMIT_TASKS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static PAUSE_SIGCHLD_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SIGCHLD_BOOKKEEPING_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_POSTHOOK_FUTEX_INTERRUPT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_PIPE_READ_HELD_WRITER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_TIMEOUT_VS_SPINNER_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1179,6 +1181,56 @@ fn pid_namespace_nested_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "pid-namespace-nested guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn sigchld_bookkeeping_guest() -> &'static Path {
+    SIGCHLD_BOOKKEEPING_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("sigchld-bookkeeping");
+        fs::create_dir_all(&build_root).expect("failed to create sigchld-bookkeeping directory");
+        let guest = build_root.join("sigchld_bookkeeping");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/sigchld_bookkeeping.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile sigchld-bookkeeping guest");
+        assert!(
+            output.status.success(),
+            "sigchld-bookkeeping guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn pause_sigchld_guest() -> &'static Path {
+    PAUSE_SIGCHLD_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("pause-sigchld");
+        fs::create_dir_all(&build_root).expect("failed to create pause-sigchld directory");
+        let guest = build_root.join("pause_sigchld");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/pause_sigchld.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile pause-sigchld guest");
+        assert!(
+            output.status.success(),
+            "pause-sigchld guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -23790,6 +23842,572 @@ fn a_namespace_only_run_on_a_terminal_keeps_its_terminal_behaviour() {
         Some(libc::SIGINT),
         "Ctrl-C must end the run as SIGINT: {status:?}\n{transcript}"
     );
+}
+
+/// A parent waiting in `pause()` for a child's `SIGCHLD` returns from it, as
+/// on Linux. The scheduler sends that `SIGCHLD` when the child exits, which can
+/// be while the parent's pause request is filed but still queued; the signal
+/// was dropped there, the pause parked with it gone by, and the run ended in a
+/// false "Deadlock detected" (https://github.com/rrnewton/hermit/issues/4126).
+#[test]
+fn a_pause_returns_for_a_childs_sigchld() {
+    let guest = pause_sigchld_guest().to_str().unwrap().to_owned();
+    let command = hermit_command(&["run", "--strict", "--timeout", "60", "--", guest.as_str()]);
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) =
+        run_with_deadline(command, directory.path(), Duration::from_secs(120), false);
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "{status:?}\nstdout:\n{stdout}\nstderr:\n{log}"
+    );
+    assert_eq!(
+        stdout, "SIGCHLD handled: 1, child exit status: 0\n",
+        "stderr:\n{log}"
+    );
+}
+
+/// A child-exit `SIGCHLD` ends a `pause` or `nanosleep` only as Linux delivery
+/// would: caught and unblocked, it ends the call (EINTR); blocked, or with its
+/// default (ignore) action, the call goes on, a pause until its `SIGALRM`, a
+/// nanosleep to its full length. The same holds whether the signal arrives while
+/// the sleep is still queued or once it has parked (the `late-` modes, whose
+/// child exits after 100 ms). Before, a blocked or default `SIGCHLD` ended the
+/// sleep with EINTR (https://github.com/rrnewton/hermit/issues/4126; the Claude
+/// review of https://github.com/rrnewton/hermit/pull/4131).
+#[test]
+fn a_childs_sigchld_ends_a_sleep_only_when_caught_and_unblocked() {
+    let guest = pause_sigchld_guest().to_str().unwrap().to_owned();
+    for (mode, expected) in [
+        (
+            "pause-blocked",
+            "pause-blocked: pause -1 EINTR, SIGALRM 1, SIGCHLD 0\n\
+             pause-blocked: after unblocking, SIGCHLD 1\n",
+        ),
+        (
+            "pause-default",
+            "pause-default: pause -1 EINTR, SIGALRM 1, SIGCHLD 0\n",
+        ),
+        (
+            "nano-caught",
+            "nano-caught: nanosleep -1 EINTR, SIGCHLD 1\n",
+        ),
+        ("nano-blocked", "nano-blocked: nanosleep 0, SIGCHLD 0\n"),
+        ("nano-default", "nano-default: nanosleep 0, SIGCHLD 0\n"),
+    ] {
+        for prefix in ["", "late-"] {
+            let argument = format!("{prefix}{mode}");
+            let command = hermit_command(&[
+                "run",
+                "--strict",
+                "--timeout",
+                "60",
+                "--",
+                guest.as_str(),
+                argument.as_str(),
+            ]);
+            let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+            let (status, log) =
+                run_with_deadline(command, directory.path(), Duration::from_secs(120), false);
+            let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+                .expect("failed to read the guest's stdout");
+            assert_eq!(
+                status.and_then(|status| status.code()),
+                Some(0),
+                "{argument}: {status:?}\nstdout:\n{stdout}\nstderr:\n{log}"
+            );
+            assert_eq!(stdout, expected, "{argument}: stderr:\n{log}");
+        }
+    }
+    // With a worker thread that keeps running, the queued sleep woken for that
+    // SIGCHLD still runs its turn. Ignored, the signal leaves it to sleep again
+    // to its deadline and return 0: deferred behind the worker, it never reached
+    // the deadline (the Codex review of
+    // https://github.com/rrnewton/hermit/pull/4131). Caught, the handler runs in
+    // the sleeper, whose sleep ends with EINTR, whether or not the worker blocks
+    // SIGCHLD; blocked during the sleep, the sleep returns 0 and the handler runs
+    // in the sleeper once it unblocks the signal. So it does for a non-leader
+    // sleeper, the child's creator, while the leader spins. Before, the real
+    // delivery lost its admission to the woken turn, or found it on the leader,
+    // and waited behind the spinning thread, or the sleep returned EINTR while
+    // the handler ran in the worker (the Claude re-checks of
+    // https://github.com/rrnewton/hermit/pull/4131). The parked variant still
+    // waits behind such a worker, as on main
+    // (https://github.com/rrnewton/hermit/issues/4132), so it is not run.
+    //
+    // A chaos schedule that targets races may run the worker first, and then
+    // the worker takes the SIGCHLD: the sleep must then run to its deadline, as
+    // on Linux when another thread takes the signal. At this seed it does, and
+    // before, the sleep still returned EINTR, an outcome Linux cannot give; the
+    // other legal outcome, the sleeper taking it, is accepted too.
+    let chaos = [
+        "--chaos",
+        "--sched-seed",
+        "18",
+        "--chaos-target-races",
+        "--fuzz-seed",
+        "18",
+    ];
+    for (flags, mode, expected) in [
+        (
+            &[][..],
+            "nano-default-yield",
+            &["nano-default-yield: nanosleep 0, SIGCHLD 0\n"][..],
+        ),
+        (
+            &[],
+            "nano-caught-yield",
+            &[
+                "nano-caught-yield: nanosleep -1 EINTR, SIGCHLD 1, then 1, handler in sleeper: yes\n",
+            ],
+        ),
+        (
+            &[],
+            "nano-caught-yield-wblock",
+            &[
+                "nano-caught-yield-wblock: nanosleep -1 EINTR, SIGCHLD 1, then 1, \
+               handler in sleeper: yes\n",
+            ],
+        ),
+        (
+            &[],
+            "nano-blocked-yield",
+            &["nano-blocked-yield: nanosleep 0, SIGCHLD 0, then 1, handler in sleeper: yes\n"],
+        ),
+        (
+            &[],
+            "nano-caught-nonleader",
+            &["nano-caught-nonleader: nanosleep -1 EINTR, SIGCHLD 1, handler in sleeper: yes\n"],
+        ),
+        (
+            &[],
+            "twokid-yield",
+            &["twokid-yield: nanosleep -1 EINTR, SIGCHLD in sleeper before return 1, in all 2\n"],
+        ),
+        // A guest's own SIGCHLD in a thread's private queue, queued with
+        // pthread_sigqueue, pthread_kill or, self-directed, with a forged
+        // child-exit siginfo, is not the shared queue's: taken first, it leaves
+        // the scheduler's copy its own delivery, with the child's siginfo.
+        // Before, it took the send window and the child's copy was dropped as
+        // a duplicate, or (pthread_kill) its record outlived it and the
+        // delivery waited behind the spinning thread (the design check of
+        // https://github.com/rrnewton/hermit/issues/4132).
+        (
+            &[],
+            "sigqueue-private",
+            &["sigqueue-private: SIGCHLD handled 2, the child's exit 1\n"],
+        ),
+        (
+            &[],
+            "tgkill-private",
+            &["tgkill-private: SIGCHLD handled 2, the child's exit 1\n"],
+        ),
+        (
+            &[],
+            "tgsigqueue-forged",
+            &["tgsigqueue-forged: SIGCHLD handled 2, the child's exit 2\n"],
+        ),
+        (
+            &[],
+            "twokid-nonleader",
+            &[
+                "twokid-nonleader: nanosleep -1 EINTR, SIGCHLD in sleeper before return 1, \
+                 in all 2\n",
+            ],
+        ),
+        (
+            &chaos[..],
+            "nano-caught-yield",
+            &[
+                "nano-caught-yield: nanosleep 0, SIGCHLD 1, then 1, handler in sleeper: no\n",
+                "nano-caught-yield: nanosleep -1 EINTR, SIGCHLD 1, then 1, handler in sleeper: yes\n",
+            ],
+        ),
+    ] {
+        let mut argv = vec!["run", "--strict"];
+        argv.extend_from_slice(flags);
+        argv.extend(["--timeout", "60", "--", guest.as_str(), mode]);
+        let command = hermit_command(&argv);
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let (status, log) =
+            run_with_deadline(command, directory.path(), Duration::from_secs(120), false);
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{flags:?} {mode}: {status:?}\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert!(
+            expected.contains(&stdout.as_str()),
+            "{flags:?} {mode}: {stdout:?} is none of {expected:?}\nstderr:\n{log}"
+        );
+    }
+    // Two children while another thread spins: each child-exit copy the
+    // scheduler sends admits only the thread that takes it, so neither the
+    // sibling's delivery of the first nor the sleeper's of the second waits
+    // behind the spinning thread (the rows above). Under chaos schedules either
+    // thread may take either copy, and the kernel's own copy of an exit can sit
+    // in the shared queue after a sibling took the scheduler's; the sleep may
+    // end with EINTR only if a handler ran in it before it returned. Before,
+    // these hung, or the sleep answered EINTR with no handler in it (the
+    // Claude re-check of https://github.com/rrnewton/hermit/pull/4131).
+    for (mode, flags) in [
+        (
+            "twokid-yield",
+            &["--chaos", "--sched-seed", "1", "--fuzz-seed", "1"][..],
+        ),
+        (
+            "twokid-nonleader",
+            &["--chaos", "--sched-seed", "1", "--fuzz-seed", "1"],
+        ),
+        ("twokid-yield", &chaos[..]),
+        ("twokid-nonleader", &chaos[..]),
+    ] {
+        let mut argv = vec!["run", "--strict"];
+        argv.extend_from_slice(flags);
+        argv.extend(["--timeout", "60", "--", guest.as_str(), mode]);
+        let command = hermit_command(&argv);
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let (status, log) =
+            run_with_deadline(command, directory.path(), Duration::from_secs(120), false);
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{flags:?} {mode}: {status:?}\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert!(
+            twokid_outcome_is_legal(mode, &stdout),
+            "{flags:?} {mode}: {stdout:?} is not an outcome Linux allows\nstderr:\n{log}"
+        );
+    }
+}
+
+/// Each SIGCHLD copy is accounted for as Linux does (the re-checks of
+/// https://github.com/rrnewton/hermit/pull/4131): a sibling in `sigsuspend`
+/// whose mask blocks SIGCHLD cannot take the child's copy, so the main
+/// thread's `pause` or `nanosleep`, queued or parked, ends with EINTR (before,
+/// the pause deadlocked and the nanosleep ran its length); a flush by
+/// `SIG_IGN` or `SIG_DFL` discards the pending copy and the next child's
+/// copy carries its own siginfo; a process's own `sigqueue` queued before a
+/// child's exit keeps its siginfo (before, the child's replaced it); and a
+/// copy a `sigtimedwait` took before its siginfo copy-out faulted is gone, so
+/// later waits report their own children (before, the second reported the
+/// first's status), while a fault reading the set takes nothing, and a fault
+/// writing the siginfo took only the lowest signal of the queue it took from;
+/// a signalfd read or readv whose record copy faults likewise took the signal
+/// (from the private or the shared queue, first record or a later one).
+/// A thread-scoped pidfd send lands in the thread's private queue. A sibling
+/// blocked reading a signalfd for SIGCHLD (with or without a real-time
+/// signal in its mask) and the main thread's handler never both take one
+/// SIGCHLD, also under chaos schedules (such a process does not use the
+/// send window); a sibling polling it inside the schedule keeps the window,
+/// which orders its reads; and an unread signalfd changes nothing for the
+/// sigsuspend case. With a sigsuspend sibling that leaves SIGCHLD unblocked, the sleep
+/// ends with EINTR only if the handler ran in it. Every exact expected line
+/// is native output. The rows with several outcomes check for one Linux
+/// allows; one of those, in the signalfd-sibling `nanosleep` rows, is never
+/// seen natively and comes from a known strict-mode gap (https://github.com/rrnewton/hermit/issues/4229).
+#[test]
+fn every_sigchld_copy_is_accounted_for_as_on_linux() {
+    let guest = sigchld_bookkeeping_guest().to_str().unwrap().to_owned();
+    for (args, expected) in [
+        (
+            &["susblk-pause"][..],
+            "susblk-pause: pause EINTR, SIGCHLD at return 1, in main yes\n",
+        ),
+        (
+            &["susblk-nano"],
+            "susblk-nano: nanosleep EINTR, SIGCHLD at return 1, in main yes\n",
+        ),
+        (
+            &["susblk-pause", "late"],
+            "susblk-pause late: pause EINTR, SIGCHLD at return 1, in main yes\n",
+        ),
+        (
+            &["susblk-nano", "late"],
+            "susblk-nano late: nanosleep EINTR, SIGCHLD at return 1, in main yes\n",
+        ),
+        (
+            &["flush-ign"],
+            "flush-ign: after flush 0, nanosleep EINTR, then: handled 1: [CLD_EXITED c2]\n",
+        ),
+        (
+            &["flush-dfl"],
+            "flush-dfl: after flush 0, nanosleep EINTR, then: handled 1: [CLD_EXITED c2]\n",
+        ),
+        (&["sq-before"], "sq-before: handled 1: [SI_QUEUE v7]\n"),
+        (&["sq-after"], "sq-after: handled 1: [CLD_EXITED c1]\n"),
+        (
+            &["susblk-pause", "sfd"],
+            "susblk-pause sfd: pause EINTR, SIGCHLD at return 1, in main yes\n",
+        ),
+        (
+            &["susblk-nano", "late", "sfd"],
+            "susblk-nano late sfd: nanosleep EINTR, SIGCHLD at return 1, in main yes\n",
+        ),
+        (
+            &["efin-priv"],
+            "efin-priv: input fault EFAULT; [SI_QUEUE v9] [CLD_EXITED c1 11] \
+             [wait Resource temporarily unavailable]\n",
+        ),
+        (
+            &["efin-shared"],
+            "efin-shared: input fault EFAULT; [CLD_EXITED c1 11] \
+             [wait Resource temporarily unavailable] [wait Resource temporarily unavailable]\n",
+        ),
+        (
+            &["pidfd-thread"],
+            "pidfd-thread: handled 2: [SI_TKILL] [CLD_EXITED c1]\n",
+        ),
+        (
+            &["efwide-priv"],
+            "efwide-priv: output fault EFAULT, usr1 pending 0; [SI_QUEUE v9] [CLD_EXITED c1 11]\n",
+        ),
+        (
+            &["efwide-shared"],
+            "efwide-shared: output fault EFAULT, usr1 pending 0; [CLD_EXITED c1 11] \
+             [wait Resource temporarily unavailable]\n",
+        ),
+        (
+            &["efault-wait"],
+            "efault-wait: EFAULT 1, still pending 0\n\
+             first matches 1 status 11\n\
+             second matches 1 status 22\n",
+        ),
+        (
+            &["efault-sfd"],
+            "efault-sfd: EFAULT 1, still pending 0\n\
+             first matches 1 status 11\n\
+             second matches 1 status 22\n",
+        ),
+        (
+            &["efault-sfdv"],
+            "efault-sfdv: EFAULT 1, still pending 0\n\
+             first matches 1 status 11\n\
+             second matches 1 status 22\n",
+        ),
+        (
+            &["efault-sfdtail"],
+            "efault-sfdtail: read 128 signo 10, still pending 0\n\
+             first matches 1 status 11\n\
+             second matches 1 status 22\n",
+        ),
+        (
+            &["efault-sfdshared"],
+            "efault-sfdshared: EFAULT 1, still pending 0\n\
+             second matches 1 status 22\n",
+        ),
+        (
+            &["efault-sfdhigh"],
+            "efault-sfdhigh: EFAULT 1, as Linux does 1\n\
+             first matches 1 status 11\n\
+             second matches 1 status 22\n",
+        ),
+        (
+            &["efault-sfdkern"],
+            "efault-sfdkern: EFAULT 1, still pending 1\n\
+             reaped child: [CLD_EXITED c1 11]\n\
+             second matches 1 status 22\n",
+        ),
+        (
+            &["pidfd-efault"],
+            "pidfd-efault: output fault EFAULT; [CLD_EXITED c1 11] \
+             [wait Resource temporarily unavailable]\n",
+        ),
+    ] {
+        let mut argv = vec!["run", "--strict", "--timeout", "60", "--", guest.as_str()];
+        argv.extend_from_slice(args);
+        let command = hermit_command(&argv);
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let (status, log) =
+            run_with_deadline(command, directory.path(), Duration::from_secs(120), false);
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{args:?}: {status:?}\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert_eq!(stdout, expected, "{args:?}: stderr:\n{log}");
+    }
+    // A sibling in a `sigsuspend` that leaves SIGCHLD unblocked may take it,
+    // or the sleeping main thread may: EINTR only with the handler in main
+    // (before, a woken sleep there answered EINTR while the handler ran in
+    // the sibling, the Claude re-check of
+    // https://github.com/rrnewton/hermit/pull/4131 at ba6747e8). Under chaos,
+    // the handler may also run in main before its `nanosleep` begins.
+    for seed in [
+        &[][..],
+        &["--sched-seed", "1"],
+        &["--sched-seed", "2"],
+        &["--sched-seed", "3"],
+    ] {
+        for args in [
+            &["susblk-nano", "open"][..],
+            &["susblk-nano", "late", "open"],
+        ] {
+            let mut argv = vec!["run", "--strict", "--timeout", "60"];
+            if !seed.is_empty() {
+                argv.extend_from_slice(&["--chaos", "--chaos-target-races"]);
+                argv.extend_from_slice(seed);
+            }
+            argv.extend_from_slice(&["--", guest.as_str()]);
+            argv.extend_from_slice(args);
+            let command = hermit_command(&argv);
+            let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+            let (status, log) =
+                run_with_deadline(command, directory.path(), Duration::from_secs(120), false);
+            let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+                .expect("failed to read the guest's stdout");
+            assert_eq!(
+                status.and_then(|status| status.code()),
+                Some(0),
+                "{seed:?} {args:?}: {status:?}\nstdout:\n{stdout}\nstderr:\n{log}"
+            );
+            let label = args.join(" ");
+            let mut legal = vec![
+                format!("{label}: nanosleep EINTR, SIGCHLD at return 1, in main yes\n"),
+                format!("{label}: nanosleep 0, SIGCHLD at return 1, in main no\n"),
+            ];
+            if !seed.is_empty() {
+                legal.push(format!(
+                    "{label}: nanosleep 0, SIGCHLD at return 1, in main yes\n"
+                ));
+            }
+            assert!(
+                legal.contains(&stdout),
+                "{seed:?} {args:?}: {stdout:?} is not an outcome Linux allows\nstderr:\n{log}"
+            );
+        }
+    }
+    // A sibling that blocks SIGCHLD and blocks reading a signalfd for it may
+    // take the one SIGCHLD, or the main thread's handler may: Linux allows
+    // either, never both (before the revert of the SIGCHLD signalfd
+    // registration, the Claude re-check of
+    // https://github.com/rrnewton/hermit/pull/4131 at 8692836e measured both
+    // in 9 of 9 runs).
+    // Under chaos, only the `nanosleep` modes: a `pause` entered after the
+    // one SIGCHLD was taken waits forever, on Linux too.
+    let chaos = ["--chaos", "--chaos-target-races"];
+    let mut cases: Vec<(&[&str], &[&str])> = Vec::new();
+    for args in [
+        &["sfdsib-pause"][..],
+        &["sfdsib-nano"],
+        &["sfdsib-pause", "late"],
+        &["sfdsib-nano", "late"],
+        &["sfdsib-pause", "rt"],
+        &["sfdsib-nano", "rt"],
+        &["sfdsib-pause", "late", "rt"],
+        &["sfdsib-nano", "late", "rt"],
+        &["sfdsib-nano", "poll"],
+        &["sfdsib-nano", "late", "poll"],
+    ] {
+        cases.push((&[], args));
+    }
+    for seed in [&["--seed", "1"][..], &["--seed", "2"], &["--seed", "3"]] {
+        cases.push((seed, &["sfdsib-nano", "late"]));
+        cases.push((seed, &["sfdsib-nano", "late", "rt"]));
+    }
+    // A sibling polling the signalfd reads it inside the schedule, so the
+    // process keeps the send window, which orders those reads as committed
+    // dequeues.
+    for seed in [
+        &["--sched-seed", "1"][..],
+        &["--sched-seed", "2"],
+        &["--sched-seed", "3"],
+    ] {
+        cases.push((seed, &["sfdsib-nano", "poll"]));
+        cases.push((seed, &["sfdsib-nano", "late", "poll"]));
+    }
+    for (seed, args) in cases {
+        let mut argv = vec!["run", "--strict", "--timeout", "60"];
+        if !seed.is_empty() {
+            argv.extend_from_slice(&chaos);
+            argv.extend_from_slice(seed);
+        }
+        argv.extend_from_slice(&["--", guest.as_str()]);
+        argv.extend_from_slice(args);
+        let command = hermit_command(&argv);
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let (status, log) =
+            run_with_deadline(command, directory.path(), Duration::from_secs(120), false);
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{args:?}: {status:?}\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        let label = args.join(" ");
+        let sleep = if args[0] == "sfdsib-pause" {
+            "pause"
+        } else {
+            "nanosleep"
+        };
+        // Exactly one of main's handler and the sibling's read takes the
+        // SIGCHLD, and the sleep ends with EINTR exactly when a handler ran in
+        // main before it returned. A `nanosleep` may also return 0 with the
+        // sibling's read and no handler in main. That is formally Linux-legal
+        // (the reader starved for 5 s) but never seen natively (0 of 200): it
+        // is a KNOWN GAP of strict mode, where the reader's blocking read
+        // dequeues outside the schedule, so host load can let main's sleep run
+        // its length in virtual time first
+        // (https://github.com/rrnewton/hermit/issues/4229). Under chaos, a handler in main may also
+        // run before its `nanosleep` begins, which then returns 0.
+        let line = |ret: &str, handler: u8, usr1: u8, read: bool| {
+            let code = if read { "CLD_EXITED" } else { "none" };
+            format!(
+                "{label}: {sleep} {ret}, main handler {handler}, usr1 {usr1}, sibling read {} code {code}\n",
+                u8::from(read)
+            )
+        };
+        let mut legal = vec![line("EINTR", 1, 0, false), line("EINTR", 0, 1, true)];
+        if sleep == "nanosleep" {
+            legal.push(line("0", 0, 0, true));
+            if !seed.is_empty() {
+                legal.push(line("0", 1, 0, false));
+                legal.push(line("0", 0, 1, true));
+            }
+        }
+        assert!(
+            legal.contains(&stdout),
+            "{seed:?} {args:?}: {stdout:?} is not an outcome Linux allows\nstderr:\n{log}"
+        );
+    }
+}
+
+/// Whether a `twokid-` line of the `pause_sigchld` guest is an outcome Linux
+/// allows: the sleep ends with EINTR only if a handler ran in the sleeper
+/// before it returned, at least one of the two SIGCHLDs is handled (two may
+/// coalesce into one), and no more ran in the sleeper than in all.
+fn twokid_outcome_is_legal(mode: &str, stdout: &str) -> bool {
+    let Some(rest) = stdout
+        .strip_prefix(mode)
+        .and_then(|rest| rest.strip_prefix(": nanosleep "))
+        .and_then(|rest| rest.strip_suffix('\n'))
+    else {
+        return false;
+    };
+    let Some((result, counts)) = rest.split_once(", SIGCHLD in sleeper before return ") else {
+        return false;
+    };
+    let Some((own, all)) = counts.split_once(", in all ") else {
+        return false;
+    };
+    let (Ok(own), Ok(all)) = (own.parse::<u32>(), all.parse::<u32>()) else {
+        return false;
+    };
+    let interrupted = match result {
+        "-1 EINTR" => true,
+        "0" => false,
+        _ => return false,
+    };
+    (!interrupted || own >= 1) && (1..=2).contains(&all) && own <= all
 }
 
 /// Runs the `signal_hermit_tasks` guest with `args` under Hermit `flags` in a

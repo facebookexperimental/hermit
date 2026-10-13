@@ -3231,6 +3231,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // one delivered to a handler does. A read whose every record
                 // was a dropped duplicate reads again, as if those copies had
                 // never been queued.
+                let extents = [(call.buf().map_or(0, |buf| buf.as_raw()), call.len())];
                 match (result, call.buf()) {
                     (Ok(read), Some(buf))
                         if read > 0 && self.cfg.backend.reports_child_exit_publication =>
@@ -3238,9 +3239,21 @@ impl<T: RecordOrReplay> Detcore<T> {
                         let kept = self
                             .reconcile_signalfd_records(guest, buf, read as usize)
                             .await;
+                        self.settle_faulted_signalfd_record(
+                            guest,
+                            call.fd(),
+                            &extents,
+                            Some(read as usize),
+                        )
+                        .await;
                         if kept > 0 {
                             break Ok(kept as i64);
                         }
+                    }
+                    (Err(Error::Errno(Errno::EFAULT)), _) => {
+                        self.settle_faulted_signalfd_record(guest, call.fd(), &extents, None)
+                            .await;
+                        break Err(Errno::EFAULT.into());
                     }
                     (result, _) => break result,
                 }
@@ -4000,6 +4013,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         C: Into<Syscall> + Copy,
     {
         const IOVEC: usize = std::mem::size_of::<libc::iovec>();
+        let fd = match call.into() {
+            Syscall::Readv(call) => call.fd(),
+            Syscall::Preadv2(call) => call.fd(),
+            _ => -1,
+        };
         // Linux passes the count on as an `unsigned int` (Codex re-check #7).
         let count = crate::io_buffers::linux_iovec_count(count as u64);
         if count > libc::UIO_MAXIOV as usize {
@@ -4058,6 +4076,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                     let kept = self
                         .reconcile_signalfd_extents(guest, &extents, read as usize)
                         .await;
+                    self.settle_faulted_signalfd_record(guest, fd, &extents, Some(read as usize))
+                        .await;
                     if kept > 0 {
                         *observed = Some(
                             crate::syscalls::signal::signalfd_extent_pieces(&extents, kept)
@@ -4076,9 +4096,92 @@ impl<T: RecordOrReplay> Detcore<T> {
                         break Err(Errno::EFAULT.into());
                     }
                 }
+                Err(Error::Errno(Errno::EFAULT)) => {
+                    self.settle_faulted_signalfd_record(guest, fd, &extents, None)
+                        .await;
+                    break Err(Errno::EFAULT.into());
+                }
                 result => break result,
             }
         }
+    }
+
+    /// Linux's signalfd read dequeues each signal before it copies its record
+    /// out, and stops at the first copy that faults, so that signal is lost:
+    /// the read fails with EFAULT if it was the first record, or returns the
+    /// records before it. The SIGCHLD such a record may have held is settled
+    /// with the child-exit ledger as a faulted `rt_sigtimedwait`'s is
+    /// (`WaitFaulted`; the Codex re-check of
+    /// https://github.com/rrnewton/hermit/pull/4131 at 8692836e). `extents`
+    /// are the read's buffers and `read` the bytes it returned, or `None` for
+    /// an EFAULT.
+    ///
+    /// An EFAULT dequeued nothing when a buffer is not a user address at all
+    /// (`access_ok`, checked before any dequeue). After a positive read, a
+    /// record was lost only if the buffers had room for another and some
+    /// byte of it is not writable; even then no signal may have been left to
+    /// take, so the shared queue's pending bit decides that case.
+    async fn settle_faulted_signalfd_record<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: i32,
+        extents: &[(usize, usize)],
+        read: Option<usize>,
+    ) {
+        if !self.cfg.backend.reports_child_exit_publication || !guest.config().sequentialize_threads
+        {
+            return;
+        }
+        match read {
+            None => {
+                let user_end = user_address_end();
+                if extents.iter().any(|(address, len)| {
+                    address.checked_add(*len).is_none_or(|end| end > user_end)
+                }) {
+                    return;
+                }
+            }
+            Some(read) => {
+                let Some(next) = signalfd_next_record(extents, read) else {
+                    return;
+                };
+                let Ok(maps) =
+                    std::fs::read_to_string(format!("/proc/{}/maps", guest.tid().as_raw()))
+                else {
+                    return;
+                };
+                if next
+                    .iter()
+                    .all(|(address, len)| signalfd_range_is_writable(&maps, *address, *len))
+                {
+                    return;
+                }
+            }
+        }
+        let sigchld = crate::syscalls::threads::kernel_sigset_bit(libc::SIGCHLD);
+        let mask = signalfd_sigmask(guest.pid().as_raw(), fd);
+        if mask.is_some_and(|mask| mask & sigchld == 0) {
+            return;
+        }
+        let Ok(state) =
+            crate::syscalls::threads::read_thread_wait_signal_state(guest.pid(), guest.tid())
+        else {
+            return;
+        };
+        // A failed read of a descriptor for SIGCHLD alone took a SIGCHLD.
+        let shared_pending = if read.is_none() && mask == Some(sigchld) {
+            false
+        } else {
+            state.shared_pending & sigchld != 0
+        };
+        crate::tool_global::child_exit_sigchld(
+            guest,
+            crate::scheduler::child_exit_sigchld::ChildExitSigchldControl::WaitFaulted {
+                private_pending: state.thread_pending & sigchld != 0,
+                shared_pending,
+            },
+        )
+        .await;
     }
 
     /// SYS_readv system call: the vectored form of `read`.
@@ -6671,9 +6774,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         let signalfd = self.record_or_replay(guest, call).await? as RawFd;
         // A real-time timer expiration this descriptor, or a copy a fork
         // inherits, could read is never kept pending
-        // (`Scheduler::real_time_expiration_fate`), and a `SIGEV_THREAD_ID`
+        // (`Scheduler::real_time_expiration_fate`), a `SIGEV_THREAD_ID`
         // timer's copy of a signal it covers may be taken unobserved
-        // (`Scheduler::thread_timer_copy_is_observable`).
+        // (`Scheduler::thread_timer_copy_is_observable`), and a process one
+        // of whose threads blocks in an I/O call while it holds one for
+        // SIGCHLD does not attribute SIGCHLD through the send window
+        // (`Scheduler::note_outside_blocker`), since that call may read it
+        // outside the schedule.
         if let Some(mask) = mask
             && mask != 0
             && let Some(detpid) = guest.thread_state().detpid
@@ -7085,7 +7192,23 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         }
         if thread_scope {
-            let value = self.record_or_replay(guest, call).await?;
+            // A thread-scoped send queues the copy in the named thread's
+            // private queue (the Claude re-check of
+            // https://github.com/rrnewton/hermit/pull/4131).
+            let value = match (named, process) {
+                (Some(thread), Some(process)) => {
+                    self.send_guest_signal(
+                        guest,
+                        call,
+                        DetTid::from_raw(thread.as_raw()),
+                        signal,
+                        Some(process),
+                        true,
+                    )
+                    .await?
+                }
+                _ => self.record_or_replay(guest, call).await?,
+            };
             if let (Some(thread), Some(process)) = (named, process) {
                 let thread = DetTid::from_raw(thread.as_raw());
                 if signal == libc::SIGKILL {
@@ -7133,7 +7256,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
             }
         }
-        let value = self.record_or_replay(guest, call).await?;
+        let value = match receiver {
+            Some((thread, process)) => {
+                self.send_guest_signal(guest, call, thread, signal, Some(process), false)
+                    .await?
+            }
+            None => self.record_or_replay(guest, call).await?,
+        };
         if let Some((thread, process)) = receiver {
             // Tell the scheduler, as `kill` does, so a receiver parked in a
             // blocking call (pause(), a futex wait) is woken to take it
@@ -8334,10 +8463,98 @@ impl<'a> GetdentsCall<'a> {
 /// Whether every byte of `[address, address + len)` lies in some mapping of a
 /// `/proc/<pid>/maps` listing (`Detcore::vectored_signalfd_read`).
 fn signalfd_range_is_mapped(maps: &str, address: usize, len: usize) -> bool {
+    signalfd_range_is_covered(maps, address, len, false)
+}
+
+/// Whether every byte of `[address, address + len)` lies in some writable
+/// mapping of a `/proc/<pid>/maps` listing
+/// (`Detcore::settle_faulted_signalfd_record`).
+fn signalfd_range_is_writable(maps: &str, address: usize, len: usize) -> bool {
+    signalfd_range_is_covered(maps, address, len, true)
+}
+
+/// The pieces of the guest buffers `extents` (address, length) that the
+/// signalfd record after the first `read` bytes would fill, or `None` if
+/// they have no room for a whole record there (Linux reads only whole ones).
+fn signalfd_next_record(extents: &[(usize, usize)], read: usize) -> Option<Vec<(usize, usize)>> {
+    const RECORD: usize = std::mem::size_of::<libc::signalfd_siginfo>();
+    let capacity = extents
+        .iter()
+        .try_fold(0usize, |total, (_, len)| total.checked_add(*len))?;
+    if capacity / RECORD <= read / RECORD {
+        return None;
+    }
+    let mut skip = read - read % RECORD;
+    let mut left = RECORD;
+    let mut pieces = Vec::new();
+    for (address, len) in extents {
+        if left == 0 {
+            break;
+        }
+        if skip >= *len {
+            skip -= len;
+            continue;
+        }
+        let take = (len - skip).min(left);
+        pieces.push((address + skip, take));
+        left -= take;
+        skip = 0;
+    }
+    Some(pieces)
+}
+
+/// The end of the user address space, x86-64's `TASK_SIZE_MAX`, above which
+/// `access_ok` fails a buffer before a call does anything: 2^56 - 4096 where
+/// the kernel runs five-level page tables, 2^47 - 4096 otherwise. Measured
+/// once, by asking for a mapping above 2^47, which the kernel grants there
+/// only with five-level page tables.
+fn user_address_end() -> usize {
+    static END: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *END.get_or_init(|| {
+        const HINT: usize = 1 << 48;
+        // SAFETY: a fresh anonymous mapping, unmapped at once; the hint is
+        // only a hint (no MAP_FIXED).
+        let at = unsafe {
+            libc::mmap(
+                HINT as *mut libc::c_void,
+                4096,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if at == libc::MAP_FAILED {
+            return (1 << 47) - 4096;
+        }
+        // SAFETY: the mapping made above.
+        unsafe { libc::munmap(at, 4096) };
+        if at as usize >= 1 << 47 {
+            (1 << 56) - 4096
+        } else {
+            (1 << 47) - 4096
+        }
+    })
+}
+
+/// The signals a signalfd reads, from its `/proc/<pid>/fdinfo` entry.
+fn signalfd_sigmask(pid: i32, fd: i32) -> Option<u64> {
+    let info = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}")).ok()?;
+    let mask = info
+        .lines()
+        .find_map(|line| line.strip_prefix("sigmask:"))?;
+    u64::from_str_radix(mask.trim(), 16).ok()
+}
+
+fn signalfd_range_is_covered(maps: &str, address: usize, len: usize, writable: bool) -> bool {
     let mut ranges: Vec<(usize, usize)> = maps
         .lines()
         .filter_map(|line| {
-            let (start, end) = line.split_whitespace().next()?.split_once('-')?;
+            let mut fields = line.split_whitespace();
+            let (start, end) = fields.next()?.split_once('-')?;
+            if writable && !fields.next()?.contains('w') {
+                return None;
+            }
             Some((
                 usize::from_str_radix(start, 16).ok()?,
                 usize::from_str_radix(end, 16).ok()?,
@@ -8362,7 +8579,9 @@ fn signalfd_range_is_mapped(maps: &str, address: usize, len: usize) -> bool {
 
 #[cfg(test)]
 mod signalfd_geometry_tests {
+    use super::signalfd_next_record;
     use super::signalfd_range_is_mapped;
+    use super::signalfd_range_is_writable;
 
     /// A range is mapped only when contiguous mappings cover every byte.
     #[test]
@@ -8377,6 +8596,31 @@ mod signalfd_geometry_tests {
         assert!(!signalfd_range_is_mapped(maps, 0x4000, 16));
         assert!(!signalfd_range_is_mapped(maps, usize::MAX - 4, 16));
         assert!(!signalfd_range_is_mapped("", 0x1000, 16));
+    }
+
+    /// The record a signalfd read could have lost after the bytes it
+    /// returned: only where the buffers hold a whole further record, which
+    /// may span iovecs, and lost only if some byte of it is not writable.
+    #[test]
+    fn the_record_after_a_read_is_where_the_buffers_have_room_for_it() {
+        assert_eq!(
+            signalfd_next_record(&[(0x1000, 256)], 128),
+            Some(vec![(0x1080, 128)])
+        );
+        assert_eq!(signalfd_next_record(&[(0x1000, 255)], 128), None);
+        assert_eq!(signalfd_next_record(&[(0x1000, 128)], 128), None);
+        assert_eq!(
+            signalfd_next_record(&[(0x1000, 100), (0x3000, 60), (0x5000, 300)], 128),
+            Some(vec![(0x3000 + 28, 32), (0x5000, 96)])
+        );
+        assert_eq!(
+            signalfd_next_record(&[(0x1000, usize::MAX), (0x2000, 2)], 0),
+            None
+        );
+        let maps = "1000-2000 rw-p 0 0:0 0\n2000-3000 ---p 0 0:0 0\n";
+        assert!(signalfd_range_is_writable(maps, 0x1f80, 128));
+        assert!(!signalfd_range_is_writable(maps, 0x1fc0, 128));
+        assert!(signalfd_range_is_mapped(maps, 0x1fc0, 128));
     }
 }
 

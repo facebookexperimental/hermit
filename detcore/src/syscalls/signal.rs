@@ -847,6 +847,23 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await;
             }
         }
+        // Linux flushes a pending SIGCHLD when its action becomes SIG_IGN or
+        // SIG_DFL, which ignores it (`do_sigaction`, `sig_handler_ignored`): the
+        // child-exit ledger's send window goes with it, in this committed turn
+        // (https://github.com/rrnewton/hermit/issues/4126).
+        if call.signum() == libc::SIGCHLD
+            && guest.config().sequentialize_threads
+            && matches!(result, Ok(_) | Err(Errno::EFAULT))
+            && kernel_action.is_some_and(|action| {
+                action.handler == libc::SIG_IGN as u64 || action.handler == libc::SIG_DFL as u64
+            })
+        {
+            crate::tool_global::child_exit_sigchld(
+                guest,
+                crate::scheduler::child_exit_sigchld::ChildExitSigchldControl::Flushed,
+            )
+            .await;
+        }
         // Linux flushes the pending instances of a signal whose disposition
         // becomes SIG_IGN (`do_sigaction`), among them a pending real-time timer
         // expiration (https://github.com/rrnewton/hermit/issues/4089).
@@ -1051,7 +1068,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .await;
             // A consumed child-exit copy that the notification ledger drops
             // is not returned: the wait goes on, to the same deadline.
-            if self.synchronous_sigchld_stands(guest, call, &result).await {
+            if self
+                .synchronous_sigchld_stands(guest, call, waited, &result)
+                .await
+            {
                 break result;
             }
             if let (Some(info), Some(bytes)) = (call.info(), before.as_ref()) {
@@ -1158,25 +1178,83 @@ impl<T: RecordOrReplay> Detcore<T> {
         &self,
         guest: &mut G,
         call: syscalls::RtSigtimedwait,
+        waited: Option<u64>,
         result: &Result<i64, Error>,
     ) -> bool {
-        use crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer;
-        use crate::scheduler::child_exit_sigchld::OwnCopy;
-        if !self.cfg.backend.reports_child_exit_publication
-            || !matches!(result, Ok(signal) if *signal == libc::SIGCHLD as i64)
+        if !self.cfg.backend.reports_child_exit_publication {
+            return true;
+        }
+        // Linux copies the set in before it dequeues, and the siginfo out
+        // after, so an EFAULT with a readable set (`waited`) took a signal it
+        // never reports; an unreadable set dequeued nothing. Which copy it
+        // took: a recorded private one if SIGCHLD is gone from the thread's
+        // private queue, which only committed guest sends fill; otherwise,
+        // with SIGCHLD the only signal in the set, the shared queue's. A wider
+        // set falls back to the shared queue's pending bit (the Claude and
+        // Codex re-checks of https://github.com/rrnewton/hermit/pull/4131).
+        if matches!(result, Err(Error::Errno(Errno::EFAULT)))
+            && guest.config().sequentialize_threads
+            && let Some(set) = waited
         {
+            let sigchld = kernel_sigset_bit(libc::SIGCHLD);
+            if set & sigchld != 0
+                && let Ok(state) = crate::syscalls::threads::read_thread_wait_signal_state(
+                    guest.pid(),
+                    guest.tid(),
+                )
+            {
+                let shared_pending = if set & !sigchld == 0 {
+                    false
+                } else {
+                    state.shared_pending & sigchld != 0
+                };
+                crate::tool_global::child_exit_sigchld(
+                    guest,
+                    crate::scheduler::child_exit_sigchld::ChildExitSigchldControl::WaitFaulted {
+                        private_pending: state.thread_pending & sigchld != 0,
+                        shared_pending,
+                    },
+                )
+                .await;
+            }
+            return true;
+        }
+        if !matches!(result, Ok(signal) if *signal == libc::SIGCHLD as i64) {
             return true;
         }
         // Without a siginfo buffer the guest sees only the signal number,
-        // which every copy shares.
+        // which every copy shares; the ledger still learns that the wait took
+        // one (`DequeuedCopy::Unknown`), which may be the shared queue's.
         let Some(info) = call.info() else {
+            crate::tool_global::child_exit_sigchld(
+                guest,
+                crate::scheduler::child_exit_sigchld::ChildExitSigchldControl::Dequeue {
+                    copy: crate::scheduler::child_exit_sigchld::DequeuedCopy::Unknown,
+                    admits: false,
+                },
+            )
+            .await;
             return true;
         };
         let Some(bytes) = read_siginfo(guest, info) else {
             return true;
         };
+        Self::synchronous_sigchld_copy_stands(guest, info, &bytes).await
+    }
+
+    /// The child-exit ledger's answer for the `SIGCHLD` with siginfo `bytes`
+    /// that `rt_sigtimedwait` returned into `info`
+    /// (`synchronous_sigchld_stands`).
+    async fn synchronous_sigchld_copy_stands<G: Guest<Self>>(
+        guest: &mut G,
+        info: AddrMut<'_, libc::siginfo_t>,
+        bytes: &[u8; 128],
+    ) -> bool {
+        use crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer;
+        use crate::scheduler::child_exit_sigchld::OwnCopy;
+        // Taken by the wait, a kept copy makes no `InboundSignal` request.
         let Some(control) =
-            crate::scheduler::child_exit_sigchld::control_for(&bytes, std::process::id())
+            crate::scheduler::child_exit_sigchld::control_for(bytes, std::process::id(), false)
         else {
             return true;
         };
@@ -1447,13 +1525,29 @@ impl<T: RecordOrReplay> Detcore<T> {
             .backend
             .requires_thread_directed_process_signals
         {
-            self.record_or_replay(guest, call).await?
+            self.send_guest_signal(
+                guest,
+                call,
+                tid,
+                call.sig(),
+                Some(DetPid::from_raw(process)),
+                false,
+            )
+            .await?
         } else {
             let targeted = syscalls::Tgkill::new()
                 .with_tgid(process)
                 .with_tid(tid.as_raw())
                 .with_sig(call.sig());
-            self.record_or_replay(guest, targeted).await?
+            self.send_guest_signal(
+                guest,
+                targeted,
+                tid,
+                call.sig(),
+                Some(DetPid::from_raw(process)),
+                false,
+            )
+            .await?
         };
         self.notify_cross_task_signal(guest, tid, call.sig(), Some(DetPid::from_raw(process)))
             .await;
@@ -1941,7 +2035,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return self.send_reserved_sigkill(guest, reservation, call).await;
         }
-        let value = self.record_or_replay(guest, call).await?;
+        let value = self
+            .send_guest_signal(
+                guest,
+                call,
+                DetTid::from_raw(call.tid()),
+                call.sig(),
+                None,
+                true,
+            )
+            .await?;
         // `pthread_kill` lowers to `tgkill`, so this is the ordinary way one
         // guest THREAD signals a sibling. Like `kill`, a successful cross-task
         // send must tell the scheduler, or a target parked in a child wait is
@@ -2008,7 +2111,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return self.send_reserved_sigkill(guest, reservation, call).await;
         }
-        let value = self.record_or_replay(guest, call).await?;
+        let value = self
+            .send_guest_signal(
+                guest,
+                call,
+                DetTid::from_raw(call.tid()),
+                call.sig(),
+                None,
+                true,
+            )
+            .await?;
         // Same wakeup obligation as `tgkill`; `tkill` is the older two-argument
         // spelling of the same thread-directed send.
         self.notify_cross_task_signal(guest, DetTid::from_raw(tid), call.sig(), None)
@@ -2063,6 +2175,75 @@ impl<T: RecordOrReplay> Detcore<T> {
         resource_request(guest, request).await;
         commit_sigkill(guest, reservation.token, true).await;
         Ok(self.record_or_replay(guest, call).await?)
+    }
+
+    /// Send a guest's signal with `syscall`, first recording, for a `SIGCHLD`,
+    /// the queue its copy will join (`record_guest_sigchld_send`), and undoing
+    /// that record if the send fails. Recorded before the physical send: a
+    /// thread outside the schedule (in a real `rt_sigsuspend` or blocking
+    /// call) can take the copy the moment it is queued, before this handler
+    /// could record it afterwards (the Claude re-check of
+    /// https://github.com/rrnewton/hermit/pull/4131). `thread_directed`: the
+    /// send names one thread (`tkill`, `tgkill`, `rt_tgsigqueueinfo`, a
+    /// thread-scoped `pidfd_send_signal`).
+    pub(crate) async fn send_guest_signal<G, S>(
+        &self,
+        guest: &mut G,
+        syscall: S,
+        target: DetTid,
+        raw_signal: i32,
+        target_process: Option<DetPid>,
+        thread_directed: bool,
+    ) -> Result<i64, Error>
+    where
+        G: Guest<Self>,
+        S: Into<reverie::syscalls::Syscall>,
+    {
+        use crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer;
+        use crate::scheduler::child_exit_sigchld::ChildExitSigchldControl;
+        let mut undo = None;
+        if raw_signal == libc::SIGCHLD && guest.config().sequentialize_threads {
+            // Without a process, or on a backend that sends process signals to
+            // a thread, the copy joins the target's private queue.
+            if thread_directed
+                || target_process.is_none()
+                || guest
+                    .config()
+                    .backend
+                    .requires_thread_directed_process_signals
+            {
+                let answer = crate::tool_global::child_exit_sigchld(
+                    guest,
+                    ChildExitSigchldControl::PrivateSent { target },
+                )
+                .await;
+                // A copy already pending there coalesces: only a new record is
+                // undone.
+                if answer == ChildExitSigchldAnswer::Placed(true) {
+                    undo = Some(ChildExitSigchldControl::SendFailed {
+                        private: Some(target),
+                        shared: None,
+                    });
+                }
+            } else if let Some(process) = target_process {
+                crate::tool_global::child_exit_sigchld(
+                    guest,
+                    ChildExitSigchldControl::SharedSent { target: process },
+                )
+                .await;
+                undo = Some(ChildExitSigchldControl::SendFailed {
+                    private: None,
+                    shared: Some(process),
+                });
+            }
+        }
+        let result = self.record_or_replay(guest, syscall).await;
+        if result.is_err()
+            && let Some(undo) = undo
+        {
+            crate::tool_global::child_exit_sigchld(guest, undo).await;
+        }
+        Ok(result?)
     }
 
     /// Tell the scheduler that a successful thread-directed send left a signal
@@ -2189,7 +2370,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return Ok(0);
         }
-        let value = self.record_or_replay(guest, call).await?;
+        let value = self
+            .send_guest_signal(
+                guest,
+                call,
+                DetTid::from_raw(call.tid()),
+                call.sig(),
+                None,
+                true,
+            )
+            .await?;
         // Thread-directed like `tgkill`, so it carries the same wakeup
         // obligation. `sigqueue`/`pthread_sigqueue` reach a parked sibling
         // through here.
@@ -2387,14 +2577,30 @@ impl<T: RecordOrReplay> Detcore<T> {
             .backend
             .requires_thread_directed_process_signals
         {
-            self.record_or_replay(guest, call).await?
+            self.send_guest_signal(
+                guest,
+                call,
+                tid,
+                call.sig(),
+                Some(DetPid::from_raw(process)),
+                false,
+            )
+            .await?
         } else {
             let targeted = syscalls::RtTgsigqueueinfo::new()
                 .with_tgid(process)
                 .with_tid(tid.as_raw())
                 .with_sig(call.sig())
                 .with_siginfo(call.siginfo());
-            self.record_or_replay(guest, targeted).await?
+            self.send_guest_signal(
+                guest,
+                targeted,
+                tid,
+                call.sig(),
+                Some(DetPid::from_raw(process)),
+                false,
+            )
+            .await?
         };
         self.notify_cross_task_signal(guest, tid, call.sig(), Some(DetPid::from_raw(process)))
             .await;
@@ -2513,9 +2719,9 @@ pub(crate) enum SleepSignal {
     /// default: the kernel delivers it as the call returns. `pause` returns
     /// `ERESTARTNOHAND` for it and `nanosleep` `EINTR`.
     Pending,
-    /// The scheduler ended the sleep for a signal whose pending bit cannot
-    /// decide (below), or this backend does not report the guest's signal
-    /// state: the call returns `EINTR`, as every wake did before.
+    /// The scheduler woke the sleep for a held signal of its own that ends it
+    /// (`held_wake_ends_sleep`), or this backend does not report the guest's
+    /// signal state: the call returns `EINTR`, as every wake did before.
     Held,
     /// Nothing ends the sleep, and it waits (again) with its original deadline.
     None,
@@ -2538,11 +2744,15 @@ pub(crate) enum SleepSignal {
 ///
 /// `SIGCHLD` and the signals a host-timed source armed by a guest can post
 /// (`host_timed_signals`) are held: the kernel can post them at a moment set by
-/// host timing, and `/proc` cannot tell that copy from one a guest sent, so
-/// their pending bits are never read. They never end a sleep before it parks,
-/// nor does the scheduler record a guest's cross-task send of one for a sleep;
-/// a wake the scheduler committed for one of its own, a child-exit `SIGCHLD`,
-/// ends it with `Held`, as before. Like the precise futex
+/// host timing, and `/proc` cannot tell that copy from one a guest sent. They
+/// never end a sleep before it parks, nor does the scheduler record a guest's
+/// cross-task send of one for a sleep. A wake the scheduler committed for its
+/// own child-exit `SIGCHLD` ends the sleep with `Held` only while the copy it
+/// sent is still pending in the process's shared queue
+/// (`ChildExitSigchldControl::PlacedPending`, which `/proc` cannot answer),
+/// `/proc` shows it pending, and it is unblocked and caught or default-fatal
+/// (`held_wake_ends_sleep`); a host-timed held signal, from the mask and
+/// dispositions alone. Like the precise futex
 /// wait's check, this reads the pending set before the sleep parks as well as
 /// after a wake: a signal sent while the thread was stopped short of filing
 /// its request, as when its timeslice ended in the syscall's prehook, is
@@ -2575,19 +2785,22 @@ where
             SleepCheck::AfterWake(_) => SleepSignal::Held,
         });
     }
-    let held = kernel_sigset_bit(libc::SIGCHLD) | host_timed_signals(guest).await;
+    let host_timed = host_timed_signals(guest).await;
+    let held = kernel_sigset_bit(libc::SIGCHLD) | host_timed;
     let before_park = check == SleepCheck::BeforePark;
-    let (deciding, held_wake) = match check {
-        SleepCheck::BeforePark => (!held, false),
-        SleepCheck::AfterWake(None) => (0, true),
+    // `held_woken`: the held signals the scheduler woke this sleep for.
+    // `unknown_held_wake`: a wake that names no signal.
+    let (deciding, held_woken, unknown_held_wake) = match check {
+        SleepCheck::BeforePark => (!held, 0, false),
+        SleepCheck::AfterWake(None) => (0, 0, true),
         SleepCheck::AfterWake(Some(woken)) => {
             let woken = woken
                 .iter()
                 .fold(0, |set, signal| set | kernel_sigset_bit(signal.raw()));
-            (woken & !held, woken & held != 0)
+            (woken & !held, woken & held, false)
         }
     };
-    if deciding != 0 {
+    if deciding != 0 || held_woken != 0 {
         let state = read_thread_wait_signal_state(guest.pid(), guest.tid())?;
         let mut ending = state.pending_interrupting(state.blocked, false) & deciding;
         if !stops_end_it && before_park {
@@ -2596,8 +2809,40 @@ where
         if ending != 0 {
             return Ok(SleepSignal::Pending);
         }
+        // The committed `SIGCHLD` counts only while the copy the scheduler
+        // sent is still pending in the process's shared queue, as the schedule
+        // fixes it (`PlacedPending`): `/proc` cannot tell it from a kernel copy
+        // that host timing posted after a sibling took the scheduler's.
+        let committed_sigchld = held_woken & kernel_sigset_bit(libc::SIGCHLD) & !host_timed;
+        let held_woken = if committed_sigchld == 0 {
+            held_woken
+        } else if matches!(
+            crate::tool_global::child_exit_sigchld(
+                guest,
+                crate::scheduler::child_exit_sigchld::ChildExitSigchldControl::PlacedPending,
+            )
+            .await,
+            crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer::Placed(true)
+        ) {
+            // A copy still pending in the shared queue shows in `/proc`: an
+            // invariant, not a second condition.
+            if state.pending & committed_sigchld == 0 {
+                tracing::error!(
+                    "[dtid {}] the scheduler's SIGCHLD is pending by the schedule but not in /proc",
+                    guest.thread_state().dettid
+                );
+                debug_assert!(false, "a placed SIGCHLD is not pending in /proc");
+            }
+            held_woken
+        } else {
+            held_woken & !committed_sigchld
+        };
+        if held_wake_ends_sleep(&state, held_woken) {
+            return Ok(SleepSignal::Held);
+        }
+        return Ok(SleepSignal::None);
     }
-    Ok(if held_wake {
+    Ok(if unknown_held_wake {
         SleepSignal::Held
     } else {
         SleepSignal::None
@@ -2623,6 +2868,7 @@ fn signalfd_record_controls(
     tracer: u32,
 ) -> Vec<Option<crate::scheduler::child_exit_sigchld::ChildExitSigchldControl>> {
     use crate::scheduler::child_exit_sigchld::ChildExitSigchldControl;
+    use crate::scheduler::child_exit_sigchld::DequeuedCopy;
     bytes
         .chunks(SIGNALFD_RECORD)
         .map(|record| {
@@ -2632,17 +2878,24 @@ fn signalfd_record_controls(
             let code = signalfd_field(record, 8) as i32;
             let pid = signalfd_field(record, 12);
             let value = signalfd_field(record, 44) as i32;
-            if crate::scheduler::child_exit_sigchld::is_child_exit_code(code) {
-                Some(ChildExitSigchldControl::ClaimKernelCopy {
+            let copy = if crate::scheduler::child_exit_sigchld::is_child_exit_code(code) {
+                DequeuedCopy::Kernel {
                     child: DetPid::from_raw(pid as i32),
-                })
+                }
             } else if crate::scheduler::child_exit_sigchld::is_own_sigchld_mark(
                 code, pid as i32, value, tracer,
             ) {
-                Some(ChildExitSigchldControl::TakeOwnCopy)
+                DequeuedCopy::Scheduler
+            } else if code == libc::SI_TKILL {
+                DequeuedCopy::Thread
             } else {
-                None
-            }
+                DequeuedCopy::Other
+            };
+            // Read, a kept record makes no `InboundSignal` request.
+            Some(ChildExitSigchldControl::Dequeue {
+                copy,
+                admits: false,
+            })
         })
         .collect()
 }
@@ -2751,11 +3004,12 @@ mod signalfd_record_tests {
     }
 
     /// At a receiver in a nested PID namespace, a record of the scheduler's
-    /// marked `SI_QUEUE` copy (pid 0, `ssi_int` the mark) asks for its own
-    /// copy; an ancestor's `SI_USER` from pid 0 and an unmarked `SI_QUEUE` ask
-    /// nothing (<https://github.com/rrnewton/hermit/issues/4155>).
+    /// marked `SI_QUEUE` copy (pid 0, `ssi_int` the mark) is its own copy; an
+    /// ancestor's `SI_USER` from pid 0 and an unmarked `SI_QUEUE` are another
+    /// (<https://github.com/rrnewton/hermit/issues/4155>).
     #[test]
     fn a_nested_receivers_marked_record_asks_for_the_own_copy() {
+        use crate::scheduler::child_exit_sigchld::DequeuedCopy;
         let marked = |value: i32| {
             let mut record = record(libc::SIGCHLD, libc::SI_QUEUE, 0, 0);
             record[44..48].copy_from_slice(&value.to_ne_bytes());
@@ -2767,32 +3021,53 @@ mod signalfd_record_tests {
             record(libc::SIGCHLD, libc::SI_USER, 0, 0),
         ]
         .concat();
+        let dequeue = |copy| {
+            Some(ChildExitSigchldControl::Dequeue {
+                copy,
+                admits: false,
+            })
+        };
         assert_eq!(
             signalfd_record_controls(&bytes, TRACER),
-            vec![Some(ChildExitSigchldControl::TakeOwnCopy), None, None]
+            vec![
+                dequeue(DequeuedCopy::Scheduler),
+                dequeue(DequeuedCopy::Other),
+                dequeue(DequeuedCopy::Other),
+            ]
         );
     }
 
-    /// A kernel child-exit copy asks the ledger about its child, the
-    /// scheduler's `SI_USER` copy asks for its own copy, and anything else,
-    /// including a guest's `SI_USER` SIGCHLD, asks nothing.
+    /// Each `SIGCHLD` record from the shared queue tells the ledger it was
+    /// taken, as which copy: a kernel child-exit copy names its child, the
+    /// scheduler's `SI_USER` copy is its own, a guest's `SI_USER` is another,
+    /// and a `SI_TKILL` copy is thread-directed; any other signal asks nothing.
+    /// A read makes no `InboundSignal` request (`admits` unset).
     #[test]
     fn each_record_asks_the_ledger_only_about_a_child_exit_copy() {
+        use crate::scheduler::child_exit_sigchld::DequeuedCopy;
         let bytes = [
             record(libc::SIGCHLD, libc::CLD_KILLED, 31, libc::SIGKILL),
             record(libc::SIGCHLD, libc::SI_USER, TRACER, 0),
             record(libc::SIGCHLD, libc::SI_USER, 77, 0),
+            record(libc::SIGCHLD, libc::SI_TKILL, 77, 0),
             record(libc::SIGUSR1, libc::SI_USER, TRACER, 0),
         ]
         .concat();
+        let dequeue = |copy| {
+            Some(ChildExitSigchldControl::Dequeue {
+                copy,
+                admits: false,
+            })
+        };
         assert_eq!(
             signalfd_record_controls(&bytes, TRACER),
             vec![
-                Some(ChildExitSigchldControl::ClaimKernelCopy {
+                dequeue(DequeuedCopy::Kernel {
                     child: DetPid::from_raw(31)
                 }),
-                Some(ChildExitSigchldControl::TakeOwnCopy),
-                None,
+                dequeue(DequeuedCopy::Scheduler),
+                dequeue(DequeuedCopy::Other),
+                dequeue(DequeuedCopy::Thread),
                 None,
             ]
         );
@@ -3291,6 +3566,31 @@ fn orphaned_group_signals(sig: libc::c_int) -> u64 {
     }
 }
 
+/// Whether a held signal the scheduler woke a sleep for (`held_woken`, a
+/// child-exit `SIGCHLD`) ends it: as Linux delivery would, only when this
+/// thread's mask leaves it unblocked and it is caught or acted on by default
+/// (`KernelSignalState::interrupting`). A blocked one stays pending, and a
+/// default-ignored one (`SIGCHLD` without a handler) is discarded, and either
+/// way the sleep goes on (https://github.com/rrnewton/hermit/issues/4126).
+///
+/// The caller has already removed a committed `SIGCHLD` that no longer counts:
+/// the scheduler sends it to the process, so the kernel gives it to whichever
+/// thread resumes first without blocking it, and a schedule may run a sibling
+/// first (`--chaos-target-races`). Taken by that sibling, it is gone from the
+/// child-exit ledger's send window (`ChildExitSigchldControl::PlacedPending`),
+/// and the sleep goes on to its original deadline, as a futex wait woken for a
+/// signal waits again (`futex_wait_held_after_wake`). Answering EINTR for it
+/// anyway was a result Linux cannot give: the call interrupted, the handler run
+/// in another thread (the Claude re-check of
+/// https://github.com/rrnewton/hermit/pull/4131). A held signal a host-timed
+/// source can also post is decided from the mask and dispositions alone.
+fn held_wake_ends_sleep(
+    state: &crate::syscalls::threads::KernelSignalState,
+    held_woken: KernelSigset,
+) -> bool {
+    state.interrupting(state.blocked) & held_woken != 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3318,6 +3618,35 @@ mod tests {
                 "signal {sig}"
             );
         }
+    }
+
+    /// A child-exit `SIGCHLD` the scheduler woke a sleep for ends it only when
+    /// it is unblocked and caught: blocked, or with its default (ignore)
+    /// action, the sleep goes on, as on Linux
+    /// (https://github.com/rrnewton/hermit/issues/4126). Taken by a sibling
+    /// first, it is no longer among the held signals the wake counts, and the
+    /// sleep goes on too (the Claude re-check of
+    /// https://github.com/rrnewton/hermit/pull/4131). A default-fatal held
+    /// signal (a host-timed `SIGALRM` without a handler) ends it.
+    #[test]
+    fn a_held_wake_ends_a_sleep_only_when_unblocked_and_caught_or_fatal() {
+        use crate::syscalls::threads::KernelSignalState;
+        let chld = kernel_sigset_bit(libc::SIGCHLD);
+        let alrm = kernel_sigset_bit(libc::SIGALRM);
+        let state = |caught: KernelSigset, blocked: KernelSigset| KernelSignalState {
+            caught,
+            blocked,
+            ..Default::default()
+        };
+        assert!(held_wake_ends_sleep(&state(chld, 0), chld));
+        assert!(!held_wake_ends_sleep(&state(chld, chld), chld));
+        assert!(!held_wake_ends_sleep(&state(0, 0), chld));
+        assert!(held_wake_ends_sleep(&state(0, 0), alrm));
+        assert!(!held_wake_ends_sleep(&state(0, alrm), alrm));
+        assert!(
+            !held_wake_ends_sleep(&state(chld, 0), 0),
+            "taken by a sibling"
+        );
     }
 
     #[test]

@@ -387,7 +387,16 @@ impl RecordVersion {
 // 0x142 -> 0x143: epoll_ctl is recorded, and replay answers it from the
 // recording (https://github.com/rrnewton/hermit/issues/31). An older recording
 // has no event for it.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x143);
+// 0x143 -> 0x144 (https://github.com/rrnewton/hermit/pull/4131):
+// a child-exit SIGCHLD the scheduler sends ends an emulated pause or nanosleep
+// only when the thread's mask leaves it unblocked and it is caught or
+// default-fatal, and a still-queued sleep is woken for it
+// (https://github.com/rrnewton/hermit/issues/4126). Replay recomputes such a
+// sleep's result, so an older recording of a blocked or default SIGCHLD during
+// a nanosleep holds the EINTR it used to return, and this replayer would answer
+// 0: a successful replay with different output (Codex review of
+// https://github.com/rrnewton/hermit/pull/4131).
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x144);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -412,7 +421,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x143);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x143;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x144;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -803,6 +812,22 @@ mod tests {
         // yielder was queued, and its replayer cannot follow one that did.
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x132)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x131)));
+    }
+
+    #[test]
+    fn pre_held_sleep_signal_recordings_are_refused_by_the_version_gate() {
+        // A recording from before this epoch of a blocked or default SIGCHLD
+        // during a nanosleep holds the EINTR the call used to return, where
+        // this replayer recomputes 0: 0x143 (the previous epoch), 0x142,
+        // 0x13e, 0x13d, 0x13c, 0x139, 0x138 and 0x135.
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x143)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x142)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x13e)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x13d)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x13c)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x139)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x138)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x135)));
     }
 
     #[test]

@@ -691,7 +691,14 @@ impl Scheduler {
             }
         } else if normal_due && matches!(id, SignalTimerId::ChildExit { .. }) {
             let parent = id.process();
-            self.blocked.sigchld_ready.insert(parent);
+            // Where the scheduler models signal targets, the thread that takes
+            // this send is marked when it does (`dequeue_sigchld`); a mark for
+            // the process, its leader's id, would let any thread's delivery of
+            // any copy take it. Where the send window is not used, the mark
+            // is the process's, as before it.
+            if !self.models_signal_targets || !self.sigchld_window_usable(parent) {
+                self.blocked.sigchld_ready.insert(parent);
+            }
             if let Some(deferred) = self.deferred_child_exit_sigchld(parent, tid) {
                 // That thread already dequeued a `SIGCHLD` of this process (the
                 // kernel's own, raised when the tracer released the child), and
@@ -889,7 +896,11 @@ impl Scheduler {
     /// first, as the kernel prefers it, then the others in thread-ID order.
     /// Otherwise the timer targets the leader, so only the leader is looked up,
     /// as before.
-    fn deferred_child_exit_sigchld(&self, process: DetPid, creator: DetTid) -> Option<DetTid> {
+    pub(super) fn deferred_child_exit_sigchld(
+        &self,
+        process: DetPid,
+        creator: DetTid,
+    ) -> Option<DetTid> {
         if !self.models_signal_targets {
             return self
                 .blocked
@@ -897,16 +908,20 @@ impl Scheduler {
                 .contains(&process)
                 .then_some(process);
         }
-        if self.blocked.sigchld_deferred.contains(&creator)
-            && self.sigchld_process(creator) == process
-        {
+        // A delivery the child-exit ledger matched to another child's exit
+        // stands for that one, not this (`ChildExitSigchldLedger::attributed`).
+        let stands_in = |thread: &DetTid| {
+            self.sigchld_process(*thread) == process
+                && !self.child_exit_sigchld.attributed.contains(thread)
+        };
+        if self.blocked.sigchld_deferred.contains(&creator) && stands_in(&creator) {
             return Some(creator);
         }
         self.blocked
             .sigchld_deferred
             .iter()
             .copied()
-            .find(|thread| self.sigchld_process(*thread) == process)
+            .find(|thread| stands_in(thread))
     }
 
     fn publish_real_expiry(

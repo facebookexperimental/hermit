@@ -970,7 +970,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         let Some(info) = guest.signal_info() else {
             return true;
         };
-        let Some(control) = scheduler::child_exit_sigchld::control_for(&info, std::process::id())
+        // A delivery stop: a kept copy's `InboundSignal` request follows.
+        let Some(control) =
+            scheduler::child_exit_sigchld::control_for(&info, std::process::id(), true)
         else {
             return true;
         };
@@ -2087,47 +2089,50 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         rpc: &R,
         unreported: reverie::UnreportedSignal,
     ) -> bool {
-        use scheduler::child_exit_sigchld::ChildExitSigchldAnswer;
-        use scheduler::child_exit_sigchld::OwnCopy;
         if unreported.signal() != Signal::SIGCHLD
             || !self.cfg.backend.reports_child_exit_publication
         {
             return true;
         }
-        let Some(control) = unreported
-            .siginfo()
-            .and_then(|info| scheduler::child_exit_sigchld::control_for(&info, std::process::id()))
-        else {
+        let Some(info) = unreported.siginfo() else {
             return true;
         };
-        // The control message carries no logical time; the scheduler answers
-        // it before any clock accounting.
         let tid = DetTid::from_raw(unreported.tid().as_raw());
-        let (_, response) = rpc
-            .send_rpc((
-                DetTime::default(),
-                MmId::initial(tid),
-                tool_global::GlobalRequest::ChildExitSigchld(control),
-            ))
-            .await;
-        match response {
-            tool_global::GlobalResponse::ChildExitSigchld(ChildExitSigchldAnswer::Claimed(
-                dropped,
-            )) => !dropped,
-            tool_global::GlobalResponse::ChildExitSigchld(ChildExitSigchldAnswer::OwnCopy(
-                OwnCopy::Duplicate,
-            )) => false,
-            tool_global::GlobalResponse::ChildExitSigchld(
-                ChildExitSigchldAnswer::OwnCopy(OwnCopy::Deliver(own))
-                | ChildExitSigchldAnswer::ClaimedFor(own),
-            ) => {
-                warn!(
-                    "[dtid {}] the SIGCHLD for child {} passed on unreported keeps its delivered siginfo",
-                    tid, own.pid
-                );
-                true
+        // Passed on unreported, a kept copy makes no `InboundSignal` request.
+        match scheduler::child_exit_sigchld::control_for(&info, std::process::id(), false) {
+            None => true,
+            Some(control) => {
+                use scheduler::child_exit_sigchld::ChildExitSigchldAnswer;
+                use scheduler::child_exit_sigchld::OwnCopy;
+                // The control message carries no logical time; the scheduler answers
+                // it before any clock accounting.
+                let (_, response) = rpc
+                    .send_rpc((
+                        DetTime::default(),
+                        MmId::initial(tid),
+                        tool_global::GlobalRequest::ChildExitSigchld(control),
+                    ))
+                    .await;
+                match response {
+                    tool_global::GlobalResponse::ChildExitSigchld(
+                        ChildExitSigchldAnswer::Claimed(dropped),
+                    ) => !dropped,
+                    tool_global::GlobalResponse::ChildExitSigchld(
+                        ChildExitSigchldAnswer::OwnCopy(OwnCopy::Duplicate),
+                    ) => false,
+                    tool_global::GlobalResponse::ChildExitSigchld(
+                        ChildExitSigchldAnswer::OwnCopy(OwnCopy::Deliver(own))
+                        | ChildExitSigchldAnswer::ClaimedFor(own),
+                    ) => {
+                        warn!(
+                            "[dtid {}] the SIGCHLD for child {} passed on unreported keeps its delivered siginfo",
+                            tid, own.pid
+                        );
+                        true
+                    }
+                    _ => true,
+                }
             }
-            _ => true,
         }
     }
 

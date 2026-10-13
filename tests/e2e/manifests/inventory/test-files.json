@@ -1165,6 +1165,12 @@
       "why": "tests/c/pause_cross_task_signal.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): Standalone C guest is calibrated under strict verification for ptrace and runs in blocking GitHub CI; it asserts that a signal one guest process sends another parked in pause(2) or nanosleep(2) is delivered as on Linux: a default-fatal signal kills it, a caught one ends the call with EINTR, blocked and ignored signals leave it asleep, and a stop and continue restart pause"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/pause_sigchld.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/pause_sigchld.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_pause_returns_for_a_childs_sigchld compiles this guest, whose parent waits in pause() for the SIGCHLD of a child that exits at once, and requires the run to finish with the handler's output (https://github.com/rrnewton/hermit/issues/4126); it remains a guest fixture because its CLI test checks the exact status and stdout of one strict run."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/perf_event_hardware_enosys.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
@@ -1901,6 +1907,12 @@
       "path": "tests/c/sigaltstack_state.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
       "why": "tests/c/sigaltstack_state.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: Direct C guest for sigaltstack(2) install and query round-tripping, verified with an exact stdout golden"
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/sigchld_bookkeeping.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/sigchld_bookkeeping.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test every_sigchld_copy_is_accounted_for_as_on_linux compiles this guest, which exercises who may take the scheduler's SIGCHLD copy, which siginfo a coalesced delivery carries, a flush, and a faulted sigtimedwait (https://github.com/rrnewton/hermit/issues/4126); it remains a guest fixture because its CLI test checks the exact status and stdout of strict runs."
     },
     {
       "disposition": "guest-fixture",

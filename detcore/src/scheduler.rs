@@ -519,6 +519,14 @@ pub struct BlockedPool {
     /// turn the scheduler selects them.
     pub sigchld_ready: BTreeSet<DetTid>,
 
+    /// Threads whose `pause` or `nanosleep`, still queued or parked, the
+    /// scheduler woke for a signal it sent (`wake_signaled_guest`). That
+    /// synthetic `InboundSignal` turn is granted at once and consumes only this
+    /// mark; the real `SIGCHLD` delivery that may follow is admitted by its own
+    /// (`dequeue_sigchld`)
+    /// (<https://github.com/rrnewton/hermit/issues/4126>).
+    pub woken_sleeps: BTreeSet<DetTid>,
+
     /// Threads in `external_io_blockers` or `rt_sigsuspend_blockers` that the
     /// scheduler signaled at a committed point (`wake_signaled_guest`) while
     /// they slept with no posted request. Their request was consumed when they
@@ -1384,6 +1392,11 @@ pub struct Scheduler {
     /// a change of the signal's disposition to `SIG_IGN` discards it, as Linux
     /// does. Exec keeps it, as exec keeps pending signals.
     pending_real_time_expirations: BTreeMap<DetPid, u64>,
+
+    /// The owned child whose `ChildExit` timer is sending its `SIGCHLD` right
+    /// now (`send_child_exit_sigchld`), for `signal_guest` to enter in the
+    /// child-exit ledger's send window when the send succeeds.
+    sending_child_exit: Option<DetPid>,
 
     /// The signals (a kernel sigset) of each signalfd a process created, by
     /// process; a real-time timer expiration such a descriptor could read is
@@ -3267,6 +3280,7 @@ impl Scheduler {
             child_exit_sigchld: Default::default(),
             saved_guest_sigmasks: Default::default(),
             pending_real_time_expirations: Default::default(),
+            sending_child_exit: None,
             signalfd_masks: Default::default(),
             handler_restore_unblocked: Default::default(),
             background_call_processes: Default::default(),
@@ -3968,6 +3982,8 @@ impl Scheduler {
         self.release_vfork_child(*dtid);
         self.vfork_registration_origins.remove(dtid);
         self.saved_guest_sigmasks.remove(dtid);
+        // Its private queue dies with it.
+        self.child_exit_sigchld.private_sent.remove(dtid);
         if dtid.as_raw() == detpid.as_raw() {
             self.child_exit_publications_completed.remove(detpid);
         }
@@ -4057,6 +4073,7 @@ impl Scheduler {
             self.real_timers.retire_process(*detpid);
             // A dying process discards its pending signals.
             self.pending_real_time_expirations.remove(detpid);
+            self.child_exit_sigchld.forget_process(*detpid);
         }
     }
 
@@ -5124,6 +5141,8 @@ impl Scheduler {
         self.blocked.timed_out_futex_waiters.remove(dtid);
         self.blocked.sigchld_deferred.remove(dtid);
         self.blocked.sigchld_ready.remove(dtid);
+        self.blocked.woken_sleeps.remove(dtid);
+        self.child_exit_sigchld.attributed.remove(dtid);
         self.blocked.signaled_background.remove(dtid);
         let _ = self.blocked.signaled_sigsuspend_requests.remove(dtid);
         self.blocked.child_waiters.remove(dtid);
@@ -6798,7 +6817,19 @@ impl Scheduler {
         };
         match result {
             Ok(()) if thread_of.is_none() => {
-                self.note_scheduler_signal_sent(dettid, signal as libc::c_int)
+                self.note_scheduler_signal_sent(dettid, signal as libc::c_int);
+                // `kill` is a group send, into the process's shared queue: the
+                // child-exit ledger's send window (`take_window`).
+                if signal == Signal::SIGCHLD
+                    && self.models_signal_targets
+                    && !self.physical_thread_pidfds.contains_key(&dettid)
+                {
+                    let process = self.sigchld_process(dettid);
+                    let child = self.sending_child_exit.take();
+                    if self.sigchld_window_usable(process) {
+                        self.child_exit_sigchld.note_send(process, child);
+                    }
+                }
             }
             Ok(()) => {}
             // ⚠️ ESRCH IS AN EXPECTED OUTCOME HERE, NOT AN ERROR. The target
@@ -7002,11 +7033,57 @@ impl Scheduler {
                         })
                     });
 
+                // A `pause` or `nanosleep` filed but not yet parked is still
+                // queued. Granting it would park the thread with the signal
+                // already gone by, and a pause would then never return: the run
+                // ended in a false deadlock where Linux returns from the call
+                // (https://github.com/rrnewton/hermit/issues/4126). It is woken
+                // as one already parked is (`NotRunning` below), at the front of
+                // its band; its own turn decides whether the signal ends it
+                // (`sleep_signal`): only if it is still pending for this thread,
+                // unblocked, and caught or fatal. Only where the
+                // backend reports the guest's signal state (`signal_sleep`):
+                // elsewhere a woken sleep cannot tell, and every wake ends it.
+                // A `nanosleep` whose deadline has passed completes at its
+                // admission instead, as a parked one does at its timed pop.
+                let is_queued_sleep = match self.signal_sleep(dettid) {
+                    Some(sleep_signal::SignalSleep::Pause) => true,
+                    Some(sleep_signal::SignalSleep::Nanosleep { deadline }) => {
+                        deadline > self.committed_time
+                    }
+                    None => false,
+                };
                 if is_internal_io_polling {
                     assert!(self.run_queue.remove_tid(dettid));
                     let mut rsrcs = Resources::new(dettid);
                     rsrcs.insert(ResourceID::InboundSignal(signal), Permission::W);
                     self.force_unblock_thread(dettid, rsrcs);
+                } else if is_queued_sleep && self.run_queue.contains_tid(dettid) {
+                    assert!(self.run_queue.remove_tid(dettid));
+                    // The child-exit timer may already have marked the real
+                    // delivery as placed (`sigchld_ready`); the requeue clears
+                    // that mark, and the delivery after this wake needs it, or
+                    // it is deferred behind any runnable sibling.
+                    let delivery_placed = self.blocked.sigchld_ready.contains(&dettid);
+                    let mut rsrcs = Resources::new(dettid);
+                    rsrcs.insert(ResourceID::InboundSignal(signal), Permission::W);
+                    // At the front of its band, as a cross-task signal requeues
+                    // a sleep (`drain_sleep_signals`): the woken thread is the
+                    // next to resume, so it is the one that dequeues a
+                    // process-directed signal the kernel could not give a
+                    // ptrace-stopped thread. Behind a running sibling, the
+                    // sibling took the handler while the sleep still answered
+                    // EINTR.
+                    self.force_unblock_thread_at(dettid, rsrcs, true);
+                    if delivery_placed {
+                        self.blocked.sigchld_ready.insert(dettid);
+                    }
+                    // Granted at its turn without consuming `sigchld_ready`
+                    // (`woken_sleeps`): deferred, a `nanosleep` the
+                    // signal does not end never reached its deadline while a
+                    // sibling kept running (the Codex review of
+                    // https://github.com/rrnewton/hermit/pull/4131).
+                    self.blocked.woken_sleeps.insert(dettid);
                 }
                 // TODO(T137242449): other runnable requests could be reprioritized to run
                 // sooner, but for now we leave their priorities alone.
@@ -7057,9 +7134,17 @@ impl Scheduler {
                     self.force_unblock_thread_at(dettid, rsrcs, true);
                     return;
                 }
+                // A parked `pause` or `nanosleep` woken for the scheduler's own
+                // signal: its turn is granted at once, as a queued one's is
+                // (`woken_sleeps`), so it decides in its own turn, not after a
+                // sibling that never blocks.
+                let parked_sleep = self.signal_sleep(dettid).is_some();
                 let mut rsrcs = Resources::new(dettid);
                 rsrcs.insert(ResourceID::InboundSignal(signal), Permission::W);
                 self.force_unblock_thread(dettid, rsrcs);
+                if parked_sleep {
+                    self.blocked.woken_sleeps.insert(dettid);
+                }
             }
         }
     }
@@ -8980,6 +9065,8 @@ impl Scheduler {
                     .insert(self.sigchld_process(dettid));
                 if let Some(mask) = sleeping_mask {
                     self.blocked.out_of_scheduler_masks.insert(dettid, mask);
+                    let descriptors = !matches!(rid, ResourceID::BlockingRtSigsuspend(_));
+                    self.note_outside_blocker(dettid, mask, descriptors);
                 }
                 if let Some(mask) = entry_barrier {
                     self.background_entry_barriers.insert(
@@ -9250,6 +9337,10 @@ impl Scheduler {
             // that the scheduler itself synthesizes deterministically (timers via
             // `fire_alarm`) are never SIGCHLD and are unaffected.
             ResourceID::WaitidSignals(_) => Ok(()),
+            // A still-queued sleep the scheduler woke for its own signal is
+            // granted at once, and keeps `sigchld_ready` for the delivery
+            // (`woken_sleeps`).
+            ResourceID::InboundSignal(_) if self.blocked.woken_sleeps.remove(&dettid) => Ok(()),
             ResourceID::InboundSignal(sig) => {
                 // The thread's own request at a delivery stop
                 // (`handle_signal_event`, read-write) follows the kernel's
@@ -9261,7 +9352,9 @@ impl Scheduler {
                 }
                 // `sigchld_ready` marks a parent step2e has already re-admitted,
                 // or a delivery the scheduler already placed; grant it now rather
-                // than deferring it (a second time).
+                // than deferring it (a second time). Where the scheduler models
+                // signal targets, a delivery of a copy it sent is marked for the
+                // very thread that took it (`dequeue_sigchld`).
                 let already_readmitted = self.blocked.sigchld_ready.remove(&dettid);
                 if sig.signal() == Some(Signal::SIGCHLD)
                     && signal_interrupt_errno.is_none()
@@ -17945,10 +18038,13 @@ mod test {
     /// a child's exit `SIGCHLD` carries the child's nested pid, which claims
     /// that child's exit, so its `ChildExit` timer then sends nothing. The
     /// scheduler's own copy is delivered with the nested pid, not the DetPid.
+    /// A dequeue of a kernel copy whose pid names no task there is taken as
+    /// another copy.
     #[test]
     fn a_nested_parents_child_exit_sigchld_is_answered_in_its_namespace() {
         use child_exit_sigchld::ChildExitSigchldAnswer;
         use child_exit_sigchld::ChildExitSigchldControl;
+        use child_exit_sigchld::DequeuedCopy;
         use child_exit_sigchld::OwnCopy;
         use child_exit_sigchld::TimerSend;
         for kernel_copy_first in [false, true] {
@@ -17975,8 +18071,24 @@ mod test {
                 assert_eq!(
                     scheduler.child_exit_sigchld_control_for_receiver(
                         parent,
-                        ChildExitSigchldControl::ClaimKernelCopy {
-                            child: DetPid::from_raw(2),
+                        ChildExitSigchldControl::Dequeue {
+                            copy: DequeuedCopy::Kernel {
+                                child: DetPid::from_raw(99),
+                            },
+                            admits: true,
+                        },
+                    ),
+                    ChildExitSigchldAnswer::Recorded,
+                    "a pid that names no task in the namespace"
+                );
+                assert_eq!(
+                    scheduler.child_exit_sigchld_control_for_receiver(
+                        parent,
+                        ChildExitSigchldControl::Dequeue {
+                            copy: DequeuedCopy::Kernel {
+                                child: DetPid::from_raw(2),
+                            },
+                            admits: true,
                         },
                     ),
                     ChildExitSigchldAnswer::Claimed(false)
@@ -17993,7 +18105,10 @@ mod test {
                 );
                 match scheduler.child_exit_sigchld_control_for_receiver(
                     parent,
-                    ChildExitSigchldControl::TakeOwnCopy,
+                    ChildExitSigchldControl::Dequeue {
+                        copy: DequeuedCopy::Scheduler,
+                        admits: true,
+                    },
                 ) {
                     ChildExitSigchldAnswer::OwnCopy(OwnCopy::Deliver(info)) => {
                         assert_eq!(info.pid, 2, "the own copy names the child's nested pid")
@@ -21656,6 +21771,627 @@ mod test {
         set_sleeper_state(&mut scheduler, target, sleeper_state(0, 0, 0, 0));
         send_cross_task(&mut scheduler, target, &[libc::SIGTERM], None);
         assert_sleep_woken(&scheduler, target, &[libc::SIGTERM], "queued pause");
+    }
+
+    /// `sigchld_family` with two children of the parent process, 200 and 201,
+    /// whose notifications the child-exit ledger owns.
+    fn owned_sigchld_family() -> (Scheduler, DetTid, DetTid, [DetPid; 2]) {
+        let (mut scheduler, parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+        let children = [200, 201].map(DetPid::from_raw);
+        for child in children {
+            scheduler.child_exit_sigchld.exit_status.insert(
+                child,
+                child_exit_sigchld::ChildExitSiginfo {
+                    code: libc::CLD_EXITED,
+                    pid: child.as_raw(),
+                    uid: 0,
+                    status: 0,
+                },
+            );
+            assert!(scheduler.child_exit_sigchld.own(parent, child));
+        }
+        (scheduler, parent, creator, children)
+    }
+
+    /// The `ChildExit` timer of `child` sends its copy, as `signal_guest`
+    /// records it in the send window.
+    fn timer_sends(scheduler: &mut Scheduler, parent: DetPid, child: DetPid) {
+        assert_eq!(
+            scheduler.child_exit_sigchld.timer(parent, child),
+            Some(child_exit_sigchld::TimerSend::Send)
+        );
+        scheduler.child_exit_sigchld.note_send(parent, Some(child));
+    }
+
+    fn dequeue(
+        scheduler: &mut Scheduler,
+        thread: DetTid,
+        copy: child_exit_sigchld::DequeuedCopy,
+    ) -> child_exit_sigchld::ChildExitSigchldAnswer {
+        scheduler.child_exit_sigchld_control(
+            thread,
+            child_exit_sigchld::ChildExitSigchldControl::Dequeue { copy, admits: true },
+        )
+    }
+
+    fn delivers(child: DetPid) -> child_exit_sigchld::ChildExitSigchldAnswer {
+        child_exit_sigchld::ChildExitSigchldAnswer::OwnCopy(child_exit_sigchld::OwnCopy::Deliver(
+            child_exit_sigchld::ChildExitSiginfo {
+                code: libc::CLD_EXITED,
+                pid: child.as_raw(),
+                uid: 0,
+                status: 0,
+            },
+        ))
+    }
+
+    /// The scheduler's copy for child 201 is sent while the kernel's late copy
+    /// for child 200, already notified, is pending: Linux keeps the first
+    /// copy's siginfo and does not queue the second, so the dequeue shows
+    /// child 200's exit. It stands for child 201, with its siginfo, and is not
+    /// dropped; classified by its siginfo it was dropped as child 200's
+    /// duplicate, and child 201's notification was lost (the design check of
+    /// https://github.com/rrnewton/hermit/pull/4131).
+    #[test]
+    fn a_send_coalesced_into_a_pending_kernel_copy_is_delivered_for_its_own_child() {
+        use child_exit_sigchld::DequeuedCopy;
+        let (mut scheduler, parent, creator, [first, second]) = owned_sigchld_family();
+        timer_sends(&mut scheduler, parent, first);
+        assert_eq!(
+            dequeue(&mut scheduler, parent, DequeuedCopy::Scheduler),
+            delivers(first)
+        );
+        timer_sends(&mut scheduler, parent, second);
+        assert_eq!(
+            dequeue(
+                &mut scheduler,
+                creator,
+                DequeuedCopy::Kernel { child: first }
+            ),
+            delivers(second)
+        );
+        assert_eq!(
+            dequeue(
+                &mut scheduler,
+                creator,
+                DequeuedCopy::Kernel { child: second }
+            ),
+            child_exit_sigchld::ChildExitSigchldAnswer::Claimed(true),
+            "child 201's own late kernel copy is the duplicate"
+        );
+    }
+
+    /// A kernel copy taken while another child's send is in the window does
+    /// not stand for its own child when that child is not yet notified: its
+    /// timer still sends its own copy, as it does when host timing posts the
+    /// kernel copy after the send and it coalesces. A SIGKILL cohort's copy,
+    /// which names a member host timing chooses, likewise. Retiring the named
+    /// child made its timer send or not by host timing, and `--verify-strict`
+    /// of `a_cross_process_sigkill_verifies_at_bitwise_parity` diverged.
+    #[test]
+    fn a_kernel_copy_in_the_window_leaves_an_unnotified_child_its_own_timer() {
+        use child_exit_sigchld::DequeuedCopy;
+        let (_, _, _, [first, second]) = owned_sigchld_family();
+        for (cohort, named) in [(false, second), (true, first), (true, second)] {
+            let case = format!("cohort={cohort}, named {named}");
+            let (mut scheduler, parent, creator, _) = owned_sigchld_family();
+            if cohort {
+                scheduler.child_exit_sigchld.join_cohort(first, 7);
+                scheduler.child_exit_sigchld.join_cohort(second, 7);
+            }
+            timer_sends(&mut scheduler, parent, first);
+            assert_eq!(
+                dequeue(
+                    &mut scheduler,
+                    creator,
+                    DequeuedCopy::Kernel { child: named }
+                ),
+                delivers(first),
+                "{case}"
+            );
+            assert_eq!(
+                scheduler.child_exit_sigchld.timer(parent, second),
+                Some(child_exit_sigchld::TimerSend::Send),
+                "{case}"
+            );
+        }
+    }
+
+    /// A thread a guest sent a thread-directed `SIGCHLD` takes that copy from
+    /// its private queue first, whatever its siginfo says: it is delivered as
+    /// it is and granted, and the send window and the ledger are left for the
+    /// shared queue's copy. A flush and the thread's exit forget the record.
+    #[test]
+    fn a_private_sigchld_leaves_the_send_window_alone() {
+        use child_exit_sigchld::ChildExitSigchldAnswer;
+        use child_exit_sigchld::ChildExitSigchldControl;
+        use child_exit_sigchld::DequeuedCopy;
+        let (mut scheduler, parent, creator, [first, second]) = owned_sigchld_family();
+        let private_sent = |scheduler: &mut Scheduler, target: DetTid| {
+            scheduler
+                .child_exit_sigchld_control(parent, ChildExitSigchldControl::PrivateSent { target })
+        };
+        timer_sends(&mut scheduler, parent, first);
+        private_sent(&mut scheduler, creator);
+        assert_eq!(
+            dequeue(
+                &mut scheduler,
+                creator,
+                DequeuedCopy::Kernel { child: first }
+            ),
+            ChildExitSigchldAnswer::Recorded,
+            "a forged child-exit siginfo claims nothing"
+        );
+        assert!(scheduler.blocked.sigchld_ready.remove(&creator));
+        assert_eq!(
+            dequeue(&mut scheduler, creator, DequeuedCopy::Scheduler),
+            delivers(first),
+            "the window is still the shared copy's"
+        );
+
+        // A `tkill`/`tgkill` copy (`SI_TKILL`) consumes the record the same way.
+        timer_sends(&mut scheduler, parent, second);
+        private_sent(&mut scheduler, creator);
+        assert_eq!(
+            dequeue(&mut scheduler, creator, DequeuedCopy::Thread),
+            ChildExitSigchldAnswer::Recorded
+        );
+        assert!(scheduler.blocked.sigchld_ready.remove(&creator));
+        assert_eq!(
+            dequeue(&mut scheduler, creator, DequeuedCopy::Scheduler),
+            delivers(second)
+        );
+
+        private_sent(&mut scheduler, creator);
+        scheduler.child_exit_sigchld_control(parent, ChildExitSigchldControl::Flushed);
+        assert!(!scheduler.child_exit_sigchld.private_sent.contains(&creator));
+        private_sent(&mut scheduler, creator);
+        scheduler.logically_kill_thread(&creator, &parent, MmId::initial(creator));
+        assert!(!scheduler.child_exit_sigchld.private_sent.contains(&creator));
+    }
+
+    /// A thread of the process outside the schedule takes the woken decision
+    /// away from the send window only if it could take the copy: its recorded
+    /// mask is unknown or leaves SIGCHLD unblocked, or its process holds a
+    /// signalfd for SIGCHLD: the woken path then never ends the sleep for it.
+    /// One whose recorded mask blocks it, such as a sibling in a
+    /// `sigsuspend` that blocks SIGCHLD, does not (the Claude re-checks of
+    /// https://github.com/rrnewton/hermit/pull/4131).
+    #[test]
+    fn only_an_outside_thread_that_could_take_sigchld_holds_the_woken_decision() {
+        use child_exit_sigchld::ChildExitSigchldAnswer;
+        use child_exit_sigchld::ChildExitSigchldControl;
+        let chld = kernel_signal_bit(libc::SIGCHLD);
+        for (mask, signalfd, answer) in [
+            (Some(chld), false, ChildExitSigchldAnswer::Placed(true)),
+            (Some(0), false, ChildExitSigchldAnswer::Placed(false)),
+            (None, false, ChildExitSigchldAnswer::Placed(false)),
+            (Some(chld), true, ChildExitSigchldAnswer::Placed(false)),
+        ] {
+            let case = format!("mask={mask:?}, signalfd={signalfd}");
+            let (mut scheduler, parent, creator, [first, _]) = owned_sigchld_family();
+            timer_sends(&mut scheduler, parent, first);
+            scheduler
+                .blocked
+                .external_io_blockers
+                .insert(creator, ExternalOpId::new(creator, 1));
+            scheduler
+                .blocked
+                .out_of_scheduler_masks
+                .insert(creator, mask);
+            if signalfd {
+                scheduler.register_signalfd(parent, chld);
+            }
+            scheduler.note_outside_blocker(creator, mask, true);
+            assert_eq!(
+                scheduler
+                    .child_exit_sigchld_control(parent, ChildExitSigchldControl::PlacedPending),
+                answer,
+                "{case}"
+            );
+        }
+    }
+
+    /// A guest's process-directed SIGCHLD joins the window in its sender's
+    /// turn. Queued first, it keeps its siginfo, as Linux keeps the
+    /// first-queued copy's; the child sent after it is still notified by that
+    /// delivery, and its late kernel copy is dropped. Queued after a child's
+    /// copy, the delivery carries the child's siginfo.
+    #[test]
+    fn a_guest_copy_queued_first_keeps_its_siginfo() {
+        use child_exit_sigchld::ChildExitSigchldAnswer;
+        use child_exit_sigchld::ChildExitSigchldControl;
+        use child_exit_sigchld::DequeuedCopy;
+        let (mut scheduler, parent, creator, [first, second]) = owned_sigchld_family();
+        scheduler.child_exit_sigchld_control(
+            creator,
+            ChildExitSigchldControl::SharedSent { target: parent },
+        );
+        timer_sends(&mut scheduler, parent, first);
+        assert_eq!(
+            dequeue(&mut scheduler, parent, DequeuedCopy::Other),
+            ChildExitSigchldAnswer::OwnCopy(child_exit_sigchld::OwnCopy::Unowned)
+        );
+        assert_eq!(
+            dequeue(
+                &mut scheduler,
+                parent,
+                DequeuedCopy::Kernel { child: first }
+            ),
+            ChildExitSigchldAnswer::Claimed(true)
+        );
+        timer_sends(&mut scheduler, parent, second);
+        scheduler.child_exit_sigchld_control(
+            creator,
+            ChildExitSigchldControl::SharedSent { target: parent },
+        );
+        assert_eq!(
+            dequeue(&mut scheduler, parent, DequeuedCopy::Scheduler),
+            delivers(second)
+        );
+    }
+
+    /// An `rt_sigtimedwait` that fails with EFAULT took a signal before its
+    /// siginfo copy-out faulted if `SIGCHLD` is gone from the queue it would
+    /// come from: the private record, which that queue serves first, or else
+    /// the window. Still pending (a fault reading the inputs), nothing is
+    /// taken (the Codex re-check of https://github.com/rrnewton/hermit/pull/4131).
+    #[test]
+    fn a_faulted_wait_takes_only_the_copy_gone_from_its_queue() {
+        use child_exit_sigchld::ChildExitSigchldControl;
+        let (mut scheduler, parent, creator, [first, _]) = owned_sigchld_family();
+        let faulted = |scheduler: &mut Scheduler, private_pending: bool, shared_pending: bool| {
+            scheduler.child_exit_sigchld_control(
+                creator,
+                ChildExitSigchldControl::WaitFaulted {
+                    private_pending,
+                    shared_pending,
+                },
+            )
+        };
+        timer_sends(&mut scheduler, parent, first);
+        scheduler.child_exit_sigchld_control(
+            creator,
+            ChildExitSigchldControl::PrivateSent { target: creator },
+        );
+        faulted(&mut scheduler, true, false);
+        assert!(
+            scheduler.child_exit_sigchld.private_sent.contains(&creator),
+            "an input fault"
+        );
+        faulted(&mut scheduler, false, true);
+        assert!(!scheduler.child_exit_sigchld.private_sent.contains(&creator));
+        assert!(
+            scheduler.child_exit_sigchld.window_open(parent),
+            "the private queue went first"
+        );
+        faulted(&mut scheduler, false, true);
+        assert!(
+            scheduler.child_exit_sigchld.window_open(parent),
+            "still pending"
+        );
+        faulted(&mut scheduler, false, false);
+        assert!(!scheduler.child_exit_sigchld.window_open(parent));
+    }
+
+    /// A guest's send records its copy before the physical send and undoes
+    /// the record if the send fails: a new private record is removed (one
+    /// that was already there, for a copy still pending, stays), and the
+    /// shared send's window entry is dropped.
+    #[test]
+    fn a_failed_guest_send_undoes_its_record() {
+        use child_exit_sigchld::ChildExitSigchldAnswer;
+        use child_exit_sigchld::ChildExitSigchldControl;
+        let (mut scheduler, parent, creator, _) = owned_sigchld_family();
+        let private = |scheduler: &mut Scheduler| {
+            scheduler.child_exit_sigchld_control(
+                parent,
+                ChildExitSigchldControl::PrivateSent { target: creator },
+            )
+        };
+        assert_eq!(
+            private(&mut scheduler),
+            ChildExitSigchldAnswer::Placed(true)
+        );
+        assert_eq!(
+            private(&mut scheduler),
+            ChildExitSigchldAnswer::Placed(false),
+            "coalesced"
+        );
+        scheduler.child_exit_sigchld_control(
+            parent,
+            ChildExitSigchldControl::SendFailed {
+                private: Some(creator),
+                shared: None,
+            },
+        );
+        assert!(!scheduler.child_exit_sigchld.private_sent.contains(&creator));
+
+        scheduler.child_exit_sigchld_control(
+            creator,
+            ChildExitSigchldControl::SharedSent { target: parent },
+        );
+        assert!(scheduler.child_exit_sigchld.window_open(parent));
+        scheduler.child_exit_sigchld_control(
+            creator,
+            ChildExitSigchldControl::SendFailed {
+                private: None,
+                shared: Some(parent),
+            },
+        );
+        assert!(!scheduler.child_exit_sigchld.window_open(parent));
+    }
+
+    /// Two sends with no dequeue between them are one pending signal: one
+    /// delivery stands for both children, and each one's later kernel copy is
+    /// dropped, deterministically.
+    #[test]
+    fn two_sends_with_no_dequeue_between_are_one_delivery() {
+        use child_exit_sigchld::DequeuedCopy;
+        let (mut scheduler, parent, creator, [first, second]) = owned_sigchld_family();
+        timer_sends(&mut scheduler, parent, first);
+        timer_sends(&mut scheduler, parent, second);
+        assert_eq!(
+            dequeue(&mut scheduler, creator, DequeuedCopy::Scheduler),
+            delivers(first)
+        );
+        for child in [second, first] {
+            assert_eq!(
+                dequeue(&mut scheduler, creator, DequeuedCopy::Kernel { child }),
+                child_exit_sigchld::ChildExitSigchldAnswer::Claimed(true),
+                "child {child}"
+            );
+        }
+    }
+
+    /// Setting `SIGCHLD` to `SIG_IGN` or `SIG_DFL` flushes the pending signal:
+    /// the send window empties, a woken sleep no longer counts the copy, and
+    /// the child's later kernel copy is dropped.
+    #[test]
+    fn a_flush_empties_the_send_window() {
+        use child_exit_sigchld::ChildExitSigchldAnswer;
+        use child_exit_sigchld::ChildExitSigchldControl;
+        let (mut scheduler, parent, creator, [first, _]) = owned_sigchld_family();
+        timer_sends(&mut scheduler, parent, first);
+        assert_eq!(
+            scheduler.child_exit_sigchld_control(creator, ChildExitSigchldControl::PlacedPending),
+            ChildExitSigchldAnswer::Placed(true)
+        );
+        scheduler.child_exit_sigchld_control(parent, ChildExitSigchldControl::Flushed);
+        assert_eq!(
+            scheduler.child_exit_sigchld_control(creator, ChildExitSigchldControl::PlacedPending),
+            ChildExitSigchldAnswer::Placed(false)
+        );
+        assert_eq!(
+            dequeue(
+                &mut scheduler,
+                creator,
+                child_exit_sigchld::DequeuedCopy::Kernel { child: first }
+            ),
+            ChildExitSigchldAnswer::Claimed(true)
+        );
+    }
+
+    /// The `ChildExit` timer commits a deferred delivery as its child's
+    /// notification only if the ledger did not match that delivery to another
+    /// child's exit.
+    #[test]
+    fn the_timer_lets_only_an_unattributed_deferred_delivery_stand_in() {
+        let (mut scheduler, parent, creator, _children) = owned_sigchld_family();
+        scheduler.blocked.sigchld_deferred.insert(creator);
+        scheduler.child_exit_sigchld.attributed.insert(creator);
+        assert_eq!(scheduler.deferred_child_exit_sigchld(parent, creator), None);
+        scheduler.child_exit_sigchld.attributed.remove(&creator);
+        assert_eq!(
+            scheduler.deferred_child_exit_sigchld(parent, creator),
+            Some(creator)
+        );
+    }
+
+    /// A delivery of a `SIGCHLD` the scheduler sent is admitted by a mark for
+    /// the very thread whose dequeue took it. In the two-child order a
+    /// sibling's delivery of the first copy and the sleeper's of the second are
+    /// each granted although another thread is runnable; before, both shared
+    /// one mark for the process, and the second was deferred forever (the
+    /// Claude re-check of https://github.com/rrnewton/hermit/pull/4131). A
+    /// dequeue with no send in the window marks nothing, and a woken sleep is
+    /// told no copy is pending while a thread of the process is in a call
+    /// outside the schedule, which could take it at host time.
+    #[test]
+    fn each_scheduler_sigchld_copy_admits_only_the_thread_that_took_it() {
+        use child_exit_sigchld::ChildExitSigchldAnswer;
+        use child_exit_sigchld::ChildExitSigchldControl;
+        use child_exit_sigchld::DequeuedCopy;
+        let (mut scheduler, parent, creator, [first, second]) = owned_sigchld_family();
+        let placed = |scheduler: &mut Scheduler| {
+            scheduler.child_exit_sigchld_control(creator, ChildExitSigchldControl::PlacedPending)
+        };
+        let admitted = |scheduler: &mut Scheduler, thread: DetTid| {
+            scheduler.runqueue_push_back(parent);
+            scheduler.runqueue_push_back(creator);
+            assert_eq!(scheduler.run_queue.tentative_pop_tid(thread), Some(thread));
+            let admitted = scheduler
+                .block_for_one_resource(
+                    thread,
+                    &ResourceID::InboundSignal(SigWrapper(libc::SIGCHLD)),
+                    &Permission::W,
+                    None,
+                    None,
+                    &Ivar::new(),
+                )
+                .is_ok();
+            if scheduler.run_queue.tentative_pop_in_progress() {
+                scheduler.run_queue.undo_tentative_pop();
+            }
+            scheduler.run_queue.remove_tid(parent);
+            scheduler.run_queue.remove_tid(creator);
+            scheduler.blocked.sigchld_deferred.clear();
+            admitted
+        };
+        assert_eq!(
+            placed(&mut scheduler),
+            ChildExitSigchldAnswer::Placed(false)
+        );
+        timer_sends(&mut scheduler, parent, first);
+        assert_eq!(placed(&mut scheduler), ChildExitSigchldAnswer::Placed(true));
+        dequeue(&mut scheduler, parent, DequeuedCopy::Scheduler);
+        assert_eq!(
+            placed(&mut scheduler),
+            ChildExitSigchldAnswer::Placed(false)
+        );
+        timer_sends(&mut scheduler, parent, second);
+        dequeue(&mut scheduler, creator, DequeuedCopy::Scheduler);
+        assert!(admitted(&mut scheduler, parent), "the leader's copy 1");
+        assert!(admitted(&mut scheduler, creator), "the creator's copy 2");
+        dequeue(&mut scheduler, creator, DequeuedCopy::Other);
+        assert!(
+            !admitted(&mut scheduler, creator),
+            "no send was in the window"
+        );
+
+        scheduler.child_exit_sigchld.note_send(parent, None);
+        scheduler
+            .blocked
+            .external_io_blockers
+            .insert(parent, ExternalOpId::new(parent, 1));
+        scheduler.note_outside_blocker(parent, None, true);
+        assert_eq!(
+            placed(&mut scheduler),
+            ChildExitSigchldAnswer::Placed(false)
+        );
+    }
+
+    /// A process a thread of which could take SIGCHLD outside the schedule
+    /// does not attribute it through the send window: one a thread of which
+    /// was granted a blocking I/O call while the process held a signalfd for
+    /// SIGCHLD, or a blocking call that leaves SIGCHLD unblocked. A send recorded before is
+    /// forgotten at the next dequeue, which the siginfo decides as before the
+    /// window: the kernel's late copy of a notified child is its duplicate,
+    /// not a send it absorbed. Through the window, an outside reader's
+    /// dequeue, reported after it rejoined, took a send it never held, and one
+    /// SIGCHLD was delivered twice (the Claude re-check of
+    /// https://github.com/rrnewton/hermit/pull/4131 at f37277ef).
+    #[test]
+    fn a_process_that_could_take_sigchld_outside_the_schedule_does_not_use_the_window() {
+        use child_exit_sigchld::ChildExitSigchldAnswer;
+        use child_exit_sigchld::DequeuedCopy;
+        let chld = kernel_signal_bit(libc::SIGCHLD);
+        for outside in ["signalfd", "blocker"] {
+            let (mut scheduler, parent, creator, [first, second]) = owned_sigchld_family();
+            timer_sends(&mut scheduler, parent, first);
+            assert_eq!(
+                dequeue(&mut scheduler, parent, DequeuedCopy::Scheduler),
+                delivers(first),
+                "{outside}"
+            );
+            assert!(scheduler.sigchld_window_usable(parent), "{outside}");
+            match outside {
+                "signalfd" => {
+                    scheduler.register_signalfd(parent, chld);
+                    assert!(
+                        scheduler.sigchld_window_usable(parent),
+                        "an unread signalfd"
+                    );
+                    scheduler.note_outside_blocker(creator, Some(chld), true);
+                }
+                _ => scheduler.note_outside_blocker(creator, Some(0), true),
+            }
+            assert!(!scheduler.sigchld_window_usable(parent), "{outside}");
+            timer_sends(&mut scheduler, parent, second);
+            assert_eq!(
+                dequeue(
+                    &mut scheduler,
+                    creator,
+                    DequeuedCopy::Kernel { child: first }
+                ),
+                ChildExitSigchldAnswer::Claimed(true),
+                "{outside}: the siginfo decides"
+            );
+            assert!(
+                !scheduler.child_exit_sigchld.window_open(parent),
+                "{outside}"
+            );
+            assert!(
+                !scheduler.blocked.sigchld_ready.contains(&creator),
+                "{outside}: no mark for the taker"
+            );
+        }
+        // A blocker whose mask blocks SIGCHLD cannot take it, nor can a
+        // `sigsuspend` with such a mask read the process's signalfd.
+        let (mut scheduler, parent, creator, _) = owned_sigchld_family();
+        scheduler.note_outside_blocker(creator, Some(chld), true);
+        assert!(scheduler.sigchld_window_usable(parent));
+        scheduler.register_signalfd(parent, chld);
+        scheduler.note_outside_blocker(creator, Some(chld), false);
+        assert!(scheduler.sigchld_window_usable(parent));
+    }
+
+    /// A signal the scheduler sends itself (a child exit's `SIGCHLD`, a timer's
+    /// `SIGALRM`) to a thread whose `pause` or `nanosleep` request is filed but
+    /// still queued, not yet parked, ends it in place: its request becomes the
+    /// signal and it is requeued at the front of its band, ahead of a sibling
+    /// already queued, so it is the next to resume and dequeue the signal. That
+    /// turn is granted at once (`woken_sleeps`), and a `sigchld_ready`
+    /// mark the child-exit timer set for the real delivery survives it. Its own
+    /// turn then decides whether the signal ends the call (`sleep_signal`).
+    /// Before, the queued sleep was left alone, and a pause parked with the
+    /// signal gone by, a false deadlock
+    /// (https://github.com/rrnewton/hermit/issues/4126). Left alone: a queued
+    /// sleep where the backend does not report the guest's signal state
+    /// (`models_signal_targets` unset), and a `nanosleep` whose deadline has
+    /// passed, which completes at its admission.
+    #[test]
+    fn a_scheduler_signal_ends_a_sleep_still_on_the_run_queue() {
+        let future = LogicalTime::from_nanos(1_000_000_000);
+        for (models_signal_targets, deadline, fyi, delivery_placed, woken) in [
+            (true, LogicalTime::INDEFINITE, PAUSE_FYI, false, true),
+            (true, LogicalTime::INDEFINITE, PAUSE_FYI, true, true),
+            (true, future, NANOSLEEP_FYI, true, true),
+            (false, LogicalTime::INDEFINITE, PAUSE_FYI, false, false),
+            (
+                true,
+                LogicalTime::from_nanos(0),
+                NANOSLEEP_FYI,
+                false,
+                false,
+            ),
+        ] {
+            let case = format!(
+                "{fyi} until {deadline:?}, models_signal_targets={models_signal_targets}, \
+                 delivery_placed={delivery_placed}"
+            );
+            let mut scheduler = gated_scheduler();
+            scheduler.models_signal_targets = models_signal_targets;
+            let target = filed_sleep(&mut scheduler, deadline, fyi, true);
+            let sibling = DetTid::from_raw(101);
+            register_known_thread(&mut scheduler, sibling);
+            scheduler.runqueue_push_back(sibling);
+            if delivery_placed {
+                scheduler.blocked.sigchld_ready.insert(target);
+            }
+            scheduler.wake_signaled_guest(target, Signal::SIGCHLD);
+            assert_eq!(
+                scheduler.run_queue.tids().copied().collect::<Vec<_>>(),
+                vec![target, sibling],
+                "{case}"
+            );
+            assert_eq!(
+                scheduler.blocked.sigchld_ready.contains(&target),
+                delivery_placed,
+                "{case}"
+            );
+            if woken {
+                assert_eq!(
+                    scheduler.inbound_signals(target),
+                    vec![SigWrapper(libc::SIGCHLD)],
+                    "{case}"
+                );
+                assert!(scheduler.blocked.woken_sleeps.contains(&target), "{case}");
+            } else {
+                assert_eq!(scheduler.inbound_signals(target), vec![], "{case}");
+                assert!(!scheduler.blocked.woken_sleeps.contains(&target), "{case}");
+            }
+        }
     }
 
     /// Signals a pause does not return for leave it parked: one its mask
