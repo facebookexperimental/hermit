@@ -1539,8 +1539,14 @@ fi
 # KVM SDK-BUDGET CARRY (2026-10-13): advance from a7402b9d to e39c780fd2d48424f3f7389330d22689526856fa.
 # The added commits change only reverie-kvm/; every SDK recipe input, build.rs
 # and the vendored DynamoRIO tree are unchanged, so the budgets above carry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != e39c780fd2d48424f3f7389330d22689526856fa ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie e39c780fd2d48424f3f7389330d22689526856fa (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# DBT IDENTITY SDK-BUDGET CARRY (2026-10-13): advance from e39c780f to 42adcb1d44f38477e14a073b135ceccecae0a7a5.
+# The added commit changes only reverie-dbt/native/client.c,
+# reverie-dbt/native/virtual_identity.h and a reverie-dbt test fixture, none an
+# SDK recipe input: build.rs, the vendored DynamoRIO tree, third-party/, the
+# root Cargo.toml and rust-toolchain.toml are unchanged, and no file is added
+# (inventory 947), so the budgets above carry. No new timing sample is claimed.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 42adcb1d44f38477e14a073b135ceccecae0a7a5 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 42adcb1d44f38477e14a073b135ceccecae0a7a5 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
