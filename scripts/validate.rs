@@ -11757,7 +11757,10 @@ fn manifest_bucket_of(step: &Step) -> Option<(String, String)> {
                 i += 1;
             }
             // Tokens that change nothing about WHICH cells are selected.
-            "--allow-empty" | "--prebuilt" => i += 1,
+            // `--diagnostic-results` only picks the schema-4 report a
+            // diagnostic bucket (compat) writes; its cells are the same, so
+            // its withheld cells must count against completeness too.
+            "--allow-empty" | "--prebuilt" | "--diagnostic-results" => i += 1,
             // How many cells run at once, never which: a bucket with `--jobs 1`
             // selects the same cells, and leaving it out would hide its
             // withheld cells from the accounting. The value must be a count.
@@ -15513,6 +15516,21 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
                 ));
             }
         }
+        // The report schema is not selection: the same bucket with
+        // `--diagnostic-results`, as the shipped compat bucket runs, binds to
+        // the same accounting.
+        let mut diagnostic = shipped.clone();
+        diagnostic.cmd = "target/debug/test-harness run --lane privileged --category c-programs \
+                          --ci-only --prebuilt --diagnostic-results --results r --junit j"
+            .to_string();
+        if manifest_bucket_of(&diagnostic)
+            != Some(("privileged".to_string(), "c-programs".to_string()))
+        {
+            return Err(format!(
+                "node vacuity: {:?} selects the bucket's cells and must bind to it",
+                diagnostic.cmd
+            ));
+        }
         // Parallelism is not selection: the same bucket with `--jobs 1`, as
         // the shipped system-utils buckets run, binds to the same accounting.
         let mut serial = shipped.clone();
@@ -16075,6 +16093,18 @@ fn committed_cell_capability_bracket(root: &Path) -> Result<(), String> {
         .filter(|(tag, ..)| tag == "e2e.manifest_c_programs")
         .cloned()
         .collect::<Vec<_>>();
+    // The compat corpus requires KVM cells through its `additional` backends
+    // and runs them in a diagnostic bucket node.
+    let compat = portable
+        .iter()
+        .filter(|(tag, ..)| tag == "e2e.manifest_compat")
+        .cloned()
+        .collect::<Vec<_>>();
+    if compat.is_empty() {
+        return Err(
+            "committed cell capability: the required plan lost portable/compat kvm cells".into(),
+        );
+    }
     // (label, argv, expected (tag, kvm cells, selected cells) rows, node-level kvm tag)
     type RefusedCase<'a> = (
         &'a str,
@@ -16082,7 +16112,7 @@ fn committed_cell_capability_bracket(root: &Path) -> Result<(), String> {
         Vec<&'a [(String, usize, usize)]>,
         Option<&'a str>,
     );
-    let refused_cases: [RefusedCase<'_>; 5] = [
+    let refused_cases: [RefusedCase<'_>; 6] = [
         (
             "portable profile",
             vec!["portable-only"],
@@ -16099,6 +16129,12 @@ fn committed_cell_capability_bracket(root: &Path) -> Result<(), String> {
             "--only portable e2e.manifest_c_programs",
             vec!["--only", "portable", "e2e.manifest_c_programs"],
             vec![&c_programs[..]],
+            None,
+        ),
+        (
+            "--only portable e2e.manifest_compat",
+            vec!["--only", "portable", "e2e.manifest_compat"],
+            vec![&compat[..]],
             None,
         ),
         (
@@ -16217,10 +16253,6 @@ fn committed_cell_capability_bracket(root: &Path) -> Result<(), String> {
                 "--hosted-portable-only",
                 ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION,
             ],
-        ),
-        (
-            "--only portable e2e.manifest_compat",
-            vec!["--only", "portable", "e2e.manifest_compat"],
         ),
         (
             "--only portable e2e.manifest_bin_c",
