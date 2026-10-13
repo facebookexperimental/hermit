@@ -408,6 +408,7 @@ fn decode_catalogue(bytes: &[u8]) -> Result<TrackedCells, String> {
                 last_tested: None,
                 observations: Vec::new(),
                 measurement: default_measurement(),
+                aggregate: CellAggregate::default(),
             })
             .collect(),
     })
@@ -481,6 +482,13 @@ struct ObservationProjection {
     /// older writers refuse rather than silently discard the new authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     comparison_attempt_bindings_v1: Option<ComparisonAttemptBindings>,
+    /// True once the observations below are capped to each provenance's
+    /// latest ([`cap_observations`]) with the rest folded into each cell's
+    /// `aggregate`. A writer from before the cap does not know this field, so
+    /// this closed envelope makes it refuse the document rather than drop the
+    /// aggregates and re-derive `measurement` from the capped observations.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    observations_capped: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -543,10 +551,195 @@ struct TrackedCell {
     /// disagrees with the derivation.
     #[serde(default = "default_measurement")]
     measurement: MeasurementState,
+    /// What every observation this cell has held says, kept when `observations`
+    /// keeps only each provenance's latest one. See [`CellAggregate`].
+    #[serde(default, skip_serializing_if = "CellAggregate::is_empty")]
+    aggregate: CellAggregate,
 }
 
 fn default_measurement() -> MeasurementState {
     MeasurementState::NeverMeasured
+}
+
+/// The part of a cell's evidence that outlives its capped observations.
+///
+/// The document keeps only each provenance's LATEST observation (cap 1,
+/// <https://github.com/rrnewton/dev-hermit/issues/563>); the full history lives
+/// in the series and the validation history. Before older observations are
+/// dropped, what they said is folded in here, so [`derive_measurement`] keeps
+/// its meaning: a cell that ever diverged still reads `diverged`.
+///
+/// Every field merges idempotently (a flag is OR-ed, a bound is min/max-ed, a
+/// count keeps its largest value), because the projector re-derives the series
+/// observations on every write and folds them again: a sum would grow with each
+/// regeneration. So `located_coordinates` and each range's `samples` are lower
+/// bounds ("at least this many"), never exact totals; the exact runs are in the
+/// series.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CellAggregate {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    passed: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    diverged: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    located: bool,
+    /// The largest [`located_evidence`] the cell's observations ever held.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    located_coordinates: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    first_divergent_scheduler_turn: Option<ObservedRange>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    first_divergent_virtual_nanoseconds: Option<ObservedRange>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    first_divergent_record: Option<ObservedRange>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    first_divergent_syscall: Option<ObservedRange>,
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+impl CellAggregate {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Fold OBSERVATIONS in, idempotently.
+    fn fold(&mut self, observations: &[Observation]) {
+        let flags = evidence_flags(observations);
+        self.passed |= flags.passed;
+        self.diverged |= flags.diverged;
+        self.located |= flags.located;
+        self.located_coordinates = self
+            .located_coordinates
+            .max(located_coordinates(observations) as u64);
+        fn widen(into: &mut Option<ObservedRange>, from: Option<ObservedRange>) {
+            *into = match (*into, from) {
+                (None, from) => from,
+                (into, None) => into,
+                (Some(into), Some(from)) => Some(ObservedRange {
+                    earliest: into.earliest.min(from.earliest),
+                    latest: into.latest.max(from.latest),
+                    samples: into.samples.max(from.samples),
+                }),
+            };
+        }
+        for observation in observations
+            .iter()
+            .filter(|observation| locates(observation))
+        {
+            widen(
+                &mut self.first_divergent_scheduler_turn,
+                observation.first_divergent_scheduler_turn.range(),
+            );
+            widen(
+                &mut self.first_divergent_virtual_nanoseconds,
+                observation.first_divergent_virtual_nanoseconds.range(),
+            );
+            widen(
+                &mut self.first_divergent_record,
+                observation.first_divergent_record.range(),
+            );
+            widen(
+                &mut self.first_divergent_syscall,
+                observation.first_divergent_syscall.range(),
+            );
+        }
+    }
+}
+
+/// Keep each cell's latest observation per provenance and comparison domain,
+/// and fold the rest into its [`CellAggregate`] (cap 1,
+/// <https://github.com/rrnewton/dev-hermit/issues/563>).
+///
+/// The two domains are an observation that carries canonical comparisons and
+/// one that carries none (a below-L2 stripped pass, or a projected series
+/// row). They are kept apart because a newer stripped pass may not retire an
+/// older canonical failure (each is in its own comparison domain). The latest
+/// observation of a provenance and domain is the one holding the cell's
+/// `last_tested` Hermit commit, else the one at the greatest Hermit depth; a
+/// tie goes to a writer-owned observation (no series event ids), then to the
+/// later one. Provenances are never merged (see `observations`), so a cell
+/// keeps at most two observations of each. A comparison-attempt binding whose original comparison left with a
+/// dropped observation, and that no retired receipt archives, is dropped with
+/// it ([`preserve_attempt_bindings_for_writer`] accepts exactly that).
+fn cap_observations(tracked: &mut TrackedCells) {
+    if let Some(projection) = tracked.projection.as_mut() {
+        projection.observations_capped = true;
+    }
+    for cell in &mut tracked.cells {
+        cell.aggregate.fold(&cell.observations);
+        let latest_commit = cell
+            .last_tested
+            .as_ref()
+            .map(|tested| tested.hermit_sha.as_str());
+        let rank = |observation: &Observation| {
+            let depth = observation.depth.get("hermit");
+            (
+                latest_commit.is_some_and(|commit| observation.hermit_shas.contains(commit)),
+                depth.map_or(0, |depth| depth.commits),
+                depth.map_or(0, |depth| depth.first_parent),
+                observation.event_ids.is_empty(),
+            )
+        };
+        let mut chosen: BTreeMap<(ObservationProvenance, bool), usize> = BTreeMap::new();
+        for (index, observation) in cell.observations.iter().enumerate() {
+            let domain = (
+                observation.provenance,
+                observation.canonical_comparisons.is_empty(),
+            );
+            match chosen.get(&domain) {
+                Some(&best) if rank(&cell.observations[best]) > rank(observation) => {}
+                _ => {
+                    chosen.insert(domain, index);
+                }
+            }
+        }
+        if chosen.len() == cell.observations.len() {
+            continue;
+        }
+        let kept = chosen.into_values().collect::<BTreeSet<usize>>();
+        let mut index = 0;
+        cell.observations.retain(|_| {
+            let keep = kept.contains(&index);
+            index += 1;
+            keep
+        });
+    }
+    let keep = match comparison_attempt_bindings(tracked) {
+        Some(envelope) => {
+            let cells = CellsById::new(tracked);
+            envelope
+                .bindings
+                .iter()
+                .map(|binding| {
+                    !bound_canonical_comparisons_in(&cells, binding).is_empty()
+                        || envelope
+                            .retired_canonical_comparisons
+                            .iter()
+                            .any(|retired| retired_comparison_key(retired) == binding_key(binding))
+                })
+                .collect::<Vec<bool>>()
+        }
+        None => return,
+    };
+    let Some(projection) = tracked.projection.as_mut() else {
+        return;
+    };
+    let Some(envelope) = projection.comparison_attempt_bindings_v1.as_mut() else {
+        return;
+    };
+    let mut index = 0;
+    envelope.bindings.retain(|_| {
+        let retained = keep[index];
+        index += 1;
+        retained
+    });
+    if envelope.bindings.is_empty() && envelope.retired_canonical_comparisons.is_empty() {
+        projection.comparison_attempt_bindings_v1 = None;
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -724,37 +917,15 @@ impl MeasurementState {
 /// unless the same observation also carries a determinism or replay failure:
 /// the rerun's positions are parity positions.
 fn derive_measurement(cell: &TrackedCell) -> MeasurementState {
-    if cell.observations.is_empty() {
+    if cell.observations.is_empty() && cell.aggregate.is_empty() {
         return MeasurementState::NeverMeasured;
     }
-    let mut diverged = false;
-    let mut passed = false;
-    let mut located = false;
-    for observation in &cell.observations {
-        let mut determinism_divergence = false;
-        for result in &observation.results {
-            match result {
-                ObservedResult::Pass => passed = true,
-                ObservedResult::DeterminismFailure | ObservedResult::ReplayFailure => {
-                    determinism_divergence = true;
-                }
-                ObservedResult::ParityFailure
-                | ObservedResult::CrashError
-                | ObservedResult::Timeout
-                | ObservedResult::Oom
-                | ObservedResult::SandboxDenied
-                | ObservedResult::InfrastructureError => {}
-            }
-        }
-        diverged |= determinism_divergence;
-        let parity_positions_only =
-            !determinism_divergence && observation.results.contains(&ObservedResult::ParityFailure);
-        located |= !parity_positions_only
-            && (!observation.first_divergent_record.is_empty()
-                || !observation.first_divergent_syscall.is_empty()
-                || !observation.first_divergent_scheduler_turn.is_empty()
-                || !observation.first_divergent_virtual_nanoseconds.is_empty());
-    }
+    // What the capped-away observations said counts exactly as if they were
+    // still here (see [`CellAggregate`]).
+    let flags = evidence_flags(&cell.observations);
+    let diverged = flags.diverged || cell.aggregate.diverged;
+    let passed = flags.passed || cell.aggregate.passed;
+    let located = flags.located || cell.aggregate.located;
     if diverged {
         return if located {
             MeasurementState::Diverged
@@ -766,6 +937,46 @@ fn derive_measurement(cell: &TrackedCell) -> MeasurementState {
         MeasurementState::MeasuredAndPassed
     } else {
         MeasurementState::MeasuredNoVerdict
+    }
+}
+
+struct EvidenceFlags {
+    passed: bool,
+    diverged: bool,
+    located: bool,
+}
+
+/// Whether an observation's results include a determinism or replay failure.
+fn determinism_divergence(observation: &Observation) -> bool {
+    observation.results.iter().any(|result| {
+        matches!(
+            result,
+            ObservedResult::DeterminismFailure | ObservedResult::ReplayFailure
+        )
+    })
+}
+
+/// Whether an observation's recorded positions locate a divergence: any
+/// position, unless it sits only beside a parity failure (see
+/// [`derive_measurement`]: the rerun's positions are parity positions).
+fn locates(observation: &Observation) -> bool {
+    let parity_positions_only = !determinism_divergence(observation)
+        && observation.results.contains(&ObservedResult::ParityFailure);
+    !parity_positions_only
+        && (!observation.first_divergent_record.is_empty()
+            || !observation.first_divergent_syscall.is_empty()
+            || !observation.first_divergent_scheduler_turn.is_empty()
+            || !observation.first_divergent_virtual_nanoseconds.is_empty())
+}
+
+/// What OBSERVATIONS say for [`derive_measurement`].
+fn evidence_flags(observations: &[Observation]) -> EvidenceFlags {
+    EvidenceFlags {
+        passed: observations
+            .iter()
+            .any(|observation| observation.results.contains(&ObservedResult::Pass)),
+        diverged: observations.iter().any(determinism_divergence),
+        located: observations.iter().any(locates),
     }
 }
 
@@ -1130,7 +1341,12 @@ fn enforce_projection_preserves_evidence(
 /// three located coordinates on main disappear. The quantity that can vanish is
 /// the quantity that has to be counted.
 fn located_evidence(cell: &TrackedCell) -> usize {
-    cell.observations
+    located_coordinates(&cell.observations).max(cell.aggregate.located_coordinates as usize)
+}
+
+/// [`located_evidence`] of OBSERVATIONS alone.
+fn located_coordinates(observations: &[Observation]) -> usize {
+    observations
         .iter()
         .map(|observation| {
             [
@@ -7999,6 +8215,7 @@ fn tracked_from(
                 last_tested,
                 observations,
                 measurement: MeasurementState::NeverMeasured,
+                aggregate: CellAggregate::default(),
                 green_removal_reason,
             };
             cell.measurement = derive_measurement(&cell);
@@ -10413,6 +10630,7 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
             selected_lines: None,
         },
     )?;
+    cap_observations(&mut tracked);
     refresh_measurement(&mut tracked);
     enforce_writer_boundary(&before, &tracked, Writer::Observations)?;
     let transitions = measurement_transitions(root, &before, &tracked, &head)?;
@@ -10743,6 +10961,7 @@ fn import_results(
         ));
     }
     archive_retired_import_comparisons(&before, &mut tracked)?;
+    cap_observations(&mut tracked);
     refresh_measurement(&mut tracked);
     enforce_writer_boundary(&before, &tracked, Writer::ImportResults)?;
 
@@ -11112,6 +11331,7 @@ fn update_observations(
         }
     }
 
+    cap_observations(&mut tracked);
     refresh_measurement(&mut tracked);
     enforce_writer_boundary(&before, &tracked, Writer::Observations)?;
     write_observation_files(root, &derived, &tracked)?;
@@ -11169,7 +11389,9 @@ fn project_observations(root: &Path, series_root: &Path, refreshed_at: &str) -> 
         rows_read,
         pre_series_corpus: rows.is_empty() || representation.has_unrepresented_direct_evidence,
         comparison_attempt_bindings_v1: comparison_attempt_bindings(&tracked).cloned(),
+        observations_capped: false,
     });
+    cap_observations(&mut tracked);
     refresh_measurement(&mut tracked);
 
     // The guard runs BEFORE the write, not after. A projection that has already
@@ -12038,6 +12260,7 @@ where
         rows_read,
         pre_series_corpus: true,
         comparison_attempt_bindings_v1: comparison_attempt_bindings(&tracked).cloned(),
+        observations_capped: false,
     });
     // It reads BEFORE only when no row was read; it returns at once otherwise.
     if rows_read == 0 {
@@ -12133,6 +12356,7 @@ where
         // its richer stored form deliberately has no event_ids.
         pre_series_corpus: rows_read == 0 || representation.has_unrepresented_direct_evidence,
         comparison_attempt_bindings_v1: comparison_attempt_bindings(&tracked).cloned(),
+        observations_capped: false,
     });
     append_attempt_bindings(
         &mut tracked,
@@ -12156,6 +12380,7 @@ where
     snapshot.rows = Vec::new();
     let before = reconciled_history(false)?;
     enforce_projection_preserves_evidence(&before, &tracked, rows_read)?;
+    cap_observations(&mut tracked);
     refresh_measurement(&mut tracked);
     enforce_writer_boundary(&before, &tracked, Writer::Observations)?;
     let transitions = measurement_transitions(root, &before, &tracked, &head)?;
@@ -13246,6 +13471,7 @@ impl AttemptBindingSnapshot {
             rows_read: rows_read as u64,
             pre_series_corpus: true,
             comparison_attempt_bindings_v1: None,
+            observations_capped: false,
         }
     }
 }
@@ -13555,11 +13781,48 @@ fn preserve_attempt_bindings_for_writer(
     let new = comparison_attempt_bindings(after);
     let before_cells = CellsById::new(before);
     let after_cells = CellsById::new(after);
+    // cap_observations drops an observation older than its provenance's latest
+    // and, with it, each binding whose original comparison only that
+    // observation held. Such a binding is capped, not removed: its
+    // observation is gone from AFTER while the cell keeps a newer one of the
+    // same provenance, and no retired receipt archives it.
+    let capped = |binding: &ComparisonAttemptBinding| {
+        binding_observations(&before_cells, binding)
+            .next()
+            .is_some()
+            && binding_observations(&after_cells, binding).next().is_none()
+            && after_cells
+                .0
+                .get(&binding.cell)
+                .into_iter()
+                .flatten()
+                .any(|cell| {
+                    cell.observations
+                        .iter()
+                        .any(|observation| observation.provenance == binding.provenance)
+                })
+            && !new.is_some_and(|new| {
+                new.retired_canonical_comparisons
+                    .iter()
+                    .any(|retired| retired_comparison_key(retired) == binding_key(binding))
+            })
+    };
     if let Some(old) = old {
-        let new = new.ok_or("writer dropped comparison-attempt binding authority")?;
+        let kept_bindings = old
+            .bindings
+            .iter()
+            .filter(|binding| !capped(binding))
+            .cloned()
+            .collect::<Vec<_>>();
+        let Some(new) = new else {
+            if kept_bindings.is_empty() && old.retired_canonical_comparisons.is_empty() {
+                return validate_attempt_bindings(after, None).map(|_| ());
+            }
+            return Err("writer dropped comparison-attempt binding authority".into());
+        };
         if old.schema != new.schema
             || old.authority != new.authority
-            || !all_contained(&old.bindings, &new.bindings, binding_lookup_key)
+            || !all_contained(&kept_bindings, &new.bindings, binding_lookup_key)
             || !all_contained(
                 &old.retired_canonical_comparisons,
                 &new.retired_canonical_comparisons,
@@ -13568,7 +13831,7 @@ fn preserve_attempt_bindings_for_writer(
         {
             return Err("writer changed or removed an immutable comparison-attempt binding or retired receipt".into());
         }
-        for binding in &old.bindings {
+        for binding in &kept_bindings {
             if writer != Writer::ImportResults
                 && !bound_canonical_comparisons_in(&before_cells, binding).is_empty()
                 && bound_canonical_comparisons_in(&after_cells, binding).is_empty()
@@ -21915,6 +22178,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
             last_tested: None,
             observations: Vec::new(),
             measurement: MeasurementState::NeverMeasured,
+            aggregate: CellAggregate::default(),
             green_removal_reason: None,
         }],
     };
@@ -21942,6 +22206,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
             last_tested: None,
             observations: Vec::new(),
             measurement: MeasurementState::NeverMeasured,
+            aggregate: CellAggregate::default(),
             green_removal_reason: None,
         }],
     };
@@ -22001,6 +22266,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
             last_tested: None,
             observations: Vec::new(),
             measurement: MeasurementState::NeverMeasured,
+            aggregate: CellAggregate::default(),
             green_removal_reason: None,
         }],
     };
@@ -22130,6 +22396,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
             last_tested: None,
             observations: Vec::new(),
             measurement: MeasurementState::NeverMeasured,
+            aggregate: CellAggregate::default(),
             green_removal_reason: None,
         }
     };
@@ -23427,6 +23694,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
                 last_tested: None,
                 observations: Vec::new(),
                 measurement: MeasurementState::NeverMeasured,
+                aggregate: CellAggregate::default(),
                 green_removal_reason: None,
             }],
         },
@@ -23454,6 +23722,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
             last_tested: None,
             observations: Vec::new(),
             measurement: MeasurementState::NeverMeasured,
+            aggregate: CellAggregate::default(),
             green_removal_reason: None,
         }],
     };
@@ -23540,6 +23809,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
             last_tested: None,
             observations: Vec::new(),
             measurement: MeasurementState::NeverMeasured,
+            aggregate: CellAggregate::default(),
             green_removal_reason: None,
         }],
     };
@@ -23594,6 +23864,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
                 last_tested: None,
                 observations: Vec::new(),
                 measurement: MeasurementState::NeverMeasured,
+                aggregate: CellAggregate::default(),
                 green_removal_reason: None,
             }],
         },
@@ -25030,6 +25301,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
                 rows_read: 1,
                 pre_series_corpus: false,
                 comparison_attempt_bindings_v1: None,
+                observations_capped: false,
             });
             refresh_measurement(&mut projected_seed);
             let replaced_projection = reconcile_control(
@@ -26620,6 +26892,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
         last_tested: None,
         observations: Vec::new(),
         measurement: MeasurementState::NeverMeasured,
+        aggregate: CellAggregate::default(),
         green_removal_reason: None,
     };
     let coordinate_less_row = |id: &CellId, outcome: &str| {
@@ -28739,6 +29012,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
             not_applicable_reason: None,
             last_tested: None,
             measurement: MeasurementState::NeverMeasured,
+            aggregate: CellAggregate::default(),
             green_removal_reason: None,
             observations,
         };
@@ -29031,6 +29305,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
                 last_tested: None,
                 observations: Vec::new(),
                 measurement: MeasurementState::NeverMeasured,
+                aggregate: CellAggregate::default(),
                 green_removal_reason: None,
             },
         ],
@@ -29757,6 +30032,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
                 rows_read: captured_rows.len() as u64,
                 pre_series_corpus: outcome.pre_series_corpus,
                 comparison_attempt_bindings_v1: None,
+                observations_capped: false,
             });
             refresh_measurement(&mut tracked);
             Ok((tracked, outcome))
@@ -30313,6 +30589,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
                 rows_read: ambient_rows.len() as u64,
                 pre_series_corpus: false,
                 comparison_attempt_bindings_v1: None,
+                observations_capped: false,
             }),
             cells: vec![target_cell],
         };
@@ -30516,6 +30793,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
             rows_read: 7,
             pre_series_corpus: false,
             comparison_attempt_bindings_v1: None,
+            observations_capped: false,
         }),
         cells: vec![boundary_cell(vec![sample.clone()], CellStatus::Red)],
     };
@@ -33280,21 +33558,22 @@ mod post_verdict_transaction_tests {
         update_observations(&fixture.root, &[], false).unwrap();
         assert!(read_history_files(&fixture.root).unwrap() == projected);
 
-        // The supported current-only ingest route also emits authority and
-        // keeps both previous rows when the receiving head differs.
+        // The supported current-only ingest route also emits authority. The
+        // document keeps only the latest observation of each provenance and
+        // domain (cap 1, https://github.com/rrnewton/dev-hermit/issues/563),
+        // so when the receiving head differs, the two previous heads'
+        // observations are capped and their bindings leave with them: only
+        // the current run's binding stays, and the writer boundary accepts
+        // exactly that.
         fs::create_dir(&fixture.options.results).unwrap();
         fixture.row["hermit_sha"] = fixture.options.expected_head.clone().into();
         fixture.row["run_id"] = "direct-current-run".into();
         fixture.publish_inputs();
         observe_results(&fixture.root, &fixture.options.results).unwrap();
         let current = fixture.cells();
-        assert_eq!(
-            comparison_attempt_bindings(&current)
-                .unwrap()
-                .bindings
-                .len(),
-            3
-        );
+        let bindings = &comparison_attempt_bindings(&current).unwrap().bindings;
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].run_id, "direct-current-run");
         preserve_attempt_bindings(&successor, &current).unwrap();
     }
 
@@ -37361,7 +37640,10 @@ mod post_verdict_transaction_tests {
             Some(StampComparisonVerdict::Matched)
         );
         // A later invocation of an older measured tree preserves that newer
-        // stamp while retaining the older observation as additional evidence.
+        // stamp. Its older observation is not the latest of its provenance, so
+        // the cap folds it into the cell's aggregate rather than keeping it
+        // (https://github.com/rrnewton/dev-hermit/issues/563); the stamped
+        // observation stays.
         fixture.row["hermit_sha"] = measured.clone().into();
         fixture.row["run_id"] = "later-old-source-run".into();
         fixture.options.results_head = Some(measured.clone());
@@ -37377,8 +37659,15 @@ mod post_verdict_transaction_tests {
         assert!(
             cell.observations
                 .iter()
+                .any(|observation| observation.hermit_shas.contains(&invoker))
+        );
+        assert!(
+            !cell
+                .observations
+                .iter()
                 .any(|observation| observation.hermit_shas.contains(&measured))
         );
+        assert!(cell.aggregate.passed);
         assert!(
             read_generated_files(&fixture.root).unwrap() == source_before,
             "ledger publication must not mutate Hermit's catalogue or page"
@@ -37982,6 +38271,7 @@ mod post_verdict_transaction_tests {
                 last_tested: None,
                 observations: Vec::new(),
                 measurement: MeasurementState::NeverMeasured,
+                aggregate: CellAggregate::default(),
                 green_removal_reason: None,
             }],
         }
@@ -40438,6 +40728,7 @@ mod regeneration_notice_tests {
                     bindings,
                     retired_canonical_comparisons: Vec::new(),
                 }),
+                observations_capped: false,
             }),
             cells: Vec::new(),
         }
@@ -41415,6 +41706,7 @@ mod parity_summary_tests {
             observations,
             measurement: MeasurementState::NeverMeasured,
             green_removal_reason: None,
+            aggregate: CellAggregate::default(),
         }
     }
 
@@ -44604,6 +44896,7 @@ mod series_comparison_tests {
                 last_tested: None,
                 observations: Vec::new(),
                 measurement: MeasurementState::NeverMeasured,
+                aggregate: CellAggregate::default(),
                 green_removal_reason: None,
             }],
         };
@@ -44808,6 +45101,7 @@ mod legacy_verify_divergence_tests {
                 last_tested: None,
                 observations: Vec::new(),
                 measurement: MeasurementState::NeverMeasured,
+                aggregate: CellAggregate::default(),
                 green_removal_reason: None,
             }],
         };
@@ -44906,5 +45200,161 @@ mod legacy_verify_divergence_tests {
         let mut other_tree = published_row(0);
         other_tree["series"]["tree"] = "2".repeat(40).into();
         assert_determinism_failure(other_tree);
+    }
+}
+
+#[cfg(test)]
+mod cap_observation_tests {
+    use super::*;
+
+    fn observation(provenance: &str, sha: &str, commits: u64, results: &[&str]) -> Observation {
+        serde_json::from_value(serde_json::json!({
+            "provenance": provenance,
+            "hermit_shas": [sha],
+            "depth": {"hermit": {"commits": commits, "first_parent": commits}},
+            "results": results,
+            "invocations": [],
+        }))
+        .unwrap()
+    }
+
+    fn cell(observations: Vec<Observation>) -> TrackedCells {
+        let mut tracked = TrackedCells {
+            schema: SCHEMA,
+            projection: None,
+            cells: vec![TrackedCell {
+                id: CellId {
+                    lane: "portable".into(),
+                    category: "c-programs".into(),
+                    test: "c-programs/cap".into(),
+                    mode: "verify".into(),
+                    backend: "ptrace".into(),
+                },
+                status: CellStatus::Green,
+                ci_disabled_reason: None,
+                green_removal_reason: None,
+                not_applicable_reason: None,
+                last_tested: None,
+                observations,
+                measurement: MeasurementState::NeverMeasured,
+                aggregate: CellAggregate::default(),
+            }],
+        };
+        refresh_measurement(&mut tracked);
+        tracked
+    }
+
+    #[test]
+    fn the_cap_keeps_the_latest_per_provenance_and_keeps_the_verdict() {
+        // An old located divergence, a later pass, and a pressure-test pass.
+        let mut diverged = observation("validate", &"a".repeat(40), 10, &["determinism-failure"]);
+        diverged.first_divergent_record.record(Some(42));
+        let mut tracked = cell(vec![
+            diverged,
+            observation("validate", &"b".repeat(40), 20, &["pass"]),
+            observation("pressure-test", &"c".repeat(40), 15, &["pass"]),
+        ]);
+        let before = tracked.cells[0].measurement;
+        let located_before = located_evidence(&tracked.cells[0]);
+        assert_eq!(before, MeasurementState::Diverged);
+        cap_observations(&mut tracked);
+        refresh_measurement(&mut tracked);
+        let capped = &tracked.cells[0];
+        // Kept: the newest validate observation and the only pressure-test one.
+        let kept = capped
+            .observations
+            .iter()
+            .map(|observation| observation.hermit_shas.iter().next().unwrap().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(kept, ["b".repeat(40), "c".repeat(40)]);
+        // The verdict is sticky, as before the cap, and no located coordinate
+        // is lost from the count the evidence guard reads.
+        assert_eq!(capped.measurement, before);
+        assert!(capped.aggregate.diverged && capped.aggregate.located && capped.aggregate.passed);
+        assert_eq!(located_evidence(capped), located_before);
+        assert_eq!(
+            capped.aggregate.first_divergent_record,
+            Some(ObservedRange {
+                earliest: 42,
+                latest: 42,
+                samples: 1
+            })
+        );
+    }
+
+    #[test]
+    fn the_cap_is_idempotent_and_prefers_the_stamped_commit() {
+        let mut tracked = cell(vec![
+            observation("validate", &"d".repeat(40), 30, &["pass"]),
+            observation("validate", &"e".repeat(40), 5, &["timeout"]),
+        ]);
+        // The stamped commit wins over greater depth.
+        tracked.cells[0].last_tested = Some(LastTested {
+            hermit_sha: "e".repeat(40),
+            detcore_tree: "f".repeat(40),
+            depth: BTreeMap::new(),
+            check: None,
+            applicable_when_tested: None,
+            comparison_verdict: None,
+        });
+        cap_observations(&mut tracked);
+        refresh_measurement(&mut tracked);
+        let once = tracked.clone();
+        assert_eq!(once.cells[0].observations.len(), 1);
+        assert!(
+            once.cells[0].observations[0]
+                .hermit_shas
+                .contains(&"e".repeat(40))
+        );
+        // Folding what was already folded changes nothing.
+        cap_observations(&mut tracked);
+        refresh_measurement(&mut tracked);
+        assert_eq!(
+            serde_json::to_value(&tracked).unwrap(),
+            serde_json::to_value(&once).unwrap()
+        );
+        assert_eq!(
+            once.cells[0].measurement,
+            MeasurementState::MeasuredAndPassed
+        );
+    }
+
+    #[test]
+    fn a_stripped_domain_does_not_retire_a_canonical_one() {
+        // A newer observation without canonical comparisons (a below-L2
+        // stripped pass) and an older one with a canonical failure are in
+        // different comparison domains: both stay.
+        let mut canonical = observation("validate", &"1".repeat(40), 10, &["determinism-failure"]);
+        canonical.canonical_comparisons.insert(CanonicalComparison {
+            hermit_sha: "1".repeat(40),
+            hermit_commits: 10,
+            hermit_first_parent: 10,
+            run_id: "r".into(),
+            evidence_sha256: "2".repeat(64),
+            result: ObservedResult::DeterminismFailure,
+            left_info_messages: BTreeSet::from([5]),
+            right_info_messages: BTreeSet::from([5]),
+        });
+        let mut tracked = cell(vec![
+            canonical,
+            observation("validate", &"3".repeat(40), 20, &["pass"]),
+            observation("validate", &"4".repeat(40), 15, &["pass"]),
+        ]);
+        cap_observations(&mut tracked);
+        let kept = tracked.cells[0]
+            .observations
+            .iter()
+            .map(|observation| observation.hermit_shas.iter().next().unwrap().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(kept, ["1".repeat(40), "3".repeat(40)]);
+    }
+
+    #[test]
+    fn a_document_without_an_aggregate_reads_as_before() {
+        let tracked = cell(vec![observation("validate", &"9".repeat(40), 1, &["pass"])]);
+        let encoded = serde_json::to_value(&tracked).unwrap();
+        assert!(encoded["cells"][0].get("aggregate").is_none());
+        let decoded: TrackedCells = serde_json::from_value(encoded).unwrap();
+        assert!(decoded.cells[0].aggregate.is_empty());
     }
 }
