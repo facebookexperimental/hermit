@@ -40444,6 +40444,25 @@
       ],
       "test": "c-programs/record-lock",
       "timeout_seconds": 57
+    },
+    {
+      "backend": "kvm",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
+      "test": "compat/setfattr",
+      "timeout_seconds": 57
     }
   ],
   "schema": 1

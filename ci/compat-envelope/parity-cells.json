@@ -9,7 +9,7 @@
   "counts": {
     "all": {
       "cells": 4085,
-      "applicable": 1918,
+      "applicable": 1919,
       "selectable": 1590,
       "population": 2775,
       "population_candidate_selected": 1590,
@@ -37,7 +37,7 @@
       },
       "kvm": {
         "cells": 817,
-        "applicable": 549,
+        "applicable": 550,
         "selectable": 519,
         "population": 555,
         "population_candidate_selected": 519,
@@ -2327,7 +2327,7 @@
     {"test_id":"compat/setfacl","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/setfattr","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/setfattr","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only run type selects this cell, by its manifest label; full validation does not."},
-    {"test_id":"compat/setfattr","backend":"kvm","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/setfattr","backend":"kvm","category":"compat","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/setfattr","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/setfattr","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/sha1sum","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: A compat corpus row runs only its lane's verify cell on ptrace, a verify cell on liteinst and in-guest-trap and kvm, a focused run type's verify cell on sabre, and a focused run type's replay cell on ptrace"},

@@ -1464,13 +1464,13 @@ corpus:
           pathchk, perl, perl-direct, pidstat-disk, pinky, pkg-config, pr,
           printenv, printf, ptx, pwd, python3, ranlib, readelf, readlink,
           realpath, rev, rm, rmdir, ruby, sar-resource-tables, sed, seq,
-          setfacl, sha1sum, sha224sum, sha256sum, sha384sum, sha512sum, shred,
-          shuf, size, sleep, sort, split, sqlite3, ss, stat, stdbuf, strings,
-          strip, sum, sync, tac, tar, tar-roundtrip, taskset, tcl, tee, test,
-          time, timeout, top, touch, tr, "true", truncate, tsort, tty, uname,
-          unexpand, uniq, uptime, users, uuidgen, vmstat, wc, wc-lines,
-          wget-localhost, whoami, xmllint, xxd, xz, xz-roundtrip, "yes",
-          zip-unzip, zstd, zstd-roundtrip
+          setfacl, setfattr, sha1sum, sha224sum, sha256sum, sha384sum,
+          sha512sum, shred, shuf, size, sleep, sort, split, sqlite3, ss, stat,
+          stdbuf, strings, strip, sum, sync, tac, tar, tar-roundtrip, taskset,
+          tcl, tee, test, time, timeout, top, touch, tr, "true", truncate,
+          tsort, tty, uname, unexpand, uniq, uptime, users, uuidgen, vmstat,
+          wc, wc-lines, wget-localhost, whoami, xmllint, xxd, xz, xz-roundtrip,
+          "yes", zip-unzip, zstd, zstd-roundtrip
         ]
       disabled_reason: >-
         Not in the 2026-10-13 KVM survey: its KVM verify cell was not green

@@ -13843,6 +13843,13 @@
         {
           "lane": "portable",
           "category": "compat",
+          "test": "compat/setfattr",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
           "test": "compat/sha1sum",
           "mode": "verify",
           "backend": "in-guest-trap"
@@ -16892,6 +16899,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/setfacl",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/setfattr",
           "mode": "verify",
           "backend": "kvm"
         },
@@ -59663,6 +59677,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/setfacl",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/setfattr",
           "mode": "verify",
           "backend": "kvm"
         },
