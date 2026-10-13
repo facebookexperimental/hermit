@@ -3367,6 +3367,13 @@
           "category": "c-programs",
           "test": "c-programs/hardware-trap-identity",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/hardware-trap-identity",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -49176,6 +49183,13 @@
           "test": "c-programs/getsockopt-null",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/hardware-trap-identity",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
