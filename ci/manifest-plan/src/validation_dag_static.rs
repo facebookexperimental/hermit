@@ -1473,7 +1473,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the three manifest unit tests of network and syscall recordings
     // (https://github.com/rrnewton/hermit/issues/4271): 1084.
     // And +3 from ce6d9a4f: 1087.
-    ("test.hermit_unit", 1087),
+    // And metadata::tests::record_version_rejects_streams_from_before_private_sigchld_ends_a_wait
+    // (https://github.com/rrnewton/hermit/issues/4132): 1088.
+    ("test.hermit_unit", 1088),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2090,7 +2092,18 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // an_exec_after_the_leader_was_retired_at_exit_admits_the_new_leader
     // (reviews of https://github.com/rrnewton/hermit/pull/4245): 1540.
     // And the nine machine-description tests and the three torn-read and vector-flag tests (B2a, https://github.com/rrnewton/hermit/issues/4266): 1552.
-    ("test.detcore_unit", 1552),
+    // And the eight guest private SIGCHLD futex-wait tests, scheduler::test::
+    // a_private_sigchld_ends_a_parked_futex_wait_through_the_drain,
+    // a_futex_waiter_held_at_a_gate_is_not_marked_as_drain_woken,
+    // only_a_scheduler_sent_sigchld_is_committed_to_a_woken_futex_waiter,
+    // a_recorded_private_sigchld_does_not_end_a_restartable_internal_read_poll and
+    // a_futex_waits_question_counts_only_a_recorded_private_sigchld, and
+    // syscalls::signal::before_park_tests::
+    // a_private_sigchld_committed_before_a_futex_wait_parks_ends_it_through_the_ledger,
+    // a_futex_waits_check_after_a_wake_needs_the_private_copy_and_its_record and
+    // a_shared_sigchld_after_a_flush_does_not_end_a_drain_woken_futex_wait
+    // (https://github.com/rrnewton/hermit/issues/4132): 1560, listed.
+    ("test.detcore_unit", 1560),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2890,7 +2903,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And detcore_fixes_the_virtual_kernel_files_on_every_backend (B2a, https://github.com/rrnewton/hermit/issues/4266): 367.
     // And +5 from ce6d9a4f: 372.
     // And +1 from 843b8e10: 373.
-    ("test.cli", 373),
+    // And the five guest SIGCHLD futex-wait tests,
+    // a_guests_sigchld_to_a_futex_waiting_sibling_ends_its_wait_as_on_linux,
+    // a_guests_sigchld_to_a_futex_waiting_sibling_beside_a_cpu_bound_one_ends_its_wait,
+    // a_private_sigchld_sent_before_a_futex_wait_parks_ends_it_as_on_linux,
+    // a_futex_wait_a_private_sigchld_ends_records_and_replays and
+    // a_guests_sigchld_to_a_futex_waiter_has_a_linux_outcome_under_chaos
+    // (https://github.com/rrnewton/hermit/issues/4132): 378.
+    ("test.cli", 378),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3188,7 +3208,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And detcore_fixes_the_virtual_kernel_files_on_every_backend (B2a, https://github.com/rrnewton/hermit/issues/4266): 303.
     // And +5 from ce6d9a4f: 308.
     // And +1 from 843b8e10: 309.
-    ("test.cli_on_host", 309),
+    // So do the five guest SIGCHLD futex-wait tests
+    // (https://github.com/rrnewton/hermit/issues/4132): 314.
+    ("test.cli_on_host", 314),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -3379,7 +3401,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the three exited-leader retirement tests: 1538.
     // And the stat-parser and retire-then-exec tests: 1540.
     // And the nine machine-description tests and the three torn-read and vector-flag tests (B2a, https://github.com/rrnewton/hermit/issues/4266): 1552.
-    ("test.detcore_unit_on_host", 1552),
+    // And the eight guest private SIGCHLD futex-wait tests: 1560.
+    ("test.detcore_unit_on_host", 1560),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -3552,7 +3575,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the three manifest unit tests of network and syscall recordings
     // (https://github.com/rrnewton/hermit/issues/4271): 1084.
     // And +3 from ce6d9a4f: 1087.
-    ("test.hermit_unit_on_host", 1087),
+    // And the private-SIGCHLD wait record-epoch test: 1088.
+    ("test.hermit_unit_on_host", 1088),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
