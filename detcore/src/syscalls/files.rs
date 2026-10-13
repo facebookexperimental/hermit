@@ -3258,7 +3258,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                     (result, _) => break result,
                 }
             },
-            FdType::Eventfd | FdType::Timerfd | FdType::Inotify => {
+            FdType::Timerfd => {
+                trace!("Possibly blocking read call on timerfd {}", call.fd());
+                // Expirations up to this thread's virtual now make the host
+                // descriptor readable before a nonblocking read's one attempt;
+                // a blocking read's retries publish again at each turn.
+                crate::syscalls::timerfd::publish_expired(guest).await;
+                let result = self.execute_nonblockable_fd_syscall(guest, call).await;
+                crate::syscalls::timerfd::finish_read(guest, call.fd(), call.buf(), result)
+            }
+            FdType::Eventfd | FdType::Inotify => {
                 trace!(
                     "Possibly blocking read call on notification fd {}, type {:?}",
                     call.fd(),
@@ -4286,6 +4295,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                 },
                 rng_output,
             )
+        } else if fd_type == FdType::Timerfd && crate::syscalls::timerfd::enabled(guest) {
+            // As `read` of a timerfd on virtual time: publish its expirations,
+            // retry a logically blocking read in turns, and return the
+            // virtual count (`crate::syscalls::timerfd`).
+            crate::syscalls::timerfd::publish_expired(guest).await;
+            let result = self.execute_nonblockable_fd_syscall(guest, call).await;
+            crate::syscalls::timerfd::finish_readv(guest, call.fd(), call.iov(), call.len(), result)
         } else if physically_nonblocking
             && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd)
         {
@@ -5420,6 +5436,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Ioctl,
     ) -> Result<i64, Error> {
         let fd = call.fd();
+        // Setting a virtual timerfd's host tick count would make the host
+        // disagree with Detcore's count (`crate::syscalls::timerfd`).
+        if Syscall::Ioctl(call).into_parts().1.arg1 as u64
+            == crate::syscalls::timerfd::TFD_IOC_SET_TICKS
+            && crate::syscalls::timerfd::enabled(guest)
+            && crate::syscalls::timerfd::is_timerfd(guest, fd)
+        {
+            crate::syscalls::timerfd::refuse(format_args!(
+                "ioctl(TFD_IOC_SET_TICKS) on timerfd {fd} would set the host's tick count"
+            ));
+        }
         // Before anything else, so a refused call has no other effect.
         let (call, _owner_copy) = self.screen_ioctl_owner(guest, call).await?;
         // As in `handle_fcntl`: an asynchronous-I/O owner, and a session whose
@@ -6808,7 +6835,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::TimerfdCreate,
     ) -> Result<i64, Error> {
-        let fd = self.record_or_replay(guest, call).await? as RawFd;
+        // A timerfd on virtual time is physically nonblocking, as an eventfd
+        // is, so a logically blocking read retries in scheduler turns
+        // (internal IO polling) instead of blocking in the host until a
+        // host-timed moment (`crate::syscalls::timerfd`).
+        let internally_nonblocking = crate::syscalls::timerfd::enabled(guest);
+        let injected = if internally_nonblocking {
+            call.with_flags(call.flags() | syscalls::TimerFlags::TFD_NONBLOCK)
+        } else {
+            call
+        };
+        let fd = self.record_or_replay(guest, injected).await? as RawFd;
         self.add_fd(
             guest,
             fd,
@@ -6818,6 +6855,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             FdType::Timerfd,
         )
         .await?;
+        if internally_nonblocking {
+            self.maybe_set_nonblocking_fd(guest, fd);
+        }
         Ok(fd as i64)
     }
 
@@ -6832,22 +6872,35 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(self.record_or_replay(guest, call).await?)
     }
 
-    /// timerfd_settime system call.
+    /// timerfd_settime system call. Under virtual time the setting is kept on
+    /// Detcore's clock and the host timerfd stays disarmed
+    /// (`crate::syscalls::timerfd`).
     pub async fn handle_timerfd_settime<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::TimerfdSettime,
     ) -> Result<i64, Error> {
-        self.notification_fd_control(guest, call.into()).await
+        let dettid = guest.thread_state().dettid;
+        resource_request(guest, Resources::new(dettid)).await;
+        if let Some(result) = crate::syscalls::timerfd::settime(guest, call).await? {
+            return Ok(result);
+        }
+        Ok(self.record_or_replay(guest, call).await?)
     }
 
-    /// timerfd_gettime system call.
+    /// timerfd_gettime system call, answered from the virtual clock for a
+    /// timerfd Detcore keeps there.
     pub async fn handle_timerfd_gettime<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::TimerfdGettime,
     ) -> Result<i64, Error> {
-        self.notification_fd_control(guest, call.into()).await
+        let dettid = guest.thread_state().dettid;
+        resource_request(guest, Resources::new(dettid)).await;
+        if let Some(result) = crate::syscalls::timerfd::gettime(guest, call).await? {
+            return Ok(result);
+        }
+        Ok(self.record_or_replay(guest, call).await?)
     }
 
     /// inotify_init1 system call.

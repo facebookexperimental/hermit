@@ -227,6 +227,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         blocked_signal_mask_unknown: bool,
         after_grant: impl FnOnce(&mut G),
     ) -> Result<i64, Error> {
+        // A host wait on descriptors that may include a timerfd on virtual
+        // time would never see it readable (`crate::syscalls::timerfd`).
+        crate::syscalls::timerfd::refuse_host_wait_for(guest, call);
         let dettid = guest.thread_state().dettid;
         let op_id = match &blocking_resource {
             ResourceID::BlockingExternalIO(op_id) | ResourceID::BlockingRtSigsuspend(op_id) => {
@@ -1967,7 +1970,7 @@ where
     let consumed = call0.signals_consumed_by_wait(&guest.memory());
     // The stack-allocated memory here needs to live across the loop, which means
     // surviving multiple syscall injections:
-    let (call, _maybe_stackguard) = call0.into_nonblocking(guest).await;
+    let (mut call, mut maybe_stackguard) = call0.into_nonblocking(guest).await;
     let mut rsrc = rsrc.clone();
     rsrc.poll_deadline = poll_deadline_for(guest, maybe_timeout.map(|(deadline, _)| deadline));
     // A restartable call parked in internal IO polling, such as a `read` of an
@@ -1994,11 +1997,31 @@ where
 
     loop {
         let resumed = match call.into() {
-            Syscall::Read(read) if maybe_timeout.is_none() && _maybe_stackguard.is_none() => {
+            Syscall::Read(read) if maybe_timeout.is_none() && maybe_stackguard.is_none() => {
                 crate::tool_global::polled_read_request(guest, read, rsrc.clone()).await
             }
             _ => resource_request(guest, rsrc.clone()).await,
         };
+        // A virtual timerfd this probe may observe is readable on the host
+        // exactly when its virtual deadline has passed by this turn
+        // (`crate::syscalls::timerfd`); its next deadline restores this
+        // poller if it backs off.
+        // Publishing may take the scratch stack, which the nonblocking form
+        // holds; release it first and convert again after.
+        let reconvert =
+            maybe_stackguard.is_some() && crate::syscalls::timerfd::may_publish(guest, call.into());
+        if reconvert {
+            maybe_stackguard = None;
+        }
+        rsrc.poll_deadline = crate::syscalls::timerfd::publish_before_probe(
+            guest,
+            call.into(),
+            maybe_timeout.map(|(deadline, _)| deadline),
+        )
+        .await;
+        if reconvert {
+            (call, maybe_stackguard) = call0.into_nonblocking(guest).await;
+        }
         // A signal ends the call only if it would still block, as Linux
         // checks for a pending signal only when the call must wait: a byte
         // written, or the last writer closed, before the signal is read
@@ -2185,6 +2208,23 @@ where
         // A scheduler `Signaled` answer only says a signal may be pending. The kernel's
         // state below decides whether it ends the wait.
         let resumed = resource_request(guest, rsrc.clone()).await;
+        // As in `retry_nonblocking_syscall_helper`: virtual timerfds first.
+        // As in `retry_nonblocking_syscall_helper`: release the nonblocking
+        // form's scratch stack before publishing, and convert again after.
+        let reconvert =
+            guard.is_some() && crate::syscalls::timerfd::may_publish(guest, call.into());
+        if reconvert {
+            guard = None;
+        }
+        rsrc.poll_deadline = crate::syscalls::timerfd::publish_before_probe(
+            guest,
+            call.into(),
+            maybe_timeout.map(|(deadline, _)| deadline),
+        )
+        .await;
+        if reconvert {
+            (call, guard) = call0.into_nonblocking(guest).await;
+        }
         // Read in this turn, before the probe: another thread may have armed a
         // host-timed source since the last turn, and none can until this turn ends.
         signals.hold_until_return(host_timed_signals(guest).await);

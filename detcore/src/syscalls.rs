@@ -46,6 +46,7 @@ pub(crate) use threads::real_uid;
 pub(crate) use threads::signal_state_read_seam;
 pub(crate) use threads::thread_is_gone;
 pub(crate) mod time;
+pub(crate) mod timerfd;
 
 use crate::consts::DET_SPECIAL_INODE_OFFSET;
 use crate::resources::Device;

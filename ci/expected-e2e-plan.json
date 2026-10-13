@@ -40582,6 +40582,23 @@
       ],
       "test": "c-programs/writev-determinism",
       "timeout_seconds": 57
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/timer-family-identity",
+      "timeout_seconds": 57
     }
   ],
   "schema": 1

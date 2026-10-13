@@ -12,6 +12,9 @@ mod exec_posix_timers;
 #[path = "common/fault_sites.rs"]
 mod fault_sites;
 
+#[path = "common/timerfd_virtual_time.rs"]
+mod timerfd_virtual_time;
+
 #[path = "common/skid_overshoot.rs"]
 mod skid_overshoot;
 use skid_overshoot::SKID_OVERSHOOT_REFUSAL_PREFIX;
@@ -21362,6 +21365,241 @@ fn run_kvm_exit_group_cancels_rdtsc_posthook_wait() {
 #[test]
 fn run_kvm_itimer_real_interrupts_sleep_in_all_eight_modes() {
     kvm_itimer::run();
+}
+
+#[test]
+fn run_ptrace_timerfd_virtual_catchup() {
+    timerfd_virtual_time::verify("ptrace", "catchup", timerfd_virtual_time::CATCHUP);
+}
+
+#[test]
+fn run_kvm_timerfd_virtual_catchup() {
+    timerfd_virtual_time::verify("kvm", "catchup", timerfd_virtual_time::CATCHUP);
+}
+
+#[test]
+fn run_ptrace_timerfd_virtual_abstime() {
+    timerfd_virtual_time::verify("ptrace", "abstime", timerfd_virtual_time::ABSTIME);
+}
+
+#[test]
+fn run_kvm_timerfd_virtual_abstime() {
+    timerfd_virtual_time::verify("kvm", "abstime", timerfd_virtual_time::ABSTIME);
+}
+
+#[test]
+fn run_ptrace_timerfd_virtual_nonblock() {
+    timerfd_virtual_time::verify("ptrace", "nonblock", timerfd_virtual_time::NONBLOCK);
+}
+
+#[test]
+fn run_kvm_timerfd_virtual_nonblock() {
+    timerfd_virtual_time::verify("kvm", "nonblock", timerfd_virtual_time::NONBLOCK);
+}
+
+#[test]
+fn run_ptrace_timerfd_virtual_epoll_pwait2() {
+    timerfd_virtual_time::verify("ptrace", "epoll-pwait2", timerfd_virtual_time::EPOLL_PWAIT2);
+}
+
+#[test]
+fn run_kvm_timerfd_virtual_epoll_pwait2() {
+    timerfd_virtual_time::verify("kvm", "epoll-pwait2", timerfd_virtual_time::EPOLL_PWAIT2);
+}
+
+#[test]
+fn run_ptrace_timerfd_virtual_zero_timeout() {
+    timerfd_virtual_time::verify("ptrace", "zero-timeout", timerfd_virtual_time::ZERO_TIMEOUT);
+}
+
+#[test]
+fn run_kvm_timerfd_virtual_zero_timeout() {
+    timerfd_virtual_time::verify("kvm", "zero-timeout", timerfd_virtual_time::ZERO_TIMEOUT);
+}
+
+#[test]
+fn run_ptrace_timerfd_virtual_waits() {
+    timerfd_virtual_time::verify("ptrace", "waits", timerfd_virtual_time::WAITS);
+}
+
+#[test]
+fn run_kvm_timerfd_virtual_waits() {
+    timerfd_virtual_time::verify("kvm", "waits", timerfd_virtual_time::WAITS);
+}
+
+#[test]
+fn run_ptrace_timerfd_virtual_epollet() {
+    timerfd_virtual_time::verify("ptrace", "epollet", timerfd_virtual_time::EPOLLET);
+}
+
+#[test]
+fn run_kvm_timerfd_virtual_epollet() {
+    timerfd_virtual_time::verify("kvm", "epollet", timerfd_virtual_time::EPOLLET);
+}
+
+#[test]
+fn run_ptrace_timerfd_virtual_dup_fork() {
+    timerfd_virtual_time::verify("ptrace", "dup-fork", timerfd_virtual_time::DUP_FORK);
+}
+
+#[test]
+fn run_kvm_timerfd_virtual_dup_fork() {
+    timerfd_virtual_time::verify("kvm", "dup-fork", timerfd_virtual_time::DUP_FORK);
+}
+
+#[test]
+fn run_ptrace_timerfd_virtual_exec() {
+    timerfd_virtual_time::verify("ptrace", "exec", timerfd_virtual_time::EXEC);
+}
+
+#[test]
+fn run_kvm_timerfd_virtual_exec() {
+    timerfd_virtual_time::verify("kvm", "exec", timerfd_virtual_time::EXEC);
+}
+
+#[test]
+fn run_ptrace_timerfd_virtual_readv() {
+    timerfd_virtual_time::verify("ptrace", "readv", timerfd_virtual_time::READV);
+}
+
+#[test]
+fn run_kvm_timerfd_virtual_readv() {
+    timerfd_virtual_time::verify("kvm", "readv", timerfd_virtual_time::READV);
+}
+
+#[test]
+fn run_ptrace_timerfd_virtual_sigchld_storm() {
+    timerfd_virtual_time::verify(
+        "ptrace",
+        "sigchld-storm",
+        timerfd_virtual_time::SIGCHLD_STORM,
+    );
+}
+
+#[test]
+fn run_kvm_timerfd_virtual_sigchld_storm() {
+    timerfd_virtual_time::verify("kvm", "sigchld-storm", timerfd_virtual_time::SIGCHLD_STORM);
+}
+
+#[test]
+fn run_ptrace_timerfd_virtual_masked_waits() {
+    timerfd_virtual_time::verify("ptrace", "masked-waits", timerfd_virtual_time::MASKED_WAITS);
+}
+
+/// KVM cannot tell whether the backend holds a signal that should end a
+/// masked wait, so a masked epoll_pwait that may wait runs in the host, where
+/// a timerfd on virtual time never becomes readable: the run is refused by
+/// name.
+#[test]
+fn run_kvm_timerfd_virtual_masked_waits_is_refused_by_name() {
+    timerfd_virtual_time::refused(
+        "kvm",
+        "masked-waits",
+        None,
+        "epoll_pwait with a signal mask would wait in the host",
+    );
+}
+
+/// A timerfd the host never makes readable ends the run on a named refusal,
+/// not an errno.
+#[test]
+fn run_ptrace_timerfd_virtual_never_readable_is_refused_by_name() {
+    timerfd_virtual_time::refused(
+        "ptrace",
+        "nonblock",
+        Some(("HERMIT_TEST_TIMERFD_FAULT", "never-readable")),
+        "did not become readable within",
+    );
+}
+
+#[test]
+fn run_kvm_timerfd_virtual_never_readable_is_refused_by_name() {
+    timerfd_virtual_time::refused(
+        "kvm",
+        "nonblock",
+        Some(("HERMIT_TEST_TIMERFD_FAULT", "never-readable")),
+        "did not become readable within",
+    );
+}
+
+#[test]
+fn run_ptrace_timerfd_virtual_signal_during_publish() {
+    timerfd_virtual_time::signal_during_publish("ptrace");
+}
+
+#[test]
+fn run_kvm_timerfd_virtual_signal_fault_is_inert() {
+    timerfd_virtual_time::signal_during_publish("kvm");
+}
+
+#[test]
+fn run_ptrace_timerfd_virtual_masked_ppoll_expired() {
+    timerfd_virtual_time::verify(
+        "ptrace",
+        "masked-ppoll-expired",
+        timerfd_virtual_time::MASKED_PPOLL_EXPIRED,
+    );
+}
+
+/// A timerfd passed to another process over SCM_RIGHTS would have no model
+/// there: the run is refused by name before the message is sent, whether the
+/// timer is already armed or is armed only after it is sent.
+#[test]
+fn run_ptrace_timerfd_virtual_scm_rights_is_refused_by_name() {
+    timerfd_virtual_time::refused("ptrace", "scm-rights", None, "a message passes timerfd");
+    timerfd_virtual_time::refused(
+        "ptrace",
+        "scm-rights-unarmed",
+        None,
+        "a message passes timerfd",
+    );
+}
+
+/// So is an epoll descriptor while the process holds a timerfd its set may
+/// include.
+#[test]
+fn run_ptrace_timerfd_virtual_scm_rights_epoll_is_refused_by_name() {
+    timerfd_virtual_time::refused(
+        "ptrace",
+        "scm-rights-epoll",
+        None,
+        "a message passes epoll descriptor",
+    );
+}
+
+#[test]
+fn run_kvm_timerfd_virtual_masked_ppoll_expired() {
+    timerfd_virtual_time::verify(
+        "kvm",
+        "masked-ppoll-expired",
+        timerfd_virtual_time::MASKED_PPOLL_EXPIRED,
+    );
+}
+
+/// A timerfd passed to another process over SCM_RIGHTS would have no model
+/// there: the run is refused by name before the message is sent, whether the
+/// timer is already armed or is armed only after it is sent.
+#[test]
+fn run_kvm_timerfd_virtual_scm_rights_is_refused_by_name() {
+    timerfd_virtual_time::refused("kvm", "scm-rights", None, "a message passes timerfd");
+    timerfd_virtual_time::refused(
+        "kvm",
+        "scm-rights-unarmed",
+        None,
+        "a message passes timerfd",
+    );
+}
+
+/// So is an epoll descriptor while the process holds a timerfd its set may
+/// include.
+#[test]
+fn run_kvm_timerfd_virtual_scm_rights_epoll_is_refused_by_name() {
+    timerfd_virtual_time::refused(
+        "kvm",
+        "scm-rights-epoll",
+        None,
+        "a message passes epoll descriptor",
+    );
 }
 
 #[test]

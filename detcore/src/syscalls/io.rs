@@ -205,6 +205,10 @@ struct StagedCells<Guard> {
     /// `PrivateCells::ZeroTimeout`.
     at: usize,
     storage: StagedCellsStorage<Guard>,
+    /// Memory for making an expired timerfd readable while these cells hold
+    /// the scratch stack (`crate::syscalls::timerfd::publish_expired_in`);
+    /// `None` for red-zone cells, which hold no stack.
+    timerfd_scratch: Option<crate::syscalls::timerfd::Scratch>,
 }
 
 impl<Guard> StagedCells<Guard> {
@@ -277,6 +281,7 @@ where
         PrivateCells::ZeroTimeout => stack.reserve::<Timespec>().as_raw(),
         _ => stack.reserve::<[u64; 3]>().as_raw(),
     };
+    let timerfd_scratch = crate::syscalls::timerfd::reserve_scratch(&mut stack);
     match stack.commit() {
         Ok(guard) => {
             let bytes = AddrMut::<u8>::from_raw(at).ok_or(Errno::EFAULT)?;
@@ -285,6 +290,7 @@ where
             return Ok(Some(StagedCells {
                 at,
                 storage: StagedCellsStorage::Stack(guard),
+                timerfd_scratch: Some(timerfd_scratch),
             }));
         }
         Err(Errno::EFAULT) => {}
@@ -319,6 +325,7 @@ where
     let staged = StagedCells {
         at,
         storage: StagedCellsStorage::RedZone { at, len, saved },
+        timerfd_scratch: None,
     };
     if guest
         .memory()
@@ -829,6 +836,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             if self.cfg.recordreplay_modes {
                 Ok(self.record_or_replay(guest, call).await?)
             } else {
+                // A virtual timerfd among the fds is readable exactly when its
+                // deadline has passed (`crate::syscalls::timerfd`).
+                crate::syscalls::timerfd::publish_expired(guest).await;
                 Ok(guest.inject(call).await?)
             }
         } else if !self.cfg.sequentialize_threads || self.cfg.recordreplay_modes {
@@ -1113,6 +1123,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await?;
         }
         if timeout == Some(Duration::ZERO) {
+            // A virtual timerfd among the sets is readable exactly when its
+            // deadline has passed (`crate::syscalls::timerfd`).
+            crate::syscalls::timerfd::publish_expired(guest).await;
             return Ok(guest.inject(call).await?);
         }
 
@@ -1293,6 +1306,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         // below).
         let mut deliver_under_temporary_mask = false;
         let mask_cell = signals.as_ref().map(|_| stack.reserve::<KernelSigset>());
+        // This frame holds the scratch stack across every probe, so the
+        // memory that makes an expired timerfd readable is reserved here
+        // (`crate::syscalls::timerfd::publish_expired_in`).
+        let timerfd_scratch = crate::syscalls::timerfd::reserve_scratch(&mut stack);
         let _guard = stack.commit()?;
         let probe = call
             .with_readfds(readfds)
@@ -1325,6 +1342,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                         resource_request(guest, resources.clone()).await,
                         ResumeStatus::Signaled(_)
                     );
+                    // Virtual timerfds first (`crate::syscalls::timerfd`).
+                    let next_timerfd =
+                        crate::syscalls::timerfd::publish_expired_in(guest, Some(timerfd_scratch))
+                            .await;
+                    resources.poll_deadline =
+                        crate::syscalls::timerfd::poll_deadline_with(guest, deadline, next_timerfd);
                     // A pending real-time timer expiration that this wait would
                     // be ended by, under the guest's mask or the call's temporary
                     // one (https://github.com/rrnewton/hermit/issues/4089).
@@ -1569,7 +1592,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             None => None,
         };
         if matches!(raw_timeout, Some(timeout) if timeout.tv_sec == 0 && timeout.tv_usec == 0) {
-            // A zero timeout is a pure non-blocking poll; the kernel can service it directly.
+            // A zero timeout is a pure non-blocking poll; the kernel can service it directly,
+            // once a virtual timerfd among the sets is readable exactly when its deadline
+            // has passed (`crate::syscalls::timerfd`).
+            crate::syscalls::timerfd::publish_expired(guest).await;
             return Ok(guest.inject(call).await?);
         }
 
@@ -1640,6 +1666,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             .backend_supports_blocked_wait_signal_interruption
             .then(|| KernelSignalWait::for_select(guest));
         let mask_cell = signals.as_ref().map(|_| stack.reserve::<KernelSigset>());
+        // This frame holds the scratch stack across every probe, so the
+        // memory that makes an expired timerfd readable is reserved here
+        // (`crate::syscalls::timerfd::publish_expired_in`).
+        let timerfd_scratch = crate::syscalls::timerfd::reserve_scratch(&mut stack);
         let _guard = stack.commit()?;
         let probe = call
             .with_readfds(readfds)
@@ -1670,6 +1700,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                         resource_request(guest, resources.clone()).await,
                         ResumeStatus::Signaled(_)
                     );
+                    // Virtual timerfds first (`crate::syscalls::timerfd`).
+                    let next_timerfd =
+                        crate::syscalls::timerfd::publish_expired_in(guest, Some(timerfd_scratch))
+                            .await;
+                    resources.poll_deadline =
+                        crate::syscalls::timerfd::poll_deadline_with(guest, deadline, next_timerfd);
                     // A pending real-time timer expiration that this wait would
                     // be ended by (https://github.com/rrnewton/hermit/issues/4089).
                     let pending = pending_real_time_among(guest, REAL_TIME_SIGNALS).await;
@@ -1832,6 +1868,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         let result: Result<i64, Error> = if timeout == Some(Duration::ZERO) {
             if self.cfg.recordreplay_modes {
                 resource_request(guest, Resources::new(guest.thread_state().dettid)).await;
+            } else {
+                // A virtual timerfd among the fds is readable exactly when its
+                // deadline has passed (`crate::syscalls::timerfd`); before the
+                // probe's copies take the scratch stack.
+                crate::syscalls::timerfd::publish_expired(guest).await;
             }
             let (probe, staged) = match self.prepare_ppoll_probe(guest, call).await? {
                 Some((probe, staged)) => (probe, Some(staged)),
@@ -2089,12 +2130,21 @@ impl<T: RecordOrReplay> Detcore<T> {
                 };
             };
             let result = if self.cfg.backend_supports_blocked_wait_signal_interruption {
-                self.wait_on_masked_ppoll_probe(guest, probe, staged.mask(), deadline)
-                    .await
+                self.wait_on_masked_ppoll_probe(
+                    guest,
+                    probe,
+                    staged.mask(),
+                    staged.timerfd_scratch,
+                    deadline,
+                )
+                .await
             } else {
                 // Without the kernel's signal state, Hermit cannot tell whether
                 // the backend holds a signal that should end the wait, so a
-                // ppoll that would block still fails closed.
+                // ppoll that would block still fails closed. An expired
+                // timerfd on virtual time is made readable first, in the
+                // staged cells' scratch (`crate::syscalls::timerfd`).
+                crate::syscalls::timerfd::publish_expired_in(guest, staged.timerfd_scratch).await;
                 let result = guest.inject_with_retry(probe).await;
                 if probe.syscall_would_have_blocked(result) {
                     Err(Errno::ENOSYS.into())
@@ -2161,6 +2211,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         probe: syscalls::Ppoll,
         mask: usize,
+        timerfd_scratch: Option<crate::syscalls::timerfd::Scratch>,
         deadline: Option<LogicalTime>,
     ) -> Result<i64, Error> {
         let temporary_mask: KernelSigset = guest
@@ -2180,6 +2231,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         rsrc.set_signal_interrupt_errno(Errno::EINTR);
         let result = loop {
             resource_request(guest, rsrc.clone()).await;
+            // Virtual timerfds first (`crate::syscalls::timerfd`), in the
+            // staged cells' scratch while they hold the stack.
+            let next_timerfd =
+                crate::syscalls::timerfd::publish_expired_in(guest, timerfd_scratch).await;
+            rsrc.poll_deadline =
+                crate::syscalls::timerfd::poll_deadline_with(guest, deadline, next_timerfd);
             // A pending real-time timer expiration that the temporary mask lets
             // the kernel deliver or discard
             // (https://github.com/rrnewton/hermit/issues/4089).
@@ -2255,6 +2312,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 zero_timeout_poll_request(guest.thread_state().dettid, yield_to_peer),
             )
             .await;
+            crate::syscalls::timerfd::publish_expired(guest).await;
             Ok(guest.inject(call).await?) // Already non-blocking.
         } else {
             let maybe_timeout_ns = millis_duration_to_absolute_timeout(guest, timeout_millis).await;
@@ -2400,6 +2458,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await?;
             let dettid = guest.thread_state().dettid;
             resource_request(guest, Resources::new(dettid)).await; // empty request
+            // The raw call runs in this turn. A zero timeout only probes, once a
+            // virtual timerfd is readable exactly when its deadline has passed;
+            // any other waits in the host (`crate::syscalls::timerfd`).
+            if call.timeout() == 0 {
+                crate::syscalls::timerfd::publish_expired(guest).await;
+            } else {
+                crate::syscalls::timerfd::refuse_host_wait(guest, "epoll_pwait with a signal mask");
+            }
             return Ok(self.record_or_replay(guest, call).await?);
         }
         if self.cfg.recordreplay_modes && call.timeout() == 0 {
@@ -2609,6 +2675,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 )
                 .await;
             }
+            crate::syscalls::timerfd::publish_expired(guest).await;
             Ok(guest.inject(call).await?) // Already non-blocking.
         } else {
             let maybe_timeout_ns = millis_duration_to_absolute_timeout(guest, timeout_millis).await;
@@ -2677,6 +2744,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let dettid = guest.thread_state().dettid;
         resource_request(guest, Resources::new(dettid)).await; // empty request
+        // The raw call runs in this turn. A zero timeout only probes, once a
+        // virtual timerfd is readable exactly when its deadline has passed;
+        // any other wait here is in the host (`crate::syscalls::timerfd`).
+        if zero_timeout {
+            crate::syscalls::timerfd::publish_expired(guest).await;
+        } else {
+            crate::syscalls::timerfd::refuse_host_wait(guest, "epoll_pwait2 with a signal mask");
+        }
         Ok(self.record_or_replay(guest, call).await?)
     }
 
@@ -2867,6 +2942,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let timeout_millis = call.timeout();
         if timeout_millis == 0 {
+            crate::syscalls::timerfd::publish_expired(guest).await;
             Ok(guest.inject(call).await?) // Already non-blocking.
         } else {
             let maybe_timeout_ns = millis_duration_to_absolute_timeout(guest, timeout_millis).await;
@@ -2984,6 +3060,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .collect();
             self.mark_exported_listeners(guest, &headers);
         }
+        let headers: Vec<usize> = call
+            .msg()
+            .map(|header| header.as_raw())
+            .into_iter()
+            .collect();
+        self.refuse_sending_virtual_timerfds(guest, &headers);
         let result = self.execute_nonblockable_fd_syscall(guest, call).await?;
         guest.thread_state().forget_flock_modes();
         Ok(result)
@@ -3008,36 +3090,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// listener this did not see.
     // TODO-HUMAN-REVIEW(PR-3908)
     fn mark_exported_listeners<G: Guest<Self>>(&self, guest: &mut G, headers: &[usize]) {
-        let mut sent: Vec<RawFd> = Vec::new();
-        let mut unread = false;
-        for header in headers {
-            // A null header or control buffer fails the call with EFAULT
-            // before Linux reads any descriptor.
-            let Some(header) = Addr::<libc::msghdr>::from_raw(*header) else {
-                continue;
-            };
-            let Ok(header) = guest.memory().read_value::<_, libc::msghdr>(header) else {
-                unread = true;
-                continue;
-            };
-            let Some(control_address) = Addr::<u8>::from_raw(header.msg_control as usize) else {
-                continue;
-            };
-            if header.msg_controllen > MAX_CONTROL_BYTES {
-                unread = true;
-                continue;
-            }
-            let mut control = vec![0; header.msg_controllen];
-            if guest
-                .memory()
-                .read_exact(control_address, &mut control)
-                .is_err()
-            {
-                unread = true;
-                continue;
-            }
-            sent.extend(received_descriptors(&control));
-        }
+        let (sent, unread) = sent_descriptors(guest, headers);
         if unread {
             // Linux can read memory Detcore cannot (a write-only page) and
             // accepts more control data than Detcore reads, so a message it
@@ -3056,6 +3109,82 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Refuse the run, by name, before messages at `headers` pass a timerfd
+    /// over `SCM_RIGHTS` while timerfds run on Detcore's virtual clock, armed
+    /// or not (one armed after it is sent would be modelled only by the
+    /// sender), or an epoll descriptor while this process holds an armed one
+    /// (its set may include it). The receiving process keeps no model of the
+    /// timer, so its probes would never make it readable and it would wait
+    /// where Linux wakes (`crate::syscalls::timerfd`). A message whose control
+    /// data Detcore cannot read refuses too while this process holds an armed
+    /// timerfd.
+    fn refuse_sending_virtual_timerfds<G: Guest<Self>>(&self, guest: &mut G, headers: &[usize]) {
+        if !crate::syscalls::timerfd::enabled(guest) {
+            return;
+        }
+        let holds_armed = crate::syscalls::timerfd::has_virtual_timerfds(guest);
+        let (sent, unread) = sent_descriptors(guest, headers);
+        if unread && holds_armed {
+            crate::syscalls::timerfd::refuse(format_args!(
+                "a message whose SCM_RIGHTS control data Detcore cannot read may pass a timerfd to another process"
+            ));
+        }
+        for fd in sent {
+            match guest.thread_state().with_detfd(fd, |detfd| detfd.ty()) {
+                Ok(FdType::Timerfd) => crate::syscalls::timerfd::refuse(format_args!(
+                    "a message passes timerfd {fd} over SCM_RIGHTS, and its receiver keeps no model of the timer"
+                )),
+                Ok(FdType::Epoll) if holds_armed => crate::syscalls::timerfd::refuse(format_args!(
+                    "a message passes epoll descriptor {fd} over SCM_RIGHTS while this process holds a timerfd its set may include"
+                )),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// The descriptors the messages at `headers` name in `SCM_RIGHTS`, and
+/// whether a header or control buffer could not be read in full, in which case
+/// the list may be incomplete (`mark_exported_listeners`).
+fn sent_descriptors<T, G>(guest: &G, headers: &[usize]) -> (Vec<RawFd>, bool)
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let mut sent: Vec<RawFd> = Vec::new();
+    let mut unread = false;
+    for header in headers {
+        // A null header or control buffer fails the call with EFAULT
+        // before Linux reads any descriptor.
+        let Some(header) = Addr::<libc::msghdr>::from_raw(*header) else {
+            continue;
+        };
+        let Ok(header) = guest.memory().read_value::<_, libc::msghdr>(header) else {
+            unread = true;
+            continue;
+        };
+        let Some(control_address) = Addr::<u8>::from_raw(header.msg_control as usize) else {
+            continue;
+        };
+        if header.msg_controllen > MAX_CONTROL_BYTES {
+            unread = true;
+            continue;
+        }
+        let mut control = vec![0; header.msg_controllen];
+        if guest
+            .memory()
+            .read_exact(control_address, &mut control)
+            .is_err()
+        {
+            unread = true;
+            continue;
+        }
+        sent.extend(received_descriptors(&control));
+    }
+    (sent, unread)
+}
+
+impl<T: RecordOrReplay> Detcore<T> {
     /// Sends a message batch and invalidates process-wide flock knowledge when the
     /// kernel reports at least one message sent. This intentionally includes
     /// descriptors named only by an unsent tail message: the mutable guest array is
@@ -3080,6 +3209,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             });
             self.mark_exported_listeners(guest, &headers);
         }
+        // As for `sendmsg`: every entry Linux could send.
+        let headers: Vec<usize> = call.msgvec().map_or_else(Vec::new, |vector| {
+            (0..call.vlen().min(libc::UIO_MAXIOV as u32) as usize)
+                .map(|index| vector.as_raw() + index * std::mem::size_of::<libc::mmsghdr>())
+                .collect()
+        });
+        self.refuse_sending_virtual_timerfds(guest, &headers);
         let result = self.execute_nonblockable_fd_syscall(guest, call).await?;
         if result > 0 {
             guest.thread_state().forget_flock_modes();

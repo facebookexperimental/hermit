@@ -67,7 +67,6 @@ c-programs/sysv-shm-enosys verify dbt
 c-programs/tee-enosys verify dbt
 c-programs/thread-self-procfs-handoff verify sabre
 c-programs/threadexhaustion verify sabre
-c-programs/timer-family-identity verify ptrace
 c-programs/userfaultfd-self-service verify ptrace
 c-programs/ustat-enosys verify dbt
 c-programs/vmsplice-enosys verify dbt

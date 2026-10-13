@@ -10582,6 +10582,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/timer-family-identity",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/umask-mode",
           "mode": "verify",
           "backend": "dbt"
@@ -24011,7 +24018,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1499",
+        "NEXTEST_EXPECTED_EXECUTED": "1504",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -24530,7 +24537,7 @@
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
         "HERMIT_REQUIRE_DAP": "1",
         "HERMIT_REQUIRE_DAP_GDB": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "337",
+        "NEXTEST_EXPECTED_EXECUTED": "354",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
@@ -24582,7 +24589,7 @@
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
         "HERMIT_REQUIRE_DAP": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "273",
+        "NEXTEST_EXPECTED_EXECUTED": "290",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
@@ -25714,7 +25721,7 @@
         "full",
         "kvm"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_EPOCH --env HERMIT_PREPARED_NEXTEST_REQUIRED --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_EXPECTED_EXECUTED --env NEXTEST_PREPARED_BUILD_SELECTION --env NEXTEST_TEST_THREADS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf '\\''test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\\n'\\'' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap '\\''rm -f \"$log\"'\\'' EXIT; if ! ./ci/nextest-binaries.rs list ${CI:+--profile ci} -p hermit --features third-party-backends,kvm-execution-tests --lib --test cli -E '\\''test(/^run_kvm_/) | test(=kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution)'\\'' --message-format json >\"$log\"; then exit 1; fi; if ! jq -e '\\''[.\"rust-suites\"[] | .testcases | to_entries[] | select(.value.\"filter-match\".status == \"matches\")] as $selected | ($selected | length == 58) and ([$selected[].key] | unique | length == 58) and ($selected | all(.value.ignored == false)) and ([$selected[] | select(.key == \"run_kvm_self_sigkill_from_nonleader_is_group_fatal\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_synchronous_root_segv_preserves_guest_exit\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_synchronous_orphan_segv_preserves_root_success\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_root_exit_reparents_live_child_and_grandchild\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_exec_deletes_posix_timers_and_preserves_itimer\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_nonleader_exec_is_policy_refusal\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_futex_wait_on_an_unreadable_word_matches_linux\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_a_parked_sleep_carries_the_deadline_cap\")] | length == 1) and ([$selected[] | select(.key | startswith(\"run_kvm_\"))] | length == 57) and ([$selected[] | select(.key == \"kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution\")] | length == 1)'\\'' \"$log\" >/dev/null; then printf '\\''test.cli_kvm: expected exactly 57 distinct, nonignored run_kvm_ tests including self-SIGKILL, both synchronous-fault regressions, root-exit reparenting, exec timer lifetime, nonleader-exec refusal, the unreadable futex word, the parked-sleep deadline cap, and the named setup test; the inventory changed. Update the tests and this gate together.\\n'\\'' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends,kvm-execution-tests --lib --test cli -j 1 -E '\\''test(/^run_kvm_/) | test(=kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution)'\\''; exit $?'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_EPOCH --env HERMIT_PREPARED_NEXTEST_REQUIRED --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_EXPECTED_EXECUTED --env NEXTEST_PREPARED_BUILD_SELECTION --env NEXTEST_TEST_THREADS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf '\\''test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\\n'\\'' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap '\\''rm -f \"$log\"'\\'' EXIT; if ! ./ci/nextest-binaries.rs list ${CI:+--profile ci} -p hermit --features third-party-backends,kvm-execution-tests --lib --test cli -E '\\''test(/^run_kvm_/) | test(=kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution)'\\'' --message-format json >\"$log\"; then exit 1; fi; if ! jq -e '\\''[.\"rust-suites\"[] | .testcases | to_entries[] | select(.value.\"filter-match\".status == \"matches\")] as $selected | ($selected | length == 75) and ([$selected[].key] | unique | length == 75) and ($selected | all(.value.ignored == false)) and ([$selected[] | select(.key == \"run_kvm_self_sigkill_from_nonleader_is_group_fatal\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_synchronous_root_segv_preserves_guest_exit\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_synchronous_orphan_segv_preserves_root_success\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_root_exit_reparents_live_child_and_grandchild\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_exec_deletes_posix_timers_and_preserves_itimer\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_nonleader_exec_is_policy_refusal\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_futex_wait_on_an_unreadable_word_matches_linux\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_a_parked_sleep_carries_the_deadline_cap\")] | length == 1) and ([$selected[] | select(.key | startswith(\"run_kvm_\"))] | length == 74) and ([$selected[] | select(.key == \"kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution\")] | length == 1)'\\'' \"$log\" >/dev/null; then printf '\\''test.cli_kvm: expected exactly 74 distinct, nonignored run_kvm_ tests including self-SIGKILL, both synchronous-fault regressions, root-exit reparenting, exec timer lifetime, nonleader-exec refusal, the unreadable futex word, the parked-sleep deadline cap, and the named setup test; the inventory changed. Update the tests and this gate together.\\n'\\'' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends,kvm-execution-tests --lib --test cli -j 1 -E '\\''test(/^run_kvm_/) | test(=kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution)'\\''; exit $?'",
       "result_manifests": [
         {
           "kind": "structured-test-results",
@@ -25736,7 +25743,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "58",
+        "NEXTEST_EXPECTED_EXECUTED": "75",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends,kvm-execution-tests\",\"--lib\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
@@ -27801,6 +27808,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/timer-create-determinism",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/timer-family-identity",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -30283,7 +30297,7 @@
         "privileged",
         "kvm"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_EPOCH --env HERMIT_PREPARED_NEXTEST_REQUIRED --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_EXPECTED_EXECUTED --env NEXTEST_PREPARED_BUILD_SELECTION --env NEXTEST_TEST_THREADS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf '\\''test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\\n'\\'' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap '\\''rm -f \"$log\"'\\'' EXIT; if ! ./ci/nextest-binaries.rs list ${CI:+--profile ci} -p hermit --features third-party-backends,kvm-execution-tests --lib --test cli -E '\\''test(/^run_kvm_/) | test(=kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution)'\\'' --message-format json >\"$log\"; then exit 1; fi; if ! jq -e '\\''[.\"rust-suites\"[] | .testcases | to_entries[] | select(.value.\"filter-match\".status == \"matches\")] as $selected | ($selected | length == 58) and ([$selected[].key] | unique | length == 58) and ($selected | all(.value.ignored == false)) and ([$selected[] | select(.key == \"run_kvm_self_sigkill_from_nonleader_is_group_fatal\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_synchronous_root_segv_preserves_guest_exit\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_synchronous_orphan_segv_preserves_root_success\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_root_exit_reparents_live_child_and_grandchild\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_exec_deletes_posix_timers_and_preserves_itimer\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_nonleader_exec_is_policy_refusal\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_futex_wait_on_an_unreadable_word_matches_linux\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_a_parked_sleep_carries_the_deadline_cap\")] | length == 1) and ([$selected[] | select(.key | startswith(\"run_kvm_\"))] | length == 57) and ([$selected[] | select(.key == \"kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution\")] | length == 1)'\\'' \"$log\" >/dev/null; then printf '\\''test.cli_kvm: expected exactly 57 distinct, nonignored run_kvm_ tests including self-SIGKILL, both synchronous-fault regressions, root-exit reparenting, exec timer lifetime, nonleader-exec refusal, the unreadable futex word, the parked-sleep deadline cap, and the named setup test; the inventory changed. Update the tests and this gate together.\\n'\\'' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends,kvm-execution-tests --lib --test cli -j 1 -E '\\''test(/^run_kvm_/) | test(=kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution)'\\''; exit $?'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_EPOCH --env HERMIT_PREPARED_NEXTEST_REQUIRED --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_EXPECTED_EXECUTED --env NEXTEST_PREPARED_BUILD_SELECTION --env NEXTEST_TEST_THREADS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf '\\''test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\\n'\\'' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap '\\''rm -f \"$log\"'\\'' EXIT; if ! ./ci/nextest-binaries.rs list ${CI:+--profile ci} -p hermit --features third-party-backends,kvm-execution-tests --lib --test cli -E '\\''test(/^run_kvm_/) | test(=kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution)'\\'' --message-format json >\"$log\"; then exit 1; fi; if ! jq -e '\\''[.\"rust-suites\"[] | .testcases | to_entries[] | select(.value.\"filter-match\".status == \"matches\")] as $selected | ($selected | length == 75) and ([$selected[].key] | unique | length == 75) and ($selected | all(.value.ignored == false)) and ([$selected[] | select(.key == \"run_kvm_self_sigkill_from_nonleader_is_group_fatal\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_synchronous_root_segv_preserves_guest_exit\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_synchronous_orphan_segv_preserves_root_success\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_root_exit_reparents_live_child_and_grandchild\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_exec_deletes_posix_timers_and_preserves_itimer\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_nonleader_exec_is_policy_refusal\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_futex_wait_on_an_unreadable_word_matches_linux\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_a_parked_sleep_carries_the_deadline_cap\")] | length == 1) and ([$selected[] | select(.key | startswith(\"run_kvm_\"))] | length == 74) and ([$selected[] | select(.key == \"kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution\")] | length == 1)'\\'' \"$log\" >/dev/null; then printf '\\''test.cli_kvm: expected exactly 74 distinct, nonignored run_kvm_ tests including self-SIGKILL, both synchronous-fault regressions, root-exit reparenting, exec timer lifetime, nonleader-exec refusal, the unreadable futex word, the parked-sleep deadline cap, and the named setup test; the inventory changed. Update the tests and this gate together.\\n'\\'' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends,kvm-execution-tests --lib --test cli -j 1 -E '\\''test(/^run_kvm_/) | test(=kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution)'\\''; exit $?'",
       "result_manifests": [
         {
           "kind": "structured-test-results",
@@ -30305,7 +30319,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "58",
+        "NEXTEST_EXPECTED_EXECUTED": "75",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends,kvm-execution-tests\",\"--lib\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
@@ -35726,6 +35740,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/timer-family-identity",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/umask-mode",
           "mode": "verify",
           "backend": "dbt"
@@ -39255,7 +39276,7 @@
       "labels": [
         "hosted-privileged"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f \"$log\"' EXIT; if ! ./ci/nextest-binaries.rs list ${CI:+--profile ci} -p hermit --features third-party-backends,kvm-execution-tests --lib --test cli -E 'test(/^run_kvm_/) | test(=kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution)' --message-format json >\"$log\"; then exit 1; fi; if ! jq -e '[.\"rust-suites\"[] | .testcases | to_entries[] | select(.value.\"filter-match\".status == \"matches\")] as $selected | ($selected | length == 58) and ([$selected[].key] | unique | length == 58) and ($selected | all(.value.ignored == false)) and ([$selected[] | select(.key == \"run_kvm_self_sigkill_from_nonleader_is_group_fatal\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_synchronous_root_segv_preserves_guest_exit\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_synchronous_orphan_segv_preserves_root_success\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_root_exit_reparents_live_child_and_grandchild\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_exec_deletes_posix_timers_and_preserves_itimer\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_nonleader_exec_is_policy_refusal\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_futex_wait_on_an_unreadable_word_matches_linux\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_a_parked_sleep_carries_the_deadline_cap\")] | length == 1) and ([$selected[] | select(.key | startswith(\"run_kvm_\"))] | length == 57) and ([$selected[] | select(.key == \"kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution\")] | length == 1)' \"$log\" >/dev/null; then printf 'test.cli_kvm: expected exactly 57 distinct, nonignored run_kvm_ tests including self-SIGKILL, both synchronous-fault regressions, root-exit reparenting, exec timer lifetime, nonleader-exec refusal, the unreadable futex word, the parked-sleep deadline cap, and the named setup test; the inventory changed. Update the tests and this gate together.\\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends,kvm-execution-tests --lib --test cli -j 1 -E 'test(/^run_kvm_/) | test(=kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution)'; exit $?",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f \"$log\"' EXIT; if ! ./ci/nextest-binaries.rs list ${CI:+--profile ci} -p hermit --features third-party-backends,kvm-execution-tests --lib --test cli -E 'test(/^run_kvm_/) | test(=kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution)' --message-format json >\"$log\"; then exit 1; fi; if ! jq -e '[.\"rust-suites\"[] | .testcases | to_entries[] | select(.value.\"filter-match\".status == \"matches\")] as $selected | ($selected | length == 75) and ([$selected[].key] | unique | length == 75) and ($selected | all(.value.ignored == false)) and ([$selected[] | select(.key == \"run_kvm_self_sigkill_from_nonleader_is_group_fatal\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_synchronous_root_segv_preserves_guest_exit\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_synchronous_orphan_segv_preserves_root_success\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_root_exit_reparents_live_child_and_grandchild\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_exec_deletes_posix_timers_and_preserves_itimer\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_nonleader_exec_is_policy_refusal\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_futex_wait_on_an_unreadable_word_matches_linux\")] | length == 1) and ([$selected[] | select(.key == \"run_kvm_a_parked_sleep_carries_the_deadline_cap\")] | length == 1) and ([$selected[] | select(.key | startswith(\"run_kvm_\"))] | length == 74) and ([$selected[] | select(.key == \"kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution\")] | length == 1)' \"$log\" >/dev/null; then printf 'test.cli_kvm: expected exactly 74 distinct, nonignored run_kvm_ tests including self-SIGKILL, both synchronous-fault regressions, root-exit reparenting, exec timer lifetime, nonleader-exec refusal, the unreadable futex word, the parked-sleep deadline cap, and the named setup test; the inventory changed. Update the tests and this gate together.\\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends,kvm-execution-tests --lib --test cli -j 1 -E 'test(/^run_kvm_/) | test(=kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution)'; exit $?",
       "result_manifests": [
         {
           "kind": "structured-test-results",
@@ -39274,7 +39295,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "58",
+        "NEXTEST_EXPECTED_EXECUTED": "75",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends,kvm-execution-tests\",\"--lib\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
@@ -46189,7 +46210,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1499",
+        "NEXTEST_EXPECTED_EXECUTED": "1504",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -56484,6 +56505,13 @@
           "test": "c-programs/timer-create-determinism",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/timer-family-identity",
+          "mode": "verify",
+          "backend": "ptrace"
         },
         {
           "lane": "portable",

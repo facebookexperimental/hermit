@@ -2425,6 +2425,13 @@ pub(crate) fn chaos_per_thread_slowdown_factor(
 }
 
 impl<T> ThreadState<T> {
+    /// What `observe_guest_clock(raw)` would return, without raising the
+    /// clock's floor: the guest clock as of a raw observation.
+    pub(crate) fn peek_guest_clock(&self, raw: LogicalTime) -> LogicalTime {
+        let clock = self.guest_clock.lock().expect("guest clock mutex poisoned");
+        clock.now.max(raw)
+    }
+
     pub(crate) fn observe_guest_clock(&self, raw: LogicalTime) -> LogicalTime {
         self.guest_clock
             .lock()
@@ -3076,6 +3083,29 @@ impl<T> ThreadState<T> {
     /// Overrides the task identity embedded in subsequently allocated open-file descriptions.
     pub fn set_open_file_creator(&mut self, creator: DetTid) {
         self.open_file_creator = Some(creator);
+    }
+
+    /// This process's timerfds that Detcore keeps on virtual time
+    /// (`crate::fd::VirtualTimerfd`), one descriptor per open file
+    /// description, lowest descriptor number first, so callers visit them in
+    /// a deterministic order.
+    pub(crate) fn virtual_timerfds(&self) -> Vec<(RawFd, DetFd)> {
+        let mut timerfds: Vec<(RawFd, DetFd)> = self
+            .metadata()
+            .file_handles
+            .iter()
+            .filter(|(_, detfd)| detfd.ty() == FdType::Timerfd && detfd.virtual_timerfd().is_some())
+            .map(|(&fd, detfd)| (fd, detfd.clone()))
+            .collect();
+        timerfds.sort_unstable_by_key(|(fd, _)| *fd);
+        let mut descriptions = Vec::with_capacity(timerfds.len());
+        timerfds.retain(|(_, detfd)| {
+            let id = detfd.open_file_id();
+            let first = !descriptions.contains(&id);
+            descriptions.push(id);
+            first
+        });
+        timerfds
     }
 
     /// Whether this thread's descriptor table holds a signalfd, as Detcore

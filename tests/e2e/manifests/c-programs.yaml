@@ -20613,13 +20613,12 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
-        ci_disabled_reason: 'Authoring host could not qualify the non-ptrace backends; the fixture is registered ptrace-only until each is qualified separately.'
+        ci: true
         backends_enabled:
           - ptrace
         backends_disabled:
           dbt: Not buildable on the authoring host (cmake absent); qualify DBT separately
-          kvm: KVM does not complete a guest on the authoring host; qualify KVM separately
+          kvm: Qualified on KVM separately from the ptrace cell; enabled by its own change
           sabre: Not buildable on the authoring host (cmake absent); qualify SaBRe separately
           liteinst: LiteInst preload handshake fails on the authoring host; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)

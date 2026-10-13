@@ -448,6 +448,85 @@ struct OpenFileDescription {
     /// wrong. Only the second is a reason to refuse `vfork`.
     #[serde(default)]
     flock_mode_ever_known: bool,
+    /// A timerfd's expirations as a function of virtual time, once the guest
+    /// has armed or disarmed it through Detcore (`VirtualTimerfd`). `None` for
+    /// every other description, and for a timerfd Detcore leaves to the host
+    /// (record/replay, or no virtual time).
+    #[serde(default)]
+    timerfd: Option<VirtualTimerfd>,
+}
+
+/// A timerfd's expirations counted on Detcore's virtual clock instead of the
+/// host's (timerfd_create(2)).
+///
+/// The host timerfd behind the descriptor is never armed with the guest's
+/// setting, so the host cannot make it readable at a host-timed moment.
+/// Instead, when a thread of the process observes the descriptor after the
+/// virtual deadline (`crate::syscalls::timerfd`), Detcore counts the
+/// expirations here and makes the host descriptor readable before the guest's
+/// probe runs; a `read` then returns the count kept here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct VirtualTimerfd {
+    /// The next expiration not yet counted, or `None` when disarmed.
+    pub(crate) deadline: Option<LogicalTime>,
+    /// The reload interval in nanoseconds, 0 for a one-shot timer.
+    pub(crate) interval_ns: u64,
+    /// Expirations counted but not yet read.
+    pub(crate) unread: u64,
+}
+
+impl VirtualTimerfd {
+    /// The state `timerfd_settime` leaves: armed at `deadline` (or disarmed
+    /// with `None`), with no expiration pending, as Linux discards the count.
+    /// A disarmed timer keeps `interval_ns`, which `timerfd_gettime` reports.
+    pub(crate) fn set(deadline: Option<LogicalTime>, interval_ns: u64) -> Self {
+        VirtualTimerfd {
+            deadline,
+            interval_ns,
+            unread: 0,
+        }
+    }
+
+    /// Counts every expiration at or before `now`, as Linux would have by
+    /// then, and returns how many were added. A periodic timer moves to its
+    /// first expiration after `now`; a one-shot timer disarms.
+    pub(crate) fn expire_through(&mut self, now: LogicalTime) -> u64 {
+        let Some(deadline) = self.deadline else {
+            return 0;
+        };
+        if now < deadline {
+            return 0;
+        }
+        let elapsed = now.as_nanos() - deadline.as_nanos();
+        let added = match elapsed.checked_div(self.interval_ns) {
+            // A one-shot timer expires once and disarms.
+            None => {
+                self.deadline = None;
+                1
+            }
+            Some(periods) => {
+                let added = 1 + periods;
+                self.deadline = Some(LogicalTime::from_nanos(
+                    deadline
+                        .as_nanos()
+                        .saturating_add(added.saturating_mul(self.interval_ns)),
+                ));
+                added
+            }
+        };
+        self.unread = self.unread.saturating_add(added);
+        added
+    }
+
+    /// `timerfd_gettime`'s answer at `now`, after `expire_through(now)`: the
+    /// time left to the next expiration (0 when disarmed) and the interval,
+    /// both in nanoseconds.
+    pub(crate) fn remaining(&self, now: LogicalTime) -> (u64, u64) {
+        let left = self.deadline.map_or(0, |deadline| {
+            deadline.as_nanos().saturating_sub(now.as_nanos())
+        });
+        (left, self.interval_ns)
+    }
 }
 
 impl PartialEq for DetFd {
@@ -509,6 +588,7 @@ impl DetFd {
                 flock_mode: None,
                 flock_mode_known: true,
                 flock_mode_ever_known: true,
+                timerfd: None,
                 // By default, we assume it matches the flags we were given:
                 physically_nonblocking: oflags_nonblocking(bits),
             }))),
@@ -645,6 +725,19 @@ impl DetFd {
     /// File type attached to the open file description.
     pub fn ty(&self) -> FdType {
         self.with_description(|d| d.ty)
+    }
+
+    /// This timerfd's virtual-time model, if Detcore keeps one.
+    pub(crate) fn virtual_timerfd(&self) -> Option<VirtualTimerfd> {
+        self.with_description(|d| d.timerfd)
+    }
+
+    /// Replace this timerfd's virtual-time model, under every alias.
+    pub(crate) fn set_virtual_timerfd(&self, timerfd: Option<VirtualTimerfd>) {
+        self.with_description(|d| {
+            debug_assert_eq!(d.ty, FdType::Timerfd);
+            d.timerfd = timerfd;
+        })
     }
 
     /// Record the process identity carried by a newly created pidfd.
@@ -1919,5 +2012,67 @@ mod tests {
         );
         assert_eq!(channel.canonical(id, |model| model.random_device_offset), 5);
         assert_eq!(channel.takes(id), 2);
+    }
+
+    fn at(ns: u64) -> LogicalTime {
+        LogicalTime::from_nanos(ns)
+    }
+
+    /// A one-shot timerfd counts one expiration once virtual time reaches its
+    /// deadline, then disarms; before the deadline it counts none.
+    #[test]
+    fn a_one_shot_timerfd_expires_once_at_its_virtual_deadline() {
+        let mut timer = VirtualTimerfd::set(Some(at(1_000)), 0);
+        assert_eq!(timer.expire_through(at(999)), 0);
+        assert_eq!(timer.remaining(at(999)), (1, 0));
+        assert_eq!(timer.expire_through(at(1_000)), 1);
+        assert_eq!(
+            timer,
+            VirtualTimerfd {
+                deadline: None,
+                interval_ns: 0,
+                unread: 1
+            }
+        );
+        assert_eq!(timer.expire_through(at(5_000)), 0);
+        assert_eq!(timer.remaining(at(5_000)), (0, 0));
+    }
+
+    /// A periodic timerfd observed late counts every expiration it missed,
+    /// exactly, and its next deadline stays on the original grid: the count
+    /// is a function of virtual time, not of how often it was observed.
+    #[test]
+    fn a_periodic_timerfd_counts_every_missed_expiration_on_its_grid() {
+        let mut once = VirtualTimerfd::set(Some(at(1_000)), 300);
+        assert_eq!(once.expire_through(at(1_950)), 4);
+        assert_eq!(once.deadline, Some(at(2_200)));
+        assert_eq!(once.remaining(at(1_950)), (250, 300));
+
+        let mut often = VirtualTimerfd::set(Some(at(1_000)), 300);
+        let mut added = 0;
+        for now in [1_000, 1_100, 1_300, 1_599, 1_950] {
+            added += often.expire_through(at(now));
+        }
+        assert_eq!(added, 4);
+        assert_eq!(often, once);
+    }
+
+    /// A timer disarmed with a zero value keeps its interval for
+    /// `timerfd_gettime`, as Linux does, and never expires.
+    #[test]
+    fn a_disarmed_timerfd_keeps_its_interval_and_never_expires() {
+        let mut timer = VirtualTimerfd::set(None, 300);
+        assert_eq!(timer.expire_through(at(u64::MAX / 2)), 0);
+        assert_eq!(timer.remaining(at(5)), (0, 300));
+        assert_eq!(timer.unread, 0);
+    }
+
+    /// Setting a timerfd discards its unread expirations, as Linux does.
+    #[test]
+    fn setting_a_timerfd_discards_unread_expirations() {
+        let mut timer = VirtualTimerfd::set(Some(at(10)), 0);
+        timer.expire_through(at(20));
+        assert_eq!(timer.unread, 1);
+        assert_eq!(VirtualTimerfd::set(None, 0).unread, 0);
     }
 }
