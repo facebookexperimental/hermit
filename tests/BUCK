@@ -13,7 +13,6 @@ load("//hermetic_infra/common:wrap_test_suite.bzl", "RR_TEST_TARGETS", "wrap_tes
 load(
     ":helpers.bzl",
     "hermit_bin_test",
-    "hermit_c_test",
     "hermit_chaos_stress_test",
     "hermit_python_test",
     "hermit_rust_test",
@@ -259,34 +258,10 @@ buck_sh_test(
     for p in glob(["python/non_strict/*.py"])
 ]
 
-tracereplay_exempt_c = [
-    "c/vforkExec.c",
-]
-
-[
-    hermit_c_test(
-        chaos = True,
-        chaosreplay = True,
-        no_deterministic_io = False,
-        no_sequentialize_threads = False,
-        path = p,
-        raw = True,
-        record_and_replay = True,
-        run = True,
-        # TODO(T124837711): get the rest of the tests working under trace replay:
-        tracereplay = not p in tracereplay_exempt_c,
-        # TODO(T124837711): get the rest of the tests working under trace replay:
-        tracereplay_chaos = not p in tracereplay_exempt_c
-        and not p
-        in [
-            "c/just_spin.c",
-        ],
-    )
-    for p in glob(
-        ["c/*.c"],
-        exclude = ["c/fp_reduction_nondeterminism.c"],
-    )
-]
+# The C programs in c/ are not wrapped here. Since c/BUCK made c/ its own
+# package (2026-07-25), a glob(["c/*.c"]) from this package matches nothing, so
+# the old hermit_c_test block generated no targets. The OSS e2e c-programs
+# cells, run as Tpx tests under //hermetic_infra/hermit_e2e_buck, cover them.
 
 # Similar to C tests but built in custom ways.
 [
