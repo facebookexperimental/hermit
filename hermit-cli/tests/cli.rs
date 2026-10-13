@@ -8210,35 +8210,45 @@ fn a_sigsuspend_mask_on_a_shared_stack_below_the_red_zone_is_copied_elsewhere() 
 
 /// tests/c/sigchld_once_per_child_exit.c: one SIGCHLD per child exit, with
 /// Linux's siginfo (https://github.com/rrnewton/hermit/issues/3895). The
-/// child exits with `_exit(7)`, and the parent keeps SIGCHLD unblocked for a
-/// second after its first one, so a second SIGCHLD for the exit would be
+/// child exits with `_exit(7)` (`exit-group`), or its only thread calls the
+/// raw `exit` syscall (`raw-exit`), and the parent keeps SIGCHLD unblocked for
+/// a second after its first one, so a second SIGCHLD for the exit would be
 /// delivered too. Both the kernel and the scheduler send one; the first
 /// delivered stands for the exit, the other is dropped, and the scheduler's
 /// carries CLD_EXITED, the child's pid and the status instead of the
-/// tracer's SI_USER.
+/// tracer's SI_USER. Before, a raw exit registered no `ChildExit` timer, and
+/// the parent in `sigsuspend` was reported deadlocked (exit 125) before the
+/// kernel's own copy reached it: 6 of 6 runs of `raw-exit` with
+/// `--max-timeslice=disabled`.
 #[test]
 fn a_child_exit_is_notified_once_with_linuxs_siginfo() {
     let _guard = hermit_run_guard();
     let guest = sigchld_once_per_child_exit_guest()
         .to_str()
         .expect("guest path should be UTF-8");
-    let args = [
-        "run",
-        "--strict",
-        "--verify",
-        "--verify-strict",
-        "--",
-        guest,
-        "exit-group",
-    ];
-    let output = hermit(&args);
-    assert_success(&output, &args);
-    assert_eq!(stdout(&output), "sigchld=1 code=1 pid=child status=7\n");
-    assert!(
-        stderr(&output).contains("Determinism verified"),
-        "missing verification success marker:\n{}",
-        stderr(&output)
-    );
+    // Each mode runs with default timeslices and without timeslice
+    // preemption. Without it, the parent reaches its `sigsuspend` with the
+    // child's exit already granted, the order in which a raw exit's missing
+    // timer deadlocked every run.
+    for mode in ["exit-group", "raw-exit"] {
+        for timeslice in [None, Some("--max-timeslice=disabled")] {
+            let mut args = vec!["run", "--strict", "--verify", "--verify-strict"];
+            args.extend(timeslice);
+            args.extend(["--", guest, mode]);
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            assert_eq!(
+                stdout(&output),
+                "sigchld=1 code=1 pid=child status=7\n",
+                "{mode} {timeslice:?}"
+            );
+            assert!(
+                stderr(&output).contains("Determinism verified"),
+                "{mode} {timeslice:?}: missing verification success marker:\n{}",
+                stderr(&output)
+            );
+        }
+    }
 }
 
 /// tests/c/clone_exit_signal_effective.c: a child's effective exit signal

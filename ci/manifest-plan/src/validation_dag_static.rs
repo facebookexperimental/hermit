@@ -2064,7 +2064,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And get_mempolicy_output_faults_are_efault_and_backend_errors_are_tool_errors
     // (Claude re-check of https://github.com/rrnewton/hermit/pull/4249): 1528, by listing.
     // And the five FIFO peer-scan tests (https://github.com/rrnewton/hermit/issues/4200): 1533, by listing.
-    ("test.detcore_unit", 1533),
+    // And the two raw-exit ChildExit tests (https://github.com/rrnewton/hermit/issues/3895): 1535.
+    ("test.detcore_unit", 1535),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3324,7 +3325,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the four virtual-cpuinfo tests: 1527, by listing.
     // And the get_mempolicy output-error test: 1528, by listing.
     // And the five FIFO peer-scan tests: 1533, by listing.
-    ("test.detcore_unit_on_host", 1533),
+    // And the two raw-exit ChildExit tests: 1535.
+    ("test.detcore_unit_on_host", 1535),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

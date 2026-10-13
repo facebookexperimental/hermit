@@ -1960,7 +1960,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/sigchld_once_per_child_exit.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/sigchld_once_per_child_exit.c is owned by hermit-cli/tests/cli.rs: a child's exit must notify its parent with exactly one SIGCHLD carrying Linux's siginfo (CLD_EXITED, the child's pid, its status), although both the kernel and the scheduler send one (https://github.com/rrnewton/hermit/issues/3895); the integration test runs its exit-group mode under run --strict --verify --verify-strict. It remains a fixture because its raw-exit mode documents a known deadlock and no generic manifest mode runs only one of its modes."
+      "why": "tests/c/sigchld_once_per_child_exit.c is owned by hermit-cli/tests/cli.rs: a child's exit must notify its parent with exactly one SIGCHLD carrying Linux's siginfo (CLD_EXITED, the child's pid, its status), although both the kernel and the scheduler send one (https://github.com/rrnewton/hermit/issues/3895); the integration test runs its exit-group and raw-exit modes under run --strict --verify --verify-strict, with default timeslices and with --max-timeslice=disabled. It remains a fixture because no generic manifest mode runs only one of its modes."
     },
     {
       "disposition": "guest-fixture",

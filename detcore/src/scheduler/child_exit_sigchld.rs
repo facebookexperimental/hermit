@@ -230,6 +230,12 @@ pub enum ChildExitSigchldControl {
         private: Option<DetTid>,
         shared: Option<DetPid>,
     },
+    /// The calling thread is about to request its raw `exit`, with the
+    /// `SIGCHLD` fields its process's parent would get if this exit ends the
+    /// process. Only the exit grant knows whether it does, so the status is
+    /// kept for this thread alone ([`ChildExitSigchldLedger::raw_exit_status`])
+    /// and settled there. Appended after `SendFailed`.
+    RawExitStatus { code: i32, status: i32, uid: u32 },
 }
 
 /// What becomes of a `SIGCHLD` the scheduler sent, at its delivery stop.
@@ -343,6 +349,12 @@ pub(crate) struct ChildExitSigchldLedger {
     /// window could match it to a send queued after it; for such a process
     /// the window is not used (`Scheduler::sigchld_window_usable`).
     pub(super) outside_takers: std::collections::BTreeSet<DetPid>,
+    /// The status each thread reported just before its raw `exit` request
+    /// (`ChildExitSigchldControl::RawExitStatus`), until that request's grant
+    /// settles it (`settle_exit_grant`). Kept per thread, so a raw exit of a
+    /// thread that is not the last never touches its process's
+    /// `exit_status`, which a sibling's `exit_group` may have just reported.
+    pub(super) raw_exit_status: BTreeMap<DetTid, ChildExitSiginfo>,
 }
 
 /// What the `ChildExit` timer of an owned child does.
@@ -644,6 +656,31 @@ impl ChildExitSigchldLedger {
         self.forget_window(process);
         self.outside_takers.remove(&process);
     }
+
+    /// At the `Exit` grant of `thread` of `process` (`group`: an
+    /// `exit_group`), which ends the process if `ends_process`: a raw exit
+    /// that ends the process leaves its status in `exit_status` for `own`,
+    /// and any other raw exit's status is dropped. An `exit_group` keeps the
+    /// status it reported for the process, which a sibling's raw exit no
+    /// longer overwrites. Linux notifies the parent with the status of the
+    /// last thread to leave, also when the leader raw-exited earlier and stayed
+    /// a zombie: measured natively, a leader's `exit(4)` followed by the last
+    /// worker's `exit(5)` or `exit_group(5)` gives `si_status` 5.
+    pub(crate) fn settle_exit_grant(
+        &mut self,
+        thread: DetTid,
+        process: DetPid,
+        group: bool,
+        ends_process: bool,
+    ) {
+        let raw = self.raw_exit_status.remove(&thread);
+        if ends_process
+            && !group
+            && let Some(raw) = raw
+        {
+            self.exit_status.insert(process, raw);
+        }
+    }
 }
 
 impl Scheduler {
@@ -802,6 +839,19 @@ impl Scheduler {
                     self.models_signal_targets
                         && self.child_exit_sigchld.private_sent.insert(target),
                 )
+            }
+            ChildExitSigchldControl::RawExitStatus { code, status, uid } => {
+                let process = self.sigchld_process(dtid);
+                self.child_exit_sigchld.raw_exit_status.insert(
+                    dtid,
+                    ChildExitSiginfo {
+                        code,
+                        pid: process.as_raw(),
+                        uid,
+                        status,
+                    },
+                );
+                ChildExitSigchldAnswer::Recorded
             }
             ChildExitSigchldControl::SendFailed { private, shared } => {
                 if let Some(target) = private {
@@ -1068,6 +1118,69 @@ mod tests {
             assert_eq!(info.si_stime(), 0);
         }
         assert_eq!(siginfo_code_and_pid(&bytes), (libc::CLD_EXITED, 42));
+    }
+
+    /// The status a raw `exit` reports is kept for its thread and settled at
+    /// that thread's grant (https://github.com/rrnewton/hermit/issues/3895):
+    /// - a worker's raw exit that does not end the process leaves alone the
+    ///   status a sibling's `exit_group` reported, which the process's parent
+    ///   then gets;
+    /// - a leader that raw-exits while other threads live leaves nothing
+    ///   behind, and the parent gets the last thread's status, as on Linux;
+    /// - the only thread's raw exit gives its own.
+    #[test]
+    fn a_raw_exit_status_is_settled_at_its_grant() {
+        let leader = DetTid::from_raw(CHILD.as_raw());
+        let worker = DetTid::from_raw(21);
+        let raw = |ledger: &mut ChildExitSigchldLedger, thread: DetTid, status: i32| {
+            ledger
+                .raw_exit_status
+                .insert(thread, exited(CHILD.as_raw(), status));
+        };
+
+        // A worker's raw exit between its sibling's exit_group report and
+        // that sibling's grant.
+        let mut ledger = ChildExitSigchldLedger::default();
+        raw(&mut ledger, worker, 1);
+        ledger.exit_status.insert(CHILD, exited(CHILD.as_raw(), 2));
+        ledger.settle_exit_grant(worker, CHILD, false, false);
+        assert!(ledger.raw_exit_status.is_empty());
+        ledger.settle_exit_grant(leader, CHILD, true, true);
+        assert_eq!(
+            ledger.exit_status.get(&CHILD),
+            Some(&exited(CHILD.as_raw(), 2))
+        );
+
+        // The leader leaves first, then the last thread by raw exit or
+        // exit_group.
+        for last_by_group in [false, true] {
+            let mut ledger = ChildExitSigchldLedger::default();
+            raw(&mut ledger, leader, 4);
+            ledger.settle_exit_grant(leader, CHILD, false, false);
+            assert!(ledger.exit_status.is_empty());
+            assert!(ledger.raw_exit_status.is_empty());
+            if last_by_group {
+                ledger.exit_status.insert(CHILD, exited(CHILD.as_raw(), 5));
+            } else {
+                raw(&mut ledger, worker, 5);
+            }
+            ledger.settle_exit_grant(worker, CHILD, last_by_group, true);
+            assert_eq!(
+                ledger.exit_status.get(&CHILD),
+                Some(&exited(CHILD.as_raw(), 5)),
+                "exit_group: {last_by_group}"
+            );
+        }
+
+        // The only thread's raw exit.
+        let mut ledger = ChildExitSigchldLedger::default();
+        raw(&mut ledger, leader, 7);
+        ledger.settle_exit_grant(leader, CHILD, false, true);
+        assert_eq!(
+            ledger.exit_status.get(&CHILD),
+            Some(&exited(CHILD.as_raw(), 7))
+        );
+        assert!(ledger.own(PARENT, CHILD));
     }
 
     /// Only a child that reported its status is owned, and only by its

@@ -4083,8 +4083,11 @@ impl Scheduler {
         self.release_vfork_child(*dtid);
         self.vfork_registration_origins.remove(dtid);
         self.saved_guest_sigmasks.remove(dtid);
-        // Its private queue dies with it.
+        // Its private queue dies with it, and so does a raw-exit status its
+        // grant never settled (a thread killed between its report and its
+        // grant).
         self.child_exit_sigchld.private_sent.remove(dtid);
+        self.child_exit_sigchld.raw_exit_status.remove(dtid);
         if dtid.as_raw() == detpid.as_raw() {
             self.child_exit_publications_completed.remove(detpid);
         }
@@ -9770,22 +9773,42 @@ impl Scheduler {
                 // The thread leaves by its own committed exit, not by dying
                 // with its process (https://github.com/rrnewton/hermit/issues/3904).
                 self.committed_exits.insert(dettid);
+                let last_live_thread = !self
+                    .thread_tree
+                    .my_thread_group(process)
+                    .into_iter()
+                    .any(|tid| tid != dettid && self.next_turns.contains_key(&tid));
                 // An exit that ends its process leaves the host some time after
                 // this grant. Hold turn selection from here until the backend
                 // reports the process physically gone (asynchronous exit
                 // completion), so no peer observes its descriptors still open.
                 if self.backend.process_exits_complete_asynchronously
-                    && (*group
-                        || !self
-                            .thread_tree
-                            .my_thread_group(process)
-                            .into_iter()
-                            .any(|tid| tid != dettid && self.next_turns.contains_key(&tid)))
+                    && (*group || last_live_thread)
                 {
                     self.begin_exit_at_grant(*process);
                 }
+                // Whether this grant ends `process`, as far as its parent's
+                // notification goes: an `exit_group`, or the raw `exit` of its
+                // last live thread, which Linux ends exactly as an
+                // `exit_group` (statically linked busybox leaves that way).
+                // A raw exit counts only where `process` is the exiting
+                // thread's own process: for a raw clone child with a
+                // non-SIGCHLD exit signal the backend names its creator
+                // (https://github.com/rrnewton/hermit/issues/4012).
+                let ends_process = *group
+                    || (last_live_thread && self.registered_process(dettid) == Some(*process));
+                self.child_exit_sigchld
+                    .settle_exit_grant(dettid, *process, *group, ends_process);
+                // The parent's child-exit notification is placed for every
+                // grant that ends the process. Before, only an `exit_group`
+                // registered the `ChildExit` timer, so a parent waiting in
+                // `rt_sigsuspend` for the SIGCHLD of a child whose last thread
+                // left through raw `exit` could be woken only by the kernel's
+                // own copy, at a host-timed moment, and the empty run queue was
+                // usually reported as a deadlock first
+                // (https://github.com/rrnewton/hermit/issues/3895).
                 if reserve_mode == signal_control::ExitReserveMode::Uncontrolled
-                    && *group
+                    && ends_process
                     && let Some(parent) = self.thread_tree.parent_process(process)
                     && self.should_synthesize_child_exit_signal(parent)
                 {
@@ -9878,7 +9901,10 @@ impl Scheduler {
                         }
                     }
                 }
-                if *group {
+                // The status reported for the process is consumed by a grant
+                // that ends it (`settle_exit_grant` placed it, and `own` took
+                // it if the notification is the scheduler's own).
+                if ends_process {
                     self.child_exit_sigchld.forget_exit_status(*process);
                 }
                 Ok(())

@@ -2313,6 +2313,77 @@ fn controlled_exit_mode_never_enqueues_legacy_timed_sigchld() {
     );
 }
 
+/// A raw `exit` of a process's last live thread ends the process as an
+/// `exit_group` does, so its grant registers the parent's `ChildExit` timer
+/// too; a raw `exit` of a thread that is not the last ends no process and
+/// registers none, nor does one whose backend-named process is not its own.
+/// Before, only `group: true` registered the timer, and a
+/// parent in `rt_sigsuspend` waiting for such a child's SIGCHLD was reported
+/// deadlocked (https://github.com/rrnewton/hermit/issues/3895).
+#[test]
+fn a_raw_exit_of_the_last_thread_registers_the_child_exit_timer() {
+    let raw_exit = |s: &mut Scheduler, thread: DetTid, mm: MmId| {
+        assert!(
+            s.block_for_one_resource(
+                thread,
+                &ResourceID::Exit {
+                    group: false,
+                    process: DetPid::from_raw(200),
+                    mm,
+                },
+                &Permission::RW,
+                None,
+                None,
+                &Ivar::new(),
+            )
+            .is_ok()
+        );
+    };
+    let parent = DetPid::from_raw(100);
+    let child_process = DetPid::from_raw(200);
+
+    // The child's only thread: the timer is registered.
+    let mut last = Scheduler::new(&Config::default());
+    let _ = add(&mut last, 100, 100);
+    let (child, child_mm, _) = add_process_child(&mut last, 100, 200);
+    let deadline = last.committed_time + LogicalTime::from_nanos(1);
+    raw_exit(&mut last, child, child_mm);
+    assert_eq!(
+        last.blocked.timed_waiters.iter().collect::<Vec<_>>(),
+        vec![(
+            deadline,
+            TimedEvent::SignalEvt(
+                timed_waiters::SignalTimerId::ChildExit {
+                    child: child_process,
+                    parent,
+                },
+                SignalTarget::Process(parent),
+                Signal::SIGCHLD.into(),
+            ),
+        )]
+    );
+
+    // A second thread of the child leaves first: no timer.
+    let mut not_last = Scheduler::new(&Config::default());
+    let _ = add(&mut not_last, 100, 100);
+    let (_child, child_mm, _) = add_process_child(&mut not_last, 100, 200);
+    let (thread, _, _) = add_with_mm(&mut not_last, 200, 201, child_mm);
+    raw_exit(&mut not_last, thread, child_mm);
+    assert!(not_last.blocked.timed_waiters.is_empty());
+
+    // A raw clone child that is its own process, whose exit the backend
+    // names by its creator (https://github.com/rrnewton/hermit/issues/4012),
+    // after the creator is gone: the creator's parent was already notified for
+    // the creator, so no timer.
+    let mut raw_clone = Scheduler::new(&Config::default());
+    let _ = add(&mut raw_clone, 100, 100);
+    let (creator, _, _) = add_process_child(&mut raw_clone, 100, 200);
+    let (raw_child, raw_child_mm, _) = add_process_child(&mut raw_clone, 200, 300);
+    raw_clone.next_turns.remove(&creator);
+    raw_exit(&mut raw_clone, raw_child, raw_child_mm);
+    assert!(raw_clone.blocked.timed_waiters.is_empty());
+}
+
 #[test]
 fn exit_boundary_reservation_failure_has_no_local_effect() {
     let (mut s, backend) = fixture();
