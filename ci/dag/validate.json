@@ -21789,6 +21789,13 @@
           "category": "determinism-stress-c",
           "test": "determinism-stress-c/mmap-fork-shared",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "determinism-stress-c",
+          "test": "determinism-stress-c/mmap-fork-shared",
+          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -22070,6 +22077,13 @@
           "test": "determinism-stress/process-chains",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "determinism-stress",
+          "test": "determinism-stress/thread-contention",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -60894,6 +60908,13 @@
           "category": "determinism-stress-c",
           "test": "determinism-stress-c/mmap-fork-shared",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "determinism-stress-c",
+          "test": "determinism-stress-c/mmap-fork-shared",
+          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -61166,6 +61187,13 @@
           "test": "determinism-stress/process-chains",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "determinism-stress",
+          "test": "determinism-stress/thread-contention",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",

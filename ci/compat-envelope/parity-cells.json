@@ -9,12 +9,12 @@
   "counts": {
     "all": {
       "cells": 4085,
-      "applicable": 1909,
-      "selectable": 1581,
+      "applicable": 1911,
+      "selectable": 1583,
       "population": 2775,
-      "population_candidate_selected": 1581,
+      "population_candidate_selected": 1583,
       "population_candidate_not_selected": 258,
-      "population_candidate_disabled": 936
+      "population_candidate_disabled": 934
     },
     "by_backend": {
       "dbt": {
@@ -37,12 +37,12 @@
       },
       "kvm": {
         "cells": 817,
-        "applicable": 540,
-        "selectable": 510,
+        "applicable": 542,
+        "selectable": 512,
         "population": 555,
-        "population_candidate_selected": 510,
+        "population_candidate_selected": 512,
         "population_candidate_not_selected": 3,
-        "population_candidate_disabled": 42
+        "population_candidate_disabled": 40
       },
       "liteinst": {
         "cells": 817,
@@ -3762,7 +3762,7 @@
     {"test_id":"determinism-stress-c/lock-free","backend":"sabre","category":"determinism-stress-c","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: This determinism cell calibrates the ptrace strict-verify baseline; qualify SaBRe separately"},
     {"test_id":"determinism-stress-c/mmap-fork-shared","backend":"dbt","category":"determinism-stress-c","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"determinism-stress-c/mmap-fork-shared","backend":"in-guest-trap","category":"determinism-stress-c","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"determinism-stress-c/mmap-fork-shared","backend":"kvm","category":"determinism-stress-c","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"},
+    {"test_id":"determinism-stress-c/mmap-fork-shared","backend":"kvm","category":"determinism-stress-c","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"determinism-stress-c/mmap-fork-shared","backend":"liteinst","category":"determinism-stress-c","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"determinism-stress-c/mmap-fork-shared","backend":"sabre","category":"determinism-stress-c","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"},
     {"test_id":"determinism-stress-c/pid-tid","backend":"dbt","category":"determinism-stress-c","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: This determinism cell calibrates the ptrace strict-verify baseline; qualify DBT separately"},
@@ -3822,7 +3822,7 @@
     {"test_id":"determinism-stress/process-chains","backend":"sabre","category":"determinism-stress","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: SaBRe requires its external runtime"},
     {"test_id":"determinism-stress/thread-contention","backend":"dbt","category":"determinism-stress","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: DBT coverage is owned by its backend parity partition"},
     {"test_id":"determinism-stress/thread-contention","backend":"in-guest-trap","category":"determinism-stress","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
-    {"test_id":"determinism-stress/thread-contention","backend":"kvm","category":"determinism-stress","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: KVM requires the privileged runner"},
+    {"test_id":"determinism-stress/thread-contention","backend":"kvm","category":"determinism-stress","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"determinism-stress/thread-contention","backend":"liteinst","category":"determinism-stress","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: LiteInst coverage is owned by its backend compatibility partition"},
     {"test_id":"determinism-stress/thread-contention","backend":"sabre","category":"determinism-stress","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: SaBRe requires its external runtime"},
     {"test_id":"determinism-stress/thread-interleaving","backend":"dbt","category":"determinism-stress","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is disabled: Chaos mode owns this guest; Hermit verifies same-seed repeatability inside every chaos attempt"},
