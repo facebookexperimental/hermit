@@ -186,8 +186,11 @@ hermit_e2e_bundle = rule(
     },
 )
 
-def hermit_e2e_cells(plan, re_exclusions, bundle = ":bundle", runner = "cell.sh"):
-    """One hermit_e2e_cell_test per plan cell, plus test suites all / re / local."""
+def hermit_e2e_cells(plan, re_exclusions, bundle = ":bundle", runner = "cell.sh", labels = []):
+    """One hermit_e2e_cell_test per plan cell, plus test suites all / re / local.
+
+    `labels` are added to every cell's test, e.g. a consumer's CI scheduling labels.
+    """
     routing = read_root_config("hermit_e2e", "routing", "hybrid")
     if routing not in ["hybrid", "local"]:
         fail("-c hermit_e2e.routing must be hybrid or local, got " + routing)
@@ -246,7 +249,9 @@ def hermit_e2e_cells(plan, re_exclusions, bundle = ":bundle", runner = "cell.sh"
                 "hermit_e2e",
                 "hermit_e2e_route_" + where,
                 "hermit_e2e_backend_" + cell["backend"],
-            ] + (["hermit_e2e_container_" + container.replace("-", "_")] if container else []),
+            ]
+            + (["hermit_e2e_container_" + container.replace("-", "_")] if container else [])
+            + labels,
             route = where,
         )
         by_route[where].append(":" + name)
