@@ -44,10 +44,12 @@ cargo test -p hermit --test rr_suite -- --ignored rr_hello # one
 
 Starting from the fbsource `RR_TEST_TARGETS` minus the tests fbsource already
 disables under Hermit (its `wrap_test_suite(exclude=[...])` list), **218** rr
-programs build against this checkout and **214** pass when each program receives
-a fresh scratch directory.
-One of those (`rr_multiple_pending_signals_sequential`) turned out to be flaky
-(intermittently hangs), so the harness enables the remaining **213**. Each run is
+programs build against this checkout, and the harness enables the **217** that
+pass when each program receives a fresh scratch directory.
+`rr_rusage`, `rr_sigchld_interrupt_signal`,
+`rr_sigprocmask_in_syscallbuf_sighandler` and `rr_spinlock_priorities` were
+enabled on 2026-10-13, after they passed 3 of 3 runs each (`rr_rusage` 2 of 2)
+at main `d851dee4`. Each run is
 wrapped in `timeout(1)` (`120s`) with a `10s` TERM-to-KILL grace period so any
 future hang fails that test cleanly rather than blocking the serialized suite.
 Special cases carried over from fbsource:
@@ -62,11 +64,7 @@ They are excluded from the harness and tracked here:
 
 | rr test | symptom | likely Hermit gap |
 | --- | --- | --- |
-| `rr_rusage` | guest aborts: `rusage.c:10 !(r->ru_maxrss > 0)` | `getrusage` returns `ru_maxrss == 0` (rusage not virtualized) |
-| `rr_sigchld_interrupt_signal` | hangs (>60s timeout) | SIGCHLD interrupt/restart handling |
-| `rr_sigprocmask_in_syscallbuf_sighandler` | hangs (>60s timeout) | signal mask manipulation inside a signal handler |
-| `rr_spinlock_priorities` | hangs (>60s timeout) | priority-based scheduling / spin behavior |
-| `rr_multiple_pending_signals_sequential` | flaky: intermittently hangs (passed once, hung on a later run) | nondeterministic multi-signal delivery ordering |
+| `rr_multiple_pending_signals_sequential` | refused by name (exit 122): "process-directed signal 10 to process 3 by kill is not supported: the sending thread blocks the signal"; it used to hang intermittently | https://github.com/rrnewton/hermit/issues/4034, tracked for this test in https://github.com/rrnewton/hermit/issues/116 |
 
 `rr_arch_prctl` (fbsource `test_arch_prctl`) has no plain `src/test/arch_prctl.c`
 upstream — only `src/test/x86/arch_prctl_x86.c` and `arch_prctl_xstate.c` — so it

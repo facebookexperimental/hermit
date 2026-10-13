@@ -361,8 +361,9 @@ rr_test!(
     0,
     &[]
 );
-// rr_multiple_pending_signals_sequential is flaky under Hermit (intermittently
-// hangs); see docs/rr-test-suite.md.
+// rr_multiple_pending_signals_sequential is refused under Hermit: it sends a
+// process-directed signal that the sending thread blocks
+// (https://github.com/rrnewton/hermit/issues/4034); see docs/rr-test-suite.md.
 rr_test!(rr_munmap_discontinuous, "munmap_discontinuous", 0, &[]);
 rr_test!(rr_munmap_segv, "munmap_segv", 0, &[]);
 rr_test!(rr_netlink_mmap_disable, "netlink_mmap_disable", 0, &[]);
@@ -407,6 +408,7 @@ rr_test!(rr_readv, "readv", 0, &[]);
 rr_test!(rr_recvfrom, "recvfrom", 0, &[]);
 rr_test!(rr_rename, "rename", 0, &[]);
 rr_test!(rr_rlimit, "rlimit", 0, &[]);
+rr_test!(rr_rusage, "rusage", 0, &[]);
 rr_test!(rr_sched_attr, "sched_attr", 0, &[]);
 rr_test!(rr_sched_setaffinity, "sched_setaffinity", 0, &[]);
 rr_test!(rr_sched_setparam, "sched_setparam", 0, &[]);
@@ -446,6 +448,12 @@ rr_test!(rr_shm, "shm", 0, &[]);
 rr_test!(rr_shm_unmap, "shm_unmap", 0, &[]);
 rr_test!(rr_sigaction_old, "sigaction_old", 0, &[]);
 rr_test!(rr_sigaltstack, "sigaltstack", 0, &[]);
+rr_test!(
+    rr_sigchld_interrupt_signal,
+    "sigchld_interrupt_signal",
+    0,
+    &[]
+);
 rr_test!(rr_sigcont, "sigcont", 0, &[]);
 rr_test!(
     rr_sighandler_bad_rsp_sigsegv,
@@ -468,6 +476,12 @@ rr_test!(rr_signal_unstoppable, "signal_unstoppable", 0, &[]);
 rr_test!(rr_signalfd, "signalfd", 0, &[]);
 rr_test!(rr_sigprocmask, "sigprocmask", 0, &[]);
 rr_test!(rr_sigprocmask_evil, "sigprocmask_evil", 0, &[]);
+rr_test!(
+    rr_sigprocmask_in_syscallbuf_sighandler,
+    "sigprocmask_in_syscallbuf_sighandler",
+    0,
+    &[]
+);
 rr_test!(rr_sigprocmask_syscallbuf, "sigprocmask_syscallbuf", 0, &[]);
 rr_test!(rr_sigpwr, "sigpwr", 0, &[]);
 rr_test!(rr_sigqueueinfo, "sigqueueinfo", 0, &[]);
@@ -475,6 +489,7 @@ rr_test!(rr_sigreturn_reg, "sigreturn_reg", 0, &[]);
 rr_test!(rr_sigtrap, "sigtrap", 0, &[]);
 rr_test!(rr_simple_threads_stress, "simple_threads_stress", 0, &[]);
 rr_test!(rr_small_holes, "small_holes", 0, &[]);
+rr_test!(rr_spinlock_priorities, "spinlock_priorities", 0, &[]);
 rr_test!(rr_splice, "splice", 0, &[]);
 rr_test!(
     rr_stack_growth_after_syscallbuf,
