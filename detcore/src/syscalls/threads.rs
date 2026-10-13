@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use procfs::process::Process;
 use rand::Rng;
+use reverie::BackendCapabilities;
 use reverie::Error;
 use reverie::Guest;
 use reverie::Pid;
@@ -30,6 +31,7 @@ use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::WaitPidFlag;
 use tracing::debug;
+use tracing::error;
 use tracing::info;
 use tracing::trace;
 
@@ -965,11 +967,85 @@ pub(crate) enum SignalQueue {
     Shared,
 }
 
+/// Set once per Hermit process, by [`refuse_host_signal_state_reads`], when
+/// the backend's guest thread IDs do not name host tasks (KVM): a host
+/// `/proc/<pid>/task/<tid>/status` would then describe an unrelated host task,
+/// if any, chosen by host thread-ID allocation, so its signal state must never
+/// decide a guest-visible outcome. Every read that exists today is gated off on
+/// such a backend by a capability (`models_signal_targets`,
+/// `backend_supports_blocked_wait_signal_interruption`,
+/// `reports_child_exit_publication`, a nested PID namespace, or the guard in
+/// `restartable_internal_io_interrupting_signals`); this latch is the backstop
+/// for a future path that misses its gate.
+#[cfg(not(test))]
+static HOST_SIGNAL_STATE_READS_REFUSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+thread_local! {
+    /// The latch for unit tests, per test thread, so that tests reading their
+    /// own real `/proc` state run beside one that sets it.
+    static HOST_SIGNAL_STATE_READS_REFUSED_FOR_TEST: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Whether a backend with `backend`'s capabilities forbids host `/proc` signal
+/// state reads for its guest threads: exactly when its guest thread IDs do not
+/// name host tasks (`procfs_inode::guest_tids_name_host_tasks`).
+pub(crate) fn refuses_host_signal_state_reads(backend: &BackendCapabilities) -> bool {
+    !crate::procfs_inode::guest_tids_name_host_tasks(backend, None)
+}
+
+/// Latch the refusal for this process when `backend` forbids host `/proc`
+/// signal state reads ([`refuses_host_signal_state_reads`]). Called once, when
+/// Detcore's global state is created for a run.
+pub(crate) fn refuse_host_signal_state_reads(backend: &BackendCapabilities) {
+    if !refuses_host_signal_state_reads(backend) {
+        return;
+    }
+    #[cfg(not(test))]
+    HOST_SIGNAL_STATE_READS_REFUSED.store(true, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    HOST_SIGNAL_STATE_READS_REFUSED_FOR_TEST.with(|refused| refused.set(true));
+}
+
+/// Whether host `/proc` signal state reads are refused in this process
+/// ([`refuse_host_signal_state_reads`]).
+pub(crate) fn host_signal_state_reads_refused() -> bool {
+    #[cfg(not(test))]
+    {
+        HOST_SIGNAL_STATE_READS_REFUSED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(test)]
+    {
+        HOST_SIGNAL_STATE_READS_REFUSED_FOR_TEST.with(|refused| refused.get())
+    }
+}
+
 /// Read `tid`'s signal state from the kernel.
+///
+/// On a backend whose guest thread IDs do not name host tasks
+/// ([`host_signal_state_reads_refused`]) the read is refused with `ENOSYS`
+/// before it reaches `/proc`: a caller that needs the state ends the run by
+/// name (`BlockedWaitSignalError::StateUnreadable`), and one that treats an
+/// unreadable state as unknown keeps its documented fallback. Either way no
+/// unrelated host task's state reaches a decision.
 pub(crate) fn read_kernel_signal_state(pid: Pid, tid: Pid) -> Result<KernelSignalState, Errno> {
     #[cfg(test)]
     if let Some(result) = signal_state_read_seam::scripted(pid, tid) {
         return result;
+    }
+    if host_signal_state_reads_refused() {
+        static REPORTED: std::sync::Once = std::sync::Once::new();
+        REPORTED.call_once(|| {
+            error!(
+                "refused a host /proc signal state read of guest thread {} (process {}): this \
+                 backend's guest thread IDs do not name host tasks",
+                tid.as_raw(),
+                pid.as_raw()
+            );
+        });
+        return Err(Errno::ENOSYS);
     }
     let path = format!("/proc/{}/task/{}/status", pid.as_raw(), tid.as_raw());
     let status = std::fs::read_to_string(path).map_err(|_| Errno::ESRCH)?;
@@ -4630,6 +4706,38 @@ mod tests {
         assert!(read_thread_signal_state(wrong, tid).is_ok());
         assert!(!thread_is_gone(wrong, tid));
         assert!(read_thread_wait_signal_state(wrong, tid).is_ok());
+    }
+
+    /// Host `/proc` signal state reads are forbidden exactly where guest
+    /// thread IDs do not name host tasks: KVM, and no other backend today.
+    #[test]
+    fn host_signal_state_reads_are_refused_only_where_guest_tids_are_not_host_tasks() {
+        assert!(refuses_host_signal_state_reads(&BackendCapabilities::KVM));
+        for backend in [
+            BackendCapabilities::PTRACE,
+            BackendCapabilities::E9PATCH,
+            BackendCapabilities::SABRE,
+            BackendCapabilities::DBT,
+            BackendCapabilities::LITEINST_IN_GUEST,
+        ] {
+            assert!(!refuses_host_signal_state_reads(&backend));
+        }
+    }
+
+    /// Once the refusal is latched for a backend whose guest thread IDs are
+    /// not host tasks, a signal state read never reaches `/proc`: the test's
+    /// own live thread, whose state is readable before, is refused after.
+    #[test]
+    fn a_latched_refusal_never_reads_a_host_task_signal_state() {
+        let pid = Pid::from_raw(unsafe { libc::getpid() });
+        let tid = Pid::from_raw(unsafe { libc::syscall(libc::SYS_gettid) } as i32);
+        refuse_host_signal_state_reads(&BackendCapabilities::PTRACE);
+        assert!(!host_signal_state_reads_refused());
+        assert!(read_kernel_signal_state(pid, tid).is_ok());
+        refuse_host_signal_state_reads(&BackendCapabilities::KVM);
+        assert!(host_signal_state_reads_refused());
+        assert_eq!(read_kernel_signal_state(pid, tid), Err(Errno::ENOSYS));
+        assert_eq!(read_thread_signal_state(pid, tid), Err(Errno::ENOSYS));
     }
     use crate::config::Config;
     use crate::tool_global::GlobalRequest;

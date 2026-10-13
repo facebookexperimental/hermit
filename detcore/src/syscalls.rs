@@ -40,9 +40,11 @@ pub(crate) use threads::FutexDeadline;
 /// The kernel's view of a guest thread's signals, which the scheduler reads when
 /// it commits a wake for a parked precise-mode futex waiter or an emulated sleep.
 pub(crate) use threads::KernelSignalState;
+pub(crate) use threads::host_signal_state_reads_refused;
 pub(crate) use threads::read_kernel_signal_state;
 pub(crate) use threads::read_thread_signal_state;
 pub(crate) use threads::real_uid;
+pub(crate) use threads::refuse_host_signal_state_reads;
 #[cfg(test)]
 pub(crate) use threads::signal_state_read_seam;
 pub(crate) use threads::thread_is_gone;

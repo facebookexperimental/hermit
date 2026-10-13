@@ -2555,6 +2555,11 @@ pub(crate) fn classify_sigchld_notification(
 /// `/proc/<pid>/status`, or of `/proc/<pid>/task/<tid>/status` for a thread.
 #[cfg_attr(test, allow(dead_code))]
 fn proc_status_signal_mask(pid: DetPid, tid: Option<DetTid>, field: &str) -> Option<u64> {
+    // Refused, as `read_kernel_signal_state` is, where guest thread IDs do not
+    // name host tasks.
+    if crate::syscalls::host_signal_state_reads_refused() {
+        return None;
+    }
     let path = match tid {
         Some(tid) => format!("/proc/{}/task/{}/status", pid.as_raw(), tid.as_raw()),
         None => format!("/proc/{}/status", pid.as_raw()),

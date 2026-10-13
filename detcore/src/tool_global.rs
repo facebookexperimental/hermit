@@ -1725,6 +1725,9 @@ impl GlobalTool for GlobalState {
 
     /// Called once during startup.
     async fn init_global_state(cfg: &Config) -> GlobalState {
+        // A backend whose guest thread IDs are not host tasks never reads a
+        // host task's `/proc` signal state for them (`read_kernel_signal_state`).
+        crate::syscalls::refuse_host_signal_state_reads(&cfg.backend);
         GlobalState::initialize(cfg, true)
     }
 
