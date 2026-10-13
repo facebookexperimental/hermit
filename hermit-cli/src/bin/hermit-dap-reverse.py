@@ -695,8 +695,71 @@ def _keep_tail(fd, tail):
             tail[:] = (bytes(tail) + chunk)[-_REPLAY_STDERR_TAIL:]
 
 
+# The current replay's stderr tail and the thread that drains it, kept with
+# the process so a failure noticed later (at attach, or at a restart's
+# connection) can still say what the replay said.
+_replay_tail = bytearray()
+_replay_drain = None
+
+
+def _replay_failure(what):
+    # WHAT, followed by the replay's exit status and the end of its stderr, if
+    # the replay has exited; None while it is still running.
+    if _replay_process is None:
+        return None
+    status = _replay_process.poll()
+    if status is None:
+        return None
+    # The replay has exited, so its stderr reaches end of file promptly.
+    if _replay_drain is not None:
+        _replay_drain.join(timeout=2.0)
+    reason = bytes(_replay_tail).decode("utf-8", "replace").strip()
+    return "{}: {}{}".format(what, status, "; it said:\n" + reason if reason else "")
+
+
+def _replay_port_listening():
+    # Whether anything in this network namespace listens on the replay's TCP
+    # port. Read from /proc rather than by connecting: the replay's gdbserver
+    # accepts one client, and a probe connection would be that client.
+    wanted = ":{:04X}".format(int(_replay_target.rsplit(":", 1)[1]))
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(table) as rows:
+                next(rows, None)
+                for row in rows:
+                    fields = row.split()
+                    if (
+                        len(fields) > 3
+                        and fields[1].endswith(wanted)
+                        and fields[3] == "0A"
+                    ):
+                        return True
+        except OSError:
+            pass
+    return False
+
+
+# How long attach waits for the replay's gdbserver to listen.
+_REPLAY_LISTEN_TIMEOUT = 60.0
+
+
+def _await_replay_listening():
+    # Wait until the replay listens, and return None, or until it exits, and
+    # return why. On a timeout, return None and let GDB's own connection
+    # attempt report what it finds.
+    deadline = time.monotonic() + _REPLAY_LISTEN_TIMEOUT
+    while time.monotonic() < deadline:
+        failure = _replay_failure("Hermit replay exited before GDB attached")
+        if failure is not None:
+            return failure
+        if _replay_port_listening():
+            return None
+        time.sleep(0.05)
+    return None
+
+
 def _start_replay():
-    global _replay_process
+    global _replay_process, _replay_tail, _replay_drain
     read_end, write_end = os.pipe()
     tail = bytearray()
     try:
@@ -712,20 +775,16 @@ def _start_replay():
         raise
     finally:
         os.close(write_end)
-    drain = threading.Thread(target=_keep_tail, args=(read_end, tail), daemon=True)
-    drain.start()
+    _replay_tail = tail
+    _replay_drain = threading.Thread(
+        target=_keep_tail, args=(read_end, tail), daemon=True
+    )
+    _replay_drain.start()
     time.sleep(0.5)
-    status = _replay_process.poll()
-    if status is not None:
+    failure = _replay_failure("Hermit replay exited before GDB attached")
+    if failure is not None:
         _replay_process = None
-        # The replay has exited, so its stderr reaches end of file promptly.
-        drain.join(timeout=2.0)
-        reason = bytes(tail).decode("utf-8", "replace").strip()
-        raise gdb.error(
-            "Hermit replay exited before GDB attached: {}{}".format(
-                status, "; it said:\n" + reason if reason else ""
-            )
-        )
+        raise gdb.error(failure)
 
 
 def _connect_replay():
@@ -738,6 +797,13 @@ def _connect_replay():
             return
         except gdb.error as error:
             last_error = error
+            failure = _replay_failure("Hermit replay exited")
+            if failure is not None:
+                raise gdb.error(
+                    "Hermit replay did not accept a GDB connection: {}; {}".format(
+                        last_error, failure
+                    )
+                )
             time.sleep(0.05)
     raise gdb.error("Hermit replay did not accept a GDB connection: " + str(last_error))
 
@@ -1186,6 +1252,12 @@ def _attach(**args):
         raise DAPException(
             "managed replay requires DAP target {}".format(_replay_target)
         )
+    # GDB connects at configurationDone and reports a refused connection
+    # without the replay's reason, so a replay that failed after startup's
+    # first check is reported here, with what it said.
+    failure = _await_replay_listening()
+    if failure is not None:
+        raise DAPException(failure)
     return _original_attach(**args)
 
 

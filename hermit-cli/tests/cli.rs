@@ -15399,6 +15399,71 @@ fn hermit_dap_replay_startup_failure_carries_the_replays_reason() {
     }
 }
 
+/// A managed replay that passes startup's first check and then exits before
+/// GDB attaches still reaches the client with what it said: the `attach`
+/// request fails with the replay's reason, not GDB's later "Connection
+/// refused".
+///
+/// hermit-dap runs the `hermit` beside itself, so a copy of hermit-dap sits
+/// beside a stand-in `hermit` that writes a reason and exits 125 after 1.5 s,
+/// past the 0.5 s check that the test above covers.
+#[test]
+fn hermit_dap_replay_late_startup_failure_reaches_attach_with_its_reason() {
+    const TEST: &str = "hermit_dap_replay_late_startup_failure_reaches_attach_with_its_reason";
+    const REASON: &str = "stand-in replay refused: late-startup-reason-7731";
+    let Some(hermit_dap) = hermit_dap_binary(TEST) else {
+        return;
+    };
+    let Some(gdb) = dap_capable_gdb(TEST) else {
+        return;
+    };
+    let work = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the hermit-dap work dir");
+    let bin = work.path().join("bin");
+    fs::create_dir(&bin).expect("failed to create the stand-in bin dir");
+    let adapter_copy = bin.join("hermit-dap");
+    fs::copy(hermit_dap, &adapter_copy).expect("failed to copy hermit-dap");
+    let stand_in = bin.join("hermit");
+    fs::write(
+        &stand_in,
+        format!("#!/bin/sh\nsleep 1.5\necho '{REASON}' >&2\nexit 125\n"),
+    )
+    .expect("failed to write the stand-in hermit");
+    fs::set_permissions(&stand_in, fs::Permissions::from_mode(0o755))
+        .expect("failed to make the stand-in hermit executable");
+
+    let port = unused_local_port();
+    let data_dir = work.path().join("recordings");
+    let adapter = dap_replay_adapter(
+        &adapter_copy,
+        &gdb,
+        "0123456789abcdef0123456789abcdef",
+        &data_dir,
+        port,
+    );
+    let mut dap = DapClient::spawn(adapter, work.path().join("hermit-dap.stderr"));
+    if let Err(refusal) = dap.initialize() {
+        dap_gdb_skip(TEST, &refusal);
+        return;
+    }
+    let attach = dap.request(
+        "attach",
+        serde_json::json!({"program": "/bin/true", "target": format!("127.0.0.1:{port}")}),
+    );
+    let response = dap.wait_for("the attach response", DAP_TIMEOUT, |message| {
+        message["type"] == "response" && message["request_seq"] == attach
+    });
+    let message = response["message"].as_str().unwrap_or_default();
+    if response["success"] != false
+        || !message.contains("Hermit replay exited before GDB attached: 125")
+        || !message.contains(REASON)
+    {
+        dap.fail(&format!(
+            "attach must fail with the late-exiting replay's status and reason: {response}"
+        ));
+    }
+}
+
 /// A managed-replay startup refusal must reach the DAP client as a failed
 /// response to its first request, and must also be written to stderr.
 ///

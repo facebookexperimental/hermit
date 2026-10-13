@@ -2856,7 +2856,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // hermit_replay_dap_listen_serves_one_tcp_client_with_step_back
     // (hermit-dap --listen and hermit replay --dap-listen): 360.
     // And hermit_dap_replay_startup_failure_carries_the_replays_reason: 361.
-    ("test.cli", 361),
+    // And hermit_dap_replay_late_startup_failure_reaches_attach_with_its_reason: 362.
+    ("test.cli", 362),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3147,7 +3148,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two hermit-dap --listen tests, which skip without a DAP-capable
     // GDB but still execute: 296.
     // And the managed-replay startup-failure reason test: 297.
-    ("test.cli_on_host", 297),
+    // And the late managed-replay startup-failure test: 298.
+    ("test.cli_on_host", 298),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux

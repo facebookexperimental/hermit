@@ -29,6 +29,8 @@ Usage: editors/vscode/test/run.sh --code PATH [--hermit 'CMD ...'] [--hermit-dap
                      (default: target/debug/hermit-dap).
   --work DIR         Scratch directory, not under /tmp, where Hermit refuses
                      to run guests (default: target/vscode-test).
+  --timeout SECONDS  Bound on each VS Code run (default: 300). A run that
+                     takes longer is killed and counts as a failure.
   -h, --help         Show this help.
 USAGE
 }
@@ -39,12 +41,14 @@ code=""
 hermit="$repo/target/debug/hermit"
 hermit_dap="$repo/target/debug/hermit-dap"
 work="$repo/target/vscode-test"
+trial_timeout=300
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --code) code=$2; shift 2 ;;
         --hermit) hermit=$2; shift 2 ;;
         --hermit-dap) hermit_dap=$2; shift 2 ;;
         --work) work=$2; shift 2 ;;
+        --timeout) trial_timeout=$2; shift 2 ;;
         -h | --help) usage; exit 0 ;;
         *) echo "run.sh: unknown argument $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -76,20 +80,93 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# run_code NAME EXPECT CONFIG_JSON: one headless VS Code run of test/index.js.
+# stop_server PID GRACE: wait up to GRACE tenths of a second for a session's
+# Hermit process to exit on its own, as it does when the debug session ends;
+# then kill it. After a failed session GRACE is 0: the process is killed at
+# once. Fails if a process with a grace period had to be killed, or if one
+# would not exit even then, so no wait is unbounded.
+stop_server() {
+    local pid=$1 grace=$2
+    if [ "$grace" -eq 0 ]; then
+        kill "$pid" 2>/dev/null || true
+    fi
+    for _ in $(seq "$grace"); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            wait "$pid" 2>/dev/null || true
+            return 0
+        fi
+        sleep 0.1
+    done
+    kill "$pid" 2>/dev/null || true
+    for _ in $(seq 100); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            wait "$pid" 2>/dev/null || true
+            if [ "$grace" -gt 0 ]; then
+                echo "run.sh: Hermit process $pid did not exit after the session; killed it" >&2
+                return 1
+            fi
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "run.sh: Hermit process $pid did not exit even when killed" >&2
+    return 1
+}
+
+# check_result NAME EXPECT NONCE: the result file this run wrote, for this
+# scenario, with every required step and no failures.
+check_result() {
+    node - "$work/$1.json" "$2" "$3" <<'NODE'
+const fs = require('fs');
+const [file, expect, nonce] = process.argv.slice(2);
+let result;
+try {
+  result = JSON.parse(fs.readFileSync(file, 'utf8'));
+} catch (error) {
+  console.error(`no result from this run: ${error.message}`);
+  process.exit(1);
+}
+const required = expect === 'reverse'
+  ? ['attach', 'continue', 'continue', 'stepBack', 'reverseContinue']
+  : ['attach', 'continue', 'continue'];
+const steps = (result.steps || []).map((step) => step.action);
+const problems = [];
+if (result.nonce !== nonce) problems.push(`result is not from this run (nonce ${result.nonce})`);
+if (result.expect !== expect) problems.push(`result is for scenario ${result.expect}`);
+if (JSON.stringify(steps) !== JSON.stringify(required)) problems.push(`steps ${steps.join(',')}`);
+if (!Array.isArray(result.failures) || result.failures.length) {
+  problems.push(`failures: ${JSON.stringify(result.failures)}`);
+}
+if (problems.length) {
+  console.error(problems.join('\n'));
+  process.exit(1);
+}
+NODE
+}
+
+# run_code NAME EXPECT CONFIG_JSON: one bounded, headless VS Code run of
+# test/index.js, judged only by the result file it writes.
 run_code() {
-    local name=$1 expect=$2 config=$3 status=0
+    local name=$1 expect=$2 config=$3 status=0 nonce
+    nonce="$name-$$-$RANDOM-$(date +%s%N)"
+    rm -f "$work/$name.json"
     HERMIT_SOURCE="$here/fixtures/squares.c" \
     HERMIT_VSCODE_EXPECT="$expect" \
+    HERMIT_VSCODE_NONCE="$nonce" \
     HERMIT_VSCODE_RESULT="$work/$name.json" \
     HERMIT_DEBUG_CONFIG="$config" \
+        timeout --kill-after=10 "$trial_timeout" \
         "$code" --no-sandbox --disable-gpu --ozone-platform=headless \
         --user-data-dir="$work/$name-user-data" --extensions-dir="$work/$name-extensions" \
         --disable-extensions --disable-workspace-trust --skip-welcome --skip-release-notes \
         --extensionDevelopmentPath="$here/.." --extensionTestsPath="$here/index.js" \
         "$work" >"$work/$name-vscode.log" 2>&1 || status=$?
-    if [ "$status" -ne 0 ] || [ ! -s "$work/$name.json" ]; then
-        echo "FAIL $name (VS Code exit $status); see $work/$name.json and $work/$name-vscode.log" >&2
+    if [ "$status" -ne 0 ]; then
+        echo "FAIL $name (VS Code exit $status$([ "$status" -ge 124 ] && echo ", timed out after ${trial_timeout} s or killed")); see $work/$name-vscode.log" >&2
+        return 1
+    fi
+    if ! check_result "$name" "$expect" "$nonce" 2>"$work/$name-check.log"; then
+        echo "FAIL $name: $(tr '\n' ' ' <"$work/$name-check.log"); see $work/$name.json" >&2
         return 1
     fi
     echo "PASS $name"
@@ -112,12 +189,18 @@ failed=0
 gdb_port=$(free_port)
 "${hermit_cmd[@]}" run --gdbserver --gdbserver-port="$gdb_port" -- "$work/squares" \
     </dev/null >"$work/forward-hermit.log" 2>&1 &
-background+=("$!")
+server=$!
+background+=("$server")
 sleep 2
-run_code forward forward "{\"type\": \"hermit\", \"request\": \"attach\", \"name\": \"forward\",
+if run_code forward forward "{\"type\": \"hermit\", \"request\": \"attach\", \"name\": \"forward\",
     \"program\": \"$work/squares\", \"target\": \"127.0.0.1:$gdb_port\",
-    \"dapPath\": \"$hermit_dap\"}" || failed=1
-wait "${background[-1]}" || true
+    \"dapPath\": \"$hermit_dap\"}"; then
+    grace=300
+else
+    grace=0
+    failed=1
+fi
+stop_server "$server" "$grace" || failed=1
 
 # reverse: VS Code connects to hermit replay --dap-listen.
 rm -rf "${work:?}/recordings"
@@ -129,11 +212,22 @@ dap_port=$(free_port)
 "${hermit_cmd[@]}" replay "$recording" --data-dir "$work/recordings" \
     --gdbserver-port="$gdb_port" --dap-listen="$dap_port" \
     </dev/null >"$work/reverse-hermit.log" 2>&1 &
-background+=("$!")
-wait_for_line "$work/reverse-hermit.log" "hermit-dap: listening on"
-run_code reverse reverse "{\"type\": \"hermit\", \"request\": \"attach\", \"name\": \"reverse\",
-    \"port\": $dap_port, \"program\": \"$work/recordings/$recording/exe\",
-    \"target\": \"127.0.0.1:$gdb_port\"}" || failed=1
-wait "${background[-1]}" || true
+server=$!
+background+=("$server")
+if wait_for_line "$work/reverse-hermit.log" "hermit-dap: listening on"; then
+    if run_code reverse reverse "{\"type\": \"hermit\", \"request\": \"attach\", \"name\": \"reverse\",
+        \"port\": $dap_port, \"program\": \"$work/recordings/$recording/exe\",
+        \"target\": \"127.0.0.1:$gdb_port\"}"; then
+        grace=300
+    else
+        grace=0
+        failed=1
+    fi
+else
+    echo "FAIL reverse: hermit replay --dap-listen never listened; see $work/reverse-hermit.log" >&2
+    grace=0
+    failed=1
+fi
+stop_server "$server" "$grace" || failed=1
 
 exit "$failed"

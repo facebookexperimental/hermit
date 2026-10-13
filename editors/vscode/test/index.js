@@ -65,7 +65,7 @@ function expectStop(result, step, reason, fn, line, name, value) {
 }
 
 exports.run = async function () {
-  const result = {expect: env.HERMIT_VSCODE_EXPECT, steps: [], failures: []};
+  const result = {expect: env.HERMIT_VSCODE_EXPECT, nonce: env.HERMIT_VSCODE_NONCE, steps: [], failures: []};
   try {
     vscode.debug.registerDebugAdapterTrackerFactory('hermit', {
       createDebugAdapterTracker() {
@@ -113,8 +113,10 @@ exports.run = async function () {
     // VS Code's own breakpoint model must hold only the breakpoint set above.
     result.editorBreakpoints = vscode.debug.breakpoints.map((b) =>
       b.location ? `${b.location.uri.fsPath}:${b.location.range.start.line + 1}` : String(b));
-    if (result.editorBreakpoints.length !== 1) {
-      result.failures.push(`expected 1 breakpoint in VS Code, got ${result.editorBreakpoints.join(', ')}`);
+    const expected = `${env.HERMIT_SOURCE}:${BREAK_LINE}`;
+    if (JSON.stringify(result.editorBreakpoints) !== JSON.stringify([expected])) {
+      result.failures.push(`expected VS Code's breakpoints to be exactly ${expected}, got ` +
+        `${result.editorBreakpoints.join(', ') || 'none'}`);
     }
     result.hiddenBreakpointEvents = messages.filter((m) => m.type === 'event' && m.event === 'breakpoint' &&
       !(m.body?.breakpoint?.id > 0)).length;
