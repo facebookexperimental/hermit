@@ -1423,7 +1423,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (Codex review of https://github.com/rrnewton/hermit/pull/4131): 1062.
     // And metadata::tests::record_version_rejects_streams_without_fcntl_output_events
     // (https://github.com/rrnewton/hermit/issues/2289): 1063.
-    ("test.hermit_unit", 1063),
+    // dbt_backend_disables_uts_assumption split into
+    // dbt_backend_keeps_uts_assumption_with_namespaces and
+    // dbt_backend_disables_uts_assumption_without_namespaces
+    // (https://github.com/rrnewton/hermit/issues/4009): 1064.
+    ("test.hermit_unit", 1064),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2753,7 +2757,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_childs_sigchld_ends_a_sleep_only_when_caught_and_unblocked and
     // every_sigchld_copy_is_accounted_for_as_on_linux
     // (https://github.com/rrnewton/hermit/issues/4126): 331.
-    ("test.cli", 331),
+    // And dbt_guest_runs_in_the_common_container and
+    // dbt_keeps_dynamorio_configuration_out_of_home
+    // (https://github.com/rrnewton/hermit/issues/4009): 333.
+    ("test.cli", 333),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3352,7 +3359,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the epoll_ctl record-epoch test: 1061.
     // And the held-sleep-signal record-version test: 1062.
     // And the fcntl-output record-version test: 1063.
-    ("test.hermit_unit_on_host", 1063),
+    // And the DBT UTS assumption test split in two: 1064.
+    ("test.hermit_unit_on_host", 1064),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
