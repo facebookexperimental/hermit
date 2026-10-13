@@ -169,6 +169,12 @@ impl Drop for PublishedFailureExit {
         if self.unresolved {
             unsafe { libc::_exit(125) }
         }
+        if super::container::exits_init_after_publication() {
+            // The result is encoded, flushed and closed. An unwind still means
+            // publication failed, never a success.
+            let status = if std::thread::panicking() { 125 } else { 0 };
+            unsafe { libc::_exit(status) }
+        }
     }
 }
 

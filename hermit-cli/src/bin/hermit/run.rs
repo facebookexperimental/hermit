@@ -4219,17 +4219,31 @@ fn no_namespace_uses_host_resources_and_disables_uts_assumption() {
 }
 
 #[test]
-fn dbt_backend_disables_uts_assumption() {
-    // The DBT backend runs the guest under DynamoRIO without Reverie's
-    // `Container`, so it never enters a UTS namespace or applies the
-    // deterministic hostname. `has_uts_namespace` must therefore be false even
-    // with namespaces otherwise enabled, so Detcore's `handle_uname` rewrites
-    // the nodename to `hermetic-container.local` instead of leaking the host
-    // FQDN. Regression guard for DBT uname parity with the ptrace backend.
+fn dbt_backend_keeps_uts_assumption_with_namespaces() {
+    // The DBT backend launches each physical run through Reverie's
+    // `Container`, as ptrace does, so its guest is in a UTS namespace with the
+    // deterministic hostname (https://github.com/rrnewton/hermit/issues/4009).
     let mut opts = run_opts_for(&["hermit", "--backend=dbt", "run", "fakeprog"]);
     opts.validate_args_with_perf_support(true).unwrap();
     assert_eq!(opts.selected_backend(), Backend::Dbt);
     assert!(!opts.no_namespace);
+    assert!(opts.det_opts.det_config.has_uts_namespace);
+}
+
+#[test]
+fn dbt_backend_disables_uts_assumption_without_namespaces() {
+    // `--no-namespace` starts no container, so Detcore's `handle_uname` must
+    // rewrite the nodename instead of leaking the host FQDN.
+    let mut opts = run_opts_for(&[
+        "hermit",
+        "--backend=dbt",
+        "run",
+        "--no-namespace",
+        "fakeprog",
+    ]);
+    opts.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(opts.selected_backend(), Backend::Dbt);
+    assert!(opts.no_namespace);
     assert!(!opts.det_opts.det_config.has_uts_namespace);
 }
 
@@ -5246,13 +5260,14 @@ impl RunOpts {
     /// Reverie sets that option only after the guest exists (below), so it
     /// binds the guest for the rest of the run, not for all of it.
     ///
-    /// So every `--no-namespace` configuration is refused, and DBT, whose guest
-    /// is outside hermit's namespace in both modes, is refused in both:
+    /// So every `--no-namespace` configuration is refused, and DBT is refused in
+    /// both modes:
     ///
-    /// - DBT, in every namespace mode: `backends::run_dbt` starts `drrun` as a
-    ///   plain child of the outer process. It creates no namespace, and Reverie's
-    ///   DBT launcher sets only a process group and the personality: no
-    ///   parent-death signal and no ptrace attachment.
+    /// - DBT with `--no-namespace`: `backends::run_dbt` starts `drrun` as a
+    ///   plain child of the outer process, and Reverie's DBT launcher sets only
+    ///   a process group and the personality: no parent-death signal and no
+    ///   ptrace attachment. With namespaces, the guest is inside hermit's PID
+    ///   namespace, but the cap has not yet been tested ending such a run.
     /// - ptrace with `--no-namespace`, and `--backend=e9patch` with it (e9patch
     ///   preprocessing, whose rewritten guest runs on the ptrace backend,
     ///   `runtime_backend`): Reverie's
@@ -5302,10 +5317,14 @@ impl RunOpts {
     ///   and `oci ls`, `inspect` and `pull` initialize no tracing at all.
     fn log_cap_refusal(backend: Backend, no_namespace: bool) -> Option<&'static str> {
         match backend {
+            // In its container the guest is inside hermit's PID namespace, but
+            // no run has yet shown the cap ending a DBT run there
+            // (https://github.com/rrnewton/hermit/issues/4009).
             Backend::Dbt => Some(
-                "--backend=dbt: the DynamoRIO guest is a plain child of this hermit process, \
-                 and no PID namespace, parent-death signal or ptrace attachment binds it to \
-                 hermit, so exiting 123 at the cap would leave the guest running",
+                "--backend=dbt: under --no-namespace the DynamoRIO guest is a plain child of this \
+                 hermit process that no PID namespace, parent-death signal or ptrace attachment \
+                 binds to hermit, so exiting 123 at the cap would leave the guest running, and \
+                 the cap has not been tested ending a DBT run inside hermit's PID namespace",
             ),
             Backend::Liteinst if no_namespace => Some(
                 "--backend=liteinst and --no-namespace: the in-guest LiteInst guest is neither \
@@ -5675,6 +5694,7 @@ impl RunOpts {
             | Backend::Kvm
             | Backend::E9patch => {}
             Backend::Dbt => {
+                self.warn_no_namespace();
                 let environment = self.guest_command()?.get_captured_envs();
                 // Keep the dedicated DynamoRIO launcher, but give it the same
                 // backend capability configuration as the public library path.
@@ -5698,8 +5718,8 @@ impl RunOpts {
                     environment,
                     self.workdir.as_deref().map(Path::new),
                     self.dbt_binds(),
-                    self.network.uses_local_namespace(self.analyze_networking),
                     dbt_verification_stdin,
+                    self,
                 );
             }
         }
@@ -5718,18 +5738,7 @@ impl RunOpts {
             );
         }
 
-        if self.no_namespace {
-            // Not `eprintln!`, which panics when stderr's reader has gone
-            // (EPIPE): a warning must not end the run with 101.
-            use std::io::Write as _;
-            let _ = writeln!(
-                std::io::stderr(),
-                "WARNING: --no-namespace is not a sandbox; run trusted guests only. The guest \
-                 inherits the caller UID/GID/capabilities and shares host /proc, filesystem, /tmp, \
-                 localhost/network, ports, Unix sockets, and mutable state between runs. Unsupported \
-                 syscalls can mutate host state; --verify may be less deterministic due to shared state."
-            );
-        }
+        self.warn_no_namespace();
 
         if self.namespace_only {
             self.run_with_namespace_only(global)
@@ -5867,8 +5876,8 @@ impl RunOpts {
         }
         if backend == Backend::Dbt && !self.mount.is_empty() {
             anyhow::bail!(
-                "the dbt backend cannot apply --mount because its DynamoRIO adapter has no guest \
-                 mount namespace to apply it in; it applies only --bind targets under /tmp"
+                "the dbt backend cannot apply --mount yet: its container would apply it, but no \
+                 DBT run has been tested with one; it applies --bind targets under /tmp"
             );
         }
         if self.backend_engagement_json.is_some()
@@ -5891,19 +5900,12 @@ impl RunOpts {
 
         let config = &mut self.det_opts.det_config;
 
-        // Only the ptrace-family backends launch the guest through Reverie's
-        // `Container` (see `container::default_container`), which unshares
-        // `CLONE_NEWUTS` and applies the deterministic hostname
-        // `hermetic-container.local`. The DBT backend returns early from
-        // dispatch and runs the guest under DynamoRIO with no UTS namespace, so
-        // its `uname()` nodename would otherwise leak the real host FQDN.
-        // Reflect that reality here so Detcore's `handle_uname` deterministic
-        // nodename/domainname rewrite fires for DBT (it is gated on
-        // `!has_uts_namespace`). Guest `sethostname`/`setdomainname` are refused
-        // with a deterministic `EPERM` on every backend, so this never masks a
-        // hostname the guest legitimately set.
-        let backend_applies_uts_hostname = !matches!(backend, Backend::Dbt);
-        config.has_uts_namespace = !self.no_namespace && backend_applies_uts_hostname;
+        // Every backend, DBT included, launches the guest through Reverie's
+        // `Container` (see `container::default_container`) unless
+        // `--no-namespace` is given. It unshares `CLONE_NEWUTS` and applies the
+        // deterministic hostname `hermetic-container.local`; without it,
+        // Detcore's `handle_uname` rewrites the nodename instead.
+        config.has_uts_namespace = !self.no_namespace;
 
         if self.no_namespace {
             self.network = NetworkingMode::Host;
@@ -7124,65 +7126,89 @@ impl RunOpts {
         let guest_capture = guest_capture
             .map(GuestRunCaptureSession::try_clone_for_child)
             .transpose()?;
-        let timeout = self.run_timeout();
-        if self.no_namespace {
-            let mut process = Container::new();
-            apply_affinity(&mut process, self.pin_threads);
-            let resources = if network_trace.is_some() {
-                "held summary/output and network trace descriptors; no PID namespace"
-            } else {
-                "held summary/output descriptors; no PID namespace"
-            };
-            return super::owned_container::run(
-                &mut process,
-                (summary_output, network_trace),
-                resources.into(),
-                false,
-                "with_container",
-                timeout,
-                move |(summary, _)| {
-                    options.run_in_container(
-                        &global,
-                        capture_output,
-                        guest_capture.as_ref(),
-                        summary.as_ref(),
-                        None,
-                    )
-                },
-            )
-            .map(|(value, _guards)| value);
-        }
-        let tmpfs = self.tmpfs()?;
-        let (mut container, identity) = self.container(tmpfs.path())?;
         let resources = if network_trace.is_some() {
-            format!(
-                "private tmp {}, identity mounts, summary/output and network trace descriptors",
-                tmpfs.path().display()
-            )
+            "summary/output and network trace descriptors"
         } else {
-            format!(
-                "private tmp {}, identity mounts and summary/output descriptors",
-                tmpfs.path().display()
-            )
+            "summary/output descriptors"
         };
-        super::owned_container::run(
-            &mut container,
-            (tmpfs, identity, summary_output, network_trace),
+        self.launch_in_container(
+            (summary_output, network_trace),
             resources,
-            true,
-            "with_container",
-            timeout,
-            move |(_, identity, summary, _)| {
+            self.run_timeout(),
+            move |(summary, _), identity| {
                 options.run_in_container(
                     &global,
                     capture_output,
                     guest_capture.as_ref(),
                     summary.as_ref(),
-                    Some(identity),
+                    identity,
                 )
             },
         )
         .map(|(value, _guards)| value)
+    }
+
+    fn warn_no_namespace(&self) {
+        if self.no_namespace {
+            // Not `eprintln!`, which panics when stderr's reader has gone
+            // (EPIPE): a warning must not end the run with 101.
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "WARNING: --no-namespace is not a sandbox; run trusted guests only. The guest \
+                 inherits the caller UID/GID/capabilities and shares host /proc, filesystem, /tmp, \
+                 localhost/network, ports, Unix sockets, and mutable state between runs. Unsupported \
+                 syscalls can mutate host state; --verify may be less deterministic due to shared state."
+            );
+        }
+    }
+
+    /// Run `work` as the init of this run's container: the PID, UTS, mount and
+    /// network namespaces, private /tmp and identity mounts that every backend
+    /// shares, or a plain child under `--no-namespace`. `work` receives the
+    /// parent-held `guards` and the container's identity mounts.
+    pub(super) fn launch_in_container<G, F, T>(
+        &self,
+        guards: G,
+        resources: &str,
+        timeout: Option<Duration>,
+        mut work: F,
+    ) -> Result<(T, G), Error>
+    where
+        G: 'static,
+        F: FnMut(&mut G, Option<&IdentityGuard>) -> Result<T, Error> + 'static,
+        T: serde::Serialize + serde::de::DeserializeOwned + 'static,
+    {
+        let (mut container, tmpfs, identity, resources) = if self.no_namespace {
+            let mut container = Container::new();
+            apply_affinity(&mut container, self.pin_threads);
+            (
+                container,
+                None,
+                None,
+                format!("held {resources}; no PID namespace"),
+            )
+        } else {
+            let tmpfs = self.tmpfs()?;
+            let (container, identity) = self.container(tmpfs.path())?;
+            let resources = format!(
+                "private tmp {}, identity mounts and {resources}",
+                tmpfs.path().display()
+            );
+            (container, Some(tmpfs), Some(identity), resources)
+        };
+        super::owned_container::run(
+            &mut container,
+            (tmpfs, identity, guards),
+            resources,
+            !self.no_namespace,
+            "with_container",
+            timeout,
+            move |(_, identity, guards): &mut (Option<Tmpfs>, Option<IdentityGuard>, G)| {
+                work(guards, identity.as_ref())
+            },
+        )
+        .map(|(value, (_, _, guards))| (value, guards))
     }
 
     fn run_with_namespace_only(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
@@ -7840,10 +7866,10 @@ impl RunOpts {
         Ok(status)
     }
 
-    /// The `--bind`s the DBT adapter applies, as (source, target) pairs: those
+    /// The `--bind`s the DBT adapter checks, as (source, target) pairs: those
     /// with a target under guest `/tmp`, which is where [`Self::mounts`] applies
-    /// binds for the other backends. Any other bind gets the same warning
-    /// there and here, and has no effect.
+    /// binds for every backend. It warns about any other bind, which has no
+    /// effect.
     fn dbt_binds(&self) -> Vec<(PathBuf, PathBuf)> {
         let mut binds = Vec::with_capacity(self.bind.len());
         for bind in &self.bind {
@@ -7851,11 +7877,27 @@ impl RunOpts {
             let target = PathBuf::from(OsStr::from_bytes(bind.target.to_bytes()));
             if target.starts_with(TMP_DIR) {
                 binds.push((source, target));
-            } else {
-                warn_bind_outside_tmp(bind);
             }
         }
         binds
+    }
+
+    /// These options with the DBT adapter's own container inputs added after
+    /// the caller's: each of `preserved`, a host path below /tmp made before
+    /// the run, bound at the same path in the private /tmp, and `mounts`.
+    #[cfg(feature = "dbt")]
+    pub(super) fn with_dbt_mounts(&self, preserved: &[PathBuf], mounts: Vec<Mount>) -> Self {
+        let mut options = self.clone();
+        for path in preserved.iter().filter(|path| path.starts_with(TMP_DIR)) {
+            let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+                .expect("a path read from the filesystem has no NUL byte");
+            options.bind.push(Bind {
+                source: path.clone(),
+                target: path,
+            });
+        }
+        options.mount.extend(mounts);
+        options
     }
 
     /// Returns the mounts to be used with the container.
@@ -7978,40 +8020,8 @@ impl RunOpts {
         let mut options = self.clone();
         let network_trace = options.open_network_trace()?;
         let global = global.clone();
-        if self.no_namespace {
-            let mut process = Container::new();
-            apply_affinity(&mut process, self.pin_threads);
-            let resources = format!(
-                "verification log{}{} descriptors; no PID namespace",
-                if network_trace.is_some() {
-                    ", network trace"
-                } else {
-                    ""
-                },
-                if forwarded_detlogs.is_some() {
-                    ", forwarded DETLOG"
-                } else {
-                    ""
-                },
-            );
-            return super::owned_container::run(
-                &mut process,
-                (Some(log_file), network_trace, forwarded_detlogs),
-                resources,
-                false,
-                "with_container",
-                None,
-                move |(log, _, forwarded)| {
-                    options.run_verify_in_container(log, forwarded, &global, None)
-                },
-            )
-            .map(|(value, _guards)| value);
-        }
-        let tmpfs = self.tmpfs()?;
-        let (mut container, identity) = self.container(tmpfs.path())?;
         let resources = format!(
-            "private tmp {}, identity mounts, verification log{}{} descriptors",
-            tmpfs.path().display(),
+            "verification log{}{} descriptors",
             if network_trace.is_some() {
                 ", network trace"
             } else {
@@ -8023,21 +8033,12 @@ impl RunOpts {
                 ""
             },
         );
-        super::owned_container::run(
-            &mut container,
-            (
-                tmpfs,
-                identity,
-                Some(log_file),
-                network_trace,
-                forwarded_detlogs,
-            ),
-            resources,
-            true,
-            "with_container",
+        self.launch_in_container(
+            (Some(log_file), network_trace, forwarded_detlogs),
+            &resources,
             None,
-            move |(_, identity, log, _, forwarded)| {
-                options.run_verify_in_container(log, forwarded, &global, Some(identity))
+            move |(log, _, forwarded), identity| {
+                options.run_verify_in_container(log, forwarded, &global, identity)
             },
         )
         .map(|(value, _guards)| value)
@@ -8283,7 +8284,7 @@ impl RunOpts {
     ///
     /// Mirrors `StartOpts::record_timeout` so the two spellings of a hermit
     /// deadline are read the same way.
-    fn run_timeout(&self) -> Option<Duration> {
+    pub(super) fn run_timeout(&self) -> Option<Duration> {
         self.timeout
             .map(|seconds| Duration::from_secs(seconds.get()))
     }
@@ -8473,22 +8474,9 @@ impl RunOpts {
             }
         }
 
-        let mut config = self.effective_det_config();
-        // The guest inherits this thread's seccomp filters, as Hermit installs
-        // none besides the backend's own, and the only `pre_exec` callback of
-        // its command, above, installs none either.
-        config.inherited_seccomp = detcore::InheritedSeccomp::measure();
-        config.mountinfo_root_rewrites = identity_sources
-            .map(IdentityGuard::mountinfo_root_rewrites)
-            .transpose()?
-            .unwrap_or_default();
-        let mountinfo_order = identity_sources
-            .map(IdentityGuard::mountinfo_identity_order)
-            .transpose()?
-            .unwrap_or_default();
-        config.mountinfo_mount_ids = mountinfo_order;
-        config.mountinfo_mount_ids_captured = identity_sources.is_some();
-        config.mount_id_assignment_order.clear();
+        // The only `pre_exec` callback of the command, above, installs no
+        // seccomp filter.
+        let config = complete_container_config(self.effective_det_config(), identity_sources)?;
 
         let timeout = self.run_timeout();
         super::staged_summary::with_published_summary(
@@ -8590,22 +8578,8 @@ impl RunOpts {
 
         let command = self.guest_command()?;
 
-        let mut config = self.effective_det_config();
-        // The guest inherits this thread's seccomp filters, as Hermit installs
-        // none besides the backend's own, and its command has no `pre_exec`
-        // callback.
-        config.inherited_seccomp = detcore::InheritedSeccomp::measure();
-        config.mountinfo_root_rewrites = identity_sources
-            .map(IdentityGuard::mountinfo_root_rewrites)
-            .transpose()?
-            .unwrap_or_default();
-        let mountinfo_order = identity_sources
-            .map(IdentityGuard::mountinfo_identity_order)
-            .transpose()?
-            .unwrap_or_default();
-        config.mountinfo_mount_ids = mountinfo_order;
-        config.mountinfo_mount_ids_captured = identity_sources.is_some();
-        config.mount_id_assignment_order.clear();
+        // The command has no `pre_exec` callback.
+        let config = complete_container_config(self.effective_det_config(), identity_sources)?;
 
         let forwarding = forwarded_detlogs.take().map(|(sender, receiver)| {
             hermit::forward_in_guest_detlogs_to(sender);
@@ -8653,6 +8627,27 @@ impl Tmpfs {
             Self::Temp(temp) => temp.path(),
         }
     }
+}
+
+/// Complete `config` inside the container whose identity mounts are
+/// `identity_sources`, on every backend. The guest inherits this thread's
+/// seccomp filters, as Hermit installs none besides the backend's own.
+pub(super) fn complete_container_config(
+    mut config: DetConfig,
+    identity_sources: Option<&IdentityGuard>,
+) -> Result<DetConfig, Error> {
+    config.inherited_seccomp = detcore::InheritedSeccomp::measure();
+    config.mountinfo_root_rewrites = identity_sources
+        .map(IdentityGuard::mountinfo_root_rewrites)
+        .transpose()?
+        .unwrap_or_default();
+    config.mountinfo_mount_ids = identity_sources
+        .map(IdentityGuard::mountinfo_identity_order)
+        .transpose()?
+        .unwrap_or_default();
+    config.mountinfo_mount_ids_captured = identity_sources.is_some();
+    config.mount_id_assignment_order.clear();
+    Ok(config)
 }
 
 #[cfg(test)]
