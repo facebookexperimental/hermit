@@ -1340,6 +1340,13 @@ pub struct Scheduler {
     /// overtaking a child exit that is not physically waitable yet.
     pending_physical_process_exits: BTreeSet<DetPid>,
 
+    /// Processes Linux is killing because their PID namespace's init exited
+    /// (`note_pid_namespace_end`). The kill (`zap_pid_namespace`) lands at a
+    /// host-chosen moment after the init's Exit grant, so while one of them
+    /// still has a thread, an empty run queue is waiting for that kill, not
+    /// deadlocked.
+    namespace_zap_victims: BTreeSet<DetPid>,
+
     /// Logically exited child processes whose terminal wait status has not been consumed.
     logically_exited_processes: BTreeSet<DetPid>,
 
@@ -3272,6 +3279,7 @@ impl Scheduler {
             exec_teardowns: Default::default(),
             deregistration_accounted: Default::default(),
             pending_physical_process_exits: Default::default(),
+            namespace_zap_victims: Default::default(),
             logically_exited_processes: Default::default(),
             autoreaped_exits: Default::default(),
             completed_physical_process_exits: Default::default(),
@@ -4052,6 +4060,8 @@ impl Scheduler {
             let _ = self.begin_physical_process_exit(*detpid);
             self.reparent_orphans(*detpid);
             self.logically_exited_processes.insert(*detpid);
+            // The kill a namespace's end owed it has arrived.
+            self.namespace_zap_victims.remove(detpid);
             // Linux decides at exit whether the parent reaps this child
             // automatically (do_notify_parent), and only for a child whose
             // exit signal is SIGCHLD; a later change of the parent's
@@ -4279,10 +4289,27 @@ impl Scheduler {
         live.sort();
         live.dedup();
         if !live.is_empty() {
+            self.namespace_zap_victims.extend(live.iter().copied());
             self.note_determinism_loss(format!(
                 "PID namespace init {exiting} exited while its namespace still held live processes {live:?}; Linux kills them at host-timed moments (https://github.com/rrnewton/hermit/issues/4155)"
             ));
         }
+    }
+
+    /// Whether a process `note_pid_namespace_end` saw Linux about to kill
+    /// still has a thread in the scheduler. Victims whose threads are all
+    /// gone are dropped. The run already carries the determinism loss for
+    /// them, so waiting here only lets the host's kill arrive; it cannot make
+    /// a comparable run depend on host timing.
+    fn awaiting_namespace_zap(&mut self) -> bool {
+        let next_turns = &self.next_turns;
+        let thread_tree = &self.thread_tree;
+        self.namespace_zap_victims.retain(|victim| {
+            next_turns
+                .keys()
+                .any(|tid| thread_tree.process_of(*tid) == Some(*victim))
+        });
+        !self.namespace_zap_victims.is_empty()
     }
 
     /// The reaper Linux's `find_new_reaper` falls back to when no subreaper
@@ -8496,6 +8523,23 @@ impl Scheduler {
         SkipTurn
     }
 
+    /// [`Self::report_terminal_deadlock`], except while a process Linux is
+    /// killing for its namespace's end still has a thread
+    /// ([`Self::awaiting_namespace_zap`]): that thread, often a `pause(2)`
+    /// with no deadline, is about to die, so the state is not terminal. Spin
+    /// until the backend reports the kill, as the external-IO wait does.
+    fn report_terminal_deadlock_unless_zap_pending(&mut self) -> SkipTurn {
+        if self.awaiting_namespace_zap() {
+            trace!(
+                "[scheduler] empty run-queue while Linux kills {:?} for their PID namespace's end. SPINNING!",
+                &self.namespace_zap_victims
+            );
+            std::thread::yield_now();
+            return SkipTurn;
+        }
+        self.report_terminal_deadlock()
+    }
+
     /// Take the pending terminal-deadlock report, if the scheduler produced one.
     fn take_terminal_deadlock(&mut self) -> Option<String> {
         self.terminal_deadlock.take()
@@ -8650,7 +8694,7 @@ impl Scheduler {
                 && external_waits_settled
                 && (!futex_empty || !rt_sigsuspend_empty || !hb_parked_empty)
             {
-                return Err(self.report_terminal_deadlock());
+                return Err(self.report_terminal_deadlock_unless_zap_pending());
             } else if !timed_empty {
                 // Only a *reachable* deadline justifies fast-forwarding the clock.
                 // `LogicalTime::INDEFINITE` is the sentinel a `pause(2)` (or a
@@ -8678,7 +8722,7 @@ impl Scheduler {
                         std::thread::yield_now();
                         return Err(SkipTurn);
                     }
-                    return Err(self.report_terminal_deadlock());
+                    return Err(self.report_terminal_deadlock_unless_zap_pending());
                 }
                 debug!(
                     "[scheduler] Deadlock avoidance! Empty run-queue, so waking next timed event."
@@ -19463,6 +19507,60 @@ mod test {
         assert!(scheduler.take_terminal_deadlock().is_none());
         assert_eq!(global_time.lock().unwrap().as_nanos(), initial_time);
         assert!(!scheduler.blocked.timed_waiters.is_empty());
+    }
+
+    /// A nested namespace's init exits beside a child in `pause(2)`. Linux
+    /// kills the child (`zap_pid_namespace`) at a moment the host chooses, so
+    /// until the backend reports that kill the empty run queue is waiting for
+    /// it, not deadlocked; a deadlock verdict here ended the run before its
+    /// determinism loss could be reported
+    /// (https://github.com/rrnewton/hermit/issues/4155).
+    #[test]
+    fn a_pause_in_an_ended_pid_namespace_waits_for_the_kill_not_a_deadlock() {
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let [root, init, child] = [3, 5, 7].map(DetTid::from_raw);
+        scheduler.thread_tree.add_child(root, root, true);
+        scheduler.thread_tree.add_child(root, init, true);
+        scheduler.thread_tree.enter_new_pid_namespace(init);
+        scheduler.thread_tree.mark_pid_namespace_init(init);
+        scheduler.thread_tree.add_child(init, child, true);
+        let namespaces = &mut scheduler.thread_tree.pid_namespaces;
+        namespaces.record(init, &[init], &[5, 1]).unwrap();
+        namespaces.record(child, &[init], &[7, 2]).unwrap();
+        for tid in [init, child] {
+            register_known_thread(&mut scheduler, tid);
+        }
+
+        scheduler.note_pid_namespace_end(init);
+        assert_eq!(scheduler.determinism_losses.len(), 1);
+        scheduler.next_turns.remove(&init);
+        scheduler
+            .blocked
+            .timed_waiters
+            .insert(LogicalTime::INDEFINITE, child);
+
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
+        assert!(
+            scheduler.take_terminal_deadlock().is_none(),
+            "a thread Linux is killing is not a deadlock"
+        );
+
+        // The backend reports the kill: nothing is left, and nothing waits.
+        scheduler.logically_kill_thread(&child, &child, MmId::initial(child));
+        assert!(scheduler.namespace_zap_victims.is_empty());
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
+        assert!(scheduler.take_terminal_deadlock().is_none());
+
+        // Without a namespace end, the same pause is still a deadlock.
+        register_known_thread(&mut scheduler, child);
+        scheduler
+            .blocked
+            .timed_waiters
+            .insert(LogicalTime::INDEFINITE, child);
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
+        assert!(scheduler.take_terminal_deadlock().is_some());
     }
 
     #[test]
