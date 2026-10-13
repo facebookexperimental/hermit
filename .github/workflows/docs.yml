@@ -99,6 +99,14 @@ jobs:
       if: runner.environment == 'self-hosted'
       run: |
         set -euo pipefail
+        # The workspace persists between runs here. The extracted website
+        # under target/doc is read-only (directories 0555, files 0444), and
+        # actions/checkout's clean could not remove it: the next run failed
+        # 13 s in, at checkout, on 2026-10-13 02:23 UTC. Make the previous
+        # run's files writable before checkout cleans them.
+        if [[ -d "$GITHUB_WORKSPACE" ]]; then
+          chmod -R u+w -- "$GITHUB_WORKSPACE"
+        fi
         printf '%s\n' "$HOME/.cargo/bin" >> "$GITHUB_PATH"
         mkdir -p "$HOME/.cache"
         scratch=$(mktemp -d "$HOME/.cache/hermit-docs-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.XXXXXX")
@@ -624,3 +632,6 @@ jobs:
         set -euo pipefail
         chmod -R u+w -- "${COMPATIBILITY_SCRATCH_PARENT:?}"
         rm -rf -- "${COMPATIBILITY_SCRATCH_PARENT:?}"
+        if [[ -d target/doc ]]; then
+          chmod -R u+w -- target/doc
+        fi
