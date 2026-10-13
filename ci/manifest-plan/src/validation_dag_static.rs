@@ -1441,7 +1441,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4194): 1066.
     // And metadata::tests::record_version_rejects_streams_from_before_one_node_get_mempolicy
     // (https://github.com/rrnewton/hermit/issues/4214): 1067.
-    ("test.hermit_unit", 1067),
+    // And metadata::tests::record_version_rejects_streams_from_before_virtual_cpuinfo
+    // (https://github.com/rrnewton/hermit/issues/4161): 1068.
+    ("test.hermit_unit", 1068),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2041,7 +2043,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_drain_that_arms_a_sleeper_ends_the_pass_before_a_child_exit_timer): 1522.
     // And a_rendered_snapshot_survives_exec
     // (https://github.com/rrnewton/hermit/issues/4213 fix-forward): 1523.
-    ("test.detcore_unit", 1523),
+    // And cpuid::tests::cpuinfo_describes_the_virtual_cpu,
+    // cpuid::tests::cpuinfo_follows_linux_on_other_cpus,
+    // cpuid::tests::cpuinfo_flag_words_are_well_formed and
+    // procfs::tests::cpuinfo_describes_the_virtual_cpu_when_cpuid_is_virtualized
+    // (https://github.com/rrnewton/hermit/issues/4161): 1527, by listing.
+    ("test.detcore_unit", 1527),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2822,7 +2829,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4132): 355 (over main's 354).
     // And detcore_renders_its_procfs_files_on_every_backend
     // (https://github.com/rrnewton/hermit/issues/4213): 356.
-    ("test.cli", 356),
+    // And cpuinfo_matches_cpuid
+    // (https://github.com/rrnewton/hermit/issues/4161): 357.
+    ("test.cli", 357),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3108,7 +3117,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Nor does the guest SIGCHLD to a sleeping sibling test: 291 (over main's 290).
     // So does detcore_renders_its_procfs_files_on_every_backend
     // (https://github.com/rrnewton/hermit/issues/4213): 292.
-    ("test.cli_on_host", 292),
+    // Nor does the cpuinfo-matches-CPUID test: 293.
+    ("test.cli_on_host", 293),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -3292,7 +3302,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two host-signal-state refusal tests: 1520.
     // And the two ChildExit target tests of the 4237 fix-forward: 1522.
     // And the rendered-snapshot-across-exec test: 1523.
-    ("test.detcore_unit_on_host", 1523),
+    // And the four virtual-cpuinfo tests: 1527, by listing.
+    ("test.detcore_unit_on_host", 1527),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -3458,7 +3469,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the exec timer-flush record-epoch test: 1065.
     // And the vfork-gate fallback record-epoch test: 1066.
     // And the one-node get_mempolicy record-epoch test: 1067.
-    ("test.hermit_unit_on_host", 1067),
+    // And the virtual-cpuinfo record-epoch test: 1068.
+    ("test.hermit_unit_on_host", 1068),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

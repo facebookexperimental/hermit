@@ -217,6 +217,12 @@
       "why": "tests/c/cpuid_probe.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/cpuinfo_matches_cpuid.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/cpuinfo_matches_cpuid.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test cpuinfo_matches_cpuid compiles this guest, which compares /proc/cpuinfo's vendor, family, model, stepping, model name and 22 feature flags with what the CPUID instruction reports and prints only whether each matches, and requires every line to match at bitwise parity under hermit run --strict --verify --verify-strict (https://github.com/rrnewton/hermit/issues/4161: /proc/cpuinfo showed the host CPU while CPUID showed the virtual one); it remains a guest fixture because a generic manifest cannot assert this exact output."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/cwd_roundtrip.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

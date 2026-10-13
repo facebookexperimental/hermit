@@ -721,6 +721,12 @@ pub(crate) struct ProcfsSnapshotContext {
     pub(crate) mapping_identities: BTreeMap<(u64, u64), (u64, u64)>,
     pub(crate) mountinfo: Option<MountInfoSnapshot>,
     pub(crate) random_uuid: Option<[u8; 16]>,
+    /// `/proc/cpuinfo` rendered from the table Detcore answers the guest's
+    /// CPUID instruction from, when it does, so that the file describes that
+    /// virtual CPU rather than the host's
+    /// (<https://github.com/rrnewton/hermit/issues/4161>). Built by the caller
+    /// from `Detcore::virtual_cpuid`, the instruction's own source.
+    pub(crate) virtual_cpuinfo: Option<Vec<u8>>,
 }
 
 impl ProcfsFile {
@@ -1060,6 +1066,12 @@ impl ProcfsFile {
         self.kind == ProcfsKind::RandomUuid
     }
 
+    /// Returns true for `/proc/cpuinfo`, which may be rendered from the
+    /// virtual CPUID table instead of the host's file.
+    pub(crate) fn is_cpuinfo(&self) -> bool {
+        self.kind == ProcfsKind::Cpuinfo
+    }
+
     /// Returns true when this snapshot renders `btime`, the boot instant.
     pub(crate) fn needs_boot_time(&self) -> bool {
         self.kind == ProcfsKind::SystemStat
@@ -1081,6 +1093,7 @@ impl ProcfsFile {
             random_uuid,
             mapping_identities,
             mountinfo,
+            virtual_cpuinfo,
         } = context;
         let mapping_identities = &mapping_identities;
         self.contents = Some(match &self.kind {
@@ -1111,7 +1124,7 @@ impl ProcfsFile {
                 virtual_uptime_seconds,
                 virtual_boot_time_seconds.expect("system stat snapshot omitted its boot time"),
             ),
-            ProcfsKind::Cpuinfo => sanitize_cpuinfo(&contents),
+            ProcfsKind::Cpuinfo => virtual_cpuinfo.unwrap_or_else(|| sanitize_cpuinfo(&contents)),
             ProcfsKind::Diskstats => sanitize_diskstats(&contents),
             ProcfsKind::Loadavg => sanitize_loadavg(&contents),
             ProcfsKind::ProcessIo => sanitize_process_io(&contents),
@@ -6092,6 +6105,27 @@ Rss:                   4 kB\n" as &[u8];
             sanitize_cpuinfo(input),
             b"processor\t: 0\ncpu MHz\t\t: 1000.000\ncache size\t: 1024 KB\n"
         );
+    }
+
+    #[test]
+    fn cpuinfo_describes_the_virtual_cpu_when_cpuid_is_virtualized() {
+        let host = b"processor\t: 0\nmodel name\t: Example CPU\nflags\t\t: fpu avx512f\n\n";
+        let read = |virtual_cpuinfo: Option<Vec<u8>>| {
+            let mut file = ProcfsFile::from_path(Path::new("/proc/cpuinfo")).unwrap();
+            file.initialize(
+                host.to_vec(),
+                ProcfsSnapshotContext {
+                    virtual_cpuinfo,
+                    ..ProcfsSnapshotContext::default()
+                },
+            );
+            file.take(usize::MAX).unwrap()
+        };
+        let virtual_cpuinfo = crate::cpuid::InterceptedCpuid::new().cpuinfo();
+        // The host's file does not show through, whatever it says.
+        assert_eq!(read(Some(virtual_cpuinfo.clone())), virtual_cpuinfo);
+        // When the guest's CPUID is the host's, so is the file, normalized.
+        assert_eq!(read(None), sanitize_cpuinfo(host));
     }
 
     #[test]

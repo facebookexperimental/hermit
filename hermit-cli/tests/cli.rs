@@ -161,6 +161,7 @@ static PID_NAMESPACE_NESTED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RENDERED_PROCFS_FILES_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KERNEL_MAX_AFFINITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPU_DIRECTORY_READS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static CPUINFO_MATCHES_CPUID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_PROCESS_GROUP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_CREATE_RT_SIGNAL_REFUSED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_RT_SIGNAL_PENDING_OBSERVED_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -23499,6 +23500,86 @@ fn a_cpu_set_sized_from_kernel_max_holds_the_one_virtual_cpu() {
          nprocessors_conf=1 setsize=8 sched_getaffinity rc=0 ok count=1\n",
         "stderr:\n{log}"
     );
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
+            .expect("the verdict must be JSON");
+    assert_eq!(report["bitwise_parity"], true, "{report}");
+}
+
+/// /proc/cpuinfo describes the CPU that the CPUID instruction describes
+/// (https://github.com/rrnewton/hermit/issues/4161). The guest compares the
+/// vendor, family, model, stepping, model name and 22 feature flags that
+/// builds select code by, and prints only whether each matches, so the output
+/// is the same on every host and natively. Before, the file showed the host's
+/// CPU while CPUID showed Hermit's virtual one, and on an AMD EPYC host 15 of
+/// the 27 lines were MISMATCH.
+#[test]
+fn cpuinfo_matches_cpuid() {
+    let guest = futex_c_guest(&CPUINFO_MATCHES_CPUID_GUEST, "cpuinfo_matches_cpuid")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let verdict = directory.path().join("verify.json");
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "--log=info",
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            verdict.to_str().unwrap(),
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+        ]),
+        directory.path(),
+        Duration::from_secs(180),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "stdout:\n{stdout}\nstderr:\n{log}"
+    );
+    let mut expected = String::from(
+        "vendor_id: match\n\
+         cpu family: match\n\
+         model: match\n\
+         stepping: match\n\
+         model name: match\n",
+    );
+    for flag in [
+        "sse",
+        "sse2",
+        "pni",
+        "pclmulqdq",
+        "ssse3",
+        "fma",
+        "sse4_1",
+        "sse4_2",
+        "movbe",
+        "popcnt",
+        "aes",
+        "avx",
+        "f16c",
+        "bmi1",
+        "avx2",
+        "bmi2",
+        "avx512f",
+        "adx",
+        "sha_ni",
+        "avx512bw",
+        "vaes",
+        "vpclmulqdq",
+    ] {
+        expected += &format!("flag {flag}: match\n");
+    }
+    assert_eq!(stdout, expected, "stderr:\n{log}");
     let report: serde_json::Value =
         serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
             .expect("the verdict must be JSON");

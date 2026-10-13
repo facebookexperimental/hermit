@@ -384,6 +384,15 @@ enum CheckIn {
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
+    /// The table Detcore answers a guest's CPUID instruction from. Both the
+    /// instruction (`handle_cpuid_event`) and `/proc/cpuinfo` take it from
+    /// here, so a CPU profile such as
+    /// <https://github.com/rrnewton/hermit/issues/4243> proposes cannot give
+    /// the two views different CPUs.
+    pub(crate) fn virtual_cpuid(&self) -> cpuid::InterceptedCpuid {
+        cpuid::InterceptedCpuid::new()
+    }
+
     /// Signal phase 1, step I4 (design section 4, "The commit"): when the
     /// caller's process holds a SIGALRM entry that is due for it, run the
     /// signal pipeline ptrace runs at a signal-delivery stop (step 2), take
@@ -1999,7 +2008,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         let res = if self.cfg.virtualize_cpuid {
             let dettid = guest.thread_state().dettid;
             let time = &mut guest.thread_state_mut().thread_logical_time;
-            let intercepted = cpuid::InterceptedCpuid::new();
+            let intercepted = self.virtual_cpuid();
             time.add_cpuid();
             let nanos = time.as_nanos();
             trace!(

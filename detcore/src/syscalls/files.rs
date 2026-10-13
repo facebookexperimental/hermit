@@ -3146,6 +3146,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             None
         };
+        // The guest's CPUID instruction is answered from Detcore's table
+        // exactly when CPUID is virtualized and the backend delivers the
+        // instruction to Detcore (`handle_cpuid_event`), on ptrace and KVM
+        // alike; without CPUID interception the guest sees the host's CPU,
+        // and so does this file. On KVM this replaces the fixed stub
+        // reverie-kvm opens /proc/cpuinfo onto.
+        let is_cpuinfo = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.procfs_is_cpuinfo())?;
+        let virtual_cpuinfo =
+            (is_cpuinfo && self.cfg.virtualize_cpuid && guest.has_cpuid_interception())
+                .then(|| self.virtual_cpuid().cpuinfo());
         let needs_random_uuid = guest
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_needs_random_uuid())?;
@@ -3351,6 +3363,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     virtual_pty_count,
                     fdinfo_identity,
                     random_uuid,
+                    virtual_cpuinfo: virtual_cpuinfo.clone(),
                 },
             );
         })?;

@@ -421,7 +421,13 @@ impl RecordVersion {
 // refuses are EINVAL, where Detcore answered 0. Replay answers the call
 // itself, so an older recording of such a call would replay with different
 // answers.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x148);
+// 0x148 -> 0x149: when the guest's CPUID comes from Detcore's table,
+// /proc/cpuinfo describes that virtual CPU, generated from the table, where it
+// showed the host's model, flags and caches
+// (https://github.com/rrnewton/hermit/issues/4161). Record virtualizes CPUID,
+// and Detcore renders procfs over the recorded bytes during recording and
+// again during replay, so an older recording would replay with different bytes.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x149);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -446,7 +452,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x148);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x148;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x149;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1303,6 +1309,14 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_from_before_one_node_get_mempolicy() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x147)));
+    }
+
+    /// A recording older than 0x149 was made when /proc/cpuinfo showed the
+    /// host's CPU while CPUID showed the virtual one
+    /// (https://github.com/rrnewton/hermit/issues/4161).
+    #[test]
+    fn record_version_rejects_streams_from_before_virtual_cpuinfo() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x148)));
     }
 
     #[test]

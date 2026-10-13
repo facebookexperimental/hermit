@@ -913,6 +913,10 @@ impl DetFd {
         self.with_description(|d| d.procfs.as_ref().is_some_and(ProcfsFile::needs_random_uuid))
     }
 
+    pub(crate) fn procfs_is_cpuinfo(&self) -> bool {
+        self.with_description(|d| d.procfs.as_ref().is_some_and(ProcfsFile::is_cpuinfo))
+    }
+
     pub(crate) fn procfs_needs_boot_time(&self) -> bool {
         self.with_description(|d| d.procfs.as_ref().is_some_and(ProcfsFile::needs_boot_time))
     }
