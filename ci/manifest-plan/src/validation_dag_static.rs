@@ -2722,7 +2722,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4160): 325.
     // And a_signal_to_a_guest_blocked_in_a_polled_call_acts_as_on_linux
     // (https://github.com/rrnewton/hermit/issues/4187): 326.
-    ("test.cli", 326),
+    // a_cross_process_sigkill_verifies_at_bitwise_parity split into three
+    // tests, same modes (https://github.com/rrnewton/hermit/issues/4220): 327.
+    ("test.cli", 328),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2989,7 +2991,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Nor does the kernel_max affinity test: 260.
     // Nor does the CPU directory reads test: 261.
     // And the polled-call signal test: 262.
-    ("test.cli_on_host", 262),
+    // And the cross-process SIGKILL parity test split into three: 263.
+    ("test.cli_on_host", 264),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux

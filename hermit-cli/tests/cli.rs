@@ -21416,15 +21416,51 @@ fn a_killed_vfork_parent_does_not_stop_the_schedule() {
 /// sending turn (https://github.com/rrnewton/hermit/issues/3994), so the
 /// committed schedule and the INFO log no longer depend on when the host
 /// reports the target's death. Each mode must reach canonical bitwise parity
-/// in five consecutive verified runs. Before the fix the retirement landed at
+/// in every one of its listed consecutive verified runs (five for the kill
+/// controls). Before the fix the retirement landed at
 /// a host-chosen position: these controls matched in 2 and 6 of 10 runs.
-#[test]
-fn a_cross_process_sigkill_verifies_at_bitwise_parity() {
+///
+/// The modes are split across three tests so that each test's process stays
+/// well inside the per-test CPU budget: as one test, about 120 verified runs
+/// used 12 to 18.5 s of its 22 s and went over it under load
+/// (https://github.com/rrnewton/hermit/issues/4220).
+fn verify_sigkill_cross_process_modes(modes: &[(&str, &str, u32)]) {
     let _guard = hermit_run_guard();
     let program = sigkill_cross_process_guest()
         .to_str()
         .expect("sigkill guest path should be UTF-8");
-    for (mode, expected, attempts) in [
+    for &(mode, expected, attempts) in modes {
+        for attempt in 1..=attempts {
+            let args = [
+                "run",
+                "--strict",
+                "--verify",
+                "--verify-strict",
+                "--",
+                program,
+                mode,
+            ];
+            let output = hermit(&args);
+            let log = stderr(&output);
+            assert_success(&output, &args);
+            assert_eq!(stdout(&output), expected, "{mode} attempt {attempt}");
+            assert!(
+                log.contains(":: comparison=BitwiseInfoV1 relaxations=none"),
+                "{mode} attempt {attempt}: comparison was not canonical:\n{log}"
+            );
+            assert!(
+                log.contains(":: Success: deterministic. Determinism verified."),
+                "{mode} attempt {attempt}: verification failed:\n{log}"
+            );
+        }
+    }
+}
+
+/// A SIGKILL to another process, its process group, or a process that has
+/// already exited (see `verify_sigkill_cross_process_modes`).
+#[test]
+fn a_cross_process_sigkill_verifies_at_bitwise_parity() {
+    verify_sigkill_cross_process_modes(&[
         ("parent", "A killed by signal 9\n", 5),
         ("bystander", "A killed by signal 9\nB exited 0\n", 5),
         (
@@ -21457,6 +21493,14 @@ fn a_cross_process_sigkill_verifies_at_bitwise_parity() {
             "read after the kill: 0\nwriter killed by signal 9\n",
             5,
         ),
+    ]);
+}
+
+/// Sends that change nothing or that Linux rejects, and a non-SIGKILL signal
+/// to an exited child (see `verify_sigkill_cross_process_modes`).
+#[test]
+fn a_cross_process_sigkill_edge_case_verifies_at_bitwise_parity() {
+    verify_sigkill_cross_process_modes(&[
         ("cleartid", "futex word: 0\nchild killed by signal 9\n", 2),
         ("sigign", "kill: 0, waitpid: -1 errno ECHILD\n", 2),
         ("nocldwait", "kill: 0, waitpid: -1 errno ECHILD\n", 2),
@@ -21482,6 +21526,15 @@ fn a_cross_process_sigkill_verifies_at_bitwise_parity() {
         ("zombie_term", "kill(child, SIGTERM): 0 ok\n", 3),
         ("autoreap_term", "kill(child, SIGTERM): -1 ESRCH\n", 3),
         ("nocldwait_term", "kill(child, SIGTERM): -1 ESRCH\n", 3),
+    ]);
+}
+
+/// The SIGCHLD notifications of killed children, collected with
+/// sigtimedwait, a handler or a signalfd (see
+/// `verify_sigkill_cross_process_modes`).
+#[test]
+fn a_cross_process_sigkill_notification_verifies_at_bitwise_parity() {
+    verify_sigkill_cross_process_modes(&[
         // A blocked SIGCHLD collected with sigtimedwait carries Linux's
         // siginfo, for one child and for a killed group of two.
         (
@@ -21553,31 +21606,7 @@ fn a_cross_process_sigkill_verifies_at_bitwise_parity() {
             "preadv at offset 0: -1 ESPIPE\npreadv2 at offset 0: -1 ESPIPE\n",
             3,
         ),
-    ] {
-        for attempt in 1..=attempts {
-            let args = [
-                "run",
-                "--strict",
-                "--verify",
-                "--verify-strict",
-                "--",
-                program,
-                mode,
-            ];
-            let output = hermit(&args);
-            let log = stderr(&output);
-            assert_success(&output, &args);
-            assert_eq!(stdout(&output), expected, "{mode} attempt {attempt}");
-            assert!(
-                log.contains(":: comparison=BitwiseInfoV1 relaxations=none"),
-                "{mode} attempt {attempt}: comparison was not canonical:\n{log}"
-            );
-            assert!(
-                log.contains(":: Success: deterministic. Determinism verified."),
-                "{mode} attempt {attempt}: verification failed:\n{log}"
-            );
-        }
-    }
+    ]);
 }
 
 /// A SIGKILL whose victim is blocked in a background operation (a read of an
