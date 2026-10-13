@@ -13185,6 +13185,13 @@
         {
           "lane": "portable",
           "category": "compat",
+          "test": "compat/node",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
           "test": "compat/nohup",
           "mode": "verify",
           "backend": "kvm"
@@ -16432,6 +16439,13 @@
           "test": "compat/nm",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/node",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -22370,6 +22384,13 @@
           "test": "language-runtimes/m4-macro-mkstemp",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/node-v8-jit",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -59046,6 +59067,13 @@
         {
           "lane": "portable",
           "category": "compat",
+          "test": "compat/node",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
           "test": "compat/nohup",
           "mode": "verify",
           "backend": "kvm"
@@ -61552,6 +61580,13 @@
           "test": "language-runtimes/m4-macro-mkstemp",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/node-v8-jit",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",

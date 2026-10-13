@@ -40523,6 +40523,45 @@
       ],
       "test": "bin-c/posix-timer-test",
       "timeout_seconds": 57
+    },
+    {
+      "backend": "kvm",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
+      "test": "compat/node",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "kvm",
+      "category": "language-runtimes",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "node"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
+      "test": "language-runtimes/node-v8-jit",
+      "timeout_seconds": 57
     }
   ],
   "schema": 1

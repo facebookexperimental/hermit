@@ -1459,7 +1459,7 @@ corpus:
           install, ionice, iostat, ip, join, jq, ld, ln, logger, logname, ls,
           lscpu, lua, lua-direct, m4, make, md5sum, mkdir, mkfifo, mktemp,
           mpstat-softirqs, msgfmt, msgunfmt, mv, namei, netlink-route,
-          netlink-sock-diag, nice, nl, nm, nohup, nproc, numactl-hardware,
+          netlink-sock-diag, nice, nl, nm, node, nohup, nproc, numactl-hardware,
           numastat, numfmt, objcopy, objdump, od, openssl, paste, patch,
           pathchk, perl, perl-direct, pidstat-disk, pinky, pkg-config, pr,
           printenv, printf, ptx, pwd, python3, ranlib, readelf, readlink,

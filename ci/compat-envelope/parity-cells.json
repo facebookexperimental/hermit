@@ -9,12 +9,12 @@
   "counts": {
     "all": {
       "cells": 4085,
-      "applicable": 1922,
-      "selectable": 1593,
+      "applicable": 1924,
+      "selectable": 1594,
       "population": 2775,
-      "population_candidate_selected": 1593,
+      "population_candidate_selected": 1594,
       "population_candidate_not_selected": 258,
-      "population_candidate_disabled": 924
+      "population_candidate_disabled": 923
     },
     "by_backend": {
       "dbt": {
@@ -37,12 +37,12 @@
       },
       "kvm": {
         "cells": 817,
-        "applicable": 553,
-        "selectable": 522,
+        "applicable": 555,
+        "selectable": 523,
         "population": 555,
-        "population_candidate_selected": 522,
+        "population_candidate_selected": 523,
         "population_candidate_not_selected": 3,
-        "population_candidate_disabled": 30
+        "population_candidate_disabled": 29
       },
       "liteinst": {
         "cells": 817,
@@ -2127,7 +2127,7 @@
     {"test_id":"compat/nm","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: The guest starts a second program image, and each image after the first makes 33 raw system calls in ld-linux and libc, which SaBRe's execution-path contract refuses (trusted_shared_object_sites > 0)"},
     {"test_id":"compat/node","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/node","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only run type selects this cell, by its manifest label; full validation does not."},
-    {"test_id":"compat/node","backend":"kvm","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/node","backend":"kvm","category":"compat","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/node","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/node","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/nohup","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: A compat corpus row runs only its lane's verify cell on ptrace, a verify cell on kvm, a focused run type's verify cell on sabre, and a focused run type's replay cell on ptrace"},
@@ -3872,7 +3872,7 @@
     {"test_id":"language-runtimes/m4-macro-mkstemp","backend":"sabre","category":"language-runtimes","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: SaBRe requires its external runtime"},
     {"test_id":"language-runtimes/node-v8-jit","backend":"dbt","category":"language-runtimes","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: DBI rewrites the code stream, so a JIT that writes its own code at run time needs separate qualification"},
     {"test_id":"language-runtimes/node-v8-jit","backend":"in-guest-trap","category":"language-runtimes","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
-    {"test_id":"language-runtimes/node-v8-jit","backend":"kvm","category":"language-runtimes","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: KVM requires the privileged runner"},
+    {"test_id":"language-runtimes/node-v8-jit","backend":"kvm","category":"language-runtimes","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"language-runtimes/node-v8-jit","backend":"liteinst","category":"language-runtimes","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: LiteInst patches the code stream, so JIT-generated code needs separate qualification"},
     {"test_id":"language-runtimes/node-v8-jit","backend":"sabre","category":"language-runtimes","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: SaBRe requires its external runtime"},
     {"test_id":"language-runtimes/perl-hash-order","backend":"dbt","category":"language-runtimes","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: DBT perl support is tracked by backend compatibility"},
