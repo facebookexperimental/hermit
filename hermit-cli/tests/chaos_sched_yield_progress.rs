@@ -145,7 +145,12 @@ fn contention_guest() -> &'static Path {
 }
 
 fn run_seed(seed: u64, chaos_args: &[&str], guest_args: &[&str]) {
-    let stdout = run_chaos(guest(), seed, chaos_args, guest_args);
+    // A typed PMU skid-overshoot refusal (exit 122) says nothing about
+    // progress, and the guest has usually finished by then; run again as the
+    // random-heuristic checks do. Main cbf1bef2's validation failed this way at
+    // seed 9 of the yield-then-write check, after the guest printed both lines.
+    let output = run_chaos_retrying_skid(guest(), seed, &[], chaos_args, guest_args);
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("sched-yield-progress-ok"),
         "missing progress marker under chaos with seed {seed}; stdout:\n{stdout}"
