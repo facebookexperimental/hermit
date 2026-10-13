@@ -982,8 +982,8 @@ pub(super) fn run_dbt(
     mut environment: BTreeMap<OsString, OsString>,
     workdir: Option<&Path>,
     binds: Vec<(PathBuf, PathBuf)>,
+    local_networking: bool,
     verification_stdin: Option<std::fs::File>,
-    options: &super::run::RunOpts,
 ) -> Result<ExitStatus, Error> {
     if let Some(path) = verify_json.filter(|_| verify) {
         write_pending_verification_json(path)?;
@@ -1032,14 +1032,13 @@ pub(super) fn run_dbt(
              --bind target, for DBT",
         ));
     }
-    // The container applies the binds; keep the existing target admission.
-    for bind in &binds {
-        hermit_test_workdir::check_bind_target(&bind.target)?;
-    }
-    let execution = DbtExecution::new(
-        options,
-        isolated_workdir.is_some() && workdir == isolated_workdir,
-    );
+    let isolation = hermit_test_workdir::Isolation {
+        test_workdir: isolated_workdir.is_some() && workdir == isolated_workdir,
+        local_networking,
+        binds,
+        preserve: Vec::new(),
+    };
+    let execution = DbtExecution::new(isolation)?;
     let stdin_is_terminal = std::io::stdin().is_terminal();
 
     let (drrun, client) = detcore_dbt::prepare_native_client().map_err(|error| {
@@ -1491,53 +1490,64 @@ pub(super) fn run_dbt(
     _environment: BTreeMap<OsString, OsString>,
     _workdir: Option<&Path>,
     _binds: Vec<(std::path::PathBuf, std::path::PathBuf)>,
+    _local_networking: bool,
     _verification_stdin: Option<std::fs::File>,
-    _options: &super::run::RunOpts,
 ) -> Result<ExitStatus, Error> {
     Err(Error::msg("DBT support was not included in this build"))
 }
 
-/// Each physical DBT run is the init of its own container, the one every
-/// backend uses (`RunOpts::launch_in_container`): PID, UTS, mount and
-/// network namespaces, a private /tmp and the identity mounts. Under
-/// `--no-namespace` it is a plain child. The coordinator runtime is created
-/// inside, so its workers and the guest share those namespaces.
+/// Local networking, marked workdirs, and binds create coordinator workers in
+/// fresh namespaces for each physical run. Only host-network runs without mount
+/// isolation share the calling thread's coordinator runtime.
 #[cfg(feature = "dbt")]
 struct DbtExecution {
-    options: super::run::RunOpts,
-    /// Statistics sinks, made below the original /tmp before the run, that
-    /// the client must still reach at the same path inside the private /tmp.
-    statistics: std::cell::RefCell<Vec<PathBuf>>,
+    runtime: Option<tokio::runtime::Runtime>,
+    isolation: Option<std::sync::Mutex<hermit_test_workdir::Isolation>>,
 }
 
 #[cfg(feature = "dbt")]
 impl DbtExecution {
-    fn new(options: &super::run::RunOpts, test_workdir: bool) -> Self {
-        // A marked workdir gets the fresh tmpfs that `hermit_test_workdir`
-        // mounts on it.
-        let mounts = if test_workdir {
-            vec![
-                reverie::process::Mount::tmpfs(hermit_test_workdir::WORKDIR)
-                    .flags(
-                        reverie::process::MountFlags::MS_NOSUID
-                            | reverie::process::MountFlags::MS_NODEV,
-                    )
-                    .data("mode=1777"),
-            ]
+    fn new(isolation: hermit_test_workdir::Isolation) -> Result<Self, Error> {
+        Ok(if isolation.is_empty() {
+            Self {
+                runtime: Some(Self::new_runtime()?),
+                isolation: None,
+            }
         } else {
-            Vec::new()
-        };
-        Self {
-            options: options.with_dbt_mounts(&[], mounts),
-            statistics: Default::default(),
-        }
+            // The run's mount/network namespaces need CAP_SYS_ADMIN. A caller without it
+            // takes it the way every other backend's container does (root mapped
+            // to the caller), so a bound DBT run needs no privileged host; such a
+            // caller has no capability to lose, and its file access is unchanged.
+            // A caller that holds it keeps its own credentials, so nothing it
+            // writes after the run (verify reports, retained logs) loses one.
+            // Nothing has started a thread yet.
+            if !hermit_test_workdir::has_cap_sys_admin()? {
+                hermit_test_workdir::enter_root_user_namespace().map_err(|error| {
+                    Error::msg(format!(
+                        "failed to give the DBT run the user namespace its local networking \
+                         or private mounts need: {error}"
+                    ))
+                })?;
+            }
+            Self {
+                runtime: None,
+                isolation: Some(std::sync::Mutex::new(isolation)),
+            }
+        })
     }
 
+    /// A statistics sink the client can still write once binds replace /tmp:
+    /// its directory is made before the run, below the original /tmp, so the
+    /// namespace re-binds it at the same path.
     fn stats_capture(&self) -> Result<DbtStatsCapture, Error> {
         let capture = DbtStatsCapture::new()?;
-        self.statistics
-            .borrow_mut()
-            .push(capture.directory.path().to_path_buf());
+        if let Some(isolation) = &self.isolation {
+            isolation
+                .lock()
+                .expect("DBT isolation lock")
+                .preserve
+                .push(capture.directory.path().to_path_buf());
+        }
         Ok(capture)
     }
 
@@ -1550,140 +1560,37 @@ impl DbtExecution {
             .map_err(|error| Error::msg(format!("failed to start the DBT coordinator: {error}")))
     }
 
-    /// Run `run` with a fresh coordinator runtime and `config` completed for
-    /// the container. The guest's environment keeps the configuration
-    /// encoded before the container exists: the completed one carries this
-    /// run's host mount IDs, and its length would move the guest's stack.
-    fn run<F, T>(&self, config: &Config, mut run: F) -> Result<T, Error>
+    fn run<F, T>(&self, run: F) -> Result<T, Error>
     where
-        F: FnMut(&tokio::runtime::Runtime, &Config) -> Result<T, Error> + 'static,
-        T: serde::Serialize + serde::de::DeserializeOwned + 'static,
+        F: FnOnce(&tokio::runtime::Runtime) -> Result<T, Error> + Send,
+        T: Send,
     {
+        if let Some(runtime) = &self.runtime {
+            return run(runtime);
+        }
+        let mut isolation = self
+            .isolation
+            .as_ref()
+            .expect("a DBT execution without a runtime is isolated")
+            .lock()
+            .expect("DBT isolation lock")
+            .clone();
         // A verification's run-1 statistics sink is finished and removed before
         // run 2; only the sinks that still exist are this run's to preserve.
-        let preserved = self
-            .statistics
-            .borrow()
-            .iter()
-            .filter(|path| path.exists())
-            .cloned()
-            .collect::<Vec<_>>();
-        let options = self.options.with_dbt_mounts(&preserved, Vec::new());
-        let config = config.clone();
-        options
-            .launch_in_container(
-                (),
-                "the DBT coordinator",
-                options.run_timeout(),
-                move |_, identity| {
-                    // The detached stdin reader may stay blocked after the
-                    // guest exits.
-                    super::container::exit_init_after_publication();
-                    let config = super::run::complete_container_config(config.clone(), identity)?;
-                    let runtime = Self::new_runtime()?;
-                    // The operation consumes GlobalState cleanup; runtime Drop
-                    // joins its workers before the result is published.
-                    run(&runtime, &config)
-                },
-            )
-            .map(|(value, ())| value)
+        isolation.preserve.retain(|path| path.exists());
+        hermit_test_workdir::with_isolation(&isolation, move || {
+            let runtime = Self::new_runtime()?;
+            // The operation consumes GlobalState cleanup before returning;
+            // runtime Drop joins its workers before this scoped thread exits.
+            run(&runtime)
+        })
+        .map_err(|error| {
+            Error::msg(format!(
+                "failed to set up the DBT run's private namespaces for local networking \
+                 or private mounts: {error}"
+            ))
+        })?
     }
-}
-
-/// A run's wait status and output, in the form the container init publishes.
-#[cfg(feature = "dbt")]
-#[derive(serde::Serialize, serde::Deserialize)]
-struct DbtPhysicalOutput {
-    status: i32,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-}
-
-#[cfg(feature = "dbt")]
-impl From<Output> for DbtPhysicalOutput {
-    fn from(output: Output) -> Self {
-        Self {
-            status: output.status.into_raw(),
-            stdout: output.stdout,
-            stderr: output.stderr,
-        }
-    }
-}
-
-#[cfg(feature = "dbt")]
-impl From<DbtPhysicalOutput> for Output {
-    fn from(output: DbtPhysicalOutput) -> Self {
-        Self {
-            status: std::process::ExitStatus::from_raw(output.status),
-            stdout: output.stdout,
-            stderr: output.stderr,
-        }
-    }
-}
-
-/// The container init's copy-on-write view of the caller's input. The init
-/// exits without unwinding, which closes its descriptors; dropping the reader
-/// would free heap the parent still owns.
-#[cfg(feature = "dbt")]
-struct ChildInput<R>(std::mem::ManuallyDrop<R>);
-
-#[cfg(feature = "dbt")]
-impl<R: Read> Read for ChildInput<R> {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        self.0.read(buffer)
-    }
-}
-
-/// [`DbtRunEvidence`] with its own descriptor, for the container init.
-#[cfg(feature = "dbt")]
-struct OwnedDbtRunEvidence {
-    file: std::fs::File,
-    log_level: DbtEvidenceLogLevel,
-    label: &'static str,
-}
-
-#[cfg(feature = "dbt")]
-impl OwnedDbtRunEvidence {
-    fn from_borrowed(evidence: Option<DbtRunEvidence<'_>>) -> Result<Option<Self>, Error> {
-        evidence
-            .map(|evidence| {
-                Ok(Self {
-                    file: evidence.file.try_clone()?,
-                    log_level: evidence.log_level,
-                    label: evidence.label,
-                })
-            })
-            .transpose()
-    }
-
-    fn borrowed(&self) -> DbtRunEvidence<'_> {
-        DbtRunEvidence {
-            file: &self.file,
-            log_level: self.log_level,
-            label: self.label,
-        }
-    }
-}
-
-/// A copy of `guest`, which `std::process::Command` cannot clone.
-#[cfg(feature = "dbt")]
-fn copy_dbt_command(guest: &StdCommand) -> StdCommand {
-    let mut command = StdCommand::new(guest.get_program());
-    command.args(guest.get_args());
-    for (name, value) in guest.get_envs() {
-        match value {
-            Some(value) => {
-                command.env(name, value);
-            }
-            None => {
-                command.env_remove(name);
-            }
-        }
-    }
-    if let Some(directory) = guest.get_current_dir() {
-        command.current_dir(directory);
-    }
-    command
 }
 
 /// Create the abstract Unix evidence listener only after entering this physical
@@ -1726,35 +1633,21 @@ fn run_once<R: Read + Send + 'static>(
     evidence: Option<DbtRunEvidence<'_>>,
     input: R,
 ) -> Result<Output, Error> {
-    let runner = runner.clone();
-    let guest = copy_dbt_command(guest);
-    let drrun = drrun.to_path_buf();
-    let evidence = OwnedDbtRunEvidence::from_borrowed(evidence)?;
-    let mut input = Some(input);
-    execution
-        .run(config, move |runtime, config| {
-            let runner = configure_dbt_run_evidence(
-                &runner,
-                evidence.as_ref().map(OwnedDbtRunEvidence::borrowed),
-            )?;
-            let guest = prepare_dbt_physical_command(&guest)?;
-            let input =
-                ChildInput(std::mem::ManuallyDrop::new(input.take().ok_or_else(
-                    || Error::msg("DBT physical input already consumed"),
-                )?));
-            let (output, global) = runtime
-                .block_on(
-                    runner.output_with_detached_reader_and_global::<detcore::GlobalState, _>(
-                        &guest,
-                        input,
-                        config.clone(),
-                    ),
-                )
-                .map_err(|error| dbt_run_error(&drrun, error))?;
-            runtime.block_on(clean_up_dbt_global(&output.status, global));
-            Ok(DbtPhysicalOutput::from(output))
-        })
-        .map(Output::from)
+    execution.run(move |runtime| {
+        let runner = configure_dbt_run_evidence(runner, evidence)?;
+        let guest = prepare_dbt_physical_command(guest)?;
+        let (output, global) = runtime
+            .block_on(
+                runner.output_with_detached_reader_and_global::<detcore::GlobalState, _>(
+                    &guest,
+                    input,
+                    config.clone(),
+                ),
+            )
+            .map_err(|error| dbt_run_error(drrun, error))?;
+        runtime.block_on(clean_up_dbt_global(&output.status, global));
+        Ok(output)
+    })
 }
 
 #[cfg(feature = "dbt")]
@@ -1766,29 +1659,20 @@ fn run_once_with_terminal_input(
     config: &Config,
     evidence: Option<DbtRunEvidence<'_>>,
 ) -> Result<Output, Error> {
-    let runner = runner.clone();
-    let guest = copy_dbt_command(guest);
-    let drrun = drrun.to_path_buf();
-    let evidence = OwnedDbtRunEvidence::from_borrowed(evidence)?;
-    execution
-        .run(config, move |runtime, config| {
-            let runner = configure_dbt_run_evidence(
-                &runner,
-                evidence.as_ref().map(OwnedDbtRunEvidence::borrowed),
-            )?;
-            let guest = prepare_dbt_physical_command(&guest)?;
-            let (output, global) = runtime
-                .block_on(
-                    runner.output_with_inherited_stdin_and_global::<detcore::GlobalState>(
-                        &guest,
-                        config.clone(),
-                    ),
-                )
-                .map_err(|error| dbt_run_error(&drrun, error))?;
-            runtime.block_on(clean_up_dbt_global(&output.status, global));
-            Ok(DbtPhysicalOutput::from(output))
-        })
-        .map(Output::from)
+    execution.run(move |runtime| {
+        let runner = configure_dbt_run_evidence(runner, evidence)?;
+        let guest = prepare_dbt_physical_command(guest)?;
+        let (output, global) = runtime
+            .block_on(
+                runner.output_with_inherited_stdin_and_global::<detcore::GlobalState>(
+                    &guest,
+                    config.clone(),
+                ),
+            )
+            .map_err(|error| dbt_run_error(drrun, error))?;
+        runtime.block_on(clean_up_dbt_global(&output.status, global));
+        Ok(output)
+    })
 }
 
 #[cfg(feature = "dbt")]
@@ -1799,19 +1683,14 @@ fn run_status(
     drrun: &Path,
     config: &Config,
 ) -> Result<std::process::ExitStatus, Error> {
-    let runner = runner.clone();
-    let guest = copy_dbt_command(guest);
-    let drrun = drrun.to_path_buf();
-    execution
-        .run(config, move |runtime, config| {
-            let guest = prepare_dbt_physical_command(&guest)?;
-            let (status, global) = runtime
-                .block_on(runner.status_with_global::<detcore::GlobalState>(&guest, config.clone()))
-                .map_err(|error| dbt_run_error(&drrun, error))?;
-            runtime.block_on(clean_up_dbt_global(&status, global));
-            Ok(status.into_raw())
-        })
-        .map(std::process::ExitStatus::from_raw)
+    execution.run(move |runtime| {
+        let guest = prepare_dbt_physical_command(guest)?;
+        let (status, global) = runtime
+            .block_on(runner.status_with_global::<detcore::GlobalState>(&guest, config.clone()))
+            .map_err(|error| dbt_run_error(drrun, error))?;
+        runtime.block_on(clean_up_dbt_global(&status, global));
+        Ok(status)
+    })
 }
 
 #[cfg(feature = "dbt")]

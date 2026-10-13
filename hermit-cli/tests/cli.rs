@@ -3493,47 +3493,6 @@ fn run_dbt_binds_in_a_user_namespace_of_its_own() {
     assert_eq!(lines.next(), None, "{text}");
 }
 
-/// DBT launches through the same container as ptrace
-/// (https://github.com/rrnewton/hermit/issues/4009): the guest's PID 1 is
-/// Hermit's container init rather than the host's, the hostname comes from a
-/// UTS namespace that Detcore does not rewrite (procfs `hostname` is raw), and
-/// /tmp is private.
-#[test]
-fn dbt_guest_runs_in_the_common_container() {
-    if dbt_unavailable("dbt_guest_runs_in_the_common_container") {
-        return;
-    }
-    let marker = tempfile::Builder::new()
-        .prefix("hermit-host-tmp-marker-")
-        .tempfile_in("/tmp")
-        .expect("create a host /tmp marker");
-    let script = format!(
-        "cat /proc/1/comm /proc/sys/kernel/hostname; \
-         if test -e {0}; then echo visible; else echo hidden; fi",
-        marker.path().display()
-    );
-    for backend in ["ptrace", "dbt"] {
-        let args = [
-            "--backend",
-            backend,
-            "run",
-            "--strict",
-            "--base-env=minimal",
-            "--",
-            "/bin/sh",
-            "-c",
-            &script,
-        ];
-        let output = hermit(&args);
-        assert_success(&output, &args);
-        assert_eq!(
-            stdout(&output),
-            "hermit\nhermetic-container.local\nhidden\n",
-            "{backend}"
-        );
-    }
-}
-
 #[test]
 #[ignore = "requires the pinned-root isolation validation node and its /test marker"]
 fn run_dbt_verifies_fresh_physical_workdirs() {
@@ -3801,9 +3760,10 @@ fn dbt_verify_without_json_rejects_io_buffer_content_divergence() {
         String::from_utf8_lossy(&compile.stderr)
     );
 
-    // Outside /tmp: both runs must reach the same host file through the
-    // container's private /tmp, as they would under ptrace.
-    let state = build_root.path().join("state");
+    let state = Path::new("/tmp").join(format!(
+        "hermit-dbt-iobuf-verification-{}",
+        std::process::id()
+    ));
     fs::write(&state, b"AAAAAAAAAAAAAAAA").expect("failed to seed DBT io-buffer state");
     let log_dir = build_root.path().join("verify-logs");
     fs::create_dir(&log_dir).expect("failed to create DBT verification log directory");
@@ -12746,8 +12706,8 @@ fn max_log_bytes_verify_exits_promptly_when_stderr_fills_after_run1() {
 /// the flag instead, with 122 (round-2 review of
 /// https://github.com/rrnewton/hermit/pull/3686, finding 2). LiteInst, which
 /// runs only in-guest, under `--no-namespace` spawns a guest that is not traced
-/// and that no PID namespace contains, DBT is refused in every namespace mode until the cap
-/// is tested ending a run in its container, and KVM's host processes under `--no-namespace` are not
+/// and that no PID namespace contains, DBT's guest is a plain child of the outer process in
+/// every namespace mode, and KVM's host processes under `--no-namespace` are not
 /// shown to die with hermit. SaBRe under `--no-namespace` hands its guest to the
 /// supervisor worker stopped and untraced, before `PTRACE_O_EXITKILL` binds it
 /// (round-3 review of the same pull request, finding 2). The refusal comes

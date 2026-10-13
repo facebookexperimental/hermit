@@ -2747,7 +2747,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_childs_sigchld_ends_a_sleep_only_when_caught_and_unblocked and
     // every_sigchld_copy_is_accounted_for_as_on_linux
     // (https://github.com/rrnewton/hermit/issues/4126): 331.
-    ("test.cli", 332),
+    ("test.cli", 331),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.

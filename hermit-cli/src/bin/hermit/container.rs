@@ -944,25 +944,6 @@ pub(super) const CONTAINER_INIT_ARMING_STALL_ENV: &str =
 pub(super) const CONTAINER_INIT_ARMING_STALL: std::time::Duration =
     std::time::Duration::from_secs(60);
 
-/// Set inside a container init by [`exit_init_after_publication`].
-static EXIT_AFTER_PUBLICATION: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Called by work running in a container init that leaves a thread behind (a
-/// detached stdin reader that may stay blocked): the init exits as soon as its
-/// result is published instead of waiting for that thread, with the status
-/// the init returns anyway. Each init is its own process, so this never
-/// affects the caller.
-#[cfg(feature = "dbt")]
-pub(super) fn exit_init_after_publication() {
-    EXIT_AFTER_PUBLICATION.store(true, Ordering::Release);
-}
-
-/// Whether [`exit_init_after_publication`] was called in this process.
-pub(super) fn exits_init_after_publication() -> bool {
-    EXIT_AFTER_PUBLICATION.load(Ordering::Acquire)
-}
-
 /// Arm both container-init guards. Call this as the FIRST statement inside any
 /// `Container::run` closure that is not going through [`with_container`].
 ///
