@@ -2682,8 +2682,9 @@ fn record_nested_vfork_chains() {
 /// calls the host times while a sibling thread spins: its readmission is not
 /// logged, so the scheduler must commit no other turn while it is in the
 /// background (Claude review of https://github.com/rrnewton/hermit/pull/4205).
-/// The spinning sibling makes a PMU skid-overshoot refusal possible, so an
-/// attempt that ends in one is retried.
+/// Only that spinning case retries an attempt that ends in a PMU skid-overshoot
+/// refusal (at most 3 attempts), as the spinning sibling makes one possible;
+/// the other two modes get one attempt.
 #[test]
 fn record_vfork_child_waiting_for_another_thread() {
     let _guard = hermit_record_lock();
@@ -2705,22 +2706,24 @@ fn record_vfork_child_waiting_for_another_thread() {
         "guest compilation failed:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    for (mode, line) in [
-        ("fork-wait", "fork-wait done, child status 0\n"),
+    for (mode, line, max_attempts) in [
+        ("fork-wait", "fork-wait done, child status 0\n", 1),
         (
             "sibling-pipe",
             "sibling-pipe done, child status 0, writer status 0\n",
+            1,
         ),
         (
             "background-sibling",
             "background-sibling done, child status 0, sibling progress while the child waited ",
+            3,
         ),
     ] {
         let output = canonical_record_replay_command_retrying_skid(
             &format!("vfork child {mode}"),
             &guest,
             &[OsStr::new(mode)],
-            3,
+            max_attempts,
         );
         assert!(output.contains(line), "missing {line:?} in:\n{output}");
     }

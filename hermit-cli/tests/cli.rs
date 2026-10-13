@@ -22996,47 +22996,72 @@ fn cpu_directory_reads_list_only_cpu0_on_every_path() {
 /// for, another thread waited forever. A child whose calls the host times, with
 /// a sibling thread spinning, still runs at parity: the sibling's progress
 /// while the child waits must not depend on host timing (Claude review of
-/// https://github.com/rrnewton/hermit/pull/4205).
+/// https://github.com/rrnewton/hermit/pull/4205). Only that spinning case
+/// retries an attempt that ends in a typed PMU skid-overshoot refusal (at most
+/// 3 attempts, https://github.com/rrnewton/hermit/issues/1845), which the
+/// spinning sibling makes possible; the other modes get one attempt.
 #[test]
 fn a_vfork_child_waiting_for_another_thread_completes_at_bitwise_parity() {
     let guest = futex_c_guest(&VFORK_CHILD_WAITS_GUEST, "vfork_child_waits")
         .to_str()
         .unwrap()
         .to_owned();
-    for (mode, expected) in [
-        ("fork-wait", "fork-wait done, child status 0\n"),
+    for (mode, expected, max_attempts) in [
+        ("fork-wait", "fork-wait done, child status 0\n", 1),
         (
             "sibling-pipe",
             "sibling-pipe done, child status 0, writer status 0\n",
+            1,
         ),
         (
             "background-sibling",
             "background-sibling done, child status 0, sibling progress while the child waited ",
+            3,
         ),
     ] {
-        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-        let verdict = directory.path().join("verify.json");
-        let (status, log) = run_with_deadline(
-            hermit_command(&[
-                "--log=info",
-                "run",
-                "--strict",
-                "--verify",
-                "--verify-strict",
-                "--verify-json",
-                verdict.to_str().unwrap(),
-                "--timeout",
-                "60",
-                "--",
-                guest.as_str(),
-                mode,
-            ]),
-            directory.path(),
-            Duration::from_secs(180),
-            false,
-        );
-        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
-            .expect("failed to read the guest's stdout");
+        let (status, log, stdout, verdict, _directory) = (1..=max_attempts)
+            .map(|attempt| {
+                let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+                let verdict = directory.path().join("verify.json");
+                let (status, log) = run_with_deadline(
+                    hermit_command(&[
+                        "--log=info",
+                        "run",
+                        "--strict",
+                        "--verify",
+                        "--verify-strict",
+                        "--verify-json",
+                        verdict.to_str().unwrap(),
+                        "--timeout",
+                        "60",
+                        "--",
+                        guest.as_str(),
+                        mode,
+                    ]),
+                    directory.path(),
+                    Duration::from_secs(180),
+                    false,
+                );
+                let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+                    .expect("failed to read the guest's stdout");
+                (attempt, status, log, stdout, verdict, directory)
+            })
+            .find(|(attempt, status, log, ..)| {
+                let refusal = skid_overshoot_refusal(status.and_then(|status| status.code()), log);
+                if *attempt < max_attempts
+                    && let Some(refusal) = refusal
+                {
+                    eprintln!(
+                        "SKID-RETRY {mode}: attempt {attempt} of at most {max_attempts}: {refusal}"
+                    );
+                    return false;
+                }
+                true
+            })
+            .map(|(_, status, log, stdout, verdict, directory)| {
+                (status, log, stdout, verdict, directory)
+            })
+            .expect("the last attempt is always kept");
         assert_eq!(
             status.and_then(|status| status.code()),
             Some(0),

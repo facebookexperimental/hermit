@@ -5966,7 +5966,7 @@ impl Scheduler {
         if self.blocked.sigchld_deferred.is_empty() {
             return;
         }
-        let only_pollers = self.run_queue.only_pollers();
+        let only_pollers = self.run_queue.only_pollers() && !self.vfork_child_runs_turn();
         if !self.run_queue.is_empty() && !only_pollers {
             return;
         }
@@ -8133,6 +8133,21 @@ impl Scheduler {
             .copied()
     }
 
+    /// Whether a vfork barrier's child is queued to run a turn (not only
+    /// polling): step 3 then selects it first. The deterministic-work-first
+    /// gates count it as ordinary work even when its priority is in the last
+    /// band, where `only_pollers` counts every entry as a poller, so that no
+    /// background call or deferred signal is admitted between its turns at a
+    /// moment the host chose. The fence that step 3 applies and the gates that
+    /// admit host-timed completions then agree on what is runnable work (Codex
+    /// re-check of https://github.com/rrnewton/hermit/pull/4205).
+    fn vfork_child_runs_turn(&self) -> bool {
+        self.vfork_barriers
+            .values()
+            .flatten()
+            .any(|child| self.run_queue.contains_non_polling_tid(*child))
+    }
+
     /// Check on threads executing blocking syscalls outside the runnable set.
     fn step2c_process_io_blockers(&mut self) -> Result<(), SkipTurn> {
         if !self.blocked.external_io_blockers.is_empty()
@@ -8227,7 +8242,10 @@ impl Scheduler {
                 // background pselect6 forever (https://github.com/rrnewton/hermit/issues/4092).
                 // Whether the call has finished is host-timed, as for a poller;
                 // `log_rejoin` records the turn of the readmission for replay.
-                let only_pollers = self.run_queue.only_pollers_or_yielders();
+                // A vfork barrier's child that will run a turn is work too,
+                // whatever its priority (see `vfork_child_runs_turn`).
+                let only_pollers =
+                    self.run_queue.only_pollers_or_yielders() && !self.vfork_child_runs_turn();
 
                 // Deterministic work is runnable: let it proceed. Waiting here while such
                 // work exists can deadlock thread creation -- the parent and new child
@@ -8325,7 +8343,7 @@ impl Scheduler {
             // completion timing must not decide whether a ready continuation overtakes
             // guest work that was already runnable. Pollers are excluded because they
             // commonly wait for the completed operation and would otherwise starve it.
-            let only_pollers = self.run_queue.only_pollers();
+            let only_pollers = self.run_queue.only_pollers() && !self.vfork_child_runs_turn();
             if !self.run_queue.is_empty() && !only_pollers {
                 if let Some(child) = self.vfork_gated_background_child()
                     && ready.contains(&child)
@@ -14279,6 +14297,66 @@ mod test {
         assert!(scheduler.step2c_process_io_blockers().is_ok());
         assert!(scheduler.blocked.external_io_blockers.is_empty());
         assert!(scheduler.run_queue.contains_tid(parent));
+    }
+
+    /// With two vfork barriers, a child in the last priority band that is not
+    /// polling (P->C, Q->D: D runnable at `LAST_PRIORITY`) is the work step 3
+    /// selects, so a finished background call of the other child C is not
+    /// harvested between D's turns, in run or record mode: the fence and the
+    /// deterministic-work-first gates agree (Codex re-check of
+    /// https://github.com/rrnewton/hermit/pull/4205).
+    #[test]
+    fn a_runnable_last_band_vfork_child_keeps_another_childs_background_call_parked() {
+        for recordreplay in [false, true] {
+            let mut scheduler = Scheduler::new(&Config::default());
+            scheduler.recordreplay_modes = recordreplay;
+            let (p, c) = (DetTid::from_raw(3), DetTid::from_raw(5));
+            let (q, d) = (DetTid::from_raw(9), DetTid::from_raw(11));
+            let op_id = ExternalOpId::new(c, 1);
+            let mut continuation = Resources::new(c);
+            continuation.insert(ResourceID::BlockedExternalContinue(op_id), Permission::RW);
+            scheduler.vfork_barriers.insert(p, Some(c));
+            scheduler.vfork_barriers.insert(q, Some(d));
+            for tid in [c, d] {
+                scheduler.priorities.insert(tid, DEFAULT_PRIORITY);
+            }
+            scheduler.next_turns.insert(
+                c,
+                ThreadNextTurn {
+                    dettid: c,
+                    child_tid_addr: 0,
+                    req: Ivar::full(Ok(continuation)),
+                    resp: Ivar::new(),
+                    protocol: Default::default(),
+                },
+            );
+            scheduler.next_turns.insert(
+                d,
+                ThreadNextTurn {
+                    dettid: d,
+                    child_tid_addr: 0,
+                    req: Ivar::full(Ok(Resources::new(d))),
+                    resp: Ivar::new(),
+                    protocol: Default::default(),
+                },
+            );
+            scheduler.blocked.external_io_blockers.insert(c, op_id);
+            scheduler.run_queue.push_back(d, runqueue::LAST_PRIORITY);
+            assert!(
+                scheduler.run_queue.only_pollers(),
+                "the band alone reads as a poller"
+            );
+
+            assert!(scheduler.step2c_process_io_blockers().is_ok());
+            assert_eq!(
+                scheduler.blocked.external_io_blockers.get(&c),
+                Some(&op_id),
+                "record/replay {recordreplay}: the finished call stays parked while D runs"
+            );
+            let (selected, _, _) = scheduler.step3_peek().expect("D runs");
+            assert_eq!(selected, d, "record/replay {recordreplay}");
+            scheduler.run_queue.undo_tentative_pop();
+        }
     }
 
     #[test]

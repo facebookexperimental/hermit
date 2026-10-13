@@ -70,8 +70,8 @@ static int sibling_pipe(void) {
     close(fds[1]);
     pid_t child = vfork();
     if (child == 0) {
-        char byte;
-        if (read(fds[0], &byte, 1) == 1) {
+        char byte = 0;
+        if (read(fds[0], &byte, 1) == 1 && byte == 'x') {
             execl("/bin/true", "true", (char *)NULL);
         }
         _exit(2);
