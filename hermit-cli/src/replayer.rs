@@ -662,6 +662,9 @@ impl Tool for Replayer {
                 self.handle_replayed_side_effect(guest, syscall, "fcntl_setfd")
                     .await
             }
+            Syscall::Fcntl(call) if crate::event::fcntl_output(&call).is_some() => {
+                self.handle_fcntl_output(guest, call).await
+            }
             Syscall::Fcntl(_) => self.handle_simple(guest, syscall).await,
             // A regular file the guest opened but did not create is usually an
             // eventfd placeholder here, which epoll accepts where the recording
@@ -2438,6 +2441,28 @@ impl Replayer {
     ///     this rule since it affects later memory access.
     ///
     /// There are many syscalls who satisfy these two requirements.
+    /// Replays an `fcntl` that writes its result through its argument
+    /// (`crate::event::fcntl_output`): the recorded status, and on success the
+    /// recorded bytes, written back to the guest's buffer
+    /// (https://github.com/rrnewton/hermit/issues/2289).
+    async fn handle_fcntl_output<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Fcntl,
+    ) -> Result<i64, Errno> {
+        let recorded = next_event!(guest, Return);
+        if recorded.is_ok() {
+            let (buf, len) = crate::event::fcntl_output(&call)
+                .unwrap_or_else(|| unreachable!("fcntl output replay called for {call:?}"));
+            let bytes = next_event!(guest, Bytes)?;
+            assert_eq!(bytes.len(), len, "recorded fcntl output has the wrong size");
+            guest
+                .memory()
+                .write_exact(buf.ok_or(Errno::EFAULT)?, &bytes)?;
+        }
+        recorded
+    }
+
     async fn handle_simple<G: Guest<Self>>(
         &self,
         guest: &mut G,

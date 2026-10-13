@@ -794,6 +794,9 @@ impl Tool for Recorder {
             Syscall::Settimeofday(_) => self.handle_simple(guest, syscall).await,
             Syscall::Time(syscall) => self.handle_time(guest, syscall).await,
             Syscall::Setsockopt(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Fcntl(call) if crate::event::fcntl_output(&call).is_some() => {
+                self.handle_fcntl_output(guest, call).await
+            }
             // FIXME: Not all fcntl cases are simple.
             Syscall::Fcntl(_) => self.handle_simple(guest, syscall).await,
             // epoll_ctl's answer depends on the kind of its target, which
@@ -1573,6 +1576,29 @@ impl Recorder {
     ///     this rule since it affects later memory access.
     ///
     /// There are many syscalls who satisfy these two requirements.
+    /// Records an `fcntl` that writes its result through its argument
+    /// (`crate::event::fcntl_output`): its status, and on success the bytes it
+    /// wrote, which replay writes back.
+    async fn handle_fcntl_output<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: reverie::syscalls::Fcntl,
+    ) -> Result<i64, Errno> {
+        use reverie::syscalls::MemoryAccess;
+        let (buf, len) = crate::event::fcntl_output(&call)
+            .unwrap_or_else(|| unreachable!("fcntl output recording called for {call:?}"));
+        let result = guest.inject(call).await;
+        self.record_event(guest, result.map(SyscallEvent::Return));
+        if result.is_ok() {
+            let mut bytes = vec![0; len];
+            let read = buf
+                .ok_or(Errno::EFAULT)
+                .and_then(|buf| guest.memory().read_exact(buf, &mut bytes));
+            self.record_event(guest, read.map(|()| SyscallEvent::Bytes(bytes)));
+        }
+        result
+    }
+
     async fn handle_simple<G: Guest<Self>>(
         &self,
         guest: &mut G,

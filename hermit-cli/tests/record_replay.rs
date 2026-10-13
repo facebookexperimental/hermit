@@ -2409,6 +2409,60 @@ fn record_pidfd_open_modeled_descriptor_ops() {
     record_replay(workload("c_pidfd_poll_self"));
 }
 
+/// An fcntl that answers through its argument writes a struct the guest reads
+/// back: F_GETOWN_EX (which glibc uses for F_GETOWN too) and F_GETLK. Replay
+/// returned only the recorded status, so the guest read its struct as it had
+/// left it, and record and replay printed different answers
+/// (https://github.com/rrnewton/hermit/issues/2289).
+#[test]
+fn record_fcntl_queries_replay_the_struct_they_write() {
+    let _guard = hermit_record_lock();
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest build directory");
+    let compile = |source: &str, name: &str, defines: &[&str]| {
+        let guest = build.path().join(name);
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .args(defines)
+            .arg(repository.join(source))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .unwrap_or_else(|error| panic!("failed to compile {source}: {error}"));
+        assert!(
+            output.status.success(),
+            "{source} failed to compile:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        guest
+    };
+    let owner = compile("tests/c/fcntl_owner.c", "fcntl_owner", &["-D_GNU_SOURCE"]);
+    let output = canonical_record_replay_command("fcntl owner queries", &owner, &[]);
+    let line = "fowner ok=6 getsig=10 owner_type=1 getown_is_self=1 ex_pid_is_self=1\n";
+    assert!(
+        output.contains(line),
+        "the guest must print {line:?}:\n{output}"
+    );
+
+    let getlk = compile(
+        "tests/c/record_replay_fcntl_getlk.c",
+        "record_replay_fcntl_getlk",
+        &[],
+    );
+    let locks = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the lock directory");
+    let output =
+        canonical_record_replay_command("fcntl F_GETLK", &getlk, &[locks.path().as_os_str()]);
+    let line = "getlk rc=0 type_is_wrlck=1 pid_is_parent=1\n";
+    assert!(
+        output.contains(line),
+        "the guest must print {line:?}:\n{output}"
+    );
+}
+
 /// epoll_ctl answers EPERM for a regular file, which cannot be polled. Replay
 /// stands in for a regular file the guest opened with an eventfd placeholder,
 /// which epoll accepts, so a replay that asked the kernel again answered 0, and

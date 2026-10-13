@@ -1421,7 +1421,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/31): 1061.
     // And metadata::tests::pre_held_sleep_signal_recordings_are_refused_by_the_version_gate
     // (Codex review of https://github.com/rrnewton/hermit/pull/4131): 1062.
-    ("test.hermit_unit", 1062),
+    // And metadata::tests::record_version_rejects_streams_without_fcntl_output_events
+    // (https://github.com/rrnewton/hermit/issues/2289): 1063.
+    ("test.hermit_unit", 1063),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2354,7 +2356,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (Claude review of https://github.com/rrnewton/hermit/pull/4166): 197.
     // And record_epoll_ctl_on_a_regular_file_replays_its_answer
     // (https://github.com/rrnewton/hermit/issues/31): 198.
-    ("test.record_replay", 198),
+    // And record_fcntl_queries_replay_the_struct_they_write
+    // (https://github.com/rrnewton/hermit/issues/2289): 199.
+    ("test.record_replay", 199),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -3344,7 +3348,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the polled-call signal record-epoch test: 1060.
     // And the epoll_ctl record-epoch test: 1061.
     // And the held-sleep-signal record-version test: 1062.
-    ("test.hermit_unit_on_host", 1062),
+    // And the fcntl-output record-version test: 1063.
+    ("test.hermit_unit_on_host", 1063),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

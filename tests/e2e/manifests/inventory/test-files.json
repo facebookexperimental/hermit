@@ -1573,6 +1573,12 @@
       "why": "tests/c/record_replay_execveat_paths.c is owned by hermit-cli/tests/record_replay.rs: The record/replay integration suite compiles this workload and asserts path handling across execveat image changes under caller-controlled recording and replay phases."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/record_replay_fcntl_getlk.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/record_replay_fcntl_getlk.c is owned by hermit-cli/tests/record_replay.rs: record_fcntl_queries_replay_the_struct_they_write compiles it and runs it under record start --strict --verify --verify-strict on a fresh directory, requiring the child's F_GETLK answer (F_WRLCK, the parent's pid) to replay as recorded (https://github.com/rrnewton/hermit/issues/2289). It stays a fixture because it needs a writable directory argument and a record/replay command that a generic manifest does not express."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/record_replay_fd_close.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

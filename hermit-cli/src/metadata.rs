@@ -396,7 +396,12 @@ impl RecordVersion {
 // a nanosleep holds the EINTR it used to return, and this replayer would answer
 // 0: a successful replay with different output (Codex review of
 // https://github.com/rrnewton/hermit/pull/4131).
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x144);
+// 0x144 -> 0x145: an fcntl that writes its result through its argument
+// (F_GETOWN_EX, which glibc uses for F_GETOWN; F_GETLK, F_GETLK64,
+// F_OFD_GETLK; the write-hint queries) records the bytes it wrote, and replay
+// writes them back (https://github.com/rrnewton/hermit/issues/2289). An older
+// recording has no such event.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x145);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -421,7 +426,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x144);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x144;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x145;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1235,6 +1240,15 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_from_before_signals_ended_polled_calls() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x141)));
+    }
+
+    /// A recording older than 0x145 has no bytes for an fcntl that writes its
+    /// result through its argument, which this replayer writes back
+    /// (https://github.com/rrnewton/hermit/issues/2289).
+    #[test]
+    fn record_version_rejects_streams_without_fcntl_output_events() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x144)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x143)));
     }
 
     /// A recording older than 0x143 has no event for epoll_ctl, which this

@@ -53,6 +53,38 @@ pub(crate) fn xattr_query_output(syscall: &Syscall) -> Option<(Option<AddrMut<'_
     }
 }
 
+/// Returns the output buffer and its size for an `fcntl` command that writes a
+/// result through its argument instead of returning it: `F_GETOWN_EX`, the
+/// record-lock queries `F_GETLK`, `F_GETLK64` and `F_OFD_GETLK`, and the
+/// write-hint queries. Recording keeps those bytes, and replay writes them
+/// back; returning only the recorded status would leave the guest's struct as
+/// it was (https://github.com/rrnewton/hermit/issues/2289). glibc implements
+/// `fcntl(F_GETOWN)` with `F_GETOWN_EX`, so this also covers `F_GETOWN`.
+pub(crate) fn fcntl_output(
+    call: &reverie::syscalls::Fcntl,
+) -> Option<(Option<AddrMut<'static, u8>>, usize)> {
+    use reverie::syscalls::FcntlCmd;
+    let out = |addr: Option<usize>, len: usize| Some((addr.and_then(AddrMut::from_raw), len));
+    match call.cmd() {
+        // `struct f_owner_ex { int type; pid_t pid; }`.
+        FcntlCmd::F_GETOWN_EX(addr) => out(
+            addr.map(|a| a.as_raw()),
+            std::mem::size_of::<[libc::c_int; 2]>(),
+        ),
+        FcntlCmd::F_GETLK(addr) | FcntlCmd::F_OFD_GETLK(addr) => {
+            out(addr.map(|a| a.as_raw()), std::mem::size_of::<libc::flock>())
+        }
+        FcntlCmd::F_GETLK64(addr) => out(
+            addr.map(|a| a.as_raw()),
+            std::mem::size_of::<libc::flock64>(),
+        ),
+        FcntlCmd::F_GET_RW_HINT(addr) | FcntlCmd::F_GET_FILE_RW_HINT(addr) => {
+            out(addr.map(|a| a.as_raw()), std::mem::size_of::<u64>())
+        }
+        _ => None,
+    }
+}
+
 /// An event. This contains everything needed to verify and reproduce the
 /// execution of a syscall.
 #[derive(Debug, Serialize, Deserialize)]
