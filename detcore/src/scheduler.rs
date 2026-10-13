@@ -14359,6 +14359,38 @@ mod test {
         }
     }
 
+    /// A deferred SIGCHLD is not admitted while a vfork barrier's child in the
+    /// last priority band is runnable: step 2e's gate counts it as work, as
+    /// step 3's fence does, so the signal's commit point does not depend on
+    /// when the host delivered it (Claude re-check of
+    /// https://github.com/rrnewton/hermit/pull/4205).
+    #[test]
+    fn a_deferred_sigchld_waits_while_a_last_band_vfork_child_is_runnable() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let (parent, child) = (DetTid::from_raw(3), DetTid::from_raw(5));
+        let waiter = DetTid::from_raw(13);
+        scheduler.vfork_barriers.insert(parent, Some(child));
+        scheduler.priorities.insert(child, DEFAULT_PRIORITY);
+        scheduler
+            .run_queue
+            .push_back(child, runqueue::LAST_PRIORITY);
+        assert!(
+            scheduler.run_queue.only_pollers(),
+            "the band alone reads as a poller"
+        );
+        scheduler.blocked.sigchld_deferred.insert(waiter);
+
+        scheduler.step2e_process_signal_deferred();
+        assert!(scheduler.blocked.sigchld_deferred.contains(&waiter));
+        assert!(!scheduler.blocked.sigchld_ready.contains(&waiter));
+        assert!(!scheduler.run_queue.contains_tid(waiter));
+
+        // With the child gone, no work is queued and the signal is admitted.
+        assert!(scheduler.run_queue.remove_tid(child));
+        scheduler.step2e_process_signal_deferred();
+        assert!(scheduler.blocked.sigchld_ready.contains(&waiter));
+    }
+
     #[test]
     fn external_io_continuation_does_not_overtake_runnable_peer() {
         let mut scheduler = Scheduler::new(&Config::default());

@@ -2012,7 +2012,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4194): 1496.
     // And a_runnable_last_band_vfork_child_keeps_another_childs_background_call_parked
     // (Codex re-check of https://github.com/rrnewton/hermit/pull/4205): 1497.
-    ("test.detcore_unit", 1497),
+    // And a_deferred_sigchld_waits_while_a_last_band_vfork_child_is_runnable
+    // (Claude re-check of https://github.com/rrnewton/hermit/pull/4205): 1498.
+    ("test.detcore_unit", 1498),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3234,9 +3236,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And a_signalfd_in_any_process_makes_every_copy_of_its_signal_unproven: 1494.
     // And the no-charge signal delivery test: 1495.
     // And the vfork-barrier selection test: 1496.
-    // And the vfork-barrier selection test: 1496.
     // And the two-barrier last-band gate test: 1497.
-    ("test.detcore_unit_on_host", 1497),
+    // And the deferred-SIGCHLD last-band gate test: 1498.
+    ("test.detcore_unit_on_host", 1498),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
