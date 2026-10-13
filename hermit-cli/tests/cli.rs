@@ -14383,10 +14383,13 @@ fn keep_stop_class_event(early: &mut Vec<serde_json::Value>, message: serde_json
 /// failure shows the whole exchange together with the adapter's stderr.
 struct DapClient {
     adapter: KillOnDrop,
-    stdin: std::process::ChildStdin,
+    /// The adapter's stdin, or the TCP connection to a `--listen` adapter.
+    to_adapter: Box<dyn Write + Send>,
     messages: std::sync::mpsc::Receiver<Result<serde_json::Value, String>>,
     next_seq: u64,
     transcript: Vec<String>,
+    /// Every `breakpoint` event received, in full: an editor draws each one.
+    breakpoint_events: Vec<serde_json::Value>,
     stderr_path: PathBuf,
     /// The scaled [`DAP_SESSION_BUDGET`] and the instant it runs out.
     session_budget: Duration,
@@ -14413,9 +14416,80 @@ impl DapClient {
             .stdout
             .take()
             .expect("hermit-dap stdout should be piped");
+        Self::over(
+            KillOnDrop(adapter),
+            Box::new(stdin),
+            stdout,
+            stderr_path,
+            session_budget,
+            session_deadline,
+        )
+    }
+
+    /// Spawns `command`, an adapter that serves DAP on TCP (`hermit-dap
+    /// --listen`, or `hermit replay --dap-listen`), and connects to it once
+    /// its stderr names the address, as an editor attaching to it would.
+    fn connect(mut command: Command, stderr_path: PathBuf) -> Self {
+        let session_budget = DAP_SESSION_BUDGET.mul_f64(dap_wall_timeout_multiplier());
+        let session_deadline = Instant::now() + session_budget;
+        let stderr =
+            fs::File::create(&stderr_path).expect("failed to create the hermit-dap stderr file");
+        let mut adapter = KillOnDrop(
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(stderr)
+                .spawn()
+                .expect("failed to spawn the listening DAP adapter"),
+        );
+        let address = loop {
+            let text = fs::read_to_string(&stderr_path).unwrap_or_default();
+            if let Some(address) = text
+                .lines()
+                .find_map(|line| line.strip_prefix("hermit-dap: listening on "))
+            {
+                break address.trim().to_owned();
+            }
+            let exited = adapter.0.try_wait().ok().flatten();
+            assert!(
+                exited.is_none() && Instant::now() < session_deadline,
+                "the DAP adapter never said where it listens ({}):\n{text}",
+                exited.map_or_else(
+                    || format!("not within {session_budget:?}"),
+                    |s| s.to_string()
+                )
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+        let stream = std::net::TcpStream::connect(&address).unwrap_or_else(|error| {
+            panic!("failed to connect to hermit-dap at {address}: {error}")
+        });
+        let reader = stream
+            .try_clone()
+            .expect("failed to clone the hermit-dap connection");
+        Self::over(
+            adapter,
+            Box::new(stream),
+            reader,
+            stderr_path,
+            session_budget,
+            session_deadline,
+        )
+    }
+
+    /// A client that writes requests to `to_adapter` and reads DAP messages
+    /// from `from_adapter` on a thread of its own.
+    fn over(
+        adapter: KillOnDrop,
+        to_adapter: Box<dyn Write + Send>,
+        from_adapter: impl std::io::Read + Send + 'static,
+        stderr_path: PathBuf,
+        session_budget: Duration,
+        session_deadline: Instant,
+    ) -> Self {
         let (sender, messages) = std::sync::mpsc::channel();
         thread::spawn(move || {
-            let mut reader = BufReader::new(stdout);
+            let mut reader = BufReader::new(from_adapter);
             loop {
                 let mut length = None;
                 loop {
@@ -14456,11 +14530,12 @@ impl DapClient {
             }
         });
         Self {
-            adapter: KillOnDrop(adapter),
-            stdin,
+            adapter,
+            to_adapter,
             messages,
             next_seq: 0,
             transcript: Vec::new(),
+            breakpoint_events: Vec::new(),
             stderr_path,
             session_budget,
             session_deadline,
@@ -14507,8 +14582,12 @@ impl DapClient {
         })
         .to_string();
         self.transcript.push(format!("-> {body}"));
-        let sent = write!(self.stdin, "Content-Length: {}\r\n\r\n{body}", body.len())
-            .and_then(|()| self.stdin.flush());
+        let sent = write!(
+            self.to_adapter,
+            "Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .and_then(|()| self.to_adapter.flush());
         if let Err(error) = sent {
             self.fail(&format!("could not send {command}: {error}"));
         }
@@ -14543,6 +14622,9 @@ impl DapClient {
                     let text = message.to_string();
                     self.transcript
                         .push(format!("<- {}", text.chars().take(600).collect::<String>()));
+                    if message["type"] == "event" && message["event"] == "breakpoint" {
+                        self.breakpoint_events.push(message.clone());
+                    }
                     if matches(&message) {
                         return message;
                     }
@@ -15047,6 +15129,276 @@ fn hermit_dap_replay_steps_back_and_reverse_continues_through_a_recording() {
     );
 }
 
+/// The `breakpoint` event with `reason` for a user (positive-numbered)
+/// breakpoint that `matches`, whether it already arrived or is still to come.
+fn dap_user_breakpoint_event(
+    dap: &mut DapClient,
+    reason: &str,
+    matches: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    let wanted = |event: &serde_json::Value| {
+        event["type"] == "event"
+            && event["event"] == "breakpoint"
+            && event["body"]["reason"] == reason
+            && event["body"]["breakpoint"]["id"]
+                .as_i64()
+                .is_some_and(|id| id > 0)
+            && matches(&event["body"]["breakpoint"])
+    };
+    if let Some(event) = dap.breakpoint_events.iter().find(|event| wanted(event)) {
+        return event.clone();
+    }
+    dap.wait_for(
+        &format!("a `{reason}` breakpoint event for the console breakpoint"),
+        DAP_TIMEOUT,
+        wanted,
+    )
+}
+
+/// `hermit-dap --listen` on a port that is already taken fails before it
+/// starts GDB, and says how to pick a port that works.
+#[test]
+fn hermit_dap_listen_refuses_a_busy_port_and_names_the_remedy() {
+    let Some(hermit_dap) =
+        hermit_dap_binary("hermit_dap_listen_refuses_a_busy_port_and_names_the_remedy")
+    else {
+        return;
+    };
+    let busy = std::net::TcpListener::bind("127.0.0.1:0").expect("failed to bind a loopback port");
+    let address = busy.local_addr().expect("failed to read the bound address");
+    let output = Command::new(hermit_dap)
+        .args([
+            "--gdb",
+            "/nonexistent/gdb",
+            "--listen",
+            &address.to_string(),
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run hermit-dap");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success()
+            && stderr.contains(&format!("could not listen on {address}"))
+            && stderr.contains("port 0"),
+        "hermit-dap --listen on a busy port: {}\nstderr:\n{stderr}",
+        output.status
+    );
+}
+
+/// `hermit replay --dap-listen` serves a recording to one DAP client over TCP,
+/// the way an editor attaches to an adapter it did not start: it tells the
+/// user the attach request's `program` and `target`, runs `hermit-dap
+/// --listen --replay` from beside `hermit`, and the session reaches a
+/// breakpoint and steps back through the replay like the stdio sessions above.
+///
+/// Once the first client is served, the listening socket is closed, so a second
+/// client is refused rather than left waiting for a session GDB will never
+/// serve.
+#[test]
+fn hermit_replay_dap_listen_serves_one_tcp_client_with_step_back() {
+    const TEST: &str = "hermit_replay_dap_listen_serves_one_tcp_client_with_step_back";
+    let Some(hermit_dap) = hermit_dap_binary(TEST) else {
+        return;
+    };
+    let beside = Path::new(env!("CARGO_BIN_EXE_hermit")).with_file_name("hermit-dap");
+    assert_eq!(
+        fs::canonicalize(&beside).ok(),
+        fs::canonicalize(hermit_dap).ok(),
+        "hermit replay --dap-listen runs {}, which must be the hermit-dap under test",
+        beside.display()
+    );
+    let Some(_gdb) = dap_capable_gdb(TEST) else {
+        return;
+    };
+    let work = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the hermit-dap work dir");
+    let (source, program) = dap_guest(work.path());
+    let data_dir = work.path().join("recordings");
+    let recording = dap_record(&program, &data_dir, "total=5");
+
+    let port = unused_local_port();
+    let data_dir_arg = data_dir.to_str().expect("data dir should be UTF-8");
+    let replay = hermit_command(&[
+        "replay",
+        &recording,
+        "--data-dir",
+        data_dir_arg,
+        &format!("--gdbserver-port={port}"),
+        "--dap-listen",
+        "127.0.0.1:0",
+    ]);
+    let stderr_path = work.path().join("hermit-replay.stderr");
+    let mut dap = DapClient::connect(replay, stderr_path.clone());
+
+    // What the user is told to put in the attach request.
+    let recorded_program = data_dir.join(&recording).join("exe");
+    let target = format!("127.0.0.1:{port}");
+    let told = fs::read_to_string(&stderr_path).unwrap_or_default();
+    for expected in [
+        format!("\"program\": {:?}", recorded_program.display().to_string()),
+        format!("\"target\": \"{target}\""),
+    ] {
+        if !told.contains(&expected) {
+            dap.fail(&format!(
+                "hermit replay --dap-listen must tell the user {expected}"
+            ));
+        }
+    }
+
+    let initialized = match dap.initialize() {
+        Ok(response) => response,
+        Err(refusal) => {
+            dap_gdb_skip(TEST, &refusal);
+            return;
+        }
+    };
+    if initialized["body"]["supportsStepBack"] != true {
+        dap.fail(&format!(
+            "managed replay must advertise supportsStepBack: {initialized}"
+        ));
+    }
+    let listen_address = told
+        .lines()
+        .find_map(|line| line.strip_prefix("hermit-dap: listening on "))
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_owned();
+    if let Ok(_second) = std::net::TcpStream::connect(&listen_address) {
+        dap.fail(&format!(
+            "a second DAP client connected to {listen_address}, which must be closed once \
+             the first client is served"
+        ));
+    }
+
+    let thread = dap.attach_and_break(&recorded_program, &target, &source, DAP_GUEST_BREAK_LINE);
+    let in_square = [
+        ("square", DAP_GUEST_BREAK_LINE),
+        ("main", DAP_GUEST_CALL_LINE),
+    ];
+    for x in ["0", "1"] {
+        dap.call(
+            "continue",
+            serde_json::json!({"threadId": thread}),
+            DAP_TIMEOUT,
+        );
+        let what = format!("the breakpoint hit with x = {x}");
+        let stop = dap.stopped(&what, DAP_TIMEOUT);
+        dap.assert_stop(&what, &stop, &thread, "breakpoint", &in_square, ("x", x));
+    }
+    dap.call(
+        "stepBack",
+        serde_json::json!({"threadId": thread}),
+        DAP_REVERSE_TIMEOUT,
+    );
+    let stop = dap.stopped("the stop after stepBack", DAP_REVERSE_TIMEOUT);
+    dap.assert_stop(
+        "stepBack from the second hit",
+        &stop,
+        &thread,
+        "step",
+        &[("main", DAP_GUEST_CALL_LINE)],
+        ("i", "1"),
+    );
+    // Positive control for the check below: a breakpoint the user creates
+    // outside setBreakpoints, here from the debug console, must still reach
+    // the client, as a `new` and then a `removed` event naming its positive
+    // number. A filter that dropped every breakpoint event would fail here.
+    const PRINT_LINE: u64 = 13; // the printf line of DAP_GUEST_SOURCE
+    dap.call(
+        "evaluate",
+        serde_json::json!({
+            "expression": format!("break {}:{PRINT_LINE}", source.display()),
+            "context": "repl",
+        }),
+        DAP_TIMEOUT,
+    );
+    let created = dap_user_breakpoint_event(&mut dap, "new", |breakpoint| {
+        breakpoint["line"] == PRINT_LINE
+    });
+    let id = created["body"]["breakpoint"]["id"].clone();
+    dap.call(
+        "evaluate",
+        serde_json::json!({"expression": format!("delete {id}"), "context": "repl"}),
+        DAP_TIMEOUT,
+    );
+    dap_user_breakpoint_event(&mut dap, "removed", |breakpoint| breakpoint["id"] == id);
+
+    // hermit-dap's hidden line and arrival breakpoints are GDB-internal
+    // (negative ids). A `breakpoint` event for one tells the client about a
+    // breakpoint the user never set; Dapper listed one on every line of the
+    // program.
+    let hidden: Vec<String> = dap
+        .breakpoint_events
+        .iter()
+        .filter(|event| {
+            event["body"]["breakpoint"]["id"]
+                .as_i64()
+                .is_none_or(|id| id <= 0)
+        })
+        .map(ToString::to_string)
+        .collect();
+    if !hidden.is_empty() {
+        dap.fail(&format!(
+            "the client was told about {} hidden breakpoint(s): {}",
+            hidden.len(),
+            hidden.join(", ")
+        ));
+    }
+    dap.call(
+        "disconnect",
+        serde_json::json!({"terminateDebuggee": true}),
+        DAP_TIMEOUT,
+    );
+}
+
+/// When the managed replay exits before GDB can attach, the client's failed
+/// `initialize` response carries what `hermit replay` said, not only its exit
+/// status.
+///
+/// Before the fix the replay's stderr went to /dev/null, so a recording made
+/// by an older Hermit (whose replay refuses with "Version mismatch") reached a
+/// VS Code user as "Hermit replay exited before GDB attached: 125" and nothing
+/// else. A recording ID with no recording behind it fails the same way, and
+/// faster.
+#[test]
+fn hermit_dap_replay_startup_failure_carries_the_replays_reason() {
+    const TEST: &str = "hermit_dap_replay_startup_failure_carries_the_replays_reason";
+    let Some(hermit_dap) = hermit_dap_binary(TEST) else {
+        return;
+    };
+    let Some(gdb) = dap_capable_gdb(TEST) else {
+        return;
+    };
+    let work = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the hermit-dap work dir");
+    let data_dir = work.path().join("recordings");
+    fs::create_dir(&data_dir).expect("failed to create the recordings dir");
+    let adapter = dap_replay_adapter(
+        hermit_dap,
+        &gdb,
+        "0123456789abcdef0123456789abcdef",
+        &data_dir,
+        unused_local_port(),
+    );
+    let mut dap = DapClient::spawn(adapter, work.path().join("hermit-dap.stderr"));
+    let response = dap.initialize_response();
+    let message = response["message"].as_str().unwrap_or_default().to_owned();
+    if message.contains(DAP_GDB_REFUSAL) {
+        dap_gdb_skip(TEST, &message);
+        return;
+    }
+    if response["success"] != false
+        || !message.contains("Hermit replay exited before GDB attached")
+        || !message.contains("metadata.json")
+    {
+        dap.fail(&format!(
+            "initialize must fail with the replay's own reason (its missing metadata.json): \
+             {response}"
+        ));
+    }
+}
+
 /// A managed-replay startup refusal must reach the DAP client as a failed
 /// response to its first request, and must also be written to stderr.
 ///
@@ -15169,8 +15521,12 @@ fn hermit_dap_replay_refusal_reaches_the_client() {
 
     let mut dap = no_readelf("event-first.stderr");
     let event = r#"{"seq":1,"type":"event","event":"hermitTestNotARequest"}"#;
-    let sent = write!(dap.stdin, "Content-Length: {}\r\n\r\n{event}", event.len())
-        .and_then(|()| dap.stdin.flush());
+    let sent = write!(
+        dap.to_adapter,
+        "Content-Length: {}\r\n\r\n{event}",
+        event.len()
+    )
+    .and_then(|()| dap.to_adapter.flush());
     if let Err(error) = sent {
         dap.fail(&format!("could not send the leading event: {error}"));
     }
@@ -15191,7 +15547,8 @@ fn hermit_dap_replay_refusal_reaches_the_client() {
     }
 
     let mut dap = no_readelf("no-content-length.stderr");
-    let sent = write!(dap.stdin, "X-Not-Dap: 1\r\n\r\n{{}}").and_then(|()| dap.stdin.flush());
+    let sent =
+        write!(dap.to_adapter, "X-Not-Dap: 1\r\n\r\n{{}}").and_then(|()| dap.to_adapter.flush());
     if let Err(error) = sent {
         dap.fail(&format!("could not send the unframed header: {error}"));
     }

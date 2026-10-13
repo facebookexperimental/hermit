@@ -273,164 +273,20 @@ Use `--data-dir=DIR` or `HERMIT_DATA_DIR` to select another directory.
 
 ### Debug Adapter Protocol
 
-The DAP adapter is experimental. It is tested end to end with GDB 17.2 on a
-single-threaded C program: attaching to `run --gdbserver`, hitting a source
-breakpoint, continuing, reading the stack and evaluating variables, and, for a
-recording, `stepBack` and `reverseContinue`, including `stepBack` after a
-`stepOut` or `next`, in recursion and between two calls from the same caller,
-and a `reverseContinue` back to the replay's entry (the `hermit_dap_*` tests in
-`hermit-cli/tests/cli.rs`). Other GDB versions are not tested. Reverse replay
-patches GDB's DAP server internals, so under a GDB whose
-DAP server lacks them it refuses to start: the client's first request gets a
-failed response naming the missing hook, and the adapter writes the same
-message to its stderr and exits. It refuses the same way when `readelf` or
-`setpriv` is missing from `PATH`. Multithreaded guests are not yet covered by
-these tests.
-
-Hermit exposes a GDB remote target with `run --gdbserver` and `replay`.
-`hermit-dap` starts GDB's Debug Adapter Protocol interpreter with the local
-system root configured so GDB does not request shared libraries from Hermit's
-remote server. A GDB build with the DAP interpreter is required. Use `--gdb`
-when that executable is not `/usr/bin/gdb`. To identify the default GDB:
-
-```bash
-/usr/bin/gdb --interpreter=dap --version
-```
-
-A version string alone does not establish a working DAP session. To build
-the adapter and start a remote target (the first command rebuilds
-`target/debug/hermit` with default features, so if you built it with
-`--features liteinst` above, rerun that build afterwards to keep LiteInst):
+Hermit can be debugged with GDB and, through the `hermit-dap` adapter, from
+Debug Adapter Protocol clients such as editors and
+[Dapper](https://github.com/facebookexperimental/dapper). On a recording, the
+adapter supports reverse execution (`stepBack` and `reverseContinue`):
 
 ```bash
 cargo build -p hermit --bin hermit --bin hermit-dap
-target/debug/hermit run --gdbserver --gdbserver-port=1234 -- /path/to/program
-
-# Or serve the latest recording without launching GDB itself.
-target/debug/hermit replay --serve-only --gdbserver-port=1234
+target/debug/hermit record start -- ./program
+target/debug/hermit replay --dap-listen=4711  # a DAP client attaches to 127.0.0.1:4711
 ```
 
-In another terminal, a DAP client can spawn `target/debug/hermit-dap` and send
-an `attach` request containing the executable and remote target. For example,
-[Dapper](https://github.com/facebookexperimental/dapper) can run this session
-from a JSON configuration:
-
-```json
-{
-  "spawnConfig": {
-    "type": "stdio",
-    "cmd": "/path/to/hermit/target/debug/hermit-dap"
-  },
-  "debugRequest": {
-    "request": "attach",
-    "program": "/path/to/program",
-    "target": "127.0.0.1:1234"
-  },
-  "breakpoints": [
-    {
-      "type": "source",
-      "path": "/path/to/program.c",
-      "line": 12
-    }
-  ],
-  "installDefaultExceptionBreakpoints": false
-}
-```
-
-```bash
-dapper proxy --control-port 4711 from-config hermit-dap.json
-dapper debug --control-port 4711 continue 1
-dapper debug --control-port 4711 stack-trace 1
-dapper debug --control-port 4711 step over 1
-```
-
-The same adapter command can be used by an editor or another DAP client. To
-enable reverse execution for a recording, let the adapter manage the replay by
-adding the recording arguments to `spawnConfig`:
-
-```json
-{
-  "spawnConfig": {
-    "type": "stdio",
-    "cmd": "/path/to/hermit/target/debug/hermit-dap",
-    "args": [
-      "--replay", "RECORDING_ID",
-      "--data-dir", "/path/to/recordings",
-      "--gdbserver-port", "1234"
-    ]
-  },
-  "debugRequest": {
-    "request": "attach",
-    "program": "/path/to/program",
-    "target": "127.0.0.1:1234"
-  }
-}
-```
-
-When its extension loads successfully, the adapter advertises `supportsStepBack`
-and implements DAP `stepBack` and `reverseContinue` by restarting the
-deterministic replay and running forward to the requested earlier source
-position. `stepBack` returns to the previous source line the replay passed or
-the previous place the client stopped, whichever came later. When that place
-does not start a source line, such as the return address a `stepOut` stops at,
-`stepBack` restarts the replay once more to count the earlier passes through
-it, and may first run the current replay forward to the next source line. This
-first implementation favors correctness over speed.
-
-`stepBack` goes back to the previous stop or line arrival, not to the previous
-instruction GDB's own reverse-step would reach. When the client stops in a
-one-line loop, for example by stepping out of the loop body's call, then
-continues past the loop, `stepBack` returns to that stop. It skips the later
-passes through the loop's line, which the client never stopped at and which
-start no new source line. A `stepOut` from a function without debug
-information reports the stop with reason `stopped` rather than `step`.
-
-The adapter finds line arrivals with an internal breakpoint on every source
-line, and chooses which arrival at an address to restart to by counting the
-earlier ones. If the debugger stub loses one of those breakpoints, the count
-is wrong and the replay runs to another arrival at the same address. Reverie's
-gdbstub did lose them: it restored a whole 8-byte word when it removed a
-software breakpoint, so when GDB removed a breakpoint to step over it, a
-breakpoint up to 7 bytes after it was erased for the rest of that resume. That
-was fixed in https://github.com/rrnewton/reverie/pull/890.
-
-As a check on the count, the adapter records a frame identity with every stop
-and line arrival: the program counter and stack pointer of the innermost
-frame and of up to 7 of its callers, 8 frames at most (GDB does not unwind
-past `main` by default, so a shallower stack gives fewer). When it replays to
-a stop, it compares the identity where the replay landed. If they differ, it
-puts the replay back at the client's current stop, sends a `stopped` event for
-it, and fails the `stepBack` or `reverseContinue` with an error saying it
-could not reach the earlier stop exactly. If it cannot put the replay back
-either, the request fails and the adapter ends the session: it sends an
-`output` event saying why, then `terminated`.
-
-The frame identity tells apart two activations of a function at different
-call depths, such as recursive calls, and two calls at the same depth from
-different call sites, such as `g(1)` and `g(2)` on consecutive lines, as long
-as the calling frame is among the 8. It cannot tell apart two passes through
-the same activation, such as two iterations of a loop, two calls from the
-same call site at the same depth, such as a call inside a loop, or two
-arrivals whose 8 innermost frames are all equal and which differ only further
-out, such as the same chain of 8 or more nested helper calls entered from
-two call sites in one caller. Their identities are equal, so a wrong count
-there would land at the wrong pass without an error. A test pins the limit:
-with a chain of 7 helpers, the two activations differ only in the caller's
-return address, frame 7, and a wrong count must be refused.
-
-The identity is limited to 8 frames because the adapter takes it at every
-line arrival while the replay runs forward, and unwinding every frame made
-forward execution cost the square of the stack depth. Measured on devbig030
-with GDB 17.2, one `continue` past a recursion 300 calls deep took 12.15 s
-with every frame and 1.59 s with 8; past a recursion 1000 calls deep it took
-121.79 s with every frame and 4.77 s with 8. A `stepBack` from there took
-1.0 s at depth 300 and 1.3 s at depth 1000 either way.
-
-```bash
-dapper proxy --control-port 4711 from-config hermit-dap-replay.json
-dapper debug --control-port 4711 step back 1
-dapper debug --control-port 4711 reverse-continue 1
-```
+[DEBUGGING.md](DEBUGGING.md) covers GDB, `hermit-dap`, reverse execution,
+driving a session with Dapper, the state of VS Code support, and the
+adapter's tests.
 
 ### Chaos Mode Demonstration
 
@@ -582,6 +438,8 @@ and licensing guidelines.
   measured outcomes by workload, backend, and mode.
 - [Test selection catalogue](SCORECARD.md): which tests apply to each backend.
 - [User Guide](docs/USER_GUIDE.md): modes, flags, examples, and troubleshooting.
+- [Debugging](DEBUGGING.md): GDB, the `hermit-dap` Debug Adapter Protocol
+  adapter, reverse execution on recordings, and editor support.
 - [Architecture](docs/ARCHITECTURE.md): Reverie, Detcore, scheduling, time, and
   record/replay internals.
 - [e9patch Compatibility](docs/E9PATCH_COMPATIBILITY.md): measured application

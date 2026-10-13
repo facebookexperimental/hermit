@@ -19,6 +19,7 @@ import re
 import select
 import shutil
 import subprocess
+import threading
 import time
 
 import gdb
@@ -234,6 +235,13 @@ def _send_event(self, event, body=None):
             for breakpoint_id in body["hitBreakpointIds"]
             if breakpoint_id > 0
         ]
+    # GDB's DAP server reports every breakpoint it creates, changes or
+    # deletes, including this script's hidden ones, which are GDB-internal and
+    # so have negative numbers. A client that keeps a list of the adapter's
+    # breakpoints from these events would list one on every source line:
+    # Dapper did, before this filter. (VS Code 1.141 ignores them.)
+    if event == "breakpoint" and (body or {}).get("breakpoint", {}).get("id", 1) <= 0:
+        return
     _original_send_event(self, event, body)
 
 
@@ -670,20 +678,54 @@ def _terminate_replay():
     _wait_for_replay(0)
 
 
+# How much of the replay's stderr is kept to explain a replay that exits
+# before GDB attaches.
+_REPLAY_STDERR_TAIL = 4096
+
+
+def _keep_tail(fd, tail):
+    # Read FD to its end, keeping only its last _REPLAY_STDERR_TAIL bytes in
+    # TAIL. Draining it for the replay's whole life means a talkative replay
+    # neither blocks on a full pipe nor takes SIGPIPE from a closed one.
+    with os.fdopen(fd, "rb", buffering=0) as stream:
+        while True:
+            chunk = stream.read(65536)
+            if not chunk:
+                return
+            tail[:] = (bytes(tail) + chunk)[-_REPLAY_STDERR_TAIL:]
+
+
 def _start_replay():
     global _replay_process
-    _replay_process = subprocess.Popen(
-        [_setpriv, "--pdeathsig", "SIGKILL", "--"] + _replay_command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        close_fds=True,
-    )
+    read_end, write_end = os.pipe()
+    tail = bytearray()
+    try:
+        _replay_process = subprocess.Popen(
+            [_setpriv, "--pdeathsig", "SIGKILL", "--"] + _replay_command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=write_end,
+            close_fds=True,
+        )
+    except BaseException:
+        os.close(read_end)
+        raise
+    finally:
+        os.close(write_end)
+    drain = threading.Thread(target=_keep_tail, args=(read_end, tail), daemon=True)
+    drain.start()
     time.sleep(0.5)
     status = _replay_process.poll()
     if status is not None:
         _replay_process = None
-        raise gdb.error("Hermit replay exited before GDB attached: {}".format(status))
+        # The replay has exited, so its stderr reaches end of file promptly.
+        drain.join(timeout=2.0)
+        reason = bytes(tail).decode("utf-8", "replace").strip()
+        raise gdb.error(
+            "Hermit replay exited before GDB attached: {}{}".format(
+                status, "; it said:\n" + reason if reason else ""
+            )
+        )
 
 
 def _connect_replay():

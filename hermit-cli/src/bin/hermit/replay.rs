@@ -53,6 +53,17 @@ pub struct ReplayOpts {
     /// Additional gdb command passed by `-ex`
     #[clap(long, value_delimiter = ';', conflicts_with = "serve_only")]
     gdbex: Vec<String>,
+
+    /// Serve the replay to one Debug Adapter Protocol client, such as an
+    /// editor, on the TCP address [HOST:]PORT (HOST defaults to 127.0.0.1).
+    /// This runs `hermit-dap --replay` from beside this executable, which
+    /// supports stepBack and reverseContinue. See DEBUGGING.md.
+    #[clap(
+        long,
+        value_name = "[HOST:]PORT",
+        conflicts_with_all = ["autopilot", "serve_only", "gdbex"]
+    )]
+    dap_listen: Option<String>,
 }
 
 impl ReplayOpts {
@@ -65,6 +76,10 @@ impl ReplayOpts {
                 .last_id()
                 .context("Failed to find last recording ID")?,
         };
+
+        if let Some(address) = &self.dap_listen {
+            return Err(self.exec_dap_adapter(&hermit, id, address));
+        }
 
         let recorded_local = hermit.recording_metadata(id)?.local_networking == Some(true);
         let network = replay_network(self.autopilot, recorded_local);
@@ -169,6 +184,44 @@ impl ReplayOpts {
                 (Err(primary), Ok(false)) => Err(primary),
             }
         }
+    }
+
+    /// Replaces this process with `hermit-dap --listen ADDRESS --replay ID`,
+    /// after telling the user what a DAP client's attach request must name.
+    /// Returns only the error that kept it from doing so.
+    fn exec_dap_adapter(&self, hermit: &HermitData, id: Id, address: &str) -> Error {
+        use std::os::unix::process::CommandExt;
+
+        let adapter = match std::env::current_exe() {
+            Ok(exe) => exe.with_file_name("hermit-dap"),
+            Err(error) => return Error::from(error).context("Failed to locate hermit"),
+        };
+        if !adapter.is_file() {
+            return Error::msg(format!(
+                "--dap-listen needs hermit-dap beside hermit, and {} does not exist; \
+                 build it with `cargo build -p hermit --bin hermit --bin hermit-dap`",
+                adapter.display()
+            ));
+        }
+        let exe = hermit.data_dir().join(format!("{}/exe", id));
+        let program = Shebang::new(&exe).map_or(exe, |s| s.interpreter().into());
+        eprintln!(
+            "hermit replay: starting hermit-dap to serve recording {id} to one DAP client; \
+             its attach request needs \"program\": {:?} and \"target\": \"127.0.0.1:{}\"",
+            program.display().to_string(),
+            self.gdbserver_port
+        );
+        let error = std::process::Command::new(&adapter)
+            .arg("--listen")
+            .arg(address)
+            .arg("--replay")
+            .arg(id.to_string())
+            .arg("--data-dir")
+            .arg(hermit.data_dir())
+            .arg("--gdbserver-port")
+            .arg(self.gdbserver_port.to_string())
+            .exec();
+        Error::from(error).context(format!("Failed to execute {}", adapter.display()))
     }
 
     fn container_main(

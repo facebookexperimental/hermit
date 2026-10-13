@@ -850,10 +850,12 @@ impl StartOpts {
 /// Plain playback comes first because a bare `hermit replay` starts an
 /// interactive GDB session (see `ReplayOpts::main`), which is a debugging
 /// tool, not the way to watch a recording run again. `--autopilot` replays to
-/// the end without a debugger. A recording made with `--data-dir` (or
-/// `HERMIT_DATA_DIR`) is only found by a replay given the same directory, so
-/// the directory is repeated in both commands.
-fn replay_hint_commands(id: &str, data_dir: Option<&Path>) -> [(&'static str, String); 2] {
+/// the end without a debugger. `--dap-listen` serves the replay to an editor
+/// or another Debug Adapter Protocol client, with stepBack (DEBUGGING.md). A
+/// recording made with `--data-dir` (or `HERMIT_DATA_DIR`) is only found by a
+/// replay given the same directory, so the directory is repeated in every
+/// command.
+fn replay_hint_commands(id: &str, data_dir: Option<&Path>) -> [(&'static str, String); 3] {
     let data_dir = data_dir.map_or_else(String::new, |dir| {
         format!(" --data-dir={}", shell_words::quote(&dir.to_string_lossy()))
     });
@@ -866,6 +868,10 @@ fn replay_hint_commands(id: &str, data_dir: Option<&Path>) -> [(&'static str, St
             "To replay it under GDB for debugging",
             format!("hermit replay{data_dir} {id}"),
         ),
+        (
+            "To debug it from an editor or another DAP client, with stepBack",
+            format!("hermit replay --dap-listen=4711{data_dir} {id}"),
+        ),
     ]
 }
 
@@ -876,13 +882,16 @@ mod tests {
     #[test]
     fn completion_hint_offers_plain_playback_before_the_gdb_session() {
         let id = "0123456789abcdef0123456789abcdef";
-        let [(plain_label, plain), (gdb_label, gdb)] = replay_hint_commands(id, None);
+        let [(plain_label, plain), (gdb_label, gdb), (dap_label, dap)] =
+            replay_hint_commands(id, None);
         assert_eq!(plain, format!("hermit replay --autopilot {id}"));
         assert_eq!(plain_label, "To replay it to the end");
         assert_eq!(gdb, format!("hermit replay {id}"));
         assert!(gdb_label.contains("GDB"), "{gdb_label}");
+        assert_eq!(dap, format!("hermit replay --dap-listen=4711 {id}"));
+        assert!(dap_label.contains("DAP"), "{dap_label}");
 
-        let [(_, plain), (_, gdb)] =
+        let [(_, plain), (_, gdb), (_, dap)] =
             replay_hint_commands(id, Some(Path::new("/data/my recordings")));
         assert_eq!(
             plain,
@@ -893,10 +902,10 @@ mod tests {
             format!("hermit replay --data-dir='/data/my recordings' {id}")
         );
 
-        // Both offered commands must parse as real `hermit replay` invocations,
-        // and only the plain one may select autopilot (no GDB).
+        // Every offered command must parse as a real `hermit replay`
+        // invocation, and only the plain one may select autopilot (no GDB).
         use clap::CommandFactory;
-        for (command, autopilot) in [(&plain, true), (&gdb, false)] {
+        for (command, autopilot) in [(&plain, true), (&gdb, false), (&dap, false)] {
             let matches = crate::Args::command()
                 .try_get_matches_from(shell_words::split(command).unwrap())
                 .unwrap_or_else(|e| panic!("{command}: {e}"));
