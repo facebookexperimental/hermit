@@ -11,7 +11,9 @@ ERROR rather than run on the host. In the container, the private bundle copy's D
 client directory gets a link to each library the image's loader (a stand-in ldd)
 resolves outside the bundle, never replacing one the bundle ships, and a library the
 image lacks is an ERROR. The wrapper and the harness each get a deadline that leaves
-the next one out time to stop them. Nothing here needs podman, /test or capabilities.
+the next one out time to stop them. A cell the harness withholds as HOST-INAPPLICABLE
+is reported skipped, with the harness's reason, on a local route only; on RE, or with any
+other run failure, it stays failed. Nothing here needs podman, /test or capabilities.
 
 A diverging verify cell's artifacts also go through ci/buck-e2e/ingest.py, as Tpx
 would list them, to check that both run logs come back to this host from a cell that
@@ -108,6 +110,29 @@ outcome = os.environ.get("FAKE_OUTCOME", "PASS")
 results, tpx = host(flag("--results")), host(flag("--tpx-json"))
 os.makedirs(os.path.dirname(results), exist_ok=True)
 test, mode, backend = flag("--test"), flag("--mode"), flag("--backend")
+if outcome == "HOST-INAPPLICABLE":
+    # Like the harness withholding its one cell: no row, the cell's test_done skipped, and
+    # a failed run-verdict record because the run executed nothing. FAKE_RUN_FAILURES adds
+    # further run failures; FAKE_RUN_FAILURES_ONLY replaces them all. FAKE_WITHHELD_TEST,
+    # FAKE_WITHHELD_STATUS and FAKE_WITHHELD_OUTCOME change the withheld record.
+    open(results, "w").close()
+    with open(host(flag("--junit")), "w") as f:
+        f.write("<testsuite/>\n")
+    failures = ["every one of the 1 selected cell(s) was host-inapplicable; "
+                "a run that executed no cell is not a pass"]
+    failures += json.loads(os.environ.get("FAKE_RUN_FAILURES") or "[]")
+    if os.environ.get("FAKE_RUN_FAILURES_ONLY"):
+        failures = json.loads(os.environ["FAKE_RUN_FAILURES_ONLY"])
+    with open(tpx, "w") as f:
+        f.write(json.dumps({"op": "test_done",
+                            "test": os.environ.get("FAKE_WITHHELD_TEST") or test + "/" + mode + "@" + backend,
+                            "status": os.environ.get("FAKE_WITHHELD_STATUS", "skipped"),
+                            "details": json.dumps({"outcome": os.environ.get("FAKE_WITHHELD_OUTCOME", "HOST-INAPPLICABLE"),
+                                                   "reason": "NOT RUN, NOT a pass, no coverage: this machine lacks exact-branch-counter"})}) + "\n")
+        f.write(json.dumps({"op": "test_done", "test": "test-harness/run-verdict", "status": "failed",
+                            "details": json.dumps({"run_failures": failures})}) + "\n")
+        f.write(json.dumps({"op": "all_done"}) + "\n")
+    sys.exit(1)
 with open(results, "w") as f:
     f.write(json.dumps({"test": test, "mode": mode, "backend": backend, "outcome": outcome,
                         "run_id": os.environ["E2E_RUN_ID"]}) + "\n")
@@ -626,6 +651,49 @@ class CellTest(unittest.TestCase):
                 self.assert_evidence(False, "verify-1.json", FAKE_VERIFY_JSON=verify_json,
                                      FAKE_DETLOGS="12")
         self.assert_evidence(False, "verify-1.json", FAKE_VERDICT="", FAKE_DETLOGS="12")
+    def test_local_host_inapplicable_cell_is_a_skip_with_the_harness_reason(self) -> None:
+        done, result = self.run_cell(FAKE_OUTCOME="HOST-INAPPLICABLE", HERMIT_E2E_ROUTE="local")
+        self.assertEqual(done["test"], CELL)
+        self.assertEqual(done["status"], "skipped", done)
+        details = json.loads(done["details"])
+        self.assertEqual(details["outcome"], "HOST-INAPPLICABLE")
+        self.assertEqual(details["reason"],
+                         "SKIP: NOT RUN, NOT a pass, no coverage: this machine lacks exact-branch-counter")
+        self.assertEqual(result["harness_rc"], 1)
+
+    def test_re_host_inapplicable_cell_still_fails_so_tpx_retries_it(self) -> None:
+        # ci/buck-e2e/run relies on the failure: Tpx retries the cell on another RE worker.
+        done, _ = self.run_cell(FAKE_OUTCOME="HOST-INAPPLICABLE", HERMIT_E2E_ROUTE="re")
+        self.assertEqual(done["status"], "failed", done)
+        self.assertIn("produced 2 test_done records", json.loads(done["details"])["reason"])
+
+    def test_host_inapplicable_cell_with_another_run_failure_still_fails(self) -> None:
+        done, _ = self.run_cell(FAKE_OUTCOME="HOST-INAPPLICABLE", HERMIT_E2E_ROUTE="local",
+                                FAKE_RUN_FAILURES=json.dumps(["cannot write the test-count file"]))
+        self.assertEqual(done["status"], "failed", done)
+        self.assertIn("produced 2 test_done records", json.loads(done["details"])["reason"])
+
+    # Each of these changes one part of the withheld pair; each must stay a plain failure,
+    # not a skip, so every clause of cell.sh's withheld_here predicate is pinned.
+    def assert_withheld_variant_fails(self, **env: str) -> None:
+        done, _ = self.run_cell(FAKE_OUTCOME="HOST-INAPPLICABLE", HERMIT_E2E_ROUTE="local", **env)
+        self.assertEqual(done["test"], CELL)
+        self.assertEqual(done["status"], "failed", done)
+        self.assertIn("produced 2 test_done records", json.loads(done["details"])["reason"])
+
+    def test_a_skipped_record_for_another_cell_still_fails(self) -> None:
+        self.assert_withheld_variant_fails(FAKE_WITHHELD_TEST="other_cell/strict@ptrace")
+
+    def test_a_skipped_record_whose_outcome_is_not_host_inapplicable_still_fails(self) -> None:
+        self.assert_withheld_variant_fails(FAKE_WITHHELD_OUTCOME="FAIL")
+
+    def test_a_host_inapplicable_record_that_is_not_skipped_still_fails(self) -> None:
+        self.assert_withheld_variant_fails(FAKE_WITHHELD_STATUS="failed")
+
+    def test_a_single_run_failure_other_than_the_vacuity_refusal_still_fails(self) -> None:
+        self.assert_withheld_variant_fails(
+            FAKE_RUN_FAILURES_ONLY=json.dumps(["cannot write the test-count file"]))
+
     def test_a_diverged_cells_run_logs_come_back_through_ingest(self) -> None:
         # Run 2's log is over cell.sh's 256 KiB compression threshold, as a real DETLOG is.
         done, result = self.run_cell(FAKE_OUTCOME="FAIL", FAKE_VERDICT="diverged", FAKE_DETLOG_LINES="20000")

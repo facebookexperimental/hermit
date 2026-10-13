@@ -21,6 +21,9 @@
 #                                  (default /tmp/hermit-e2e-kvm-slots-UID)
 # stdout: Tpx HPHP-JSON (`type = "json"`): the harness's test_done for the cell, turned
 #         into a failure if its evidence is incomplete, then all_done. Always exits 0.
+#         A cell the harness withholds as HOST-INAPPLICABLE on a local route is reported
+#         skipped, with the harness's reason; on RE it stays failed, so Tpx retries it on
+#         another worker (see ci/buck-e2e/run).
 set -u
 TEST=$1 MODE=$2 BACKEND=$3
 shift 3
@@ -323,12 +326,40 @@ for f in result.json tpx.jsonl summary.json results.jsonl harness.stderr; do
 done
 rm -rf "${W:?}"
 
-python3 - "$A/tpx.jsonl" "$CELL" "$evidence_complete" "$harness_rc" "${missing[*]}" <<'PY'
-import json, os, sys
-path, cell, complete, rc, missing = sys.argv[1:6]
+python3 - "$A/tpx.jsonl" "$CELL" "$evidence_complete" "$harness_rc" "${missing[*]}" "${HERMIT_E2E_ROUTE:-}" <<'PY'
+import json, os, re, sys
+path, cell, complete, rc, missing, route = sys.argv[1:7]
 records = [json.loads(l) for l in open(path) if l.strip()] if os.path.exists(path) else []
 done = [r for r in records if r.get("op") == "test_done"]
-if len(done) != 1:
+
+def withheld_here(done):
+    """The cell's own record, as a skip, when the harness withheld this one cell as
+    HOST-INAPPLICABLE and failed the run only because it executed nothing; else None.
+
+    A local host that lacks a capability lacks it on a retry too, so the cell is
+    reported skipped with the harness's reason, never as a pass. Only a local route
+    qualifies: an RE worker that lacks the capability is retried on another worker."""
+    if route != "local" or len(done) != 2:
+        return None
+    own = [r for r in done if r.get("test") == cell]
+    run = [r for r in done if r.get("test") == "test-harness/run-verdict"]
+    if len(own) != 1 or len(run) != 1 or own[0].get("status") != "skipped":
+        return None
+    try:
+        details = json.loads(own[0]["details"])
+        failures = json.loads(run[0]["details"])["run_failures"]
+    except (KeyError, TypeError, ValueError):
+        return None
+    vacuous = r"every one of the 1 selected cell\(s\) was host-inapplicable; .*"
+    if details.get("outcome") != "HOST-INAPPLICABLE" or len(failures) != 1 or not re.fullmatch(vacuous, failures[0]):
+        return None
+    details["reason"] = "SKIP: " + (details.get("reason") or "host-inapplicable")
+    return dict(own[0], details=json.dumps(details))
+
+skip = withheld_here(done)
+if skip:
+    done = [skip]
+elif len(done) != 1:
     done = [{"op": "test_done", "test": cell, "status": "failed",
              "details": json.dumps({"outcome": "ERROR", "reason": f"harness rc={rc} produced {len(done)} test_done records"})}]
 elif complete != "true" and done[0]["status"] == "passed":
