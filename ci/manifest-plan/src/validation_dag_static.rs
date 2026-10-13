@@ -1977,7 +1977,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the kernel_max, SMT, topology-ID and node single-CPU test
     // (https://github.com/rrnewton/hermit/issues/4160): 1461.
     // And the absent-CPU directory entry test (https://github.com/rrnewton/hermit/issues/4160): 1462.
-    ("test.detcore_unit", 1462),
+    // And a_signal_the_temporary_mask_blocks_is_held_not_ended: 1463.
+    ("test.detcore_unit", 1463),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3146,7 +3147,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the own-copy signalfd rewrite test: 1460.
     // And the kernel_max, SMT, topology-ID and node single-CPU test: 1461.
     // And the absent-CPU directory entry test: 1462.
-    ("test.detcore_unit_on_host", 1462),
+    // And the pselect6 temporary-mask hold test: 1463.
+    ("test.detcore_unit_on_host", 1463),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -7580,7 +7582,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"super"########,
         job: r########"pselect_signal_interruption_diagnostic"########,
         desc: r########"Pselect signal-interruption diagnostic"########,
-        description: r########"Runs the whole pselect6_simulation integration binary (two tests, pselect6_preserves_kernel_abi_and_unblocks_scheduler and pselect6_sleeps_under_its_temporary_mask) on one thread. The second compiles tests/c/pselect_temporary_mask.c and runs its four modes under `hermit --log=info run --strict --verify --verify-strict --base-env=minimal`, requiring the guest's own Linux check, a matched verdict and bitwise parity: a SIGALRM that pselect6's temporary mask blocks must not end the call, and one that only the temporary mask unblocks must end it with EINTR and its handler run before pselect returns, with a timeout the guest prints, the remaining time must hold no host time, and a sibling's rewrite of the mask buffer during the call must change nothing (https://github.com/rrnewton/hermit/issues/3991). The test compiles tests/c/pselect6_simulation.c and runs it twice on the default ptrace backend under a 30-second timeout: `hermit --log=trace run --strict --base-env=minimal`, which must print pselect6-simulation-ok and log "Retry #1 for syscall due to result Ok(0): pselect6(", then `hermit --log=info run --strict --verify --base-env=minimal`, which must print "Determinism verified". The guest checks that Hermit keeps pselect6's kernel ABI: EINVAL and EFAULT ordering, timeout writeback, SIGUSR1 from a helper thread interrupting pselect6 with EINTR and a partly decremented timeout, and a delayed pipe writer waking an infinite wait. If the strict scheduler stopped polling a blocked pselect6 by retry, the trace line is missing; if the wait never returns, the timeout kills the run. A failure is blocking for the super validation."########,
+        description: r########"Runs the whole pselect6_simulation integration binary (two tests, pselect6_preserves_kernel_abi_and_unblocks_scheduler and pselect6_sleeps_under_its_temporary_mask) on one thread. The second compiles tests/c/pselect_temporary_mask.c and runs its five modes under `hermit --log=info run --strict --verify --verify-strict --base-env=minimal`, requiring the guest's own Linux check, a matched verdict, bitwise parity and nonzero compared INFO messages on each side: a SIGALRM that pselect6's temporary mask blocks must not end the call or run its handler during the call, including one that fires as the call starts, and one that only the temporary mask unblocks must end it with EINTR and its handler run before pselect returns, with a timeout the guest prints, the remaining time must hold no host time, and a sibling's rewrite of the mask buffer during the call must change nothing (https://github.com/rrnewton/hermit/issues/3991). The test compiles tests/c/pselect6_simulation.c and runs it twice on the default ptrace backend under a 30-second timeout: `hermit --log=trace run --strict --base-env=minimal`, which must print pselect6-simulation-ok and log "Retry #1 for syscall due to result Ok(0): pselect6(", then `hermit --log=info run --strict --verify --base-env=minimal`, which must print "Determinism verified". The guest checks that Hermit keeps pselect6's kernel ABI: EINVAL and EFAULT ordering, timeout writeback, SIGUSR1 from a helper thread interrupting pselect6 with EINTR and a partly decremented timeout, and a delayed pipe writer waking an infinite wait. If the strict scheduler stopped polling a blocked pselect6 by retry, the trace line is missing; if the wait never returns, the timeout kills the run. A failure is blocking for the super validation."########,
         labels: &[r########"super"########],
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit --features third-party-backends --test pselect6_simulation -j 1 --"########,
         cmdtype: CmdType::Unknown,

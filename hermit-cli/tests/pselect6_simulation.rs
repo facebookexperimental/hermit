@@ -93,6 +93,10 @@ fn pselect6_preserves_kernel_abi_and_unblocks_scheduler() {
 ///
 /// - `blocks`: the timer's SIGALRM, unblocked in the waiter's own mask and
 ///   blocked by the call's mask, must not end the call. It returned EINTR.
+/// - `blocks-early`: `blocks`, with the timer firing as the call starts,
+///   before the wait blocks signals. The handler must not run in the middle of
+///   the call, with the pipe still empty: it ran there, and the call restarted
+///   (review of https://github.com/rrnewton/hermit/pull/4051).
 /// - `unblocks`: a SIGALRM blocked in the waiter's own mask and unblocked by
 ///   the call's mask must end it with EINTR, with the handler run before
 ///   pselect returns. It returned EINTR, but the handler did not run until the
@@ -106,7 +110,8 @@ fn pselect6_preserves_kernel_abi_and_unblocks_scheduler() {
 ///   over the remaining virtual time Hermit writes.
 ///
 /// The guest checks each result against Linux's and exits nonzero on a
-/// mismatch. Each mode runs under strict verification.
+/// mismatch. Each mode runs under strict verification, which must compare a
+/// nonzero number of INFO messages on each side.
 #[test]
 fn pselect6_sleeps_under_its_temporary_mask() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -123,7 +128,13 @@ fn pselect6_sleeps_under_its_temporary_mask() {
         .arg(&guest);
     command_output(compile, "pselect temporary-mask guest compilation");
 
-    for mode in ["blocks", "unblocks", "unblocks-timed", "unblocks-rewritten"] {
+    for mode in [
+        "blocks",
+        "blocks-early",
+        "unblocks",
+        "unblocks-timed",
+        "unblocks-rewritten",
+    ] {
         let verdict = build_root.join(format!("verify-{mode}.json"));
         let mut command = Command::new("timeout");
         command
@@ -153,5 +164,13 @@ fn pselect6_sleeps_under_its_temporary_mask() {
         .expect("strict verification verdict is valid JSON");
         assert_eq!(report["verdict"], serde_json::json!("matched"), "{mode}");
         assert_eq!(report["bitwise_parity"], serde_json::json!(true), "{mode}");
+        for side in ["left", "right"] {
+            assert!(
+                report["compared_log_messages"][side]
+                    .as_u64()
+                    .is_some_and(|count| count > 0),
+                "{mode}: strict verification compared no {side} INFO messages: {report}"
+            );
+        }
     }
 }

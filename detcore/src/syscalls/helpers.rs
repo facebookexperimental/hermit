@@ -2643,8 +2643,9 @@ impl KernelSignalWait {
         Self { deadline, ..self }
     }
 
-    /// The wait of `select`, or of `pselect6` without a temporary mask, which
-    /// holds no signal until the call returns (`held_until_return` is empty):
+    /// The wait of `select` and of `pselect6`, which holds no signal until the
+    /// call returns (`held_until_return` is empty); a `pselect6` with a
+    /// temporary mask adds it with `with_wait_mask`:
     /// any pending signal that could interrupt it ends it, `SIGCHLD` included.
     ///
     /// Linux ends these calls with `ERESTARTNOHAND` whenever no descriptor is
@@ -2743,8 +2744,8 @@ impl KernelSignalWait {
     /// The signals that would end the wait natively under the guest's mask, given
     /// the kernel's `state`.
     /// The signals whose pending presence this wait would observe now: those
-    /// it consumes, and those that would end it under the guest's mask
-    /// (`could_interrupt`). Read from the kernel's state in this turn.
+    /// it consumes, and those that would end it under the guest's mask, or
+    /// the wait mask when it has one (`could_interrupt`). Read from the kernel's state in this turn.
     pub(crate) fn observable_now(&self) -> Result<KernelSigset, Error> {
         let state = read_wait_signal_state(self.pid, self.tid)?;
         Ok(self.consumed | self.could_interrupt(&state))
@@ -2821,6 +2822,8 @@ impl KernelSignalWait {
     /// - Any other `SIGCHLD`, and a default job-control stop that the wait
     ///   defers, are held, and so are an ignored signal and a default-ignored
     ///   one. The injection runs again.
+    /// - A signal that the wait mask (`with_wait_mask`) blocks is held: Linux
+    ///   keeps it pending until the call returns.
     /// - Anything else, which is the backend's own preemption signal, ends the
     ///   wait with `ERESTARTNOINTR`, or is held in a wait with a deadline.
     ///
@@ -3160,7 +3163,13 @@ impl KernelSignalWait {
         if (before.ignored | (default_ignored & !before.caught)) & bit != 0 {
             return StopVerdict::Absorb(HeldKind::Harmless);
         }
-        if self.deadline {
+        // A signal that the wait mask blocks, and the guest's own mask does
+        // not, can stop an injection that runs before `block` takes effect.
+        // Linux keeps it pending for the whole call, under the temporary mask,
+        // and delivers it as the call returns, so it is held and never ends
+        // the wait (review of
+        // https://github.com/rrnewton/hermit/pull/4051).
+        if self.deadline || self.wait_mask.is_some_and(|mask| mask & bit != 0) {
             StopVerdict::Absorb(HeldKind::Precious)
         } else {
             StopVerdict::End(Errno::ERESTARTNOINTR)
@@ -5394,5 +5403,40 @@ mod kernel_signal_wait_failures {
             libc::SIGUSR1,
             SignalQueue::Thread
         ));
+    }
+
+    /// A select wait with a pselect6 temporary mask (`with_wait_mask`) holds a
+    /// caught signal that the temporary mask blocks, and the guest's own mask
+    /// does not, when it stops an injection before `block` takes effect, as
+    /// Linux keeps it pending for the whole call; without the temporary mask
+    /// the same stop ends the wait, and a signal only the temporary mask
+    /// unblocks ends it too (review of
+    /// https://github.com/rrnewton/hermit/pull/4051).
+    #[test]
+    fn a_signal_the_temporary_mask_blocks_is_held_not_ended() {
+        let bit = kernel_sigset_bit;
+        let (guest, _kernel) = WaitGuest::live(guest_mask());
+        let before = KernelSignalState {
+            pending: bit(libc::SIGALRM),
+            thread_pending: bit(libc::SIGALRM),
+            blocked: guest_mask(),
+            caught: bit(libc::SIGALRM) | bit(libc::SIGUSR2),
+            ..KernelSignalState::default()
+        };
+        let plain = KernelSignalWait::for_select(&guest);
+        assert_eq!(
+            plain.stop_verdict(&before, libc::SIGALRM),
+            StopVerdict::End(Errno::ERESTARTNOHAND)
+        );
+        let masked = KernelSignalWait::for_select(&guest).with_wait_mask(Some(bit(libc::SIGALRM)));
+        assert_eq!(
+            masked.stop_verdict(&before, libc::SIGALRM),
+            StopVerdict::Absorb(HeldKind::Precious)
+        );
+        let unblocking = KernelSignalWait::for_select(&guest).with_wait_mask(Some(0));
+        assert_eq!(
+            unblocking.stop_verdict(&before, libc::SIGUSR2),
+            StopVerdict::End(Errno::ERESTARTNOHAND)
+        );
     }
 }

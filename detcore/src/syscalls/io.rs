@@ -1456,12 +1456,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             // Linux delivers such a signal before it puts the guest's own mask
             // back, which may block it, and the handler's frame restores the
             // guest's mask when it returns. Only the kernel can do both, so the
-            // thread makes one more pselect6, with no descriptors, a zero
-            // timeout and the call's temporary mask: the kernel installs the
-            // mask, finds the signal pending, returns ERESTARTNOHAND and
-            // delivers it as the call returns, EINTR after a handler
-            // (https://github.com/rrnewton/hermit/issues/3991).
-            // - The mask is a scratch copy of the one this call read at entry
+            // thread makes one more call, a ppoll with no descriptors, a zero
+            // timeout and the call's temporary mask, as replay delivers a
+            // recorded call's signal (`inject_signal_delivery`): the kernel
+            // installs the mask, finds the signal pending, returns
+            // ERESTARTNOHAND and delivers it as the call returns, EINTR after a
+            // handler (https://github.com/rrnewton/hermit/issues/3991).
+            // - The mask is a private copy of the one this call read at entry
             //   (`sigmask`), as Linux copies it once at entry; the guest's
             //   buffer, which a sibling may have rewritten since, is not read
             //   again (review of https://github.com/rrnewton/hermit/pull/4051).
@@ -1471,27 +1472,22 @@ impl<T: RecordOrReplay> Detcore<T> {
             // - A plain injection, not a tail injection, so the rest of this
             //   handler and Detcore's post-syscall work still run.
             drop(_guard);
-            let mut stack = guest.stack().await;
-            let mask_copy = stack.push(mask);
-            let wrapper = stack
-                .push(Pselect6SigmaskArg {
-                    sigmask: mask_copy.as_raw(),
-                    sigsetsize: KERNEL_SIGSET_SIZE,
-                })
-                .cast();
-            let zero_timeout = stack.reserve::<Timespec>();
-            let _delivery_guard = stack.commit()?;
-            let _ = guest
-                .inject(
-                    syscalls::Pselect6::new()
-                        .with_nfds(0)
-                        .with_readfds(None)
-                        .with_writefds(None)
-                        .with_exceptfds(None)
-                        .with_timeout(Some(zero_timeout))
-                        .with_sigmask(Some(wrapper)),
-                )
-                .await;
+            // No room for the cells cannot happen in practice: this call's
+            // probe cells, at least as large, were committed in the same stack
+            // scratch above. Should it happen, the signal stays pending under
+            // the guest's own mask and the call returns EINTR without its
+            // handler run, as before this delivery existed.
+            match stage_private_cells(guest, PrivateCells::MaskAndZeroTimeout(mask), &[]).await? {
+                Some(staged) => {
+                    inject_signal_delivery(guest, staged.mask(), staged.after_mask()).await;
+                    staged.release(guest);
+                }
+                None => tracing::warn!(
+                    "[tid {}] no room to deliver a pselect6 signal under its temporary mask; \
+                     its handler runs only once the guest unblocks it",
+                    guest.tid()
+                ),
+            }
         }
         refuse_held_signal_loss(guest, Sysno::pselect6, result).await
     }
