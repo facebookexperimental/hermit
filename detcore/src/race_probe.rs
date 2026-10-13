@@ -46,9 +46,22 @@ pub(crate) const BG_POST_CALL: &str = "bg_post_call";
 /// The scheduler treats a finished backgrounded call as still running on one
 /// of its checks.
 pub(crate) const BG_HARVEST_SKIP: &str = "bg_harvest_skip";
+/// An async wait after a FIFO open's staging page is mapped, before anything
+/// is written to it: a task killed by a host process then leaves the page
+/// mapped and empty, as one killed during the `mmap` does.
+pub(crate) const FIFO_STAGING_MAPPED: &str = "fifo_staging_mapped";
+/// An async wait before a task unmaps a staging page that a killed task left:
+/// a task killed by a host process then leaves the page to the next task.
+pub(crate) const FIFO_STAGING_RECLAIM: &str = "fifo_staging_reclaim";
 
 /// Every probe point, for validating a configuration.
-const POINTS: [&str; 3] = [BG_PRE_CALL, BG_POST_CALL, BG_HARVEST_SKIP];
+const POINTS: [&str; 5] = [
+    BG_PRE_CALL,
+    BG_POST_CALL,
+    BG_HARVEST_SKIP,
+    FIFO_STAGING_MAPPED,
+    FIFO_STAGING_RECLAIM,
+];
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Spec {

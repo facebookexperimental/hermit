@@ -274,7 +274,8 @@ where
         ResumeStatus::InGuestFatalAlarm => Err(failure(
             "in-guest sleep response reached an emulated waitid",
         )),
-        ResumeStatus::Normal => Ok(None),
+        // A child wait never asks for `NothingElseCanRun`.
+        ResumeStatus::Normal | ResumeStatus::NothingElseCanRun => Ok(None),
         // The capable resource protocol has already selected a real caught
         // signal. Its returning gate protects copyout through frame delivery.
         ResumeStatus::Signaled(None) => Ok(Some(WaitSignalDisposition::Interrupt)),

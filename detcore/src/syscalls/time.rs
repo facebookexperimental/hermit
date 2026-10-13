@@ -740,7 +740,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                     self.stage_in_guest_fatal_alarm(guest).await;
                     return Err(Errno::EINTR.into());
                 }
-                ResumeStatus::Normal => return Ok(0),
+                // A sleep never asks for `NothingElseCanRun`.
+                ResumeStatus::Normal | ResumeStatus::NothingElseCanRun => return Ok(0),
                 ResumeStatus::Signaled(signals) => {
                     match super::signal::sleep_signal(guest, SleepCheck::AfterWake(signals), false)
                         .await?

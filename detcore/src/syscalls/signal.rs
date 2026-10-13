@@ -795,7 +795,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                         self.stage_in_guest_fatal_alarm(guest).await;
                         return Err(Errno::EINTR.into());
                     }
-                    ResumeStatus::Normal => {
+                    // A pause never asks for `NothingElseCanRun`.
+                    ResumeStatus::Normal | ResumeStatus::NothingElseCanRun => {
                         panic!(
                             "Internal violation: pause should never return from the scheduler except by interruption!"
                         )

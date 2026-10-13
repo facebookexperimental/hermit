@@ -160,6 +160,11 @@ pub enum SchedResponse {
     /// Keep running.
     Go(Option<SchedValue>),
 
+    /// Keep running, and nothing else can run (`Scheduler::nothing_else_can_run`):
+    /// the answer to a polling turn that asked for it
+    /// (`Resources::waits_until_nothing_else_can_run`). The payload is `Go`'s.
+    GoAlone(Option<SchedValue>),
+
     /// The guest was interupted by a signal while waiting on the scheduler, and will now execute
     /// the handler.
     Signaled(Option<Vec<SigWrapper>>),
@@ -1213,6 +1218,25 @@ pub struct Scheduler {
     /// [`Scheduler::admit_to_run_queue`] and
     /// [`Scheduler::drain_pending_run_queue_admissions`].
     pending_run_queue_admissions: BTreeMap<DetTid, AdmitIntent>,
+    /// The sequence number of the latest committed turn (`nothing_else_can_run`).
+    progress_epoch: u64,
+    /// The sequence number of the latest committed turn known to be progress:
+    /// any turn but a guest-state-only poll's grant
+    /// (`Resources::polls_guest_state_only`), and such a grant once the
+    /// thread's next request shows its attempt moved something (it is not a
+    /// retry, or is one with `previous_attempt_made_progress`).
+    last_progress: u64,
+    /// The sequence number of each guest-state-only poller's latest grant,
+    /// until the thread commits a turn of another kind.
+    guest_state_polled_at: BTreeMap<DetTid, u64>,
+    /// The sequence number of each thread's latest committed turn: a poller's
+    /// failed attempt came no earlier.
+    last_commit_at: BTreeMap<DetTid, u64>,
+    /// Set at the commit of a FIFO open's poll when nothing else can run but
+    /// a timer is due at a finite deadline: the next pass moves global time
+    /// to that deadline, as an empty run queue does, rather than letting the
+    /// poll crawl there one turn charge at a time (`unblock_guest`).
+    fast_forward_for_alone_poller: bool,
 
     /// Run-queue *removals* requested by a global-request handler
     /// (`reconnect_after_exec` -> `logically_kill_thread`), deferred to the same
@@ -3397,6 +3421,11 @@ impl Scheduler {
             test_task_states: Default::default(),
             unresolved_sigkill: false,
             pending_run_queue_admissions: Default::default(),
+            progress_epoch: 0,
+            last_progress: 0,
+            guest_state_polled_at: Default::default(),
+            last_commit_at: Default::default(),
+            fast_forward_for_alone_poller: false,
             pending_run_queue_removals: Default::default(),
             pending_cross_task_signals: Default::default(),
             models_signal_targets: cfg.sequentialize_threads
@@ -6271,6 +6300,9 @@ impl Scheduler {
         if self.replay_waits_before_maintenance() {
             return Err(SkipTurn);
         }
+        if std::mem::take(&mut self.fast_forward_for_alone_poller) {
+            self.fast_forward_to_next_finite_deadline(global_time);
+        }
         self.step2b_process_timed(global_time);
         self.step2b_restore_due_pollers();
         // A timed signal that just armed a background thread is followed by an
@@ -6285,6 +6317,30 @@ impl Scheduler {
         self.step2c_process_io_blockers()?;
         self.step2e_process_signal_deferred();
         self.step2d_handle_empty_queue(global_time)
+    }
+
+    /// Move global time to the earliest finite timed deadline, if it lies
+    /// ahead, so that `step2b_process_timed` fires it once committed time
+    /// catches up (the next pass, after step 1 updates committed time). Requested by a
+    /// FIFO open's poll when nothing else can run but such a timer
+    /// (`fast_forward_for_alone_poller`): as when the run queue is empty
+    /// (`step2d_decide_empty_queue`), no thread could otherwise act before it.
+    fn fast_forward_to_next_finite_deadline(&mut self, global_time: &Arc<Mutex<GlobalTime>>) {
+        let Some(deadline) = self.blocked.timed_waiters.next_deadline() else {
+            return;
+        };
+        if deadline.is_indefinite() {
+            return;
+        }
+        let mut gt = global_time.lock().unwrap();
+        let now = gt.as_nanos();
+        if deadline > now {
+            info!(
+                "[scheduler] Nothing but a FIFO open's poll can run; skipping global time ahead to {}.",
+                deadline
+            );
+            gt.add_extra_time(deadline.duration_since(now));
+        }
     }
 
     /// How long the release barrier waits for an armed thread's continuation
@@ -10640,8 +10696,9 @@ impl Scheduler {
     /// Precondition: The guest is stopped, so that no one is potentially using the request Ivar.
     /// The request Ivar should also be full with the passed resources
     fn upgrade_polled_to_runnable(&mut self, dettid: DetTid, rs: &Resources) {
-        let mut retry_rs = rs.clone();
-        retry_rs.poll_attempt = 0;
+        // Still the same retry, though now runnable at once
+        // (`nothing_else_can_run` reads it).
+        let retry_rs = rs.upgraded_to_runnable();
         let runnable_req = Ivar::full(Ok(retry_rs.clone()));
         let req = &mut self
             .next_turns
@@ -11293,6 +11350,110 @@ impl Scheduler {
         Self::is_x_turn(rsrcs, &ResourceID::InternalIOPolling)
     }
 
+    /// Which retry of its call a request is: `poll_attempt`, or the one a
+    /// skipped retry had before it was made runnable (`upgraded_from_attempt`).
+    fn retry_number(rs: &Resources) -> u32 {
+        rs.poll_attempt.max(rs.upgraded_from_attempt)
+    }
+
+    /// A retry after an attempt that moved nothing: the thread waits on what
+    /// another must do.
+    fn waits_after_a_failed_attempt(rs: &Resources) -> bool {
+        Self::retry_number(rs) > 0 && !rs.previous_attempt_made_progress
+    }
+
+    /// A second or later retry of one call after an attempt that moved
+    /// nothing: the thread's previous grant was for that same call, and its
+    /// attempt moved nothing. A first retry (`1`) follows a grant in which the
+    /// thread may have finished other calls first, which counts as progress.
+    fn retries_its_call_without_progress(rs: &Resources) -> bool {
+        Self::retry_number(rs) > 1 && !rs.previous_attempt_made_progress
+    }
+
+    /// Whether no guest thread other than `dtid` can make progress unless a
+    /// host acts or a timer fires, judged from scheduler state alone at
+    /// `dtid`'s commit (<https://github.com/rrnewton/hermit/issues/2203>).
+    /// Every other registered thread must be one of:
+    ///
+    /// - queued as a poller whose attempts depend only on guest actions
+    ///   (`Resources::polls_guest_state_only`), whatever its backoff, whose
+    ///   request retries after an attempt that moved nothing
+    ///   (`waits_after_a_failed_attempt`), made no earlier than the latest
+    ///   progress: its latest commit (`last_commit_at`) is at or after every
+    ///   turn known to be progress (`last_progress`) and every other poller's
+    ///   grant whose thread's request does not repeat that call without
+    ///   progress (`retries_its_call_without_progress`);
+    /// - parked as a futex waiter, a child waiter, an `rt_sigsuspend` waiter,
+    ///   at a happens-before gate, in a timed wait, or in a call that waits on
+    ///   a host (external IO): with nothing else able to run, only one of
+    ///   those pollers, a host or a timer could wake it.
+    ///
+    /// A thread in neither state is runnable work, is running, or awaits
+    /// admission to the run queue, so something else can run; so can a thread
+    /// queued after `sched_yield` or polling what a host can change. The answer
+    /// leans to "something else can run", which only keeps a FIFO open
+    /// polling. When it is "nothing", the caller still waits for any timer due
+    /// at a finite deadline first (`unblock_guest`).
+    fn nothing_else_can_run(&self, dtid: DetTid) -> bool {
+        // A grant counts as progress unless the thread's current request
+        // repeats that grant's call after an attempt that moved nothing.
+        let progress = self
+            .guest_state_polled_at
+            .iter()
+            .filter(|&(&tid, _)| tid != dtid)
+            .filter(|&(&tid, _)| {
+                !self
+                    .next_turns
+                    .get(&tid)
+                    .and_then(|turn| turn.req.try_read())
+                    .is_some_and(
+                        |req| matches!(req, Ok(rs) if Self::retries_its_call_without_progress(&rs)),
+                    )
+            })
+            .map(|(_, &grant)| grant)
+            .fold(self.last_progress, u64::max);
+        self.next_turns
+            .keys()
+            .filter(|&&tid| tid != dtid)
+            .all(|&tid| {
+                let idle_poller = self.run_queue.contains_tid(tid)
+                    && self
+                        .last_commit_at
+                        .get(&tid)
+                        .is_some_and(|&commit| commit >= progress)
+                    && self
+                        .next_turns
+                        .get(&tid)
+                        .and_then(|turn| turn.req.try_read())
+                        .is_some_and(|req| {
+                            matches!(req, Ok(rs) if Self::is_polling_turn(&rs)
+                            && rs.polls_guest_state_only
+                            && Self::waits_after_a_failed_attempt(&rs))
+                        });
+                let parked_futex = self.next_turns.get(&tid).is_some_and(is_futex_request)
+                    && self
+                        .blocked
+                        .futex_waiters
+                        .values()
+                        .any(|waiters| waiters.iter().any(|waiter| waiter.dettid == tid));
+                let parked = parked_futex
+                    || self.blocked.child_waiters.contains_key(&tid)
+                    || self
+                        .blocked
+                        .physical_child_waiters
+                        .values()
+                        .any(|waiters| waiters.contains(&tid))
+                    || self.blocked.rt_sigsuspend_blockers.contains_key(&tid)
+                    || self.blocked.external_io_blockers.contains_key(&tid)
+                    || self.blocked.timed_waiters.thread_deadline(tid).is_some()
+                    || self
+                        .happens_before
+                        .as_ref()
+                        .is_some_and(|hb| hb.parked.contains(&tid));
+                idle_poller || parked
+            })
+    }
+
     /// A backend whose internal pipe turns are host-timed (today SaBRe) discovers an
     /// inherited stdio pipe as a device resource before the inner
     /// `InternalIOPolling` request. Both turns belong to one host-timing-sensitive pipe
@@ -11588,6 +11749,45 @@ impl Scheduler {
         }
         let fatal_alarm = self.in_guest_fatal_alarm_pending(dtid);
         let futex_timed_out = self.blocked.timed_out_futex_waiters.remove(&dtid);
+        let (guest_state_poll, fruitless, wants_alone) = match self
+            .next_turns
+            .get(&dtid)
+            .and_then(|turn| turn.req.try_read())
+        {
+            Some(Ok(rs)) => (
+                Self::is_polling_turn(&rs) && rs.polls_guest_state_only,
+                Self::retries_its_call_without_progress(&rs),
+                rs.waits_until_nothing_else_can_run,
+            ),
+            _ => (false, false, false),
+        };
+        self.progress_epoch += 1;
+        self.last_commit_at.insert(dtid, self.progress_epoch);
+        let previous_grant = self.guest_state_polled_at.remove(&dtid);
+        if guest_state_poll {
+            // This thread's previous grant moved something unless this request
+            // retries after an attempt that did not.
+            if let Some(previous) = previous_grant
+                && !fruitless
+            {
+                self.last_progress = self.last_progress.max(previous);
+            }
+            self.guest_state_polled_at.insert(dtid, self.progress_epoch);
+        } else {
+            self.last_progress = self.progress_epoch;
+        }
+        let mut alone = wants_alone && self.nothing_else_can_run(dtid);
+        if alone
+            && self
+                .blocked
+                .timed_waiters
+                .next_deadline()
+                .is_some_and(|deadline| !deadline.is_indefinite())
+        {
+            // Only a timer can still let another thread run: move to it now.
+            alone = false;
+            self.fast_forward_for_alone_poller = true;
+        }
         if let Err(error) = self.clear_nextturn(dtid) {
             self.fail_parked(dtid, error);
             return Err(SkipTurn);
@@ -11607,7 +11807,11 @@ impl Scheduler {
                 .as_ref()
                 .map(LogicalTime::as_nanos)
                 .map(SchedValue::Value);
-            SchedResponse::Go(as_schedvalue)
+            if alone {
+                SchedResponse::GoAlone(as_schedvalue)
+            } else {
+                SchedResponse::Go(as_schedvalue)
+            }
         };
         match self.deadline_remaining_from(dtid, self.committed_time) {
             Some(remaining) => self.deadline_hints.insert(dtid, remaining),
@@ -12948,6 +13152,231 @@ mod test {
     #[cfg(test)]
     pub(crate) fn register_known_thread_for(sched: &mut Scheduler, tid: DetTid) {
         register_known_thread(sched, tid);
+    }
+
+    /// A queued polling thread whose request carries `polls_guest_state_only`
+    /// as given and retries after an attempt that moved nothing, with its
+    /// latest grant recorded as the latest committed turn.
+    fn queued_poller(sched: &mut Scheduler, tid: DetTid, guest_state_only: bool) {
+        register_known_thread(sched, tid);
+        let mut resources = Resources::new(tid);
+        resources.insert(ResourceID::InternalIOPolling, Permission::W);
+        resources.poll_attempt = 1;
+        resources.polls_guest_state_only = guest_state_only;
+        sched.next_turns[&tid].req.put(Ok(resources));
+        sched.run_queue.push_poller(tid, DEFAULT_PRIORITY, 1);
+        sched.last_commit_at.insert(tid, sched.progress_epoch);
+        if guest_state_only {
+            sched
+                .guest_state_polled_at
+                .insert(tid, sched.progress_epoch);
+        }
+    }
+
+    #[test]
+    fn nothing_else_can_run_beside_a_guest_poller_that_failed_since_the_last_progress() {
+        let mut sched = Scheduler::new(&Config::default());
+        let opener = DetTid::from_raw(3);
+        register_known_thread(&mut sched, opener);
+        queued_poller(&mut sched, DetTid::from_raw(5), true);
+        assert!(sched.nothing_else_can_run(opener));
+    }
+
+    #[test]
+    fn a_guest_poller_that_has_not_retried_since_progress_may_still_run() {
+        let mut sched = Scheduler::new(&Config::default());
+        let opener = DetTid::from_raw(3);
+        register_known_thread(&mut sched, opener);
+        queued_poller(&mut sched, DetTid::from_raw(5), true);
+        // A turn committed after the poller's latest grant was progress; its
+        // next attempt may succeed.
+        sched.progress_epoch += 1;
+        sched.last_progress = sched.progress_epoch;
+        assert!(!sched.nothing_else_can_run(opener));
+    }
+
+    /// A partial pipe write's retry follows an attempt that moved bytes: the
+    /// writer may move more (Claude review of
+    /// https://github.com/rrnewton/hermit/pull/4329, F1).
+    #[test]
+    fn a_guest_poller_whose_last_attempt_moved_data_may_still_run() {
+        let mut sched = Scheduler::new(&Config::default());
+        let opener = DetTid::from_raw(3);
+        register_known_thread(&mut sched, opener);
+        let writer = DetTid::from_raw(5);
+        register_known_thread(&mut sched, writer);
+        let mut resources = Resources::new(writer);
+        resources.insert(ResourceID::InternalIOPolling, Permission::W);
+        resources.poll_attempt = 2;
+        resources.polls_guest_state_only = true;
+        resources.previous_attempt_made_progress = true;
+        sched.next_turns[&writer].req.put(Ok(resources));
+        sched.run_queue.push_poller(writer, DEFAULT_PRIORITY, 2);
+        sched.last_commit_at.insert(writer, sched.progress_epoch);
+        sched
+            .guest_state_polled_at
+            .insert(writer, sched.progress_epoch);
+        assert!(!sched.nothing_else_can_run(opener));
+    }
+
+    /// Another poller's grant that moved data (its thread has since moved on:
+    /// here it is gone) is progress after an idle poller's failed attempt, so
+    /// that poller may succeed now (F1).
+    #[test]
+    fn a_poll_grant_that_moved_data_counts_as_progress() {
+        let mut sched = Scheduler::new(&Config::default());
+        let opener = DetTid::from_raw(3);
+        register_known_thread(&mut sched, opener);
+        queued_poller(&mut sched, DetTid::from_raw(5), true);
+        sched.progress_epoch += 1;
+        sched
+            .guest_state_polled_at
+            .insert(DetTid::from_raw(7), sched.progress_epoch);
+        assert!(!sched.nothing_else_can_run(opener));
+    }
+
+    /// A reader's read moves data (its grant), then its next read waits: the
+    /// first grant was progress after a writer's failed attempt, which the
+    /// reader's next request shows and its commit records, even once the
+    /// reader is a fruitless poller again (F1).
+    #[test]
+    fn a_poll_grant_whose_next_request_shows_progress_is_recorded() {
+        let mut sched = Scheduler::new(&Config::default());
+        let opener = DetTid::from_raw(3);
+        register_known_thread(&mut sched, opener);
+        // The writer waits for room since before the reader's read.
+        queued_poller(&mut sched, DetTid::from_raw(5), true);
+        let reader = DetTid::from_raw(7);
+        register_known_thread(&mut sched, reader);
+        let poll = |attempt: u32| {
+            let mut resources = Resources::new(reader);
+            resources.insert(ResourceID::InternalIOPolling, Permission::W);
+            resources.poll_attempt = attempt;
+            resources.polls_guest_state_only = true;
+            resources
+        };
+        // The read that moves data, then the next read, which commits.
+        sched.next_turns[&reader].req.put(Ok(poll(0)));
+        let _ = turn_answer(&mut sched, reader);
+        register_known_thread(&mut sched, reader);
+        sched.next_turns[&reader].req.put(Ok(poll(0)));
+        let _ = turn_answer(&mut sched, reader);
+        // That read found nothing, its first retry found nothing, and it
+        // retries again.
+        register_known_thread(&mut sched, reader);
+        sched.next_turns[&reader].req.put(Ok(poll(2)));
+        sched.run_queue.push_poller(reader, DEFAULT_PRIORITY, 2);
+        assert!(!sched.nothing_else_can_run(opener));
+    }
+
+    /// A poller's retry that step 4 skipped and made runnable
+    /// (`upgrade_polled_to_runnable`, which sets `poll_attempt` to 0) is still
+    /// a retry after an attempt that moved nothing. Granting it neither makes
+    /// the thread's previous grant progress nor the thread runnable work, so
+    /// beside it the FIFO open can still learn that nothing else can run
+    /// (Claude re-check of https://github.com/rrnewton/hermit/pull/4329, H1).
+    #[test]
+    fn an_upgraded_retry_is_still_fruitless() {
+        let mut sched = Scheduler::new(&Config::default());
+        let opener = DetTid::from_raw(3);
+        register_known_thread(&mut sched, opener);
+        // A waiting writer, idle since before the poller's grants.
+        queued_poller(&mut sched, DetTid::from_raw(5), true);
+        let poller = DetTid::from_raw(7);
+        register_known_thread(&mut sched, poller);
+        let retry = |attempt: u32| {
+            let mut resources = Resources::new(poller);
+            resources.insert(ResourceID::InternalIOPolling, Permission::W);
+            resources.polls_guest_state_only = true;
+            resources.poll_attempt = attempt;
+            resources
+        };
+        // Its first retry is granted, and moves nothing.
+        sched.next_turns[&poller].req.put(Ok(retry(1)));
+        let _ = turn_answer(&mut sched, poller);
+        // The second is skipped and made runnable, then granted.
+        register_known_thread(&mut sched, poller);
+        sched.next_turns[&poller].req.put(Ok(retry(2)));
+        sched.upgrade_polled_to_runnable(poller, &retry(2));
+        let _ = turn_answer(&mut sched, poller);
+        // Its third waits again.
+        register_known_thread(&mut sched, poller);
+        sched.next_turns[&poller].req.put(Ok(retry(3)));
+        sched.run_queue.push_poller(poller, DEFAULT_PRIORITY, 3);
+        assert!(sched.nothing_else_can_run(opener));
+    }
+
+    #[test]
+    fn a_poller_a_host_can_satisfy_may_still_run() {
+        let mut sched = Scheduler::new(&Config::default());
+        let opener = DetTid::from_raw(3);
+        register_known_thread(&mut sched, opener);
+        queued_poller(&mut sched, DetTid::from_raw(5), false);
+        assert!(!sched.nothing_else_can_run(opener));
+    }
+
+    #[test]
+    fn a_thread_neither_queued_nor_parked_may_still_run() {
+        let mut sched = Scheduler::new(&Config::default());
+        let opener = DetTid::from_raw(3);
+        register_known_thread(&mut sched, opener);
+        queued_poller(&mut sched, DetTid::from_raw(5), true);
+        // Registered, but running: not queued and not parked.
+        register_known_thread(&mut sched, DetTid::from_raw(7));
+        assert!(!sched.nothing_else_can_run(opener));
+    }
+
+    /// A FIFO open's polling request (`waits_until_nothing_else_can_run`).
+    fn fifo_open_poll(sched: &mut Scheduler, tid: DetTid) {
+        register_known_thread(sched, tid);
+        let mut resources = Resources::new(tid);
+        resources.insert(ResourceID::InternalIOPolling, Permission::W);
+        resources.poll_attempt = 1;
+        resources.polls_guest_state_only = true;
+        resources.waits_until_nothing_else_can_run = true;
+        sched.next_turns[&tid].req.put(Ok(resources));
+    }
+
+    /// A sleeping thread cannot run before its deadline, so it does not keep a
+    /// FIFO open polling; the open's commit moves time to the deadline first
+    /// rather than answering that nothing else can run (Claude review of
+    /// https://github.com/rrnewton/hermit/pull/4329, F3).
+    #[test]
+    fn a_fifo_open_beside_a_sleeper_moves_time_to_its_deadline() {
+        let mut sched = Scheduler::new(&Config::default());
+        let opener = DetTid::from_raw(3);
+        fifo_open_poll(&mut sched, opener);
+        let sleeper = DetTid::from_raw(5);
+        register_known_thread(&mut sched, sleeper);
+        sched
+            .blocked
+            .timed_waiters
+            .insert(LogicalTime::from_nanos(2_000_000_000), sleeper);
+        assert!(sched.nothing_else_can_run(opener));
+        let answer = turn_answer(&mut sched, opener);
+        assert!(matches!(answer, Some(SchedResponse::Go(_))), "{answer:?}");
+        assert!(sched.fast_forward_for_alone_poller);
+    }
+
+    /// Beside a wait no time ends (`pause`), the open falls back at once
+    /// (Codex review of https://github.com/rrnewton/hermit/pull/4329, P2-3).
+    #[test]
+    fn a_fifo_open_beside_an_indefinite_wait_falls_back() {
+        let mut sched = Scheduler::new(&Config::default());
+        let opener = DetTid::from_raw(3);
+        fifo_open_poll(&mut sched, opener);
+        let paused = DetTid::from_raw(5);
+        register_known_thread(&mut sched, paused);
+        sched
+            .blocked
+            .timed_waiters
+            .insert(LogicalTime::INDEFINITE, paused);
+        let answer = turn_answer(&mut sched, opener);
+        assert!(
+            matches!(answer, Some(SchedResponse::GoAlone(_))),
+            "{answer:?}"
+        );
+        assert!(!sched.fast_forward_for_alone_poller);
     }
 
     fn register_known_thread(sched: &mut Scheduler, tid: DetTid) {

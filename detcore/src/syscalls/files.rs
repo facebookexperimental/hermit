@@ -1872,6 +1872,480 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(())
     }
 
+    /// A blocking `openat` of the FIFO `fifo` (found by the tracer at `path`),
+    /// which a guest made in this run (`crate::fifo_peer::is_guest_made`), for
+    /// reading or for writing. On Linux it waits in the kernel until the other
+    /// end is open; injected as is, it would wait while it holds the scheduler
+    /// turn, and a guest that opens the other end could never run
+    /// (<https://github.com/rrnewton/hermit/issues/2203>).
+    ///
+    /// First the open is tried nonblocking. Any error other than "no reader
+    /// yet" (`ENXIO`, for a writer) is the open's own, returned at once, as
+    /// Linux returns it before waiting (`EEXIST`, `ENOENT`, `EACCES`, ...), and
+    /// nothing else is opened. A writer that finds a reader completes then, as
+    /// does a reader whose writer a guest holds or waits to open. Otherwise the
+    /// open waits in polling turns ([`crate::fifo_peer::PendingOpen`]), and the
+    /// guest's try is closed in the same turn, so no sibling sees a descriptor
+    /// for it. It waits until a guest holds the other end, is waiting to open
+    /// it, or has opened it since, then opens nonblocking and is made
+    /// blocking, as the guest asked.
+    ///
+    /// A signal ends the wait as Linux's: `ERESTARTSYS`, which the kernel turns
+    /// into `EINTR` or a restart by the guest's disposition.
+    ///
+    /// When the scheduler answers that nothing else can run
+    /// (`ResumeStatus::NothingElseCanRun`), no guest can open the other end,
+    /// so the open is made as the guest asked, waiting in the kernel while it
+    /// holds the turn, as without the poll: only a host could complete it.
+    ///
+    /// Either way the open completes on the FIFO it waited on
+    /// ([`Self::open_fifo_waited_on`]).
+    async fn open_fifo_once_a_guest_holds_its_peer<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Openat,
+        fifo: (u64, u64),
+        path: &std::ffi::OsStr,
+    ) -> Result<i64, Error> {
+        let reading = call.flags().bits() & libc::O_ACCMODE == libc::O_RDONLY;
+        let peer = if reading {
+            FifoPeer::Writer
+        } else {
+            FifoPeer::Reader
+        };
+        let nonblocking = call.with_flags(call.flags() | OFlag::O_NONBLOCK);
+        let opens_before = crate::fifo_peer::guest_opens(fifo);
+        // Guest state only, which changes in guest turns: the answer at each
+        // polling turn is deterministic.
+        let guest_peer_ready = || {
+            crate::fifo_peer::guest_holds_peer_of(fifo, peer)
+                || crate::fifo_peer::pending_opens(fifo).of(peer) > 0
+                || crate::fifo_peer::guest_opens(fifo).of(peer) > opens_before.of(peer)
+        };
+        // A nonblocking FIFO open never waits, so an injection a signal
+        // interrupts did not run, and is made again; the signal is delivered
+        // as the guest resumes.
+        let pending = match guest.inject_with_retry(nonblocking).await {
+            // A writer found a reader: Linux's open completes at once.
+            Ok(fd) if !reading => return Ok(self.make_blocking(guest, fd as RawFd).await?),
+            Ok(fd) if guest_peer_ready() => {
+                crate::fifo_peer::stand_in_for_waiting_writers(fifo, path);
+                return Ok(self.make_blocking(guest, fd as RawFd).await?);
+            }
+            Ok(fd) => {
+                // The tracer's reader opens before the guest's try closes, so
+                // the FIFO keeps a reader throughout.
+                let pending = crate::fifo_peer::PendingOpen::begin(fifo, path, call.flags().bits());
+                guest
+                    .inject_with_retry(syscalls::Close::new().with_fd(fd as RawFd))
+                    .await?;
+                pending
+            }
+            Err(Errno::ENXIO) if !reading => {
+                crate::fifo_peer::PendingOpen::begin(fifo, path, call.flags().bits())
+            }
+            Err(errno) => return Err(errno.into()),
+        };
+        info!("[detcore] the FIFO open polls for a guest peer");
+
+        let mut resources = Resources::new(guest.thread_state().dettid);
+        resources.insert(ResourceID::InternalIOPolling, Permission::W);
+        resources.fyi(call.name());
+        resources.polls_guest_state_only = true;
+        resources.waits_until_nothing_else_can_run = true;
+        // As a polled pipe read: a signal another task sends ends the wait.
+        resources.set_signal_interrupt_errno(Errno::ERESTARTSYS);
+        resources.signal_state_task = crate::syscalls::helpers::guest_signal_state_task(guest);
+        // The peer is checked again after every answer, the last one included:
+        // a guest may have opened (and closed) the other end in the turns
+        // before it.
+        loop {
+            let status = resource_request(guest, resources.clone()).await;
+            resources.poll_attempt += 1;
+            if guest_peer_ready() {
+                break;
+            }
+            match status {
+                ResumeStatus::Signaled(_) => return Err(Errno::ERESTARTSYS.into()),
+                ResumeStatus::NothingElseCanRun => {
+                    info!(
+                        "[detcore] nothing else can run; the FIFO open waits in the kernel, as without the poll"
+                    );
+                    let waited_on = pending.guest_path();
+                    return self
+                        .open_fifo_waited_on(
+                            guest,
+                            call,
+                            fifo,
+                            waited_on.as_deref(),
+                            call.flags(),
+                            false,
+                        )
+                        .await;
+                }
+                _ => {}
+            }
+        }
+        let waited_on = pending.guest_path();
+        let open = async |guest: &mut G| {
+            self.open_fifo_waited_on(
+                guest,
+                call,
+                fifo,
+                waited_on.as_deref(),
+                nonblocking.flags(),
+                true,
+            )
+            .await
+        };
+        let mut opened = open(guest).await;
+        if matches!(opened, Err(Error::Errno(Errno::ENXIO))) {
+            // A writer whose only reader has come and gone opens as Linux's did
+            // when the reader opened; the tracer stands in for that reader while
+            // the guest opens, so the guest's writes then fail with `EPIPE`, as
+            // on Linux.
+            let _stand_in = pending.open_in_tracer(libc::O_RDONLY);
+            opened = open(guest).await;
+        }
+        if reading && opened.is_ok() {
+            pending.stand_in_for_waiting_writers();
+        }
+        drop(pending);
+        Ok(self.make_blocking(guest, opened? as RawFd).await?)
+    }
+
+    /// Open, in the guest, the FIFO `fifo` a blocking open waited on, with
+    /// the guest's `flags`, whatever its name is now: through the tracer's
+    /// descriptor for it, `waited_on` ([`Self::open_waited_on_fifo`]).
+    ///
+    /// The kernel lets a guest into the tracer's descriptors only if it holds
+    /// `CAP_SYS_PTRACE` or every capability the tracer has
+    /// (`proc_fd_access_allowed`), and only if the tracer's `/proc` is under
+    /// its root; and a root whose `/proc` is not the tracer's may name another
+    /// file at that path, so what it opened is checked to be the FIFO, and
+    /// closed if not. A guest that cannot reach the descriptor (`EACCES`,
+    /// `ENOENT`, another file), or whose open waited without one (`waited_on`
+    /// is `None`),
+    /// opens the FIFO by the name it gave, as its first try did, provided the
+    /// name still reaches that FIFO: looked up first, so that no other file
+    /// is opened, and checked again once open. If the name reaches another
+    /// file or none, the open cannot complete on its FIFO, as Linux's does,
+    /// and is refused (Claude re-check of
+    /// <https://github.com/rrnewton/hermit/pull/4329> at revision 4,
+    /// MEDIUM-A).
+    ///
+    /// Either way this is a new open, so the FIFO's mode is checked again
+    /// against the guest's credentials when it completes: a FIFO whose mode
+    /// the guest may no longer open (a `chmod` during the wait) gives
+    /// `EACCES`, where Linux checked only at the start.
+    ///
+    /// `retry`: an open that cannot wait (nonblocking), which a signal stops
+    /// only before it runs. `ENXIO` (a writer whose reader is gone) and
+    /// `ERESTARTSYS` (a signal ended a blocking open) are the caller's.
+    async fn open_fifo_waited_on<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Openat,
+        fifo: (u64, u64),
+        waited_on: Option<&str>,
+        flags: OFlag,
+        retry: bool,
+    ) -> Result<i64, Error> {
+        let is_the_fifo = |stat: &libc::stat| (stat.st_dev, stat.st_ino) == fifo;
+        let unreachable = match waited_on {
+            Some(waited_on) => {
+                match Self::open_waited_on_fifo(guest, fifo, waited_on, flags, retry).await {
+                    Err(errno) if !matches!(errno, Errno::ENXIO | Errno::ERESTARTSYS) => {
+                        Some(errno)
+                    }
+                    // A root whose `/proc` is not the tracer's can name
+                    // another file at that path (Claude re-check at
+                    // revision 5, LOW-C).
+                    Ok(fd)
+                        if !self
+                            .inject_fstat(guest, fd as RawFd)
+                            .await
+                            .is_ok_and(|stat| is_the_fifo(&stat)) =>
+                    {
+                        info!(
+                            "[detcore] the tracer's descriptor path reached another file in the guest's root"
+                        );
+                        guest
+                            .inject_with_retry(syscalls::Close::new().with_fd(fd as RawFd))
+                            .await?;
+                        Some(Errno::ENOENT)
+                    }
+                    opened => return Ok(opened?),
+                }
+            }
+            None => None,
+        };
+        if let Some(errno) = unreachable {
+            info!(
+                "[detcore] the guest cannot reach the tracer's descriptor for the FIFO ({}); it opens the FIFO by its name",
+                errno
+            );
+        }
+        let path = call.path().ok_or(Errno::EFAULT)?;
+        let lookup = if flags.contains(OFlag::O_NOFOLLOW) {
+            AtFlags::AT_SYMLINK_NOFOLLOW
+        } else {
+            AtFlags::empty()
+        };
+        if Self::inject_statat(guest, call.dirfd(), path, [Some(path), None], lookup)
+            .await
+            .is_ok_and(|stat| is_the_fifo(&stat))
+        {
+            // The name was checked by the first try, and reaches the FIFO:
+            // nothing is created.
+            let open = call.with_flags(flags - (OFlag::O_CREAT | OFlag::O_EXCL));
+            let fd = if retry {
+                guest.inject_with_retry(open).await?
+            } else {
+                guest.inject(open).await?
+            };
+            if self
+                .inject_fstat(guest, fd as RawFd)
+                .await
+                .is_ok_and(|stat| is_the_fifo(&stat))
+            {
+                return Ok(fd);
+            }
+            guest
+                .inject_with_retry(syscalls::Close::new().with_fd(fd as RawFd))
+                .await?;
+        }
+        error!(
+            "[detcore] a blocking open of a FIFO a guest made waited for its peer, and cannot complete \
+             on that FIFO: the guest cannot reach the tracer's descriptor for it, and its name no \
+             longer reaches it (a guest without CAP_SYS_PTRACE, or without the tracer's /proc, whose \
+             FIFO was renamed or unlinked during the wait); refused \
+             (https://github.com/rrnewton/hermit/pull/4329)"
+        );
+        self.refuse_unserviceable_operation(
+            guest,
+            Sysno::openat,
+            unreachable.unwrap_or(Errno::ENOENT),
+        )
+        .await
+    }
+
+    /// Open, in the guest, the FIFO a waiting open waited on, at `waited_on`
+    /// (`fifo_peer::PendingOpen::guest_path`), with the guest's `flags`: the
+    /// checks of its name were made by the first try, so `O_CREAT`, `O_EXCL`
+    /// and `O_NOFOLLOW` go (the path is the tracer's descriptor link).
+    /// `retry`: an open that cannot wait (nonblocking), which a signal stops
+    /// only before it runs.
+    ///
+    /// The path is staged in a private page mapped for this open only, not
+    /// in the guest stack scratch, so that an open needs no spare stack
+    /// below the guest's stack pointer, which Linux's does not (Codex
+    /// re-check of <https://github.com/rrnewton/hermit/pull/4329> at revision
+    /// 4, P2). The page is unmapped before the guest resumes, so the guest's
+    /// memory keeps no tracer descriptor number (Claude's LOW-B there). An
+    /// error mapping or writing the page is returned, and the caller opens
+    /// the FIFO by its name instead.
+    ///
+    /// A task killed while the open waits in the kernel drops this call
+    /// before its unmap; the page is then unmapped by the next task of the
+    /// same address space to reach Detcore
+    /// ([`crate::fifo_peer::StagedPage`], [`Self::unmap_orphaned_staging_pages`]).
+    ///
+    /// What the path names is looked up first, and must be the FIFO `fifo`:
+    /// a root whose `/proc` is not the tracer's can name another file there,
+    /// which is not opened (`ESTALE`; Claude re-check at revision 6, LOW-H).
+    async fn open_waited_on_fifo<G: Guest<Self>>(
+        guest: &mut G,
+        fifo: (u64, u64),
+        waited_on: &str,
+        flags: OFlag,
+        retry: bool,
+    ) -> Result<i64, Errno> {
+        let mut path_buffer = [0_u8; crate::fifo_peer::STAGED_PAGE_LENGTH];
+        let bytes = waited_on.as_bytes();
+        if bytes.len() >= path_buffer.len() {
+            return Err(Errno::ENAMETOOLONG);
+        }
+        path_buffer[..bytes.len()].copy_from_slice(bytes);
+        // The page's owner exists before its `mmap` runs, at an address
+        // chosen first: a task killed during the `mmap` leaves its address
+        // space's next task an address to check.
+        let address =
+            crate::fifo_peer::free_staging_address(guest.tid().as_raw()).ok_or(Errno::ENOMEM)?;
+        let page = AddrMut::<u8>::from_raw(address).ok_or(Errno::ENOMEM)?;
+        let staged =
+            crate::fifo_peer::StagedPage::new(guest.thread_state().mm_id, address, path_buffer);
+        match guest
+            .inject_with_retry(Syscall::Mmap(
+                syscalls::Mmap::new()
+                    .with_addr(Some(page.cast::<libc::c_void>().into()))
+                    .with_len(path_buffer.len())
+                    .with_prot(ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
+                    .with_flags(
+                        MapFlags::MAP_PRIVATE
+                            | MapFlags::MAP_ANONYMOUS
+                            | MapFlags::MAP_FIXED_NOREPLACE,
+                    )
+                    .with_fd(-1)
+                    .with_offset(0),
+            ))
+            .await
+        {
+            Ok(mapped) if mapped as usize == address => {
+                crate::race_probe::delay(crate::race_probe::FIFO_STAGING_MAPPED).await;
+            }
+            // Nothing was mapped at the address (`EEXIST`: something is
+            // there): this route is not taken.
+            Err(errno) => {
+                staged.unmapped();
+                return Err(errno);
+            }
+            // A kernel without MAP_FIXED_NOREPLACE takes the address as a
+            // hint and maps elsewhere.
+            Ok(mapped) => {
+                staged.unmapped();
+                if let Some(elsewhere) = Addr::<libc::c_void>::from_raw(mapped as usize) {
+                    let _ = guest
+                        .inject_with_retry(Syscall::Munmap(
+                            syscalls::Munmap::new()
+                                .with_addr(Some(elsewhere))
+                                .with_len(path_buffer.len()),
+                        ))
+                        .await;
+                }
+                return Err(Errno::ENOMEM);
+            }
+        }
+        let path = PathPtr::from_ptr(page.as_raw() as *const libc::c_char)
+            .expect("a mapped page is not null");
+        let opened = match guest.memory().write_exact(page, &path_buffer) {
+            Ok(()) => match Self::inject_statat(
+                guest,
+                libc::AT_FDCWD,
+                path,
+                [Some(path), None],
+                AtFlags::empty(),
+            )
+            .await
+            {
+                Ok(stat) if (stat.st_dev, stat.st_ino) == fifo => {
+                    let open = syscalls::Openat::new()
+                        .with_dirfd(libc::AT_FDCWD)
+                        .with_path(Some(path))
+                        .with_flags(flags - (OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW))
+                        .with_mode(None);
+                    if retry {
+                        guest.inject_with_retry(open).await
+                    } else {
+                        guest.inject(open).await
+                    }
+                }
+                Ok(_) => {
+                    info!(
+                        "[detcore] the tracer's descriptor path names another file in the guest's root"
+                    );
+                    Err(Errno::ESTALE)
+                }
+                Err(errno) => Err(errno),
+            },
+            Err(error) => Err(error),
+        };
+        match guest
+            .inject_with_retry(Syscall::Munmap(
+                syscalls::Munmap::new()
+                    .with_addr(Some(page.cast::<libc::c_void>().into()))
+                    .with_len(path_buffer.len()),
+            ))
+            .await
+        {
+            Ok(_) => staged.unmapped(),
+            // An unmap that did not run (stopped before it ran) is left, with
+            // the guard, to this address space's next task.
+            Err(errno) => info!(
+                "[detcore] the transient FIFO path page is left to the next task: {}",
+                errno
+            ),
+        }
+        opened
+    }
+
+    /// Unmap the pages a completing FIFO open staged in this task's address
+    /// space and could not unmap, because its task went away while the open
+    /// waited ([`crate::fifo_peer::StagedPage`]). Called as a task reaches
+    /// Detcore, before it runs guest code again; costs one load while no page
+    /// is left.
+    pub(crate) async fn unmap_orphaned_staging_pages<G: Guest<Self>>(guest: &mut G) {
+        // Each taken page is owned by its guard until it is unmapped: one this
+        // task does not get to (its unmap does not run, or the task exits
+        // while it waits) is left again.
+        for page in crate::fifo_peer::take_orphaned_pages(guest.thread_state().mm_id) {
+            // Only a page that still holds what was staged: the guest may have
+            // unmapped it and mapped something else there.
+            let mut contents = [0_u8; crate::fifo_peer::STAGED_PAGE_LENGTH];
+            let Some(address) = Addr::<u8>::from_raw(page.address()) else {
+                page.unmapped();
+                continue;
+            };
+            let readable = guest.memory().read_exact(address, &mut contents).is_ok();
+            // A task killed during the `mmap` may have left the page before
+            // anything was written to it: a page of zeros is the staging page
+            // only where it is a lone one-page anonymous mapping.
+            if !readable
+                || (contents != *page.contents()
+                    && !(contents == [0; crate::fifo_peer::STAGED_PAGE_LENGTH]
+                        && crate::fifo_peer::is_lone_staging_mapping(
+                            guest.tid().as_raw(),
+                            page.address(),
+                        )))
+            {
+                info!("[detcore] a FIFO open's path page that a killed task left is gone");
+                page.unmapped();
+                continue;
+            }
+            info!("[detcore] unmapping a FIFO open's path page that a killed task left");
+            crate::race_probe::delay(crate::race_probe::FIFO_STAGING_RECLAIM).await;
+            let unmapped = guest
+                .inject_with_retry(Syscall::Munmap(
+                    syscalls::Munmap::new()
+                        .with_addr(Addr::<libc::c_void>::from_raw(page.address()))
+                        .with_len(contents.len()),
+                ))
+                .await;
+            match unmapped {
+                Ok(_) => page.unmapped(),
+                Err(Errno::EINVAL) => {
+                    warn!(
+                        "[detcore] could not unmap the transient FIFO path page: {}",
+                        Errno::EINVAL
+                    );
+                    page.unmapped();
+                }
+                // Stopped before it ran: the guard leaves it to the next task
+                // (Claude re-check at revision 6, MEDIUM-G).
+                Err(errno) => info!(
+                    "[detcore] the transient FIFO path page is left to the next task: {}",
+                    errno
+                ),
+            }
+        }
+    }
+
+    /// Clear `O_NONBLOCK` on the guest's FIFO descriptor `fd`, which was opened
+    /// nonblocking in place of a blocking open, and return it.
+    async fn make_blocking<G: Guest<Self>>(&self, guest: &mut G, fd: RawFd) -> Result<i64, Errno> {
+        let flags = guest
+            .inject_with_retry(syscalls::Fcntl::new().with_fd(fd).with_cmd(F_GETFL))
+            .await?;
+        guest
+            .inject_with_retry(
+                syscalls::Fcntl::new()
+                    .with_fd(fd)
+                    .with_cmd(F_SETFL(flags as i32 & !OFlag::O_NONBLOCK.bits())),
+            )
+            .await?;
+        Ok(fd as i64)
+    }
+
     /// Before a logically blocking read (`peer` is `Writer`) or write
     /// (`Reader`) on a FIFO that `handle_openat` marked: if a guest holds the
     /// other end (`crate::fifo_peer`), shrink the FIFO's capacity to the one
@@ -2371,6 +2845,105 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// The guest-made FIFO (`crate::fifo_peer::is_guest_made`) whose last
+    /// name `call` removes: the name an `unlink` or `unlinkat` removes, or the
+    /// target a `rename`, `renameat` or `renameat2` replaces (not with
+    /// `RENAME_EXCHANGE`), when it is that FIFO's only link
+    /// ([`retires_on_removal`]) and not the rename's own source (another link
+    /// of the same FIFO, or `rename(a, a)`). Stat'ed before the call runs; pass
+    /// the result to `crate::fifo_peer::forget_guest_made` if the call
+    /// succeeds, so that a FIFO that later reuses the number is not taken for
+    /// a guest's, while a FIFO that keeps a name stays a guest's. Only where
+    /// the set is shared by every guest (`fifo_peer::guest_descriptors_are_visible`).
+    pub(crate) async fn guest_made_fifos_removed_by<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: &Syscall,
+    ) -> Vec<(u64, u64)> {
+        if !crate::fifo_peer::any_guest_made()
+            || !crate::fifo_peer::guest_descriptors_are_visible(
+                &self.cfg.backend,
+                guest.thread_state().physical_tid,
+            )
+        {
+            return Vec::new();
+        }
+        let at = libc::AT_FDCWD;
+        let (removed, source) = match call {
+            #[cfg(not(target_arch = "aarch64"))]
+            Syscall::Unlink(c) => ((at, c.path()), None),
+            Syscall::Unlinkat(c) => ((c.dirfd(), c.path()), None),
+            #[cfg(not(target_arch = "aarch64"))]
+            Syscall::Rename(c) => ((at, c.newpath()), Some((at, c.oldpath()))),
+            Syscall::Renameat(c) => (
+                (c.newdirfd(), c.newpath()),
+                Some((c.olddirfd(), c.oldpath())),
+            ),
+            Syscall::Renameat2(c) if c.flags() & libc::RENAME_EXCHANGE == 0 => (
+                (c.newdirfd(), c.newpath()),
+                Some((c.olddirfd(), c.oldpath())),
+            ),
+            _ => return Vec::new(),
+        };
+        let inputs = [removed.1, source.and_then(|source| source.1)];
+        let Some(path) = removed.1 else {
+            return Vec::new();
+        };
+        let Ok(stat) = Self::inject_lstatat(guest, removed.0, path, inputs).await else {
+            return Vec::new();
+        };
+        let fifo = (stat.st_dev, stat.st_ino);
+        if stat.st_mode & libc::S_IFMT != libc::S_IFIFO
+            || !crate::fifo_peer::is_guest_made(fifo)
+            || !retires_on_removal(&stat)
+        {
+            return Vec::new();
+        }
+        if let Some((dirfd, Some(path))) = source
+            && Self::inject_lstatat(guest, dirfd, path, inputs)
+                .await
+                .is_ok_and(|source| (source.st_dev, source.st_ino) == fifo)
+        {
+            return Vec::new();
+        }
+        vec![fifo]
+    }
+
+    /// After a successful `mknod` or `mknodat` that made a FIFO, record it as
+    /// a guest's (`crate::fifo_peer::note_guest_made`), stat'ed at the name the
+    /// call made, in the same turn. Only where a blocking open of it can wait
+    /// in polling turns (sequentialized `hermit run` under a separate tracer
+    /// whose guest thread IDs are host tasks).
+    pub(crate) async fn note_guest_made_fifo<G: Guest<Self>>(&self, guest: &mut G, call: &Syscall) {
+        // Only where one set serves every guest, as `fifo_at` requires.
+        if !self.cfg.use_nonblocking_sockets()
+            || self.cfg.recordreplay_modes
+            || !crate::fifo_peer::guest_descriptors_are_visible(
+                &self.cfg.backend,
+                guest.thread_state().physical_tid,
+            )
+        {
+            return;
+        }
+        let (dirfd, path, mode) = match call {
+            #[cfg(not(target_arch = "aarch64"))]
+            Syscall::Mknod(c) => (libc::AT_FDCWD, c.path(), c.mode().bits()),
+            Syscall::Mknodat(c) => (c.dirfd(), c.path(), c.mode().bits()),
+            _ => return,
+        };
+        if mode & libc::S_IFMT != libc::S_IFIFO {
+            return;
+        }
+        let Some(path) = path else {
+            return;
+        };
+        if let Ok(stat) = Self::inject_lstatat(guest, dirfd, path, [Some(path), None]).await
+            && stat.st_mode & libc::S_IFMT == libc::S_IFIFO
+        {
+            crate::fifo_peer::note_guest_made((stat.st_dev, stat.st_ino));
+        }
+    }
+
     /// Retire the mappings of `inodes`, whose last names a successful call
     /// removed (see [`Self::last_names_removed_by`] and `InodePool::retire`).
     pub(crate) async fn retire_removed_inodes<G: Guest<Self>>(
@@ -2481,7 +3054,35 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return Err(Errno::EOPNOTSUPP.into());
         }
-        let res = self.record_or_replay(guest, Syscall::Openat(call)).await;
+        // A blocking open, for reading or for writing, of a FIFO a guest made
+        // waits in polling turns for a guest at the other end
+        // (https://github.com/rrnewton/hermit/issues/2203).
+        let fifo = (self.cfg.use_nonblocking_sockets()
+            && !self.cfg.recordreplay_modes
+            && !call.flags().intersects(OFlag::O_NONBLOCK | OFlag::O_PATH)
+            && call.flags().bits() & libc::O_ACCMODE != libc::O_RDWR)
+            .then(|| {
+                crate::fifo_peer::fifo_at(
+                    &self.cfg.backend,
+                    guest.thread_state().physical_tid,
+                    guest.tid().as_raw(),
+                    call.dirfd(),
+                    &path,
+                )
+            })
+            .flatten()
+            // Only a FIFO a guest made; every other one is opened as before.
+            .filter(|(fifo, _)| crate::fifo_peer::is_guest_made(*fifo));
+        let res: Result<i64, Error> = match fifo {
+            Some((fifo, fifo_path)) => {
+                self.open_fifo_once_a_guest_holds_its_peer(guest, call, fifo, &fifo_path)
+                    .await
+            }
+            None => self
+                .record_or_replay(guest, Syscall::Openat(call))
+                .await
+                .map_err(Error::from),
+        };
 
         match res {
             Ok(fd) => {
@@ -2631,7 +3232,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // holding the other end makes it an internally polled pipe
                 // (`fifo_polls_if_a_guest_holds_its_peer`). Run mode only, as
                 // for a reopened pipe: Replayer's descriptor is a placeholder.
-                // `is_fifo` answers yes only where it can read the guest's
+                // `fifo_of` finds a FIFO only where it can read the guest's
                 // descriptors through `/proc/<tid>`: under a separate tracer
                 // (not DBT, in its PID container) whose guest thread IDs are
                 // host tasks (not KVM). Elsewhere a FIFO blocks as before.
@@ -2639,7 +3240,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     && self.cfg.use_nonblocking_sockets()
                     && !self.cfg.recordreplay_modes
                     && !call.flags().contains(OFlag::O_PATH)
-                    && crate::fifo_peer::is_fifo(
+                    && let Some(fifo) = crate::fifo_peer::fifo_of(
                         &self.cfg.backend,
                         guest.thread_state().physical_tid,
                         guest.tid().as_raw(),
@@ -2649,6 +3250,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     guest
                         .thread_state()
                         .with_detfd(fd, |detfd| detfd.mark_fifo_awaiting_guest_peer())?;
+                    crate::fifo_peer::note_guest_open(fifo, call.flags().bits());
                 }
                 if let (true, Some(stat)) = (guest.config().record_host_inputs, &host_stat) {
                     crate::tool_global::record_host_input(
@@ -2849,17 +3451,17 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // through a spelling the lookup check does not resolve,
                 // refuses the open before its descriptor can be named; and
                 // the KVM executor refuses whatever reaches procfs.
-                let e = if matches!(e, Errno::EACCES | Errno::EPERM)
+                let e = if matches!(e, Error::Errno(Errno::EACCES | Errno::EPERM))
                     && self
                         .refused_open_reaches_procfs_name_outside_level(guest, &call)
                         .await
                 {
-                    Errno::ENOENT
+                    Errno::ENOENT.into()
                 } else {
                     e
                 };
                 resource_release_all(guest).await;
-                Err(e.into())
+                Err(e)
             }
         }
     }

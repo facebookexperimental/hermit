@@ -27,10 +27,281 @@
 //! else, and is skipped (answering no) when the tracer is not that
 //! namespace's init.
 
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+
+use detcore_model::futex::MmId;
+
+/// How many times a guest has opened each FIFO `(dev, ino)` for writing
+/// (`O_WRONLY` or `O_RDWR`) and for reading (`O_RDONLY` or `O_RDWR`),
+/// nonblocking opens included. A guest's blocking open completes when the
+/// other end opens, even one that has closed again by the opener's next
+/// polling turn, which the scan of open descriptors cannot see. Counted in
+/// the opener's turn, so the count a waiting open reads is deterministic.
+/// One count for the tracer, which is right where the scan is: only a tracer
+/// that is the init of Hermit's PID namespace scans at all.
+static GUEST_OPENS: Mutex<BTreeMap<(u64, u64), Ends>> = Mutex::new(BTreeMap::new());
+
+/// The FIFOs `(dev, ino)` a guest made in this run (a successful `mknod` or
+/// `mknodat` with `S_IFIFO`), until a guest removes the last name that
+/// reaches one (`unlink`, `unlinkat`, or a `rename` over it, not onto another
+/// link of the same FIFO). Only a blocking open of one
+/// of these waits in polling turns for a guest peer
+/// (<https://github.com/rrnewton/hermit/issues/2203>): its other end is a
+/// guest's unless a host process opens a FIFO a guest just made. Every other
+/// FIFO (a host's, one made before the run, a pipe reached by path) is opened
+/// as before, in the kernel. Changed in the guest's turn.
+///
+/// A number the kernel reuses for a new FIFO after a guest removed the old
+/// one's last name is not inherited: removing that name forgets it. A host that
+/// removes a guest-made FIFO and makes another that reuses its inode number
+/// within the run would inherit it; Detcore sees no host removal.
+static GUEST_MADE: Mutex<BTreeSet<(u64, u64)>> = Mutex::new(BTreeSet::new());
+
+/// Record that a guest made the FIFO `fifo`.
+pub(crate) fn note_guest_made(fifo: (u64, u64)) {
+    GUEST_MADE.lock().unwrap().insert(fifo);
+}
+
+/// Forget the guest-made FIFO `fifo`, whose name a guest removed.
+pub(crate) fn forget_guest_made(fifo: (u64, u64)) {
+    if GUEST_MADE.lock().unwrap().remove(&fifo) {
+        // No host inode number: the line is part of the verified log.
+        tracing::info!(
+            "[detcore] a guest removed the name of the FIFO it made; its number is forgotten"
+        );
+    }
+}
+
+/// Whether a guest made the FIFO `fifo` in this run (see `GUEST_MADE`).
+pub(crate) fn is_guest_made(fifo: (u64, u64)) -> bool {
+    GUEST_MADE.lock().unwrap().contains(&fifo)
+}
+
+/// Whether a guest has made any FIFO in this run, so that a removal is worth
+/// a look.
+pub(crate) fn any_guest_made() -> bool {
+    !GUEST_MADE.lock().unwrap().is_empty()
+}
+
+/// The guest blocking opens of each FIFO waiting, in polling turns, for the
+/// other end ([`PendingOpen`]). On Linux a blocking open counts as a reader
+/// or writer while it waits, so a waiting reader completes a writer's open
+/// and the reverse; these are those waiting opens, which hold no descriptor
+/// the scan could see. Changed in the opener's turn.
+static PENDING_OPENS: Mutex<BTreeMap<(u64, u64), Ends>> = Mutex::new(BTreeMap::new());
+
+/// A writer the tracer holds open for the waiting writers of a FIFO once a
+/// reader's open has completed ([`stand_in_for_waiting_writers`]): on Linux a
+/// waiting writer counts as a writer, so that reader's reads wait for it
+/// rather than seeing end of file. Dropped when no writer waits any more.
+static STAND_IN_WRITERS: Mutex<BTreeMap<(u64, u64), fs::File>> = Mutex::new(BTreeMap::new());
+
+/// Called as a guest reader's open of the FIFO `fifo` (found by the tracer at
+/// `path`) completes, while a reader is open: if a guest writer's blocking
+/// open is waiting, the tracer holds the FIFO open for writing until none is,
+/// so the reader does not read end of file before that writer has opened.
+pub(crate) fn stand_in_for_waiting_writers(fifo: (u64, u64), path: &std::ffi::OsStr) {
+    use std::os::unix::fs::OpenOptionsExt;
+    if pending_opens(fifo).writers == 0 {
+        return;
+    }
+    let mut stand_ins = STAND_IN_WRITERS.lock().unwrap();
+    if stand_ins.contains_key(&fifo) {
+        return;
+    }
+    // `path` may name another file by now (a rename while the open waited);
+    // only the FIFO itself is held.
+    if let Ok(file) = fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        && file
+            .metadata()
+            .is_ok_and(|meta| (meta.dev(), meta.ino()) == fifo)
+    {
+        stand_ins.insert(fifo, file);
+    }
+}
+
+/// A count for each end of a FIFO.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Ends {
+    pub(crate) readers: u64,
+    pub(crate) writers: u64,
+}
+
+impl Ends {
+    fn add(&mut self, flags: i32, by: i64) {
+        let access = flags & libc::O_ACCMODE;
+        if access != libc::O_WRONLY {
+            self.readers = self.readers.saturating_add_signed(by);
+        }
+        if access != libc::O_RDONLY {
+            self.writers = self.writers.saturating_add_signed(by);
+        }
+    }
+
+    /// The count of the end `peer` names.
+    pub(crate) fn of(self, peer: FifoPeer) -> u64 {
+        match peer {
+            FifoPeer::Reader => self.readers,
+            FifoPeer::Writer => self.writers,
+        }
+    }
+}
+
+/// Count a guest's successful open of the FIFO `fifo` with the file status
+/// flags `flags`.
+pub(crate) fn note_guest_open(fifo: (u64, u64), flags: i32) {
+    GUEST_OPENS
+        .lock()
+        .unwrap()
+        .entry(fifo)
+        .or_default()
+        .add(flags, 1);
+}
+
+/// How many times a guest has opened each end of the FIFO `fifo`.
+pub(crate) fn guest_opens(fifo: (u64, u64)) -> Ends {
+    GUEST_OPENS
+        .lock()
+        .unwrap()
+        .get(&fifo)
+        .copied()
+        .unwrap_or_default()
+}
+
+/// How many guest blocking opens of each end of the FIFO `fifo` are waiting.
+pub(crate) fn pending_opens(fifo: (u64, u64)) -> Ends {
+    PENDING_OPENS
+        .lock()
+        .unwrap()
+        .get(&fifo)
+        .copied()
+        .unwrap_or_default()
+}
+
+/// A guest blocking open of a FIFO while it waits in polling turns. It counts
+/// in [`pending_opens`] until dropped, however the open ends. The tracer holds
+/// the FIFO it waits on (`handle`, an `O_PATH` descriptor), so the open
+/// completes on that FIFO, as Linux's does, even if a guest renames or
+/// unlinks the name meanwhile. A waiting reader also holds the FIFO open for
+/// reading in the tracer (`reader`), as Linux counts it a reader while it
+/// waits: a writer's open, the guest's or a host's, then completes at once,
+/// and what a writer writes before the guest's open completes stays in the
+/// FIFO for it. The tracer's descriptors are in no guest's table, so no guest
+/// can use them.
+pub(crate) struct PendingOpen {
+    fifo: (u64, u64),
+    flags: i32,
+    handle: Option<fs::File>,
+    /// Held only to keep the FIFO open for reading while the open waits.
+    _reader: Option<fs::File>,
+}
+
+impl PendingOpen {
+    /// Start waiting to open the FIFO `fifo`, found at the tracer path `path`,
+    /// with the file status flags `flags`. Called in the turn of the guest's
+    /// own nonblocking try, once it has succeeded (a reader) or found no
+    /// reader (a writer), so a failing open opens nothing here.
+    pub(crate) fn begin(fifo: (u64, u64), path: &std::ffi::OsStr, flags: i32) -> Self {
+        use std::os::unix::fs::OpenOptionsExt;
+        let handle = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+            .open(path)
+            .ok()
+            .filter(|file| {
+                file.metadata()
+                    .is_ok_and(|meta| (meta.dev(), meta.ino()) == fifo)
+            });
+        let mut pending = PendingOpen {
+            fifo,
+            flags,
+            handle,
+            _reader: None,
+        };
+        if flags & libc::O_ACCMODE == libc::O_RDONLY {
+            pending._reader = pending.open_in_tracer(libc::O_RDONLY).ok();
+        }
+        PENDING_OPENS
+            .lock()
+            .unwrap()
+            .entry(fifo)
+            .or_default()
+            .add(flags, 1);
+        pending
+    }
+
+    /// The path at which a guest opens the FIFO this open waits on: the
+    /// tracer's descriptor for it, through the tracer's `/proc` entry (the
+    /// tracer and the guests share a PID namespace). `None` if the tracer
+    /// could not hold it.
+    pub(crate) fn guest_path(&self) -> Option<String> {
+        use std::os::fd::AsRawFd;
+        let handle = self.handle.as_ref()?;
+        Some(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            handle.as_raw_fd()
+        ))
+    }
+
+    /// [`stand_in_for_waiting_writers`] for the FIFO this open waited on, as
+    /// a reader's open of it completes.
+    pub(crate) fn stand_in_for_waiting_writers(&self) {
+        if pending_opens(self.fifo).writers == 0 {
+            return;
+        }
+        let mut stand_ins = STAND_IN_WRITERS.lock().unwrap();
+        if !stand_ins.contains_key(&self.fifo)
+            && let Ok(file) = self.open_in_tracer(libc::O_WRONLY)
+        {
+            stand_ins.insert(self.fifo, file);
+        }
+    }
+
+    /// Open the FIFO this open waits on in the tracer, nonblocking, with the
+    /// access `access` (`O_RDONLY` or `O_WRONLY`).
+    pub(crate) fn open_in_tracer(&self, access: i32) -> std::io::Result<fs::File> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let handle = self
+            .handle
+            .as_ref()
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EBADF))?;
+        fs::OpenOptions::new()
+            .read(access == libc::O_RDONLY)
+            .write(access == libc::O_WRONLY)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(format!("/proc/self/fd/{}", handle.as_raw_fd()))
+    }
+}
+
+impl Drop for PendingOpen {
+    fn drop(&mut self) {
+        let writers_left = PENDING_OPENS
+            .lock()
+            .unwrap()
+            .get_mut(&self.fifo)
+            .map(|ends| {
+                ends.add(self.flags, -1);
+                ends.writers
+            })
+            .unwrap_or(0);
+        if writers_left == 0 {
+            STAND_IN_WRITERS.lock().unwrap().remove(&self.fifo);
+        }
+    }
+}
 
 /// The end of a FIFO a waiting call needs another holder of.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,20 +354,60 @@ pub(crate) fn guest_descriptors_are_visible(
         && crate::procfs_inode::guest_tids_name_host_tasks(backend, physical_tid)
 }
 
-/// Whether guest thread `tid`'s descriptor `fd` names a FIFO (a named FIFO,
-/// or a pipe reached by path). Read through the thread, whose descriptor
-/// table may not be its leader's (a thread cloned without CLONE_FILES), and
-/// only where [`guest_descriptors_are_visible`]: elsewhere `/proc/<tid>` is
-/// not the guest's, and the answer is no. Every later check here runs only on
-/// a FIFO this said yes to.
-pub(crate) fn is_fifo(
+/// The identity `(dev, ino)` of the FIFO a guest thread's
+/// `openat(dirfd, path)` would open, and the path at which the tracer finds it, read through the thread's own root, cwd
+/// or `dirfd`; `None` when it is not a FIFO, cannot be read, or the guest's
+/// descriptors are not visible ([`guest_descriptors_are_visible`]). (An
+/// absolute symlink is resolved from the tracer's root, which only a chrooted
+/// guest sees differently; a FIFO missed that way is opened as before.)
+pub(crate) fn fifo_at(
+    backend: &reverie::BackendCapabilities,
+    physical_tid: Option<i32>,
+    tid: i32,
+    dirfd: i32,
+    path: &Path,
+) -> Option<((u64, u64), std::ffi::OsString)> {
+    if !guest_descriptors_are_visible(backend, physical_tid) {
+        return None;
+    }
+    let base = if path.is_absolute() {
+        format!("/proc/{tid}/root")
+    } else if dirfd == libc::AT_FDCWD {
+        format!("/proc/{tid}/cwd/")
+    } else {
+        format!("/proc/{tid}/fd/{dirfd}/")
+    };
+    let mut full = std::ffi::OsString::from(base);
+    full.push(path.as_os_str());
+    let meta = fs::metadata(&full).ok()?;
+    meta.file_type()
+        .is_fifo()
+        .then(|| ((meta.dev(), meta.ino()), full))
+}
+
+/// The identity `(dev, ino)` of the FIFO behind guest thread `tid`'s
+/// descriptor `fd` (a named FIFO, or a pipe reached by path), or `None` when
+/// it is not a FIFO or the guest's descriptors are not visible
+/// ([`guest_descriptors_are_visible`]). Read through the thread, whose
+/// descriptor table may not be its leader's (a thread cloned without
+/// CLONE_FILES). Every later check here runs only on a FIFO this found.
+pub(crate) fn fifo_of(
     backend: &reverie::BackendCapabilities,
     physical_tid: Option<i32>,
     tid: i32,
     fd: i32,
-) -> bool {
-    guest_descriptors_are_visible(backend, physical_tid)
-        && fs::metadata(format!("/proc/{tid}/fd/{fd}")).is_ok_and(|meta| meta.file_type().is_fifo())
+) -> Option<(u64, u64)> {
+    if !guest_descriptors_are_visible(backend, physical_tid) {
+        return None;
+    }
+    fifo_behind(tid, fd)
+}
+
+/// [`fifo_of`] without the visibility check, for the checks that run only on
+/// a FIFO it found.
+fn fifo_behind(tid: i32, fd: i32) -> Option<(u64, u64)> {
+    let meta = fs::metadata(format!("/proc/{tid}/fd/{fd}")).ok()?;
+    meta.file_type().is_fifo().then(|| (meta.dev(), meta.ino()))
 }
 
 /// Whether the kernel's open file description behind thread `tid`'s `fd` is
@@ -113,14 +424,26 @@ pub(crate) fn kernel_nonblocking(tid: i32, fd: i32) -> Option<bool> {
 /// whether data ever comes is up to the FIFO's other holders, which may be
 /// host processes only (`exec 3<>fifo`). `fd` is read in `tid`'s own table.
 pub(crate) fn guest_holds_peer(tid: i32, fd: i32, peer: FifoPeer) -> bool {
+    // A guest's blocking open of the other end that is still waiting counts:
+    // on Linux it already holds that end (a waiting writer is a writer).
+    fifo_behind(tid, fd)
+        .is_some_and(|fifo| pending_opens(fifo).of(peer) > 0 || scan(fifo, peer, Some((tid, fd))))
+}
+
+/// Whether a guest holds a descriptor for the FIFO `(dev, ino)` with the
+/// access `peer` names. For an open, which has no descriptor yet.
+pub(crate) fn guest_holds_peer_of(fifo: (u64, u64), peer: FifoPeer) -> bool {
+    scan(fifo, peer, None)
+}
+
+/// The scan behind `guest_holds_peer` and `guest_holds_peer_of`, leaving out
+/// the open file description of `own`, a `(tid, fd)` pair.
+fn scan(fifo: (u64, u64), peer: FifoPeer, own: Option<(i32, i32)>) -> bool {
     // Outside a private PID namespace `/proc` lists host processes too.
     let tracer = std::process::id();
     if tracer != 1 {
         return false;
     }
-    let Ok(fifo) = fs::metadata(format!("/proc/{tid}/fd/{fd}")) else {
-        return false;
-    };
     let proc_root = Path::new("/proc");
     let Ok(entries) = fs::read_dir(proc_root) else {
         return false;
@@ -132,15 +455,7 @@ pub(crate) fn guest_holds_peer(tid: i32, fd: i32, peer: FifoPeer) -> bool {
         .any(|process| {
             descriptor_tables(&proc_root.join(process))
                 .iter()
-                .any(|(table, task)| {
-                    holds_peer(
-                        table,
-                        *task,
-                        (fifo.dev(), fifo.ino()),
-                        peer,
-                        Some((tid, fd)),
-                    )
-                })
+                .any(|(table, task)| holds_peer(table, *task, fifo, peer, own))
         })
 }
 
@@ -242,8 +557,219 @@ fn same_description(pid1: i32, fd1: i32, pid2: i32, fd2: i32) -> bool {
     !(1..=3).contains(&order)
 }
 
+/// An address at which a FIFO open can map its staging page in thread
+/// `tid`'s address space, read from `/proc/<tid>/maps`
+/// ([`pick_staging_address`]). Chosen before the page is mapped, so that the
+/// page has an owner ([`StagedPage`]) from before its `mmap` runs: a task
+/// killed during that `mmap` leaves an address its address space's next task
+/// can check (Codex re-check of
+/// <https://github.com/rrnewton/hermit/pull/4329> at revision 6, P2).
+pub(crate) fn free_staging_address(tid: i32) -> Option<usize> {
+    pick_staging_address(&fs::read_to_string(format!("/proc/{tid}/maps")).ok()?)
+}
+
+/// Two pages below the start of the highest mapping that lies below the
+/// stack, has three free pages below it, and is not the stack itself (which
+/// grows down into the gap below it), as the kernel's top-down allocator
+/// would place a page; `None` if `maps` has no such gap.
+fn pick_staging_address(maps: &str) -> Option<usize> {
+    const PAGE: usize = 4096;
+    let mut ranges: Vec<(usize, usize, bool)> = maps
+        .lines()
+        .filter_map(|line| {
+            let (range, rest) = line.split_once(' ')?;
+            let (start, end) = range.split_once('-')?;
+            Some((
+                usize::from_str_radix(start, 16).ok()?,
+                usize::from_str_radix(end, 16).ok()?,
+                rest.trim_end().ends_with("[stack]"),
+            ))
+        })
+        .collect();
+    ranges.sort_unstable();
+    let stack = ranges
+        .iter()
+        .find(|(_, _, is_stack)| *is_stack)
+        .map(|(start, _, _)| *start)?;
+    ranges
+        .windows(2)
+        .rev()
+        .find(|pair| {
+            let ((_, below_end, _), (start, _, is_stack)) = (pair[0], pair[1]);
+            start <= stack && !is_stack && start.saturating_sub(below_end) >= 3 * PAGE
+        })
+        .map(|pair| pair[1].0 - 2 * PAGE)
+}
+
+/// Pages a completing FIFO open mapped in a guest address space to stage a
+/// path ([`StagedPage`]), and could not unmap: the task went away first (a
+/// task killed while its injected open waits in the kernel drops the open),
+/// or the unmap injection did not run. The address space can outlive the task
+/// (a `CLONE_VM` process, a `vfork` or `posix_spawn` parent, or a thread
+/// group's other threads), so the next task of that address space to reach
+/// Detcore unmaps them ([`take_orphaned_pages`]) before it runs guest code
+/// again (Codex re-check of <https://github.com/rrnewton/hermit/pull/4329> at
+/// revision 5, P2; Claude's at revision 6, MEDIUM-G).
+static ORPHANED_PAGES: Mutex<Vec<OrphanedPage>> = Mutex::new(Vec::new());
+
+/// Whether [`ORPHANED_PAGES`] may hold a page, so that the check each event
+/// makes costs one load while it is empty.
+static ANY_ORPHANED_PAGE: AtomicBool = AtomicBool::new(false);
+
+/// The bytes a staging page holds: the path, NUL-padded.
+pub(crate) const STAGED_PAGE_LENGTH: usize = 64;
+
+/// A staging page left mapped in the address space `mm` at `address`,
+/// holding `contents`, which tell it from whatever the guest mapped there
+/// since (Claude re-check at revision 6, LOW-I).
+#[derive(Clone, Copy)]
+struct OrphanedPage {
+    mm: MmId,
+    address: usize,
+    contents: [u8; STAGED_PAGE_LENGTH],
+}
+
+/// A page mapped in the address space `mm` at `address`, holding
+/// `contents`, which the caller unmaps and then reports with
+/// [`StagedPage::unmapped`]. Dropped without that report, it is left to the
+/// address space's next task ([`ORPHANED_PAGES`]): so too when the caller is
+/// cancelled, because its task exits while it waits (for the opener, and for
+/// a task that reclaims the page, Codex re-check at revision 7, P2).
+pub(crate) struct StagedPage {
+    page: OrphanedPage,
+    unmapped: bool,
+}
+
+impl StagedPage {
+    pub(crate) fn new(mm: MmId, address: usize, contents: [u8; STAGED_PAGE_LENGTH]) -> Self {
+        StagedPage {
+            page: OrphanedPage {
+                mm,
+                address,
+                contents,
+            },
+            unmapped: false,
+        }
+    }
+
+    /// The caller's unmap ran, or the page is no longer there to unmap.
+    pub(crate) fn unmapped(mut self) {
+        self.unmapped = true;
+    }
+
+    pub(crate) fn address(&self) -> usize {
+        self.page.address
+    }
+
+    pub(crate) fn contents(&self) -> &[u8; STAGED_PAGE_LENGTH] {
+        &self.page.contents
+    }
+}
+
+impl Drop for StagedPage {
+    fn drop(&mut self) {
+        if !self.unmapped {
+            leave_orphaned_page(self.page);
+        }
+    }
+}
+
+/// Leave `page` to the next task of its address space.
+fn leave_orphaned_page(page: OrphanedPage) {
+    ORPHANED_PAGES.lock().unwrap().push(page);
+    ANY_ORPHANED_PAGE.store(true, Ordering::SeqCst);
+}
+
+/// The pages ([`ORPHANED_PAGES`]) left in the address space `mm`, each
+/// owned again by a [`StagedPage`], which the caller unmaps now; any it does
+/// not report unmapped, because its unmap did not run or the caller was
+/// cancelled, are left again.
+pub(crate) fn take_orphaned_pages(mm: MmId) -> Vec<StagedPage> {
+    if !ANY_ORPHANED_PAGE.load(Ordering::SeqCst) {
+        return Vec::new();
+    }
+    let mut orphaned = ORPHANED_PAGES.lock().unwrap();
+    let (taken, kept): (Vec<_>, Vec<_>) = orphaned.drain(..).partition(|page| page.mm == mm);
+    *orphaned = kept;
+    if orphaned.is_empty() {
+        ANY_ORPHANED_PAGE.store(false, Ordering::SeqCst);
+    }
+    taken
+        .into_iter()
+        .map(|page| StagedPage {
+            page,
+            unmapped: false,
+        })
+        .collect()
+}
+
+/// Whether thread `tid`'s address space has, at `address`, a standalone
+/// one-page anonymous `rw-p` mapping, as a staging page is (the address
+/// picker leaves a free page on each side, so it never merges): a page of
+/// zeros there is then the staging page of an opener killed before it wrote
+/// the path, not a sibling's fresh mapping that covers the address (Claude
+/// re-check at revision 7, LOW-J).
+pub(crate) fn is_lone_staging_mapping(tid: i32, address: usize) -> bool {
+    fs::read_to_string(format!("/proc/{tid}/maps"))
+        .is_ok_and(|maps| maps_have_lone_staging_mapping(&maps, address))
+}
+
+fn maps_have_lone_staging_mapping(maps: &str, address: usize) -> bool {
+    let wanted = format!(
+        "{:08x}-{:08x} rw-p 00000000 00:00 0",
+        address,
+        address + 4096
+    );
+    maps.lines().any(|line| line.trim_end() == wanted)
+}
+
 #[cfg(test)]
 mod tests {
+    use super::maps_have_lone_staging_mapping;
+    use super::pick_staging_address;
+
+    /// A page of zeros is taken for a staging page only where the maps show
+    /// a standalone one-page anonymous `rw-p` mapping at its address.
+    #[test]
+    fn only_a_lone_anonymous_page_is_taken_for_a_staging_page() {
+        let lone = "7ffff7fbe000-7ffff7fbf000 rw-p 00000000 00:00 0 \n";
+        assert!(maps_have_lone_staging_mapping(lone, 0x7ffff7fbe000));
+        let larger = "7ffff7fbe000-7ffff7fc0000 rw-p 00000000 00:00 0\n";
+        assert!(!maps_have_lone_staging_mapping(larger, 0x7ffff7fbe000));
+        let covering = "7ffff7fbd000-7ffff7fbf000 rw-p 00000000 00:00 0\n";
+        assert!(!maps_have_lone_staging_mapping(covering, 0x7ffff7fbe000));
+        let file = "7ffff7fbe000-7ffff7fbf000 rw-p 00000000 00:20 7 /tmp/f\n";
+        assert!(!maps_have_lone_staging_mapping(file, 0x7ffff7fbe000));
+        let read_only = "7ffff7fbe000-7ffff7fbf000 r--p 00000000 00:00 0\n";
+        assert!(!maps_have_lone_staging_mapping(read_only, 0x7ffff7fbe000));
+    }
+
+    /// The staging page goes two pages below the highest mapping under the
+    /// stack that has three free pages below it, never into the gap below
+    /// the stack.
+    #[test]
+    fn a_staging_page_goes_below_the_highest_mapping_with_room() {
+        let maps = "\
+00400000-00401000 r--p 00000000 00:20 1 /bin/guest
+7ffff7fc0000-7ffff7fc4000 r--p 00000000 00:00 0 [vvar]
+7ffff7fc4000-7ffff7fc6000 r-xp 00000000 00:00 0 [vdso]
+7ffff7fc6000-7ffff7fc8000 r--p 00000000 00:20 2 /lib/ld.so
+7ffffffde000-7ffffffff000 rw-p 00000000 00:00 0 [stack]
+ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0 [vsyscall]
+";
+        assert_eq!(pick_staging_address(maps), Some(0x7ffff7fbe000));
+        // Too little room below the vvar page: the next gap down.
+        let tight = maps.replace(
+            "00400000-00401000 r--p 00000000 00:20 1 /bin/guest",
+            "00400000-00401000 r--p 00000000 00:20 1 /bin/guest\n7ffff7fbe000-7ffff7fc0000 rw-p 00000000 00:00 0",
+        );
+        assert_eq!(pick_staging_address(&tight), Some(0x7ffff7fbc000));
+        assert_eq!(
+            pick_staging_address("00400000-00401000 r--p 0 00:20 1 /bin/guest\n"),
+            None
+        );
+    }
+
     use std::fs::File;
     use std::fs::OpenOptions;
     use std::os::unix::fs::OpenOptionsExt;
@@ -300,9 +826,9 @@ mod tests {
             .unwrap();
         let fd = std::os::fd::AsRawFd::as_raw_fd(&end);
         let tid = nix::unistd::gettid().as_raw();
-        assert!(is_fifo(&BackendCapabilities::PTRACE, None, tid, fd));
-        assert!(!is_fifo(&BackendCapabilities::KVM, None, tid, fd));
-        assert!(!is_fifo(&BackendCapabilities::DBT, Some(tid), tid, fd));
+        assert!(fifo_of(&BackendCapabilities::PTRACE, None, tid, fd).is_some());
+        assert!(fifo_of(&BackendCapabilities::KVM, None, tid, fd).is_none());
+        assert!(fifo_of(&BackendCapabilities::DBT, Some(tid), tid, fd).is_none());
     }
 
     fn fifo_in(dir: &Path) -> std::path::PathBuf {
@@ -487,12 +1013,7 @@ mod tests {
             .unwrap();
         let fd = std::os::fd::AsRawFd::as_raw_fd(&reader);
         let pid = std::process::id() as i32;
-        assert!(is_fifo(
-            &reverie::BackendCapabilities::PTRACE,
-            None,
-            pid,
-            fd
-        ));
+        assert!(fifo_of(&reverie::BackendCapabilities::PTRACE, None, pid, fd).is_some());
         assert_eq!(kernel_nonblocking(pid, fd), Some(true));
         // SAFETY: plain fcntl on a descriptor this test owns.
         unsafe { libc::fcntl(fd, libc::F_SETFL, 0) };

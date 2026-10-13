@@ -3326,6 +3326,22 @@ impl GlobalState {
                     endtime_update,
                 )
             }
+            SchedResponse::GoAlone(schedval) => {
+                trace!(
+                    "[dtid {}] resources granted, and nothing else can run",
+                    dettid
+                );
+                let endtime_update = match schedval {
+                    Some(SchedValue::Value(timeslice)) => Some(LogicalTime::from_nanos(timeslice)),
+                    _ => None,
+                };
+                (
+                    SchedulerRpcResult::Continue(ResourceReply::Grant(
+                        ResumeStatus::NothingElseCanRun,
+                    )),
+                    endtime_update,
+                )
+            }
             SchedResponse::Go(None) => {
                 trace!(
                     "[dtid {}] resources granted but no timeslice specified",
@@ -3705,6 +3721,10 @@ impl GlobalState {
                     blocked_signal_mask_unknown: false,
                     replay_served_from_log: false,
                     reads_signalfd: false,
+                    polls_guest_state_only: false,
+                    waits_until_nothing_else_can_run: false,
+                    previous_attempt_made_progress: false,
+                    upgraded_from_attempt: 0,
                     poll_deadline: None,
                     in_guest_sleep_sigalrm: None,
                     signal_state_task: None,
@@ -4029,7 +4049,8 @@ impl GlobalState {
         };
         // Wait for wake+scheduler response.
         match response_iv.get().await {
-            SchedResponse::Go(answer) => {
+            // A futex wait never asks for `GoAlone`.
+            SchedResponse::Go(answer) | SchedResponse::GoAlone(answer) => {
                 trace!(
                     "[detcore, dtid {}] Unblocked from futex_wait! ({})",
                     &dettid, &response_iv
@@ -5449,6 +5470,8 @@ pub enum ResumeStatus {
     Signaled(Option<Vec<SigWrapper>>),
     /// A validated one-shot SIGALRM wake of this exact in-guest sleep.
     InGuestFatalAlarm,
+    /// Granted, and nothing else can run (`SchedResponse::GoAlone`).
+    NothingElseCanRun,
 }
 
 /// Internal result of a scheduler operation. Terminal results become

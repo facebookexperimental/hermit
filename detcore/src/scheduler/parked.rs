@@ -141,8 +141,7 @@ struct ReadyPolledRead {
 }
 impl ReadyPolledRead {
     fn matches(&self, turn: &ThreadNextTurn, resources: &Resources) -> bool {
-        let mut expected = self.original.clone();
-        expected.poll_attempt = 0;
+        let expected = self.original.upgraded_to_runnable();
         self.original.poll_attempt > 0
             && self.request == turn.req
             && self.response == turn.resp

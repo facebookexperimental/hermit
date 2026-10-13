@@ -2941,6 +2941,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 ],
             });
         }
+        // A FIFO open's path page that a killed task of this address space
+        // left mapped goes before this call runs (and, below, before a call
+        // that was waiting returns).
+        Self::unmap_orphaned_staging_pages(guest).await;
         // Signal phase 1: before this syscall's first scheduler request. A
         // delivery prepared here runs the guest's handler before the syscall,
         // which then starts again; what this returns is discarded.
@@ -3189,6 +3193,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // a new file the old file's number
         // (https://github.com/rrnewton/hermit/issues/3840).
         let removed_inodes = self.last_names_removed_by(guest, &call).await;
+        // The guest-made FIFOs whose name this call removes, forgotten once it
+        // succeeds (https://github.com/rrnewton/hermit/issues/2203).
+        let removed_guest_fifos = self.guest_made_fifos_removed_by(guest, &call).await;
 
         // Only an emulated RNG readv supplies authoritative imported geometry.
         // A generic pre-dispatch snapshot would become stale across pipe waits.
@@ -4156,6 +4163,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         if res.is_ok() && !removed_inodes.is_empty() {
             self.retire_removed_inodes(guest, removed_inodes).await;
         }
+        if res.is_ok() {
+            for fifo in removed_guest_fifos {
+                crate::fifo_peer::forget_guest_made(fifo);
+            }
+            self.note_guest_made_fifo(guest, &call).await;
+        }
+        Self::unmap_orphaned_staging_pages(guest).await;
 
         // With asynchronous exit completion, a descriptor that would make this
         // guest serve another guest's exit ends the run before anything

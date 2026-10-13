@@ -385,6 +385,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             let mut rsrc = Resources::new(guest.thread_state().dettid);
             rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
             rsrc.fyi(call.name());
+            // Only guests write or read the other end of an internal fd.
+            rsrc.polls_guest_state_only = internal_fd;
             // In record/replay mode, route an internal-fd (pipe or socketpair) read/write through the
             // record/replay subtool so its data is captured on record and reproduced on
             // replay (see retry_nonblocking_syscall). In plain `hermit run` there is no
@@ -495,6 +497,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             block_signals_for_disposition(guest, blocked_mask_addr, old_mask_addr).await?;
 
         let result: Result<i64, Error> = loop {
+            let written_before = written_total;
             // A cross-task signal can replace the initial scheduler request,
             // before the first physical attempt, as well as a later retry.
             let status = resource_request(guest, resources.clone()).await;
@@ -588,6 +591,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Ok(_) => break Err(Errno::EIO.into()),
             }
 
+            resources.previous_attempt_made_progress = written_total > written_before;
             resources.poll_attempt += 1;
             tracing::trace!(
                 "Retry #{} for {}blocking pipe writev after EAGAIN: {}",
@@ -645,6 +649,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // (<https://github.com/rrnewton/hermit/issues/4187>).
         resources.set_signal_interrupt_errno(call.signal_interrupt_errno());
         resources.signal_state_task = guest_signal_state_task(guest);
+        resources.polls_guest_state_only = true;
         // Without a host task whose kernel state the scheduler can filter by
         // (KVM), the scheduler keeps every signal and the write checks after
         // the wake, as `execute_blocking_pipe_writev` does, whether one would
@@ -666,6 +671,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut written_total = 0usize;
 
         loop {
+            let written_before = written_total;
             // A signal ends the write only if it would still wait for room:
             // the attempt below runs first, as Linux's `pipe_write` checks
             // for a pending signal only when it must wait. After the signal,
@@ -753,6 +759,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Ok(_) => break Err(Errno::EIO.into()),
             }
 
+            resources.previous_attempt_made_progress = written_total > written_before;
             resources.poll_attempt += 1;
             tracing::trace!(
                 "Retry #{} for blocking pipe write: {}",
@@ -1309,6 +1316,7 @@ fn pipe_writev_resources(dettid: DetTid, call: reverie::syscalls::Writev) -> Res
     // disposition itself after a `Signaled` wake, so the scheduler's drain
     // must not filter by the kernel mask (`execute_blocking_pipe_writev`).
     resources.decides_signal_interruption_itself = true;
+    resources.polls_guest_state_only = true;
     resources
 }
 
@@ -1971,7 +1979,7 @@ where
 /// signal ends an internal IO poll: the guest thread itself where guest thread
 /// IDs name host tasks, and `None` elsewhere (KVM), where
 /// `/proc/<pid>/task/<tid>` would describe an unrelated host task.
-fn guest_signal_state_task<T, G>(guest: &G) -> Option<(i32, i32)>
+pub(crate) fn guest_signal_state_task<T, G>(guest: &G) -> Option<(i32, i32)>
 where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,

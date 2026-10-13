@@ -498,6 +498,34 @@ pub struct Resources {
     /// signalfd sets nothing. `false` for every other request.
     #[serde(default)]
     pub(crate) reads_signalfd: bool,
+    /// Set on a polling request whose attempts fail or succeed only through
+    /// guest actions: a retry on a container-internal descriptor (a pipe, a
+    /// socketpair end, or a FIFO polled as a pipe), or a FIFO open waiting for
+    /// a guest peer. Such a poller cannot make progress on its own, which is
+    /// what `Scheduler::nothing_else_can_run` asks
+    /// (<https://github.com/rrnewton/hermit/issues/2203>). `false` for a poll
+    /// whose outcome a host can change.
+    #[serde(default)]
+    pub(crate) polls_guest_state_only: bool,
+    /// Set by a blocking FIFO open waiting for a guest peer. When this polling
+    /// turn commits and nothing else can run (`Scheduler::nothing_else_can_run`),
+    /// the answer is `ResumeStatus::NothingElseCanRun`, and the open then waits
+    /// in the kernel holding the turn, as without the poll.
+    #[serde(default)]
+    pub(crate) waits_until_nothing_else_can_run: bool,
+    /// Set on a retry (`poll_attempt > 0`) whose previous attempt moved data
+    /// (a partial pipe write). Every other retry follows an attempt that would
+    /// have blocked and moved nothing, which `Scheduler::nothing_else_can_run`
+    /// needs to know: a guest-state poll grant is progress unless the thread's
+    /// next request is a retry without this flag.
+    #[serde(default)]
+    pub(crate) previous_attempt_made_progress: bool,
+    /// The `poll_attempt` a skipped retry had when the scheduler replaced it
+    /// with a runnable copy whose `poll_attempt` is 0
+    /// (`Scheduler::upgrade_polled_to_runnable`): the request is still that
+    /// retry, for `Scheduler::nothing_else_can_run`.
+    #[serde(default)]
+    pub(crate) upgraded_from_attempt: u32,
     /// The absolute virtual deadline of the timed wait that a polling request
     /// (`poll_attempt > 0`) retries: `ppoll`, `poll`, `epoll_wait`,
     /// `epoll_pwait`, `rt_sigtimedwait`, `select`, `pselect6` or a polling
@@ -558,6 +586,18 @@ impl fmt::Debug for Resources {
         if self.replay_served_from_log {
             debug.field("replay_served_from_log", &true);
         }
+        if self.polls_guest_state_only {
+            debug.field("polls_guest_state_only", &true);
+        }
+        if self.waits_until_nothing_else_can_run {
+            debug.field("waits_until_nothing_else_can_run", &true);
+        }
+        if self.previous_attempt_made_progress {
+            debug.field("previous_attempt_made_progress", &true);
+        }
+        if self.upgraded_from_attempt != 0 {
+            debug.field("upgraded_from_attempt", &self.upgraded_from_attempt);
+        }
         if let Some(deadline) = self.poll_deadline {
             debug.field("poll_deadline", &deadline);
         }
@@ -575,6 +615,16 @@ impl fmt::Debug for Resources {
 }
 
 impl Resources {
+    /// The runnable copy of a skipped retry that
+    /// `Scheduler::upgrade_polled_to_runnable` puts in its place:
+    /// `poll_attempt` 0, with the retry number kept in `upgraded_from_attempt`.
+    pub(crate) fn upgraded_to_runnable(&self) -> Resources {
+        let mut runnable = self.clone();
+        runnable.upgraded_from_attempt = runnable.upgraded_from_attempt.max(runnable.poll_attempt);
+        runnable.poll_attempt = 0;
+        runnable
+    }
+
     /// Allocate a new, empty Resources request.
     pub fn new(tid: DetTid) -> Resources {
         Resources {
@@ -588,6 +638,10 @@ impl Resources {
             blocked_signal_mask_unknown: false,
             replay_served_from_log: false,
             reads_signalfd: false,
+            polls_guest_state_only: false,
+            waits_until_nothing_else_can_run: false,
+            previous_attempt_made_progress: false,
+            upgraded_from_attempt: 0,
             poll_deadline: None,
             in_guest_sleep_sigalrm: None,
             signal_state_task: None,
@@ -631,6 +685,10 @@ impl Resources {
         }
         self.decides_signal_interruption_itself |= other.decides_signal_interruption_itself;
         self.replay_served_from_log |= other.replay_served_from_log;
+        self.polls_guest_state_only |= other.polls_guest_state_only;
+        self.waits_until_nothing_else_can_run |= other.waits_until_nothing_else_can_run;
+        self.previous_attempt_made_progress |= other.previous_attempt_made_progress;
+        self.upgraded_from_attempt = self.upgraded_from_attempt.max(other.upgraded_from_attempt);
         // A merged request waits for the earlier of two deadlines.
         self.poll_deadline = match (self.poll_deadline, other.poll_deadline) {
             (Some(left), Some(right)) => Some(left.min(right)),

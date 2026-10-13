@@ -32244,3 +32244,864 @@ fn run_kvm_costs_one_host_syscall_per_guest_syscall() {
          https://github.com/rrnewton/hermit/issues/4287"
     );
 }
+
+/// A blocking open of a FIFO a guest made waits for its peer's open without
+/// holding the scheduler turn (<https://github.com/rrnewton/hermit/issues/2203>),
+/// and behaves as Linux's open does, also in the cases the Claude and Codex
+/// reviews of https://github.com/rrnewton/hermit/pull/4329 found. Each case
+/// runs as on Linux and verifies under several chaos seeds:
+///
+/// - two processes open the two ends in either order; a shell does it with
+///   `mkfifo` (the Nix shape);
+/// - the open waits beside a pipe that one child fills while another drains it
+///   (review F1: a pipe grant that moves data is progress);
+/// - a reader that opens and closes while a writer waits completes the
+///   writer's open, whose write then fails with `EPIPE` (F5);
+/// - the number a waiting open will get is not yet published (P2-1/F6);
+/// - `O_CREAT|O_EXCL` on an existing FIFO fails at once (P2-2/F7);
+/// - the writer comes from a child that sleeps 100 s first: the open's poll
+///   moves time to the sleeper's deadline instead of crawling there (F3).
+///
+/// A guest removing the FIFO's name forgets that a guest made it.
+#[test]
+fn a_blocking_fifo_open_waits_for_its_peer_without_holding_the_turn() {
+    let guest = fifo_peer_guest().to_str().unwrap();
+    let scratch = process_build_root("fifo-peer").join("open-runs");
+    let seeds = [None, Some("--seed=1"), Some("--seed=2"), Some("--seed=3")];
+    let verify = |dir: &Path, program: &[&str], expected: &str| {
+        for seed in seeds {
+            // A fresh directory: a FIFO left by an earlier run would change
+            // the guest's first unlink.
+            let _ = fs::remove_dir_all(dir);
+            fs::create_dir_all(dir).expect("failed to create the FIFO directory");
+            let mut args = vec!["run", "--strict"];
+            if let Some(seed) = seed {
+                args.extend(["--chaos", seed]);
+            }
+            args.extend(["--verify", "--verify-strict", "--"]);
+            args.extend(program);
+            let output = hermit_command(&args)
+                .current_dir(dir)
+                .output()
+                .expect("failed to run hermit");
+            assert_success(&output, &args);
+            assert_eq!(stdout(&output), expected, "{args:?}");
+            assert!(
+                stderr(&output).contains("Success: deterministic. Determinism verified."),
+                "{args:?}: verification failed:\n{}",
+                stderr(&output)
+            );
+        }
+    };
+    for (mode, expected) in [
+        ("open-writer-first", "child read: 1 'z'\nparent wrote 1\n"),
+        ("open-reader-first", "child read: 1 'z'\nparent wrote 1\n"),
+        ("open-beside-pipe", "drained 262144\nparent read: 1 'x'\n"),
+        ("open-reader-closes", "open: ok, write: -1 Broken pipe\n"),
+        (
+            "open-unpublished-reader",
+            "pending number: F_GETFD -1 Bad file descriptor\n",
+        ),
+        (
+            "open-unpublished-writer",
+            "pending number: F_GETFD -1 Bad file descriptor\n",
+        ),
+        ("open-exclusive", "exclusive open: -1 File exists\n"),
+        ("open-after-sleep", "parent read: 1 's'\n"),
+    ] {
+        let dir = scratch.join(mode);
+        let dir_arg = dir.to_str().unwrap().to_owned();
+        verify(&dir, &[guest, mode, &dir_arg], expected);
+    }
+    verify(
+        &scratch.join("shell"),
+        &[
+            "/bin/bash",
+            "-c",
+            // It removes what it made, for the verification's second run.
+            "mkfifo f; cat f > out & echo hi > f; wait; cat out; rm f out",
+        ],
+        "hi\n",
+    );
+
+    // What the log shows: the open polls, the sleeper's deadline comes at
+    // once, and removing the name forgets the FIFO.
+    let dir = scratch.join("open-after-sleep");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("failed to create the FIFO directory");
+    let dir = dir.to_str().unwrap().to_owned();
+    let args = [
+        "--log",
+        "info",
+        "run",
+        "--strict",
+        "--",
+        guest,
+        "open-after-sleep",
+        &dir,
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    let log = stderr(&output);
+    for line in [
+        "the FIFO open polls for a guest peer",
+        "Nothing but a FIFO open's poll can run; skipping global time ahead",
+        "a guest removed the name of the FIFO it made",
+    ] {
+        assert!(log.contains(line), "{args:?}: no {line:?} in:\n{log}");
+    }
+}
+
+/// A blocking open of a FIFO a guest made completes on the FIFO it found, as
+/// Linux's does, though the name changes while it waits: renamed, renamed
+/// with a new FIFO made at the old name, or linked and unlinked. And a FIFO a
+/// guest made stays a guest's while a name still reaches it: one of two links
+/// removed, a rename onto its own other link, or onto itself (Claude and Codex
+/// re-checks of https://github.com/rrnewton/hermit/pull/4329, MEDIUM-1,
+/// MEDIUM-2 and P2). Each
+/// runs as on Linux and verifies under several chaos seeds.
+#[test]
+fn a_blocking_fifo_open_completes_on_the_fifo_it_found() {
+    let guest = fifo_peer_guest().to_str().unwrap();
+    let scratch = process_build_root("fifo-peer").join("open-name-runs");
+    for (mode, expected) in [
+        ("open-renamed", "child open: ok, read 1 'x'\nparent done\n"),
+        (
+            "open-renamed-new",
+            "child open: ok, read 1 'x'\nparent done\n",
+        ),
+        (
+            "open-linked-unlinked",
+            "child open: ok, read 1 'x'\nparent done\n",
+        ),
+        (
+            "open-after-link-removed",
+            "child read: 1 'k'\nparent wrote 1\n",
+        ),
+        (
+            "open-after-name-removed",
+            "child read: 1 'k'\nparent wrote 1\n",
+        ),
+        (
+            "open-after-rename-between-links",
+            "child read: 1 'k'\nparent wrote 1\n",
+        ),
+        (
+            "open-after-self-rename",
+            "child read: 1 'k'\nparent wrote 1\n",
+        ),
+    ] {
+        let dir = scratch.join(mode);
+        let dir_arg = dir.to_str().unwrap().to_owned();
+        for seed in [None, Some("--seed=1"), Some("--seed=2"), Some("--seed=3")] {
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("failed to create the FIFO directory");
+            let mut args = vec!["run", "--strict"];
+            if let Some(seed) = seed {
+                args.extend(["--chaos", seed]);
+            }
+            args.extend(["--verify", "--verify-strict", "--", guest, mode, &dir_arg]);
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            assert_eq!(stdout(&output), expected, "{args:?}");
+            assert!(
+                stderr(&output).contains("Success: deterministic. Determinism verified."),
+                "{args:?}: verification failed:\n{}",
+                stderr(&output)
+            );
+        }
+    }
+}
+
+/// A blocking open of a FIFO a guest made completes as Linux's does for a
+/// guest that cannot reach the tracer's descriptors: one without
+/// `CAP_SYS_PTRACE`, or chrooted where there is no `/proc`. It opens the FIFO
+/// by its name, which still reaches it. Where the name no longer reaches it
+/// (renamed during the wait), the open cannot complete on its FIFO and the
+/// run is refused by name (Claude re-check of
+/// https://github.com/rrnewton/hermit/pull/4329 at revision 4, MEDIUM-A).
+/// And an open whose stack pointer has no writable memory below it completes
+/// on the FIFO it found, renamed during the wait (Codex re-check there, P2).
+#[test]
+fn a_blocking_fifo_open_completes_for_a_guest_that_cannot_reach_the_tracer() {
+    let guest = fifo_peer_guest().to_str().unwrap();
+    let scratch = process_build_root("fifo-peer").join("open-unreachable-tracer-runs");
+    for (mode, expected) in [
+        (
+            "open-without-ptrace-capability",
+            "child open: ok, read 1 'x'\nparent done\n",
+        ),
+        (
+            "open-without-ptrace-capability-writer",
+            "child open: ok, wrote 1\nparent read 1 'y'\nparent done\n",
+        ),
+        ("open-chrooted", "child open: ok, read 1 'x'\nparent done\n"),
+        (
+            "open-chrooted-writer",
+            "child open: ok, wrote 1\nparent read 1 'y'\nparent done\n",
+        ),
+        (
+            "open-on-a-tight-stack",
+            "child open: ok, read 1 'x', O_NONBLOCK 0\nparent done\n",
+        ),
+    ] {
+        let dir = scratch.join(mode);
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("failed to create the FIFO directory");
+        let dir = dir.to_str().unwrap().to_owned();
+        let args = [
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--",
+            guest,
+            mode,
+            &dir,
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{args:?}");
+        assert!(
+            stderr(&output).contains("Success: deterministic. Determinism verified."),
+            "{args:?}: verification failed:\n{}",
+            stderr(&output)
+        );
+    }
+
+    let dir = scratch.join("open-renamed-without-ptrace-capability");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("failed to create the FIFO directory");
+    let dir = dir.to_str().unwrap().to_owned();
+    let args = [
+        "--log",
+        "info",
+        "run",
+        "--strict",
+        "--",
+        guest,
+        "open-renamed-without-ptrace-capability",
+        &dir,
+    ];
+    let output = hermit(&args);
+    let log = stderr(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{args:?}: an open that cannot complete on its FIFO must be refused:\n{log}"
+    );
+    for line in [
+        "the FIFO open polls for a guest peer",
+        "the guest cannot reach the tracer's descriptor for the FIFO (-13 EACCES",
+        "a blocking open of a FIFO a guest made waited for its peer, and cannot complete on \
+         that FIFO",
+    ] {
+        assert!(log.contains(line), "{args:?}: no {line:?} in:\n{log}");
+    }
+    assert_eq!(stdout(&output), "", "{args:?}");
+}
+
+/// A blocking open of a FIFO a guest made leaves nothing of Hermit's in the
+/// guest's address space: `/proc/self/maps` is the same before and after an
+/// open that completes on a renamed FIFO (Claude re-check of
+/// https://github.com/rrnewton/hermit/pull/4329 at revision 5, LOW-F), and
+/// after a `CLONE_VM` child, or a `posix_spawn` child (`CLONE_VM` and
+/// `CLONE_VFORK`), is killed by a host process while its open waits in the
+/// kernel (Codex re-check there, P2; Claude's at revision 6, MEDIUM-G). And
+/// in a root whose `/proc/1/fd/N` are regular files or FIFOs, the open still
+/// completes on the FIFO (Claude's LOW-C at revision 5, LOW-H at revision 6).
+#[test]
+fn a_blocking_fifo_open_leaves_nothing_in_the_guest() {
+    let guest = fifo_peer_guest().to_str().unwrap();
+    let scratch = process_build_root("fifo-peer").join("open-leaves-nothing-runs");
+    for (mode, expected) in [
+        ("open-leaves-no-mapping", "read 1 'x'; maps unchanged: 1\n"),
+        (
+            "open-chrooted-beside-a-fake-proc",
+            "child open: ok, read 1 'x'\nparent done\n",
+        ),
+        (
+            "open-writer-chrooted-beside-a-fake-proc",
+            "child open: ok, wrote 1\nparent read 1 'y'\nparent done\n",
+        ),
+    ] {
+        let dir = scratch.join(mode);
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("failed to create the FIFO directory");
+        let dir = dir.to_str().unwrap().to_owned();
+        let args = [
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--",
+            guest,
+            mode,
+            &dir,
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{args:?}");
+        assert!(
+            stderr(&output).contains("Success: deterministic. Determinism verified."),
+            "{args:?}: verification failed:\n{}",
+            stderr(&output)
+        );
+    }
+
+    // The kill comes from the host, once the child waits in the kernel's
+    // FIFO open, or (under the `fifo_staging_mapped` race probe) once the
+    // staging page is mapped and still empty, as a kill during its `mmap`
+    // leaves it (Codex re-check at revision 6, P2). These runs are not
+    // verified.
+    for (mode, probe, expected) in [
+        (
+            "open-killed-beside-a-sharer",
+            None,
+            "child killed by signal 9; maps unchanged: 1\n",
+        ),
+        (
+            "open-killed-in-a-spawned-child",
+            None,
+            "spawn 0; child killed by signal 9; maps unchanged: 1\n",
+        ),
+        (
+            "open-killed-beside-a-sharer",
+            Some("fifo_staging_mapped=3000"),
+            "child killed by signal 9; maps unchanged: 1\n",
+        ),
+    ] {
+        let dir = scratch.join(mode);
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("failed to create the FIFO directory");
+        let dir = dir.to_str().unwrap().to_owned();
+        let args = ["--log", "info", "run", "--strict", "--", guest, mode, &dir];
+        // The log goes to a file: a pipe nobody reads while the test waits
+        // would fill and stop Hermit.
+        let log_path = scratch.join(format!("{mode}-{}.log", probe.is_some()));
+        let mut command = hermit_command(&args);
+        if let Some(probe) = probe {
+            command.env("HERMIT_RACE_PROBE", probe);
+        }
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(fs::File::create(&log_path).expect("create the log file"))
+            .spawn()
+            .expect("failed to start hermit");
+        let command_line = format!("{guest}\0{mode}\0{dir}\0");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut killed = false;
+        while !killed && Instant::now() < deadline {
+            for entry in fs::read_dir("/proc").expect("read /proc").flatten() {
+                let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+                    continue;
+                };
+                let proc_dir = entry.path();
+                let is_guest = |dir: &Path| {
+                    fs::read(dir.join("cmdline")).is_ok_and(|line| line == command_line.as_bytes())
+                };
+                let ready = match probe {
+                    None => fs::read_to_string(proc_dir.join("wchan"))
+                        .is_ok_and(|wchan| wchan == "wait_for_partner"),
+                    // The guest whose parent is the guest, once the probe is
+                    // reached.
+                    Some(_) => {
+                        fs::read_to_string(proc_dir.join("stat"))
+                            .ok()
+                            .and_then(|stat| {
+                                let parent = stat.rsplit_once(") ")?.1.split(' ').nth(1)?;
+                                Some(Path::new("/proc").join(parent))
+                            })
+                            .is_some_and(|parent| is_guest(&parent))
+                            && fs::read_to_string(&log_path)
+                                .is_ok_and(|log| log.contains("race_probe: HERMIT_RACE_PROBE="))
+                    }
+                };
+                if is_guest(&proc_dir) && ready {
+                    // SAFETY: kill takes no pointers; the target is the guest
+                    // child this test found waiting in the kernel.
+                    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+                    killed = true;
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        if !killed {
+            let _ = child.kill();
+        }
+        let output = child.wait_with_output().expect("wait for hermit");
+        let log = fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            killed,
+            "{args:?}: the child never waited in the kernel:\n{log}"
+        );
+        assert!(
+            output.status.success(),
+            "{args:?}: {:?}\n{log}",
+            output.status
+        );
+        assert_eq!(stdout(&output), expected, "{args:?}");
+        assert!(
+            log.contains("unmapping a FIFO open's path page that a killed task left"),
+            "{args:?}: no reclaim of the killed open's page in:\n{log}"
+        );
+    }
+
+    // The task that reclaims a killed opener's page is killed too, as it
+    // reclaims: the page passes to the next task (Codex re-check at revision
+    // 7, P2). Two `CLONE_VM` children, named by their command names: the
+    // opener is killed with its page mapped, the cleaner before its unmap.
+    let mode = "open-killed-then-its-cleaner-killed";
+    let dir = scratch.join(mode);
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("failed to create the FIFO directory");
+    let dir = dir.to_str().unwrap().to_owned();
+    let args = ["--log", "info", "run", "--strict", "--", guest, mode, &dir];
+    let log_path = scratch.join(format!("{mode}.log"));
+    let mut child = hermit_command(&args)
+        .env(
+            "HERMIT_RACE_PROBE",
+            "fifo_staging_mapped=3000,fifo_staging_reclaim=3000",
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(fs::File::create(&log_path).expect("create the log file"))
+        .spawn()
+        .expect("failed to start hermit");
+    let command_line = format!("{guest}\0{mode}\0{dir}\0");
+    let kill_named = |name: &str| {
+        for entry in fs::read_dir("/proc").expect("read /proc").flatten() {
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+                continue;
+            };
+            let proc_dir = entry.path();
+            if fs::read(proc_dir.join("cmdline")).is_ok_and(|line| line == command_line.as_bytes())
+                && fs::read_to_string(proc_dir.join("comm")).is_ok_and(|comm| comm.trim() == name)
+            {
+                // SAFETY: kill takes no pointers; the target is the guest
+                // child this test named.
+                assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+                return true;
+            }
+        }
+        false
+    };
+    let mut stages = [
+        ("race_probe: HERMIT_RACE_PROBE=", "opener"),
+        (
+            "unmapping a FIFO open's path page that a killed task left",
+            "cleaner",
+        ),
+    ]
+    .into_iter()
+    .peekable();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while let Some((marker, name)) = stages.peek().copied()
+        && Instant::now() < deadline
+    {
+        if fs::read_to_string(&log_path).is_ok_and(|log| log.contains(marker)) && kill_named(name) {
+            stages.next();
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let killed_both = stages.peek().is_none();
+    if !killed_both {
+        let _ = child.kill();
+    }
+    let output = child.wait_with_output().expect("wait for hermit");
+    let log = fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(killed_both, "{args:?}: a stage was never reached:\n{log}");
+    assert!(
+        output.status.success(),
+        "{args:?}: {:?}\n{log}",
+        output.status
+    );
+    assert_eq!(
+        stdout(&output),
+        "opener killed by signal 9; cleaner killed by signal 9; maps unchanged: 1\n",
+        "{args:?}"
+    );
+}
+
+/// A signal ends a blocking open of a FIFO a guest made, waiting for its
+/// writer, as it ends Linux's (<https://github.com/rrnewton/hermit/issues/2203>,
+/// Claude review of https://github.com/rrnewton/hermit/pull/4329, F4): `EINTR`
+/// without `SA_RESTART`, a restart with it, nothing when ignored, and both
+/// handlers for two signals. Each runs as on Linux and verifies under several
+/// chaos seeds.
+#[test]
+fn a_signal_ends_a_blocking_fifo_open_as_on_linux() {
+    let guest = fifo_peer_guest().to_str().unwrap();
+    let scratch = process_build_root("fifo-peer").join("open-signal-runs");
+    for (mode, expected) in [
+        (
+            "open-eintr",
+            "open: Interrupted system call, read '-', usr1 1, usr2 0\n",
+        ),
+        ("open-restart", "open: ok, read 'r', usr1 1, usr2 0\n"),
+        ("open-ignored", "open: ok, read 'r', usr1 0, usr2 0\n"),
+        (
+            "open-two-signals",
+            "open: Interrupted system call, read '-', usr1 1, usr2 1\n",
+        ),
+    ] {
+        let dir = scratch.join(mode);
+        let dir_arg = dir.to_str().unwrap().to_owned();
+        for seed in [None, Some("--seed=1"), Some("--seed=2"), Some("--seed=3")] {
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("failed to create the FIFO directory");
+            let mut args = vec!["run", "--strict"];
+            if let Some(seed) = seed {
+                args.extend(["--chaos", seed]);
+            }
+            args.extend(["--verify", "--verify-strict", "--", guest, mode, &dir_arg]);
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            assert_eq!(stdout(&output), expected, "{args:?}");
+            assert!(
+                stderr(&output).contains("Success: deterministic. Determinism verified."),
+                "{args:?}: verification failed:\n{}",
+                stderr(&output)
+            );
+        }
+    }
+}
+
+/// The writer of a FIFO a guest made comes after a pipeline beside the open
+/// has moved a megabyte: each pipe attempt that moves data is progress, also a
+/// first retry of a new call after a grant in which earlier calls moved data,
+/// so the open never takes the pipeline for idle (Claude reviews of
+/// https://github.com/rrnewton/hermit/pull/4329, F1 and H1). Runs as on Linux
+/// and verifies under several chaos seeds.
+#[test]
+fn a_blocking_fifo_open_beside_a_pipeline_waits_for_its_writer() {
+    let scratch = process_build_root("fifo-peer").join("open-pipeline-runs");
+    for seed in [None, Some("--seed=1"), Some("--seed=2"), Some("--seed=3")] {
+        let _ = fs::remove_dir_all(&scratch);
+        fs::create_dir_all(&scratch).expect("failed to create the FIFO directory");
+        let mut args = vec!["run", "--strict"];
+        if let Some(seed) = seed {
+            args.extend(["--chaos", seed]);
+        }
+        args.extend([
+            "--verify",
+            "--verify-strict",
+            "--",
+            "/bin/bash",
+            "-c",
+            "mkfifo f; (head -c 1000000 /dev/zero | cat > /dev/null; echo done > f) & cat f; wait; rm f",
+        ]);
+        let output = hermit_command(&args)
+            .current_dir(&scratch)
+            .output()
+            .expect("failed to run hermit");
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), "done\n", "{args:?}");
+        assert!(
+            stderr(&output).contains("Success: deterministic. Determinism verified."),
+            "{args:?}: verification failed:\n{}",
+            stderr(&output)
+        );
+    }
+}
+
+/// A blocking open of a FIFO a guest did not make, here one the test process
+/// (the host) made, is the open Hermit made before
+/// https://github.com/rrnewton/hermit/issues/2203: it waits in the kernel,
+/// and never polls. Each case is one the reviews of
+/// https://github.com/rrnewton/hermit/pull/4329 found the polled open got
+/// wrong, run against main's behaviour and Linux's output:
+///
+/// - the host end already open, with bytes (P2-3), or open with nothing
+///   written yet beside a yielding thread (M2, Codex P2-1);
+/// - the host end opening later, beside a waiting guest pipe poller (H1), a
+///   `sched_yield` spinner (M1) or a sleeper; a host writer that opens and
+///   closes without writing (H2); a host writer already waiting in its open;
+/// - the order of a yielding thread's output and the open's (M3);
+/// - `O_RDONLY|O_CREAT|O_EXCL` on an existing FIFO while a host writer waits
+///   in its open: `EEXIST`, and the host writer keeps waiting (Codex P2-2),
+///   also on a FIFO a guest made.
+#[test]
+fn a_blocking_fifo_open_with_a_host_peer_completes_as_on_linux() {
+    let guest = fifo_peer_guest().to_str().unwrap();
+    let scratch = process_build_root("fifo-peer").join("open-host-runs");
+    fs::create_dir_all(&scratch).expect("failed to create the FIFO directory");
+    let never_polls = |args: &[&str], log: &str| {
+        for line in [
+            "the FIFO open polls for a guest peer",
+            "nothing else can run; the FIFO open waits in the kernel",
+        ] {
+            assert!(
+                !log.contains(line),
+                "{args:?}: {line:?} for a host FIFO:\n{log}"
+            );
+        }
+    };
+
+    // The host end already open read-write, with bytes in it for a reader.
+    for (mode, expected) in [
+        ("open-host", "open-host read: 1 'h'\n"),
+        ("open-host-writer", "open-host-writer wrote: 1\n"),
+        (
+            "open-host-beside-poller",
+            "main wrote: 1\nthread read: 1 'p'\n",
+        ),
+        ("host-beside-yielder", "host-beside-yielder opened: yes\n"),
+        (
+            "host-beside-pause",
+            "host-beside-pause opened: yes, usr1 1\n",
+        ),
+    ] {
+        let fifo = scratch.join(format!("{mode}-fifo"));
+        let _ = fs::remove_file(&fifo);
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo failed");
+        let mut host_end = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo)
+            .expect("failed to open the host end of the FIFO");
+        host_end
+            .write_all(b"hhhhhhhhhh")
+            .expect("failed to fill the host end of the FIFO");
+        let fifo = fifo.to_str().unwrap().to_owned();
+        let args = ["--log", "info", "run", "--strict", "--", guest, mode, &fifo];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{args:?}");
+        never_polls(&args, &stderr(&output));
+        drop(host_end);
+    }
+
+    // A host peer the test plays while the run goes on.
+    for (mode, host, expected) in [
+        ("open-host", "late-writer", "open-host read: 1 'h'\n"),
+        (
+            "open-host-writer",
+            "late-reader",
+            "open-host-writer wrote: 1\n",
+        ),
+        (
+            "open-host-beside-poller",
+            "late-reader",
+            "main wrote: 1\nthread read: 1 'p'\n",
+        ),
+        (
+            "open-host-beside-spinner",
+            "late-writer",
+            "open-host-beside-spinner read: 1 'h'\n",
+        ),
+        (
+            "open-host-beside-spinner",
+            "held-writer",
+            "open-host-beside-spinner read: 1 'h'\n",
+        ),
+        (
+            "open-host-beside-sleeper",
+            "late-writer",
+            "open-host-beside-sleeper read: 1 'h'\n",
+        ),
+        (
+            "open-host-eof",
+            "empty-writer",
+            "open-host-eof open: 1, read: 0\n",
+        ),
+        ("open-host-order", "late-writer", "M 1 'h'\nS\n"),
+        ("open-host", "early-writer", "open-host read: 1 'h'\n"),
+        (
+            "open-host-beside-yielder",
+            "early-slow-writer",
+            "open-host-beside-yielder read: 1 'h'\n",
+        ),
+    ] {
+        let fifo = scratch.join(format!("{mode}-{host}-fifo"));
+        let _ = fs::remove_file(&fifo);
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo failed");
+        let host_fifo = fifo.clone();
+        // Read-write, so this open does not wait: a writer from the start.
+        let held_writer = (host == "held-writer").then(|| {
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&fifo)
+                .expect("failed to open the host end of the FIFO")
+        });
+        let peer = std::thread::spawn(move || -> Option<fs::File> {
+            let open_writer = || fs::OpenOptions::new().write(true).open(&host_fifo).unwrap();
+            match host {
+                "early-writer" => open_writer().write_all(b"h").unwrap(),
+                "early-slow-writer" => {
+                    let mut end = open_writer();
+                    std::thread::sleep(Duration::from_millis(300));
+                    end.write_all(b"h").unwrap();
+                }
+                "held-writer" => {
+                    std::thread::sleep(Duration::from_secs(1));
+                    let mut end = held_writer.unwrap();
+                    end.write_all(b"h").unwrap();
+                    // Kept open until the run ends.
+                    return Some(end);
+                }
+                "late-writer" => {
+                    std::thread::sleep(Duration::from_secs(1));
+                    open_writer().write_all(b"h").unwrap();
+                }
+                "empty-writer" => {
+                    std::thread::sleep(Duration::from_secs(1));
+                    drop(open_writer());
+                }
+                _ => {
+                    std::thread::sleep(Duration::from_secs(1));
+                    let mut end = fs::File::open(&host_fifo).unwrap();
+                    let mut byte = [0u8; 1];
+                    std::io::Read::read_exact(&mut end, &mut byte).unwrap();
+                }
+            }
+            None
+        });
+        if host.starts_with("early") {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        let fifo = fifo.to_str().unwrap().to_owned();
+        let args = ["--log", "info", "run", "--strict", "--", guest, mode, &fifo];
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let (status, log) = run_with_deadline(
+            hermit_command(&args),
+            directory.path(),
+            Duration::from_secs(40),
+            false,
+        );
+        let output = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{args:?} with a {host} host: the run must finish and exit 0:\nstdout:\n{output}\nstderr:\n{log}"
+        );
+        let held = peer.join().expect("the host end of the FIFO failed");
+        drop(held);
+        assert_eq!(
+            output, expected,
+            "{args:?} with a {host} host\nstderr:\n{log}"
+        );
+        never_polls(&args, &log);
+    }
+
+    // A FIFO the guest makes and announces, whose reader is the test, opening
+    // a second later, beside a guest thread waiting on an empty pipe: the
+    // guest's open polls, then waits in the kernel once nothing else can run,
+    // and completes when the host opens (Claude re-check of
+    // https://github.com/rrnewton/hermit/pull/4329, LOW-3). `-renamed`: a
+    // guest thread renames the FIFO while the open waits, and the host opens
+    // the new name; the open waits on the FIFO itself (MEDIUM-1).
+    for (mode, marker, host_name) in [
+        ("guest-made-host-reader", "made", "fifo"),
+        ("guest-made-host-reader-renamed", "renamed", "other"),
+    ] {
+        let dir = scratch.join(mode);
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("failed to create the FIFO directory");
+        let (reader_dir, fifo) = (dir.clone(), dir.join(host_name));
+        let reader = std::thread::spawn(move || {
+            while !reader_dir.join(marker).exists() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::thread::sleep(Duration::from_secs(1));
+            let mut end = fs::File::open(&fifo).unwrap();
+            let mut byte = [0u8; 1];
+            std::io::Read::read_exact(&mut end, &mut byte).unwrap();
+        });
+        let dir_arg = dir.to_str().unwrap().to_owned();
+        let args = [
+            "--log", "info", "run", "--strict", "--", guest, mode, &dir_arg,
+        ];
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let (status, log) = run_with_deadline(
+            hermit_command(&args),
+            directory.path(),
+            Duration::from_secs(40),
+            false,
+        );
+        let output = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{args:?}: the run must finish and exit 0:\nstdout:\n{output}\nstderr:\n{log}"
+        );
+        reader.join().expect("the host reader failed");
+        assert_eq!(
+            output, "main wrote: 1\nthread read: 1 'p'\n",
+            "{args:?}\nstderr:\n{log}"
+        );
+        for line in [
+            "the FIFO open polls for a guest peer",
+            "nothing else can run; the FIFO open waits in the kernel",
+        ] {
+            assert!(log.contains(line), "{args:?}: no {line:?} in:\n{log}");
+        }
+    }
+
+    // `O_RDONLY|O_CREAT|O_EXCL` while a host writer waits in its open: on a
+    // host FIFO, and on one the guest makes and announces (`made`) before the
+    // host blocks on it (`blocked`). The writer is still waiting after the run.
+    for guest_made in [false, true] {
+        let dir = scratch.join(format!("exclusive-reader-{guest_made}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("failed to create the FIFO directory");
+        let fifo = dir.join("fifo");
+        if !guest_made {
+            nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo failed");
+        }
+        let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+        let (writer_dir, writer_fifo) = (dir.clone(), fifo.clone());
+        let writer = std::thread::spawn(move || {
+            while guest_made && !writer_dir.join("made").exists() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let blocked = writer_dir.join("blocked");
+            let announce = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                fs::write(blocked, b"").unwrap();
+            });
+            let end = fs::OpenOptions::new()
+                .write(true)
+                .open(&writer_fifo)
+                .unwrap();
+            opened_tx.send(()).unwrap();
+            announce.join().unwrap();
+            drop(end);
+        });
+        let (mode, target) = if guest_made {
+            (
+                "exclusive-reader-beside-host",
+                dir.to_str().unwrap().to_owned(),
+            )
+        } else {
+            std::thread::sleep(Duration::from_millis(500));
+            (
+                "open-host-exclusive-reader",
+                fifo.to_str().unwrap().to_owned(),
+            )
+        };
+        let args = [
+            "--log", "info", "run", "--strict", "--", guest, mode, &target,
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(
+            stdout(&output),
+            "exclusive reader: -1 File exists\n",
+            "{args:?}"
+        );
+        never_polls(&args, &stderr(&output));
+        assert!(
+            opened_rx.try_recv().is_err(),
+            "{args:?}: the failed exclusive open let the host writer's open complete"
+        );
+        // Release the host writer.
+        drop(fs::File::open(&fifo).unwrap());
+        writer.join().expect("the host writer failed");
+    }
+}

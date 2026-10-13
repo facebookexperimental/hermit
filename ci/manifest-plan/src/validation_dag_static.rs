@@ -2225,7 +2225,17 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4243): 1648, listed.
     // And a_v3_configuration_runs_only_with_the_admitted_host_facts, renamed
     // a_v3_configuration_without_host_facts_is_refused: 1649.
-    ("test.detcore_unit", 1649),
+    // And the ten scheduler tests of the polled FIFO open
+    // (https://github.com/rrnewton/hermit/issues/2203: nothing_else_can_run_beside_*,
+    // a_guest_poller_that_has_not_retried_*, a_guest_poller_whose_last_attempt_*,
+    // a_poll_grant_that_moved_data_*, a_poll_grant_whose_next_request_*,
+    // an_upgraded_retry_is_still_fruitless, a_poller_a_host_can_satisfy_*,
+    // a_thread_neither_queued_nor_parked_*, a_fifo_open_beside_a_sleeper_*,
+    // a_fifo_open_beside_an_indefinite_wait_*) and
+    // fifo_peer::tests::a_staging_page_goes_below_the_highest_mapping_with_room
+    // and only_a_lone_anonymous_page_is_taken_for_a_staging_page: 1661, by
+    // listing.
+    ("test.detcore_unit", 1661),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3136,7 +3146,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4243): 419 - 6 = 413.
     // And the_lazy_binding_check_refuses_a_bind_now_guest and
     // cpu_profile_v3_library_run_with_unqualified_facts_is_refused: 415, listed.
-    ("test.cli", 415),
+    // And a_blocking_fifo_open_waits_for_its_peer_without_holding_the_turn,
+    // a_signal_ends_a_blocking_fifo_open_as_on_linux,
+    // a_blocking_fifo_open_completes_on_the_fifo_it_found,
+    // a_blocking_fifo_open_beside_a_pipeline_waits_for_its_writer,
+    // a_blocking_fifo_open_with_a_host_peer_completes_as_on_linux,
+    // a_blocking_fifo_open_completes_for_a_guest_that_cannot_reach_the_tracer and
+    // a_blocking_fifo_open_leaves_nothing_in_the_guest
+    // (https://github.com/rrnewton/hermit/issues/2203): 422, by listing.
+    ("test.cli", 422),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3490,7 +3508,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the v3 cpuinfo-matches-CPUID test: 355.
     // The six qualifying cpu_profile_v3 cases move to the must-qualify node: 355 - 6 = 349.
     // And the lazy-binding check and the v3 library refusal tests: 351.
-    ("test.cli_on_host", 351),
+    // And the seven blocking FIFO open tests: 358, by listing.
+    ("test.cli_on_host", 358),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -3723,7 +3742,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from 927aa185: 1645.
     // And the three x86-64-v3 table tests: 1648.
     // And the v3 admission-certificate test: 1649.
-    ("test.detcore_unit_on_host", 1649),
+    // And the ten polled-FIFO-open scheduler tests and the two staging-page
+    // tests: 1661.
+    ("test.detcore_unit_on_host", 1661),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
