@@ -209,6 +209,26 @@ fn deterministic_syslog_result(action: i32, len: usize) -> Result<i64, Errno> {
     }
 }
 
+/// Write get_mempolicy's output as Linux's `put_user`/`copy_to_user` do:
+/// through the guest's page protections, so a buffer that cannot take all the
+/// bytes is `EFAULT`. Any other failure is the backend's, not a guest fault,
+/// and is reported as a tool error rather than handed to the guest as an
+/// errno get_mempolicy never returns (Claude re-check of
+/// https://github.com/rrnewton/hermit/pull/4249).
+fn write_get_mempolicy_output<M: MemoryAccess>(
+    memory: &mut M,
+    address: AddrMut<'_, u8>,
+    bytes: &[u8],
+) -> Result<(), Error> {
+    match memory.write_with_user_access(address, bytes) {
+        Ok(written) if written == bytes.len() => Ok(()),
+        Ok(_) | Err(Errno::EFAULT) => Err(Errno::EFAULT.into()),
+        Err(errno) => Err(Error::Tool(anyhow::anyhow!(
+            "get_mempolicy output write failed: {errno}"
+        ))),
+    }
+}
+
 fn from_str(s: &str) -> [i8; 65] {
     let mut ret: [i8; 65] = [0; 65];
     for (i, ch) in s.bytes().take(64).enumerate() {
@@ -916,10 +936,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         if let Some(policy) = call.policy() {
             let policy = AddrMut::<u8>::from_raw(policy.as_raw()).ok_or(Errno::EFAULT)?;
-            let value = 0i32.to_ne_bytes();
-            if guest.memory().write_with_user_access(policy, &value)? < value.len() {
-                return Err(Errno::EFAULT.into());
-            }
+            write_get_mempolicy_output(&mut guest.memory(), policy, &0i32.to_ne_bytes())?;
         }
         if let Some(mask) = mask {
             let bytes = (call.maxnode() - 1).div_ceil(64) * 8;
@@ -932,9 +949,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             if !words.is_empty() {
                 let mask = AddrMut::<u8>::from_raw(mask.as_raw()).ok_or(Errno::EFAULT)?;
-                if guest.memory().write_with_user_access(mask, &words)? < words.len() {
-                    return Err(Errno::EFAULT.into());
-                }
+                write_get_mempolicy_output(&mut guest.memory(), mask, &words)?;
             }
         }
         Ok(0)
@@ -1035,6 +1050,27 @@ mod tests {
             })
             .collect();
         fill_canonical_random_iovecs(memory, &vectors, 0, offset, &mut DefaultHasher::new())
+    }
+
+    #[test]
+    fn get_mempolicy_output_faults_are_efault_and_backend_errors_are_tool_errors() {
+        let address = AddrMut::<u8>::from_raw(0x1000).unwrap();
+        let write = |outcome| {
+            write_get_mempolicy_output(&mut ScatterMemory::new(8, [outcome]), address, &[1; 8])
+        };
+        assert!(write(Ok(8)).is_ok());
+        for fault in [Ok(0), Ok(3), Err(Errno::EFAULT)] {
+            assert!(
+                matches!(write(fault), Err(Error::Errno(Errno::EFAULT))),
+                "{fault:?}"
+            );
+        }
+        for errno in [Errno::ENOSYS, Errno::ESRCH, Errno::EIO] {
+            assert!(
+                matches!(write(Err(errno)), Err(Error::Tool(_))),
+                "{errno:?}"
+            );
+        }
     }
 
     #[test]
