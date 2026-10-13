@@ -24,6 +24,21 @@
  *                  thread sets SIGCHLD to SIG_IGN and back to the handler,
  *                  which discards the pending copy: the sleep returns 0, and
  *                  no handler runs after the sleeper unblocks.
+ *   futex-cond, futex-timed, futex-raw, futex-restart, futex-bitset
+ *                  The sibling waits on a futex instead: pthread_cond_wait;
+ *                  pthread_cond_timedwait with a 300 ms deadline nothing
+ *                  signals (ETIMEDOUT); one raw FUTEX_WAIT (EINTR); the same
+ *                  with an SA_RESTART handler (the wait restarts and returns
+ *                  0 at the wake); one raw FUTEX_WAIT_BITSET (EINTR). Main
+ *                  waits up to 1 s for the handler (100 ms in the three modes
+ *                  below, where it does not run first) before it wakes the
+ *                  waiter, and prints whether the handler ran in it first.
+ *   futex-blocked, futex-default, futex-flush
+ *                  As blocked-nano, default-nano and flush-nano, for a
+ *                  pthread_cond_wait.
+ *   futex-cond-busy, futex-restart-busy
+ *                  futex-cond and futex-restart with a sibling that spins
+ *                  with no syscall, which Hermit can only preempt.
  *   stale, stale-nopriv
  *                  Can a private SIGCHLD record outlive its copy and end a
  *                  later sleep? SIGCHLD caught; a sibling waits in
@@ -40,6 +55,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <signal.h>
+#include <linux/futex.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
@@ -205,11 +221,139 @@ static int stale(const char* label) {
   return 0;
 }
 
+static pthread_mutex_t fx_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t fx_cond = PTHREAD_COND_INITIALIZER;
+static int fx_flag;
+static _Atomic int fx_word;
+static long fx_ret;
+
+static int is_mode(const char* name) {
+  return !strcmp(mode, name);
+}
+
+static void* busy(void* arg) {
+  (void)arg;
+  while (!atomic_load_explicit(&done, memory_order_relaxed)) {
+  }
+  return NULL;
+}
+
+static void* futex_waiter(void* arg) {
+  (void)arg;
+  atomic_store(&sleeper_tid, (pid_t)syscall(SYS_gettid));
+  int blocked = is_mode("futex-blocked") || is_mode("futex-flush");
+  if (!blocked) {
+    mask(SIG_UNBLOCK);
+  }
+  if (is_mode("futex-raw") || is_mode("futex-restart") || is_mode("futex-restart-busy") ||
+      is_mode("futex-bitset")) {
+    atomic_store(&ready, 1);
+    int op = is_mode("futex-bitset") ? FUTEX_WAIT_BITSET_PRIVATE : FUTEX_WAIT_PRIVATE;
+    fx_ret = syscall(SYS_futex, &fx_word, op, 0, NULL, NULL, FUTEX_BITSET_MATCH_ANY);
+    err = errno;
+  } else {
+    pthread_mutex_lock(&fx_lock);
+    atomic_store(&ready, 1);
+    if (is_mode("futex-timed")) {
+      struct timespec deadline;
+      clock_gettime(CLOCK_REALTIME, &deadline);
+      deadline.tv_nsec += 300 * 1000 * 1000;
+      if (deadline.tv_nsec >= 1000 * 1000 * 1000) {
+        deadline.tv_sec += 1;
+        deadline.tv_nsec -= 1000 * 1000 * 1000;
+      }
+      while (!fx_flag && ret != ETIMEDOUT) {
+        ret = pthread_cond_timedwait(&fx_cond, &fx_lock, &deadline);
+      }
+    } else {
+      while (!fx_flag) {
+        pthread_cond_wait(&fx_cond, &fx_lock);
+      }
+    }
+    pthread_mutex_unlock(&fx_lock);
+  }
+  if (blocked) {
+    while (!atomic_load(&sent)) {
+      syscall(SYS_sched_yield);
+    }
+    mask(SIG_UNBLOCK);
+  }
+  return NULL;
+}
+
+static int futex_main(void) {
+  int restart = is_mode("futex-restart") || is_mode("futex-restart-busy");
+  int raw = restart || is_mode("futex-raw") || is_mode("futex-bitset");
+  if (!is_mode("futex-default")) {
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = on_chld;
+    action.sa_flags = restart ? SA_RESTART : 0;
+    sigaction(SIGCHLD, &action, NULL);
+  }
+  mask(SIG_BLOCK);
+  pthread_t spinner, thread;
+  int cpu_bound = is_mode("futex-cond-busy") || is_mode("futex-restart-busy");
+  pthread_create(&spinner, NULL, cpu_bound ? busy : spin, NULL);
+  pthread_create(&thread, NULL, futex_waiter, NULL);
+  while (!atomic_load(&ready)) {
+    syscall(SYS_sched_yield);
+  }
+  struct timespec delay = {0, 50 * 1000 * 1000};
+  nanosleep(&delay, NULL);
+  pthread_kill(thread, SIGCHLD);
+  if (is_mode("futex-flush")) {
+    set_handler(SIG_IGN);
+    set_handler(on_chld);
+  }
+  atomic_store(&sent, 1);
+  // Up to 1 s where the handler runs before the wake, 100 ms where it
+  // does not.
+  int handler_expected =
+      !is_mode("futex-blocked") && !is_mode("futex-default") && !is_mode("futex-flush");
+  struct timespec step = {0, 10 * 1000 * 1000};
+  for (int i = 0; i < (handler_expected ? 100 : 10) && !atomic_load(&in_sleeper); i++) {
+    nanosleep(&step, NULL);
+  }
+  int before_wake = atomic_load(&in_sleeper);
+  if (restart) {
+    // Let the restarted wait park again before the word changes.
+    nanosleep(&delay, NULL);
+  }
+  if (raw) {
+    atomic_store(&fx_word, 1);
+    syscall(SYS_futex, &fx_word, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+  } else if (!is_mode("futex-timed")) {
+    pthread_mutex_lock(&fx_lock);
+    fx_flag = 1;
+    pthread_cond_signal(&fx_cond);
+    pthread_mutex_unlock(&fx_lock);
+  }
+  pthread_join(thread, NULL);
+  atomic_store(&done, 1);
+  pthread_join(spinner, NULL);
+  char result[64];
+  if (raw) {
+    snprintf(result, sizeof(result), "futex %s",
+             fx_ret == 0 ? "0" : err == EINTR ? "-1 EINTR" : err == EAGAIN ? "-1 EAGAIN" : strerror(err));
+  } else if (is_mode("futex-timed")) {
+    snprintf(result, sizeof(result), "timedwait %s", ret == ETIMEDOUT ? "ETIMEDOUT" : "other");
+  } else {
+    snprintf(result, sizeof(result), "cond_wait");
+  }
+  printf("%s: %s, handler in waiter before the wake %d, in waiter %d, in all %d\n", mode, result,
+         before_wake, atomic_load(&in_sleeper), atomic_load(&got));
+  return 0;
+}
+
 int main(int argc, char** argv) {
   setvbuf(stdout, NULL, _IONBF, 0);
   mode = argc > 1 ? argv[1] : "tgkill-nano";
   if (!strncmp(mode, "stale", 5)) {
     return stale(mode);
+  }
+  if (!strncmp(mode, "futex-", 6)) {
+    return futex_main();
   }
   if (strcmp(mode, "default-nano")) {
     set_handler(on_chld);

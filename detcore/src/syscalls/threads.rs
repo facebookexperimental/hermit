@@ -779,6 +779,43 @@ pub(crate) fn futex_wait_held_after_wake(
     (kernel_sigset_bit(libc::SIGCHLD) | host_timed) & !(committed & !host_timed)
 }
 
+/// The signals that end a precise futex wait at its own check: those pending
+/// and interrupting it (`interrupting`) that it does not hold (`held`), or,
+/// when there are none, a guest's thread-directed `SIGCHLD` in its private
+/// queue that the schedule recorded (`PrivatePending`). Such a copy may have
+/// been sent before this wait parked, and the drain that ends a parked wait for
+/// it never saw this wait, so only this check can. `/proc` cannot tell it from
+/// a copy a host-timed source posted, so its bit only prompts the question
+/// (https://github.com/rrnewton/hermit/issues/4132).
+pub(crate) async fn futex_wait_pending_signals<G, T>(
+    guest: &mut G,
+    state: &KernelSignalState,
+    interrupting: KernelSigset,
+    held: KernelSigset,
+    host_timed: KernelSigset,
+) -> KernelSigset
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let pending = interrupting & !held;
+    let sigchld = kernel_sigset_bit(libc::SIGCHLD) & !host_timed;
+    if pending == 0
+        && interrupting & state.thread_pending & held & sigchld != 0
+        && matches!(
+            crate::tool_global::child_exit_sigchld(
+                guest,
+                crate::scheduler::child_exit_sigchld::ChildExitSigchldControl::PrivatePending,
+            )
+            .await,
+            crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer::Placed(true)
+        )
+    {
+        return sigchld;
+    }
+    pending
+}
+
 /// The one-bit kernel sigset for `raw_signal` (1-based), or 0 when out of range.
 pub(crate) fn kernel_sigset_bit(raw_signal: i32) -> KernelSigset {
     if (1..=KernelSigset::BITS as i32).contains(&raw_signal) {
@@ -2280,7 +2317,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                         // ends it only when the scheduler committed it to this
                         // waiter at its wake, sent at a commit point (a child's
                         // child-exit timer, or a POSIX timer: `committed_wake`,
-                        // https://github.com/rrnewton/hermit/issues/4005); any other
+                        // https://github.com/rrnewton/hermit/issues/4005), or when it
+                        // is a guest's thread-directed copy in this thread's private
+                        // queue that the schedule recorded (`futex_wait_pending_signals`,
+                        // https://github.com/rrnewton/hermit/issues/4132); any other
                         // stays pending until the call returns, because the kernel
                         // also posts one for a child event at a moment set by host
                         // timing (https://github.com/rrnewton/hermit/issues/3146). Nor does
@@ -2325,9 +2365,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                                 host_timed,
                                 std::mem::take(&mut committed_wake),
                             );
-                            let pending = state
-                                .pending_interrupting(state.blocked, defers_default_stops)
-                                & !held;
+                            let pending = futex_wait_pending_signals(
+                                guest,
+                                &state,
+                                state.pending_interrupting(state.blocked, defers_default_stops),
+                                held,
+                                host_timed,
+                            )
+                            .await;
                             if pending != 0 {
                                 let errno = call.kernel_restart_errno();
                                 trace!(

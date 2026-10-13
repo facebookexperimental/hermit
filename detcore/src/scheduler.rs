@@ -560,6 +560,19 @@ pub struct BlockedPool {
     /// (<https://github.com/rrnewton/hermit/issues/4126>).
     pub woken_sleeps: BTreeSet<DetTid>,
 
+    /// Precise futex waiters the drain of cross-task signals woke
+    /// (`drain_pending_cross_task_signals`), until their turn answers. A
+    /// `SIGCHLD` in such a waiter's `WaitidSignals` batch, put there by that
+    /// wake or merged in later, is only a reason to run, never a committed
+    /// signal: `unblock_guest` leaves it out of the answer, so the waiter's
+    /// own check decides it from the schedule's record of a guest's private
+    /// copy (`PrivatePending`), which a flush clears. The value says the
+    /// scheduler sent the waiter a `SIGCHLD` at a commit point since
+    /// (`wake_signaled_guest`, such as a child-exit timer's): that one is
+    /// committed, and the answer names it
+    /// (<https://github.com/rrnewton/hermit/issues/4132>).
+    pub drain_woken_futex_waiters: BTreeMap<DetTid, bool>,
+
     /// Threads in `external_io_blockers` or `rt_sigsuspend_blockers` that the
     /// scheduler signaled at a committed point (`wake_signaled_guest`) while
     /// they slept with no posted request. Their request was consumed when they
@@ -5436,6 +5449,7 @@ impl Scheduler {
         self.blocked.sigchld_deferred.remove(dtid);
         self.blocked.sigchld_ready.remove(dtid);
         self.blocked.woken_sleeps.remove(dtid);
+        self.blocked.drain_woken_futex_waiters.remove(dtid);
         self.child_exit_sigchld.attributed.remove(dtid);
         self.blocked.signaled_background.remove(dtid);
         let _ = self.blocked.signaled_sigsuspend_requests.remove(dtid);
@@ -7702,6 +7716,16 @@ impl Scheduler {
                     // sibling kept running (the Codex review of
                     // https://github.com/rrnewton/hermit/pull/4131).
                     self.blocked.woken_sleeps.insert(dettid);
+                } else if let Some(scheduler_sent) =
+                    self.blocked.drain_woken_futex_waiters.get_mut(&dettid)
+                {
+                    // A futex waiter the drain woke, still to run its turn: a
+                    // `SIGCHLD` sent now at this commit point is committed to
+                    // it, which the drain's own `SIGCHLD` is not
+                    // (`drain_woken_futex_waiters`). Its turn answers with it.
+                    if signal.raw() == libc::SIGCHLD {
+                        *scheduler_sent = true;
+                    }
                 }
                 // TODO(T137242449): other runnable requests could be reprioritized to run
                 // sooner, but for now we leave their priorities alone.
@@ -7911,11 +7935,17 @@ impl Scheduler {
     /// child's child-exit timer, or from a POSIX timer whose signal is
     /// `SIGCHLD`: the wait does not hold it unless a
     /// host-timed source can post it too
-    /// (https://github.com/rrnewton/hermit/issues/4005).
+    /// (https://github.com/rrnewton/hermit/issues/4005). Nor does it hold a
+    /// guest's thread-directed `SIGCHLD` recorded in the sender's committed
+    /// turn (`private_sigchld`), which only this thread can take: the drain of
+    /// that cross-task signal ends the wait as it ends a sleep
+    /// (https://github.com/rrnewton/hermit/issues/4132). Only here, not in
+    /// `futex_wait_held_signals`, which restartable internal IO polls share.
     fn parked_futex_interrupting_signals(&self, dettid: DetTid, committed: u64) -> Option<u64> {
         let watch = self.parked_futex_waiter(dettid)?.signal_watch?;
-        let held =
-            self.futex_wait_held_signals(dettid) & !(committed & !self.host_timed_signals(dettid));
+        let held = self.futex_wait_held_signals(dettid)
+            & !self.private_sigchld(dettid)
+            & !(committed & !self.host_timed_signals(dettid));
         #[cfg(test)]
         if let Some(state) = self.test_kernel_signal_states.get(&dettid) {
             return Some(
@@ -8011,7 +8041,11 @@ impl Scheduler {
     /// process (`host_timed_signals`). A `SIGCHLD` the scheduler itself sends to
     /// the waiter at a commit point is the exception
     /// (`parked_futex_interrupting_signals`' `committed`,
-    /// https://github.com/rrnewton/hermit/issues/4005). The kernel posts these at a moment set
+    /// https://github.com/rrnewton/hermit/issues/4005), and so is a guest's
+    /// thread-directed `SIGCHLD` the schedule recorded (`private_sigchld`),
+    /// which the callers for sleeps and futex waits exempt at their own sites;
+    /// the restartable internal IO polls that share this set do not
+    /// (https://github.com/rrnewton/hermit/issues/4132). The kernel posts these at a moment set
     /// by host timing (`SIGCHLD` for a child's exit, stop or continue), and the
     /// waiter cannot tell that copy from one sent at a deterministic point. The
     /// guest side holds the same signals in its own checks (`KernelSignalWait`,
@@ -8090,6 +8124,17 @@ impl Scheduler {
     // (https://github.com/rrnewton/hermit/issues/4005). A death without that
     // timer (a child killed by a signal, or leaving through `exit` in its last
     // thread) still leaves the signal held.
+    //
+    // A guest's thread-directed `SIGCHLD` (`tgkill`, `pthread_sigqueue`),
+    // recorded in the sender's committed turn (`private_sigchld`), is the
+    // other exception, for a `pause`, a `nanosleep` and a precise futex wait:
+    // only the target can take that copy, so the drain of the cross-task
+    // signal ends the wait, and a wait that checks before it parks asks the
+    // schedule's record (`PrivatePending`, `PlacedPending`). A futex waiter's
+    // turn after that drain is not committed the signal: its own check decides
+    // from the record, which a flush clears (`drain_woken_futex_waiters`). The
+    // restartable internal IO polls and polling-mode futex waits still hold it
+    // (https://github.com/rrnewton/hermit/issues/4132).
     //
     // The waits of `select`, and of `pselect6` without a temporary mask, read
     // the same state but hold nothing (`KernelSignalWait::for_select`), so a
@@ -8345,7 +8390,7 @@ impl Scheduler {
 
     // Force a thread out blocking and into the runnable state, replacing its resource request.
     fn force_unblock_thread(&mut self, dettid: DetTid, rsrcs: Resources) {
-        self.force_unblock_thread_at(dettid, rsrcs, false);
+        let _ = self.force_unblock_thread_at(dettid, rsrcs, false);
     }
 
     /// [`Scheduler::force_unblock_thread`], queuing the thread at the front of its
@@ -8365,11 +8410,13 @@ impl Scheduler {
     /// the signal stays pending in the kernel and is delivered when the gate
     /// opens and the thread resumes, as for any runnable thread that is not
     /// running.
-    fn force_unblock_thread_at(&mut self, dettid: DetTid, rsrcs: Resources, front: bool) {
+    ///
+    /// Returns whether it unblocked the thread.
+    fn force_unblock_thread_at(&mut self, dettid: DetTid, rsrcs: Resources, front: bool) -> bool {
         // The consumed alarm already owns this exact response. A later
         // physical signal must not replace its fatal continuation.
         if self.in_guest_fatal_alarm_pending(dettid) {
-            return;
+            return false;
         }
         if self
             .happens_before
@@ -8380,7 +8427,7 @@ impl Scheduler {
                 "[dtid {}] held at a happens-before gate; leaving it held, its signal pending",
                 dettid
             );
-            return;
+            return false;
         }
         info!(
             "[dtid {}] removing blocking entries and requeuing thread",
@@ -8415,6 +8462,7 @@ impl Scheduler {
         } else {
             self.runqueue_push_back(dettid);
         }
+        true
     }
 
     /// The backgrounded vfork child that step 3 waits for, and that step 2c
@@ -10605,7 +10653,19 @@ impl Scheduler {
             "[sched-step5] Guest unblocking (via {}); clear ivars for the next turn on dettid {}",
             &resp, &dtid
         );
-        let signals = self.inbound_signals(dtid); // Peek before we clear the ivars.
+        let mut signals = self.inbound_signals(dtid); // Peek before we clear the ivars.
+        let signaled = !signals.is_empty();
+        // A precise futex waiter the drain woke: a `SIGCHLD` its batch carries
+        // is not committed to it, unless the scheduler sent one since
+        // (`drain_woken_futex_waiters`). The answer still says it was woken
+        // for a signal, with an empty set if that was the only one.
+        if let Some(scheduler_sent) = self.blocked.drain_woken_futex_waiters.remove(&dtid) {
+            signals.retain(|signal| signal.raw() != libc::SIGCHLD);
+            if scheduler_sent {
+                signals.push(SigWrapper::from(Signal::SIGCHLD));
+                signals.sort_by_key(SigWrapper::raw);
+            }
+        }
         let fatal_alarm = self.in_guest_fatal_alarm_pending(dtid);
         let futex_timed_out = self.blocked.timed_out_futex_waiters.remove(&dtid);
         if let Err(error) = self.clear_nextturn(dtid) {
@@ -10615,7 +10675,7 @@ impl Scheduler {
         self.turn += 1;
         let answer = if fatal_alarm {
             SchedResponse::InGuestFatalAlarm
-        } else if !signals.is_empty() {
+        } else if signaled {
             SchedResponse::Signaled(Some(signals))
         } else if futex_timed_out {
             SchedResponse::Go(Some(SchedValue::TimeOut))
@@ -11186,9 +11246,14 @@ impl Scheduler {
                     // The waiter runs next, so it is the thread that resumes
                     // and dequeues the signal. Its futex handler re-checks in
                     // its turn and parks again if nothing is pending for it.
+                    // Marked after the unblock, which clears blocking entries:
+                    // a `SIGCHLD` this batch carries is not committed to it
+                    // (`drain_woken_futex_waiters`).
                     let mut resources = Resources::new(dettid);
                     resources.insert(ResourceID::WaitidSignals(signals), Permission::W);
-                    self.force_unblock_thread_at(dettid, resources, true);
+                    if self.force_unblock_thread_at(dettid, resources, true) {
+                        self.blocked.drain_woken_futex_waiters.insert(dettid, false);
+                    }
                 }
                 None if let Some(sleep) = self.signal_sleep(dettid) => {
                     // An emulated `pause` or `nanosleep`, parked in the timed
@@ -16762,6 +16827,222 @@ mod test {
                 "{case}"
             );
         }
+    }
+
+    /// The answer a woken thread's turn gets (`unblock_guest`).
+    fn turn_answer(scheduler: &mut Scheduler, target: DetTid) -> Option<SchedResponse> {
+        let response = scheduler.next_turns[&target].resp.clone();
+        assert!(scheduler.unblock_guest(target, &response).is_ok());
+        response.try_read()
+    }
+
+    /// A guest's thread-directed `SIGCHLD`, recorded in the sender's turn
+    /// (`PrivateSent`), ends a parked precise-mode futex wait through the
+    /// drain of the cross-task signal, as Linux ends the wait for a caught,
+    /// unblocked signal pending for the thread. The waiter's turn says it was
+    /// woken for a signal but commits no `SIGCHLD` to it, so its own check
+    /// decides from the record (`PrivatePending`), which a flush clears. The
+    /// wait stays parked for an unrecorded copy, a recorded one a host-timed
+    /// source could also have posted, a recorded one that is default-ignored
+    /// (under ptrace the kernel queues a copy Linux discards at generation,
+    /// and the sender's turn records it), and one whose record a flush
+    /// cleared (https://github.com/rrnewton/hermit/issues/4132).
+    #[test]
+    fn a_private_sigchld_ends_a_parked_futex_wait_through_the_drain() {
+        use child_exit_sigchld::ChildExitSigchldControl;
+        let chld = kernel_signal_bit(libc::SIGCHLD);
+        let deadline = LogicalTime::from_nanos(300_000_000);
+        for case in ["recorded", "unrecorded", "host-timed", "default", "flushed"] {
+            let mut scheduler = gated_scheduler();
+            let (target, futex) = parked_futex_target(&mut scheduler);
+            if case == "host-timed" {
+                scheduler.record_host_timed_signals(target, HostTimedSignalScope::Caller, chld);
+            }
+            scheduler.sleep_futex_waiter(
+                &target,
+                futex,
+                Some(deadline),
+                u32::MAX,
+                Some(signal_watch(chld)),
+            );
+            let caught = if case == "default" { 0 } else { chld };
+            scheduler
+                .test_kernel_signal_states
+                .insert(target, signal_state(caught, 0));
+            if case != "unrecorded" {
+                scheduler.child_exit_sigchld_control(
+                    target,
+                    ChildExitSigchldControl::PrivateSent { target },
+                );
+            }
+            if case == "flushed" {
+                scheduler.child_exit_sigchld_control(target, ChildExitSigchldControl::Flushed);
+            }
+            scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGCHLD));
+            scheduler.drain_pending_cross_task_signals();
+            if case == "recorded" {
+                assert!(!scheduler.is_parked_futex_waiter(target), "{case}");
+                assert_eq!(
+                    scheduler.inbound_signals(target),
+                    vec![SigWrapper::from(Signal::SIGCHLD)],
+                    "{case}"
+                );
+                assert!(
+                    matches!(
+                        turn_answer(&mut scheduler, target),
+                        Some(SchedResponse::Signaled(Some(signals))) if signals.is_empty()
+                    ),
+                    "{case}: woken for a signal, with no SIGCHLD committed"
+                );
+                assert!(scheduler.blocked.drain_woken_futex_waiters.is_empty());
+                continue;
+            }
+            assert!(scheduler.is_parked_futex_waiter(target), "{case}");
+            assert!(!scheduler.run_queue.contains_tid(target), "{case}");
+            assert!(scheduler.inbound_signals(target).is_empty(), "{case}");
+            assert_eq!(
+                scheduler.blocked.timed_waiters.iter().collect::<Vec<_>>(),
+                vec![(deadline, TimedEvent::ThreadEvt(target))],
+                "{case}"
+            );
+        }
+    }
+
+    /// The drain marks a futex waiter only when it actually unblocked it: a
+    /// thread held at a happens-before gate is left held
+    /// (`force_unblock_thread_at`), and a mark left on it would outlive the
+    /// wake it describes (the Claude re-check of
+    /// https://github.com/rrnewton/hermit/issues/4132).
+    #[test]
+    fn a_futex_waiter_held_at_a_gate_is_not_marked_as_drain_woken() {
+        use child_exit_sigchld::ChildExitSigchldControl;
+        let chld = kernel_signal_bit(libc::SIGCHLD);
+        let mut scheduler = gated_scheduler();
+        let (target, futex) = parked_futex_target(&mut scheduler);
+        scheduler.sleep_futex_waiter(&target, futex, None, u32::MAX, Some(signal_watch(chld)));
+        scheduler
+            .test_kernel_signal_states
+            .insert(target, signal_state(chld, 0));
+        scheduler
+            .child_exit_sigchld_control(target, ChildExitSigchldControl::PrivateSent { target });
+        let mut hb = hb_runtime(HB_GATE_SPEC);
+        hb.parked.insert(target);
+        scheduler.happens_before = Some(hb);
+        scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGCHLD));
+        scheduler.drain_pending_cross_task_signals();
+        assert!(scheduler.blocked.drain_woken_futex_waiters.is_empty());
+    }
+
+    /// A `SIGCHLD` the drain merges into the batch of a futex waiter it
+    /// already woke (`WaitidSignalRequest::Pending`) is not committed either:
+    /// the waiter's turn carries the `SIGUSR1` it was woken for and no
+    /// `SIGCHLD`. A `SIGCHLD` the scheduler sends at a commit point
+    /// (`wake_signaled_guest`, https://github.com/rrnewton/hermit/issues/4005)
+    /// is committed, to a parked waiter and to one the drain already woke,
+    /// for `SIGUSR1` or for a guest's recorded private `SIGCHLD`, that has not
+    /// yet run its turn (the Claude re-check of
+    /// https://github.com/rrnewton/hermit/issues/4132: that commit was lost).
+    #[test]
+    fn only_a_scheduler_sent_sigchld_is_committed_to_a_woken_futex_waiter() {
+        use child_exit_sigchld::ChildExitSigchldControl;
+        let chld = kernel_signal_bit(libc::SIGCHLD);
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        let usr1_signal = SigWrapper::from(Signal::SIGUSR1);
+        let chld_signal = SigWrapper::from(Signal::SIGCHLD);
+        for case in [
+            "merged",
+            "parked",
+            "woken for SIGUSR1",
+            "woken for a private SIGCHLD",
+        ] {
+            let mut scheduler = gated_scheduler();
+            let (target, futex) = parked_futex_target(&mut scheduler);
+            scheduler.sleep_futex_waiter(
+                &target,
+                futex,
+                None,
+                u32::MAX,
+                Some(signal_watch(chld | usr1)),
+            );
+            scheduler
+                .test_kernel_signal_states
+                .insert(target, signal_state(chld | usr1, 0));
+            let expected = match case {
+                "merged" => {
+                    scheduler.notify_signal_pending(target, usr1_signal);
+                    scheduler.drain_pending_cross_task_signals();
+                    scheduler.notify_signal_pending(target, chld_signal);
+                    scheduler.drain_pending_cross_task_signals();
+                    assert_eq!(
+                        scheduler.inbound_signals(target),
+                        vec![usr1_signal, chld_signal],
+                        "the merge put SIGCHLD in the batch"
+                    );
+                    vec![usr1_signal]
+                }
+                "parked" => {
+                    scheduler.wake_signaled_guest(target, Signal::SIGCHLD);
+                    vec![chld_signal]
+                }
+                "woken for SIGUSR1" => {
+                    scheduler.notify_signal_pending(target, usr1_signal);
+                    scheduler.drain_pending_cross_task_signals();
+                    assert!(!scheduler.is_parked_futex_waiter(target));
+                    scheduler.wake_signaled_guest(target, Signal::SIGCHLD);
+                    vec![usr1_signal, chld_signal]
+                }
+                _ => {
+                    scheduler.child_exit_sigchld_control(
+                        target,
+                        ChildExitSigchldControl::PrivateSent { target },
+                    );
+                    scheduler.notify_signal_pending(target, chld_signal);
+                    scheduler.drain_pending_cross_task_signals();
+                    assert!(!scheduler.is_parked_futex_waiter(target));
+                    scheduler.wake_signaled_guest(target, Signal::SIGCHLD);
+                    vec![chld_signal]
+                }
+            };
+            let answer = turn_answer(&mut scheduler, target);
+            assert!(
+                matches!(&answer, Some(SchedResponse::Signaled(Some(signals))) if *signals == expected),
+                "{case}: {answer:?}"
+            );
+        }
+    }
+
+    /// A recorded private `SIGCHLD` does not end a restartable internal IO
+    /// poll: R2 exempts it only for precise futex waits, and
+    /// `futex_wait_held_signals`, which the poll shares, still holds it
+    /// (https://github.com/rrnewton/hermit/issues/4132).
+    #[test]
+    fn a_recorded_private_sigchld_does_not_end_a_restartable_internal_read_poll() {
+        use child_exit_sigchld::ChildExitSigchldControl;
+        let mut scheduler = gated_scheduler();
+        let target = restartable_read_poller(&mut scheduler);
+        assert!(scheduler.restartable_internal_io_signals(target).is_some());
+        scheduler.test_kernel_signal_states.insert(
+            target,
+            KernelSignalState {
+                caught: kernel_signal_bit(libc::SIGCHLD),
+                ..Default::default()
+            },
+        );
+        scheduler
+            .child_exit_sigchld_control(target, ChildExitSigchldControl::PrivateSent { target });
+        scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGCHLD));
+        scheduler.drain_pending_cross_task_signals();
+        assert!(scheduler.inbound_signals(target).is_empty());
+        let resources = scheduler.next_turns[&target]
+            .req
+            .try_read()
+            .and_then(Result::ok)
+            .expect("the poller keeps its request");
+        assert!(
+            resources
+                .resources
+                .contains_key(&ResourceID::InternalIOPolling)
+        );
     }
 
     /// A signal recorded as host-timed for a process, as `PR_SET_PDEATHSIG`
@@ -23886,6 +24167,52 @@ mod test {
                 "{case}"
             );
         }
+    }
+
+    /// A futex wait's question before it parks (`PrivatePending`) counts only
+    /// a guest's thread-directed `SIGCHLD` the schedule recorded: not the
+    /// scheduler's send in the window, which a sleep's question
+    /// (`PlacedPending`) counts and a futex wait holds, and not a recorded copy
+    /// when a host-timed source can post `SIGCHLD` to the process
+    /// (https://github.com/rrnewton/hermit/issues/4132).
+    #[test]
+    fn a_futex_waits_question_counts_only_a_recorded_private_sigchld() {
+        use child_exit_sigchld::ChildExitSigchldAnswer;
+        use child_exit_sigchld::ChildExitSigchldControl;
+        let (mut scheduler, parent, _, [first, _]) = owned_sigchld_family();
+        let ask = |scheduler: &mut Scheduler, control| {
+            scheduler.child_exit_sigchld_control(parent, control)
+        };
+        timer_sends(&mut scheduler, parent, first);
+        assert_eq!(
+            ask(&mut scheduler, ChildExitSigchldControl::PlacedPending),
+            ChildExitSigchldAnswer::Placed(true),
+            "a sleep counts the window's send"
+        );
+        assert_eq!(
+            ask(&mut scheduler, ChildExitSigchldControl::PrivatePending),
+            ChildExitSigchldAnswer::Placed(false),
+            "a futex wait does not"
+        );
+        ask(
+            &mut scheduler,
+            ChildExitSigchldControl::PrivateSent { target: parent },
+        );
+        assert_eq!(
+            ask(&mut scheduler, ChildExitSigchldControl::PrivatePending),
+            ChildExitSigchldAnswer::Placed(true),
+            "a recorded private copy"
+        );
+        scheduler.record_host_timed_signals(
+            parent,
+            HostTimedSignalScope::Caller,
+            kernel_signal_bit(libc::SIGCHLD),
+        );
+        assert_eq!(
+            ask(&mut scheduler, ChildExitSigchldControl::PrivatePending),
+            ChildExitSigchldAnswer::Placed(false),
+            "a host-timed source can post SIGCHLD too"
+        );
     }
 
     /// A thread a guest sent a thread-directed `SIGCHLD` takes that copy from

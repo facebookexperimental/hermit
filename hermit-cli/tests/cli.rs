@@ -26164,6 +26164,229 @@ fn every_sigchld_copy_is_accounted_for_as_on_linux() {
     }
 }
 
+/// A guest's thread-directed `SIGCHLD` to a sibling waiting on a futex, while
+/// a third thread spins, ends the wait as Linux does: caught and unblocked,
+/// the handler runs in the waiter before main wakes it, and the wait returns
+/// EINTR (a raw `FUTEX_WAIT` or `FUTEX_WAIT_BITSET`), restarts under
+/// `SA_RESTART` and returns 0 at the wake, or is retried by
+/// `pthread_cond_wait`, and a `pthread_cond_timedwait` still times out at its
+/// deadline. Blocked, the handler runs only after the wake and the unblock;
+/// default (ignore), or flushed by `SIG_IGN` while pending, nothing runs. Main
+/// waits for the handler, up to 1 s, before it wakes the waiter, so the line
+/// does not depend on where the waiter is requeued. Such a copy is in the waiter's private
+/// queue, sent at the sender's committed turn, so the wait does not hold it as
+/// it holds the kernel's shared copies. Before, the handler ran only after the
+/// wake (https://github.com/rrnewton/hermit/issues/4132). Every expected line
+/// is native output, and each run reaches canonical bitwise parity.
+#[test]
+fn a_guests_sigchld_to_a_futex_waiting_sibling_ends_its_wait_as_on_linux() {
+    verify_futex_sigchld_modes(&[
+        ("futex-cond", "cond_wait", 1, 1),
+        ("futex-timed", "timedwait ETIMEDOUT", 1, 1),
+        ("futex-raw", "futex -1 EINTR", 1, 1),
+        ("futex-restart", "futex 0", 1, 1),
+        ("futex-bitset", "futex -1 EINTR", 1, 1),
+        ("futex-blocked", "cond_wait", 0, 1),
+        ("futex-default", "cond_wait", 0, 0),
+        ("futex-flush", "cond_wait", 0, 0),
+    ]);
+}
+
+/// The same, with a sibling that spins with no syscall, which Hermit can only
+/// preempt: the woken waiter's restart-errno turn is requeued behind it, so
+/// the handler runs a round later than it would at the front, and main's wait
+/// for it keeps the line native (the design check of
+/// https://github.com/rrnewton/hermit/issues/4132 measured "before the wake 0"
+/// and, under `SA_RESTART`, EAGAIN, when main did not wait). Split from the
+/// test above to keep each test inside its CPU budget.
+#[test]
+fn a_guests_sigchld_to_a_futex_waiting_sibling_beside_a_cpu_bound_one_ends_its_wait() {
+    verify_futex_sigchld_modes(&[
+        ("futex-cond-busy", "cond_wait", 1, 1),
+        ("futex-restart-busy", "futex 0", 1, 1),
+    ]);
+}
+
+/// A guest's thread-directed `SIGCHLD` sent before its target files its futex
+/// wait ends that wait at once, as Linux does when a caught, unblocked signal
+/// is already pending at `FUTEX_WAIT`: EINTR, with the handler run in the
+/// waiter before main wakes it. A hard `--happens-before` edge holds the
+/// waiter (dettid 7, after the spinner, 5) at its first futex call until
+/// main's (dettid 3) `tgkill` has completed. The drain that ends a parked wait
+/// never sees this one, because the send found it not parked, so only the
+/// wait's own check before it parks can, by asking the schedule's record
+/// (`PrivatePending`). Without that question the wait parked, and the line
+/// read `futex 0, handler in waiter before the wake 0`
+/// (https://github.com/rrnewton/hermit/issues/4132).
+#[test]
+fn a_private_sigchld_sent_before_a_futex_wait_parks_ends_it_as_on_linux() {
+    let _guard = hermit_run_guard();
+    let guest = guest_sigchld_guest().to_str().unwrap().to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let spec = directory.path().join("before-park.json");
+    fs::write(
+        &spec,
+        r#"{"version": 1,
+            "events": {"sent": {"thread": "3", "syscall": "tgkill", "phase": "posthook"},
+                       "waits": {"thread": "7", "syscall": "futex", "nth": 1}},
+            "edges": [{"before": "sent", "after": "waits", "strength": "hard"}]}"#,
+    )
+    .unwrap();
+    let spec = spec.to_str().unwrap().to_owned();
+    let args = [
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--happens-before",
+        spec.as_str(),
+        "--",
+        guest.as_str(),
+        "futex-raw",
+    ];
+    let output = hermit(&args);
+    let log = stderr(&output);
+    assert_success(&output, &args);
+    assert_eq!(
+        stdout(&output),
+        "futex-raw: futex -1 EINTR, handler in waiter before the wake 1, in waiter 1, in all 1\n",
+        "stderr:\n{log}"
+    );
+    assert!(
+        log.contains(":: comparison=BitwiseInfoV1 relaxations=none"),
+        "comparison was not canonical:\n{log}"
+    );
+    assert!(
+        log.contains(":: Success: deterministic. Determinism verified."),
+        "verification failed:\n{log}"
+    );
+}
+
+/// A futex wait that a guest's thread-directed `SIGCHLD` ended records and
+/// replays: `record start --verify --verify-strict` replays the caught raw
+/// `FUTEX_WAIT` (EINTR) and its `SA_RESTART` form (restarted, 0) with the
+/// recording's output (https://github.com/rrnewton/hermit/issues/4132).
+#[test]
+fn a_futex_wait_a_private_sigchld_ends_records_and_replays() {
+    let _guard = hermit_run_guard();
+    let guest = guest_sigchld_guest().to_str().unwrap().to_owned();
+    for (mode, result) in [
+        ("futex-raw", "futex -1 EINTR"),
+        ("futex-restart", "futex 0"),
+    ] {
+        let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let data_dir_arg = format!("--data-dir={}", data_dir.path().display());
+        let args = [
+            "record",
+            "start",
+            "--verify",
+            "--verify-strict",
+            data_dir_arg.as_str(),
+            "--",
+            guest.as_str(),
+            mode,
+        ];
+        let output = hermit(&args);
+        let log = stderr(&output);
+        assert_success(&output, &args);
+        assert_eq!(
+            stdout(&output),
+            format!(
+                "{mode}: {result}, handler in waiter before the wake 1, in waiter 1, in all 1\n"
+            ),
+            "stderr:\n{log}"
+        );
+        assert!(
+            log.contains(":: Success: replay matched recording."),
+            "{mode}: replay did not match:\n{log}"
+        );
+    }
+}
+
+/// Under `--chaos --chaos-target-races`, 24 schedules (6 seeds for each of
+/// four futex modes) end with an outcome Linux allows: the handler runs once,
+/// in the waiter, before or after main's wake (main waits up to 1 s for it),
+/// and the wait returns EINTR, or 0 or EAGAIN when the wake came first; a
+/// flushed copy never runs (https://github.com/rrnewton/hermit/issues/4132).
+#[test]
+fn a_guests_sigchld_to_a_futex_waiter_has_a_linux_outcome_under_chaos() {
+    let _guard = hermit_run_guard();
+    let guest = guest_sigchld_guest().to_str().unwrap().to_owned();
+    for mode in ["futex-cond", "futex-raw", "futex-restart", "futex-flush"] {
+        for seed in ["1", "2", "3", "4", "5", "6"] {
+            let args = [
+                "run",
+                "--strict",
+                "--chaos",
+                "--chaos-target-races",
+                "--sched-seed",
+                seed,
+                "--",
+                guest.as_str(),
+                mode,
+            ];
+            let output = hermit(&args);
+            let log = stderr(&output);
+            assert_success(&output, &args);
+            let line = stdout(&output);
+            let legal = |result: &str, before: u8| {
+                line == format!(
+                    "{mode}: {result}, handler in waiter before the wake {before}, in waiter 1, in all 1\n"
+                )
+            };
+            let ok = match mode {
+                "futex-cond" => legal("cond_wait", 1) || legal("cond_wait", 0),
+                "futex-raw" => {
+                    legal("futex -1 EINTR", 1) || legal("futex 0", 0) || legal("futex -1 EAGAIN", 0)
+                }
+                "futex-restart" => {
+                    legal("futex 0", 1) || legal("futex 0", 0) || legal("futex -1 EAGAIN", 0)
+                }
+                _ => {
+                    line == "futex-flush: cond_wait, handler in waiter before the wake 0, in waiter 0, in all 0\n"
+                }
+            };
+            assert!(
+                ok,
+                "{mode} seed {seed}: {line:?} is not an outcome Linux allows\nstderr:\n{log}"
+            );
+        }
+    }
+}
+
+/// Runs each `guest_sigchld` futex mode under `--verify --verify-strict` and
+/// checks its native line and canonical bitwise parity.
+fn verify_futex_sigchld_modes(modes: &[(&str, &str, u8, u8)]) {
+    let _guard = hermit_run_guard();
+    let guest = guest_sigchld_guest().to_str().unwrap().to_owned();
+    for &(mode, result, before, in_waiter) in modes {
+        let expected = format!(
+            "{mode}: {result}, handler in waiter before the wake {before}, in waiter {in_waiter}, in all {in_waiter}\n"
+        );
+        let args = [
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--",
+            guest.as_str(),
+            mode,
+        ];
+        let output = hermit(&args);
+        let log = stderr(&output);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{mode}: stderr:\n{log}");
+        assert!(
+            log.contains(":: comparison=BitwiseInfoV1 relaxations=none"),
+            "{mode}: comparison was not canonical:\n{log}"
+        );
+        assert!(
+            log.contains(":: Success: deterministic. Determinism verified."),
+            "{mode}: verification failed:\n{log}"
+        );
+    }
+}
+
 /// A guest's thread-directed `SIGCHLD` to a sibling asleep in `nanosleep` or
 /// `pause`, while a third thread spins, ends the sleep as Linux does: caught
 /// and unblocked, with EINTR and the handler in the sleeper (`tgkill`,

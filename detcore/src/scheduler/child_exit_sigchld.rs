@@ -236,6 +236,13 @@ pub enum ChildExitSigchldControl {
     /// kept for this thread alone ([`ChildExitSigchldLedger::raw_exit_status`])
     /// and settled there. Appended after `SendFailed`.
     RawExitStatus { code: i32, status: i32, uid: u32 },
+    /// Whether a guest's thread-directed `SIGCHLD`, recorded in its sender's
+    /// committed turn (`Scheduler::private_sigchld`), is pending for the
+    /// calling thread, asked by a precise futex wait in its own turn before it
+    /// parks. Unlike `PlacedPending`, a send in the window does not count: a
+    /// futex wait holds shared copies (<https://github.com/rrnewton/hermit/issues/4132>).
+    /// Appended after `RawExitStatus`.
+    PrivatePending,
 }
 
 /// What becomes of a `SIGCHLD` the scheduler sent, at its delivery stop.
@@ -832,6 +839,9 @@ impl Scheduler {
             }
             ChildExitSigchldControl::PlacedPending => {
                 ChildExitSigchldAnswer::Placed(self.committed_sigchld_pending(dtid))
+            }
+            ChildExitSigchldControl::PrivatePending => {
+                ChildExitSigchldAnswer::Placed(self.private_sigchld(dtid) != 0)
             }
             ChildExitSigchldControl::PrivateSent { target } => {
                 // Whether this made a new record, which a failed send undoes.

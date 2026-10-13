@@ -4568,6 +4568,217 @@ mod before_park_tests {
             verdicts[1]
         );
     }
+
+    /// The futex counterpart: a precise futex wait's own check before it
+    /// parks (`futex_wait_pending_signals`) finds a guest's thread-directed
+    /// SIGCHLD committed (`PrivateSent`) before the wait was filed, through
+    /// the production query of the ledger, and the wait ends with its restart
+    /// errno. With no record, or when a host-timed source can post SIGCHLD to
+    /// the process, the same kernel state ends nothing and the wait parks
+    /// (https://github.com/rrnewton/hermit/issues/4132).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_private_sigchld_committed_before_a_futex_wait_parks_ends_it_through_the_ledger() {
+        let owner = stopped_child_with_a_private_sigchld();
+        let child = owner.pid;
+        let state = crate::syscalls::threads::read_thread_wait_signal_state(
+            Pid::from_raw(child),
+            Pid::from_raw(child),
+        )
+        .expect("the child's signal state");
+        let chld = kernel_sigset_bit(libc::SIGCHLD);
+        let interrupting = state.pending_interrupting(state.blocked, false);
+        let mut pending = Vec::new();
+        for (committed, host_timed) in [(true, 0), (false, 0), (true, chld)] {
+            let config = Config {
+                sequentialize_threads: true,
+                backend_supports_blocked_wait_signal_interruption: true,
+                backend_delivers_timer_events: false,
+                ..Config::default()
+            };
+            let global = GlobalState::for_tests(&config);
+            let mut guest = SleeperGuest {
+                state: &global,
+                thread: ThreadState::new(DetPid::from_raw(child), &config, ()),
+                config,
+                pid: Pid::from_raw(child),
+            };
+            if committed {
+                let target = guest.thread_state().dettid;
+                crate::tool_global::child_exit_sigchld(
+                    &mut guest,
+                    ChildExitSigchldControl::PrivateSent { target },
+                )
+                .await;
+            }
+            let held = crate::syscalls::threads::futex_wait_held_after_wake(host_timed, 0);
+            pending.push(
+                crate::syscalls::threads::futex_wait_pending_signals(
+                    &mut guest,
+                    &state,
+                    interrupting,
+                    held,
+                    host_timed,
+                )
+                .await,
+            );
+        }
+        owner.finish();
+        assert_eq!(interrupting & chld, chld, "pending, unblocked and caught");
+        assert_eq!(
+            pending,
+            vec![chld, 0, 0],
+            "recorded, unrecorded, host-timed"
+        );
+    }
+
+    /// A futex wait's own check after a wake decides a held `SIGCHLD` from
+    /// the private queue and the schedule's record together: after a flush
+    /// cleared the record, a `SIGCHLD` only in the shared queue (which a
+    /// host-timed source may have posted) ends nothing, and neither does a
+    /// record whose copy is no longer in the private queue. Both waits park
+    /// again (the design check of https://github.com/rrnewton/hermit/issues/4132).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_futex_waits_check_after_a_wake_needs_the_private_copy_and_its_record() {
+        let chld = kernel_sigset_bit(libc::SIGCHLD);
+        let state = |thread: KernelSigset, shared: KernelSigset| {
+            crate::syscalls::threads::KernelSignalState {
+                pending: thread | shared,
+                thread_pending: thread,
+                shared_pending: shared,
+                caught: chld,
+                ..Default::default()
+            }
+        };
+        let mut answers = Vec::new();
+        for (name, kernel, recorded, flushed) in [
+            ("private, recorded", state(chld, 0), true, false),
+            ("flushed, shared only", state(0, chld), true, true),
+            ("recorded, shared only", state(0, chld), true, false),
+        ] {
+            let config = Config {
+                sequentialize_threads: true,
+                backend_supports_blocked_wait_signal_interruption: true,
+                backend_delivers_timer_events: false,
+                ..Config::default()
+            };
+            let global = GlobalState::for_tests(&config);
+            let mut guest = SleeperGuest {
+                state: &global,
+                thread: ThreadState::new(DetPid::from_raw(4242), &config, ()),
+                config,
+                pid: Pid::from_raw(4242),
+            };
+            let target = guest.thread_state().dettid;
+            if recorded {
+                crate::tool_global::child_exit_sigchld(
+                    &mut guest,
+                    ChildExitSigchldControl::PrivateSent { target },
+                )
+                .await;
+            }
+            if flushed {
+                crate::tool_global::child_exit_sigchld(
+                    &mut guest,
+                    ChildExitSigchldControl::Flushed,
+                )
+                .await;
+            }
+            let held = crate::syscalls::threads::futex_wait_held_after_wake(0, 0);
+            let interrupting = kernel.pending_interrupting(kernel.blocked, false);
+            let pending = crate::syscalls::threads::futex_wait_pending_signals(
+                &mut guest,
+                &kernel,
+                interrupting,
+                held,
+                0,
+            )
+            .await;
+            answers.push((name, pending));
+        }
+        assert_eq!(
+            answers,
+            vec![
+                ("private, recorded", chld),
+                ("flushed, shared only", 0),
+                ("recorded, shared only", 0),
+            ]
+        );
+    }
+
+    /// After the drain woke a futex waiter for a guest's private `SIGCHLD`,
+    /// a sibling flushed it (`SIG_IGN`, then the handler again) and sent
+    /// `kill(getpid(), SIGCHLD)`, a copy in the shared queue. Here a forked
+    /// child, stopped with `SIGCHLD` caught and unblocked, is sent that shared
+    /// copy, so `/proc` shows it in `ShdPnd` only, and the ledger records the
+    /// private send and the flush. The waiter's check, as
+    /// `handle_futex_blocking` runs it with the drain's `SIGCHLD` left out of
+    /// the committed set (`drain_woken_futex_waiters`), ends nothing, and the
+    /// wait parks again: a futex wait holds shared copies. Had the drain's
+    /// `SIGCHLD` been committed, as before the design check of
+    /// https://github.com/rrnewton/hermit/issues/4132, the shared copy, which
+    /// a host-timed child exit could equally have posted, would have ended it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_shared_sigchld_after_a_flush_does_not_end_a_drain_woken_futex_wait() {
+        let mut owner = forked_child(false);
+        let child = owner.pid;
+        if let Err(waited) = owner.wait_stopped() {
+            panic!("the child did not stop: {waited:?}");
+        }
+        // SAFETY: the child is ours and stopped; SIGCHLD stays pending.
+        assert_eq!(
+            unsafe { libc::kill(child, libc::SIGCHLD) },
+            0,
+            "kill failed"
+        );
+        let state = crate::syscalls::threads::read_thread_wait_signal_state(
+            Pid::from_raw(child),
+            Pid::from_raw(child),
+        )
+        .expect("the child's signal state");
+        let chld = kernel_sigset_bit(libc::SIGCHLD);
+        let mut pending = Vec::new();
+        for committed_wake in [0, chld] {
+            let config = Config {
+                sequentialize_threads: true,
+                backend_supports_blocked_wait_signal_interruption: true,
+                backend_delivers_timer_events: false,
+                ..Config::default()
+            };
+            let global = GlobalState::for_tests(&config);
+            let mut guest = SleeperGuest {
+                state: &global,
+                thread: ThreadState::new(DetPid::from_raw(child), &config, ()),
+                config,
+                pid: Pid::from_raw(child),
+            };
+            let target = guest.thread_state().dettid;
+            crate::tool_global::child_exit_sigchld(
+                &mut guest,
+                ChildExitSigchldControl::PrivateSent { target },
+            )
+            .await;
+            crate::tool_global::child_exit_sigchld(&mut guest, ChildExitSigchldControl::Flushed)
+                .await;
+            let held = crate::syscalls::threads::futex_wait_held_after_wake(0, committed_wake);
+            pending.push(
+                crate::syscalls::threads::futex_wait_pending_signals(
+                    &mut guest,
+                    &state,
+                    state.pending_interrupting(state.blocked, false),
+                    held,
+                    0,
+                )
+                .await,
+            );
+        }
+        owner.finish();
+        assert_eq!(
+            (state.thread_pending & chld, state.shared_pending & chld),
+            (0, chld),
+            "SIGCHLD pending in the shared queue only"
+        );
+        assert_eq!(pending, vec![0, chld], "stripped, then committed as before");
+    }
 }
 
 #[cfg(test)]

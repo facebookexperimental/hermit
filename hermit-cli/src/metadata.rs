@@ -434,7 +434,16 @@ impl RecordVersion {
 // files whose host bytes were recorded as read. Replay serves a classified
 // procfs file itself, so an older recording of a read of one would replay
 // with different events.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x14a);
+// 0x14a -> 0x14b: a guest's thread-directed SIGCHLD (tgkill, pthread_kill,
+// pthread_sigqueue) that the sender's turn recorded ends a precise futex wait, before or after the wait
+// parks, when the waiter's mask leaves it unblocked and it is caught
+// (https://github.com/rrnewton/hermit/issues/4132). The same copy has ended an
+// emulated pause or nanosleep since
+// https://github.com/rrnewton/hermit/pull/4177, which changed those results
+// with no bump of its own; this one covers both. Replay recomputes both
+// results, so an older recording of such a send would replay with the wait or
+// the sleep ended early: a successful replay with different output.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x14b);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -459,7 +468,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x14a);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x14a;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x14b;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1333,6 +1342,17 @@ mod tests {
     fn record_version_rejects_streams_from_before_fixed_kernel_procfs_files() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x148)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x149)));
+    }
+
+    /// A recording older than 0x14b was made when a guest's recorded
+    /// thread-directed SIGCHLD did not end a precise futex wait, or, before
+    /// https://github.com/rrnewton/hermit/pull/4177 (at 0x148), an emulated
+    /// pause or nanosleep (https://github.com/rrnewton/hermit/issues/4132).
+    #[test]
+    fn record_version_rejects_streams_from_before_private_sigchld_ends_a_wait() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x14a)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x149)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x148)));
     }
 
     #[test]
