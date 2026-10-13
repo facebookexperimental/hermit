@@ -83,6 +83,9 @@
 static int failures;
 static int kvm_local_procfs;
 static int no_foreign_fd_links;
+/* The checks assume none of the capabilities that bypass the refusals they
+ * expect; with --no-bypass-capabilities the guest checks that first. */
+static int no_bypass_capabilities;
 static int no_maps_or_chroot;
 static int chroot_only;
 static int require_chroot;
@@ -108,6 +111,32 @@ static const char* program;
           "%s: %s gave %ld (%s), not %s", (what), #call, refused_result,  \
           strerror(refused_errno), strerror(expected));                   \
   } while (0)
+
+/* Whether this process lacks every capability that would bypass a refusal
+ * the checks expect: CAP_DAC_OVERRIDE (1), CAP_DAC_READ_SEARCH (2),
+ * CAP_FOWNER (3), CAP_SYS_RAWIO (17), CAP_SYS_ADMIN (21) and CAP_LEASE (28),
+ * as /proc/self/status shows them. */
+static int lacks_bypass_capabilities(void) {
+  FILE* status = fopen("/proc/self/status", "r");
+  char line[256];
+  unsigned long long effective = ~0ULL;
+  while (status && fgets(line, sizeof(line), status)) {
+    if (sscanf(line, "CapEff: %llx", &effective) == 1) {
+      break;
+    }
+  }
+  if (status) {
+    fclose(status);
+  }
+  const unsigned long long bypass =
+      1ULL << 1 | 1ULL << 2 | 1ULL << 3 | 1ULL << 17 | 1ULL << 21 | 1ULL << 28;
+  if (effective & bypass) {
+    fprintf(stderr, "FAIL: capabilities %#llx that bypass the checked refusals are effective\n",
+            effective & bypass);
+    return 0;
+  }
+  return 1;
+}
 
 static int is_uuid_text(const char* text, size_t length) {
   for (size_t i = 0; i < length; i++) {
@@ -685,6 +714,8 @@ int main(int argc, char** argv) {
       chroot_only = 1;
     } else if (strcmp(argv[i], "--require-chroot") == 0) {
       require_chroot = 1;
+    } else if (strcmp(argv[i], "--no-bypass-capabilities") == 0) {
+      no_bypass_capabilities = 1;
     } else {
       program = NULL;
     }
@@ -693,8 +724,11 @@ int main(int argc, char** argv) {
     fprintf(stderr,
             "usage: /path/to/rendered_procfs_files [--no-foreign-fd-links] "
             "[--kvm-local-procfs] [--no-maps-or-chroot] [--chroot-only] "
-            "[--require-chroot]\n");
+            "[--require-chroot] [--no-bypass-capabilities]\n");
     return 2;
+  }
+  if (no_bypass_capabilities && !lacks_bypass_capabilities()) {
+    return 1;
   }
   if (chroot_only) {
     /* Not the thread chroot, which hangs under DBT

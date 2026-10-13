@@ -3586,9 +3586,28 @@ fn run_dbt_binds_in_a_user_namespace_of_its_own() {
 #[test]
 fn detcore_renders_its_procfs_files_on_every_backend() {
     let guest = rendered_procfs_files_guest();
-    let native = Command::new(guest)
-        .output()
-        .expect("run rendered-procfs-files natively");
+    // Linux's answers the guest checks are those for a process without the
+    // capabilities that bypass them: CAP_SYS_ADMIN (security and trusted
+    // attributes, FIFREEZE), CAP_SYS_RAWIO (FIBMAP), CAP_FOWNER (the owner's
+    // calls), CAP_DAC_OVERRIDE and CAP_DAC_READ_SEARCH, and CAP_LEASE. A root
+    // caller (the validate's pinned root) keeps them across exec unless they
+    // leave its bounding set, so the native control drops them there; the
+    // guest checks that none is effective (`--no-bypass-capabilities`). An
+    // unprivileged caller cannot drop them and never had them.
+    let mut native = Command::new(guest);
+    native.arg("--no-bypass-capabilities");
+    // SAFETY: prctl is async-signal-safe and touches only this child.
+    unsafe {
+        native.pre_exec(|| {
+            for capability in [21, 17, 3, 1, 2, 28] {
+                if libc::prctl(libc::PR_CAPBSET_READ, capability, 0, 0, 0) == 1 {
+                    libc::prctl(libc::PR_CAPBSET_DROP, capability, 0, 0, 0);
+                }
+            }
+            Ok(())
+        });
+    }
+    let native = native.output().expect("run rendered-procfs-files natively");
     assert!(native.status.success(), "native: {native:?}");
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let mut identities = Vec::new();
