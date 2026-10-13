@@ -6083,6 +6083,13 @@
           "category": "c-programs",
           "test": "c-programs/personality-domain",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/personality-domain",
+          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -48984,6 +48991,13 @@
           "test": "c-programs/personality-domain",
           "mode": "verify",
           "backend": "in-guest-trap"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/personality-domain",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",

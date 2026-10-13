@@ -12894,16 +12894,17 @@ test:
           dbt: true
           liteinst: true
           in-guest-trap: true
+          kvm: true
         backends_enabled:
           - ptrace
           - sabre
           - dbt
+          - kvm
           - liteinst
           - in-guest-trap
         assert:
           bitwise_parity: true
-        backends_disabled:
-          kvm: Current KVM fixture and /bin/true controls time out before guest start on the validation host, so no personality-specific verdict is available
+        backends_disabled: {}
         hermit_args:
           liteinst:
             - --max-timeslice=disabled

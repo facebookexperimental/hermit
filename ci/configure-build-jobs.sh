@@ -1530,14 +1530,14 @@ fi
 # original n=3 hosted calibration or satisfy the >=5-sample replacement rule;
 # fresh validation is required.
 # STDIN STREAMING SDK-BUDGET CARRY (2026-10-12):
-# Advance from ab8cd517 to dfe92fe1faa03c81c7d57a29dbf8fdfe4deb7293.
+# Advance from ab8cd517 to a7402b9d25fcf785bf0b5bbeffb3e5b3c35bde43.
 # All seven recorded SDK recipe inputs retain their Git objects. The net
 # source delta is a DEV qualifier script and the host launcher helper/test.
 # Preserve CMAKE, CMAKE_GENERATOR, normalized SOURCE_DATE_EPOCH, inventory 947,
 # the 16-job clamp and existing 1050/572-job-second budgets. This carries only
 # the SDK budget; no new cold timing sample or runtime acceptance is claimed.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != dfe92fe1faa03c81c7d57a29dbf8fdfe4deb7293 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie dfe92fe1faa03c81c7d57a29dbf8fdfe4deb7293 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != a7402b9d25fcf785bf0b5bbeffb3e5b3c35bde43 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie a7402b9d25fcf785bf0b5bbeffb3e5b3c35bde43 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

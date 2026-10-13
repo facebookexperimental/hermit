@@ -9,12 +9,12 @@
   "counts": {
     "all": {
       "cells": 4085,
-      "applicable": 1701,
-      "selectable": 1399,
+      "applicable": 1702,
+      "selectable": 1400,
       "population": 2775,
-      "population_candidate_selected": 1399,
+      "population_candidate_selected": 1400,
       "population_candidate_not_selected": 258,
-      "population_candidate_disabled": 1118
+      "population_candidate_disabled": 1117
     },
     "by_backend": {
       "dbt": {
@@ -37,12 +37,12 @@
       },
       "kvm": {
         "cells": 817,
-        "applicable": 334,
-        "selectable": 330,
+        "applicable": 335,
+        "selectable": 331,
         "population": 555,
-        "population_candidate_selected": 330,
+        "population_candidate_selected": 331,
         "population_candidate_not_selected": 3,
-        "population_candidate_disabled": 222
+        "population_candidate_disabled": 221
       },
       "liteinst": {
         "cells": 817,
@@ -792,7 +792,7 @@
     {"test_id":"c-programs/periodic-setitimer-delivery","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/personality-domain","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/personality-domain","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"c-programs/personality-domain","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: Current KVM fixture and /bin/true controls time out before guest start on the validation host, so no personality-specific verdict is available"},
+    {"test_id":"c-programs/personality-domain","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/personality-domain","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/personality-domain","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/pid-probe","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
