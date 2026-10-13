@@ -1285,12 +1285,13 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          kvm: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - kvm
         backends_disabled:
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
@@ -9545,9 +9546,9 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
       naked:

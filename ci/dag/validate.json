@@ -2009,6 +2009,13 @@
           "category": "c-programs",
           "test": "c-programs/dbt-self-sigqueue",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/dbt-self-sigqueue",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -8968,6 +8975,13 @@
           "test": "c-programs/signalfd-create",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigpipe-siginfo",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -47866,6 +47880,13 @@
           "category": "c-programs",
           "test": "c-programs/dbt-self-sigqueue",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/dbt-self-sigqueue",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -54825,6 +54846,13 @@
           "test": "c-programs/signalfd-create",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigpipe-siginfo",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",

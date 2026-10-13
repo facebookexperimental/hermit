@@ -9,12 +9,12 @@
   "counts": {
     "all": {
       "cells": 4085,
-      "applicable": 1919,
-      "selectable": 1590,
+      "applicable": 1921,
+      "selectable": 1592,
       "population": 2775,
-      "population_candidate_selected": 1590,
+      "population_candidate_selected": 1592,
       "population_candidate_not_selected": 258,
-      "population_candidate_disabled": 927
+      "population_candidate_disabled": 925
     },
     "by_backend": {
       "dbt": {
@@ -37,12 +37,12 @@
       },
       "kvm": {
         "cells": 817,
-        "applicable": 550,
-        "selectable": 519,
+        "applicable": 552,
+        "selectable": 521,
         "population": 555,
-        "population_candidate_selected": 519,
+        "population_candidate_selected": 521,
         "population_candidate_not_selected": 3,
-        "population_candidate_disabled": 33
+        "population_candidate_disabled": 31
       },
       "liteinst": {
         "cells": 817,
@@ -237,7 +237,7 @@
     {"test_id":"c-programs/dbt-prlimit-self","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/dbt-self-sigqueue","backend":"dbt","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: dbt verify is not selected by full validation: Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit"},
     {"test_id":"c-programs/dbt-self-sigqueue","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
-    {"test_id":"c-programs/dbt-self-sigqueue","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"},
+    {"test_id":"c-programs/dbt-self-sigqueue","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/dbt-self-sigqueue","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)"},
     {"test_id":"c-programs/dbt-self-sigqueue","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/dbt-unsupported-syscall","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: This fixture intentionally invokes restart_syscall, which strict ptrace execution rejects as Unsupported and fails closed; the cell needs an expected-refusal contract or syscall support before it can be required validation."},
@@ -1207,7 +1207,7 @@
     {"test_id":"c-programs/signalfd-create","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/sigpipe-siginfo","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"},
     {"test_id":"c-programs/sigpipe-siginfo","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
-    {"test_id":"c-programs/sigpipe-siginfo","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"},
+    {"test_id":"c-programs/sigpipe-siginfo","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/sigpipe-siginfo","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"},
     {"test_id":"c-programs/sigpipe-siginfo","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/sigprocmask-state","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
