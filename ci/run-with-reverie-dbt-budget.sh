@@ -1452,7 +1452,14 @@ fi
 # threshold and the 16-job clamp. These local samples do not replace the
 # original n=3 hosted calibration or satisfy the >=5-sample replacement rule;
 # fresh validation is required.
-expected_pin=ab8cd5171e502e0332a9b3b0a536c12438670995
+# STDIN STREAMING SDK-BUDGET CARRY (2026-10-12):
+# Advance from ab8cd517 to dfe92fe1faa03c81c7d57a29dbf8fdfe4deb7293.
+# All seven recorded SDK recipe inputs retain their Git objects. The net
+# source delta is a DEV qualifier script and the host launcher helper/test.
+# Preserve CMAKE, CMAKE_GENERATOR, normalized SOURCE_DATE_EPOCH, inventory 947,
+# the 16-job clamp and existing 1050/572-job-second budgets. This carries only
+# the SDK budget; no new cold timing sample or runtime acceptance is claimed.
+expected_pin=dfe92fe1faa03c81c7d57a29dbf8fdfe4deb7293
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
