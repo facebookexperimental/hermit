@@ -1430,7 +1430,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And
     // metadata::tests::record_version_rejects_streams_whose_timer_signals_survived_exec
     // (https://github.com/rrnewton/hermit/issues/4184): 1065.
-    ("test.hermit_unit", 1065),
+    // And metadata::tests::record_version_rejects_streams_from_before_the_vfork_gate_fallback
+    // (https://github.com/rrnewton/hermit/issues/4194): 1066.
+    ("test.hermit_unit", 1066),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2005,7 +2007,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4184): 1493.
     // And a_signalfd_in_any_process_makes_every_copy_of_its_signal_unproven: 1494.
     // And the no-charge signal delivery test (https://github.com/rrnewton/hermit/issues/4139): 1495.
-    ("test.detcore_unit", 1495),
+    // And a_vfork_barrier_selects_its_child_only_while_it_will_run_a_turn
+    // (https://github.com/rrnewton/hermit/issues/4194): 1496.
+    ("test.detcore_unit", 1496),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2374,7 +2378,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/31): 198.
     // And record_fcntl_queries_replay_the_struct_they_write
     // (https://github.com/rrnewton/hermit/issues/2289): 199.
-    ("test.record_replay", 199),
+    // And record_vfork_child_waiting_for_another_thread
+    // (https://github.com/rrnewton/hermit/issues/4194): 200.
+    ("test.record_replay", 200),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -2773,7 +2779,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And exec_discards_a_posix_timers_pending_signal_at_bitwise_parity and
     // an_exec_with_an_unprovable_timer_copy_pending_is_refused_by_name
     // (https://github.com/rrnewton/hermit/issues/4184): 335.
-    ("test.cli", 335),
+    // And a_vfork_child_waiting_for_another_thread_completes_at_bitwise_parity
+    // (https://github.com/rrnewton/hermit/issues/4194): 336.
+    ("test.cli", 336),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3048,7 +3056,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // So do the two DBT common-container tests of main 60633eab, which main's
     // pin did not count: 269.
     // So do the two exec timer-flush tests: 271.
-    ("test.cli_on_host", 271),
+    // Nor does the vfork-child-waits test: 272.
+    ("test.cli_on_host", 272),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -3221,7 +3230,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the seven exec timer-flush scheduler tests: 1493.
     // And a_signalfd_in_any_process_makes_every_copy_of_its_signal_unproven: 1494.
     // And the no-charge signal delivery test: 1495.
-    ("test.detcore_unit_on_host", 1495),
+    // And the vfork-barrier selection test: 1496.
+    ("test.detcore_unit_on_host", 1496),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -3385,7 +3395,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the fcntl-output record-version test: 1063.
     // And the DBT UTS assumption test split in two: 1064.
     // And the exec timer-flush record-epoch test: 1065.
-    ("test.hermit_unit_on_host", 1065),
+    // And the vfork-gate fallback record-epoch test: 1066.
+    ("test.hermit_unit_on_host", 1066),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

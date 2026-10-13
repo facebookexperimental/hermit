@@ -526,6 +526,16 @@ impl RunQueue {
         self.tids().any(|t| t == &tid)
     }
 
+    /// Whether `tid` is queued as a thread that will run its turn, not as a
+    /// polling thread retrying a call that is not ready
+    /// ([`RunQueue::push_poller`], which records a polling upgrade, or a
+    /// poller for the deterministic-work-first gates). Read-only.
+    pub fn contains_non_polling_tid(&self, tid: DetTid) -> bool {
+        self.queue.iter().any(|(k, v)| {
+            v.tid == tid && v.poll_upgrade.is_none() && !v.counts_as_poller(k.priority)
+        })
+    }
+
     pub(super) fn suspend(
         &mut self,
         tid: DetTid,

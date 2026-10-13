@@ -2498,6 +2498,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/vfork_child_waits.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/vfork_child_waits.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_vfork_child_waiting_for_another_thread_completes_at_bitwise_parity compiles this guest, a vfork child that waits for a thread other than its own vfork child (a forked grandchild it waits for, or a pipe a forked sibling writes), and requires both modes to finish with their exact output at bitwise parity under hermit run --strict --verify --verify-strict; hermit-cli/tests/record_replay.rs record_vfork_child_waiting_for_another_thread also records and replays both modes at bitwise parity (https://github.com/rrnewton/hermit/issues/4194: Detcore selected only the vfork child while a barrier stood, so such a child waited forever); it remains a guest fixture because a generic manifest cannot assert this exact output."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/vfork_kill_exec.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/vfork_kill_exec.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_vfork_child_that_kills_its_parent_and_execs_lets_its_own_child_run compiles this guest, in which a vfork child sends SIGKILL to its parent and execs into a program that forks and waits, and requires exit 0 with 'A killed by signal 9' then 'forkwait ok' (https://github.com/rrnewton/hermit/issues/3984); it remains a guest fixture because a generic manifest cannot bound the run with a deadline and assert this exact output for a scheduler-liveness regression."

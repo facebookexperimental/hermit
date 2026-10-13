@@ -407,7 +407,14 @@ impl RecordVersion {
 // where they survived the exec and reached the new image. Replay recomputes
 // this, so an older recording replayed here could see a delivery its recorder
 // saw and this replayer drops.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x146);
+// 0x146 -> 0x147: while a vfork barrier stands, the scheduler selects other
+// runnable threads when no barrier child is queued to run a turn and none is in
+// the background (each is blocked on another thread or polling a call that is
+// not ready) (https://github.com/rrnewton/hermit/issues/4194). A polling child
+// used to run alone; replay recomputes the schedule, so an older recording of a
+// vfork child that polled for a host event, with other threads runnable, could
+// replay differently. A backgrounded child is still waited for, as before.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x147);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -432,7 +439,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x146);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x146;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x147;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1272,6 +1279,15 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_whose_timer_signals_survived_exec() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x145)));
+    }
+
+    /// A recording older than 0x147 was made by a scheduler that ran a polling
+    /// vfork child alone while other threads were runnable
+    /// (https://github.com/rrnewton/hermit/issues/4194).
+    #[test]
+    fn record_version_rejects_streams_from_before_the_vfork_gate_fallback() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x13f)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x146)));
     }
 
     #[test]

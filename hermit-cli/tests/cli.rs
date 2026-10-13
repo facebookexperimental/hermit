@@ -151,6 +151,7 @@ static VDSO_SYMBOL_VERSIONS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_SIGEV_THREAD_ID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_EXEC_FLUSH_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static NESTED_VFORK_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static VFORK_CHILD_WAITS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PID_NAMESPACE_NESTED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KERNEL_MAX_AFFINITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPU_DIRECTORY_READS_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -22985,6 +22986,61 @@ fn cpu_directory_reads_list_only_cpu0_on_every_path() {
         serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
             .expect("the verdict must be JSON");
     assert_eq!(report["bitwise_parity"], true, "{report}");
+}
+
+/// A vfork child that waits for a thread other than its own vfork child
+/// completes at bitwise parity (https://github.com/rrnewton/hermit/issues/4194):
+/// one that forks a grandchild and waits for it, and one that reads a pipe a
+/// forked sibling writes after a short sleep. While a vfork barrier stood,
+/// Detcore selected only the barrier's child, so a child blocked on, or polling
+/// for, another thread waited forever.
+#[test]
+fn a_vfork_child_waiting_for_another_thread_completes_at_bitwise_parity() {
+    let guest = futex_c_guest(&VFORK_CHILD_WAITS_GUEST, "vfork_child_waits")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    for (mode, expected) in [
+        ("fork-wait", "fork-wait done, child status 0\n"),
+        (
+            "sibling-pipe",
+            "sibling-pipe done, child status 0, writer status 0\n",
+        ),
+    ] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let verdict = directory.path().join("verify.json");
+        let (status, log) = run_with_deadline(
+            hermit_command(&[
+                "--log=info",
+                "run",
+                "--strict",
+                "--verify",
+                "--verify-strict",
+                "--verify-json",
+                verdict.to_str().unwrap(),
+                "--timeout",
+                "60",
+                "--",
+                guest.as_str(),
+                mode,
+            ]),
+            directory.path(),
+            Duration::from_secs(180),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{mode}\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert_eq!(stdout, expected, "{mode}\nstderr:\n{log}");
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
+                .expect("the verdict must be JSON");
+        assert_eq!(report["bitwise_parity"], true, "{mode}: {report}");
+    }
 }
 
 /// pidfd_send_signal's flags and descriptors answer as Linux answers them

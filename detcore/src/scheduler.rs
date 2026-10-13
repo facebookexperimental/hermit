@@ -9170,18 +9170,29 @@ impl Scheduler {
         if self.run_queue.is_empty() {
             None
         } else {
-            let next_dtid = if self.vfork_barriers.is_empty() {
-                self.run_queue.tentative_pop_next().expect("impossible")
-            } else {
-                let child = self
-                    .vfork_barriers
-                    .values()
-                    .flatten()
-                    .find(|child| self.run_queue.contains_tid(**child))
-                    .copied()?;
-                self.run_queue
+            // While a vfork barrier is in place its child runs first, so the
+            // vfork interval is a run of the child's turns. When no barrier
+            // child is queued to run a turn (each is blocked on another
+            // thread, in the background, or polling a call that is not ready),
+            // the queued threads run as usual: Linux suspends only the vfork
+            // parent, and a child that waits for a thread of its own or reads a
+            // pipe a sibling writes must let that thread run
+            // (https://github.com/rrnewton/hermit/issues/4194). The parent
+            // stays out of the run queue until step 2a has seen its release,
+            // and a child cannot exec or exit before another thread's turn
+            // makes its call ready, so no host-timed event ends the interval.
+            let gated_child = self
+                .vfork_barriers
+                .values()
+                .flatten()
+                .find(|child| self.run_queue.contains_non_polling_tid(**child))
+                .copied();
+            let next_dtid = match gated_child {
+                Some(child) => self
+                    .run_queue
                     .tentative_pop_tid(child)
-                    .expect("vfork child disappeared from run queue")
+                    .expect("vfork child disappeared from run queue"),
+                None => self.run_queue.tentative_pop_next().expect("impossible"),
             };
             let nextturn = self.next_turns.get(&next_dtid).unwrap_or_else(|| {
                 panic!(
@@ -13654,10 +13665,66 @@ mod test {
         assert_eq!(scheduler.vfork_barriers.get(&parent), Some(&Some(child)));
     }
 
+    /// While a vfork barrier stands, a queued child that will run its turn is
+    /// selected before other runnable threads; a child that is only polling a
+    /// call that is not ready, or not queued at all, lets them run, as when it
+    /// waits for a sibling's write (https://github.com/rrnewton/hermit/issues/4194).
+    #[test]
+    fn a_vfork_barrier_selects_its_child_only_while_it_will_run_a_turn() {
+        let parent = DetTid::from_raw(3);
+        let child = DetTid::from_raw(5);
+        let other = DetTid::from_raw(7);
+        let fresh = || {
+            let mut scheduler = Scheduler::new(&Config::default());
+            for tid in [parent, child, other] {
+                scheduler.priorities.insert(tid, DEFAULT_PRIORITY);
+                scheduler.next_turns.insert(
+                    tid,
+                    ThreadNextTurn {
+                        dettid: tid,
+                        child_tid_addr: 0,
+                        req: Ivar::full(Ok(Resources::new(tid))),
+                        resp: Ivar::new(),
+                        protocol: Default::default(),
+                    },
+                );
+            }
+            scheduler.vfork_barriers.insert(parent, Some(child));
+            scheduler
+        };
+        let selected = |scheduler: &mut Scheduler| {
+            let (tid, _, _) = scheduler.step3_peek().expect("a thread is runnable");
+            scheduler.run_queue.undo_tentative_pop();
+            tid
+        };
+
+        // The child is queued behind the other thread and still runs first.
+        let mut queued = fresh();
+        queued.run_queue.push_back(other, DEFAULT_PRIORITY);
+        queued.run_queue.push_back(child, DEFAULT_PRIORITY);
+        assert_eq!(selected(&mut queued), child);
+
+        // A polling child lets the other thread run, ahead of it in priority.
+        let mut polling = fresh();
+        polling
+            .run_queue
+            .push_poller(child, DEFAULT_PRIORITY, u32::MAX);
+        polling.run_queue.push_back(other, DEFAULT_PRIORITY);
+        assert_eq!(selected(&mut polling), other);
+
+        // A child that is not queued lets the other thread run.
+        let mut blocked = fresh();
+        blocked.run_queue.push_back(other, DEFAULT_PRIORITY);
+        assert_eq!(selected(&mut blocked), other);
+        assert_eq!(blocked.vfork_barriers.get(&parent), Some(&Some(child)));
+    }
+
     /// A vfork parent killed while its registered child's barrier is up takes
-    /// the barrier with it. Otherwise, once the child is gone, `step3_peek`
-    /// selects nothing while another thread is runnable
-    /// (https://github.com/rrnewton/hermit/issues/3984).
+    /// the barrier with it (https://github.com/rrnewton/hermit/issues/3984).
+    /// While the barrier stands and its child is not queued, another runnable
+    /// thread is selected, as when the child waits for it
+    /// (https://github.com/rrnewton/hermit/issues/4194); before that change,
+    /// `step3_peek` selected nobody here.
     #[test]
     fn a_killed_vfork_parent_takes_its_barrier_with_it() {
         let mut scheduler = Scheduler::new(&Config::default());
@@ -13679,10 +13746,12 @@ mod test {
         }
         scheduler.vfork_barriers.insert(parent, Some(child));
         scheduler.run_queue.push_back(other, DEFAULT_PRIORITY);
-        assert!(
-            scheduler.step3_peek().is_none(),
-            "with the child gone, the barrier selects nobody"
-        );
+        let (selected, _, _) = scheduler
+            .step3_peek()
+            .expect("with the child not queued, the other thread runs");
+        assert_eq!(selected, other);
+        scheduler.run_queue.undo_tentative_pop();
+        assert_eq!(scheduler.vfork_barriers.get(&parent), Some(&Some(child)));
 
         scheduler.thread_tree.add_child(parent, parent, true);
         scheduler.logically_kill_thread(&parent, &parent, MmId::initial(parent));

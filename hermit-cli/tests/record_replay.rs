@@ -2676,6 +2676,46 @@ fn record_nested_vfork_chains() {
     }
 }
 
+/// A vfork child that waits for a thread other than its own vfork child
+/// records and replays at bitwise parity
+/// (https://github.com/rrnewton/hermit/issues/4194).
+#[test]
+fn record_vfork_child_waiting_for_another_thread() {
+    let _guard = hermit_record_lock();
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest build directory");
+    let guest = build.path().join("vfork_child_waits");
+    let output = Command::new("cc")
+        .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+        .arg(repository.join("tests/c/vfork_child_waits.c"))
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile the vfork_child_waits guest");
+    assert!(
+        output.status.success(),
+        "guest compilation failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for (mode, line) in [
+        ("fork-wait", "fork-wait done, child status 0\n"),
+        (
+            "sibling-pipe",
+            "sibling-pipe done, child status 0, writer status 0\n",
+        ),
+    ] {
+        let output = canonical_record_replay_command(
+            &format!("vfork child {mode}"),
+            &guest,
+            &[OsStr::new(mode)],
+        );
+        assert!(output.contains(line), "missing {line:?} in:\n{output}");
+    }
+}
+
 #[test]
 fn record_poll_partial_revents_copyout() {
     let _guard = hermit_record_lock();
