@@ -129,7 +129,7 @@ pub fn load(root: &Path, mode: &str, paths: &CorpusPaths) -> Result<Vec<CorpusRo
 /// The strict-compat-only run type no longer reads this file: since
 /// 2026-10-02 its rows are the compat.yaml `variants` cells compat/strict-<row>.
 /// The super suite's portable strict rows still do.
-pub const STRICT_COMPAT_TOTAL: usize = 193;
+pub const STRICT_COMPAT_TOTAL: usize = 218;
 
 /// `E9PATCH_COMPAT_TOTAL` (validate.sh:1125).
 pub const E9PATCH_COMPAT_TOTAL: usize = 155;

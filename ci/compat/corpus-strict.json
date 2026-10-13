@@ -1677,6 +1677,208 @@
     "/usr/bin/free",
     "-m"
    ]
+  },
+  {
+   "label": "truncate",
+   "argv": [
+    "bash",
+    "-c",
+    "set -euo pipefail; f=$(mktemp); printf \"Hermit\\n\" >\"$f\"; /usr/bin/truncate -s 4096 \"$f\"; test \"$(stat -c %s \"$f\")\" = 4096; /usr/bin/truncate -s 7 \"$f\"; test \"$(stat -c %s \"$f\")\" = 7; test \"$(cat \"$f\")\" = Hermit; rm -f \"$f\"; printf \"truncate:4096-to-7-ok\\n\""
+   ]
+  },
+  {
+   "label": "fallocate",
+   "argv": [
+    "bash",
+    "-c",
+    "set -euo pipefail; d=$(mktemp -d); trap 'rm -rf \"$d\"' EXIT; f=\"$d/file\"; /usr/bin/fallocate -l 4096 \"$f\"; size=$(stat -c %s \"$f\"); test \"$size\" = 4096; printf \"fallocate:size=%s\\n\" \"$size\""
+   ]
+  },
+  {
+   "label": "setfattr",
+   "argv": [
+    "bash",
+    "-c",
+    "set -euo pipefail; f=$(mktemp); trap 'rm -f \"$f\"' EXIT; printf payload >\"$f\"; /usr/bin/setfattr -n user.hermit.compat -v 42 \"$f\"; value=$(/usr/bin/getfattr --absolute-names --only-values -n user.hermit.compat \"$f\"); test \"$value\" = 42; /usr/bin/setfattr -x user.hermit.compat \"$f\"; ! /usr/bin/getfattr --absolute-names --only-values -n user.hermit.compat \"$f\" >/dev/null 2>&1; printf \"setfattr:value=%s:removed\\n\" \"$value\""
+   ]
+  },
+  {
+   "label": "setfacl",
+   "argv": [
+    "bash",
+    "-c",
+    "set -euo pipefail; f=$(mktemp); trap 'rm -f \"$f\"' EXIT; chmod 600 \"$f\"; /usr/bin/setfacl -m u::rw,g::r,o::- \"$f\"; mode=$(stat -c %a \"$f\"); test \"$mode\" = 640; /usr/bin/getfacl --absolute-names -cp \"$f\" | /usr/bin/grep -Fxq \"group::r--\"; printf \"setfacl:mode=%s\\n\" \"$mode\""
+   ]
+  },
+  {
+   "label": "mountpoint",
+   "argv": [
+    "bash",
+    "-c",
+    "set -euo pipefail; /usr/bin/mountpoint -q /; ! /usr/bin/mountpoint -q \"$1\"; printf \"mountpoint:root=yes:file=no\\n\"",
+    "bash",
+    "{{REAL_COMPAT_FIXTURES}}/README.md"
+   ]
+  },
+  {
+   "label": "diff3",
+   "argv": [
+    "bash",
+    "-c",
+    "set -euo pipefail; d=$(mktemp -d); trap 'rm -rf \"$d\"' EXIT; printf \"alpha\\nbeta\\n\" >\"$d/base\"; printf \"alpha\\nbeta\\nours\\n\" >\"$d/ours\"; printf \"theirs\\nalpha\\nbeta\\n\" >\"$d/theirs\"; /usr/bin/diff3 -m \"$d/ours\" \"$d/base\" \"$d/theirs\" | /usr/bin/diff -u <(printf \"theirs\\nalpha\\nbeta\\nours\\n\") -; printf \"diff3:clean-merge-ok\\n\""
+   ]
+  },
+  {
+   "label": "basenc",
+   "argv": [
+    "bash",
+    "-c",
+    "set -euo pipefail; encoded=$(printf \"Hermit\\n\" | /usr/bin/basenc --base64url); test \"$encoded\" = SGVybWl0Cg==; decoded=$(printf \"%s\\n\" \"$encoded\" | /usr/bin/basenc --base64url -d); test \"$decoded\" = Hermit; printf \"basenc:%s:roundtrip-ok\\n\" \"$encoded\""
+   ]
+  },
+  {
+   "label": "dos2unix",
+   "argv": [
+    "bash",
+    "-c",
+    "set -euo pipefail; f=$(mktemp); trap 'rm -f \"$f\"' EXIT; printf \"alpha\\r\\nbeta\\r\\n\" >\"$f\"; /usr/bin/dos2unix -q \"$f\"; /usr/bin/diff -u <(printf \"alpha\\nbeta\\n\") \"$f\"; printf \"dos2unix:crlf-to-lf-ok\\n\""
+   ]
+  },
+  {
+   "label": "envsubst",
+   "argv": [
+    "bash",
+    "-c",
+    "set -euo pipefail; output=$(HERMIT_NAME=Hermit HERMIT_VALUE=42 /usr/bin/envsubst \"\\$HERMIT_NAME=\\$HERMIT_VALUE\" <<<\"\\$HERMIT_NAME=\\$HERMIT_VALUE\"); test \"$output\" = Hermit=42; printf \"envsubst:%s\\n\" \"$output\""
+   ]
+  },
+  {
+   "label": "col",
+   "argv": [
+    "bash",
+    "-c",
+    "set -euo pipefail; output=$(printf \"A\\bB\\n\" | /usr/bin/col -b); test \"$output\" = B; printf \"col:overstrike=%s\\n\" \"$output\""
+   ]
+  },
+  {
+   "label": "colrm",
+   "argv": [
+    "bash",
+    "-c",
+    "set -euo pipefail; output=$(printf \"abcdef\\n\" | /usr/bin/colrm 3 5); test \"$output\" = abf; printf \"colrm:%s\\n\" \"$output\""
+   ]
+  },
+  {
+   "label": "crc32",
+   "argv": [
+    "bash",
+    "-c",
+    "set -euo pipefail; f=$(mktemp); trap 'rm -f \"$f\"' EXIT; printf \"Hermit\\n\" >\"$f\"; sum=$(/usr/bin/crc32 \"$f\"); test \"$sum\" = 146f43bb; printf \"crc32:%s\\n\" \"$sum\""
+   ]
+  },
+  {
+   "label": "uuidgen",
+   "argv": [
+    "bash",
+    "-c",
+    "set -euo pipefail; value=$(/usr/bin/uuidgen --random); [[ $value =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]; printf \"uuidgen:%s\\n\" \"$value\""
+   ]
+  },
+  {
+   "label": "shred",
+   "argv": [
+    "bash",
+    "-c",
+    "set -euo pipefail; f=$(mktemp); trap 'rm -f \"$f\"' EXIT; printf seed >\"$f\"; /usr/bin/shred -n 1 -z -s 4096 \"$f\"; test \"$(stat -c %s \"$f\")\" = 4096; /usr/bin/cmp -n 4096 \"$f\" /dev/zero; printf \"shred:4096-zeroed\\n\""
+   ]
+  },
+  {
+   "label": "sync",
+   "argv": [
+    "bash",
+    "-c",
+    "set -euo pipefail; f=$(mktemp); trap 'rm -f \"$f\"' EXIT; printf \"sync-payload\\n\" >\"$f\"; /usr/bin/sync -f \"$f\"; test \"$(cat \"$f\")\" = sync-payload; printf \"sync:file-ok\\n\""
+   ]
+  },
+  {
+   "label": "pathchk",
+   "argv": [
+    "bash",
+    "-c",
+    "set -euo pipefail; /usr/bin/pathchk -p alpha/beta_42; component=$(printf \"%015d\" 0 | /usr/bin/tr 0 x); ! /usr/bin/pathchk -p \"$component\" >/dev/null 2>&1; printf \"pathchk:portable-limit-ok\\n\""
+   ]
+  },
+  {
+   "label": "namei",
+   "argv": [
+    "bash",
+    "-c",
+    "set -euo pipefail; d=$(mktemp -d); trap 'rm -rf \"$d\"' EXIT; mkdir \"$d/real\"; touch \"$d/real/file\"; ln -s real \"$d/link\"; /usr/bin/namei -m \"$d/link/file\" >\"$d/output\"; /usr/bin/grep -Fxq \" lrwxrwxrwx link -> real\" \"$d/output\"; /usr/bin/grep -Fxq \" -rw-r--r-- file\" \"$d/output\"; printf \"namei:symlink-path-ok\\n\""
+   ]
+  },
+  {
+   "label": "getconf",
+   "argv": [
+    "bash",
+    "-c",
+    "set -euo pipefail; page=$(/usr/bin/getconf PAGESIZE); bits=$(/usr/bin/getconf LONG_BIT); test \"$page:$bits\" = 4096:64; printf \"getconf:page=%s:long=%s\\n\" \"$page\" \"$bits\""
+   ]
+  },
+  {
+   "label": "cscope",
+   "argv": [
+    "bash",
+    "-c",
+    "set -euo pipefail; d=$(mktemp -d); trap 'rm -rf \"$d\"' EXIT; printf \"int compat_add(int a, int b) { return a + b; }\\nint main(void) { return compat_add(20, 22) != 42; }\\n\" >\"$d/fixture.c\"; printf \"fixture.c\\n\" >\"$d/cscope.files\"; (cd \"$d\" && /usr/bin/cscope -bq -i cscope.files); output=$(cd \"$d\" && /usr/bin/cscope -dL -1 compat_add); [[ $output == *\"fixture.c compat_add 1\"* ]]; printf \"cscope:compat_add-found\\n\""
+   ]
+  },
+  {
+   "label": "flex",
+   "argv": [
+    "bash",
+    "-c",
+    "set -euo pipefail; d=$(mktemp -d); trap 'rm -rf \"$d\"' EXIT; printf \"%s\\n\" \"%option prefix=\\\"compat\\\" noyywrap\" \"%%\" \"[0-9]+ return 1;\" \".      ;\" \"%%\" >\"$d/scanner.l\"; /usr/bin/flex -o \"$d/scanner.c\" \"$d/scanner.l\"; grep -q compatlex \"$d/scanner.c\"; printf \"flex:compat-scanner-generated\\n\""
+   ]
+  },
+  {
+   "label": "msgfmt",
+   "argv": [
+    "bash",
+    "-c",
+    "set -euo pipefail; d=$(mktemp -d); trap 'rm -rf \"$d\"' EXIT; printf \"%s\\n\" \"msgid \\\"\\\"\" \"msgstr \\\"Content-Type: text/plain; charset=UTF-8\\\\n\\\"\" \"\" \"msgid \\\"hello\\\"\" \"msgstr \\\"Hermit\\\"\" >\"$d/messages.po\"; /usr/bin/msgfmt -o \"$d/messages.mo\" \"$d/messages.po\"; test -s \"$d/messages.mo\"; printf \"msgfmt:catalog-compiled\\n\""
+   ]
+  },
+  {
+   "label": "msgunfmt",
+   "argv": [
+    "bash",
+    "-c",
+    "set -euo pipefail; d=$(mktemp -d); trap 'rm -rf \"$d\"' EXIT; printf \"%s\\n\" \"msgid \\\"\\\"\" \"msgstr \\\"Content-Type: text/plain; charset=UTF-8\\\\n\\\"\" \"\" \"msgid \\\"hello\\\"\" \"msgstr \\\"Hermit\\\"\" >\"$d/messages.po\"; /usr/bin/msgfmt -o \"$d/messages.mo\" \"$d/messages.po\"; /usr/bin/msgunfmt \"$d/messages.mo\" >\"$d/roundtrip.po\"; grep -Fq 'msgstr \"Hermit\"' \"$d/roundtrip.po\"; printf \"msgunfmt:catalog-roundtrip-ok\\n\""
+   ]
+  },
+  {
+   "label": "lua-direct",
+   "argv": [
+    "lua",
+    "-e",
+    "print(42)"
+   ]
+  },
+  {
+   "label": "perl-direct",
+   "argv": [
+    "perl",
+    "-e",
+    "print 42, chr(10)"
+   ]
+  },
+  {
+   "label": "df-direct",
+   "argv": [
+    "/usr/bin/df",
+    "-P",
+    "/"
+   ]
   }
  ]
 }

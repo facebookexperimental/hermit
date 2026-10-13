@@ -1359,40 +1359,15 @@ mod tests {
     /// under rust-script, where CARGO_MANIFEST_DIR is not ci/manifest-plan.
     const COMPAT_YAML: &str = include_str!("../../../tests/e2e/manifests/compat.yaml");
 
-    /// The 26 corpus rows the strict variant took on 2026-10-10, when the
-    /// compat corpus was given uniform strict treatment: the 23 the strict
-    /// corpus never had, and the lua, perl and df `-direct` twins. They are labelled
-    /// sabre-compat-only, so their corpus cells are not the full run's and
-    /// ci/compat/corpus-strict.json, which validate.rs binds to the full run's
-    /// portable rows, does not hold them.
-    const STRICT_VARIANT_ROWS_BEYOND_THE_STRICT_CORPUS: [&str; 26] = [
-        "basenc",
-        "col",
-        "colrm",
-        "crc32",
-        "cscope",
-        "df-direct",
-        "diff3",
-        "dos2unix",
-        "envsubst",
-        "fallocate",
-        "flex",
-        "getconf",
-        "lua-direct",
-        "mountpoint",
-        "msgfmt",
-        "msgunfmt",
-        "namei",
-        "pathchk",
-        "perl-direct",
-        "setfacl",
-        "setfattr",
-        "shred",
-        "sync",
-        "timeout",
-        "truncate",
-        "uuidgen",
-    ];
+    /// The corpus rows the strict variant runs beyond ci/compat/corpus-strict.json.
+    /// On 2026-10-10 the variant took 26 rows the strict corpus lacked: the 23
+    /// it never had, and the lua, perl and df `-direct` twins. On 2026-10-13,
+    /// 25 of them left the sabre-compat-only run type for the full run, and so
+    /// joined ci/compat/corpus-strict.json, which validate.rs binds to the full
+    /// run's portable rows, so that parity covers them
+    /// (https://github.com/rrnewton/hermit/issues/4269). timeout stays
+    /// sabre-compat-only.
+    const STRICT_VARIANT_ROWS_BEYOND_THE_STRICT_CORPUS: [&str; 1] = ["timeout"];
 
     /// compat.yaml's strict variant runs exactly the programs of
     /// ci/compat/corpus-strict.json, the corpus STRICT_COMPAT_TOTAL counts and
@@ -1439,7 +1414,8 @@ mod tests {
             .iter()
             .map(|row| row["label"].as_str().unwrap().to_owned())
             .collect::<BTreeSet<_>>();
-        assert_eq!(strict.len(), 193);
+        // 193, and the 25 rows of https://github.com/rrnewton/hermit/issues/4269.
+        assert_eq!(strict.len(), 218);
         let mut expected = strict.clone();
         for row in STRICT_VARIANT_ROWS_BEYOND_THE_STRICT_CORPUS {
             assert!(

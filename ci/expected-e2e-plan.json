@@ -40638,6 +40638,406 @@
       ],
       "test": "compat/shell-build",
       "timeout_seconds": 57
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/basenc",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/col",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/colrm",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/crc32",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/cscope",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/df-direct",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/diff3",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/dos2unix",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/envsubst",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/fallocate",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/flex",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/getconf",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/lua-direct",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/mountpoint",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/msgfmt",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/msgunfmt",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/namei",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/pathchk",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/perl-direct",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/setfacl",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/setfattr",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/shred",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/sync",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/truncate",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/uuidgen",
+      "timeout_seconds": 60
     }
   ],
   "schema": 1

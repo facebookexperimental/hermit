@@ -13705,6 +13705,8 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
         "install",
         "ls",
         "md5sum",
+        // https://github.com/rrnewton/hermit/issues/4269 moved it into the full run.
+        "mountpoint",
         "pr",
         "sha1sum",
         "sha224sum",

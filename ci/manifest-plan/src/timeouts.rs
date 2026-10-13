@@ -152,7 +152,11 @@ pub const DBT_MATRIX_2026_09_29_ENABLED_CI_FALSE_TESTS: [&str; 1] =
 /// CPU budgets are 59 s and 19 s; the slowest program used 2.9 s.
 pub const STRICT_COMPAT_FOLD_2026_10_01_EVIDENCE_SHA: &str =
     "76980bac89901c3ecefbefc816ed47bcf099eda6";
-pub const STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT: usize = 189;
+/// Since 2026-10-13 the full run also selects the ptrace verify cells of 25
+/// rows that were sabre-compat-only, with the same 59/60 s bounds, so that
+/// parity compares them (<https://github.com/rrnewton/hermit/issues/4269>):
+/// 189 + 25.
+pub const STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT: usize = 214;
 /// Ptrace replay cells selected when
 /// <https://github.com/rrnewton/hermit/pull/3580> taught the recorder and
 /// replayer `select` and `pselect6`. Before it, replay of both programs
