@@ -14142,10 +14142,10 @@ test:
           - ptrace
           - sabre
           - dbt
+          - kvm
           - liteinst
           - in-guest-trap
-        backends_disabled:
-          kvm: KVM ElfExecutor returns a deterministic error for the inotify family (inotify_init1), so the filesystem-watch descriptor lifecycle is unavailable
+        backends_disabled: {}
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -19876,16 +19876,17 @@ test:
           sabre: true
           liteinst: true
           in-guest-trap: true
+          kvm: true
         backends_enabled:
           - ptrace
           - sabre
+          - kvm
           - liteinst
           - in-guest-trap
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: 'Measured: the guest produces NO stdout and the run is killed at 150s under --backend dbi, so the event-delivery legs never complete there. Observed gap, not diagnosed by this change'
-          kvm: KVM does not start the guest on the validation host; the existing inotify_watch entry already records that its ElfExecutor personality omits the inotify family
         hermit_args:
           liteinst:
             - --max-timeslice=disabled

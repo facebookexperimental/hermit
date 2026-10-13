@@ -2296,6 +2296,13 @@
           "category": "c-programs",
           "test": "c-programs/event-delivery-ordering",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/event-delivery-ordering",
+          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -3550,6 +3557,13 @@
           "test": "c-programs/inotify-watch",
           "mode": "verify",
           "backend": "in-guest-trap"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-watch",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -48118,6 +48132,13 @@
           "category": "c-programs",
           "test": "c-programs/event-delivery-ordering",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/event-delivery-ordering",
+          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -49372,6 +49393,13 @@
           "test": "c-programs/inotify-watch",
           "mode": "verify",
           "backend": "in-guest-trap"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-watch",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
