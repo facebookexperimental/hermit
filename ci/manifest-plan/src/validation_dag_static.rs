@@ -1419,7 +1419,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4187): 1060.
     // And metadata::tests::record_version_rejects_streams_without_epoll_ctl_events
     // (https://github.com/rrnewton/hermit/issues/31): 1061.
-    ("test.hermit_unit", 1061),
+    // And metadata::tests::pre_held_sleep_signal_recordings_are_refused_by_the_version_gate
+    // (Codex review of https://github.com/rrnewton/hermit/pull/4131): 1062.
+    ("test.hermit_unit", 1062),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1984,7 +1986,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the absent-CPU directory entry test (https://github.com/rrnewton/hermit/issues/4160): 1462.
     // And a_signal_the_temporary_mask_blocks_is_held_not_ended: 1463.
     // And the three restartable internal IO poll signal-filter tests (https://github.com/rrnewton/hermit/issues/4187): 1466.
-    ("test.detcore_unit", 1466),
+    // And the queued-sleep, held-wake, child-exit send-window and window-gate
+    // tests and the signalfd next-record geometry test
+    // (https://github.com/rrnewton/hermit/issues/4126): fifteen: 1481.
+    ("test.detcore_unit", 1481),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2736,7 +2741,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4187): 326.
     // a_cross_process_sigkill_verifies_at_bitwise_parity split into three
     // tests, same modes (https://github.com/rrnewton/hermit/issues/4220): 327.
-    ("test.cli", 328),
+    // And a_pause_returns_for_a_childs_sigchld,
+    // a_childs_sigchld_ends_a_sleep_only_when_caught_and_unblocked and
+    // every_sigchld_copy_is_accounted_for_as_on_linux
+    // (https://github.com/rrnewton/hermit/issues/4126): 331.
+    ("test.cli", 331),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3004,7 +3013,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Nor does the CPU directory reads test: 261.
     // And the polled-call signal test: 262.
     // And the cross-process SIGKILL parity test split into three: 263.
-    ("test.cli_on_host", 264),
+    // Nor do the three SIGCHLD sleep and bookkeeping tests: 267.
+    ("test.cli_on_host", 267),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -3170,7 +3180,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the absent-CPU directory entry test: 1462.
     // And the pselect6 temporary-mask hold test: 1463.
     // And the three internal IO poll signal-filter tests: 1466.
-    ("test.detcore_unit_on_host", 1466),
+    // And the fifteen queued-sleep, held-wake, send-window, window-gate and
+    // signalfd geometry tests: 1481.
+    ("test.detcore_unit_on_host", 1481),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -3328,7 +3340,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the short-affinity-set record-epoch test: 1059.
     // And the polled-call signal record-epoch test: 1060.
     // And the epoll_ctl record-epoch test: 1061.
-    ("test.hermit_unit_on_host", 1061),
+    // And the held-sleep-signal record-version test: 1062.
+    ("test.hermit_unit_on_host", 1062),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
