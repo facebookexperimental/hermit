@@ -40324,6 +40324,46 @@
       ],
       "test": "compat/curl-localhost",
       "timeout_seconds": 57
+    },
+    {
+      "backend": "kvm",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
+      "test": "c-programs/pselect6-simulation",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "kvm",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
+      "test": "c-programs/signal-determinism",
+      "timeout_seconds": 57
     }
   ],
   "schema": 1

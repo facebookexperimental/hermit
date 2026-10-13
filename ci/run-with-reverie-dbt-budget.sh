@@ -1459,10 +1459,10 @@ fi
 # Preserve CMAKE, CMAKE_GENERATOR, normalized SOURCE_DATE_EPOCH, inventory 947,
 # the 16-job clamp and existing 1050/572-job-second budgets. This carries only
 # the SDK budget; no new cold timing sample or runtime acceptance is claimed.
-# KVM SDK-BUDGET CARRY (2026-10-13): advance from a7402b9d to 4701fd4197228018a6b4618d34295e32f917e556.
+# KVM SDK-BUDGET CARRY (2026-10-13): advance from a7402b9d to f3d805932c3267c231e564b5d0e286006d3d6f8d.
 # The added commits change only reverie-kvm/; every SDK recipe input, build.rs
 # and the vendored DynamoRIO tree are unchanged, so the budgets above carry.
-expected_pin=4701fd4197228018a6b4618d34295e32f917e556
+expected_pin=f3d805932c3267c231e564b5d0e286006d3d6f8d
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

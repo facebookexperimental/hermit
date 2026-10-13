@@ -7287,6 +7287,13 @@
           "category": "c-programs",
           "test": "c-programs/pselect6-simulation",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/pselect6-simulation",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -8835,6 +8842,13 @@
           "test": "c-programs/signal-delivery-sequence",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/signal-determinism",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -53088,6 +53102,13 @@
           "category": "c-programs",
           "test": "c-programs/pselect6-simulation",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/pselect6-simulation",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -54636,6 +54657,13 @@
           "test": "c-programs/signal-delivery-sequence",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/signal-determinism",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",

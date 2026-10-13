@@ -9,12 +9,12 @@
   "counts": {
     "all": {
       "cells": 4085,
-      "applicable": 1912,
-      "selectable": 1584,
+      "applicable": 1914,
+      "selectable": 1586,
       "population": 2775,
-      "population_candidate_selected": 1584,
+      "population_candidate_selected": 1586,
       "population_candidate_not_selected": 258,
-      "population_candidate_disabled": 933
+      "population_candidate_disabled": 931
     },
     "by_backend": {
       "dbt": {
@@ -37,12 +37,12 @@
       },
       "kvm": {
         "cells": 817,
-        "applicable": 543,
-        "selectable": 513,
+        "applicable": 545,
+        "selectable": 515,
         "population": 555,
-        "population_candidate_selected": 513,
+        "population_candidate_selected": 515,
         "population_candidate_not_selected": 3,
-        "population_candidate_disabled": 39
+        "population_candidate_disabled": 37
       },
       "liteinst": {
         "cells": 817,
@@ -952,7 +952,7 @@
     {"test_id":"c-programs/prodcons-determinism","backend":"sabre","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"},
     {"test_id":"c-programs/pselect6-simulation","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"},
     {"test_id":"c-programs/pselect6-simulation","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
-    {"test_id":"c-programs/pselect6-simulation","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"},
+    {"test_id":"c-programs/pselect6-simulation","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/pselect6-simulation","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"},
     {"test_id":"c-programs/pselect6-simulation","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"},
     {"test_id":"c-programs/pthread-lifecycle","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: Portable release DynamoRIO can stall or exit during native pthread startup before Detcore readiness; this was the one declared DBT gap of the retired backend-parity matrix, and a --probe-disabled run is the way to requalify it"},
@@ -1187,7 +1187,7 @@
     {"test_id":"c-programs/signal-delivery-sequence","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: New top-of-funnel coverage is established on the ptrace reference first; SaBRe ratchets against it separately"},
     {"test_id":"c-programs/signal-determinism","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"},
     {"test_id":"c-programs/signal-determinism","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
-    {"test_id":"c-programs/signal-determinism","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"},
+    {"test_id":"c-programs/signal-determinism","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/signal-determinism","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"},
     {"test_id":"c-programs/signal-determinism","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"},
     {"test_id":"c-programs/signal-disposition","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},

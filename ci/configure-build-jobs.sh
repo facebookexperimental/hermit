@@ -1536,11 +1536,11 @@ fi
 # Preserve CMAKE, CMAKE_GENERATOR, normalized SOURCE_DATE_EPOCH, inventory 947,
 # the 16-job clamp and existing 1050/572-job-second budgets. This carries only
 # the SDK budget; no new cold timing sample or runtime acceptance is claimed.
-# KVM SDK-BUDGET CARRY (2026-10-13): advance from a7402b9d to 4701fd4197228018a6b4618d34295e32f917e556.
+# KVM SDK-BUDGET CARRY (2026-10-13): advance from a7402b9d to f3d805932c3267c231e564b5d0e286006d3d6f8d.
 # The added commits change only reverie-kvm/; every SDK recipe input, build.rs
 # and the vendored DynamoRIO tree are unchanged, so the budgets above carry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 4701fd4197228018a6b4618d34295e32f917e556 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 4701fd4197228018a6b4618d34295e32f917e556 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != f3d805932c3267c231e564b5d0e286006d3d6f8d ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie f3d805932c3267c231e564b5d0e286006d3d6f8d (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
