@@ -2841,34 +2841,41 @@ where
         if ending != 0 {
             return Ok(SleepSignal::Pending);
         }
-        // The committed `SIGCHLD` counts only while the copy the scheduler
-        // sent is still pending in the process's shared queue, as the schedule
-        // fixes it (`PlacedPending`): `/proc` cannot tell it from a kernel copy
-        // that host timing posted after a sibling took the scheduler's.
-        let committed_sigchld = held_woken & kernel_sigset_bit(libc::SIGCHLD) & !host_timed;
-        let held_woken = if committed_sigchld == 0 {
-            held_woken
-        } else if matches!(
-            crate::tool_global::child_exit_sigchld(
-                guest,
-                crate::scheduler::child_exit_sigchld::ChildExitSigchldControl::PlacedPending,
-            )
-            .await,
-            crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer::Placed(true)
-        ) {
-            // A copy still pending in the shared queue shows in `/proc`: an
-            // invariant, not a second condition.
-            if state.pending & committed_sigchld == 0 {
+        // A committed `SIGCHLD` counts only while the schedule says this thread
+        // will take it (`PlacedPending`): a guest's thread-directed copy in its
+        // private queue, or the scheduler's or a guest's shared copy still in
+        // the window. `/proc` cannot tell either from a kernel copy that host
+        // timing posted, so its bits only prompt the question: a woken sleep
+        // asks for the `SIGCHLD` it was woken for, and any sleep asks when its
+        // private queue holds one, which a guest sent before it parked
+        // (https://github.com/rrnewton/hermit/issues/4132).
+        let sigchld = kernel_sigset_bit(libc::SIGCHLD) & !host_timed;
+        let committed = if asks_committed_sigchld(held_woken, &state, sigchld)
+            && matches!(
+                crate::tool_global::child_exit_sigchld(
+                    guest,
+                    crate::scheduler::child_exit_sigchld::ChildExitSigchldControl::PlacedPending,
+                )
+                .await,
+                crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer::Placed(true)
+            ) {
+            // A committed copy shows in `/proc`: an invariant, not a second
+            // condition.
+            if state.pending & sigchld == 0 {
                 tracing::error!(
-                    "[dtid {}] the scheduler's SIGCHLD is pending by the schedule but not in /proc",
+                    "[dtid {}] a committed SIGCHLD is pending by the schedule but not in /proc",
                     guest.thread_state().dettid
                 );
-                debug_assert!(false, "a placed SIGCHLD is not pending in /proc");
+                debug_assert!(false, "a committed SIGCHLD is not pending in /proc");
             }
-            held_woken
+            sigchld
         } else {
-            held_woken & !committed_sigchld
+            0
         };
+        if let Some(verdict) = committed_sigchld_verdict(&state, held_woken, committed) {
+            return Ok(verdict);
+        }
+        let held_woken = held_woken & !sigchld;
         if held_wake_ends_sleep(&state, held_woken) {
             return Ok(SleepSignal::Held);
         }
@@ -2879,6 +2886,37 @@ where
     } else {
         SleepSignal::None
     })
+}
+
+/// Whether a sleep's own check (`sleep_signal`) asks the scheduler whether a
+/// committed `SIGCHLD` is pending for it (`PlacedPending`): it was woken for
+/// one (`held_woken`), or its private queue holds one. The latter is how a
+/// guest's thread-directed copy sent before the sleeper filed its request is
+/// not lost: the sender's turn found no sleep to wake, so only the sleeper's
+/// check before it parks sees it (https://github.com/rrnewton/hermit/issues/4132).
+fn asks_committed_sigchld(
+    held_woken: KernelSigset,
+    state: &crate::syscalls::threads::KernelSignalState,
+    sigchld: KernelSigset,
+) -> bool {
+    (held_woken | state.thread_pending) & sigchld != 0
+}
+
+/// What a committed `SIGCHLD` (`committed`, the scheduler's answer) makes of
+/// the sleep: it ends it if unblocked and caught or acted on by default, as
+/// the held signal the wake named (`Held`) or as one pending for it
+/// (`Pending`); `None` leaves the decision to the rest of the check.
+fn committed_sigchld_verdict(
+    state: &crate::syscalls::threads::KernelSignalState,
+    held_woken: KernelSigset,
+    committed: KernelSigset,
+) -> Option<SleepSignal> {
+    let verdict = if held_woken & committed != 0 {
+        SleepSignal::Held
+    } else {
+        SleepSignal::Pending
+    };
+    (state.interrupting(state.blocked) & committed != 0).then_some(verdict)
 }
 
 /// The size of a `struct signalfd_siginfo`, which has ssi_signo at 0,
@@ -3681,6 +3719,46 @@ mod tests {
         );
     }
 
+    /// Before it parks, a sleep whose private queue already holds a guest's
+    /// thread-directed `SIGCHLD` asks whether the copy is committed, and a
+    /// committed one that is unblocked and caught ends the sleep as pending
+    /// for it: the copy was sent before the sleeper filed its request, so the
+    /// sender's turn had no sleep to wake (the Codex review of
+    /// https://github.com/rrnewton/hermit/pull/4177). Without one, or with no
+    /// wake and nothing private, it asks nothing; blocked, it does not end the
+    /// sleep.
+    #[test]
+    fn a_private_sigchld_sent_before_the_sleep_is_filed_ends_it_before_it_parks() {
+        use crate::syscalls::threads::KernelSignalState;
+        let chld = kernel_sigset_bit(libc::SIGCHLD);
+        let state = |blocked: KernelSigset, thread_pending: KernelSigset| KernelSignalState {
+            caught: chld,
+            blocked,
+            pending: thread_pending,
+            thread_pending,
+            ..Default::default()
+        };
+        // Before park: no wake named a signal (`held_woken` 0).
+        assert!(asks_committed_sigchld(0, &state(0, chld), chld));
+        assert!(!asks_committed_sigchld(0, &state(0, 0), chld));
+        assert!(
+            !asks_committed_sigchld(0, &state(0, chld), 0),
+            "a host-timed SIGCHLD source keeps it held"
+        );
+        assert_eq!(
+            committed_sigchld_verdict(&state(0, chld), 0, chld),
+            Some(SleepSignal::Pending)
+        );
+        assert_eq!(committed_sigchld_verdict(&state(chld, chld), 0, chld), None);
+        assert_eq!(committed_sigchld_verdict(&state(0, chld), 0, 0), None);
+        // After a wake for it, the same copy is the held signal it named.
+        assert!(asks_committed_sigchld(chld, &state(0, 0), chld));
+        assert_eq!(
+            committed_sigchld_verdict(&state(0, chld), chld, chld),
+            Some(SleepSignal::Held)
+        );
+    }
+
     #[test]
     fn raw_kernel_signal_masks_are_exactly_one_u64() {
         assert_eq!(KERNEL_SIGSET_SIZE, 8);
@@ -4145,6 +4223,350 @@ mod rt_sigsuspend_tests {
                 "slot {slot}: the caller's buffer holds only what the guest wrote"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod before_park_tests {
+    use reverie::GlobalRPC;
+    use reverie::GlobalTool;
+    use reverie::Pid;
+    use reverie::syscalls::SyscallInfo;
+
+    use super::*;
+    use crate::Config;
+    use crate::GlobalState;
+    use crate::ThreadState;
+    use crate::scheduler::child_exit_sigchld::ChildExitSigchldControl;
+
+    /// The before-park check takes no scratch stack.
+    struct NoStack;
+
+    struct NoStackGuard;
+
+    impl Drop for NoStackGuard {
+        fn drop(&mut self) {}
+    }
+
+    impl reverie::Stack for NoStack {
+        type StackGuard = NoStackGuard;
+
+        fn size(&self) -> usize {
+            panic!("the before-park check takes no stack")
+        }
+        fn capacity(&self) -> usize {
+            panic!("the before-park check takes no stack")
+        }
+        fn push<'stack, T>(&mut self, _: T) -> Addr<'stack, T> {
+            panic!("the before-park check takes no stack")
+        }
+        fn reserve<'stack, T>(&mut self) -> AddrMut<'stack, T> {
+            panic!("the before-park check takes no stack")
+        }
+        fn commit(self) -> Result<Self::StackGuard, Errno> {
+            panic!("the before-park check takes no stack")
+        }
+    }
+
+    /// A guest whose thread is a real stopped process, so `sleep_signal`
+    /// reads the kernel's signal state for it from `/proc`, and whose RPCs go
+    /// to a real `GlobalState`, so its questions reach the scheduler's ledger.
+    struct SleeperGuest<'a> {
+        state: &'a GlobalState,
+        config: Config,
+        thread: ThreadState<()>,
+        pid: Pid,
+    }
+
+    #[reverie::tool]
+    impl GlobalRPC<GlobalState> for SleeperGuest<'_> {
+        async fn send_rpc(
+            &self,
+            request: <GlobalState as GlobalTool>::Request,
+        ) -> <GlobalState as GlobalTool>::Response {
+            self.state.receive_rpc(self.pid, request).await
+        }
+        fn config(&self) -> &Config {
+            &self.config
+        }
+    }
+
+    #[reverie::tool]
+    impl Guest<Detcore> for SleeperGuest<'_> {
+        type Memory = reverie::syscalls::LocalMemory;
+        type Stack = NoStack;
+
+        fn tid(&self) -> Pid {
+            self.pid
+        }
+        fn pid(&self) -> Pid {
+            self.pid
+        }
+        fn ppid(&self) -> Option<Pid> {
+            None
+        }
+        fn memory(&self) -> Self::Memory {
+            panic!("the before-park check reads no guest memory")
+        }
+        fn thread_state_mut(&mut self) -> &mut ThreadState<()> {
+            &mut self.thread
+        }
+        fn thread_state(&self) -> &ThreadState<()> {
+            &self.thread
+        }
+        async fn regs(&mut self) -> libc::user_regs_struct {
+            panic!("the before-park check reads no registers")
+        }
+        async fn stack(&mut self) -> Self::Stack {
+            panic!("the before-park check takes no stack")
+        }
+        async fn daemonize(&mut self) {
+            panic!("the before-park check must not daemonize")
+        }
+        async fn inject<S: SyscallInfo>(&mut self, _: S) -> Result<i64, Errno> {
+            panic!("the before-park check injects no syscall")
+        }
+        async fn tail_inject<S: SyscallInfo>(&mut self, _: S) -> reverie::Never {
+            panic!("the before-park check must not retire the guest")
+        }
+        fn set_timer(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
+            panic!("the before-park check sets no timer")
+        }
+        fn set_timer_precise(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
+            panic!("the before-park check sets no timer")
+        }
+        fn read_clock(&mut self) -> Result<u64, Error> {
+            panic!("the before-park check reads no clock")
+        }
+    }
+
+    extern "C" fn caught(_: libc::c_int) {}
+
+    /// `waitpid` for exactly `child`, retried on EINTR: the pid and status
+    /// it reported, or the errno of its failure.
+    fn wait_for(
+        child: libc::pid_t,
+        options: libc::c_int,
+    ) -> Result<(libc::pid_t, libc::c_int), i32> {
+        let mut status = 0;
+        loop {
+            // SAFETY: waiting for our own child.
+            let waited = unsafe { libc::waitpid(child, &mut status, options) };
+            if waited != -1 {
+                return Ok((waited, status));
+            }
+            match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::EINTR) => continue,
+                errno => return Err(errno.unwrap_or(0)),
+            }
+        }
+    }
+
+    /// The parent's ownership of the forked child: it is killed and reaped
+    /// when the owner is dropped, so a panic or a cancelled await in the test
+    /// leaves no process behind. `finish` does the same on the normal path
+    /// and checks that the child was reaped.
+    struct ChildOwner {
+        pid: libc::pid_t,
+        reaped: bool,
+    }
+
+    impl ChildOwner {
+        /// Wait for the child to stop. A wait that reports it exited or
+        /// killed reaped it, so the owner is disarmed before anything can
+        /// unwind: its pid may already belong to another process.
+        /// An ECHILD means the child is no longer ours to wait for (it was
+        /// reaped already), so it disarms the owner too.
+        fn wait_stopped(&mut self) -> Result<(), Result<(libc::pid_t, libc::c_int), i32>> {
+            let waited = wait_for(self.pid, libc::WUNTRACED);
+            match waited {
+                Ok((pid, status))
+                    if pid == self.pid
+                        && (libc::WIFEXITED(status) || libc::WIFSIGNALED(status)) =>
+                {
+                    self.reaped = true;
+                }
+                Err(libc::ECHILD) => self.reaped = true,
+                _ => {}
+            }
+            match waited {
+                Ok((pid, status)) if pid == self.pid && libc::WIFSTOPPED(status) => Ok(()),
+                other => Err(other),
+            }
+        }
+
+        /// Whether the owner had disarmed itself, read once the child is
+        /// known to be reaped. The owner is disarmed from here on whatever
+        /// the answer, so a failed check of it unwinds without signalling a
+        /// pid that may have been reused.
+        fn disarmed_after_reap(&mut self) -> bool {
+            std::mem::replace(&mut self.reaped, true)
+        }
+
+        fn kill_and_reap(&mut self) -> Result<(libc::pid_t, libc::c_int), i32> {
+            // SAFETY: killing our own child, which is not yet reaped.
+            unsafe { libc::kill(self.pid, libc::SIGKILL) };
+            let reaped = wait_for(self.pid, 0);
+            self.reaped = true;
+            reaped
+        }
+
+        fn finish(mut self) {
+            let reaped = self.kill_and_reap();
+            assert!(
+                matches!(reaped, Ok((pid, status)) if pid == self.pid
+                    && libc::WIFSIGNALED(status)
+                    && libc::WTERMSIG(status) == libc::SIGKILL),
+                "the child was not reaped: {reaped:?}"
+            );
+        }
+    }
+
+    impl Drop for ChildOwner {
+        fn drop(&mut self) {
+            if !self.reaped {
+                // Unwinding already: the reap's outcome is not checked here.
+                let _ = self.kill_and_reap();
+            }
+        }
+    }
+
+    /// A forked child, owned by the parent from the moment `fork` returns,
+    /// that exits with status 7 at once if `exits`.
+    fn forked_child(exits: bool) -> ChildOwner {
+        // SAFETY: the child calls only async-signal-safe functions, with no
+        // allocation, lock or destructor, then stops until it is killed.
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            unsafe {
+                if exits {
+                    libc::_exit(7);
+                }
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = caught as extern "C" fn(libc::c_int) as usize;
+                libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut());
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, libc::SIGCHLD);
+                libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+                libc::raise(libc::SIGSTOP);
+                libc::_exit(0);
+            }
+        }
+        assert!(child > 0, "fork failed");
+        ChildOwner {
+            pid: child,
+            reaped: false,
+        }
+    }
+
+    /// A child stopped as a sleeper is when Detcore handles its call before
+    /// filing the sleep: SIGCHLD caught and unblocked, and SIGCHLD pending in
+    /// its private queue, sent to the thread while it was stopped.
+    fn stopped_child_with_a_private_sigchld() -> ChildOwner {
+        let mut owner = forked_child(false);
+        let child = owner.pid;
+        if let Err(waited) = owner.wait_stopped() {
+            panic!("the child did not stop: {waited:?}");
+        }
+        // SAFETY: the child is ours and stopped; SIGCHLD stays pending.
+        let sent = unsafe { libc::syscall(libc::SYS_tgkill, child, child, libc::SIGCHLD) };
+        assert_eq!(sent, 0, "tgkill failed");
+        owner
+    }
+
+    /// The before-park question through the production path: a guest's
+    /// thread-directed SIGCHLD, committed (`PrivateSent`, as the sender's turn
+    /// records it) while no sleep was filed, so that turn had no sleep to
+    /// wake, is found by `sleep_signal(BeforePark)`'s own query of the ledger,
+    /// and the sleep ends at once as pending for it. With no committed record
+    /// the same kernel state, which `/proc` cannot tell from a host-timed copy,
+    /// ends nothing (the Codex re-check of
+    /// https://github.com/rrnewton/hermit/pull/4177).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_private_sigchld_committed_before_the_sleep_is_filed_ends_it_through_the_ledger() {
+        // The fixture's owner: a child that exits instead of stopping is
+        // reaped by the wait, which disarms the owner, so an unwind then
+        // signals no pid that may have been reused.
+        let mut exited = forked_child(true);
+        let wait = exited.wait_stopped();
+        let exit_reaped = matches!(wait, Err(Ok((pid, status))) if pid == exited.pid
+            && libc::WIFEXITED(status)
+            && libc::WEXITSTATUS(status) == 7);
+        let disarmed = exit_reaped && exited.disarmed_after_reap();
+        assert!(exit_reaped, "{wait:?}");
+        assert!(disarmed, "a reaped child disarms its owner");
+        drop(exited);
+        // A child already reaped elsewhere answers ECHILD, which disarms the
+        // owner as well. The raw wait that reaps it disarms the owner before
+        // anything is checked; the owner is armed again only for the call
+        // under test.
+        let mut gone = forked_child(true);
+        let reaped_elsewhere = wait_for(gone.pid, 0);
+        gone.reaped = matches!(reaped_elsewhere, Ok((pid, _)) if pid == gone.pid)
+            || reaped_elsewhere == Err(libc::ECHILD);
+        assert!(
+            matches!(reaped_elsewhere, Ok((pid, _)) if pid == gone.pid),
+            "{reaped_elsewhere:?}"
+        );
+        gone.reaped = false;
+        let wait = gone.wait_stopped();
+        let disarmed = gone.disarmed_after_reap();
+        assert_eq!(wait, Err(Err(libc::ECHILD)));
+        assert!(disarmed, "an ECHILD disarms its owner");
+        drop(gone);
+
+        let owner = stopped_child_with_a_private_sigchld();
+        let child = owner.pid;
+        let state_of_child = crate::syscalls::threads::read_thread_wait_signal_state(
+            Pid::from_raw(child),
+            Pid::from_raw(child),
+        )
+        .expect("the child's signal state");
+        let chld = kernel_sigset_bit(libc::SIGCHLD);
+        assert_eq!(
+            state_of_child.thread_pending & chld,
+            chld,
+            "pending, private"
+        );
+        assert_eq!(state_of_child.blocked & chld, 0, "unblocked");
+        assert_eq!(state_of_child.caught & chld, chld, "caught");
+        let mut verdicts = Vec::new();
+        for committed in [true, false] {
+            let config = Config {
+                sequentialize_threads: true,
+                backend_supports_blocked_wait_signal_interruption: true,
+                backend_delivers_timer_events: false,
+                ..Config::default()
+            };
+            let state = GlobalState::for_tests(&config);
+            let mut guest = SleeperGuest {
+                state: &state,
+                thread: ThreadState::new(DetPid::from_raw(child), &config, ()),
+                config,
+                pid: Pid::from_raw(child),
+            };
+            if committed {
+                let target = guest.thread_state().dettid;
+                crate::tool_global::child_exit_sigchld(
+                    &mut guest,
+                    ChildExitSigchldControl::PrivateSent { target },
+                )
+                .await;
+            }
+            verdicts.push(sleep_signal(&mut guest, SleepCheck::BeforePark, false).await);
+        }
+        owner.finish();
+        assert!(
+            matches!(verdicts[0], Ok(SleepSignal::Pending)),
+            "committed: {:?}",
+            verdicts[0]
+        );
+        assert!(
+            matches!(verdicts[1], Ok(SleepSignal::None)),
+            "not committed: {:?}",
+            verdicts[1]
+        );
     }
 }
 

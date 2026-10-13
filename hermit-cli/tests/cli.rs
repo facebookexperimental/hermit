@@ -131,6 +131,7 @@ static HB_CHILD_WAIT_CYCLE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_KILL_HELD_CHILD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGNAL_HERMIT_TASKS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PAUSE_SIGCHLD_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static GUEST_SIGCHLD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGCHLD_BOOKKEEPING_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_POSTHOOK_FUTEX_INTERRUPT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_PIPE_READ_HELD_WRITER_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1237,6 +1238,31 @@ fn sigchld_bookkeeping_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "sigchld-bookkeeping guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn guest_sigchld_guest() -> &'static Path {
+    GUEST_SIGCHLD_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("guest-sigchld");
+        fs::create_dir_all(&build_root).expect("failed to create guest-sigchld directory");
+        let guest = build_root.join("guest_sigchld");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/guest_sigchld.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile guest-sigchld guest");
+        assert!(
+            output.status.success(),
+            "guest-sigchld guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -24964,6 +24990,129 @@ fn every_sigchld_copy_is_accounted_for_as_on_linux() {
             legal.contains(&stdout),
             "{seed:?} {args:?}: {stdout:?} is not an outcome Linux allows\nstderr:\n{log}"
         );
+    }
+}
+
+/// A guest's thread-directed `SIGCHLD` to a sibling asleep in `nanosleep` or
+/// `pause`, while a third thread spins, ends the sleep as Linux does: caught
+/// and unblocked, with EINTR and the handler in the sleeper (`tgkill`,
+/// `pthread_sigqueue`); blocked, the sleep runs its length and the handler
+/// runs once it unblocks; default (ignore), or flushed by `SIG_IGN` while
+/// pending, nothing runs. Such a copy is in the sleeper's private queue, sent
+/// at the sender's committed turn, so it is not held as the kernel's shared
+/// copies are. Before, the sleep ignored it and its delivery then waited
+/// behind the spinning thread forever
+/// (https://github.com/rrnewton/hermit/issues/4132). Every expected line is
+/// native output.
+#[test]
+fn a_guests_sigchld_to_a_sleeping_sibling_ends_its_sleep_as_on_linux() {
+    let guest = guest_sigchld_guest().to_str().unwrap().to_owned();
+    for (mode, expected) in [
+        (
+            "tgkill-nano",
+            "tgkill-nano: nanosleep -1 EINTR, in sleeper before return 1, in all 1\n",
+        ),
+        (
+            "tgkill-pause",
+            "tgkill-pause: pause -1 EINTR, in sleeper before return 1, in all 1\n",
+        ),
+        (
+            "sigqueue-nano",
+            "sigqueue-nano: nanosleep -1 EINTR, in sleeper before return 1, in all 1\n",
+        ),
+        (
+            "blocked-nano",
+            "blocked-nano: nanosleep 0, in sleeper before return 0, in all 1\n",
+        ),
+        (
+            "default-nano",
+            "default-nano: nanosleep 0, in sleeper before return 0, in all 0\n",
+        ),
+        (
+            "flush-nano",
+            "flush-nano: nanosleep 0, in sleeper before return 0, in all 0\n",
+        ),
+    ] {
+        let command = hermit_command(&[
+            "run",
+            "--strict",
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+            mode,
+        ]);
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let (status, log) =
+            run_with_deadline(command, directory.path(), Duration::from_secs(120), false);
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{mode}: {status:?}\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert_eq!(stdout, expected, "{mode}: stderr:\n{log}");
+    }
+    // A private record does not outlive its copy: after the main thread took
+    // a guest's private SIGCHLD, a child's shared one that a sigsuspend
+    // sibling may take ends main's later sleep only if main's handler ran for
+    // it (the Claude review of https://github.com/rrnewton/hermit/pull/4177:
+    // a record kept after its dequeue answered EINTR at a chaos seed).
+    let mut cases: Vec<(&str, Option<&str>)> = vec![("stale", None), ("stale-nopriv", None)];
+    for seed in ["1", "2", "3", "4", "5", "6", "7", "8"] {
+        cases.push(("stale", Some(seed)));
+    }
+    for seed in ["1", "2", "3"] {
+        cases.push(("stale-nopriv", Some(seed)));
+    }
+    for (mode, seed) in cases {
+        let mut argv = vec!["run", "--strict", "--timeout", "60"];
+        if let Some(seed) = seed {
+            argv.extend_from_slice(&["--chaos", "--chaos-target-races", "--sched-seed", seed]);
+        }
+        argv.extend_from_slice(&["--", guest.as_str(), mode]);
+        let command = hermit_command(&argv);
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let (status, log) =
+            run_with_deadline(command, directory.path(), Duration::from_secs(120), false);
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{mode} {seed:?}: {status:?}\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert!(
+            stale_outcome_is_legal(mode, seed.is_some(), &stdout),
+            "{mode} {seed:?}: {stdout:?} is not an outcome Linux allows\nstderr:\n{log}"
+        );
+    }
+}
+
+/// Whether a `stale` line of the `guest_sigchld` guest is an outcome Linux
+/// allows: the private copy, if sent, was taken by main first; the child's one
+/// SIGCHLD ran one handler; the sleep ended with EINTR exactly when that was
+/// main's, during the sleep. Under chaos main's handler may also run between
+/// marking the sleep and entering it, so the sleep then returns 0.
+fn stale_outcome_is_legal(mode: &str, chaos: bool, stdout: &str) -> bool {
+    let Some((result, events)) = stdout
+        .strip_prefix(mode)
+        .and_then(|rest| rest.strip_prefix(": nanosleep "))
+        .and_then(|rest| rest.strip_suffix('\n'))
+        .and_then(|rest| rest.split_once(" | "))
+    else {
+        return false;
+    };
+    let mut events: Vec<&str> = events.split(' ').collect();
+    if mode == "stale" && (events.is_empty() || events.remove(0) != "M:tkill") {
+        return false;
+    }
+    match (result, events.as_slice()) {
+        ("EINTR", ["M:exited:during"]) => true,
+        ("0", ["U:exited"] | ["U:exited:during"] | ["M:exited"]) => true,
+        ("0", ["M:exited:during"]) => chaos,
+        _ => false,
     }
 }
 

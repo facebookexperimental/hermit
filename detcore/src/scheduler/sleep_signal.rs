@@ -122,6 +122,20 @@ impl Scheduler {
         }
     }
 
+    /// `SIGCHLD`, if a guest's thread-directed copy of it, recorded in the
+    /// sender's committed turn, is in `dettid`'s private queue
+    /// (`ChildExitSigchldLedger::private_sent`) and no host-timed source can
+    /// post `SIGCHLD` to it. Such a copy is not held: it is recorded for a
+    /// sleep and decides like any other signal, from the record, not from
+    /// `/proc` (<https://github.com/rrnewton/hermit/issues/4132>).
+    pub(super) fn private_sigchld(&self, dettid: DetTid) -> u64 {
+        if self.child_exit_sigchld.private_sent.contains(&dettid) {
+            kernel_signal_bit(libc::SIGCHLD) & !self.host_timed_signals(dettid)
+        } else {
+            0
+        }
+    }
+
     /// Whether a cross-task `signal`, just sent to `dettid` in the sender's
     /// turn, is recorded for the drain because it may end the sleep its request
     /// is. A state that cannot be read here is recorded, and the drain decides.
@@ -129,7 +143,7 @@ impl Scheduler {
         let bit = kernel_signal_bit(signal.raw());
         if signal.raw() == libc::SIGKILL
             || self.signal_sleep(dettid).is_none()
-            || self.futex_wait_held_signals(dettid) & bit != 0
+            || self.futex_wait_held_signals(dettid) & !self.private_sigchld(dettid) & bit != 0
         {
             return false;
         }
@@ -154,9 +168,9 @@ impl Scheduler {
         sleep: SignalSleep,
     ) -> Result<u64, SleeperStateUnreadable> {
         let state = self.read_sleeper_signal_state(dettid)?;
-        let interrupting = state.pending
-            & state.interrupting(state.blocked)
-            & !self.futex_wait_held_signals(dettid);
+        let interrupting = (state.pending & !self.futex_wait_held_signals(dettid)
+            | self.private_sigchld(dettid))
+            & state.interrupting(state.blocked);
         Ok(match sleep {
             SignalSleep::Pause => interrupting,
             SignalSleep::Nanosleep { .. } => {

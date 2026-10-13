@@ -201,8 +201,8 @@ pub enum ChildExitSigchldControl {
     Flushed,
     /// Whether a `SIGCHLD` the scheduler sent is still pending in the calling
     /// thread's process's shared queue, as far as the schedule fixes it
-    /// (`Scheduler::placed_sigchld_pending`), asked by a sleep woken for it, in
-    /// its own turn. Appended after `Flushed`.
+    /// (`Scheduler::committed_sigchld_pending`), asked by a sleep woken for it,
+    /// or holding a private one, in its own turn. Appended after `Flushed`.
     PlacedPending,
     /// The calling thread, in its own turn, sent `target` a thread-directed
     /// `SIGCHLD` (`tkill`, `tgkill`, `rt_tgsigqueueinfo`): a copy in
@@ -782,8 +782,7 @@ impl Scheduler {
                 ChildExitSigchldAnswer::Recorded
             }
             ChildExitSigchldControl::PlacedPending => {
-                let parent = self.sigchld_process(dtid);
-                ChildExitSigchldAnswer::Placed(self.placed_sigchld_pending(parent))
+                ChildExitSigchldAnswer::Placed(self.committed_sigchld_pending(dtid))
             }
             ChildExitSigchldControl::PrivateSent { target } => {
                 // Whether this made a new record, which a failed send undoes.
@@ -938,26 +937,32 @@ impl Scheduler {
         answer
     }
 
-    /// Whether a `SIGCHLD` the scheduler sent `parent` is still pending in its
-    /// shared queue, for a sleep woken for it to take in its own turn: a send
-    /// in the window, which is used only where no thread outside the schedule
-    /// could take it at a moment host timing chooses
-    /// (`sigchld_window_usable`). Without signal-target modelling, the woken
-    /// sleep decides from `/proc` as before.
+    /// Whether a committed `SIGCHLD` is pending for `dtid` to take in its own
+    /// turn: a guest's thread-directed copy in its private queue
+    /// (`private_sent`), which no other thread can take; or a send in its
+    /// process's window, which is used only where no thread outside the
+    /// schedule could take that one at a moment host timing chooses
+    /// (`sigchld_window_usable`). Without signal-target modelling, the sleep
+    /// decides from `/proc` as before.
     ///
     /// Otherwise the answer is no and the sleep goes on to its deadline: which
     /// thread takes the shared copy is then a matter of host timing, and Linux
     /// allows either, so the woken sleep never answers EINTR for a copy
     /// another thread may take. In a process that does not use the window
-    /// the woken path thus never answers EINTR for it; the signal ends the
-    /// sleep only by its delivery, as before the queued wake existed (deciding
-    /// from the mask and dispositions there answered EINTR while the handler
-    /// ran in a `sigsuspend` sibling, the Claude re-check of
-    /// <https://github.com/rrnewton/hermit/pull/4131> at ba6747e8).
-    pub(crate) fn placed_sigchld_pending(&self, parent: DetPid) -> bool {
+    /// the woken path thus never answers EINTR for a shared copy; the signal
+    /// ends the sleep only by its delivery, as before the queued wake existed
+    /// (deciding from the mask and dispositions there answered EINTR while
+    /// the handler ran in a `sigsuspend` sibling, the Claude re-check of
+    /// <https://github.com/rrnewton/hermit/pull/4131> at ba6747e8). A private
+    /// copy only this thread can take counts there too.
+    pub(crate) fn committed_sigchld_pending(&self, dtid: DetTid) -> bool {
         if !self.models_signal_targets {
             return true;
         }
+        if self.child_exit_sigchld.private_sent.contains(&dtid) {
+            return true;
+        }
+        let parent = self.sigchld_process(dtid);
         self.child_exit_sigchld.window_open(parent) && self.sigchld_window_usable(parent)
     }
 

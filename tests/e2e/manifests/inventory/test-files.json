@@ -649,6 +649,12 @@
       "why": "tests/c/gettimeofday_unreadable_buffer.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration tests run this gettimeofday-into-an-unreadable-page guest on ptrace, where Detcore confirms the failed call stored nothing and the guest sees EFAULT, and on DBT, where Detcore cannot read the page in-process and refuses, to check that the refusal fails the run even when a parent ignores the failing child, with and without --verify; it remains a guest fixture because a generic manifest cannot express a run that must fail because of a child its root ignores."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/guest_sigchld.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/guest_sigchld.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_guests_sigchld_to_a_sleeping_sibling_ends_its_sleep_as_on_linux compiles this guest, in which one thread sends SIGCHLD to a sibling asleep in nanosleep or pause while a third spins, and requires each mode's native output (https://github.com/rrnewton/hermit/issues/4132); it remains a guest fixture because its CLI test checks the exact status and stdout of strict runs."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/hardware_trap_identity.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

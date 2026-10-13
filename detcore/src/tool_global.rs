@@ -1176,6 +1176,13 @@ impl GlobalState {
         self.mount_ids.lock().unwrap().provenance()
     }
 
+    /// A global state with no scheduler task, for unit tests elsewhere in the
+    /// crate that send RPCs to it directly.
+    #[cfg(test)]
+    pub(crate) fn for_tests(cfg: &Config) -> Self {
+        Self::initialize(cfg, false)
+    }
+
     fn initialize(cfg: &Config, spawn_scheduler: bool) -> Self {
         let sched = Arc::new(Mutex::new(Scheduler::new(cfg)));
         let global_time = Arc::new(Mutex::new(GlobalTime::new(cfg)));

@@ -23790,7 +23790,8 @@ mod test {
     }
 
     /// The signals a gated wait holds are never recorded for a sleep, although
-    /// caught and pending: `SIGCHLD`, and a signal a host-timed source armed by
+    /// caught and pending, unless a guest's thread-directed copy of `SIGCHLD`
+    /// is recorded (below): `SIGCHLD`, and a signal a host-timed source armed by
     /// the guest can post to its process, as for a parked futex waiter. The
     /// kernel can post either at a host-chosen moment, so neither the pending
     /// bit nor the recorded send could tell whether a later guest call, a
@@ -23814,6 +23815,43 @@ mod test {
             None,
         );
         assert_sleep_parked(&scheduler, target, LogicalTime::INDEFINITE, "held signals");
+    }
+
+    /// A guest's thread-directed `SIGCHLD`, recorded in the sender's turn
+    /// (`private_sent`), is in the sleeper's private queue, which only committed
+    /// guest sends fill, so it is not held: caught and unblocked, it ends the
+    /// sleep. It stays held where a host-timed source can post `SIGCHLD` to the
+    /// sleeper's process, and a default-ignored one, or a caught one the
+    /// sleeper's mask blocks, never ends it
+    /// (https://github.com/rrnewton/hermit/issues/4132).
+    #[test]
+    fn a_guests_thread_directed_sigchld_ends_the_sleep() {
+        use child_exit_sigchld::ChildExitSigchldControl;
+        let chld = kernel_signal_bit(libc::SIGCHLD);
+        for (caught, blocked, host_timed, woken) in [
+            (chld, 0, false, true),
+            (chld, 0, true, false),
+            (0, 0, false, false),
+            (chld, chld, false, false),
+        ] {
+            let case = format!("caught={caught:#x}, blocked={blocked:#x}, host_timed={host_timed}");
+            let mut scheduler = gated_scheduler();
+            let target = filed_sleep(&mut scheduler, LogicalTime::INDEFINITE, PAUSE_FYI, false);
+            if host_timed {
+                scheduler.record_host_timed_signals(target, HostTimedSignalScope::Caller, chld);
+            }
+            set_sleeper_state(&mut scheduler, target, sleeper_state(caught, 0, blocked, 0));
+            scheduler.child_exit_sigchld_control(
+                target,
+                ChildExitSigchldControl::PrivateSent { target },
+            );
+            send_cross_task(&mut scheduler, target, &[libc::SIGCHLD], None);
+            if woken {
+                assert_sleep_woken(&scheduler, target, &[libc::SIGCHLD], &case);
+            } else {
+                assert_sleep_parked(&scheduler, target, LogicalTime::INDEFINITE, &case);
+            }
+        }
     }
 
     /// A state the drain cannot read never invents an interruption: a thread
