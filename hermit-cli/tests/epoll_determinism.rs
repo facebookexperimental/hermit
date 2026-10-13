@@ -441,18 +441,42 @@ fn epoll_fd_supports_descriptor_table_ops() {
 /// - `chld-unblocks`: a SIGCHLD that only the call's mask lets in ends it
 ///   with EINTR after its handler ran.
 /// - `timeout`: no signal; 0 after at least the 50 ms timeout.
+/// - `plain`: no mask and no signal; 1 once a sibling fills the pipe.
+/// - `timeout-plain`: `timeout` with no mask.
+/// - `timeout-fine`: no mask and a 1.5 ms timeout (2 ms for epoll_pwait,
+///   which takes milliseconds); 0 after at least 1.5 ms.
 ///
 /// The guest checks each result against Linux's and exits nonzero on a
 /// mismatch. Each mode runs under strict verification, which must compare a
 /// nonzero number of INFO messages on each side.
 #[test]
 fn epoll_pwait_sleeps_under_its_temporary_mask() {
+    run_temporary_mask_modes(None);
+}
+
+/// The same modes through the raw epoll_pwait2 system call, which under
+/// `run --strict` used to make the real call in the thread's turn, so `plain`
+/// returned 0 at its timeout, or never, instead of 1
+/// (https://github.com/rrnewton/hermit/issues/4228). Three more modes need
+/// its timespec: `plain-huge` (a 2^64 ns timeout still waits for the pipe),
+/// `bad-timespec` (EINVAL) and `bad-timeout-pointer` (EFAULT).
+#[test]
+fn epoll_pwait2_polls_under_run_strict() {
+    run_temporary_mask_modes(Some("pwait2"));
+}
+
+/// Runs every mode of tests/c/epoll_pwait_temporary_mask.c, with `variant` as
+/// its second argument when set, under ptrace strict verification.
+fn run_temporary_mask_modes(variant: Option<&str>) {
     let _guard = hermit_run_lock();
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("epoll-pwait-temporary-mask-{}", std::process::id()));
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "epoll-pwait-temporary-mask-{}-{}",
+        variant.unwrap_or("pwait"),
+        std::process::id()
+    ));
     fs::create_dir_all(&build_root).expect("failed to create epoll guest build directory");
     let guest = build_root.join("epoll_pwait_temporary_mask");
     let mut compile = Command::new("cc");
@@ -473,7 +497,18 @@ fn epoll_pwait_sleeps_under_its_temporary_mask() {
         "pending-unblocks",
         "chld-unblocks",
         "timeout",
-    ] {
+        "plain",
+        "timeout-plain",
+        "timeout-fine",
+    ]
+    .into_iter()
+    .chain(
+        variant
+            .is_some()
+            .then_some(["plain-huge", "bad-timespec", "bad-timeout-pointer"])
+            .into_iter()
+            .flatten(),
+    ) {
         let verdict = build_root.join(format!("verify-{mode}.json"));
         let mut command = Command::new("timeout");
         command
@@ -491,8 +526,12 @@ fn epoll_pwait_sleeps_under_its_temporary_mask() {
             .arg(format!("--verify-json={}", verdict.display()))
             .arg("--")
             .arg(&guest)
-            .arg(mode);
-        let output = command_output(command, &format!("epoll_pwait temporary mask {mode}"));
+            .arg(mode)
+            .args(variant);
+        let output = command_output(
+            command,
+            &format!("epoll_pwait temporary mask {mode} {variant:?}"),
+        );
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             stdout.contains(&format!("epoll-pwait-temporary-mask mode={mode}")),

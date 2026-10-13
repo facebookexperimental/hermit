@@ -2447,14 +2447,37 @@ impl<T: RecordOrReplay> Detcore<T> {
         observe_under_mask(guest, mask).await?;
         let mask = sanitize_ppoll_signal_mask(mask);
         let deadline = millis_duration_to_absolute_timeout(guest, call.timeout()).await;
-        let mut rsrc = Resources::new(guest.thread_state().dettid);
-        rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
-        rsrc.fyi("epoll_pwait");
-        let (result, deliver) = retry_blocking_wait_under_mask(
+        self.wait_on_masked_epoll(
             guest,
             call.with_sigmask(None),
+            mask,
+            deadline,
+            "epoll_pwait",
+        )
+        .await
+    }
+
+    /// The wait of a masked epoll_pwait or epoll_pwait2 under sequentialized
+    /// threads, once the call's temporary `mask` (sanitized) has been read at
+    /// entry: `probe`, an unmasked epoll_pwait, polls until an event, an
+    /// error, a signal that `mask` lets in (EINTR), or `deadline`, which
+    /// returns 0 (`handle_internal_masked_epoll_pwait`).
+    async fn wait_on_masked_epoll<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        probe: syscalls::EpollPwait,
+        mask: KernelSigset,
+        deadline: Option<LogicalTime>,
+        fyi: &'static str,
+    ) -> Result<i64, Error> {
+        let mut rsrc = Resources::new(guest.thread_state().dettid);
+        rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
+        rsrc.fyi(fyi);
+        let (result, deliver) = retry_blocking_wait_under_mask(
+            guest,
+            probe,
             rsrc,
-            // epoll_pwait returns 0 at its timeout.
+            // Both calls return 0 at their timeout.
             deadline.map(|deadline| (deadline, Ok(0))),
             Some(crate::syscalls::signal::kernel_installed_signal_mask(mask)),
         )
@@ -2474,8 +2497,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                     staged.release(guest);
                 }
                 None => tracing::warn!(
-                    "[tid {}] no room to deliver an epoll_pwait signal under its temporary \
-                     mask; its handler runs only once the guest unblocks it",
+                    "[tid {}] no room to deliver an {fyi} signal under its temporary mask; its \
+                     handler runs only once the guest unblocks it",
                     guest.tid()
                 ),
             }
@@ -2603,8 +2626,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// epoll_pwait via epoll_pwait2 when the kernel supports it. The pinned
     /// Reverie revision has no typed variant, so it arrives as a raw
     /// `Syscall::Other` and is dispatched here by Sysno. Detcore treats it
-    /// exactly like epoll_pwait: a scheduler yield point followed by
-    /// record/replay-aware forwarding of the raw call.
+    /// like epoll_pwait: under record and replay a call that may wait waits
+    /// outside the turn; under sequentialized threads it polls
+    /// (`handle_internal_epoll_pwait2`); otherwise, and for a zero timeout, a
+    /// scheduler yield point is followed by the raw call.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#773)
     pub async fn handle_epoll_pwait2<G: Guest<Self>>(
@@ -2620,16 +2645,17 @@ impl<T: RecordOrReplay> Detcore<T> {
             args.arg5,
         )
         .await?;
+        // A NULL timeout waits forever; a zero timespec cannot wait and keeps
+        // the turn.
+        let zero_timeout = args.arg3 != 0
+            && Addr::<Timespec>::from_raw(args.arg3)
+                .and_then(|timeout| guest.memory().read_value(timeout).ok())
+                .is_some_and(|timeout: Timespec| timeout.tv_sec == 0 && timeout.tv_nsec == 0);
         // Under record and replay, a call that may wait does so outside the
         // scheduler turn, as epoll_pwait's does: unmasked through the logged
         // background path, masked as a kernel wait under a private copy of its
-        // mask (`record_or_replay_masked_epoll_pwait2`). A NULL timeout waits
-        // forever; a zero timespec cannot wait and keeps the turn.
+        // mask (`record_or_replay_masked_epoll_pwait2`).
         if self.cfg.recordreplay_modes {
-            let zero_timeout = args.arg3 != 0
-                && Addr::<Timespec>::from_raw(args.arg3)
-                    .and_then(|timeout| guest.memory().read_value(timeout).ok())
-                    .is_some_and(|timeout: Timespec| timeout.tv_sec == 0 && timeout.tv_nsec == 0);
             if !zero_timeout {
                 return if args.arg4 != 0 {
                     self.record_or_replay_masked_epoll_pwait2(guest, args).await
@@ -2637,10 +2663,76 @@ impl<T: RecordOrReplay> Detcore<T> {
                     self.record_or_replay_blocking(guest, call).await
                 };
             }
+        } else if self.cfg.sequentialize_threads
+            && !zero_timeout
+            && (args.arg4 == 0 || self.cfg.backend_supports_blocked_wait_signal_interruption)
+        {
+            // With threads sequentialized, a call that may wait polls, as
+            // epoll_pwait does, rather than waiting in the kernel inside the
+            // turn, where no other guest thread could run
+            // (https://github.com/rrnewton/hermit/issues/4228). A masked call
+            // on a backend whose kernel does not report the guest's signal
+            // state keeps the turn, as a masked epoll_pwait does there.
+            return self.handle_internal_epoll_pwait2(guest, args).await;
         }
         let dettid = guest.thread_state().dettid;
         resource_request(guest, Resources::new(dettid)).await; // empty request
         Ok(self.record_or_replay(guest, call).await?)
+    }
+
+    /// An epoll_pwait2 that may wait, under sequentialized threads: it polls
+    /// with zero-timeout probes, as epoll_pwait does. A probe is an
+    /// epoll_pwait with no mask, whose answer for a zero timeout is the same
+    /// as epoll_pwait2's. Linux copies and checks the timespec before the
+    /// mask (`record_or_replay_masked_epoll_pwait2`), then the mask's size
+    /// and the mask, before it looks at the epoll descriptor. An unmasked
+    /// call waits as an unmasked epoll_pwait does
+    /// (`handle_internal_epoll_pwait`), a masked one as a masked epoll_pwait
+    /// does (`wait_on_masked_epoll`). It used to make the real call in the
+    /// thread's turn, so it returned 0 at its timeout, or never, when only
+    /// another guest thread could make an event ready
+    /// (https://github.com/rrnewton/hermit/issues/4228).
+    async fn handle_internal_epoll_pwait2<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        args: SyscallArgs,
+    ) -> Result<i64, Error> {
+        let deadline = match Addr::<Timespec>::from_raw(args.arg3) {
+            Some(timeout) => {
+                let timeout: Timespec = guest.memory().read_value(timeout)?;
+                let timeout = ppoll_timeout_duration(timeout)?;
+                // As for ppoll: `LogicalTime + Duration` saturates, where a
+                // nanosecond count cast to u64 would wrap a 2^64 ns timeout to
+                // none at all (Claude review of
+                // https://github.com/rrnewton/hermit/pull/4235).
+                Some(thread_observe_time(guest).await + timeout)
+            }
+            None => None,
+        };
+        let probe = syscalls::EpollPwait::new()
+            .with_epfd(args.arg0 as i32)
+            .with_events(AddrMut::from_raw(args.arg1))
+            .with_maxevents(args.arg2 as i32)
+            .with_timeout(0)
+            .with_sigmask(None)
+            .with_sigsetsize(args.arg5);
+        if args.arg4 == 0 {
+            let mut rsrc = Resources::new(guest.thread_state().dettid);
+            rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
+            rsrc.fyi("epoll_pwait2");
+            return retry_nonblocking_syscall_with_timeout(guest, probe, rsrc, deadline).await;
+        }
+        if args.arg5 != KERNEL_SIGSET_SIZE {
+            return Err(Errno::EINVAL.into());
+        }
+        let mask_address = Addr::<libc::sigset_t>::from_raw(args.arg4).ok_or(Errno::EFAULT)?;
+        let mask = read_kernel_sigset(guest, mask_address).await?;
+        // A pending real-time timer expiration that the mask lets the kernel
+        // deliver or discard (https://github.com/rrnewton/hermit/issues/4089).
+        observe_under_mask(guest, mask).await?;
+        let mask = sanitize_ppoll_signal_mask(mask);
+        self.wait_on_masked_epoll(guest, probe, mask, deadline, "epoll_pwait2")
+            .await
     }
 
     /// Before a call that sleeps or probes under the temporary mask at `mask`
