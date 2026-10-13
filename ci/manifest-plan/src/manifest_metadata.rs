@@ -953,6 +953,32 @@ test:
     }
 
     #[test]
+    fn backend_env_values_affect_manifest_digest_with_guest_digest_scope_unchanged() {
+        let source = OCCASIONAL_MANIFEST.replace(
+            "      verify:\n        ci: true\n",
+            "      verify:\n        ci: true\n        env_by_backend: {ptrace: {FIXTURE_CELL: 'one'}}\n",
+        );
+        let fixture = TemporaryManifestRoot::new("occasional", &source);
+        let before = ManifestInputs::read(fixture.path()).unwrap();
+        let old = ManifestSet::from_inputs(fixture.path(), &before).unwrap();
+        fs::write(
+            fixture.path().join("tests/e2e/manifests/occasional.yaml"),
+            source.replace("FIXTURE_CELL: 'one'", "FIXTURE_CELL: 'two'"),
+        )
+        .unwrap();
+        let after = ManifestInputs::read(fixture.path()).unwrap();
+        let new = ManifestSet::from_inputs(fixture.path(), &after).unwrap();
+        assert_ne!(
+            manifest_sha256(&before).unwrap(),
+            manifest_sha256(&after).unwrap()
+        );
+        assert_eq!(
+            crate::runner::test_digest(fixture.path(), old.all_tests().next().unwrap().3).unwrap(),
+            crate::runner::test_digest(fixture.path(), new.all_tests().next().unwrap().3).unwrap()
+        );
+    }
+
+    #[test]
     fn metadata_and_digest_use_the_same_captured_inputs_during_an_aba_change() {
         let fixture = TemporaryManifestRoot::new("occasional", OCCASIONAL_MANIFEST);
         let path = fixture.path().join("tests/e2e/manifests/occasional.yaml");

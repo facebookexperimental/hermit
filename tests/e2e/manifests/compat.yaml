@@ -101,20 +101,33 @@ corpus:
       hermit_args: [--max-timeslice=disabled]
       hermit_args_reason: >-
         In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption
-        timer, so these cells run with the maximum timeslice disabled; each
-        passed 10 of 10 verify runs that way in a local survey on 2026-10-08
-        (https://github.com/rrnewton/hermit/issues/3745)
+        timer, so these cells run with the maximum timeslice disabled. The
+        previously selected cells passed 10 of 10 verify runs that way on
+        2026-10-08 (https://github.com/rrnewton/hermit/issues/3745). The
+        mpstat-softirqs and pidstat-disk cells additionally select the existing
+        in-guest SIGALRM handler path with site patching off through row_env
+        below (https://github.com/rrnewton/hermit/issues/3520)
       rows:
         [
           arch, b2sum, base32, base64, basename, bash, bracket, cal, cat, cksum,
           curl, date, df-direct, dirname, du, echo, expr, findmnt, free, getopt,
           groups, head, hostname, id, kill, logname, ls, lsirq, lsmod,
-          lua-direct, md5sum, nproc, numactl-hardware, numastat, numfmt,
-          openssl, perl-direct, pinky, pr, printf, ps, pwd, readlink, realpath,
+          lua-direct, md5sum, mpstat-softirqs, nproc, numactl-hardware, numastat, numfmt,
+          openssl, perl-direct, pidstat-disk, pinky, pr, printf, ps, pwd, readlink, realpath,
           sha1sum, sha224sum, sha256sum, sha384sum, sha512sum, sleep, stat, sum,
           sysctl-random-uuid, test, "true", uname, uptime, users, vmstat,
           vmstat-disk, wc, wc-lines, whoami
         ]
+      # These settings belong to exactly these two ordinary LiteInst cells.
+      # Strict variants retain their preemption requirement. Other rows and
+      # backends retain their existing environments and interception routes.
+      row_env:
+        mpstat-softirqs:
+          REVERIE_LITEINST_SITE_PATCHING: '0'
+          REVERIE_LITEINST_SIGALRM_HANDLERS: '1'
+        pidstat-disk:
+          REVERIE_LITEINST_SITE_PATCHING: '0'
+          REVERIE_LITEINST_SIGALRM_HANDLERS: '1'
       disabled_reason: >-
         Did not pass 10 of 10 verify runs on liteinst with the maximum
         timeslice disabled in the first local survey of 2026-10-08, which ran
@@ -601,21 +614,11 @@ corpus:
           of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): a
           guest process exited without deregistering from the in-guest runtime
           (determinism loss) (https://github.com/rrnewton/hermit/issues/3745)
-        pidstat-disk: >-
-          Its first verify run on liteinst failed in the second local survey
-          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): a
-          guest process exited without deregistering from the in-guest runtime
-          (determinism loss) (https://github.com/rrnewton/hermit/issues/3745)
         sar-resource-tables: >-
           Its first verify run on liteinst failed in the second local survey
           of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
           execve of a further program image returned EOPNOTSUPP (exec refused)
           (https://github.com/rrnewton/hermit/issues/3745)
-        mpstat-softirqs: >-
-          Its first verify run on liteinst failed in the second local survey
-          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): a
-          guest process exited without deregistering from the in-guest runtime
-          (determinism loss) (https://github.com/rrnewton/hermit/issues/3745)
         top: >-
           Its first verify run on liteinst failed in the second local survey
           of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):

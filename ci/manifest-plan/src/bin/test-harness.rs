@@ -10726,7 +10726,13 @@ sys.exit(1 if failed else 0)
             "{test} does not enable {backend}"
         );
         // A per-backend hermit_args_reason is keyed like hermit_args.
-        for per_backend in ["ci", "expected_stdout", "hermit_args", "hermit_args_reason"] {
+        for per_backend in [
+            "ci",
+            "expected_stdout",
+            "hermit_args",
+            "hermit_args_reason",
+            "env_by_backend",
+        ] {
             if let Some(map) = mode.get_mut(per_backend).and_then(Value::as_mapping_mut) {
                 map.remove(backend);
             }
@@ -10788,7 +10794,11 @@ sys.exit(1 if failed else 0)
         let before = rows.len();
         rows.retain(|row| row.as_str() != Some(label.as_str()));
         assert_eq!(rows.len() + 1, before, "{test} does not enable {backend}");
-        if rows.is_empty() {
+        let no_rows_left = rows.is_empty();
+        if let Some(env) = entry.get_mut("row_env").and_then(Value::as_mapping_mut) {
+            env.remove(label.as_str());
+        }
+        if no_rows_left {
             entries.retain(|entry| entry["backend"].as_str() != Some(backend));
         }
         serde_yaml::to_string(&manifest).unwrap()

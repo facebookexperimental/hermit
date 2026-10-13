@@ -170,7 +170,8 @@ struct CorpusFocused {
 
 /// A verify cell on one more backend, on the named rows only, that the default
 /// (full) validation runs: it carries none of the row's run-type labels. The
-/// cell shares the corpus's environment, comparator and single-attempt reason;
+/// cell shares the corpus's environment, comparator and single-attempt reason,
+/// with optional environment additions for individual rows on this backend;
 /// its Hermit flags and their reason are its own, it has the global default
 /// budget, and it is never a diagnostic. In the expanded test the flags join
 /// the verify mode's per-backend `hermit_args`, so the manifest validator's
@@ -186,6 +187,10 @@ struct CorpusAdditional {
     hermit_args_reason: Option<String>,
     /// The rows with this cell.
     rows: Vec<String>,
+    /// Guest variables added only to the named row's cell on this backend.
+    /// Keys are row labels in `rows`; common environment names cannot recur.
+    #[serde(default)]
+    row_env: BTreeMap<String, BTreeMap<String, String>>,
     /// The backend's `backends_disabled` reason on every other row.
     disabled_reason: String,
     /// Rows without this cell whose reason is their own rather than
@@ -506,6 +511,18 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
             if !with_cell.insert(label.as_str()) {
                 return Err(format!(
                     "{bucket}: corpus additional {backend} names `{label}` twice"
+                ));
+            }
+        }
+        for (label, env) in &additional.row_env {
+            if !with_cell.contains(label.as_str()) {
+                return Err(format!(
+                    "{bucket}: corpus additional {backend} row_env names `{label}`, which has no enabled cell there"
+                ));
+            }
+            if env.is_empty() {
+                return Err(format!(
+                    "{bucket}: corpus additional {backend} row_env for `{label}` is empty"
                 ));
             }
         }
@@ -849,6 +866,23 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
             verify.push(("hermit_args_reason", reason));
         }
         push_shared_verify_settings(&mut verify, &corpus.verify);
+        let row_env = additional
+            .iter()
+            .filter_map(|additional| {
+                additional.row_env.get(&row.label).map(|env| {
+                    (
+                        additional.backend.as_str(),
+                        mapping(
+                            env.iter()
+                                .map(|(name, value)| (name.as_str(), string(value))),
+                        ),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        if !row_env.is_empty() {
+            verify.push(("env_by_backend", mapping(row_env)));
+        }
         if let Some(reason) = &corpus.verify.no_retry_reason {
             verify.push(("no_retry_reason", string(reason)));
         }
@@ -1932,6 +1966,43 @@ mod tests {
   rows:
     - {label: "echo""#,
         )
+    }
+
+    #[test]
+    fn additional_row_env_keeps_sibling_rows_backends_and_strict_variants_unchanged() {
+        let corpus = variant_corpus().replace(
+            "  variants:\n",
+            "  additional:\n    - backend: liteinst\n      rows: ['g++']\n      disabled_reason: fixture not enrolled\n  variants:\n",
+        );
+        let with_env = |settings: &str| {
+            corpus.replace(
+                "      rows: ['g++']\n",
+                &format!("      rows: ['g++']\n      row_env: {settings}\n"),
+            )
+        };
+        let original = expand_corpus(document(&corpus)).unwrap();
+        let mut expanded =
+            expand_corpus(document(&with_env("{'g++': {FIXTURE_CELL: 'on'}}"))).unwrap();
+        let verify = &mut expanded["test"][1]["modes"]["verify"];
+        assert_eq!(
+            verify["env_by_backend"],
+            serde_yaml::from_str::<Value>("{liteinst: {FIXTURE_CELL: 'on'}}").unwrap()
+        );
+        verify
+            .as_mapping_mut()
+            .unwrap()
+            .remove(string("env_by_backend"));
+        // Removing exactly the addition restores the entire expansion, including
+        // the strict variant of this same row and every sibling's full recipe.
+        assert_eq!(expanded, original);
+        for (settings, needle) in [
+            ("{absent: {FIXTURE_CELL: 'on'}}", "no enabled cell there"),
+            ("{slow: {FIXTURE_CELL: 'on'}}", "no enabled cell there"),
+            ("{'g++': {}}", "is empty"),
+        ] {
+            let error = expand_corpus(document(&with_env(settings))).unwrap_err();
+            assert!(error.contains(needle), "{error}");
+        }
     }
 
     #[test]

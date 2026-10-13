@@ -1005,7 +1005,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // disjoint_main_floor_is_well_formed_only_with_a_bounded_main_delta, and
     // ledger::admission::tests::disjoint_main_floor_is_not_canonical_without_the_git_proof
     // (hermit-manifest-plan) retains all 1073: 1074.
-    ("test.regular_crates", 1074),
+    // Four backend-scoped environment/expansion/digest tests retain all 1074: 1078.
+    ("test.regular_crates", 1078),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -3436,7 +3437,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the failed-match pressure evidence test: 1059.
     // And the same eight disjoint-main floor admission tests: 1073.
     // And the same disjoint-main not-canonical test: 1074.
-    ("test.regular_crates_on_host", 1074),
+    // And the same four backend-scoped environment tests: 1078.
+    ("test.regular_crates_on_host", 1078),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).

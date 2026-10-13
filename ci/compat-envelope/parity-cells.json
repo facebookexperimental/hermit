@@ -9,12 +9,12 @@
   "counts": {
     "all": {
       "cells": 4085,
-      "applicable": 1702,
-      "selectable": 1400,
+      "applicable": 1704,
+      "selectable": 1402,
       "population": 2775,
-      "population_candidate_selected": 1400,
+      "population_candidate_selected": 1402,
       "population_candidate_not_selected": 258,
-      "population_candidate_disabled": 1117
+      "population_candidate_disabled": 1115
     },
     "by_backend": {
       "dbt": {
@@ -46,12 +46,12 @@
       },
       "liteinst": {
         "cells": 817,
-        "applicable": 318,
-        "selectable": 312,
+        "applicable": 320,
+        "selectable": 314,
         "population": 555,
-        "population_candidate_selected": 312,
+        "population_candidate_selected": 314,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 243
+        "population_candidate_disabled": 241
       },
       "sabre": {
         "cells": 817,
@@ -2075,10 +2075,10 @@
     {"test_id":"compat/mountpoint","backend":"kvm","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/mountpoint","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/mountpoint","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only run type selects this cell, by its manifest label; full validation does not."},
-    {"test_id":"compat/mpstat-softirqs","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: A compat corpus row runs only its lane's verify cell on ptrace, a focused run type's verify cell on sabre, and a focused run type's replay cell on ptrace"},
+    {"test_id":"compat/mpstat-softirqs","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: A compat corpus row runs only its lane's verify cell on ptrace, a verify cell on liteinst, a focused run type's verify cell on sabre, and a focused run type's replay cell on ptrace"},
     {"test_id":"compat/mpstat-softirqs","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Its first verify run on in-guest-trap failed in the second local survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): Hermit refused the run because no guest process reported LiteInst statistics (https://github.com/rrnewton/hermit/issues/3745)"},
-    {"test_id":"compat/mpstat-softirqs","backend":"kvm","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: A compat corpus row runs only its lane's verify cell on ptrace, a focused run type's verify cell on sabre, and a focused run type's replay cell on ptrace"},
-    {"test_id":"compat/mpstat-softirqs","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Its first verify run on liteinst failed in the second local survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): a guest process exited without deregistering from the in-guest runtime (determinism loss) (https://github.com/rrnewton/hermit/issues/3745)"},
+    {"test_id":"compat/mpstat-softirqs","backend":"kvm","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: A compat corpus row runs only its lane's verify cell on ptrace, a verify cell on liteinst, a focused run type's verify cell on sabre, and a focused run type's replay cell on ptrace"},
+    {"test_id":"compat/mpstat-softirqs","backend":"liteinst","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/mpstat-softirqs","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Diverges at an inbound-signal scheduler commit under SaBRe in 4 of 4 runs; ptrace passes 3 of 3"},
     {"test_id":"compat/msgfmt","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/msgfmt","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only run type selects this cell, by its manifest label; full validation does not."},
@@ -2205,10 +2205,10 @@
     {"test_id":"compat/pgrep","backend":"kvm","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: A compat corpus row runs only its lane's verify cell on ptrace, a focused run type's verify cell on sabre, and a focused run type's replay cell on ptrace"},
     {"test_id":"compat/pgrep","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Its first verify run on liteinst failed in the second local survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): execve of a further program image returned EOPNOTSUPP (exec refused) (https://github.com/rrnewton/hermit/issues/3745)"},
     {"test_id":"compat/pgrep","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: The guest starts a second program image, and each image after the first makes 33 raw system calls in ld-linux and libc, which SaBRe's execution-path contract refuses (trusted_shared_object_sites > 0)"},
-    {"test_id":"compat/pidstat-disk","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: A compat corpus row runs only its lane's verify cell on ptrace, a focused run type's verify cell on sabre, and a focused run type's replay cell on ptrace"},
+    {"test_id":"compat/pidstat-disk","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: A compat corpus row runs only its lane's verify cell on ptrace, a verify cell on liteinst, a focused run type's verify cell on sabre, and a focused run type's replay cell on ptrace"},
     {"test_id":"compat/pidstat-disk","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Its first verify run on in-guest-trap failed in the second local survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): Hermit refused the run because no guest process reported LiteInst statistics (https://github.com/rrnewton/hermit/issues/3745)"},
-    {"test_id":"compat/pidstat-disk","backend":"kvm","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: A compat corpus row runs only its lane's verify cell on ptrace, a focused run type's verify cell on sabre, and a focused run type's replay cell on ptrace"},
-    {"test_id":"compat/pidstat-disk","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Its first verify run on liteinst failed in the second local survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): a guest process exited without deregistering from the in-guest runtime (determinism loss) (https://github.com/rrnewton/hermit/issues/3745)"},
+    {"test_id":"compat/pidstat-disk","backend":"kvm","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: A compat corpus row runs only its lane's verify cell on ptrace, a verify cell on liteinst, a focused run type's verify cell on sabre, and a focused run type's replay cell on ptrace"},
+    {"test_id":"compat/pidstat-disk","backend":"liteinst","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/pidstat-disk","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the sabre-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/pinky","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: A compat corpus row runs only its lane's verify cell on ptrace, a verify cell on liteinst and in-guest-trap, a focused run type's verify cell on sabre, and a focused run type's replay cell on ptrace"},
     {"test_id":"compat/pinky","backend":"in-guest-trap","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},

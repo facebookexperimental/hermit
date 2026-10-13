@@ -377,6 +377,14 @@ specific configuration:
   refused. Only a verify or a replay mode accepts it. A replay cell that does
   not declare `env` inherits its verify cell's; one that does, an empty
   mapping included, records with exactly the variables it declares.
+- `env_by_backend` adds guest variables only on its named enabled backend,
+  merged with common `env`. Only verify recipes may declare it. Empty backend
+  maps, names already in common `env`, invalid names or NUL values, and
+  runner-owned names are refused. Replay inherits the effective verify
+  environment unless it declares its own `env`, including an empty mapping.
+  The effective `--env` arguments are retained in invocation evidence; exact
+  manifest bytes, including these settings, remain covered by the manifest
+  digest. The guest source/direct-command digest keeps its existing scope.
 - `comparator: stripped` runs Hermit's default `--verify` comparison instead of
   `--verify-strict`. It is below L2. The cell passes only on a verified,
   matched report that compared a non-empty stripped event stream on both
@@ -431,7 +439,10 @@ which join the mode's per-backend `hermit_args` (and, when the flagged cells'
 reasons differ, a per-backend `hermit_args_reason`). Every other row disables
 that backend with the entry's `disabled_reason`, or with its own reason in the
 entry's `disabled`. An additional backend may not be the section's backend or
-a focused one.
+a focused one. An entry's optional `row_env` maps row labels from its enabled
+`rows` to nonempty environment additions for that row on that backend alone.
+It expands to `env_by_backend` without changing common `env`, sibling rows,
+other backends or generated strict variants; unknown or disabled rows refuse.
 `replay` gives every row except those its `except` groups name (each group
 with its reason) a replay cell on ptrace in the row's own test (`hermit record
 start` then replay, compared by the harness), labelled with the section's run

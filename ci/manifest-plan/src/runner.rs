@@ -527,6 +527,11 @@ pub struct ModeRecipe {
     /// applies that rule.
     #[serde(default)]
     pub env: Option<BTreeMap<String, String>>,
+    /// Verify-only guest additions on the named enabled backend, merged with
+    /// `env` without replacing any common or runner-owned name. Replay inherits
+    /// the effective verify environment unless it declares its own `env`.
+    #[serde(default)]
+    pub env_by_backend: BTreeMap<String, BTreeMap<String, String>>,
     /// The comparison a verify cell's two runs must pass. `strict` (the
     /// default) is the canonical full-observation comparison that can
     /// establish L2. `stripped` is Hermit's default `--verify` comparison:
@@ -815,11 +820,26 @@ pub(crate) fn cell_workdir(cell: &SelectedCell) -> Option<String> {
 
 /// The guest environment variables a selected cell adds after the runner's own.
 ///
-/// A declared `env`, even an empty one, is the cell's whole addition: a replay
-/// recipe that declares `env: {}` runs without its verify recipe's, rather
-/// than inheriting variables its recording was never meant to carry.
+/// Verify merges common `env` with only this backend's additions. A replay
+/// recipe's declared `env`, even an empty one, replaces the effective verify
+/// environment rather than inheriting variables it was never meant to carry.
 fn cell_mode_env(cell: &SelectedCell) -> BTreeMap<String, String> {
-    inherited(cell, |recipe| recipe.env.clone()).unwrap_or_default()
+    inherited(cell, |recipe| {
+        let backend_env = cell
+            .id
+            .backend
+            .as_ref()
+            .and_then(|backend| recipe.env_by_backend.get(backend));
+        if recipe.env.is_none() && backend_env.is_none() {
+            return None;
+        }
+        let mut env = recipe.env.clone().unwrap_or_default();
+        if let Some(additions) = backend_env {
+            env.extend(additions.clone());
+        }
+        Some(env)
+    })
+    .unwrap_or_default()
 }
 
 /// The declared guest disposition for a selected verify or replay cell.
@@ -8302,6 +8322,11 @@ fn validate_mode_extensions(id: &str, mode: &str, recipe: &ModeRecipe) -> Result
             "{id}: {mode} declares env, which only a verify or replay mode accepts"
         ));
     }
+    if !recipe.env_by_backend.is_empty() && mode != "verify" {
+        return Err(format!(
+            "{id}: {mode} declares env_by_backend, which only a verify mode accepts"
+        ));
+    }
     if recipe
         .no_retry_reason
         .as_deref()
@@ -8361,7 +8386,32 @@ fn validate_mode_extensions(id: &str, mode: &str, recipe: &ModeRecipe) -> Result
             return Err(format!("{id}: hermit_args_reason without hermit_args"));
         }
     }
-    for (name, value) in recipe.env.iter().flatten() {
+    for (backend, env) in &recipe.env_by_backend {
+        if !recipe.backends_enabled.contains(backend) {
+            return Err(format!(
+                "{id}: env_by_backend names backend `{backend}`, which is not in backends_enabled"
+            ));
+        }
+        if env.is_empty() {
+            return Err(format!("{id}: env_by_backend for `{backend}` is empty"));
+        }
+        if let Some(name) = env.keys().find(|name| {
+            recipe
+                .env
+                .as_ref()
+                .is_some_and(|common| common.contains_key(*name))
+        }) {
+            return Err(format!(
+                "{id}: env_by_backend for `{backend}` repeats common env name `{name}`"
+            ));
+        }
+    }
+    for (name, value) in recipe
+        .env
+        .iter()
+        .flatten()
+        .chain(recipe.env_by_backend.values().flatten())
+    {
         let well_formed = name
             .chars()
             .next()
@@ -20843,6 +20893,105 @@ cp "{}" "$verdict"
         assert_eq!(cell_guest_args(&chaos, "ptrace"), Vec::<String>::new());
         assert_eq!(cell_workdir(&chaos), None);
         assert_eq!(cell_expected_guest_exit(&chaos), None);
+    }
+
+    #[test]
+    fn backend_env_is_scoped_in_argv_and_replay_inheritance() {
+        let context = run_context(Path::new("/repo"));
+        let mut cell = ptrace_cell("verify");
+        let recipe = cell.test.modes.get_mut("verify").unwrap();
+        recipe.backends_enabled.push("liteinst".into());
+        recipe.env = Some(BTreeMap::from([("TMPDIR".into(), "/tmp".into())]));
+        recipe.env_by_backend = BTreeMap::from([(
+            "liteinst".into(),
+            BTreeMap::from([("FIXTURE_CELL".into(), "on".into())]),
+        )]);
+        validate_mode_extensions("fixture/test", "verify", recipe).unwrap();
+        let verify = recipe.clone();
+        let render = |cell: &SelectedCell| {
+            build_spec(
+                &context,
+                cell,
+                PathBuf::from("/repo/results/fixture"),
+                vec!["/bin/true".into()],
+                "1",
+                None,
+                15,
+            )
+            .unwrap()
+            .argv
+        };
+        let ptrace = render(&cell);
+        cell.id.backend = Some("liteinst".into());
+        let liteinst = render(&cell);
+        assert!(ptrace.iter().any(|arg| arg == "TMPDIR=/tmp"));
+        assert!(liteinst.iter().any(|arg| arg == "TMPDIR=/tmp"));
+        assert!(!ptrace.iter().any(|arg| arg == "FIXTURE_CELL=on"));
+        let addition = liteinst
+            .windows(2)
+            .position(|pair| pair == ["--env", "FIXTURE_CELL=on"])
+            .unwrap();
+        let mut without_addition = liteinst;
+        without_addition.drain(addition..addition + 2);
+        let mut unchanged = cell.clone();
+        unchanged
+            .test
+            .modes
+            .get_mut("verify")
+            .unwrap()
+            .env_by_backend
+            .clear();
+        assert_eq!(without_addition, render(&unchanged));
+        let mut replay = replay_cell_with_verify(verify, ModeRecipe::default());
+        replay.id.backend = Some("liteinst".into());
+        assert_eq!(cell_mode_env(&replay), cell_mode_env(&cell));
+        replay.test.modes.get_mut("replay").unwrap().env = Some(BTreeMap::new());
+        assert!(cell_mode_env(&replay).is_empty());
+        assert!(!render(&replay).iter().any(|arg| arg == "FIXTURE_CELL=on"));
+    }
+
+    #[test]
+    fn backend_env_refuses_invalid_scope_names_values_and_collisions() {
+        let mut recipe = ModeRecipe {
+            backends_enabled: vec!["liteinst".into()],
+            env: Some(BTreeMap::from([("TMPDIR".into(), "/tmp".into())])),
+            ..ModeRecipe::default()
+        };
+        for (backend, name, value, needle) in [
+            ("ptrace", "FIXTURE", "on", "not in backends_enabled"),
+            ("unknown", "FIXTURE", "on", "not in backends_enabled"),
+            ("liteinst", "", "on", "not a valid NAME=VALUE"),
+            ("liteinst", "lower", "on", "not a valid NAME=VALUE"),
+            ("liteinst", "NAME", "\0", "not a valid NAME=VALUE"),
+            ("liteinst", "HOME", "x", "runner sets itself"),
+            ("liteinst", "TMPDIR", "/tmp", "repeats common env name"),
+        ] {
+            recipe.env_by_backend = BTreeMap::from([(
+                backend.into(),
+                BTreeMap::from([(name.into(), value.into())]),
+            )]);
+            let error = validate_mode_extensions("fixture/test", "verify", &recipe).unwrap_err();
+            assert!(error.contains(needle), "{error}");
+        }
+        recipe.env_by_backend = BTreeMap::from([("liteinst".into(), BTreeMap::new())]);
+        assert!(
+            validate_mode_extensions("fixture/test", "verify", &recipe)
+                .unwrap_err()
+                .contains("is empty")
+        );
+        recipe
+            .env_by_backend
+            .get_mut("liteinst")
+            .unwrap()
+            .insert("FIXTURE".into(), "on".into());
+        for mode in ["replay", "naked", "chaos", "custom"] {
+            recipe.env = None;
+            let error = validate_mode_extensions("fixture/test", mode, &recipe).unwrap_err();
+            assert!(
+                error.contains("env_by_backend, which only a verify mode accepts"),
+                "{error}"
+            );
+        }
     }
 
     /// A replay recipe that declares an environment, even an empty one, runs

@@ -1358,6 +1358,7 @@ fn validate_mode_with_cpu(
             "hermit_args",
             "hermit_args_reason",
             "env",
+            "env_by_backend",
             "comparator",
             "comparator_reason",
             "diagnostic",
@@ -2063,6 +2064,9 @@ ptrace = ["strict-compat"]
 
 [env]
 TMPDIR = "/tmp"
+
+[env_by_backend.ptrace]
+FIXTURE_CELL = "on"
 
 [diagnostic]
 ptrace = "bounded probe; its product failure does not fail the run"

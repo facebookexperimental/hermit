@@ -36328,6 +36328,44 @@
       ],
       "test": "c-programs/personality-domain",
       "timeout_seconds": 57
+    },
+    {
+      "backend": "liteinst",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
+      "test": "compat/mpstat-softirqs",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "liteinst",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
+      "test": "compat/pidstat-disk",
+      "timeout_seconds": 57
     }
   ],
   "schema": 1
