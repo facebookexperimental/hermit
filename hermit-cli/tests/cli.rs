@@ -22109,6 +22109,77 @@ fn a_guest_or_child_killed_by_a_realtime_signal_reports_it() {
     );
 }
 
+/// The KVM twin of
+/// [`a_signal_to_a_guest_blocked_in_a_polled_call_acts_as_on_linux`]: a
+/// signal sent to a guest blocked in a polled `read`, `write` or `waitpid`
+/// acts as on Linux and verifies at bitwise parity. KVM guest thread IDs are
+/// not host tasks, so the scheduler never reads their `/proc` signal state;
+/// a blocked or ignored signal must still leave a write that has made
+/// progress waiting (`write-partial-blocked`, `write-partial-ignored`) and a
+/// read waiting (`blocked`, `ignored`). The expected lines are the native
+/// run's. `cancel` and `process` are not run: glibc's cancellation signal
+/// and a signal from another process do not reach a KVM guest blocked in a
+/// polled call yet, with or without this capability.
+#[test]
+fn run_kvm_a_signal_to_a_guest_blocked_in_a_polled_call_acts_as_on_linux() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+    let guest = pipe_read_signal_guest().to_str().unwrap().to_owned();
+    for (mode, expected) in [
+        (
+            "eintr",
+            "thread read: -1 Interrupted system call, handled 1\n",
+        ),
+        ("restart", "thread read: 1 byte 'x', handled 1\n"),
+        ("ignored", "thread read: 1 byte 'x', handled 0\n"),
+        ("blocked", "thread read: 1 byte 'x', handled 0\n"),
+        ("ready", "thread read: 1 byte 'x'\n"),
+        ("eof", "thread read: 0 byte '-'\n"),
+        (
+            "write-zero",
+            "write: -1 Interrupted system call, handled 1\n",
+        ),
+        ("write-room", "write: 1\n"),
+        ("write-partial", "write: one pipe capacity, handled 1\n"),
+        (
+            "write-partial-blocked",
+            "write: two pipe capacities, handled 0\n",
+        ),
+        (
+            "write-partial-ignored",
+            "write: two pipe capacities, handled 0\n",
+        ),
+        (
+            "waitpid",
+            "waitpid: -1 Interrupted system call, handled 1\nchild exited 0\n",
+        ),
+    ] {
+        let args = [
+            "--backend=kvm",
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--",
+            guest.as_str(),
+            mode,
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "mode {mode}");
+        let log = stderr(&output);
+        assert!(
+            log.contains(":: comparison=BitwiseInfoV1 relaxations=none"),
+            "mode {mode}: comparison was not canonical:\n{log}"
+        );
+        assert!(
+            log.contains(":: Success: deterministic. Determinism verified."),
+            "mode {mode}: verification failed:\n{log}"
+        );
+    }
+}
+
 /// A signal sent to a guest blocked in a call Detcore polls internally (a
 /// `read` of an empty pipe, a `write` to a full one, a `waitpid`) acts as it
 /// does on Linux, under each disposition, and verifies at bitwise parity

@@ -6544,7 +6544,7 @@ mod tests {
             "runs_exit_robust_list": backend == Backend::Ptrace,
             "requires_thread_directed_process_signals": dbt,
             "supports_parked_write_signal_interruption":
-                matches!(backend, Backend::Ptrace | Backend::E9patch),
+                matches!(backend, Backend::Ptrace | Backend::E9patch | Backend::Kvm),
             "defers_vfork_child_registration": kvm,
             "virtualizes_capability_prctls": kvm,
             // `run_kvm` set these two after `prepare_backend_config`.
@@ -6799,7 +6799,7 @@ mod tests {
         for (backend, supports_interruption) in [
             (Backend::Ptrace, true),
             (Backend::Dbt, false),
-            (Backend::Kvm, false),
+            (Backend::Kvm, true),
             (Backend::Sabre, false),
             (Backend::Liteinst, false),
             (Backend::InGuestTrap, false),

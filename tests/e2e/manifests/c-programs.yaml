@@ -12660,9 +12660,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: The first verify run exits with waitpid error 512 after one raw libc syscall site; neither functional L2 nor a pure SaBRe path is established
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -12693,7 +12693,7 @@ test:
           in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
       custom:
         ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: the portable hermit integration node owns the ptrace success case; DBT, KVM, SaBRe, and LiteInst do not support interrupting scheduler-managed pipe writes.'
+        ci_disabled_reason: 'NOT-EXERCISED: the portable hermit integration node owns the ptrace success case; DBT, SaBRe, and LiteInst do not support interrupting scheduler-managed pipe writes, and the KVM verify cell runs the same signal-interrupted writes on its default path.'
         args:
           - --strict
           - --panic-on-unsupported-syscalls
@@ -12707,7 +12707,7 @@ test:
           - ptrace
         backends_disabled:
           dbt: DBT does not support interrupting scheduler-managed pipe writes while preserving signal restart semantics
-          kvm: KVM does not support interrupting scheduler-managed pipe writes while preserving signal restart semantics
+          kvm: The KVM verify cell runs these signal-interrupted pipe writes on its default path; this mode passes its guest arguments only to ptrace
           sabre: SaBRe does not support interrupting scheduler-managed pipe writes while preserving signal restart semantics
           liteinst: LiteInst does not support interrupting scheduler-managed pipe writes while preserving signal restart semantics
           in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
