@@ -4063,9 +4063,9 @@ impl Scheduler {
         self.remove_physical_thread(dtid, mm);
         // A killed vfork parent must not leave its barrier behind: step2a
         // drops a barrier only when it can read the parent's pending request,
-        // which `next_turns.remove` below discards, and while any barrier
-        // exists `step3_peek` selects only a barrier's child, so a barrier
-        // left behind stops the schedule once that child is gone
+        // which `next_turns.remove` below discards, and while a barrier exists
+        // `step3_peek` selects its child first, so a barrier left behind would
+        // change the schedule after that child is gone
         // (https://github.com/rrnewton/hermit/issues/3984).
         self.retire_vfork_parent(*dtid);
         // A killed vfork child is its own barrier's release edge.
@@ -5981,8 +5981,9 @@ impl Scheduler {
     }
 
     /// Keep scheduling inside an active vfork until the parent can continue.
-    /// Before child registration no guest may run; afterward step 3 admits only
-    /// the child. A failed clone reaches the parent continuation without a child.
+    /// Before child registration no guest may run; afterward step 3 selects the
+    /// child first (see [`Self::step3_peek`]). A failed clone reaches the parent
+    /// continuation without a child.
     ///
     /// On the ptrace backend the kernel keeps the vfork parent blocked inside the injected
     /// `clone(2)` until the child execs or exits, so a registered child (barrier `Some`) is always
@@ -8085,25 +8086,30 @@ impl Scheduler {
         }
     }
 
-    /// The backgrounded vfork child that must be readmitted for step 3 to select
-    /// anything, if queued work is all excluded by the vfork gate.
+    /// The backgrounded vfork child that step 3 waits for, and that step 2c
+    /// readmits as soon as its call finishes.
     ///
-    /// While a vfork barrier is in place, step 3 selects only a registered
-    /// barrier child that is in the run queue. A child can instead be in the
-    /// background pool: a vfork child that vforks again, as a double-spawning
-    /// helper does, is backgrounded in its own `vfork` until its child execs.
-    /// Then the queued threads (that grandchild among them) can never be
-    /// selected, and step 2c, seeing queued work, would never readmit the
-    /// finished child either: a livelock
-    /// (<https://github.com/rrnewton/hermit/issues/4163>).
+    /// While a vfork barrier is in place, step 3 selects a barrier child that
+    /// is queued to run a turn first. A child can instead be in the background
+    /// pool (`external_io_blockers`): a vfork child that vforks again, as a
+    /// double-spawning helper does, is backgrounded in its own `vfork` until
+    /// its child execs (<https://github.com/rrnewton/hermit/issues/4163>), and
+    /// a child can call something whose completion the host times. Letting
+    /// other threads run meanwhile would make how many turns they take before
+    /// the child resumes depend on when its call finished, so step 3 selects
+    /// nothing until it is readmitted
+    /// (<https://github.com/rrnewton/hermit/issues/4194>, Claude review of
+    /// <https://github.com/rrnewton/hermit/pull/4205>). A child blocked on, or
+    /// polling for, another thread is not here: only that thread's turn can
+    /// wake it, so the other threads run.
     ///
-    /// Returns `None` when step 3 can select queued work, or when no barrier
-    /// child is backgrounded. Otherwise returns the innermost such child: the
-    /// first backgrounded barrier child, in parent order (the order step 3
-    /// uses), that holds no barrier of its own. A child that does hold one is
-    /// still inside its own `vfork`, so it cannot finish before its child
-    /// does: with three levels (P vforks C, C vforks G, G vforks a child that
-    /// execs), C waits for G, and only G, whose child has execed, can run.
+    /// Returns `None` when a barrier child is queued to run a turn, or when no
+    /// barrier child is backgrounded. Otherwise returns the innermost such
+    /// child: the first backgrounded barrier child, in parent order (the order
+    /// step 3 uses), that holds no barrier of its own. A child that does hold
+    /// one is still inside its own `vfork`, so it cannot finish before its
+    /// child does: with three levels (P vforks C, C vforks G, G vforks a child
+    /// that execs), C waits for G, and only G, whose child has execed, can run.
     ///
     /// The choice does not depend on which background calls have finished, so
     /// waiting for that one child and readmitting it alone keeps the schedule
@@ -8115,7 +8121,7 @@ impl Scheduler {
         let mut children = self.vfork_barriers.values().flatten();
         if children
             .clone()
-            .any(|child| self.run_queue.contains_tid(*child))
+            .any(|child| self.run_queue.contains_non_polling_tid(*child))
         {
             return None;
         }
@@ -8230,8 +8236,9 @@ impl Scheduler {
                 //
                 // The vfork-gated child is readmitted here in replay too, and
                 // not logged: until it is readmitted no turn can commit (step 3
-                // selects nothing), so the turn of its readmission does not
-                // depend on when its call finished.
+                // waits for it, see `vfork_gated_background_child`), so the
+                // turn of its readmission does not depend on when its call
+                // finished.
                 if !self.run_queue.is_empty() && !only_pollers {
                     if let Some(child) = self.vfork_gated_background_child()
                         && ready.contains(&child)
@@ -9171,15 +9178,17 @@ impl Scheduler {
             None
         } else {
             // While a vfork barrier is in place its child runs first, so the
-            // vfork interval is a run of the child's turns. When no barrier
-            // child is queued to run a turn (each is blocked on another
-            // thread, in the background, or polling a call that is not ready),
-            // the queued threads run as usual: Linux suspends only the vfork
-            // parent, and a child that waits for a thread of its own or reads a
-            // pipe a sibling writes must let that thread run
+            // vfork interval is a run of the child's turns. A backgrounded
+            // child is waited for (see `vfork_gated_background_child`), as its
+            // call's completion is host-timed. When no barrier child is queued
+            // to run a turn and none is backgrounded (each is blocked on
+            // another thread or polling a call that is not ready), the queued
+            // threads run as usual: Linux suspends only the vfork parent, and a
+            // child that waits for a thread of its own or reads a pipe a sibling
+            // writes must let that thread run
             // (https://github.com/rrnewton/hermit/issues/4194). The parent
             // stays out of the run queue until step 2a has seen its release,
-            // and a child cannot exec or exit before another thread's turn
+            // and such a child cannot exec or exit before another thread's turn
             // makes its call ready, so no host-timed event ends the interval.
             let gated_child = self
                 .vfork_barriers
@@ -9192,6 +9201,7 @@ impl Scheduler {
                     .run_queue
                     .tentative_pop_tid(child)
                     .expect("vfork child disappeared from run queue"),
+                None if self.vfork_gated_background_child().is_some() => return None,
                 None => self.run_queue.tentative_pop_next().expect("impossible"),
             };
             let nextturn = self.next_turns.get(&next_dtid).unwrap_or_else(|| {
@@ -13668,7 +13678,9 @@ mod test {
     /// While a vfork barrier stands, a queued child that will run its turn is
     /// selected before other runnable threads; a child that is only polling a
     /// call that is not ready, or not queued at all, lets them run, as when it
-    /// waits for a sibling's write (https://github.com/rrnewton/hermit/issues/4194).
+    /// waits for a sibling's write (https://github.com/rrnewton/hermit/issues/4194);
+    /// a backgrounded child, whose call the host times, is waited for (Claude
+    /// review of https://github.com/rrnewton/hermit/pull/4205).
     #[test]
     fn a_vfork_barrier_selects_its_child_only_while_it_will_run_a_turn() {
         let parent = DetTid::from_raw(3);
@@ -13717,6 +13729,17 @@ mod test {
         blocked.run_queue.push_back(other, DEFAULT_PRIORITY);
         assert_eq!(selected(&mut blocked), other);
         assert_eq!(blocked.vfork_barriers.get(&parent), Some(&Some(child)));
+
+        // A backgrounded child, whose call the host times, is waited for:
+        // nothing is selected until step 2c readmits it.
+        let mut backgrounded = fresh();
+        backgrounded.run_queue.push_back(other, DEFAULT_PRIORITY);
+        backgrounded
+            .blocked
+            .external_io_blockers
+            .insert(child, ExternalOpId::new(child, 1));
+        assert!(backgrounded.step3_peek().is_none());
+        assert_eq!(backgrounded.vfork_gated_background_child(), Some(child));
     }
 
     /// A vfork parent killed while its registered child's barrier is up takes

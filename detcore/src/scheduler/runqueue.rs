@@ -527,13 +527,15 @@ impl RunQueue {
     }
 
     /// Whether `tid` is queued as a thread that will run its turn, not as a
-    /// polling thread retrying a call that is not ready
-    /// ([`RunQueue::push_poller`], which records a polling upgrade, or a
-    /// poller for the deterministic-work-first gates). Read-only.
+    /// polling thread retrying a call that is not ready: one pushed by
+    /// [`RunQueue::push_poller`] (which records a polling upgrade) or restored
+    /// as a poller and not run since. Its priority band does not decide it: a
+    /// runnable thread can sit in the last band, as under
+    /// `--chaos-target-races`. Read-only.
     pub fn contains_non_polling_tid(&self, tid: DetTid) -> bool {
-        self.queue.iter().any(|(k, v)| {
-            v.tid == tid && v.poll_upgrade.is_none() && !v.counts_as_poller(k.priority)
-        })
+        self.queue
+            .iter()
+            .any(|(_, v)| v.tid == tid && v.poll_upgrade.is_none() && !v.deadline_restored)
     }
 
     pub(super) fn suspend(

@@ -2678,7 +2678,12 @@ fn record_nested_vfork_chains() {
 
 /// A vfork child that waits for a thread other than its own vfork child
 /// records and replays at bitwise parity
-/// (https://github.com/rrnewton/hermit/issues/4194).
+/// (https://github.com/rrnewton/hermit/issues/4194), and so does one whose
+/// calls the host times while a sibling thread spins: its readmission is not
+/// logged, so the scheduler must commit no other turn while it is in the
+/// background (Claude review of https://github.com/rrnewton/hermit/pull/4205).
+/// The spinning sibling makes a PMU skid-overshoot refusal possible, so an
+/// attempt that ends in one is retried.
 #[test]
 fn record_vfork_child_waiting_for_another_thread() {
     let _guard = hermit_record_lock();
@@ -2706,11 +2711,16 @@ fn record_vfork_child_waiting_for_another_thread() {
             "sibling-pipe",
             "sibling-pipe done, child status 0, writer status 0\n",
         ),
+        (
+            "background-sibling",
+            "background-sibling done, child status 0, sibling progress while the child waited ",
+        ),
     ] {
-        let output = canonical_record_replay_command(
+        let output = canonical_record_replay_command_retrying_skid(
             &format!("vfork child {mode}"),
             &guest,
             &[OsStr::new(mode)],
+            3,
         );
         assert!(output.contains(line), "missing {line:?} in:\n{output}");
     }

@@ -22993,7 +22993,10 @@ fn cpu_directory_reads_list_only_cpu0_on_every_path() {
 /// one that forks a grandchild and waits for it, and one that reads a pipe a
 /// forked sibling writes after a short sleep. While a vfork barrier stood,
 /// Detcore selected only the barrier's child, so a child blocked on, or polling
-/// for, another thread waited forever.
+/// for, another thread waited forever. A child whose calls the host times, with
+/// a sibling thread spinning, still runs at parity: the sibling's progress
+/// while the child waits must not depend on host timing (Claude review of
+/// https://github.com/rrnewton/hermit/pull/4205).
 #[test]
 fn a_vfork_child_waiting_for_another_thread_completes_at_bitwise_parity() {
     let guest = futex_c_guest(&VFORK_CHILD_WAITS_GUEST, "vfork_child_waits")
@@ -23005,6 +23008,10 @@ fn a_vfork_child_waiting_for_another_thread_completes_at_bitwise_parity() {
         (
             "sibling-pipe",
             "sibling-pipe done, child status 0, writer status 0\n",
+        ),
+        (
+            "background-sibling",
+            "background-sibling done, child status 0, sibling progress while the child waited ",
         ),
     ] {
         let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -23035,7 +23042,16 @@ fn a_vfork_child_waiting_for_another_thread_completes_at_bitwise_parity() {
             Some(0),
             "{mode}\nstdout:\n{stdout}\nstderr:\n{log}"
         );
-        assert_eq!(stdout, expected, "{mode}\nstderr:\n{log}");
+        // The sibling's progress is a schedule-dependent number; parity holds
+        // it to the same value in both runs.
+        if mode == "background-sibling" {
+            assert!(
+                stdout.starts_with(expected),
+                "{mode}: {stdout:?}\nstderr:\n{log}"
+            );
+        } else {
+            assert_eq!(stdout, expected, "{mode}\nstderr:\n{log}");
+        }
         let report: serde_json::Value =
             serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
                 .expect("the verdict must be JSON");
