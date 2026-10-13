@@ -2020,7 +2020,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // signal::tests::a_private_sigchld_sent_before_the_sleep_is_filed_ends_it_before_it_parks
     // and signal::before_park_tests::a_private_sigchld_committed_before_the_sleep_is_filed_ends_it_through_the_ledger
     // (https://github.com/rrnewton/hermit/issues/4132): 1507 (over main's 1504).
-    ("test.detcore_unit", 1507),
+    // And the ten rendered-procfs tests: open flags, mappings, extended
+    // attributes, path calls, times, trailing slashes, metadata, placeholder
+    // links, and the reserved procfs device
+    // (https://github.com/rrnewton/hermit/issues/4213): 1517.
+    ("test.detcore_unit", 1517),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2799,7 +2803,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/issues/1930): 354.
     // And a_guests_sigchld_to_a_sleeping_sibling_ends_its_sleep_as_on_linux
     // (https://github.com/rrnewton/hermit/issues/4132): 355 (over main's 354).
-    ("test.cli", 355),
+    // And detcore_renders_its_procfs_files_on_every_backend
+    // (https://github.com/rrnewton/hermit/issues/4213): 356.
+    ("test.cli", 356),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3083,7 +3089,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Nor does the vfork-child-waits test: 272.
     // Nor does the one-node get_mempolicy test: 273.
     // Nor does the guest SIGCHLD to a sleeping sibling test: 291 (over main's 290).
-    ("test.cli_on_host", 291),
+    // So does detcore_renders_its_procfs_files_on_every_backend
+    // (https://github.com/rrnewton/hermit/issues/4213): 292.
+    ("test.cli_on_host", 292),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -3262,7 +3270,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two-barrier last-band gate test: 1497.
     // And the deferred-SIGCHLD last-band gate test: 1498.
     // And the three guest thread-directed SIGCHLD sleep tests: 1507 (over main's 1504).
-    ("test.detcore_unit_on_host", 1507),
+    // And the ten rendered-procfs tests: 1517.
+    ("test.detcore_unit_on_host", 1517),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

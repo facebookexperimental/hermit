@@ -158,6 +158,7 @@ static NESTED_VFORK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_CHILD_WAITS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static GET_MEMPOLICY_ONE_NODE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PID_NAMESPACE_NESTED_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static RENDERED_PROCFS_FILES_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KERNEL_MAX_AFFINITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPU_DIRECTORY_READS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_PROCESS_GROUP_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1188,6 +1189,31 @@ fn timer_exec_flush_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "timer-exec-flush guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn rendered_procfs_files_guest() -> &'static Path {
+    RENDERED_PROCFS_FILES_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("rendered-procfs-files");
+        fs::create_dir_all(&build_root).expect("failed to create rendered-procfs-files directory");
+        let guest = build_root.join("rendered_procfs_files");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/rendered_procfs_files.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile rendered-procfs-files guest");
+        assert!(
+            output.status.success(),
+            "rendered-procfs-files guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -3548,6 +3574,135 @@ fn run_dbt_binds_in_a_user_namespace_of_its_own() {
         "the guest shares the caller's user namespace: {text}"
     );
     assert_eq!(lines.next(), None, "{text}");
+}
+
+/// Detcore renders `/proc/sys/kernel/random/uuid` and `/proc/sys/kernel/pty/nr`
+/// without the backend opening them (https://github.com/rrnewton/hermit/issues/4213).
+/// Every backend gives the guest Linux's answers for both files, which the
+/// memfd standing in for each could not give, reaches bitwise parity, and
+/// shows the same identity: Detcore's procfs device and the inode each path
+/// names. Linux's own answers are checked natively first. A backend that is
+/// not available here is named as not compared.
+#[test]
+fn detcore_renders_its_procfs_files_on_every_backend() {
+    let guest = rendered_procfs_files_guest();
+    let native = Command::new(guest)
+        .output()
+        .expect("run rendered-procfs-files natively");
+    assert!(native.status.success(), "native: {native:?}");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mut identities = Vec::new();
+    for backend in ["ptrace", "dbt", "kvm"] {
+        if (backend == "dbt"
+            && dbt_unavailable("detcore_renders_its_procfs_files_on_every_backend"))
+            || (backend == "kvm" && !Path::new("/dev/kvm").exists())
+        {
+            eprintln!(
+                "detcore_renders_its_procfs_files_on_every_backend: NOT COMPARED: {backend} \
+                 is not available on this host or in this build"
+            );
+            continue;
+        }
+        let report = directory.path().join(format!("{backend}.json"));
+        let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
+        let mut args = vec![
+            "--backend",
+            backend,
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            &report_arg,
+        ];
+        args.extend([
+            "--base-env=minimal",
+            "--",
+            guest.to_str().expect("guest path is UTF-8"),
+        ]);
+        // Checks of procfs files other than the two rendered ones, which these
+        // backends do not yet serve faithfully (see the guest's usage).
+        // DBT's strict comparison cannot yet cover a read of /proc/self/maps
+        // (https://github.com/rrnewton/hermit/issues/4232) or a chroot
+        // (https://github.com/rrnewton/hermit/issues/4233), both older than
+        // rendered procfs files; it verifies everything else.
+        match backend {
+            "dbt" => args.extend(["--no-foreign-fd-links", "--no-maps-or-chroot"]),
+            "kvm" => args.push("--kvm-local-procfs"),
+            // Hermit's container may chroot, so the chroot checks must run.
+            _ => args.push("--require-chroot"),
+        }
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        let verdict: serde_json::Value =
+            serde_json::from_slice(&fs::read(&report).expect("read the verification report"))
+                .expect("parse the verification report");
+        assert_eq!(verdict["bitwise_parity"], true, "{backend}: {verdict}");
+        let compared = &verdict["compared_log_messages"];
+        assert!(
+            compared["left"].as_u64().is_some_and(|count| count > 0)
+                && compared["left"] == compared["right"],
+            "{backend} compared no INFO messages: {verdict}"
+        );
+        identities.push((backend, stdout(&output)));
+        // The chroot checks DBT cannot yet verify, run once: a descriptor
+        // opened before a chroot is still the file, and neither file exists
+        // inside it. (Not a thread's chroot, which hangs under DBT:
+        // https://github.com/rrnewton/hermit/issues/4254.)
+        if backend == "dbt" {
+            let args = [
+                "--backend",
+                "dbt",
+                "run",
+                "--strict",
+                "--base-env=minimal",
+                "--",
+                guest.to_str().expect("guest path is UTF-8"),
+                "--chroot-only",
+                "--require-chroot",
+            ];
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            assert_eq!(stdout(&output), "chroot checks passed\n", "dbt chroot");
+        }
+    }
+    assert!(
+        identities.len() > 1 || !cfg!(feature = "dbt"),
+        "only ptrace was compared: {identities:?}"
+    );
+    eprintln!(
+        "detcore_renders_its_procfs_files_on_every_backend compared {:?}",
+        identities
+            .iter()
+            .map(|(backend, _)| *backend)
+            .collect::<Vec<_>>()
+    );
+    let (_, first) = &identities[0];
+    let lines = first.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 3, "{first}");
+    for (line, path) in lines
+        .iter()
+        .zip(["/proc/sys/kernel/random/uuid", "/proc/sys/kernel/pty/nr"])
+    {
+        assert!(
+            line.starts_with(&format!("{path} dev=0xf000ff ino=")),
+            "{line}"
+        );
+        let ino: u64 = line
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("ino="))
+            .and_then(|ino| ino.parse().ok())
+            .unwrap_or_else(|| panic!("no inode in {line}"));
+        assert_eq!(ino & 0xf000_0000, 0xf000_0000, "{line}");
+    }
+    assert_eq!(lines[2], "inherited descriptor read 27 bytes");
+    for (backend, identity) in &identities {
+        assert_eq!(
+            identity, first,
+            "{backend} differs from {}",
+            identities[0].0
+        );
+    }
 }
 
 /// DBT launches through the same container as ptrace

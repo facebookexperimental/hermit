@@ -80,6 +80,8 @@ use crate::tool_local::Detcore;
 use crate::tool_local::finish_partial_record_or_replay_write;
 use crate::types::*;
 
+pub(crate) mod rendered_procfs;
+
 /// A conversion from SOCK_* flags to O_* flags which makes unsafe (but checked during testing) assumptions.
 fn oflag_from_sock_bits(s_bits: i32) -> OFlag {
     // An otherwise unsafe "cast" which leans on the `linux_flags_assumptions` below.
@@ -1184,6 +1186,82 @@ impl<'a> StatTarget<'a> {
     }
 }
 
+/// The rendered procfs file that a stat result describes, if it is one: by
+/// the name Detcore gave it, or by its kernel identity where Detcore names no
+/// procfs files.
+fn rendered_entry(
+    procfs: &ProcfsEntry,
+    stat: &DetStat,
+    cfg: &crate::config::Config,
+) -> Option<&'static Path> {
+    if cfg.recordreplay_modes {
+        return None;
+    }
+    match procfs {
+        ProcfsEntry::At(within) => rendered_procfs::rendered_path_within(within),
+        ProcfsEntry::NotProcfs | ProcfsEntry::Unknown => {
+            rendered_procfs::rendered_path_of_raw(stat.dev, stat.inode)
+        }
+        ProcfsEntry::Unnamed => None,
+    }
+}
+
+/// Whether `statx` accepts these `flags` and `mask` (`vfs_statx`'s and the
+/// syscall's own checks): no reserved mask bit, known flags only, and not
+/// both synchronization types at once.
+fn statx_arguments_valid(flags: i32, mask: u32) -> bool {
+    let known = libc::AT_SYMLINK_NOFOLLOW
+        | libc::AT_EMPTY_PATH
+        | libc::AT_NO_AUTOMOUNT
+        | libc::AT_STATX_SYNC_TYPE;
+    mask & 0x8000_0000 == 0
+        && flags & !known == 0
+        && flags & libc::AT_STATX_SYNC_TYPE != libc::AT_STATX_SYNC_TYPE
+}
+
+/// Whether `path` spells a descriptor link: `/dev/fd/N`, `/proc/*/fd/N` or
+/// `/proc/*/task/*/fd/N`.
+fn names_descriptor_link(path: &Path) -> bool {
+    let parts = path
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => {
+                Some(std::os::unix::ffi::OsStrExt::as_bytes(part))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let number = |part: &[u8]| !part.is_empty() && part.iter().all(u8::is_ascii_digit);
+    match parts.as_slice() {
+        [b"dev", b"fd", fd] | [b"proc", _, b"fd", fd] | [b"proc", _, b"task", _, b"fd", fd] => {
+            number(fd)
+        }
+        _ => false,
+    }
+}
+
+/// The file a call of the stat family describes.
+fn stat_family_target<'a, M: MemoryAccess>(memory: &M, call: &'a StatFamily) -> StatTarget<'a> {
+    match call {
+        StatFamily::Fstat(call) => StatTarget::Descriptor(call.fd()),
+        StatFamily::Fstatat(call) => {
+            StatTarget::at(memory, call.dirfd(), call.path(), call.flags())
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        StatFamily::Stat(call) => StatTarget::Path {
+            dirfd: libc::AT_FDCWD,
+            path: call.path(),
+            follow: true,
+        },
+        #[cfg(not(target_arch = "aarch64"))]
+        StatFamily::Lstat(call) => StatTarget::Path {
+            dirfd: libc::AT_FDCWD,
+            path: call.path(),
+            follow: false,
+        },
+    }
+}
+
 /// How many times Detcore injects the `openat` or the `close` of the
 /// `O_PATH` descriptor it opens in the guest to name a procfs entry when the
 /// call had no effect, before it records a determinism loss instead.
@@ -2043,6 +2121,31 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Ask for permission to resolve this path into a file:
         let request = guest.thread_state().mk_request(resource, Permission::R);
         resource_request(guest, request).await;
+        // An empty path names nothing to `openat`, which has no
+        // `AT_EMPTY_PATH`: the kernel's ENOENT.
+        let rendered = match if path.as_os_str().is_empty() {
+            Ok(None)
+        } else {
+            self.rendered_procfs_at(guest, &observed_path).await
+        } {
+            Ok(rendered) => rendered,
+            Err(error) => {
+                resource_release_all(guest).await;
+                // Flags `build_open_flags` refuses fail before the lookup.
+                return Err(
+                    rendered_procfs::open_flags_refused(call.flags()).map_or(error, Into::into)
+                );
+            }
+        };
+        // `O_PATH|O_NOFOLLOW` opens a descriptor link itself, which the
+        // kernel has.
+        if let Some(target) = rendered.filter(|target| {
+            !(target.via_link && call.flags().contains(OFlag::O_PATH | OFlag::O_NOFOLLOW))
+        }) {
+            let result = self.open_rendered_procfs(guest, call.flags(), target).await;
+            resource_release_all(guest).await;
+            return result;
+        }
         // Signal phase 1 (`sigalrm_phase1`): in a process that handles SIGALRM,
         // an open that may wait (a FIFO, a character or block device) is
         // refused. Checked after the grant: no other guest runs before the open.
@@ -2068,6 +2171,37 @@ impl<T: RecordOrReplay> Detcore<T> {
         match res {
             Ok(fd) => {
                 let fd = fd as RawFd;
+                // Another process's descriptor link, or another spelling of
+                // this one's, to a placeholder: the guest opened the rendered
+                // file again, as Linux opens the procfs file again.
+                // (Where one tool process serves every guest, it knows every
+                // placeholder, and a run that made none pays nothing.)
+                if names_descriptor_link(&observed_path)
+                    && !call.flags().contains(OFlag::O_PATH | OFlag::O_NOFOLLOW)
+                    && (rendered_procfs::placeholders_exist()
+                        || guest.config().backend.tool_shares_guest_descriptor_table)
+                {
+                    let behind = self.rendered_procfs_behind(guest, fd).await;
+                    if !matches!(behind, Ok(None)) {
+                        let _ = guest.inject(syscalls::Close::new().with_fd(fd)).await;
+                    }
+                    let result = match behind {
+                        Ok(None) => None,
+                        Ok(Some(path)) => {
+                            let target = rendered_procfs::RenderedTarget {
+                                procfs: ProcfsFile::from_path(path)
+                                    .expect("a rendered path is a procfs file"),
+                                via_link: true,
+                            };
+                            Some(self.open_rendered_procfs(guest, call.flags(), target).await)
+                        }
+                        Err(error) => Some(Err(error)),
+                    };
+                    if let Some(result) = result {
+                        resource_release_all(guest).await;
+                        return result;
+                    }
+                }
                 // Under a network trace mode only; the run ends before the
                 // guest sees the descriptor.
                 let pid = guest.pid().as_raw();
@@ -2113,6 +2247,40 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let host_stat = self
                     .add_fd_with_stat(guest, fd, call.flags(), fd_type)
                     .await?;
+                // A placeholder reached through any other spelling (a symbolic
+                // link to a descriptor link, `/dev/stdin`): the kernel opened
+                // the placeholder, which is the rendered file again, also for
+                // `O_PATH`. The kernel already followed every link, so none
+                // remains for `O_NOFOLLOW` to refuse (an `O_PATH|O_NOFOLLOW`
+                // descriptor for a link is the link, no placeholder).
+                // Without virtualized metadata no stat was taken; take one
+                // while a placeholder may be about.
+                let identity = match &host_stat {
+                    Some(stat) => Some(*stat),
+                    None if self.renders_procfs(guest)
+                        && (guest.thread_state().holds_a_rendered_procfs_file()
+                            || rendered_procfs::placeholders_exist()) =>
+                    {
+                        self.inject_fstat(guest, fd).await.ok()
+                    }
+                    None => None,
+                };
+                if let Some(stat) = &identity
+                    && self.renders_procfs(guest)
+                    && let Some(path) =
+                        rendered_procfs::placeholder_identity(stat.st_dev, stat.st_ino)
+                {
+                    guest.thread_state().remove_fd(fd);
+                    let _ = guest.inject(syscalls::Close::new().with_fd(fd)).await;
+                    let target = rendered_procfs::RenderedTarget {
+                        procfs: ProcfsFile::from_path(path)
+                            .expect("a rendered path is a procfs file"),
+                        via_link: false,
+                    };
+                    let result = self.open_rendered_procfs(guest, call.flags(), target).await;
+                    resource_release_all(guest).await;
+                    return result;
+                }
                 if let (true, Some(stat)) = (guest.config().record_host_inputs, &host_stat) {
                     crate::tool_global::record_host_input(
                         guest,
@@ -2751,7 +2919,23 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Read,
     ) -> Result<(), Error> {
-        let raw_contents = self.snapshot_procfs(guest, call).await?;
+        let template = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.procfs_rendering_template())?;
+        let raw_contents = match template {
+            // An `O_PATH` descriptor reads nothing.
+            Some(_)
+                if guest
+                    .thread_state()
+                    .with_detfd(call.fd(), |detfd| detfd.status_flags())?
+                    & libc::O_PATH
+                    != 0 =>
+            {
+                return Err(Errno::EBADF.into());
+            }
+            Some(template) => template.to_vec(),
+            None => self.snapshot_procfs(guest, call).await?,
+        };
         // The guest mount view is the launch namespace (guest mount/unshare/
         // setns are refused under Detcore). Ephemeral host FUSE seed rows
         // (per-process and named-tool seeds) are other tenants' propagated
@@ -2790,6 +2974,32 @@ impl<T: RecordOrReplay> Detcore<T> {
         let target_fd = guest
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_target_fd())?;
+        // The kernel's fdinfo for a procfs file Detcore renders describes the
+        // memfd standing in for it. Linux's names the file: Detcore's cursor,
+        // the guest's procfs mount and the file's inode.
+        let rendered_target = match target_fd {
+            Some(target_fd) => guest
+                .thread_state()
+                .with_detfd(target_fd, |detfd| {
+                    detfd.procfs_rendered_path().map(|path| {
+                        (
+                            path,
+                            detfd.procfs_position().map_or(0, |(offset, _)| offset),
+                        )
+                    })
+                })
+                .ok()
+                .flatten(),
+            None => None,
+        };
+        let contents = match rendered_target {
+            Some((_, offset)) => format!(
+                "pos:\t{offset}\nflags:\t0\nmnt_id:\t{}\nino:\t0\n",
+                rendered_procfs::guest_procfs_mount_id()?
+            )
+            .into_bytes(),
+            None => contents,
+        };
         let fdinfo_identity = if let Some(target_fd) = target_fd {
             let (cached_stat, logical_flags, open_file_id, fd_type, inode_override) =
                 guest.thread_state().with_detfd(target_fd, |detfd| {
@@ -2808,18 +3018,26 @@ impl<T: RecordOrReplay> Detcore<T> {
             // Keyed as `fstat` keys the descriptor, so the two numbers agree.
             let virtual_inode = match inode_override {
                 Some(inode) => inode,
+                // Detcore numbered it when it rendered the file.
+                None if let Some((path, _)) = rendered_target => {
+                    DetInode::mint(procfs_inode::rendered_inode(path))
+                }
                 None => {
                     let procfs =
                         Self::procfs_entry(guest, &stat, StatTarget::Descriptor(target_fd)).await;
-                    determinize_inode_observing_mtime(
-                        guest,
-                        stat.raw_inode(),
-                        procfs.name(stat.dev),
-                        ObservedMtime::Unobserved,
-                        InodeSighting::Descriptor,
-                    )
-                    .await
-                    .0
+                    if let Some(path) = rendered_entry(&procfs, &stat, guest.config()) {
+                        DetInode::mint(procfs_inode::rendered_inode(path))
+                    } else {
+                        determinize_inode_observing_mtime(
+                            guest,
+                            stat.raw_inode(),
+                            procfs.name(stat.dev),
+                            ObservedMtime::Unobserved,
+                            InodeSighting::Descriptor,
+                        )
+                        .await
+                        .0
+                    }
                 }
             };
             let raw_mount_id =
@@ -3178,6 +3396,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             guest.thread_state().with_detfd(call.fd(), |detfd| {
                 detfd.commit_procfs_read(offset, copied);
             })?;
+            self.sync_rendered_procfs_position(guest, call.fd()).await?;
             return Ok(copied as i64);
         }
 
@@ -3523,6 +3742,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.set_procfs_offset(new_offset))?;
+        self.sync_rendered_procfs_position(guest, call.fd()).await?;
         Ok(result)
     }
 
@@ -4976,6 +5196,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         let cfg = guest.config().clone();
 
         let mut stat: DetStat = stat.into();
+        // Detcore's placeholder, however the guest reached it: the rendered
+        // file it stands in for.
+        if inode_override.is_none()
+            && !cfg.recordreplay_modes
+            && let Some(path) = rendered_procfs::placeholder_identity(stat.dev, stat.inode)
+        {
+            return rendered_procfs::placeholder_stat(path, cfg.epoch);
+        }
         let (d_ino, global_mtime) = match inode_override {
             // The container's stdio streams have fixed inodes and always
             // report the epoch: whatever backs them on the host (a pipe, a
@@ -5017,14 +5245,32 @@ impl<T: RecordOrReplay> Detcore<T> {
                 {
                     stat.nlink = 1;
                 }
-                determinize_inode_observing_mtime(
-                    guest,
-                    stat.raw_inode(),
-                    procfs.name(stat.dev),
-                    observed,
-                    sighting,
-                )
-                .await
+                match rendered_entry(&procfs, &stat, &cfg) {
+                    // A file Detcore renders, reached through a spelling the
+                    // kernel resolved (a symbolic link): the number its path
+                    // names, and the epoch.
+                    Some(path) => {
+                        let nanos = cfg
+                            .epoch
+                            .timestamp_nanos_opt()
+                            .expect("epoch cannot be represented in nanoseconds")
+                            as u64;
+                        (
+                            DetInode::mint(procfs_inode::rendered_inode(path)),
+                            LogicalTime::from_nanos(nanos),
+                        )
+                    }
+                    None => {
+                        determinize_inode_observing_mtime(
+                            guest,
+                            stat.raw_inode(),
+                            procfs.name(stat.dev),
+                            observed,
+                            sighting,
+                        )
+                        .await
+                    }
+                }
             }
         };
         stat.inode = d_ino.as_raw(); // Reveal only the deterministic inode.
@@ -5064,24 +5310,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // filepath from tracer may cause tracer to hang under certain fuse
             // filesystem (squashfs_ll).
             // The target is found before the call, which can overwrite its path.
-            let target = match &call {
-                StatFamily::Fstat(call) => StatTarget::Descriptor(call.fd()),
-                StatFamily::Fstatat(call) => {
-                    StatTarget::at(&guest.memory(), call.dirfd(), call.path(), call.flags())
-                }
-                #[cfg(not(target_arch = "aarch64"))]
-                StatFamily::Stat(call) => StatTarget::Path {
-                    dirfd: libc::AT_FDCWD,
-                    path: call.path(),
-                    follow: true,
-                },
-                #[cfg(not(target_arch = "aarch64"))]
-                StatFamily::Lstat(call) => StatTarget::Path {
-                    dirfd: libc::AT_FDCWD,
-                    path: call.path(),
-                    follow: false,
-                },
-            };
+            let target = stat_family_target(&guest.memory(), &call);
             let target = match call.stat() {
                 Some(result) => target.unless_overwritten(
                     &guest.memory(),
@@ -5090,6 +5319,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 ),
                 None => target,
             };
+            if let Some(stat) = self.rendered_procfs_stat(guest, target).await? {
+                let statptr = call.stat().ok_or(Errno::EFAULT)?;
+                guest.memory().write_value(statptr.0, &stat.into())?;
+                return Ok(0);
+            }
             guest.inject(Syscall::from(call)).await?;
             let statptr = call.stat().ok_or(Errno::EFAULT)?;
             let inode_override = target
@@ -5107,6 +5341,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             memory.write_value(statptr.0, &stat.into())?;
             Ok(0)
         } else {
+            // A procfs file Detcore renders has no kernel object to ask.
+            let target = stat_family_target(&guest.memory(), &call);
+            if let Some(stat) = self.rendered_procfs_stat(guest, target).await? {
+                let statptr = call.stat().ok_or(Errno::EFAULT)?;
+                guest.memory().write_value(statptr.0, &stat.into())?;
+                return Ok(0);
+            }
             Ok(self.record_or_replay(guest, call).await?)
         }
     }
@@ -5117,6 +5358,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Statx,
     ) -> Result<i64, Error> {
+        // Whether `statx` accepts its arguments, which it checks before it
+        // looks at any file.
+        let renderable = statx_arguments_valid(call.flags().bits(), call.mask().bits());
         if guest.config().virtualize_metadata {
             // NB: let kernel handle error codes, it's not easy to do so without kernel
             // because there're many corner cases. i.e.: even access filepath from tracer
@@ -5131,6 +5375,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                 ),
                 None => target,
             };
+            if let Some(stat) = self.rendered_procfs_stat(guest, target).await? {
+                // Arguments `statx` refuses before it looks at any file.
+                if !renderable {
+                    return Err(Errno::EINVAL.into());
+                }
+                let statptr = call.statx().ok_or(Errno::EFAULT)?;
+                guest.memory().write_value(statptr.0, &stat.into())?;
+                return Ok(0);
+            }
             guest.inject(call).await?;
             let statptr = call.statx().ok_or(Errno::EFAULT)?;
             let inode_override = target
@@ -5148,6 +5401,17 @@ impl<T: RecordOrReplay> Detcore<T> {
             memory.write_value(statptr.0, &stat.into())?;
             Ok(0)
         } else {
+            // A procfs file Detcore renders has no kernel object to ask.
+            let target = StatTarget::at(&guest.memory(), call.dirfd(), call.path(), call.flags());
+            if let Some(stat) = self.rendered_procfs_stat(guest, target).await? {
+                // Arguments `statx` refuses before it looks at any file.
+                if !renderable {
+                    return Err(Errno::EINVAL.into());
+                }
+                let statptr = call.statx().ok_or(Errno::EFAULT)?;
+                guest.memory().write_value(statptr.0, &stat.into())?;
+                return Ok(0);
+            }
             Ok(self.record_or_replay(guest, call).await?)
         }
     }
@@ -5228,9 +5492,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         match call.cmd() {
             F_GETFL => {
                 let physical_flags = self.record_or_replay(guest, call).await?;
-                let logical_nonblocking = guest
-                    .thread_state()
-                    .with_detfd(fd, |detfd| detfd.is_nonblocking())?;
+                let (logical_nonblocking, rendered_nofollow) =
+                    guest.thread_state().with_detfd(fd, |detfd| {
+                        (
+                            detfd.is_nonblocking(),
+                            detfd.procfs_rendered_path().is_some()
+                                && detfd.status_flags() & libc::O_NOFOLLOW != 0,
+                        )
+                    })?;
+                // A rendered procfs file's placeholder was reopened without
+                // the guest's `O_NOFOLLOW`, which Linux keeps.
+                let physical_flags = if rendered_nofollow {
+                    physical_flags | i64::from(libc::O_NOFOLLOW)
+                } else {
+                    physical_flags
+                };
                 let nonblocking = i64::from(OFlag::O_NONBLOCK.bits());
                 if logical_nonblocking {
                     Ok(physical_flags | nonblocking)
@@ -5532,6 +5808,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Statfs,
     ) -> Result<i64, Error> {
+        if let Some(pointer) = call.path() {
+            let path: PathBuf = pointer.read(&guest.memory())?;
+            let observed = Self::observed_path(guest, libc::AT_FDCWD, &path)?;
+            if self.rendered_procfs_at(guest, &observed).await?.is_some()
+                || self
+                    .placeholder_reached(guest, libc::AT_FDCWD, Some(pointer), true)
+                    .await
+                    .is_some()
+            {
+                self.write_procfs_statfs(guest, call.buf())?;
+                return Ok(0);
+            }
+        }
         let ret = self.record_or_replay(guest, call).await?;
         self.canonicalize_statfs_buf(guest, call.buf())?;
         Ok(ret)
@@ -5543,6 +5832,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Fstatfs,
     ) -> Result<i64, Error> {
+        let rendered = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.procfs_rendered_path().is_some())
+            .unwrap_or(false);
+        if rendered {
+            self.write_procfs_statfs(guest, call.buf())?;
+            return Ok(0);
+        }
         let ret = self.record_or_replay(guest, call).await?;
         self.canonicalize_statfs_buf(guest, call.buf())?;
         Ok(ret)
@@ -7831,7 +8128,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let mut names = Vec::with_capacity(batch.len());
                 for (index, entry) in batch.iter().enumerate() {
                     let (host, path) = inodes.entry_inode(&entry.name, entry.ino);
-                    let (d_ino, _) = determinize_listed_inode(guest, host, path, mark).await;
+                    let d_ino = match self.rendered_listed_inode(&inodes, &entry.name, entry.ino) {
+                        Some(inode) => DetInode::mint(inode),
+                        None => determinize_listed_inode(guest, host, path, mark).await.0,
+                    };
                     let d_off = i64::try_from(start + index as u64 + 1).unwrap_or(i64::MAX);
                     call.format
                         .encode(entry, d_ino.as_raw(), d_off, &mut records);
@@ -7978,7 +8278,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut records = Vec::with_capacity(len);
         for entry in &entries {
             let (host, path) = inodes.entry_inode(&entry.name, entry.ino);
-            let (d_ino, _) = determinize_named_inode(guest, host, path).await;
+            let d_ino = match self.rendered_listed_inode(&inodes, &entry.name, entry.ino) {
+                Some(inode) => DetInode::mint(inode),
+                None => determinize_named_inode(guest, host, path).await.0,
+            };
             call.format
                 .encode(entry, d_ino.as_raw(), entry.off, &mut records);
         }

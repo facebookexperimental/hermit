@@ -122,12 +122,66 @@ fn decimal_u32(component: &OsStr) -> Option<u32> {
 
 fn decimal_fd(component: &OsStr) -> Option<i32> {
     let value = component.to_str()?;
-    (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
-        .then(|| value.parse().ok())?
+    // procfs names descriptors without leading zeros (`name_to_int`).
+    (!value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && (value == "0" || !value.starts_with('0')))
+    .then(|| value.parse().ok())?
+}
+
+/// The bytes of a readlink buffer that a placeholder's link may cover, read
+/// before the kernel writes the link (`restore_link_tail`).
+pub(crate) fn saved_link_bytes<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+    guest: &G,
+    buffer: Option<AddrMut<'_, libc::c_char>>,
+    buffer_len: usize,
+) -> Option<Vec<u8>> {
+    let buffer = buffer?;
+    let mut saved = vec![0; buffer_len.min(ANONYMOUS_PROC_FD_TARGET_CAPACITY)];
+    guest
+        .memory()
+        .read_exact(buffer.cast::<u8>(), &mut saved)
+        .ok()?;
+    Some(saved)
+}
+
+/// Put back the caller's bytes after a rewritten link of `written` bytes,
+/// where the kernel had written `kernel_len`: Linux writes only the link.
+pub(crate) fn restore_link_tail<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+    guest: &mut G,
+    buffer: AddrMut<'_, libc::c_char>,
+    written: usize,
+    kernel_len: usize,
+    saved: Option<&[u8]>,
+) -> Result<(), Error> {
+    if let Some(saved) = saved {
+        let end = kernel_len.min(saved.len());
+        if written < end {
+            // SAFETY: `written < end <= saved.len() <= buffer_len`, so the
+            // address stays inside the guest's buffer; nothing is dereferenced
+            // here, only written through the guest memory interface.
+            let tail = unsafe { buffer.cast::<u8>().add(written) };
+            guest.memory().write_exact(tail, &saved[written..end])?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether `path` spells a task's descriptor link,
+/// `/proc/<pid>/task/<tid>/fd/N`.
+fn names_task_descriptor_link(path: &Path) -> bool {
+    let Some(parts) = normalized_absolute_parts(path) else {
+        return false;
+    };
+    matches!(
+        parts.as_slice(),
+        [proc, _, task, _, fd_dir, fd]
+            if *proc == "proc" && *task == "task" && *fd_dir == "fd" && decimal_fd(fd).is_some()
+    )
 }
 
 /// Returns the optional numeric proc subject and the descriptor number.
-fn proc_fd_target(path: &Path) -> Option<(Option<u32>, i32)> {
+pub(crate) fn proc_fd_target(path: &Path) -> Option<(Option<u32>, i32)> {
     let parts = normalized_absolute_parts(path)?;
     match parts.as_slice() {
         [dev, fd_dir, fd] if *dev == "dev" && *fd_dir == "fd" => Some((None, decimal_fd(fd)?)),
@@ -265,7 +319,9 @@ fn anonymous_object_device(
 }
 
 // Long enough for `socket:[` + every decimal u64 inode + `]`.
-const ANONYMOUS_PROC_FD_TARGET_CAPACITY: usize = 32;
+/// Room for a whole pipe or socket link, and for the link of a placeholder
+/// for a procfs file Detcore renders (`crate::procfs::placeholder_link_path`).
+const ANONYMOUS_PROC_FD_TARGET_CAPACITY: usize = 128;
 
 fn needs_anonymous_proc_fd_scratch(buffer_present: bool, buffer_len: usize) -> bool {
     buffer_present && buffer_len != 0 && buffer_len < ANONYMOUS_PROC_FD_TARGET_CAPACITY
@@ -324,13 +380,29 @@ impl<T: RecordOrReplay> Detcore<T> {
     async fn canonicalize_other_proc_fd_target<G>(
         &self,
         guest: &mut G,
+        link: (i32, Option<PathPtr<'_>>),
         raw_target: &[u8],
         buffer: Option<AddrMut<'_, libc::c_char>>,
         buffer_len: usize,
+        saved: Option<&[u8]>,
     ) -> Result<Option<i64>, Error>
     where
         G: Guest<Self>,
     {
+        if let Some(path) = crate::procfs::placeholder_link_path(raw_target)
+            && self.placeholder_link_confirmed(guest, link).await
+        {
+            // Another process's link to a procfs file Detcore renders names
+            // the file, as Linux's does.
+            let link = std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str());
+            let written = link.len().min(buffer_len);
+            let buffer = buffer.ok_or(Errno::EFAULT)?;
+            guest
+                .memory()
+                .write_exact(buffer.cast(), &link[..written])?;
+            restore_link_tail(guest, buffer, written, raw_target.len(), saved)?;
+            return Ok(Some(written as i64));
+        }
         let Some(identity) = anonymous_proc_fd_identity(raw_target) else {
             return Ok(None);
         };
@@ -360,6 +432,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         let target = canonical_anonymous_proc_fd_target(&identity, inode, buffer_len);
         let buffer = buffer.ok_or(Errno::EFAULT)?;
         guest.memory().write_exact(buffer.cast(), &target)?;
+        // The raw link's longer inode digits must not stay behind the
+        // canonical one: Linux writes only the link.
+        restore_link_tail(guest, buffer, target.len(), raw_target.len(), saved)?;
         Ok(Some(target.len() as i64))
     }
 
@@ -369,9 +444,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     async fn canonicalize_other_proc_fd_readlink<G>(
         &self,
         guest: &mut G,
+        link: (i32, Option<PathPtr<'_>>),
         buffer: Option<AddrMut<'_, libc::c_char>>,
         buffer_len: usize,
         result: i64,
+        saved: Option<&[u8]>,
     ) -> Result<i64, Error>
     where
         G: Guest<Self>,
@@ -383,7 +460,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut observed = vec![0; observed_len];
         guest.memory().read_exact(buffer.cast(), &mut observed)?;
         Ok(self
-            .canonicalize_other_proc_fd_target(guest, &observed, Some(buffer), buffer_len)
+            .canonicalize_other_proc_fd_target(
+                guest,
+                link,
+                &observed,
+                Some(buffer),
+                buffer_len,
+                saved,
+            )
             .await?
             .unwrap_or(result))
     }
@@ -410,7 +494,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let current_pid = guest.inject(syscalls::Getpid::new()).await?;
                 if current_pid != i64::from(subject) {
                     return self
-                        .canonicalize_other_proc_fd_readlink(guest, buffer, buffer_len, result)
+                        .canonicalize_other_proc_fd_readlink(
+                            guest,
+                            (libc::AT_FDCWD, None),
+                            buffer,
+                            buffer_len,
+                            result,
+                            None,
+                        )
                         .await;
                 }
             }
@@ -451,6 +542,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     async fn write_other_proc_fd_target<G>(
         &self,
         guest: &mut G,
+        link: (i32, Option<PathPtr<'_>>),
         raw_target: &[u8],
         buffer: Option<AddrMut<'_, libc::c_char>>,
         buffer_len: usize,
@@ -459,7 +551,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         G: Guest<Self>,
     {
         if let Some(result) = self
-            .canonicalize_other_proc_fd_target(guest, raw_target, buffer, buffer_len)
+            .canonicalize_other_proc_fd_target(guest, link, raw_target, buffer, buffer_len, None)
             .await?
         {
             return Ok(result);
@@ -480,15 +572,24 @@ impl<T: RecordOrReplay> Detcore<T> {
     where
         G: Guest<Self>,
     {
+        let link = (libc::AT_FDCWD, call.path());
         let buffer = call.buf();
         let buffer_len = call.bufsize();
         if !needs_anonymous_proc_fd_scratch(buffer.is_some(), buffer_len) {
+            let saved = saved_link_bytes(guest, buffer, buffer_len);
             let result = self.record_or_replay(guest, call).await?;
             if result <= 0 {
                 return Ok(result);
             }
             return self
-                .canonicalize_other_proc_fd_readlink(guest, buffer, buffer_len, result)
+                .canonicalize_other_proc_fd_readlink(
+                    guest,
+                    link,
+                    buffer,
+                    buffer_len,
+                    result,
+                    saved.as_deref(),
+                )
                 .await;
         }
 
@@ -507,7 +608,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut raw_target = vec![0; length];
         guest.memory().read_exact(scratch.cast(), &mut raw_target)?;
         drop(guard);
-        self.write_other_proc_fd_target(guest, &raw_target, buffer, buffer_len)
+        self.write_other_proc_fd_target(guest, link, &raw_target, buffer, buffer_len)
             .await
     }
 
@@ -519,15 +620,24 @@ impl<T: RecordOrReplay> Detcore<T> {
     where
         G: Guest<Self>,
     {
+        let link = (call.dirfd(), call.path());
         let buffer = call.buf();
         let buffer_len = call.buf_len();
         if !needs_anonymous_proc_fd_scratch(buffer.is_some(), buffer_len) {
+            let saved = saved_link_bytes(guest, buffer, buffer_len);
             let result = self.record_or_replay(guest, call).await?;
             if result <= 0 {
                 return Ok(result);
             }
             return self
-                .canonicalize_other_proc_fd_readlink(guest, buffer, buffer_len, result)
+                .canonicalize_other_proc_fd_readlink(
+                    guest,
+                    link,
+                    buffer,
+                    buffer_len,
+                    result,
+                    saved.as_deref(),
+                )
                 .await;
         }
 
@@ -546,8 +656,51 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut raw_target = vec![0; length];
         guest.memory().read_exact(scratch.cast(), &mut raw_target)?;
         drop(guard);
-        self.write_other_proc_fd_target(guest, &raw_target, buffer, buffer_len)
+        self.write_other_proc_fd_target(guest, link, &raw_target, buffer, buffer_len)
             .await
+    }
+
+    /// The rendered procfs file that the descriptor link `path` (absolute)
+    /// names a placeholder for, read whole into scratch space.
+    async fn placeholder_behind_link<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        path: &Path,
+    ) -> Result<Option<&'static Path>, Error> {
+        const PATH_CAPACITY: usize = 64;
+        let bytes = path.as_os_str().as_bytes();
+        if bytes.len() >= PATH_CAPACITY {
+            return Ok(None);
+        }
+        let mut path_buffer = [0_u8; PATH_CAPACITY];
+        path_buffer[..bytes.len()].copy_from_slice(bytes);
+        let mut stack = guest.stack().await;
+        let path_address = stack.push(path_buffer).cast::<libc::c_char>();
+        let scratch = stack
+            .reserve::<[u8; ANONYMOUS_PROC_FD_TARGET_CAPACITY]>()
+            .cast::<libc::c_char>();
+        let guard = stack.commit()?;
+        let length = guest
+            .inject(
+                syscalls::Readlinkat::new()
+                    .with_dirfd(libc::AT_FDCWD)
+                    .with_path(PathPtr::from_ptr(
+                        path_address.as_raw() as *const libc::c_char
+                    ))
+                    .with_buf(Some(scratch))
+                    .with_buf_len(ANONYMOUS_PROC_FD_TARGET_CAPACITY),
+            )
+            .await;
+        let rendered = match length {
+            Ok(length) => {
+                let mut target = vec![0; (length as usize).min(ANONYMOUS_PROC_FD_TARGET_CAPACITY)];
+                guest.memory().read_exact(scratch.cast(), &mut target)?;
+                crate::procfs::placeholder_link_path(&target)
+            }
+            Err(_) => None,
+        };
+        drop(guard);
+        Ok(rendered)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -555,6 +708,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     async fn finish_namespace_readlink<G, S>(
         &self,
         guest: &mut G,
+        link: (i32, Option<PathPtr<'_>>),
         path: PathBuf,
         buffer: Option<AddrMut<'_, libc::c_char>>,
         buffer_len: usize,
@@ -564,7 +718,44 @@ impl<T: RecordOrReplay> Detcore<T> {
         G: Guest<Self>,
         S: Into<Syscall>,
     {
+        let saved = saved_link_bytes(guest, buffer, buffer_len);
         let result = self.record_or_replay(guest, syscall).await?;
+        // A task's spelling of a descriptor link (`task/<tid>/fd/N`) that
+        // filled a buffer too short for a placeholder's link: the whole link
+        // shows whether it was one.
+        let result = match usize::try_from(result) {
+            Ok(length)
+                if length == buffer_len
+                    && needs_anonymous_proc_fd_scratch(buffer.is_some(), buffer_len)
+                    && !self.cfg.recordreplay_modes
+                    && names_task_descriptor_link(&path) =>
+            {
+                match self.placeholder_behind_link(guest, &path).await? {
+                    Some(rendered) if self.placeholder_link_confirmed(guest, link).await => {
+                        let link = rendered.as_os_str().as_bytes();
+                        let written = link.len().min(buffer_len);
+                        let address = buffer.ok_or(Errno::EFAULT)?;
+                        guest
+                            .memory()
+                            .write_exact(address.cast(), &link[..written])?;
+                        restore_link_tail(guest, address, written, length, saved.as_deref())?;
+                        written as i64
+                    }
+                    _ => result,
+                }
+            }
+            _ => {
+                self.rewrite_placeholder_link(
+                    guest,
+                    link,
+                    buffer,
+                    buffer_len,
+                    result,
+                    saved.as_deref(),
+                )
+                .await?
+            }
+        };
         self.canonicalize_namespace_readlink_result(guest, path, buffer, buffer_len, result)
             .await
     }
@@ -578,6 +769,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Readlink,
     ) -> Result<i64, Error> {
         let path: PathBuf = call.path().ok_or(Errno::EFAULT)?.read(&guest.memory())?;
+        if let Some(result) = self
+            .readlink_rendered_procfs(guest, &path, call.buf(), call.bufsize())
+            .await?
+        {
+            return Ok(result);
+        }
         let (host_path, other_proc_fd) = if let Some((Some(subject), _)) = proc_fd_target(&path) {
             let current_pid = guest.inject(syscalls::Getpid::new()).await?;
             (
@@ -612,8 +809,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         if other_proc_fd {
             return self.finish_other_proc_fd_readlink(guest, call).await;
         }
-        self.finish_namespace_readlink(guest, path, call.buf(), call.bufsize(), call)
-            .await
+        self.finish_namespace_readlink(
+            guest,
+            (libc::AT_FDCWD, call.path()),
+            path,
+            call.buf(),
+            call.bufsize(),
+            call,
+        )
+        .await
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -633,14 +837,27 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .with_detfd(call.dirfd(), |detfd| detfd.path())?
                 .map_or(path.clone(), |directory| directory.join(path))
         };
+        if let Some(result) = self
+            .readlink_rendered_procfs(guest, &observed_path, call.buf(), call.buf_len())
+            .await?
+        {
+            return Ok(result);
+        }
         if let Some((Some(subject), _)) = proc_fd_target(&observed_path) {
             let current_pid = guest.inject(syscalls::Getpid::new()).await?;
             if current_pid != i64::from(subject) {
                 return self.finish_other_proc_fd_readlinkat(guest, call).await;
             }
         }
-        self.finish_namespace_readlink(guest, observed_path, call.buf(), call.buf_len(), call)
-            .await
+        self.finish_namespace_readlink(
+            guest,
+            (call.dirfd(), call.path()),
+            observed_path,
+            call.buf(),
+            call.buf_len(),
+            call,
+        )
+        .await
     }
 }
 
@@ -795,11 +1012,15 @@ mod tests {
         assert!(!needs_anonymous_proc_fd_scratch(false, 1));
         assert!(!needs_anonymous_proc_fd_scratch(true, 0));
         assert!(needs_anonymous_proc_fd_scratch(true, 1));
-        assert!(needs_anonymous_proc_fd_scratch(true, 31));
-        assert!(!needs_anonymous_proc_fd_scratch(true, 32));
+        assert!(needs_anonymous_proc_fd_scratch(true, 127));
+        assert!(!needs_anonymous_proc_fd_scratch(true, 128));
 
         let maximum = format!("socket:[{}]", u64::MAX);
         assert!(maximum.len() < ANONYMOUS_PROC_FD_TARGET_CAPACITY);
+        // The longest link of a placeholder for a procfs file Detcore renders.
+        let placeholder = "/memfd:hermit-procfs:/proc/sys/kernel/random/uuid (deleted)";
+        assert!(crate::procfs::placeholder_link_path(placeholder.as_bytes()).is_some());
+        assert!(placeholder.len() < ANONYMOUS_PROC_FD_TARGET_CAPACITY);
         assert_eq!(
             anonymous_proc_fd_identity(maximum.as_bytes()),
             Some(AnonymousProcFdIdentity {

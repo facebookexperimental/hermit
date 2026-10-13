@@ -816,6 +816,28 @@ impl DetFd {
         self.with_description(|d| d.procfs = Some(procfs));
     }
 
+    /// The procfs path of a file Detcore opened with no kernel object behind
+    /// it (`ProcfsFile::is_rendered`): this descriptor is a placeholder.
+    pub(crate) fn procfs_rendered_path(&self) -> Option<&'static Path> {
+        self.with_description(|d| {
+            d.procfs
+                .as_ref()
+                .filter(|procfs| procfs.is_rendered())
+                .and_then(ProcfsFile::rendered_path)
+        })
+    }
+
+    /// The bytes a rendered procfs file's snapshot starts from in place of a
+    /// capture (`ProcfsFile::rendering_template`), if this is one.
+    pub(crate) fn procfs_rendering_template(&self) -> Option<&'static [u8]> {
+        self.with_description(|d| {
+            d.procfs
+                .as_ref()
+                .filter(|procfs| procfs.is_rendered())
+                .map(ProcfsFile::rendering_template)
+        })
+    }
+
     /// Whether this procfs open file description still needs its initial snapshot.
     pub(crate) fn procfs_needs_snapshot(&self) -> bool {
         self.with_description(|d| d.procfs.as_ref().is_some_and(ProcfsFile::needs_snapshot))

@@ -817,6 +817,35 @@ impl FileMetadata {
         // This newly discovered description predates our observation. Its
         // kernel lock may be held, but no cached lock claim existed to go stale.
         self.with_detfd(fd, |detfd| detfd.mark_flock_mode_unobserved())?;
+        // A placeholder for a procfs file Detcore renders, which the backend
+        // rediscovers after `exec`: the file again, at the position the old
+        // image left (`syscalls::files::rendered_procfs`).
+        if let Some(path) =
+            crate::syscalls::rendered_procfs::placeholder_identity(raw_stat.st_dev, raw_stat.st_ino)
+                .or_else(|| placeholder_behind(fd))
+        {
+            crate::syscalls::rendered_procfs::register_placeholder(
+                raw_stat.st_dev,
+                raw_stat.st_ino,
+                path,
+            );
+            // SAFETY: lseek only reads the descriptor's position.
+            let offset = unsafe {
+                crate::util::raw_syscall(
+                    libc::SYS_lseek,
+                    [fd as u64, 0, libc::SEEK_CUR as u64, 0, 0, 0],
+                )
+            };
+            let offset = usize::try_from(offset).unwrap_or(0);
+            let procfs = crate::procfs::ProcfsFile::from_path(path)
+                .expect("a rendered path is a procfs file")
+                .into_rendered();
+            self.with_detfd(fd, |detfd| {
+                detfd.set_path(path);
+                detfd.set_procfs(procfs.clone());
+                detfd.set_procfs_offset(offset);
+            })?;
+        }
         if let Some(resource) = stdio_resource(fd) {
             self.with_detfd(fd, |detfd| detfd.set_resource(resource.clone()))?;
         }
@@ -2087,6 +2116,14 @@ pub struct ThreadState<T> {
     #[serde(default)]
     pub(crate) nested_pid_namespace: bool,
 
+    /// This task's root directory may not be the container's: a task it shares
+    /// its root with (`CLONE_FS`), or one it inherited the root from, changed
+    /// it with `chroot`. Detcore then leaves whether a procfs file exists to
+    /// the kernel (`rendered_procfs`). Shared like the root itself: every task
+    /// that shares the creator's filesystem information shares this flag.
+    #[serde(default)]
+    pub(crate) changed_root: Arc<std::sync::atomic::AtomicBool>,
+
     /// POSIX per-process timers created via `timer_create(2)`. Shared among the
     /// threads of a process (`CLONE_THREAD`) and not inherited across `fork`.
     pub(crate) posix_timers: Arc<Mutex<PosixTimers>>,
@@ -2709,6 +2746,7 @@ impl<T> ThreadState<T> {
             timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
             default_timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
             nested_pid_namespace: false,
+            changed_root: Default::default(),
             posix_timers: Arc::new(Mutex::new(PosixTimers::default())),
             resource_limits: Arc::new(Mutex::new(ResourceLimits::default())),
             process_cpu_time: Arc::new(Mutex::new(ProcessCpuTime::default())),
@@ -3115,6 +3153,15 @@ impl<T> ThreadState<T> {
             .file_handles
             .values()
             .any(|detfd| matches!(detfd.ty(), FdType::Signalfd))
+    }
+
+    /// Whether this thread's descriptor table holds a procfs file Detcore
+    /// renders (`syscalls::files::rendered_procfs`).
+    pub(crate) fn holds_a_rendered_procfs_file(&self) -> bool {
+        self.metadata()
+            .file_handles
+            .values()
+            .any(|detfd| detfd.procfs_rendered_path().is_some())
     }
 
     /// Get a mutable reference of `DetFd` from a raw file descriptor, and
@@ -4928,4 +4975,43 @@ fn thread_rng_from_parent_entropy_labeled(
     rng.next_u64();
     rng.next_u64();
     rng
+}
+
+/// The procfs path that descriptor `fd` of the calling process is a
+/// placeholder for, which this image of the process has not seen: a memfd
+/// named for it and sealed as Detcore seals its placeholders, which a guest
+/// could imitate (a known limitation, see
+/// <https://github.com/rrnewton/hermit/issues/4263>). Read with raw
+/// system calls (under in-guest backends the tool shares the guest's C
+/// library).
+fn placeholder_behind(fd: RawFd) -> Option<&'static std::path::Path> {
+    // SAFETY: F_GET_SEALS only reads the descriptor's seals.
+    let seals = unsafe {
+        crate::util::raw_syscall(
+            libc::SYS_fcntl,
+            [fd as u64, libc::F_GET_SEALS as u64, 0, 0, 0, 0],
+        )
+    };
+    let wanted = i64::from(crate::syscalls::rendered_procfs::PLACEHOLDER_SEALS);
+    if seals < 0 || seals & wanted != wanted {
+        return None;
+    }
+    let link = std::ffi::CString::new(format!("/proc/self/fd/{fd}")).ok()?;
+    let mut target = [0_u8; 128];
+    // SAFETY: the path is NUL-terminated and `target` is writable.
+    let length = unsafe {
+        crate::util::raw_syscall(
+            libc::SYS_readlinkat,
+            [
+                libc::AT_FDCWD as u64,
+                link.as_ptr() as u64,
+                target.as_mut_ptr() as u64,
+                target.len() as u64,
+                0,
+                0,
+            ],
+        )
+    };
+    let length = usize::try_from(length).ok()?.min(target.len());
+    crate::procfs::placeholder_link_path(&target[..length])
 }

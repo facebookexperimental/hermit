@@ -991,12 +991,39 @@ impl DevicePool {
         }
     }
 
+    /// The pool of a run whose guest mount namespace is this process's: its
+    /// procfs device reports Detcore's procfs device, as the procfs files
+    /// Detcore renders do (<https://github.com/rrnewton/hermit/issues/4213>).
+    /// Outside record and replay, the process holding the global state is in
+    /// the guest's mount namespace on every backend. Replay's tracer is not,
+    /// and its devices are the recording's, so record and replay number
+    /// devices as before ([`Self::new`]).
+    fn for_this_mount_namespace() -> Self {
+        let mut pool = Self::new();
+        match std::fs::metadata("/proc") {
+            Ok(proc) => {
+                pool.devices.insert(
+                    std::os::unix::fs::MetadataExt::dev(&proc),
+                    procfs_inode::VIRTUAL_PROC_DEVICE,
+                );
+            }
+            Err(error) => warn!(
+                "[detcore] /proc could not be read, so its device is numbered when first seen: {error}"
+            ),
+        }
+        pool
+    }
+
     /// Return the deterministic device id for `raw_device`, allocating a new one
-    /// (in first-observation order) the first time a raw device is seen.
+    /// (in first-observation order) the first time a raw device is seen. The
+    /// procfs device is never allocated to another device.
     fn determinize(&mut self, raw_device: u64) -> u64 {
         match self.devices.get(&raw_device) {
             Some(dev) => *dev,
             None => {
+                if self.next_device == procfs_inode::VIRTUAL_PROC_DEVICE {
+                    self.next_device += 1;
+                }
                 let new = self.next_device;
                 self.next_device += 1;
                 self.devices.insert(raw_device, new);
@@ -1249,7 +1276,11 @@ impl GlobalState {
             inodes: Arc::new(Mutex::new(InodePool::new())),
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping state.
-            devices: Arc::new(Mutex::new(DevicePool::new())),
+            devices: Arc::new(Mutex::new(if cfg.recordreplay_modes {
+                DevicePool::new()
+            } else {
+                DevicePool::for_this_mount_namespace()
+            })),
             mount_ids: Mutex::new(MountIdPool::from_config(
                 &cfg.mountinfo_mount_ids,
                 cfg.mountinfo_mount_ids_captured,
@@ -10222,6 +10253,33 @@ mod tests {
         // Re-observing a raw device is stable within a run.
         assert_eq!(pool1.determinize(raw_root), root1);
         assert_eq!(pool1.determinize(raw_proc_run1), proc1);
+    }
+
+    #[test]
+    fn the_procfs_device_is_never_minted_for_another_device() {
+        use super::DevicePool;
+
+        let mut pool = DevicePool::new();
+        pool.next_device = crate::procfs_inode::VIRTUAL_PROC_DEVICE - 1;
+        let before = pool.determinize(libc::makedev(8, 1));
+        let after = pool.determinize(libc::makedev(8, 2));
+        assert_eq!(before, crate::procfs_inode::VIRTUAL_PROC_DEVICE - 1);
+        assert_eq!(after, crate::procfs_inode::VIRTUAL_PROC_DEVICE + 1);
+    }
+
+    #[test]
+    fn this_namespaces_procfs_device_is_detcores() {
+        use std::os::unix::fs::MetadataExt;
+
+        use super::DevicePool;
+
+        let mut pool = DevicePool::for_this_mount_namespace();
+        let proc = std::fs::metadata("/proc").unwrap().dev();
+        assert_eq!(
+            pool.determinize(proc),
+            crate::procfs_inode::VIRTUAL_PROC_DEVICE
+        );
+        assert_eq!(pool.determinize(libc::makedev(8, 1)), 1);
     }
 
     #[test]

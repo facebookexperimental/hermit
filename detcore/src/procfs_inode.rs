@@ -96,7 +96,22 @@ use crate::util::describe_io_error;
 pub(crate) const PROC_ROOT_INO: u64 = 1;
 
 /// The block size procfs reports (`s_blocksize` is 1024).
-const PROC_BLOCK_SIZE: i64 = 1024;
+pub(crate) const PROC_BLOCK_SIZE: i64 = 1024;
+
+/// The device every procfs file reports to the guest, on every backend:
+/// Detcore's own number (major 0, minor 4095), never a host device. The
+/// device pool maps the guest's procfs device to it and never mints it for
+/// another device (<https://github.com/rrnewton/hermit/issues/4213>).
+pub(crate) const VIRTUAL_PROC_DEVICE: u64 = 0x00f0_00ff;
+
+/// The inode number a procfs file Detcore renders reports, on every backend:
+/// a function of its path alone, so that no other observation of the run can
+/// change it. It is in a range Detcore's inode pool, which counts up from a
+/// few thousand, never reaches.
+pub(crate) fn rendered_inode(path: &Path) -> u64 {
+    const RENDERED_INODE_BASE: u64 = 0xf000_0000;
+    RENDERED_INODE_BASE | (fnv1a(FNV_OFFSET_BASIS, path.as_os_str().as_bytes()) & 0x0fff_ffff)
+}
 
 /// The bit every path key sets, which no 32-bit procfs inode number has.
 const PATH_KEY_BIT: u64 = 1 << 63;
@@ -796,6 +811,22 @@ pub(crate) struct DirectoryInodes {
 impl DirectoryInodes {
     pub(crate) fn new(device: u64, procfs: Option<ProcfsDirectory>) -> Self {
         Self { device, procfs }
+    }
+
+    /// The host device of the directory, which every entry shares.
+    pub(crate) fn device(&self) -> u64 {
+        self.device
+    }
+
+    /// The inode number of the entry named `name` if it is a procfs file
+    /// Detcore renders, which names it by its path alone ([`rendered_inode`]).
+    pub(crate) fn rendered_entry_inode(&self, name: &[u8]) -> Option<u64> {
+        let within = self.procfs.as_ref()?.entry_path(name);
+        let relative = within.strip_prefix("/").unwrap_or(&within);
+        let path = Path::new("/proc").join(relative);
+        crate::procfs::ProcfsFile::from_path(&path)?
+            .rendered_path()
+            .map(rendered_inode)
     }
 
     /// The keys for the entry named `name`, which the host listed with inode

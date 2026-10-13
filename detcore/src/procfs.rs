@@ -346,6 +346,24 @@ fn sysfs_rtc_kind(path: &Path) -> Option<ProcfsKind> {
     }
 }
 
+/// What the name of the memfd standing in for a procfs file Detcore renders
+/// starts with (`syscalls::files::rendered_procfs`); the file's path follows.
+/// Linux shows a memfd named `N` as `/memfd:N (deleted)` in descriptor links.
+pub(crate) const PLACEHOLDER_NAME_PREFIX: &str = "hermit-procfs:";
+
+/// The procfs path a descriptor link names, if it names a placeholder for a
+/// procfs file Detcore renders.
+pub(crate) fn placeholder_link_path(link: &[u8]) -> Option<&'static Path> {
+    let path = link
+        .strip_prefix(b"/memfd:")?
+        .strip_prefix(PLACEHOLDER_NAME_PREFIX.as_bytes())?
+        .strip_suffix(b" (deleted)")?;
+    ProcfsFile::from_path(Path::new(
+        <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(path),
+    ))?
+    .rendered_path()
+}
+
 /// State for a procfs file whose volatile fields require normalization.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ProcfsFile {
@@ -354,6 +372,11 @@ pub(crate) struct ProcfsFile {
     bound_thread_identity: Option<(i32, i32, i32)>,
     #[serde(default)]
     timer_slack_identity: Option<(u64, u64)>,
+    /// Detcore renders this file without the backend opening it: the guest's
+    /// descriptor is a placeholder and no kernel bytes exist to capture (see
+    /// [`ProcfsFile::rendered_path`]).
+    #[serde(default)]
+    rendered: bool,
     contents: Option<Vec<u8>>,
     offset: usize,
 }
@@ -884,9 +907,53 @@ impl ProcfsFile {
             target_fd,
             bound_thread_identity: None,
             timer_slack_identity: None,
+            rendered: false,
             contents: None,
             offset: 0,
         })
+    }
+
+    /// The path within procfs of a file whose every byte Detcore renders from
+    /// its own state, so that Detcore decides that it exists and what it
+    /// holds on every backend instead of the backend's `open`
+    /// (<https://github.com/rrnewton/hermit/issues/4213>). `None` for the files
+    /// whose bytes come from the kernel.
+    pub(crate) fn rendered_path(&self) -> Option<&'static Path> {
+        match self.kind {
+            ProcfsKind::RandomUuid => Some(Path::new("/proc/sys/kernel/random/uuid")),
+            ProcfsKind::PtyNr => Some(Path::new("/proc/sys/kernel/pty/nr")),
+            _ => None,
+        }
+    }
+
+    /// This file, opened by Detcore without a kernel object behind it. It
+    /// must be one [`Self::rendered_path`] names.
+    pub(crate) fn into_rendered(self) -> Self {
+        assert!(
+            self.rendered_path().is_some(),
+            "{:?} is not rendered",
+            self.kind
+        );
+        Self {
+            rendered: true,
+            ..self
+        }
+    }
+
+    /// Whether Detcore opened this file without a kernel object behind it.
+    pub(crate) fn is_rendered(&self) -> bool {
+        self.rendered
+    }
+
+    /// The kernel-shaped bytes a rendered file's snapshot starts from in place
+    /// of a capture. Its sanitizer replaces every byte of them.
+    pub(crate) fn rendering_template(&self) -> &'static [u8] {
+        assert!(self.rendered, "{:?} is not rendered", self.kind);
+        match self.kind {
+            ProcfsKind::RandomUuid => b"00000000-0000-4000-8000-000000000000\n",
+            ProcfsKind::PtyNr => b"0\n",
+            _ => unreachable!("{:?} has no rendered path", self.kind),
+        }
     }
 
     /// Returns true until the underlying procfs content has been captured.

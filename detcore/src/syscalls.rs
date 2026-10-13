@@ -17,6 +17,7 @@ pub mod helpers;
 pub(crate) use files::DETERMINISTIC_PIPE_CAPACITY_BYTES;
 pub(crate) use files::read_guest_exact;
 pub(crate) use files::read_guest_prefix;
+pub(crate) use files::rendered_procfs;
 pub(crate) use threads::VIRTUAL_CPUSET_BYTES;
 mod io;
 mod memory;

@@ -1765,6 +1765,12 @@
       "why": "tests/c/renameat2_flags.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/rendered_procfs_files.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/rendered_procfs_files.c is owned by hermit-cli/tests/cli.rs: the CLI test detcore_renders_its_procfs_files_on_every_backend runs it on ptrace, DBT and KVM and requires every backend to give Linux's answers for /proc/sys/kernel/random/uuid and /proc/sys/kernel/pty/nr, which Detcore renders without the backend opening them, and the same device and inode on each (https://github.com/rrnewton/hermit/issues/4213). It stays a fixture because a generic manifest cannot pass the KVM-only option or compare stdout across backends."
+    },
+    {
       "disposition": "cargo-integration-test-fixture",
       "path": "tests/c/replay_epoch_probe.c",
       "runner": "cargo test -p hermit --test clock_determinism and --test cli",

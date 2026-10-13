@@ -2265,6 +2265,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     nested_pid_namespace: pts.1.nested_pid_namespace
                         || (clone_flags.contains(CloneFlags::CLONE_NEWPID)
                             && !clone_flags.contains(CloneFlags::CLONE_THREAD)),
+                    // A new task starts in its creator's root, and with
+                    // CLONE_FS keeps sharing it.
+                    changed_root: if clone_flags.contains(CloneFlags::CLONE_FS) {
+                        Arc::clone(&pts.1.changed_root)
+                    } else {
+                        Arc::new(std::sync::atomic::AtomicBool::new(
+                            pts.1.changed_root.load(std::sync::atomic::Ordering::SeqCst),
+                        ))
+                    },
                     // POSIX timers are shared among threads of a process but are
                     // NOT inherited across fork(2). Share the table for a new
                     // thread (CLONE_THREAD); give a new process a fresh, empty
@@ -2488,6 +2497,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             }
             result => result?,
         }
+        // Exec gives the task filesystem information of its own
+        // (`unshare_fs_struct`): a root it shared through CLONE_FS is now its
+        // own, as it stands.
+        let changed_root = guest
+            .thread_state()
+            .changed_root
+            .load(std::sync::atomic::Ordering::SeqCst);
+        guest.thread_state_mut().changed_root =
+            Arc::new(std::sync::atomic::AtomicBool::new(changed_root));
         // The guest's first image is entered by an execve. A backend that traces
         // the guest from before it (ptrace) intercepts that execve and counts it
         // as the guest's first syscall. A backend that starts the guest already
@@ -2950,8 +2968,32 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         } else {
             None
         };
+        // A procfs file Detcore renders answers, as Linux does, the calls
+        // that would reach the placeholder standing in for it.
+        let rendered_procfs_answer = if sigalrm_refusal.is_none() {
+            match self.answer_rendered_procfs_operation(guest, &call) {
+                Some(answer) => Some(answer),
+                None => self
+                    .answer_rendered_procfs_path_call(guest, &call)
+                    .await
+                    .transpose(),
+            }
+        } else {
+            None
+        };
         let res = match classify_syscall(call.number()) {
             _ if sigalrm_refusal.is_some() => Err(sigalrm_refusal.expect("checked").into()),
+            _ if rendered_procfs_answer.is_some() => rendered_procfs_answer.expect("checked"),
+            SyscallClassification::PassThrough if call.number() == Sysno::chroot => {
+                let result = self.passthrough(guest, call).await;
+                if result.is_ok() {
+                    guest
+                        .thread_state()
+                        .changed_root
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                result
+            }
             // Outbound TCP channels under a network trace mode; never with no mode.
             _ if self.network_trace_owns(guest, &call) => {
                 self.handle_network_trace_syscall(guest, call).await
