@@ -795,12 +795,17 @@ fn run_stress_standin(root: &Path, dir: &Path) -> Result<String, String> {
     // bound is measured rather than assumed. Repetition 3 ends its output
     // without a newline; 5 outlives the bound; 6 also ignores SIGTERM; 7 prints
     // timeout's KILL message itself; 8 and 9 exit 137 and 124 themselves.
+    // Repetition 6 ignores SIGTERM on its first line, before the bookkeeping:
+    // installed after it, a loaded host could let timeout's TERM arrive first,
+    // and the repetition exited 124 instead of waiting for the KILL
+    // (https://github.com/rrnewton/hermit/issues/4226).
     let standin = dir.join("hermit");
     write_executable(
         &standin,
         &format!(
             "#!/usr/bin/env bash\n\
              rep=${{!#}}; rep=${{rep##*-}}; d={dir}\n\
+             [ \"$rep\" = 6 ] && trap '' TERM\n\
              mkdir \"$d/running.$rep\"\n\
              ls -d \"$d\"/running.* | wc -l >\"$d/peak.$rep\"\n\
              sleep 0.2\n\
@@ -810,7 +815,7 @@ fn run_stress_standin(root: &Path, dir: &Path) -> Result<String, String> {
              3) printf 'hermit-super-3'; exit 0;;\n\
              4) echo \"stand-in diagnostic $rep\" >&2; exit 3;;\n\
              5) sleep 5;;\n\
-             6) trap '' TERM; sleep 5;;\n\
+             6) sleep 10;;\n\
              7) echo \"timeout: sending signal KILL to command 'x'\"; exit 5;;\n\
              8) exit 137;;\n\
              9) exit 124;;\n\
@@ -821,10 +826,12 @@ fn run_stress_standin(root: &Path, dir: &Path) -> Result<String, String> {
     )?;
     // The node calls `timeout --verbose --kill-after=G T <command...>`; the
     // shim drops its own directory from PATH and keeps only the command. Only
-    // repetitions 5 and 6 are meant to outlive the bound, so only they get the
-    // 1 s one; the rest get 30 s, so a loaded host cannot time out a
+    // repetitions 5 and 6 are meant to outlive the bound, so only they get a
+    // short one; the rest get 30 s, so a loaded host cannot time out a
     // repetition that should exit on its own (9's own 124 then read as
-    // timeout's, at load average 300 on 2026-10-07).
+    // timeout's, at load average 300 on 2026-10-07). Repetition 6 gets 3 s, so
+    // its bash has that long to reach its first line, where it ignores TERM,
+    // and it sleeps 10 s, longer than the bound and the 1 s grace together.
     let shim_dir = dir.join("bin");
     std::fs::create_dir_all(&shim_dir)
         .map_err(|error| format!("cannot create super stand-in shim dir: {error}"))?;
@@ -832,7 +839,7 @@ fn run_stress_standin(root: &Path, dir: &Path) -> Result<String, String> {
         &shim_dir.join("timeout"),
         "#!/usr/bin/env bash\n\
          rep=${!#}; rep=${rep##*-}\n\
-         case $rep in 5|6) bound=1;; *) bound=30;; esac\n\
+         case $rep in 5) bound=1;; 6) bound=3;; *) bound=30;; esac\n\
          PATH=${PATH#*:} exec timeout --verbose --kill-after=1 \"$bound\" \"${@:4}\"\n",
     )?;
     let path = format!(
