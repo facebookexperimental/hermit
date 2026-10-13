@@ -114,6 +114,31 @@ impl<R: Read + AsRawFd> CapturedStream<R> {
     }
 }
 
+/// How a KVM guest's root ends, as Hermit reports it: an exit code, or death by
+/// a signal, which KVM reports as a signal, as ptrace does
+/// (https://github.com/rrnewton/hermit/issues/4181).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum RootOutcome {
+    Exit(i32),
+    Signal(i32),
+}
+
+impl RootOutcome {
+    pub(super) fn exit_code(self) -> Option<i32> {
+        match self {
+            RootOutcome::Exit(code) => Some(code),
+            RootOutcome::Signal(_) => None,
+        }
+    }
+
+    pub(super) fn signal(self) -> Option<i32> {
+        match self {
+            RootOutcome::Signal(signal) => Some(signal),
+            RootOutcome::Exit(_) => None,
+        }
+    }
+}
+
 pub(super) fn bounded_read(path: &Path, limit: u64) -> Vec<u8> {
     let mut bytes = Vec::new();
     fs::File::open(path)

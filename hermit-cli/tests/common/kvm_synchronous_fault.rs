@@ -9,6 +9,7 @@
 mod hermit_binary;
 
 use std::fs;
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
@@ -17,20 +18,21 @@ use detcore::Digest;
 use hermit::canonical_verdict::ComparedLogScope;
 use hermit::canonical_verdict::VerificationReport;
 
+use super::kvm_cancellation::RootOutcome;
 use super::kvm_cancellation::bounded_command_with_timeout;
 use super::kvm_cancellation::bounded_read;
 
 const MIB: u64 = 1024 * 1024;
 
 pub(super) fn run_root() {
-    run("root", 139, b"");
+    run("root", RootOutcome::Signal(libc::SIGSEGV), b"");
 }
 
 pub(super) fn run_orphan() {
-    run("orphan", 0, b"root saw n=0\n");
+    run("orphan", RootOutcome::Exit(0), b"root saw n=0\n");
 }
 
-fn run(mode: &str, expected_status: i32, expected_stdout: &[u8]) {
+fn run(mode: &str, expected: RootOutcome, expected_stdout: &[u8]) {
     let _lock = super::hermit_run_guard();
     let _kvm = fs::OpenOptions::new()
         .read(true)
@@ -117,7 +119,7 @@ fn run(mode: &str, expected_status: i32, expected_stdout: &[u8]) {
         "--env",
         &config_env,
     ];
-    if expected_status != 0 {
+    if expected != RootOutcome::Exit(0) {
         // The root intentionally dies from SIGSEGV; the orphan case must use
         // the default success-only admission gate for the surviving root.
         args.push("--verify-allow=failure");
@@ -127,11 +129,12 @@ fn run(mode: &str, expected_status: i32, expected_stdout: &[u8]) {
     super::append_hermit_args(&mut command, &args);
     command.env("HERMIT_LOG_MAX_BYTES", (64 * MIB).to_string());
     let status = bounded_command_with_timeout(&mut command, &directory, Duration::from_secs(57));
-    // EXIT-CLASS: guest. Synchronous fatal signals are transported by this CLI
-    // as 128 + signal, while a fault in an orphan must not fail the live root.
+    // EXIT-CLASS: guest. A synchronous fatal signal in the root ends this CLI
+    // with the same signal, as under ptrace, while a fault in an orphan must
+    // not fail the live root.
     assert_eq!(
-        status.code(),
-        Some(expected_status),
+        (status.code(), status.signal()),
+        (expected.exit_code(), expected.signal()),
         "exact guest outcome for synchronous {mode} SIGSEGV; artifacts: {}",
         root.display()
     );
@@ -147,8 +150,8 @@ fn run(mode: &str, expected_status: i32, expected_stdout: &[u8]) {
     report
         .require_exact_output_match()
         .expect("exact two-run status/stdout/stderr match");
-    assert_eq!(report.guest_exit_code, Some(expected_status));
-    assert!(report.guest_signal.is_none());
+    assert_eq!(report.guest_exit_code, expected.exit_code());
+    assert_eq!(report.guest_signal, expected.signal());
     let policy = report.comparison.as_ref().unwrap();
     assert_eq!(policy.display_name.as_deref(), Some("BitwiseInfoV1"));
     assert_eq!(policy.compare_io_buffers, Some(true));
@@ -171,8 +174,8 @@ fn run(mode: &str, expected_status: i32, expected_stdout: &[u8]) {
     );
     let outputs = report.compared_outputs.as_ref().unwrap();
     for operand in [&outputs.left, &outputs.right] {
-        assert_eq!(operand.exit_code, Some(expected_status));
-        assert!(operand.signal.is_none());
+        assert_eq!(operand.exit_code, expected.exit_code());
+        assert_eq!(operand.signal, expected.signal());
         assert_eq!(operand.stdout_bytes, expected_stdout.len() as u64);
         assert_eq!(
             operand.stdout_sha256,
