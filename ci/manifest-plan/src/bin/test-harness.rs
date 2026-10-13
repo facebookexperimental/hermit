@@ -7823,12 +7823,16 @@ sys.exit(1 if failed else 0)
         // run by full, and full planned neither side of their parity cell, so
         // they were unreported; switched off, they are no longer applicable.
         // The 2 left are example-timed-progress-bar's DBT and KVM cells.
-        assert_eq!(unreported.len(), 2 + 30, "{unreported:?}");
+        // 2 + 5 since https://github.com/rrnewton/hermit/issues/4269 moved 25
+        // of the 30 SaBRe-run-type-only rows' ptrace cells into full: the 5
+        // left are rustc, javac, java and node, whose ptrace cells are the
+        // super suite's, and timeout, whose ptrace cell is unselected.
+        assert_eq!(unreported.len(), 2 + 5, "{unreported:?}");
         let sabre_only = unreported
             .iter()
             .filter(|cell| cell.starts_with("compat/") && cell.ends_with("@sabre"))
             .count();
-        assert_eq!(sabre_only, 30, "{unreported:?}");
+        assert_eq!(sabre_only, 5, "{unreported:?}");
     }
 
     #[test]
@@ -10783,6 +10787,24 @@ sys.exit(1 if failed else 0)
             .as_str()
             .unwrap()
             .to_owned();
+        // A row's cell on the corpus's own backend is full's while the row
+        // names no run type; naming a focused one takes it out of full, as
+        // https://github.com/rrnewton/hermit/issues/4269 put it in by removing
+        // that label.
+        if manifest["corpus"]["backend"].as_str() == Some(backend) {
+            let row = manifest["corpus"]["rows"]
+                .as_sequence_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|row| row["label"].as_str() == Some(label.as_str()))
+                .unwrap();
+            assert!(row.get("labels").is_none(), "{test} is not full's");
+            row.as_mapping_mut().unwrap().insert(
+                Value::from("labels"),
+                Value::Sequence(vec![Value::from("sabre-compat-only")]),
+            );
+            return serde_yaml::to_string(&manifest).unwrap();
+        }
         let entries = manifest["corpus"]["additional"]
             .as_sequence_mut()
             .unwrap_or_else(|| panic!("{test}: the corpus has no additional backend"));
