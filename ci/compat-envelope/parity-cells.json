@@ -9,12 +9,12 @@
   "counts": {
     "all": {
       "cells": 4085,
-      "applicable": 1906,
-      "selectable": 1580,
+      "applicable": 1909,
+      "selectable": 1581,
       "population": 2775,
-      "population_candidate_selected": 1580,
+      "population_candidate_selected": 1581,
       "population_candidate_not_selected": 258,
-      "population_candidate_disabled": 937
+      "population_candidate_disabled": 936
     },
     "by_backend": {
       "dbt": {
@@ -37,12 +37,12 @@
       },
       "kvm": {
         "cells": 817,
-        "applicable": 537,
-        "selectable": 509,
+        "applicable": 540,
+        "selectable": 510,
         "population": 555,
-        "population_candidate_selected": 509,
+        "population_candidate_selected": 510,
         "population_candidate_not_selected": 3,
-        "population_candidate_disabled": 43
+        "population_candidate_disabled": 42
       },
       "liteinst": {
         "cells": 817,
@@ -227,7 +227,7 @@
     {"test_id":"c-programs/dbt-mmap-exec","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/dbt-pid-virtualization","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit"},
     {"test_id":"c-programs/dbt-pid-virtualization","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit"},
-    {"test_id":"c-programs/dbt-pid-virtualization","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit"},
+    {"test_id":"c-programs/dbt-pid-virtualization","backend":"kvm","category":"c-programs","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit"},
     {"test_id":"c-programs/dbt-pid-virtualization","backend":"liteinst","category":"c-programs","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit"},
     {"test_id":"c-programs/dbt-pid-virtualization","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit"},
     {"test_id":"c-programs/dbt-prlimit-self","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"},
@@ -292,7 +292,7 @@
     {"test_id":"c-programs/eventfd-semantics","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/exec-pipe-state","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/exec-pipe-state","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
-    {"test_id":"c-programs/exec-pipe-state","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: This descriptor regression is calibrated on ptrace and DBT; KVM qualification is separate"},
+    {"test_id":"c-programs/exec-pipe-state","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/exec-pipe-state","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: New top-of-funnel coverage is established on the ptrace reference first; LiteInst ratchets against it separately"},
     {"test_id":"c-programs/exec-pipe-state","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: New top-of-funnel coverage is established on the ptrace reference first; SaBRe ratchets against it separately"},
     {"test_id":"c-programs/faccessat2-flags","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
@@ -1032,7 +1032,7 @@
     {"test_id":"c-programs/record-replay-fd-close","backend":"sabre","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites"},
     {"test_id":"c-programs/record-replay-file-state","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"},
     {"test_id":"c-programs/record-replay-file-state","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"},
-    {"test_id":"c-programs/record-replay-file-state","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"},
+    {"test_id":"c-programs/record-replay-file-state","backend":"kvm","category":"c-programs","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"},
     {"test_id":"c-programs/record-replay-file-state","backend":"liteinst","category":"c-programs","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"},
     {"test_id":"c-programs/record-replay-file-state","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"},
     {"test_id":"c-programs/record-replay-file-state-regular-sink","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},

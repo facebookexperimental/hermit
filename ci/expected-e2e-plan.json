@@ -40205,6 +40205,66 @@
       ],
       "test": "c-programs/nanosleep-threads-simple",
       "timeout_seconds": 57
+    },
+    {
+      "backend": "kvm",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
+      "test": "c-programs/dbt-pid-virtualization",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "kvm",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
+      "test": "c-programs/exec-pipe-state",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "kvm",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
+      "test": "c-programs/record-replay-file-state",
+      "timeout_seconds": 57
     }
   ],
   "schema": 1

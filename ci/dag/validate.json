@@ -1960,6 +1960,13 @@
           "category": "c-programs",
           "test": "c-programs/dbt-pid-virtualization",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/dbt-pid-virtualization",
+          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -2353,6 +2360,13 @@
           "test": "c-programs/exec-pipe-state",
           "mode": "verify",
           "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/exec-pipe-state",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -7785,6 +7799,13 @@
           "test": "c-programs/record-replay-file-state",
           "mode": "verify",
           "backend": "in-guest-trap"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/record-replay-file-state",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -47709,6 +47730,13 @@
           "category": "c-programs",
           "test": "c-programs/dbt-pid-virtualization",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/dbt-pid-virtualization",
+          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -48102,6 +48130,13 @@
           "test": "c-programs/exec-pipe-state",
           "mode": "verify",
           "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/exec-pipe-state",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -53534,6 +53569,13 @@
           "test": "c-programs/record-replay-file-state",
           "mode": "verify",
           "backend": "in-guest-trap"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/record-replay-file-state",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
