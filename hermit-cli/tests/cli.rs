@@ -22611,7 +22611,9 @@ fn a_cpu_set_sized_from_kernel_max_holds_the_one_virtual_cpu() {
 /// descriptor; through one received over SCM_RIGHTS, which Detcore does not
 /// track, read with a 48-byte buffer, so that whole kernel buffers hold only
 /// other CPUs (they must be read past, not end the listing) and the bytes past
-/// each return must not keep their names; and after a `getdents64` whose count
+/// each return, or in the buffer of the call that ends the listing (in
+/// `/sys/bus/cpu/devices`, whose last kernel buffers hold only other CPUs),
+/// must not keep their names; and after a `getdents64` whose count
 /// does not fit in an int, which takes the snapshot when the descriptor had
 /// been moved to a host offset.
 #[test]
@@ -22651,6 +22653,7 @@ fn cpu_directory_reads_list_only_cpu0_on_every_path() {
         stdout,
         "tracked: other_cpus=0 error=0\n\
          received: other_cpus=0 entries_match=1 dirty_tail=0 error=0\n\
+         received bus: entries=3 other_cpus=0 dirty_tail=0 error=0\n\
          negative: rc=-1 Invalid argument other_cpus=0 error=0\n",
         "stderr:\n{log}"
     );

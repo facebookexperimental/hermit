@@ -13,7 +13,11 @@
 //   48-byte buffer that holds one or two entries, so that a kernel buffer can
 //   hold only CPUs other than cpu0. It also reports whether the entry count
 //   matches the tracked one and whether every byte past each call's return
-//   value is either untouched (0xaa) or zero;
+//   value, and every byte of the final call's buffer, is either untouched
+//   (0xaa) or zero;
+// - "received bus": the same for /sys/bus/cpu/devices, which holds only
+//   cpuN entries, so its last kernel buffers hold only CPUs other than cpu0
+//   and the call that ends the listing follows them;
 // - "negative": an ordinary descriptor read to its end, rewound, moved to
 //   offset 3, given a getdents64 whose count does not fit in an int (EINVAL),
 //   then read on from where that left it.
@@ -29,6 +33,7 @@
 #include <unistd.h>
 
 #define DIRECTORY "/sys/devices/system/cpu"
+#define BUS_DIRECTORY "/sys/bus/cpu/devices"
 
 struct dirent64 {
     uint64_t ino;
@@ -70,6 +75,11 @@ static struct listing list(int fd, size_t size) {
             break;
         }
         if (n == 0) {
+            for (size_t i = 0; i < size; i++) {
+                if (buffer[i] != 0xaa && buffer[i] != 0) {
+                    result.dirty_tail = 1;
+                }
+            }
             break;
         }
         for (long i = 0; i < n;) {
@@ -136,6 +146,14 @@ int main(void) {
     printf("received: other_cpus=%d entries_match=%d dirty_tail=%d error=%d\n",
            received.other_cpus, received.entries == tracked.entries, received.dirty_tail,
            received.error);
+
+    fd = open(BUS_DIRECTORY, O_RDONLY | O_DIRECTORY);
+    copy = received_copy(fd);
+    close(fd);
+    struct listing bus = list(copy, 48);
+    close(copy);
+    printf("received bus: entries=%d other_cpus=%d dirty_tail=%d error=%d\n", bus.entries,
+           bus.other_cpus, bus.dirty_tail, bus.error);
 
     fd = open(DIRECTORY, O_RDONLY | O_DIRECTORY);
     struct listing first = list(fd, 32768);

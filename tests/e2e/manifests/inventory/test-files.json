@@ -202,7 +202,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/cpu_directory_reads.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/cpu_directory_reads.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test cpu_directory_reads_list_only_cpu0_on_every_path compiles this guest, which lists /sys/devices/system/cpu through an ordinary descriptor, through one received over SCM_RIGHTS with a 48-byte buffer (checking the entry count and the bytes past each return), and after a getdents64 with a count that does not fit in an int, and requires exact lines showing no CPU other than cpu0 at bitwise parity under hermit run --strict --verify --verify-strict (https://github.com/rrnewton/hermit/issues/4160); it remains a guest fixture because a generic manifest cannot assert this exact output."
+      "why": "tests/c/cpu_directory_reads.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test cpu_directory_reads_list_only_cpu0_on_every_path compiles this guest, which lists /sys/devices/system/cpu through an ordinary descriptor, through one received over SCM_RIGHTS with a 48-byte buffer (checking the entry count, the bytes past each return and the buffer of the call that ends the listing, also for /sys/bus/cpu/devices), and after a getdents64 with a count that does not fit in an int, and requires exact lines showing no CPU other than cpu0 at bitwise parity under hermit run --strict --verify --verify-strict (https://github.com/rrnewton/hermit/issues/4160); it remains a guest fixture because a generic manifest cannot assert this exact output."
     },
     {
       "disposition": "manifest-test",
