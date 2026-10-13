@@ -281,7 +281,11 @@ where
         PrivateCells::ZeroTimeout => stack.reserve::<Timespec>().as_raw(),
         _ => stack.reserve::<[u64; 3]>().as_raw(),
     };
-    let timerfd_scratch = crate::syscalls::timerfd::reserve_scratch(&mut stack);
+    // Only a process with an armed virtual timerfd can need the publication
+    // scratch; any other keeps the whole stack for its cells, as before
+    // timerfds were virtualized.
+    let timerfd_scratch = crate::syscalls::timerfd::holds_armed_virtual_timerfd(guest)
+        .then(|| crate::syscalls::timerfd::reserve_scratch(&mut stack));
     match stack.commit() {
         Ok(guard) => {
             let bytes = AddrMut::<u8>::from_raw(at).ok_or(Errno::EFAULT)?;
@@ -290,7 +294,7 @@ where
             return Ok(Some(StagedCells {
                 at,
                 storage: StagedCellsStorage::Stack(guard),
-                timerfd_scratch: Some(timerfd_scratch),
+                timerfd_scratch,
             }));
         }
         Err(Errno::EFAULT) => {}

@@ -367,6 +367,26 @@ pub(crate) struct Scratch {
 }
 
 /// Reserve a [`Scratch`] on `stack`, before the caller commits it.
+/// Whether this process holds an armed timerfd on Detcore's virtual clock:
+/// exactly when [`publish_expired_in`] can need guest scratch. A caller that
+/// stages its own cells on the stack reserves the scratch only then, so a call
+/// on a process with no armed timerfd keeps every byte of the stack it had
+/// before timerfds were virtualized (a large masked `pselect6` on a tight
+/// stack, `stage_private_cells`). It cannot change during one system call:
+/// the guest runs no code between staging and publication.
+pub(crate) fn holds_armed_virtual_timerfd<T, G>(guest: &G) -> bool
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    enabled(guest)
+        && guest
+            .thread_state()
+            .virtual_timerfds()
+            .iter()
+            .any(|(_, detfd)| detfd.virtual_timerfd().and_then(|t| t.deadline).is_some())
+}
+
 pub(crate) fn reserve_scratch<S: Stack>(stack: &mut S) -> Scratch {
     Scratch {
         setting: stack.reserve(),
@@ -401,18 +421,10 @@ where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
-    if !enabled(guest) {
+    if !holds_armed_virtual_timerfd(guest) {
         return None;
     }
     let timerfds = guest.thread_state().virtual_timerfds();
-    if timerfds.iter().all(|(_, detfd)| {
-        detfd
-            .virtual_timerfd()
-            .and_then(|timer| timer.deadline)
-            .is_none()
-    }) {
-        return None;
-    }
     let now = timerfd_now(guest).await;
     let mut next: Option<LogicalTime> = None;
     for (fd, detfd) in timerfds {
