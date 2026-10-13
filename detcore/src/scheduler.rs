@@ -5841,6 +5841,16 @@ impl Scheduler {
         self.step2_sigalrm_ledger();
         self.step2_release_signaled_background()?;
         self.step2_drain_prefix()?;
+        // A signal the drain placed that armed a background thread ends the
+        // pass before any timer pops: the release barrier requeues that thread
+        // at the top of the next one. A `ChildExit` target is then chosen with
+        // it no longer asleep, as the kernel would, which skips a sleeper that
+        // already has a signal pending (`kernel_sigchld_target`); otherwise
+        // the timer could name it while the kernel woke another sleeper that
+        // nothing armed.
+        if !self.blocked.signaled_background.is_empty() {
+            return Err(SkipTurn);
+        }
         self.step2b_process_timed(global_time);
         self.step2b_restore_due_pollers();
         // A timed signal that just armed a background thread is followed by an
@@ -6238,7 +6248,18 @@ impl Scheduler {
         {
             self.host_signal_attempts += 1;
         }
-        let Some(target) = self.select_signal_target(dpid, Some(dtid)) else {
+        let target = self.select_signal_target(dpid, Some(dtid));
+        self.fire_alarm_at(dpid, target, sig, info)
+    }
+
+    fn fire_alarm_at(
+        &mut self,
+        dpid: DetPid,
+        target: Option<DetTid>,
+        sig: Signal,
+        info: Option<[u8; 128]>,
+    ) -> bool {
+        let Some(target) = target else {
             info!(
                 "[dpid {}] Alarm expired after its target exited; ignoring.",
                 dpid
@@ -6710,21 +6731,38 @@ impl Scheduler {
         // always steering it to the hinted/leader thread, pick a random eligible
         // thread to surface signal-timing races. This stays reproducible under a
         // fixed `--fuzz-seed`.
-        if self.chaos_target_races {
-            let group = self.thread_tree.my_thread_group(&detpid);
-            let eligible: Vec<DetTid> = group
-                .into_iter()
-                .filter(|t| !matches!(self.thread_status(*t), ThreadStatus::Gone))
-                .collect();
-            if let Some(chosen) = chaos_pick(&mut self.fuzz_prng, &eligible) {
-                info!(
-                    "[targeted-chaos] delivering process-directed signal to random group thread {} (of {:?})",
-                    chosen, eligible
-                );
-                return Some(chosen);
-            }
+        if let Some(chosen) = self.chaos_signal_target(detpid) {
+            return Some(chosen);
         }
+        self.live_signal_target(detpid, m_dettid)
+    }
 
+    /// Under targeted chaos (`--chaos-target-races`), a random live thread of
+    /// `detpid` to steer a process-directed signal to; `None` otherwise. Each
+    /// call draws once from the fuzz PRNG.
+    fn chaos_signal_target(&mut self, detpid: DetPid) -> Option<DetTid> {
+        if !self.chaos_target_races {
+            return None;
+        }
+        let group = self.thread_tree.my_thread_group(&detpid);
+        let eligible: Vec<DetTid> = group
+            .into_iter()
+            .filter(|t| !matches!(self.thread_status(*t), ThreadStatus::Gone))
+            .collect();
+        let chosen = chaos_pick(&mut self.fuzz_prng, &eligible)?;
+        info!(
+            "[targeted-chaos] delivering process-directed signal to random group thread {} (of {:?})",
+            chosen, eligible
+        );
+        Some(chosen)
+    }
+
+    /// `select_signal_target` without targeted chaos: `m_dettid` if it is
+    /// live, else the leader, else the process's first live thread.
+    fn live_signal_target(&self, detpid: DetPid, m_dettid: Option<DetTid>) -> Option<DetTid> {
+        if !self.thread_tree.thread_group_leaders.contains(&detpid) {
+            return None;
+        }
         if let Some(dettid) = m_dettid {
             match self.thread_status(dettid) {
                 ThreadStatus::Gone => {}
@@ -7942,6 +7980,51 @@ impl Scheduler {
             .filter(|thread| self.blocked.rt_sigsuspend_blockers.contains_key(thread))
             .find(unblocked)
             .or_else(|| threads.iter().copied().find(unblocked))
+    }
+
+    /// Send a `ChildExit` timer's `SIGCHLD` to `parent` (`info`: the siginfo
+    /// to send instead of the kernel's `SI_USER`), and return the thread it
+    /// was sent to. Where the scheduler models signal targets, that is the
+    /// thread the kernel gives it (`kernel_sigchld_target`), trying first the
+    /// child's `creator`, or under targeted chaos a random live thread of the
+    /// process; the send then goes to exactly that thread, which
+    /// `wake_signaled_guest` arms if it sleeps outside the schedule. Before,
+    /// targeted chaos drew its random thread after the kernel's choice and
+    /// replaced it, so it could name a stopped thread while the kernel woke an
+    /// `rt_sigsuspend` sibling that nothing armed (the Codex review of
+    /// https://github.com/rrnewton/hermit/commit/2f046e41b49d4b24b1bec605f269e3c3afde5895).
+    /// One chaos draw per send, as before.
+    pub(super) fn fire_child_exit_alarm(
+        &mut self,
+        parent: DetPid,
+        creator: DetTid,
+        info: Option<[u8; 128]>,
+    ) -> Option<DetTid> {
+        let sig = Signal::SIGCHLD;
+        #[cfg(test)]
+        {
+            self.host_signal_attempts += 1;
+        }
+        if !self.models_signal_targets {
+            let target = self.select_signal_target(parent, Some(creator));
+            return self
+                .fire_alarm_at(parent, target, sig, info)
+                .then_some(target)?;
+        }
+        let target = self.child_exit_sigchld_target(parent, creator);
+        let target = self.live_signal_target(parent, Some(target));
+        self.fire_alarm_at(parent, target, sig, info)
+            .then_some(target)?
+    }
+
+    /// The thread of `parent` that a `ChildExit` timer's `SIGCHLD` is sent to
+    /// where the scheduler models signal targets (`fire_child_exit_alarm`):
+    /// the kernel's choice (`kernel_sigchld_target`), trying first `creator`,
+    /// or under targeted chaos a random live thread of the process.
+    fn child_exit_sigchld_target(&mut self, parent: DetPid, creator: DetTid) -> DetTid {
+        let preferred = self.chaos_signal_target(parent).unwrap_or(creator);
+        self.kernel_sigchld_target(parent, preferred)
+            .unwrap_or(preferred)
     }
 
     /// `thread`'s signal mask: the one its parked futex wait reported, which only
@@ -17054,6 +17137,77 @@ mod test {
                 assert!(scheduler.blocked.sigchld_ready.contains(&parent));
             }
         }
+    }
+
+    /// Under targeted chaos, the random thread is only the one the kernel
+    /// tries first: a `ChildExit` send still goes to the `rt_sigsuspend`
+    /// sibling the kernel wakes, whichever thread chaos draws. Before, the
+    /// draw replaced the kernel's choice, so it could name the stopped creator
+    /// while the kernel woke the sibling, which nothing armed. With the
+    /// sibling's mask blocking `SIGCHLD`, every draw ends at the creator (the
+    /// Codex review of
+    /// https://github.com/rrnewton/hermit/commit/2f046e41b49d4b24b1bec605f269e3c3afde5895).
+    #[test]
+    fn targeted_chaos_does_not_replace_the_kernels_child_exit_target() {
+        let chld = kernel_signal_bit(libc::SIGCHLD);
+        for (sleeping_mask, sibling_takes) in [(0, true), (chld, false)] {
+            let (mut scheduler, parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+            scheduler.chaos_target_races = true;
+            scheduler
+                .test_kernel_signal_states
+                .insert(creator, signal_state(chld, 0));
+            scheduler
+                .test_kernel_signal_states
+                .insert(parent, signal_state(chld, 0));
+            commit_out_of_scheduler_call(
+                &mut scheduler,
+                parent,
+                ResourceID::BlockingRtSigsuspend(ExternalOpId::new(parent, 1)),
+                Some(sleeping_mask),
+            );
+            let expected = if sibling_takes { parent } else { creator };
+            for draw in 0..16 {
+                assert_eq!(
+                    scheduler.child_exit_sigchld_target(parent, creator),
+                    expected,
+                    "draw {draw}, sleeping mask {sleeping_mask:#x}"
+                );
+            }
+        }
+    }
+
+    /// A guest's signal that the drain places on an `rt_sigsuspend` sleeper
+    /// arms it, and the pass then ends before a due `ChildExit` timer pops:
+    /// the timer chooses its target only after the release barrier has
+    /// requeued that thread. Otherwise the timer could name the sleeper, which
+    /// the kernel skips because a signal is already pending for it, while the
+    /// kernel woke another sleeper that nothing armed (the Codex review of
+    /// https://github.com/rrnewton/hermit/commit/2f046e41b49d4b24b1bec605f269e3c3afde5895).
+    #[test]
+    fn a_drain_that_arms_a_sleeper_ends_the_pass_before_a_child_exit_timer() {
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+        let (mut scheduler, parent, creator, child) = sigchld_family(libc::SIGCHLD);
+        commit_out_of_scheduler_call(
+            &mut scheduler,
+            parent,
+            ResourceID::BlockingRtSigsuspend(ExternalOpId::new(parent, 1)),
+            Some(0),
+        );
+        let deadline = scheduler.committed_time;
+        scheduler
+            .blocked
+            .timed_waiters
+            .insert_child_exit(deadline, child, parent, creator);
+        scheduler.committed_time = deadline + LogicalTime::from_nanos(10);
+        scheduler.notify_signal_pending(parent, SigWrapper::from(Signal::SIGUSR1));
+
+        assert!(scheduler.step2_process_blocked(&global_time).is_err());
+        assert!(scheduler.blocked.signaled_background.contains(&parent));
+        assert_eq!(
+            scheduler.blocked.timed_waiters.iter().count(),
+            1,
+            "the ChildExit timer must not pop in the pass that armed the sleeper"
+        );
     }
 
     /// A signal the scheduler sends while a thread is still stopped at its

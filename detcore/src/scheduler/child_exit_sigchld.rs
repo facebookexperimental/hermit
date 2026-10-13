@@ -255,6 +255,18 @@ pub(crate) enum WindowSend {
     Guest,
 }
 
+/// What a `ChildExit` timer's own send did
+/// (`Scheduler::send_child_exit_sigchld`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChildExitSend {
+    /// The notification is not the scheduler's own; nothing was sent.
+    NotOwned,
+    /// The kernel's copy was delivered first; nothing was sent.
+    Nothing,
+    /// Sent, to this thread (`None` if no live thread could take it).
+    Sent(Option<DetTid>),
+}
+
 /// The answer to a [`ChildExitSigchldControl`].
 #[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize)]
 pub enum ChildExitSigchldAnswer {
@@ -637,23 +649,23 @@ impl ChildExitSigchldLedger {
 impl Scheduler {
     /// At the `ChildExit` timer of `child`, whose notification to `parent`
     /// is the scheduler's own (`ChildExitSigchldLedger::own`): send its
-    /// `SIGCHLD` to `target`, process-directed as for any other child, unless
-    /// the kernel's copy was delivered first. Returns false, doing nothing,
-    /// for a notification that is not the scheduler's own.
+    /// `SIGCHLD`, process-directed as for any other child, to the thread
+    /// `fire_child_exit_alarm` resolves from the child's `creator`, unless the
+    /// kernel's copy was delivered first.
     pub(super) fn send_child_exit_sigchld(
         &mut self,
         parent: DetPid,
-        target: DetTid,
+        creator: DetTid,
         child: DetPid,
-    ) -> bool {
+    ) -> ChildExitSend {
         match self.child_exit_sigchld.timer(parent, child) {
-            None => false,
+            None => ChildExitSend::NotOwned,
             Some(TimerSend::Nothing) => {
                 info!(
                     "[dpid {}] SIGCHLD for child {} was the kernel's, delivered before the timer.",
                     parent, child
                 );
-                true
+                ChildExitSend::Nothing
             }
             Some(TimerSend::Send) => {
                 // A receiver in a nested PID namespace sees the tracer as pid
@@ -665,9 +677,9 @@ impl Scheduler {
                     .is_some()
                     .then(|| marked_own_copy(std::process::id(), nix::unistd::getuid().as_raw()));
                 self.sending_child_exit = Some(child);
-                self.fire_alarm_with(parent, target, nix::sys::signal::Signal::SIGCHLD, marked);
+                let receiver = self.fire_child_exit_alarm(parent, creator, marked);
                 self.sending_child_exit = None;
-                true
+                ChildExitSend::Sent(receiver)
             }
         }
     }

@@ -704,9 +704,9 @@ impl Scheduler {
             // the process, its leader's id, would let any thread's delivery of
             // any copy take it. Where the send window is not used, the mark
             // is the process's, as before it.
-            if !self.models_signal_targets || !self.sigchld_window_usable(parent) {
-                self.blocked.sigchld_ready.insert(parent);
-            }
+            let leader_marked = (!self.models_signal_targets
+                || !self.sigchld_window_usable(parent))
+                && self.blocked.sigchld_ready.insert(parent);
             if let Some(deferred) = self.deferred_child_exit_sigchld(parent, tid) {
                 // That thread already dequeued a `SIGCHLD` of this process (the
                 // kernel's own, raised when the tracer released the child), and
@@ -722,22 +722,36 @@ impl Scheduler {
                 }
             } else {
                 // Where the scheduler models signal targets, send to the thread
-                // the kernel gives this shared-queue `SIGCHLD`: the child's
-                // creator (`tid`) if it does not block the signal, otherwise the
-                // next thread that does not. Only if that thread sleeps outside
-                // the schedule is it woken (`arm_signaled_background`); a gated
+                // the kernel gives this shared-queue `SIGCHLD`
+                // (`fire_child_exit_alarm`): the child's creator (`tid`) if it
+                // does not block the signal and no `rt_sigsuspend` sibling the
+                // kernel would wake instead exists, otherwise the next thread
+                // that does not. Only if that thread sleeps outside the
+                // schedule is it woken (`arm_signaled_background`); a gated
                 // wait holds `SIGCHLD` until its call returns
                 // (https://github.com/rrnewton/hermit/issues/3146).
-                let target = if self.models_signal_targets {
-                    self.kernel_sigchld_target(parent, tid).unwrap_or(tid)
-                } else {
-                    tid
-                };
                 let SignalTimerId::ChildExit { child, .. } = id else {
                     unreachable!("matched a ChildExit timer");
                 };
-                if !self.send_child_exit_sigchld(parent, target, child) {
-                    self.fire_alarm(parent, target, signal);
+                let receiver = match self.send_child_exit_sigchld(parent, tid, child) {
+                    super::child_exit_sigchld::ChildExitSend::NotOwned => {
+                        self.fire_child_exit_alarm(parent, tid, None)
+                    }
+                    super::child_exit_sigchld::ChildExitSend::Nothing => None,
+                    super::child_exit_sigchld::ChildExitSend::Sent(receiver) => receiver,
+                };
+                // A receiver armed for the release barrier carries its own
+                // mark (`arm_signaled_background`) and takes this signal at a
+                // fixed point, so the process's mark set above would outlive
+                // it and could later let another, host-timed `SIGCHLD`
+                // delivery to the leader skip its deferral (the Codex review
+                // of https://github.com/rrnewton/hermit/commit/2f046e41b49d4b24b1bec605f269e3c3afde5895).
+                if leader_marked
+                    && receiver.is_some_and(|receiver| {
+                        receiver != parent && self.blocked.signaled_background.contains(&receiver)
+                    })
+                {
+                    self.blocked.sigchld_ready.remove(&parent);
                 }
             }
         } else if !self.divert_in_guest_fatal_alarm(deadline, id, tid, signal, observed_now) {
