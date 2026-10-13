@@ -1069,6 +1069,11 @@ pub struct Scheduler {
     /// The logical, global time consumed by actions that have been committed already.
     pub committed_time: LogicalTime,
 
+    /// The thread of the last committed turn, so that `bump_global_time` can
+    /// tell a signal delivery to the thread that was already running from one
+    /// that switches threads (<https://github.com/rrnewton/hermit/issues/4139>).
+    previous_turn_tid: Option<DetTid>,
+
     /// INVARIANT: Thread IDs in `blocked` are absent from `run_queue`.
     pub blocked: BlockedPool,
 
@@ -1614,7 +1619,9 @@ pub struct Scheduler {
     recordreplay_modes: bool,
     /// Two scheduler turn charges ([`Config::scheduler_turn_charge`]): a
     /// periodic timer whose period is at most this hints no slice end
-    /// (`deadline_remaining_from`).
+    /// (`deadline_remaining_from`). The exclusion predates the free delivery
+    /// to the running thread (<https://github.com/rrnewton/hermit/issues/4139>)
+    /// and is kept; lifting it is a separate change.
     fast_timer_period: LogicalTime,
     /// The timeout deadlines of backed-off pollers, in the order
     /// `step2b_restore_due_pollers` resolves them: once committed time passes
@@ -3262,6 +3269,7 @@ impl Scheduler {
             physical_thread_pidfds: Default::default(),
             bg_action_pool: Default::default(),
             committed_time: Default::default(),
+            previous_turn_tid: None,
             blocked: Default::default(),
             vfork_barriers: Default::default(),
             background_entry_barriers: Default::default(),
@@ -9942,6 +9950,16 @@ impl Scheduler {
         rsrcs.fyi == LOOPBACK_POLL_YIELD_FYI
     }
 
+    /// A turn that commits only `InboundSignal` resources: a thread's signal
+    /// stop asking to take the signal.
+    fn is_inbound_signal_turn(rsrcs: &Resources) -> bool {
+        !rsrcs.resources.is_empty()
+            && rsrcs
+                .resources
+                .keys()
+                .all(|id| matches!(id, ResourceID::InboundSignal(_)))
+    }
+
     fn is_x_turn(rsrcs: &Resources, x: &ResourceID) -> bool {
         if rsrcs.resources.contains_key(x) {
             if rsrcs.resources.len() > 1 {
@@ -9981,6 +9999,27 @@ impl Scheduler {
                     || self.is_loopback_poll_yield_turn(resources)
             })
             .unwrap_or(false);
+
+        // A turn that only delivers signals to the thread whose committed turn
+        // came last, with no other thread in between, is not a context switch:
+        // Linux runs the handler on the running thread's own timeslice.
+        // Charging it a scheduler turn made a periodic timer whose period is at
+        // most one turn charge expire again during every delivery, so the guest
+        // ran nothing but its handler
+        // (https://github.com/rrnewton/hermit/issues/4139). The previous turn
+        // is the last committed one other than a host-timed polling retry
+        // (`last_turn_was_polling`); skipped turns do not count. So the rule
+        // also frees the signal wake of a thread asleep in pause, nanosleep or
+        // a futex wait when that thread had the previous turn. Both inputs are
+        // committed turns that both runs of --verify share, so they decide
+        // alike. Record and replay keep the charge, as they keep the deadline
+        // cap, so recordings keep their time stream and RECORD_VERSION is
+        // unchanged.
+        let own_signal_delivery = !self.recordreplay_modes
+            && last_turn.as_ref().is_ok_and(|resources| {
+                self.previous_turn_tid == Some(resources.tid)
+                    && Self::is_inbound_signal_turn(resources)
+            });
 
         // At this moment, when threads are parked, we know that the global_time is
         // frozen and we can read it without any race.
@@ -10031,6 +10070,10 @@ impl Scheduler {
                 trace!(
                     "[scheduler] skipping scheduler time advance because just-finished turn served a backend-runtime bootstrap syscall whose cost is withheld"
                 );
+            } else if own_signal_delivery {
+                trace!(
+                    "[scheduler] skipping scheduler time advance because just-finished turn delivered a signal to the thread already running"
+                );
             } else {
                 let newtime = match gtime.add_scheduler_time() {
                     Ok(newtime) => newtime,
@@ -10056,6 +10099,14 @@ impl Scheduler {
             }
             gtime.as_nanos()
         };
+        // A host-timed retry is not a turn that both runs of --verify share:
+        // letting it set the previous turn's thread would make whether the
+        // next signal delivery is charged depend on how many retries ran.
+        if let Ok(resources) = last_turn
+            && !last_turn_was_polling
+        {
+            self.previous_turn_tid = Some(resources.tid);
+        }
 
         match snapshot.cmp(&self.committed_time) {
             std::cmp::Ordering::Less => {
@@ -10244,12 +10295,12 @@ impl Scheduler {
                     .is_some_and(|process| self.sigkilled_processes.contains(&process))
         };
         let ahead = |deadline: &LogicalTime| *deadline > now && !deadline.is_indefinite();
-        // Each expiry of a periodic timer that ends a slice costs two turns:
-        // the slice end and the signal's delivery. A timer whose period is at
-        // most two turn charges would spend more virtual time on turns than
-        // on the guest, and at one charge or less its expiries outrun the
-        // guest entirely (https://github.com/rrnewton/hermit/issues/4139). It
-        // hints nothing, as before this cap.
+        // Each expiry of a periodic timer that ends a slice costs a turn for
+        // the slice end, and its delivery is charged again when it switches
+        // threads (a delivery to the running thread is free since
+        // https://github.com/rrnewton/hermit/issues/4139). A timer whose period
+        // is at most two turn charges could still spend more virtual time on
+        // turns than on the guest. It hints nothing, as before this cap.
         let fast_periodic = |event: &TimedEvent| match event {
             TimedEvent::SignalEvt(id, _, _) => self
                 .blocked
@@ -13355,6 +13406,100 @@ mod test {
         );
     }
 
+    /// https://github.com/rrnewton/hermit/issues/4139: a turn that delivers a
+    /// signal to the thread whose turn came last is not charged a scheduler
+    /// turn. The same delivery to another thread is, an ordinary turn of the
+    /// same thread is, a waitid turn is, and under record/replay the delivery
+    /// is too. A host-timed polling retry in between does not count as the
+    /// previous turn.
+    #[test]
+    fn a_signal_delivered_to_the_running_thread_is_not_charged_a_turn() {
+        let config = Config::default();
+        let running = DetTid::from_raw(13);
+        let other = DetTid::from_raw(14);
+        let delivery = |tid: DetTid| {
+            let mut request = Resources::new(tid);
+            request.insert(
+                ResourceID::InboundSignal(SigWrapper(libc::SIGALRM)),
+                Permission::W,
+            );
+            request
+        };
+        let retry = |tid: DetTid| {
+            let mut request = Resources::new(tid);
+            request.insert(ResourceID::InternalIOPolling, Permission::W);
+            request
+        };
+        // The advance of the last of `turns`, committed in order.
+        let advance = |record_replay: bool, turns: &[Resources]| {
+            let mut sched = Scheduler::new(&config);
+            sched.recordreplay_modes = record_replay;
+            for tid in [running, other] {
+                sched.priorities.insert(tid, DEFAULT_PRIORITY);
+                sched.runqueue_push_back(tid);
+            }
+            let time = Mutex::new(GlobalTime::new(&config));
+            let (last, earlier) = turns.split_last().unwrap();
+            for turn in earlier {
+                sched.bump_global_time(&time, &Ok(turn.clone()));
+            }
+            let before = time.lock().unwrap().as_nanos();
+            sched.bump_global_time(&time, &Ok(last.clone()));
+            let after = time.lock().unwrap().as_nanos();
+            after.duration_since(before)
+        };
+        let charge = advance(false, &[Resources::new(running), Resources::new(running)]);
+        assert!(charge > Duration::ZERO, "an ordinary turn is charged");
+        assert_eq!(
+            advance(false, &[Resources::new(running), delivery(running)]),
+            Duration::ZERO,
+            "a delivery to the thread whose turn came last"
+        );
+        assert_eq!(
+            advance(false, &[delivery(running), delivery(running)]),
+            Duration::ZERO,
+            "a second delivery in a row to the same thread"
+        );
+        assert_eq!(
+            advance(false, &[Resources::new(other), delivery(running)]),
+            charge,
+            "a delivery that switches threads"
+        );
+        assert_eq!(
+            advance(true, &[Resources::new(running), delivery(running)]),
+            charge,
+            "a delivery under record/replay"
+        );
+        let mut waitid = Resources::new(running);
+        waitid.insert(
+            ResourceID::WaitidSignals(vec![SigWrapper(libc::SIGCHLD)]),
+            Permission::W,
+        );
+        assert_eq!(
+            advance(false, &[Resources::new(running), waitid]),
+            charge,
+            "a waitid turn is not a signal delivery"
+        );
+        // A host-timed polling retry does not count as the previous turn, so
+        // the charge cannot depend on how many retries ran.
+        assert_eq!(
+            advance(
+                false,
+                &[Resources::new(other), retry(running), delivery(running)]
+            ),
+            charge,
+            "a retry between another thread's turn and the delivery"
+        );
+        assert_eq!(
+            advance(
+                false,
+                &[Resources::new(running), retry(running), delivery(running)]
+            ),
+            Duration::ZERO,
+            "a retry between the same thread's turn and the delivery"
+        );
+    }
+
     /// https://github.com/rrnewton/hermit/issues/3517: a committed turn that
     /// served a backend-runtime bootstrap syscall whose cost is withheld does not
     /// advance virtual time. The identical request without the mark does, so the
@@ -14470,7 +14615,7 @@ mod test {
     }
 
     /// A periodic timer whose period is at most two turn charges (1 ms by
-    /// default) hints nothing: each expiry would cost two turns, more than the
+    /// default) hints nothing: its expiries could cost more turns than the
     /// period (https://github.com/rrnewton/hermit/issues/4139). A longer
     /// period hints as any deadline does.
     #[test]

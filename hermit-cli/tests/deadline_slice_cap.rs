@@ -41,6 +41,11 @@ const MAX_WAIT_US: i64 = 20_000;
 /// The shortest wait that shows a slice ran to its maximum (200 ms).
 const UNCAPPED_WAIT_US: i64 = 150_000;
 
+/// The least virtual time the storm fixture's 20M-iteration loop may take
+/// under a slow timer; it takes about 200 ms
+/// (https://github.com/rrnewton/hermit/issues/4139).
+const MIN_STORM_WORK_US: i64 = 50_000;
+
 static SPIN_WAIT: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_RESUME: OnceLock<PathBuf> = OnceLock::new();
 static SELF_ALARM: OnceLock<PathBuf> = OnceLock::new();
@@ -48,6 +53,7 @@ static START_CAP: OnceLock<PathBuf> = OnceLock::new();
 static PARENT_CONTINUE: OnceLock<PathBuf> = OnceLock::new();
 static SLEEPY_SIBLING: OnceLock<PathBuf> = OnceLock::new();
 static ITIMER_LOOP: OnceLock<PathBuf> = OnceLock::new();
+static ITIMER_STORM: OnceLock<PathBuf> = OnceLock::new();
 
 /// Compile `hermit-cli/tests/fixtures/<name>.c` once.
 fn fixture(cell: &'static OnceLock<PathBuf>, name: &str) -> &'static Path {
@@ -223,8 +229,8 @@ fn the_caps_turns_cost_no_more_than_the_work() {
 }
 
 /// A periodic timer whose period is at most two turn charges (1 ms) ends no
-/// slice: each expiry would cost two turns, more than the period
-/// (https://github.com/rrnewton/hermit/issues/4139). The thread's 50,000
+/// slice (`fast_timer_period`): its expiries could cost more turns than the
+/// period (https://github.com/rrnewton/hermit/issues/4139). The thread's 50,000
 /// getppid calls (13.5 virtual ms) then run as before the cap. A slower timer
 /// does end slices, at a bounded cost.
 #[test]
@@ -232,19 +238,20 @@ fn a_fast_periodic_timer_ends_no_slice() {
     let guest = fixture(&ITIMER_LOOP, "deadline_itimer_loop");
     for period_us in ["400", "1000"] {
         let (stdout, _) = run_strict(guest, &[period_us, "50"], &[]);
-        // These pin the exclusion that keeps the ITIMER livelock of
-        // https://github.com/rrnewton/hermit/issues/4139 out of a thread's
-        // first slice; a fix for 4139 that lets fast timers deliver must
-        // change them.
+        // These pin the cap's exclusion of a periodic timer of at most two
+        // turn charges (`fast_timer_period`), which keeps such a timer from
+        // ending a syscall spinner's slice. Lifting that exclusion must
+        // change them; the no-charge delivery of
+        // https://github.com/rrnewton/hermit/issues/4139 does not.
         assert_eq!(
             field(&stdout, "signals"),
             0,
-            "{period_us} us (a fix for https://github.com/rrnewton/hermit/issues/4139 must update this):\n{stdout}"
+            "{period_us} us (lifting the cap's fast_timer_period exclusion must update this):\n{stdout}"
         );
         let virtual_ms = field(&stdout, "virtual_ms");
         assert!(
             virtual_ms < 20,
-            "{period_us} us: {virtual_ms} ms (a fix for https://github.com/rrnewton/hermit/issues/4139 must update this):\n{stdout}"
+            "{period_us} us: {virtual_ms} ms (lifting the cap's fast_timer_period exclusion must update this):\n{stdout}"
         );
     }
     let (stdout, _) = run_strict(guest, &["2000", "50"], &[]);
@@ -255,6 +262,43 @@ fn a_fast_periodic_timer_ends_no_slice() {
         "2 ms timer delivered {signals} signals:\n{stdout}"
     );
     assert!(virtual_ms < 50, "2 ms timer: {virtual_ms} ms:\n{stdout}");
+}
+
+/// A periodic `ITIMER_REAL` of at most one scheduler turn charge (500 us) no
+/// longer stalls a CPU-bound thread that makes no syscalls
+/// (https://github.com/rrnewton/hermit/issues/4139). Each delivery to the
+/// running thread used to be charged a turn, so the next expiry was due
+/// before the guest ran again: on main 0923c6a175 the 100 us and 400 us
+/// periods never finished, and 520 us took 5,173 virtual ms for 200 ms of
+/// work. Now each period takes about as long as the same loop under a 50 ms
+/// timer, and delivers about one signal per period, as Linux does.
+#[test]
+fn a_fast_periodic_timer_does_not_stall_a_cpu_bound_thread() {
+    let guest = fixture(&ITIMER_STORM, "deadline_itimer_storm");
+    let (stdout, _) = run_strict(guest, &["50000", "20"], &[]);
+    let work_us = field(&stdout, "virtual_us");
+    // The loop's 20M iterations take about 200 virtual ms; a far smaller
+    // reference would make the bounds below meaningless.
+    assert!(
+        work_us >= MIN_STORM_WORK_US,
+        "the loop under a 50 ms timer took {work_us} virtual us:\n{stdout}"
+    );
+    for period_us in [100, 400, 520, 1000] {
+        let (stdout, _) = run_strict(guest, &[&period_us.to_string(), "20"], &[]);
+        let virtual_us = field(&stdout, "virtual_us");
+        let signals = field(&stdout, "signals");
+        // Virtual time keeps counting the loop's work through the deliveries,
+        // and the deliveries add little to it.
+        assert!(
+            virtual_us >= work_us * 9 / 10 && virtual_us <= work_us * 5 / 4,
+            "{period_us} us: {virtual_us} virtual us against {work_us} under a 50 ms timer:\n{stdout}"
+        );
+        let periods = virtual_us / period_us;
+        assert!(
+            periods >= 100 && signals >= periods * 9 / 10 && signals <= periods + 1,
+            "{period_us} us: {signals} signals over {periods} periods:\n{stdout}"
+        );
+    }
 }
 
 /// The capped schedules are deterministic: canonical INFO verification
