@@ -9,12 +9,12 @@
   "counts": {
     "all": {
       "cells": 4085,
-      "applicable": 1917,
-      "selectable": 1589,
+      "applicable": 1918,
+      "selectable": 1590,
       "population": 2775,
-      "population_candidate_selected": 1589,
+      "population_candidate_selected": 1590,
       "population_candidate_not_selected": 258,
-      "population_candidate_disabled": 928
+      "population_candidate_disabled": 927
     },
     "by_backend": {
       "dbt": {
@@ -37,12 +37,12 @@
       },
       "kvm": {
         "cells": 817,
-        "applicable": 548,
-        "selectable": 518,
+        "applicable": 549,
+        "selectable": 519,
         "population": 555,
-        "population_candidate_selected": 518,
+        "population_candidate_selected": 519,
         "population_candidate_not_selected": 3,
-        "population_candidate_disabled": 34
+        "population_candidate_disabled": 33
       },
       "liteinst": {
         "cells": 817,
@@ -1022,7 +1022,7 @@
     {"test_id":"c-programs/readdir-order-identity","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: SaBRe is not buildable on the current host (same third-party-backends gate); qualify SaBRe separately"},
     {"test_id":"c-programs/record-lock","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/record-lock","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"c-programs/record-lock","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: KVM ElfExecutor implements F_SETLK advisory locking but returns a deterministic ENOSYS for F_GETLK lock queries"},
+    {"test_id":"c-programs/record-lock","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/record-lock","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/record-lock","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/record-replay-fd-close","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"},

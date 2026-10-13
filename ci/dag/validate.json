@@ -7749,6 +7749,13 @@
           "category": "c-programs",
           "test": "c-programs/record-lock",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/record-lock",
+          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -53579,6 +53586,13 @@
           "test": "c-programs/record-lock",
           "mode": "verify",
           "backend": "in-guest-trap"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/record-lock",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",

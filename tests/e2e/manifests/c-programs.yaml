@@ -18901,16 +18901,17 @@ test:
           dbt: true
           liteinst: true
           in-guest-trap: true
+          kvm: true
         backends_enabled:
           - ptrace
           - sabre
           - dbt
+          - kvm
           - liteinst
           - in-guest-trap
         assert:
           bitwise_parity: true
-        backends_disabled:
-          kvm: KVM ElfExecutor implements F_SETLK advisory locking but returns a deterministic ENOSYS for F_GETLK lock queries
+        backends_disabled: {}
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
