@@ -115,6 +115,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "pidfd_creation",
             "--test",
+            "ppoll_simulation",
+            "--test",
             "process_isolation_refusals",
             "--test",
             "proc_fdinfo_determinism",
@@ -653,8 +655,9 @@ mod tests {
             // crowded-stack pselect6 record refusal test (Claude review of
             // https://github.com/rrnewton/hermit/pull/4166), plus the single-CPU
             // sysfs numbers and node files test and the directory listing test
-            // (https://github.com/rrnewton/hermit/issues/4160).
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "294");
+            // (https://github.com/rrnewton/hermit/issues/4160), plus the four
+            // ppoll_simulation tests (https://github.com/rrnewton/hermit/issues/4042).
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "298");
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

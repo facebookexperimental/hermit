@@ -3080,6 +3080,22 @@ impl KernelSignalWait {
                 return Ok(result);
             }
             let after = read_wait_signal_state(self.pid, self.tid)?;
+            // A probe that carries the call's temporary mask, as a masked
+            // ppoll's does (`with_wait_mask`), and that the kernel itself
+            // ended, for a pending signal the mask lets in, leaves that mask
+            // installed with its restore pending until the signal is delivered
+            // as the guest resumes, so `/proc` reports a mask other than the one
+            // before the injection. That ERESTARTNOHAND is the call's own
+            // result, not a stop, and no injection may follow it: a repeated
+            // probe would save the temporary mask as the guest's
+            // (https://github.com/rrnewton/reverie/issues/1003). A pselect6
+            // wait's probes carry no mask, so this never holds for one.
+            if self.wait_mask.is_some()
+                && errno == Errno::ERESTARTNOHAND
+                && after.blocked != before.blocked
+            {
+                return Ok(result);
+            }
             let identified =
                 next.filter(|&(signal, queue)| stop_took_only(&before, &after, signal, queue));
             let Some((signal, queue)) = identified else {

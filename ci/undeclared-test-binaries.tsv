@@ -48,7 +48,6 @@ name_to_handle_refusal	none-recorded	No reason was recorded when this binary was
 netlink_table_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 netns_cookie_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 optional_memory_features	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
-ppoll_simulation	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 prctl_dumpable_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 privileged_observation	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 proc_fd_link_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.

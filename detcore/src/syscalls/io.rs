@@ -2066,9 +2066,17 @@ impl<T: RecordOrReplay> Detcore<T> {
             _ => unreachable!(),
         };
 
-        // A zero probe can honor a temporary signal mask atomically. Keeping that mask
-        // active while parked would require scheduler-level pending-signal state, so fail
-        // closed rather than letting a masked signal interrupt a simulated wait.
+        // Every zero-timeout probe carries a private copy of the call's temporary
+        // mask, so the kernel applies it atomically, as pselect6's probes do
+        // (`handle_internal_pselect6`). A pending signal that the mask lets in
+        // ends a probe with ERESTARTNOHAND at that probe's scheduler point, and
+        // the kernel delivers it under the temporary mask and only then puts the
+        // thread's own mask back, as Linux does for a ppoll that a signal
+        // interrupts. That probe is the last injection before the guest
+        // resumes, so nothing disturbs the pending restore
+        // (https://github.com/rrnewton/reverie/issues/1003). A ppoll that would
+        // block used to return ENOSYS here
+        // (https://github.com/rrnewton/hermit/issues/4042).
         if call.sigmask().is_some() {
             let Some((probe, staged)) = self.prepare_ppoll_probe(guest, call).await? else {
                 // The guest's own mask could block Hermit's timer signal while
@@ -2079,18 +2087,23 @@ impl<T: RecordOrReplay> Detcore<T> {
                     None => Err(Errno::ENOSYS.into()),
                 };
             };
-            let result = if self.cfg.recordreplay_modes {
-                self.record_or_replay(guest, probe).await
+            let result = if self.cfg.backend_supports_blocked_wait_signal_interruption {
+                self.wait_on_masked_ppoll_probe(guest, probe, staged.mask(), deadline)
+                    .await
             } else {
-                guest.inject_with_retry(probe).await
+                // Without the kernel's signal state, Hermit cannot tell whether
+                // the backend holds a signal that should end the wait, so a
+                // ppoll that would block still fails closed.
+                let result = guest.inject_with_retry(probe).await;
+                if probe.syscall_would_have_blocked(result) {
+                    Err(Errno::ENOSYS.into())
+                } else {
+                    result.map_err(Into::into)
+                }
             };
             // Before the time left is written: the copies' red-zone window may
             // cover the guest's timeout, which Linux never sees.
             staged.release(guest);
-            if probe.syscall_would_have_blocked(result) {
-                return Err(Errno::ENOSYS.into());
-            }
-            let result = result.map_err(Into::into);
             if let (Some(timeout_address), Some(timeout), Some(started_at)) =
                 (timeout_address, timeout, started_at)
             {
@@ -2111,6 +2124,95 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await?;
         }
         result
+    }
+
+    /// The wait of a ppoll with a temporary mask under sequentialized threads:
+    /// `probe`, a zero-timeout copy of the call that reads the mask staged at
+    /// `mask` (`prepare_ppoll_probe`), runs once per scheduler turn until it
+    /// reports a ready descriptor or an error, until a signal that the mask
+    /// lets in ends the wait, or until `deadline` passes, which returns 0.
+    ///
+    /// The probe carries the mask, so the kernel ends a probe with
+    /// ERESTARTNOHAND for a pending signal the mask lets in, and delivers it
+    /// under the mask as the call returns. A signal that the guest's own mask
+    /// lets in can instead stop a probe before the kernel installs the mask;
+    /// the backend then holds it, and `KernelSignalWait` decides against the
+    /// call's mask whether it ends the wait (`with_wait_mask`). Without that,
+    /// the wait ran on to its deadline, or forever, with the signal held. The
+    /// backend delivers a held signal under the guest's own mask
+    /// (https://github.com/rrnewton/reverie/issues/1011). A signal that only
+    /// the mask lets in can be pending at a turn's check without having ended
+    /// that turn's probe only if it arrived from outside the guest between
+    /// the two; the next probe, which carries the mask, ends the call for it
+    /// and the kernel delivers it under the mask. The wait never blocks
+    /// signals (`KernelSignalWait::block`): a probe that a signal ended would
+    /// then leave the all-blocked mask to be restored.
+    ///
+    /// Every probe runs before the turn's check, as Linux's do_poll polls every
+    /// descriptor before it tests for a pending signal. The wait holds no
+    /// signal until the call returns (`KernelSignalWait::for_select`): the
+    /// kernel ends a probe for any pending signal the mask lets in, `SIGCHLD`
+    /// included, so a `SIGCHLD` the kernel posts for a child ends it at a turn
+    /// that host timing chooses, the known gap that select and pselect6 waits
+    /// share (https://github.com/rrnewton/hermit/issues/3146).
+    async fn wait_on_masked_ppoll_probe<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        probe: syscalls::Ppoll,
+        mask: usize,
+        deadline: Option<LogicalTime>,
+    ) -> Result<i64, Error> {
+        let temporary_mask: KernelSigset = guest
+            .memory()
+            .read_value(Addr::<KernelSigset>::from_raw(mask).ok_or(Errno::EFAULT)?)?;
+        let mut signals = KernelSignalWait::for_select(guest)
+            .with_wait_mask(Some(crate::syscalls::signal::kernel_installed_signal_mask(
+                temporary_mask,
+            )))
+            .with_deadline(deadline.is_some());
+        let mut rsrc = Resources::new(guest.thread_state().dettid);
+        rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
+        rsrc.fyi("ppoll");
+        rsrc.poll_deadline = poll_deadline_for(guest, deadline);
+        // As for pselect6: a scheduler `Signaled` answer wakes the wait, and
+        // the probe and the kernel's state decide whether a signal ends it.
+        rsrc.set_signal_interrupt_errno(Errno::EINTR);
+        let result = loop {
+            resource_request(guest, rsrc.clone()).await;
+            // A pending real-time timer expiration that the temporary mask lets
+            // the kernel deliver or discard
+            // (https://github.com/rrnewton/hermit/issues/4089).
+            if let Err(error) = observe_under_mask(guest, temporary_mask).await {
+                break Err(error);
+            }
+            let injected = match signals.inject_first_probe(guest, probe).await {
+                Ok(result) => result,
+                Err(error) => break Err(error),
+            };
+            if !probe.syscall_would_have_blocked(injected) {
+                break injected.map_err(Into::into);
+            }
+            match signals.interrupted_with_state() {
+                Ok((false, _)) => {}
+                // The next probe ends the call for it (see above).
+                Ok((true, state))
+                    if !signals.holds_signal()
+                        && signals.interrupts_only_under_wait_mask(&state) =>
+                {
+                    continue;
+                }
+                Ok((true, _)) => break Err(Errno::ERESTARTNOHAND.into()),
+                Err(error) => break Err(error),
+            }
+            rsrc.poll_attempt += 1;
+            if let Some(deadline) = deadline
+                && thread_observe_time(guest).await >= deadline
+            {
+                break Ok(0);
+            }
+            record_retry_event(guest, probe).await;
+        };
+        refuse_held_signal_loss(guest, Sysno::ppoll, result).await
     }
 
     pub(super) async fn write_ppoll_remaining<G: Guest<Self>>(
