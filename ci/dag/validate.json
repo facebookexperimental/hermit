@@ -11780,6 +11780,13 @@
           "category": "compat",
           "test": "compat/curl-localhost",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/curl-localhost",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -15312,6 +15319,13 @@
           "test": "compat/csplit",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/curl-localhost",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -57544,6 +57558,13 @@
           "test": "compat/csplit",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/curl-localhost",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",

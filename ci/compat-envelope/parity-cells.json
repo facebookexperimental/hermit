@@ -9,12 +9,12 @@
   "counts": {
     "all": {
       "cells": 4085,
-      "applicable": 1911,
-      "selectable": 1583,
+      "applicable": 1912,
+      "selectable": 1584,
       "population": 2775,
-      "population_candidate_selected": 1583,
+      "population_candidate_selected": 1584,
       "population_candidate_not_selected": 258,
-      "population_candidate_disabled": 934
+      "population_candidate_disabled": 933
     },
     "by_backend": {
       "dbt": {
@@ -37,12 +37,12 @@
       },
       "kvm": {
         "cells": 817,
-        "applicable": 542,
-        "selectable": 512,
+        "applicable": 543,
+        "selectable": 513,
         "population": 555,
-        "population_candidate_selected": 512,
+        "population_candidate_selected": 513,
         "population_candidate_not_selected": 3,
-        "population_candidate_disabled": 40
+        "population_candidate_disabled": 39
       },
       "liteinst": {
         "cells": 817,
@@ -1705,9 +1705,9 @@
     {"test_id":"compat/curl","backend":"kvm","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/curl","backend":"liteinst","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/curl","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the sabre-compat-only run type selects this cell, by its manifest label; full validation does not."},
-    {"test_id":"compat/curl-localhost","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: A compat corpus row runs only its lane's verify cell on ptrace, a focused run type's verify cell on sabre, and a focused run type's replay cell on ptrace"},
+    {"test_id":"compat/curl-localhost","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: A compat corpus row runs only its lane's verify cell on ptrace, a verify cell on kvm, a focused run type's verify cell on sabre, and a focused run type's replay cell on ptrace"},
     {"test_id":"compat/curl-localhost","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Its first verify run on in-guest-trap failed in the second local survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): execve of a further program image returned EOPNOTSUPP (exec refused) (https://github.com/rrnewton/hermit/issues/3745)"},
-    {"test_id":"compat/curl-localhost","backend":"kvm","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: Not in the 2026-10-13 KVM survey: its KVM verify cell was not green on the compatibility ledger"},
+    {"test_id":"compat/curl-localhost","backend":"kvm","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/curl-localhost","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Its first verify run on liteinst failed in the second local survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): execve of a further program image returned EOPNOTSUPP (exec refused) (https://github.com/rrnewton/hermit/issues/3745)"},
     {"test_id":"compat/curl-localhost","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: The guest starts a second program image, and each image after the first makes 33 raw system calls in ld-linux and libc, which SaBRe's execution-path contract refuses (trusted_shared_object_sites > 0)"},
     {"test_id":"compat/cut","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: A compat corpus row runs only its lane's verify cell on ptrace, a verify cell on kvm, a focused run type's verify cell on sabre, and a focused run type's replay cell on ptrace"},

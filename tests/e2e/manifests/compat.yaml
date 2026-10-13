@@ -1442,7 +1442,8 @@ corpus:
     # /proc redesign): each row below passed 10 of 10 KVM verify runs at
     # Hermit 40c5b066 on 2026-10-13 with this entry in place (default
     # budget, no relaxations); the survey covered the 205 rows whose KVM
-    # cell was green on the compatibility ledger.
+    # cell was green on the compatibility ledger. curl-localhost joined
+    # after KVM began answering getsockopt(SO_ERROR), 10 of 10.
     - backend: kvm
       rows:
         [
@@ -1450,26 +1451,26 @@ corpus:
           basenc, bash, bc, bracket, bzip2, bzip2-roundtrip, "c++filt", cal,
           cargo, cat, chmod, chown, chrt, cksum, clang, cmake, cmp, col, colrm,
           column, comm, cp, cpio-roundtrip, cpp, crc32, cscope, csplit, curl,
-          cut, date, dc, dd, df, df-direct, diff, diff3, dirname, dos2unix, du,
-          echo, egrep, elfedit, env, envsubst, expand, expr, factor, fallocate,
-          fgrep, file, find, findmnt, flex, flock, fmt, fold, free, "g++", gcc,
-          gcov, getconf, getopt, git, gprof, grep, groups, gzip,
-          gzip-roundtrip, head, hexdump, hostname, iconv, id, install, ionice,
-          iostat, ip, join, jq, ld, ln, logger, logname, ls, lscpu, lua,
-          lua-direct, m4, make, md5sum, mkdir, mkfifo, mktemp, mpstat-softirqs,
-          msgfmt, msgunfmt, mv, namei, netlink-route, netlink-sock-diag, nice,
-          nl, nm, nohup, nproc, numactl-hardware, numastat, numfmt, objcopy,
-          objdump, od, openssl, paste, patch, pathchk, perl, perl-direct,
-          pidstat-disk, pinky, pkg-config, pr, printenv, printf, ptx, pwd,
-          python3, ranlib, readelf, readlink, realpath, rev, rm, rmdir, ruby,
-          sar-resource-tables, sed, seq, setfacl, sha1sum, sha224sum,
-          sha256sum, sha384sum, sha512sum, shred, shuf, size, sleep, sort,
-          split, sqlite3, ss, stat, stdbuf, strings, strip, sum, sync, tac,
-          tar, tar-roundtrip, taskset, tcl, tee, test, time, timeout, top,
-          touch, tr, "true", truncate, tsort, tty, uname, unexpand, uniq,
-          uptime, users, uuidgen, vmstat, wc, wc-lines, wget-localhost, whoami,
-          xmllint, xxd, xz, xz-roundtrip, "yes", zip-unzip, zstd,
-          zstd-roundtrip
+          curl-localhost, cut, date, dc, dd, df, df-direct, diff, diff3,
+          dirname, dos2unix, du, echo, egrep, elfedit, env, envsubst, expand,
+          expr, factor, fallocate, fgrep, file, find, findmnt, flex, flock,
+          fmt, fold, free, "g++", gcc, gcov, getconf, getopt, git, gprof, grep,
+          groups, gzip, gzip-roundtrip, head, hexdump, hostname, iconv, id,
+          install, ionice, iostat, ip, join, jq, ld, ln, logger, logname, ls,
+          lscpu, lua, lua-direct, m4, make, md5sum, mkdir, mkfifo, mktemp,
+          mpstat-softirqs, msgfmt, msgunfmt, mv, namei, netlink-route,
+          netlink-sock-diag, nice, nl, nm, nohup, nproc, numactl-hardware,
+          numastat, numfmt, objcopy, objdump, od, openssl, paste, patch,
+          pathchk, perl, perl-direct, pidstat-disk, pinky, pkg-config, pr,
+          printenv, printf, ptx, pwd, python3, ranlib, readelf, readlink,
+          realpath, rev, rm, rmdir, ruby, sar-resource-tables, sed, seq,
+          setfacl, sha1sum, sha224sum, sha256sum, sha384sum, sha512sum, shred,
+          shuf, size, sleep, sort, split, sqlite3, ss, stat, stdbuf, strings,
+          strip, sum, sync, tac, tar, tar-roundtrip, taskset, tcl, tee, test,
+          time, timeout, top, touch, tr, "true", truncate, tsort, tty, uname,
+          unexpand, uniq, uptime, users, uuidgen, vmstat, wc, wc-lines,
+          wget-localhost, whoami, xmllint, xxd, xz, xz-roundtrip, "yes",
+          zip-unzip, zstd, zstd-roundtrip
         ]
       disabled_reason: >-
         Not in the 2026-10-13 KVM survey: its KVM verify cell was not green
