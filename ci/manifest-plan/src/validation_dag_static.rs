@@ -1432,7 +1432,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4184): 1065.
     // And metadata::tests::record_version_rejects_streams_from_before_the_vfork_gate_fallback
     // (https://github.com/rrnewton/hermit/issues/4194): 1066.
-    ("test.hermit_unit", 1066),
+    // And metadata::tests::record_version_rejects_streams_from_before_one_node_get_mempolicy
+    // (https://github.com/rrnewton/hermit/issues/4214): 1067.
+    ("test.hermit_unit", 1067),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2786,7 +2788,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4184): 335.
     // And a_vfork_child_waiting_for_another_thread_completes_at_bitwise_parity
     // (https://github.com/rrnewton/hermit/issues/4194): 336.
-    ("test.cli", 336),
+    // And get_mempolicy_answers_as_a_one_node_machine
+    // (https://github.com/rrnewton/hermit/issues/4214): 337.
+    ("test.cli", 337),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3062,7 +3066,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // pin did not count: 269.
     // So do the two exec timer-flush tests: 271.
     // Nor does the vfork-child-waits test: 272.
-    ("test.cli_on_host", 272),
+    // Nor does the one-node get_mempolicy test: 273.
+    ("test.cli_on_host", 273),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -3403,7 +3408,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the DBT UTS assumption test split in two: 1064.
     // And the exec timer-flush record-epoch test: 1065.
     // And the vfork-gate fallback record-epoch test: 1066.
-    ("test.hermit_unit_on_host", 1066),
+    // And the one-node get_mempolicy record-epoch test: 1067.
+    ("test.hermit_unit_on_host", 1067),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

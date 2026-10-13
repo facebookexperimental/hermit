@@ -583,6 +583,12 @@
       "why": "tests/c/getCpu.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/get_mempolicy_one_node.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/get_mempolicy_one_node.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test get_mempolicy_answers_as_a_one_node_machine compiles this guest, which asks get_mempolicy the questions libnuma asks (MPOL_F_MEMS_ALLOWED, the default policy, refused flag combinations, maxnode 0 and 1, the node of an address) and requires the exact answers of a one-node Linux machine at bitwise parity under hermit run --strict --verify --verify-strict (https://github.com/rrnewton/hermit/issues/4214: MPOL_F_MEMS_ALLOWED left the node mask unwritten); it remains a guest fixture because a generic manifest cannot assert this exact output."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/get_robust_list_child.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

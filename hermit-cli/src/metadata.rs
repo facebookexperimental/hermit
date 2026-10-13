@@ -414,7 +414,14 @@ impl RecordVersion {
 // used to run alone; replay recomputes the schedule, so an older recording of a
 // vfork child that polled for a host event, with other threads runnable, could
 // replay differently. A backgrounded child is still waited for, as before.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x147);
+// 0x147 -> 0x148: get_mempolicy answers as a one-node Linux machine
+// (https://github.com/rrnewton/hermit/issues/4214): MPOL_F_MEMS_ALLOWED fills
+// the node mask with node 0 and the default policy's mask is written empty,
+// where Detcore left the guest's buffer unwritten, and flag combinations Linux
+// refuses are EINVAL, where Detcore answered 0. Replay answers the call
+// itself, so an older recording of such a call would replay with different
+// answers.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x148);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -439,7 +446,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x147);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x147;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x148;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1288,6 +1295,14 @@ mod tests {
     fn record_version_rejects_streams_from_before_the_vfork_gate_fallback() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x13f)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x146)));
+    }
+
+    /// A recording older than 0x148 was made when get_mempolicy left the node
+    /// mask unwritten and answered 0 to flags Linux refuses
+    /// (https://github.com/rrnewton/hermit/issues/4214).
+    #[test]
+    fn record_version_rejects_streams_from_before_one_node_get_mempolicy() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x147)));
     }
 
     #[test]

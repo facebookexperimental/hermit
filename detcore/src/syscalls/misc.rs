@@ -860,6 +860,32 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// resolves to node 0. The result is fully emulated (never injected), so it
     /// is bitwise-identical across the two --verify runs and under record/replay,
     /// removing the host-NUMA-topology dependence a passthrough would introduce.
+    ///
+    /// It follows Linux's `kernel_get_mempolicy` and `do_get_mempolicy`
+    /// (mm/mempolicy.c) for a kernel with one node (`nr_node_ids` 1):
+    /// - a node mask with `maxnode` below 1 is EINVAL;
+    /// - an unknown flag (any bit beyond `MPOL_F_NODE`, `MPOL_F_ADDR` and
+    ///   `MPOL_F_MEMS_ALLOWED`, including those above bit 31 of the raw
+    ///   argument, which Reverie's typed call drops), `MPOL_F_MEMS_ALLOWED`
+    ///   with `MPOL_F_NODE` or `MPOL_F_ADDR`, and an address without
+    ///   `MPOL_F_ADDR` are EINVAL;
+    /// - `*policy` is 0: `MPOL_DEFAULT`, or node 0 for `MPOL_F_NODE`;
+    /// - the node mask is written as `copy_nodes_to_user` writes it: node 0
+    ///   alone for `MPOL_F_MEMS_ALLOWED`, as `/proc/<pid>/status` reports
+    ///   `Mems_allowed_list` (<https://github.com/rrnewton/hermit/issues/4214>),
+    ///   and no node for the default policy, in `ALIGN(maxnode - 1, 64) / 8`
+    ///   bytes (none for a `maxnode` of 1), EINVAL beyond a page;
+    /// - both are written with the guest's own access rights, so a read-only or
+    ///   unmapped buffer is EFAULT, as from `put_user` and `copy_to_user`.
+    ///
+    /// Limits: `set_mempolicy` and `mbind` succeed without recording a policy,
+    /// so this always reports the default policy, where Linux reports, say,
+    /// `MPOL_INTERLEAVE` after `set_mempolicy(MPOL_INTERLEAVE)`. For the same
+    /// reason `MPOL_F_NODE` without `MPOL_F_ADDR` answers node 0, as Linux does
+    /// for an interleave policy (libnuma's `numa_get_interleave_node`), where
+    /// it refuses it under the default policy. `MPOL_F_ADDR` does not check
+    /// that the address is mapped, where Linux answers EFAULT for an unmapped
+    /// one.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#720)
     pub async fn handle_get_mempolicy<G: Guest<Self>>(
@@ -867,11 +893,49 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::GetMempolicy,
     ) -> Result<i64, Error> {
-        // Report MPOL_DEFAULT (0) for the current policy / node when requested.
-        // The nodemask output is left untouched: reverie exposes it as an
-        // immutable pointer, and MPOL_DEFAULT carries no node set.
+        const MPOL_F_NODE: u64 = 1;
+        const MPOL_F_ADDR: u64 = 2;
+        const MPOL_F_MEMS_ALLOWED: u64 = 4;
+        const PAGE: u64 = 4096;
+        let mask = call.nodemask();
+        if mask.is_some() && call.maxnode() < 1 {
+            return Err(Errno::EINVAL.into());
+        }
+        // The flags argument is an unsigned long; Reverie decodes it as u32.
+        let flags = guest.regs().await.r8;
+        if flags & !(MPOL_F_NODE | MPOL_F_ADDR | MPOL_F_MEMS_ALLOWED) != 0 {
+            return Err(Errno::EINVAL.into());
+        }
+        let mems_allowed = flags & MPOL_F_MEMS_ALLOWED != 0;
+        if mems_allowed {
+            if flags & (MPOL_F_NODE | MPOL_F_ADDR) != 0 {
+                return Err(Errno::EINVAL.into());
+            }
+        } else if flags & MPOL_F_ADDR == 0 && call.addr().is_some() {
+            return Err(Errno::EINVAL.into());
+        }
         if let Some(policy) = call.policy() {
-            guest.memory().write_value(policy, &0)?;
+            let policy = AddrMut::<u8>::from_raw(policy.as_raw()).ok_or(Errno::EFAULT)?;
+            let value = 0i32.to_ne_bytes();
+            if guest.memory().write_with_user_access(policy, &value)? < value.len() {
+                return Err(Errno::EFAULT.into());
+            }
+        }
+        if let Some(mask) = mask {
+            let bytes = (call.maxnode() - 1).div_ceil(64) * 8;
+            if bytes > PAGE.max(8) {
+                return Err(Errno::EINVAL.into());
+            }
+            let mut words = vec![0u8; bytes as usize];
+            if mems_allowed && !words.is_empty() {
+                words[0] = 1;
+            }
+            if !words.is_empty() {
+                let mask = AddrMut::<u8>::from_raw(mask.as_raw()).ok_or(Errno::EFAULT)?;
+                if guest.memory().write_with_user_access(mask, &words)? < words.len() {
+                    return Err(Errno::EFAULT.into());
+                }
+            }
         }
         Ok(0)
     }

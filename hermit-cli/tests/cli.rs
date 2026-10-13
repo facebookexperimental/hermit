@@ -152,6 +152,7 @@ static TIMER_SIGEV_THREAD_ID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_EXEC_FLUSH_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static NESTED_VFORK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_CHILD_WAITS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static GET_MEMPOLICY_ONE_NODE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PID_NAMESPACE_NESTED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KERNEL_MAX_AFFINITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPU_DIRECTORY_READS_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -23082,6 +23083,77 @@ fn a_vfork_child_waiting_for_another_thread_completes_at_bitwise_parity() {
                 .expect("the verdict must be JSON");
         assert_eq!(report["bitwise_parity"], true, "{mode}: {report}");
     }
+}
+
+/// get_mempolicy answers the questions libnuma asks as a Linux machine with one
+/// NUMA node does (https://github.com/rrnewton/hermit/issues/4214):
+/// `MPOL_F_MEMS_ALLOWED` fills the node mask with node 0 alone, as
+/// `/proc/<pid>/status` reports `Mems_allowed_list: 0`, where Detcore left the
+/// guest's buffer as it was; the default policy's mask is empty; flag
+/// combinations Linux refuses, including a flag above bit 31, are EINVAL; a
+/// `maxnode` of 1, which is enough for one node, leaves the mask unwritten, as
+/// Linux's `copy_nodes_to_user` does for it; a read-only or unmapped mask is
+/// EFAULT (Claude review of https://github.com/rrnewton/hermit/pull/4249); and
+/// `MPOL_F_NODE` alone answers node 0, as Linux does after
+/// `set_mempolicy(MPOL_INTERLEAVE)` (Detcore records no policy, so it answers
+/// so under the default policy too, where Linux says EINVAL). On this two-node
+/// host natively the allowed mask reads 0x3 and a `maxnode` of 1 is EINVAL,
+/// which is the host showing through.
+#[test]
+fn get_mempolicy_answers_as_a_one_node_machine() {
+    let guest = futex_c_guest(&GET_MEMPOLICY_ONE_NODE_GUEST, "get_mempolicy_one_node")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let verdict = directory.path().join("verify.json");
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "--log=info",
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            verdict.to_str().unwrap(),
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+        ]),
+        directory.path(),
+        Duration::from_secs(180),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "stdout:\n{stdout}\nstderr:\n{log}"
+    );
+    assert_eq!(
+        stdout,
+        "mems_allowed: rc=0 policy=0 mask=0x1\n\
+         default policy: rc=0 policy=0 mask=0\n\
+         mems_allowed with node: Invalid argument\n\
+         node without addr: rc=0 policy=0 mask=0xffffffffffffffff\n\
+         addr without flag: Invalid argument\n\
+         unknown flag: Invalid argument\n\
+         maxnode 0: Invalid argument\n\
+         maxnode 1: rc=0 policy=0 mask=0xffffffffffffffff\n\
+         node of addr: rc=0 policy=0 mask=0xffffffffffffffff\n\
+         flag above bit 31: Invalid argument\n\
+         read-only mask: Bad address\n\
+         unmapped mask: Bad address\n\
+         set interleave: rc=0\n\
+         interleave node: rc=0 policy=0 mask=0xffffffffffffffff\n",
+        "stderr:\n{log}"
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
+            .expect("the verdict must be JSON");
+    assert_eq!(report["bitwise_parity"], true, "{report}");
 }
 
 /// pidfd_send_signal's flags and descriptors answer as Linux answers them
