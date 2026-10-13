@@ -13716,6 +13716,16 @@ mod test {
         queued.run_queue.push_back(child, DEFAULT_PRIORITY);
         assert_eq!(selected(&mut queued), child);
 
+        // A runnable child in the last priority band, where
+        // `--chaos-target-races` can put it, is not polling and still runs
+        // first (Claude re-check of https://github.com/rrnewton/hermit/pull/4205).
+        let mut last_band = fresh();
+        last_band.run_queue.push_back(other, DEFAULT_PRIORITY);
+        last_band
+            .run_queue
+            .push_back(child, runqueue::LAST_PRIORITY);
+        assert_eq!(selected(&mut last_band), child);
+
         // A polling child lets the other thread run, ahead of it in priority.
         let mut polling = fresh();
         polling
