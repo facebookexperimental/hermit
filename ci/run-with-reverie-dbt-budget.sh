@@ -1468,7 +1468,15 @@ fi
 # SDK recipe input: build.rs, the vendored DynamoRIO tree, third-party/, the
 # root Cargo.toml and rust-toolchain.toml are unchanged, and no file is added
 # (inventory 947), so the budgets above carry. No new timing sample is claimed.
-expected_pin=42adcb1d44f38477e14a073b135ceccecae0a7a5
+# DBT SETTID AND LITEINST SDK-BUDGET CARRY (2026-10-13): advance from 42adcb1d to c18356c5b022700a96006dd240014c64d42f7ed0.
+# The added commits are c58538858a94 (native LiteInst initial image: reverie-inguest,
+# reverie-liteinst, reverie-rpc-transport, reverie-ptrace/src/vdso.rs and lib.rs,
+# scripts/m1_artifact.rs) and c18356c5b022 (reverie-dbt/native/client.c, the
+# thread_start_live test and two new reverie-dbt test fixtures). None is an SDK
+# recipe input: build.rs, the vendored DynamoRIO tree, third-party/, the root
+# Cargo.toml and rust-toolchain.toml are unchanged. The two fixtures raise the
+# reverie-dbt inventory from 947 to 949. No new timing sample is claimed.
+expected_pin=c18356c5b022700a96006dd240014c64d42f7ed0
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
