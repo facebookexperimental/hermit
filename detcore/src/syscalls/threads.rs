@@ -3491,10 +3491,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Linux's `sched_getaffinity` accepts any length whose bits cover
     /// `nr_cpu_ids` (one, for Hermit's single virtual CPU) and that is a
     /// multiple of `sizeof(long)`, copies `min(len, cpumask_size())` bytes and
-    /// returns that count. Detcore's mask is [`VIRTUAL_CPUSET_BYTES`] long
+    /// returns that count. Detcore's mask is `VIRTUAL_CPUSET_BYTES` long
     /// (`kernel_max` 127), so an 8-byte set, which `CPU_ALLOC` gives for the
     /// one CPU that `sysconf(_SC_NPROCESSORS_CONF)` reports, receives its
-    /// first 8 bytes (https://github.com/rrnewton/hermit/issues/4160).
+    /// first 8 bytes (<https://github.com/rrnewton/hermit/issues/4160>).
     pub async fn handle_sched_getaffinity<G: Guest<Self>>(
         &self,
         guest: &mut G,
