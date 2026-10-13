@@ -742,6 +742,28 @@ fn cap_observations(tracked: &mut TrackedCells) {
     }
 }
 
+/// Whether CELL accounts for OBSERVATION after [`cap_observations`]: the cell
+/// still holds it, or the cap folded it, so that the cell keeps an observation
+/// of the same provenance and comparison domain in its place and folding it
+/// into the aggregate again changes nothing (everything it said is already
+/// there). An observation that is neither held nor so folded was lost.
+fn cell_accounts_for(cell: &TrackedCell, observation: &Observation) -> bool {
+    if cell.observations.contains(observation) {
+        return true;
+    }
+    let domain = (
+        observation.provenance,
+        observation.canonical_comparisons.is_empty(),
+    );
+    let replaced = cell
+        .observations
+        .iter()
+        .any(|kept| (kept.provenance, kept.canonical_comparisons.is_empty()) == domain);
+    let mut aggregate = cell.aggregate.clone();
+    aggregate.fold(std::slice::from_ref(observation));
+    replaced && aggregate == cell.aggregate
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct CiDisabledReasonData {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -26054,13 +26076,17 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
                         display_id(&import_id)
                     )
                 })?;
+            // Cap 1 (https://github.com/rrnewton/dev-hermit/issues/563) keeps
+            // each provenance's latest observation and folds the rest into the
+            // cell's aggregate; a folded observation is carried only if the
+            // aggregate already says everything it said (cell_accounts_for).
             let missing = carried
                 .iter()
-                .filter(|observation| !live.observations.contains(observation))
+                .filter(|observation| !cell_accounts_for(live, observation))
                 .count();
             if missing != 0 {
                 return Err(format!(
-                    "{command} front door lost {missing} of {} pre-fold observation(s) of {}",
+                    "{command} front door lost {missing} of {} pre-fold observation(s) of {} (neither kept nor folded into its aggregate)",
                     carried.len(),
                     display_id(&import_id)
                 ));
@@ -45280,6 +45306,38 @@ mod cap_observation_tests {
                 samples: 1
             })
         );
+    }
+
+    #[test]
+    fn a_folded_observation_is_accounted_for_only_through_its_aggregate() {
+        // The self-test's front-door check (self-test-commands, part 4) uses
+        // this to tell an observation the cap folded from one a front door lost.
+        let mut diverged = observation("validate", &"a".repeat(40), 10, &["determinism-failure"]);
+        diverged.first_divergent_record.record(Some(42));
+        let pass = observation("validate", &"b".repeat(40), 20, &["pass"]);
+        let pressure = observation("pressure-test", &"c".repeat(40), 15, &["pass"]);
+        let mut tracked = cell(vec![diverged.clone(), pass.clone(), pressure.clone()]);
+        cap_observations(&mut tracked);
+        let capped = &tracked.cells[0];
+        assert!(!capped.observations.contains(&diverged));
+        for observation in [&diverged, &pass, &pressure] {
+            assert!(cell_accounts_for(capped, observation));
+        }
+        // Dropped without folding: the aggregate does not say what it said.
+        let mut unfolded = capped.clone();
+        unfolded.aggregate = CellAggregate::default();
+        unfolded.aggregate.fold(&unfolded.observations.clone());
+        assert!(!cell_accounts_for(&unfolded, &diverged));
+        // Folded, but nothing of its provenance and domain kept in its place.
+        let mut orphaned = capped.clone();
+        orphaned
+            .observations
+            .retain(|kept| kept.provenance != diverged.provenance);
+        assert!(!cell_accounts_for(&orphaned, &diverged));
+        // A different divergence the aggregate never saw is not accounted for.
+        let mut other = diverged.clone();
+        other.first_divergent_record.record(Some(7));
+        assert!(!cell_accounts_for(capped, &other));
     }
 
     #[test]
