@@ -9,12 +9,12 @@
   "counts": {
     "all": {
       "cells": 4085,
-      "applicable": 1921,
-      "selectable": 1592,
+      "applicable": 1922,
+      "selectable": 1593,
       "population": 2775,
-      "population_candidate_selected": 1592,
+      "population_candidate_selected": 1593,
       "population_candidate_not_selected": 258,
-      "population_candidate_disabled": 925
+      "population_candidate_disabled": 924
     },
     "by_backend": {
       "dbt": {
@@ -37,12 +37,12 @@
       },
       "kvm": {
         "cells": 817,
-        "applicable": 552,
-        "selectable": 521,
+        "applicable": 553,
+        "selectable": 522,
         "population": 555,
-        "population_candidate_selected": 521,
+        "population_candidate_selected": 522,
         "population_candidate_not_selected": 3,
-        "population_candidate_disabled": 31
+        "population_candidate_disabled": 30
       },
       "liteinst": {
         "cells": 817,
@@ -97,7 +97,7 @@
     {"test_id":"applications/timed-progress-bar","backend":"sabre","category":"applications","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: SaBRe does not yet determinize busy-wait polling on virtual wall-clock advancement; main validation has observed verify failure under load"},
     {"test_id":"bin-c/posix-timer-test","backend":"dbt","category":"bin-c","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"bin-c/posix-timer-test","backend":"in-guest-trap","category":"bin-c","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
-    {"test_id":"bin-c/posix-timer-test","backend":"kvm","category":"bin-c","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"},
+    {"test_id":"bin-c/posix-timer-test","backend":"kvm","category":"bin-c","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"bin-c/posix-timer-test","backend":"liteinst","category":"bin-c","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)"},
     {"test_id":"bin-c/posix-timer-test","backend":"sabre","category":"bin-c","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"bin-c/robust-futex-test","backend":"dbt","category":"bin-c","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"},

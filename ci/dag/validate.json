@@ -1099,6 +1099,13 @@
           "category": "bin-c",
           "test": "bin-c/posix-timer-test",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "bin-c",
+          "test": "bin-c/posix-timer-test",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -46973,6 +46980,13 @@
           "test": "bin-c/posix-timer-test",
           "mode": "verify",
           "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "bin-c",
+          "test": "bin-c/posix-timer-test",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",

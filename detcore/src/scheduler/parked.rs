@@ -689,6 +689,14 @@ impl Scheduler {
             if let Err(failure) = self.publish_real_expiry(id.process(), deadline) {
                 self.fail_parked(tid, failure);
             }
+        } else if self.signal_control_installed()
+            && let SignalTimerId::Posix(process, timer) = id
+        {
+            // A controlled backend's guest tasks are reached only through the
+            // control: the physical send below would hit a host process.
+            if let Err(failure) = self.publish_posix_timer_expiry(process, timer, signal) {
+                self.fail_parked(tid, failure);
+            }
         } else if normal_due && matches!(id, SignalTimerId::ChildExit { .. }) {
             let parent = id.process();
             // Where the scheduler models signal targets, the thread that takes
@@ -956,6 +964,50 @@ impl Scheduler {
         }
         self.real_timers.publication(expiry, outcome)?;
         Ok(())
+    }
+
+    /// Publishes one expiration of `process`'s process-directed POSIX timer
+    /// `timer` through the installed control, as Linux queues a
+    /// `SIGEV_SIGNAL` timer's signal on the process's shared queue with
+    /// `SI_TIMER` and the timer's id. The expiration was popped at its
+    /// virtual-time deadline (`dispatch_timed_signal`), and the publication
+    /// commits under the same scheduler lock, so what is pending after it is a
+    /// function of the schedule. A waiter it should interrupt is found the
+    /// way an `ITIMER_REAL` expiration's is, by the recipients the backend
+    /// reports for the pending signal (`select_parked_alarm`).
+    ///
+    /// `si_overrun` is 0, as `timer_getoverrun` reports; the timer's
+    /// `sigev_value` is not retained by `timer_create`, so `si_value` is 0.
+    fn publish_posix_timer_expiry(
+        &mut self,
+        pid: DetPid,
+        timer: i32,
+        signal: nix::sys::signal::Signal,
+    ) -> Result<(), ProtocolFailure> {
+        let process = self.real_timers.process_identity(pid)?;
+        let control = self
+            .parked
+            .control
+            .clone()
+            .ok_or(ProtocolFailure::Identity)?;
+        let signo = signal as libc::c_int;
+        let mut siginfo = [0; 128];
+        siginfo[..4].copy_from_slice(&signo.to_ne_bytes());
+        siginfo[8..12].copy_from_slice(&libc::SI_TIMER.to_ne_bytes());
+        // `si_timerid`, the first field of the kernel's `_timer` member.
+        siginfo[16..20].copy_from_slice(&timer.to_ne_bytes());
+        let event = SignalEvent::new(signo, siginfo, SignalTarget::Process { pid: process.tgid })
+            .map_err(|_| ProtocolFailure::Identity)?;
+        match control.process.publish_timer_expiry(process, event) {
+            ProcessSignalPublicationResult::Committed(_) => Ok(()),
+            ProcessSignalPublicationResult::FailedAfterCommit { .. } => {
+                self.parked.failures.push(process);
+                Ok(())
+            }
+            outcome @ ProcessSignalPublicationResult::RejectedBeforeCommit(_) => {
+                Err(TimerFailure::Publication(outcome).into())
+            }
+        }
     }
 
     /// Called by the daemon only after the quiescent due-event drain. Backend

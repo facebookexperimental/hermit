@@ -51,6 +51,7 @@ struct Backend {
     failure_probe: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     recipients: Mutex<Vec<SignalRecipient>>,
     publications: Mutex<Vec<(SignalProcessId, reverie::SignalEvent)>>,
+    timer_publications: Mutex<Vec<(SignalProcessId, reverie::SignalEvent)>>,
     reject_child_publication: std::sync::atomic::AtomicBool,
     permits: Mutex<Vec<SignalDeliveryPermit>>,
 }
@@ -83,6 +84,22 @@ impl ProcessSignalControl for Backend {
         } else {
             ProcessSignalPublicationResult::Committed(receipt)
         }
+    }
+    fn publish_timer_expiry(
+        &self,
+        process: SignalProcessId,
+        event: reverie::SignalEvent,
+    ) -> ProcessSignalPublicationResult {
+        self.timer_publications
+            .lock()
+            .unwrap()
+            .push((process, event));
+        ProcessSignalPublicationResult::Committed(ProcessSignalPublication {
+            process,
+            pending_generation: 0,
+            coalesced: false,
+            disposition: reverie::ProcessAlarmSignalDisposition::Caught,
+        })
     }
     fn publish_child_exit(&self, completion: ChildExitCompletion) -> ChildExitPublicationResult {
         if let Some(probe) = self.child_publication_probe.lock().unwrap().as_ref() {
@@ -239,6 +256,47 @@ fn fixture_with_control(installed: bool) -> (Scheduler, Arc<Backend>) {
     assert_eq!(s.signal_control_installed(), installed);
     (s, backend)
 }
+/// A controlled backend's guest tasks are reached only through the control,
+/// so a process-directed POSIX timer's expiration is published there, as
+/// Linux queues it: the timer's signal with `SI_TIMER` and the timer's id.
+/// Nothing is sent to a host process, and the `ITIMER_REAL` publication is
+/// not used.
+#[test]
+fn controlled_posix_timer_expiry_is_published_not_sent_to_a_host_process() {
+    let (mut s, backend) = fixture();
+    let (tid, _, _) = add(&mut s, 10, 10);
+    let deadline = LogicalTime::from_nanos(80);
+    s.dispatch_timed_signal(
+        deadline,
+        timed_waiters::SignalTimerId::Posix(DetPid::from_raw(10), 3),
+        timed_waiters::SignalTarget::Process(tid),
+        timed_waiters::TimerSignal::Send(nix::sys::signal::Signal::SIGUSR1),
+        true,
+        deadline,
+    );
+    assert_eq!(s.host_signal_attempts, 0);
+    assert!(backend.publications.lock().unwrap().is_empty());
+    let published = backend.timer_publications.lock().unwrap();
+    let [(process, event)] = published.as_slice() else {
+        panic!("one timer publication expected, got {published:?}");
+    };
+    assert_eq!(*process, task(10, 10).process);
+    assert_eq!(event.signal(), libc::SIGUSR1);
+    assert_eq!(
+        event.target(),
+        reverie::SignalTarget::Process {
+            pid: reverie::Pid::from_raw(10)
+        }
+    );
+    let info = event.siginfo();
+    let field = |at: usize| i32::from_ne_bytes(info[at..at + 4].try_into().unwrap());
+    assert_eq!(
+        (field(0), field(8), field(16), field(20)),
+        (libc::SIGUSR1, libc::SI_TIMER, 3, 0)
+    );
+    assert_eq!(s.parked.failure, None);
+}
+
 #[test]
 fn async_exit_completion_refuses_signal_control() {
     // The controlled turn loop releases the scheduler mutex between phases,

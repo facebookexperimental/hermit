@@ -12,12 +12,9 @@ use std::time::Duration;
 use detcore::Digest;
 use hermit::HERMIT_INTERNAL_FAILURE_EXIT;
 use hermit::canonical_verdict::ComparedLogScope;
-use hermit::canonical_verdict::ContainerDisposition;
-use hermit::canonical_verdict::ContainerFailure;
 use hermit::canonical_verdict::NoResultReason;
 use hermit::canonical_verdict::Verdict;
 use hermit::canonical_verdict::VerificationReport;
-use hermit::canonical_verdict::VerificationRun;
 
 use super::kvm_cancellation::bounded_command_with_timeout;
 use super::kvm_cancellation::bounded_read;
@@ -224,8 +221,12 @@ fn run_failed_exec_expiry(backend: &str, guest: &Path, root: &Path) {
     assert!(report.compared_outputs.is_none());
     assert!(report.infrastructure_error.is_none());
     assert!(report.guest_exit_code.is_none());
+    // Both backends deliver the timer's SIGUSR2 to the guest, whose default
+    // action kills it: a POSIX timer expiry reaches a KVM guest through the
+    // backend's process signal control, as a ptrace guest's reaches it
+    // through the kernel.
     let expected_reason = match backend {
-        "ptrace" => {
+        "ptrace" | "kvm" => {
             assert_eq!(report.guest_signal, Some(libc::SIGUSR2));
             NoResultReason::FirstRunRejected {
                 exit_code: None,
@@ -233,18 +234,6 @@ fn run_failed_exec_expiry(backend: &str, guest: &Path, root: &Path) {
                 stdout_bytes: 0,
                 stderr_bytes: 0,
             }
-        }
-        "kvm" => {
-            // POSIX timer expiry currently kills the KVM host container. This
-            // proves the deadline survived, not caught/blocked guest delivery.
-            assert!(report.guest_signal.is_none());
-            NoResultReason::ContainerFailed(ContainerFailure {
-                run: VerificationRun::Run1,
-                disposition: ContainerDisposition::Signaled {
-                    signal: libc::SIGUSR2,
-                    core_dumped: false,
-                },
-            })
         }
         _ => panic!("unsupported exec timer test backend: {backend}"),
     };

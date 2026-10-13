@@ -16105,6 +16105,19 @@ fn committed_cell_capability_bracket(root: &Path) -> Result<(), String> {
             "committed cell capability: the required plan lost portable/compat kvm cells".into(),
         );
     }
+    // bin-c gained its first KVM cell (bin-c/posix-timer-test); with it every
+    // portable bucket carries kvm cells, so the inert case below keeps only a
+    // profile that plans no kvm-capable node.
+    let bin_c = portable
+        .iter()
+        .filter(|(tag, ..)| tag == "e2e.manifest_bin_c")
+        .cloned()
+        .collect::<Vec<_>>();
+    if bin_c.is_empty() {
+        return Err(
+            "committed cell capability: the required plan lost portable/bin-c kvm cells".into(),
+        );
+    }
     // (label, argv, expected (tag, kvm cells, selected cells) rows, node-level kvm tag)
     type RefusedCase<'a> = (
         &'a str,
@@ -16112,7 +16125,7 @@ fn committed_cell_capability_bracket(root: &Path) -> Result<(), String> {
         Vec<&'a [(String, usize, usize)]>,
         Option<&'a str>,
     );
-    let refused_cases: [RefusedCase<'_>; 6] = [
+    let refused_cases: [RefusedCase<'_>; 7] = [
         (
             "portable profile",
             vec!["portable-only"],
@@ -16138,6 +16151,12 @@ fn committed_cell_capability_bracket(root: &Path) -> Result<(), String> {
             None,
         ),
         (
+            "--only portable e2e.manifest_bin_c",
+            vec!["--only", "portable", "e2e.manifest_bin_c"],
+            vec![&bin_c[..]],
+            None,
+        ),
+        (
             "full profile",
             vec!["full"],
             vec![&portable[..], &full_privileged[..]],
@@ -16150,6 +16169,7 @@ fn committed_cell_capability_bracket(root: &Path) -> Result<(), String> {
             Some("privileged-only-test.cli_kvm"),
         ),
     ];
+    let refused_count = refused_cases.len();
     for (label, argv, rows, node_level) in refused_cases {
         let expected: BTreeSet<(String, usize, usize)> = rows
             .iter()
@@ -16246,19 +16266,15 @@ fn committed_cell_capability_bracket(root: &Path) -> Result<(), String> {
 
     // INERT — selections whose bucket nodes cannot run kvm cells: KVM absence
     // refuses nothing, and they carry no cell-level kvm need at all.
-    for (label, argv) in [
-        (
-            "hosted-portable profile",
-            vec![
-                "--hosted-portable-only",
-                ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION,
-            ],
-        ),
-        (
-            "--only portable e2e.manifest_bin_c",
-            vec!["--only", "portable", "e2e.manifest_bin_c"],
-        ),
-    ] {
+    let inert = [(
+        "hosted-portable profile",
+        vec![
+            "--hosted-portable-only",
+            ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION,
+        ],
+    )];
+    let inert_count = inert.len();
+    for (label, argv) in inert {
         let mut plan = plan_for(&argv)?;
         if !planned_cell_capability_needs(root, &plan)?.is_empty() {
             return Err(format!(
@@ -16299,11 +16315,12 @@ fn committed_cell_capability_bracket(root: &Path) -> Result<(), String> {
         .map(|(_, kvm, all)| (*kvm, *all))
         .unwrap_or_default();
     println!(
-        "  committed cell capability: KVM absent refuses 5 selections (portable {} nodes / {} \
-         kvm cells, --only full and --only portable c-programs {c_programs_kvm} of \
-         {c_programs_all}, full {} nodes, privileged {} nodes) with the graph unchanged; every \
-         capability present admits all 5 unchanged; 3 kvm-free selections admitted with KVM \
-         absent; unreadable plan refused",
+        "  committed cell capability: KVM absent refuses {refused_count} selections (portable {} \
+         nodes / {} kvm cells, --only full and --only portable c-programs {c_programs_kvm} of \
+         {c_programs_all}, --only portable compat and bin-c, full {} nodes, privileged {} nodes) \
+         with the graph unchanged; every capability present admits all {refused_count} \
+         unchanged; {inert_count} kvm-free selection(s) admitted with KVM absent; unreadable \
+         plan refused",
         portable.len(),
         portable.iter().map(|(_, kvm, _)| kvm).sum::<usize>(),
         portable.len() + full_privileged.len(),
