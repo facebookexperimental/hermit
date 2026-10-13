@@ -448,6 +448,10 @@ pub fn default_container(pin_threads: bool) -> Container {
         .map_root()
         .hostname("hermetic-container.local")
         .domainname("local")
+        // A mount namespace created inside a user namespace starts as a slave
+        // of the host's, so host mounts and unmounts would keep changing the
+        // guest's mount table during a run. Cut that propagation first.
+        .mount(Mount::new("/").rprivate())
         .mount(Mount::proc().allow_readonly_fallback());
 
     apply_affinity(&mut container, pin_threads);
@@ -484,7 +488,9 @@ pub(super) fn image_container(
         .unshare(Namespace::PID)
         .map_root()
         .hostname("hermetic-container.local")
-        .domainname("local");
+        .domainname("local")
+        // As in `default_container`: stop host mount propagation.
+        .mount(Mount::new("/").rprivate());
 
     // The cache is a deterministic input, not a writable container layer. Bind
     // it onto itself and remount it read-only so a guest cannot poison later
