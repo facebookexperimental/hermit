@@ -1,165 +1,170 @@
-load("@fbcode_macros//build_defs:cpp_unittest.bzl", "cpp_unittest")
+load("@fbcode_macros//build_defs:cpp_binary.bzl", "cpp_binary")
 
 oncall("hermit")
 
-cpp_unittest(
+# These are guest programs for `hermit run`, not unit tests: each has its own
+# main(), several expect Hermit's virtualized results, and none speaks the
+# gtest listing protocol. As cpp_unittest, fbcode CI tried to list them as
+# GTest tests and every listing failed.
+
+cpp_binary(
     name = "fp_reduction_nondeterminism",
     srcs = ["fp_reduction_nondeterminism.c"],
     labels = ["autodeps2_generated"],
     external_deps = [("openmp", None, "omp")],
 )
 
-cpp_unittest(
+cpp_binary(
     name = "ppoll_readv",
     srcs = ["ppoll_readv.c"],
     labels = ["autodeps2_generated"],
 )
 
-cpp_unittest(
+cpp_binary(
     name = "madvise_determinism",
     srcs = ["madvise_determinism.c"],
     labels = ["autodeps2_generated"],
 )
 
-cpp_unittest(
+cpp_binary(
     name = "ipc_determinism",
     srcs = ["ipc_determinism.c"],
     labels = ["autodeps2_generated"],
 )
 
-cpp_unittest(
+cpp_binary(
     name = "setitimer_determinism",
     srcs = ["setitimer_determinism.c"],
     labels = ["autodeps2_generated"],
 )
 
-cpp_unittest(
+cpp_binary(
     name = "ioctl_siocethtool",
     srcs = ["ioctl_siocethtool.c"],
     labels = ["autodeps2_generated"],
 )
 
-cpp_unittest(
+cpp_binary(
     name = "timer_create_determinism",
     srcs = ["timer_create_determinism.c"],
     labels = ["autodeps2_generated"],
 )
 
-cpp_unittest(
+cpp_binary(
     name = "getsockopt_null",
     srcs = ["getsockopt_null.c"],
     labels = ["autodeps2_generated"],
 )
 
-cpp_unittest(
+cpp_binary(
     name = "epoll_determinism",
     srcs = ["epoll_determinism.c"],
     labels = ["autodeps2_generated"],
 )
 
-cpp_unittest(
+cpp_binary(
     name = "ppoll_simulation",
     srcs = ["ppoll_simulation.c"],
     labels = ["autodeps2_generated"],
 )
 
-cpp_unittest(
+cpp_binary(
     name = "sigpipe_siginfo",
     srcs = ["sigpipe_siginfo.c"],
     labels = ["autodeps2_generated"],
 )
 
-cpp_unittest(
+cpp_binary(
     name = "arch_prctl_determinism",
     srcs = ["arch_prctl_determinism.c"],
     labels = ["autodeps2_generated"],
 )
 
-cpp_unittest(
+cpp_binary(
     name = "clock_determinism",
     srcs = ["clock_determinism.c"],
     labels = ["autodeps2_generated"],
 )
 
-cpp_unittest(
+cpp_binary(
     name = "dbi_mmap_exec",
     srcs = ["dbt_mmap_exec.c"],
     labels = ["autodeps2_generated"],
 )
 
-cpp_unittest(
+cpp_binary(
     name = "writev_determinism",
     srcs = ["writev_determinism.c"],
     labels = ["autodeps2_generated"],
 )
 
-cpp_unittest(
+cpp_binary(
     name = "resource_determinism",
     srcs = ["resource_determinism.c"],
     labels = ["autodeps2_generated"],
 )
 
-cpp_unittest(
+cpp_binary(
     name = "ioctl_fioclex",
     srcs = ["ioctl_fioclex.c"],
     labels = ["autodeps2_generated"],
 )
 
-cpp_unittest(
+cpp_binary(
     name = "sched_yield_progress",
     srcs = ["sched_yield_progress.c"],
     labels = ["autodeps2_generated"],
 )
 
-cpp_unittest(
+cpp_binary(
     name = "replay_epoch_probe",
     srcs = ["replay_epoch_probe.c"],
     labels = ["autodeps2_generated"],
 )
 
-cpp_unittest(
+cpp_binary(
     name = "recvmsg_scm_rights_mmap",
     srcs = ["recvmsg_scm_rights_mmap.c"],
     labels = ["autodeps2_generated"],
 )
 
-cpp_unittest(
+cpp_binary(
     name = "thread_sync_determinism",
     srcs = ["thread_sync_determinism.c"],
     labels = ["autodeps2_generated"],
 )
 
-cpp_unittest(
+cpp_binary(
     name = "random_sources",
     srcs = ["random_sources.c"],
     labels = ["autodeps2_generated"],
 )
 
-cpp_unittest(
+cpp_binary(
     name = "record_replay_fd_close",
     srcs = ["record_replay_fd_close.c"],
     labels = ["autodeps2_generated"],
 )
 
-cpp_unittest(
+cpp_binary(
     name = "mmap_determinism",
     srcs = ["mmap_determinism.c"],
     labels = ["autodeps2_generated"],
 )
 
-cpp_unittest(
+cpp_binary(
     name = "rcx_canonicalization",
     srcs = ["rcx_canonicalization.c"],
     labels = ["autodeps2_generated"],
 )
 
-cpp_unittest(
+cpp_binary(
     name = "io_uring_fallback",
     srcs = ["io_uring_fallback.c"],
     labels = ["autodeps2_generated"],
 )
 
-cpp_unittest(
+cpp_binary(
     name = "signal_determinism",
     srcs = ["signal_determinism.c"],
     labels = ["autodeps2_generated"],
