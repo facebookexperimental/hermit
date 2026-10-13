@@ -2710,7 +2710,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_nested_namespace_init_exiting_beside_a_live_process_is_a_named_determinism_loss
     // (https://github.com/rrnewton/hermit/issues/4155): 322.
     // And a_sigchld_forging_the_own_copy_mark_is_refused_by_name: 323.
-    ("test.cli", 323),
+    // And a_cpu_set_sized_from_kernel_max_holds_the_one_virtual_cpu
+    // (https://github.com/rrnewton/hermit/issues/4160): 324.
+    ("test.cli", 324),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2974,7 +2976,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Nor does the nested-vfork test: 256.
     // So do the two nested-PID-namespace tests: 258.
     // So does the own-copy mark refusal test: 259.
-    ("test.cli_on_host", 259),
+    // Nor does the kernel_max affinity test: 260.
+    ("test.cli_on_host", 260),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux

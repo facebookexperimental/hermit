@@ -92,7 +92,7 @@ mod kvm_waitid;
 
 // Preserve the historical Detcore ABI while hiding the host's configured CPU
 // count. This represents one virtual CPU in a fixed 128-bit kernel mask.
-const VIRTUAL_CPUSET_BYTES: usize = 16;
+pub(crate) const VIRTUAL_CPUSET_BYTES: usize = 16;
 
 const IOPRIO_WHO_PROCESS: libc::c_int = 1;
 const IOPRIO_WHO_PGRP: libc::c_int = 2;

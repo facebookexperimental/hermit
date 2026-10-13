@@ -781,6 +781,12 @@
       "why": "tests/c/kcmp_refusal.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/kernel_max_affinity.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/kernel_max_affinity.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_cpu_set_sized_from_kernel_max_holds_the_one_virtual_cpu compiles this guest, which sizes a CPU set from /sys/devices/system/cpu/kernel_max + 1 and asks sched_getaffinity for it, and requires the exact line kernel_max=127 setsize=16 rc=0 count=1 at bitwise parity under hermit run --strict --verify --verify-strict (https://github.com/rrnewton/hermit/issues/4160: a kernel_max of 0 made the set too small for Detcore's 16-byte mask); it remains a guest fixture because a generic manifest cannot assert this exact output."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/keyctl_enosys.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",

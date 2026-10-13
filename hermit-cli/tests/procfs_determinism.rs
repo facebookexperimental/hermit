@@ -475,29 +475,41 @@ fn sys_cpu_lists_report_one_virtual_cpu() {
     }
 }
 
-/// The CPU and node files that are numbers or node lists describe one CPU on
-/// one node, as on such a machine: the highest supported CPU number, whether
-/// SMT siblings are active, cpu0's topology IDs, which nodes exist and have
-/// CPUs or memory, and node 0's distances
-/// (https://github.com/rrnewton/hermit/issues/4160).
+/// The CPU and node files that are numbers, flags or node lists describe one
+/// CPU on one node, as on such a machine: the highest supported CPU number
+/// sizes the 128-bit mask `sched_getaffinity` answers with, no SMT sibling is
+/// active or supported, cpu0's topology IDs are 0, the node lists name node 0
+/// and node 0's distances list only its own
+/// (https://github.com/rrnewton/hermit/issues/4160). A file the host kernel
+/// does not have (no SMT control, no NUMA, no cluster ID) is skipped, as the
+/// guest cannot open it either.
 #[test]
 fn sys_cpu_numbers_and_node_files_describe_one_cpu_and_node() {
-    for path in [
-        "/sys/devices/system/cpu/kernel_max",
-        "/sys/devices/system/cpu/smt/active",
-        "/sys/devices/system/cpu/cpu0/topology/cluster_id",
-        "/sys/devices/system/cpu/cpu0/topology/core_id",
-        "/sys/devices/system/cpu/cpu0/topology/physical_package_id",
-        "/sys/devices/system/node/online",
-        "/sys/devices/system/node/possible",
-        "/sys/devices/system/node/has_cpu",
-        "/sys/devices/system/node/has_memory",
+    for (path, expected) in [
+        ("/sys/devices/system/cpu/kernel_max", &b"127\n"[..]),
+        ("/sys/devices/system/cpu/smt/active", b"0\n"),
+        ("/sys/devices/system/cpu/smt/control", b"notsupported\n"),
+        ("/sys/devices/system/cpu/cpu0/topology/cluster_id", b"0\n"),
+        ("/sys/devices/system/cpu/cpu0/topology/core_id", b"0\n"),
+        ("/sys/devices/system/cpu/cpu0/topology/die_id", b"0\n"),
+        (
+            "/sys/devices/system/cpu/cpu0/topology/physical_package_id",
+            b"0\n",
+        ),
+        ("/sys/devices/system/node/online", b"0\n"),
+        ("/sys/devices/system/node/possible", b"0\n"),
+        ("/sys/devices/system/node/has_cpu", b"0\n"),
+        ("/sys/devices/system/node/has_memory", b"0\n"),
+        ("/sys/devices/system/node/has_normal_memory", b"0\n"),
+        ("/sys/devices/system/node/has_generic_initiator", b"\n"),
+        ("/sys/devices/system/node/node0/distance", b"10\n"),
     ] {
-        assert_deterministic(path, |contents| assert_eq!(contents, b"0\n", "{path}"));
+        if !Path::new(path).exists() {
+            eprintln!("skipping {path}: the host kernel does not have it");
+            continue;
+        }
+        assert_deterministic(path, |contents| assert_eq!(contents, expected, "{path}"));
     }
-    assert_deterministic("/sys/devices/system/node/node0/distance", |contents| {
-        assert_eq!(contents, b"10\n")
-    });
 }
 
 /// `nproc` asks `sched_getaffinity`; `getconf _NPROCESSORS_ONLN` asks glibc's

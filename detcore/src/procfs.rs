@@ -25,6 +25,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::syscalls::DETERMINISTIC_PIPE_CAPACITY_BYTES;
+use crate::syscalls::VIRTUAL_CPUSET_BYTES;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum ProcfsKind {
@@ -153,12 +154,9 @@ enum ProcfsKind {
     /// A CPU-mask file describing Hermit's single virtual CPU: `cpu0`'s
     /// topology masks and `node0/cpumap`.
     CpuMask,
-    /// A number that is 0 on a machine with one CPU and one node:
-    /// `cpu/kernel_max`, `cpu/smt/active` and `cpu0`'s topology IDs.
-    SingleCpuZero,
-    /// `node0/distance`: the distances from node 0 to every node, of which
-    /// Hermit's single virtual node has one, its distance to itself.
-    NodeDistance,
+    /// A CPU or node file whose contents are fixed for Hermit's single
+    /// virtual CPU on a single node (see [`SingleCpuFile`]).
+    SingleCpuConstant(SingleCpuFile),
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-957): Review Btrfs reservation normalization.
     BtrfsBytesMayUse,
@@ -756,8 +754,9 @@ impl ProcfsFile {
             | "/sys/devices/system/cpu/present" => ProcfsKind::CpuList,
             other if is_virtual_cpu_list_path(other) => ProcfsKind::CpuList,
             other if is_virtual_cpu_mask_path(other) => ProcfsKind::CpuMask,
-            other if is_single_cpu_zero_path(other) => ProcfsKind::SingleCpuZero,
-            "/sys/devices/system/node/node0/distance" => ProcfsKind::NodeDistance,
+            other if let Some(file) = SingleCpuFile::from_path(other) => {
+                ProcfsKind::SingleCpuConstant(file)
+            }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-939): Review NUMA node VM accounting normalization.
             other if is_node_vmstat_path(other) => ProcfsKind::NodeVmstat,
@@ -1011,8 +1010,7 @@ impl ProcfsFile {
             ProcfsKind::UeventSeqnum => sanitize_uevent_seqnum(&contents),
             ProcfsKind::CpuList => sanitize_cpu_list(&contents),
             ProcfsKind::CpuMask => sanitize_cpu_mask(&contents),
-            ProcfsKind::SingleCpuZero => sanitize_single_cpu_zero(&contents),
-            ProcfsKind::NodeDistance => sanitize_node_distance(&contents),
+            ProcfsKind::SingleCpuConstant(file) => file.contents(),
             ProcfsKind::BtrfsBytesMayUse => sanitize_btrfs_bytes_may_use(&contents),
             ProcfsKind::BlockInflight => sanitize_block_inflight(&contents),
             ProcfsKind::IrqPerCpuCount => sanitize_irq_per_cpu_count(&contents),
@@ -1393,35 +1391,70 @@ fn is_cpu0_cache_file(path: &str, attribute: &str) -> bool {
         })
 }
 
-/// The node lists in `/sys/devices/system/node`: the nodes that are online,
-/// possible, or have CPUs or memory. `has_generic_initiator` is empty on a
-/// machine without such initiators, and an empty list is reported unchanged.
+/// The node lists in `/sys/devices/system/node` that name nodes: those that
+/// are online, possible, or have CPUs or memory. Hermit's single virtual node
+/// is node 0, which has both.
 const NODE_LISTS: &[&str] = &[
     "online",
     "possible",
     "has_cpu",
     "has_memory",
     "has_normal_memory",
-    "has_generic_initiator",
 ];
 
-/// Files whose number is 0 on a machine with one CPU: the highest CPU number
-/// the kernel supports (`kernel_max`, 511 on a kernel built for 512 CPUs),
-/// whether SMT siblings are active (`smt/active`), and `cpu0`'s topology IDs
-/// (its cluster, core, die and package; x86 reports a cluster ID of 65535
-/// when the CPU has none).
-fn is_single_cpu_zero_path(path: &str) -> bool {
-    matches!(
-        path,
-        "/sys/devices/system/cpu/kernel_max" | "/sys/devices/system/cpu/smt/active"
-    ) || path
-        .strip_prefix("/sys/devices/system/cpu/cpu0/topology/")
-        .is_some_and(|attribute| {
-            matches!(
-                attribute,
-                "cluster_id" | "core_id" | "die_id" | "physical_package_id"
-            )
+/// CPU and node files whose contents Hermit fixes for its single virtual CPU
+/// on a single node, whatever the host reports.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum SingleCpuFile {
+    /// `cpu/kernel_max`, the highest CPU number the kernel supports
+    /// (`NR_CPUS - 1`): 127, the size of the 128-bit mask Detcore's
+    /// `sched_getaffinity` answers with ([`VIRTUAL_CPUSET_BYTES`]), so a
+    /// guest that sizes its CPU set from `kernel_max + 1`, as the kernel
+    /// documents, passes a buffer that call accepts. An SMP kernel reports at
+    /// least 1 here whatever CPUs are present; only a uniprocessor kernel
+    /// reports 0, and it has no `cpu/smt`.
+    KernelMax,
+    /// `cpu/smt/active`: no SMT sibling is online.
+    SmtActive,
+    /// `cpu/smt/control`: `notsupported`, as for a CPU without SMT.
+    SmtControl,
+    /// `cpu0`'s cluster, core, die and package IDs: 0. x86 reports a cluster
+    /// ID of 65535 when the CPU has none, but `/proc/cpuinfo`'s
+    /// `physical id` and `core id`, which Detcore reports as 0, are the same
+    /// numbering.
+    TopologyId,
+    /// `node/has_generic_initiator`: empty, as on a machine without generic
+    /// initiators.
+    GenericInitiators,
+    /// `node0/distance`: one distance per node, so only node 0's to itself,
+    /// which Linux reports as 10.
+    Node0Distance,
+}
+
+impl SingleCpuFile {
+    fn from_path(path: &str) -> Option<Self> {
+        Some(match path {
+            "/sys/devices/system/cpu/kernel_max" => Self::KernelMax,
+            "/sys/devices/system/cpu/smt/active" => Self::SmtActive,
+            "/sys/devices/system/cpu/smt/control" => Self::SmtControl,
+            "/sys/devices/system/node/has_generic_initiator" => Self::GenericInitiators,
+            "/sys/devices/system/node/node0/distance" => Self::Node0Distance,
+            _ => match path.strip_prefix("/sys/devices/system/cpu/cpu0/topology/")? {
+                "cluster_id" | "core_id" | "die_id" | "physical_package_id" => Self::TopologyId,
+                _ => return None,
+            },
         })
+    }
+
+    fn contents(self) -> Vec<u8> {
+        match self {
+            Self::KernelMax => format!("{}\n", VIRTUAL_CPUSET_BYTES * 8 - 1).into_bytes(),
+            Self::SmtActive | Self::TopologyId => b"0\n".to_vec(),
+            Self::SmtControl => b"notsupported\n".to_vec(),
+            Self::GenericInitiators => b"\n".to_vec(),
+            Self::Node0Distance => b"10\n".to_vec(),
+        }
+    }
 }
 
 /// Whether `name`, an entry of the directory at the canonical path
@@ -1689,36 +1722,6 @@ fn sanitize_cpu_mask(contents: &[u8]) -> Vec<u8> {
         return contents.to_vec();
     }
     b"1\n".to_vec()
-}
-
-/// Reports a number of [`is_single_cpu_zero_path`] as `0`. Anything that is
-/// not a newline-terminated decimal number is returned unchanged.
-fn sanitize_single_cpu_zero(contents: &[u8]) -> Vec<u8> {
-    match contents.strip_suffix(b"\n") {
-        Some(number) if !number.is_empty() && number.iter().all(u8::is_ascii_digit) => {
-            b"0\n".to_vec()
-        }
-        _ => contents.to_vec(),
-    }
-}
-
-/// Reports `node0/distance` for Hermit's single virtual node: only node 0's
-/// distance to itself, the first of the host's distances (10 on Linux).
-/// Anything that is not a newline-terminated, space-separated list of
-/// decimal numbers is returned unchanged.
-fn sanitize_node_distance(contents: &[u8]) -> Vec<u8> {
-    let Some(distances) = contents.strip_suffix(b"\n") else {
-        return contents.to_vec();
-    };
-    let mut fields = distances.split(|byte| *byte == b' ');
-    let Some(own) = fields.next() else {
-        return contents.to_vec();
-    };
-    let numeric = |field: &[u8]| !field.is_empty() && field.iter().all(u8::is_ascii_digit);
-    if !numeric(own) || !fields.all(numeric) {
-        return contents.to_vec();
-    }
-    [own, b"\n"].concat()
 }
 
 /// Reports a kernel CPU list (`/sys/devices/system/cpu/online` and its
@@ -6072,55 +6075,52 @@ Rss:                   4 kB\n" as &[u8];
 
     #[test]
     fn kernel_max_smt_topology_ids_and_nodes_describe_one_cpu_and_node() {
-        for path in [
-            "/sys/devices/system/cpu/kernel_max",
-            "/sys/devices/system/cpu/smt/active",
-            "/sys/devices/system/cpu/cpu0/topology/cluster_id",
-            "/sys/devices/system/cpu/cpu0/topology/core_id",
-            "/sys/devices/system/cpu/cpu0/topology/die_id",
-            "/sys/devices/system/cpu/cpu0/topology/physical_package_id",
-        ] {
+        let kind = |path: &str| ProcfsFile::from_path(Path::new(path)).map(|file| file.kind);
+        let constant = |path: &str| match kind(path) {
+            Some(ProcfsKind::SingleCpuConstant(file)) => file.contents(),
+            other => panic!("{path} is {other:?}, not a constant"),
+        };
+        assert_eq!(constant("/sys/devices/system/cpu/kernel_max"), b"127\n");
+        // The mask kernel_max sizes is one sched_getaffinity accepts.
+        assert_eq!((127 + 1) / 8, VIRTUAL_CPUSET_BYTES);
+        assert_eq!(constant("/sys/devices/system/cpu/smt/active"), b"0\n");
+        assert_eq!(
+            constant("/sys/devices/system/cpu/smt/control"),
+            b"notsupported\n"
+        );
+        for attribute in ["cluster_id", "core_id", "die_id", "physical_package_id"] {
             assert_eq!(
-                ProcfsFile::from_path(Path::new(path)).unwrap().kind,
-                ProcfsKind::SingleCpuZero,
-                "{path}"
-            );
-        }
-        for list in NODE_LISTS {
-            let path = format!("/sys/devices/system/node/{list}");
-            assert_eq!(
-                ProcfsFile::from_path(Path::new(&path)).unwrap().kind,
-                ProcfsKind::CpuList,
-                "{path}"
+                constant(&format!(
+                    "/sys/devices/system/cpu/cpu0/topology/{attribute}"
+                )),
+                b"0\n",
+                "{attribute}"
             );
         }
         assert_eq!(
-            ProcfsFile::from_path(Path::new("/sys/devices/system/node/node0/distance"))
-                .unwrap()
-                .kind,
-            ProcfsKind::NodeDistance
+            constant("/sys/devices/system/node/has_generic_initiator"),
+            b"\n"
         );
-        // smt/control and another node's distances are untouched.
+        assert_eq!(constant("/sys/devices/system/node/node0/distance"), b"10\n");
         for path in [
-            "/sys/devices/system/cpu/smt/control",
-            "/sys/devices/system/node/node1/distance",
-            "/sys/devices/system/cpu/cpu0/topology/ppin",
+            "/sys/devices/system/node/online",
+            "/sys/devices/system/node/possible",
+            "/sys/devices/system/node/has_cpu",
+            "/sys/devices/system/node/has_memory",
+            "/sys/devices/system/node/has_normal_memory",
         ] {
-            assert!(ProcfsFile::from_path(Path::new(path)).is_none(), "{path}");
+            assert_eq!(kind(path), Some(ProcfsKind::CpuList), "{path}");
         }
-        assert_eq!(sanitize_single_cpu_zero(b"511\n"), b"0\n");
-        assert_eq!(sanitize_single_cpu_zero(b"65535\n"), b"0\n");
-        assert_eq!(sanitize_single_cpu_zero(b"0\n"), b"0\n");
-        // Not a number: left alone.
-        assert_eq!(sanitize_single_cpu_zero(b"on\n"), b"on\n");
-        assert_eq!(sanitize_single_cpu_zero(b"1"), b"1");
-        assert_eq!(sanitize_single_cpu_zero(b"\n"), b"\n");
-        assert_eq!(sanitize_node_distance(b"10 18\n"), b"10\n");
-        assert_eq!(sanitize_node_distance(b"10 21 31 21\n"), b"10\n");
-        assert_eq!(sanitize_node_distance(b"10\n"), b"10\n");
-        assert_eq!(sanitize_node_distance(b"10 x\n"), b"10 x\n");
-        assert_eq!(sanitize_node_distance(b"10 18"), b"10 18");
-        assert_eq!(sanitize_node_distance(b"\n"), b"\n");
+        // Another node's distances, another CPU's IDs and cpu0's PPIN are
+        // left to the directory listing or the host.
+        for path in [
+            "/sys/devices/system/node/node1/distance",
+            "/sys/devices/system/cpu/cpu1/topology/core_id",
+            "/sys/devices/system/cpu/cpu0/topology/ppin",
+            "/sys/devices/system/node/has_cpu_extra",
+        ] {
+            assert_eq!(kind(path), None, "{path}");
+        }
         assert_eq!(sanitize_cpu_list(b"0-1\n"), b"0\n");
         assert_eq!(sanitize_cpu_list(b"\n"), b"\n");
     }

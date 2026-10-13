@@ -148,6 +148,7 @@ static VDSO_SYMBOL_VERSIONS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_SIGEV_THREAD_ID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static NESTED_VFORK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PID_NAMESPACE_NESTED_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static KERNEL_MAX_AFFINITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_PROCESS_GROUP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_CREATE_RT_SIGNAL_REFUSED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_RT_SIGNAL_PENDING_OBSERVED_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -22551,6 +22552,54 @@ fn a_nested_vfork_child_that_exits_completes_at_bitwise_parity() {
                 .expect("the verdict must be JSON");
         assert_eq!(report["bitwise_parity"], true, "depth {depth}: {report}");
     }
+}
+
+/// A CPU set sized from `/sys/devices/system/cpu/kernel_max + 1`, as the
+/// kernel documents, is one Detcore's `sched_getaffinity` accepts, and it holds
+/// the one virtual CPU (https://github.com/rrnewton/hermit/issues/4160).
+/// Reporting `kernel_max` as 0 made that set 8 bytes, which the call refuses
+/// with EINVAL.
+#[test]
+fn a_cpu_set_sized_from_kernel_max_holds_the_one_virtual_cpu() {
+    let guest = futex_c_guest(&KERNEL_MAX_AFFINITY_GUEST, "kernel_max_affinity")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let verdict = directory.path().join("verify.json");
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "--log=info",
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            verdict.to_str().unwrap(),
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+        ]),
+        directory.path(),
+        Duration::from_secs(180),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "stdout:\n{stdout}\nstderr:\n{log}"
+    );
+    assert_eq!(
+        stdout, "kernel_max=127 setsize=16 sched_getaffinity rc=0 ok count=1\n",
+        "stderr:\n{log}"
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
+            .expect("the verdict must be JSON");
+    assert_eq!(report["bitwise_parity"], true, "{report}");
 }
 
 /// pidfd_send_signal's flags and descriptors answer as Linux answers them
