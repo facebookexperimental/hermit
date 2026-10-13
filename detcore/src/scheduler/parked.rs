@@ -978,6 +978,8 @@ impl Scheduler {
     ///
     /// `si_overrun` is 0, as `timer_getoverrun` reports; the timer's
     /// `sigev_value` is not retained by `timer_create`, so `si_value` is 0.
+    // TODO-HUMAN-REVIEW(PR-1019): Review routing POSIX timer expirations
+    // through the backend's ProcessSignalControl::publish_timer_expiry.
     fn publish_posix_timer_expiry(
         &mut self,
         pid: DetPid,

@@ -1991,7 +1991,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the queued-sleep, held-wake, child-exit send-window and window-gate
     // tests and the signalfd next-record geometry test
     // (https://github.com/rrnewton/hermit/issues/4126): fifteen: 1481.
-    ("test.detcore_unit", 1485),
+    ("test.detcore_unit", 1486),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3190,7 +3190,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the three internal IO poll signal-filter tests: 1466.
     // And the fifteen queued-sleep, held-wake, send-window, window-gate and
     // signalfd geometry tests: 1481.
-    ("test.detcore_unit_on_host", 1485),
+    ("test.detcore_unit_on_host", 1486),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
