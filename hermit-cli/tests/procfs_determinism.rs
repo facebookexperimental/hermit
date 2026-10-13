@@ -475,6 +475,31 @@ fn sys_cpu_lists_report_one_virtual_cpu() {
     }
 }
 
+/// The CPU and node files that are numbers or node lists describe one CPU on
+/// one node, as on such a machine: the highest supported CPU number, whether
+/// SMT siblings are active, cpu0's topology IDs, which nodes exist and have
+/// CPUs or memory, and node 0's distances
+/// (https://github.com/rrnewton/hermit/issues/4160).
+#[test]
+fn sys_cpu_numbers_and_node_files_describe_one_cpu_and_node() {
+    for path in [
+        "/sys/devices/system/cpu/kernel_max",
+        "/sys/devices/system/cpu/smt/active",
+        "/sys/devices/system/cpu/cpu0/topology/cluster_id",
+        "/sys/devices/system/cpu/cpu0/topology/core_id",
+        "/sys/devices/system/cpu/cpu0/topology/physical_package_id",
+        "/sys/devices/system/node/online",
+        "/sys/devices/system/node/possible",
+        "/sys/devices/system/node/has_cpu",
+        "/sys/devices/system/node/has_memory",
+    ] {
+        assert_deterministic(path, |contents| assert_eq!(contents, b"0\n", "{path}"));
+    }
+    assert_deterministic("/sys/devices/system/node/node0/distance", |contents| {
+        assert_eq!(contents, b"10\n")
+    });
+}
+
 /// `nproc` asks `sched_getaffinity`; `getconf _NPROCESSORS_ONLN` asks glibc's
 /// `get_nprocs`, which reads `/sys/devices/system/cpu/online`. A build that
 /// sizes its parallelism from either must see the same single CPU, or its

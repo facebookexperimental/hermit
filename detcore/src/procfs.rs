@@ -153,6 +153,12 @@ enum ProcfsKind {
     /// A CPU-mask file describing Hermit's single virtual CPU: `cpu0`'s
     /// topology masks and `node0/cpumap`.
     CpuMask,
+    /// A number that is 0 on a machine with one CPU and one node:
+    /// `cpu/kernel_max`, `cpu/smt/active` and `cpu0`'s topology IDs.
+    SingleCpuZero,
+    /// `node0/distance`: the distances from node 0 to every node, of which
+    /// Hermit's single virtual node has one, its distance to itself.
+    NodeDistance,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-957): Review Btrfs reservation normalization.
     BtrfsBytesMayUse,
@@ -750,6 +756,8 @@ impl ProcfsFile {
             | "/sys/devices/system/cpu/present" => ProcfsKind::CpuList,
             other if is_virtual_cpu_list_path(other) => ProcfsKind::CpuList,
             other if is_virtual_cpu_mask_path(other) => ProcfsKind::CpuMask,
+            other if is_single_cpu_zero_path(other) => ProcfsKind::SingleCpuZero,
+            "/sys/devices/system/node/node0/distance" => ProcfsKind::NodeDistance,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-939): Review NUMA node VM accounting normalization.
             other if is_node_vmstat_path(other) => ProcfsKind::NodeVmstat,
@@ -1003,6 +1011,8 @@ impl ProcfsFile {
             ProcfsKind::UeventSeqnum => sanitize_uevent_seqnum(&contents),
             ProcfsKind::CpuList => sanitize_cpu_list(&contents),
             ProcfsKind::CpuMask => sanitize_cpu_mask(&contents),
+            ProcfsKind::SingleCpuZero => sanitize_single_cpu_zero(&contents),
+            ProcfsKind::NodeDistance => sanitize_node_distance(&contents),
             ProcfsKind::BtrfsBytesMayUse => sanitize_btrfs_bytes_may_use(&contents),
             ProcfsKind::BlockInflight => sanitize_block_inflight(&contents),
             ProcfsKind::IrqPerCpuCount => sanitize_irq_per_cpu_count(&contents),
@@ -1356,11 +1366,15 @@ const CPU_TOPOLOGY_ATTRIBUTES: [&str; 6] = [
 
 /// CPU lists that describe the CPUs sharing something with Hermit's single
 /// virtual CPU: `cpu0`'s topology lists, the CPUs sharing each of `cpu0`'s
-/// caches, and `node0`'s CPU list. Other CPUs'
+/// caches, and `node0`'s CPU list; and the node lists, which name Hermit's
+/// single virtual node, node 0. Other CPUs'
 /// and nodes' files are left to the directory listing, which should not show
 /// them at all.
 fn is_virtual_cpu_list_path(path: &str) -> bool {
     path == "/sys/devices/system/node/node0/cpulist"
+        || path
+            .strip_prefix("/sys/devices/system/node/")
+            .is_some_and(|list| NODE_LISTS.contains(&list))
         || is_cpu0_cache_file(path, "shared_cpu_list")
         || path
             .strip_prefix("/sys/devices/system/cpu/cpu0/topology/")
@@ -1376,6 +1390,37 @@ fn is_cpu0_cache_file(path: &str, attribute: &str) -> bool {
             !index.is_empty()
                 && index.bytes().all(|byte| byte.is_ascii_digit())
                 && leaf == attribute
+        })
+}
+
+/// The node lists in `/sys/devices/system/node`: the nodes that are online,
+/// possible, or have CPUs or memory. `has_generic_initiator` is empty on a
+/// machine without such initiators, and an empty list is reported unchanged.
+const NODE_LISTS: &[&str] = &[
+    "online",
+    "possible",
+    "has_cpu",
+    "has_memory",
+    "has_normal_memory",
+    "has_generic_initiator",
+];
+
+/// Files whose number is 0 on a machine with one CPU: the highest CPU number
+/// the kernel supports (`kernel_max`, 511 on a kernel built for 512 CPUs),
+/// whether SMT siblings are active (`smt/active`), and `cpu0`'s topology IDs
+/// (its cluster, core, die and package; x86 reports a cluster ID of 65535
+/// when the CPU has none).
+fn is_single_cpu_zero_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/sys/devices/system/cpu/kernel_max" | "/sys/devices/system/cpu/smt/active"
+    ) || path
+        .strip_prefix("/sys/devices/system/cpu/cpu0/topology/")
+        .is_some_and(|attribute| {
+            matches!(
+                attribute,
+                "cluster_id" | "core_id" | "die_id" | "physical_package_id"
+            )
         })
 }
 
@@ -1626,6 +1671,36 @@ fn sanitize_cpu_mask(contents: &[u8]) -> Vec<u8> {
         return contents.to_vec();
     }
     b"1\n".to_vec()
+}
+
+/// Reports a number of [`is_single_cpu_zero_path`] as `0`. Anything that is
+/// not a newline-terminated decimal number is returned unchanged.
+fn sanitize_single_cpu_zero(contents: &[u8]) -> Vec<u8> {
+    match contents.strip_suffix(b"\n") {
+        Some(number) if !number.is_empty() && number.iter().all(u8::is_ascii_digit) => {
+            b"0\n".to_vec()
+        }
+        _ => contents.to_vec(),
+    }
+}
+
+/// Reports `node0/distance` for Hermit's single virtual node: only node 0's
+/// distance to itself, the first of the host's distances (10 on Linux).
+/// Anything that is not a newline-terminated, space-separated list of
+/// decimal numbers is returned unchanged.
+fn sanitize_node_distance(contents: &[u8]) -> Vec<u8> {
+    let Some(distances) = contents.strip_suffix(b"\n") else {
+        return contents.to_vec();
+    };
+    let mut fields = distances.split(|byte| *byte == b' ');
+    let Some(own) = fields.next() else {
+        return contents.to_vec();
+    };
+    let numeric = |field: &[u8]| !field.is_empty() && field.iter().all(u8::is_ascii_digit);
+    if !numeric(own) || !fields.all(numeric) {
+        return contents.to_vec();
+    }
+    [own, b"\n"].concat()
 }
 
 /// Reports a kernel CPU list (`/sys/devices/system/cpu/online` and its
@@ -5957,7 +6032,7 @@ Rss:                   4 kB\n" as &[u8];
         // Other CPUs and nodes, and other topology attributes, are untouched.
         for path in [
             "/sys/devices/system/cpu/cpu1/topology/thread_siblings_list",
-            "/sys/devices/system/cpu/cpu0/topology/core_id",
+            "/sys/devices/system/cpu/cpu1/topology/core_id",
             "/sys/devices/system/node/node1/cpulist",
             "/sys/devices/system/cpu/cpu1/cache/index3/shared_cpu_list",
             "/sys/devices/system/cpu/cpu0/cache/index3/size",
@@ -5975,6 +6050,61 @@ Rss:                   4 kB\n" as &[u8];
         assert_eq!(sanitize_cpu_mask(b"ff"), b"ff");
         assert_eq!(sanitize_cpu_mask(b"0-3\n"), b"0-3\n");
         assert_eq!(sanitize_cpu_mask(b"\n"), b"\n");
+    }
+
+    #[test]
+    fn kernel_max_smt_topology_ids_and_nodes_describe_one_cpu_and_node() {
+        for path in [
+            "/sys/devices/system/cpu/kernel_max",
+            "/sys/devices/system/cpu/smt/active",
+            "/sys/devices/system/cpu/cpu0/topology/cluster_id",
+            "/sys/devices/system/cpu/cpu0/topology/core_id",
+            "/sys/devices/system/cpu/cpu0/topology/die_id",
+            "/sys/devices/system/cpu/cpu0/topology/physical_package_id",
+        ] {
+            assert_eq!(
+                ProcfsFile::from_path(Path::new(path)).unwrap().kind,
+                ProcfsKind::SingleCpuZero,
+                "{path}"
+            );
+        }
+        for list in NODE_LISTS {
+            let path = format!("/sys/devices/system/node/{list}");
+            assert_eq!(
+                ProcfsFile::from_path(Path::new(&path)).unwrap().kind,
+                ProcfsKind::CpuList,
+                "{path}"
+            );
+        }
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/sys/devices/system/node/node0/distance"))
+                .unwrap()
+                .kind,
+            ProcfsKind::NodeDistance
+        );
+        // smt/control and another node's distances are untouched.
+        for path in [
+            "/sys/devices/system/cpu/smt/control",
+            "/sys/devices/system/node/node1/distance",
+            "/sys/devices/system/cpu/cpu0/topology/ppin",
+        ] {
+            assert!(ProcfsFile::from_path(Path::new(path)).is_none(), "{path}");
+        }
+        assert_eq!(sanitize_single_cpu_zero(b"511\n"), b"0\n");
+        assert_eq!(sanitize_single_cpu_zero(b"65535\n"), b"0\n");
+        assert_eq!(sanitize_single_cpu_zero(b"0\n"), b"0\n");
+        // Not a number: left alone.
+        assert_eq!(sanitize_single_cpu_zero(b"on\n"), b"on\n");
+        assert_eq!(sanitize_single_cpu_zero(b"1"), b"1");
+        assert_eq!(sanitize_single_cpu_zero(b"\n"), b"\n");
+        assert_eq!(sanitize_node_distance(b"10 18\n"), b"10\n");
+        assert_eq!(sanitize_node_distance(b"10 21 31 21\n"), b"10\n");
+        assert_eq!(sanitize_node_distance(b"10\n"), b"10\n");
+        assert_eq!(sanitize_node_distance(b"10 x\n"), b"10 x\n");
+        assert_eq!(sanitize_node_distance(b"10 18"), b"10 18");
+        assert_eq!(sanitize_node_distance(b"\n"), b"\n");
+        assert_eq!(sanitize_cpu_list(b"0-1\n"), b"0\n");
+        assert_eq!(sanitize_cpu_list(b"\n"), b"\n");
     }
 
     #[test]
