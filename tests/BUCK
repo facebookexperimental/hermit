@@ -206,20 +206,21 @@ buck_sh_test(
         (
             "racewrite_nostdlib",
             "$(location //hermetic_infra/hermit/tests:racewrite_nostdlib)",
-            "--selfcheck --run-arg=--base-env=empty --target-exit-code=0 --target-stdout=barfoo",
+            # The non-chaos baseline now prints barfoo, so analyze the opposite
+            # write order to keep the endpoints distinct (as OSS
+            # hermit-cli/tests/analyze.rs does).
+            "--selfcheck --run-arg=--base-env=empty --target-exit-code=0 --target-stdout=foobar",
             "simple/racewrite_nostdlib.c:35",
         ),
         # TODO: enable more analyze tests:
         # ("cas_sequence", "$(location //hermetic_infra/hermit/tests:chaos_cas_sequence_bin)"),
-        (
-            "nanosleep-threads-nocrash",
-            "$(location //hermetic_infra/hermit/tests:nanosleep-threads-nocrash)",
-            # TODO(T139493442): this test exits under the baseline hermit run currently, so we could use a feature to
-            # flip the target/baseline automatically
-            "--run-arg=--base-env=empty --target-exit-code=0",
-            # TODO: indicate the right lines to blame:
-            "",
-        ),
+        # nanosleep-threads-nocrash is not here: its baseline run also exits 0,
+        # so analyze correctly refuses ("baseline run matched target criteria
+        # when it should not"). OSS asserts that refusal in
+        # hermit-cli/tests/analyze.rs
+        # (analyze_nanosleep_threads_rejects_indistinguishable_baseline), but
+        # that test is #[ignore]d (slow, needs PMU counters) and no OSS
+        # validate node runs it.
     ]
 ]
 
