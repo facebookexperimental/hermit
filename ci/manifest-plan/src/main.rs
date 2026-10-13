@@ -1363,6 +1363,8 @@ fn validate_mode_with_cpu(
             "comparator_reason",
             "diagnostic",
             "no_retry_reason",
+            "max_level",
+            "max_level_reason",
         ]),
         // A replay cell may restate the environment it records with, an empty
         // mapping included (runner::cell_mode_env); otherwise it inherits its

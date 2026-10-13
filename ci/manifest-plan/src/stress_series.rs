@@ -629,6 +629,11 @@ pub struct SeriesPayload {
     /// derivable from the machine name or kernel version.
     #[serde(default)]
     pub host_capabilities: Option<HostCapabilities>,
+    /// How the observed cell ran: its strictness level and Hermit settings
+    /// (`runner::CellResult::strictness`). Absent means not recorded, never
+    /// "strict": a reader must not infer it from the host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strictness: Option<crate::runner::CellStrictness>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -1725,6 +1730,7 @@ mod tests {
                         },
                     ),
                 ])),
+                strictness: None,
             },
         }
     }

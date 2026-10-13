@@ -417,6 +417,43 @@ specific configuration:
   Because the ledger keeps the failure out of `passed_tests`, a run with a
   diagnostic failure is not a qualifying receipt.
 
+### Strictness level: one run per test
+
+Every test runs once per validation, at the deepest strictness level the host
+and the cell allow:
+
+- **strict** on a host with CPUID faulting whose Hermit reports an exact
+  retired-branch counter (`hermit host-capabilities`): no relaxation, so CPUID
+  virtualization and the preemption timer stay on.
+- **relaxed** on any other host, or anywhere when `E2E_STRICTNESS_LEVEL=relaxed`
+  is set: a verify cell on ptrace or e9patch adds `--no-virtualize-cpuid
+  --max-timeslice=disabled`, which is what lets `hermit run --strict` run there
+  (without the preemption timer it does not refuse an inexact counter). Nothing
+  can make a host without the capabilities run the strict level.
+
+Only a verify cell on ptrace or e9patch, the backends whose virtual clock reads
+the host's branch counter, has a relaxed form. Every other cell runs as
+declared, and a chaos or replay cell that needs the counter is still
+`HOST-INAPPLICABLE` on a host without it. `test-harness run` prints the level it
+chose and why.
+
+A verify mode that does not depend on preemption or CPUID virtualization may cap
+itself at the relaxed level, so it never has a strict form on any host:
+
+```yaml
+      verify:
+        max_level: relaxed
+        max_level_reason: Prints a constant; no schedule or CPUID value reaches it
+```
+
+`max_level` accepts only `relaxed`, needs a non-empty `max_level_reason`, and
+needs a ptrace or e9patch backend in `backends_enabled`. Each flag the relaxed
+level adds is recorded in the row's `relaxations` with its reason (the cap's, or
+the host's), and every row records how its cell ran in `strictness`:
+`{"level": "strict"|"relaxed", "virtualize_cpuid": bool, "max_timeslice":
+"disabled"|<nanoseconds>, "capped": bool}`. A row without `strictness` is a row
+written before it existed; readers must not infer the level from the host.
+
 A bucket whose tests share one recipe may state it once in a `corpus` section
 instead of a `test` list (`compat.yaml` is the one such bucket).
 `ci/manifest-plan/src/manifest_corpus.rs` expands every row into an ordinary

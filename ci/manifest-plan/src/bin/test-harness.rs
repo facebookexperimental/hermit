@@ -28,7 +28,9 @@ use hermit_manifest_plan::runner::FailureClass;
 use hermit_manifest_plan::runner::MAX_ATTEMPTS_PER_CELL;
 use hermit_manifest_plan::runner::ManifestSet;
 use hermit_manifest_plan::runner::Population;
+use hermit_manifest_plan::runner::RELAXED_LEVEL_ARGS;
 use hermit_manifest_plan::runner::RunContext;
+use hermit_manifest_plan::runner::STRICTNESS_LEVEL_ENV;
 use hermit_manifest_plan::runner::ScheduledWorkerCapacity;
 use hermit_manifest_plan::runner::SelectedCell;
 use hermit_manifest_plan::runner::Selection;
@@ -43,6 +45,7 @@ use hermit_manifest_plan::runner::checked_add_cpu_usage;
 use hermit_manifest_plan::runner::diagnostic_failure_reason;
 use hermit_manifest_plan::runner::host_inapplicable_result;
 use hermit_manifest_plan::runner::host_input_change_only;
+use hermit_manifest_plan::runner::host_strictness;
 use hermit_manifest_plan::runner::is_diagnostic_cell;
 use hermit_manifest_plan::runner::prepare_result_path;
 use hermit_manifest_plan::runner::refused_on_an_inexact_branch_counter;
@@ -2715,6 +2718,7 @@ fn audit_compile(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode 
             enabled: false,
             timeout_seconds,
             cpu_timeout_seconds,
+            host_level: hermit_manifest_plan::runner::HostLevel::default(),
         };
         checked += 1;
         let dir = context
@@ -3090,7 +3094,7 @@ fn run_cells(manifests: &ManifestSet, args: &Args) -> Result<Vec<SelectedCell>, 
 }
 
 fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
-    let cells = run_cells(manifests, args).unwrap_or_else(|e| fail(e));
+    let mut cells = run_cells(manifests, args).unwrap_or_else(|e| fail(e));
     if !args.selection.exclude_backends.is_empty() {
         let unfiltered = manifests
             .select(&Selection {
@@ -3144,6 +3148,34 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
             if verdict.present { "PRESENT" } else { "ABSENT" },
             verdict.evidence
         );
+    }
+    // One run per test, at the deepest level this host supports; a verify cell
+    // that caps itself runs relaxed everywhere. The level is the host's, so it
+    // is set only here, where the cells run, and never in a plan. An import
+    // runs nothing: its rows ran at their producer's level, and the host checks
+    // it applies to them are the producer's, as before.
+    if import_root.is_none() {
+        let host_level = host_strictness(
+            &context.host_capabilities,
+            context.exact_branch_counter.as_ref(),
+            std::env::var(STRICTNESS_LEVEL_ENV).ok().as_deref(),
+        )
+        .unwrap_or_else(|e| fail(e));
+        eprintln!(
+            "Strictness level: {}{}",
+            host_level.level.as_str().to_uppercase(),
+            host_level
+                .reason
+                .as_deref()
+                .map(|reason| format!(
+                    " — {reason}; verify cells on ptrace and e9patch add {}",
+                    RELAXED_LEVEL_ARGS.join(" ")
+                ))
+                .unwrap_or_default()
+        );
+        for cell in &mut cells {
+            cell.host_level = host_level.clone();
+        }
     }
     let results_path = args.results.clone().unwrap_or_else(|| {
         context

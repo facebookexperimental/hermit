@@ -1006,7 +1006,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // ledger::admission::tests::disjoint_main_floor_is_not_canonical_without_the_git_proof
     // (hermit-manifest-plan) retains all 1073: 1074.
     // Four backend-scoped environment/expansion/digest tests retain all 1074: 1078.
-    ("test.regular_crates", 1078),
+    // runner::tests::{host_strictness_is_strict_only_with_cpuid_faulting_and_an_exact_counter,
+    // a_relaxed_host_runs_a_ptrace_verify_cell_once_at_the_relaxed_level,
+    // a_capped_cell_runs_relaxed_on_every_host_and_records_its_cap,
+    // the_relaxed_level_adds_no_flag_a_recipe_already_declares,
+    // only_a_pmu_clock_verify_cell_has_a_relaxed_form, max_level_is_validated,
+    // max_timeslice_reads_and_writes_disabled_or_a_number} (hermit-manifest-plan)
+    // retain all 1078: 1085.
+    ("test.regular_crates", 1085),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -3571,7 +3578,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same eight disjoint-main floor admission tests: 1073.
     // And the same disjoint-main not-canonical test: 1074.
     // And the same four backend-scoped environment tests: 1078.
-    ("test.regular_crates_on_host", 1078),
+    // And the same seven strictness-level tests: 1085.
+    ("test.regular_crates_on_host", 1085),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).

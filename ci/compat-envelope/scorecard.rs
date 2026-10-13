@@ -24721,6 +24721,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
                         },
                     ),
                 ])),
+                strictness: None,
             },
         };
         series_row.validate_for_read()?;
@@ -29452,6 +29453,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
                         },
                     ),
                 ])),
+                strictness: None,
             },
         }
     };

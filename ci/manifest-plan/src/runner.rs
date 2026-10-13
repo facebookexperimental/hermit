@@ -328,7 +328,9 @@ pub fn pmu_clock_backend(backend: &str) -> bool {
 /// (<https://github.com/rrnewton/hermit/issues/3810>). A custom cell passes it
 /// when its arguments say so, unless they also select `--namespace-only`
 /// (alias `--lite`), which arms no branch counter. A naked cell runs no
-/// hermit.
+/// hermit. A verify cell at the relaxed strictness level runs without the
+/// preemption timer ([`RELAXED_LEVEL_ARGS`]), which is what Hermit refuses
+/// on an inexact counter, so it is not refused.
 pub fn refused_on_an_inexact_branch_counter(cell: &SelectedCell) -> bool {
     let strict_run = match cell.id.mode.as_str() {
         "verify" | "chaos" | "replay" => true,
@@ -339,7 +341,9 @@ pub fn refused_on_an_inexact_branch_counter(cell: &SelectedCell) -> bool {
         }
         _ => false,
     };
-    strict_run && cell.id.backend.as_deref().is_some_and(pmu_clock_backend)
+    strict_run
+        && cell.id.backend.as_deref().is_some_and(pmu_clock_backend)
+        && cell.strictness_level() != Some(StrictnessLevel::Relaxed)
 }
 
 pub fn requires_capability(token: &str) -> Result<Option<HostCapability>, String> {
@@ -559,6 +563,15 @@ pub struct ModeRecipe {
     /// test's own `labels` for that cell only. See [`cell_labels`].
     #[serde(default)]
     pub labels: BTreeMap<String, Vec<String>>,
+    /// The deepest strictness level this verify cell runs at. `relaxed` caps a
+    /// test whose result does not depend on preemption or CPUID
+    /// virtualization at the relaxed level on every host, so it never has a
+    /// second, strict form ([`SelectedCell::strictness_level`]). Only
+    /// `relaxed` may be written, with `max_level_reason`, and only on a verify
+    /// mode with a ptrace or e9patch cell, the backends that have a relaxed
+    /// form.
+    pub max_level: Option<StrictnessLevel>,
+    pub max_level_reason: Option<String>,
 }
 
 /// The run type of a cell that names none: the full validation, whose
@@ -1474,6 +1487,297 @@ pub struct SelectedCell {
     pub enabled: bool,
     pub timeout_seconds: u64,
     pub cpu_timeout_seconds: u64,
+    /// The strictness level of the host that runs this cell
+    /// ([`host_strictness`]). Selection leaves it at the strict default, which
+    /// describes no host; the harness that runs the cells sets it from the
+    /// host it runs on, so a plan or an inventory never depends on a host. An
+    /// import leaves it too: its rows ran at their producer's level.
+    pub host_level: HostLevel,
+}
+
+/// How deep a cell's run goes. A host with a PMU and CPUID faulting runs every
+/// test at the strict level; a host without them runs it at the relaxed level,
+/// which adds [`RELAXED_LEVEL_ARGS`]; a verify cell may cap itself at the
+/// relaxed level ([`ModeRecipe::max_level`]). One run per test, at the deepest
+/// level the host and the cell allow, and the row records which
+/// ([`CellResult::strictness`]).
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Deserialize,
+    Eq,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Serialize
+)]
+#[serde(rename_all = "lowercase")]
+pub enum StrictnessLevel {
+    /// CPUID virtualization and the preemption timer off.
+    Relaxed,
+    /// No relaxation: CPUID virtualization and the preemption timer on.
+    #[default]
+    Strict,
+}
+
+impl StrictnessLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Relaxed => "relaxed",
+            Self::Strict => "strict",
+        }
+    }
+}
+
+/// How one cell ran: its strictness level and the Hermit settings it ran
+/// with, recorded on its result row ([`CellResult::strictness`]) and its
+/// series observation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CellStrictness {
+    pub level: StrictnessLevel,
+    /// Whether Hermit virtualized CPUID (no `--no-virtualize-cpuid`).
+    pub virtualize_cpuid: bool,
+    /// The preemption timeslice Hermit ran with: its `--max-timeslice`, or
+    /// Hermit's default when the cell passed none.
+    pub max_timeslice: MaxTimeslice,
+    /// Whether the cell's recipe caps it at the relaxed level
+    /// ([`ModeRecipe::max_level`]).
+    pub capped: bool,
+}
+
+/// A `--max-timeslice` value: `"disabled"` in JSON, or the timeslice in
+/// virtual nanoseconds as a number.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaxTimeslice {
+    Disabled,
+    Nanoseconds(u64),
+}
+
+impl MaxTimeslice {
+    /// The value of a `--max-timeslice=<value>` flag, or `None` when Hermit
+    /// would not accept it.
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "disabled" => Some(Self::Disabled),
+            value => value
+                .parse::<u64>()
+                .ok()
+                .filter(|nanoseconds| *nanoseconds > 0)
+                .map(Self::Nanoseconds),
+        }
+    }
+
+    /// The timeslice Hermit runs with when it is given no `--max-timeslice`.
+    fn hermit_default() -> Self {
+        detcore_model::config::Config::default()
+            .max_timeslice
+            .map_or(Self::Disabled, |nanoseconds| {
+                Self::Nanoseconds(nanoseconds.get())
+            })
+    }
+}
+
+impl Serialize for MaxTimeslice {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Disabled => serializer.serialize_str("disabled"),
+            Self::Nanoseconds(nanoseconds) => serializer.serialize_u64(*nanoseconds),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for MaxTimeslice {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Word(String),
+            Nanoseconds(u64),
+        }
+        match Repr::deserialize(deserializer)? {
+            Repr::Word(word) if word == "disabled" => Ok(Self::Disabled),
+            Repr::Word(word) => Err(serde::de::Error::custom(format!(
+                "max_timeslice must be \"disabled\" or a positive number, got {word:?}"
+            ))),
+            Repr::Nanoseconds(0) => Err(serde::de::Error::custom(
+                "max_timeslice must be \"disabled\" or a positive number, got 0",
+            )),
+            Repr::Nanoseconds(nanoseconds) => Ok(Self::Nanoseconds(nanoseconds)),
+        }
+    }
+}
+
+/// The strictness level a host runs, and why when it is not strict.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HostLevel {
+    pub level: StrictnessLevel,
+    /// Why the host runs the relaxed level; `None` at the strict level.
+    pub reason: Option<String>,
+}
+
+/// The environment variable that makes a host run the relaxed level although
+/// it could run the strict one. Its only accepted value is `relaxed`: nothing
+/// can make a host without the capabilities run the strict level.
+pub const STRICTNESS_LEVEL_ENV: &str = "E2E_STRICTNESS_LEVEL";
+
+/// The Hermit `run` flags a verify cell adds at the relaxed level: CPUID
+/// virtualization off, which needs CPUID faulting, and the preemption timer
+/// off, which needs an exact retired-branch counter. Without the timer
+/// `hermit run --strict` does not refuse an inexact counter.
+pub const RELAXED_LEVEL_ARGS: [&str; 2] = ["--no-virtualize-cpuid", "--max-timeslice=disabled"];
+
+/// The strictness level of this host: relaxed when it lacks CPUID faulting,
+/// when the hermit binary reports its retired-branch counter inexact, or when
+/// `forced` (the value of [`STRICTNESS_LEVEL_ENV`]) is `relaxed`; strict
+/// otherwise. A binary that gives no counter verdict does not relax the host,
+/// as it does not make a cell HOST-INAPPLICABLE. Any other forced value is
+/// refused.
+pub fn host_strictness(
+    host_capabilities: &HostCapabilities,
+    exact_branch_counter: Option<&CapabilityVerdict>,
+    forced: Option<&str>,
+) -> Result<HostLevel, String> {
+    let relaxed = |reason: String| HostLevel {
+        level: StrictnessLevel::Relaxed,
+        reason: Some(reason),
+    };
+    match forced {
+        None | Some("") => {}
+        Some("relaxed") => return Ok(relaxed(format!("{STRICTNESS_LEVEL_ENV}=relaxed"))),
+        Some(other) => {
+            return Err(format!(
+                "{STRICTNESS_LEVEL_ENV} must be `relaxed` or unset, got {other:?}; a host runs the \
+                 strict level whenever it can, and nothing can make it run the strict level when \
+                 it cannot"
+            ));
+        }
+    }
+    let mut missing = Vec::new();
+    match host_capabilities.get(&HostCapability::CpuidFaulting) {
+        Some(verdict) if verdict.present => {}
+        Some(verdict) => missing.push(format!("no CPUID faulting ({})", verdict.evidence)),
+        None => missing.push("no CPUID faulting verdict".to_string()),
+    }
+    // No verdict is not a verdict of absence: like the HOST-INAPPLICABLE
+    // rule ([`refused_on_an_inexact_branch_counter`]'s caller), the level
+    // relaxes only where the binary reported the counter inexact.
+    if let Some(verdict) = exact_branch_counter.filter(|verdict| !verdict.present) {
+        missing.push(format!("no exact branch counter ({})", verdict.evidence));
+    }
+    Ok(if missing.is_empty() {
+        HostLevel::default()
+    } else {
+        relaxed(format!("this host has {}", missing.join(" and ")))
+    })
+}
+
+impl SelectedCell {
+    /// The strictness level this cell runs at, or `None` for a naked cell,
+    /// which runs no Hermit.
+    ///
+    /// Only a verify cell on a backend that reads its virtual clock from the
+    /// host's branch counter ([`pmu_clock_backend`]) has a relaxed form, so
+    /// only it runs relaxed: on a relaxed host, or when its recipe caps it.
+    /// Every other cell runs as declared, at the strict level; a chaos or
+    /// replay cell that needs the counter is not run on a host without it.
+    pub fn strictness_level(&self) -> Option<StrictnessLevel> {
+        (self.id.mode != "naked").then(|| {
+            if self.relaxed_level_reason().is_some() {
+                StrictnessLevel::Relaxed
+            } else {
+                StrictnessLevel::Strict
+            }
+        })
+    }
+
+    /// How this cell runs ([`CellStrictness`]), or `None` for a naked cell.
+    /// The settings are read from the Hermit flags the cell passes: a verify
+    /// cell's recipe flags, level flags and probe flag, or a custom cell's
+    /// arguments. Chaos and replay cells pass none.
+    pub fn strictness(&self) -> Option<CellStrictness> {
+        let level = self.strictness_level()?;
+        let recipe = &self.test.modes[&self.id.mode];
+        let flags: Vec<String> = match (self.id.mode.as_str(), self.id.backend.as_deref()) {
+            ("verify", Some(backend)) => cell_hermit_args(recipe, backend)
+                .iter()
+                .cloned()
+                .chain(
+                    self.level_relaxations()
+                        .into_iter()
+                        .map(|(arg, _)| arg.to_string()),
+                )
+                .chain(probe_relaxation(self, backend).map(str::to_string))
+                .collect(),
+            ("custom", _) => recipe.args.clone(),
+            _ => Vec::new(),
+        };
+        let max_timeslice = flags
+            .iter()
+            .rev()
+            .find_map(|flag| flag.strip_prefix("--max-timeslice="))
+            .and_then(MaxTimeslice::parse)
+            .unwrap_or_else(MaxTimeslice::hermit_default);
+        Some(CellStrictness {
+            level,
+            virtualize_cpuid: !flags.iter().any(|flag| flag == "--no-virtualize-cpuid"),
+            max_timeslice,
+            capped: self.id.mode == "verify" && recipe.max_level == Some(StrictnessLevel::Relaxed),
+        })
+    }
+
+    /// Why this cell runs at the relaxed level, or `None` when it does not.
+    /// The cell's own cap is named first: it holds on every host.
+    fn relaxed_level_reason(&self) -> Option<String> {
+        if self.id.mode != "verify" || !self.id.backend.as_deref().is_some_and(pmu_clock_backend) {
+            return None;
+        }
+        let recipe = &self.test.modes[&self.id.mode];
+        if recipe.max_level == Some(StrictnessLevel::Relaxed) {
+            return Some(format!(
+                "the cell caps itself at the relaxed level: {}",
+                recipe
+                    .max_level_reason
+                    .as_deref()
+                    .unwrap_or("reason missing")
+            ));
+        }
+        (self.host_level.level == StrictnessLevel::Relaxed).then(|| {
+            format!(
+                "the host runs the relaxed level: {}",
+                self.host_level
+                    .reason
+                    .as_deref()
+                    .unwrap_or("reason missing")
+            )
+        })
+    }
+
+    /// The [`RELAXED_LEVEL_ARGS`] this cell adds at the relaxed level, each
+    /// with the reason, leaving out a flag its recipe already declares.
+    pub fn level_relaxations(&self) -> Vec<(&'static str, String)> {
+        let Some(reason) = self.relaxed_level_reason() else {
+            return Vec::new();
+        };
+        let declared = self
+            .id
+            .backend
+            .as_deref()
+            .map(|backend| cell_hermit_args(&self.test.modes[&self.id.mode], backend))
+            .unwrap_or_default();
+        let flag_name = |arg: &str| arg.split_once('=').map_or(arg, |(flag, _)| flag).to_owned();
+        RELAXED_LEVEL_ARGS
+            .into_iter()
+            .filter(|arg| {
+                !declared
+                    .iter()
+                    .any(|declared| flag_name(declared) == flag_name(arg))
+            })
+            .map(|arg| (arg, reason.clone()))
+            .collect()
+    }
 }
 
 /// Named manifest bytes captured once for shared parsing and provenance.
@@ -1730,6 +2034,7 @@ impl ManifestSet {
                             .get("native")
                             .copied()
                             .unwrap_or(*default_cpu_timeout_seconds),
+                        host_level: HostLevel::default(),
                     });
                     continue;
                 }
@@ -1779,6 +2084,7 @@ impl ManifestSet {
                         enabled,
                         timeout_seconds,
                         cpu_timeout_seconds,
+                        host_level: HostLevel::default(),
                     });
                 }
             }
@@ -2173,6 +2479,9 @@ pub fn cell_relaxations(cell: &SelectedCell) -> Vec<String> {
         for arg in cell_hermit_args(recipe, backend) {
             relaxations.push(format!("{arg}: {args_reason}"));
         }
+        for (arg, reason) in cell.level_relaxations() {
+            relaxations.push(format!("{arg}: {LEVEL_RELAXATION_PREFIX}{reason}"));
+        }
         if let Some(arg) = probe_relaxation(cell, backend) {
             relaxations.push(format!("{arg}: {PROBE_RELAXATION_REASON}"));
         }
@@ -2188,6 +2497,10 @@ pub fn cell_relaxations(cell: &SelectedCell) -> Vec<String> {
     }
     relaxations
 }
+
+/// What follows the flag in the relaxation that records a flag the relaxed
+/// strictness level added ([`SelectedCell::level_relaxations`]).
+pub const LEVEL_RELAXATION_PREFIX: &str = "strictness level relaxed: ";
 
 /// The relaxation that records a stripped-comparator cell and its reason. The
 /// ledger reads it back to judge the cell by the comparison it declared.
@@ -2682,6 +2995,13 @@ pub struct CellResult {
     pub shell_command: String,
     #[serde(default)]
     pub relaxations: Vec<String>,
+    /// How the cell ran ([`SelectedCell::strictness`]): its strictness level
+    /// and the Hermit settings that level and the recipe selected. `None` for
+    /// a naked cell, which runs no Hermit, and in a row written before this
+    /// field; a reader must treat that as not recorded and never infer it from
+    /// the host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strictness: Option<CellStrictness>,
     pub execution_path: Option<JsonValue>,
     pub diversity: Option<JsonValue>,
     pub attempts: Vec<AttemptResult>,
@@ -4832,6 +5152,11 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
     // still rendered for a recipe built without validation, such as one that
     // reproduces a retained row recorded before the refusal.
     argv.extend(cell_hermit_args(mode_recipe, backend).iter().cloned());
+    argv.extend(
+        cell.level_relaxations()
+            .into_iter()
+            .map(|(arg, _)| arg.to_string()),
+    );
     argv.extend(probe_relaxation(cell, backend).map(str::to_string));
     if mode_recipe.compare_io_buffers == Some(false) {
         argv.push("--no-detlog-io-buffers".into());
@@ -7593,6 +7918,7 @@ fn run_cell_inner(
         cwd: literal_cwd,
         shell_command: literal_shell_command,
         relaxations: cell_relaxations(cell),
+        strictness: cell.strictness(),
         execution_path,
         diversity: (cell.id.mode == "chaos").then(|| {
             diversity_evidence(
@@ -7675,6 +8001,7 @@ pub fn infrastructure_error_result(
         cwd: context.root.to_string_lossy().into_owned(),
         shell_command: String::new(),
         relaxations: cell_relaxations(cell),
+        strictness: cell.strictness(),
         execution_path: None,
         diversity: None,
         attempts: Vec::new(),
@@ -7751,6 +8078,7 @@ pub fn host_inapplicable_result(
         cwd: context.root.to_string_lossy().into_owned(),
         shell_command: String::new(),
         relaxations: cell_relaxations(cell),
+        strictness: cell.strictness(),
         execution_path: None,
         diversity: None,
         attempts: Vec::new(),
@@ -8308,11 +8636,40 @@ fn validate_mode_extensions(id: &str, mode: &str, recipe: &ModeRecipe) -> Result
         || recipe.comparator.is_some()
         || recipe.comparator_reason.is_some()
         || !recipe.diagnostic.is_empty()
-        || recipe.no_retry_reason.is_some();
+        || recipe.no_retry_reason.is_some()
+        || recipe.max_level.is_some()
+        || recipe.max_level_reason.is_some();
     if extends && mode != "verify" {
         return Err(format!(
-            "{id}: {mode} declares hermit_args, comparator, diagnostic or no_retry_reason, which only a verify mode accepts"
+            "{id}: {mode} declares hermit_args, comparator, diagnostic, no_retry_reason or max_level, which only a verify mode accepts"
         ));
+    }
+    match (recipe.max_level, recipe.max_level_reason.as_deref()) {
+        (None, None) => {}
+        (Some(StrictnessLevel::Relaxed), Some(reason)) if !reason.trim().is_empty() => {
+            if !recipe
+                .backends_enabled
+                .iter()
+                .any(|backend| pmu_clock_backend(backend))
+            {
+                return Err(format!(
+                    "{id}: max_level caps a ptrace or e9patch cell, and this verify mode enables neither"
+                ));
+            }
+        }
+        (Some(StrictnessLevel::Strict), _) => {
+            return Err(format!(
+                "{id}: max_level: strict is every cell's default; only `relaxed` caps a cell"
+            ));
+        }
+        (Some(StrictnessLevel::Relaxed), _) => {
+            return Err(format!(
+                "{id}: max_level: relaxed requires a substantive max_level_reason"
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(format!("{id}: max_level_reason without max_level"));
+        }
     }
     // A replay cell records and replays the program its verify cell checks,
     // so it may restate that program's environment (see [`cell_mode_env`]);
@@ -9322,6 +9679,7 @@ corpus:
                 enabled: true,
                 timeout_seconds: 15,
                 cpu_timeout_seconds: 15,
+                host_level: HostLevel::default(),
             })
         };
         assert_eq!(
@@ -9743,6 +10101,7 @@ corpus:
             enabled: true,
             timeout_seconds: 15,
             cpu_timeout_seconds: 10,
+            host_level: HostLevel::default(),
         };
         assert_eq!(
             cell_relaxations(&cell),
@@ -9886,6 +10245,266 @@ corpus:
         assert_eq!(error, "--label super names no test in any manifest");
     }
 
+    fn relaxed_host() -> HostLevel {
+        HostLevel {
+            level: StrictnessLevel::Relaxed,
+            reason: Some("this host has no exact branch counter (fixture)".into()),
+        }
+    }
+
+    /// The run flags of a verify spec: the tokens after `--strict` that its
+    /// recipe, level or probe added.
+    fn verify_run_flags(spec: &CellRunSpec) -> Vec<String> {
+        spec.argv
+            .iter()
+            .filter(|arg| allowed_hermit_arg(arg))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn host_strictness_is_strict_only_with_cpuid_faulting_and_an_exact_counter() {
+        let exact = CapabilityVerdict {
+            present: true,
+            evidence: "fixture counter".into(),
+        };
+        let inexact = CapabilityVerdict {
+            present: false,
+            evidence: "SpecLockMap is enabled".into(),
+        };
+        let capable = fixture_host_capabilities();
+        assert_eq!(
+            host_strictness(&capable, Some(&exact), None).unwrap(),
+            HostLevel::default()
+        );
+        let level = host_strictness(&capable, Some(&inexact), None).unwrap();
+        assert_eq!(level.level, StrictnessLevel::Relaxed);
+        assert_eq!(
+            level.reason.as_deref(),
+            Some("this host has no exact branch counter (SpecLockMap is enabled)")
+        );
+        // No verdict is not a verdict of absence.
+        assert_eq!(
+            host_strictness(&capable, None, None).unwrap(),
+            HostLevel::default()
+        );
+        let mut no_faulting = capable.clone();
+        no_faulting
+            .get_mut(&HostCapability::CpuidFaulting)
+            .unwrap()
+            .present = false;
+        let level = host_strictness(&no_faulting, Some(&inexact), None).unwrap();
+        assert_eq!(
+            level.reason.as_deref(),
+            Some(
+                "this host has no CPUID faulting (fixture cpuid probe) and no exact branch \
+                 counter (SpecLockMap is enabled)"
+            )
+        );
+        // Forcing relaxed works on a capable host; nothing forces strict.
+        let level = host_strictness(&capable, Some(&exact), Some("relaxed")).unwrap();
+        assert_eq!(level.level, StrictnessLevel::Relaxed);
+        assert_eq!(
+            level.reason.as_deref(),
+            Some("E2E_STRICTNESS_LEVEL=relaxed")
+        );
+        for refused in ["strict", "Relaxed", "both"] {
+            assert!(host_strictness(&capable, Some(&exact), Some(refused)).is_err());
+        }
+    }
+
+    #[test]
+    fn a_relaxed_host_runs_a_ptrace_verify_cell_once_at_the_relaxed_level() {
+        let mut cell = verify_cell("ptrace", true, BTreeMap::new(), None);
+        assert_eq!(cell.strictness_level(), Some(StrictnessLevel::Strict));
+        assert!(verify_run_flags(&verify_spec_of(cell.clone())).is_empty());
+        assert!(refused_on_an_inexact_branch_counter(&cell));
+        assert_eq!(
+            cell.strictness(),
+            Some(CellStrictness {
+                level: StrictnessLevel::Strict,
+                virtualize_cpuid: true,
+                max_timeslice: MaxTimeslice::Nanoseconds(200_000_000),
+                capped: false,
+            })
+        );
+
+        cell.host_level = relaxed_host();
+        assert_eq!(cell.strictness_level(), Some(StrictnessLevel::Relaxed));
+        assert_eq!(
+            verify_run_flags(&verify_spec_of(cell.clone())),
+            RELAXED_LEVEL_ARGS
+        );
+        // Without the preemption timer Hermit does not refuse the counter.
+        assert!(!refused_on_an_inexact_branch_counter(&cell));
+        assert_eq!(
+            cell_relaxations(&cell),
+            [
+                "--no-virtualize-cpuid: strictness level relaxed: the host runs the relaxed \
+                 level: this host has no exact branch counter (fixture)",
+                "--max-timeslice=disabled: strictness level relaxed: the host runs the relaxed \
+                 level: this host has no exact branch counter (fixture)",
+            ]
+        );
+        assert_eq!(
+            cell.strictness(),
+            Some(CellStrictness {
+                level: StrictnessLevel::Relaxed,
+                virtualize_cpuid: false,
+                max_timeslice: MaxTimeslice::Disabled,
+                capped: false,
+            })
+        );
+    }
+
+    #[test]
+    fn a_capped_cell_runs_relaxed_on_every_host_and_records_its_cap() {
+        let mut cell = verify_cell("ptrace", true, BTreeMap::new(), None);
+        let mode = cell.test.modes.get_mut("verify").unwrap();
+        mode.max_level = Some(StrictnessLevel::Relaxed);
+        mode.max_level_reason = Some("prints a constant; preemption cannot change it".into());
+        assert_eq!(cell.strictness_level(), Some(StrictnessLevel::Relaxed));
+        assert_eq!(
+            verify_run_flags(&verify_spec_of(cell.clone())),
+            RELAXED_LEVEL_ARGS
+        );
+        assert!(
+            cell_relaxations(&cell)
+                .iter()
+                .all(|relaxation| relaxation.ends_with(
+                    "strictness level relaxed: the cell caps itself at the relaxed level: prints a \
+             constant; preemption cannot change it"
+                ))
+        );
+        assert!(cell.strictness().unwrap().capped);
+        // The cap names itself first on a relaxed host too, so the row's
+        // relaxations do not depend on the host.
+        let strict_host_relaxations = cell_relaxations(&cell);
+        cell.host_level = relaxed_host();
+        assert_eq!(cell_relaxations(&cell), strict_host_relaxations);
+    }
+
+    #[test]
+    fn the_relaxed_level_adds_no_flag_a_recipe_already_declares() {
+        let hermit_args =
+            BTreeMap::from([("ptrace".into(), vec!["--max-timeslice=400000".into()])]);
+        let mut cell = verify_cell("ptrace", true, hermit_args, None);
+        assert_eq!(
+            cell.strictness().unwrap().max_timeslice,
+            MaxTimeslice::Nanoseconds(400_000)
+        );
+        cell.host_level = relaxed_host();
+        assert_eq!(
+            verify_run_flags(&verify_spec_of(cell.clone())),
+            ["--max-timeslice=400000", "--no-virtualize-cpuid"]
+        );
+    }
+
+    #[test]
+    fn only_a_pmu_clock_verify_cell_has_a_relaxed_form() {
+        for backend in ["kvm", "dbt", "sabre", "liteinst", "in-guest-trap"] {
+            let mut cell = verify_cell(backend, true, BTreeMap::new(), None);
+            cell.host_level = relaxed_host();
+            assert_eq!(
+                cell.strictness_level(),
+                Some(StrictnessLevel::Strict),
+                "{backend}"
+            );
+            assert!(cell.level_relaxations().is_empty(), "{backend}");
+        }
+        for mode in ["chaos", "replay"] {
+            let mut cell = ptrace_cell(mode);
+            cell.host_level = relaxed_host();
+            assert_eq!(cell.strictness_level(), Some(StrictnessLevel::Strict));
+            // Still refused where the host lacks the counter.
+            assert!(refused_on_an_inexact_branch_counter(&cell), "{mode}");
+        }
+        let mut naked = ptrace_cell("naked");
+        naked.id.backend = None;
+        assert_eq!(naked.strictness_level(), None);
+        assert_eq!(naked.strictness(), None);
+    }
+
+    #[test]
+    fn max_level_is_validated() {
+        let check = |mode: &str, edit: &dyn Fn(&mut ModeRecipe)| {
+            let mut recipe = recipe(true).modes.remove("verify").unwrap();
+            edit(&mut recipe);
+            validate_mode_extensions("fixture/test", mode, &recipe)
+        };
+        let capped = |recipe: &mut ModeRecipe| {
+            recipe.max_level = Some(StrictnessLevel::Relaxed);
+            recipe.max_level_reason = Some("constant output".into());
+        };
+        check("verify", &capped).unwrap();
+        assert!(
+            check("chaos", &capped)
+                .unwrap_err()
+                .contains("which only a verify mode accepts")
+        );
+        assert!(
+            check("verify", &|recipe| {
+                capped(recipe);
+                recipe.max_level = Some(StrictnessLevel::Strict);
+            })
+            .unwrap_err()
+            .contains("only `relaxed` caps a cell")
+        );
+        assert!(
+            check("verify", &|recipe| {
+                capped(recipe);
+                recipe.max_level_reason = Some(" ".into());
+            })
+            .unwrap_err()
+            .contains("substantive max_level_reason")
+        );
+        assert!(
+            check("verify", &|recipe| recipe.max_level_reason =
+                Some("why".into()))
+            .unwrap_err()
+            .contains("max_level_reason without max_level")
+        );
+        assert!(
+            check("verify", &|recipe| {
+                capped(recipe);
+                recipe.backends_enabled = vec!["kvm".into()];
+            })
+            .unwrap_err()
+            .contains("enables neither")
+        );
+    }
+
+    #[test]
+    fn max_timeslice_reads_and_writes_disabled_or_a_number() {
+        let strictness = CellStrictness {
+            level: StrictnessLevel::Relaxed,
+            virtualize_cpuid: false,
+            max_timeslice: MaxTimeslice::Disabled,
+            capped: true,
+        };
+        let json = serde_json::to_value(strictness).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "level": "relaxed",
+                "virtualize_cpuid": false,
+                "max_timeslice": "disabled",
+                "capped": true,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CellStrictness>(json).unwrap(),
+            strictness
+        );
+        assert_eq!(
+            serde_json::from_value::<MaxTimeslice>(serde_json::json!(5000)).unwrap(),
+            MaxTimeslice::Nanoseconds(5000)
+        );
+        for refused in [serde_json::json!(0), serde_json::json!("off")] {
+            assert!(serde_json::from_value::<MaxTimeslice>(refused).is_err());
+        }
+    }
+
     fn extended_verify_spec(comparator: Option<Comparator>) -> CellRunSpec {
         let hermit_args = BTreeMap::from([("ptrace".into(), vec!["--no-virtualize-cpuid".into()])]);
         verify_spec("ptrace", true, hermit_args, comparator)
@@ -9928,6 +10547,7 @@ corpus:
             enabled,
             timeout_seconds: 15,
             cpu_timeout_seconds: 10,
+            host_level: HostLevel::default(),
         }
     }
 
@@ -10744,6 +11364,7 @@ corpus:
             enabled: true,
             timeout_seconds: 600,
             cpu_timeout_seconds: 22,
+            host_level: HostLevel::default(),
         }
     }
 
@@ -14859,6 +15480,7 @@ int main(int argc, char **argv) {
             enabled: true,
             timeout_seconds: 10,
             cpu_timeout_seconds: 1,
+            host_level: HostLevel::default(),
         };
         let context = RunContext {
             root: root.clone(),
@@ -14935,6 +15557,7 @@ int main(int argc, char **argv) {
             enabled: true,
             timeout_seconds: 15,
             cpu_timeout_seconds: 10,
+            host_level: HostLevel::default(),
         };
         let context = RunContext {
             root: root.clone(),
@@ -15061,6 +15684,7 @@ int main(int argc, char **argv) {
             enabled: true,
             timeout_seconds: 15,
             cpu_timeout_seconds: 10,
+            host_level: HostLevel::default(),
         };
         let mut context = RunContext {
             root: root.clone(),
@@ -15339,6 +15963,7 @@ backends_disabled:
                 enabled: true,
                 timeout_seconds: 15,
                 cpu_timeout_seconds: 10,
+                host_level: HostLevel::default(),
             };
             let context = RunContext {
                 root: PathBuf::from("/repo"),
@@ -15416,6 +16041,7 @@ backends_disabled:
             enabled: true,
             timeout_seconds: 15,
             cpu_timeout_seconds: 10,
+            host_level: HostLevel::default(),
         };
         let context = RunContext {
             root: PathBuf::from("/repo"),
@@ -15475,6 +16101,7 @@ backends_disabled:
             enabled: true,
             timeout_seconds: 15,
             cpu_timeout_seconds: 10,
+            host_level: HostLevel::default(),
         };
         let context = RunContext {
             root: PathBuf::from("/repo"),
@@ -15539,6 +16166,7 @@ backends_disabled:
             enabled: true,
             timeout_seconds: 15,
             cpu_timeout_seconds: 10,
+            host_level: HostLevel::default(),
         };
         let replay = build_spec(
             &context,
@@ -15581,6 +16209,7 @@ backends_disabled:
             enabled: true,
             timeout_seconds: 15,
             cpu_timeout_seconds: 10,
+            host_level: HostLevel::default(),
         };
         let custom = build_spec(
             &context,
@@ -15619,6 +16248,7 @@ backends_disabled:
             enabled: true,
             timeout_seconds: 15,
             cpu_timeout_seconds: 10,
+            host_level: HostLevel::default(),
         };
         let naked_error = build_spec(
             &context,
@@ -15794,6 +16424,7 @@ backends_disabled:
             enabled: true,
             timeout_seconds: 15,
             cpu_timeout_seconds: 10,
+            host_level: HostLevel::default(),
         };
         let context = RunContext {
             root: PathBuf::from("/repo"),
@@ -16287,6 +16918,7 @@ backends_disabled:
             enabled: true,
             timeout_seconds: 15,
             cpu_timeout_seconds: 10,
+            host_level: HostLevel::default(),
         };
         let context = RunContext {
             root: PathBuf::from("/repo"),
@@ -16361,6 +16993,7 @@ backends_disabled:
             enabled: true,
             timeout_seconds: 15,
             cpu_timeout_seconds: 10,
+            host_level: HostLevel::default(),
         };
         let replay = build_spec(
             &context,
@@ -16413,6 +17046,7 @@ backends_disabled:
             enabled: true,
             timeout_seconds: 15,
             cpu_timeout_seconds: 10,
+            host_level: HostLevel::default(),
         };
         let custom = build_spec(
             &context,
@@ -16663,6 +17297,7 @@ backends_disabled:
             artifact_dir: "/repo/artifacts".into(),
             expected_guest_exit: None,
             declared_stdout: None,
+            strictness: None,
         }
     }
 
@@ -22415,6 +23050,7 @@ cp "{}" "$verdict"
             enabled: true,
             timeout_seconds: 1,
             cpu_timeout_seconds: 1,
+            host_level: HostLevel::default(),
         };
 
         let error = run_preparation(
@@ -22508,6 +23144,7 @@ cp "{}" "$verdict"
             enabled: true,
             timeout_seconds: 4,
             cpu_timeout_seconds: 1,
+            host_level: HostLevel::default(),
         };
         let context = run_context(&root);
 
@@ -22560,6 +23197,7 @@ cp "{}" "$verdict"
             enabled: true,
             timeout_seconds: 15,
             cpu_timeout_seconds: 10,
+            host_level: HostLevel::default(),
         };
         let context = RunContext {
             root: root.clone(),
