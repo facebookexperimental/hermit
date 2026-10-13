@@ -3487,17 +3487,24 @@ impl<T: RecordOrReplay> Detcore<T> {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#546)
     /// Report that we are on cpu 0, irrespective of what physical CPU we are on.
+    ///
+    /// Linux's `sched_getaffinity` accepts any length whose bits cover
+    /// `nr_cpu_ids` (one, for Hermit's single virtual CPU) and that is a
+    /// multiple of `sizeof(long)`, copies `min(len, cpumask_size())` bytes and
+    /// returns that count. Detcore's mask is [`VIRTUAL_CPUSET_BYTES`] long
+    /// (`kernel_max` 127), so an 8-byte set, which `CPU_ALLOC` gives for the
+    /// one CPU that `sysconf(_SC_NPROCESSORS_CONF)` reports, receives its
+    /// first 8 bytes (https://github.com/rrnewton/hermit/issues/4160).
     pub async fn handle_sched_getaffinity<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::SchedGetaffinity,
     ) -> Result<i64, Error> {
         let size_bytes: usize = call.len() as usize;
-        if size_bytes < VIRTUAL_CPUSET_BYTES
-            || !size_bytes.is_multiple_of(std::mem::size_of::<libc::c_ulong>())
-        {
+        if size_bytes == 0 || !size_bytes.is_multiple_of(std::mem::size_of::<libc::c_ulong>()) {
             return Err(Errno::EINVAL.into());
         }
+        let copied = size_bytes.min(VIRTUAL_CPUSET_BYTES);
 
         // N.B. we can't use an opaque, type-safe representation such as
         // nix::sched::CpuSet currently.  The problem is that the
@@ -3507,16 +3514,18 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         info!(
             "Suppressing sched_getaffinity and returning {}-byte virtualized result, {:?}",
-            VIRTUAL_CPUSET_BYTES, cpu_set
+            copied,
+            &cpu_set[..copied]
         );
         if let Some(mask) = call.mask() {
             let mask: AddrMut<u8> = mask.cast();
-            guest.memory().write_exact(mask, &cpu_set)?;
+            guest.memory().write_exact(mask, &cpu_set[..copied])?;
             // From the man page:
             // > On success, the raw sched_getaffinity() system call returns the size (in bytes) of
             // > the cpumask_t data type that is used internally by the kernel to represent the CPU
             // > set bit mask.
-            Ok(VIRTUAL_CPUSET_BYTES as i64)
+            // Linux returns the bytes it copied, the smaller of that size and the caller's.
+            Ok(copied as i64)
         } else {
             Err(Error::Errno(Errno::EFAULT))
         }

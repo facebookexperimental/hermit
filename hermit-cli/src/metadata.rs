@@ -372,7 +372,12 @@ impl RecordVersion {
 // private copy; replay read it after the grant
 // (https://github.com/rrnewton/hermit/issues/4095). An older recording whose
 // sibling rewrote the mask between the two can replay differently here.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x140);
+// 0x140 -> 0x141: sched_getaffinity accepts any length that is a nonzero
+// multiple of sizeof(long), as Linux does for one CPU, and copies and returns
+// min(len, 16), where it answered EINVAL below 16 bytes
+// (https://github.com/rrnewton/hermit/issues/4160). Replay answers the call
+// itself, so an older recording that saw EINVAL would see success here.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x141);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -397,7 +402,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x140);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x140;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x141;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1178,6 +1183,15 @@ mod tests {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x13f)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x13e)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x13d)));
+    }
+
+    /// A recording older than 0x141 was made when sched_getaffinity refused a
+    /// set shorter than 16 bytes, which this replayer accepts
+    /// (https://github.com/rrnewton/hermit/issues/4160).
+    #[test]
+    fn record_version_rejects_streams_whose_short_affinity_sets_were_refused() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x13f)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x140)));
     }
 
     #[test]

@@ -7519,8 +7519,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // `DirectoryStream`).
         let inodes = self.directory_inodes(guest, call.fd).await?;
         match self.snapshot_directory_privately(guest, call).await {
-            Ok(Some(mut entries)) => {
-                self.drop_absent_cpu_entries(guest, call.fd, &mut entries);
+            Ok(Some(entries)) => {
                 let mut entries = Some(entries);
                 guest.thread_state().with_detfd(call.fd, |detfd| {
                     detfd.install_directory_snapshot(
@@ -7765,18 +7764,27 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// A buffer whose every entry is dropped (see
     /// [`Self::drop_absent_cpu_entries`]) is not returned empty, which would
     /// end the directory: the call is issued again from where the kernel
-    /// left off. The bytes the kernel wrote past the entries returned are
-    /// zeroed, as they may name the entries dropped.
+    /// left off. The bytes the kernel wrote past the entries returned, by this
+    /// call or one it reissued, are zeroed, as they may name the entries
+    /// dropped; so is a buffer every dropped entry was written to when the
+    /// directory then ends.
     async fn sort_one_buffer<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: GetdentsCall<'_>,
     ) -> Result<i64, Error> {
+        // The longest any call wrote: a reissued call can write less than the
+        // one before it, whose dropped names lie past it.
+        let mut written = 0;
         let (len, mut entries) = loop {
             let len = self.record_or_replay(guest, call.call).await? as usize;
             if len == 0 {
+                if written > 0 {
+                    guest.memory().write_exact(call.buf, &vec![0; written])?;
+                }
                 return Ok(0);
             }
+            written = written.max(len);
             let mut entries = read_records(&guest.memory(), call.buf, len, call.format)?;
             self.drop_absent_cpu_entries(guest, call.fd, &mut entries);
             if !entries.is_empty() {
@@ -7794,7 +7802,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let returned = records.len();
         // Zero what the kernel wrote past the entries returned.
-        records.resize(returned.max(len), 0);
+        records.resize(returned.max(written), 0);
         if guest.memory().write_exact(call.buf, &records).is_err() {
             // The padding after the last name may not be writable, as Linux
             // does not write it.
@@ -7809,7 +7817,9 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// Read the whole host directory behind `call.fd` into a private mapping
     /// (see [`Self::snapshot_directory`]), and return its entries in host
-    /// order.
+    /// order, less the CPUs and nodes Hermit's single virtual CPU and node
+    /// leave out (see [`Self::drop_absent_cpu_entries`]). Every directory
+    /// snapshot a stream stores comes from here, so none holds them.
     ///
     /// Linux writes into guest memory only the records a call returns and the
     /// fields it stored of one it could not finish, so the reads do not go to
@@ -7874,7 +7884,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await;
         // A mapping left behind would be visible to the guest.
         unmapped?;
-        snapshot
+        let mut snapshot = snapshot?;
+        if let Some(entries) = &mut snapshot {
+            self.drop_absent_cpu_entries(guest, call.fd, entries);
+        }
+        Ok(snapshot)
     }
 
     /// Read the whole host directory by issuing `call.call` until it returns

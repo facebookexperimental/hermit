@@ -148,8 +148,8 @@ enum ProcfsKind {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-958): Review host-global uevent sequence normalization.
     UeventSeqnum,
-    /// `/sys/devices/system/cpu/{online,possible,present}`: the host's CPU
-    /// list, reported as Hermit's single virtual CPU.
+    /// `/sys/devices/system/cpu/{online,possible,present,enabled}`: the host's
+    /// CPU list, reported as Hermit's single virtual CPU.
     CpuList,
     /// A CPU-mask file describing Hermit's single virtual CPU: `cpu0`'s
     /// topology masks and `node0/cpumap`.
@@ -751,7 +751,8 @@ impl ProcfsFile {
             "/sys/kernel/uevent_seqnum" => ProcfsKind::UeventSeqnum,
             "/sys/devices/system/cpu/online"
             | "/sys/devices/system/cpu/possible"
-            | "/sys/devices/system/cpu/present" => ProcfsKind::CpuList,
+            | "/sys/devices/system/cpu/present"
+            | "/sys/devices/system/cpu/enabled" => ProcfsKind::CpuList,
             other if is_virtual_cpu_list_path(other) => ProcfsKind::CpuList,
             other if is_virtual_cpu_mask_path(other) => ProcfsKind::CpuMask,
             other if let Some(file) = SingleCpuFile::from_path(other) => {
@@ -5997,7 +5998,7 @@ Rss:                   4 kB\n" as &[u8];
         assert_eq!(sanitize_cpu_list(b"0-3"), b"0-3");
         assert_eq!(sanitize_cpu_list(b"\n"), b"\n");
         assert_eq!(sanitize_cpu_list(b"all\n"), b"all\n");
-        for path in ["online", "possible", "present"] {
+        for path in ["online", "possible", "present", "enabled"] {
             assert_eq!(
                 ProcfsFile::from_path(Path::new(&format!("/sys/devices/system/cpu/{path}")))
                     .unwrap()

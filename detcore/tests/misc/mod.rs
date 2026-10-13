@@ -911,6 +911,29 @@ fn sched_affinity_is_normalized_to_virtual_cpu_zero() {
             "sched_getaffinity must not overwrite bytes beyond its return value"
         );
 
+        // An 8-byte set, which CPU_ALLOC gives for the one CPU that
+        // _SC_NPROCESSORS_CONF reports, covers the one virtual CPU: Linux
+        // copies min(len, its mask size) and returns that count.
+        mask.fill(0xaa);
+        assert_eq!(
+            unsafe { libc::syscall(libc::SYS_sched_getaffinity, 0, 8, mask.as_mut_ptr()) },
+            8
+        );
+        assert_eq!(mask[0], 1);
+        assert!(mask[1..8].iter().all(|byte| *byte == 0));
+        assert!(
+            mask[8..].iter().all(|byte| *byte == 0xaa),
+            "sched_getaffinity must not overwrite bytes beyond its return value"
+        );
+        assert_eq!(
+            unsafe { libc::syscall(libc::SYS_sched_getaffinity, 0, 0, mask.as_mut_ptr()) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINVAL)
+        );
+
         let mut short_mask = [0_u8; VIRTUAL_CPUSET_BYTES - 1];
         assert_eq!(
             unsafe {

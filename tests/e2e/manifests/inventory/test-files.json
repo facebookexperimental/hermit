@@ -199,6 +199,12 @@
       "why": "tests/c/copy_file_range_refusal_probe.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/cpu_directory_reads.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/cpu_directory_reads.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test cpu_directory_reads_list_only_cpu0_on_every_path compiles this guest, which lists /sys/devices/system/cpu through an ordinary descriptor, through one received over SCM_RIGHTS with a 48-byte buffer (checking the entry count and the bytes past each return), and after a getdents64 with a count that does not fit in an int, and requires exact lines showing no CPU other than cpu0 at bitwise parity under hermit run --strict --verify --verify-strict (https://github.com/rrnewton/hermit/issues/4160); it remains a guest fixture because a generic manifest cannot assert this exact output."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/cpu_virtualization.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
@@ -784,7 +790,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/kernel_max_affinity.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/kernel_max_affinity.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_cpu_set_sized_from_kernel_max_holds_the_one_virtual_cpu compiles this guest, which sizes a CPU set from /sys/devices/system/cpu/kernel_max + 1 and asks sched_getaffinity for it, and requires the exact line kernel_max=127 setsize=16 rc=0 count=1 at bitwise parity under hermit run --strict --verify --verify-strict (https://github.com/rrnewton/hermit/issues/4160: a kernel_max of 0 made the set too small for Detcore's 16-byte mask); it remains a guest fixture because a generic manifest cannot assert this exact output."
+      "why": "tests/c/kernel_max_affinity.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_cpu_set_sized_from_kernel_max_holds_the_one_virtual_cpu compiles this guest, which sizes CPU sets from /sys/devices/system/cpu/kernel_max + 1 and from sysconf(_SC_NPROCESSORS_CONF) and asks sched_getaffinity for each, and requires the exact lines (kernel_max 127, set sizes 16 and 8, one CPU each) at bitwise parity under hermit run --strict --verify --verify-strict (https://github.com/rrnewton/hermit/issues/4160); it remains a guest fixture because a generic manifest cannot assert this exact output."
     },
     {
       "disposition": "manifest-test",

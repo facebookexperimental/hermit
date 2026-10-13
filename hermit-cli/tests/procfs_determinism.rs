@@ -487,6 +487,7 @@ fn sys_cpu_lists_report_one_virtual_cpu() {
 fn sys_cpu_numbers_and_node_files_describe_one_cpu_and_node() {
     for (path, expected) in [
         ("/sys/devices/system/cpu/kernel_max", &b"127\n"[..]),
+        ("/sys/devices/system/cpu/enabled", b"0\n"),
         ("/sys/devices/system/cpu/smt/active", b"0\n"),
         ("/sys/devices/system/cpu/smt/control", b"notsupported\n"),
         ("/sys/devices/system/cpu/cpu0/topology/cluster_id", b"0\n"),
