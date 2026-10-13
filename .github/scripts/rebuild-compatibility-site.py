@@ -260,6 +260,22 @@ def _is_ancestor(ledger, ancestor, descendant):
     return result.returncode == 0
 
 
+def _history_complete(ledger, ledger_commit, depth):
+    """Whether the fetch at DEPTH already reached ledger_commit's root commit.
+
+    After the ledger's main is squashed to one snapshot commit
+    (https://github.com/rrnewton/dev-hermit/issues/562), a parity summary
+    written before the squash names a commit that is in no history this fetch
+    can reach, and deepening further only repeats the fetch.
+    """
+    try:
+        count = int(run(["git", "--no-replace-objects", "-C", ledger, "rev-list", "--count",
+                         ledger_commit]))
+    except (subprocess.CalledProcessError, ValueError):
+        return False
+    return count < depth
+
+
 def fetch_ledger(ledger, ledger_commit):
     """Fetch ledger_commit and only the history the builder reads."""
     fetch = ["git", "-C", ledger, "fetch", "--no-tags", "--no-recurse-submodules"]
@@ -270,6 +286,7 @@ def fetch_ledger(ledger, ledger_commit):
         summarized not in (None, ledger_commit)
         and not _is_ancestor(ledger, summarized, ledger_commit)
         and depth < LEDGER_DEEPEN_LIMIT
+        and not _history_complete(ledger, ledger_commit, depth)
     ):
         # Past the limit the builder still refuses only the parity panel,
         # naming the summarized commit it could not place.

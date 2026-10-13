@@ -548,6 +548,20 @@ class HostedAdapterTests(unittest.TestCase):
         with patch.dict(os.environ, env):
             self.assertEqual(ADAPTER.fetch_ledger(ledger, newest), 1)
 
+        # After a squash (https://github.com/rrnewton/dev-hermit/issues/562)
+        # main is a new root, and a summary written before it names a commit
+        # no deeper fetch reaches: the fetch stops once it has the whole
+        # history instead of deepening to the limit.
+        snapshot = sh(origin, "commit-tree", newest + "^{tree}", "-m", "ledger snapshot")
+        sh(origin, "checkout", "-q", "--detach", snapshot)
+        (origin / "scorecard/parity.json").write_text(
+            json.dumps({"generated_from": {"series_commit": summarized}}))
+        sh(origin, "commit", "-q", "-am", "scorecard after the squash")
+        squashed = sh(origin, "rev-parse", "HEAD")
+        sh(origin, "update-ref", "refs/heads/main", squashed)
+        with patch.dict(os.environ, env):
+            self.assertEqual(ADAPTER.fetch_ledger(ledger, squashed), 51)
+
     def test_ledger_capture_is_exact_and_invocation_failures_refuse(self):
         captured = "a" * 40
         with patch.object(
