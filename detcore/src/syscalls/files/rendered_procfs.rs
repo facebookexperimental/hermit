@@ -18,7 +18,8 @@
 //! way, the kernel itself refuses writes, write locks and size changes, and
 //! reports the guest's status flags and a read-only descriptor link, as it
 //! does for the procfs file. Detcore answers the rest as Linux answers for a
-//! 0444 procfs sysctl file:
+//! procfs file only global root may write (0444, or 0644 for the fixed
+//! tunables of `procfs::fixed`), to a process that is not global root:
 //!
 //! - opening it, including the flag errors Linux reports;
 //! - reads, from the procfs snapshot, as for every procfs file;
@@ -28,7 +29,7 @@
 //!   and for every spelling that reaches the file;
 //! - the descriptor's link in any process's `/proc/*/fd`, and reopening
 //!   through it;
-//! - its `fdinfo`, `statfs`, and the calls a procfs sysctl file refuses:
+//! - its `fdinfo`, `statfs`, and the calls such a procfs file refuses:
 //!   `mmap`, `fsync`, `fchmod`, extended attributes, file `ioctl`s and seals.
 //!
 //! Not under record and replay, whose Replayer stands its own placeholder in
@@ -66,6 +67,7 @@ use reverie::syscalls::Timespec;
 
 use super::StatTarget;
 use crate::fd::FdType;
+use crate::procfs::FixedProcfsFile;
 use crate::procfs::ProcfsFile;
 use crate::procfs::placeholder_link_path;
 use crate::procfs::placeholder_name;
@@ -135,22 +137,89 @@ pub(crate) fn placeholder_identity(dev: u64, ino: u64) -> Option<&'static Path> 
         .copied()
 }
 
-/// The paths of every procfs file Detcore renders.
-const RENDERED_PATHS: [&std::ffi::CStr; 2] =
+/// The procfs files Detcore renders from its run state, as opposed to the
+/// fixed files of `procfs::fixed`.
+const DYNAMIC_PATHS: [&std::ffi::CStr; 2] =
     [c"/proc/sys/kernel/random/uuid", c"/proc/sys/kernel/pty/nr"];
 
-/// The rendered file that the kernel's procfs inode `(dev, ino)` is, if it is
-/// one: the guest reached it through a spelling Detcore did not resolve, as a
-/// symbolic link or a directory listing, under a backend whose procfs files
-/// Detcore does not name by path (`procfs_inode::guest_tids_name_host_tasks`).
-pub(crate) fn rendered_path_of_raw(dev: u64, ino: u64) -> Option<&'static Path> {
-    static PROC_DEVICE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    let proc_device =
-        *PROC_DEVICE.get_or_init(|| GuestProcfs::stat(c"/proc").ok().map(|stat| stat.st_dev));
-    if proc_device != Some(dev) {
+/// The paths of every procfs file Detcore renders.
+pub(crate) fn rendered_paths() -> impl Iterator<Item = &'static std::ffi::CStr> {
+    DYNAMIC_PATHS.into_iter().chain(
+        FixedProcfsFile::ALL
+            .into_iter()
+            .map(FixedProcfsFile::c_path),
+    )
+}
+
+/// The last component of a rendered file's path.
+fn rendered_name(path: &std::ffi::CStr) -> &[u8] {
+    let bytes = path.to_bytes();
+    bytes.rsplit(|byte| *byte == b'/').next().unwrap_or(bytes)
+}
+
+/// The rendered file that the kernel's file with metadata `stat` is, if it
+/// is one: the guest reached it through a spelling Detcore did not resolve,
+/// as a symbolic link or a directory listing, under a backend whose procfs
+/// files Detcore does not name by path
+/// (`procfs_inode::guest_tids_name_host_tasks`).
+///
+/// Each candidate costs a stat, so only a regular file with one link and
+/// permissions 0444 or 0644, as every rendered file is in the kernel's
+/// procfs, is checked, and an identity found not to be a rendered file is
+/// remembered (`NOT_RENDERED`): the checks of one procfs file cost their
+/// stats once per tool process.
+pub(crate) fn rendered_path_of_raw(stat: &DetStat) -> Option<&'static Path> {
+    let has = |field| stat.mask.contains(field);
+    if (has(StatxMask::STATX_TYPE) && stat.mode & libc::S_IFMT != libc::S_IFREG)
+        || (has(StatxMask::STATX_NLINK) && stat.nlink != 1)
+        || (has(StatxMask::STATX_MODE) && !matches!(stat.mode & 0o7777, 0o444 | 0o644))
+    {
         return None;
     }
-    RENDERED_PATHS.iter().find_map(|path| {
+    let identity = (stat.dev, stat.inode);
+    if NOT_RENDERED
+        .lock()
+        .expect("raw identity cache poisoned")
+        .contains(&identity)
+    {
+        return None;
+    }
+    let found = rendered_path_among(stat.dev, stat.inode, rendered_paths());
+    if found.is_none() && proc_device() == Some(stat.dev) {
+        NOT_RENDERED
+            .lock()
+            .expect("raw identity cache poisoned")
+            .insert(identity);
+    }
+    found
+}
+
+/// The kernel procfs identities `(dev, ino)` this tool process found not to be
+/// a rendered file. procfs does not reuse an inode number during a run (sysctl
+/// and per-process inodes take `get_next_ino`; `/proc/version`'s and
+/// `/proc/cmdline`'s are fixed), so an identity that was not a rendered file
+/// never becomes one. A rendered file's inode that the kernel drops and makes
+/// again gets a new number, which is not here.
+static NOT_RENDERED: std::sync::Mutex<std::collections::BTreeSet<(u64, u64)>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// The device of the guest's procfs mount, read once.
+fn proc_device() -> Option<u64> {
+    static PROC_DEVICE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *PROC_DEVICE.get_or_init(|| GuestProcfs::stat(c"/proc").ok().map(|stat| stat.st_dev))
+}
+
+/// The rendered file among `paths` that the kernel's procfs inode
+/// `(dev, ino)` is, if it is one.
+fn rendered_path_among(
+    dev: u64,
+    ino: u64,
+    mut paths: impl Iterator<Item = &'static std::ffi::CStr>,
+) -> Option<&'static Path> {
+    if proc_device() != Some(dev) {
+        return None;
+    }
+    paths.find_map(|path| {
         let stat = GuestProcfs::stat(path).ok()?;
         (stat.st_dev == dev && stat.st_ino == ino)
             .then(|| Path::new(OsStr::from_bytes(path.to_bytes())))
@@ -193,8 +262,9 @@ impl GuestProcfs {
         Ok(unsafe { stat.assume_init() })
     }
 
-    /// The owner Linux reports for the guest's procfs sysctl files: global
-    /// root as the guest's user namespace sees it.
+    /// The owner Linux reports for the guest's procfs sysctl files, and for
+    /// the other system-wide procfs files (`/proc/version`, `/proc/cmdline`):
+    /// global root as the guest's user namespace sees it.
     fn sysctl_owner() -> Result<(u32, u32), Errno> {
         static OWNER: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
         if let Some(owner) = OWNER.get() {
@@ -358,14 +428,18 @@ pub(super) fn guest_procfs_mount_id() -> Result<u64, Error> {
     GuestProcfs::mount_id()
 }
 
-/// The metadata Linux gives the procfs file at `path`, a 0444 sysctl file
-/// owned by `owner`, with Detcore's procfs device, the inode its path names,
-/// and every time at `epoch`, on every backend.
+/// The metadata Linux gives the procfs file at `path`, owned by `owner`,
+/// with Detcore's procfs device, the inode its path names, and every time at
+/// `epoch`, on every backend.
 fn rendered_stat(path: &Path, epoch: Timespec, owner: (u32, u32)) -> DetStat {
+    let permissions = path
+        .to_str()
+        .and_then(FixedProcfsFile::from_path)
+        .map_or(0o444, FixedProcfsFile::permissions);
     DetStat {
         // What a procfs file's `statx` reports.
         mask: StatxMask::STATX_BASIC_STATS | StatxMask::STATX_MNT_ID,
-        mode: libc::S_IFREG | 0o444,
+        mode: libc::S_IFREG | permissions,
         uid: owner.0,
         gid: owner.1,
         attributes: StatxAttributes::empty(),
@@ -415,9 +489,9 @@ fn names_a_directory(path: &Path) -> bool {
     bytes.ends_with(b"/") || bytes.ends_with(b"/.")
 }
 
-/// Linux's answer to opening an existing 0444 procfs sysctl file with
-/// `flags`, from a process whose user namespace does not own it, before it
-/// opens anything: `build_open_flags`, then the lookup's `O_EXCL` and type
+/// Linux's answer to opening an existing rendered procfs file (owned by
+/// global root, writable by its owner at most) with `flags`, from a process
+/// that is not global root, before it opens anything: `build_open_flags`, then the lookup's `O_EXCL` and type
 /// checks, then `may_open` and `do_dentry_open`. On success, the flags the
 /// placeholder is reopened with.
 fn rendered_open_flags(flags: OFlag) -> Result<OFlag, Errno> {
@@ -521,9 +595,13 @@ fn rendered_mmap_answer(
         if addr & 4095 != 0 {
             return Err(Errno::EINVAL);
         }
-        // `security_mmap_addr`: below `vm.mmap_min_addr` (65536, the value
-        // Hermit's machine reports) needs CAP_SYS_RAWIO, which a guest lacks.
-        if addr < 65536 {
+        // `security_mmap_addr`: below `vm.mmap_min_addr` (the machine's, which
+        // does not depend on the configuration) needs CAP_SYS_RAWIO, which a
+        // guest lacks.
+        let mmap_min_addr = crate::machine::MachineDescription::default()
+            .limits
+            .mmap_min_addr;
+        if (addr as u64) < mmap_min_addr {
             return Err(Errno::EPERM);
         }
     }
@@ -1040,7 +1118,8 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// The snapshot of the rendered file `procfs` an open takes, from
     /// Detcore's state, as its first read used to: a UUID from the thread's
-    /// generator, or Detcore's count of open ptys.
+    /// generator, Detcore's count of open ptys, or a fact of the machine
+    /// description.
     fn render_snapshot<G: Guest<Self>>(&self, guest: &mut G, procfs: &ProcfsFile) -> Vec<u8> {
         use rand::RngExt as _;
         let mut file = procfs.clone();
@@ -1056,6 +1135,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             crate::procfs::ProcfsSnapshotContext {
                 random_uuid,
                 virtual_pty_count,
+                machine: crate::machine::MachineDescription::of(guest.config()),
                 ..Default::default()
             },
         );
@@ -1163,14 +1243,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             return None;
         }
         // By kernel identity only for an entry named as a rendered file is,
-        // which costs two stats, and only then.
+        // which costs a stat for each rendered file of that name (at most
+        // two: `version`), and only then.
         inodes.rendered_entry_inode(name).or_else(|| {
-            RENDERED_PATHS
-                .iter()
-                .any(|path| path.to_bytes().rsplit(|byte| *byte == b'/').next() == Some(name))
-                .then(|| rendered_path_of_raw(inodes.device(), host_ino))
-                .flatten()
-                .map(procfs_inode::rendered_inode)
+            let named = rendered_paths().filter(|path| rendered_name(path) == name);
+            rendered_path_among(inodes.device(), host_ino, named).map(procfs_inode::rendered_inode)
         })
     }
 
@@ -1613,9 +1690,10 @@ enum PathRequest {
     Fault,
 }
 
-/// Linux's answer to `request` for a 0444 procfs sysctl file owned by a user
-/// the guest's user namespace does not map, given the attribute `name` when
-/// it changes one.
+/// Linux's answer to `request` for a rendered procfs file (0444, or 0644 for
+/// a fixed tunable: only the owner may write either) owned by a user the
+/// guest's user namespace does not map, given the attribute `name` when it
+/// changes one.
 fn path_request_answer(
     request: PathRequest,
     name: Option<&[u8]>,
@@ -1942,9 +2020,7 @@ fn could_name_rendered(path: &Path) -> bool {
         return false;
     };
     let last = last.as_bytes();
-    RENDERED_PATHS
-        .iter()
-        .any(|rendered| rendered.to_bytes().rsplit(|byte| *byte == b'/').next() == Some(last))
+    rendered_paths().any(|rendered| rendered_name(rendered) == last)
         || (!last.is_empty() && last.iter().all(u8::is_ascii_digit))
 }
 
@@ -2063,6 +2139,89 @@ mod tests {
             rendered_stat(Path::new("/proc/sys/kernel/pty/nr"), epoch, (0, 0)).inode,
             stat.inode
         );
+    }
+
+    /// Every rendered file is one `ProcfsFile` renders, under its own inode,
+    /// and the fixed tunables are writable by their owner as on Linux.
+    #[test]
+    fn rendered_files_have_distinct_inodes_and_linux_modes() {
+        let epoch = Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let paths: Vec<&Path> = rendered_paths()
+            .map(|path| Path::new(path.to_str().unwrap()))
+            .collect();
+        let inodes: std::collections::BTreeSet<u64> = paths
+            .iter()
+            .map(|path| procfs_inode::rendered_inode(path))
+            .collect();
+        assert_eq!(inodes.len(), paths.len());
+        for path in &paths {
+            assert_eq!(
+                ProcfsFile::from_path(path).and_then(|file| file.rendered_path()),
+                Some(*path)
+            );
+            // (That its placeholder's name, with its snapshot, fits a memfd
+            // name is checked in `namespace`'s readlink scratch test.)
+            assert!(could_name_rendered(path), "{path:?}");
+        }
+        let mode = |path: &str| rendered_stat(Path::new(path), epoch, (0, 0)).mode;
+        assert_eq!(mode("/proc/version"), libc::S_IFREG | 0o444);
+        assert_eq!(mode("/proc/sys/kernel/osrelease"), libc::S_IFREG | 0o444);
+        assert_eq!(mode("/proc/sys/kernel/overflowgid"), libc::S_IFREG | 0o644);
+        assert_eq!(mode("/proc/sys/vm/max_map_count"), libc::S_IFREG | 0o644);
+    }
+
+    /// The raw-identity check finds a rendered file by the kernel identity of
+    /// its procfs file, however it was reached, and nothing else: measured
+    /// against this host's procfs.
+    #[test]
+    fn raw_identity_finds_rendered_files_and_nothing_else() {
+        let host = |path: &str| {
+            let path = std::ffi::CString::new(path).unwrap();
+            DetStat::from(GuestProcfs::stat(&path).expect("stat the host's procfs"))
+        };
+        assert_eq!(
+            rendered_path_of_raw(&host("/proc/version")),
+            Some(Path::new("/proc/version"))
+        );
+        assert_eq!(
+            rendered_path_of_raw(&host("/proc/sys/kernel/osrelease")),
+            Some(Path::new("/proc/sys/kernel/osrelease"))
+        );
+        // A procfs file no rendered file is: not found, and then remembered.
+        let status = host("/proc/self/status");
+        assert_eq!(rendered_path_of_raw(&status), None);
+        assert!(
+            NOT_RENDERED
+                .lock()
+                .unwrap()
+                .contains(&(status.dev, status.inode))
+        );
+        assert_eq!(rendered_path_of_raw(&status), None);
+        // A directory is not even looked at.
+        assert_eq!(rendered_path_of_raw(&host("/proc/sys/kernel")), None);
+    }
+
+    /// pty/nr is an integer sysctl: a read that copied part of it is followed
+    /// by end of file, as Linux's `proc_dointvec` gives.
+    #[test]
+    fn pty_nr_ends_after_a_partial_read() {
+        let mut file = ProcfsFile::from_path(Path::new("/proc/sys/kernel/pty/nr"))
+            .unwrap()
+            .into_rendered();
+        let template = file.rendering_template().to_vec();
+        file.initialize(
+            template,
+            crate::procfs::ProcfsSnapshotContext {
+                virtual_pty_count: 12,
+                ..Default::default()
+            },
+        );
+        assert_eq!(file.take(1), Some(b"1".to_vec()));
+        assert_eq!(file.take(64), Some(Vec::new()));
+        assert_eq!(file.take_at(0, 64), Some(b"12\n".to_vec()));
     }
 
     #[test]

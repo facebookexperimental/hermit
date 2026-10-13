@@ -55,6 +55,7 @@ mod iovecs;
 #[allow(unused)]
 mod ivar;
 pub mod logdiff;
+pub mod machine;
 mod memory;
 pub mod netlink_route;
 pub mod nonwaiting_write;

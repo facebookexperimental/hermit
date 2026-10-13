@@ -1089,14 +1089,20 @@ mod tests {
         // (249 bytes) in `/memfd:<name> (deleted)`.
         let longest = format!("/memfd:{} (deleted)", "x".repeat(249));
         assert!(longest.len() < ANONYMOUS_PROC_FD_TARGET_CAPACITY);
-        // A placeholder for a UUID, the longest snapshot of the two files.
-        let name = crate::procfs::placeholder_name(
-            std::path::Path::new("/proc/sys/kernel/random/uuid"),
-            b"00000000-0000-4000-8000-000000000000\n",
-        );
-        assert!(name.len() <= 249, "{name}");
-        let placeholder = format!("/memfd:{name} (deleted)");
-        assert!(crate::procfs::placeholder_link_path(placeholder.as_bytes()).is_some());
+        // Each rendered file's placeholder, with its snapshot, fits a memfd
+        // name and is read back from its link.
+        let machine = crate::machine::MachineDescription::default();
+        for path in crate::syscalls::rendered_procfs::rendered_paths() {
+            let path = std::path::Path::new(path.to_str().unwrap());
+            let snapshot = match crate::procfs::FixedProcfsFile::from_path(path.to_str().unwrap()) {
+                Some(file) => file.contents(&machine),
+                None => b"00000000-0000-4000-8000-000000000000\n".to_vec(),
+            };
+            let name = crate::procfs::placeholder_name(path, &snapshot);
+            assert!(name.len() <= 249, "{name}");
+            let placeholder = format!("/memfd:{name} (deleted)");
+            assert!(crate::procfs::placeholder_link_path(placeholder.as_bytes()).is_some());
+        }
         assert_eq!(
             anonymous_proc_fd_identity(maximum.as_bytes()),
             Some(AnonymousProcFdIdentity {

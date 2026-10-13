@@ -835,6 +835,24 @@ impl DetFd {
         })
     }
 
+    /// The procfs path of a file whose every byte Detcore renders
+    /// (`ProcfsFile::rendered_path`), whether Detcore opened it as a
+    /// placeholder or the kernel opened it: through a symbolic link or `..`,
+    /// after `chroot`, or under record and replay.
+    pub(crate) fn procfs_renderable_path(&self) -> Option<&'static Path> {
+        self.with_description(|d| d.procfs.as_ref().and_then(ProcfsFile::rendered_path))
+    }
+
+    /// Whether a short copy of a read of this procfs file is `EFAULT`
+    /// (`ProcfsFile::faults_on_a_short_copy`).
+    pub(crate) fn procfs_faults_on_a_short_copy(&self) -> bool {
+        self.with_description(|d| {
+            d.procfs
+                .as_ref()
+                .is_some_and(ProcfsFile::faults_on_a_short_copy)
+        })
+    }
+
     /// The bytes a rendered procfs file's snapshot starts from in place of a
     /// capture (`ProcfsFile::rendering_template`), if this is one.
     pub(crate) fn procfs_rendering_template(&self) -> Option<&'static [u8]> {

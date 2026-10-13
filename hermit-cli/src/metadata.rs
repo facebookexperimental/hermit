@@ -427,7 +427,14 @@ impl RecordVersion {
 // (https://github.com/rrnewton/hermit/issues/4161). Record virtualizes CPUID,
 // and Detcore renders procfs over the recorded bytes during recording and
 // again during replay, so an older recording would replay with different bytes.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x149);
+// 0x149 -> 0x14a: the procfs files that describe the kernel and its fixed
+// limits (/proc/version, /proc/cmdline and 12 kernel and vm sysctls)
+// are procfs files whose contents Detcore fixes from its machine description
+// (https://github.com/rrnewton/hermit/issues/4266), where they were ordinary
+// files whose host bytes were recorded as read. Replay serves a classified
+// procfs file itself, so an older recording of a read of one would replay
+// with different events.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x14a);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -452,7 +459,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x149);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x149;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x14a;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1317,6 +1324,15 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_from_before_virtual_cpuinfo() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x148)));
+    }
+
+    /// A recording older than 0x14a recorded the host's bytes for the procfs
+    /// files Detcore now fixes from its machine description
+    /// (https://github.com/rrnewton/hermit/issues/4266).
+    #[test]
+    fn record_version_rejects_streams_from_before_fixed_kernel_procfs_files() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x148)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x149)));
     }
 
     #[test]

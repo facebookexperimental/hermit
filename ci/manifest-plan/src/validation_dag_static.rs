@@ -1468,7 +1468,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // library's a_manifest_only_recording_can_be_removed;
     // https://github.com/rrnewton/hermit/issues/4271): 1080, listed with this
     // node's arguments.
-    ("test.hermit_unit", 1080),
+    // And the fixed-kernel-procfs record-version test (B2a, https://github.com/rrnewton/hermit/issues/4266): 1081.
+    ("test.hermit_unit", 1081),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2084,7 +2085,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And a_task_state_is_read_after_any_command_name and
     // an_exec_after_the_leader_was_retired_at_exit_admits_the_new_leader
     // (reviews of https://github.com/rrnewton/hermit/pull/4245): 1540.
-    ("test.detcore_unit", 1540),
+    // And the nine machine-description tests and the three torn-read and vector-flag tests (B2a, https://github.com/rrnewton/hermit/issues/4266): 1552.
+    ("test.detcore_unit", 1552),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2881,7 +2883,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_worker_exit_code_ends_a_process_whose_leader_called_pthread_exit and
     // record_refuses_a_leader_that_exits_while_its_threads_run_on
     // (https://github.com/rrnewton/hermit/issues/4100): 366.
-    ("test.cli", 366),
+    // And detcore_fixes_the_virtual_kernel_files_on_every_backend (B2a, https://github.com/rrnewton/hermit/issues/4266): 367.
+    ("test.cli", 367),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3176,7 +3179,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Nor does the run-manifest rerun test: 299, listed with this node's
     // arguments.
     // So do the three leader pthread_exit tests: 302.
-    ("test.cli_on_host", 302),
+    // And detcore_fixes_the_virtual_kernel_files_on_every_backend (B2a, https://github.com/rrnewton/hermit/issues/4266): 303.
+    ("test.cli_on_host", 303),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -3366,7 +3370,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two raw-exit ChildExit tests: 1535.
     // And the three exited-leader retirement tests: 1538.
     // And the stat-parser and retire-then-exec tests: 1540.
-    ("test.detcore_unit_on_host", 1540),
+    // And the nine machine-description tests and the three torn-read and vector-flag tests (B2a, https://github.com/rrnewton/hermit/issues/4266): 1552.
+    ("test.detcore_unit_on_host", 1552),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -3535,7 +3540,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the virtual-cpuinfo record-epoch test: 1068.
     // And the hermit-dap --listen address test: 1069.
     // And the eleven run-manifest unit tests: 1080.
-    ("test.hermit_unit_on_host", 1080),
+    // And the fixed-kernel-procfs record-version test (B2a, https://github.com/rrnewton/hermit/issues/4266): 1081.
+    ("test.hermit_unit_on_host", 1081),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

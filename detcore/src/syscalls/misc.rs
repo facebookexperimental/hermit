@@ -645,9 +645,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let ret = self.record_or_replay(guest, call).await?;
         if let Some(buf) = call.buf() {
             let mut un = guest.memory().read_value(buf)?;
-            // Keep this in configured UTC: `Local` initializes libc TLS, which is unavailable
-            // while a DynamoRIO application thread is executing a client callback.
-            let epoch = guest.config().epoch;
+            let kernel = crate::machine::MachineDescription::of(guest.config()).kernel;
 
             if !guest.config().has_uts_namespace {
                 // FIXME: It should be possible to remove this once all tests
@@ -656,8 +654,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 un.domainname = from_str(DEFAULT_HOSTNAME.split('.').next_back().unwrap_or(""));
             }
 
-            un.release = from_str("5.2.0");
-            un.version = from_str(&format!("#1 SMP {}", epoch.format("%a %b %d %T %Z %Y")));
+            // The kernel procfs describes too (`procfs::fixed`).
+            un.sysname = from_str(&kernel.sysname);
+            un.release = from_str(&kernel.release);
+            un.version = from_str(&kernel.version());
             guest.memory().write_value(buf, &un)?;
         }
 

@@ -161,6 +161,7 @@ static VFORK_CHILD_WAITS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static GET_MEMPOLICY_ONE_NODE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PID_NAMESPACE_NESTED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RENDERED_PROCFS_FILES_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static VIRTUAL_KERNEL_FILES_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KERNEL_MAX_AFFINITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPU_DIRECTORY_READS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUINFO_MATCHES_CPUID_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1267,6 +1268,31 @@ fn leader_pthread_exit_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "leader-pthread-exit guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn virtual_kernel_files_guest() -> &'static Path {
+    VIRTUAL_KERNEL_FILES_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("virtual-kernel-files");
+        fs::create_dir_all(&build_root).expect("failed to create virtual-kernel-files directory");
+        let guest = build_root.join("virtual_kernel_files");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/virtual_kernel_files.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile virtual-kernel-files guest");
+        assert!(
+            output.status.success(),
+            "virtual-kernel-files guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -3643,6 +3669,133 @@ fn run_dbt_binds_in_a_user_namespace_of_its_own() {
         "the guest shares the caller's user namespace: {text}"
     );
     assert_eq!(lines.next(), None, "{text}");
+}
+
+/// The procfs files that describe the kernel and its fixed limits hold one
+/// value each, the same on every backend and host, and agree with `uname`
+/// (https://github.com/rrnewton/hermit/issues/4266). Before, the host-process
+/// backends passed the host's bytes through and KVM made up its own, which
+/// disagreed with `uname`. Linux's own invariants are checked natively first.
+/// A backend that is not available here is named as not compared.
+#[test]
+fn detcore_fixes_the_virtual_kernel_files_on_every_backend() {
+    let guest = virtual_kernel_files_guest();
+    let native = Command::new(guest)
+        .output()
+        .expect("run virtual-kernel-files natively");
+    assert!(native.status.success(), "native: {native:?}");
+    let version = "#1 SMP Thu Jan 01 00:00:00 UTC 2026";
+    let expected = [
+        (
+            "/proc/version",
+            "0444",
+            format!("Linux version 5.2.0 {version}"),
+        ),
+        (
+            "/proc/cmdline",
+            "0444",
+            "BOOT_IMAGE=/vmlinuz-5.2.0 quiet".into(),
+        ),
+        ("/proc/sys/kernel/osrelease", "0444", "5.2.0".into()),
+        ("/proc/sys/kernel/ostype", "0444", "Linux".into()),
+        ("/proc/sys/kernel/version", "0444", version.into()),
+        (
+            "/proc/sys/kernel/random/boot_id",
+            "0444",
+            "6865726d-6974-4000-8000-000000000000".into(),
+        ),
+        (
+            "/proc/sys/kernel/random/entropy_avail",
+            "0444",
+            "256".into(),
+        ),
+        ("/proc/sys/kernel/overflowuid", "0644", "65534".into()),
+        ("/proc/sys/kernel/overflowgid", "0644", "65534".into()),
+        ("/proc/sys/kernel/pid_max", "0644", "4194304".into()),
+        ("/proc/sys/kernel/cap_last_cap", "0444", "40".into()),
+        ("/proc/sys/vm/overcommit_memory", "0644", "0".into()),
+        ("/proc/sys/vm/max_map_count", "0644", "65530".into()),
+        ("/proc/sys/vm/mmap_min_addr", "0644", "65536".into()),
+    ];
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mut outputs = Vec::new();
+    for backend in ["ptrace", "dbt", "kvm"] {
+        if (backend == "dbt"
+            && dbt_unavailable("detcore_fixes_the_virtual_kernel_files_on_every_backend"))
+            || (backend == "kvm"
+                && kvm_unavailable("detcore_fixes_the_virtual_kernel_files_on_every_backend"))
+        {
+            eprintln!(
+                "detcore_fixes_the_virtual_kernel_files_on_every_backend: NOT COMPARED: \
+                 {backend} is not available on this host or in this build"
+            );
+            continue;
+        }
+        let report = directory.path().join(format!("{backend}.json"));
+        let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
+        let mut args = vec![
+            "--backend",
+            backend,
+            "run",
+            "--strict",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            &report_arg,
+            "--base-env=minimal",
+            "--",
+            guest.to_str().expect("guest path is UTF-8"),
+        ];
+        // KVM's own /proc lists no directory entries, so its listings cannot
+        // agree with the files' inodes until it is removed (slice B4 of
+        // https://github.com/rrnewton/hermit/issues/4266). Every other check
+        // runs on every backend.
+        if backend == "kvm" {
+            args.push("--kvm-local-procfs");
+        }
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        let verdict: serde_json::Value =
+            serde_json::from_slice(&fs::read(&report).expect("read the verification report"))
+                .expect("parse the verification report");
+        assert_eq!(verdict["bitwise_parity"], true, "{backend}: {verdict}");
+        let compared = &verdict["compared_log_messages"];
+        assert!(
+            compared["left"].as_u64().is_some_and(|count| count > 0)
+                && compared["left"] == compared["right"],
+            "{backend} compared no INFO messages: {verdict}"
+        );
+        let text = stdout(&output);
+        let lines = text.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), expected.len(), "{backend}: {text}");
+        for (line, (path, mode, contents)) in lines.iter().zip(&expected) {
+            assert!(
+                line.starts_with(&format!("{path} mode={mode} dev=0xf000ff ino="))
+                    && line.ends_with(&format!(" {contents}")),
+                "{backend}: {line}"
+            );
+        }
+        outputs.push((backend, text));
+    }
+    assert!(
+        outputs.len() > 1 || !cfg!(feature = "dbt"),
+        "only ptrace was compared"
+    );
+    eprintln!(
+        "detcore_fixes_the_virtual_kernel_files_on_every_backend compared {:?}",
+        outputs
+            .iter()
+            .map(|(backend, _)| *backend)
+            .collect::<Vec<_>>()
+    );
+    for (backend, text) in &outputs {
+        assert_eq!(
+            text, &outputs[0].1,
+            "{backend} differs from {}",
+            outputs[0].0
+        );
+    }
 }
 
 /// Detcore renders `/proc/sys/kernel/random/uuid` and `/proc/sys/kernel/pty/nr`

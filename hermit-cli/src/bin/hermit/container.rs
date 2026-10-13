@@ -54,7 +54,6 @@ use reverie::process::RunError;
 
 const GROUP_FILE: &str = "/etc/group";
 const NSCD_DIR: &str = "/var/run/nscd";
-const OVERFLOW_GID: &str = "65534";
 const DETERMINISTIC_GROUP_ROOT: &[u8] = b"/tmpvol/.hermit/etc/group";
 const DETERMINISTIC_NSCD_ROOT: &[u8] = b"/tmpvol/.hermit/run/nscd";
 const DETERMINISTIC_TMP_ROOT: &[u8] = b"/tmpvol/.hermit/tmp";
@@ -340,24 +339,35 @@ pub(super) fn mount_target_is_shadowed(target: &Path, overriding_target: &Path) 
     canonical_mount_target(target).starts_with(canonical_mount_target(overriding_target))
 }
 
+/// The overflow group ID of the guest's machine (`kernel/overflowgid`), which
+/// the frozen group database must name. It does not depend on the run's
+/// configuration.
+fn overflow_gid() -> String {
+    detcore::machine::MachineDescription::default()
+        .limits
+        .overflow_gid
+        .to_string()
+}
+
 /// Snapshot the host group database into a private temp file, appending a
-/// synthetic overflow group (`nobody:x:65534`) when the host lacks one. Binding
-/// this frozen copy read-only over `/etc/group` keeps guest group-name
-/// resolution stable across otherwise-identical runs.
+/// synthetic overflow group (`nobody:x:<overflow gid>`) when the host lacks
+/// one. Binding this frozen copy read-only over `/etc/group` keeps guest
+/// group-name resolution stable across otherwise-identical runs.
 fn frozen_group_file() -> Result<tempfile::NamedTempFile, Error> {
+    let overflow_gid = overflow_gid();
     let mut contents = fs::read_to_string(GROUP_FILE)
         .context("Failed to read the host group database for the guest")?;
     let has_overflow_group = contents.lines().any(|line| {
         line.split(':')
             .nth(2)
-            .is_some_and(|gid| gid == OVERFLOW_GID)
+            .is_some_and(|gid| gid == overflow_gid)
     });
     if !has_overflow_group {
         if !contents.ends_with('\n') {
             contents.push('\n');
         }
         contents.push_str("nobody:x:");
-        contents.push_str(OVERFLOW_GID);
+        contents.push_str(&overflow_gid);
         contents.push_str(":\n");
     }
 
@@ -2344,11 +2354,13 @@ mod tests {
             .expect("identity hardening must produce a frozen group file");
         let contents = fs::read_to_string(group_file.path())
             .expect("frozen group database should be readable");
+        let overflow_gid = overflow_gid();
+        assert_eq!(overflow_gid, "65534");
         assert!(
             contents
                 .lines()
-                .any(|line| line.split(':').nth(2) == Some(OVERFLOW_GID)),
-            "frozen group database must resolve overflow gid {OVERFLOW_GID}:\n{contents}"
+                .any(|line| line.split(':').nth(2) == Some(overflow_gid.as_str())),
+            "frozen group database must resolve overflow gid {overflow_gid}:\n{contents}"
         );
     }
 

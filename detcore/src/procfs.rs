@@ -21,11 +21,15 @@ use detcore_model::procfs::MountInfoRow;
 pub(crate) use detcore_model::procfs::exclude_ephemeral_host_seed_mounts;
 use detcore_model::procfs::mount_ids_are_ordered_subset;
 pub(crate) use detcore_model::procfs::parse_mountinfo;
+pub(crate) use fixed::FixedProcfsFile;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::machine::MachineDescription;
 use crate::syscalls::DETERMINISTIC_PIPE_CAPACITY_BYTES;
 use crate::syscalls::VIRTUAL_CPUSET_BYTES;
+
+mod fixed;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum ProcfsKind {
@@ -166,6 +170,9 @@ enum ProcfsKind {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-938): Review host VM accounting normalization.
     Vmstat,
+    /// A system-wide file with one fixed value, rendered by Detcore (see
+    /// [`FixedProcfsFile`]).
+    Fixed(FixedProcfsFile),
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -727,6 +734,8 @@ pub(crate) struct ProcfsSnapshotContext {
     /// (<https://github.com/rrnewton/hermit/issues/4161>). Built by the caller
     /// from `Detcore::virtual_cpuid`, the instruction's own source.
     pub(crate) virtual_cpuinfo: Option<Vec<u8>>,
+    /// The machine the fixed files describe.
+    pub(crate) machine: MachineDescription,
 }
 
 impl ProcfsFile {
@@ -754,6 +763,7 @@ impl ProcfsFile {
         let path_text = path.to_str()?;
         let target_fd = parse_fdinfo_target(path_text);
         let kind = match path_text {
+            other if let Some(file) = FixedProcfsFile::from_path(other) => ProcfsKind::Fixed(file),
             "/proc/self/stat" => ProcfsKind::Stat,
             "/proc/self/status" => ProcfsKind::Status,
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -962,6 +972,7 @@ impl ProcfsFile {
         match self.kind {
             ProcfsKind::RandomUuid => Some(Path::new("/proc/sys/kernel/random/uuid")),
             ProcfsKind::PtyNr => Some(Path::new("/proc/sys/kernel/pty/nr")),
+            ProcfsKind::Fixed(file) => Some(file.path()),
             _ => None,
         }
     }
@@ -1007,6 +1018,7 @@ impl ProcfsFile {
         match self.kind {
             ProcfsKind::RandomUuid => b"00000000-0000-4000-8000-000000000000\n",
             ProcfsKind::PtyNr => b"0\n",
+            ProcfsKind::Fixed(_) => b"",
             _ => unreachable!("{:?} has no rendered path", self.kind),
         }
     }
@@ -1072,6 +1084,34 @@ impl ProcfsFile {
         self.kind == ProcfsKind::Cpuinfo
     }
 
+    /// Whether Linux answers a read of this file at a nonzero position with
+    /// end of file: an integer sysctl (`proc_dointvec`,
+    /// `proc_doulongvec_minmax`) formats its value only for a read from
+    /// position 0, so a read that copied part of it is followed by end of
+    /// file. Of the integer sysctls Detcore serves, only those whose every
+    /// byte it renders follow this so far.
+    fn reads_only_from_the_start(&self) -> bool {
+        match self.kind {
+            ProcfsKind::PtyNr => true,
+            ProcfsKind::Fixed(file) => file.is_integer(),
+            _ => false,
+        }
+    }
+
+    /// Whether a read that cannot copy everything it formats fails with
+    /// `EFAULT` and leaves the position where it was: a sysctl's
+    /// `proc_sys_call_handler` copies its buffer in one `copy_to_iter` and
+    /// reports any shortfall as a fault, where a `seq_file` returns the bytes
+    /// it copied before the fault. Of the sysctls Detcore serves, only those
+    /// whose every byte it renders follow this so far.
+    pub(crate) fn faults_on_a_short_copy(&self) -> bool {
+        match self.kind {
+            ProcfsKind::RandomUuid | ProcfsKind::PtyNr => true,
+            ProcfsKind::Fixed(file) => !file.is_seq_file(),
+            _ => false,
+        }
+    }
+
     /// Returns true when this snapshot renders `btime`, the boot instant.
     pub(crate) fn needs_boot_time(&self) -> bool {
         self.kind == ProcfsKind::SystemStat
@@ -1094,6 +1134,7 @@ impl ProcfsFile {
             mapping_identities,
             mountinfo,
             virtual_cpuinfo,
+            machine,
         } = context;
         let mapping_identities = &mapping_identities;
         self.contents = Some(match &self.kind {
@@ -1141,6 +1182,7 @@ impl ProcfsFile {
             ProcfsKind::CpuList => sanitize_cpu_list(&contents),
             ProcfsKind::CpuMask => sanitize_cpu_mask(&contents),
             ProcfsKind::SingleCpuConstant(file) => file.contents(),
+            ProcfsKind::Fixed(file) => file.contents(&machine),
             ProcfsKind::BtrfsBytesMayUse => sanitize_btrfs_bytes_may_use(&contents),
             ProcfsKind::BlockInflight => sanitize_block_inflight(&contents),
             ProcfsKind::IrqPerCpuCount => sanitize_irq_per_cpu_count(&contents),
@@ -1314,6 +1356,9 @@ impl ProcfsFile {
     /// Returns bytes at an explicit offset without changing the shared cursor.
     pub(crate) fn take_at(&self, offset: usize, maximum: usize) -> Option<Vec<u8>> {
         let contents = self.contents.as_ref()?;
+        if offset > 0 && self.reads_only_from_the_start() {
+            return Some(Vec::new());
+        }
         let start = offset.min(contents.len());
         let end = start.saturating_add(maximum).min(contents.len());
         Some(contents[start..end].to_vec())
@@ -7447,6 +7492,29 @@ total_commit_ms 0\n"
               SwapFree:       0 kB\n"
         );
         assert!(sanitize_meminfo(b"", 1_048_576).is_empty());
+    }
+
+    /// The sysctls Detcore renders fault on a short copy; its `seq_file`
+    /// files and the files whose bytes come from the kernel do not.
+    #[test]
+    fn rendered_sysctls_fault_on_a_short_copy() {
+        let faults = |path: &str| {
+            ProcfsFile::from_path(Path::new(path))
+                .unwrap()
+                .faults_on_a_short_copy()
+        };
+        for path in [
+            "/proc/sys/kernel/random/uuid",
+            "/proc/sys/kernel/pty/nr",
+            "/proc/sys/kernel/pid_max",
+            "/proc/sys/kernel/random/boot_id",
+            "/proc/sys/kernel/osrelease",
+        ] {
+            assert!(faults(path), "{path}");
+        }
+        for path in ["/proc/version", "/proc/cmdline", "/proc/self/status"] {
+            assert!(!faults(path), "{path}");
+        }
     }
 
     #[test]

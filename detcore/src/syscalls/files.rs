@@ -299,6 +299,53 @@ fn copy_procfs_output<M: MemoryAccess>(
     }
 }
 
+/// Copy the bytes of a read of a procfs file as its read handler does: a
+/// `seq_file` copies up to the first byte it cannot write, and a sysctl
+/// (`faults_on_a_short_copy`) copies all of them or fails with `EFAULT`, so
+/// that the caller commits nothing.
+fn copy_procfs_read<M: MemoryAccess>(
+    memory: &mut M,
+    destination: Option<AddrMut<'_, u8>>,
+    bytes: &[u8],
+    faults_on_a_short_copy: bool,
+) -> Result<usize, Error> {
+    let copied = copy_procfs_output(memory, destination, bytes)?;
+    if faults_on_a_short_copy && copied < bytes.len() {
+        return Err(Errno::EFAULT.into());
+    }
+    Ok(copied)
+}
+
+/// The `RWF_*` flags of a vectored read of a procfs file Detcore renders, as
+/// `kiocb_set_rw_flags` checks them for a file with `read_iter` and without
+/// `FMODE_NOWAIT` or `FOP_DONTCACHE`: an unknown flag, then `RWF_APPEND` with
+/// `RWF_NOAPPEND` (`EINVAL`), then `RWF_NOWAIT`, `RWF_ATOMIC` (a read) and
+/// `RWF_DONTCACHE` (`EOPNOTSUPP`). Measured on Linux 7.1 for `/proc/version`
+/// and the sysctls, which also accept `RWF_NOSIGNAL`.
+fn validate_procfs_vector_flags(flags: i32) -> Result<(), Errno> {
+    // Linux 7.1's RWF_NOSIGNAL is newer than the pinned libc crate.
+    const RWF_NOSIGNAL: i32 = 0x100;
+    const KNOWN: i32 = libc::RWF_HIPRI
+        | libc::RWF_DSYNC
+        | libc::RWF_SYNC
+        | libc::RWF_NOWAIT
+        | libc::RWF_APPEND
+        | libc::RWF_NOAPPEND
+        | libc::RWF_ATOMIC
+        | libc::RWF_DONTCACHE
+        | RWF_NOSIGNAL;
+    if flags & !KNOWN != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    if flags & libc::RWF_APPEND != 0 && flags & libc::RWF_NOAPPEND != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if flags & (libc::RWF_NOWAIT | libc::RWF_ATOMIC | libc::RWF_DONTCACHE) != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    Ok(())
+}
+
 /// Check the caller's whole requested range as `vfs_read`'s `access_ok` does
 /// before the file is read, so an address range beyond the user address limit
 /// is `EFAULT` even at EOF, when nothing would be copied. A procfs snapshot read
@@ -1201,7 +1248,7 @@ fn rendered_entry(
     match procfs {
         ProcfsEntry::At(within) => rendered_procfs::rendered_path_within(within),
         ProcfsEntry::NotProcfs | ProcfsEntry::Unknown => {
-            rendered_procfs::rendered_path_of_raw(stat.dev, stat.inode)
+            rendered_procfs::rendered_path_of_raw(stat)
         }
         ProcfsEntry::Unnamed => None,
     }
@@ -1490,6 +1537,102 @@ impl<T: RecordOrReplay> Detcore<T> {
             })?
             .expect("timer-slack procfs state disappeared");
         Ok(copy_timer_slack_output(&mut guest.memory(), buffer, &bytes)? as i64)
+    }
+
+    /// A vectored read of a procfs file Detcore renders: one read of its
+    /// snapshot, as Linux's `read_iter` serves the whole vector at once,
+    /// scattered over the `count` vectors at `address`, at `offset` or at
+    /// (and advancing) the shared cursor. The order is `vfs_readv`'s: the
+    /// descriptor's access mode, then the vectors' import (`EFAULT` for any
+    /// destination outside the user address range, even at end of file), an
+    /// empty vector (0), the range (`rw_verify_area`), and the flags.
+    async fn readv_rendered_procfs<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        address: usize,
+        count: usize,
+        offset: Option<i64>,
+        flags: i32,
+    ) -> Result<i64, Error> {
+        let status = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.status_flags())?;
+        if status & libc::O_PATH != 0 || status & libc::O_ACCMODE == libc::O_WRONLY {
+            return Err(Errno::EBADF.into());
+        }
+        let iovecs = crate::iovecs::import_read_iovecs(&guest.memory(), address, count, || {
+            crate::iovecs::UserAddressLimit::from_query(guest.user_address_limit())
+        })?;
+        let maximum = iovecs.iter().map(|iovec| iovec.len).sum::<usize>();
+        if maximum == 0 {
+            return Ok(0);
+        }
+        if let Some(offset) = offset
+            && offset.checked_add(maximum as i64).is_none()
+        {
+            return Err(Errno::EINVAL.into());
+        }
+        validate_procfs_vector_flags(flags)?;
+        // A file the kernel opened takes its snapshot at its first read.
+        if guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.procfs_needs_snapshot())?
+        {
+            self.initialize_procfs_snapshot(guest, syscalls::Read::new().with_fd(fd))
+                .await?;
+        }
+        let start = match offset {
+            Some(offset) => offset as usize,
+            None => {
+                self.adopt_rendered_procfs_position(guest, fd).await?;
+                guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| detfd.procfs_position())?
+                    .map_or(0, |(offset, _)| offset)
+            }
+        };
+        let (bytes, faults_on_a_short_copy) = guest.thread_state().with_detfd(fd, |detfd| {
+            (
+                detfd.take_procfs_at(start, maximum).unwrap_or_default(),
+                detfd.procfs_faults_on_a_short_copy(),
+            )
+        })?;
+        // Like `copy_to_iter`, stop at the first byte that cannot be written,
+        // leaving later vectors untouched.
+        let mut copied = 0;
+        for iovec in iovecs {
+            if copied == bytes.len() {
+                break;
+            }
+            if iovec.len == 0 {
+                continue;
+            }
+            let end = (copied + iovec.len).min(bytes.len());
+            let written = match copy_procfs_output(
+                &mut guest.memory(),
+                AddrMut::from_raw(iovec.base),
+                &bytes[copied..end],
+            ) {
+                Ok(written) => written,
+                Err(Error::Errno(Errno::EFAULT)) => 0,
+                Err(error) => return Err(error),
+            };
+            copied += written;
+            if copied < end {
+                break;
+            }
+        }
+        if copied < bytes.len() && (faults_on_a_short_copy || copied == 0) {
+            return Err(Errno::EFAULT.into());
+        }
+        if offset.is_none() {
+            guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.commit_procfs_read(start, copied))?;
+            self.sync_rendered_procfs_position(guest, fd).await?;
+        }
+        Ok(copied as i64)
     }
 
     async fn readv_timer_slack<G: Guest<Self>>(
@@ -3458,6 +3601,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             None
         };
+        let machine = crate::machine::MachineDescription::of(guest.config());
         guest.thread_state().with_detfd(call.fd(), |detfd| {
             detfd.initialize_procfs(
                 contents.clone(),
@@ -3474,6 +3618,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     fdinfo_identity,
                     random_uuid,
                     virtual_cpuinfo: virtual_cpuinfo.clone(),
+                    machine: machine.clone(),
                 },
             );
         })?;
@@ -3554,7 +3699,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.preview_procfs(call.len()))?;
         if let Some((offset, bytes)) = procfs_preview {
-            let copied = copy_procfs_output(&mut guest.memory(), call.buf(), &bytes)?;
+            let faults_on_a_short_copy = guest
+                .thread_state()
+                .with_detfd(call.fd(), |detfd| detfd.procfs_faults_on_a_short_copy())?;
+            let copied = copy_procfs_read(
+                &mut guest.memory(),
+                call.buf(),
+                &bytes,
+                faults_on_a_short_copy,
+            )?;
             guest.thread_state().with_detfd(call.fd(), |detfd| {
                 detfd.commit_procfs_read(offset, copied);
             })?;
@@ -3731,7 +3884,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.take_procfs_at(offset, call.len()))?;
         if let Some(bytes) = procfs_bytes {
-            let copied = copy_procfs_output(&mut guest.memory(), call.buf(), &bytes)?;
+            let faults_on_a_short_copy = guest
+                .thread_state()
+                .with_detfd(call.fd(), |detfd| detfd.procfs_faults_on_a_short_copy())?;
+            let copied = copy_procfs_read(
+                &mut guest.memory(),
+                call.buf(),
+                &bytes,
+                faults_on_a_short_copy,
+            )?;
             return Ok(copied as i64);
         }
 
@@ -3881,21 +4042,28 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(result);
         }
 
-        // A procfs file Detcore renders, a sysctl file: an `O_PATH`
+        // A procfs file Detcore renders, whichever opened it: an `O_PATH`
         // descriptor has no position (EBADF), before the seek's arguments are
-        // looked at; otherwise `default_llseek` on a file of size 0, whatever
-        // the snapshot holds.
+        // looked at; otherwise a sysctl file's `default_llseek` on a file of
+        // size 0, whatever the snapshot holds, or a `seq_file`'s `seq_lseek`,
+        // which seeks only from the start or the position.
         let rendered = guest
             .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.procfs_rendered_path().is_some())?;
-        if rendered {
+            .with_detfd(call.fd(), |detfd| detfd.procfs_renderable_path())?;
+        if let Some(rendered) = rendered {
             if status_flags & libc::O_PATH != 0 {
                 return Err(Errno::EBADF.into());
             }
+            let seq_file = rendered
+                .to_str()
+                .and_then(crate::procfs::FixedProcfsFile::from_path)
+                .is_some_and(crate::procfs::FixedProcfsFile::is_seq_file);
             let requested = i128::from(call.offset());
             let new_offset = match call.whence() {
-                Whence::SEEK_SET | Whence::SEEK_END => requested,
+                Whence::SEEK_SET => requested,
                 Whence::SEEK_CUR => current as i128 + requested,
+                _ if seq_file => return Err(Errno::EINVAL.into()),
+                Whence::SEEK_END => requested,
                 // At or past the end, which is 0.
                 Whence::SEEK_DATA | Whence::SEEK_HOLE if requested >= 0 => {
                     return Err(Errno::ENXIO.into());
@@ -4680,6 +4848,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .readv_timer_slack(guest, call.fd(), iovecs, None, 0)
                 .await;
         }
+        if guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.procfs_renderable_path().is_some())?
+        {
+            let address = call.iov().map_or(0, |address| address.as_raw());
+            return self
+                .readv_rendered_procfs(guest, call.fd(), address, call.len(), None, 0)
+                .await;
+        }
 
         let is_procfs = guest
             .thread_state()
@@ -4790,6 +4967,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .readv_timer_slack(guest, call.fd(), iovecs, Some(offset), 0)
                 .await;
         }
+        if guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.procfs_renderable_path().is_some())?
+        {
+            let address = call.iov().map_or(0, |address| address.as_raw());
+            return self
+                .readv_rendered_procfs(guest, call.fd(), address, call.iov_len(), Some(offset), 0)
+                .await;
+        }
 
         let is_procfs = guest
             .thread_state()
@@ -4861,6 +5047,23 @@ impl<T: RecordOrReplay> Detcore<T> {
                 self.readv_timer_slack(guest, call.fd(), iovecs, Some(offset), call.flags())
                     .await
             };
+        }
+        if guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.procfs_renderable_path().is_some())?
+        {
+            let address = call.iov().map_or(0, |address| address.as_raw());
+            let offset = (offset != -1).then_some(offset);
+            return self
+                .readv_rendered_procfs(
+                    guest,
+                    call.fd(),
+                    address,
+                    call.iov_len() as usize,
+                    offset,
+                    call.flags(),
+                )
+                .await;
         }
 
         let is_procfs = guest
@@ -10271,6 +10474,71 @@ mod test {
                     .chain(&contents[PAGE - 4..])
                     .all(|&byte| byte == Pages::FILL),
                 "{format:?}: bytes outside the records copied changed"
+            );
+        }
+    }
+
+    /// A read of a procfs file whose buffer faults two bytes in: a
+    /// `seq_file` returns the two bytes, a sysctl fails with `EFAULT`, as
+    /// measured on Linux 7.1; a file that fits copies whole either way.
+    #[test]
+    fn a_torn_procfs_read_is_partial_for_a_seq_file_and_a_fault_for_a_sysctl() {
+        let pages = Pages::new(&[libc::PROT_READ | libc::PROT_WRITE, libc::PROT_NONE]);
+        let edge = || Some(pages.address(PAGE - 2));
+        let read = |bytes: &[u8], sysctl| {
+            super::copy_procfs_read(&mut LocalMemory::new(), edge(), bytes, sysctl)
+                .map_err(|error| error.into_errno().unwrap())
+        };
+        assert_eq!(read(b"Linux version\n", false), Ok(2));
+        assert_eq!(
+            read(b"65530\n", true),
+            Err(reverie::syscalls::Errno::EFAULT)
+        );
+        assert_eq!(read(b"0\n", true), Ok(2));
+        assert_eq!(read(b"", true), Ok(0));
+    }
+
+    /// `kiocb_set_rw_flags` for a procfs file, in Linux 7.1's order.
+    #[test]
+    fn procfs_vector_flags_are_refused_in_linux_order() {
+        use reverie::syscalls::Errno;
+        const NOSIGNAL: i32 = 0x100;
+        const UNKNOWN: i32 = 0x200;
+        for accepted in [
+            0,
+            libc::RWF_HIPRI,
+            libc::RWF_DSYNC,
+            libc::RWF_SYNC,
+            libc::RWF_APPEND,
+            libc::RWF_NOAPPEND,
+            NOSIGNAL,
+        ] {
+            assert_eq!(super::validate_procfs_vector_flags(accepted), Ok(()));
+        }
+        for (flags, errno) in [
+            (libc::RWF_NOWAIT, Errno::EOPNOTSUPP),
+            (libc::RWF_ATOMIC, Errno::EOPNOTSUPP),
+            (libc::RWF_DONTCACHE, Errno::EOPNOTSUPP),
+            (UNKNOWN, Errno::EOPNOTSUPP),
+            (libc::RWF_APPEND | libc::RWF_NOAPPEND, Errno::EINVAL),
+            (libc::RWF_NOWAIT | UNKNOWN, Errno::EOPNOTSUPP),
+            (
+                libc::RWF_APPEND | libc::RWF_NOAPPEND | UNKNOWN,
+                Errno::EOPNOTSUPP,
+            ),
+            (
+                libc::RWF_ATOMIC | libc::RWF_APPEND | libc::RWF_NOAPPEND,
+                Errno::EINVAL,
+            ),
+            (
+                libc::RWF_NOWAIT | libc::RWF_APPEND | libc::RWF_NOAPPEND,
+                Errno::EINVAL,
+            ),
+        ] {
+            assert_eq!(
+                super::validate_procfs_vector_flags(flags),
+                Err(errno),
+                "{flags:#x}"
             );
         }
     }
