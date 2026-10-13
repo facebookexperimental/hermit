@@ -2066,13 +2066,42 @@ where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
+    retry_blocking_wait_under_mask(guest, call0, rsrc, maybe_timeout, None)
+        .await
+        .0
+}
+
+/// `retry_blocking_wait_with_kernel_signal_state` for a call that sleeps under
+/// `wait_mask` instead of the guest's own mask, when it is set: the temporary
+/// mask of an `epoll_pwait` (`KernelSignalWait::with_wait_mask`). `call0`
+/// carries no mask, so its probes run under the guest's own mask until every
+/// blockable signal is blocked, as for any other wait. Also returns whether the
+/// signal that ended the wait must still be delivered under `wait_mask`: one
+/// that only `wait_mask` lets in, pending in the kernel under the guest's own
+/// mask once it is put back, which the caller delivers with
+/// `inject_signal_delivery`, as a masked pselect6 does.
+pub(crate) async fn retry_blocking_wait_under_mask<T, G, C>(
+    guest: &mut G,
+    call0: C,
+    rsrc: Resources,
+    maybe_timeout: Option<(LogicalTime, Result<i64, Errno>)>,
+    wait_mask: Option<KernelSigset>,
+) -> (Result<i64, Error>, bool)
+where
+    C: NonblockableSyscall + Into<Syscall>,
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
     let mut signals = KernelSignalWait::new(
         guest,
         call0.signals_consumed_by_wait(&guest.memory()),
         call0.restart_keeps_deadline(),
         call0.kernel_restart_errno(),
     )
-    .with_deadline(maybe_timeout.is_some());
+    .with_deadline(maybe_timeout.is_some())
+    .with_wait_mask(wait_mask);
+    // Set when a signal that only `wait_mask` lets in ends the wait.
+    let mut deliver_under_wait_mask = false;
     let mut rsrc = rsrc.clone();
     rsrc.poll_deadline = poll_deadline_for(guest, maybe_timeout.map(|(deadline, _)| deadline));
     let (mut call, mut guard) = call0.into_nonblocking(guest).await;
@@ -2124,9 +2153,11 @@ where
                 // https://github.com/rrnewton/hermit/pull/4039).
                 Ok((true, state)) if signals.interrupts_only_by_committed(&state) => {
                     interrupt_after_probe = true;
+                    deliver_under_wait_mask = signals.interrupts_only_under_wait_mask(&state);
                     state
                 }
-                Ok((true, _)) => {
+                Ok((true, state)) => {
+                    deliver_under_wait_mask = signals.interrupts_only_under_wait_mask(&state);
                     let errno = call0.kernel_restart_errno();
                     tracing::trace!(
                         "retry_nonblocking_syscall: pending signals interrupt {}: {:?}",
@@ -2175,7 +2206,8 @@ where
             // The first turn's check, after its probe found nothing to report.
             match signals.interrupted_with_state() {
                 Ok((false, _)) => {}
-                Ok((true, _)) => {
+                Ok((true, state)) => {
+                    deliver_under_wait_mask = signals.interrupts_only_under_wait_mask(&state);
                     let errno = call0.kernel_restart_errno();
                     tracing::trace!(
                         "retry_nonblocking_syscall: pending signals interrupt {}: {:?}",
@@ -2226,8 +2258,17 @@ where
     };
 
     drop(guard);
-    let result = result_after_restore(signals.restore(guest, None).await, result)?;
-    refuse_held_signal_loss(guest, call0.number(), result).await
+    let result = match result_after_restore(signals.restore(guest, None).await, result) {
+        Ok(result) => result,
+        Err(error) => return (Err(error), false),
+    };
+    // A signal the backend holds is delivered as the guest resumes, under the
+    // guest's own mask (https://github.com/rrnewton/reverie/issues/1011).
+    let deliver = deliver_under_wait_mask && !signals.holds_signal() && result.is_err();
+    (
+        refuse_held_signal_loss(guest, call0.number(), result).await,
+        deliver,
+    )
 }
 
 /// The policy of `Detcore::refuse_unserviceable_operation`, for a caller that
@@ -2742,11 +2783,17 @@ impl KernelSignalWait {
     /// Whether a signal that ends the wait, pending in the kernel per `state`,
     /// is one the guest's own mask blocks: it ends the wait only because the
     /// wait mask (`with_wait_mask`) leaves it unblocked, and it stays pending
-    /// when the guest's own mask is put back.
+    /// when the guest's own mask is put back. A signal the wait holds until
+    /// the call returns counts once the scheduler committed it in this turn
+    /// (`admit_committed`), as in `interrupted_with_state`: otherwise a
+    /// committed `SIGCHLD` that only the wait mask lets in ended the call
+    /// without its handler (Claude review of
+    /// https://github.com/rrnewton/hermit/pull/4217).
     pub(crate) fn interrupts_only_under_wait_mask(&self, state: &KernelSignalState) -> bool {
         let own_mask = self.saved_mask.unwrap_or(state.blocked);
+        let held_until_return = self.held_until_return & !self.committed;
         self.wait_mask.is_some()
-            && state.pending & self.could_interrupt(state) & !self.held_until_return & own_mask != 0
+            && state.pending & self.could_interrupt(state) & !held_until_return & own_mask != 0
     }
 
     /// Adds `signals` to the ones this wait holds until the call returns

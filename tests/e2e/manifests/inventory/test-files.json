@@ -326,6 +326,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/epoll_pwait_temporary_mask.c",
+      "runner": "hermit-cli/tests/epoll_determinism.rs",
+      "why": "tests/c/epoll_pwait_temporary_mask.c is owned by hermit-cli/tests/epoll_determinism.rs: The integration test compiles this guest and checks, under strict verification, that epoll_pwait sleeps under its temporary signal mask: a signal the mask blocks does not end the call, and one the mask lets in ends it with EINTR after its handler ran."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/epoll_pwait_zero_timeout_progress.c",
       "runner": "hermit-cli/tests/epoll_pwait_zero_timeout_progress.rs",
       "why": "tests/c/epoll_pwait_zero_timeout_progress.c is owned by hermit-cli/tests/epoll_pwait_zero_timeout_progress.rs: Producer/poller guest covering BOTH epoll_pwait scheduler defects in #1850, selected by an optional argv: no argument runs the zero-timeout case (must not STARVE its producer), 'blocking' runs the infinite-timeout case (must not DEADLOCK the scheduler). The blocking mode is the bracket for the headline fix and was added after review found that reverting the epoll_pwait routing left the whole suite green. The Rust integration test compiles it with cc and runs it under hermit, asserting PROGRESS rather than a syscall return value -- a return-value assertion passes while the producer starves. It issues the raw SYS_epoll_pwait with an explicitly NULL sigmask so it pins that exact routing rather than whatever glibc emits. Driven only by its own integration test, so it is a test-owned guest fixture rather than a manifest-discovered CI program."

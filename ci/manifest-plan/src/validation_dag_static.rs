@@ -2200,7 +2200,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // dbt_masked_ppoll_that_would_block_fails_closed, less
     // ppoll_waits_use_nonblocking_probes_and_verify, which is skipped by name
     // (https://github.com/rrnewton/hermit/issues/3147): 298.
-    ("test.hermit_integration", 298),
+    // And epoll_determinism::epoll_pwait_sleeps_under_its_temporary_mask
+    // (https://github.com/rrnewton/hermit/issues/4041): 299.
+    ("test.hermit_integration", 299),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -3225,7 +3227,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the single-CPU sysfs numbers and node files test: 293.
     // And the single-CPU directory listing test: 294.
     // And four of the five ppoll_simulation tests: 298.
-    ("test.hermit_integration_on_host", 298),
+    // And the masked epoll_pwait test: 299.
+    ("test.hermit_integration_on_host", 299),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

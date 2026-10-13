@@ -424,3 +424,93 @@ fn epoll_fd_supports_descriptor_table_ops() {
         String::from_utf8_lossy(&output),
     );
 }
+
+/// Under `run --strict` on the ptrace backend, epoll_pwait sleeps under its
+/// temporary signal mask, as Linux installs it for the whole call
+/// (https://github.com/rrnewton/hermit/issues/4041). It used to run the real
+/// call in the thread's turn and return at once or at its timeout.
+/// tests/c/epoll_pwait_temporary_mask.c describes the modes:
+///
+/// - `blocks`, `blocks-early`: a SIGALRM the call's mask blocks does not end
+///   the call, which returns 1 for the pipe; the handler runs after.
+/// - `unblocks`, `unblocks-timed`, `unblocks-rewritten`: a SIGALRM only the
+///   call's mask lets in ends it with EINTR after its handler ran, also when
+///   a sibling rewrites the mask buffer during the wait.
+/// - `admits`: the thread's own mask lets it in too; EINTR after the handler.
+/// - `pending-unblocks`: the SIGALRM is already pending when the call begins.
+/// - `chld-unblocks`: a SIGCHLD that only the call's mask lets in ends it
+///   with EINTR after its handler ran.
+/// - `timeout`: no signal; 0 after at least the 50 ms timeout.
+///
+/// The guest checks each result against Linux's and exits nonzero on a
+/// mismatch. Each mode runs under strict verification, which must compare a
+/// nonzero number of INFO messages on each side.
+#[test]
+fn epoll_pwait_sleeps_under_its_temporary_mask() {
+    let _guard = hermit_run_lock();
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("epoll-pwait-temporary-mask-{}", std::process::id()));
+    fs::create_dir_all(&build_root).expect("failed to create epoll guest build directory");
+    let guest = build_root.join("epoll_pwait_temporary_mask");
+    let mut compile = Command::new("cc");
+    compile
+        .args(["-O0", "-g", "-pthread", "-Wall", "-Wextra", "-Werror"])
+        .arg(repository.join("tests/c/epoll_pwait_temporary_mask.c"))
+        .arg("-o")
+        .arg(&guest);
+    command_output(compile, "epoll_pwait temporary-mask guest compilation");
+
+    for mode in [
+        "blocks",
+        "blocks-early",
+        "unblocks",
+        "unblocks-timed",
+        "unblocks-rewritten",
+        "admits",
+        "pending-unblocks",
+        "chld-unblocks",
+        "timeout",
+    ] {
+        let verdict = build_root.join(format!("verify-{mode}.json"));
+        let mut command = Command::new("timeout");
+        command
+            .args(["--kill-after", "5s", "45s"])
+            .arg(hermit_test::hermit_binary())
+            .args([
+                "--log=info",
+                "--backend=ptrace",
+                "run",
+                "--strict",
+                "--verify",
+                "--verify-strict",
+                "--base-env=minimal",
+            ])
+            .arg(format!("--verify-json={}", verdict.display()))
+            .arg("--")
+            .arg(&guest)
+            .arg(mode);
+        let output = command_output(command, &format!("epoll_pwait temporary mask {mode}"));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(&format!("epoll-pwait-temporary-mask mode={mode}")),
+            "guest omitted its result line\nstdout:\n{stdout}"
+        );
+        let report: serde_json::Value = serde_json::from_slice(
+            &fs::read(&verdict).expect("strict verification wrote no verdict"),
+        )
+        .expect("strict verification verdict is valid JSON");
+        assert_eq!(report["verdict"], serde_json::json!("matched"), "{mode}");
+        assert_eq!(report["bitwise_parity"], serde_json::json!(true), "{mode}");
+        for side in ["left", "right"] {
+            assert!(
+                report["compared_log_messages"][side]
+                    .as_u64()
+                    .is_some_and(|count| count > 0),
+                "{mode}: strict verification compared no {side} INFO messages: {report}"
+            );
+        }
+    }
+}

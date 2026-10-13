@@ -55,6 +55,7 @@ use crate::syscalls::helpers::poll_deadline_for;
 use crate::syscalls::helpers::record_retry_event;
 use crate::syscalls::helpers::refuse_held_signal_loss;
 use crate::syscalls::helpers::result_after_restore;
+use crate::syscalls::helpers::retry_blocking_wait_under_mask;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::syscalls::helpers::unblocked_by;
 use crate::syscalls::network_trace::received_descriptors;
@@ -2374,16 +2375,25 @@ impl<T: RecordOrReplay> Detcore<T> {
         // semantically identical, so route them together.
         //
         // A NON-NULL sigmask swaps the signal mask atomically for the duration
-        // of the wait, which a timeout-0 polling loop cannot reproduce. Under
-        // record and replay a masked call that may wait is a kernel wait
-        // outside the turn (`record_or_replay_masked_epoll_pwait`). Otherwise,
-        // and for a zero timeout, it keeps its turn: under a sequentialized
-        // run such a call can still block the scheduler, a known remaining
-        // gap (https://github.com/rrnewton/hermit/issues/4041), and because
-        // it never sleeps outside the runnable set the scheduler needs no
-        // record of its temporary mask (`Resources::blocked_signal_mask`).
+        // of the wait. Under record and replay a masked call that may wait is
+        // a kernel wait outside the turn (`record_or_replay_masked_epoll_pwait`).
+        // A sequentialized run on a backend whose kernel reports the guest's
+        // signal state polls it under that mask
+        // (`handle_internal_masked_epoll_pwait`). Otherwise, and for a zero
+        // timeout, it keeps its turn: on another backend, or without
+        // sequentialized threads, such a call can still block the scheduler
+        // (https://github.com/rrnewton/hermit/issues/4041), and because it
+        // never sleeps outside the runnable set the scheduler needs no record
+        // of its temporary mask (`Resources::blocked_signal_mask`).
         if call.sigmask().is_some() && self.cfg.recordreplay_modes && call.timeout() != 0 {
             return self.record_or_replay_masked_epoll_pwait(guest, call).await;
+        }
+        if call.sigmask().is_some()
+            && call.timeout() != 0
+            && self.cfg.sequentialize_threads
+            && self.cfg.backend_supports_blocked_wait_signal_interruption
+        {
+            return self.handle_internal_masked_epoll_pwait(guest, call).await;
         }
         if call.sigmask().is_some() {
             self.observe_under_temporary_mask(guest, call.sigmask(), call.sigsetsize())
@@ -2404,6 +2414,73 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             self.handle_internal_epoll_pwait(guest, call).await
         }
+    }
+
+    /// A masked `epoll_pwait` that may wait, under sequentialized threads on a
+    /// backend whose kernel reports the guest's signal state. It used to run
+    /// the real call in the thread's turn, so nothing else ran while it waited
+    /// and it returned 0 at once or at its timeout
+    /// (https://github.com/rrnewton/hermit/issues/4041). It now polls, as an
+    /// unmasked `epoll_pwait` does, with probes that carry no mask, and decides
+    /// interruption against the temporary mask read at entry
+    /// (`retry_blocking_wait_under_mask`): a signal the mask blocks never ends
+    /// the call and is delivered after it, and one the mask lets in ends it
+    /// with EINTR although the guest's own mask may block it. A zero-timeout
+    /// `epoll_pwait` never looks at pending signals, so no probe could be ended
+    /// by one in any case. A signal that only the temporary mask lets in stays
+    /// pending under the guest's own mask once it is put back, and is delivered
+    /// under the temporary mask (`inject_signal_delivery`), as for a masked
+    /// pselect6. Linux checks the mask's size, then reads it, before it looks
+    /// at the epoll descriptor.
+    async fn handle_internal_masked_epoll_pwait<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::EpollPwait,
+    ) -> Result<i64, Error> {
+        if call.sigsetsize() != KERNEL_SIGSET_SIZE {
+            return Err(Errno::EINVAL.into());
+        }
+        let mask_address = call.sigmask().ok_or(Errno::EFAULT)?;
+        let mask = read_kernel_sigset(guest, mask_address.cast()).await?;
+        // A pending real-time timer expiration that the mask lets the kernel
+        // deliver or discard (https://github.com/rrnewton/hermit/issues/4089).
+        observe_under_mask(guest, mask).await?;
+        let mask = sanitize_ppoll_signal_mask(mask);
+        let deadline = millis_duration_to_absolute_timeout(guest, call.timeout()).await;
+        let mut rsrc = Resources::new(guest.thread_state().dettid);
+        rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
+        rsrc.fyi("epoll_pwait");
+        let (result, deliver) = retry_blocking_wait_under_mask(
+            guest,
+            call.with_sigmask(None),
+            rsrc,
+            // epoll_pwait returns 0 at its timeout.
+            deadline.map(|deadline| (deadline, Ok(0))),
+            Some(crate::syscalls::signal::kernel_installed_signal_mask(mask)),
+        )
+        .await;
+        if deliver && matches!(result, Err(Error::Errno(Errno::EINTR))) {
+            // The probes staged nothing, so they say nothing about room for
+            // these 24 bytes. `stage_private_cells`, which tests a window by
+            // reading it, finds none only on a stack whose pointer is less
+            // than 24 bytes above unreadable memory and whose red zone is
+            // unreadable too
+            // (https://github.com/rrnewton/hermit/issues/4113). Then the signal
+            // stays pending under the guest's own mask, and the call returns
+            // EINTR without its handler run and logs this warning.
+            match stage_private_cells(guest, PrivateCells::MaskAndZeroTimeout(mask), &[]).await? {
+                Some(staged) => {
+                    inject_signal_delivery(guest, staged.mask(), staged.after_mask()).await;
+                    staged.release(guest);
+                }
+                None => tracing::warn!(
+                    "[tid {}] no room to deliver an epoll_pwait signal under its temporary \
+                     mask; its handler runs only once the guest unblocks it",
+                    guest.tid()
+                ),
+            }
+        }
+        result
     }
 
     /// A masked `epoll_pwait` that may wait, under record and replay. As for a

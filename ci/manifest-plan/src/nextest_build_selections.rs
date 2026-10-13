@@ -656,8 +656,10 @@ mod tests {
             // https://github.com/rrnewton/hermit/pull/4166), plus the single-CPU
             // sysfs numbers and node files test and the directory listing test
             // (https://github.com/rrnewton/hermit/issues/4160), plus the four
-            // ppoll_simulation tests (https://github.com/rrnewton/hermit/issues/4042).
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "298");
+            // ppoll_simulation tests (https://github.com/rrnewton/hermit/issues/4042),
+            // plus the masked epoll_pwait test
+            // (https://github.com/rrnewton/hermit/issues/4041).
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "299");
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(
