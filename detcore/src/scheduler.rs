@@ -7868,16 +7868,34 @@ impl Scheduler {
     ///
     /// Linux's `complete_signal` takes `preferred` if it does not block the
     /// signal, and otherwise looks for another thread that does not. Under a
-    /// tracer, a thread held in a ptrace stop does not qualify, and the kernel
-    /// instead leaves the signal pending for whichever thread resumes first
-    /// without blocking it. The order here is `preferred`, then the rest in
-    /// thread-ID order, which stands in for the kernel's round-robin
-    /// `curr_target`. Only a chosen thread that sleeps outside the runnable
-    /// set is woken (`arm_signaled_background`). A chosen parked futex waiter
-    /// is not woken by the drain: its wait holds `SIGCHLD` until the call
-    /// returns (`futex_wait_held_signals`), unless the `ChildExit` timer's own
-    /// send names it (`wake_signaled_guest`). A running thread counts as much
-    /// as a parked one.
+    /// tracer, a thread held in a ptrace stop does not qualify
+    /// (`wants_signal`), and here every thread the scheduler holds is in one.
+    /// So a thread in a real `rt_sigsuspend` (`rt_sigsuspend_blockers`) whose
+    /// temporary mask does not block the signal comes first: if it is still
+    /// asleep, the kernel queues the signal for it and wakes it. If it has
+    /// already returned and stopped (its continuation posted), the kernel
+    /// leaves the signal pending, and the thread takes it when it resumes:
+    /// the temporary mask stays installed until a signal is delivered
+    /// (`set_restore_sigmask`). Either way it is armed for the release barrier
+    /// (`arm_signaled_background`), which admits it at the front of the run
+    /// queue before any other thread takes a turn. Other calls outside the
+    /// runnable set are not preferred: a `ppoll` or `pselect6` that returned
+    /// restored the thread's own mask, which may block the signal, and a vfork
+    /// parent's killable sleep is not woken. Only when there is no such
+    /// `rt_sigsuspend` does the order below decide, over every thread that
+    /// does not block the signal; when all of them are stopped, the kernel
+    /// leaves the signal pending for whichever resumes first. The order is
+    /// `preferred`, then the rest in thread-ID order, which stands in for the
+    /// kernel's round-robin `curr_target`. Before, a stopped `preferred` was
+    /// named ahead of a `sigsuspend` sibling the kernel woke: the sibling was
+    /// not armed, so whether it took the signal before `preferred` resumed
+    /// from a sleep that virtual time ended depended on host timing
+    /// (<https://github.com/rrnewton/hermit/issues/4237>). Only a chosen
+    /// thread that sleeps outside the runnable set is woken
+    /// (`arm_signaled_background`). A chosen parked futex waiter is not woken
+    /// by the drain: its wait holds `SIGCHLD` until the call returns
+    /// (`futex_wait_held_signals`), unless the `ChildExit` timer's own send
+    /// names it (`wake_signaled_guest`).
     ///
     /// Every mask this uses is a function of the schedule, so the choice is
     /// too. Call this only at the step2 drain or a step2b timed pop, where no
@@ -7909,10 +7927,16 @@ impl Scheduler {
         let mut threads = self.process_signal_targets(process);
         // Stable, so the rest stay in thread-ID order.
         threads.sort_by_key(|thread| *thread != preferred);
-        threads.into_iter().find(|thread| {
+        let unblocked = |thread: &DetTid| {
             self.thread_signal_mask(*thread)
                 .is_some_and(|mask| mask & sigchld == 0)
-        })
+        };
+        threads
+            .iter()
+            .copied()
+            .filter(|thread| self.blocked.rt_sigsuspend_blockers.contains_key(thread))
+            .find(unblocked)
+            .or_else(|| threads.iter().copied().find(unblocked))
     }
 
     /// `thread`'s signal mask: the one its parked futex wait reported, which only
@@ -16980,6 +17004,51 @@ mod test {
             scheduler.kernel_sigchld_target(parent, creator),
             Some(creator)
         );
+    }
+
+    /// The creator is stopped at a request without blocking `SIGCHLD` while a
+    /// sibling sleeps in an `rt_sigsuspend` whose mask lets it through. The
+    /// kernel passes over a thread in a ptrace stop, so it gives the signal to
+    /// the sibling and wakes it: the sibling is the target, and the signal the
+    /// `ChildExit` timer sends it arms it for the release barrier. Before, the
+    /// creator was named and the sibling not armed, so whether it took the
+    /// signal before the creator resumed from a sleep virtual time ended was
+    /// host-timed (<https://github.com/rrnewton/hermit/issues/4237>). The
+    /// creator is named as before when the sibling's mask blocks `SIGCHLD`,
+    /// and when the sibling is in other external IO: a `ppoll` that returned
+    /// has restored its own mask, and a vfork parent's sleep is not woken.
+    #[test]
+    fn a_sigchld_goes_to_a_sibling_sleeping_outside_the_scheduler_before_a_stopped_creator() {
+        let chld = kernel_signal_bit(libc::SIGCHLD);
+        for (sigsuspend, sleeping_mask, sibling_takes) in
+            [(true, 0, true), (true, chld, false), (false, 0, false)]
+        {
+            let (mut scheduler, parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+            scheduler
+                .test_kernel_signal_states
+                .insert(creator, signal_state(chld, 0));
+            scheduler
+                .test_kernel_signal_states
+                .insert(parent, signal_state(chld, 0));
+            let op = ExternalOpId::new(parent, 1);
+            let rid = if sigsuspend {
+                ResourceID::BlockingRtSigsuspend(op)
+            } else {
+                ResourceID::BlockingExternalIO(op)
+            };
+            commit_out_of_scheduler_call(&mut scheduler, parent, rid, Some(sleeping_mask));
+            let expected = if sibling_takes { parent } else { creator };
+            assert_eq!(
+                scheduler.kernel_sigchld_target(parent, creator),
+                Some(expected),
+                "rt_sigsuspend {sigsuspend}, sleeping mask {sleeping_mask:#x}"
+            );
+            if sibling_takes {
+                scheduler.wake_signaled_guest(parent, Signal::SIGCHLD);
+                assert!(scheduler.blocked.signaled_background.contains(&parent));
+                assert!(scheduler.blocked.sigchld_ready.contains(&parent));
+            }
+        }
     }
 
     /// A signal the scheduler sends while a thread is still stopped at its
