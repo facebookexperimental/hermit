@@ -84,7 +84,11 @@ const MIN_DISTINCT_OUTCOMES: usize = 12;
 /// chaos setting and guest mode, rather than one test of 66 runs: the 66 runs
 /// used 16.3-20.7 CPU-s in 13 validations, and one validation ended at the
 /// budget (exit 124) at run 33 of 66, after a skid-refused attempt at seed 28.
-/// The costliest group of 11 measured about 10.3 CPU-s.
+/// The costliest group of 11 (yield-then-write, whose syscall-free spinners burn
+/// CPU until a preemption) measured 8.5-9.7 CPU-s in a review's repeats, 8.7 in
+/// a validation, and 14.1 on a host at load 40 or more. Two skid retries of its
+/// costliest run (2.8 CPU-s) keep it under the budget, with little margin on a
+/// loaded host.
 const SKID_ATTEMPTS: u32 = 3;
 
 /// Per-run timeout. A healthy run finishes in well under a second; a starved
@@ -92,6 +96,10 @@ const SKID_ATTEMPTS: u32 = 3;
 /// per-test budget, so a hang fails with this test's message naming the seed
 /// rather than with the budget's bare exit 124.
 const TIMEOUT_SECONDS: u64 = 10;
+
+/// Per-run timeout for the strict `--verify`, preemption-replay and vfork
+/// runs, which run the guest two or three times and took 1.9-8 s in a review.
+const REPLAY_TIMEOUT_SECONDS: u64 = 30;
 
 static GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CONTENTION_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -428,7 +436,7 @@ fn targeted_chaos_preemption_replay_matches_two_pinned_records() {
             let mut command = Command::new("timeout");
             command
                 .arg("--kill-after=2s")
-                .arg(format!("{TIMEOUT_SECONDS}s"))
+                .arg(format!("{REPLAY_TIMEOUT_SECONDS}s"))
                 .arg(hermit_test::hermit_binary())
                 .args([
                     "run",
@@ -474,7 +482,7 @@ fn run_strict_guest(args: &[&str]) {
     let mut command = Command::new("timeout");
     command
         .arg("--kill-after=2s")
-        .arg(format!("{TIMEOUT_SECONDS}s"))
+        .arg(format!("{REPLAY_TIMEOUT_SECONDS}s"))
         .arg(hermit_test::hermit_binary())
         .args([
             "run",
@@ -535,7 +543,7 @@ fn preemption_replay_preserves_vfork_sched_yield_progress() {
         let mut command = Command::new("timeout");
         command
             .arg("--kill-after=2s")
-            .arg(format!("{TIMEOUT_SECONDS}s"))
+            .arg(format!("{REPLAY_TIMEOUT_SECONDS}s"))
             .arg(hermit_test::hermit_binary())
             .args([
                 "run",
