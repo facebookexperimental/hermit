@@ -271,7 +271,9 @@ static void check_descriptor_refusals(const char* path, int fd) {
   REFUSED(fsetxattr(fd, "security.x", "1", 1, 0), EPERM, path);
   REFUSED(fremovexattr(fd, "security.x"), EPERM, path);
   REFUSED(fsetxattr(fd, "system.x", "1", 1, 0), EOPNOTSUPP, path);
-  REFUSED(fsetxattr(fd, "user.x", NULL, 1, 0), EFAULT, path);
+  /* The raw call: the C library's prototype forbids the null value its
+   * size describes, which is the case under test. */
+  REFUSED(syscall(SYS_fsetxattr, fd, "user.x", NULL, 1, 0), EFAULT, path);
   REFUSED(mmap(NULL, 4096, PROT_READ, MAP_PRIVATE | MAP_HUGETLB, fd, 0), EINVAL, path);
   REFUSED(mmap(NULL, 4096, PROT_READ, MAP_SHARED_VALIDATE | MAP_SYNC, fd, 0), EOPNOTSUPP, path);
   int clone_source = open(program, O_RDONLY);
