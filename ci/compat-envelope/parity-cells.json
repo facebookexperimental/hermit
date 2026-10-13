@@ -9,12 +9,12 @@
   "counts": {
     "all": {
       "cells": 4085,
-      "applicable": 1926,
-      "selectable": 1596,
+      "applicable": 1927,
+      "selectable": 1597,
       "population": 2780,
-      "population_candidate_selected": 1596,
+      "population_candidate_selected": 1597,
       "population_candidate_not_selected": 258,
-      "population_candidate_disabled": 926
+      "population_candidate_disabled": 925
     },
     "by_backend": {
       "dbt": {
@@ -37,12 +37,12 @@
       },
       "kvm": {
         "cells": 817,
-        "applicable": 557,
-        "selectable": 525,
+        "applicable": 558,
+        "selectable": 526,
         "population": 556,
-        "population_candidate_selected": 525,
+        "population_candidate_selected": 526,
         "population_candidate_not_selected": 3,
-        "population_candidate_disabled": 28
+        "population_candidate_disabled": 27
       },
       "liteinst": {
         "cells": 817,
@@ -2355,9 +2355,9 @@
     {"test_id":"compat/sha512sum","backend":"kvm","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/sha512sum","backend":"liteinst","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/sha512sum","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the sabre-compat-only run type selects this cell, by its manifest label; full validation does not."},
-    {"test_id":"compat/shell-build","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: A compat corpus row runs only its lane's verify cell on ptrace, and a focused run type's replay cell on ptrace"},
+    {"test_id":"compat/shell-build","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: A compat corpus row runs only its lane's verify cell on ptrace, a verify cell on kvm, and a focused run type's replay cell on ptrace"},
     {"test_id":"compat/shell-build","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Its first verify run on in-guest-trap failed in the second local survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): execve of a further program image returned EOPNOTSUPP (exec refused) (https://github.com/rrnewton/hermit/issues/3745)"},
-    {"test_id":"compat/shell-build","backend":"kvm","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: Diverged in 2 of 10 KVM verify runs on 2026-10-13; not yet diagnosed"},
+    {"test_id":"compat/shell-build","backend":"kvm","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/shell-build","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Its first verify run on liteinst failed in the second local survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): execve of a further program image returned EOPNOTSUPP (exec refused) (https://github.com/rrnewton/hermit/issues/3745)"},
     {"test_id":"compat/shell-build","backend":"sabre","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: Not in the SaBRe corpus this replaced (ci/compat/corpus-sabre.json had no shell-build row)"},
     {"test_id":"compat/shred","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only run type selects this cell, by its manifest label; full validation does not."},

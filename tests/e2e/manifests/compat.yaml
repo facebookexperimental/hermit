@@ -1443,7 +1443,10 @@ corpus:
     # Hermit 40c5b066 on 2026-10-13 with this entry in place (default
     # budget, no relaxations); the survey covered the 205 rows whose KVM
     # cell was green on the compatibility ledger. curl-localhost joined
-    # after KVM began answering getsockopt(SO_ERROR), 10 of 10.
+    # after KVM began answering getsockopt(SO_ERROR), 10 of 10. shell-build
+    # joined once its workload's cd became physical (a logical cd stats every
+    # ancestor of the run-state work dir, whose sizes change while sibling
+    # cells run): 10 of 10 with four runs at once.
     - backend: kvm
       rows:
         [
@@ -1465,12 +1468,12 @@ corpus:
           printenv, printf, ptx, pwd, python3, ranlib, readelf, readlink,
           realpath, rev, rm, rmdir, ruby, sar-resource-tables, sed, seq,
           setfacl, setfattr, sha1sum, sha224sum, sha256sum, sha384sum,
-          sha512sum, shred, shuf, size, sleep, sort, split, sqlite3, ss, stat,
-          stdbuf, strings, strip, sum, sync, tac, tar, tar-roundtrip, taskset,
-          tcl, tee, test, time, timeout, top, touch, tr, "true", truncate,
-          tsort, tty, uname, unexpand, uniq, uptime, users, uuidgen, vmstat,
-          wc, wc-lines, wget-localhost, whoami, xmllint, xxd, xz, xz-roundtrip,
-          "yes", zip-unzip, zstd, zstd-roundtrip
+          sha512sum, shell-build, shred, shuf, size, sleep, sort, split,
+          sqlite3, ss, stat, stdbuf, strings, strip, sum, sync, tac, tar,
+          tar-roundtrip, taskset, tcl, tee, test, time, timeout, top, touch, tr,
+          "true", truncate, tsort, tty, uname, unexpand, uniq, uptime, users,
+          uuidgen, vmstat, wc, wc-lines, wget-localhost, whoami, xmllint, xxd,
+          xz, xz-roundtrip, "yes", zip-unzip, zstd, zstd-roundtrip
         ]
       disabled_reason: >-
         Not in the 2026-10-13 KVM survey: its KVM verify cell was not green
@@ -1480,9 +1483,6 @@ corpus:
           Diverged in 4 of 10 KVM verify runs on 2026-10-13: the size KVM
           reports for /proc/self/mountinfo follows the host's mount table,
           which changed between runs (https://github.com/rrnewton/hermit/issues/4213)
-        shell-build: >-
-          Diverged in 2 of 10 KVM verify runs on 2026-10-13; not yet
-          diagnosed
         rustc: >-
           Exceeded the default 22-second CPU budget in 10 of 10 KVM verify
           runs on 2026-10-13; the lane's own cell gives this heavy row 599

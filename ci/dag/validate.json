@@ -14041,6 +14041,13 @@
           "category": "compat",
           "test": "compat/shell-build",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/shell-build",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -17034,6 +17041,13 @@
           "test": "compat/sha512sum",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/shell-build",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -59952,6 +59966,13 @@
           "test": "compat/sha512sum",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/shell-build",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",

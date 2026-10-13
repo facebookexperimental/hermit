@@ -23,6 +23,12 @@ export PATH=/usr/bin:/bin
 # virtualizes getrandom deterministically, so an in-guest `mktemp -d` also
 # yields the same name across both runs.
 readonly WORK_DIR="${1:-$(mktemp -d "${TMPDIR:-/tmp}/hermit-complex-shell-workload.XXXXXX")}"
+# Every `cd` below is physical (`cd -P`). A logical `cd` to an absolute path
+# makes bash stat each ancestor to canonicalize it, and those stats carry the
+# ancestors' st_size into the run's records. $1 sits under the harness's run
+# state, whose ancestors gain and lose entries while sibling cells run, so the
+# two verify runs saw different sizes (compat/shell-build diverged on KVM under
+# parallel runs). `cd -P` is a bare chdir.
 readonly SRC_DIR="$WORK_DIR/src"
 readonly BUILD_DIR="$WORK_DIR/build"
 
@@ -42,7 +48,7 @@ int probe(uint32_t value) { return (int)(value + 1); }
 EOF
 
 if (
-    cd "$BUILD_DIR"
+    cd -P "$BUILD_DIR"
     /usr/bin/gcc -std=c11 -Wall -Werror -ffreestanding -fno-ident \
         -frandom-seed=hermit-configure -c "$SRC_DIR/conftest.c" \
         -o conftest.o
@@ -105,7 +111,7 @@ message:
 EOF
 
 (
-    cd "$BUILD_DIR"
+    cd -P "$BUILD_DIR"
     SOURCE_DATE_EPOCH=946684800 /usr/bin/gcc -std=c11 -O2 -Wall -Werror \
         -ffreestanding -fno-ident -frandom-seed=hermit-shell-build \
         -fno-stack-protector -fno-pie -I. -c "$SRC_DIR/answer.c" \

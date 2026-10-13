@@ -243,7 +243,9 @@ function test_git_workload_ignores_inherited_location {
         failures=0
         assignments=()
 
-        self=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
+        # Physical cd: a logical one stats every ancestor of the repository
+        # checkout, whose sizes change as sibling checkouts come and go.
+        self=$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")
         if [[ -x /usr/local/bin/git.meta.real ]]; then
             git_bin=/usr/local/bin/git.meta.real
         else
