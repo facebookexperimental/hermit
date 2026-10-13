@@ -47,6 +47,7 @@ pub mod edit_distance;
 pub mod exit_dependencies;
 mod fatal_core;
 mod fd;
+mod fifo_peer;
 mod host_inputs;
 pub mod in_guest_site_patching;
 mod io_buffers;

@@ -439,6 +439,12 @@
       "why": "tests/c/fd_duplication.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/fifo_peer.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/fifo_peer.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test runs this guest with a FIFO shared by two guest threads or processes, under strict verification and chaos seeds, and with a FIFO whose other end the test process itself holds as the host peer; it remains a guest fixture because a generic manifest cannot provide that host-side FIFO end or assert from the log that a host-peer FIFO is not polled."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/file_backed_mmap.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

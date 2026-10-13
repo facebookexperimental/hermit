@@ -315,6 +315,13 @@ struct OpenFileDescription {
     /// purposes.
     physically_nonblocking: bool,
 
+    /// A FIFO opened by path in `hermit run`, still `Regular` and physically
+    /// blocking: its first blocking read or write that finds a guest holding
+    /// the other end makes it an internally polled `Pipe`
+    /// (`Detcore::fifo_polls_if_a_guest_holds_its_peer`).
+    #[serde(default)]
+    fifo_awaiting_guest_peer: bool,
+
     /// cached statbuf
     ///
     /// This is the RAW stat from the file system, NOT determinized.
@@ -565,6 +572,7 @@ impl DetFd {
                 path: None,
                 inode: None,
                 dirty: false,
+                fifo_awaiting_guest_peer: false,
                 stat: None,
                 random_device_offset: 0,
                 resource: None,
@@ -1128,6 +1136,32 @@ impl DetFd {
     /// Mark every alias of this open file description physically nonblocking.
     pub fn set_physically_nonblocking(&self) {
         self.with_description(|d| d.physically_nonblocking = true);
+    }
+
+    /// Whether this is a FIFO that may still become an internally polled pipe
+    /// (see `OpenFileDescription::fifo_awaiting_guest_peer`).
+    pub(crate) fn fifo_awaiting_guest_peer(&self) -> bool {
+        self.with_description(|d| d.fifo_awaiting_guest_peer)
+    }
+
+    /// Mark a `Regular` FIFO as one that may become an internally polled pipe.
+    pub(crate) fn mark_fifo_awaiting_guest_peer(&self) {
+        self.with_description(|d| {
+            debug_assert_eq!(d.ty, FdType::Regular);
+            d.fifo_awaiting_guest_peer = true;
+        });
+    }
+
+    /// The FIFO is now physically nonblocking (Detcore set `O_NONBLOCK`, here
+    /// or through another process sharing the open file description): treat
+    /// it from now on as a scheduler-managed pipe, as `pipe2` creates.
+    pub(crate) fn fifo_joins_internal_polling(&self) {
+        self.with_description(|d| {
+            debug_assert!(d.fifo_awaiting_guest_peer);
+            d.fifo_awaiting_guest_peer = false;
+            d.ty = FdType::Pipe;
+            d.physically_nonblocking = true;
+        });
     }
 
     /// Update file status flags for every alias of this open file description.

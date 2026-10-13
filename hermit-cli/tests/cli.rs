@@ -122,6 +122,7 @@ static DBT_GUEST_ENVIRONMENT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_INERT_RUNTIME: OnceLock<PathBuf> = OnceLock::new();
 static EXEC_CLOCK_CONTINUITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_TWO_THREADS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static FIFO_PEER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_SOURCE_THEN_FUTEX_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_SIGNAL_WHILE_HELD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_SPAWN_DUP2_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -627,6 +628,31 @@ fn exec_clock_continuity_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "exec-clock-continuity guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn fifo_peer_guest() -> &'static Path {
+    FIFO_PEER_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("fifo-peer");
+        fs::create_dir_all(&build_root).expect("failed to create fifo-peer guest directory");
+        let guest = build_root.join("fifo_peer");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/fifo_peer.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile fifo-peer guest");
+        assert!(
+            output.status.success(),
+            "fifo-peer guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -26957,4 +26983,179 @@ fn an_unusable_verify_tmpdir_is_a_clean_error_naming_the_variable() {
             "{args:?}: {stderr}"
         );
     }
+}
+
+/// A FIFO whose other end another guest holds: a read or write that must wait
+/// for that guest no longer blocks in the kernel while it holds the scheduler
+/// turn, where the guest at the other end could never run
+/// (https://github.com/rrnewton/hermit/issues/4200). Each mode prints what
+/// Linux gives it, deterministically, under several chaos seeds too. A FIFO
+/// whose other end only a host process holds still blocks in the kernel, as
+/// before: no guest's progress depends on it, and polling it would make the
+/// schedule depend on when the host writes.
+#[test]
+fn a_fifo_shared_by_guests_does_not_hold_the_turn() {
+    let guest = fifo_peer_guest().to_str().unwrap();
+    let scratch = process_build_root("fifo-peer").join("runs");
+    for (mode, expected) in [
+        ("thread", "thread read: 1 'x'\n"),
+        // A signal to the polling reader ends its read, as on Linux
+        // (https://github.com/rrnewton/hermit/issues/4200's first report).
+        (
+            "signal",
+            "thread read: -1 Interrupted system call, handled 1\n",
+        ),
+        ("process", "child read: 1 'y'\n"),
+        (
+            "fill",
+            "thread wrote: 196731\nmain read: 196731 bytes, sum 1452010763\n",
+        ),
+        // The child's read polls the shared read end first; the parent's read
+        // must then poll it too, not see EAGAIN.
+        ("shared", "child read: 1 'a'\nparent read: 1 'b'\n"),
+        (
+            "vector",
+            "thread readv: 2 'ab'\nthread writev: 196731\nmain read: 196731 bytes, sum 1452010763\n",
+        ),
+        // A thread cloned without CLONE_FILES reads a FIFO the leader writes.
+        ("private-table-guest", "thread read: 1 'g'\n"),
+        // The only writer is in a thread's own table (CLONE_FILES unset).
+        ("private-writer", "leader read: 1 'w'\n"),
+    ] {
+        let dir = scratch.join(mode);
+        fs::create_dir_all(&dir).expect("failed to create the FIFO directory");
+        let dir = dir.to_str().unwrap();
+        for seed in [None, Some("--seed=1"), Some("--seed=2"), Some("--seed=3")] {
+            let mut args = vec!["run", "--strict"];
+            if let Some(seed) = seed {
+                args.extend(["--chaos", seed]);
+            }
+            args.extend(["--verify", "--verify-strict", "--", guest, mode, dir]);
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            assert_eq!(stdout(&output), expected, "{args:?}");
+            let log = stderr(&output);
+            assert!(
+                log.contains("Success: deterministic. Determinism verified."),
+                "{args:?}: verification failed:\n{log}"
+            );
+        }
+        // The descriptors become internally polled pipes.
+        let args = ["--log", "info", "run", "--strict", "--", guest, mode, dir];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert!(
+            stderr(&output).contains("is a FIFO with a guest at its other end"),
+            "{args:?}: the FIFO was not polled:\n{}",
+            stderr(&output)
+        );
+    }
+
+    // A FIFO with only the host (this test process) at its other end: the
+    // guest's call waits for the host, in the kernel, and is never polled.
+    // `host`: the guest reads a byte the host writes. `host-rdwr`: the same
+    // through a descriptor the guest opened read-write, which is its own writer
+    // to the kernel but not a guest peer. `host-readers`: the same through one
+    // of two read-only descriptions; the other is a reader, not a writer. `host-reader`: the guest writes 24
+    // FIFO capacities, which the host reads.
+    const FILL_BYTES: usize = 3 * 65536 + 123;
+    for (mode, expected) in [
+        ("host", "host read: 1 'h'\n".to_owned()),
+        ("host-rdwr", "host-rdwr read: 1 'h'\n".to_owned()),
+        ("host-readers", "host-readers read: 1 'h'\n".to_owned()),
+        ("host-reader", format!("host-reader wrote: {FILL_BYTES}\n")),
+        // An O_PATH handle on the FIFO is neither a reader nor a writer.
+        (
+            "host-reader-opath",
+            format!("host-reader-opath wrote: {FILL_BYTES}\n"),
+        ),
+    ] {
+        let fifo = scratch.join(format!("{mode}-fifo"));
+        let _ = fs::remove_file(&fifo);
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo failed");
+        // Read-write, so this open does not wait for the guest's.
+        let mut host_end = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo)
+            .expect("failed to open the host end of the FIFO");
+        let fifo = fifo.to_str().unwrap().to_owned();
+        let args = ["--log", "info", "run", "--strict", "--", guest, mode, &fifo];
+        let child = hermit_command(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to start hermit");
+        // On its own thread, so that `wait_with_output` drains Hermit's log
+        // meanwhile: a full stderr pipe would stop the tracer, and the guest.
+        let host = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            if matches!(mode, "host-reader" | "host-reader-opath") {
+                let mut buffer = vec![0u8; FILL_BYTES];
+                std::io::Read::read_exact(&mut host_end, &mut buffer)
+                    .expect("failed to read what the guest wrote");
+            } else {
+                host_end
+                    .write_all(b"h")
+                    .expect("failed to write the host end of the FIFO");
+            }
+        });
+        let output = child.wait_with_output().expect("failed to wait for hermit");
+        host.join().expect("the host end of the FIFO failed");
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{args:?}");
+        assert!(
+            !stderr(&output).contains("is a FIFO with a guest at its other end"),
+            "{args:?}: a FIFO with only a host at its other end was polled:\n{}",
+            stderr(&output)
+        );
+        if matches!(mode, "host-reader" | "host-reader-opath") {
+            // Nothing else in these runs polls: the write blocked in the kernel.
+            assert!(
+                !stderr(&output).contains("InternalIOPolling"),
+                "{args:?}: the write to a host-read FIFO polled:\n{}",
+                stderr(&output)
+            );
+        }
+    }
+
+    // The leader holds another FIFO, which has a guest writer, at fd 10; a
+    // thread cloned without CLONE_FILES puts this host-written FIFO at its own
+    // fd 10. The check must read the thread's table, so the FIFO keeps
+    // blocking.
+    let fifo = scratch.join("private-table-fifo");
+    let _ = fs::remove_file(&fifo);
+    nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo failed");
+    let mut host_end = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&fifo)
+        .expect("failed to open the host end of the FIFO");
+    host_end
+        .write_all(b"h")
+        .expect("failed to write the host end of the FIFO");
+    let dir = scratch.join("private-table");
+    fs::create_dir_all(&dir).expect("failed to create the FIFO directory");
+    let (fifo, dir) = (fifo.to_str().unwrap(), dir.to_str().unwrap());
+    let args = [
+        "--log",
+        "info",
+        "run",
+        "--strict",
+        "--",
+        guest,
+        "private-table",
+        fifo,
+        dir,
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "thread read: 1 'h'\n", "{args:?}");
+    assert!(
+        !stderr(&output).contains("is a FIFO with a guest at its other end"),
+        "{args:?}: the thread's host-written FIFO was polled:\n{}",
+        stderr(&output)
+    );
+    drop(host_end);
 }

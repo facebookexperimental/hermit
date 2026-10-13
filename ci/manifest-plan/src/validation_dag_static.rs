@@ -2063,7 +2063,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4161): 1527, by listing.
     // And get_mempolicy_output_faults_are_efault_and_backend_errors_are_tool_errors
     // (Claude re-check of https://github.com/rrnewton/hermit/pull/4249): 1528, by listing.
-    ("test.detcore_unit", 1528),
+    // And the five FIFO peer-scan tests (https://github.com/rrnewton/hermit/issues/4200): 1533, by listing.
+    ("test.detcore_unit", 1533),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2846,7 +2847,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4213): 356.
     // And cpuinfo_matches_cpuid
     // (https://github.com/rrnewton/hermit/issues/4161): 357.
-    ("test.cli", 357),
+    // And a_fifo_shared_by_guests_does_not_hold_the_turn
+    // (https://github.com/rrnewton/hermit/issues/4200): 358, by listing.
+    ("test.cli", 358),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3133,7 +3136,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // So does detcore_renders_its_procfs_files_on_every_backend
     // (https://github.com/rrnewton/hermit/issues/4213): 292.
     // Nor does the cpuinfo-matches-CPUID test: 293.
-    ("test.cli_on_host", 293),
+    // And the FIFO peer test: 294.
+    ("test.cli_on_host", 294),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -3319,7 +3323,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the rendered-snapshot-across-exec test: 1523.
     // And the four virtual-cpuinfo tests: 1527, by listing.
     // And the get_mempolicy output-error test: 1528, by listing.
-    ("test.detcore_unit_on_host", 1528),
+    // And the five FIFO peer-scan tests: 1533, by listing.
+    ("test.detcore_unit_on_host", 1533),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

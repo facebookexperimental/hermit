@@ -55,6 +55,7 @@ use super::deterministic_stdio_inode_for_resource;
 use crate::config::SchedHeuristic;
 use crate::dirents::*;
 use crate::fd::*;
+use crate::fifo_peer::FifoPeer;
 use crate::procfs::MountInfoSnapshot;
 use crate::procfs::ProcfsFile;
 use crate::procfs::ProcfsSnapshotContext;
@@ -1662,6 +1663,92 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(())
     }
 
+    /// Before a logically blocking read (`peer` is `Writer`) or write
+    /// (`Reader`) on a FIFO that `handle_openat` marked: if a guest holds the
+    /// other end (`crate::fifo_peer`), shrink the FIFO's capacity to the one
+    /// `handle_pipe2` pins a pipe to (never growing one the guest shrank), make
+    /// it physically nonblocking, and treat it from then on as a
+    /// scheduler-managed pipe. The call then polls in
+    /// turns instead of blocking in the kernel while it holds the turn, where
+    /// the guest at the other end could never run
+    /// (<https://github.com/rrnewton/hermit/issues/4200>). A FIFO whose other
+    /// ends are all on the host is left blocking, as before.
+    ///
+    /// The open file description may be shared with another process that
+    /// already made this change: the kernel then reports it nonblocking while
+    /// this process still sees it blocking, and this process follows. On
+    /// ptrace a forked child shares the parent's model (`fork_for` clones the
+    /// `Arc`), so it sees the change at once; this branch is for a backend
+    /// whose fork copies the model into the child's address space (DBT), and
+    /// the ptrace tests do not reach it.
+    /// Shrink a FIFO that is about to be polled as a pipe to the capacity
+    /// `handle_pipe2` pins a pipe to, if it is larger, so that its partial
+    /// writes do not depend on the host's pipe defaults. A capacity the guest
+    /// set smaller is kept, as Linux keeps it. The kernel refuses (`EBUSY`)
+    /// while more is buffered than the new capacity holds; the FIFO is then
+    /// polled at its current capacity, which only that buffered amount
+    /// decides.
+    async fn shrink_fifo_capacity<G: Guest<Self>>(&self, guest: &mut G, fd: RawFd) {
+        let Ok(capacity) = guest
+            .inject(syscalls::Fcntl::new().with_fd(fd).with_cmd(F_GETPIPE_SZ))
+            .await
+        else {
+            return;
+        };
+        if capacity > i64::from(DETERMINISTIC_PIPE_CAPACITY_BYTES)
+            && let Err(errno) = guest
+                .inject(
+                    syscalls::Fcntl::new()
+                        .with_fd(fd)
+                        .with_cmd(F_SETPIPE_SZ(DETERMINISTIC_PIPE_CAPACITY_BYTES)),
+                )
+                .await
+        {
+            info!(
+                "[detcore] FIFO fd {} keeps its {}-byte capacity: shrinking it failed with {}",
+                fd, capacity, errno
+            );
+        }
+    }
+
+    async fn fifo_polls_if_a_guest_holds_its_peer<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        peer: FifoPeer,
+    ) {
+        let Ok((awaiting, logically_nonblocking)) = guest.thread_state().with_detfd(fd, |detfd| {
+            (detfd.fifo_awaiting_guest_peer(), detfd.is_nonblocking())
+        }) else {
+            return;
+        };
+        if !awaiting || logically_nonblocking {
+            return;
+        }
+        // The calling thread's own table: it may not be its leader's (a thread
+        // cloned without CLONE_FILES), and `fd` is changed in this one.
+        let tid = guest.tid().as_raw();
+        let joins = match crate::fifo_peer::kernel_nonblocking(tid, fd) {
+            Some(true) => true,
+            Some(false) => {
+                crate::fifo_peer::guest_holds_peer(tid, fd, peer) && {
+                    self.shrink_fifo_capacity(guest, fd).await;
+                    self.inject_physical_nonblocking(guest, fd).await.is_ok()
+                }
+            }
+            None => false,
+        };
+        if joins {
+            info!(
+                "[detcore] fd {} is a FIFO with a guest at its other end; polling it as a pipe",
+                fd
+            );
+            let _ = guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.fifo_joins_internal_polling());
+        }
+    }
+
     /// Inject an extra fstat to retrieve file metadata.
     ///
     /// The kernel needs a writable `struct stat` in the guest. It is staged
@@ -2306,6 +2393,29 @@ impl<T: RecordOrReplay> Detcore<T> {
                     let result = self.open_rendered_procfs(guest, call.flags(), target).await;
                     resource_release_all(guest).await;
                     return result;
+                }
+                // A FIFO (a named one, or a pipe reached by path that the
+                // check above left `Regular`) stays `Regular` and physically
+                // blocking, so a FIFO whose other end is on the host blocks as
+                // before. Its first blocking read or write that finds a guest
+                // holding the other end makes it an internally polled pipe
+                // (`fifo_polls_if_a_guest_holds_its_peer`). Run mode only, as
+                // for a reopened pipe: Replayer's descriptor is a placeholder.
+                // Only where the tool is a separate tracer: the check reads
+                // the guest's descriptors through `/proc/<tid>`, which names
+                // the guest's own table only from outside it. A backend whose
+                // tool runs in the guest (DBT, in its PID container) keeps a
+                // FIFO as before.
+                if fd_type == FdType::Regular
+                    && self.cfg.use_nonblocking_sockets()
+                    && !self.cfg.recordreplay_modes
+                    && !self.cfg.backend.tool_shares_guest_descriptor_table
+                    && !call.flags().contains(OFlag::O_PATH)
+                    && crate::fifo_peer::is_fifo(guest.tid().as_raw(), fd)
+                {
+                    guest
+                        .thread_state()
+                        .with_detfd(fd, |detfd| detfd.mark_fifo_awaiting_guest_peer())?;
                 }
                 if let (true, Some(stat)) = (guest.config().record_host_inputs, &host_stat) {
                     crate::tool_global::record_host_input(
@@ -3452,6 +3562,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(copied as i64);
         }
 
+        self.fifo_polls_if_a_guest_holds_its_peer(guest, call.fd(), FifoPeer::Writer)
+            .await;
         let (fd_type, physically_nonblocking, logically_nonblocking, resource, random_device) =
             guest.thread_state_mut().with_detfd(call.fd(), |detfd| {
                 (
@@ -4022,6 +4134,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await;
         }
 
+        if call.len() > 0 {
+            self.fifo_polls_if_a_guest_holds_its_peer(guest, call.fd(), FifoPeer::Reader)
+                .await;
+        }
         let (
             fd_type,
             physically_nonblocking,
@@ -4248,6 +4364,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             return self.writev_timer_slack(guest, call.fd(), iovecs, 0).await;
         }
 
+        self.fifo_polls_if_a_guest_holds_its_peer(guest, call.fd(), FifoPeer::Reader)
+            .await;
         let (
             fd_type,
             physically_nonblocking,
@@ -4570,6 +4688,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Errno::ENOSYS.into());
         }
 
+        self.fifo_polls_if_a_guest_holds_its_peer(guest, call.fd(), FifoPeer::Writer)
+            .await;
         let (fd_type, physically_nonblocking, logically_nonblocking, resource, detfd) =
             guest.thread_state().with_detfd(call.fd(), |detfd| {
                 (
