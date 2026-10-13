@@ -58,6 +58,7 @@ use crate::fd::*;
 use crate::procfs::MountInfoSnapshot;
 use crate::procfs::ProcfsFile;
 use crate::procfs::ProcfsSnapshotContext;
+use crate::procfs::is_absent_cpu_entry;
 use crate::procfs_inode;
 use crate::procfs_inode::DirectoryInodes;
 use crate::procfs_inode::ProcfsDirectory;
@@ -7518,7 +7519,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         // `DirectoryStream`).
         let inodes = self.directory_inodes(guest, call.fd).await?;
         match self.snapshot_directory_privately(guest, call).await {
-            Ok(Some(entries)) => {
+            Ok(Some(mut entries)) => {
+                self.drop_absent_cpu_entries(guest, call.fd, &mut entries);
                 let mut entries = Some(entries);
                 guest.thread_state().with_detfd(call.fd, |detfd| {
                     detfd.install_directory_snapshot(
@@ -7728,21 +7730,59 @@ impl<T: RecordOrReplay> Detcore<T> {
         let _ = self.record_or_replay(guest, seek).await;
     }
 
+    /// Drop from `entries`, read from the directory open as `fd`, the CPUs and
+    /// nodes that Hermit's single virtual CPU and node leave out (see
+    /// [`is_absent_cpu_entry`]), so that a guest counting
+    /// `/sys/devices/system/cpu/cpuN` finds one CPU, as `online` and
+    /// `sched_getaffinity` report
+    /// (<https://github.com/rrnewton/hermit/issues/4160>).
+    ///
+    /// The directory is named by the kernel's path for the descriptor, so a
+    /// relative or symlinked spelling is recognized too. Not under record and
+    /// replay, where the replayer's descriptor does not name the recorded
+    /// directory, so the two runs would not drop alike; Detcore names no
+    /// procfs entry there either (see [`Self::procfs_entry`]).
+    fn drop_absent_cpu_entries<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        fd: RawFd,
+        entries: &mut Vec<DirEntry>,
+    ) {
+        if self.cfg.recordreplay_modes {
+            return;
+        }
+        if let Some(directory) = resolved_open_path(guest.pid().as_raw(), fd) {
+            entries.retain(|entry| !is_absent_cpu_entry(&directory, &entry.name));
+        }
+    }
+
     /// Answer `getdents` without a directory stream by issuing the guest's own
     /// call, sorting the entries of that one kernel buffer and determinizing
     /// their inodes. The host's `d_off` cookies are kept, so the kernel can
     /// still interpret them. A directory larger than one buffer comes back as
     /// sorted runs whose boundaries depend on the host.
+    ///
+    /// A buffer whose every entry is dropped (see
+    /// [`Self::drop_absent_cpu_entries`]) is not returned empty, which would
+    /// end the directory: the call is issued again from where the kernel
+    /// left off. The bytes the kernel wrote past the entries returned are
+    /// zeroed, as they may name the entries dropped.
     async fn sort_one_buffer<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: GetdentsCall<'_>,
     ) -> Result<i64, Error> {
-        let len = self.record_or_replay(guest, call.call).await? as usize;
-        if len == 0 {
-            return Ok(0);
-        }
-        let mut entries = read_records(&guest.memory(), call.buf, len, call.format)?;
+        let (len, mut entries) = loop {
+            let len = self.record_or_replay(guest, call.call).await? as usize;
+            if len == 0 {
+                return Ok(0);
+            }
+            let mut entries = read_records(&guest.memory(), call.buf, len, call.format)?;
+            self.drop_absent_cpu_entries(guest, call.fd, &mut entries);
+            if !entries.is_empty() {
+                break (len, entries);
+            }
+        };
         sort_dir_entries(&mut entries);
         let inodes = self.directory_inodes(guest, call.fd).await?;
         let mut records = Vec::with_capacity(len);
@@ -7752,16 +7792,19 @@ impl<T: RecordOrReplay> Detcore<T> {
             call.format
                 .encode(entry, d_ino.as_raw(), entry.off, &mut records);
         }
+        let returned = records.len();
+        // Zero what the kernel wrote past the entries returned.
+        records.resize(returned.max(len), 0);
         if guest.memory().write_exact(call.buf, &records).is_err() {
             // The padding after the last name may not be writable, as Linux
             // does not write it.
             let written = entries.last().map_or(0, |last| {
-                records.len() - call.format.record_len(last.name.len())
+                returned - call.format.record_len(last.name.len())
                     + call.format.written_len(last.name.len())
             });
             guest.memory().write_exact(call.buf, &records[..written])?;
         }
-        Ok(records.len() as i64)
+        Ok(returned as i64)
     }
 
     /// Read the whole host directory behind `call.fd` into a private mapping

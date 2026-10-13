@@ -1424,6 +1424,24 @@ fn is_single_cpu_zero_path(path: &str) -> bool {
         })
 }
 
+/// Whether `name`, an entry of the directory at the canonical path
+/// `directory`, is a CPU, node or cpufreq policy other than number 0, which a
+/// machine with one CPU and one node does not have. glibc's `get_nprocs_conf`
+/// (`sysconf(_SC_NPROCESSORS_CONF)`, `nproc --all`) counts the `cpuN` entries
+/// of `/sys/devices/system/cpu`, and libnuma counts them and the `nodeN`
+/// entries of `/sys/devices/system/node`.
+pub(crate) fn is_absent_cpu_entry(directory: &Path, name: &[u8]) -> bool {
+    let prefix: &[u8] = match directory.to_str() {
+        Some("/sys/devices/system/cpu" | "/sys/bus/cpu/devices") => b"cpu",
+        Some("/sys/devices/system/node" | "/sys/bus/node/devices") => b"node",
+        Some("/sys/devices/system/cpu/cpufreq") => b"policy",
+        _ => return false,
+    };
+    name.strip_prefix(prefix).is_some_and(|number| {
+        !number.is_empty() && number.iter().all(u8::is_ascii_digit) && number != b"0"
+    })
+}
+
 /// The mask forms of [`is_virtual_cpu_list_path`]'s files.
 fn is_virtual_cpu_mask_path(path: &str) -> bool {
     path == "/sys/devices/system/node/node0/cpumap"
@@ -6105,6 +6123,61 @@ Rss:                   4 kB\n" as &[u8];
         assert_eq!(sanitize_node_distance(b"\n"), b"\n");
         assert_eq!(sanitize_cpu_list(b"0-1\n"), b"0\n");
         assert_eq!(sanitize_cpu_list(b"\n"), b"\n");
+    }
+
+    #[test]
+    fn directory_listings_drop_cpus_and_nodes_other_than_zero() {
+        for (directory, absent, kept) in [
+            (
+                "/sys/devices/system/cpu",
+                &["cpu1", "cpu10", "cpu315"][..],
+                &[
+                    "cpu0",
+                    "cpufreq",
+                    "cpuidle",
+                    "online",
+                    "kernel_max",
+                    "cpu",
+                    "cpux1",
+                ][..],
+            ),
+            ("/sys/bus/cpu/devices", &["cpu7"], &["cpu0"]),
+            (
+                "/sys/devices/system/node",
+                &["node1", "node12"],
+                &["node0", "online", "has_cpu", "node"],
+            ),
+            ("/sys/bus/node/devices", &["node1"], &["node0"]),
+            (
+                "/sys/devices/system/cpu/cpufreq",
+                &["policy1", "policy315"],
+                &["policy0", "boost"],
+            ),
+        ] {
+            for name in absent {
+                assert!(
+                    is_absent_cpu_entry(Path::new(directory), name.as_bytes()),
+                    "{directory}/{name}"
+                );
+            }
+            for name in kept {
+                assert!(
+                    !is_absent_cpu_entry(Path::new(directory), name.as_bytes()),
+                    "{directory}/{name}"
+                );
+            }
+        }
+        // Other directories keep every entry.
+        for (directory, name) in [
+            ("/sys/devices/system/cpu/cpu0", "cpu1"),
+            ("/sys/devices/system", "node1"),
+            ("/tmp", "cpu1"),
+        ] {
+            assert!(
+                !is_absent_cpu_entry(Path::new(directory), name.as_bytes()),
+                "{directory}/{name}"
+            );
+        }
     }
 
     #[test]

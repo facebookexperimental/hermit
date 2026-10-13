@@ -1974,7 +1974,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And a_rewritten_own_copy_keeps_none_of_its_marked_record: 1460.
     // And the kernel_max, SMT, topology-ID and node single-CPU test
     // (https://github.com/rrnewton/hermit/issues/4160): 1461.
-    ("test.detcore_unit", 1461),
+    // And the absent-CPU directory entry test (https://github.com/rrnewton/hermit/issues/4160): 1462.
+    ("test.detcore_unit", 1462),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2176,7 +2177,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (Claude review of https://github.com/rrnewton/hermit/pull/4166): 292.
     // And procfs_determinism::sys_cpu_numbers_and_node_files_describe_one_cpu_and_node
     // (https://github.com/rrnewton/hermit/issues/4160): 293.
-    ("test.hermit_integration", 293),
+    // And procfs_determinism::cpu_and_node_directories_list_one_cpu_and_node
+    // (https://github.com/rrnewton/hermit/issues/4160): 294.
+    ("test.hermit_integration", 294),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -3134,7 +3137,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two own-copy mark tests: 1459.
     // And the own-copy signalfd rewrite test: 1460.
     // And the kernel_max, SMT, topology-ID and node single-CPU test: 1461.
-    ("test.detcore_unit_on_host", 1461),
+    // And the absent-CPU directory entry test: 1462.
+    ("test.detcore_unit_on_host", 1462),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -3175,7 +3179,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // That test split into six: 291.
     // And the crowded-stack pselect6 record refusal test: 292.
     // And the single-CPU sysfs numbers and node files test: 293.
-    ("test.hermit_integration_on_host", 293),
+    // And the single-CPU directory listing test: 294.
+    ("test.hermit_integration_on_host", 294),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

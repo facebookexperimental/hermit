@@ -531,6 +531,45 @@ fn cpu_count_queries_agree_on_one_virtual_cpu() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), "1\n1\n");
 }
 
+/// `nproc --all` and `getconf _NPROCESSORS_CONF` ask glibc's
+/// `get_nprocs_conf`, which counts the `cpuN` entries of
+/// `/sys/devices/system/cpu`; libnuma counts those and the `nodeN` entries of
+/// `/sys/devices/system/node`. They must list Hermit's one CPU and one node,
+/// as `online` does (https://github.com/rrnewton/hermit/issues/4160).
+#[test]
+fn cpu_and_node_directories_list_one_cpu_and_node() {
+    let _guard = hermit_run_lock();
+    let mut command = Command::new(hermit_test::hermit_binary());
+    command.args([
+        "--log=error",
+        "run",
+        "--base-env=minimal",
+        "--",
+        "/bin/sh",
+        "-c",
+        "nproc --all; getconf _NPROCESSORS_CONF; \
+         ls /sys/devices/system/cpu | grep -c '^cpu[0-9]'; \
+         ls /sys/devices/system/node | grep -c '^node[0-9]'; \
+         cd /sys/devices/system && ls cpu | grep '^cpu[0-9]'; \
+         ls /sys/bus/cpu/devices",
+    ]);
+    hermit_test::configure_guest_execution(&mut command);
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+    assert!(
+        output.status.success(),
+        "CPU-listing probe failed: {rendered}\nstatus: {}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "1\n1\n1\n1\ncpu0\ncpu0\n"
+    );
+}
+
 #[test]
 fn proc_loadavg_uses_virtual_values() {
     assert_deterministic("/proc/loadavg", |contents| {
