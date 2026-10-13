@@ -318,7 +318,49 @@ static void check_descriptor_refusals(const char* path, int fd) {
       2, 0, 0, 0, 1,   0, 6, 0, 255, 255, 255, 255, 2,   0,   4,   0,   255, 255, 255, 255, 4, 0,
       4, 0, 255, 255, 255, 255, 0x10, 0, 4, 0, 255, 255, 255, 255, 0x20, 0, 4, 0, 255, 255, 255, 255};
   REFUSED(fsetxattr(fd, "system.posix_acl_access", named_acl, sizeof(named_acl), 0), EINVAL, path);
+  /* Only the parser refuses a list (a partial entry); procfs then cannot keep
+   * any list, even an empty one or one without a group entry. */
+  REFUSED(fsetxattr(fd, "system.posix_acl_access", acl, 0, 0), EOPNOTSUPP, path);
+  REFUSED(fsetxattr(fd, "system.posix_acl_access", acl, 12, 0), EOPNOTSUPP, path);
+  REFUSED(fsetxattr(fd, "system.posix_acl_access", acl, 6, 0), EINVAL, path);
+  /* file_mmap_ok: an offset past the largest file offset. */
+  REFUSED(mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, -4096), EOVERFLOW, path);
+  /* A fixed address below vm.mmap_min_addr needs CAP_SYS_RAWIO. */
+  REFUSED(mmap((void*)0x1000, 4096, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0), EPERM, path);
+  /* With AT_FDCWD a NULL path is looked up, whatever the flags. */
+  REFUSED(syscall(SYS_utimensat, AT_FDCWD, NULL, NULL, AT_SYMLINK_NOFOLLOW), EFAULT, path);
+  /* Both times omitted is success before the flags are looked at. */
+  CHECK(syscall(SYS_utimensat, fd, NULL, omitted, AT_SYMLINK_NOFOLLOW) == 0,
+        "%s utimensat(UTIME_OMIT, AT_SYMLINK_NOFOLLOW): %s", path, strerror(errno));
+  /* The size less the position, and the bytes used, of a procfs file whose
+   * size is 0. */
+  int unread = 12345;
+  CHECK(ioctl(fd, FIONREAD, &unread) == 0 && unread == -(int)lseek(fd, 0, SEEK_CUR),
+        "%s FIONREAD %d at %ld", path, unread, (long)lseek(fd, 0, SEEK_CUR));
+  long long used = 777;
+  CHECK(ioctl(fd, FIOQSIZE, &used) == 0 && used == 0, "%s FIOQSIZE %lld", path, used);
   struct stat ignored;
+  /* Flags newfstatat refuses before it looks up the file. */
+  REFUSED(syscall(SYS_newfstatat, AT_FDCWD, path, &ignored, 0x80000000), EINVAL, path);
+  /* ...but takes the synchronization flags, and on the descriptor itself
+   * looks at no flag (measured on Linux 7.1). */
+  CHECK(syscall(SYS_newfstatat, AT_FDCWD, path, &ignored, AT_STATX_SYNC_TYPE) == 0,
+        "%s newfstatat(AT_STATX_SYNC_TYPE): %s", path, strerror(errno));
+  CHECK(syscall(SYS_newfstatat, fd, "", &ignored, AT_EMPTY_PATH | 0x80000000) == 0,
+        "%s newfstatat(\"\", AT_EMPTY_PATH|unknown): %s", path, strerror(errno));
+  struct statx by_descriptor;
+  CHECK(syscall(SYS_statx, fd, "", AT_EMPTY_PATH | 0x80000000, STATX_BASIC_STATS,
+                &by_descriptor) == 0,
+        "%s statx(\"\", AT_EMPTY_PATH|unknown): %s", path, strerror(errno));
+  /* utimensat: both times omitted is success before the path is looked up;
+   * unknown flags are refused before it; out-of-range times after it. */
+  char slashed[128];
+  snprintf(slashed, sizeof(slashed), "%s/", path);
+  CHECK(syscall(SYS_utimensat, AT_FDCWD, slashed, omitted, 0) == 0,
+        "%s utimensat(UTIME_OMIT): %s", slashed, strerror(errno));
+  REFUSED(syscall(SYS_utimensat, AT_FDCWD, slashed, NULL, 0x8000), EINVAL, slashed);
+  struct timespec bad_nsec[2] = {{.tv_nsec = -5}, {.tv_nsec = 0}};
+  REFUSED(syscall(SYS_utimensat, AT_FDCWD, slashed, bad_nsec, 0), ENOTDIR, slashed);
   REFUSED(fstatat(fd, "", &ignored, 0), ENOENT, path);
   int block = 0;
   REFUSED(ioctl(fd, FIBMAP, &block), EPERM, path);
@@ -359,6 +401,25 @@ static void check_path_calls(const char* path, const char* spelling) {
         "%s identity or size changed", spelling);
 }
 
+/* Seeking a sysctl file: a file of size 0 (`default_llseek`), so SEEK_END
+ * is the offset alone and SEEK_DATA finds nothing; an O_PATH descriptor has
+ * no position. */
+static void check_seeks(const char* path) {
+  int fd = open(path, O_RDONLY);
+  CHECK(fd >= 0 && lseek(fd, 0, SEEK_END) == 0, "%s SEEK_END %ld", path,
+        (long)lseek(fd, 0, SEEK_CUR));
+  char contents[64];
+  CHECK(read(fd, contents, sizeof(contents)) > 0, "%s read after SEEK_END", path);
+  REFUSED(lseek(fd, 0, SEEK_DATA), ENXIO, path);
+  REFUSED(lseek(fd, 0, SEEK_HOLE), ENXIO, path);
+  REFUSED(lseek(fd, -1, SEEK_SET), EINVAL, path);
+  close(fd);
+  int located = open(path, O_PATH);
+  REFUSED(lseek(located, -1, SEEK_SET), EBADF, path);
+  REFUSED(lseek(located, 0, SEEK_SET), EBADF, path);
+  close(located);
+}
+
 static void check_file(const char* path, int uuid) {
   struct stat by_path;
   CHECK(stat(path, &by_path) == 0, "stat(%s): %s", path, strerror(errno));
@@ -367,6 +428,7 @@ static void check_file(const char* path, int uuid) {
   CHECK(by_path.st_size == 0 && by_path.st_nlink == 1, "%s size %lld nlink %lld", path,
         (long long)by_path.st_size, (long long)by_path.st_nlink);
   check_open_errors(path);
+  check_seeks(path);
   check_path_calls(path, path);
   if (!kvm_local_procfs) {
     /* One procfs device, Detcore's, for every procfs file. */
@@ -395,29 +457,59 @@ static void check_file(const char* path, int uuid) {
   snprintf(self_link, sizeof(self_link), "/proc/self/fd/%d", fd);
   CHECK(link_names(self_link, path), "%s descriptor link", path);
   check_path_calls(path, self_link);
-  if (!kvm_local_procfs) {
-    /* procfs names descriptors without leading zeros (KVM's own procfs
-     * resolves this one). */
+  {
+    /* procfs names descriptors without leading zeros. */
     char zero_link[80];
     snprintf(zero_link, sizeof(zero_link), "/proc/self/fd/0%d", fd);
     REFUSED(open(zero_link, O_RDONLY), ENOENT, zero_link);
+    snprintf(zero_link, sizeof(zero_link), "/dev/fd/0%d", fd);
+    REFUSED(open(zero_link, O_RDONLY), ENOENT, zero_link);
+    /* Not even a creating open finds it (measured on Linux 7.1). */
+    snprintf(zero_link, sizeof(zero_link), "/proc/self/fd/0%d", fd);
+    REFUSED(open(zero_link, O_RDONLY | O_CREAT, 0444), ENOENT, zero_link);
+  }
+  if (!kvm_local_procfs) {
+    /* The link read through a symbolic link to the descriptor directory, into
+     * a buffer shorter than the link: the start of the file's path. (KVM's
+     * own /proc refuses symbolic links into /proc until it is removed,
+     * https://github.com/rrnewton/hermit/issues/4282.) */
+    char directory[] = "/tmp/rendered-procfs-fd-XXXXXX";
+    CHECK(mkdtemp(directory) != NULL, "mkdtemp: %s", strerror(errno));
+    char directory_link[96], through[128], target[20];
+    snprintf(directory_link, sizeof(directory_link), "%s/fd", directory);
+    CHECK(symlink("/proc/self/fd", directory_link) == 0, "symlink: %s", strerror(errno));
+    snprintf(through, sizeof(through), "%s/%d", directory_link, fd);
+    ssize_t short_length = readlink(through, target, sizeof(target));
+    CHECK(short_length == (ssize_t)sizeof(target) && memcmp(target, path, sizeof(target)) == 0,
+          "%s read into %zu bytes: %.*s", through, sizeof(target),
+          (int)(short_length > 0 ? short_length : 0), target);
+    unlink(directory_link);
+    rmdir(directory);
   }
   struct statx extended;
   REFUSED(syscall(SYS_statx, AT_FDCWD, path, 0, 0x80000000u, &extended), EINVAL, path);
+  /* `O_CREAT|O_EXCL` follows no final link: the link exists. */
+  REFUSED(open(self_link, O_RDONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0444), EEXIST, self_link);
   REFUSED(syscall(SYS_openat, AT_FDCWD, self_link, 020000000 | O_RDWR), EINVAL, self_link);
   char link_dir[80];
   struct stat link_ignored;
   snprintf(link_dir, sizeof(link_dir), "%s/", self_link);
   REFUSED(open(link_dir, O_RDONLY), ENOTDIR, link_dir);
   REFUSED(stat(link_dir, &link_ignored), ENOTDIR, link_dir);
+  /* statx refuses its arguments before it looks up the path. */
+  REFUSED(syscall(SYS_statx, AT_FDCWD, link_dir, 0, 0x80000000u, &extended), EINVAL, link_dir);
   snprintf(link_dir, sizeof(link_dir), "%s/.", self_link);
   REFUSED(open(link_dir, O_RDONLY), ENOTDIR, link_dir);
   /* This thread's spelling of the link: the same file, and the same link
-   * even into a buffer shorter than anything but the path. (Under DBT the
-   * thread ID Detcore gives the guest does not name a /proc task entry.) */
+   * even into a buffer shorter than anything but the path. The thread is
+   * named as procfs names it (/proc/thread-self), which is what a /proc
+   * reader sees. */
   if (!no_foreign_fd_links) {
-    char task_link[96];
-    snprintf(task_link, sizeof(task_link), "/proc/self/task/%d/fd/%d", (int)gettid(), fd);
+    char thread_self[64];
+    ssize_t named = readlink("/proc/thread-self", thread_self, sizeof(thread_self) - 1);
+    thread_self[named < 0 ? 0 : named] = '\0';
+    char task_link[160];
+    snprintf(task_link, sizeof(task_link), "/proc/%s/fd/%d", thread_self, fd);
     struct stat by_task;
     CHECK(stat(task_link, &by_task) == 0 && by_task.st_ino == by_path.st_ino &&
               by_task.st_dev == by_path.st_dev,
@@ -547,6 +639,15 @@ static void check_file(const char* path, int uuid) {
       REFUSED(faccessat(located_alias, "", W_OK, AT_EMPTY_PATH), EACCES, alias_link);
       REFUSED(syscall(SYS_fchmodat2, located_alias, "", 0644, AT_EMPTY_PATH), EPERM, alias_link);
       REFUSED(syscall(SYS_utimensat, located_alias, NULL, NULL, 0), EBADF, alias_link);
+      /* The flags are checked before the descriptor, the times after it;
+       * both omitted is success before anything. */
+      struct timespec bad_times[2] = {{.tv_nsec = -5}, {.tv_nsec = 0}};
+      REFUSED(syscall(SYS_utimensat, located_alias, NULL, bad_times, 0), EBADF, alias_link);
+      REFUSED(syscall(SYS_utimensat, located_alias, NULL, bad_times, AT_SYMLINK_NOFOLLOW), EINVAL,
+              alias_link);
+      struct timespec both_omitted[2] = {{.tv_nsec = UTIME_OMIT}, {.tv_nsec = UTIME_OMIT}};
+      CHECK(syscall(SYS_utimensat, located_alias, NULL, both_omitted, 0) == 0,
+            "%s O_PATH utimensat(UTIME_OMIT): %s", alias_link, strerror(errno));
       close(located_alias);
     }
     CHECK(stat(alias_link, &by_alias) == 0 && by_alias.st_ino == by_path.st_ino &&
@@ -579,12 +680,15 @@ static void check_file(const char* path, int uuid) {
           "%s reopened as /dev/stdin", path);
   }
   if (!no_foreign_fd_links) {
-    /* Another process's descriptor link names the file, and reopens it. */
-    pid_t parent = getpid();
+    /* Another process's descriptor link names the file, and reopens it. The
+     * process is named as procfs names it (/proc/self). */
+    char parent[32];
+    ssize_t named = readlink("/proc/self", parent, sizeof(parent) - 1);
+    parent[named < 0 ? 0 : named] = '\0';
     pid_t child = fork();
     if (child == 0) {
-      char other_link[64];
-      snprintf(other_link, sizeof(other_link), "/proc/%d/fd/%d", (int)parent, fd);
+      char other_link[96];
+      snprintf(other_link, sizeof(other_link), "/proc/%s/fd/%d", parent, fd);
       /* Without a rendered descriptor of its own. */
       close(fd);
       errno = 0;
@@ -680,8 +784,102 @@ static void check_thread_chroot(void) {
   rmdir(root);
 }
 
-/* After exec: the inherited descriptor is still the file, at its position. */
-static int inherited(int fd, unsigned long long ino, long offset) {
+/* A process that shares the open file across fork moves the one position:
+ * the parent continues where its child stopped. Prints both parts. */
+static void check_fork_shares_the_position(void) {
+  int fd = open("/proc/sys/kernel/random/uuid", O_RDONLY);
+  CHECK(fd >= 0, "open for fork: %s", strerror(errno));
+  fflush(stdout);
+  pid_t child = fork();
+  if (child == 0) {
+    char head[10];
+    ssize_t length = read(fd, head, sizeof(head));
+    printf("fork child: %.*s\n", (int)(length > 0 ? length : 0), head);
+    fflush(stdout);
+    _exit(length == (ssize_t)sizeof(head) ? 0 : 1);
+  }
+  int status = 0;
+  waitpid(child, &status, 0);
+  CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0, "fork child read");
+  /* What the parent sees of the shared position before it reads or seeks:
+   * FIONREAD (the size, 0, less the position) and its fdinfo. */
+  int unread = 12345;
+  CHECK(ioctl(fd, FIONREAD, &unread) == 0 && unread == -10, "FIONREAD after the child %d",
+        unread);
+  char fdinfo_path[64];
+  snprintf(fdinfo_path, sizeof(fdinfo_path), "/proc/self/fdinfo/%d", fd);
+  FILE* fdinfo = fopen(fdinfo_path, "r");
+  long position = -1;
+  CHECK(fdinfo != NULL && fscanf(fdinfo, "pos: %ld", &position) == 1 && position == 10,
+        "fdinfo position after the child %ld", position);
+  if (fdinfo) {
+    fclose(fdinfo);
+  }
+  CHECK(lseek(fd, 0, SEEK_CUR) == 10, "position after the child's read %ld",
+        (long)lseek(fd, 0, SEEK_CUR));
+  char rest[64];
+  ssize_t length = read(fd, rest, sizeof(rest));
+  CHECK(length == 27 && is_uuid_text(rest, length), "parent read after fork %zd", length);
+  /* The rest ends with the file's newline. */
+  printf("fork parent: %.*s", (int)(length > 0 ? length : 0), rest);
+  char whole[64];
+  ssize_t whole_length = pread(fd, whole, sizeof(whole), 0);
+  printf("fork whole: %.*s", (int)(whole_length > 0 ? whole_length : 0), whole);
+  close(fd);
+}
+
+/* Print the file's contents, as one read returns them. */
+static void print_contents(const char* path) {
+  char contents[64];
+  int fd = open(path, O_RDONLY);
+  ssize_t length = fd < 0 ? -1 : read(fd, contents, sizeof(contents));
+  CHECK(length > 0 && contents[length - 1] == '\n', "%s contents", path);
+  if (fd >= 0) {
+    close(fd);
+  }
+  printf("%s: %.*s", path, (int)(length > 0 ? length : 0), contents);
+}
+
+/* After exec: the inherited descriptor and its duplicate are still the file,
+ * one open file at its position. Prints what they read, which every backend
+ * must agree on. */
+static int inherited(int fd, int duplicate, unsigned long long ino, long offset) {
+  /* Through a symbolic link to its descriptor link first, before anything
+   * looks at the descriptor; then by the descriptor link, and through an
+   * O_PATH reopen of it. */
+  char self_link[64];
+  snprintf(self_link, sizeof(self_link), "/proc/self/fd/%d", fd);
+  /* (Not on KVM, whose own /proc refuses symbolic links into /proc until it
+   * is removed, https://github.com/rrnewton/hermit/issues/4282.) */
+  if (!kvm_local_procfs) {
+    char alias[] = "/tmp/rendered-procfs-exec-XXXXXX";
+    CHECK(mkdtemp(alias) != NULL, "mkdtemp: %s", strerror(errno));
+    char alias_link[96];
+    snprintf(alias_link, sizeof(alias_link), "%s/link", alias);
+    CHECK(symlink(self_link, alias_link) == 0, "symlink: %s", strerror(errno));
+    REFUSED(access(alias_link, W_OK), EACCES, alias_link);
+    struct stat by_alias;
+    CHECK(stat(alias_link, &by_alias) == 0 && by_alias.st_ino == ino && by_alias.st_size == 0,
+          "inherited descriptor through a symbolic link %llu",
+          (unsigned long long)by_alias.st_ino);
+    unlink(alias_link);
+    rmdir(alias);
+  }
+  struct stat by_link;
+  CHECK(stat(self_link, &by_link) == 0 && by_link.st_ino == ino && by_link.st_size == 0,
+        "inherited descriptor link identity %llu", (unsigned long long)by_link.st_ino);
+  struct statx extended;
+  CHECK(statx(AT_FDCWD, self_link, 0, STATX_BASIC_STATS, &extended) == 0 &&
+            extended.stx_ino == ino,
+        "inherited descriptor link statx %llu", (unsigned long long)extended.stx_ino);
+  int located = open(self_link, O_PATH | O_CLOEXEC);
+  struct stat by_located;
+  CHECK(located >= 0 && fstat(located, &by_located) == 0 && by_located.st_ino == ino,
+        "inherited descriptor's O_PATH reopen identity %llu",
+        (unsigned long long)by_located.st_ino);
+  if (located >= 0) {
+    close(located);
+  }
   struct stat by_fd;
   CHECK(fstat(fd, &by_fd) == 0 && by_fd.st_ino == ino && S_ISREG(by_fd.st_mode) &&
             (by_fd.st_mode & 07777) == 0444,
@@ -689,18 +887,32 @@ static int inherited(int fd, unsigned long long ino, long offset) {
         by_fd.st_mode);
   CHECK(lseek(fd, 0, SEEK_CUR) == offset, "inherited position %ld",
         (long)lseek(fd, 0, SEEK_CUR));
+  /* The duplicate shares the position. */
+  char next[5];
+  CHECK(read(duplicate, next, sizeof(next)) == sizeof(next), "inherited duplicate read");
+  CHECK(lseek(fd, 0, SEEK_CUR) == offset + (long)sizeof(next), "shared position %ld",
+        (long)lseek(fd, 0, SEEK_CUR));
   char rest[64];
   ssize_t length = read(fd, rest, sizeof(rest));
-  CHECK(length == 37 - offset && is_uuid_text(rest, length), "inherited read %zd", length);
+  CHECK(length == 37 - offset - (long)sizeof(next) && is_uuid_text(next, sizeof(next)) &&
+            is_uuid_text(rest, length),
+        "inherited read %zd", length);
   REFUSED(write(fd, "1\n", 2), EBADF, "inherited descriptor");
-  printf("inherited descriptor read %zd bytes\n", length);
+  /* The rest ends with the file's newline. */
+  printf("after exec: %.*s%.*s", (int)sizeof(next), next, (int)(length > 0 ? length : 0), rest);
+  /* The whole file, read from its start, as Hermit keeps it: one snapshot
+   * (Linux formats a new UUID for each read). */
+  char whole[64];
+  ssize_t whole_length = pread(fd, whole, sizeof(whole), 0);
+  printf("exec whole: %.*s", (int)(whole_length > 0 ? whole_length : 0), whole);
   return failures == 0 ? 0 : 1;
 }
 
 int main(int argc, char** argv) {
   program = argv[0];
-  if (argc == 5 && strcmp(argv[1], "--inherited") == 0) {
-    return inherited(atoi(argv[2]), strtoull(argv[3], NULL, 10), atol(argv[4]));
+  if (argc == 7 && strcmp(argv[1], "--inherited") == 0) {
+    kvm_local_procfs = atoi(argv[6]);
+    return inherited(atoi(argv[2]), atoi(argv[3]), strtoull(argv[4], NULL, 10), atol(argv[5]));
   }
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--kvm-local-procfs") == 0) {
@@ -737,6 +949,24 @@ int main(int argc, char** argv) {
     printf("chroot checks %s\n", failures == 0 ? "passed" : "failed");
     return failures == 0 ? 0 : 1;
   }
+  /* The workload every backend runs alike, first, so that each draws the
+   * same UUIDs: each file's contents, a read shared across fork, and the
+   * descriptor that survives exec. Its output must be the same on every
+   * backend. */
+  print_contents("/proc/sys/kernel/random/uuid");
+  print_contents("/proc/sys/kernel/pty/nr");
+  check_fork_shares_the_position();
+  int fd = open("/proc/sys/kernel/random/uuid", O_RDONLY);
+  int duplicate = dup(fd);
+  struct stat by_fd;
+  char head[10];
+  if (fd < 0 || duplicate < 0 || fstat(fd, &by_fd) != 0 ||
+      read(fd, head, sizeof(head)) != sizeof(head)) {
+    fprintf(stderr, "FAIL: cannot prepare the inherited descriptor: %s\n", strerror(errno));
+    return 1;
+  }
+  printf("before exec: %.*s\n", (int)sizeof(head), head);
+
   check_file("/proc/sys/kernel/random/uuid", 1);
   check_file("/proc/sys/kernel/pty/nr", 0);
   if (!kvm_local_procfs && !no_maps_or_chroot) {
@@ -746,20 +976,17 @@ int main(int argc, char** argv) {
   if (failures != 0) {
     return 1;
   }
-  /* The descriptor survives exec, as it is, at its position. */
-  int fd = open("/proc/sys/kernel/random/uuid", O_RDONLY);
-  struct stat by_fd;
-  char head[10];
-  if (fd < 0 || fstat(fd, &by_fd) != 0 || read(fd, head, sizeof(head)) != sizeof(head)) {
-    fprintf(stderr, "FAIL: cannot prepare the inherited descriptor: %s\n", strerror(errno));
-    return 1;
-  }
+  /* The descriptor survives exec, as it is, at its position, with the
+   * snapshot it took. */
   fflush(stdout);
   char fd_text[16];
+  char duplicate_text[16];
   char ino_text[32];
   snprintf(fd_text, sizeof(fd_text), "%d", fd);
+  snprintf(duplicate_text, sizeof(duplicate_text), "%d", duplicate);
   snprintf(ino_text, sizeof(ino_text), "%llu", (unsigned long long)by_fd.st_ino);
-  char* const arguments[] = {(char*)program, "--inherited", fd_text, ino_text, "10", NULL};
+  char* const arguments[] = {(char*)program, "--inherited",   fd_text, duplicate_text, ino_text,
+                             "10",          kvm_local_procfs ? "1" : "0", NULL};
   execv(program, arguments);
   fprintf(stderr, "FAIL: exec: %s\n", strerror(errno));
   return 1;

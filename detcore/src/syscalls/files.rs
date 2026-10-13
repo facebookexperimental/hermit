@@ -1207,15 +1207,17 @@ fn rendered_entry(
 }
 
 /// Whether `statx` accepts these `flags` and `mask` (`vfs_statx`'s and the
-/// syscall's own checks): no reserved mask bit, known flags only, and not
-/// both synchronization types at once.
-fn statx_arguments_valid(flags: i32, mask: u32) -> bool {
+/// syscall's own checks): no reserved mask bit, known flags only (unless the
+/// call names no path), and not both synchronization types at once.
+fn statx_arguments_valid(flags: i32, mask: u32, names_no_path: bool) -> bool {
     let known = libc::AT_SYMLINK_NOFOLLOW
         | libc::AT_EMPTY_PATH
         | libc::AT_NO_AUTOMOUNT
         | libc::AT_STATX_SYNC_TYPE;
+    // A call on the descriptor itself (`AT_EMPTY_PATH` with an empty or
+    // NULL path) does not look at the other flags (measured on Linux 7.1).
     mask & 0x8000_0000 == 0
-        && flags & !known == 0
+        && (names_no_path || flags & !known == 0)
         && flags & libc::AT_STATX_SYNC_TYPE != libc::AT_STATX_SYNC_TYPE
 }
 
@@ -1237,6 +1239,23 @@ fn names_descriptor_link(path: &Path) -> bool {
             number(fd)
         }
         _ => false,
+    }
+}
+
+/// Whether a stat call's own arguments are ones Linux accepts before it looks
+/// up any file: `newfstatat` refuses unknown flags (`vfs_fstatat`), except on
+/// the descriptor itself (`AT_EMPTY_PATH` with an empty path), which it
+/// stats without looking at them (measured on Linux 7.1).
+fn stat_family_arguments_valid<M: MemoryAccess>(memory: &M, call: &StatFamily) -> bool {
+    match call {
+        StatFamily::Fstatat(call) => {
+            let known = libc::AT_SYMLINK_NOFOLLOW
+                | libc::AT_NO_AUTOMOUNT
+                | libc::AT_EMPTY_PATH
+                | libc::AT_STATX_SYNC_TYPE;
+            names_no_path(memory, call.path(), call.flags()) || call.flags().bits() & !known == 0
+        }
+        _ => true,
     }
 }
 
@@ -2265,11 +2284,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                     }
                     None => None,
                 };
-                if let Some(stat) = &identity
-                    && self.renders_procfs(guest)
-                    && let Some(path) =
-                        rendered_procfs::placeholder_identity(stat.st_dev, stat.st_ino)
-                {
+                let reached = match &identity {
+                    Some(stat) if self.renders_procfs(guest) => {
+                        self.recognize_placeholder(
+                            guest,
+                            &DetStat::from(*stat),
+                            StatTarget::Descriptor(fd),
+                        )
+                        .await
+                    }
+                    _ => None,
+                };
+                if let Some(path) = reached {
                     guest.thread_state().remove_fd(fd);
                     let _ = guest.inject(syscalls::Close::new().with_fd(fd)).await;
                     let target = rendered_procfs::RenderedTarget {
@@ -2976,7 +3002,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_detfd(call.fd(), |detfd| detfd.procfs_target_fd())?;
         // The kernel's fdinfo for a procfs file Detcore renders describes the
         // memfd standing in for it. Linux's names the file: Detcore's cursor,
-        // the guest's procfs mount and the file's inode.
+        // the guest's procfs mount and the file's inode. The cursor is the one
+        // processes sharing the open file share.
+        if let Some(target_fd) = target_fd {
+            self.adopt_rendered_procfs_position(guest, target_fd)
+                .await?;
+        }
         let rendered_target = match target_fd {
             Some(target_fd) => guest
                 .thread_state()
@@ -3367,13 +3398,19 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await;
         }
 
-        let (needs_procfs_snapshot, serves_procfs_snapshot) =
+        let (needs_procfs_snapshot, serves_procfs_snapshot, opened_for_path) =
             guest.thread_state().with_detfd(call.fd(), |detfd| {
                 (
                     detfd.procfs_needs_snapshot(),
                     detfd.procfs_serves_snapshot(),
+                    detfd.status_flags() & libc::O_PATH != 0,
                 )
             })?;
+        // An `O_PATH` descriptor reads nothing (EBADF), before its buffer is
+        // looked at; a rendered file's snapshot exists from its open.
+        if serves_procfs_snapshot && opened_for_path {
+            return Err(Errno::EBADF.into());
+        }
         if serves_procfs_snapshot {
             validate_procfs_destination(
                 || crate::iovecs::UserAddressLimit::from_query(guest.user_address_limit()),
@@ -3385,6 +3422,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             self.initialize_procfs_snapshot(guest, call).await?;
         }
 
+        self.adopt_rendered_procfs_position(guest, call.fd())
+            .await?;
         // Like a seq_file read, advance the shared cursor only by the bytes
         // actually copied: a read that faults before copying anything leaves
         // it where it was.
@@ -3535,13 +3574,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let offset = usize::try_from(call.offset()).map_err(|_| Errno::EINVAL)?;
-        let (needs_procfs_snapshot, serves_procfs_snapshot) =
+        let (needs_procfs_snapshot, serves_procfs_snapshot, opened_for_path) =
             guest.thread_state().with_detfd(call.fd(), |detfd| {
                 (
                     detfd.procfs_needs_snapshot(),
                     detfd.procfs_serves_snapshot(),
+                    detfd.status_flags() & libc::O_PATH != 0,
                 )
             })?;
+        // An `O_PATH` descriptor reads nothing (EBADF), before its buffer is
+        // looked at; a rendered file's snapshot exists from its open.
+        if serves_procfs_snapshot && opened_for_path {
+            return Err(Errno::EBADF.into());
+        }
         if serves_procfs_snapshot {
             validate_procfs_destination(
                 || crate::iovecs::UserAddressLimit::from_query(guest.user_address_limit()),
@@ -3608,6 +3653,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.directory_lock())?;
         let _seeking = directory_lock.lock().await;
+        self.adopt_rendered_procfs_position(guest, call.fd())
+            .await?;
         let (fd_type, status_flags, procfs_position, resource, directory_stream, host_order) =
             guest.thread_state().with_detfd(call.fd(), |detfd| {
                 (
@@ -3706,6 +3753,37 @@ impl<T: RecordOrReplay> Detcore<T> {
             guest
                 .thread_state()
                 .with_detfd(call.fd(), |detfd| detfd.set_procfs_offset(new_offset))?;
+            return Ok(result);
+        }
+
+        // A procfs file Detcore renders, a sysctl file: an `O_PATH`
+        // descriptor has no position (EBADF), before the seek's arguments are
+        // looked at; otherwise `default_llseek` on a file of size 0, whatever
+        // the snapshot holds.
+        let rendered = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.procfs_rendered_path().is_some())?;
+        if rendered {
+            if status_flags & libc::O_PATH != 0 {
+                return Err(Errno::EBADF.into());
+            }
+            let requested = i128::from(call.offset());
+            let new_offset = match call.whence() {
+                Whence::SEEK_SET | Whence::SEEK_END => requested,
+                Whence::SEEK_CUR => current as i128 + requested,
+                // At or past the end, which is 0.
+                Whence::SEEK_DATA | Whence::SEEK_HOLE if requested >= 0 => {
+                    return Err(Errno::ENXIO.into());
+                }
+                Whence::SEEK_DATA | Whence::SEEK_HOLE => requested,
+                _ => return Err(Errno::EINVAL.into()),
+            };
+            let new_offset = usize::try_from(new_offset).map_err(|_| Errno::EINVAL)?;
+            let result = i64::try_from(new_offset).map_err(|_| Errno::EOVERFLOW)?;
+            guest
+                .thread_state()
+                .with_detfd(call.fd(), |detfd| detfd.set_procfs_offset(new_offset))?;
+            self.sync_rendered_procfs_position(guest, call.fd()).await?;
             return Ok(result);
         }
 
@@ -5310,7 +5388,19 @@ impl<T: RecordOrReplay> Detcore<T> {
             // filepath from tracer may cause tracer to hang under certain fuse
             // filesystem (squashfs_ll).
             // The target is found before the call, which can overwrite its path.
+            // A procfs file Detcore renders is answered from the path as named,
+            // as Linux reads the path before it writes the result, once the
+            // call's own arguments passed.
             let target = stat_family_target(&guest.memory(), &call);
+            if !stat_family_arguments_valid(&guest.memory(), &call) {
+                if !matches!(self.rendered_procfs_stat(guest, target).await, Ok(None)) {
+                    return Err(Errno::EINVAL.into());
+                }
+            } else if let Some(stat) = self.rendered_procfs_stat(guest, target).await? {
+                let statptr = call.stat().ok_or(Errno::EFAULT)?;
+                guest.memory().write_value(statptr.0, &stat.into())?;
+                return Ok(0);
+            }
             let target = match call.stat() {
                 Some(result) => target.unless_overwritten(
                     &guest.memory(),
@@ -5319,11 +5409,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                 ),
                 None => target,
             };
-            if let Some(stat) = self.rendered_procfs_stat(guest, target).await? {
-                let statptr = call.stat().ok_or(Errno::EFAULT)?;
-                guest.memory().write_value(statptr.0, &stat.into())?;
-                return Ok(0);
-            }
             guest.inject(Syscall::from(call)).await?;
             let statptr = call.stat().ok_or(Errno::EFAULT)?;
             let inode_override = target
@@ -5331,6 +5416,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .and_then(|fd| stdio_inode_override(guest, fd));
             let mut memory = guest.memory();
             let stat: libc::stat = memory.read_value(statptr.0)?;
+            // A placeholder another process made, or an earlier image of this
+            // one, becomes known by its identity (`determinize_stat`).
+            if inode_override.is_none() {
+                let _ = self
+                    .recognize_placeholder(guest, &DetStat::from(&stat), target)
+                    .await;
+            }
             let procfs = match inode_override {
                 Some(_) => ProcfsEntry::NotProcfs,
                 None => Self::procfs_entry(guest, &DetStat::from(&stat), target).await,
@@ -5343,7 +5435,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             // A procfs file Detcore renders has no kernel object to ask.
             let target = stat_family_target(&guest.memory(), &call);
-            if let Some(stat) = self.rendered_procfs_stat(guest, target).await? {
+            if !stat_family_arguments_valid(&guest.memory(), &call) {
+                if !matches!(self.rendered_procfs_stat(guest, target).await, Ok(None)) {
+                    return Err(Errno::EINVAL.into());
+                }
+            } else if let Some(stat) = self.rendered_procfs_stat(guest, target).await? {
                 let statptr = call.stat().ok_or(Errno::EFAULT)?;
                 guest.memory().write_value(statptr.0, &stat.into())?;
                 return Ok(0);
@@ -5360,13 +5456,30 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         // Whether `statx` accepts its arguments, which it checks before it
         // looks at any file.
-        let renderable = statx_arguments_valid(call.flags().bits(), call.mask().bits());
+        let renderable = statx_arguments_valid(
+            call.flags().bits(),
+            call.mask().bits(),
+            names_no_path(&guest.memory(), call.path(), call.flags()),
+        );
         if guest.config().virtualize_metadata {
             // NB: let kernel handle error codes, it's not easy to do so without kernel
             // because there're many corner cases. i.e.: even access filepath from tracer
             // may cause tracer to hang under certain fuse filesystem (squashfs_ll).
             // The target is found before the call, which can overwrite its path.
+            // A procfs file Detcore renders is answered from the path as named,
+            // as Linux reads the path before it writes the result, once the
+            // call's own arguments passed (which `statx` checks before it
+            // looks up any file).
             let target = StatTarget::at(&guest.memory(), call.dirfd(), call.path(), call.flags());
+            if !renderable {
+                if !matches!(self.rendered_procfs_stat(guest, target).await, Ok(None)) {
+                    return Err(Errno::EINVAL.into());
+                }
+            } else if let Some(stat) = self.rendered_procfs_stat(guest, target).await? {
+                let statptr = call.statx().ok_or(Errno::EFAULT)?;
+                guest.memory().write_value(statptr.0, &stat.into())?;
+                return Ok(0);
+            }
             let target = match call.statx() {
                 Some(result) => target.unless_overwritten(
                     &guest.memory(),
@@ -5375,15 +5488,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                 ),
                 None => target,
             };
-            if let Some(stat) = self.rendered_procfs_stat(guest, target).await? {
-                // Arguments `statx` refuses before it looks at any file.
-                if !renderable {
-                    return Err(Errno::EINVAL.into());
-                }
-                let statptr = call.statx().ok_or(Errno::EFAULT)?;
-                guest.memory().write_value(statptr.0, &stat.into())?;
-                return Ok(0);
-            }
             guest.inject(call).await?;
             let statptr = call.statx().ok_or(Errno::EFAULT)?;
             let inode_override = target
@@ -5391,6 +5495,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .and_then(|fd| stdio_inode_override(guest, fd));
             let mut memory = guest.memory();
             let stat: libc::statx = memory.read_value(statptr.0)?;
+            // A placeholder another process made, or an earlier image of this
+            // one, becomes known by its identity (`determinize_stat`).
+            if inode_override.is_none() {
+                let _ = self
+                    .recognize_placeholder(guest, &DetStat::from(stat), target)
+                    .await;
+            }
             let procfs = match inode_override {
                 Some(_) => ProcfsEntry::NotProcfs,
                 None => Self::procfs_entry(guest, &DetStat::from(stat), target).await,
@@ -5403,11 +5514,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             // A procfs file Detcore renders has no kernel object to ask.
             let target = StatTarget::at(&guest.memory(), call.dirfd(), call.path(), call.flags());
-            if let Some(stat) = self.rendered_procfs_stat(guest, target).await? {
-                // Arguments `statx` refuses before it looks at any file.
-                if !renderable {
+            // Arguments `statx` refuses before it looks up any file, here a
+            // file Detcore renders.
+            if !renderable {
+                if !matches!(self.rendered_procfs_stat(guest, target).await, Ok(None)) {
                     return Err(Errno::EINVAL.into());
                 }
+            } else if let Some(stat) = self.rendered_procfs_stat(guest, target).await? {
                 let statptr = call.statx().ok_or(Errno::EFAULT)?;
                 guest.memory().write_value(statptr.0, &stat.into())?;
                 return Ok(0);

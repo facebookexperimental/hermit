@@ -3280,6 +3280,22 @@ fn dbt_unavailable(test: &str) -> bool {
     true
 }
 
+/// Whether this host has no KVM: no `/dev/kvm`. A device that exists but
+/// cannot be used fails the run that tries it. With `HERMIT_REQUIRE_KVM` set, a
+/// missing device is a failure rather than a skip, as `HERMIT_REQUIRE_DBT` is
+/// for DBT.
+fn kvm_unavailable(test: &str) -> bool {
+    if Path::new("/dev/kvm").exists() {
+        return false;
+    }
+    assert!(
+        std::env::var_os("HERMIT_REQUIRE_KVM").is_none(),
+        "HERMIT_REQUIRE_KVM is set, but this host has no /dev/kvm, so {test} cannot \
+         exercise the backend it claims to cover."
+    );
+    true
+}
+
 #[test]
 fn run_dbt_executes_integrated_backend() {
     if dbt_unavailable("run_dbt_executes_integrated_backend") {
@@ -3614,7 +3630,8 @@ fn detcore_renders_its_procfs_files_on_every_backend() {
     for backend in ["ptrace", "dbt", "kvm"] {
         if (backend == "dbt"
             && dbt_unavailable("detcore_renders_its_procfs_files_on_every_backend"))
-            || (backend == "kvm" && !Path::new("/dev/kvm").exists())
+            || (backend == "kvm"
+                && kvm_unavailable("detcore_renders_its_procfs_files_on_every_backend"))
         {
             eprintln!(
                 "detcore_renders_its_procfs_files_on_every_backend: NOT COMPARED: {backend} \
@@ -3644,8 +3661,16 @@ fn detcore_renders_its_procfs_files_on_every_backend() {
         // DBT's strict comparison cannot yet cover a read of /proc/self/maps
         // (https://github.com/rrnewton/hermit/issues/4232) or a chroot
         // (https://github.com/rrnewton/hermit/issues/4233), both older than
-        // rendered procfs files; it verifies everything else.
+        // rendered procfs files; it verifies everything else. KVM's own /proc
+        // answers every other /proc path until it is removed
+        // (https://github.com/rrnewton/hermit/issues/4282).
         match backend {
+            // DBT's virtual PIDs are not the container's procfs names
+            // (getpid() 3 where /proc/self is 4), and Detcore takes a
+            // /proc/<pid> spelling by the virtual PID, so another process's
+            // descriptor link can name the caller's own descriptor. Detcore's
+            // own per-process /proc removes this (slice B3 of
+            // https://github.com/rrnewton/hermit/issues/4266).
             "dbt" => args.extend(["--no-foreign-fd-links", "--no-maps-or-chroot"]),
             "kvm" => args.push("--kvm-local-procfs"),
             // Hermit's container may chroot, so the chroot checks must run.
@@ -3698,23 +3723,54 @@ fn detcore_renders_its_procfs_files_on_every_backend() {
     );
     let (_, first) = &identities[0];
     let lines = first.lines().collect::<Vec<_>>();
-    assert_eq!(lines.len(), 3, "{first}");
-    for (line, path) in lines
-        .iter()
-        .zip(["/proc/sys/kernel/random/uuid", "/proc/sys/kernel/pty/nr"])
-    {
-        assert!(
-            line.starts_with(&format!("{path} dev=0xf000ff ino=")),
-            "{line}"
-        );
-        let ino: u64 = line
+    // The guest's lines, in order: each file's contents, a read shared across
+    // fork and the whole file read from its start, the bytes read before exec,
+    // each file's identity, and the bytes read after exec and the whole file.
+    let line = |index: usize, prefix: &str| {
+        lines
+            .get(index)
+            .and_then(|line| line.strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("line {index} is not {prefix:?}: {first}"))
+    };
+    assert_eq!(lines.len(), 10, "{first}");
+    for (index, path) in [
+        (6, "/proc/sys/kernel/random/uuid"),
+        (7, "/proc/sys/kernel/pty/nr"),
+    ] {
+        let identity = line(index, &format!("{path} dev=0xf000ff ino="));
+        let ino: u64 = identity
             .split_whitespace()
-            .find_map(|field| field.strip_prefix("ino="))
+            .next()
             .and_then(|ino| ino.parse().ok())
-            .unwrap_or_else(|| panic!("no inode in {line}"));
-        assert_eq!(ino & 0xf000_0000, 0xf000_0000, "{line}");
+            .unwrap_or_else(|| panic!("no inode in {identity}"));
+        assert_eq!(ino & 0xf000_0000, 0xf000_0000, "{identity}");
     }
-    assert_eq!(lines[2], "inherited descriptor read 27 bytes");
+    // The contents, and reads that continue from one snapshot across fork and
+    // across exec: each pair of parts is the whole file read from its start,
+    // a UUID. (Not native: Linux formats a new UUID for each read.) Every
+    // backend must print the same bytes (below).
+    let uuid_shape = |text: &str| {
+        text.len() == 36
+            && text.char_indices().all(|(index, character)| match index {
+                8 | 13 | 18 | 23 => character == '-',
+                14 => character == '4',
+                _ => character.is_ascii_hexdigit() && !character.is_ascii_uppercase(),
+            })
+    };
+    assert!(
+        uuid_shape(line(0, "/proc/sys/kernel/random/uuid: ")),
+        "{first}"
+    );
+    assert!(
+        line(1, "/proc/sys/kernel/pty/nr: ").parse::<u32>().is_ok(),
+        "{first}"
+    );
+    let forked = format!("{}{}", line(2, "fork child: "), line(3, "fork parent: "));
+    assert!(uuid_shape(&forked), "{first}");
+    assert_eq!(forked, line(4, "fork whole: "), "{first}");
+    let execed = format!("{}{}", line(5, "before exec: "), line(8, "after exec: "));
+    assert!(uuid_shape(&execed), "{first}");
+    assert_eq!(execed, line(9, "exec whole: "), "{first}");
     for (backend, identity) in &identities {
         assert_eq!(
             identity, first,

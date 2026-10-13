@@ -66,14 +66,15 @@ use reverie::syscalls::Timespec;
 
 use super::StatTarget;
 use crate::fd::FdType;
-use crate::procfs::PLACEHOLDER_NAME_PREFIX;
 use crate::procfs::ProcfsFile;
 use crate::procfs::placeholder_link_path;
+use crate::procfs::placeholder_name;
 use crate::procfs_inode;
 use crate::record_or_replay::RecordOrReplay;
 use crate::stat::DetStat;
 use crate::stat::StatxAttributes;
 use crate::syscalls::namespace::proc_fd_target;
+use crate::syscalls::namespace::proc_fd_target_with_leading_zeros;
 use crate::tool_local::Detcore;
 use crate::util::raw_result;
 use crate::util::raw_syscall;
@@ -95,6 +96,10 @@ pub(crate) fn rendered_path_within(within: &Path) -> Option<&'static Path> {
 pub(crate) const PLACEHOLDER_SEALS: libc::c_int =
     libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
 
+/// The bytes of the buffer a placeholder's memfd name, with its NUL, is built
+/// in: the most a memfd name holds (`NAME_MAX` less `memfd:`), and its NUL.
+const PLACEHOLDER_NAME_CAPACITY: usize = 250;
+
 /// The placeholders this tool process made, by their memfd's kernel identity
 /// `(dev, ino)`, and the rendered file each stands in for. A kernel object
 /// with one of these identities is Detcore's placeholder however the guest
@@ -113,7 +118,7 @@ pub(crate) fn register_placeholder(dev: u64, ino: u64, path: &'static Path) {
 }
 
 /// Whether this tool process knows any placeholder.
-pub(super) fn placeholders_exist() -> bool {
+pub(crate) fn placeholders_exist() -> bool {
     !PLACEHOLDERS
         .lock()
         .expect("placeholder registry poisoned")
@@ -262,9 +267,9 @@ impl GuestProcfs {
         // SAFETY: the call succeeded and initialized the structure.
         let statx = unsafe { statx.assume_init() };
         if statx.stx_mask & libc::STATX_MNT_ID == 0 {
-            return Err(Error::Tool(anyhow::anyhow!(
-                "the kernel did not report the mount ID of /proc"
-            )));
+            // A kernel too old to report it: the guest's read fails with
+            // the errno a missing feature gives, not the run.
+            return Err(Errno::EOPNOTSUPP.into());
         }
         Ok(*MOUNT_ID.get_or_init(|| statx.stx_mnt_id))
     }
@@ -494,21 +499,39 @@ fn rendered_mmap_answer(
     if flags.contains(MapFlags::MAP_HUGETLB) || len == 0 || offset & 4095 != 0 {
         return Err(Errno::EINVAL);
     }
-    // A length that cannot fit the address space, or whose page count
-    // overflows the offset, fails before the file is looked at.
+    // A length that cannot fit the address space fails before the file is
+    // looked at (`PAGE_ALIGN` overflowing, then `__get_unmapped_area`).
+    // The 47-bit user address space of x86_64 without 5-level paging, which
+    // Hermit assumes: on a host with LA57, Linux would take a higher fixed
+    // address and answer ENODEV where this answers ENOMEM.
     const TASK_SIZE: usize = 0x7fff_ffff_f000;
-    let Some(pages) = len.checked_add(4095).map(|length| length / 4096) else {
+    let Some(len) = len.checked_add(4095).map(|length| length & !4095) else {
         return Err(Errno::ENOMEM);
     };
-    if pages * 4096 > TASK_SIZE {
+    if len > TASK_SIZE {
         return Err(Errno::ENOMEM);
     }
-    if (offset as u64 / 4096).checked_add(pages as u64).is_none() {
-        return Err(Errno::EOVERFLOW);
+    // A fixed address is taken as given; then it must leave room for the
+    // mapping below TASK_SIZE, and be page aligned (measured: EINVAL before
+    // ENODEV).
+    if flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE) {
+        if addr > TASK_SIZE - len {
+            return Err(Errno::ENOMEM);
+        }
+        if addr & 4095 != 0 {
+            return Err(Errno::EINVAL);
+        }
+        // `security_mmap_addr`: below `vm.mmap_min_addr` (65536, the value
+        // Hermit's machine reports) needs CAP_SYS_RAWIO, which a guest lacks.
+        if addr < 65536 {
+            return Err(Errno::EPERM);
+        }
     }
-    // A fixed address must be page aligned (measured: EINVAL before ENODEV).
-    if flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE) && addr & 4095 != 0 {
-        return Err(Errno::EINVAL);
+    // `file_mmap_ok`: the mapping must end within the largest offset a
+    // regular file can have (`MAX_LFS_FILESIZE`), the offset taken unsigned.
+    const MAX_LFS_FILESIZE: u64 = i64::MAX as u64;
+    if offset as u64 / 4096 > (MAX_LFS_FILESIZE - len as u64) >> 12 {
+        return Err(Errno::EOVERFLOW);
     }
     let map_type = flags.bits() & libc::MAP_TYPE;
     if map_type != libc::MAP_SHARED
@@ -556,7 +579,7 @@ fn xattr_change_answer(
         Err(Errno::EPERM)
     } else if name == b"system.posix_acl_access" || name == b"system.posix_acl_default" {
         // A list is parsed first; procfs then has no way to keep it.
-        if setting && !valid_posix_acl(value.unwrap_or_default()) {
+        if setting && posix_acl_parser_refuses(value.unwrap_or_default()) {
             Err(Errno::EINVAL)
         } else {
             Err(Errno::EOPNOTSUPP)
@@ -575,47 +598,38 @@ fn xattr_change_answer(
     }
 }
 
-/// Whether `value` is a POSIX access control list the kernel accepts
-/// (`posix_acl_from_xattr`, then `posix_acl_valid`): version 2, whole
-/// entries with known tags and permissions, each kind of entry in order,
-/// one owner, group and other entry, and a mask exactly when there are named
-/// users or groups. An empty list removes the list and is valid.
-fn valid_posix_acl(value: &[u8]) -> bool {
-    const ORDER: [u16; 6] = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20];
-    let Some((header, entries)) = value.split_first_chunk::<4>() else {
-        return false;
-    };
-    if u32::from_le_bytes(*header) != 2 || entries.len() % 8 != 0 {
+/// Whether the kernel's parser (`posix_acl_from_xattr`) refuses `value` as a
+/// POSIX access control list: a value too short for its header, a size that
+/// is not a whole number of entries, an unknown tag, or a named user or group
+/// the caller's user namespace does not map. A bad version, an empty value or
+/// an empty list are not refused here; procfs then has no way to keep any
+/// list (EOPNOTSUPP). The checks of a list's order, permissions and counts
+/// (`posix_acl_valid`) come after that, so a procfs file never reaches them.
+/// Measured on Linux 7.1, as a user and as root in a user namespace.
+fn posix_acl_parser_refuses(value: &[u8]) -> bool {
+    if value.is_empty() {
         return false;
     }
-    if entries.is_empty() {
+    let Some((header, entries)) = value.split_first_chunk::<4>() else {
+        return true;
+    };
+    if u32::from_le_bytes(*header) != 2 {
+        return false;
+    }
+    if entries.len() % 8 != 0 {
         return true;
     }
-    let mut last = 0;
-    let mut counts = [0_usize; 6];
-    for entry in entries.as_chunks::<8>().0 {
+    entries.as_chunks::<8>().0.iter().any(|entry| {
         let tag = u16::from_le_bytes([entry[0], entry[1]]);
-        let perm = u16::from_le_bytes([entry[2], entry[3]]);
-        let Some(rank) = ORDER.iter().position(|known| *known == tag) else {
-            return false;
-        };
-        if perm & !7 != 0 || rank < last {
-            return false;
-        }
-        // A named user or group must be one the caller's user namespace maps.
         let id = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
-        if (tag == 0x02 && !GuestProcfs::maps_id(false, id))
-            || (tag == 0x08 && !GuestProcfs::maps_id(true, id))
-        {
-            return false;
+        match tag {
+            // ACL_USER_OBJ, ACL_GROUP_OBJ, ACL_MASK, ACL_OTHER.
+            0x01 | 0x04 | 0x10 | 0x20 => false,
+            0x02 => !GuestProcfs::maps_id(false, id),
+            0x08 => !GuestProcfs::maps_id(true, id),
+            _ => true,
         }
-        last = rank;
-        counts[rank] += 1;
-    }
-    // Owner, owning group and other once each; a mask exactly when named
-    // users or groups need one.
-    let named = counts[1] + counts[3] > 0;
-    counts[0] == 1 && counts[2] == 1 && counts[5] == 1 && counts[4] == usize::from(named)
+    })
 }
 
 /// Linux's answer to reading the extended attribute `name` of a procfs file,
@@ -703,6 +717,23 @@ impl<T: RecordOrReplay> Detcore<T> {
                 via_link: false,
             }));
         }
+        // procfs names descriptors without leading zeros, so `fd/03` does not
+        // exist even where descriptor 3 is a placeholder. Detcore answers so
+        // on every backend (KVM's own procfs resolves the spelling).
+        if let Some((subject, fd)) = proc_fd_target_with_leading_zeros(path) {
+            let own = match subject {
+                Some(subject) => guest.inject(syscalls::Getpid::new()).await? == i64::from(subject),
+                None => true,
+            };
+            let rendered = guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.procfs_rendered_path().is_some())
+                .unwrap_or(false);
+            if own && rendered {
+                return Err(Errno::ENOENT.into());
+            }
+            return Ok(None);
+        }
         let Some((subject, fd)) = proc_fd_target(path) else {
             return Ok(None);
         };
@@ -767,9 +798,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .with_cmd(syscalls::FcntlCmd::F_GET_SEALS),
             )
             .await;
-        // `MFD_NOEXEC_SEAL` adds `F_SEAL_EXEC` to the seals Detcore sets.
+        // `MFD_NOEXEC_SEAL` adds `F_SEAL_EXEC` to the seals Detcore sets. An
+        // `O_PATH` descriptor cannot show its seals (EBADF); its name decides.
         let wanted = i64::from(PLACEHOLDER_SEALS);
-        Ok(named.filter(|_| seals.is_ok_and(|seals| seals & wanted == wanted)))
+        Ok(named.filter(|_| match seals {
+            Ok(seals) => seals & wanted == wanted,
+            Err(errno) => errno == Errno::EBADF,
+        }))
     }
 
     /// The rendered procfs file that descriptor `fd`'s memfd is named for,
@@ -779,7 +814,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         fd: RawFd,
     ) -> Result<Option<&'static Path>, Error> {
-        const TARGET_CAPACITY: usize = 128;
+        const TARGET_CAPACITY: usize = crate::procfs::PLACEHOLDER_LINK_CAPACITY;
         let mut stack = guest.stack().await;
         let link = stack.push(c_string::<32>(format!("/proc/self/fd/{fd}").as_bytes()));
         let target = stack.reserve::<[u8; TARGET_CAPACITY]>();
@@ -819,15 +854,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         follow: bool,
     ) -> Option<&'static Path> {
         let pointer = path?;
-        // No placeholder known to this tool process: nothing can reach one.
-        // (Checked first: it costs nothing, while the next looks at every
-        // descriptor.)
-        if !placeholders_exist() || !self.renders_procfs(guest) {
+        // No placeholder known to this tool process, which serves every
+        // guest process: nothing can reach one. (Checked first: it costs
+        // nothing, while the next looks at every descriptor.) Where the tool
+        // runs in each guest process, another process's may.
+        let in_guest = self.cfg.backend.tool_shares_guest_descriptor_table;
+        if (!placeholders_exist() && !in_guest) || !self.renders_procfs(guest) {
             return None;
         }
         // Another process's descriptor link (or `/dev/std*`) may reach a
-        // placeholder this process does not hold.
-        if !guest.thread_state().holds_a_rendered_procfs_file() {
+        // placeholder this process does not hold. Where the tool runs in each
+        // guest process, any spelling may reach one this image inherited and
+        // has not yet looked at (descriptors are discovered when used).
+        if !in_guest && !guest.thread_state().holds_a_rendered_procfs_file() {
             let text: std::path::PathBuf = pointer.read(&guest.memory()).ok()?;
             let names_a_link = super::names_descriptor_link(&text)
                 || text.starts_with("/dev/std")
@@ -845,22 +884,103 @@ impl<T: RecordOrReplay> Detcore<T> {
         let stat = Self::inject_statat(guest, dirfd, path, [Some(path), None], flags)
             .await
             .ok()?;
-        placeholder_identity(stat.st_dev, stat.st_ino)
+        let target = StatTarget::Path {
+            dirfd,
+            path: Some(path),
+            follow,
+        };
+        self.recognize_placeholder(guest, &DetStat::from(stat), target)
+            .await
+    }
+
+    /// The rendered file whose placeholder the kernel object with metadata
+    /// `stat`, reached through `target`, is. By its kernel identity, where this
+    /// tool process made or learned the placeholder. Where the tool runs in
+    /// each guest process, a placeholder another process made, or an earlier
+    /// image of this one (inherited across `fork` or `exec`), is learned here:
+    /// an empty regular file with no link, as a placeholder is, is checked by
+    /// its memfd's name and seals, and then known by its identity. A path is
+    /// opened `O_PATH` for that, which no file notices; an `O_PATH`
+    /// descriptor shows no seals, so for a path, or an `O_PATH` descriptor,
+    /// the name alone decides. (A guest could imitate the name and seals: a known
+    /// limitation, see <https://github.com/rrnewton/hermit/issues/4263>.)
+    pub(super) async fn recognize_placeholder<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        stat: &DetStat,
+        target: StatTarget<'_>,
+    ) -> Option<&'static Path> {
+        if let Some(path) = placeholder_identity(stat.dev, stat.inode) {
+            return Some(path);
+        }
+        let has = |field| stat.mask.contains(field);
+        let may_be_placeholder = (!has(StatxMask::STATX_TYPE)
+            || stat.mode & libc::S_IFMT == libc::S_IFREG)
+            && (!has(StatxMask::STATX_NLINK) || stat.nlink == 0)
+            && (!has(StatxMask::STATX_SIZE) || stat.size == 0);
+        if !self.cfg.backend.tool_shares_guest_descriptor_table
+            || self.cfg.recordreplay_modes
+            || !may_be_placeholder
+        {
+            return None;
+        }
+        let (fd, opened) = match target {
+            StatTarget::Descriptor(fd) => (fd, false),
+            StatTarget::Path {
+                dirfd,
+                path: Some(path),
+                follow,
+            } => {
+                let flags = OFlag::O_PATH
+                    | OFlag::O_CLOEXEC
+                    | if follow {
+                        OFlag::empty()
+                    } else {
+                        OFlag::O_NOFOLLOW
+                    };
+                let fd = guest
+                    .inject(
+                        syscalls::Openat::new()
+                            .with_dirfd(dirfd)
+                            .with_path(Some(path))
+                            .with_flags(flags),
+                    )
+                    .await
+                    .ok()?;
+                (fd as RawFd, true)
+            }
+            _ => return None,
+        };
+        let path = self.rendered_procfs_behind(guest, fd).await.ok().flatten();
+        if opened {
+            let _ = guest.inject(syscalls::Close::new().with_fd(fd)).await;
+        }
+        if let Some(path) = path {
+            register_placeholder(stat.dev, stat.inode, path);
+        }
+        path
     }
 
     /// The rendered file whose placeholder descriptor `fd` is, though Detcore
     /// did not record it as one (an alias the kernel opened while metadata is
-    /// not virtualized). Only while this process holds a rendered descriptor.
+    /// not virtualized). Where one tool process serves every guest, only while
+    /// this process holds a rendered descriptor; where the tool runs in each
+    /// guest process, for any descriptor (an `fstat` per call, only without
+    /// virtualized metadata).
     async fn placeholder_descriptor<G: Guest<Self>>(
         &self,
         guest: &mut G,
         fd: RawFd,
     ) -> Option<&'static Path> {
-        if !placeholders_exist() || !guest.thread_state().holds_a_rendered_procfs_file() {
+        let in_guest = self.cfg.backend.tool_shares_guest_descriptor_table;
+        if !in_guest
+            && (!placeholders_exist() || !guest.thread_state().holds_a_rendered_procfs_file())
+        {
             return None;
         }
         let stat = self.inject_fstat(guest, fd).await.ok()?;
-        placeholder_identity(stat.st_dev, stat.st_ino)
+        self.recognize_placeholder(guest, &DetStat::from(stat), StatTarget::Descriptor(fd))
+            .await
     }
 
     /// Open the rendered procfs file `target` names with the guest's `flags`.
@@ -876,6 +996,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         if let Some(errno) = open_flags_refused(flags) {
             return Err(errno.into());
         }
+        // `O_CREAT|O_EXCL` follows no final link: the link exists (EEXIST).
+        if target.via_link
+            && flags.contains(OFlag::O_CREAT | OFlag::O_EXCL)
+            && !flags.contains(OFlag::O_PATH)
+        {
+            return Err(Errno::EEXIST.into());
+        }
         if target.via_link && flags.contains(OFlag::O_NOFOLLOW) {
             return Err(Errno::ELOOP.into());
         }
@@ -888,7 +1015,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             .procfs
             .rendered_path()
             .expect("an opened rendered procfs file has a path");
-        let fd = self.inject_placeholder(guest, path, reopen).await?;
+        // The snapshot this open takes, which its placeholder's name carries,
+        // so that every backend has it after `exec`.
+        let procfs = target.procfs.into_rendered();
+        let snapshot = self.render_snapshot(guest, &procfs);
+        let fd = self
+            .inject_placeholder(guest, path, &snapshot, reopen)
+            .await?;
         // The status flags Linux keeps, which include `O_NOFOLLOW`: the
         // placeholder cannot be reopened with it through its link.
         guest.thread_state().add_fd(
@@ -897,12 +1030,38 @@ impl<T: RecordOrReplay> Detcore<T> {
             FdType::Regular,
             Some(rendered_stat(path, epoch_time(guest.config().epoch), owner)),
         )?;
-        let procfs = target.procfs.into_rendered();
+        let procfs = procfs.with_rendered_snapshot(snapshot);
         guest.thread_state().with_detfd(fd, |detfd| {
             detfd.set_path(path);
             detfd.set_procfs(procfs.clone());
         })?;
         Ok(fd as i64)
+    }
+
+    /// The snapshot of the rendered file `procfs` an open takes, from
+    /// Detcore's state, as its first read used to: a UUID from the thread's
+    /// generator, or Detcore's count of open ptys.
+    fn render_snapshot<G: Guest<Self>>(&self, guest: &mut G, procfs: &ProcfsFile) -> Vec<u8> {
+        use rand::RngExt as _;
+        let mut file = procfs.clone();
+        let random_uuid = file
+            .needs_random_uuid()
+            .then(|| guest.thread_state_mut().thread_prng().random::<[u8; 16]>());
+        let virtual_pty_count = guest
+            .thread_state()
+            .count_open_files_at_paths(&[Path::new("/dev/ptmx"), Path::new("/dev/pts/ptmx")]);
+        let template = file.rendering_template().to_vec();
+        file.initialize(
+            template,
+            crate::procfs::ProcfsSnapshotContext {
+                random_uuid,
+                virtual_pty_count,
+                ..Default::default()
+            },
+        );
+        file.rendered_snapshot()
+            .expect("a rendered file has its snapshot once initialized")
+            .to_vec()
     }
 
     /// Inject a placeholder for `path` open with `flags`, at the lowest free
@@ -911,11 +1070,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         &self,
         guest: &mut G,
         path: &'static Path,
+        snapshot: &[u8],
         flags: OFlag,
     ) -> Result<RawFd, Error> {
-        let name = format!("{PLACEHOLDER_NAME_PREFIX}{}", path.display());
+        let name = placeholder_name(path, snapshot);
         let mut stack = guest.stack().await;
-        let name = stack.push(c_string::<64>(name.as_bytes()));
+        let name = stack.push(c_string::<PLACEHOLDER_NAME_CAPACITY>(name.as_bytes()));
         let link = stack.reserve::<[u8; 32]>();
         let stack_guard = stack.commit()?;
         let name = name.as_raw();
@@ -1014,9 +1174,47 @@ impl<T: RecordOrReplay> Detcore<T> {
         })
     }
 
+    /// Where the tool runs in each guest process, take a placeholder's cursor
+    /// from its kernel position, before a read or seek uses it. Processes
+    /// that share the open file across `fork` share only that position, which
+    /// Detcore keeps at each one's cursor after every read and seek
+    /// (`sync_rendered_procfs_position`). Where one tool process serves every
+    /// guest, the cursor itself is shared.
+    pub(super) async fn adopt_rendered_procfs_position<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Result<(), Error> {
+        if !self.cfg.backend.tool_shares_guest_descriptor_table {
+            return Ok(());
+        }
+        let rendered = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.procfs_rendered_path().is_some())
+            .unwrap_or(false);
+        if !rendered {
+            return Ok(());
+        }
+        // An `O_PATH` descriptor has no position (EBADF): nothing to adopt.
+        if let Ok(offset) = guest
+            .inject(
+                syscalls::Lseek::new()
+                    .with_fd(fd)
+                    .with_offset(0)
+                    .with_whence(syscalls::Whence::SEEK_CUR),
+            )
+            .await
+        {
+            guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.set_procfs_offset(offset as usize))?;
+        }
+        Ok(())
+    }
+
     /// Keep a placeholder's kernel position at Detcore's cursor, which a
-    /// backend that rediscovers descriptors after `exec` reads back, and which
-    /// `FIONREAD` reports from.
+    /// backend that rediscovers descriptors after `exec`, or another process
+    /// sharing the open file, reads back (`adopt_rendered_procfs_position`).
     pub(super) async fn sync_rendered_procfs_position<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1151,7 +1349,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         let (Some(address), Ok(length)) = (buffer, usize::try_from(result)) else {
             return Ok(result);
         };
-        if self.cfg.recordreplay_modes || length == 0 {
+        // Nothing to rewrite where no placeholder can be reached: one tool
+        // process serves every guest and knows none.
+        if self.cfg.recordreplay_modes
+            || length == 0
+            || (!placeholders_exist() && !self.cfg.backend.tool_shares_guest_descriptor_table)
+        {
             return Ok(result);
         }
         let mut bytes = vec![0; length.min(buffer_len)];
@@ -1311,9 +1514,34 @@ impl<T: RecordOrReplay> Detcore<T> {
                         _ => Err(Errno::EFAULT),
                     }
                 }
-                // FIONCLEX, FIOCLEX, FIOASYNC, FIONBIO, FIONREAD and FIOQSIZE,
-                // which the kernel answers alike for both files.
-                0x5450..=0x5452 | 0x5421 | 0x541b | 0x5460 => return None,
+                // FIONCLEX, FIOCLEX, FIOASYNC and FIONBIO, which the kernel
+                // answers alike for both files.
+                0x5450..=0x5452 | 0x5421 => return None,
+                // FIONREAD: the file's size, 0, less the position, as an int.
+                // Where the tool runs in each guest process, the kernel answers
+                // from the empty placeholder's position, which Detcore keeps
+                // current and which processes sharing the open file share.
+                // Elsewhere Detcore answers from its own cursor, shared there
+                // too (KVM's executor has no answer for a memfd).
+                0x541b if self.cfg.backend.tool_shares_guest_descriptor_table => return None,
+                0x541b => match AddrMut::<libc::c_int>::from_raw(args.arg2) {
+                    Some(address) => {
+                        let position = guest
+                            .thread_state()
+                            .with_detfd(args.arg0 as RawFd, |detfd| {
+                                detfd.procfs_position().map_or(0, |(offset, _)| offset)
+                            })
+                            .unwrap_or(0);
+                        let unread = 0_i64.wrapping_sub(position as i64) as libc::c_int;
+                        guest.memory().write_value(address, &unread).map(|()| 0)
+                    }
+                    None => Err(Errno::EFAULT),
+                },
+                // FIOQSIZE: the bytes the file uses, none for procfs.
+                0x5460 => match AddrMut::<libc::loff_t>::from_raw(args.arg2) {
+                    Some(address) => guest.memory().write_value(address, &0).map(|()| 0),
+                    None => Err(Errno::EFAULT),
+                },
                 // FIGETBSZ: procfs's block size.
                 2 => match AddrMut::<libc::c_int>::from_raw(args.arg2) {
                     Some(address) => guest
@@ -1475,6 +1703,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             [args.arg0, args.arg1, args.arg2, args.arg3, args.arg4].map(|arg| arg as u64);
         let at = libc::AT_FDCWD as u64;
         // (dirfd, path, flags, request, attribute name pointer)
+        // For `futimens` on an `O_PATH` descriptor: whether the call is done
+        // before the descriptor is looked up (both times omitted), or refused
+        // first (unknown flags).
+        let mut decided_before_descriptor = false;
         let (dirfd, path, flags, request, name) = match sysno {
             Sysno::access => (at, a0, 0, PathRequest::Access { mode: a1, flags: 0 }, 0),
             Sysno::faccessat => (a0, a1, 0, PathRequest::Access { mode: a2, flags: 0 }, 0),
@@ -1533,11 +1765,36 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let Ok(times) = read_pair::<libc::timespec, _>(&guest.memory(), a2) else {
                     return Ok(None);
                 };
-                // `do_utimes` refuses unknown flags, out-of-range times, and
-                // any flag with a NULL path, before it looks at the file.
-                let valid = a3 & !((libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH) as u64) == 0
-                    && times.is_none_or(|times| times.iter().all(valid_utime_nsec))
-                    && (a1 != 0 || a3 == 0);
+                // Both times omitted is success before anything is looked at;
+                // unknown flags, or any flag with a NULL path, are refused
+                // before the file is looked up; out-of-range times after it
+                // (measured on Linux 7.1). Detcore answers the first two for
+                // every file where it renders procfs files: Linux's answer
+                // does not depend on the file.
+                let omitted = times
+                    .is_some_and(|times| times.iter().all(|time| time.tv_nsec == libc::UTIME_OMIT));
+                // A NULL path with flags is refused only for a descriptor:
+                // with AT_FDCWD, Linux looks the NULL path up (EFAULT).
+                let flags_valid = a3 & !((libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH) as u64)
+                    == 0
+                    && (a1 != 0 || a3 == 0 || a0 as i32 == libc::AT_FDCWD);
+                if self.renders_procfs(guest) {
+                    if omitted {
+                        return Ok(Some(0));
+                    }
+                    if !flags_valid {
+                        return Err(Errno::EINVAL.into());
+                    }
+                    // A NULL path with AT_FDCWD is looked up, and faults (KVM's
+                    // executor answers otherwise).
+                    if a1 == 0 && a0 as i32 == libc::AT_FDCWD {
+                        return Err(Errno::EFAULT.into());
+                    }
+                }
+                decided_before_descriptor = omitted || !flags_valid;
+                let valid = omitted
+                    || (flags_valid
+                        && times.is_none_or(|times| times.iter().all(valid_utime_nsec)));
                 (
                     a0,
                     a1,
@@ -1566,13 +1823,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 legacy_times_request(&guest.memory(), a1, true),
                 0,
             ),
-            Sysno::futimesat => (
-                a0,
-                a1,
-                0,
-                legacy_times_request(&guest.memory(), a2, true),
-                0,
-            ),
+            // `futimesat` is ENOSYS under Detcore for every file.
             Sysno::chdir => (at, a0, 0, PathRequest::Chdir, 0),
             _ => return Ok(None),
         };
@@ -1603,9 +1854,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .ok()
                 .flatten();
             // `futimens` needs a descriptor opened for I/O: an `O_PATH` one
-            // is EBADF.
+            // is EBADF, after the flags are checked and before the times are
+            // (measured on Linux 7.1).
             if let Some((_, true)) = rendered
                 && path_text.is_none()
+                && !decided_before_descriptor
             {
                 return Err(Errno::EBADF.into());
             }
@@ -1760,6 +2013,37 @@ fn read_pair<U: Copy, M: MemoryAccess>(memory: &M, address: u64) -> Result<Optio
 mod tests {
     use super::*;
 
+    /// The snapshot a placeholder carries across `exec` is the one its open
+    /// took, and a later image continues from it.
+    #[test]
+    fn a_rendered_snapshot_survives_exec() {
+        let open = || {
+            ProcfsFile::from_path(Path::new("/proc/sys/kernel/random/uuid"))
+                .unwrap()
+                .into_rendered()
+        };
+        let mut before = open();
+        assert_eq!(before.rendered_snapshot(), None);
+        let template = before.rendering_template().to_vec();
+        before.initialize(
+            template,
+            crate::procfs::ProcfsSnapshotContext {
+                random_uuid: Some([0x5a; 16]),
+                ..Default::default()
+            },
+        );
+        let snapshot = before.rendered_snapshot().unwrap().to_vec();
+        assert_eq!(snapshot.len(), 37);
+        let head = before.take(10).unwrap();
+        // A later image rediscovers the placeholder at the same position.
+        let mut after = open().with_rendered_snapshot(snapshot.clone());
+        after.set_offset(10);
+        assert!(!after.needs_snapshot());
+        let mut joined = head;
+        joined.extend(after.take(64).unwrap());
+        assert_eq!(joined, snapshot);
+    }
+
     #[test]
     fn rendered_stat_is_a_read_only_regular_procfs_file() {
         let epoch = Timespec {
@@ -1784,16 +2068,29 @@ mod tests {
     #[test]
     fn placeholder_links_name_only_rendered_files() {
         assert_eq!(
-            placeholder_link_path(b"/memfd:hermit-procfs:/proc/sys/kernel/random/uuid (deleted)"),
+            placeholder_link_path(
+                b"/memfd:hermit-procfs:/proc/sys/kernel/random/uuid@30 (deleted)"
+            ),
             Some(Path::new("/proc/sys/kernel/random/uuid"))
         );
         assert_eq!(
-            placeholder_link_path(b"/memfd:hermit-procfs:/proc/sys/kernel/pty/nr (deleted)"),
-            Some(Path::new("/proc/sys/kernel/pty/nr"))
+            crate::procfs::placeholder_link(
+                b"/memfd:hermit-procfs:/proc/sys/kernel/pty/nr@330a (deleted)"
+            ),
+            Some((Path::new("/proc/sys/kernel/pty/nr"), b"3\n".to_vec()))
+        );
+        // The name a placeholder gets is the one its link is read back from.
+        let name = placeholder_name(Path::new("/proc/sys/kernel/pty/nr"), b"12\n");
+        assert_eq!(
+            crate::procfs::placeholder_link(format!("/memfd:{name} (deleted)").as_bytes()),
+            Some((Path::new("/proc/sys/kernel/pty/nr"), b"12\n".to_vec()))
         );
         for link in [
-            b"/memfd:hermit-procfs:/proc/uptime (deleted)".as_slice(),
-            b"/memfd:hermit-procfs:/proc/sys/kernel/random/uuid",
+            b"/memfd:hermit-procfs:/proc/uptime@30 (deleted)".as_slice(),
+            b"/memfd:hermit-procfs:/proc/sys/kernel/random/uuid (deleted)",
+            b"/memfd:hermit-procfs:/proc/sys/kernel/random/uuid@3 (deleted)",
+            b"/memfd:hermit-procfs:/proc/sys/kernel/random/uuid@zz (deleted)",
+            b"/memfd:hermit-procfs:/proc/sys/kernel/random/uuid@30",
             b"/memfd: (deleted)",
             b"/proc/sys/kernel/random/uuid",
         ] {
@@ -1861,6 +2158,36 @@ mod tests {
             rendered_mmap_answer(0, 4096, 0, exec, private, false),
             Err(Errno::ENODEV)
         );
+        // `file_mmap_ok`: an offset past the largest file offset, taken
+        // unsigned.
+        assert_eq!(answer(4096, -4096, read, private), Err(Errno::EOVERFLOW));
+        assert_eq!(
+            answer(4096, 0x7fff_ffff_ffff_f000, read, private),
+            Err(Errno::EOVERFLOW)
+        );
+        assert_eq!(
+            answer(4096, 0x7fff_ffff_ffff_e000, read, private),
+            Err(Errno::ENODEV)
+        );
+        // A fixed mapping that would end above TASK_SIZE.
+        let fixed = MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED;
+        assert_eq!(
+            rendered_mmap_answer(0x7fff_ffff_f000, 4096, 0, read, fixed, false),
+            Err(Errno::ENOMEM)
+        );
+        assert_eq!(
+            rendered_mmap_answer(0x7fff_ffff_e000, 4096, 0, read, fixed, false),
+            Err(Errno::ENODEV)
+        );
+        assert_eq!(
+            rendered_mmap_answer(0x1001, 4096, 0, read, fixed, false),
+            Err(Errno::EINVAL)
+        );
+        // Below vm.mmap_min_addr, after the alignment check.
+        assert_eq!(
+            rendered_mmap_answer(0x1000, 4096, 0, read, fixed, false),
+            Err(Errno::EPERM)
+        );
     }
 
     #[test]
@@ -1897,15 +2224,34 @@ mod tests {
             Err(Errno::EOPNOTSUPP)
         );
         assert_eq!(change(acl, None, None), Err(Errno::EOPNOTSUPP));
-        assert!(!valid_posix_acl(&good[..12]), "no group or other entry");
-        // A named user entry needs a mask and an ID the namespace maps; -1
-        // never is one.
+        // Measured: only the parser refuses (EINVAL); a list it accepts,
+        // valid or not, is EOPNOTSUPP on procfs.
+        assert_eq!(change(acl, Some(0), Some(&[])), Err(Errno::EOPNOTSUPP));
+        assert_eq!(
+            change(acl, Some(12), Some(&good[..12])),
+            Err(Errno::EOPNOTSUPP)
+        );
+        assert_eq!(change(acl, Some(6), Some(&good[..6])), Err(Errno::EINVAL));
+        assert_eq!(change(acl, Some(2), Some(&good[..2])), Err(Errno::EINVAL));
+        let mut bad_version = good;
+        bad_version[0] = 7;
+        assert_eq!(
+            change(acl, Some(28), Some(&bad_version)),
+            Err(Errno::EOPNOTSUPP)
+        );
+        let mut bad_permissions = good;
+        bad_permissions[6] = 0x40;
+        assert_eq!(
+            change(acl, Some(28), Some(&bad_permissions)),
+            Err(Errno::EOPNOTSUPP)
+        );
+        // A named user must be one the namespace maps; -1 never is one.
         let named = [
             2, 0, 0, 0, 1, 0, 6, 0, 255, 255, 255, 255, 2, 0, 4, 0, 255, 255, 255, 255, 4, 0, 4, 0,
             255, 255, 255, 255, 0x10, 0, 4, 0, 255, 255, 255, 255, 0x20, 0, 4, 0, 255, 255, 255,
             255,
         ];
-        assert!(!valid_posix_acl(&named), "user ID -1");
+        assert!(posix_acl_parser_refuses(&named), "user ID -1");
         assert_eq!(xattr_get_answer(b""), Err(Errno::ERANGE));
         assert_eq!(xattr_get_answer(b"trusted.x"), Err(Errno::ENODATA));
         assert_eq!(xattr_get_answer(b"user.x"), Err(Errno::EOPNOTSUPP));

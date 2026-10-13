@@ -137,12 +137,37 @@ pub(crate) fn saved_link_bytes<G: Guest<Detcore<T>>, T: RecordOrReplay>(
     buffer_len: usize,
 ) -> Option<Vec<u8>> {
     let buffer = buffer?;
+    // Also what a pipe or socket link's canonicalization restores, so it is
+    // read for every link, not only a placeholder's.
     let mut saved = vec![0; buffer_len.min(ANONYMOUS_PROC_FD_TARGET_CAPACITY)];
-    guest
+    if guest
         .memory()
         .read_exact(buffer.cast::<u8>(), &mut saved)
-        .ok()?;
-    Some(saved)
+        .is_ok()
+    {
+        return Some(saved);
+    }
+    // The readable prefix, a page at a time: a buffer may run into an
+    // unmapped page past the link the kernel writes.
+    const PAGE: usize = 4096;
+    let start = buffer.as_raw();
+    let mut read = 0;
+    while read < saved.len() {
+        let end = (((start + read) / PAGE + 1) * PAGE - start).min(saved.len());
+        // SAFETY: `read < saved.len() <= buffer_len`, so the address stays
+        // inside the guest's buffer; nothing is dereferenced here.
+        let chunk = unsafe { buffer.cast::<u8>().add(read) };
+        if guest
+            .memory()
+            .read_exact(chunk, &mut saved[read..end])
+            .is_err()
+        {
+            break;
+        }
+        read = end;
+    }
+    saved.truncate(read);
+    (read > 0).then_some(saved)
 }
 
 /// Put back the caller's bytes after a rewritten link of `written` bytes,
@@ -194,6 +219,30 @@ pub(crate) fn proc_fd_target(path: &Path) -> Option<(Option<u32>, i32)> {
         }
         _ => None,
     }
+}
+
+/// The optional numeric proc subject and descriptor number of a descriptor
+/// link spelled with leading zeros (`/proc/self/fd/03`, `/dev/fd/03`), which
+/// procfs does not have.
+pub(crate) fn proc_fd_target_with_leading_zeros(path: &Path) -> Option<(Option<u32>, i32)> {
+    let parts = normalized_absolute_parts(path)?;
+    let (subject, fd) = match parts.as_slice() {
+        [dev, fd_dir, fd] if *dev == "dev" && *fd_dir == "fd" => (None, fd),
+        [proc, subject, fd_dir, fd] if *proc == "proc" && *fd_dir == "fd" => (Some(subject), fd),
+        _ => return None,
+    };
+    let fd = fd.to_str()?;
+    if fd.len() < 2 || !fd.starts_with('0') || !fd.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let subject = match subject {
+        None => None,
+        Some(subject) => match subject.to_str()? {
+            "self" | "thread-self" => None,
+            _ => Some(decimal_u32(subject)?),
+        },
+    };
+    Some((subject, fd.parse().ok()?))
 }
 
 // TODO-HUMAN-REVIEW(PR-1079): Review numeric virtual-self proc-fd path rewriting.
@@ -321,7 +370,7 @@ fn anonymous_object_device(
 // Long enough for `socket:[` + every decimal u64 inode + `]`.
 /// Room for a whole pipe or socket link, and for the link of a placeholder
 /// for a procfs file Detcore renders (`crate::procfs::placeholder_link_path`).
-const ANONYMOUS_PROC_FD_TARGET_CAPACITY: usize = 128;
+const ANONYMOUS_PROC_FD_TARGET_CAPACITY: usize = crate::procfs::PLACEHOLDER_LINK_CAPACITY;
 
 fn needs_anonymous_proc_fd_scratch(buffer_present: bool, buffer_len: usize) -> bool {
     buffer_present && buffer_len != 0 && buffer_len < ANONYMOUS_PROC_FD_TARGET_CAPACITY
@@ -720,15 +769,28 @@ impl<T: RecordOrReplay> Detcore<T> {
     {
         let saved = saved_link_bytes(guest, buffer, buffer_len);
         let result = self.record_or_replay(guest, syscall).await?;
-        // A task's spelling of a descriptor link (`task/<tid>/fd/N`) that
-        // filled a buffer too short for a placeholder's link: the whole link
-        // shows whether it was one.
+        // A link that filled a buffer too short for a placeholder's link,
+        // spelled as a task's descriptor link (`task/<tid>/fd/N`) or starting
+        // as a placeholder's link does: the whole link shows whether it was
+        // one.
+        let filled_like_a_placeholder = match (buffer, usize::try_from(result)) {
+            (Some(address), Ok(length)) if length == buffer_len => {
+                let prefix = b"/memfd:hermit-procfs:";
+                let mut head = vec![0; length.min(prefix.len())];
+                guest
+                    .memory()
+                    .read_exact(address.cast::<u8>(), &mut head)
+                    .is_ok()
+                    && prefix.starts_with(&head)
+            }
+            _ => false,
+        };
         let result = match usize::try_from(result) {
             Ok(length)
                 if length == buffer_len
                     && needs_anonymous_proc_fd_scratch(buffer.is_some(), buffer_len)
                     && !self.cfg.recordreplay_modes
-                    && names_task_descriptor_link(&path) =>
+                    && (names_task_descriptor_link(&path) || filled_like_a_placeholder) =>
             {
                 match self.placeholder_behind_link(guest, &path).await? {
                     Some(rendered) if self.placeholder_link_confirmed(guest, link).await => {
@@ -1012,15 +1074,29 @@ mod tests {
         assert!(!needs_anonymous_proc_fd_scratch(false, 1));
         assert!(!needs_anonymous_proc_fd_scratch(true, 0));
         assert!(needs_anonymous_proc_fd_scratch(true, 1));
-        assert!(needs_anonymous_proc_fd_scratch(true, 127));
-        assert!(!needs_anonymous_proc_fd_scratch(true, 128));
+        assert!(needs_anonymous_proc_fd_scratch(
+            true,
+            ANONYMOUS_PROC_FD_TARGET_CAPACITY - 1
+        ));
+        assert!(!needs_anonymous_proc_fd_scratch(
+            true,
+            ANONYMOUS_PROC_FD_TARGET_CAPACITY
+        ));
 
         let maximum = format!("socket:[{}]", u64::MAX);
         assert!(maximum.len() < ANONYMOUS_PROC_FD_TARGET_CAPACITY);
-        // The longest link of a placeholder for a procfs file Detcore renders.
-        let placeholder = "/memfd:hermit-procfs:/proc/sys/kernel/random/uuid (deleted)";
+        // The longest link a placeholder can have: the longest memfd name
+        // (249 bytes) in `/memfd:<name> (deleted)`.
+        let longest = format!("/memfd:{} (deleted)", "x".repeat(249));
+        assert!(longest.len() < ANONYMOUS_PROC_FD_TARGET_CAPACITY);
+        // A placeholder for a UUID, the longest snapshot of the two files.
+        let name = crate::procfs::placeholder_name(
+            std::path::Path::new("/proc/sys/kernel/random/uuid"),
+            b"00000000-0000-4000-8000-000000000000\n",
+        );
+        assert!(name.len() <= 249, "{name}");
+        let placeholder = format!("/memfd:{name} (deleted)");
         assert!(crate::procfs::placeholder_link_path(placeholder.as_bytes()).is_some());
-        assert!(placeholder.len() < ANONYMOUS_PROC_FD_TARGET_CAPACITY);
         assert_eq!(
             anonymous_proc_fd_identity(maximum.as_bytes()),
             Some(AnonymousProcFdIdentity {

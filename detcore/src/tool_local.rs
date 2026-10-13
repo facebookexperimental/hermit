@@ -819,16 +819,28 @@ impl FileMetadata {
         self.with_detfd(fd, |detfd| detfd.mark_flock_mode_unobserved())?;
         // A placeholder for a procfs file Detcore renders, which the backend
         // rediscovers after `exec`: the file again, at the position the old
-        // image left (`syscalls::files::rendered_procfs`).
-        if let Some(path) =
-            crate::syscalls::rendered_procfs::placeholder_identity(raw_stat.st_dev, raw_stat.st_ino)
-                .or_else(|| placeholder_behind(fd))
+        // image left and with the snapshot it took, as a backend that keeps
+        // Detcore's state across `exec` has them (`syscalls::files::rendered_procfs`).
+        // The snapshot is the one its name carries (`procfs::placeholder_name`).
+        // Only an empty regular file with no link can be one.
+        let may_be_placeholder = raw_stat.st_mode & libc::S_IFMT == libc::S_IFREG
+            && raw_stat.st_nlink == 0
+            && raw_stat.st_size == 0;
+        if let Some((path, snapshot)) = may_be_placeholder.then(|| placeholder_behind(fd)).flatten()
         {
             crate::syscalls::rendered_procfs::register_placeholder(
                 raw_stat.st_dev,
                 raw_stat.st_ino,
                 path,
             );
+            // Every open makes its own placeholder, so another descriptor on
+            // the same one is the same open file: one cursor, as before.
+            if let Some(alias) = self.rendered_alias(fd, raw_stat.st_dev, raw_stat.st_ino) {
+                let mut alias = alias.with_fd(fd);
+                alias.set_cloexec(fd_flags & libc::FD_CLOEXEC != 0);
+                self.add_detfd(alias);
+                return Ok(());
+            }
             // SAFETY: lseek only reads the descriptor's position.
             let offset = unsafe {
                 crate::util::raw_syscall(
@@ -840,6 +852,11 @@ impl FileMetadata {
             let procfs = crate::procfs::ProcfsFile::from_path(path)
                 .expect("a rendered path is a procfs file")
                 .into_rendered();
+            let procfs = if snapshot.is_empty() {
+                procfs
+            } else {
+                procfs.with_rendered_snapshot(snapshot)
+            };
             self.with_detfd(fd, |detfd| {
                 detfd.set_path(path);
                 detfd.set_procfs(procfs.clone());
@@ -853,6 +870,19 @@ impl FileMetadata {
             self.with_detfd(fd, |detfd| detfd.set_physically_nonblocking())?;
         }
         Ok(())
+    }
+
+    /// Another descriptor of this process open on the placeholder `(dev,
+    /// ino)`, which `fd` is too.
+    fn rendered_alias(&self, fd: RawFd, dev: u64, ino: u64) -> Option<DetFd> {
+        self.file_handles
+            .iter()
+            .filter(|(other, detfd)| **other != fd && detfd.procfs_rendered_path().is_some())
+            .find(|(other, _)| {
+                stat::fstat(unsafe { BorrowedFd::borrow_raw(**other) })
+                    .is_ok_and(|stat| stat.st_dev == dev && stat.st_ino == ino)
+            })
+            .map(|(_, detfd)| detfd.clone())
     }
 
     /// get detfd from rawfd, rawfd must be added or dup-ed first.
@@ -4984,7 +5014,7 @@ fn thread_rng_from_parent_entropy_labeled(
 /// <https://github.com/rrnewton/hermit/issues/4263>). Read with raw
 /// system calls (under in-guest backends the tool shares the guest's C
 /// library).
-fn placeholder_behind(fd: RawFd) -> Option<&'static std::path::Path> {
+fn placeholder_behind(fd: RawFd) -> Option<(&'static std::path::Path, Vec<u8>)> {
     // SAFETY: F_GET_SEALS only reads the descriptor's seals.
     let seals = unsafe {
         crate::util::raw_syscall(
@@ -4992,12 +5022,13 @@ fn placeholder_behind(fd: RawFd) -> Option<&'static std::path::Path> {
             [fd as u64, libc::F_GET_SEALS as u64, 0, 0, 0, 0],
         )
     };
+    // An `O_PATH` descriptor cannot show its seals (EBADF); its name decides.
     let wanted = i64::from(crate::syscalls::rendered_procfs::PLACEHOLDER_SEALS);
-    if seals < 0 || seals & wanted != wanted {
+    if seals != -i64::from(libc::EBADF) && (seals < 0 || seals & wanted != wanted) {
         return None;
     }
     let link = std::ffi::CString::new(format!("/proc/self/fd/{fd}")).ok()?;
-    let mut target = [0_u8; 128];
+    let mut target = [0_u8; crate::procfs::PLACEHOLDER_LINK_CAPACITY];
     // SAFETY: the path is NUL-terminated and `target` is writable.
     let length = unsafe {
         crate::util::raw_syscall(
@@ -5013,5 +5044,5 @@ fn placeholder_behind(fd: RawFd) -> Option<&'static std::path::Path> {
         )
     };
     let length = usize::try_from(length).ok()?.min(target.len());
-    crate::procfs::placeholder_link_path(&target[..length])
+    crate::procfs::placeholder_link(&target[..length])
 }

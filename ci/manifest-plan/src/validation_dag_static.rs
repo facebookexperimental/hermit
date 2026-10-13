@@ -2039,7 +2039,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two ChildExit target tests of the 4237 fix-forward
     // (targeted_chaos_does_not_replace_the_kernels_child_exit_target,
     // a_drain_that_arms_a_sleeper_ends_the_pass_before_a_child_exit_timer): 1522.
-    ("test.detcore_unit", 1522),
+    // And a_rendered_snapshot_survives_exec
+    // (https://github.com/rrnewton/hermit/issues/4213 fix-forward): 1523.
+    ("test.detcore_unit", 1523),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3289,7 +3291,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the SIGCHLD sibling-before-stopped-creator test: 1518.
     // And the two host-signal-state refusal tests: 1520.
     // And the two ChildExit target tests of the 4237 fix-forward: 1522.
-    ("test.detcore_unit_on_host", 1522),
+    // And the rendered-snapshot-across-exec test: 1523.
+    ("test.detcore_unit_on_host", 1523),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

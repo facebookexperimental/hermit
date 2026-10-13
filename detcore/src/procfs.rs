@@ -354,14 +354,48 @@ pub(crate) const PLACEHOLDER_NAME_PREFIX: &str = "hermit-procfs:";
 /// The procfs path a descriptor link names, if it names a placeholder for a
 /// procfs file Detcore renders.
 pub(crate) fn placeholder_link_path(link: &[u8]) -> Option<&'static Path> {
-    let path = link
+    placeholder_link(link).map(|(path, _)| path)
+}
+
+/// The most bytes a placeholder's link (`/memfd:<name> (deleted)`) takes.
+pub(crate) const PLACEHOLDER_LINK_CAPACITY: usize = 288;
+
+/// The memfd name of a placeholder for the rendered file `path` holding the
+/// snapshot `snapshot`: `PLACEHOLDER_NAME_PREFIX`, the path, `@`, and the
+/// snapshot in hexadecimal. The name carries the snapshot across `exec` to a
+/// backend that rediscovers its descriptors; the file itself stays empty.
+pub(crate) fn placeholder_name(path: &Path, snapshot: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut name = format!("{PLACEHOLDER_NAME_PREFIX}{}@", path.display());
+    for byte in snapshot {
+        let _ = write!(name, "{byte:02x}");
+    }
+    name
+}
+
+/// The rendered file, and the snapshot, that a placeholder's link names.
+pub(crate) fn placeholder_link(link: &[u8]) -> Option<(&'static Path, Vec<u8>)> {
+    let name = link
         .strip_prefix(b"/memfd:")?
         .strip_prefix(PLACEHOLDER_NAME_PREFIX.as_bytes())?
         .strip_suffix(b" (deleted)")?;
-    ProcfsFile::from_path(Path::new(
+    let at = name.iter().rposition(|byte| *byte == b'@')?;
+    let (path, hex) = (&name[..at], &name[at + 1..]);
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    if !hex.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    let snapshot = hex
+        .chunks(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
+        .collect::<Option<Vec<u8>>>()?;
+    let path = ProcfsFile::from_path(Path::new(
         <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(path),
     ))?
-    .rendered_path()
+    .rendered_path()?;
+    Some((path, snapshot))
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -943,6 +977,21 @@ impl ProcfsFile {
     /// Whether Detcore opened this file without a kernel object behind it.
     pub(crate) fn is_rendered(&self) -> bool {
         self.rendered
+    }
+
+    /// The snapshot of this rendered file, once taken (at its open).
+    pub(crate) fn rendered_snapshot(&self) -> Option<&[u8]> {
+        self.contents.as_deref().filter(|_| self.rendered)
+    }
+
+    /// This rendered file, with the snapshot an earlier image of the process
+    /// took, which its placeholder carried across `exec`.
+    pub(crate) fn with_rendered_snapshot(self, snapshot: Vec<u8>) -> Self {
+        assert!(self.rendered, "{:?} is not rendered", self.kind);
+        Self {
+            contents: Some(snapshot),
+            ..self
+        }
     }
 
     /// The kernel-shaped bytes a rendered file's snapshot starts from in place
