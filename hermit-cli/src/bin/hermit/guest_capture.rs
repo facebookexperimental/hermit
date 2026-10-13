@@ -16,11 +16,9 @@ use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 
-use hermit::Backend;
 use hermit::Context;
 use hermit::Error;
 use hermit::run_evidence::CapturedGuestStream;
-use hermit::run_evidence::DispositionLimitation;
 use hermit::run_evidence::GuestDisposition;
 use hermit::run_evidence::GuestRunDeterminism;
 use hermit::run_evidence::GuestRunResult;
@@ -356,7 +354,6 @@ impl GuestRunCaptureSession {
 
     pub(crate) fn finish(
         &mut self,
-        backend: Backend,
         status: ExitStatus,
         determinism: GuestRunDeterminism,
     ) -> Result<(), Error> {
@@ -376,7 +373,7 @@ impl GuestRunCaptureSession {
 
         let result = GuestRunResult {
             schema_version: GuestRunResult::SCHEMA_VERSION,
-            disposition: guest_disposition(backend, status)?,
+            disposition: guest_disposition(status),
             determinism,
             stdout,
             stderr,
@@ -508,24 +505,17 @@ fn read_captured_stream(
     })
 }
 
-fn guest_disposition(backend: Backend, status: ExitStatus) -> Result<GuestDisposition, Error> {
-    match (backend, status) {
-        (Backend::Kvm, ExitStatus::Exited(code)) => Ok(GuestDisposition::ExitCodeOnly {
-            code,
-            limitation: DispositionLimitation::KvmExitCodeOnly,
-        }),
-        (Backend::Kvm, ExitStatus::Signaled(_, _) | ExitStatus::SignaledRaw(_, _)) => {
-            anyhow::bail!("KVM guest capture cannot represent a signal disposition")
-        }
-        (_, ExitStatus::Exited(code)) => Ok(GuestDisposition::Exited { code }),
-        (_, ExitStatus::Signaled(signal, core_dumped)) => Ok(GuestDisposition::Signaled {
+fn guest_disposition(status: ExitStatus) -> GuestDisposition {
+    match status {
+        ExitStatus::Exited(code) => GuestDisposition::Exited { code },
+        ExitStatus::Signaled(signal, core_dumped) => GuestDisposition::Signaled {
             signal: signal as i32,
             core_dumped,
-        }),
-        (_, ExitStatus::SignaledRaw(signal, core_dumped)) => Ok(GuestDisposition::Signaled {
+        },
+        ExitStatus::SignaledRaw(signal, core_dumped) => GuestDisposition::Signaled {
             signal,
             core_dumped,
-        }),
+        },
     }
 }
 
@@ -822,7 +812,6 @@ mod tests {
         fs::rename(&moved, &capture_dir).unwrap();
         capture
             .finish(
-                Backend::Ptrace,
                 ExitStatus::Exited(0),
                 GuestRunDeterminism {
                     detlog_io_buffers: true,
@@ -938,7 +927,6 @@ mod tests {
         fs::write(&paths.stderr, b"replacement").unwrap();
         let error = capture
             .finish(
-                Backend::Ptrace,
                 ExitStatus::Exited(0),
                 GuestRunDeterminism {
                     detlog_io_buffers: true,
@@ -963,7 +951,6 @@ mod tests {
             .unwrap();
         capture
             .finish(
-                Backend::Kvm,
                 ExitStatus::Exited(7),
                 GuestRunDeterminism {
                     detlog_io_buffers: true,
@@ -976,13 +963,7 @@ mod tests {
         assert_eq!(fs::read(&paths.stderr).unwrap(), b"virtual stderr");
         let result =
             GuestRunResult::from_current_json_slice(&fs::read(&paths.result).unwrap()).unwrap();
-        assert_eq!(
-            result.disposition,
-            GuestDisposition::ExitCodeOnly {
-                code: 7,
-                limitation: DispositionLimitation::KvmExitCodeOnly,
-            }
-        );
+        assert_eq!(result.disposition, GuestDisposition::Exited { code: 7 });
         for (stream, path) in [
             (&result.stdout, &paths.stdout),
             (&result.stderr, &paths.stderr),
@@ -1010,7 +991,6 @@ mod tests {
             stderr.write_all(b"err").unwrap();
             let error = capture
                 .finish(
-                    Backend::Ptrace,
                     ExitStatus::Exited(code),
                     GuestRunDeterminism {
                         detlog_io_buffers: true,

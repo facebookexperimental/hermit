@@ -5348,6 +5348,13 @@
           "category": "c-programs",
           "test": "c-programs/nanosleep-threads-simple",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/nanosleep-threads-simple",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -51084,6 +51091,13 @@
           "test": "c-programs/nanosleep-threads-nocrash",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/nanosleep-threads-simple",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",

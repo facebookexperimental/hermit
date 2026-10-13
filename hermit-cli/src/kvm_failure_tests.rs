@@ -70,26 +70,42 @@ async fn kvm_normal_completion_preserves_status_and_output() {
     let global_state = detcore::GlobalState::init_global_state(&config).await;
     let completion = reverie_kvm::ToolRunCompletion {
         global_state,
-        result: Ok((37, b"stdout\n".to_vec(), b"stderr\n".to_vec())),
+        result: Ok((
+            ExitStatus::Exited(37),
+            b"stdout\n".to_vec(),
+            b"stderr\n".to_vec(),
+        )),
     };
     assert_eq!(
         finish_kvm_tool_completion(completion, false, &None)
             .await
             .unwrap(),
-        (37, b"stdout\n".to_vec(), b"stderr\n".to_vec()),
+        (
+            ExitStatus::Exited(37),
+            b"stdout\n".to_vec(),
+            b"stderr\n".to_vec()
+        ),
     );
 
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("summary.json");
     let completion = reverie_kvm::ToolRunCompletion {
         global_state: detcore::GlobalState::init_global_state(&config).await,
-        result: Ok((37, b"stdout\n".to_vec(), b"stderr\n".to_vec())),
+        result: Ok((
+            ExitStatus::Exited(37),
+            b"stdout\n".to_vec(),
+            b"stderr\n".to_vec(),
+        )),
     };
     assert_eq!(
         finish_kvm_tool_completion(completion, false, &Some(path.clone()))
             .await
             .unwrap(),
-        (37, b"stdout\n".to_vec(), b"stderr\n".to_vec()),
+        (
+            ExitStatus::Exited(37),
+            b"stdout\n".to_vec(),
+            b"stderr\n".to_vec()
+        ),
     );
     let bytes = std::fs::read(path).unwrap();
     let summary: detcore_model::summary::RunSummary = serde_json::from_slice(&bytes).unwrap();
@@ -97,6 +113,26 @@ async fn kvm_normal_completion_preserves_status_and_output() {
         bytes,
         (serde_json::to_string_pretty(&summary).unwrap() + "\n").as_bytes()
     );
+
+    // Death by a signal stays distinct from an ordinary exit with the same
+    // shell code (128 + signal).
+    for status in [
+        ExitStatus::Signaled(reverie::process::Signal::SIGSEGV, false),
+        ExitStatus::Signaled(reverie::process::Signal::SIGABRT, true),
+        ExitStatus::Exited(139),
+    ] {
+        let completion = reverie_kvm::ToolRunCompletion {
+            global_state: detcore::GlobalState::init_global_state(&config).await,
+            result: Ok((status, Vec::new(), Vec::new())),
+        };
+        assert_eq!(
+            finish_kvm_tool_completion(completion, false, &None)
+                .await
+                .unwrap()
+                .0,
+            status
+        );
+    }
 }
 
 #[tokio::test]
@@ -594,7 +630,7 @@ mod combined {
             .unwrap_or_else(|_| panic!("finished owners retained GlobalState"));
         let completion = reverie_kvm::ToolRunCompletion {
             global_state,
-            result: Ok((37, stdout, stderr)),
+            result: Ok((ExitStatus::Exited(37), stdout, stderr)),
         };
         assert_eq!(
             tokio::time::timeout(
@@ -605,7 +641,7 @@ mod combined {
             .unwrap()
             .unwrap()
             .0,
-            37
+            ExitStatus::Exited(37)
         );
     }
 }

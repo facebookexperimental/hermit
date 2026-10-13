@@ -5743,7 +5743,6 @@ impl RunOpts {
                     self.runtime_backend(),
                 );
                 capture.finish(
-                    self.selected_backend(),
                     status,
                     GuestRunDeterminism {
                         detlog_io_buffers: config.detlog_io_buffers,
@@ -9328,7 +9327,6 @@ mod tests {
         let mut capture = GuestRunCaptureSession::create(&paths, &evidence).unwrap();
         capture
             .finish(
-                Backend::Ptrace,
                 ExitStatus::Exited(0),
                 GuestRunDeterminism {
                     detlog_io_buffers: true,

@@ -2955,7 +2955,7 @@ async fn run_kvm(
     // Drop explicitly so the host's KVM VM teardown cost remains observable.
     drop(backend);
     let teardown_finished = Instant::now();
-    let (code, stdout, stderr) = result?;
+    let (status, stdout, stderr) = result?;
 
     // Every field below is a host wall-clock duration. Keep this diagnostic at
     // DEBUG so it remains available for backend profiling without entering the
@@ -2978,7 +2978,7 @@ async fn run_kvm(
     }
 
     Ok(Output {
-        status: ExitStatus::Exited(code),
+        status,
         stdout,
         stderr,
     })
@@ -2990,7 +2990,7 @@ async fn finish_kvm_tool_completion(
     completion: reverie_kvm::ToolRunCompletion<detcore::GlobalState>,
     print_summary: bool,
     print_summary_to_json_file: &Option<PathBuf>,
-) -> Result<(i32, Vec<u8>, Vec<u8>), Error> {
+) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), Error> {
     match completion.result {
         Ok(output) => {
             completion

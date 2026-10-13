@@ -330,12 +330,16 @@ fn disposition_matches_backend(backend: RunEvidenceBackend, disposition: GuestDi
         return false;
     }
     match backend {
+        // Evidence written before KVM reported typed statuses carries the
+        // exit-code-only form; it stays readable.
         RunEvidenceBackend::Kvm => matches!(
             disposition,
-            GuestDisposition::ExitCodeOnly {
-                limitation: DispositionLimitation::KvmExitCodeOnly,
-                ..
-            }
+            GuestDisposition::Exited { .. }
+                | GuestDisposition::Signaled { .. }
+                | GuestDisposition::ExitCodeOnly {
+                    limitation: DispositionLimitation::KvmExitCodeOnly,
+                    ..
+                }
         ),
         RunEvidenceBackend::Ptrace
         | RunEvidenceBackend::Liteinst
@@ -1022,29 +1026,22 @@ Apr 09 06:08:02.100  INFO hermit_test: second evidence record\n"
                 }
             }
         }
-        for (backend, disposition) in [
-            (
-                RunEvidenceBackend::Kvm,
-                GuestDisposition::Exited { code: 0 },
-            ),
-            (
-                RunEvidenceBackend::Ptrace,
-                GuestDisposition::ExitCodeOnly {
+        // KVM now reports typed statuses; only KVM may carry the legacy
+        // exit-code-only form.
+        replace_manifest(directory.path(), |report| {
+            *report = template.clone();
+            report.backend = RunEvidenceBackend::Ptrace;
+            report.outcome = RunEvidenceOutcome::Complete {
+                disposition: GuestDisposition::ExitCodeOnly {
                     code: 0,
                     limitation: DispositionLimitation::KvmExitCodeOnly,
                 },
-            ),
-        ] {
-            replace_manifest(directory.path(), |report| {
-                *report = template.clone();
-                report.backend = backend;
-                report.outcome = RunEvidenceOutcome::Complete { disposition };
-            });
-            assert_eq!(
-                inspect_run_evidence(directory.path()),
-                RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::InvalidManifest)
-            );
-        }
+            };
+        });
+        assert_eq!(
+            inspect_run_evidence(directory.path()),
+            RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::InvalidManifest)
+        );
     }
 
     #[test]

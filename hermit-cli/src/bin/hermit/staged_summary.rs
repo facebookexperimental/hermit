@@ -454,7 +454,6 @@ impl Drop for StagedChild<'_> {
 mod tests {
     use std::os::unix::fs::symlink;
 
-    use hermit::Backend;
     use hermit::run_evidence::GuestRunDeterminism;
     use reverie::process::ExitStatus;
 
@@ -518,7 +517,6 @@ mod tests {
             // This is the actual capture publication API, after the same
             // fallible summary boundary used by run_in_container.
             self.capture.finish(
-                Backend::Kvm,
                 status,
                 GuestRunDeterminism {
                     detlog_io_buffers: true,

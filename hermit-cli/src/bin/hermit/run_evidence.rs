@@ -20,7 +20,6 @@ use hermit::Error;
 use hermit::canonical_verdict::RecordEnvelopeReport;
 use hermit::run_evidence::CanonicalInfoEvidence;
 use hermit::run_evidence::CanonicalInfoPolicy;
-use hermit::run_evidence::DispositionLimitation;
 use hermit::run_evidence::GuestDisposition;
 use hermit::run_evidence::RUN_EVIDENCE_INFO_ARTIFACT;
 use hermit::run_evidence::RUN_EVIDENCE_MANIFEST;
@@ -195,7 +194,7 @@ impl RunEvidenceSession {
     pub(crate) fn finish(mut self, run_result: Result<&ExitStatus, &Error>) -> Result<(), Error> {
         let observed_disposition = run_result
             .ok()
-            .and_then(|status| guest_disposition(self.backend, *status));
+            .and_then(|status| guest_disposition(*status));
         let unsupported = !matches!(
             self.backend,
             Backend::Ptrace | Backend::Liteinst | Backend::InGuestTrap | Backend::Kvm
@@ -651,24 +650,19 @@ fn report_backend(backend: Backend) -> RunEvidenceBackend {
     }
 }
 
-fn guest_disposition(backend: Backend, status: ExitStatus) -> Option<GuestDisposition> {
+fn guest_disposition(status: ExitStatus) -> Option<GuestDisposition> {
     // ExitStatus already describes an observed Linux result. Never clamp an
     // impossible value into plausible evidence; the reader enforces the same range.
     if matches!(status, ExitStatus::Exited(code) if !(0..=255).contains(&code)) {
         return None;
     }
-    match (backend, status) {
-        (Backend::Kvm, ExitStatus::Exited(code)) => Some(GuestDisposition::ExitCodeOnly {
-            code,
-            limitation: DispositionLimitation::KvmExitCodeOnly,
-        }),
-        (Backend::Kvm, ExitStatus::Signaled(_, _) | ExitStatus::SignaledRaw(_, _)) => None,
-        (_, ExitStatus::Exited(code)) => Some(GuestDisposition::Exited { code }),
-        (_, ExitStatus::Signaled(signal, core_dumped)) => Some(GuestDisposition::Signaled {
+    match status {
+        ExitStatus::Exited(code) => Some(GuestDisposition::Exited { code }),
+        ExitStatus::Signaled(signal, core_dumped) => Some(GuestDisposition::Signaled {
             signal: signal as i32,
             core_dumped,
         }),
-        (_, ExitStatus::SignaledRaw(signal, core_dumped)) => Some(GuestDisposition::Signaled {
+        ExitStatus::SignaledRaw(signal, core_dumped) => Some(GuestDisposition::Signaled {
             signal,
             core_dumped,
         }),
@@ -955,27 +949,32 @@ mod tests {
     }
 
     #[test]
-    fn kvm_disposition_states_its_exit_code_only_limit() {
-        assert_eq!(
-            guest_disposition(Backend::Kvm, ExitStatus::Exited(23)),
-            Some(GuestDisposition::ExitCodeOnly {
-                code: 23,
-                limitation: DispositionLimitation::KvmExitCodeOnly,
-            })
-        );
-
+    fn kvm_disposition_keeps_signal_death_distinct_from_exit() {
         let parent = tempfile::tempdir().unwrap();
-        let destination = parent.path().join("unexpected-signal");
-        let session = RunEvidenceSession::create(&destination, Backend::Kvm).unwrap();
-        write_valid_log(&session);
-        let status = ExitStatus::Signaled(reverie::process::Signal::SIGTERM, false);
-        session.finish(Ok(&status)).unwrap();
-        assert_eq!(
-            inspect_run_evidence(&destination),
-            RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::ReportedNoResult(
-                RunEvidenceNoResultReason::UnsupportedDisposition
-            ))
-        );
+        for (name, status, disposition) in [
+            (
+                "exit",
+                ExitStatus::Exited(139),
+                GuestDisposition::Exited { code: 139 },
+            ),
+            (
+                "signal",
+                ExitStatus::Signaled(reverie::process::Signal::SIGSEGV, false),
+                GuestDisposition::Signaled {
+                    signal: libc::SIGSEGV,
+                    core_dumped: false,
+                },
+            ),
+        ] {
+            let destination = parent.path().join(name);
+            let session = RunEvidenceSession::create(&destination, Backend::Kvm).unwrap();
+            write_valid_log(&session);
+            session.finish(Ok(&status)).unwrap();
+            let RunEvidenceInspection::Complete(report) = inspect_run_evidence(&destination) else {
+                panic!("{name}: KVM disposition refused");
+            };
+            assert_eq!(report.outcome, RunEvidenceOutcome::Complete { disposition });
+        }
     }
 
     #[test]
@@ -1246,7 +1245,7 @@ mod tests {
                 assert_eq!(
                     report.outcome,
                     RunEvidenceOutcome::Complete {
-                        disposition: guest_disposition(backend, status).unwrap()
+                        disposition: guest_disposition(status).unwrap()
                     }
                 );
             }
@@ -1258,7 +1257,7 @@ mod tests {
                 Backend::InGuestTrap,
                 Backend::Kvm,
             ] {
-                assert_eq!(guest_disposition(backend, ExitStatus::Exited(code)), None);
+                assert_eq!(guest_disposition(ExitStatus::Exited(code)), None);
                 let destination = parent.path().join(format!("invalid-{backend:?}-{code}"));
                 let session = RunEvidenceSession::create(&destination, backend).unwrap();
                 write_valid_log(&session);
