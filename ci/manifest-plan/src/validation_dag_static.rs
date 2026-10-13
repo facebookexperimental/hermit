@@ -2016,7 +2016,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (Codex re-check of https://github.com/rrnewton/hermit/pull/4205): 1497.
     // And a_deferred_sigchld_waits_while_a_last_band_vfork_child_is_runnable
     // (Claude re-check of https://github.com/rrnewton/hermit/pull/4205): 1498.
-    ("test.detcore_unit", 1498),
+    ("test.detcore_unit", 1499),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3243,7 +3243,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the vfork-barrier selection test: 1496.
     // And the two-barrier last-band gate test: 1497.
     // And the deferred-SIGCHLD last-band gate test: 1498.
-    ("test.detcore_unit_on_host", 1498),
+    ("test.detcore_unit_on_host", 1499),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

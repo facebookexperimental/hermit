@@ -49,6 +49,12 @@
  *                  of a larger write and blocks for the rest: the write
  *                  returns the bytes written, exactly the capacity
  *                  (F_GETPIPE_SZ, which differs under Hermit).
+ *   write-partial-blocked  as write-partial, but the writer blocks SIGUSR1,
+ *                  and the main thread then reads both capacities: the
+ *                  blocked signal does not end the write, which returns all
+ *                  of it.
+ *   write-partial-ignored  the same with SIGUSR1 ignored: the write returns
+ *                  all of it, as Linux discards an ignored signal.
  *   waitpid        a sibling signals a thread blocked in
  *                  waitpid(child, WUNTRACED) for a child that has not exited:
  *                  the wait fails with EINTR.
@@ -247,8 +253,21 @@ static int cancel_mode(void) {
   return 0;
 }
 
+static int partial_mode_keeps_writing(void) {
+  return strcmp(mode, "write-partial-blocked") == 0 ||
+      strcmp(mode, "write-partial-ignored") == 0;
+}
+
 static void* blocked_writer(void* unused) {
   (void)unused;
+  if (strcmp(mode, "write-partial-blocked") == 0) {
+    sigset_t usr1;
+    sigemptyset(&usr1);
+    sigaddset(&usr1, SIGUSR1);
+    if (pthread_sigmask(SIG_BLOCK, &usr1, NULL) != 0) {
+      fail("pthread_sigmask");
+    }
+  }
   int capacity = fcntl(pipe_fds[1], F_GETPIPE_SZ);
   if (capacity <= 0) {
     fail("F_GETPIPE_SZ");
@@ -291,6 +310,8 @@ static void* blocked_writer(void* unused) {
   }
   if (n < 0) {
     printf("write: -1 %s, handled %d\n", strerror(errno), (int)handled);
+  } else if (n == 2 * (ssize_t)capacity) {
+    printf("write: two pipe capacities, handled %d\n", (int)handled);
   } else if (n == capacity) {
     printf("write: one pipe capacity, handled %d\n", (int)handled);
   } else {
@@ -300,7 +321,7 @@ static void* blocked_writer(void* unused) {
 }
 
 static int write_mode(void) {
-  install(0, handler);
+  install(0, strcmp(mode, "write-partial-ignored") == 0 ? SIG_IGN : handler);
   pthread_t thread;
   if (pthread_create(&thread, NULL, blocked_writer, NULL) != 0) {
     fail("pthread_create");
@@ -316,6 +337,24 @@ static int write_mode(void) {
   }
   if (pthread_kill(thread, SIGUSR1) != 0) {
     fail("pthread_kill");
+  }
+  if (partial_mode_keeps_writing()) {
+    /* The signal must not end the write: drain both capacities. */
+    settle();
+    int capacity = fcntl(pipe_fds[0], F_GETPIPE_SZ);
+    if (capacity <= 0) {
+      fail("F_GETPIPE_SZ");
+    }
+    static char sink[4096];
+    size_t remaining = 2 * (size_t)capacity;
+    while (remaining > 0) {
+      size_t chunk = remaining < sizeof(sink) ? remaining : sizeof(sink);
+      ssize_t got = read(pipe_fds[0], sink, chunk);
+      if (got <= 0) {
+        fail("read");
+      }
+      remaining -= (size_t)got;
+    }
   }
   if (pthread_join(thread, NULL) != 0) {
     fail("pthread_join");
@@ -403,7 +442,7 @@ int main(int argc, char** argv) {
   if (argc != 2) {
     fprintf(stderr,
             "usage: %s eintr|restart|ignored|blocked|ready|eof|ready2|cancel|process|write-zero|write-room|write-partial|"
-            "waitpid\n",
+            "write-partial-blocked|write-partial-ignored|waitpid\n",
             argv[0]);
     return 2;
   }
@@ -418,7 +457,7 @@ int main(int argc, char** argv) {
     return process_mode();
   }
   if (strcmp(mode, "write-zero") == 0 || strcmp(mode, "write-room") == 0 ||
-      strcmp(mode, "write-partial") == 0) {
+      strcmp(mode, "write-partial") == 0 || partial_mode_keeps_writing()) {
     return write_mode();
   }
   if (strcmp(mode, "waitpid") == 0) {

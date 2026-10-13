@@ -1221,6 +1221,10 @@ pub struct Scheduler {
     /// so a test can show that a path which must not read `/proc` does not.
     #[cfg(test)]
     test_kernel_mask_reads: std::sync::atomic::AtomicUsize,
+    /// Counts the drain's reads of a polling thread's kernel signal state
+    /// (`restartable_internal_io_interrupting_signals`).
+    #[cfg(test)]
+    test_internal_io_signal_state_reads: std::sync::atomic::AtomicUsize,
 
     /// Child-TID futexes whose kernel clear may still be racing a guest join.
     cleared_child_tids: HashMap<FutexID, DetTid>,
@@ -3294,6 +3298,8 @@ impl Scheduler {
             test_sleeper_read_failures: Default::default(),
             #[cfg(test)]
             test_kernel_mask_reads: Default::default(),
+            #[cfg(test)]
+            test_internal_io_signal_state_reads: Default::default(),
             cleared_child_tids: Default::default(),
             terminal_deadlock: None,
             terminal_clock_exhaustion: None,
@@ -7713,11 +7719,24 @@ impl Scheduler {
         task: Option<(i32, i32)>,
     ) -> u64 {
         let held = self.futex_wait_held_signals(dettid);
+        // A guest thread ID names a host task only on a backend whose guest
+        // runs as host tasks. Elsewhere (KVM) `/proc/<pid>/task/<tid>` is an
+        // unrelated host task, if any, chosen by host thread-ID allocation, so
+        // its state must never decide which signal ends the poll: keep every
+        // signal the wait does not hold, and the woken call decides from the
+        // backend's own state (a scalar pipe write checks the guest's mask and
+        // disposition; a call with no progress returns ERESTARTSYS, which the
+        // backend restarts unless a signal it would deliver is pending).
+        if !crate::procfs_inode::guest_tids_name_host_tasks(&self.backend, None) {
+            return !held;
+        }
         // Unit tests script a thread's state; one with none scripted keeps
         // the unfiltered behaviour and never reads a host task's.
         #[cfg(test)]
         {
             let _ = task;
+            self.test_internal_io_signal_state_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             match self.test_kernel_signal_states.get(&dettid) {
                 Some(state) => state.interrupting_wait(state.blocked, false) & !held,
                 None => !held,
@@ -19409,6 +19428,51 @@ mod test {
                 .resources
                 .contains_key(&ResourceID::InternalIOPolling)
         );
+    }
+
+    /// On a backend that owns process signal control (KVM) a guest thread ID
+    /// is not a host task, so the drain never reads kernel signal state for
+    /// it: `/proc/<pid>/task/<tid>` would describe an unrelated host task,
+    /// chosen by host thread-ID allocation. Every signal the wait does not
+    /// hold wakes the poll, which decides for itself: here the SIGUSR1 that
+    /// the (never consulted) scripted state blocks still wakes it. On ptrace
+    /// the same poll is filtered by that state.
+    #[test]
+    fn the_drain_never_reads_kernel_signal_state_under_process_signal_control() {
+        use std::sync::atomic::Ordering;
+        let config = Config::default().with_backend(|backend| {
+            backend.provides_process_signal_control = true;
+            backend.supports_parked_write_signal_interruption = true;
+        });
+        let mut scheduler = Scheduler::new(&config);
+        let target = restartable_read_poller(&mut scheduler);
+
+        scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR1));
+        scheduler.drain_pending_cross_task_signals();
+
+        assert_eq!(
+            scheduler
+                .test_internal_io_signal_state_reads
+                .load(Ordering::Relaxed),
+            0,
+            "the drain read a guest thread's kernel signal state"
+        );
+        assert_eq!(
+            scheduler.inbound_signals(target),
+            vec![SigWrapper::from(Signal::SIGUSR1)]
+        );
+
+        let mut ptrace = Scheduler::new(&Config::default());
+        let target = restartable_read_poller(&mut ptrace);
+        ptrace.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR1));
+        ptrace.drain_pending_cross_task_signals();
+        assert_eq!(
+            ptrace
+                .test_internal_io_signal_state_reads
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(ptrace.inbound_signals(target).is_empty());
     }
 
     /// A poll that decides for itself whether a signal interrupts it (a

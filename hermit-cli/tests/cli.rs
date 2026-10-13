@@ -22144,6 +22144,14 @@ fn a_signal_to_a_guest_blocked_in_a_polled_call_acts_as_on_linux() {
         ("write-room", "write: 1\n"),
         ("write-partial", "write: one pipe capacity, handled 1\n"),
         (
+            "write-partial-blocked",
+            "write: two pipe capacities, handled 0\n",
+        ),
+        (
+            "write-partial-ignored",
+            "write: two pipe capacities, handled 0\n",
+        ),
+        (
             "waitpid",
             "waitpid: -1 Interrupted system call, handled 1\nchild exited 0\n",
         ),

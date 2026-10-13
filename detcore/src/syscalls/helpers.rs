@@ -620,7 +620,23 @@ impl<T: RecordOrReplay> Detcore<T> {
         // bytes it wrote, or ERESTARTSYS before any
         // (<https://github.com/rrnewton/hermit/issues/4187>).
         resources.set_signal_interrupt_errno(call.signal_interrupt_errno());
-        resources.signal_state_task = Some((guest.pid().as_raw(), guest.tid().as_raw()));
+        resources.signal_state_task = guest_signal_state_task(guest);
+        // Without a host task whose kernel state the scheduler can filter by
+        // (KVM), the scheduler keeps every signal and the write checks after
+        // the wake, as `execute_blocking_pipe_writev` does, whether one would
+        // be delivered: a blocked or ignored signal must not end a write that
+        // has made progress, which would return a short count where Linux
+        // keeps waiting.
+        let disposition_scratch = if resources.signal_state_task.is_none() {
+            resources.decides_signal_interruption_itself = true;
+            let mut stack = guest.stack().await;
+            let mask_addr = stack.reserve::<KernelSigset>();
+            let action_addr = stack.reserve::<KernelSigaction>();
+            let guard = stack.commit()?;
+            Some((mask_addr, action_addr, guard))
+        } else {
+            None
+        };
         let subtool = self.cfg.recordreplay_modes.then_some(self);
         let mut current = call;
         let mut written_total = 0usize;
@@ -631,11 +647,18 @@ impl<T: RecordOrReplay> Detcore<T> {
             // for a pending signal only when it must wait. After the signal,
             // the bytes written so far are returned, or the restart errno if
             // there are none.
-            let signaled = resources.poll_attempt > 0
-                && matches!(
-                    resource_request(guest, resources.clone()).await,
-                    ResumeStatus::Signaled(_)
-                );
+            let signaled = if resources.poll_attempt > 0 {
+                let status = resource_request(guest, resources.clone()).await;
+                match (&status, &disposition_scratch) {
+                    (ResumeStatus::Signaled(_), None) => true,
+                    (ResumeStatus::Signaled(_), Some((mask_addr, action_addr, _))) => {
+                        own_disposition_interrupts(guest, status, *mask_addr, *action_addr).await?
+                    }
+                    _ => false,
+                }
+            } else {
+                false
+            };
 
             if resources.poll_attempt > 0
                 && !guest
@@ -1885,6 +1908,48 @@ where
     retry_nonblocking_syscall_helper(guest, call, rsrc, maybe_tup, None).await
 }
 
+/// The task whose kernel signal state the scheduler may read to decide which
+/// signal ends an internal IO poll: the guest thread itself where guest thread
+/// IDs name host tasks, and `None` elsewhere (KVM), where
+/// `/proc/<pid>/task/<tid>` would describe an unrelated host task.
+fn guest_signal_state_task<T, G>(guest: &G) -> Option<(i32, i32)>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    crate::procfs_inode::guest_tids_name_host_tasks(&guest.config().backend, None)
+        .then(|| (guest.pid().as_raw(), guest.tid().as_raw()))
+}
+
+/// Whether a signal that woke a poll would be delivered to this thread now,
+/// read from the backend's own state of the thread: its current mask (the
+/// old set of a query-only `rt_sigprocmask`) and each signal's disposition
+/// (`wait_signal_disposition`). A blocked or ignored signal, or one whose
+/// default action ignores it, does not.
+async fn own_disposition_interrupts<T, G>(
+    guest: &mut G,
+    status: ResumeStatus,
+    mask_addr: AddrMut<'_, KernelSigset>,
+    action_addr: AddrMut<'_, KernelSigaction>,
+) -> Result<bool, Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let query = syscalls::RtSigprocmask::new()
+        .with_how(libc::SIG_BLOCK)
+        .with_set(None)
+        .with_oldset(Some(mask_addr.cast()))
+        .with_sigsetsize(KERNEL_SIGSET_SIZE);
+    guest.inject_with_retry(query).await?;
+    let mask: KernelSigset = guest.memory().read_value(mask_addr)?;
+    Ok(
+        wait_signal_disposition(guest, status, &mask, action_addr, true)
+            .await?
+            .is_some(),
+    )
+}
+
 // Private helper.
 async fn retry_nonblocking_syscall_helper<T, G, C>(
     guest: &mut G,
@@ -1920,7 +1985,11 @@ where
         && call.signal_interrupt_errno() == Errno::ERESTARTSYS
     {
         rsrc.set_signal_interrupt_errno(Errno::ERESTARTSYS);
-        rsrc.signal_state_task = Some((guest.pid().as_raw(), guest.tid().as_raw()));
+        // Where guest thread IDs are not host tasks (KVM) the scheduler keeps
+        // every signal: the call has made no progress when it returns
+        // ERESTARTSYS, and the backend restarts it unless a signal it would
+        // deliver is pending, so a blocked or ignored signal leaves it waiting.
+        rsrc.signal_state_task = guest_signal_state_task(guest);
     }
 
     loop {
