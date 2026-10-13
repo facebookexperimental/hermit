@@ -1,16 +1,15 @@
 [workspace]
+# fbsource: ci/manifest-plan, detcore-dbt, detcore-sabre and hermit-install
+# are OSS workspace members whose manifests the import leaves out
+# (hermetic_infra/hermit_import/README.md), so they are not members here.
 members = [
   "common/test-allocator",
   "common/test-workdir",
-  "ci/manifest-plan",
   "detcore",
   "detcore-model",
-  "detcore-dbt",
-  "detcore-sabre",
   "detcore/tests/testutils",
   "flaky-tests",
   "hermit-cli",
-  "hermit-install",
   "hermit-resources",
   "hermit-verify",
   "tests",
@@ -26,7 +25,6 @@ exclude = ["agent-utils"]
 default-members = [
   "common/test-allocator",
   "common/test-workdir",
-  "ci/manifest-plan",
   "detcore",
   "detcore-model",
   "detcore/tests/testutils",
