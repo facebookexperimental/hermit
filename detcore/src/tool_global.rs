@@ -3379,6 +3379,8 @@ impl GlobalState {
                             child_dettid, reason
                         );
                         pid_namespaces.mark_untranslatable(child_dettid, reason);
+                    } else if is_group_leader {
+                        sched.note_member_of_ended_namespace(child_dettid);
                     }
                 }
                 if is_group_leader && flags.is_some() {

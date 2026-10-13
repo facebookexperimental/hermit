@@ -1347,6 +1347,13 @@ pub struct Scheduler {
     /// deadlocked.
     namespace_zap_victims: BTreeSet<DetPid>,
 
+    /// When the current wait for `namespace_zap_victims` began; reset once
+    /// none is left. Bounded by `namespace_zap_valve`.
+    namespace_zap_wait_since: Option<std::time::Instant>,
+
+    /// `NAMESPACE_ZAP_VALVE`, shortened only by tests that expire it.
+    pub(crate) namespace_zap_valve: Duration,
+
     /// Logically exited child processes whose terminal wait status has not been consumed.
     logically_exited_processes: BTreeSet<DetPid>,
 
@@ -3280,6 +3287,8 @@ impl Scheduler {
             deregistration_accounted: Default::default(),
             pending_physical_process_exits: Default::default(),
             namespace_zap_victims: Default::default(),
+            namespace_zap_wait_since: None,
+            namespace_zap_valve: Self::NAMESPACE_ZAP_VALVE,
             logically_exited_processes: Default::default(),
             autoreaped_exits: Default::default(),
             completed_physical_process_exits: Default::default(),
@@ -3448,6 +3457,8 @@ impl Scheduler {
     pub(crate) fn forget_committed_exit(&mut self, dettid: DetTid) {
         self.forget_sigkill_receipt(dettid);
         self.committed_exits.remove(&dettid);
+        // A reused pid names a new process, not one a namespace's end doomed.
+        self.namespace_zap_victims.remove(&dettid);
     }
 
     pub(crate) fn note_process_sigkill(&mut self, dettid: DetTid, detpid: DetPid) {
@@ -4054,6 +4065,7 @@ impl Scheduler {
                 .into_iter()
                 .any(|tid| self.next_turns.contains_key(&tid))
         {
+            self.namespace_zap_victims.remove(&registered);
             self.reparent_orphans(registered);
         }
         if !live_process_thread {
@@ -4293,6 +4305,21 @@ impl Scheduler {
             self.note_determinism_loss(format!(
                 "PID namespace init {exiting} exited while its namespace still held live processes {live:?}; Linux kills them at host-timed moments (https://github.com/rrnewton/hermit/issues/4155)"
             ));
+        }
+    }
+
+    /// `child`, a process just created, belongs to a PID namespace whose
+    /// init's exit is already granted. Linux lets such a fork succeed until
+    /// it starts killing the namespace (`zap_pid_namespace`), then kills the
+    /// child with the rest, so it is a victim like those
+    /// `note_pid_namespace_end` named.
+    pub(crate) fn note_member_of_ended_namespace(&mut self, child: DetPid) {
+        let chain = self.thread_tree.pid_namespaces.chain_of(child);
+        if chain
+            .iter()
+            .any(|init| *init != child && self.thread_tree.granted_exits.contains(init))
+        {
+            self.namespace_zap_victims.insert(child);
         }
     }
 
@@ -5735,6 +5762,14 @@ impl Scheduler {
     /// refused. Like `VFORK_BARRIER_VALVE`, it bounds the wait without ever
     /// deciding a turn: host timing decides only how long a pause lasts.
     pub(crate) const SIGKILL_FENCE_VALVE: Duration = Duration::from_secs(30);
+
+    /// How long, in host time, an empty run queue waits for Linux's kill of
+    /// the processes of an ended PID namespace to be reported
+    /// (`report_terminal_deadlock_unless_zap_pending`) before the run is
+    /// stopped by name. A backend that never reports such a death (an
+    /// in-guest tool that a SIGKILL gives no exit hook) would otherwise wait
+    /// forever. Like the other valves, it decides no turn.
+    pub(crate) const NAMESPACE_ZAP_VALVE: Duration = Duration::from_secs(30);
 
     /// Requeue, at a fixed point, the background-pool threads that a committed
     /// signal armed (`BlockedPool::signaled_background`, set by
@@ -8527,9 +8562,18 @@ impl Scheduler {
     /// killing for its namespace's end still has a thread
     /// ([`Self::awaiting_namespace_zap`]): that thread, often a `pause(2)`
     /// with no deadline, is about to die, so the state is not terminal. Spin
-    /// until the backend reports the kill, as the external-IO wait does.
+    /// until the backend reports the kill, as the external-IO wait does, but
+    /// at most `namespace_zap_valve`: a backend that never reports the death
+    /// gets a named deadlock instead of an unbounded wait.
     fn report_terminal_deadlock_unless_zap_pending(&mut self) -> SkipTurn {
-        if self.awaiting_namespace_zap() {
+        if !self.awaiting_namespace_zap() {
+            self.namespace_zap_wait_since = None;
+            return self.report_terminal_deadlock();
+        }
+        let since = *self
+            .namespace_zap_wait_since
+            .get_or_insert_with(std::time::Instant::now);
+        if since.elapsed() < self.namespace_zap_valve {
             trace!(
                 "[scheduler] empty run-queue while Linux kills {:?} for their PID namespace's end. SPINNING!",
                 &self.namespace_zap_victims
@@ -8537,7 +8581,20 @@ impl Scheduler {
             std::thread::yield_now();
             return SkipTurn;
         }
-        self.report_terminal_deadlock()
+        // Past the valve: stop by name. The line carries only DetPids and
+        // the configured bound, so it is the same on every run.
+        let first_verdict = self.terminal_deadlock.is_none();
+        let skip = self.report_terminal_deadlock();
+        if first_verdict
+            && !self.terminal_is_refusal
+            && let Some(report) = self.terminal_deadlock.as_mut()
+        {
+            *report = format!(
+                "HERMIT_DEADLOCK: processes {:?}, which Linux kills because their PID namespace's init exited, were not reported dead within {:?}\n{}",
+                self.namespace_zap_victims, self.namespace_zap_valve, report
+            );
+        }
+        skip
     }
 
     /// Take the pending terminal-deadlock report, if the scheduler produced one.
@@ -19559,6 +19616,97 @@ mod test {
             .blocked
             .timed_waiters
             .insert(LogicalTime::INDEFINITE, child);
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
+        assert!(scheduler.take_terminal_deadlock().is_some());
+    }
+
+    /// A namespace whose init exited, with its member `child` in `pause(2)`
+    /// and nothing else left: the state `note_pid_namespace_end` leaves.
+    fn ended_namespace_with_a_paused_member(child: DetTid) -> Scheduler {
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        let [root, init] = [3, 5].map(DetTid::from_raw);
+        scheduler.thread_tree.add_child(root, root, true);
+        scheduler.thread_tree.add_child(root, init, true);
+        scheduler.thread_tree.enter_new_pid_namespace(init);
+        scheduler.thread_tree.mark_pid_namespace_init(init);
+        scheduler.thread_tree.add_child(init, child, true);
+        let namespaces = &mut scheduler.thread_tree.pid_namespaces;
+        namespaces.record(init, &[init], &[5, 1]).unwrap();
+        namespaces
+            .record(child, &[init], &[child.as_raw(), 2])
+            .unwrap();
+        for tid in [init, child] {
+            register_known_thread(&mut scheduler, tid);
+        }
+        scheduler.note_pid_namespace_end(init);
+        scheduler.next_turns.remove(&init);
+        scheduler
+            .blocked
+            .timed_waiters
+            .insert(LogicalTime::INDEFINITE, child);
+        scheduler
+    }
+
+    /// A backend that never reports the killed member's death (an in-guest
+    /// tool gets no exit hook for a SIGKILL) must not wait forever: past the
+    /// valve the run stops on a deadlock that names the victims, and the
+    /// report is the same text every time.
+    #[test]
+    fn a_namespace_kill_never_reported_ends_in_a_named_deadlock() {
+        let child = DetTid::from_raw(7);
+        let mut scheduler = ended_namespace_with_a_paused_member(child);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
+        assert!(scheduler.take_terminal_deadlock().is_none());
+
+        scheduler.namespace_zap_valve = Duration::ZERO;
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
+        let report = scheduler
+            .take_terminal_deadlock()
+            .expect("past the valve the wait ends in a report");
+        assert!(
+            report.starts_with(
+                "HERMIT_DEADLOCK: processes {DetPid(7)}, which Linux kills because their PID namespace's init exited, were not reported dead within 0ns\n"
+            ),
+            "unexpected report:\n{report}"
+        );
+        assert!(
+            report.contains("thread(s) waiting indefinitely"),
+            "{report}"
+        );
+    }
+
+    /// A process forked into the namespace after its init's Exit grant, but
+    /// before Linux starts killing the namespace, dies with it too, so it is
+    /// waited for like the members named at the grant. A process outside the
+    /// ended namespace is not.
+    #[test]
+    fn a_process_forked_into_an_ended_namespace_is_a_victim() {
+        let child = DetTid::from_raw(7);
+        let mut scheduler = ended_namespace_with_a_paused_member(child);
+        let [init, late, outsider] = [5, 9, 11].map(DetTid::from_raw);
+        scheduler.thread_tree.granted_exits.insert(init);
+        let namespaces = &mut scheduler.thread_tree.pid_namespaces;
+        namespaces.record(late, &[init], &[9, 3]).unwrap();
+        scheduler.note_member_of_ended_namespace(late);
+        scheduler.note_member_of_ended_namespace(outsider);
+        assert_eq!(
+            scheduler.namespace_zap_victims,
+            BTreeSet::from([child, late])
+        );
+    }
+
+    /// A victim entry never outlives its pid: a new task that reuses it is
+    /// not doomed, so its own deadlock is still reported.
+    #[test]
+    fn a_reused_pid_is_not_a_namespace_kill_victim() {
+        let child = DetTid::from_raw(7);
+        let mut scheduler = ended_namespace_with_a_paused_member(child);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+        // As the clone path does for a new task on a reused tid.
+        scheduler.forget_committed_exit(child);
+        assert!(scheduler.namespace_zap_victims.is_empty());
         assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
         assert!(scheduler.take_terminal_deadlock().is_some());
     }
