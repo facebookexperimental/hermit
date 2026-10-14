@@ -328,16 +328,20 @@ pub fn pmu_clock_backend(backend: &str) -> bool {
 /// (<https://github.com/rrnewton/hermit/issues/3810>). A custom cell passes it
 /// when its arguments say so, unless they also select `--namespace-only`
 /// (alias `--lite`), which arms no branch counter. A naked cell runs no
-/// hermit. A verify cell at the relaxed strictness level runs without the
-/// preemption timer ([`RELAXED_LEVEL_ARGS`]), which is what Hermit refuses
-/// on an inexact counter, so it is not refused.
+/// hermit. A run with `--max-timeslice=disabled` reads no branch counter, so
+/// Hermit does not refuse it (<https://github.com/rrnewton/hermit/issues/4291>):
+/// not a custom cell that passes it, and not a verify cell at the relaxed
+/// strictness level, which adds it ([`RELAXED_LEVEL_ARGS`]).
 pub fn refused_on_an_inexact_branch_counter(cell: &SelectedCell) -> bool {
     let strict_run = match cell.id.mode.as_str() {
         "verify" | "chaos" | "replay" => true,
         "custom" => {
             let args = &cell.test.modes["custom"].args;
             let has = |flag: &str| args.iter().any(|arg| arg == flag);
-            has("--strict") && !has("--namespace-only") && !has("--lite")
+            has("--strict")
+                && !has("--namespace-only")
+                && !has("--lite")
+                && !has("--max-timeslice=disabled")
         }
         _ => false,
     };
@@ -10423,6 +10427,24 @@ corpus:
         naked.id.backend = None;
         assert_eq!(naked.strictness_level(), None);
         assert_eq!(naked.strictness(), None);
+    }
+
+    /// A run with `--max-timeslice=disabled` reads no branch counter, so
+    /// Hermit does not refuse it on a host whose counter miscounts, and the
+    /// harness does not withhold it there
+    /// (https://github.com/rrnewton/hermit/issues/4291).
+    #[test]
+    fn a_strict_custom_cell_without_a_timeslice_is_not_refused_on_an_inexact_counter() {
+        let mut cell = ptrace_cell("custom");
+        cell.test.modes.get_mut("custom").unwrap().args = vec!["--strict".into()];
+        assert!(refused_on_an_inexact_branch_counter(&cell));
+        cell.test.modes.get_mut("custom").unwrap().args =
+            vec!["--strict".into(), "--max-timeslice=disabled".into()];
+        assert!(!refused_on_an_inexact_branch_counter(&cell));
+        assert_eq!(
+            cell.strictness().unwrap().max_timeslice,
+            MaxTimeslice::Disabled
+        );
     }
 
     #[test]

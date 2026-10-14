@@ -97,7 +97,7 @@ fn validation_failure_kind(error: &PmuValidationError) -> String {
 
 /// The `exact_branch_counter` verdict that `hermit host-capabilities` reports.
 /// It is absent exactly when `hermit run --strict` refuses the ptrace and
-/// e9patch backends, which names the counts.
+/// e9patch backends with a timeslice, which names the counts.
 pub(crate) fn exact_branch_counter_verdict() -> CapabilityVerdict {
     let cpu = cpu_identity();
     let failure = inexact_branch_counter(reverie_ptrace::is_perf_supported(), || {

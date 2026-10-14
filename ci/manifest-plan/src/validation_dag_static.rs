@@ -1026,7 +1026,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // manifest_corpus::tests::a_heavy_label_marks_only_the_corpus_backend_cell,
     // added when the super run type's heavy compat rows moved from
     // ci/compat/corpus-strict.json onto compat.yaml cells, retains all 1084: 1085.
-    ("test.regular_crates", 1085),
+    // runner::tests::a_strict_custom_cell_without_a_timeslice_is_not_refused_on_an_inexact_counter
+    // and test-harness's
+    // import_mode_keeps_a_relaxed_row_from_a_worker_whose_counter_miscounts
+    // (hermit-manifest-plan, https://github.com/rrnewton/hermit/issues/4291)
+    // retain all 1085: 1087.
+    ("test.regular_crates", 1087),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -3642,7 +3647,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same seven strictness-level tests: 1085.
     // And the same retirement of the strict variants' tests: 1084.
     // And the same heavy-label test: 1085.
-    ("test.regular_crates_on_host", 1085),
+    // And the same two tests of a run without a timeslice on an inexact
+    // counter: 1087.
+    ("test.regular_crates_on_host", 1087),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).

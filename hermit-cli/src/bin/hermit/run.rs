@@ -1038,7 +1038,8 @@ pub struct RunOpts {
     /// `hermit record` to reproduce it. `--verify --verify-strict` reports the difference; plain
     /// `--verify` reports it only when host time reaches the guest's output. On the ptrace and
     /// e9patch backends, `--strict` also refuses to run when the host's performance counters fail
-    /// Reverie's validation, because the virtual clock counts retired branches and cannot be exact.
+    /// Reverie's validation, because the virtual clock counts retired branches and cannot be exact;
+    /// with `--max-timeslice=disabled` no branch is counted, so that run is not refused.
     #[clap(
         long,
         conflicts_with_all = ["no_sequentialize_threads", "no_deterministic_io", "strace_only"]
@@ -4156,6 +4157,24 @@ fn strict_refusal_needs_strict_a_pmu_backend_and_an_inexact_counter() {
         &["hermit", "run", "--strict", "--namespace-only", "fakeprog"],
         unreachable,
     );
+    // Without a timeslice Detcore reads no branch counter, so the relaxed
+    // strictness level runs where the counter miscounts
+    // (https://github.com/rrnewton/hermit/issues/4291).
+    for backend in ["ptrace", "e9patch"] {
+        let backend_flag = format!("--backend={backend}");
+        check(
+            &[
+                "hermit",
+                &backend_flag,
+                "run",
+                "--strict",
+                "--no-virtualize-cpuid",
+                "--max-timeslice=disabled",
+                "fakeprog",
+            ],
+            unreachable,
+        );
+    }
 }
 
 #[test]
@@ -8483,11 +8502,26 @@ impl RunOpts {
     /// Refuse rather than run a strict guest on a clock that is not exact.
     /// Runs without `--strict` go ahead, and Reverie logs the failed
     /// validation.
+    ///
+    /// A run with `--max-timeslice=disabled` reads no branch counter at all:
+    /// Detcore reads it only to advance logical time and to place preemption
+    /// points, and does neither without a timeslice
+    /// (`DetConfig::use_rcb_time`, `Detcore::update_logical_time_rcbs`). So
+    /// such a run is not refused; that is what lets a test run at the relaxed
+    /// strictness level on a host whose counter miscounts
+    /// (<https://github.com/rrnewton/hermit/issues/4291>).
     fn refuse_strict_with_inexact_branch_counter(&self) -> Result<(), Error> {
-        if !self.strict || !self.arms_reverie_ptrace_pmu_timer() {
+        if !self.strict || !self.reads_the_branch_counter() {
             return Ok(());
         }
         refuse_an_inexact_branch_counter(self.selected_backend(), self.inexact_branch_counter)
+    }
+
+    /// Whether this run reads the retired-conditional-branch counter that
+    /// [`Self::refuse_strict_with_inexact_branch_counter`] guards: on a
+    /// backend that arms Reverie's ptrace PMU timer, with a timeslice.
+    fn reads_the_branch_counter(&self) -> bool {
+        self.arms_reverie_ptrace_pmu_timer() && self.det_opts.det_config.max_timeslice.is_some()
     }
 
     /// [`Self::refuse_strict_with_inexact_branch_counter`] for an `analyze` or
@@ -8497,7 +8531,10 @@ impl RunOpts {
     /// (alias `--lite`) does not reach `run_with_namespace_only`: the trial
     /// still runs on the backend's runtime and its counter, and is not exempt.
     pub(crate) fn refuse_strict_trial_with_inexact_branch_counter(&self) -> Result<(), Error> {
-        if !self.strict || !self.backend_arms_reverie_ptrace_pmu_timer() {
+        if !self.strict
+            || !self.backend_arms_reverie_ptrace_pmu_timer()
+            || self.det_opts.det_config.max_timeslice.is_none()
+        {
             return Ok(());
         }
         refuse_an_inexact_branch_counter(self.selected_backend(), self.inexact_branch_counter)

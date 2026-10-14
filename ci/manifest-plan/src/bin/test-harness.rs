@@ -6253,6 +6253,123 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
     /// machine's reason, not the producer's. No environment can make a host
     /// capability absent, so this drives `imported_results::load` with the
     /// policy the harness would build on such a machine.
+    /// A Buck remote-execution worker decides its own strictness level: one
+    /// whose branch counter miscounts runs a ptrace verify cell at the relaxed
+    /// level, and its row says so. The import keeps that row as the producer
+    /// wrote it, a PASS at the relaxed level, rather than judging it by this
+    /// machine's level (https://github.com/rrnewton/hermit/issues/4291).
+    #[test]
+    fn import_mode_keeps_a_relaxed_row_from_a_worker_whose_counter_miscounts() {
+        use hermit_manifest_plan::imported_results;
+        use hermit_manifest_plan::imported_results::bucket_dir;
+        use hermit_manifest_plan::runner::HostLevel;
+        use hermit_manifest_plan::runner::RELAXED_LEVEL_ARGS;
+        use hermit_manifest_plan::runner::RunContext;
+        use hermit_manifest_plan::runner::StrictnessLevel;
+        use hermit_manifest_plan::runner::host_strictness;
+        use serde_json::json;
+
+        const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+        let fixture = std::env::temp_dir().join(format!(
+            "hermit-harness-import-relaxed-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir(&fixture).unwrap();
+        write_import_fixture(&fixture);
+        let manifests = ManifestSet::load(&fixture).unwrap();
+        let selection = parse(
+            ["--category", "imported", "--backend", "ptrace", "--ci-only"]
+                .into_iter()
+                .map(String::from),
+        );
+        let cells = run_cells(&manifests, &selection).unwrap();
+        let context = RunContext::for_import(fixture.clone(), Some(SHA)).unwrap();
+
+        // The worker: no CPUID faulting, and a counter that fails Reverie's
+        // validation, as the AMD EPYC 9D64 of the issue does.
+        let mut worker = context.clone();
+        worker.exact_branch_counter =
+            Some(hermit_manifest_plan::host_capability::CapabilityVerdict {
+                present: false,
+                evidence:
+                    "Reverie performance-counter validation failed (AmdSpecLockMapShouldBeDisabled)"
+                        .into(),
+            });
+        let worker_level = host_strictness(
+            &worker.host_capabilities,
+            worker.exact_branch_counter.as_ref(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(worker_level.level, StrictnessLevel::Relaxed);
+        let import = fixture.join("import");
+        let bucket = bucket_dir(&import, "portable", "imported");
+        fs::create_dir_all(&bucket).unwrap();
+        let (rows, evidence): (Vec<_>, Vec<_>) = cells
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| {
+                let mut ran = cell.clone();
+                ran.host_level = HostLevel::clone(&worker_level);
+                let row =
+                    import_producer_row(&worker, &ran, format!("buck-worker-{index}"), 1, "PASS");
+                (serde_json::to_string(&row).unwrap(), import_execution(&row))
+            })
+            .unzip();
+        assert!(!rows.is_empty());
+        fs::write(bucket.join("results.jsonl"), rows.join("\n") + "\n").unwrap();
+        fs::write(
+            bucket.join("summary.json"),
+            serde_json::to_vec(&json!({"evidence_complete_executions": evidence})).unwrap(),
+        )
+        .unwrap();
+
+        // This machine runs every cell.
+        let earns_retry = |_: &SelectedCell, _: &CellResult| true;
+        let host_inapplicable = |_: &SelectedCell| None;
+        let policy = imported_results::ImportPolicy {
+            earns_retry: &earns_retry,
+            host_inapplicable: &host_inapplicable,
+        };
+        let imported = imported_results::load(
+            &import,
+            &cells,
+            &context,
+            &fixture.join("out/results.jsonl"),
+            &policy,
+        )
+        .unwrap();
+        for (cell, imported) in cells.iter().zip(&imported.cells) {
+            let [row] = imported.rows.as_slice() else {
+                panic!("one row per cell: {:?}", imported.rows);
+            };
+            assert_eq!(row.outcome, "PASS", "{:?}", cell.id);
+            let strictness = row.strictness.expect("the worker records its level");
+            if cell.id.mode == "verify" {
+                assert_eq!(strictness.level, StrictnessLevel::Relaxed, "{:?}", cell.id);
+                assert!(!strictness.virtualize_cpuid);
+                for flag in RELAXED_LEVEL_ARGS {
+                    assert!(
+                        row.relaxations
+                            .iter()
+                            .any(|relaxation| relaxation.starts_with(&format!("{flag}: "))),
+                        "{flag}: {:?}",
+                        row.relaxations
+                    );
+                }
+            }
+            assert_eq!(
+                row.exact_branch_counter
+                    .as_ref()
+                    .map(|verdict| verdict.present),
+                Some(false)
+            );
+        }
+        assert_eq!(imported.missing, 0);
+        fs::remove_dir_all(&fixture).unwrap();
+    }
+
     #[test]
     fn import_mode_host_inapplicable_claim_needs_this_machines_confirmation() {
         use hermit_manifest_plan::imported_results;
