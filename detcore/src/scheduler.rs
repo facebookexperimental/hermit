@@ -3931,7 +3931,7 @@ impl Scheduler {
                 det_tid
             )
         });
-        if nextturn.req.try_read().is_none() {
+        if nextturn.req.is_empty() {
             Some(nextturn.req.clone())
         } else {
             None
@@ -4931,7 +4931,7 @@ impl Scheduler {
             && self
                 .next_turns
                 .get(&dettid)
-                .is_some_and(|turn| turn.req.try_read().is_none())
+                .is_some_and(|turn| turn.req.is_empty())
             && !self.blocked.external_io_blockers.contains_key(&dettid)
             && !self.blocked.rt_sigsuspend_blockers.contains_key(&dettid)
             && !self.blocked.signaled_background.contains(&dettid)
@@ -8148,7 +8148,7 @@ impl Scheduler {
                 .get(&dettid)
                 .expect("internal invariant broken");
             assert!(
-                nxtturn.req.try_read().is_some(),
+                nxtturn.req.is_full(),
                 "signal_guest: thread should be parked in the scheduler"
             );
         }

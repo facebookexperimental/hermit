@@ -48,7 +48,7 @@ impl GlobalState {
             || !sched.rpc_incarnation_matches(former, prepared.mm)
             || !sched.next_turns.contains_key(&former)
             || (self.cfg.sequentialize_threads
-                && (sched.next_turns[&former].req.try_read().is_some()
+                && (sched.next_turns[&former].req.is_full()
                     || (sched.next_turns.contains_key(&current)
                         && !sched.exec_sibling_retirement_observed(current, process, prepared.mm))))
             || !self.global_time.lock().unwrap().contains_thread(former)

@@ -284,7 +284,7 @@ impl Scheduler {
             || self.parked.control.is_some()
             || !self.next_turns.is_empty()
             || self.turn != 0
-            || self.started_up.try_read().is_some()
+            || self.started_up.is_full()
         {
             return Err(reverie::syscalls::Errno::EINVAL.into());
         }

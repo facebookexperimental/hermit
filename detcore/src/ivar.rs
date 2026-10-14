@@ -121,6 +121,24 @@ impl<T: Debug> Default for Ivar<T> {
     }
 }
 
+impl<T> Ivar<T> {
+    /// Whether the Ivar is filled right now, without cloning its contents.
+    /// The same caveat as [`Ivar::try_read`] applies.
+    pub fn is_full(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("Ivar is_full could not lock.")
+            .contents
+            .is_some()
+    }
+
+    /// Whether the Ivar is still empty right now, without cloning anything.
+    /// The same caveat as [`Ivar::try_read`] applies.
+    pub fn is_empty(&self) -> bool {
+        !self.is_full()
+    }
+}
+
 /// Equality on Ivars is pointer equality.
 impl<T: Debug> PartialEq for Ivar<T> {
     fn eq(&self, other: &Self) -> bool {
@@ -222,7 +240,10 @@ mod tests {
         let iv = Ivar::new();
         let e = iv.try_read();
         assert_eq!(e, None);
+        // The presence checks agree with try_read without cloning.
+        assert!(iv.is_empty() && !iv.is_full());
         iv.put(33);
+        assert!(iv.is_full() && !iv.is_empty());
         let x = iv.clone().await;
         let z = iv.try_read();
         let y = iv.await;

@@ -470,7 +470,7 @@ impl Scheduler {
             .next_turns
             .get_mut(&tid)
             .ok_or(ProtocolFailure::Identity)?;
-        if turn.req.try_read().is_some() {
+        if turn.req.is_full() {
             // Existing legacy signal merging must retain its installed origin.
             if turn.protocol.origin != Some(origin) {
                 return Err(ProtocolFailure::Phase);
@@ -1147,10 +1147,7 @@ impl Scheduler {
                     }
                     _ => continue,
                 };
-                if deadline <= self.committed_time
-                    || turn.req.try_read().is_none()
-                    || turn.resp.try_read().is_some()
-                {
+                if deadline <= self.committed_time || turn.req.is_empty() || turn.resp.is_full() {
                     continue;
                 }
                 // Other wait families remain pending for their existing return
@@ -1260,7 +1257,7 @@ impl Scheduler {
             .try_read()
             .ok_or(ProtocolFailure::Phase)?
             .map_err(|_| ProtocolFailure::Phase)?;
-        if turn.resp.try_read().is_some() {
+        if turn.resp.is_full() {
             return Err(ProtocolFailure::Phase);
         }
         if let ControlCapability::ParkedWait { policy, .. } = origin.control {
@@ -1476,8 +1473,8 @@ impl Scheduler {
                 .get(&wait.dettid)
                 .ok_or(ProtocolFailure::Identity)?;
             if turn.protocol.owner != (NextTurnOwner::Observation { wait, lease })
-                || turn.req.try_read().is_some()
-                || turn.resp.try_read().is_some()
+                || turn.req.is_full()
+                || turn.resp.is_full()
                 || !self.run_queue.contains_tid(wait.dettid)
             {
                 return Err(ProtocolFailure::Phase);
@@ -1555,7 +1552,7 @@ impl Scheduler {
         let result = (|| {
             if !matches!(owned.phase, ContinuationPhase::AwaitingResumeRegistration(expected) if expected == ticket)
                 || ticket.site != site
-                || response.try_read().is_some()
+                || response.is_full()
             {
                 return Err(ProtocolFailure::Identity);
             }
@@ -1665,7 +1662,7 @@ impl Scheduler {
                 break;
             }
         }
-        if self.parked.wake.try_read().is_some() {
+        if self.parked.wake.is_full() {
             self.parked.wake = Ivar::new();
         }
     }
@@ -1713,7 +1710,7 @@ impl Scheduler {
         }
         if turn.protocol.owner != NextTurnOwner::Ordinary
             || self.parked.permits.contains_key(&tid)
-            || turn.resp.try_read().is_some()
+            || turn.resp.is_full()
         {
             return Err(ProtocolFailure::Phase);
         }
@@ -1789,7 +1786,7 @@ impl Scheduler {
                 && original.resources.get(&ResourceID::InternalIOPolling) == Some(&Permission::W)
                 && matches!(previous.try_read(), Some(Ok(ref prior)) if prior == original)
                 && turn.req == *replacement
-                && turn.resp.try_read().is_none())
+                && turn.resp.is_empty())
             .then(|| ReadyPolledRead {
                 request: replacement.clone(),
                 response: turn.resp.clone(),
