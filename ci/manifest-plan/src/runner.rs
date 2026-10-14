@@ -1397,17 +1397,137 @@ fn equalized_guest_path(cell_dir: &Path, value: &str) -> Option<String> {
     })
 }
 
-/// `guest_argv` with each whole argument that names a path in one of the
-/// cell's equalized input directories rewritten to its guest path, so the
-/// program is launched as `/tmp/e2e/fixtures/program`. A path embedded in a
-/// longer argument is left alone; it still names a host file the guest can
-/// read, and the parity post-pass then sees unequal argv and reports the
-/// comparison as not equalized.
-fn equalized_guest_argv(cell_dir: &Path, guest_argv: Vec<String>) -> Vec<String> {
-    guest_argv
+/// Where a verify guest sees the validation's compatibility fixtures,
+/// `{{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures` on the host.
+pub const COMPAT_FIXTURES_GUEST_PATH: &str = "/tmp/e2e/compat-fixtures";
+
+/// Where a verify guest sees the repository checkout, `{{ROOT_DIR}}` on the
+/// host.
+pub const REPOSITORY_GUEST_PATH: &str = "/tmp/e2e/repo";
+
+/// The compatibility fixtures, below the validation's run-state directory.
+const COMPAT_FIXTURES_RUN_STATE_SUBDIR: &str = "strict-compat/real-compat-fixtures";
+
+/// A host directory outside the cell directory that a verify cell's argv may
+/// name, and the guest path it is bound at when it does.
+///
+/// The ptrace reference and each candidate backend run as separate cells.
+/// Under Buck each cell has its own run-state directory and its own bundle
+/// checkout, so a fixture or repository file named by its host path is a
+/// different string in every cell, and the parity post-pass diverged on the
+/// path alone: 22 cells in the f406d84f validation
+/// (<https://github.com/rrnewton/hermit/issues/4337>). Naming the guest path
+/// instead gives every run of the test the same arguments.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EqualizedRoot {
+    host: String,
+    guest: &'static str,
+    /// Host directories below `host` that it does not cover: the harness's
+    /// own per-run trees, whose paths would still differ from cell to cell.
+    except: Vec<String>,
+}
+
+/// The equalized roots of `context` with run-state directory `run_state`,
+/// the most specific first: the fixtures are below the run state, which is
+/// commonly below the checkout. The checkout root does not cover the
+/// harness's result, build and run-state trees.
+fn equalized_roots(context: &RunContext, run_state: Option<&OsStr>) -> Vec<EqualizedRoot> {
+    let text = |path: &Path| path.to_string_lossy().into_owned();
+    let run_state = run_state.filter(|state| !state.is_empty()).map(Path::new);
+    let mut roots = Vec::new();
+    if let Some(state) = run_state {
+        roots.push(EqualizedRoot {
+            host: text(&state.join(COMPAT_FIXTURES_RUN_STATE_SUBDIR)),
+            guest: COMPAT_FIXTURES_GUEST_PATH,
+            except: Vec::new(),
+        });
+    }
+    roots.push(EqualizedRoot {
+        host: text(&context.root),
+        guest: REPOSITORY_GUEST_PATH,
+        except: [
+            Some(context.result_root.as_path()),
+            Some(context.build_root.as_path()),
+            run_state,
+        ]
         .into_iter()
-        .map(|arg| equalized_guest_path(cell_dir, &arg).unwrap_or(arg))
-        .collect()
+        .flatten()
+        .map(text)
+        .collect(),
+    });
+    roots
+}
+
+/// `value` with the host directory `host` replaced by `guest`, when `value`
+/// is that directory or a path below it.
+fn rebased(host: &str, guest: &str, value: &str) -> Option<String> {
+    if value == host {
+        Some(guest.to_string())
+    } else {
+        value
+            .strip_prefix(host)
+            .filter(|rest| rest.starts_with('/'))
+            .map(|rest| format!("{guest}{rest}"))
+    }
+}
+
+/// `guest_argv` with each argument that names a path in one of the cell's
+/// equalized input directories, or below one of `roots`, rewritten to its
+/// guest path, so the program is launched as `/tmp/e2e/fixtures/program`. An
+/// environment assignment (`env NAME=PATH`) has its value rewritten the same
+/// way. A path embedded in any other longer argument is left alone; it still
+/// names a host file the guest can read, and the parity post-pass then sees
+/// unequal argv and reports the comparison as not equalized. Also returns the
+/// roots some argument named, which the run must bind.
+fn equalized_guest_argv(
+    cell_dir: &Path,
+    roots: &[EqualizedRoot],
+    guest_argv: Vec<String>,
+) -> (Vec<String>, Vec<EqualizedRoot>) {
+    let mut named = Vec::new();
+    let mut rewrite = |value: &str| -> Option<String> {
+        equalized_guest_path(cell_dir, value).or_else(|| {
+            roots.iter().find_map(|root| {
+                if root
+                    .except
+                    .iter()
+                    .any(|except| rebased(except, "", value).is_some())
+                {
+                    return None;
+                }
+                let rewritten = rebased(&root.host, root.guest, value)?;
+                if !named.contains(root) {
+                    named.push(root.clone());
+                }
+                Some(rewritten)
+            })
+        })
+    };
+    let argv = guest_argv
+        .into_iter()
+        .map(|arg| {
+            if let Some(rewritten) = rewrite(&arg) {
+                return rewritten;
+            }
+            match arg.split_once('=') {
+                Some((name, value)) if is_environment_name(name) => rewrite(value)
+                    .map(|value| format!("{name}={value}"))
+                    .unwrap_or(arg),
+                _ => arg,
+            }
+        })
+        .collect();
+    (argv, named)
+}
+
+/// Whether `name` can be an environment variable's name, as `env NAME=VALUE`
+/// takes it.
+fn is_environment_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
 /// The cell environment as the guest of an equalized cell sees it: each
@@ -1421,14 +1541,18 @@ fn equalized_guest_env(env: &BTreeMap<String, String>) -> BTreeMap<String, Strin
     env
 }
 
-/// Bind each equalized input directory of `cell_dir` to its guest path.
-fn append_equalized_input_binds(argv: &mut Vec<String>, cell_dir: &Path) {
+/// Bind each equalized input directory of `cell_dir` to its guest path, and
+/// each equalized root the cell's argv names.
+fn append_equalized_input_binds(argv: &mut Vec<String>, cell_dir: &Path, roots: &[EqualizedRoot]) {
     for input in EQUALIZED_INPUTS {
         argv.push(format!(
             "--bind={}:{}",
             cell_dir.join(input.cell_subdir).to_string_lossy(),
             input.guest_path
         ));
+    }
+    for root in roots {
+        argv.push(format!("--bind={}:{}", root.host, root.guest));
     }
 }
 
@@ -4975,10 +5099,14 @@ pub fn build_spec(
     let equalized_inputs = equalizes_guest_inputs(&cell.id.mode);
     // The recorded guest argv is the argv after `--`, so both carry the guest
     // paths of an equalized cell.
-    let guest_argv = if equalized_inputs {
-        equalized_guest_argv(&dir, guest_argv)
+    let (guest_argv, named_roots) = if equalized_inputs {
+        let roots = equalized_roots(
+            context,
+            crate::manifest_corpus::validate_run_state().as_deref(),
+        );
+        equalized_guest_argv(&dir, &roots, guest_argv)
     } else {
-        guest_argv
+        (guest_argv, Vec::new())
     };
     let mode_recipe = &cell.test.modes[&cell.id.mode];
     let mut env = execution_cell_env(context, &dir, cell.id.mode != "naked");
@@ -5048,6 +5176,7 @@ pub fn build_spec(
                 verify_runs: verify_runs.as_deref(),
                 bound_workdir_source,
                 equalized_inputs_dir: equalized_inputs.then_some(dir.as_path()),
+                equalized_roots: &named_roots,
                 env: &env,
                 guest_argv: &guest_argv,
             });
@@ -5136,6 +5265,8 @@ struct VerifiedInvocationArgs<'a> {
     /// The cell directory whose inputs are bound at their guest paths, for an
     /// equalized cell.
     equalized_inputs_dir: Option<&'a Path>,
+    /// The equalized roots the cell's argv names, bound beside its inputs.
+    equalized_roots: &'a [EqualizedRoot],
     env: &'a BTreeMap<String, String>,
     guest_argv: &'a [String],
 }
@@ -5303,6 +5434,7 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
         verify_runs,
         bound_workdir_source,
         equalized_inputs_dir,
+        equalized_roots,
         env,
         guest_argv,
     } = args;
@@ -5416,7 +5548,7 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
     );
     let isolated = context.isolated_workdir.is_some();
     if let Some(cell_dir) = equalized_inputs_dir {
-        append_equalized_input_binds(&mut argv, cell_dir);
+        append_equalized_input_binds(&mut argv, cell_dir, equalized_roots);
         append_guest_env_args(&mut argv, &equalized_guest_env(env), isolated);
     } else {
         append_guest_env_args(&mut argv, env, isolated);
@@ -16770,6 +16902,87 @@ backends_disabled:
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// The compat corpus hands its guests fixtures below the run state and
+    /// files below the checkout. A verify guest names both at fixed guest
+    /// paths, so the reference and each candidate cell, which have their own
+    /// run state and bundle checkout under Buck, pass the same arguments
+    /// (https://github.com/rrnewton/hermit/issues/4337). The harness's own
+    /// per-cell trees are not rebased onto the checkout.
+    #[test]
+    fn verify_guests_name_fixtures_and_checkout_files_at_fixed_guest_paths() {
+        let mut context = run_context(Path::new("/repo"));
+        context.result_root = PathBuf::from("/repo/target/results");
+        context.build_root = PathBuf::from("/repo/target/build");
+        let cell_dir = Path::new("/repo/target/results/cell");
+        let argv_for = |run_state: &str| {
+            let roots = equalized_roots(&context, Some(OsStr::new(run_state)));
+            let fixtures = format!("{run_state}/strict-compat/real-compat-fixtures");
+            equalized_guest_argv(
+                cell_dir,
+                &roots,
+                vec![
+                    "env".into(),
+                    format!("REAL_COMPAT_FIXTURES={fixtures}"),
+                    "bash".into(),
+                    "/repo/tests/compat/real_compat_workload.sh".into(),
+                    format!("{fixtures}/README.md"),
+                    "/repo/target/results/cell/tmp/out".into(),
+                    format!("{run_state}/strict-compat/shell-build"),
+                    "--tab-file=/repo/ci/compat/findmnt.fixture".into(),
+                ],
+            )
+        };
+        let (reference, reference_roots) = argv_for("/repo/target/validation/run-a/state");
+        let (candidate, candidate_roots) = argv_for("/repo/target/validation/run-b/state");
+        assert_eq!(
+            reference[..5],
+            [
+                "env".to_string(),
+                format!("REAL_COMPAT_FIXTURES={COMPAT_FIXTURES_GUEST_PATH}"),
+                "bash".into(),
+                format!("{REPOSITORY_GUEST_PATH}/tests/compat/real_compat_workload.sh"),
+                format!("{COMPAT_FIXTURES_GUEST_PATH}/README.md"),
+            ]
+        );
+        assert_eq!(reference[..5], candidate[..5]);
+        // Per-run harness paths stay host paths, and so does a path embedded
+        // in an option.
+        assert_eq!(reference[5], "/repo/target/results/cell/tmp/out");
+        assert_eq!(
+            reference[6],
+            "/repo/target/validation/run-a/state/strict-compat/shell-build"
+        );
+        assert_eq!(reference[7], "--tab-file=/repo/ci/compat/findmnt.fixture");
+        // Each named root is bound from that cell's own directory.
+        let binds = |roots: &[EqualizedRoot]| {
+            let mut argv = Vec::new();
+            append_equalized_input_binds(&mut argv, cell_dir, roots);
+            argv.split_off(EQUALIZED_INPUTS.len())
+        };
+        assert_eq!(
+            binds(&reference_roots),
+            [
+                format!(
+                    "--bind=/repo/target/validation/run-a/state/strict-compat/real-compat-fixtures:{COMPAT_FIXTURES_GUEST_PATH}"
+                ),
+                format!("--bind=/repo:{REPOSITORY_GUEST_PATH}"),
+            ]
+        );
+        assert_eq!(
+            binds(&candidate_roots)[0],
+            format!(
+                "--bind=/repo/target/validation/run-b/state/strict-compat/real-compat-fixtures:{COMPAT_FIXTURES_GUEST_PATH}"
+            )
+        );
+        // An argv that names neither root binds neither.
+        let (_, none) = equalized_guest_argv(
+            cell_dir,
+            &equalized_roots(&context, None),
+            vec!["/usr/bin/true".into()],
+        );
+        assert!(none.is_empty());
+    }
+
     #[test]
     fn ordinary_fixed_workdir_resolves_repo_inputs_before_chdir() {
         let root = std::env::temp_dir().join(format!(
@@ -16807,10 +17020,22 @@ backends_disabled:
             cell_dir.join("workdir/1"),
             "the ordinary supported path must retain hermit-132's per-attempt bind"
         );
+        // Absolute before the guest changes to /tmp/test, and named at the
+        // repository's guest path, bound from the checkout, so every backend's
+        // run of the test names it alike
+        // (https://github.com/rrnewton/hermit/issues/4337).
         assert_eq!(
             spec.guest_argv[1],
-            root.join("fixtures/input.txt").to_string_lossy(),
+            format!("{REPOSITORY_GUEST_PATH}/fixtures/input.txt"),
             "repo input must be absolute before the guest changes to /tmp/test"
+        );
+        assert!(
+            spec.argv.contains(&format!(
+                "--bind={}:{REPOSITORY_GUEST_PATH}",
+                root.display()
+            )),
+            "{:?}",
+            spec.argv
         );
         assert_eq!(spec.guest_argv[2], ".");
         fs::remove_dir_all(root).unwrap();
