@@ -82,6 +82,15 @@
  *                  takes the one SIGCHLD: the main thread's handler (EINTR),
  *                  or the sibling's read, which then interrupts main with
  *                  SIGUSR1. Never both.
+ *   sfdheld-pause, sfdheld-nano (with "restart", the handler has SA_RESTART,
+ *                  which never restarts these calls after a handler)
+ *                  The process holds a signalfd for SIGCHLD that no thread
+ *                  reads, and a sibling that blocks SIGCHLD and SIGUSR2 waits
+ *                  in a blocking read of a second signalfd, for SIGUSR2 only.
+ *                  The main thread (SIGCHLD caught) forks a child that exits
+ *                  100 ms in and pauses or sleeps 5 s. Nothing else can take
+ *                  the SIGCHLD, so the main thread's handler does and its sleep
+ *                  ends with EINTR (https://github.com/rrnewton/hermit/issues/4229).
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -586,6 +595,71 @@ static int sfdsib(const char* mode, int late, int rt, int poll) {
   return 0;
 }
 
+static int usr2_reader;
+static _Atomic int held_sibling_ready;
+
+static void* usr2_sibling(void* arg) {
+  (void)arg;
+  sigset_t mask;
+  sigemptyset(&mask);
+  sigaddset(&mask, SIGCHLD);
+  sigaddset(&mask, SIGUSR2);
+  pthread_sigmask(SIG_BLOCK, &mask, NULL);
+  atomic_store(&held_sibling_ready, 1);
+  struct signalfd_siginfo info;
+  if (read(usr2_reader, &info, sizeof(info)) < 0) {
+    return NULL;
+  }
+  return NULL;
+}
+
+static int sfdheld(const char* mode, int restart) {
+  int pausing = !strcmp(mode, "sfdheld-pause");
+  catch_chld();
+  if (restart) {
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_sigaction = on_chld;
+    action.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigaction(SIGCHLD, &action, NULL);
+  }
+  sigset_t chld;
+  sigemptyset(&chld);
+  sigaddset(&chld, SIGCHLD);
+  int held = signalfd(-1, &chld, 0);
+  sigset_t usr2;
+  sigemptyset(&usr2);
+  sigaddset(&usr2, SIGUSR2);
+  usr2_reader = signalfd(-1, &usr2, 0);
+  if (held < 0 || usr2_reader < 0) {
+    return 3;
+  }
+  pthread_t thread;
+  pthread_create(&thread, NULL, usr2_sibling, NULL);
+  while (!atomic_load(&held_sibling_ready)) {
+    syscall(SYS_sched_yield);
+  }
+  msleep(50);
+  pid_t child = spawn(100, 0);
+  int ret;
+  if (pausing) {
+    ret = pause();
+  } else {
+    struct timespec request = {5, 0};
+    ret = nanosleep(&request, NULL);
+  }
+  int error = errno;
+  int in_main = handled;
+  pthread_kill(thread, SIGUSR2);
+  pthread_join(thread, NULL);
+  waitpid(child, NULL, 0);
+  close(held);
+  printf("%s%s: %s %s, main handler %d\n", mode, restart ? " restart" : "",
+         pausing ? "pause" : "nanosleep", ret == 0 ? "0" : error == EINTR ? "EINTR" : strerror(error),
+         in_main);
+  return 0;
+}
+
 static int pidfd_efault(void) {
   signal(SIGCHLD, SIG_DFL);
   sigset_t set;
@@ -642,6 +716,9 @@ int main(int argc, char** argv) {
   }
   if (!strncmp(mode, "efwide-", 7)) {
     return efwide(mode);
+  }
+  if (!strncmp(mode, "sfdheld-", 8)) {
+    return sfdheld(mode, argc > 2 && !strcmp(argv[2], "restart"));
   }
   if (!strncmp(mode, "sfdsib-", 7)) {
     int late = 0, rt = 0, poll = 0;

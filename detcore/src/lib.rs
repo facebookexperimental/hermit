@@ -985,6 +985,17 @@ impl<T: RecordOrReplay> Detcore<T> {
                 dettid, mycount, signal
             );
             self.record_handler_restore_mask(guest, signal).await;
+            // A handler runs for a caught signal, so the call it ended returns
+            // EINTR rather than restarting; an ignored one restarts it, which
+            // keeps the deadline (`ThreadState::nanosleep_restart`).
+            if guest.thread_state().nanosleep_restart.is_some()
+                && crate::syscalls::read_thread_signal_state(guest.pid(), guest.tid())
+                    .map_or(true, |state| {
+                        state.caught & (1u64 << (signal.raw() - 1)) != 0
+                    })
+            {
+                guest.thread_state_mut().nanosleep_restart = None;
+            }
 
             self.post_handler_hook(guest, CheckIn::Event).await;
             Ok(Some(signal))
@@ -2451,6 +2462,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     chaos_epoch: tool_local::chaos_epoch_sentinel(),
                     chaos_slowdown_factor: RcbTimeMultiplier::ONE,
                     chaos_slowdown_active: false,
+                    nanosleep_restart: None,
                     pending_chaos_epochs: Vec::new(),
                     max_timeslice_end: None,
                     last_grant_deadline: None,

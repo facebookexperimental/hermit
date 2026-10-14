@@ -26569,6 +26569,31 @@ fn every_sigchld_copy_is_accounted_for_as_on_linux() {
             &["susblk-nano", "late", "sfd"],
             "susblk-nano late sfd: nanosleep EINTR, SIGCHLD at return 1, in main yes\n",
         ),
+        // A held signalfd for SIGCHLD makes the process's send window unusable,
+        // and nothing takes the copy outside the schedule: the woken sleep ends
+        // for it. Before, its own turn parked it again, so the pause never
+        // returned and the nanosleep returned 0 with the handler run as it
+        // returned, the outcome a slow signalfd reader gave
+        // `sfdsib-nano late rt` 1 run in many
+        // (https://github.com/rrnewton/hermit/issues/4229).
+        (
+            &["sfdheld-pause"],
+            "sfdheld-pause: pause EINTR, main handler 1\n",
+        ),
+        (
+            &["sfdheld-nano"],
+            "sfdheld-nano: nanosleep EINTR, main handler 1\n",
+        ),
+        // With SA_RESTART too: Linux never restarts `pause` or `nanosleep`
+        // after a handler (the Claude review of the fix found both restarted).
+        (
+            &["sfdheld-pause", "restart"],
+            "sfdheld-pause restart: pause EINTR, main handler 1\n",
+        ),
+        (
+            &["sfdheld-nano", "restart"],
+            "sfdheld-nano restart: nanosleep EINTR, main handler 1\n",
+        ),
         (
             &["efin-priv"],
             "efin-priv: input fault EFAULT; [SI_QUEUE v9] [CLD_EXITED c1 11] \

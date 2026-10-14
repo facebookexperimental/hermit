@@ -25889,6 +25889,28 @@ mod test {
         );
     }
 
+    /// `WindowUnusable` answers whether the asking thread's process gave up
+    /// the send window: false while every thread that could take its
+    /// `SIGCHLD` does so at a committed point, true once one entered a blocking
+    /// call outside the schedule with `SIGCHLD` unblocked, and false on a
+    /// backend that does not model signal targets
+    /// (https://github.com/rrnewton/hermit/issues/4229).
+    #[test]
+    fn window_unusable_reports_an_outside_taker() {
+        use child_exit_sigchld::ChildExitSigchldAnswer;
+        use child_exit_sigchld::ChildExitSigchldControl;
+        let (mut scheduler, parent, creator, _) = owned_sigchld_family();
+        let ask = |scheduler: &mut Scheduler| {
+            scheduler.child_exit_sigchld_control(creator, ChildExitSigchldControl::WindowUnusable)
+        };
+        assert_eq!(ask(&mut scheduler), ChildExitSigchldAnswer::Placed(false));
+        scheduler.note_outside_blocker(creator, Some(0), false);
+        assert!(!scheduler.sigchld_window_usable(parent));
+        assert_eq!(ask(&mut scheduler), ChildExitSigchldAnswer::Placed(true));
+        scheduler.models_signal_targets = false;
+        assert_eq!(ask(&mut scheduler), ChildExitSigchldAnswer::Placed(false));
+    }
+
     /// A thread a guest sent a thread-directed `SIGCHLD` takes that copy from
     /// its private queue first, whatever its siginfo says: it is delivered as
     /// it is and granted, and the send window and the ledger are left for the

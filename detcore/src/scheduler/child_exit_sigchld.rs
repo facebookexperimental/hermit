@@ -243,6 +243,14 @@ pub enum ChildExitSigchldControl {
     /// futex wait holds shared copies (<https://github.com/rrnewton/hermit/issues/4132>).
     /// Appended after `RawExitStatus`.
     PrivatePending,
+    /// Whether the calling thread's process does not use the send window
+    /// (`Scheduler::sigchld_window_usable` is false: a thread could take its
+    /// `SIGCHLD` outside the schedule), asked by a sleep woken for the
+    /// scheduler's `SIGCHLD` when `PlacedPending` says no. There the window
+    /// records no committed copy, so the copy's pending bit decides, as
+    /// before the window existed (<https://github.com/rrnewton/hermit/issues/4229>).
+    /// Appended after `PrivatePending`.
+    WindowUnusable,
 }
 
 /// What becomes of a `SIGCHLD` the scheduler sent, at its delivery stop.
@@ -843,6 +851,10 @@ impl Scheduler {
             ChildExitSigchldControl::PrivatePending => {
                 ChildExitSigchldAnswer::Placed(self.private_sigchld(dtid) != 0)
             }
+            ChildExitSigchldControl::WindowUnusable => ChildExitSigchldAnswer::Placed(
+                self.models_signal_targets
+                    && !self.sigchld_window_usable(self.sigchld_process(dtid)),
+            ),
             ChildExitSigchldControl::PrivateSent { target } => {
                 // Whether this made a new record, which a failed send undoes.
                 ChildExitSigchldAnswer::Placed(

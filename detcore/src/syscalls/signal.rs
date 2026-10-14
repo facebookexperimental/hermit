@@ -300,6 +300,44 @@ where
     Ok(taken?)
 }
 
+/// Claim a pending `SIGCHLD` for the calling thread, in its own turn, so that
+/// it is delivered to this thread as it next resumes and no other thread can
+/// take it. Returns whether there was one.
+///
+/// A harmless `getpid` is injected. Reverie runs an injected call by stepping
+/// the thread through user mode, so while a signal is pending and unblocked the
+/// kernel dequeues it at that step, Reverie holds it for delivery as the thread
+/// resumes, and the injection returns a restart errno instead of running. The
+/// caller calls this only while SIGCHLD is the signal the kernel dequeues next,
+/// so that held signal is the copy: claimed. If an outside thread took the copy
+/// first, nothing is pending, the call runs, and nothing is claimed. The call
+/// consumes no signal itself, so a stop that ends it can lose nothing (the Codex
+/// review of a version that took the copy with `rt_sigtimedwait` and queued it
+/// again).
+pub(crate) async fn claim_pending_sigchld<G, T>(guest: &mut G) -> Result<bool, Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match guest.inject(syscalls::Getpid::new()).await {
+        Ok(_) => Ok(false),
+        Err(errno) if is_restart_errno(errno) => Ok(true),
+        Err(errno) => Err(errno.into()),
+    }
+}
+
+/// Whether `errno` is a restart errno, which an injection returns when a signal
+/// stop ended it before it ran (`claim_pending_sigchld`).
+fn is_restart_errno(errno: Errno) -> bool {
+    matches!(
+        errno,
+        Errno::ERESTARTSYS
+            | Errno::ERESTARTNOINTR
+            | Errno::ERESTARTNOHAND
+            | Errno::ERESTART_RESTARTBLOCK
+    )
+}
+
 /// The guest's virtual SIGALRM blocked bit, read from the runtime (which
 /// answers the query from its virtual state).
 pub(crate) async fn virtual_sigalrm_blocked<G, T>(guest: &mut G) -> Result<bool, Error>
@@ -673,7 +711,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     }
                     ResumeStatus::Signaled(signals) => {
                         match sleep_signal(guest, SleepCheck::AfterWake(signals), true).await? {
-                            SleepSignal::Pending => return Err(Errno::ERESTARTNOHAND.into()),
+                            SleepSignal::Pending | SleepSignal::Claimed => {
+                                return Err(Errno::ERESTARTNOHAND.into());
+                            }
                             SleepSignal::Held => return Err(Errno::EINTR.into()),
                             SleepSignal::None => {
                                 info!(
@@ -2757,6 +2797,14 @@ pub(crate) enum SleepSignal {
     Held,
     /// Nothing ends the sleep, and it waits (again) with its original deadline.
     None,
+    /// The scheduler's `SIGCHLD`, in a process whose send window is unusable,
+    /// that this thread claimed (`claim_pending_sigchld`): it is held for
+    /// delivery to this thread as it resumes, so a signal is always pending
+    /// then. Both calls return `ERESTARTNOHAND`: `EINTR` when a handler runs,
+    /// whatever its `SA_RESTART`, and a restart when none does (the child-exit
+    /// ledger drops a duplicate copy). A `nanosleep` keeps its deadline for that
+    /// restart (`ThreadState::nanosleep_restart`).
+    Claimed,
 }
 
 /// Decides, in this thread's own turn, whether a signal ends an emulated
@@ -2875,6 +2923,42 @@ where
         if let Some(verdict) = committed_sigchld_verdict(&state, held_woken, committed) {
             return Ok(verdict);
         }
+        // Where the process does not use the send window, a thread outside the
+        // schedule could take the scheduler's copy at a moment host timing
+        // chooses, so the window records none, and `PlacedPending` says no
+        // whether or not that thread took it. Parked again, the sleep ran to its
+        // deadline with the copy pending and the handler ran as it returned, an
+        // outcome Linux never gives (https://github.com/rrnewton/hermit/issues/4229).
+        // So this thread claims the copy itself, in its own turn
+        // (`claim_pending_sigchld`), while SIGCHLD is the signal its kernel
+        // dequeues next: held for delivery to it, where no other thread can
+        // take it, so the handler runs as the sleep returns (`Claimed`). If the
+        // outside thread took it first, the claim finds none and the sleep
+        // parks again, as on Linux, where the woken sleeper finds no signal. Reading the pending bit and then ending the sleep
+        // left a gap in which the outside thread could take it, and then the
+        // sleep returned EINTR with no handler
+        // (https://github.com/rrnewton/hermit/issues/4341).
+        //
+        // Only in a run: record and replay keep parking it, since replay may
+        // serve the outside thread's signalfd read from the log without taking
+        // the copy (https://github.com/rrnewton/hermit/issues/4343).
+        if committed == 0
+            && held_woken & sigchld != 0
+            && !guest.config().recordreplay_modes
+            && woken_sigchld_pending(&state, sigchld)
+            && matches!(
+                crate::tool_global::child_exit_sigchld(
+                    guest,
+                    crate::scheduler::child_exit_sigchld::ChildExitSigchldControl::WindowUnusable,
+                )
+                .await,
+                crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer::Placed(true)
+            )
+            && state.next_dequeued(state.blocked).map(|(signal, _)| signal) == Some(libc::SIGCHLD)
+            && claim_pending_sigchld(guest).await?
+        {
+            return Ok(SleepSignal::Claimed);
+        }
         let held_woken = held_woken & !sigchld;
         if held_wake_ends_sleep(&state, held_woken) {
             return Ok(SleepSignal::Held);
@@ -2886,6 +2970,17 @@ where
     } else {
         SleepSignal::None
     })
+}
+
+/// Whether `sigchld`, the scheduler's copy a sleep was woken for, is still
+/// pending for it and ends it: in the thread's or its process's queue, and
+/// unblocked and caught or acted on by default (`sleep_signal`, for a process
+/// whose send window is unusable).
+fn woken_sigchld_pending(
+    state: &crate::syscalls::threads::KernelSignalState,
+    sigchld: KernelSigset,
+) -> bool {
+    state.pending & state.interrupting(state.blocked) & sigchld != 0
 }
 
 /// Whether a sleep's own check (`sleep_signal`) asks the scheduler whether a
@@ -3726,6 +3821,50 @@ mod tests {
     /// sender's turn had no sleep to wake (the Codex review of
     /// https://github.com/rrnewton/hermit/pull/4177). Without one, or with no
     /// wake and nothing private, it asks nothing; blocked, it does not end the
+    /// In a process whose send window is unusable, a sleep woken for the
+    /// scheduler's `SIGCHLD` ends for it when the copy is still pending, in its
+    /// process's queue or its own, and unblocked and caught. It parks again
+    /// when another thread took the copy, its mask blocks it, or it is left at
+    /// its default action, which ignores it
+    /// (https://github.com/rrnewton/hermit/issues/4229).
+    #[test]
+    fn a_woken_sleep_counts_a_pending_sigchld_in_an_unusable_window() {
+        use crate::syscalls::threads::KernelSignalState;
+        let chld = kernel_sigset_bit(libc::SIGCHLD);
+        let state =
+            |caught: KernelSigset, blocked: KernelSigset, shared: KernelSigset| KernelSignalState {
+                caught,
+                blocked,
+                pending: shared,
+                shared_pending: shared,
+                ..Default::default()
+            };
+        assert!(woken_sigchld_pending(&state(chld, 0, chld), chld));
+        assert!(
+            !woken_sigchld_pending(&state(chld, 0, 0), chld),
+            "another thread took it"
+        );
+        assert!(
+            !woken_sigchld_pending(&state(chld, chld, chld), chld),
+            "blocked"
+        );
+        assert!(
+            !woken_sigchld_pending(&state(0, 0, chld), chld),
+            "default, ignored"
+        );
+        assert!(
+            !woken_sigchld_pending(&state(chld, 0, chld), 0),
+            "host-timed SIGCHLD keeps it held"
+        );
+        let private = KernelSignalState {
+            caught: chld,
+            pending: chld,
+            thread_pending: chld,
+            ..Default::default()
+        };
+        assert!(woken_sigchld_pending(&private, chld));
+    }
+
     /// sleep.
     #[test]
     fn a_private_sigchld_sent_before_the_sleep_is_filed_ends_it_before_it_parks() {

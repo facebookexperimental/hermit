@@ -713,6 +713,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Lets the scheduler end the sleep for a cross-task signal that
         // interrupts it (`scheduler::sleep_signal`).
         request.fyi(crate::resources::NANOSLEEP_FYI);
+        let mut claimed = false;
         loop {
             // A signal already pending ends the sleep before it parks, and one
             // still pending after a wake ends it; a wake whose signal was taken
@@ -745,6 +746,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .await?
                     {
                         SleepSignal::Pending | SleepSignal::Held => break,
+                        SleepSignal::Claimed => {
+                            claimed = true;
+                            break;
+                        }
                         SleepSignal::None => trace!(
                             "nanosleep woken for a signal no longer pending for it; sleeping again until {}",
                             target_time
@@ -775,6 +780,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             info!("[interrupted] nanosleep rem argument is null, not writing it.")
         }
+        if claimed {
+            // A claimed `SIGCHLD` is held for delivery as the thread resumes:
+            // `EINTR` if a handler runs, else a restart that keeps this
+            // deadline (`SleepSignal::Claimed`).
+            guest.thread_state_mut().nanosleep_restart = Some(target_time);
+            return Err(reverie::Error::Errno(Errno::ERESTARTNOHAND));
+        }
         Err(reverie::Error::Errno(Errno::EINTR))
     }
 
@@ -787,6 +799,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         if call.flags() > libc::TIMER_ABSTIME {
             trace!("Unhandled clock_nanosleep flags, letting syscall through...");
             return Ok(guest.inject(Syscall::from(call)).await?);
+        }
+
+        // The kernel's restart of a relative call that ended for a claimed
+        // `SIGCHLD` no handler ran for (`ThreadState::nanosleep_restart`). Like
+        // Linux's restart block, it keeps the deadline it already has and does
+        // not read the request again, which another thread may have changed.
+        let restart = guest.thread_state_mut().nanosleep_restart.take();
+        if let Some(deadline) = restart
+            && call.flags() == 0
+            && self.cfg.sequentialize_threads
+        {
+            let request = Self::sleep_request_abs(guest, deadline).await;
+            return self.wait_and_return(guest, request, call).await;
         }
 
         let addr = call.req().ok_or(Errno::EFAULT)?;

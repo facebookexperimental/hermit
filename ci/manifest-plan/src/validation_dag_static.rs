@@ -2148,7 +2148,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +6 from 0a80f81a: 1581.
     // And scheduler::test::a_timer_signal_goes_to_a_thread_that_does_not_block_it
     // (https://github.com/rrnewton/hermit/issues/4320): 1582, run.
-    ("test.detcore_unit", 1582),
+    // And syscalls::signal::tests::a_woken_sleep_counts_a_pending_sigchld_in_an_unusable_window
+    // and scheduler::test::window_unusable_reports_an_outside_taker
+    // (https://github.com/rrnewton/hermit/issues/4229): 1584.
+    ("test.detcore_unit", 1584),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3508,7 +3511,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +8 from 74689bb0: 1575.
     // And +6 from 0a80f81a: 1581.
     // And the timer signal target test: 1582.
-    ("test.detcore_unit_on_host", 1582),
+    // And the two unusable-window SIGCHLD tests (https://github.com/rrnewton/hermit/issues/4229): 1584.
+    ("test.detcore_unit_on_host", 1584),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
