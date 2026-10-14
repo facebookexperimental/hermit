@@ -1520,7 +1520,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the four cpu_profile_admission tests: 1066, listed.
     // And a_replay_host_is_compared_fact_by_fact and
     // record_version_rejects_streams_from_before_cpu_profiles: 1068, listed.
-    ("test.hermit_unit", 1068),
+    // And admission_forbids_floating_point_register_writes: 1069.
+    ("test.hermit_unit", 1069),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3913,7 +3914,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the eleven xstate_probe tests: 1062.
     // And the four cpu_profile_admission tests: 1066.
     // And the replay-host and 0x155 version tests: 1068.
-    ("test.hermit_unit_on_host", 1068),
+    // And the floating-point write admission test: 1069.
+    ("test.hermit_unit_on_host", 1069),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

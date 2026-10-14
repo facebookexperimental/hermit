@@ -998,6 +998,7 @@ dependencies = [
  "reverie-rpc-transport",
  "reverie-sabre-stats",
  "ruzstd 0.9.0",
+ "safeptrace",
  "serde",
  "serde_json",
  "serde_yaml",

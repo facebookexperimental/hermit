@@ -312,15 +312,42 @@ static ADMITTED: std::sync::OnceLock<(xstate_probe::ProbeReport, HostXstate)> =
     std::sync::OnceLock::new();
 
 /// Admits a v3 run on this host, or names why not. On success the probe report
-/// and the host facts to bind are returned. The request's own refusals are
-/// checked every time; the host qualification runs once per process.
+/// and the host facts to bind are returned, and this process's ptrace
+/// floating-point register writes are refused from then on. The request's own
+/// refusals are checked every time; the host qualification runs once per
+/// process.
 pub fn admit(
     request: &AdmissionRequest<'_>,
 ) -> Result<(xstate_probe::ProbeReport, HostXstate), AdmissionRefusal> {
+    admit_with(request, qualify_host)
+}
+
+/// [`admit`] with its host qualification as a parameter, so that a test can
+/// admit without probing.
+fn admit_with(
+    request: &AdmissionRequest<'_>,
+    qualify: impl FnOnce() -> Result<(xstate_probe::ProbeReport, HostXstate), AdmissionRefusal>,
+) -> Result<(xstate_probe::ProbeReport, HostXstate), AdmissionRefusal> {
     check_request(request)?;
-    if let Some(admitted) = ADMITTED.get() {
-        return Ok(admitted.clone());
-    }
+    let admitted = match ADMITTED.get() {
+        Some(admitted) => admitted.clone(),
+        None => {
+            let qualified = qualify()?;
+            ADMITTED.get_or_init(|| qualified).clone()
+        }
+    };
+    // The qualification covers the XSTATE_BV a guest's own instructions
+    // produce. A tracer write of its floating-point registers (PTRACE_SETFPREGS
+    // or PTRACE_SETREGSET NT_X86_XSTATE) sets that header from the tracer's
+    // buffer instead, which nothing checked, so it fails with EPERM. The flag
+    // is process-wide and set before the container child is forked, so the
+    // tracer inherits it.
+    safeptrace::forbid_fpu_register_writes();
+    Ok(admitted)
+}
+
+/// The host half of [`admit`], run once per process.
+fn qualify_host() -> Result<(xstate_probe::ProbeReport, HostXstate), AdmissionRefusal> {
     let release = nix::sys::utsname::uname()
         .map_err(|e| format!("uname failed: {e}"))?
         .release()
@@ -335,7 +362,7 @@ pub fn admit(
     }
     let probe = xstate_probe::qualify(xstate_probe::ProbeOptions::default())?;
     let host = capture(&probe)?;
-    Ok(ADMITTED.get_or_init(|| (probe, host)).clone())
+    Ok((probe, host))
 }
 
 #[cfg(test)]
@@ -386,6 +413,49 @@ mod tests {
         let mut r = request("ptrace");
         r.gdbserver = true;
         assert!(check_request(&r).unwrap_err().contains("--gdbserver"));
+    }
+
+    /// An admitted v3 run refuses ptrace floating-point register writes, and
+    /// a refused request neither probes the host nor forbids them. No other
+    /// test admits, so the process-wide flag starts clear.
+    #[test]
+    fn admission_forbids_floating_point_register_writes() {
+        let refused = admit_with(&request("kvm"), || {
+            panic!("a refused request probed the host")
+        });
+        assert!(refused.is_err());
+        assert!(!safeptrace::fpu_register_writes_forbidden());
+        let report = xstate_probe::ProbeReport {
+            cpu: 3,
+            xcr0: 0x2e7,
+            cases: 33,
+            cells: 396,
+            repetitions: 32,
+            certified_pairs: 12672,
+            forced_exit: false,
+            reload_bound: 0,
+            cpuid_min_cycles: 0,
+            calibration: String::new(),
+            retried_references: 0,
+            retried_reloads: 0,
+            retried_exits: 0,
+            counter_reopens: 0,
+        };
+        let host = HostXstate {
+            vendor: [1, 2, 3],
+            signature: 0x00b1_0f11,
+            xcr0: 0x2e7,
+            xsave_leaves: vec![[0, 0x2e7, 0x988, 0x988, 0]],
+            xcomp_supp: 0x2e7,
+            xcomp_perm: 0x2e7,
+            xcomp_guest_perm: 0x2e7,
+            xfeature_max: 20,
+            probe_cases: 33,
+            probe_forced_exit: false,
+        };
+        let admitted = admit_with(&request("ptrace"), || Ok((report.clone(), host.clone())));
+        assert_eq!(admitted, Ok((report, host)));
+        assert!(safeptrace::fpu_register_writes_forbidden());
     }
 
     #[test]

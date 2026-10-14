@@ -149,6 +149,7 @@ rust_library(
         "//hermetic_infra/reverie:reverie-ptrace",
         "//hermetic_infra/reverie:reverie-rpc-transport",
         "//hermetic_infra/reverie:reverie-sabre-stats",
+        "//hermetic_infra/reverie:safeptrace",
     ],
 )
 
@@ -282,6 +283,7 @@ rust_library(
         "//hermetic_infra/reverie:reverie-ptrace",
         "//hermetic_infra/reverie:reverie-rpc-transport",
         "//hermetic_infra/reverie:reverie-sabre-stats",
+        "//hermetic_infra/reverie:safeptrace",
     ],
     **release_features
 )
