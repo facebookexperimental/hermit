@@ -915,6 +915,7 @@ mod tests {
         ),
         ("no-virtualize-time", &["--no-virtualize-time"]),
         ("no-virtualize-cpuid", &["--no-virtualize-cpuid"]),
+        ("cpu-profile", &["--cpu-profile", "x86-64-v3"]),
         ("epoch", &["--epoch", "2001-02-03T04:05:06.123Z"]),
         ("seed", &["--seed=7"]),
         ("rng-seed", &["--rng-seed=18446744073709551615"]),

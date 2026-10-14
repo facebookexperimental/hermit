@@ -5304,6 +5304,41 @@ impl RunOpts {
     /// it would only reach the build-feature refusal one run later. Such a
     /// build skips it, and `refuse_liteinst_without_the_feature` names the
     /// missing feature instead.
+    /// Admits `--cpu-profile x86-64-v3` on this host and binds the host facts
+    /// the guest's leaf 0xD and xstate answers come from, or refuses the run
+    /// by name (<https://github.com/rrnewton/hermit/issues/4243>). A v2 run is
+    /// untouched.
+    fn admit_cpu_profile(&mut self) -> Result<(), Error> {
+        let config = &self.det_opts.det_config;
+        if config.cpu_profile.is_default() {
+            return Ok(());
+        }
+        let backend = self.selected_backend();
+        let request = hermit::cpu_profile_admission::AdmissionRequest {
+            backend: backend.as_str(),
+            ptrace: backend == Backend::Ptrace,
+            virtualize_cpuid: config.virtualize_cpuid,
+            strace_only: self.strace_only,
+            gdbserver: config.gdbserver,
+        };
+        match hermit::cpu_profile_admission::admit(&request) {
+            Ok((probe, host)) => {
+                tracing::info!(
+                    "--cpu-profile x86-64-v3 admitted: XINUSE probe on CPU {}, XCR0 {:#x}, {} cases, \
+                     {} certified pairs",
+                    probe.cpu,
+                    probe.xcr0,
+                    probe.cases,
+                    probe.certified_pairs
+                );
+                self.det_opts.det_config.cpu_profile_host = Some(host);
+                Ok(())
+            }
+            Err(refusal) => Err(Error::new(PolicyRefusal)
+                .context(format!("--cpu-profile x86-64-v3 refused: {refusal}"))),
+        }
+    }
+
     fn refuse_unqualified_liteinst_in_guest_options(&self) -> Result<(), Error> {
         if !self.uses_in_guest_liteinst() {
             return Ok(());
@@ -5696,6 +5731,9 @@ impl RunOpts {
         if let Some(fd) = self.native_exec_shared_inputs {
             self.shared_inputs = Some(std::sync::Arc::new(super::verify_inputs::take_adopted(fd)?));
         }
+        // Also before stdin is read: a host or run the x86-64-v3 profile
+        // cannot qualify is refused at once.
+        self.admit_cpu_profile()?;
         if self.verify || self.verify_run.is_some() {
             validate_log_level(global)?;
         }

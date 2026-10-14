@@ -409,6 +409,22 @@ enum CheckIn {
     InstructionTrap,
 }
 
+/// The feature words the x86-64-v3 table advertises, as `(leaf, subleaf,
+/// register, bits)` with registers 0-3 for EAX-EDX, for the CLI's check that
+/// the host has every one of them natively
+/// (<https://github.com/rrnewton/hermit/issues/4243>). Leaf 0xD, which comes
+/// from the host, is not among them.
+pub fn v3_feature_words() -> Vec<(u32, u32, usize, u32)> {
+    cpuid::v3_feature_words()
+}
+
+/// The digest of the CPUID table and bound host xstate facts `cfg` selects,
+/// which a recording carries so that replay can refuse a different table
+/// (<https://github.com/rrnewton/hermit/issues/4243>).
+pub fn virtual_cpuid_digest(cfg: &Config) -> [u8; 32] {
+    cpuid::InterceptedCpuid::for_config(cfg).digest(cfg.cpu_profile_host.as_ref())
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     /// Rule 4 for the coalescing ITIMER_REAL: tell the scheduler about a
     /// committed guest SIGALRM send (https://github.com/rrnewton/hermit/issues/4139).
@@ -428,7 +444,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// <https://github.com/rrnewton/hermit/issues/4243> proposes cannot give
     /// the two views different CPUs.
     pub(crate) fn virtual_cpuid(&self) -> cpuid::InterceptedCpuid {
-        cpuid::InterceptedCpuid::new()
+        cpuid::InterceptedCpuid::for_config(&self.cfg)
     }
 
     /// Signal phase 1, step I4 (design section 4, "The commit"): when the
@@ -2646,6 +2662,22 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 .await;
             }
             result => result?,
+        }
+        // Under x86-64-v3 the guest's CPUID must come from Detcore's table: a
+        // native CPUID would show the host's features and leaf 0xD. Reverie
+        // re-arms CPUID faulting for each new image before this callback and
+        // only warns when that fails, so a v3 run ends here, by name, instead
+        // of running on with the host's CPUID
+        // (https://github.com/rrnewton/hermit/issues/4243).
+        if self.cfg.cpu_profile == detcore_model::cpu_profile::CpuProfile::X86_64V3
+            && !guest.has_cpuid_interception()
+        {
+            let message = "--cpu-profile x86-64-v3 refused: CPUID faulting is not active for \
+                           this image, so the guest would see the host's CPUID";
+            error!("{message}");
+            let _ = writeln!(crate::util::RetryingStderr, "{message}");
+            tool_global::unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
+                .await;
         }
         // Exec gives the task filesystem information of its own
         // (`unshare_fs_struct`): a root it shared through CLONE_FS is now its

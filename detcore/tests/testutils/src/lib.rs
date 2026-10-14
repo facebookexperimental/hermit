@@ -88,6 +88,8 @@ static DEFAULT_CFG: LazyLock<Config> = LazyLock::new(Default::default);
 /// (This is the bottom element of a lattice containing exponentially many possibly Configs.)
 pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     virtualize_cpuid: false,
+    cpu_profile: Default::default(),
+    cpu_profile_host: None,
     // These test configs run detcore under the ptrace backend.
     backend: <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities(),
     backend_supports_blocked_wait_signal_interruption: false,
@@ -177,6 +179,8 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| Config {
 /// (This is drawn from the middle of the lattice of possible Configs.)
 pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     virtualize_cpuid: true,
+    cpu_profile: Default::default(),
+    cpu_profile_host: None,
     // These test configs run detcore under the ptrace backend.
     backend: <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities(),
     backend_supports_blocked_wait_signal_interruption: false,
@@ -266,6 +270,8 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| Config {
 /// (This is the top element of a lattice containing exponentially many possibly Configs.)
 pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     virtualize_cpuid: true,
+    cpu_profile: Default::default(),
+    cpu_profile_host: None,
     // These test configs run detcore under the ptrace backend.
     backend: <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities(),
     backend_supports_blocked_wait_signal_interruption: false,

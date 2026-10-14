@@ -774,6 +774,10 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         mountinfo_mount_ids_captured: false,
         mount_id_assignment_order: Vec::new(),
         virtualize_cpuid: true,
+        // The recorder and the replayer set the profile from the command line
+        // and the recording; see `record_or_replay_config`'s callers.
+        cpu_profile: default_config.cpu_profile,
+        cpu_profile_host: None,
         // Record and replay run under the ptrace backend.
         backend: <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities(),
         // As `hermit run` sets it for ptrace (`prepare_backend_config` in

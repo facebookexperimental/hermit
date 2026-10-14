@@ -8,33 +8,181 @@
 
 //! cpuid interception
 
+use detcore_model::cpu_profile::CpuProfile;
+use detcore_model::cpu_profile::HostXstate;
 use raw_cpuid::CpuIdResult;
+use sha2::Digest;
+use sha2::Sha256;
 
+/// The CPUID table a guest sees: the fixed x86-64-v2 table, or the x86-64-v3
+/// table built from it (<https://github.com/rrnewton/hermit/issues/4243>).
 #[derive(Debug, Clone, Copy)]
-pub struct InterceptedCpuid();
+pub struct InterceptedCpuid {
+    profile: CpuProfile,
+    /// Under v3, the guest's leaf 0xD rows for subleaves 0-9, derived from the
+    /// host's: a guest's XGETBV and XSAVE run on the host, so leaf 0xD must
+    /// describe the host's XCR0 and layout.
+    xsave: [[u32; 4]; XSAVE_SUBLEAVES],
+}
 
-impl InterceptedCpuid {
-    pub fn new() -> Self {
-        InterceptedCpuid()
+/// Leaf 0xD subleaves the v3 table answers from the host: 0, and components
+/// 2-9 (the components the qualification covers stop at PKRU, bit 9).
+const XSAVE_SUBLEAVES: usize = 10;
+
+/// Leaf 1 ECX bits v3 adds to v2: FMA (12), MOVBE (22), XSAVE (26), OSXSAVE
+/// (27) and F16C (29). AVX (28), SSE4.2, POPCNT and the rest are already there.
+pub const V3_LEAF1_ECX_ADDED: u32 = (1 << 12) | (1 << 22) | (1 << 26) | (1 << 27) | (1 << 29);
+/// Leaf 1 ECX bit 31, "running under a hypervisor": a platform declaration,
+/// not an instruction the guest needs, which v3 clears so that the host check
+/// does not refuse every bare-metal host.
+pub const LEAF1_ECX_HYPERVISOR: u32 = 1 << 31;
+/// Leaf 7 EBX bits v3 clears: HLE (4) and RTM (11). With AVX2 and RTM both
+/// advertised, glibc picks its `*_avx2_rtm` functions, which raise SIGILL
+/// where TSX is absent (<https://github.com/rrnewton/hermit/issues/4251>).
+pub const V3_LEAF7_EBX_CLEARED: u32 = (1 << 4) | (1 << 11);
+/// Leaf 0x80000001 ECX bit v3 adds: LZCNT/ABM (5).
+pub const V3_EXT1_ECX_ADDED: u32 = 1 << 5;
+
+/// See [`crate::v3_feature_words`].
+pub(crate) fn v3_feature_words() -> Vec<(u32, u32, usize, u32)> {
+    let host = HostXstate {
+        vendor: [0; 3],
+        signature: 0,
+        xcr0: 0,
+        xsave_leaves: Vec::new(),
+        xcomp_supp: 0,
+        xcomp_perm: 0,
+        xcomp_guest_perm: 0,
+        xfeature_max: 0,
+        probe_cases: 0,
+        probe_forced_exit: false,
+    };
+    let v3 = InterceptedCpuid::v3(&host);
+    let mut words = Vec::new();
+    for (leaf, registers) in [
+        (0x1, [2, 3].as_slice()),
+        (0x7, &[1, 2, 3]),
+        (0x8000_0001, &[2, 3]),
+    ] {
+        let r = v3.cpuid(leaf, 0).unwrap_or(cpuid_result(0, 0, 0, 0));
+        let values = [r.eax, r.ebx, r.ecx, r.edx];
+        for &register in registers {
+            words.push((leaf, 0, register, values[register]));
+        }
     }
+    words
 }
 
 impl InterceptedCpuid {
+    /// The x86-64-v2 table.
+    pub fn new() -> Self {
+        InterceptedCpuid {
+            profile: CpuProfile::X86_64V2,
+            xsave: [[0; 4]; XSAVE_SUBLEAVES],
+        }
+    }
+
+    /// The x86-64-v3 table for a host that passed the qualification.
+    pub fn v3(host: &HostXstate) -> Self {
+        let mut xsave = [[0; 4]; XSAVE_SUBLEAVES];
+        // Subleaf 0: the enabled components (EAX, EDX) and the save-area size
+        // for them (EBX). ECX, the size for every supported component, is
+        // given as EBX: the guest can enable nothing beyond XCR0.
+        let size = host.xsave_leaf(0).map_or(0, |[_, ebx, _, _]| ebx);
+        xsave[0] = [host.xcr0 as u32, size, size, (host.xcr0 >> 32) as u32];
+        // Subleaf 1 (XSAVEOPT, XSAVEC, XGETBV1, XSAVES) stays zero.
+        for (component, row) in xsave.iter_mut().enumerate().skip(2) {
+            if host.xcr0 & (1 << component) != 0
+                && let Some([eax, ebx, ecx, _]) = host.xsave_leaf(component as u32)
+            {
+                *row = [eax, ebx, ecx, 0];
+            }
+        }
+        InterceptedCpuid {
+            profile: CpuProfile::X86_64V3,
+            xsave,
+        }
+    }
+
+    /// The table a run's configuration selects. Under v3 the CLI sets the host
+    /// facts after the host qualifies; a v3 configuration without them is a
+    /// launch defect, so it is refused rather than given a guessed leaf 0xD.
+    pub fn for_config(cfg: &crate::Config) -> Self {
+        match cfg.cpu_profile {
+            CpuProfile::X86_64V2 => Self::new(),
+            CpuProfile::X86_64V3 => Self::v3(cfg.cpu_profile_host.as_ref().expect(
+                "--cpu-profile x86-64-v3 reached Detcore without the qualified host's xstate facts",
+            )),
+        }
+    }
+
     pub fn cpuid(&self, leaf: u32, subleaf: u32) -> Option<CpuIdResult> {
         let request = leaf as usize;
-        let result = if request >= 0x80000000 && request < 0x80000000 + EXTENDED_CPUIDS.len() {
+        let mut result = if request >= 0x80000000 && request < 0x80000000 + EXTENDED_CPUIDS.len() {
             EXTENDED_CPUIDS[request - 0x80000000]
         } else if request < CPUIDS.len() {
             CPUIDS[request]
         } else {
             return None;
         };
+        if self.profile == CpuProfile::X86_64V3 {
+            match leaf {
+                0x1 => result.ecx = (result.ecx | V3_LEAF1_ECX_ADDED) & !LEAF1_ECX_HYPERVISOR,
+                0x7 => result.ebx &= !V3_LEAF7_EBX_CLEARED,
+                0xd => {
+                    let [eax, ebx, ecx, edx] =
+                        self.xsave.get(subleaf as usize).copied().unwrap_or([0; 4]);
+                    return Some(cpuid_result(eax, ebx, ecx, edx));
+                }
+                0x8000_0001 => result.ecx |= V3_EXT1_ECX_ADDED,
+                _ => {}
+            }
+        }
 
         if subleaf != 0 && uses_subleaf(leaf) {
             Some(cpuid_result(0, 0, 0, 0))
         } else {
             Some(result)
         }
+    }
+
+    /// SHA-256 over a canonical encoding of everything this table answers and
+    /// the host facts a v3 run binds, for the recording to carry: the profile
+    /// name (length-prefixed), then each basic and extended leaf with each of
+    /// its subleaves 0-63 (only subleaf 0 for leaves without subleaves) as
+    /// little-endian u32 leaf, subleaf, EAX, EBX, ECX, EDX, sorted by leaf then
+    /// subleaf; then, under v3, XCR0, the three XCOMP masks (u64 each) and
+    /// XFEATURE_MAX (u32).
+    pub fn digest(&self, host: Option<&HostXstate>) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        let name = self.profile.name().as_bytes();
+        hash.update((name.len() as u32).to_le_bytes());
+        hash.update(name);
+        let leaves =
+            (0..CPUIDS.len() as u32).chain(0x8000_0000..0x8000_0000 + EXTENDED_CPUIDS.len() as u32);
+        for leaf in leaves {
+            let subleaves = if uses_subleaf(leaf) { 64 } else { 1 };
+            for subleaf in 0..subleaves {
+                let r = self
+                    .cpuid(leaf, subleaf)
+                    .unwrap_or(cpuid_result(0, 0, 0, 0));
+                for word in [leaf, subleaf, r.eax, r.ebx, r.ecx, r.edx] {
+                    hash.update(word.to_le_bytes());
+                }
+            }
+        }
+        if let Some(host) = host {
+            for word in [
+                host.xcr0,
+                host.xcomp_supp,
+                host.xcomp_perm,
+                host.xcomp_guest_perm,
+            ] {
+                hash.update(word.to_le_bytes());
+            }
+            hash.update(host.xfeature_max.to_le_bytes());
+        }
+        hash.finalize().into()
     }
 }
 
@@ -73,16 +221,23 @@ impl InterceptedCpuid {
     /// (such as `constant_tsc`), which describe the kernel rather than CPUID,
     /// are not shown.
     pub fn cpuinfo(&self) -> Vec<u8> {
-        render_cpuinfo(|leaf, subleaf| {
-            self.cpuid(leaf, subleaf)
-                .unwrap_or(cpuid_result(0, 0, 0, 0))
-        })
+        let bugs = match self.profile {
+            CpuProfile::X86_64V2 => CPUINFO_BUGS,
+            CpuProfile::X86_64V3 => CPUINFO_BUGS_V3,
+        };
+        render_cpuinfo(
+            |leaf, subleaf| {
+                self.cpuid(leaf, subleaf)
+                    .unwrap_or(cpuid_result(0, 0, 0, 0))
+            },
+            bugs,
+        )
     }
 }
 
 /// [`InterceptedCpuid::cpuinfo`] for the CPU whose CPUID answers as `leaf`
 /// does.
-fn render_cpuinfo(leaf: impl Fn(u32, u32) -> CpuIdResult) -> Vec<u8> {
+fn render_cpuinfo(leaf: impl Fn(u32, u32) -> CpuIdResult, bugs: &str) -> Vec<u8> {
     let basic = leaf(0, 0);
     let vendor: Vec<u8> = [basic.ebx, basic.edx, basic.ecx]
         .iter()
@@ -192,7 +347,7 @@ fn render_cpuinfo(leaf: impl Fn(u32, u32) -> CpuIdResult) -> Vec<u8> {
     out += &format!("cpuid level\t: {}\n", basic.eax);
     out += "wp\t\t: yes\n";
     out += &format!("flags\t\t: {}\n", flags.join(" "));
-    out += &format!("bugs\t\t: {CPUINFO_BUGS}\n");
+    out += &format!("bugs\t\t: {bugs}\n");
     out += "bogomips\t: 2000.00\n";
     if tlb_pages != 0 {
         out += &format!("TLB size\t: {tlb_pages} 4K pages\n");
@@ -345,6 +500,14 @@ const LEAF2_CACHES: &str = "06:i:8 08:i:16 09:i:32 0a:d:8 0c:d:16 0d:d:16 0e:d:2
 /// vendor, family, model and features.
 const CPUINFO_BUGS: &str = "cpu_meltdown spectre_v1 spectre_v2 spec_store_bypass l1tf mds swapgs taa \
     itlb_multihit bhi spectre_v2_user its";
+
+/// The `bugs` set Linux 7.1.3's `cpu_set_bug_bits` derives for the v3 table:
+/// the v2 set without `taa` (it needs RTM, which v3 clears), `bhi` (it needs
+/// enhanced IBRS or the hypervisor bit, and v3 clears the hypervisor bit) and
+/// `its` (outside a hypervisor it needs a model on the ITS list, and family 6
+/// model 6 is not on it).
+const CPUINFO_BUGS_V3: &str = "cpu_meltdown spectre_v1 spectre_v2 spec_store_bypass l1tf mds swapgs \
+    itlb_multihit spectre_v2_user";
 
 /// A CPUID register.
 #[derive(Clone, Copy, Debug)]
@@ -633,14 +796,17 @@ mod tests {
     /// (`(leaf, subleaf, [eax, ebx, ecx, edx])`) and zero elsewhere, and the
     /// value of each line it renders.
     fn render(entries: &[(u32, u32, [u32; 4])]) -> std::collections::BTreeMap<String, String> {
-        let block = render_cpuinfo(|leaf, subleaf| {
-            entries
-                .iter()
-                .find(|(l, s, _)| *l == leaf && *s == subleaf)
-                .map_or(cpuid_result(0, 0, 0, 0), |(_, _, [a, b, c, d])| {
-                    cpuid_result(*a, *b, *c, *d)
-                })
-        });
+        let block = render_cpuinfo(
+            |leaf, subleaf| {
+                entries
+                    .iter()
+                    .find(|(l, s, _)| *l == leaf && *s == subleaf)
+                    .map_or(cpuid_result(0, 0, 0, 0), |(_, _, [a, b, c, d])| {
+                        cpuid_result(*a, *b, *c, *d)
+                    })
+            },
+            CPUINFO_BUGS,
+        );
         String::from_utf8(block)
             .unwrap()
             .lines()
@@ -770,5 +936,134 @@ mod tests {
                 "extended leaf {leaf:#x}"
             );
         }
+    }
+
+    /// The host facts of an AMD EPYC 9D85 (XCR0 0x2e7, Linux 7.1.3), as the
+    /// CLI captures them.
+    fn epyc_9d85() -> HostXstate {
+        HostXstate {
+            vendor: [0x6874_7541, 0x6974_6e65, 0x444d_4163],
+            signature: 0x00b1_0f11,
+            xcr0: 0x2e7,
+            xsave_leaves: vec![
+                [0, 0x2e7, 0x988, 0x1800, 0],
+                [2, 0x100, 0x240, 0, 0],
+                [5, 0x40, 0x340, 0, 0],
+                [6, 0x200, 0x380, 0, 0],
+                [7, 0x400, 0x580, 0, 0],
+                [9, 0x8, 0x980, 0, 0],
+            ],
+            xcomp_supp: 0x2e7,
+            xcomp_perm: 0x2e7,
+            xcomp_guest_perm: 0x2e7,
+            xfeature_max: 20,
+            probe_cases: 33,
+            probe_forced_exit: false,
+        }
+    }
+
+    #[test]
+    fn the_v3_table_is_v2_with_the_v3_bits_and_the_hosts_leaf_0xd() {
+        let v2 = InterceptedCpuid::new();
+        let v3 = InterceptedCpuid::v3(&epyc_9d85());
+        let regs = |t: &InterceptedCpuid, leaf, sub| registers(t.cpuid(leaf, sub).unwrap());
+        let [_, _, ecx2, _] = regs(&v2, 1, 0);
+        let [_, _, ecx3, _] = regs(&v3, 1, 0);
+        assert_eq!(ecx3, (ecx2 | V3_LEAF1_ECX_ADDED) & !LEAF1_ECX_HYPERVISOR);
+        assert_ne!(
+            ecx2 & LEAF1_ECX_HYPERVISOR,
+            0,
+            "v2 keeps its hypervisor bit"
+        );
+        // AVX with OSXSAVE now, and FMA, MOVBE, XSAVE, F16C.
+        for bit in [12, 22, 26, 27, 28, 29] {
+            assert_ne!(ecx3 & (1 << bit), 0, "leaf 1 ECX bit {bit}");
+        }
+        // RDRAND stays masked.
+        assert_eq!(ecx3 & (1 << 30), 0);
+        let [_, ebx7, _, _] = regs(&v3, 7, 0);
+        assert_eq!(ebx7 & V3_LEAF7_EBX_CLEARED, 0, "HLE and RTM cleared");
+        // AVX2, BMI1, BMI2 stay; RDSEED stays masked.
+        for bit in [3, 5, 8] {
+            assert_ne!(ebx7 & (1 << bit), 0, "leaf 7 EBX bit {bit}");
+        }
+        assert_eq!(ebx7 & (1 << 18), 0);
+        assert_ne!(regs(&v3, 0x8000_0001, 0)[2] & V3_EXT1_ECX_ADDED, 0, "LZCNT");
+        // Leaf 0xD: the host's enabled components and size, ECX = EBX.
+        assert_eq!(regs(&v3, 0xd, 0), [0x2e7, 0x988, 0x988, 0]);
+        assert_eq!(
+            regs(&v3, 0xd, 1),
+            [0; 4],
+            "no XSAVEOPT, XSAVEC, XGETBV1, XSAVES"
+        );
+        assert_eq!(regs(&v3, 0xd, 2), [0x100, 0x240, 0, 0]);
+        assert_eq!(regs(&v3, 0xd, 9), [0x8, 0x980, 0, 0]);
+        assert_eq!(regs(&v3, 0xd, 3), [0; 4], "MPX is not in XCR0");
+        assert_eq!(regs(&v3, 0xd, 11), [0; 4], "CET is not in XCR0");
+        assert_eq!(regs(&v3, 0xd, 63), [0; 4]);
+        // Everything else is v2's.
+        for leaf in [0, 2, 4, 0xb, 0x8000_0000, 0x8000_0002, 0x8000_0008] {
+            assert_eq!(regs(&v3, leaf, 0), regs(&v2, leaf, 0), "leaf {leaf:#x}");
+        }
+    }
+
+    #[test]
+    fn the_digest_follows_the_profile_and_every_bound_host_fact() {
+        let host = epyc_9d85();
+        let v3 = InterceptedCpuid::v3(&host);
+        let digest = v3.digest(Some(&host));
+        assert_ne!(digest, InterceptedCpuid::new().digest(None));
+        assert_eq!(
+            digest,
+            InterceptedCpuid::v3(&host.clone()).digest(Some(&host))
+        );
+        let changed = |f: fn(&mut HostXstate)| {
+            let mut other = host.clone();
+            f(&mut other);
+            InterceptedCpuid::v3(&other).digest(Some(&other))
+        };
+        assert_ne!(changed(|h| h.xcr0 = 0x207), digest);
+        assert_ne!(
+            changed(|h| h.xsave_leaves[2][2] = 0x440),
+            digest,
+            "a component offset"
+        );
+        assert_ne!(
+            changed(|h| h.xsave_leaves[0][2] = 0xa88),
+            digest,
+            "the save size"
+        );
+        assert_ne!(changed(|h| h.xcomp_perm = 0x207), digest);
+        assert_ne!(changed(|h| h.xfeature_max = 19), digest);
+    }
+
+    #[test]
+    fn v3_cpuinfo_shows_the_v3_flags_and_bugs() {
+        let text = String::from_utf8(InterceptedCpuid::v3(&epyc_9d85()).cpuinfo()).unwrap();
+        let line = |key: &str| {
+            text.lines()
+                .find_map(|l| {
+                    l.strip_prefix(key)?
+                        .split_once(':')
+                        .map(|(_, v)| v.trim().to_owned())
+                })
+                .unwrap()
+        };
+        let flags = line("flags");
+        for flag in [
+            "fma", "movbe", "xsave", "avx", "f16c", "avx2", "bmi1", "bmi2", "abm",
+        ] {
+            assert!(flags.split(' ').any(|f| f == flag), "{flag} in {flags}");
+        }
+        for flag in ["hypervisor", "hle", "rtm", "rdrand", "rdseed", "avx512f"] {
+            assert!(!flags.split(' ').any(|f| f == flag), "{flag} in {flags}");
+        }
+        assert_eq!(line("bugs"), CPUINFO_BUGS_V3);
+        // The v2 file is unchanged.
+        assert!(
+            String::from_utf8(InterceptedCpuid::new().cpuinfo())
+                .unwrap()
+                .contains(" hypervisor ")
+        );
     }
 }

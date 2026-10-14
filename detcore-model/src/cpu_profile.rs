@@ -60,6 +60,49 @@ impl std::fmt::Display for CpuProfile {
     }
 }
 
+/// The host facts a v3 guest's CPUID and xstate answers are built from,
+/// captured once at startup on a host that passed the qualification, and bound
+/// into a recording so that replay refuses a host where any of them differs.
+///
+/// On the ptrace backend a guest's XGETBV and XSAVE run on the host, so leaf
+/// 0xD must describe the host's XCR0 and save layout; everything else in the v3
+/// table is fixed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct HostXstate {
+    /// CPUID leaf 0 EBX, EDX, ECX: the vendor string.
+    pub vendor: [u32; 3],
+    /// CPUID leaf 1 EAX: family, model and stepping.
+    pub signature: u32,
+    /// XCR0, as XGETBV(0) reads it.
+    pub xcr0: u64,
+    /// The host's CPUID leaf 0xD rows the guest table is built from, as
+    /// `[subleaf, eax, ebx, ecx, edx]`: subleaf 0 and each enabled component
+    /// from 2 up, in order.
+    pub xsave_leaves: Vec<[u32; 5]>,
+    /// `arch_prctl` ARCH_GET_XCOMP_SUPP, ARCH_GET_XCOMP_PERM and
+    /// ARCH_GET_XCOMP_GUEST_PERM.
+    pub xcomp_supp: u64,
+    pub xcomp_perm: u64,
+    pub xcomp_guest_perm: u64,
+    /// The first component index ARCH_REQ_XCOMP_PERM answers EINVAL for
+    /// (Linux's XFEATURE_MAX); below it the answer is EOPNOTSUPP.
+    pub xfeature_max: u32,
+    /// The qualification this host passed: its case count and whether the
+    /// forced-exit arm ran.
+    pub probe_cases: u32,
+    pub probe_forced_exit: bool,
+}
+
+impl HostXstate {
+    /// The host's leaf 0xD row for `subleaf`, if it was captured.
+    pub fn xsave_leaf(&self, subleaf: u32) -> Option<[u32; 4]> {
+        self.xsave_leaves
+            .iter()
+            .find(|row| row[0] == subleaf)
+            .map(|row| [row[1], row[2], row[3], row[4]])
+    }
+}
+
 /// What the host's XSAVE results can depend on, stated wherever v3 is offered:
 /// the `--cpu-profile` help, `--verify` output, the recording and the docs.
 pub const V3_RESIDUAL: &str = "With --cpu-profile x86-64-v3, Hermit checks at startup that this \

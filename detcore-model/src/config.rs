@@ -133,6 +133,24 @@ pub struct Config {
     #[clap(long = "no-virtualize-cpuid", action = clap::ArgAction::SetFalse)]
     pub virtualize_cpuid: bool,
 
+    /// The CPU the guest sees: x86-64-v2 (the default) or x86-64-v3. v3 is
+    /// offered only on the ptrace backend, on hosts that pass a startup
+    /// qualification of the XSAVE in-use bits a guest can read; see
+    /// `hermit host-capabilities --cpu-profile x86-64-v3`
+    /// (<https://github.com/rrnewton/hermit/issues/4243>). Its check samples a
+    /// fixed set of cases, so it cannot exclude a CPU or hypervisor that
+    /// behaves differently on other paths.
+    #[clap(long, value_enum, default_value_t)]
+    #[serde(default)]
+    pub cpu_profile: crate::cpu_profile::CpuProfile,
+
+    /// The host facts a v3 guest's leaf 0xD and xstate answers come from, set
+    /// by the CLI after the host qualifies; `None` under v2. Neither profile
+    /// field enters the legacy form the DBT runtime reads (DBT refuses v3).
+    #[clap(skip)]
+    #[serde(default)]
+    pub cpu_profile_host: Option<crate::cpu_profile::HostXstate>,
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-845): Review in-process backend descriptor discovery.
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -2233,7 +2251,9 @@ mod legacy_backend_json {
     /// in-guest LiteInst), so it is never written and reads as false.
     /// `inherited_seccomp` came after the legacy form froze too. It is never
     /// written and reads as unknown.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 12] = [
+    /// `cpu_profile` and `cpu_profile_host` came after it as well. DBT refuses
+    /// the x86-64-v3 profile, so they are never written and read as v2.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 14] = [
         "backend",
         "record_host_inputs",
         "backend_supports_blocked_wait_signal_interruption",
@@ -2246,6 +2266,8 @@ mod legacy_backend_json {
         "replaying",
         "scheduler_turn_cost",
         "inherited_seccomp",
+        "cpu_profile",
+        "cpu_profile_host",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -2385,6 +2407,18 @@ mod legacy_backend_json {
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
                 // Unset, as its serde default is.
                 Some("in_guest_detlog_forward_policy" | "scheduler_turn_cost") => seed
+                    .deserialize(serde_json::Value::Null)
+                    .map(Some)
+                    .map_err(<A::Error as de::Error>::custom),
+                // x86-64-v2, as their serde defaults are.
+                Some("cpu_profile") => {
+                    let v2 = serde_json::to_value(crate::cpu_profile::CpuProfile::X86_64V2)
+                        .map_err(<A::Error as de::Error>::custom)?;
+                    seed.deserialize(v2)
+                        .map(Some)
+                        .map_err(<A::Error as de::Error>::custom)
+                }
+                Some("cpu_profile_host") => seed
                     .deserialize(serde_json::Value::Null)
                     .map(Some)
                     .map_err(<A::Error as de::Error>::custom),
@@ -2645,7 +2679,9 @@ mod legacy_backend_json {
                 | "futex_wake_yields"
                 | "replaying"
                 | "scheduler_turn_cost"
-                | "inherited_seccomp" => Ok(()),
+                | "inherited_seccomp"
+                | "cpu_profile"
+                | "cpu_profile_host" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
         }
@@ -3261,7 +3297,9 @@ mod tests {
                 | "futex_wake_yields"
                 | "replaying"
                 | "scheduler_turn_cost"
-                | "inherited_seccomp" => {}
+                | "inherited_seccomp"
+                | "cpu_profile"
+                | "cpu_profile_host" => {}
                 other => expected.push(other.to_owned()),
             }
         }
@@ -3276,9 +3314,10 @@ mod tests {
         // `backend_delivers_timer_events`, `guest_may_inherit_a_terminal`,
         // `in_guest_detlog_forward_policy`, `in_guest_site_patching_off`,
         // `target_timeslice_syscalls_only`, `futex_wake_yields`, `replaying`,
-        // `scheduler_turn_cost` and `inherited_seccomp` none.
+        // `scheduler_turn_cost`, `inherited_seccomp`, `cpu_profile` and
+        // `cpu_profile_host` none.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len() + 3, keys.len());
+        assert_eq!(fields.len() + 1, keys.len());
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -3471,6 +3510,33 @@ mod tests {
     /// `inherited_seccomp` never enters the legacy form, whatever its value:
     /// the guest-visible string stays the legacy bytes, and it reads back as
     /// unknown from both the object and the array form.
+    #[test]
+    fn the_cpu_profile_never_enters_the_legacy_form() {
+        let v2 = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let v3 = Config {
+            cpu_profile: crate::cpu_profile::CpuProfile::X86_64V3,
+            ..v2.clone()
+        };
+        let json = to_legacy_backend_json(&v3).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&v2).unwrap());
+        assert!(!json.contains("cpu_profile"), "{json}");
+        assert_eq!(
+            from_legacy_backend_json(&json).unwrap().cpu_profile,
+            crate::cpu_profile::CpuProfile::X86_64V2
+        );
+        // The bincode form the tool reads carries both fields.
+        let wire = bincode::serde::encode_to_vec(&v3, bincode::config::legacy()).unwrap();
+        let (decoded, _): (Config, usize) =
+            bincode::serde::decode_from_slice(&wire, bincode::config::legacy()).unwrap();
+        assert_eq!(
+            decoded.cpu_profile,
+            crate::cpu_profile::CpuProfile::X86_64V3
+        );
+    }
+
     #[test]
     fn inherited_seccomp_never_enters_the_legacy_form() {
         use crate::config::InheritedSeccomp;

@@ -317,6 +317,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         seccomp_result(call.op(), call.flags(), call.args().is_some()).map_err(Into::into)
     }
 
+    /// The host xstate facts of an x86-64-v3 run, or `None` under v2.
+    fn v3_host_xstate(&self) -> Option<&detcore_model::cpu_profile::HostXstate> {
+        (self.cfg.cpu_profile == detcore_model::cpu_profile::CpuProfile::X86_64V3)
+            .then_some(self.cfg.cpu_profile_host.as_ref())
+            .flatten()
+    }
+
     fn write_arch_prctl_u64<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -381,6 +388,32 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Ok(guest.inject(call).await?)
             }
 
+            // Under x86-64-v3 the guest's XGETBV and XSAVE run on the host, so
+            // the xstate queries answer with the host's masks, captured at
+            // startup on a host without dynamic features and bound in the
+            // recording; the requests answer as Linux does on such a host:
+            // EOPNOTSUPP below XFEATURE_MAX and EINVAL from it up
+            // (https://github.com/rrnewton/hermit/issues/4243).
+            ArchPrctlCmd::Other(
+                cmd @ (ARCH_GET_XCOMP_SUPP | ARCH_GET_XCOMP_PERM | ARCH_GET_XCOMP_GUEST_PERM),
+                addr,
+            ) if let Some(host) = self.v3_host_xstate() => {
+                let mask = match cmd {
+                    ARCH_GET_XCOMP_SUPP => host.xcomp_supp,
+                    ARCH_GET_XCOMP_PERM => host.xcomp_perm,
+                    _ => host.xcomp_guest_perm,
+                };
+                self.write_arch_prctl_u64(guest, addr, mask)
+            }
+            ArchPrctlCmd::Other(ARCH_REQ_XCOMP_PERM | ARCH_REQ_XCOMP_GUEST_PERM, index)
+                if let Some(host) = self.v3_host_xstate() =>
+            {
+                if index >= host.xfeature_max as usize {
+                    Err(Errno::EINVAL.into())
+                } else {
+                    Err(Errno::EOPNOTSUPP.into())
+                }
+            }
             // Expose a conservative virtual CPU with no optional extended-state permissions.
             ArchPrctlCmd::Other(
                 ARCH_GET_XCOMP_SUPP | ARCH_GET_XCOMP_PERM | ARCH_GET_XCOMP_GUEST_PERM,
