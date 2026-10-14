@@ -134,7 +134,14 @@ test:
         backends_disabled:
           sabre: SaBRe does not yet determinize busy-wait polling on virtual wall-clock advancement; keep the identical example workload unqualified
         ci_disabled_reason:
-          ptrace: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit", "result": "infrastructure-error"}
+          ptrace:
+            result: timeout
+            evidence: local 10-repetition ptrace verify at Hermit 46163a3ea878f5eac9184f0d1e70a856792d6dfe, 10 of 10 PASS, median 15.8 and maximum 18.1 wall seconds (https://github.com/rrnewton/dev-hermit/issues/564)
+            reason: >-
+              Passes repeated verification, but this default 50 x 20 ms workload
+              reached the 32-second CPU bound under ptrace on a remote-execution
+              host on 2026-10-05, so full validation does not select it;
+              applications/timed-progress-bar runs the 53 x 5 ms variant there
           kvm: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit", "result": "infrastructure-error"}
           dbt:
             result: infrastructure-error
