@@ -1491,7 +1491,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // with the maintained third-party features and unchanged skip filters.
     // And +6 from 74689bb0: 1040.
     // And +1 from 0a80f81a: 1041.
-    ("test.hermit_unit", 1041),
+    // And metadata::tests::record_version_rejects_streams_from_before_mask_aware_timer_targets
+    // (https://github.com/rrnewton/hermit/issues/4320): 1042, run.
+    ("test.hermit_unit", 1042),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2144,7 +2146,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/issues/4246: 1567, by listing.
     // And +8 from 74689bb0: 1575.
     // And +6 from 0a80f81a: 1581.
-    ("test.detcore_unit", 1581),
+    // And scheduler::test::a_timer_signal_goes_to_a_thread_that_does_not_block_it
+    // (https://github.com/rrnewton/hermit/issues/4320): 1582, run.
+    ("test.detcore_unit", 1582),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2970,7 +2974,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // run_dbt_leader_pthread_exit_leaves_its_group_running_at_bitwise_parity
     // (https://github.com/rrnewton/hermit/issues/4246): 383.
     // And +2 from 74689bb0: 385.
-    ("test.cli", 385),
+    // And a_timer_signal_reaches_the_thread_that_does_not_block_it_under_chaos
+    // (https://github.com/rrnewton/hermit/issues/4320): 386.
+    // And a_timer_armed_by_a_thread_that_blocks_its_signal_wakes_another_thread and
+    // a_timer_signal_and_an_rt_sigsuspend_sleeper_verify_under_chaos (Claude review of
+    // https://github.com/rrnewton/hermit/pull/4331): 388, by listing.
+    ("test.cli", 388),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3288,7 +3297,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (B2b): 315.
     // And the three DBT thread-join tests and the DBT leader-exit test: 319.
     // And +2 from 74689bb0: 321.
-    ("test.cli_on_host", 321),
+    // And the masked timer signal target test: 322.
+    // And the armer-blocks and sleeper timer tests: 324.
+    ("test.cli_on_host", 324),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -3496,7 +3507,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the four exited-thread barrier tests: 1567.
     // And +8 from 74689bb0: 1575.
     // And +6 from 0a80f81a: 1581.
-    ("test.detcore_unit_on_host", 1581),
+    // And the timer signal target test: 1582.
+    ("test.detcore_unit_on_host", 1582),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -3682,7 +3694,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // maintained lib/bin selection, measured without changing its skips.
     // And +6 from 74689bb0: 1040.
     // And +1 from 0a80f81a: 1041.
-    ("test.hermit_unit_on_host", 1041),
+    // And the mask-aware timer target record-epoch test: 1042.
+    ("test.hermit_unit_on_host", 1042),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

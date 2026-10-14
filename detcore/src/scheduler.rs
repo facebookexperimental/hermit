@@ -6583,8 +6583,52 @@ impl Scheduler {
         {
             self.host_signal_attempts += 1;
         }
-        let target = self.select_signal_target(dpid, Some(dtid));
+        let target = self
+            .select_signal_target(dpid, Some(dtid))
+            .map(|preferred| self.timer_signal_target(dpid, preferred, sig));
         self.fire_alarm_at(dpid, target, sig, info)
+    }
+
+    /// The thread of `process` that a timer's process-directed `sig` is sent
+    /// to, given the thread `select_signal_target` drew (`preferred`): the
+    /// thread `kernel_signal_target` gives it (an `rt_sigsuspend` sleeper that
+    /// does not block it, else `preferred` if it does not, else the first
+    /// thread that does not), or `preferred` when every thread blocks it.
+    ///
+    /// The send names one thread, and the scheduler wakes that thread
+    /// (`wake_signaled_guest`). Linux gives a process-directed signal only to
+    /// a thread that does not block it (`complete_signal`), so naming a thread
+    /// that blocks it woke the wrong thread: under `--chaos-target-races`, a
+    /// SIGALRM drawn for a worker that blocks it left the thread in `pause`
+    /// asleep forever (https://github.com/rrnewton/hermit/issues/4320). A
+    /// sleeper comes first because the kernel wakes it while the drawn thread
+    /// is held in a ptrace stop, which `wants_signal` skips; naming the drawn
+    /// thread then left which of the two took the signal to host timing
+    /// (Claude review of https://github.com/rrnewton/hermit/pull/4331, the same
+    /// race https://github.com/rrnewton/hermit/issues/4237 fixed for SIGCHLD).
+    /// When every thread blocks it, Linux keeps it in the shared queue for the
+    /// first thread that unblocks it, which `kill` to any of them does too.
+    ///
+    /// Called only at a timed dispatch, where no guest thread holds the turn,
+    /// so every mask read is a function of the schedule (see
+    /// `kernel_sigchld_target`). Without signal-target modelling no mask is
+    /// read, and `preferred` is kept.
+    fn timer_signal_target(&self, process: DetPid, preferred: DetTid, sig: Signal) -> DetTid {
+        if !self.models_signal_targets {
+            return preferred;
+        }
+        match self.kernel_signal_target(process, preferred, sig as libc::c_int) {
+            Some(thread) => {
+                if thread != preferred {
+                    info!(
+                        "[dpid {}] sending {} to thread {} rather than the drawn thread {}.",
+                        process, sig, thread, preferred
+                    );
+                }
+                thread
+            }
+            None => preferred,
+        }
     }
 
     fn fire_alarm_at(
@@ -8448,13 +8492,27 @@ impl Scheduler {
     /// dying thread either (`wants_signal` skips `PF_EXITING`). Returns `None`
     /// when every thread blocks the signal.
     fn kernel_sigchld_target(&self, process: DetPid, preferred: DetTid) -> Option<DetTid> {
-        let sigchld = kernel_signal_bit(libc::SIGCHLD);
+        self.kernel_signal_target(process, preferred, libc::SIGCHLD)
+    }
+
+    /// `kernel_sigchld_target` for any process-directed signal `signo`: an
+    /// `rt_sigsuspend` sleeper that does not block it first, then `preferred`
+    /// if it does not, then the first other thread that does not; `None` when
+    /// every thread blocks it. A timer's signal is chosen with it too
+    /// (`timer_signal_target`).
+    fn kernel_signal_target(
+        &self,
+        process: DetPid,
+        preferred: DetTid,
+        signo: libc::c_int,
+    ) -> Option<DetTid> {
+        let bit = kernel_signal_bit(signo);
         let mut threads = self.process_signal_targets(process);
         // Stable, so the rest stay in thread-ID order.
         threads.sort_by_key(|thread| *thread != preferred);
         let unblocked = |thread: &DetTid| {
             self.thread_signal_mask(*thread)
-                .is_some_and(|mask| mask & sigchld == 0)
+                .is_some_and(|mask| mask & bit == 0)
         };
         threads
             .iter()
@@ -18984,6 +19042,110 @@ mod test {
         scheduler.logically_kill_thread(&child, &child, MmId::initial(child));
         scheduler.drain_pending_cross_task_signals();
         assert!(scheduler.is_parked_futex_waiter(creator));
+    }
+
+    /// A timer's process-directed signal is sent to a thread that does not
+    /// block it, since Linux gives it to no other, and the scheduler wakes the
+    /// thread it names. The thread `select_signal_target` drew keeps it if it
+    /// does not block it; when every thread blocks it, the drawn thread is
+    /// kept, and `kill` leaves it in the shared queue. Before, a SIGALRM drawn
+    /// under `--chaos-target-races` for a worker that blocks it woke that
+    /// worker, and the thread in `pause` slept forever
+    /// (https://github.com/rrnewton/hermit/issues/4320).
+    #[test]
+    fn a_timer_signal_goes_to_a_thread_that_does_not_block_it() {
+        let alrm = kernel_signal_bit(libc::SIGALRM);
+        let state = |blocked: u64| KernelSignalState {
+            blocked,
+            ..signal_state(alrm, 0)
+        };
+        let (mut scheduler, leader, worker, _child) = sigchld_family(libc::SIGCHLD);
+        assert!(scheduler.models_signal_targets);
+        scheduler.test_kernel_signal_states.insert(leader, state(0));
+        scheduler
+            .test_kernel_signal_states
+            .insert(worker, state(alrm));
+        assert_eq!(
+            scheduler.timer_signal_target(leader, worker, Signal::SIGALRM),
+            leader,
+            "the worker blocks SIGALRM, the leader does not"
+        );
+        assert_eq!(
+            scheduler.timer_signal_target(leader, leader, Signal::SIGALRM),
+            leader
+        );
+
+        scheduler.test_kernel_signal_states.insert(worker, state(0));
+        assert_eq!(
+            scheduler.timer_signal_target(leader, worker, Signal::SIGALRM),
+            worker,
+            "a drawn thread that does not block it keeps it"
+        );
+
+        scheduler
+            .test_kernel_signal_states
+            .insert(leader, state(alrm));
+        scheduler
+            .test_kernel_signal_states
+            .insert(worker, state(alrm));
+        assert_eq!(
+            scheduler.timer_signal_target(leader, worker, Signal::SIGALRM),
+            worker,
+            "every thread blocks it: the drawn thread is kept"
+        );
+
+        // A second candidate: the fallback takes the lowest thread ID that
+        // does not block it.
+        let third = DetTid::from_raw(102);
+        scheduler.thread_tree.add_child(leader, third, false);
+        register_known_thread(&mut scheduler, third);
+        scheduler.test_kernel_signal_states.insert(leader, state(0));
+        scheduler.test_kernel_signal_states.insert(third, state(0));
+        assert_eq!(
+            scheduler.timer_signal_target(leader, worker, Signal::SIGALRM),
+            leader,
+            "the lowest thread that does not block it"
+        );
+
+        // A thread asleep in rt_sigsuspend whose mask admits the signal comes
+        // first, ahead of a drawn thread that does not block it either: the
+        // kernel wakes the sleeper while the drawn thread is held in a ptrace
+        // stop (Claude review of https://github.com/rrnewton/hermit/pull/4331).
+        let op = ExternalOpId::new(third, 1);
+        commit_out_of_scheduler_call(
+            &mut scheduler,
+            third,
+            ResourceID::BlockingRtSigsuspend(op),
+            Some(0),
+        );
+        scheduler.test_kernel_signal_states.insert(worker, state(0));
+        assert_eq!(
+            scheduler.timer_signal_target(leader, worker, Signal::SIGALRM),
+            third,
+            "the rt_sigsuspend sleeper, not the drawn worker"
+        );
+        assert_eq!(
+            scheduler.timer_signal_target(leader, leader, Signal::SIGALRM),
+            third,
+            "nor the drawn leader"
+        );
+
+        scheduler.models_signal_targets = false;
+        let reads = scheduler
+            .test_kernel_mask_reads
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            scheduler.timer_signal_target(leader, worker, Signal::SIGALRM),
+            worker,
+            "without signal-target modelling the drawn thread is kept"
+        );
+        assert_eq!(
+            scheduler
+                .test_kernel_mask_reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            reads,
+            "and no mask is read"
+        );
     }
 
     /// Commit `thread`'s request to begin a blocking call outside the runnable

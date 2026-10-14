@@ -149,6 +149,7 @@ static FUTEX_LOCK_PI_REFUSED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_KEYED_ACCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_WAKE_OP_FILE_SHARED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_REWAIT_CHANGED_WORD_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static TIMER_SIGNAL_MASKED_THREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_WAIT_UNREADABLE_WORD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PIDFD_SEND_SIGNAL_MULTITHREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PIDFD_SEND_SIGNAL_FLAGS_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -28428,6 +28429,138 @@ fn a_futex_waiter_woken_for_a_signal_another_thread_takes_rereads_its_word() {
         log.contains("Success: replay matched recording."),
         "the replay must match the recording:\nstderr:\n{log}"
     );
+}
+
+/// A timer's process-directed SIGALRM reaches the thread in `pause`, not a
+/// worker that blocks it, at every chaos seed. On main at 3a52ec7b,
+/// `--chaos-target-races` drew the worker at 10 of seeds 1-14 (2 and 4
+/// among them), woke it, and left main asleep until the deadline
+/// (https://github.com/rrnewton/hermit/issues/4320).
+#[test]
+fn a_timer_signal_reaches_the_thread_that_does_not_block_it_under_chaos() {
+    let guest = futex_c_guest(
+        &TIMER_SIGNAL_MASKED_THREAD_GUEST,
+        "timer_signal_masked_thread",
+    )
+    .to_str()
+    .unwrap()
+    .to_owned();
+    let runs: [&[&str]; 3] = [
+        &[],
+        &["--chaos", "--chaos-target-races", "--seed", "2"],
+        &["--chaos", "--chaos-target-races", "--seed", "4"],
+    ];
+    for extra in runs {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let mut args = vec!["run", "--strict", "--timeout", "60"];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["--", guest.as_str()]);
+        let (status, log) = run_with_deadline(
+            hermit_command(&args),
+            directory.path(),
+            Duration::from_secs(120),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{extra:?}: the run must finish and exit 0:\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert_eq!(stdout, "main woke from pause\n", "{extra:?}");
+    }
+}
+
+/// Runs `timer_signal_masked_thread` in `mode` under `run --strict` with
+/// `extra` flags, returning its exit code, stdout and Hermit's stderr.
+fn run_timer_signal_guest(mode: &str, extra: &[&str]) -> (Option<i32>, String, String) {
+    let guest = futex_c_guest(
+        &TIMER_SIGNAL_MASKED_THREAD_GUEST,
+        "timer_signal_masked_thread",
+    )
+    .to_str()
+    .unwrap()
+    .to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mut args = vec!["run", "--strict", "--timeout", "60"];
+    args.extend_from_slice(extra);
+    args.extend_from_slice(&["--", guest.as_str(), mode]);
+    let (status, log) = run_with_deadline(
+        hermit_command(&args),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    (status.and_then(|status| status.code()), stdout, log)
+}
+
+/// Without chaos: the thread that arms the timer blocks its signal, as a
+/// program with a dedicated signal thread does, and the other thread waits
+/// in `pause`. Detcore named the arming thread, so the waiter was never woken
+/// and the run ran to its deadline on main, for `alarm` and for a
+/// `SIGEV_SIGNAL` POSIX timer alike (Claude review of
+/// https://github.com/rrnewton/hermit/pull/4331).
+#[test]
+fn a_timer_armed_by_a_thread_that_blocks_its_signal_wakes_another_thread() {
+    for mode in ["armer-blocks", "posix-armer-blocks"] {
+        let (code, stdout, log) = run_timer_signal_guest(mode, &[]);
+        assert_eq!(
+            code,
+            Some(0),
+            "{mode}: the run must finish and exit 0:\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert_eq!(
+            stdout,
+            format!("{mode}: the worker woke, taken by worker 1\n"),
+            "{mode}"
+        );
+    }
+}
+
+/// Main waits in `pause` for its alarm while a worker sleeps in
+/// `rt_sigsuspend` with nothing blocked. The kernel wakes the sleeper while
+/// the drawn thread is held in a ptrace stop, so the sleeper must be the
+/// thread named, and its `rt_sigsuspend` must return as on Linux even under
+/// SA_RESTART. At seeds that draw main, which thread took the signal, and
+/// whether the worker slept again, depended on host timing (Claude review of
+/// https://github.com/rrnewton/hermit/pull/4331). Checked under
+/// `--verify --verify-strict`.
+#[test]
+fn a_timer_signal_and_an_rt_sigsuspend_sleeper_verify_under_chaos() {
+    for seed in ["6", "10"] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let verdict = directory.path().join("verify.json");
+        let verdict_arg = verdict.to_str().unwrap().to_owned();
+        let extra = [
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            verdict_arg.as_str(),
+            "--chaos",
+            "--chaos-target-races",
+            "--seed",
+            seed,
+        ];
+        let (code, stdout, log) = run_timer_signal_guest("sleeper", &extra);
+        assert_eq!(
+            code,
+            Some(0),
+            "seed {seed}: the run must verify and exit 0:\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert!(
+            stdout.contains("sleeper: SIGALRM taken by worker\n"),
+            "seed {seed}: {stdout:?}"
+        );
+        let report: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&verdict).expect("failed to read the verify verdict"),
+        )
+        .expect("the verify verdict is not JSON");
+        assert_eq!(report["verdict"], "matched", "seed {seed}: {report}");
+        assert_eq!(report["bitwise_parity"], true, "seed {seed}: {report}");
+    }
 }
 
 /// FUTEX_WAIT and FUTEX_WAIT_BITSET on a word they cannot read give EFAULT,

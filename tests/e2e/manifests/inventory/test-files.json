@@ -2438,6 +2438,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/timer_signal_masked_thread.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/timer_signal_masked_thread.c is owned by hermit-cli/tests/cli.rs: The integration tests a_timer_signal_reaches_the_thread_that_does_not_block_it_under_chaos, a_timer_armed_by_a_thread_that_blocks_its_signal_wakes_another_thread and a_timer_signal_and_an_rt_sigsuspend_sleeper_verify_under_chaos run this guest under run --strict: a timer signal must wake a thread that does not block it, plainly and under chaos, for alarm and a POSIX timer, and the choice beside an rt_sigsuspend sleeper must verify at bitwise parity (https://github.com/rrnewton/hermit/issues/4320); a generic manifest cannot assert these modes and the verify verdict."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/timerslack_proc_record_replay.c",
       "runner": "hermit-cli/tests/record_replay.rs",
       "why": "tests/c/timerslack_proc_record_replay.c is owned by hermit-cli/tests/record_replay.rs: The Rust integration test compiles this guest and runs its strict record/replay contract, asserting that one timer-slack value composes across relative and absolute procfs reads/writes, prctl access, zero-length I/O, seek behavior, and replay. It remains a test-owned guest fixture because that phase-spanning contract is asserted by the dedicated record/replay test rather than a generic manifest cell."

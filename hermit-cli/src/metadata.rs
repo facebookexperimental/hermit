@@ -465,7 +465,16 @@ impl RecordVersion {
 // (https://github.com/rrnewton/hermit/issues/4304). Replay recomputes the
 // schedule and futex results, so an older recording of such an exit would
 // replay with the handler in another thread and a different futex result.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x14e);
+// 0x14e -> 0x14f: a timer's process-directed signal (alarm, an itimer, a
+// POSIX timer) is sent to a thread that does not block it, not to the thread
+// that armed it or the one chaos drew when that thread blocks it, and that
+// thread is the one woken (https://github.com/rrnewton/hermit/issues/4320).
+// Replay recomputes the send, so an older recording of a timer whose arming
+// thread blocked its signal would replay with another thread woken. And a
+// background rt_sigsuspend that the host reports as ERESTARTSYS returns
+// ERESTARTNOHAND, the only result Linux's rt_sigsuspend has, so an older
+// recording of one would replay with a different result and restart.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x14f);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -490,7 +499,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x14e);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x14e;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x14f;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1401,6 +1410,14 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_from_before_fixed_kernel_tables() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x14c)));
+    }
+
+    /// A recording older than 0x14f sent a timer's signal to its arming or
+    /// drawn thread even when that thread blocked it
+    /// (https://github.com/rrnewton/hermit/issues/4320).
+    #[test]
+    fn record_version_rejects_streams_from_before_mask_aware_timer_targets() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x14e)));
     }
 
     #[test]

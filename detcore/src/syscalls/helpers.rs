@@ -187,14 +187,29 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let dettid = guest.thread_state().dettid;
         let op_id = ExternalOpId::new(dettid, guest.thread_state().stats.syscall_count);
-        self.record_or_replay_blocking_resource(
-            guest,
-            call.into(),
-            ResourceID::BlockingRtSigsuspend(op_id),
-            Some(temporary_mask),
-            false,
-        )
-        .await
+        let result = self
+            .record_or_replay_blocking_resource(
+                guest,
+                call.into(),
+                ResourceID::BlockingRtSigsuspend(op_id),
+                Some(temporary_mask),
+                false,
+            )
+            .await;
+        // Linux's rt_sigsuspend ends only with ERESTARTNOHAND, which a handler
+        // turns into EINTR and never restarts. The host call reports
+        // ERESTARTSYS instead when the signal reached the thread before the
+        // call ran, which depends on host timing; under SA_RESTART the guest
+        // then slept again where Linux returns
+        // (https://github.com/rrnewton/hermit/issues/4320). This fixes the
+        // result and the restart only: in that case the call never ran, so
+        // the kernel never installed its temporary mask, and the handler runs
+        // under the thread's pre-call mask, still a host-timed difference when
+        // the two masks differ (https://github.com/rrnewton/hermit/issues/4338).
+        match result {
+            Err(Error::Errno(Errno::ERESTARTSYS)) => Err(Errno::ERESTARTNOHAND.into()),
+            other => other,
+        }
     }
 
     async fn record_or_replay_blocking_resource<G: Guest<Self>>(
