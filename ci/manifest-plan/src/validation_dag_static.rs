@@ -2192,7 +2192,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // scheduler::test::run_mode_admits_nothing_host_timed_while_a_last_band_thread_is_runnable
     // and scheduler::test::a_call_that_begins_with_a_scheduler_signal_waiting_is_armed
     // (https://github.com/rrnewton/hermit/issues/4234): 1636, run.
-    ("test.detcore_unit", 1636),
+    // And +1 from 98cd5052: 1637.
+    ("test.detcore_unit", 1637),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3603,7 +3604,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from 4afd3a3e: 1624.
     // And +7 from bd38bb81: 1631.
     // And the five last-band poller and waiting-signal tests: 1636.
-    ("test.detcore_unit_on_host", 1636),
+    // And +1 from 98cd5052: 1637.
+    ("test.detcore_unit_on_host", 1637),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

@@ -1152,6 +1152,15 @@ static FORWARDED_COUNTS: [ForwardedCount; 512] = [const {
 static FORWARDING_UNCOUNTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Set by the first record this image counts, before it claims a slot. Until
+/// then no slot holds a count (only [`count_forwarded`] adds to one), so taking
+/// or releasing a count has nothing to do. The usual case is a Tool image that
+/// never forwards records, such as Detcore under ptrace or KVM, where it saves
+/// a getpid, a gettid and a scan of [`FORWARDED_COUNTS`] on every request. A
+/// forked child inherits its parent's flag together with its parent's table.
+static FORWARDING_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// The count a request reports when some thread's records could not be
 /// counted.
 pub const UNCOUNTED: u64 = u64::MAX;
@@ -1226,6 +1235,11 @@ fn private_copy(owner: i32, pid: i32) -> bool {
 /// counted interval (0 when the thread could not be counted, which makes every
 /// later count [`UNCOUNTED`]).
 fn count_forwarded() -> u64 {
+    // Read first, so steady forwarding does not write the shared flag on every
+    // record. Once true it stays true, so this thread's later take sees it.
+    if !FORWARDING_STARTED.load(Ordering::Acquire) {
+        FORWARDING_STARTED.store(true, Ordering::Release);
+    }
     match forwarded_count_slot(current_tid()) {
         Some(slot) => slot.count.fetch_add(1, Ordering::AcqRel) + 1,
         None => {
@@ -1243,6 +1257,11 @@ fn count_forwarded() -> u64 {
 pub fn take_forwarded_since_request() -> u64 {
     if FORWARDING_UNCOUNTED.load(Ordering::Acquire) {
         return UNCOUNTED;
+    }
+    // Each thread takes only the count it added to itself, so its own earlier
+    // store of the flag is the one that matters here.
+    if !FORWARDING_STARTED.load(Ordering::Acquire) {
+        return 0;
     }
     forwarded_count_slot(current_tid())
         .map(|slot| slot.count.swap(0, Ordering::AcqRel))
@@ -1267,7 +1286,9 @@ pub fn require_forwarding(expected: &str) {
 /// Releases this thread's count slot, at its deregistration, after its last
 /// count was taken.
 pub fn release_forwarded_count() {
-    release_count_slot(current_tid());
+    if FORWARDING_STARTED.load(Ordering::Acquire) {
+        release_count_slot(current_tid());
+    }
 }
 
 fn release_count_slot(tid: i32) {
@@ -1429,6 +1450,52 @@ mod tests {
             }
             let reported = super::take_forwarded_since_request();
             unsafe { libc::_exit(if reported == super::UNCOUNTED { 0 } else { 1 }) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "{status:#x}"
+        );
+    }
+
+    /// Until the image counts its first record, taking and releasing counts
+    /// touch no slot (the fast path for Tools that never forward), and the
+    /// first record then counts exactly as before. Checked in a forked child
+    /// with the process-wide flag and table reset, since other tests set them.
+    #[test]
+    fn counts_are_untouched_until_the_first_record() {
+        let _source = global_source_test();
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            unsafe { libc::alarm(20) };
+            for slot in &super::FORWARDED_COUNTS {
+                slot.tid.store(0, Ordering::Release);
+                slot.count.store(0, Ordering::Release);
+            }
+            super::FORWARDING_STARTED.store(false, Ordering::Release);
+            let me = super::current_tid();
+            let claimed = || {
+                super::FORWARDED_COUNTS
+                    .iter()
+                    .any(|slot| slot.tid.load(Ordering::Acquire) != 0)
+            };
+            let ok = super::take_forwarded_since_request() == 0
+                && !claimed()
+                && {
+                    super::release_forwarded_count();
+                    !claimed()
+                }
+                && super::count_forwarded() == 1
+                && super::FORWARDING_STARTED.load(Ordering::Acquire)
+                && super::FORWARDED_COUNTS
+                    .iter()
+                    .any(|slot| slot.tid.load(Ordering::Acquire) == me)
+                && super::count_forwarded() == 2
+                && super::take_forwarded_since_request() == 2
+                && super::take_forwarded_since_request() == 0;
+            unsafe { libc::_exit(if ok { 0 } else { 1 }) };
         }
         let mut status = 0;
         assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
