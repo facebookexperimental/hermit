@@ -64,13 +64,13 @@ rand_pcg = { version = "0.10.2", features = ["serde"] }
 regex = "1.13.1"
 # Reverie is pinned to a specific commit for reproducibility. Keep this rev in
 # sync across all crates and bump it via docs/updating-reverie.md.
-reverie = { package = "reverie-core", version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "afa7e5e191d8561fd9e4fd0c2231d49d07eb45dc" }
-reverie-dbt = { version = "0.4.0", git = "https://github.com/rrnewton/reverie.git", rev = "afa7e5e191d8561fd9e4fd0c2231d49d07eb45dc", default-features = false, optional = true }
-reverie-kvm = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "afa7e5e191d8561fd9e4fd0c2231d49d07eb45dc" }
-reverie-ptrace = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "afa7e5e191d8561fd9e4fd0c2231d49d07eb45dc" }
-reverie-liteinst = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "afa7e5e191d8561fd9e4fd0c2231d49d07eb45dc", default-features = false, optional = true }
-reverie-rpc-transport = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "afa7e5e191d8561fd9e4fd0c2231d49d07eb45dc", optional = true }
-reverie-sabre-stats = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "afa7e5e191d8561fd9e4fd0c2231d49d07eb45dc", optional = true }
+reverie = { package = "reverie-core", version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "0c65d74c023f0d1c10413ade2d1029f802293cb9" }
+reverie-dbt = { version = "0.4.0", git = "https://github.com/rrnewton/reverie.git", rev = "0c65d74c023f0d1c10413ade2d1029f802293cb9", default-features = false, optional = true }
+reverie-kvm = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "0c65d74c023f0d1c10413ade2d1029f802293cb9" }
+reverie-ptrace = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "0c65d74c023f0d1c10413ade2d1029f802293cb9" }
+reverie-liteinst = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "0c65d74c023f0d1c10413ade2d1029f802293cb9", default-features = false, optional = true }
+reverie-rpc-transport = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "0c65d74c023f0d1c10413ade2d1029f802293cb9", optional = true }
+reverie-sabre-stats = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "0c65d74c023f0d1c10413ade2d1029f802293cb9", optional = true }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 serde_yaml = "0.9.34"

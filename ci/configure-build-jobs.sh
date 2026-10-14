@@ -1614,8 +1614,12 @@ fi
 # afa7e5e191d8561fd9e4fd0c2231d49d07eb45dc. The added commits change reverie-inguest, reverie-liteinst, scripts/m1_artifact.rs,
 # reverie-process (tokio 1.53.3 lint fixes) and one line of reverie-dbt/src/launcher.rs; no SDK recipe
 # input, build.rs or vendored DynamoRIO file changes and no reverie-dbt file is added, so the budgets carry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != afa7e5e191d8561fd9e4fd0c2231d49d07eb45dc ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie afa7e5e191d8561fd9e4fd0c2231d49d07eb45dc (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# KVM R6 + 4a SDK-BUDGET CARRY (2026-10-14): advance from afa7e5e1 to 0c65d74c023f0d1c10413ade2d1029f802293cb9 (R6 and 4a re-parented by
+# the coordinator onto the LiteInst shared-handler stack). The added commits change only reverie-kvm
+# (file-table install skip, cached host tid); no SDK recipe input, build.rs or vendored DynamoRIO file
+# changes and no reverie-dbt file is added, so the budgets above carry.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 0c65d74c023f0d1c10413ade2d1029f802293cb9 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 0c65d74c023f0d1c10413ade2d1029f802293cb9 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
