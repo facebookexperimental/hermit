@@ -1618,8 +1618,12 @@ fi
 # the coordinator onto the LiteInst shared-handler stack). The added commits change only reverie-kvm
 # (file-table install skip, cached host tid); no SDK recipe input, build.rs or vendored DynamoRIO file
 # changes and no reverie-dbt file is added, so the budgets above carry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 0c65d74c023f0d1c10413ade2d1029f802293cb9 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 0c65d74c023f0d1c10413ade2d1029f802293cb9 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# KVM SLICE 3 SDK-BUDGET CARRY (2026-10-14): advance from 0c65d74c to 6dd1d62bf71ae171945feed82154a43aedf555bf.
+# The added commits change only reverie-kvm (src/entry.rs, src/entry/signal.rs, src/clock.rs, README.md and tests); every SDK recipe
+# input, build.rs and the vendored DynamoRIO tree are unchanged, and no
+# reverie-dbt file is added (inventory 950), so the budgets above carry.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 6dd1d62bf71ae171945feed82154a43aedf555bf ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 6dd1d62bf71ae171945feed82154a43aedf555bf (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
