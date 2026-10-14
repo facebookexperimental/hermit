@@ -1043,7 +1043,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4337): 1093.
     // And +1 from bd38bb81: 1094.
     // And +4 from f4e27a59: 1098.
-    ("test.regular_crates", 1098),
+    // And detcore-model's CpuProfile name test
+    // (https://github.com/rrnewton/hermit/issues/4243): 1099, listed.
+    ("test.regular_crates", 1099),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1512,7 +1514,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4234): 1050, run.
     // And host_base_env_keeps_hermits_own_variables_from_the_guest
     // (hermit run --dap-listen): 1051.
-    ("test.hermit_unit", 1051),
+    // And the eleven xstate_probe tests of the x86-64-v3 qualification
+    // (https://github.com/rrnewton/hermit/issues/4243): 1062, listed.
+    ("test.hermit_unit", 1062),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3890,7 +3894,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from f4e27a59: 1049.
     // And the armed-waiting-signal record-epoch test: 1050.
     // And the host-environment test for hermit run --dap-listen: 1051.
-    ("test.hermit_unit_on_host", 1051),
+    // And the eleven xstate_probe tests: 1062.
+    ("test.hermit_unit_on_host", 1062),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -4024,7 +4029,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4337): 1093.
     // And +1 from bd38bb81: 1094.
     // And +4 from f4e27a59: 1098.
-    ("test.regular_crates_on_host", 1098),
+    // And the CpuProfile name test: 1099.
+    ("test.regular_crates_on_host", 1099),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).

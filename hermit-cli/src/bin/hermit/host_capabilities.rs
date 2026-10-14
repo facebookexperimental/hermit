@@ -9,6 +9,7 @@
 use std::io::Write;
 
 use clap::Args;
+use detcore_model::cpu_profile::CpuProfile;
 use detcore_model::host_capability::CapabilityVerdict;
 use detcore_model::host_capability::HostCapabilitiesReport;
 use hermit::Error;
@@ -20,10 +21,19 @@ pub struct HostCapabilitiesOpts {
     /// Emit the complete producer-owned capability record as one JSON object.
     #[clap(long)]
     json: bool,
+
+    /// Also run the startup qualification of this CPU profile and report its
+    /// verdict. For x86-64-v3 that is the XINUSE probe; a host that fails it
+    /// is reported with the reason and exit status 122.
+    #[clap(long, value_enum)]
+    cpu_profile: Option<CpuProfile>,
 }
 
 impl HostCapabilitiesOpts {
     pub fn main(&self) -> Result<ExitStatus, Error> {
+        if let Some(profile) = self.cpu_profile {
+            return qualify_cpu_profile(profile);
+        }
         let report = HostCapabilitiesReport::probe(exact_branch_counter_verdict());
         report.validate().map_err(Error::msg)?;
         let mut stdout = std::io::stdout().lock();
@@ -150,6 +160,53 @@ fn cpu_identity_from(cpuinfo: &str) -> String {
         field("model"),
         field("microcode")
     )
+}
+
+/// `hermit host-capabilities --cpu-profile`: the profile's startup
+/// qualification, as text (<https://github.com/rrnewton/hermit/issues/4243>).
+fn qualify_cpu_profile(profile: CpuProfile) -> Result<ExitStatus, Error> {
+    let mut stdout = std::io::stdout().lock();
+    if profile.is_default() {
+        writeln!(
+            stdout,
+            "{profile}: QUALIFIED — the default profile needs no qualification"
+        )?;
+        return Ok(ExitStatus::Exited(0));
+    }
+    match hermit::xstate_probe::qualify(hermit::xstate_probe::ProbeOptions::default()) {
+        Ok(report) => {
+            writeln!(
+                stdout,
+                "{profile}: QUALIFIED — XINUSE probe on CPU {}: XCR0 {:#x}, {} cases, {} cells, \
+                 {} certified pairs at {} repetitions; forced exit {}; interrupt counter: {}; \
+                 retried {} reference, {} reload and {} exit trials; reopened the counter {} times",
+                report.cpu,
+                report.xcr0,
+                report.cases,
+                report.cells,
+                report.certified_pairs,
+                report.repetitions,
+                if report.forced_exit {
+                    "on"
+                } else {
+                    "off (no hypervisor)"
+                },
+                report.calibration,
+                report.retried_references,
+                report.retried_reloads,
+                report.retried_exits,
+                report.counter_reopens,
+            )?;
+            writeln!(stdout, "{}", detcore_model::cpu_profile::V3_RESIDUAL)?;
+            Ok(ExitStatus::Exited(0))
+        }
+        Err(refusal) => {
+            writeln!(stdout, "{profile}: REFUSED — {refusal}")?;
+            Ok(ExitStatus::Exited(
+                detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
+            ))
+        }
+    }
 }
 
 #[cfg(test)]
