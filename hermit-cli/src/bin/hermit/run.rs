@@ -888,19 +888,59 @@ fn remove_fatal_core_files(dir: &Path, owner: &str) -> usize {
     removed
 }
 
-/// Set, to the supervising process's ID, in the run that
+/// Set, to `PID:TOKEN` (see [`dap_supervisor_socket_name`]), in the run that
 /// `hermit run --dap-listen` starts and supervises, which is the same command
 /// run as a plain `--gdbserver` run.
 const DAP_LISTEN_INNER_ENV: &str = "HERMIT_DAP_LISTEN_INNER";
 
+/// The abstract Unix socket a supervising `hermit run --dap-listen` holds
+/// for as long as it supervises its run: `hermit-dap-listen/PID/TOKEN`, with
+/// TOKEN random. The run is told PID and TOKEN through
+/// [`DAP_LISTEN_INNER_ENV`]; the socket itself, unlike a passed descriptor,
+/// survives the run's start (which closes every inherited descriptor above
+/// 2), and nothing but its holder can make the kernel list it.
+fn dap_supervisor_socket_name(pid: u32, token: &str) -> String {
+    format!("hermit-dap-listen/{pid}/{token}")
+}
+
+/// Binds this process's supervisor socket (see
+/// [`dap_supervisor_socket_name`]), returning it, to be held while the run is
+/// supervised, and the value of [`DAP_LISTEN_INNER_ENV`] for the run,
+/// `PID:TOKEN`.
+fn bind_dap_supervisor_socket() -> Result<(std::os::unix::net::UnixListener, String), Error> {
+    use std::os::linux::net::SocketAddrExt;
+    let mut bytes = [0u8; 16];
+    fs::File::open("/dev/urandom")
+        .and_then(|mut random| random.read_exact(&mut bytes))
+        .context("Failed to read a random token for the DAP supervisor")?;
+    let token: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    let pid = std::process::id();
+    let address = std::os::unix::net::SocketAddr::from_abstract_name(
+        dap_supervisor_socket_name(pid, &token).as_bytes(),
+    )
+    .context("Failed to name the DAP supervisor's socket")?;
+    let socket = std::os::unix::net::UnixListener::bind_addr(&address)
+        .context("Failed to bind the DAP supervisor's socket")?;
+    Ok((socket, format!("{pid}:{token}")))
+}
+
 /// Whether this process's parent is the `hermit run --dap-listen` that
-/// `owner`, the value of [`DAP_LISTEN_INNER_ENV`], names: its process ID,
-/// running this same `hermit` executable (the same file), with
-/// `--dap-listen` among its arguments. Any other parent, a shell that set the
-/// variable to its own ID for one, is not a supervisor.
+/// `owner`, the value of [`DAP_LISTEN_INNER_ENV`], names as `PID:TOKEN`: its
+/// process ID, running this same `hermit` executable (the same file), and
+/// holding the supervisor socket named by PID and TOKEN (see
+/// [`dap_supervisor_socket_name`]). This does not depend on how the parent
+/// was given `--dap-listen` (on its command line or in a `--config` file).
+/// Any other parent, a shell that set the variable to its own ID for one, is
+/// not a supervisor.
 fn started_by_a_dap_supervisor(owner: &OsStr) -> bool {
     let parent = std::os::unix::process::parent_id();
-    if owner.to_str().and_then(|owner| owner.parse().ok()) != Some(parent) {
+    let Some((pid, token)) = owner.to_str().and_then(|owner| owner.split_once(':')) else {
+        return false;
+    };
+    if pid.parse() != Ok(parent)
+        || token.len() != 32
+        || !token.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
         return false;
     }
     let identity = |path: String| {
@@ -915,12 +955,29 @@ fn started_by_a_dap_supervisor(owner: &OsStr) -> bool {
     };
     let same_executable = identity(format!("/proc/{parent}/exe"))
         .is_some_and(|parent| Some(parent) == identity("/proc/self/exe".to_owned()));
-    let serves_dap = fs::read(format!("/proc/{parent}/cmdline")).is_ok_and(|cmdline| {
-        cmdline
-            .split(|byte| *byte == 0)
-            .any(|argument| argument == b"--dap-listen" || argument.starts_with(b"--dap-listen="))
-    });
-    same_executable && serves_dap
+    // The socket's inode, from /proc/net/unix ("Num RefCount Protocol Flags
+    // Type St Inode Path", an abstract path shown with a leading '@').
+    let name = format!("@{}", dap_supervisor_socket_name(parent, token));
+    let inodes: Vec<String> = fs::read_to_string("/proc/net/unix")
+        .unwrap_or_default()
+        .lines()
+        .skip(1)
+        .filter_map(|row| {
+            let fields: Vec<&str> = row.split_whitespace().collect();
+            (fields.len() >= 8 && fields[7] == name).then(|| format!("socket:[{}]", fields[6]))
+        })
+        .collect();
+    let holds_the_socket = !inodes.is_empty()
+        && fs::read_dir(format!("/proc/{parent}/fd")).is_ok_and(|entries| {
+            entries.filter_map(Result::ok).any(|entry| {
+                fs::read_link(entry.path()).is_ok_and(|target| {
+                    inodes
+                        .iter()
+                        .any(|inode| target.as_os_str() == inode.as_str())
+                })
+            })
+        });
+    same_executable && holds_the_socket
 }
 
 /// Command-line options for the "run" subcommand.
@@ -5582,10 +5639,12 @@ impl RunOpts {
         // own status (127 if it is not found); hermit-dap is looked for only
         // once the run gets that far.
         let guest = self.guest_program().ok();
+        // Held until this function returns, while the run is supervised.
+        let (_supervisor_socket, marker) = bind_dap_supervisor_socket()?;
         let run = super::dap_adapter::spawn_owned(
             std::process::Command::new(std::env::current_exe().context("Failed to locate hermit")?)
                 .args(std::env::args_os().skip(1))
-                .env(DAP_LISTEN_INNER_ENV, std::process::id().to_string()),
+                .env(DAP_LISTEN_INNER_ENV, marker),
         )
         .context("Failed to start the run")?;
         super::dap_adapter::supervise(

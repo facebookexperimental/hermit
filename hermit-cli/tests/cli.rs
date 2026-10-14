@@ -16869,8 +16869,8 @@ fn hermit_run_dap_listen_refusals_start_no_adapter() {
              got {status:?}\nstderr:\n{stderr}"
         );
     }
-    // A parent whose process ID the mark does name, but which is a shell, not
-    // a supervising `hermit run --dap-listen`. `; exit` keeps the shell from
+    // A parent whose process ID the mark does name, with a well-formed token,
+    // but which is a shell, not a supervising `hermit run --dap-listen`. `; exit` keeps the shell from
     // replacing itself with hermit, so it stays the parent.
     let hermit = hermit_command(&["run", "--dap-listen", "127.0.0.1:0", "--", "/bin/true"]);
     let stderr_file = tempfile::NamedTempFile::new_in(env!("CARGO_TARGET_TMPDIR"))
@@ -16881,7 +16881,7 @@ fn hermit_run_dap_listen_refusals_start_no_adapter() {
     std::os::unix::process::CommandExt::process_group(&mut shell, 0);
     shell
         .arg("-c")
-        .arg(r#"HERMIT_DAP_LISTEN_INNER=$$ "$0" "$@"; exit $?"#)
+        .arg(r#"HERMIT_DAP_LISTEN_INNER=$$:0123456789abcdef0123456789abcdef "$0" "$@"; exit $?"#)
         .arg(hermit.get_program())
         .args(hermit.get_args());
     for (name, value) in hermit.get_envs() {
@@ -17333,6 +17333,59 @@ fn hermit_run_dap_listen_names_the_file_a_guest_symlink_reaches() {
         );
         drop(run);
     }
+}
+
+/// `--dap-listen` given in a `--config` file, rather than on the command
+/// line, is served the same way: the run is admitted as the supervised run
+/// and the adapter starts, naming the program.
+#[test]
+fn hermit_run_dap_listen_serves_a_run_config() {
+    const TEST: &str = "hermit_run_dap_listen_serves_a_run_config";
+    let Some(_hermit_dap) = hermit_dap_binary(TEST) else {
+        return;
+    };
+    let work = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the hermit-dap work dir");
+    let (_source, program) = dap_guest(work.path());
+    let config = work.path().join("run.yaml");
+    fs::write(
+        &config,
+        format!(
+            "schema: hermit-run-config/v1\nrun:\n  gdbserver-port: {}\n  dap-listen: \
+             127.0.0.1:0\nprogram: {}\n",
+            unused_local_port(),
+            program.display()
+        ),
+    )
+    .expect("failed to write the run config");
+    let config_arg = config.to_str().expect("config path should be UTF-8");
+    let stderr_path = work.path().join("hermit-run.stderr");
+    let mut run = KillOnDrop(
+        hermit_command(&["run", "--config", config_arg])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(fs::File::create(&stderr_path).expect("failed to create stderr file"))
+            .spawn()
+            .expect("failed to run hermit"),
+    );
+    let expected = format!("\"program\": {:?}", program.display().to_string());
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        let text = fs::read_to_string(&stderr_path).unwrap_or_default();
+        if text
+            .lines()
+            .any(|line| line.contains("starting hermit-dap") && line.contains(&expected))
+            && text.contains("hermit-dap: listening on ")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline && run.0.try_wait().ok().flatten().is_none(),
+            "hermit run --config with dap-listen must start the adapter naming {expected}:\n{text}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    drop(run);
 }
 
 /// A program that is not found gets the same status with `--dap-listen` as

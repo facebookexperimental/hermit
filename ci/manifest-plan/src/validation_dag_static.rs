@@ -3060,7 +3060,6 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // hermit_run_dap_listen_refusals_start_no_adapter,
     // hermit_run_dap_listen_names_the_program_the_guest_runs
     // and hermit_dap_listen_without_an_adapter_names_the_build_command
-    // (hermit run --dap-listen): 404.
     // (hermit run --dap-listen): 405.
     // And hermit_run_dap_listen_ends_the_run_when_its_debugger_cannot_attach,
     // hermit_run_dap_listen_names_a_mounted_interpreter and
@@ -3069,7 +3068,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // hermit_run_dap_listen_refuses_a_script, and
     // hermit_run_dap_listen_killed_supervisor_leaves_no_run_or_adapter: 409.
     // And hermit_run_dap_listen_names_the_file_a_guest_symlink_reaches: 410.
-    ("test.cli", 410),
+    // And hermit_run_dap_listen_serves_a_run_config: 411.
+    ("test.cli", 411),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3407,7 +3407,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And three more: 344.
     // And one more: 345.
     // And the guest-symlink test: 346.
-    ("test.cli_on_host", 346),
+    // And the run-config test: 347.
+    ("test.cli_on_host", 347),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
