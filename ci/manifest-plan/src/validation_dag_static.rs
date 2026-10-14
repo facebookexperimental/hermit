@@ -5348,8 +5348,14 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"super.build_release_hermit"########,
         ],
         env: &[
-            (r########"HERMIT_BIN"########, r########"target/release/hermit"########),
-            (r########"HERMIT_E2E_EMPTY_WORKDIR"########, r########"/test"########),
+            (
+                r########"HERMIT_BIN"########,
+                r########"target/release/hermit"########,
+            ),
+            (
+                r########"HERMIT_E2E_EMPTY_WORKDIR"########,
+                r########"/test"########,
+            ),
         ],
         hint: HintSpec {
             resources: &[(r########"manifest_guest"########, 8)],
