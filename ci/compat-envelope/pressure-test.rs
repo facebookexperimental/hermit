@@ -12095,12 +12095,15 @@ fn matched_pass_row(
 /// `row` with the command fields the runner's executor writes for a verify
 /// cell on the row's backend (`native` when it records none) that records the
 /// row's relaxations and expected guest exit (`verified_invocation_argv`,
-/// `run_cell_inner`). Each attempt runs `hermit --log info --backend <backend>
-/// run --base-env=minimal --strict`, then `--verify-strict` unless the row
-/// records the stripped comparator, the run flags its relaxations record (the
+/// `run_cell_inner`). Each attempt runs the paired program
+/// (`paired_verification_argv`): a `hermit log-diff --verify-json` comparison
+/// with the report path and `--verify-allow=failure` when the row declares an
+/// exit, and a run command `hermit --log info --backend <backend> run
+/// --base-env=minimal --strict`, then `--verify-strict` unless the row records
+/// the stripped comparator, the run flags its relaxations record (the
 /// manifest's Hermit arguments before `--no-detlog-io-buffers` and
-/// `--no-rcb-time`), `--verify` with `--verify-allow=failure` when the row
-/// declares an exit, the report path, and `--` before the attempt's guest argv.
+/// `--no-rcb-time`), `--verify-run @VERIFY_RUN_DIR@`, and `--` before the
+/// attempt's guest argv.
 /// Each attempt's shell command is rendered from its argv, and the row carries
 /// the first attempt's copies, with the argv after the Hermit path as its
 /// effective args and log level `info`. The runner re-decides a retained row
@@ -12143,16 +12146,24 @@ fn with_executor_invocation(mut row: CellResult) -> CellResult {
             .filter(|flag| flags.iter().any(|recorded| recorded == *flag))
             .map(|flag| (*flag).to_owned()),
     );
-    options.push("--verify".into());
+    options.extend([
+        "--verify-run".into(),
+        hermit_manifest_plan::runner::VERIFY_RUN_DIR_PLACEHOLDER.into(),
+    ]);
+    let mut comparison: Vec<String> = ["hermit", "log-diff", "--verify-json"]
+        .map(String::from)
+        .to_vec();
+    comparison.push("/fixture/verification.json".into());
     if row.expected_guest_exit.is_some() {
-        options.push("--verify-allow=failure".into());
+        comparison.push("--verify-allow=failure".into());
     }
-    options.extend(["--verify-json".into(), "/fixture/verification.json".into()]);
+    comparison.extend(["/fixture/verify-runs/1/run1", "/fixture/verify-runs/1/run2"].map(String::from));
     for attempt in &mut row.attempts {
-        let mut argv = vec!["hermit".to_owned()];
-        argv.extend(options.iter().cloned());
-        argv.push("--".into());
-        argv.extend(attempt.guest_argv.iter().cloned());
+        let mut run = vec!["hermit".to_owned()];
+        run.extend(options.iter().cloned());
+        run.push("--".into());
+        run.extend(attempt.guest_argv.iter().cloned());
+        let argv = hermit_manifest_plan::runner::paired_verification_argv(comparison.clone(), run);
         attempt.shell_command = literal_shell_command(&attempt.cwd, &attempt.env, &argv);
         attempt.argv = argv;
     }

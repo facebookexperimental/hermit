@@ -5194,6 +5194,15 @@ fn probe_relaxation(cell: &SelectedCell, backend: &str) -> Option<&'static str> 
 /// bind source's host path is visible to the guest in /proc/self/mountinfo,
 /// so two concurrent runs could not each have their own without the guest
 /// seeing the difference.
+///
+/// Each run also writes to the same path, `run` beside the two directories,
+/// which is moved to its own directory once the run has ended. Hermit is
+/// the guest's PID 1, so its command line and its open files are the
+/// guest's to read (`ps aux` prints `/proc/1/cmdline`): a run told
+/// `--verify-run .../run1` and one told `.../run2` were two different
+/// guests, and compat/ps, compat/pgrep and compat/pkill diverged on exactly
+/// that. `run --verify` gave its two runs one command line; this gives them
+/// one too.
 const VERIFY_PAIR_SCRIPT: &str = r#"set -u
 for ((start = 2; start <= $#; start++)); do
   [[ ${!start} == "$1" ]] && break
@@ -5205,13 +5214,21 @@ allow=success
 for word in "${comparison[@]}"; do
   case $word in --verify-allow=*) allow=${word#--verify-allow=} ;; esac
 done
+staging=${directories[0]%/*}/run
 verify_run() {
-  local directory=$1 word words=()
+  local directory=$1 status word words=()
   for word in "${run[@]}"; do
-    [[ $word == @VERIFY_RUN_DIR@ ]] && word=$directory
+    [[ $word == @VERIFY_RUN_DIR@ ]] && word=$staging
     words+=("$word")
   done
-  "${words[@]}" >"$directory.stdout" 2>"$directory.stderr"
+  "${words[@]}" >"$staging.stdout" 2>"$staging.stderr"
+  status=$?
+  mv "$staging.stdout" "$directory.stdout"
+  mv "$staging.stderr" "$directory.stderr"
+  if [[ -e $staging ]]; then
+    mv "$staging" "$directory"
+  fi
+  return "$status"
 }
 end_without_comparison() {
   cat "$1.stdout"
@@ -5239,9 +5256,9 @@ exec "${comparison[@]}"
 /// `$0` of [`VERIFY_PAIR_SCRIPT`], which names it in the shell's own messages.
 const VERIFY_PAIR_NAME: &str = "hermit-verify-pair";
 
-/// The word of a paired run command that [`VERIFY_PAIR_SCRIPT`] replaces with
-/// each execution's `--verify-run` directory.
-const VERIFY_RUN_DIR_PLACEHOLDER: &str = "@VERIFY_RUN_DIR@";
+/// The word of a paired run command that `VERIFY_PAIR_SCRIPT` replaces with
+/// the one path both executions write their `--verify-run` directory at.
+pub const VERIFY_RUN_DIR_PLACEHOLDER: &str = "@VERIFY_RUN_DIR@";
 
 /// The `--verify-run` directories of a paired attempt, below its
 /// `verify-runs/<attempt>` directory.
@@ -5403,18 +5420,24 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
     argv.extend(guest_argv.iter().cloned());
     match comparison {
         None => argv,
-        Some(comparison) => {
-            let mut paired = vec![
-                "bash".into(),
-                "-c".into(),
-                VERIFY_PAIR_SCRIPT.into(),
-                VERIFY_PAIR_NAME.into(),
-            ];
-            paired.extend(comparison);
-            paired.extend(argv);
-            paired
-        }
+        Some(comparison) => paired_verification_argv(comparison, argv),
     }
+}
+
+/// The argv of `VERIFY_PAIR_SCRIPT` comparing two executions of the `run`
+/// command with the `comparison` command, as the executor runs every
+/// verified attempt. `run` carries `--verify-run @VERIFY_RUN_DIR@`; the last
+/// two words of `comparison` are the attempt's run1 and run2 directories.
+pub fn paired_verification_argv(comparison: Vec<String>, run: Vec<String>) -> Vec<String> {
+    let mut paired = vec![
+        "bash".into(),
+        "-c".into(),
+        VERIFY_PAIR_SCRIPT.into(),
+        VERIFY_PAIR_NAME.into(),
+    ];
+    paired.extend(comparison);
+    paired.extend(run);
+    paired
 }
 
 fn current_verification_report(bytes: &[u8]) -> Result<VerificationReport, String> {
@@ -10984,11 +11007,16 @@ esac
             text(&output.stderr),
             "run 1 stderr\nrun 2 stderr\ncomparison stderr\n"
         );
+        // Both runs are given one path, so they are one guest command line,
+        // and each run's evidence then moves to its own directory.
+        let staging = first.parent().unwrap().join("run");
         let lines: Vec<&str> = calls.lines().collect();
-        assert_eq!(lines[0], format!("run1 {}", first.display()));
-        assert_eq!(lines[1], format!("run2 {}", second.display()));
+        assert_eq!(lines[0], format!("run1 {}", staging.display()));
+        assert_eq!(lines[1], format!("run2 {}", staging.display()));
         assert!(lines[2].ends_with(&format!("{} {}", first.display(), second.display())));
         assert_eq!(lines.len(), 3);
+        assert!(first.join("verify-run.json").exists() && second.join("verify-run.json").exists());
+        assert!(!staging.exists());
 
         // A status the allowance refuses: no run 2, as `run --verify`.
         let (output, calls, ..) = pair("rejected", None, ["record:3", "record:0"]);
