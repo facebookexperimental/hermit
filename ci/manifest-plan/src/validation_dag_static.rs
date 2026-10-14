@@ -2440,7 +2440,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And kvm_lifecycle_timing_log_level and sqlite_veryquick's fast subset,
     // whose separately compared runs now share one epoch
     // (https://github.com/rrnewton/hermit/issues/4321): 407, listed.
-    ("test.hermit_integration", 407),
+    // And mount_introspection's guest_mounts_receive_no_host_propagation and
+    // host_mount_events_during_a_run_leave_the_guest_mountinfo_unchanged
+    // (https://github.com/rrnewton/hermit/issues/4167): 409, run.
+    ("test.hermit_integration", 409),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -3690,7 +3693,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +2 from d0584c31: 402.
     // And redis_strict's three tests: 405.
     // And kvm_lifecycle_timing_log_level and sqlite_veryquick: 407.
-    ("test.hermit_integration_on_host", 407),
+    // And the two mount-propagation tests: 409.
+    ("test.hermit_integration_on_host", 409),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

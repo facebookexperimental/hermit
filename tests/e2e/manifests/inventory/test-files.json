@@ -1063,6 +1063,12 @@
       "why": "tests/c/mountinfo_device_identity.c is owned by hermit-cli/tests/kvm_harder.rs: The KVM integration suite compiles this focused guest and checks deterministic mountinfo device identities through its backend-specific execution contract; it is not a standalone manifest program."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/mountinfo_reread.c",
+      "runner": "hermit-cli/tests/mount_introspection.rs",
+      "why": "tests/c/mountinfo_reread.c is owned by hermit-cli/tests/mount_introspection.rs: The integration test host_mount_events_during_a_run_leave_the_guest_mountinfo_unchanged runs this guest under run --strict inside a user and mount namespace with shared mounts while a loop mounts and unmounts a tmpfs there, and requires 500 rereads of /proc/self/mountinfo to complete with a constant line count (https://github.com/rrnewton/hermit/issues/4167); a generic manifest cannot create the namespace or the concurrent host mount events."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/msync_writeback.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
