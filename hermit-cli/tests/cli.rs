@@ -18681,9 +18681,41 @@ fn every_record_container_site_classifies_a_child_fault_by_name() {
     let data_dir =
         tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("failed to create a data dir");
 
+    // `{fresh}` is a new `--verify-run` directory for each case, and
+    // `{recording}` a `--verify-run` directory holding a completed recording
+    // for the replay to replay.
+    let recording = data_dir.path().join("verify-run-recording");
+    let recorded = hermit_command(&[
+        "record",
+        "--verify-run",
+        recording.to_str().unwrap(),
+        "--",
+        "/bin/true",
+    ])
+    .env("HERMIT_DATA_DIR", data_dir.path())
+    .output()
+    .expect("failed to record for the replay sites");
+    assert!(
+        recording.join("verify-run.json").exists(),
+        "{}",
+        String::from_utf8_lossy(&recorded.stderr)
+    );
+    let fresh = std::sync::atomic::AtomicUsize::new(0);
     let case = |site: &str, fault: &str, extra: &[&str]| -> String {
+        let fresh = data_dir.path().join(format!(
+            "verify-run-{}",
+            fresh.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let extra = extra
+            .iter()
+            .map(|arg| match *arg {
+                "{fresh}" => fresh.to_str().unwrap(),
+                "{recording}" => recording.to_str().unwrap(),
+                arg => arg,
+            })
+            .collect::<Vec<_>>();
         let mut args = vec!["record"];
-        args.extend_from_slice(extra);
+        args.extend_from_slice(&extra);
         args.extend_from_slice(&["--", "/bin/true"]);
         let output = hermit_command(&args)
             .env("HERMIT_TEST_CONTAINER_CHILD_FAULT", fault)
@@ -18740,11 +18772,21 @@ fn a_fault_aimed_at_no_existing_site_fires_nowhere() {
 /// reaches it. Kept at module scope so
 /// `no_container_site_is_unreachable_by_the_fault_injector` can hold the source
 /// to it.
-const RECORD_FAULT_SITES: [(&str, &[&str]); 6] = [
+const RECORD_FAULT_SITES: [(&str, &[&str]); 8] = [
     ("record.main", &[]),
     ("record.main.deadline", &["--record-timeout", "600"]),
     ("record_verify.record", &["--verify"]),
     ("record_verify.replay", &["--verify"]),
+    ("record_verify_run.record", &["--verify-run", "{fresh}"]),
+    (
+        "record_verify_run.replay",
+        &[
+            "--verify-run",
+            "{fresh}",
+            "--verify-replay-of",
+            "{recording}",
+        ],
+    ),
     (
         "record_verify_debug.record",
         &["--verify-with-gdbex", "quit"],

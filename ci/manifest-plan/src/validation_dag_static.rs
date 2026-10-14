@@ -2913,7 +2913,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_futex_wait_a_private_sigchld_ends_records_and_replays and
     // a_guests_sigchld_to_a_futex_waiter_has_a_linux_outcome_under_chaos
     // (https://github.com/rrnewton/hermit/issues/4132): 377.
-    ("test.cli", 377),
+    // And the paired recording-and-replay test
+    // (https://github.com/rrnewton/hermit/issues/4275): 378, by listing.
+    ("test.cli", 378),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3216,7 +3218,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from 843b8e10: 309.
     // So do the four guest SIGCHLD futex-wait tests
     // (https://github.com/rrnewton/hermit/issues/4132): 313.
-    ("test.cli_on_host", 313),
+    // And the paired recording-and-replay test: 314.
+    ("test.cli_on_host", 314),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux

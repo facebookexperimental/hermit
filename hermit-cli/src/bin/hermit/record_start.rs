@@ -182,6 +182,7 @@ fn with_recording_deadline<T>(
 }
 
 #[derive(Debug, Args, Clone)]
+#[clap(group(clap::ArgGroup::new("verification").args(["verify", "verify_run"])))]
 pub struct StartOpts {
     /// Program to run.
     #[clap(value_name = "PROGRAM", required = true)]
@@ -300,8 +301,27 @@ pub struct StartOpts {
     /// parity, not bitwise identity. A record/replay determinism ratchet keying on
     /// the verdict should set this so it cannot be silently weakened to a stripped
     /// comparison.
-    #[clap(long, requires = "verify")]
+    #[clap(long, requires = "verification")]
     verify_strict: bool,
+
+    /// One half of `--verify`, written to NEW_DIR, which must not exist: the
+    /// recording, kept in NEW_DIR/recording, with its verification log, the
+    /// guest's output and a verify-run.json record of how it ended. With
+    /// `--verify-replay-of FIRST`, the replay of FIRST's recording instead.
+    /// `hermit log-diff --verify-json REPORT FIRST NEW_DIR` compares the two
+    /// as `--verify` compares its recording and replay, and writes the report
+    /// `--verify --verify-json` writes. Give both halves the same options.
+    #[clap(
+        long,
+        value_name = "NEW_DIR",
+        conflicts_with_all = ["verify", "gdbex"]
+    )]
+    verify_run: Option<PathBuf>,
+
+    /// With `--verify-run`, replay the recording in this `--verify-run`
+    /// directory, instead of recording.
+    #[clap(long, value_name = "FIRST", requires = "verify_run")]
+    verify_replay_of: Option<PathBuf>,
 
     /// After recording, immediately replays the command to verify that it works
     /// With provided gdb command (passed by `-ex`).
@@ -507,6 +527,9 @@ impl StartOpts {
         if self.verify {
             validate_log_level(global)?;
             self.record_verify(global)
+        } else if let Some(directory) = &self.verify_run {
+            validate_log_level(global)?;
+            self.record_verify_run(directory, global)
         } else if !self.gdbex.is_empty() {
             self.refuse_strict_with_inexact_branch_counter(global)?;
             self.record_verify_debug(global)
@@ -602,11 +625,7 @@ impl StartOpts {
         // After the pending report carries the counter verdict, so that a
         // refused recording still says which counter it would have read.
         self.refuse_strict_with_inexact_branch_counter(global)?;
-        let strictness = if self.verify_strict {
-            LogCompareStrictness::Canonical
-        } else {
-            LogCompareStrictness::Stripped
-        };
+        let strictness = self.verification_strictness();
         let ((global1, log1), (global2, log2)) =
             setup_double_run(global, "record", "replay", strictness)
                 .context("Failed to create verification log files")?;
@@ -671,58 +690,175 @@ impl StartOpts {
             },
         )?;
 
-        let outcome = compare_two_runs(
-            ComparedRun {
-                output: &recording,
-                log: log1.into_temp_path(),
-                label: "the recording",
-            },
-            ComparedRun {
-                output: &replay,
-                log: log2.into_temp_path(),
-                label: "the replay",
-            },
-            ComparisonOptions {
-                verbose: false,
+        conclude_record_replay(
+            [&recording, &replay],
+            [log1.into_temp_path(), log2.into_temp_path()],
+            strictness,
+            self.verify_json.as_deref(),
+            false,
+        )
+    }
+
+    fn verification_strictness(&self) -> LogCompareStrictness {
+        if self.verify_strict {
+            LogCompareStrictness::Canonical
+        } else {
+            LogCompareStrictness::Stripped
+        }
+    }
+
+    /// `record start --verify-run DIR`: one half of `--verify`, the recording
+    /// or (`--verify-replay-of`) its replay, run as `record_verify` runs it,
+    /// with what its comparison reads written to DIR (`verify_run`).
+    fn record_verify_run(
+        &self,
+        directory: &Path,
+        global: &GlobalOpts,
+    ) -> Result<ExitStatus, Error> {
+        use super::verify_run;
+
+        let strictness = self.verification_strictness();
+        let first = self
+            .verify_replay_of
+            .as_deref()
+            .map(verify_run::VerifyRunDirectory::read)
+            .transpose()?;
+        if let Some(first) = &first {
+            first.recording()?;
+        }
+        let writer = verify_run::VerifyRunWriter::create(directory)?;
+        let log_path = writer.path(verify_run::LOG);
+        fs::File::create_new(&log_path)
+            .with_context(|| format!("creating the verification log {}", log_path.display()))?;
+        let mut run_global = global.clone();
+        run_global.log_file = Some(log_path);
+        run_global.log = Some(super::verify::verification_log_level(
+            global.log, strictness, false,
+        ));
+        let exact_branch_counter = crate::run::branch_counter_verdict();
+        let result = match &first {
+            None => self
+                .refuse_strict_with_inexact_branch_counter(global)
+                .and_then(|()| self.record_into(&writer.path(verify_run::RECORDING), &run_global)),
+            Some(first) => {
+                self.replay_from(&first.directory().join(verify_run::RECORDING), &run_global)
+            }
+        };
+        let (outcome, result) = match result {
+            Ok(output) => {
+                writer.write(verify_run::STDOUT, &output.stdout)?;
+                writer.write(verify_run::STDERR, &output.stderr)?;
+                (
+                    verify_run::VerifyRunOutcome::Completed {
+                        status: verify_run::RecordedStatus::of(output.status),
+                        skid_overshoots: 0,
+                        forwarded_syscalls: None,
+                    },
+                    Ok(output.status),
+                )
+            }
+            Err(error) => (crate::run::verify_run_outcome_of(&error), Err(error)),
+        };
+        writer.commit(&verify_run::VerifyRunRecord {
+            schema: verify_run::SCHEMA,
+            backend: global.backend.unwrap_or_default().as_str().to_string(),
+            comparison: verify_run::RecordedComparison {
                 strictness,
-                compare_logs: true,
                 diagnostic_full_trace: false,
-                // Recording DOES enable the syscall output-buffer hash, so a
-                // replay verdict here is a content-parity claim. It was not
-                // before: this line and the recorder's own setting were two
-                // independent hard-coded `false`s, and they are now one
-                // constant precisely so they cannot drift apart again. See its
-                // doc on `RECORD_REPLAY_HASHES_IO_BUFFERS`.
                 compare_io_buffers: hermit::RECORD_REPLAY_HASHES_IO_BUFFERS,
-                // Disclose the time policy this path actually runs under. It is
-                // the SAME constant `record_or_replay_config` uses, so the report
-                // cannot describe a policy the run did not use.
                 virtualize_time: hermit::RECORD_REPLAY_VIRTUALIZES_TIME,
-                keep_logs: false,
-                match_overridden: false,
-                failed_log_retention: Some(super::verify::default_failed_verify_log_retention()),
-                record_envelope: RecordEnvelope::all_records_v1(),
-                caller_owns_logs: false,
+            },
+            passthru_opt: false,
+            epoch: verify_run::RECORDING_EPOCH.into(),
+            exact_branch_counter: Some(exact_branch_counter),
+            dbt: None,
+            role: if first.is_some() {
+                verify_run::RunRole::Replay
+            } else {
+                verify_run::RunRole::Record
+            },
+            outcome,
+        })?;
+        result
+    }
+
+    /// Record the guest into `data`, as `record_verify` records it.
+    fn record_into(
+        &self,
+        data: &Path,
+        global: &GlobalOpts,
+    ) -> Result<reverie::process::Output, Error> {
+        fs::create_dir(data).with_context(|| format!("creating {}", data.display()))?;
+        let (mut container, identity_guard) = self.recording_container(global)?;
+        eprintln!(":: {}", "Recording...".yellow().bold());
+        let record_timeout = self.record_timeout();
+        let local_networking = self.network() == NetworkingMode::Local;
+        let options = self.clone();
+        let record_global = global.clone();
+        let data = data.to_owned();
+        let resources = format!(
+            "verification recording {} and identity mounts",
+            data.display()
+        );
+        let (recording, _identity) = super::owned_container::run(
+            &mut container,
+            identity_guard,
+            resources,
+            true,
+            "record_verify_run.record",
+            None,
+            move |identity| {
+                let _guard = record_global.init_tracing();
+                let command = options.guest_command()?;
+                let mountinfo = identity.mountinfo_root_rewrites()?;
+                match record_timeout {
+                    Some(timeout) => with_recording_deadline(timeout, || {
+                        hermit::record_with_output_with_mountinfo(
+                            command,
+                            &data,
+                            mountinfo,
+                            local_networking,
+                        )
+                    }),
+                    None => hermit::record_with_output_with_mountinfo(
+                        command,
+                        &data,
+                        mountinfo,
+                        local_networking,
+                    ),
+                }
             },
         )?;
-
-        // Emit the machine-readable verdict (if requested) before collapsing the
-        // outcome to the historical exit-code convention, so the verdict is
-        // recorded whether or not the runs matched and independent of the guest's
-        // own exit status.
-        if let Some(path) = &self.verify_json {
-            write_verification_json(path, &outcome)?;
-        }
-        announce_verification_outcome(
-            &outcome,
-            SecondRun::Replay,
-            "Success: replay matched recording.",
-            "Recording output did not match replay output!",
-        );
-        emit_compared_guest_output(outcome.verified(), &recording, &replay)?;
-
-        outcome.into_exit_status()
+        Ok(recording)
     }
+
+    /// Replay the recording in `data`, as `record_verify` replays it.
+    fn replay_from(
+        &self,
+        data: &Path,
+        global: &GlobalOpts,
+    ) -> Result<reverie::process::Output, Error> {
+        eprintln!(":: {}", "Replaying...".yellow().bold());
+        let (mut container, identity) = self.configured_container(self.network())?;
+        let mounts = self.mount.clone();
+        let replay_global = global.clone();
+        let data = data.to_owned();
+        let resources = format!("verification replay {} and identity mounts", data.display());
+        let (replay, _identity) = super::owned_container::run(
+            &mut container,
+            identity,
+            resources,
+            true,
+            "record_verify_run.replay",
+            None,
+            move |_| {
+                let _guard = replay_global.init_tracing();
+                hermit::replay_with_output_and_mounts(&data, &mounts)
+            },
+        )?;
+        Ok(replay)
+    }
+
     /// This is called when `--verify-with-gdbex` is passed to the command line.
     fn record_verify_debug(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         self.check_gdb_replay_network()?;
@@ -908,6 +1044,72 @@ fn write_full_record_manifest(
     )
 }
 
+/// Compare a recording with its replay, publish the report to `verify_json`,
+/// announce the verdict and return the status `record start --verify` exits
+/// with. `record start --verify` reaches it after its replay, and `hermit
+/// log-diff --verify-json` after reading the two `--verify-run` directories,
+/// whose logs it owns (`caller_owns_logs`).
+pub(super) fn conclude_record_replay(
+    [recording, replay]: [&reverie::process::Output; 2],
+    [log1, log2]: [tempfile::TempPath; 2],
+    strictness: LogCompareStrictness,
+    verify_json: Option<&Path>,
+    caller_owns_logs: bool,
+) -> Result<ExitStatus, Error> {
+    let outcome = compare_two_runs(
+        ComparedRun {
+            output: recording,
+            log: log1,
+            label: "the recording",
+        },
+        ComparedRun {
+            output: replay,
+            log: log2,
+            label: "the replay",
+        },
+        ComparisonOptions {
+            verbose: false,
+            strictness,
+            compare_logs: true,
+            diagnostic_full_trace: false,
+            // Recording DOES enable the syscall output-buffer hash, so a
+            // replay verdict here is a content-parity claim. It was not
+            // before: this line and the recorder's own setting were two
+            // independent hard-coded `false`s, and they are now one
+            // constant precisely so they cannot drift apart again. See its
+            // doc on `RECORD_REPLAY_HASHES_IO_BUFFERS`.
+            compare_io_buffers: hermit::RECORD_REPLAY_HASHES_IO_BUFFERS,
+            // Disclose the time policy this path actually runs under. It is
+            // the SAME constant `record_or_replay_config` uses, so the report
+            // cannot describe a policy the run did not use.
+            virtualize_time: hermit::RECORD_REPLAY_VIRTUALIZES_TIME,
+            keep_logs: false,
+            match_overridden: false,
+            failed_log_retention: (!caller_owns_logs)
+                .then(super::verify::default_failed_verify_log_retention),
+            record_envelope: RecordEnvelope::all_records_v1(),
+            caller_owns_logs,
+        },
+    )?;
+
+    // Emit the machine-readable verdict (if requested) before collapsing the
+    // outcome to the historical exit-code convention, so the verdict is
+    // recorded whether or not the runs matched and independent of the guest's
+    // own exit status.
+    if let Some(path) = verify_json {
+        write_verification_json(path, &outcome)?;
+    }
+    announce_verification_outcome(
+        &outcome,
+        SecondRun::Replay,
+        "Success: replay matched recording.",
+        "Recording output did not match replay output!",
+    );
+    emit_compared_guest_output(outcome.verified(), recording, replay)?;
+
+    outcome.into_exit_status()
+}
+
 fn replay_hint_commands(id: &str, data_dir: Option<&Path>) -> [(&'static str, String); 3] {
     let data_dir = data_dir.map_or_else(String::new, |dir| {
         format!(" --data-dir={}", shell_words::quote(&dir.to_string_lossy()))
@@ -1008,6 +1210,8 @@ mod tests {
             verify: false,
             verify_json: None,
             verify_strict: false,
+            verify_run: None,
+            verify_replay_of: None,
             gdbex: Vec::new(),
             inexact_branch_counter: || None,
         }
@@ -1290,6 +1494,8 @@ mod tests {
             verify: false,
             verify_json: None,
             verify_strict: false,
+            verify_run: None,
+            verify_replay_of: None,
             gdbex: Vec::new(),
             inexact_branch_counter: || None,
         };

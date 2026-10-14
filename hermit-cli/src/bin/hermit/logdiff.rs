@@ -202,7 +202,8 @@ pub struct LogDiffCLIOpts {
     verify_json: Option<PathBuf>,
 
     /// With --verify-json, the guest exit status run 1 must have, as `hermit
-    /// run --verify-allow` requires it.
+    /// run --verify-allow` requires it. A recording needs none: `hermit
+    /// record start --verify` replays and compares every recording.
     #[clap(
         long,
         value_name = "success|failure|both",

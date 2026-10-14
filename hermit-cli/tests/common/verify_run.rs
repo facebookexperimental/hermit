@@ -318,3 +318,77 @@ fn paired_verify_runs_keep_logs_and_need_no_run_two_after_a_rejected_run_one() {
     assert_eq!(report(&verdict)["guest_exit_code"], 3);
     assert_eq!(retained(&logs), ["run1"]);
 }
+
+/// `hermit record start --verify-run`, then the same with
+/// `--verify-replay-of` the first, then `log-diff --verify-json`, against
+/// `record start --verify --verify-json`: the same report, exit code and
+/// guest stdout, for a guest that succeeds and one that fails (which `record
+/// start --verify` replays and compares all the same).
+#[test]
+fn paired_recording_and_replay_report_what_record_verify_reports() {
+    let _guard = hermit_run_guard();
+    let record = |flags: &[&str], guest: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+        command
+            .args(["record", "start", "--strict", "--verify-strict"])
+            .args(flags)
+            .arg("--")
+            .args(guest)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("failed to run hermit record start")
+    };
+    for (label, guest) in [
+        ("echo", &["/bin/echo", "recorded"][..]),
+        ("failing", &["/bin/sh", "-c", "echo failing; exit 3"][..]),
+    ] {
+        let root = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let (first, second) = (root.path().join("record"), root.path().join("replay"));
+        let recorded = record(&["--verify-run", first.to_str().unwrap()], guest);
+        assert!(
+            first.join("verify-run.json").exists(),
+            "{label}: {}",
+            stderr(&recorded)
+        );
+        let replayed = record(
+            &[
+                "--verify-run",
+                second.to_str().unwrap(),
+                "--verify-replay-of",
+                first.to_str().unwrap(),
+            ],
+            guest,
+        );
+        assert!(
+            second.join("verify-run.json").exists(),
+            "{label}: {}",
+            stderr(&replayed)
+        );
+        let paired_report = root.path().join("paired.json");
+        let paired = log_diff(&paired_report, [&first, &second], &[]);
+        let internal_report = root.path().join("internal.json");
+        let internal = record(
+            &[
+                "--verify",
+                "--verify-json",
+                internal_report.to_str().unwrap(),
+            ],
+            guest,
+        );
+        let paired_value = report(&paired_report);
+        assert_eq!(
+            paired_value,
+            report(&internal_report),
+            "{label}\nlog-diff stderr:\n{}\nrecord --verify stderr:\n{}",
+            stderr(&paired),
+            stderr(&internal)
+        );
+        assert_eq!(paired_value["verdict"], "matched", "{label}");
+        assert_eq!(paired.status.code(), internal.status.code(), "{label}");
+        assert_eq!(
+            String::from_utf8_lossy(&paired.stdout),
+            String::from_utf8_lossy(&internal.stdout),
+            "{label}"
+        );
+    }
+}

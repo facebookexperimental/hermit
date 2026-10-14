@@ -7544,6 +7544,7 @@ impl RunOpts {
             epoch: self.epoch_rfc3339(),
             exact_branch_counter,
             dbt,
+            role: verify_run::RunRole::Run,
             outcome,
         }
     }

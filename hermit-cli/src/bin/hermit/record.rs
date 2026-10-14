@@ -47,7 +47,7 @@ enum RecordCommand {
 
     /// Start recording.
     #[clap(name = "start")]
-    Start(StartOpts),
+    Start(Box<StartOpts>),
 }
 
 impl RecordOpts {

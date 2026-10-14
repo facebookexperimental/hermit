@@ -594,6 +594,18 @@ hermit record clean
 command. On a successful replay it deletes the temporary recording, so do not
 use this form when the recording must be retained.
 
+The recording and its replay can also be run as separate commands and
+compared afterwards, as `hermit run --verify-run` splits `--verify`:
+
+```bash
+hermit record start --verify-strict --verify-run rec -- PROGRAM
+hermit record start --verify-strict --verify-run rep --verify-replay-of rec -- PROGRAM
+hermit log-diff --verify-json report.json rec rep
+```
+
+`rec/recording` holds the recording. Give both commands the same options; the
+comparison writes the report `record start --verify --verify-json` writes.
+
 Replay depends on the captured data and compatible Hermit behavior. Keep the
 recording directory intact and prefer the same Hermit revision for recording
 and replay.

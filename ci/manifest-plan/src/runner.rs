@@ -5017,7 +5017,7 @@ pub fn build_spec(
     let isolated = context.isolated_workdir.is_some();
     let verdict = dir.join(format!("verify-{attempt}.json"));
     let mut verification_log_dir = None;
-    let verify_runs = matches!(cell.id.mode.as_str(), "verify" | "chaos")
+    let verify_runs = matches!(cell.id.mode.as_str(), "verify" | "chaos" | "replay")
         .then(|| dir.join("verify-runs").join(attempt));
     let (argv, verdict_path) = match cell.id.mode.as_str() {
         "naked" => (guest_argv.clone(), None),
@@ -5025,7 +5025,6 @@ pub fn build_spec(
             let invocation = match mode {
                 "verify" => VerifiedInvocation::Verify,
                 "replay" => VerifiedInvocation::Replay {
-                    data_dir: dir.join("recording"),
                     record_timeout_seconds: timeout_seconds,
                 },
                 _ => VerifiedInvocation::Chaos {
@@ -5115,11 +5114,10 @@ enum VerifiedInvocation {
     /// Two `hermit run --verify-run` runs, compared by `hermit log-diff
     /// --verify-json` ([`VERIFY_PAIR_SCRIPT`]).
     Verify,
-    /// `hermit record start --verify`: a recording and its replay compared.
-    Replay {
-        data_dir: PathBuf,
-        record_timeout_seconds: u64,
-    },
+    /// `hermit record start --verify-run`, then the same command replaying
+    /// that recording (`--verify-replay-of`), compared by `hermit log-diff
+    /// --verify-json`.
+    Replay { record_timeout_seconds: u64 },
     /// The same pair, each run under one random schedule (`--chaos`).
     Chaos { seed: i64 },
 }
@@ -5172,21 +5170,29 @@ fn probe_relaxation(cell: &SelectedCell, backend: &str) -> Option<&'static str> 
     .then_some("--max-timeslice=disabled")
 }
 
-/// The program a verify or chaos attempt runs: two `hermit run --verify-run`
-/// executions of the guest, then `hermit log-diff --verify-json` over their
-/// two directories (https://github.com/rrnewton/hermit/issues/4275).
+/// The program every verify, chaos and replay attempt runs: two executions of
+/// the guest, each writing its evidence to a `--verify-run` directory, then
+/// `hermit log-diff --verify-json` over the two directories
+/// (https://github.com/rrnewton/hermit/issues/4275). For a verify or chaos
+/// cell both are `hermit run`s; for a replay cell the first is `hermit record
+/// start` and the second replays its recording, the run command's
+/// [`VERIFY_REPLAY_OF_PLACEHOLDER`] becoming `--verify-replay-of <run1>` there
+/// and nothing in the first.
 ///
 /// It is run as `bash -c VERIFY_PAIR_SCRIPT VERIFY_PAIR_NAME COMPARISON...
 /// RUN...`, so the attempt is one process tree: the executor's CPU budget,
 /// timeout and CPU evidence cover all three commands, as they covered the
-/// single `run --verify` they replace. COMPARISON is the `log-diff` command,
-/// whose last two words are the run directories; RUN is the `run` command,
+/// single `run --verify` or `record start --verify` they replace. COMPARISON
+/// is the `log-diff` command, whose last two words are the run directories;
+/// RUN is the guest command,
 /// with [`VERIFY_RUN_DIR_PLACEHOLDER`] where each execution's directory goes.
 /// Both start with the Hermit binary, which no other word of COMPARISON is,
 /// so its second appearance is where RUN starts.
 ///
 /// It follows `run --verify`: run 2 starts only when run 1 left a record and
-/// its exit status is one `--verify-allow` admits, and when a run leaves no
+/// its exit status is one `--verify-allow` admits (a replay cell admits
+/// every status, as `record start --verify` replays every recording), and
+/// when a run leaves no
 /// record (Hermit refused it before it started) the attempt ends with that
 /// run's status and output, after the comparison has stamped its report. Each
 /// run's own stderr is passed on, run 1's first. The two runs execute one
@@ -5218,6 +5224,10 @@ staging=${directories[0]%/*}/run
 verify_run() {
   local directory=$1 status word words=()
   for word in "${run[@]}"; do
+    if [[ $word == @VERIFY_REPLAY_OF@ ]]; then
+      [[ $directory == "${directories[1]}" ]] && words+=(--verify-replay-of "${directories[0]}")
+      continue
+    fi
     [[ $word == @VERIFY_RUN_DIR@ ]] && word=$staging
     words+=("$word")
   done
@@ -5260,6 +5270,11 @@ const VERIFY_PAIR_NAME: &str = "hermit-verify-pair";
 /// the one path both executions write their `--verify-run` directory at.
 pub const VERIFY_RUN_DIR_PLACEHOLDER: &str = "@VERIFY_RUN_DIR@";
 
+/// The word of a paired `record start` command that [`VERIFY_PAIR_SCRIPT`]
+/// drops from the recording's command and replaces with `--verify-replay-of
+/// <run1>` in the replay's.
+const VERIFY_REPLAY_OF_PLACEHOLDER: &str = "@VERIFY_REPLAY_OF@";
+
 /// The `--verify-run` directories of a paired attempt, below its
 /// `verify-runs/<attempt>` directory.
 fn verify_run_directories(verify_runs: &Path) -> [PathBuf; 2] {
@@ -5272,8 +5287,8 @@ fn verify_run_directories(verify_runs: &Path) -> [PathBuf; 2] {
 /// strictness, execution root and guest environment; only the subcommand and
 /// the arguments in [`VerifiedInvocation`] differ. Building them in one place is
 /// what keeps a replay cell from silently running a different guest than the
-/// verify cell it records. A verify or chaos cell runs the guest command under
-/// [`VERIFY_PAIR_SCRIPT`]; a replay cell runs `record start --verify`.
+/// verify cell it records. Every one runs its guest command under
+/// [`VERIFY_PAIR_SCRIPT`].
 fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
     let VerifiedInvocationArgs {
         context,
@@ -5332,73 +5347,63 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
     // The allowance `run --verify` would take, which the paired comparison
     // takes in its place.
     let verify_allow = match &invocation {
-        VerifiedInvocation::Chaos { .. } => Some("--verify-allow=both"),
+        // `record start --verify` replays and compares every recording,
+        // whatever its status; `both` has the paired program do the same,
+        // and a recording's comparison applies no allowance.
+        VerifiedInvocation::Chaos { .. } | VerifiedInvocation::Replay { .. } => {
+            Some("--verify-allow=both")
+        }
         // The exact disposition is enforced on the report after the
         // comparison; this only lets a failing first run be compared.
-        // `record start --verify` always compares and returns the guest's
-        // status on a match, so it needs no allowance.
         VerifiedInvocation::Verify if cell_expected_guest_exit(cell).is_some() => {
             Some("--verify-allow=failure")
         }
-        VerifiedInvocation::Verify | VerifiedInvocation::Replay { .. } => None,
+        VerifiedInvocation::Verify => None,
     };
-    let mut comparison = None;
     match invocation {
         VerifiedInvocation::Replay {
-            data_dir,
             record_timeout_seconds,
         } => {
-            argv.push("--verify".into());
             argv.extend([
-                "--verify-json".into(),
-                verdict.to_string_lossy().into_owned(),
-            ]);
-            if let Some(logs) = verification_log_dir {
-                argv.extend([
-                    "--keep-logs".into(),
-                    "--verify-log-dir".into(),
-                    logs.to_string_lossy().into_owned(),
-                ]);
-            }
-            argv.extend([
-                "--data-dir".into(),
-                data_dir.to_string_lossy().into_owned(),
+                "--verify-run".into(),
+                VERIFY_RUN_DIR_PLACEHOLDER.into(),
+                VERIFY_REPLAY_OF_PLACEHOLDER.into(),
                 "--record-timeout".into(),
                 record_timeout_seconds.to_string(),
             ]);
         }
-        VerifiedInvocation::Verify | VerifiedInvocation::Chaos { .. } => {
+        VerifiedInvocation::Verify => {
             argv.extend(["--verify-run".into(), VERIFY_RUN_DIR_PLACEHOLDER.into()]);
-            if let VerifiedInvocation::Chaos { seed } = invocation {
-                argv.extend([
-                    "--chaos".into(),
-                    "--sched-heuristic=random".into(),
-                    format!("--seed={seed}"),
-                ]);
-            }
-            let mut words = vec![
-                hermit,
-                "log-diff".into(),
-                "--verify-json".into(),
-                verdict.to_string_lossy().into_owned(),
-            ];
-            words.extend(verify_allow.map(str::to_string));
-            if let Some(logs) = verification_log_dir {
-                words.extend([
-                    "--verify-log-dir".into(),
-                    logs.to_string_lossy().into_owned(),
-                ]);
-            }
-            let verify_runs =
-                verify_runs.expect("a verify or chaos attempt has its verify-run directories");
-            words.extend(
-                verify_run_directories(verify_runs)
-                    .iter()
-                    .map(|directory| directory.to_string_lossy().into_owned()),
-            );
-            comparison = Some(words);
+        }
+        VerifiedInvocation::Chaos { seed } => {
+            argv.extend([
+                "--verify-run".into(),
+                VERIFY_RUN_DIR_PLACEHOLDER.into(),
+                "--chaos".into(),
+                "--sched-heuristic=random".into(),
+                format!("--seed={seed}"),
+            ]);
         }
     }
+    let mut comparison = vec![
+        hermit,
+        "log-diff".into(),
+        "--verify-json".into(),
+        verdict.to_string_lossy().into_owned(),
+    ];
+    comparison.extend(verify_allow.map(str::to_string));
+    if let Some(logs) = verification_log_dir {
+        comparison.extend([
+            "--verify-log-dir".into(),
+            logs.to_string_lossy().into_owned(),
+        ]);
+    }
+    let verify_runs = verify_runs.expect("a verified attempt has its verify-run directories");
+    comparison.extend(
+        verify_run_directories(verify_runs)
+            .iter()
+            .map(|directory| directory.to_string_lossy().into_owned()),
+    );
     append_execution_root_args(
         &mut argv,
         backend,
@@ -5418,10 +5423,7 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
     }
     argv.push("--".into());
     argv.extend(guest_argv.iter().cloned());
-    match comparison {
-        None => argv,
-        Some(comparison) => paired_verification_argv(comparison, argv),
-    }
+    paired_verification_argv(comparison, argv)
 }
 
 /// The argv of `VERIFY_PAIR_SCRIPT` comparing two executions of the `run`
@@ -8708,14 +8710,7 @@ pub fn write_junit(path: &Path, results: &[CellResult]) -> Result<(), String> {
 }
 
 fn prepare_dirs(root: &Path, dir: &Path) -> Result<(), String> {
-    for child in [
-        "home",
-        "xdg-config",
-        "tmp",
-        "fixtures",
-        "recording",
-        "captures",
-    ] {
+    for child in ["home", "xdg-config", "tmp", "fixtures", "captures"] {
         fs::create_dir_all(dir.join(child)).map_err(|e| e.to_string())?;
     }
     let xdg = root.join("tests/e2e/xdg-config");
@@ -22144,7 +22139,8 @@ cp "{}" "$verdict"
             15,
         )
         .unwrap();
-        assert_eq!(&spec.argv[5..7], ["record", "start"]);
+        let log = spec.argv.iter().position(|arg| arg == "--log").unwrap();
+        assert_eq!(&spec.argv[log + 4..log + 6], ["record", "start"]);
         assert!(
             !spec.argv.iter().any(|arg| arg.starts_with("TMPDIR=")),
             "{:?}",
@@ -22195,7 +22191,8 @@ cp "{}" "$verdict"
             15,
         )
         .unwrap();
-        assert_eq!(&spec.argv[5..7], ["record", "start"]);
+        let log = spec.argv.iter().position(|arg| arg == "--log").unwrap();
+        assert_eq!(&spec.argv[log + 4..log + 6], ["record", "start"]);
         assert!(spec.argv.iter().any(|arg| arg == "MODE=x"));
         assert!(
             spec.argv
@@ -22207,12 +22204,15 @@ cp "{}" "$verdict"
                 .windows(2)
                 .any(|window| window[0] == "--record-timeout" && window[1] == "15")
         );
-        assert!(
-            !spec
-                .argv
-                .iter()
-                .any(|arg| arg.starts_with("--verify-allow"))
-        );
+        // The recording is replayed whatever its status, as `record start
+        // --verify` replays it, and the replay replays the recording.
+        assert!(spec.argv.iter().any(|arg| arg == "--verify-allow=both"));
+        assert!(spec.argv.windows(3).any(|window| window
+            == [
+                "--verify-run",
+                VERIFY_RUN_DIR_PLACEHOLDER,
+                VERIFY_REPLAY_OF_PLACEHOLDER
+            ]));
         assert_eq!(spec.argv.last().map(String::as_str), Some("/bin/true"));
     }
 

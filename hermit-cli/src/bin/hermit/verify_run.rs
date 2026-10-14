@@ -71,6 +71,13 @@ pub(crate) const STDERR: &str = "stderr";
 pub(crate) const SUMMARY: &str = "summary.json";
 /// The host files the run's guest opened (`hermit::host_input_change`).
 pub(crate) const HOST_INPUTS: &str = "host-inputs";
+/// The recording a `record start --verify-run` execution made, which a
+/// `--verify-replay-of` execution replays.
+pub(crate) const RECORDING: &str = "recording";
+/// The epoch a recording and its replay record: the replay runs at the
+/// recording's own epoch, so the pair agrees on it by construction.
+pub(crate) const RECORDING_EPOCH: &str = "recording";
+
 /// The DBT backend's typed whole-process statistics stream, as DynamoRIO's
 /// client wrote it (`backends::read_dbt_stats` decodes it).
 #[cfg_attr(not(feature = "dbt"), allow(dead_code))]
@@ -101,7 +108,29 @@ pub(crate) struct VerifyRunRecord {
     /// What the DBT backend's comparison reads besides the log, for a DBT run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) dbt: Option<DbtRunRecord>,
+    /// Which half of which verification this is.
+    #[serde(default, skip_serializing_if = "RunRole::is_run")]
+    pub(crate) role: RunRole,
     pub(crate) outcome: VerifyRunOutcome,
+}
+
+/// Which half of which verification a `--verify-run` execution is.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RunRole {
+    /// One of `run --verify`'s two runs.
+    #[default]
+    Run,
+    /// `record start --verify`'s recording.
+    Record,
+    /// `record start --verify`'s replay of a recording.
+    Replay,
+}
+
+impl RunRole {
+    fn is_run(&self) -> bool {
+        *self == Self::Run
+    }
 }
 
 /// What a DBT run's comparison reads besides its log and [`DBT_STATS`].
@@ -269,13 +298,13 @@ impl VerifyRunWriter {
 }
 
 /// A `--verify-run` directory, read.
-struct VerifyRunDirectory {
+pub(crate) struct VerifyRunDirectory {
     directory: PathBuf,
     record: VerifyRunRecord,
 }
 
 impl VerifyRunDirectory {
-    fn read(directory: &Path) -> Result<Self, Error> {
+    pub(crate) fn read(directory: &Path) -> Result<Self, Error> {
         let path = directory.join(RECORD);
         let bytes = fs::read(&path).with_context(|| {
             format!(
@@ -296,6 +325,25 @@ impl VerifyRunDirectory {
             directory: directory.to_path_buf(),
             record,
         })
+    }
+
+    pub(crate) fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    /// Refuse a directory that holds no completed recording to replay.
+    pub(crate) fn recording(&self) -> Result<(), Error> {
+        if self.record.role != RunRole::Record
+            || !matches!(self.record.outcome, VerifyRunOutcome::Completed { .. })
+        {
+            anyhow::bail!(
+                "{} holds no completed recording: it is a {:?} execution that ended {:?}",
+                self.directory.display(),
+                self.record.role,
+                self.record.outcome
+            );
+        }
+        Ok(())
     }
 
     fn summary(&self) -> Option<RunSummary> {
@@ -415,6 +463,9 @@ pub(crate) fn compare(
         };
         retain_logs(logs, runs)
     };
+    if record1.role == RunRole::Record {
+        return compare_recording_and_replay(&run1, directories[1], verify_json, &retain);
+    }
     let summary1 = run1.summary();
 
     let VerifyRunOutcome::Completed {
@@ -465,6 +516,7 @@ pub(crate) fn compare(
     if record1.backend != record2.backend
         || record1.comparison != record2.comparison
         || record1.passthru_opt != record2.passthru_opt
+        || record2.role != RunRole::Run
     {
         anyhow::bail!(
             "the two --verify-run directories were not run alike, so they are not compared: \
@@ -582,6 +634,93 @@ pub(crate) fn compare(
     Ok(outcome.guest_status)
 }
 
+/// [`compare`] for a recording (`run1`) and the directory of its replay, as
+/// `record start --verify` compares them (`conclude_record_replay`). As
+/// there, a failed recording or replay ends the comparison with its error
+/// and the pending report, and every recording is replayed whatever its
+/// status.
+fn compare_recording_and_replay(
+    run1: &VerifyRunDirectory,
+    directory2: &Path,
+    verify_json: Option<&Path>,
+    retain: &dyn Fn(&[&VerifyRunDirectory]) -> Result<(), Error>,
+) -> Result<ExitStatus, Error> {
+    let completed = |run: &VerifyRunDirectory, label: &str| match &run.record.outcome {
+        VerifyRunOutcome::Completed { status, .. } => run.output(*status),
+        outcome => Err(Error::msg(format!("{label} did not complete: {outcome:?}"))),
+    };
+    let recording = match completed(run1, "the recording") {
+        Ok(output) => output,
+        Err(error) => {
+            retain(&[run1])?;
+            return Err(error);
+        }
+    };
+    let run2 = match VerifyRunDirectory::read(directory2) {
+        Ok(run2) => run2,
+        Err(error) => {
+            retain(&[run1])?;
+            return Err(error);
+        }
+    };
+    let (record1, record2) = (&run1.record, &run2.record);
+    if record2.role != RunRole::Replay
+        || record1.backend != record2.backend
+        || record1.comparison != record2.comparison
+    {
+        anyhow::bail!(
+            "{} is not the replay of the recording in {}: {:?} on {} with {:?}",
+            directory2.display(),
+            run1.directory.display(),
+            record2.role,
+            record2.backend,
+            record2.comparison,
+        );
+    }
+    let replay = match completed(&run2, "the replay") {
+        Ok(output) => output,
+        Err(error) => {
+            retain(&[run1, &run2])?;
+            return Err(error);
+        }
+    };
+    let links = tempfile::Builder::new()
+        .prefix(".hermit-verify-run-compare-")
+        .tempdir_in(run1.directory.parent().unwrap_or(Path::new(".")))
+        .context("creating a directory for the compared logs' links")?;
+    let link = |run: &VerifyRunDirectory, name: &str| -> Result<tempfile::TempPath, Error> {
+        let source = run.directory.join(LOG);
+        let target = links.path().join(name);
+        fs::hard_link(&source, &target)
+            .or_else(|_| fs::copy(&source, &target).map(|_| ()))
+            .with_context(|| format!("linking {}", source.display()))?;
+        Ok(tempfile::TempPath::try_from_path(target)?)
+    };
+    let status = super::record_start::conclude_record_replay(
+        [&recording, &replay],
+        [link(run1, "record.log")?, link(&run2, "replay.log")?],
+        record1.comparison.strictness,
+        verify_json,
+        true,
+    );
+    // After a match the recording's log is kept as the golden log, as
+    // `--keep-logs` keeps one; otherwise both.
+    match &status {
+        Ok(_) if read_verified(verify_json) => retain(&[run1])?,
+        _ => retain(&[run1, &run2])?,
+    }
+    status
+}
+
+/// Whether the report at `verify_json` says the runs were verified; false
+/// when there is no report or it cannot be read.
+fn read_verified(verify_json: Option<&Path>) -> bool {
+    verify_json
+        .and_then(|path| fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_some_and(|report| report["verified"] == true)
+}
+
 /// Keep the logs of `runs` in `logs` under the names `run --verify
 /// --keep-logs` gives them (`run1_log_*`, `run2_log_*`), as links, so the
 /// directories keep theirs.
@@ -692,6 +831,7 @@ mod tests {
             epoch: "2026-01-01T00:00:00Z".into(),
             exact_branch_counter: None,
             dbt: None,
+            role: RunRole::Run,
             outcome: VerifyRunOutcome::Completed {
                 status: RecordedStatus::Exited { code: 0 },
                 skid_overshoots: 0,
@@ -731,6 +871,7 @@ mod tests {
                 epoch: "2026-01-01T00:00:00Z".into(),
                 exact_branch_counter: None,
                 dbt: None,
+                role: RunRole::Run,
                 outcome: VerifyRunOutcome::Error {
                     detail: "fixture".into(),
                 },
