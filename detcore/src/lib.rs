@@ -64,6 +64,7 @@ pub mod nonwaiting_write;
 mod procfs;
 mod procfs_inode;
 mod procmaps;
+pub mod race_probe;
 pub mod random;
 mod record_or_replay;
 mod resources;

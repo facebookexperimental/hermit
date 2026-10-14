@@ -2159,17 +2159,22 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And robust_list's two owner-death walk tests, tool_local's five
     // exit_group hold tests, and the exit_group grant-hold and owner-death-path
     // tests (https://github.com/rrnewton/hermit/issues/4238): 1594, by listing.
+    // And race_probe::tests::{race_probes_are_off_unless_configured,
+    // race_probe_settings_parse_as_documented,
+    // race_probe_choices_follow_probability_range_and_seed} (docs/RACE_PROBES.md):
+    // 1597, run.
     // And the seventeen scheduler::itimer_coalesce tests, the four
     // timed_waiters alarm-phase tests and the alarm() rounding test of the
     // ITIMER_REAL coalescing (https://github.com/rrnewton/hermit/issues/4139):
-    // 1616, listed.
+    // 1619, listed.
     // And syscalls::files::tests::a_host_pipe_capacity_reads_no_larger_than_the_ceiling
     // (the F_GETPIPE_SZ host-capacity leak): 1617, listed. (Race probes reverted: -3.)
     // And scheduler::test::a_claimed_sigchld_delivery_is_placed,
     // a_signal_to_a_thread_with_a_deferred_sigchld_delivery_readmits_it and
     // syscalls::signal::tests::a_claimed_sigchld_stays_claimed_while_pending
     // (https://github.com/rrnewton/hermit/issues/4229): 1620, listed.
-    ("test.detcore_unit", 1620),
+    // And +3 from 8475d18e: 1623.
+    ("test.detcore_unit", 1623),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3561,7 +3566,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the 22 ITIMER_REAL coalescing tests: 1616, by listing.
     // And the host pipe-capacity ceiling test: 1617, by listing. (Race probes reverted: -3.)
     // And the three claimed-delivery tests (https://github.com/rrnewton/hermit/issues/4229): 1620.
-    ("test.detcore_unit_on_host", 1620),
+    // And +3 from 8475d18e: 1623.
+    ("test.detcore_unit_on_host", 1623),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

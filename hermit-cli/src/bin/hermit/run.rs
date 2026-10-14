@@ -1536,8 +1536,11 @@ fn apply_base_and_explicit_environment(
             command.env("HOME", "/root");
         }
         BaseEnv::Host => {
-            // Hermit's own setting for where its verify logs go, not the guest's.
+            // Hermit's own settings, not the guest's: where its verify logs go,
+            // and its race probes, which must not change what the guest sees.
             command.env_remove(super::verify::VERIFY_TMPDIR_ENV);
+            command.env_remove(detcore::race_probe::RACE_PROBE_ENV);
+            command.env_remove(detcore::race_probe::RACE_PROBE_SEED_ENV);
         }
     }
     for (name, value) in env {
