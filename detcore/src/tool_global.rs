@@ -5309,6 +5309,24 @@ where
     }
     if resp.1 == GlobalResponse::ThreadExited {
         let dettid = guest.thread_state().dettid;
+        // A thread an exit_group killed, on DBT where the exit_group's handler
+        // walks the group's robust lists after the grant: its own native exit
+        // would let Linux mark and clear the same words before the walk reads
+        // them, so it retires only after the walk
+        // (https://github.com/rrnewton/hermit/issues/4302).
+        guest.thread_state().cancel_exit_group_filing();
+        if !guest
+            .thread_state()
+            .wait_for_exit_group_robust_walk(crate::tool_local::EXIT_GROUP_ROBUST_WALK_WAIT)
+        {
+            // Retiring now would let this thread's native exit race a walk
+            // that may still be running, so the run fails instead.
+            panic!(
+                "[detcore, dtid {}] EXIT_GROUP_ROBUST_WALK_TIMEOUT: the exit_group's robust-list walk neither finished nor was cancelled within {:?}",
+                dettid,
+                crate::tool_local::EXIT_GROUP_ROBUST_WALK_WAIT,
+            );
+        }
         trace!(
             "[detcore, dtid {}] exiting after terminal scheduler cancellation",
             dettid

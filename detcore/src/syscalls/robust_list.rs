@@ -32,11 +32,17 @@
 //!   dying thread's handler pending through its tail-injected exit, so Linux
 //!   changes the word before the exit callback releases another scheduler turn.
 //!
-//! DBT and SaBRe invoke their task-exit callback before executing the native
-//! exit, and KVM has no Linux task-exit path. Those backends do not run this
-//! owner-death path until they can provide an atomic update or a post-cleanup
-//! callback. The fake below models the unsafe separate read/write window so a
-//! future implementation cannot hide it behind an atomic test double.
+//! DBT invokes its task-exit callback before executing the native exit. There
+//! Detcore also leaves the word to Linux and wakes at once, and the scheduler
+//! commits no turn until the kernel has ended the thread
+//! (`Scheduler::exited_thread_barriers`), so the waiter runs only after Linux
+//! has made the transition. For an exit_group the threads it kills hold their
+//! native exits until its walk is done
+//! (`ThreadState::wait_for_exit_group_robust_walk`), so Linux marks no word
+//! before the walk reads it. SaBRe and KVM, which have neither a
+//! post-cleanup callback nor that barrier, do not run this path.
+//! The fake below models the unsafe separate read/write window so an
+//! implementation cannot hide it behind an atomic test double.
 //!
 //! # Lifecycle scope
 //!
@@ -47,8 +53,11 @@
 //! terminate an injected blocking syscall do not currently provide that
 //! Guest-bearing callback. A successful exec reads the group's lists at its
 //! entry and delivers their wakes after it returns
-//! (`ThreadState::stage_robust_list_wakes_for_exec`). DBT, KVM, and SaBRe also
-//! need backend-specific lifecycle or atomic-memory support.
+//! (`ThreadState::stage_robust_list_wakes_for_exec`). DBT models an owner's
+//! exit and an exit_group, but not yet an exec
+//! (<https://github.com/rrnewton/hermit/issues/4268>) or a fatal signal
+//! (<https://github.com/rrnewton/hermit/issues/4278>); KVM and SaBRe model
+//! none of them.
 //!
 //! # Structure
 //!
@@ -167,11 +176,14 @@ enum DeathStep {
 pub(crate) enum FutexCasOutcome {
     /// The word still held the expected value, so the replacement goes ahead.
     ///
-    /// The production effects do not store the word themselves: the backend's
-    /// native task exit repeats the owner check and replaces the word
-    /// atomically before the modeled wake can let another thread run. The
-    /// unit-test model stores it immediately, so the walk can be checked
-    /// against the kernel's write sequence.
+    /// Where the backend's native task exit makes the transition
+    /// (ptrace), the production effects do not store the word themselves: the
+    /// native exit repeats the owner check and replaces the word atomically
+    /// before the modeled wake can let another thread run; on DBT the
+    /// scheduler's exited-thread barrier gives the same order. Later reads in
+    /// the same exit see the value Linux will store. The unit-test model
+    /// stores it immediately, so the walk can be checked against the kernel's
+    /// write sequence.
     Matched,
     /// The word held this other value instead, so nothing was written. The
     /// kernel's `goto retry`.
@@ -886,6 +898,50 @@ mod tests {
         assert!(guest.wakes.is_empty());
         assert_eq!(outcome.entries_visited, 1);
         assert_eq!(outcome.cas_retries, 1);
+    }
+
+    #[test]
+    fn a_self_cycled_entry_is_marked_and_woken_once() {
+        // A node whose next pointer is itself: the walk follows it until
+        // ROBUST_LIST_LIMIT, marks the word on the first visit and, seeing no
+        // owner on every later one, wakes once, as Linux does.
+        let mut guest = FakeGuest::default();
+        guest.head(0x1000, 0x2020, 0);
+        guest.node(0x2020, 0x2020, FUTEX_WAITERS | OWNER);
+
+        let outcome = walk(&mut guest, 0x1000, OWNER);
+
+        assert!(outcome.truncated);
+        assert_eq!(guest.marks.len(), 1);
+        assert_eq!(
+            guest.wakes,
+            vec![(0x2000, FUTEX_WAITERS | FUTEX_OWNER_DIED)]
+        );
+    }
+
+    #[test]
+    fn each_thread_pending_on_an_ownerless_word_wakes_once() {
+        // Linux's pending rule wakes once for each dying thread whose pending
+        // slot holds a non-PI word with no owner, whatever its other bits:
+        // free, or already marked by an earlier owner's death, with or
+        // without waiters. Two such threads wake twice.
+        for word in [0, FUTEX_OWNER_DIED, FUTEX_WAITERS | FUTEX_OWNER_DIED] {
+            let mut guest = FakeGuest::default();
+            guest.head(0x1000, 0x1000, 0x2020);
+            guest.head(0x3000, 0x3000, 0x2020);
+            guest.put_u32(0x2000, word);
+
+            walk(&mut guest, 0x1000, OWNER);
+            walk(&mut guest, 0x3000, 7);
+
+            assert!(guest.marks.is_empty(), "word {word:#x}");
+            assert_eq!(guest.get_u32(0x2000), Some(word), "word {word:#x}");
+            assert_eq!(
+                guest.wakes,
+                vec![(0x2000, word), (0x2000, word)],
+                "word {word:#x}"
+            );
+        }
     }
 
     #[test]

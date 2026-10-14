@@ -5062,10 +5062,19 @@ impl Scheduler {
         if !self.committed_exits.contains(&dettid) {
             return;
         }
-        let Some((_, physical_pid, physical_tid, pidfd)) = self
+        if self
             .physical_thread_pidfds
             .get(&dettid)
-            .filter(|(registered_mm, ..)| *registered_mm == mm)
+            .is_some_and(|(registered_mm, ..)| *registered_mm == mm)
+        {
+            self.hold_turns_until_gone(dettid);
+        }
+    }
+
+    /// Add an `exited_thread_barriers` entry for `thread`'s registered host
+    /// thread, if it has one.
+    fn hold_turns_until_gone(&mut self, thread: DetTid) {
+        let Some((_, physical_pid, physical_tid, pidfd)) = self.physical_thread_pidfds.get(&thread)
         else {
             return;
         };
@@ -5077,16 +5086,26 @@ impl Scheduler {
                     physical_tid: *physical_tid,
                     since: std::time::Instant::now(),
                 };
-                self.exited_thread_barriers.insert(dettid, barrier);
+                self.exited_thread_barriers.insert(thread, barrier);
             }
             Err(error) => {
                 let reason = format!(
-                    "HERMIT_DEADLOCK: cannot hold turns until exited thread {dettid} is gone: \
+                    "HERMIT_DEADLOCK: cannot hold turns until exited thread {thread} is gone: \
                      duplicating its pidfd failed: {error}"
                 );
                 tracing::error!("[step2] {reason}");
                 self.terminal_deadlock.get_or_insert(reason);
             }
+        }
+    }
+
+    /// At an exit_group's grant, hold turns until the kernel has ended every
+    /// thread of `process` whose host thread has a registered pidfd
+    /// (`exited_thread_barriers`). The threads the grant kills have no Exit
+    /// grant of their own, so their deregistrations add no hold.
+    fn hold_turns_until_the_group_ends(&mut self, process: DetPid) {
+        for thread in self.thread_tree.my_thread_group(&process) {
+            self.hold_turns_until_gone(thread);
         }
     }
 
@@ -10495,6 +10514,13 @@ impl Scheduler {
                     self.thread_tree.granted_exits.insert(exiting);
                     self.note_pid_namespace_end(exiting);
                 }
+                // An exit_group ends every thread of the group, and on a
+                // backend that reports exits before the kernel runs them each
+                // thread's native exit walks its robust list and clears its
+                // TID. No turn runs until all of them are done.
+                if *group && let Some(exiting) = self.registered_process(dettid) {
+                    self.hold_turns_until_the_group_ends(exiting);
+                }
                 // The grant is a vfork child's release edge: a barrier whose
                 // parent has died ends here, inside this committed turn.
                 self.release_vfork_child(dettid);
@@ -12721,6 +12747,70 @@ mod test {
         // The pidfd alone would hold the barrier.
         assert_eq!(unsafe { libc::poll(&mut poll, 1, 0) }, 0);
         assert!(scheduler.step2a_wait_for_exited_threads().is_ok());
+        assert!(scheduler.exited_thread_barriers.is_empty());
+        assert!(scheduler.terminal_deadlock.is_none());
+    }
+
+    /// An exit_group's grant ends every thread of the group, and the threads it
+    /// kills have no Exit grant of their own, so the grant itself holds turns
+    /// until the kernel has ended each thread of the group that has a host
+    /// pidfd, and no other process's (Claude review of
+    /// https://github.com/rrnewton/hermit/pull/4277 at 65138a17, N3).
+    #[test]
+    fn an_exit_group_grant_holds_turns_for_every_thread_of_its_group() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let leader = DetTid::from_raw(36);
+        let process = DetPid::from_raw(36);
+        let sibling = DetTid::from_raw(37);
+        let other = DetTid::from_raw(40);
+        let mm = MmId::initial(process);
+        scheduler.thread_tree.add_child(leader, leader, true);
+        scheduler.thread_tree.add_child(leader, sibling, false);
+        scheduler.thread_tree.add_child(other, other, true);
+        let mut host_threads = Vec::new();
+        for (tid, tid_mm) in [(leader, mm), (sibling, mm), (other, MmId::initial(other))] {
+            register_known_thread(&mut scheduler, tid);
+            let (handle, exit_tx, host_tid) = spawn_host_thread_until_told();
+            scheduler
+                .register_physical_thread(tid, tid_mm, std::process::id() as i32, host_tid)
+                .unwrap();
+            host_threads.push((handle, exit_tx));
+        }
+
+        assert!(
+            scheduler
+                .block_for_one_resource(
+                    sibling,
+                    &ResourceID::Exit {
+                        group: true,
+                        process,
+                        mm,
+                    },
+                    &Permission::RW,
+                    None,
+                    None,
+                    &Ivar::new(),
+                )
+                .is_ok()
+        );
+        assert_eq!(
+            scheduler
+                .exited_thread_barriers
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![leader, sibling]
+        );
+        assert!(scheduler.step2a_wait_for_exited_threads().is_err());
+
+        for (handle, exit_tx) in host_threads {
+            exit_tx.send(()).unwrap();
+            handle.join().unwrap();
+        }
+        let started = std::time::Instant::now();
+        while scheduler.step2a_wait_for_exited_threads().is_err() {
+            assert!(started.elapsed() < Duration::from_secs(10));
+        }
         assert!(scheduler.exited_thread_barriers.is_empty());
         assert!(scheduler.terminal_deadlock.is_none());
     }

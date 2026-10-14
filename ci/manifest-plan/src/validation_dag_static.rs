@@ -1493,7 +1493,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from 0a80f81a: 1041.
     // And metadata::tests::record_version_rejects_streams_from_before_mask_aware_timer_targets
     // (https://github.com/rrnewton/hermit/issues/4320): 1042, run.
-    ("test.hermit_unit", 1042),
+    // And the robust-word record-version test
+    // (https://github.com/rrnewton/hermit/issues/4238): 1043.
+    ("test.hermit_unit", 1043),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2152,7 +2154,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and scheduler::test::window_unusable_reports_an_outside_taker
     // (https://github.com/rrnewton/hermit/issues/4229): 1584.
     // And +1 from 0288b4fe: 1585.
-    ("test.detcore_unit", 1585),
+    // And robust_list's two owner-death walk tests, tool_local's five
+    // exit_group hold tests, and the exit_group grant-hold and owner-death-path
+    // tests (https://github.com/rrnewton/hermit/issues/4238): 1594, by listing.
+    ("test.detcore_unit", 1594),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2377,7 +2382,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // procfs_determinism::a_user_bind_changes_no_other_rows_root and
     // procfs_determinism::user_binds_show_their_targets_whatever_earlier_mounts_did
     // (https://github.com/rrnewton/hermit/issues/4266): 290.
-    ("test.hermit_integration", 290),
+    // And the nine DBT robust-futex owner-death tests
+    // (https://github.com/rrnewton/hermit/issues/4238): 299.
+    // And the ptrace shared-alias and self-alias record tests: 301.
+    ("test.hermit_integration", 301),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -3514,7 +3522,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the timer signal target test: 1582.
     // And the two unusable-window SIGCHLD tests (https://github.com/rrnewton/hermit/issues/4229): 1584.
     // And +1 from 0288b4fe: 1585.
-    ("test.detcore_unit_on_host", 1585),
+    // And the nine owner-death unit tests of
+    // https://github.com/rrnewton/hermit/issues/4238: 1594.
+    ("test.detcore_unit_on_host", 1594),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -3562,7 +3572,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same retired run_evidence target: 287.
     // And -13 from e4508c8d: 287.
     // And the three user-bind mountinfo tests: 290.
-    ("test.hermit_integration_on_host", 290),
+    // And the nine DBT robust-futex owner-death tests: 299.
+    // And the ptrace shared-alias and self-alias record tests: 301.
+    ("test.hermit_integration_on_host", 301),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
@@ -3701,7 +3713,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +6 from 74689bb0: 1040.
     // And +1 from 0a80f81a: 1041.
     // And the mask-aware timer target record-epoch test: 1042.
-    ("test.hermit_unit_on_host", 1042),
+    // And the robust-word record-version test: 1043.
+    ("test.hermit_unit_on_host", 1043),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

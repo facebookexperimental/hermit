@@ -4173,7 +4173,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         if !exit_time_accounted {
             // Preserve benign cleanup for a retired incarnation without
             // acknowledging an unaccounted owner or releasing its staged wakes.
-            thread_state.record_robust_list_head(None);
+            thread_state.drop_robust_list_head_at_exit();
         }
         if exit_time_accounted
             && let Some((_group_time, ready)) = thread_state.take_robust_list_wakes_after_exit(

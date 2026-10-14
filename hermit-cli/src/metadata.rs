@@ -474,7 +474,14 @@ impl RecordVersion {
 // background rt_sigsuspend that the host reports as ERESTARTSYS returns
 // ERESTARTNOHAND, the only result Linux's rt_sigsuspend has, so an older
 // recording of one would replay with a different result and restart.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x14f);
+// 0x14f -> 0x150: a robust futex word that one exit's walk finds owned by its
+// dying owner reads as marked FUTEX_OWNER_DIED for the rest of that exit, as
+// Linux's own store makes it (https://github.com/rrnewton/hermit/issues/4238).
+// A word reached twice, through an alias or an entry that is its own
+// successor, was woken again, waking a second waiter Linux leaves to time out.
+// Replay recomputes the wakes, so an older recording of such an exit would
+// replay with one wake fewer: a successful replay with different output.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x150);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -499,7 +506,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x14f);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x14f;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x150;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1383,6 +1390,14 @@ mod tests {
     /// scheduler sent a parked futex waiter could be deferred behind a
     /// runnable sibling, which then took it
     /// (https://github.com/rrnewton/hermit/issues/4304).
+    /// A recording older than 0x150 was made when one exit's robust-list walk
+    /// could wake a word it reached twice
+    /// (https://github.com/rrnewton/hermit/issues/4238).
+    #[test]
+    fn record_version_rejects_streams_from_before_one_exit_marks_a_robust_word_once() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x14f)));
+    }
+
     #[test]
     fn record_version_rejects_streams_from_before_a_woken_futex_waiter_takes_its_sigchld() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x14d)));

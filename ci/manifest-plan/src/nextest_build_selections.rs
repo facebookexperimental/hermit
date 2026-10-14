@@ -671,8 +671,10 @@ mod tests {
             // plus the paired user-bind mountinfo test, the test that a user
             // bind changes no other row, and the test that user binds show their
             // targets whatever earlier mounts did
-            // (https://github.com/rrnewton/hermit/issues/4266).
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "290");
+            // (https://github.com/rrnewton/hermit/issues/4266), plus the nine
+            // DBT robust-futex owner-death tests and the two ptrace ones
+            // (https://github.com/rrnewton/hermit/issues/4238).
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "301");
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

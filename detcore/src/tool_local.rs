@@ -2391,12 +2391,45 @@ impl PendingRobustListWakes {
     }
 }
 
+/// How long a thread an exit_group killed waits for its robust-list walk
+/// ([`ThreadState::wait_for_exit_group_robust_walk`]).
+pub(crate) const EXIT_GROUP_ROBUST_WALK_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
+/// A registered robust list: its owner and head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RobustListOwner {
+    pub(crate) dettid: DetTid,
+    pub(crate) head: usize,
+}
+
 /// Robust-list registrations and staged wakes shared by one Linux thread
 /// group. A forked process starts with an empty instance; `CLONE_THREAD`
 /// members share it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct RobustListProcessState {
     heads: BTreeMap<DetTid, usize>,
+    /// Threads whose own exit Detcore has already walked on DBT
+    /// ([`crate::syscalls::threads`]'s `OwnerDeathPath::Barrier`).
+    #[serde(default)]
+    tool_walked: BTreeSet<DetTid>,
+    /// An exit_group on DBT (`OwnerDeathPath::Barrier`) has been filed: an
+    /// exiting thread keeps its head here for that exit_group's walk
+    /// ([`ThreadState::drop_robust_list_head_at_exit`]).
+    #[serde(default)]
+    exit_group_filed: bool,
+    /// The threads whose filed exit_group is still pending: filed, and
+    /// neither granted nor cancelled by the thread's own death.
+    #[serde(default)]
+    exit_group_filers: BTreeSet<DetTid>,
+    /// The thread whose filed exit_group was granted and is walking the
+    /// group's lists ([`ThreadState::begin_exit_group_robust_walk`]).
+    #[serde(default)]
+    exit_group_walker: Option<DetTid>,
+    /// That exit_group's walk has finished
+    /// ([`ThreadState::finish_exit_group_robust_walk`]).
+    #[serde(default)]
+    exit_group_walked: bool,
     pending: BTreeMap<DetTid, PendingRobustListWakes>,
     matched_physical_exits: BTreeMap<DetTid, DetTime>,
     /// Wakes read at an `execve`'s entry, delivered only if it succeeds.
@@ -3260,6 +3293,161 @@ impl<T> ThreadState<T> {
         }
     }
 
+    /// Record that Detcore has walked this thread's own robust list at its
+    /// exit (`OwnerDeathPath::Barrier`), so a later exit_group of its group
+    /// does not walk the list again ([`exit_group_robust_list_owners`]).
+    pub(crate) fn mark_robust_list_walked_by_tool(&self) {
+        self.robust_list_process
+            .lock()
+            .expect("robust-list process state mutex poisoned")
+            .tool_walked
+            .insert(self.dettid);
+    }
+
+    /// Note that an exit_group on DBT (`OwnerDeathPath::Barrier`) has been
+    /// filed. From now on a thread the exit_group's grant kills waits for its
+    /// walk before its native exit ([`Self::wait_for_exit_group_robust_walk`]),
+    /// and a thread of the group that exits keeps its head registered for the
+    /// walk, so the walk sees the registrations current at the grant even if
+    /// an exit hook runs first. A registration, replacement or unregistration
+    /// a thread makes still takes effect.
+    ///
+    /// Nothing clears the filing: the thread group ends with the exit_group.
+    /// The one exception is an exec granted first, which kills the filer.
+    /// Where exec keeps this shared state for the new image, killed threads'
+    /// old heads would then stay listed for a later exit_group. Only DBT files,
+    /// and there the exec replaces the in-guest runtime's memory, this state
+    /// included; modeling exec on DBT
+    /// (<https://github.com/rrnewton/hermit/issues/4268>) must keep it so.
+    pub(crate) fn file_exit_group_for_robust_lists(&self) {
+        let mut process = self
+            .robust_list_process
+            .lock()
+            .expect("robust-list process state mutex poisoned");
+        process.exit_group_filed = true;
+        process.exit_group_filers.insert(self.dettid);
+    }
+
+    /// Note that this thread's exit_group was granted and that it now walks
+    /// the group's lists. Only this thread does not wait for the walk: any
+    /// other thread, including one that filed an exit_group of its own and
+    /// was killed by this one's grant, waits.
+    pub(crate) fn begin_exit_group_robust_walk(&self) {
+        self.robust_list_process
+            .lock()
+            .expect("robust-list process state mutex poisoned")
+            .exit_group_walker = Some(self.dettid);
+    }
+
+    /// Note that this thread was killed, so any exit_group it filed can never
+    /// be granted. Once every filing is cancelled this way with none granted
+    /// (an exec ended the group first), no walk will come, and the threads
+    /// waiting for one are released ([`Self::wait_for_exit_group_robust_walk`]).
+    pub(crate) fn cancel_exit_group_filing(&self) {
+        self.robust_list_process
+            .lock()
+            .expect("robust-list process state mutex poisoned")
+            .exit_group_filers
+            .remove(&self.dettid);
+    }
+
+    /// Note that the filed exit_group's walk has finished, releasing the
+    /// threads it killed ([`Self::wait_for_exit_group_robust_walk`]).
+    pub(crate) fn finish_exit_group_robust_walk(&self) {
+        self.robust_list_process
+            .lock()
+            .expect("robust-list process state mutex poisoned")
+            .exit_group_walked = true;
+    }
+
+    /// Where an exit_group of this thread's group is filed and this thread is
+    /// not walking it, wait until that exit_group's walk has finished, or until
+    /// every filing has been cancelled with none granted, at most `bound`.
+    /// Returns false if the bound expired first, which the caller treats as a
+    /// failure of the run, never as permission to go on.
+    ///
+    /// A thread the exit_group kills retires with a native exit. On DBT that
+    /// exit first rewrites the thread's robust-list owner words to its host
+    /// TID and then lets Linux mark them, which would race the walk: the walk
+    /// could find a word that no longer names its owner, and could not tell
+    /// whose it was. Waiting makes the walk see every word as the guest left
+    /// it. That includes a thread that filed an exit_group of its own and was
+    /// killed by another's grant; only the thread whose exit_group was granted
+    /// ([`Self::begin_exit_group_robust_walk`]) does not wait. The wait is on
+    /// host time, but nothing guest-visible depends on how long it takes: the
+    /// thread is already logically dead. A walk that never comes, because an
+    /// exec killed every filer first, is recognised when the last filing is
+    /// cancelled ([`Self::cancel_exit_group_filing`]). Only DBT files an
+    /// exit_group, and there each guest thread polls its own callbacks, so the
+    /// blocking wait holds up only this thread.
+    pub(crate) fn wait_for_exit_group_robust_walk(&self, bound: std::time::Duration) -> bool {
+        let started = std::time::Instant::now();
+        loop {
+            {
+                let process = self
+                    .robust_list_process
+                    .lock()
+                    .expect("robust-list process state mutex poisoned");
+                if !process.exit_group_filed
+                    || process.exit_group_walked
+                    || process.exit_group_walker == Some(self.dettid)
+                    || (process.exit_group_walker.is_none() && process.exit_group_filers.is_empty())
+                {
+                    return true;
+                }
+            }
+            if started.elapsed() >= bound {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+    }
+
+    /// The exit hook's counterpart of `record_robust_list_head(None)`: the
+    /// thread is gone, so its own head is cleared, but while an exit_group is
+    /// filed ([`Self::file_exit_group_for_robust_lists`]) its registration
+    /// stays in the group's index.
+    pub(crate) fn drop_robust_list_head_at_exit(&mut self) {
+        self.robust_list_head = None;
+        let mut process = self
+            .robust_list_process
+            .lock()
+            .expect("robust-list process state mutex poisoned");
+        if !process.exit_group_filed {
+            process.heads.remove(&self.dettid);
+        }
+    }
+
+    /// The registrations an exit_group walks on DBT
+    /// (`OwnerDeathPath::Barrier`), read at its grant: every registration current then, including
+    /// those of threads the grant killed, less any thread whose own exit
+    /// Detcore already replayed, so no list is walked twice.
+    pub(crate) fn robust_list_owners_for_exit_group(&self) -> Vec<RobustListOwner> {
+        let walked = self
+            .robust_list_process
+            .lock()
+            .expect("robust-list process state mutex poisoned")
+            .tool_walked
+            .clone();
+        self.robust_list_owners()
+            .into_iter()
+            .filter(|owner| !walked.contains(&owner.dettid))
+            .collect()
+    }
+
+    /// [`Self::robust_list_heads`] as [`RobustListOwner`]s.
+    pub(crate) fn robust_list_owners(&self) -> Vec<RobustListOwner> {
+        let process = self
+            .robust_list_process
+            .lock()
+            .expect("robust-list process state mutex poisoned");
+        process
+            .heads
+            .iter()
+            .map(|(&dettid, &head)| RobustListOwner { dettid, head })
+            .collect()
+    }
+
     pub(crate) fn robust_list_heads(&self) -> Vec<(DetTid, usize)> {
         self.robust_list_process
             .lock()
@@ -3304,7 +3492,9 @@ impl<T> ThreadState<T> {
             .robust_list_process
             .lock()
             .expect("robust-list process state mutex poisoned");
-        process.heads.remove(&self.dettid);
+        if !process.exit_group_filed {
+            process.heads.remove(&self.dettid);
+        }
         let pending = process.pending.get(&self.dettid)?;
         if !pending.matches_exit(exit_signal) {
             return None;
@@ -4171,6 +4361,156 @@ mod timeslice_tests {
     use super::*;
     use crate::DEFAULT_PRIORITY;
     use crate::preemptions::ThreadHistory;
+
+    /// Once an exit_group is filed on DBT (`OwnerDeathPath::Barrier`), an
+    /// exiting thread's head stays registered for the exit_group's walk, but
+    /// an unregistration still counts, a registration made after the filing
+    /// is seen, and a thread whose own exit Detcore replayed is left out
+    /// (https://github.com/rrnewton/hermit/issues/4238).
+    #[test]
+    fn an_exit_group_walks_the_registrations_current_at_its_grant() {
+        let owner = |tid: i32, head: usize| RobustListOwner {
+            dettid: DetTid::from_raw(tid),
+            head,
+        };
+        let mut caller = ThreadState::<()>::new(DetTid::from_raw(3), &Config::default(), ());
+        let sibling = |tid: i32| {
+            let mut state = caller.clone();
+            state.dettid = DetTid::from_raw(tid);
+            state
+        };
+        let (mut killed, mut exited, mut late, mut replaced, mut unregistered) =
+            (sibling(4), sibling(5), sibling(6), sibling(7), sibling(8));
+        caller.record_robust_list_head(Some(0x3000));
+        killed.record_robust_list_head(Some(0x4000));
+        exited.record_robust_list_head(Some(0x5000));
+        replaced.record_robust_list_head(Some(0x7000));
+        unregistered.record_robust_list_head(Some(0x8000));
+
+        caller.file_exit_group_for_robust_lists();
+        // Before the grant: thread 5 makes its own exit, which Detcore
+        // replays; thread 6 registers; thread 7 replaces its head; thread 8
+        // unregisters.
+        exited.mark_robust_list_walked_by_tool();
+        exited.drop_robust_list_head_at_exit();
+        late.record_robust_list_head(Some(0x6000));
+        replaced.record_robust_list_head(Some(0x7700));
+        unregistered.record_robust_list_head(None);
+        // The grant kills thread 4, whose exit hook runs before the walk.
+        killed.drop_robust_list_head_at_exit();
+        assert_eq!(
+            killed.take_robust_list_wakes_after_exit(None, DetTime::default()),
+            None
+        );
+
+        assert_eq!(
+            caller.robust_list_owners_for_exit_group(),
+            vec![
+                owner(3, 0x3000),
+                owner(4, 0x4000),
+                owner(6, 0x6000),
+                owner(7, 0x7700)
+            ]
+        );
+    }
+
+    /// A thread an exit_group killed waits for that exit_group's walk before
+    /// its native exit, including one that filed an exit_group of its own,
+    /// whichever of two competing filings is granted; the walker does not
+    /// wait, nor does a group with no filing.
+    #[test]
+    fn a_killed_thread_waits_for_the_exit_group_walk() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
+        const BOUND: std::time::Duration = EXIT_GROUP_ROBUST_WALK_WAIT;
+
+        for granted_first_filer in [true, false] {
+            let first = ThreadState::<()>::new(DetTid::from_raw(3), &Config::default(), ());
+            let mut second = first.clone();
+            second.dettid = DetTid::from_raw(4);
+            // Nothing filed: no wait.
+            assert!(second.wait_for_exit_group_robust_walk(BOUND));
+
+            first.file_exit_group_for_robust_lists();
+            second.file_exit_group_for_robust_lists();
+            let (walker, killed) = if granted_first_filer {
+                (first, second)
+            } else {
+                (second, first)
+            };
+            walker.begin_exit_group_robust_walk();
+            assert!(walker.wait_for_exit_group_robust_walk(BOUND));
+
+            let released = Arc::new(AtomicBool::new(false));
+            let entered = Arc::new(AtomicBool::new(false));
+            let waiter = {
+                let released = Arc::clone(&released);
+                let entered = Arc::clone(&entered);
+                std::thread::spawn(move || {
+                    killed.cancel_exit_group_filing();
+                    entered.store(true, Ordering::SeqCst);
+                    let finished = killed.wait_for_exit_group_robust_walk(BOUND);
+                    (finished, released.load(Ordering::SeqCst))
+                })
+            };
+            // The killed thread is in the wait before the walk finishes, so the
+            // check below is not passed by a waiter that started late (Claude
+            // review of https://github.com/rrnewton/hermit/pull/4277, N6).
+            while !entered.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(
+                !waiter.is_finished(),
+                "the killed filer did not wait for the walk"
+            );
+            released.store(true, Ordering::SeqCst);
+            walker.finish_exit_group_robust_walk();
+            assert_eq!(
+                waiter.join().unwrap(),
+                (true, true),
+                "the killed filer went on before the walk finished (first filer granted: {granted_first_filer})"
+            );
+        }
+    }
+
+    /// A granted walk that has not finished keeps its killed threads waiting
+    /// to the bound, which is reported, not taken as completion.
+    #[test]
+    fn an_unfinished_walk_is_never_released_by_the_bound() {
+        let walker = ThreadState::<()>::new(DetTid::from_raw(3), &Config::default(), ());
+        let mut killed = walker.clone();
+        killed.dettid = DetTid::from_raw(4);
+        walker.file_exit_group_for_robust_lists();
+        walker.begin_exit_group_robust_walk();
+        killed.cancel_exit_group_filing();
+        assert!(!killed.wait_for_exit_group_robust_walk(std::time::Duration::from_millis(20)));
+    }
+
+    /// When every filing is cancelled by its filer's death and none was
+    /// granted (an exec ended the group first), no walk will come, and the
+    /// killed threads are released at once.
+    #[test]
+    fn a_wait_ends_when_every_filing_is_cancelled() {
+        let filer = ThreadState::<()>::new(DetTid::from_raw(3), &Config::default(), ());
+        let mut other = filer.clone();
+        other.dettid = DetTid::from_raw(4);
+        filer.file_exit_group_for_robust_lists();
+        other.cancel_exit_group_filing();
+        assert!(!other.wait_for_exit_group_robust_walk(std::time::Duration::from_millis(20)));
+        filer.cancel_exit_group_filing();
+        assert!(other.wait_for_exit_group_robust_walk(std::time::Duration::from_millis(20)));
+    }
+
+    /// Without a filed exit_group an exiting thread's head leaves the index.
+    #[test]
+    fn an_exit_drops_its_head_when_no_exit_group_is_filed() {
+        let mut state = ThreadState::<()>::new(DetTid::from_raw(4), &Config::default(), ());
+        state.record_robust_list_head(Some(0x4000));
+        state.drop_robust_list_head_at_exit();
+        assert!(state.robust_list_heads().is_empty());
+        assert_eq!(state.robust_list_head, None);
+    }
 
     /// A stale robust-list head must never survive into a new address space.
     /// `run_robust_list_owner_death` walks from whatever this field holds, so if
