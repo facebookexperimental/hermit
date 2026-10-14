@@ -972,6 +972,10 @@ mod tests {
         ("gdbserver", &["--gdbserver"]),
         ("gdbserver-port", &["--gdbserver-port=4321"]),
         ("dap-listen", &["--dap-listen=127.0.0.1:4711"]),
+        (
+            "dap-gdb",
+            &["--dap-listen=127.0.0.1:4711", "--dap-gdb=/usr/bin/gdb"],
+        ),
         ("max-timeslice", &["--preemption-timeout=disabled"]),
         ("target-timeslice", &["--target-timeslice=5000"]),
         (

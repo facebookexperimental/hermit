@@ -36,6 +36,15 @@ struct Options {
     gdb: OsString,
     replay: Option<ReplayOptions>,
     listen: Option<Listen>,
+    end_waiting_run: Option<WaitingRun>,
+}
+
+/// `--end-waiting-run PID:PORT`: the `hermit run` that started this adapter
+/// and the port its gdbserver waits for a debugger on.
+#[derive(Debug, PartialEq)]
+struct WaitingRun {
+    pid: i32,
+    gdbserver_port: u16,
 }
 
 /// Where `--listen` or `--listen-fd` takes its one client from.
@@ -47,7 +56,7 @@ enum Listen {
 
 fn usage() {
     println!(
-        "Usage: hermit-dap [--gdb PATH] [--listen [HOST:]PORT | --listen-fd FD] [--replay ID [--data-dir DIR] [--gdbserver-port PORT]]\n\n\
+        "Usage: hermit-dap [--gdb PATH] [--listen [HOST:]PORT | --listen-fd FD] [--end-waiting-run PID:PORT] [--replay ID [--data-dir DIR] [--gdbserver-port PORT]]\n\n\
          Start a Debug Adapter Protocol server for a Hermit GDB remote target.\n\
          The DAP attach request must include the guest executable as 'program'\n\
          and the Hermit GDB server address as 'target'.\n\n\
@@ -57,7 +66,10 @@ fn usage() {
          `hermit-dap: listening on HOST:PORT` to stderr, and serves that client.\n\
          --listen-fd FD does the same on a TCP socket already bound and listening\n\
          on descriptor FD, which `hermit run --dap-listen` uses so that it, not\n\
-         hermit-dap, reports an address it cannot listen on.\n\n\
+         hermit-dap, reports an address it cannot listen on.\n\
+         --end-waiting-run PID:PORT, also for `hermit run`, sends SIGTERM to PID if\n\
+         the debugger ends while a gdbserver still listens on PORT, so that run\n\
+         does not wait forever for a debugger that cannot come.\n\n\
          With --replay, hermit-dap starts and manages `hermit replay --serve-only`,\n\
          enabling source-level stepBack and reverseContinue by replaying from the beginning."
     );
@@ -78,6 +90,7 @@ where
 {
     let mut gdb = None;
     let mut listen = None;
+    let mut end_waiting_run = None;
     let mut replay = None;
     let mut data_dir = None;
     let mut gdbserver_port = 1234;
@@ -99,6 +112,23 @@ where
             let address = listen_address(&address.to_string_lossy())?;
             if listen.replace(Listen::Address(address)).is_some() {
                 return Err("--listen and --listen-fd may only be specified once".to_owned());
+            }
+        } else if argument == "--end-waiting-run" {
+            let value = args
+                .next()
+                .ok_or_else(|| "--end-waiting-run requires PID:PORT".to_owned())?;
+            let value = value.to_string_lossy();
+            let run = value
+                .split_once(':')
+                .and_then(|(pid, port)| {
+                    Some(WaitingRun {
+                        pid: pid.parse().ok().filter(|pid: &i32| *pid > 1)?,
+                        gdbserver_port: port.parse().ok()?,
+                    })
+                })
+                .ok_or_else(|| "--end-waiting-run requires PID:PORT".to_owned())?;
+            if end_waiting_run.replace(run).is_some() {
+                return Err("--end-waiting-run may only be specified once".to_owned());
             }
         } else if argument == "--listen-fd" {
             let fd = args
@@ -156,6 +186,7 @@ where
     Ok(Some(Options {
         gdb: gdb.unwrap_or_else(default_gdb),
         listen,
+        end_waiting_run,
         replay: replay.map(|id| ReplayOptions {
             id,
             data_dir,
@@ -223,6 +254,99 @@ fn accept_client(listen: &Listen) -> Result<(), String> {
         .map_err(|error| format!("could not serve the DAP client {peer}: {error}"))?;
     eprintln!("hermit-dap: serving the DAP client at {peer}");
     Ok(())
+}
+
+/// Whether anything in this network namespace listens on TCP `port`, read
+/// from /proc so as not to use up the gdbserver's one client.
+fn tcp_port_is_listening(port: u16) -> bool {
+    let wanted = format!(":{port:04X}");
+    ["/proc/net/tcp", "/proc/net/tcp6"].iter().any(|table| {
+        std::fs::read_to_string(table).is_ok_and(|text| {
+            text.lines().skip(1).any(|row| {
+                let fields: Vec<&str> = row.split_whitespace().collect();
+                fields.len() > 3 && fields[1].ends_with(&wanted) && fields[3] == "0A"
+            })
+        })
+    })
+}
+
+/// For `--end-waiting-run`: forks, and returns in the child, which goes on to
+/// serve the client and become GDB. This process stays behind and waits for
+/// it. If the debugger ends for any reason (it could not start, failed, was
+/// killed, or its client left before attaching) while the run's gdbserver
+/// still listens, or starts listening within 60 s, no debugger can ever
+/// connect, so this ends the run with SIGTERM instead of leaving it waiting.
+/// A debugger that connected and later left is
+/// <https://github.com/rrnewton/hermit/issues/4313>.
+fn supervise(run: &WaitingRun, listen: Option<&Listen>) -> Result<(), String> {
+    // SAFETY: this process is single-threaded here, so the child may run
+    // ordinary code after fork.
+    let child = unsafe { libc::fork() };
+    if child == -1 {
+        return Err(format!(
+            "could not fork to watch the debugger: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    if child == 0 {
+        // SAFETY: prctl and getppid touch no caller memory.
+        let parent_gone = unsafe {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 || libc::getppid() == 1
+        };
+        if parent_gone {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    // Only the child serves the client: this process must not keep the
+    // listening socket open, or a second client could connect to it.
+    if let Some(Listen::Fd(fd)) = listen {
+        // SAFETY: close on a descriptor this process no longer uses.
+        unsafe {
+            libc::close(*fd);
+        }
+    }
+    let mut raw = 0;
+    let status = loop {
+        // SAFETY: waitpid writes only the status integer passed to it.
+        if unsafe { libc::waitpid(child, &mut raw, 0) } == child {
+            if libc::WIFEXITED(raw) {
+                break format!("exit status {}", libc::WEXITSTATUS(raw));
+            }
+            if libc::WIFSIGNALED(raw) {
+                break format!("signal {}", libc::WTERMSIG(raw));
+            }
+        } else if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            break format!("an unknown status ({})", io::Error::last_os_error());
+        }
+    };
+    // Even a clean exit counts: this adapter serves one client, so once its
+    // debugger is gone none can follow, and a gdbserver still listening has
+    // never had one. The run may still be starting, its gdbserver not yet
+    // listening, so wait for that; a gdbserver that took a connection never
+    // listens again, and this process is stopped when the run ends.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !tcp_port_is_listening(run.gdbserver_port) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    if tcp_port_is_listening(run.gdbserver_port) {
+        eprintln!(
+            "hermit-dap: the debugger ended with {status} before connecting to the run's \
+             gdbserver on port {}, so no debugger can attach; ending hermit run (pid {}) \
+             rather than leaving it waiting",
+            run.gdbserver_port, run.pid
+        );
+        // SAFETY: kill has no pointer arguments.
+        unsafe {
+            libc::kill(run.pid, libc::SIGTERM);
+        }
+        std::process::exit(1);
+    }
+    if status != "exit status 0" {
+        eprintln!("hermit-dap: the debugger ended with {status}");
+        std::process::exit(1);
+    }
+    std::process::exit(0);
 }
 
 fn replay_command(options: &ReplayOptions) -> Result<Vec<String>, String> {
@@ -305,6 +429,14 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    if let Some(run) = &options.end_waiting_run {
+        // Only the forked child returns: it serves the client below.
+        if let Err(error) = supervise(run, options.listen.as_ref()) {
+            eprintln!("hermit-dap: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
 
     if let Some(listen) = &options.listen {
         // Before client_fds() below, which duplicates the client's stdin
@@ -408,6 +540,23 @@ mod tests {
             assert_eq!(
                 listen_fd(refused),
                 Err("--listen-fd requires a descriptor above 2".to_owned())
+            );
+        }
+        let end = |argument: &str| {
+            parse_options(["--end-waiting-run".into(), argument.into()])
+                .map(|options| options.unwrap().end_waiting_run)
+        };
+        assert_eq!(
+            end("4242:1234"),
+            Ok(Some(WaitingRun {
+                pid: 4242,
+                gdbserver_port: 1234
+            }))
+        );
+        for refused in ["4242", "1:1234", "x:1234", "4242:70000"] {
+            assert_eq!(
+                end(refused),
+                Err("--end-waiting-run requires PID:PORT".to_owned())
             );
         }
         assert_eq!(

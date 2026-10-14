@@ -178,25 +178,33 @@ hermit-dap: listening on 127.0.0.1:4711
 `--gdbserver` holds. Before anything starts, `hermit run` refuses a run it
 could not serve: one whose `--gdbserver` would be refused (under `--strict`,
 for example), one with `--verify` (which runs the program twice, and the
-adapter serves one session) or `--namespace-only` (which has no GDB server),
-and an address that does not parse or cannot be listened on. It binds the
-address itself and hands the listening socket to `hermit-dap`, which runs
-beside `hermit`, outside the guest, and dies with it; the program waits for
-the client's `attach` before its first instruction.
+adapter serves one session), `--namespace-only` (which has no GDB server) or
+`--image` (whose program lives in the image), and an address that does not
+parse or cannot be listened on. A program that does not exist is reported
+as in any run, with status 127. It binds the address itself and hands the
+listening socket to `hermit-dap`, which runs beside `hermit`, outside the
+guest, and dies with it; the program waits for the client's `attach` before
+its first instruction. `--dap-gdb PATH` chooses the GDB the adapter runs.
 
 The `program` it prints is the executable the guest command actually runs,
 found the way the guest finds it (its working directory, its `PATH`, the
 run's mounts), as a path on the host. For a script that starts with `#!`, it
-is the script's interpreter.
+is the script's interpreter, found through the same mounts.
+
+If the debugger ends before it has connected to the run's GDB server
+(GDB cannot start, fails, or the DAP client leaves before attaching), no
+debugger can attach any more, so `hermit-dap` says so and ends the run with
+SIGTERM (a shell reports status 143) instead of leaving it waiting.
 
 When the run ends, `hermit run` waits up to 5 seconds for the adapter to
 finish its session, then stops it, so a client that stays connected sees its
 connection close; an adapter that no client connected to is stopped at once.
 
-A client that disconnects before attaching leaves the program waiting for a
-debugger that cannot come: Hermit's GDB server takes one connection and then
-stops listening. This is true of `--gdbserver`, and of `hermit replay`
-under GDB, too; stop the run with Ctrl-C.
+A debugger that connected to the GDB server and then went away still leaves
+the program waiting: Hermit's GDB server takes one connection and then stops
+listening (https://github.com/rrnewton/hermit/issues/4313). This is true of
+plain `--gdbserver`, and of `hermit replay` under GDB, too; stop the run with
+Ctrl-C.
 
 `--dap-listen` also combines with `--from`, so
 `hermit run --from last-run --dap-listen=4711` reruns a recorded run under a

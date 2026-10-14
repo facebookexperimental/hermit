@@ -3060,7 +3060,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and hermit_dap_listen_without_an_adapter_names_the_build_command
     // (hermit run --dap-listen): 404.
     // (hermit run --dap-listen): 405.
-    ("test.cli", 405),
+    // And hermit_run_dap_listen_ends_the_run_when_its_debugger_cannot_attach,
+    // hermit_run_dap_listen_names_a_mounted_interpreter and
+    // hermit_run_dap_listen_keeps_the_not_found_status: 408.
+    ("test.cli", 408),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3395,7 +3398,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same nine last-band and waiting-signal tests: 337.
     // And the three hermit run --dap-listen tests: 340.
     // And the four hermit run --dap-listen tests: 341.
-    ("test.cli_on_host", 341),
+    // And three more: 344.
+    ("test.cli_on_host", 344),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux

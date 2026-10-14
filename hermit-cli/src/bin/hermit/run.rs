@@ -912,13 +912,19 @@ pub struct RunOpts {
     /// Implies --gdbserver: it starts `hermit-dap --listen` from beside this
     /// executable, and the client's attach request names the program and the
     /// GDB server, as printed. Not with --verify, which runs the program
-    /// twice, or --namespace-only, which has no GDB server. See DEBUGGING.md.
+    /// twice, --namespace-only, which has no GDB server, or --image, whose
+    /// program lives in the image. See DEBUGGING.md.
     #[clap(
         long,
         value_name = "[HOST:]PORT",
-        conflicts_with_all = ["verify", "namespace_only"]
+        conflicts_with_all = ["verify", "namespace_only", "image"]
     )]
     dap_listen: Option<String>,
+
+    /// The GDB, with its DAP interpreter, that `--dap-listen`'s adapter runs
+    /// (default: /usr/bin/gdb, else gdb on PATH).
+    #[clap(long, value_name = "PATH", requires = "dap_listen")]
+    dap_gdb: Option<PathBuf>,
 
     /// The adapter `--dap-listen` started, kept until the run ends.
     #[clap(skip)]
@@ -5518,19 +5524,57 @@ impl RunOpts {
             return Ok(None);
         };
         let listener = super::dap_adapter::bind(argument)?;
-        // The executable the guest command actually selects (guest working
-        // directory, guest PATH, mounts), as the host sees it: the file the
-        // debugger loads symbols from.
-        let (_, host) = self
-            .resolve_guest_and_host_program()
-            .context("--dap-listen needs the program's file on the host for the debugger")?;
-        let program = Shebang::new(&host).map_or(host, |s| s.interpreter().into());
-        let adapter = super::dap_adapter::ListeningAdapter::spawn(listener)?;
+        // The checks and errors (and exit statuses, 127 for a program that is
+        // not found) of an ordinary run, before this path adds its own.
+        self.validate_program()?;
+        let program = self.debuggee_host_file()?;
+        let port = self.det_opts.det_config.gdbserver_port;
+        let adapter =
+            super::dap_adapter::ListeningAdapter::spawn(listener, port, self.dap_gdb.as_deref())?;
         eprintln!(
             "hermit run: started hermit-dap to serve this run to one DAP client; {}",
-            super::dap_adapter::attach_hint(&program, self.det_opts.det_config.gdbserver_port)
+            super::dap_adapter::attach_hint(&program, port)
         );
         Ok(Some(adapter))
+    }
+
+    /// The host file the debugger loads symbols from: the executable the guest
+    /// command selects (guest working directory, guest PATH, mounts), and for a
+    /// `#!` script its interpreter, found through the same mounts, as the
+    /// kernel would (it follows at most 4 interpreters).
+    fn debuggee_host_file(&self) -> Result<PathBuf, Error> {
+        let (mut guest, mut host) = self
+            .resolve_guest_and_host_program()
+            .context("--dap-listen needs the program's file on the host for the debugger")?;
+        for _ in 0..4 {
+            // The `#!` line only: the interpreter it names is a guest path,
+            // which need not exist on the host as named.
+            let mut head = Vec::new();
+            std::fs::File::open(&host)
+                .and_then(|file| std::io::Read::read_to_end(&mut file.take(256), &mut head))
+                .with_context(|| format!("--dap-listen cannot read {}", host.display()))?;
+            let Some(interpreter) = Shebang::interpreter_from_buf(&head) else {
+                return Ok(host);
+            };
+            let interpreter = normalize_guest_path(&interpreter)?;
+            host = self
+                .mapped_or_visible_host_program(&interpreter)
+                // A file mounted at exactly this path maps to its source
+                // joined with an empty remainder, a trailing '/'; drop it.
+                .map(|host| host.components().collect::<PathBuf>())
+                .ok_or_else(|| {
+                    Error::msg(format!(
+                        "--dap-listen cannot find the host file of {}, the interpreter of {}",
+                        interpreter.display(),
+                        guest.display()
+                    ))
+                })?;
+            guest = interpreter;
+        }
+        anyhow::bail!(
+            "--dap-listen cannot debug {}: its interpreters nest more than 4 deep",
+            guest.display()
+        )
     }
 
     fn main_without_core_cleanup(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {

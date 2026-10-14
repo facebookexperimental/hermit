@@ -54,7 +54,7 @@ pub fn attach_hint(program: &Path, gdbserver_port: u16) -> String {
     )
 }
 
-/// Binds `--dap-listen`'s [HOST:]PORT (`PORT` alone means loopback), so an
+/// Binds `--dap-listen`'s `[HOST:]PORT` (`PORT` alone means loopback), so an
 /// address that does not parse or cannot be listened on is refused here,
 /// before the run starts, and the adapter is handed a socket already
 /// listening.
@@ -80,15 +80,23 @@ pub fn bind(argument: &str) -> Result<TcpListener, Error> {
 /// process. It runs outside the guest's namespaces, as the GDB client of a
 /// plain `--gdbserver` run does, and is stopped when this value is dropped:
 /// at once if no client ever connected, or after [`ADAPTER_EXIT_GRACE`] if its
-/// session has not ended by then. It also dies with this process.
+/// session has not ended by then. It also dies with this process. With
+/// `--end-waiting-run`, it ends this process with SIGTERM if its debugger
+/// fails while the gdbserver still waits for one, so the run cannot wait for
+/// a debugger that will never come.
 #[derive(Debug)]
 pub struct ListeningAdapter {
     child: Child,
 }
 
 impl ListeningAdapter {
-    /// Starts the adapter on `listener`, which it inherits as [`LISTEN_FD`].
-    pub fn spawn(listener: TcpListener) -> Result<Self, Error> {
+    /// Starts the adapter on `listener`, which it inherits as [`LISTEN_FD`],
+    /// for the gdbserver on `gdbserver_port`, running `gdb` if given.
+    pub fn spawn(
+        listener: TcpListener,
+        gdbserver_port: u16,
+        gdb: Option<&Path>,
+    ) -> Result<Self, Error> {
         let adapter = hermit_dap_beside_hermit()?;
         let listener_fd = listener.as_raw_fd();
         // SAFETY: getpid has no arguments; read before fork, compared after.
@@ -97,8 +105,13 @@ impl ListeningAdapter {
         command
             .arg("--listen-fd")
             .arg(LISTEN_FD.to_string())
+            .arg("--end-waiting-run")
+            .arg(format!("{parent}:{gdbserver_port}"))
             .stdin(Stdio::null())
             .stdout(Stdio::null());
+        if let Some(gdb) = gdb {
+            command.arg("--gdb").arg(gdb);
+        }
         // SAFETY: only async-signal-safe calls (dup2, fcntl, prctl, getppid)
         // between fork and exec; they touch no memory of the parent.
         unsafe {
@@ -131,11 +144,16 @@ impl ListeningAdapter {
         Ok(Self { child })
     }
 
-    /// Whether the adapter is still waiting for its client. `hermit-dap`
-    /// becomes GDB, by `exec`, once a client connects.
+    /// Whether the adapter is still waiting for its client. Its supervising
+    /// process forks the one that serves the client, which becomes GDB, by
+    /// `exec`, once a client connects.
     fn still_waiting_for_a_client(&self) -> bool {
-        std::fs::read_to_string(format!("/proc/{}/comm", self.child.id()))
-            .is_ok_and(|comm| comm.trim_end() == "hermit-dap")
+        let pid = self.child.id();
+        std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+            .ok()
+            .and_then(|children| children.split_whitespace().next().map(str::to_owned))
+            .and_then(|worker| std::fs::read_to_string(format!("/proc/{worker}/comm")).ok())
+            .is_some_and(|comm| comm.trim_end() == "hermit-dap")
     }
 }
 
