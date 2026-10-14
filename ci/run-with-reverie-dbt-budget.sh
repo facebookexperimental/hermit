@@ -1552,7 +1552,12 @@ fi
 # KVM RDPMC SDK-BUDGET CARRY (2026-10-14): advance from e1ecaeb3 to 16ffab7c558c47c78c43aa8e0e4242eb2deeeb3d (the KVM lane's rdpmc counter
 # reads, re-parented by the coordinator onto DBT D3). The added commit changes only reverie-kvm; no SDK
 # recipe input, build.rs or vendored DynamoRIO file changes and no reverie-dbt file is added.
-expected_pin=16ffab7c558c47c78c43aa8e0e4242eb2deeeb3d
+# DBT SHARED-STATS SDK-BUDGET CARRY (2026-10-14): advance from 16ffab7c to dde3f9da33a0474d0fa9b273a25100fc0db4d751.
+# Only Rust statistics ownership, launcher exports and capture tests change (inventory 952 -> 953).
+# SDK recipe inputs, build.rs, native CMake and vendored DynamoRIO are unchanged, so these budgets
+# carry by source equality. This does not reuse or qualify an old native client/runtime artifact.
+# Re-parented onto Reverie main ccf6b58a as 9bff68ac24c4e0a41a39bab2c6e6f14f3d0acf40; the added commit changes only safeptrace.
+expected_pin=9bff68ac24c4e0a41a39bab2c6e6f14f3d0acf40
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

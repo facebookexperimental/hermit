@@ -79,7 +79,7 @@ pub(crate) const RECORDING: &str = "recording";
 pub(crate) const RECORDING_EPOCH: &str = "recording";
 
 /// The DBT backend's typed whole-process statistics stream, as DynamoRIO's
-/// client wrote it (`backends::read_dbt_stats` decodes it).
+/// client wrote it (Reverie decodes it; `backends::require_dbt_stats` applies verification policy).
 #[cfg_attr(not(feature = "dbt"), allow(dead_code))]
 pub(crate) const DBT_STATS: &str = "dbt-stats.bin";
 
@@ -756,7 +756,7 @@ fn conclude_dbt(
     use super::backends::DbtCompletedRun;
     use super::backends::DbtConclusion;
     use super::backends::conclude_dbt_verification;
-    use super::backends::read_dbt_stats;
+    use super::backends::require_dbt_stats;
 
     let [log1, log2] = logs;
     let completed = |run: &VerifyRunDirectory, output, log| -> Result<DbtCompletedRun<'_>, Error> {
@@ -769,7 +769,9 @@ fn conclude_dbt(
         Ok(DbtCompletedRun {
             output,
             log,
-            stats: read_dbt_stats(&run.directory.join(DBT_STATS))?,
+            stats: require_dbt_stats(&reverie_dbt::backend_stats::DbtStatsCapture::read(
+                &run.directory.join(DBT_STATS),
+            ))?,
             initialization_records: usize::try_from(record.initialization_records)?,
         })
     };

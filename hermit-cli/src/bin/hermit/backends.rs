@@ -71,9 +71,11 @@ use reverie_dbt::DbtEvidenceLogLevel;
 #[cfg(feature = "dbt")]
 use reverie_dbt::DbtRunner;
 #[cfg(feature = "dbt")]
-use reverie_dbt::backend_stats::DbtBackendStatsAggregator;
+use reverie_dbt::DbtStatsSink;
 #[cfg(feature = "dbt")]
 use reverie_dbt::backend_stats::DbtBackendStatsSnapshot;
+#[cfg(feature = "dbt")]
+use reverie_dbt::backend_stats::DbtStatsCapture;
 #[cfg(any(feature = "sabre", feature = "dbt"))]
 use tracing::metadata::LevelFilter;
 
@@ -225,94 +227,48 @@ fn record_dbt_branch_clock_comparison(
     }
 }
 
-/// Own the typed statistics stream for one complete DBT process tree.
-///
-/// Reverie's client writes one fixed-size record per process image at exit.
-/// The protected-evidence runner does not expose its convenience stats method,
-/// so this adapter uses the same public typed wire decoder and waits until the
-/// runner has reaped the whole isolated process group before reading it.
+/// Apply Hermit's execution-evidence policy to the shared physical capture.
+/// Capture/reading/decoding belong to Reverie; this refusal policy also applies
+/// to caller-retained saved runs and remains after evidence/latch checks.
 #[cfg(feature = "dbt")]
-struct DbtStatsCapture {
-    directory: tempfile::TempDir,
-    path: PathBuf,
-}
-
-#[cfg(feature = "dbt")]
-impl DbtStatsCapture {
-    fn new() -> Result<Self, Error> {
-        let directory = tempfile::Builder::new()
-            .prefix("hermit-dbt-verify-stats-")
-            .tempdir()
-            .map_err(|error| {
-                Error::msg(format!(
-                    "failed to create DBT whole-process statistics sink: {error}"
-                ))
-            })?;
-        let path = directory.path().join("records.bin");
-        Ok(Self { directory, path })
+pub(super) fn require_dbt_stats(
+    capture: &DbtStatsCapture,
+) -> Result<DbtBackendStatsSnapshot, Error> {
+    match capture {
+        DbtStatsCapture::Missing => {
+            return Err(Error::msg(
+                "DBT verification did not reach a verdict: typed whole-process statistics were missing",
+            ));
+        }
+        DbtStatsCapture::Unreadable { message, .. } => {
+            return Err(Error::msg(format!(
+                "DBT verification did not reach a verdict: failed to read typed whole-process statistics: {message}"
+            )));
+        }
+        DbtStatsCapture::Records(bytes) if bytes.is_empty() => {
+            return Err(Error::msg(
+                "DBT verification did not reach a verdict: typed whole-process statistics were empty",
+            ));
+        }
+        DbtStatsCapture::Records(_) => {}
     }
-
-    fn configure(&self, runner: DbtRunner) -> DbtRunner {
-        runner
-            .client_argument("-stats_path")
-            .client_argument(self.path.clone().into_os_string())
+    let snapshot = capture.snapshot().map_err(|error| Error::msg(format!(
+        "DBT verification did not reach a verdict: typed whole-process statistics were unreadable: {error}"
+    )))?;
+    if snapshot.process_images() == 0 {
+        return Err(Error::msg(
+            "DBT verification did not reach a verdict: typed whole-process statistics contained no process records",
+        ));
     }
-
-    fn finish(self) -> Result<DbtBackendStatsSnapshot, Error> {
-        read_dbt_stats(&self.path)
-    }
-
-    /// The typed whole-process statistics stream this capture configures.
-    fn records(&self) -> &Path {
-        &self.path
-    }
-}
-
-/// Decode a typed whole-process statistics stream that a DBT run wrote to
-/// `path` (`DbtStatsCapture`).
-#[cfg(feature = "dbt")]
-pub(super) fn read_dbt_stats(path: &Path) -> Result<DbtBackendStatsSnapshot, Error> {
+    if snapshot.counted_branches() == 0
+        || snapshot.intercepted_syscalls() == 0
+        || snapshot.rewritten_syscalls() > snapshot.intercepted_syscalls()
     {
-        let bytes = match fs::read(path) {
-            Ok(bytes) if !bytes.is_empty() => bytes,
-            Ok(_) => {
-                return Err(Error::msg(
-                    "DBT verification did not reach a verdict: typed whole-process statistics were empty",
-                ));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(Error::msg(
-                    "DBT verification did not reach a verdict: typed whole-process statistics were missing",
-                ));
-            }
-            Err(error) => {
-                return Err(Error::msg(format!(
-                    "DBT verification did not reach a verdict: failed to read typed whole-process statistics: {error}"
-                )));
-            }
-        };
-        let mut aggregator = DbtBackendStatsAggregator::new();
-        let records = aggregator.absorb_wire_stream(&bytes).map_err(|error| {
-            Error::msg(format!(
-                "DBT verification did not reach a verdict: typed whole-process statistics were unreadable: {error}"
-            ))
-        })?;
-        if records == 0 {
-            return Err(Error::msg(
-                "DBT verification did not reach a verdict: typed whole-process statistics contained no process records",
-            ));
-        }
-        let snapshot = aggregator.snapshot();
-        if snapshot.counted_branches() == 0
-            || snapshot.intercepted_syscalls() == 0
-            || snapshot.rewritten_syscalls() > snapshot.intercepted_syscalls()
-        {
-            return Err(Error::msg(
-                "DBT typed native callback counters are inconsistent",
-            ));
-        }
-        Ok(snapshot)
+        return Err(Error::msg(
+            "DBT typed native callback counters are inconsistent",
+        ));
     }
+    Ok(snapshot)
 }
 
 /// Render the native DBT counters as a labeled `--summary` block.
@@ -366,11 +322,11 @@ const DBT_BACKEND_FAILURE_EXIT_CODE: i32 = 101;
 /// backend failure in a guest child is found (see [`fail_on_dbt_backend_failure`]).
 #[cfg(feature = "dbt")]
 fn finish_single_run_dbt_stats(
-    capture: DbtStatsCapture,
+    capture: DbtStatsSink,
     summary: bool,
     engagement_json: Option<&Path>,
 ) -> Result<Option<DbtBackendStatsSnapshot>, Error> {
-    match capture.finish() {
+    match require_dbt_stats(&capture.capture()) {
         Ok(stats) => {
             if summary {
                 eprint!("{}", format_dbt_stats(&stats));
@@ -1242,7 +1198,7 @@ impl DbtVerification {
 /// their diagnostic precedence even when the stats artifact is missing.
 #[cfg(feature = "dbt")]
 pub(super) struct DbtRunCompletion {
-    stats: DbtStatsCapture,
+    stats: DbtStatsSink,
     initialization_records: usize,
     terminal_stdin: bool,
 }
@@ -1254,9 +1210,7 @@ impl DbtRunCompletion {
         output: &reverie::process::Output,
         run: VerificationRun,
     ) -> Result<DbtRunFacts, Error> {
-        let stats = self
-            .stats
-            .finish()
+        let stats = require_dbt_stats(&self.stats.capture())
             .map_err(|error| error.context(hermit::BackendRunFailure))?;
         if run == VerificationRun::Run1 && self.terminal_stdin && stats.stdin_reads() != 0 {
             std::io::stdout().write_all(&output.stdout)?;
@@ -1406,7 +1360,8 @@ fn dbt_verify_run(
         materialize_dbt_evidence_log(&evidence, log_file, &log_path)
             .map_err(|error| error.context(hermit::BackendRunFailure))?;
         dbt_run_latches(&evidence).refuse_comparison("run")?;
-        let snapshot = read_dbt_stats(stats.records())
+        let records = stats.capture();
+        let snapshot = require_dbt_stats(&records)
             .map_err(|error| error.context(hermit::BackendRunFailure))?;
         if terminal_stdin && snapshot.stdin_reads() != 0 {
             return Err(Error::msg(format!(
@@ -1415,19 +1370,13 @@ fn dbt_verify_run(
                 snapshot.stdin_reads()
             )));
         }
-        let records = fs::read(stats.records()).map_err(|error| {
-            Error::msg(format!(
-                "reading the DBT whole-process statistics stream: {error}"
-            ))
-            .context(hermit::BackendRunFailure)
-        })?;
         Ok((dbt_verification_output(raw), evidence, records))
     });
     let (outcome, dbt, result) = match completed {
         Ok((output, evidence, records)) => {
             writer.write(verify_run::STDOUT, &output.stdout)?;
             writer.write(verify_run::STDERR, &output.stderr)?;
-            writer.write(verify_run::DBT_STATS, &records)?;
+            writer.write(verify_run::DBT_STATS, records.records()?)?;
             (
                 verify_run::VerifyRunOutcome::Completed {
                     status: verify_run::RecordedStatus::of(output.status),
@@ -1593,11 +1542,15 @@ impl DbtExecution {
         }
     }
 
-    fn stats_capture(&self) -> Result<DbtStatsCapture, Error> {
-        let capture = DbtStatsCapture::new()?;
+    fn stats_capture(&self) -> Result<DbtStatsSink, Error> {
+        let capture = DbtStatsSink::with_prefix("hermit-dbt-verify-stats-").map_err(|error| {
+            Error::msg(format!(
+                "failed to create DBT whole-process statistics sink: {error}"
+            ))
+        })?;
         self.statistics
             .borrow_mut()
-            .push(capture.directory.path().to_path_buf());
+            .push(capture.directory().to_path_buf());
         Ok(capture)
     }
 
@@ -2397,6 +2350,7 @@ mod tests {
         stdin_reads: u64,
         memory_hash: u64,
     ) -> DbtBackendStatsSnapshot {
+        use reverie_dbt::backend_stats::DbtBackendStatsAggregator;
         use reverie_dbt::backend_stats::DbtProcessRecord;
 
         let record = DbtProcessRecord {
@@ -2724,7 +2678,7 @@ mod tests {
             (VerificationRun::Run2, "run2"),
         ] {
             let completion = DbtRunCompletion {
-                stats: DbtStatsCapture::new().unwrap(),
+                stats: DbtStatsSink::new().unwrap(),
                 initialization_records: 1,
                 terminal_stdin: false,
             };
@@ -2813,7 +2767,7 @@ mod tests {
                             log_sink_failure: None,
                         },
                         dbt: Some(DbtRunCompletion {
-                            stats: DbtStatsCapture::new()?,
+                            stats: DbtStatsSink::new()?,
                             initialization_records: 1,
                             terminal_stdin: false,
                         }),
@@ -2867,7 +2821,7 @@ mod tests {
                 let bytes = format!("completed {run:?}: guest exit 23\n");
                 log.write_all(bytes.as_bytes())?;
                 runs.push((run, path.to_path_buf(), bytes));
-                let stats = DbtStatsCapture::new()?;
+                let stats = DbtStatsSink::new()?;
                 if run == VerificationRun::Run1 {
                     let record = reverie_dbt::backend_stats::DbtProcessRecord {
                         branches: 1,
@@ -2876,7 +2830,7 @@ mod tests {
                         ..Default::default()
                     };
                     fs::write(
-                        &stats.path,
+                        stats.directory().join("records.bin"),
                         reverie_dbt::backend_stats::encode_process_record(&record),
                     )?;
                 }
@@ -2922,10 +2876,13 @@ mod tests {
         use reverie_dbt::backend_stats::DbtProcessRecord;
         use reverie_dbt::backend_stats::encode_process_record;
 
-        let capture = DbtStatsCapture::new().unwrap();
+        use super::super::verify_run;
+
+        let capture = DbtStatsSink::new().unwrap();
         let root = DbtProcessRecord {
             branches: 400,
             syscalls: 7,
+            memory_hash: 0xff00_0a0d_001a_0000,
             ..Default::default()
         };
         let child = DbtProcessRecord {
@@ -2934,20 +2891,35 @@ mod tests {
             ..Default::default()
         };
         let bytes = [encode_process_record(&root), encode_process_record(&child)].concat();
-        fs::write(&capture.path, bytes).unwrap();
+        fs::write(capture.directory().join("records.bin"), &bytes).unwrap();
 
-        let snapshot = capture.finish().unwrap();
+        let captured = capture.capture();
+        let snapshot = require_dbt_stats(&captured).unwrap();
 
         assert_eq!(snapshot.process_images(), 2);
         assert_eq!(snapshot.counted_branches(), 423);
         assert_eq!(snapshot.intercepted_syscalls(), 9);
+        // The actual saved-run writer must preserve unequal binary records,
+        // not regenerate an aggregate or reorder images. Offline strict policy
+        // reads that same artifact through the shared capture/codec owner.
+        let directory = tempfile::tempdir().unwrap();
+        let writer = verify_run::VerifyRunWriter::create(&directory.path().join("saved")).unwrap();
+        writer
+            .write(verify_run::DBT_STATS, captured.records().unwrap())
+            .unwrap();
+        let saved = writer.path(verify_run::DBT_STATS);
+        assert_eq!(fs::read(&saved).unwrap(), bytes);
+        assert_eq!(
+            require_dbt_stats(&DbtStatsCapture::read(&saved)).unwrap(),
+            snapshot
+        );
     }
 
     #[test]
     #[cfg(feature = "dbt")]
     fn dbt_engagement_record_follows_the_typed_branch_count() {
         fn record(branches: u64) -> serde_json::Value {
-            let capture = DbtStatsCapture::new().unwrap();
+            let capture = DbtStatsSink::new().unwrap();
             let row = reverie_dbt::backend_stats::DbtProcessRecord {
                 branches,
                 syscalls: 1,
@@ -2955,7 +2927,7 @@ mod tests {
                 ..Default::default()
             };
             fs::write(
-                &capture.path,
+                capture.directory().join("records.bin"),
                 reverie_dbt::backend_stats::encode_process_record(&row),
             )
             .unwrap();
@@ -2978,31 +2950,31 @@ mod tests {
     #[test]
     #[cfg(feature = "dbt")]
     fn typed_stats_capture_refuses_missing_empty_or_truncated_evidence() {
-        let missing = DbtStatsCapture::new().unwrap();
-        let error = missing.finish().unwrap_err();
+        let missing = DbtStatsSink::new().unwrap();
+        let error = require_dbt_stats(&missing.capture()).unwrap_err();
         assert!(
             error.to_string().contains("statistics were missing"),
             "{error}"
         );
 
-        let empty = DbtStatsCapture::new().unwrap();
-        fs::write(&empty.path, b"").unwrap();
-        let error = empty.finish().unwrap_err();
+        let empty = DbtStatsSink::new().unwrap();
+        fs::write(empty.directory().join("records.bin"), b"").unwrap();
+        let error = require_dbt_stats(&empty.capture()).unwrap_err();
         assert!(
             error.to_string().contains("statistics were empty"),
             "{error}"
         );
 
-        let truncated = DbtStatsCapture::new().unwrap();
-        fs::write(&truncated.path, b"truncated").unwrap();
-        let error = truncated.finish().unwrap_err();
+        let truncated = DbtStatsSink::new().unwrap();
+        fs::write(truncated.directory().join("records.bin"), b"truncated").unwrap();
+        let error = require_dbt_stats(&truncated.capture()).unwrap_err();
         assert!(
             error.to_string().contains("statistics were unreadable"),
             "{error}"
         );
         assert!(error.to_string().contains("truncated"), "{error}");
 
-        let inconsistent = DbtStatsCapture::new().unwrap();
+        let inconsistent = DbtStatsSink::new().unwrap();
         let record = reverie_dbt::backend_stats::DbtProcessRecord {
             branches: 18,
             syscalls: 1,
@@ -3010,11 +2982,11 @@ mod tests {
             ..Default::default()
         };
         fs::write(
-            &inconsistent.path,
+            inconsistent.directory().join("records.bin"),
             reverie_dbt::backend_stats::encode_process_record(&record),
         )
         .unwrap();
-        let error = inconsistent.finish().unwrap_err();
+        let error = require_dbt_stats(&inconsistent.capture()).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -3029,9 +3001,9 @@ mod tests {
         let verdict_file = tempfile::NamedTempFile::new().unwrap();
         super::super::verify::write_pending_verification_json(verdict_file.path()).unwrap();
 
-        let empty = DbtStatsCapture::new().unwrap();
-        fs::write(&empty.path, b"").unwrap();
-        assert!(empty.finish().is_err());
+        let empty = DbtStatsSink::new().unwrap();
+        fs::write(empty.directory().join("records.bin"), b"").unwrap();
+        assert!(require_dbt_stats(&empty.capture()).is_err());
 
         let json: serde_json::Value =
             serde_json::from_slice(&fs::read(verdict_file.path()).unwrap()).unwrap();
