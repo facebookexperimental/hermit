@@ -893,6 +893,36 @@ fn remove_fatal_core_files(dir: &Path, owner: &str) -> usize {
 /// run as a plain `--gdbserver` run.
 const DAP_LISTEN_INNER_ENV: &str = "HERMIT_DAP_LISTEN_INNER";
 
+/// Whether this process's parent is the `hermit run --dap-listen` that
+/// `owner`, the value of [`DAP_LISTEN_INNER_ENV`], names: its process ID,
+/// running this same `hermit` executable (the same file), with
+/// `--dap-listen` among its arguments. Any other parent, a shell that set the
+/// variable to its own ID for one, is not a supervisor.
+fn started_by_a_dap_supervisor(owner: &OsStr) -> bool {
+    let parent = std::os::unix::process::parent_id();
+    if owner.to_str().and_then(|owner| owner.parse().ok()) != Some(parent) {
+        return false;
+    }
+    let identity = |path: String| {
+        fs::metadata(path)
+            .map(|metadata| {
+                (
+                    std::os::unix::fs::MetadataExt::dev(&metadata),
+                    std::os::unix::fs::MetadataExt::ino(&metadata),
+                )
+            })
+            .ok()
+    };
+    let same_executable = identity(format!("/proc/{parent}/exe"))
+        .is_some_and(|parent| Some(parent) == identity("/proc/self/exe".to_owned()));
+    let serves_dap = fs::read(format!("/proc/{parent}/cmdline")).is_ok_and(|cmdline| {
+        cmdline
+            .split(|byte| *byte == 0)
+            .any(|argument| argument == b"--dap-listen" || argument.starts_with(b"--dap-listen="))
+    });
+    same_executable && serves_dap
+}
+
 /// Command-line options for the "run" subcommand.
 #[derive(Debug, Parser, Clone)]
 #[clap(group(clap::ArgGroup::new("verification").args(["verify", "verify_run"])))]
@@ -5509,9 +5539,7 @@ impl RunOpts {
             match std::env::var_os(DAP_LISTEN_INNER_ENV) {
                 None => return self.serve_dap(),
                 // The run a supervising `hermit run --dap-listen` started.
-                Some(owner)
-                    if owner.to_str().and_then(|owner| owner.parse().ok())
-                        == Some(std::os::unix::process::parent_id()) => {}
+                Some(owner) if started_by_a_dap_supervisor(&owner) => {}
                 Some(owner) => anyhow::bail!(
                     "{DAP_LISTEN_INNER_ENV}={owner:?} is set, but its parent did not start this \
                      hermit run --dap-listen; unset {DAP_LISTEN_INNER_ENV}"
@@ -5548,14 +5576,12 @@ impl RunOpts {
              gdbserver listens and give that port to the debugger; pass another port than 0"
         );
         let listener = super::dap_adapter::bind(argument)?;
-        // The guest path the guest command selects (guest working directory,
-        // PATH, mounts). A program that cannot be resolved is left to the
-        // run, which reports it with its own status (127 if it is not
-        // found); hermit-dap is looked for only once the run gets that far.
-        let guest = self
-            .resolve_guest_and_host_program()
-            .ok()
-            .map(|(guest, _)| guest);
+        // Where the guest command finds its program (guest working
+        // directory, PATH), searched later in the guest's own view. A program
+        // that cannot be found is left to the run, which reports it with its
+        // own status (127 if it is not found); hermit-dap is looked for only
+        // once the run gets that far.
+        let guest = self.guest_program().ok();
         let run = super::dap_adapter::spawn_owned(
             std::process::Command::new(std::env::current_exe().context("Failed to locate hermit")?)
                 .args(std::env::args_os().skip(1))
@@ -5567,7 +5593,7 @@ impl RunOpts {
             listener,
             gdbserver_port,
             |guest_pid| {
-                let guest = guest.as_deref().ok_or_else(|| {
+                let guest = guest.as_ref().ok_or_else(|| {
                     anyhow::anyhow!(
                         "--dap-listen cannot tell which file the guest runs for {}",
                         self.program.display()
@@ -6779,6 +6805,43 @@ impl RunOpts {
             );
         }
         Ok(ExitStatus::SUCCESS)
+    }
+
+    /// Where the guest command finds its program, as guest paths: the path
+    /// it names, made absolute against its working directory, or, for a bare
+    /// name, each `PATH` candidate in order, as
+    /// [`Self::resolve_guest_and_host_program`] tries them.
+    fn guest_program(&self) -> Result<super::dap_adapter::GuestProgram, Error> {
+        use super::dap_adapter::GuestProgram;
+        let command = self.guest_command()?;
+        let requested = Path::new(command.get_program());
+        if requested.is_absolute() {
+            return Ok(GuestProgram::Named(normalize_guest_path(requested)?));
+        }
+        let current_dir = self.guest_current_dir(&command)?;
+        if requested.components().count() > 1 {
+            return Ok(GuestProgram::Named(normalize_guest_path(
+                &current_dir.join(requested),
+            )?));
+        }
+        let path = command
+            .get_captured_envs()
+            .get(OsStr::new("PATH"))
+            .cloned()
+            .unwrap_or_default();
+        let candidates = path
+            .as_bytes()
+            .split(|byte| *byte == b':')
+            .map(|bytes| Path::new(OsStr::from_bytes(bytes)))
+            .map(|directory| {
+                normalize_guest_path(&if directory.is_absolute() {
+                    directory.join(requested)
+                } else {
+                    current_dir.join(directory).join(requested)
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(GuestProgram::Search(candidates))
     }
 
     fn resolve_guest_and_host_program(&self) -> Result<(PathBuf, PathBuf), Error> {

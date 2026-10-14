@@ -254,21 +254,54 @@ fn canonical_in_root(root: &OwnedFd, path: &Path) -> std::io::Result<PathBuf> {
     Ok(resolved)
 }
 
+/// Where the guest finds its program: a path it names (`Named`), or the
+/// candidates of a `PATH` search, in order (`Search`), of which the guest runs
+/// the first that is a regular file with an execute bit.
+#[derive(Debug)]
+pub enum GuestProgram {
+    Named(PathBuf),
+    Search(Vec<PathBuf>),
+}
+
+/// Whether `path`, followed as the guest sees it, is a regular file with an
+/// execute bit: the test the run's own `PATH` search applies.
+fn executable_in_root(root: &OwnedFd, path: &Path) -> bool {
+    canonical_in_root(root, path)
+        .and_then(|canonical| open_in_root(root, &canonical, libc::O_PATH))
+        .and_then(|fd| std::fs::File::from(fd).metadata())
+        .is_ok_and(|metadata| metadata.is_file() && metadata.mode() & 0o111 != 0)
+}
+
 /// The host file a debugger must load for the program the guest of process
-/// `guest_pid` is about to execute, `guest_program` (a guest path), with
-/// `to_host` mapping a guest path without symbolic links to the host file the
-/// run's mounts make it. The answer is checked against the guest's own view:
-/// the file the guest opens there must be that same host file (device and
-/// inode), readable, and an ELF executable, since a debugger can load nothing
-/// else. Anything else is refused with the reason, before any hint is given.
+/// `guest_pid` is about to execute, `guest_program`, with `to_host` mapping a
+/// guest path without symbolic links to the host file the run's mounts make
+/// it. Both steps happen in the guest's own view, through its root: the
+/// `PATH` search, so a mount that makes an earlier candidate executable
+/// selects it there as it does for the guest, and the symbolic links of the
+/// selected path. The answer is then checked: the file the guest opens there
+/// must be that same host file (device and inode), readable, and an ELF
+/// executable, since a debugger can load nothing else. Anything else is
+/// refused with the reason, before any hint is given.
 pub fn identify_debuggee(
     guest_pid: i32,
-    guest_program: &Path,
+    guest_program: &GuestProgram,
     to_host: impl Fn(&Path) -> Option<PathBuf>,
 ) -> Result<PathBuf, Error> {
     let root = std::fs::File::open(format!("/proc/{guest_pid}/root"))
         .map(OwnedFd::from)
         .with_context(|| format!("Failed to open the root of the guest's process {guest_pid}"))?;
+    let guest_program = match guest_program {
+        GuestProgram::Named(path) => path.as_path(),
+        GuestProgram::Search(candidates) => candidates
+            .iter()
+            .find(|candidate| executable_in_root(&root, candidate))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--dap-listen finds no executable among the guest's PATH candidates {:?}",
+                    candidates
+                )
+            })?,
+    };
     let canonical = canonical_in_root(&root, guest_program).with_context(|| {
         format!(
             "--dap-listen cannot follow {} through the guest's file system",

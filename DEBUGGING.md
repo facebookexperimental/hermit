@@ -192,9 +192,12 @@ program waits for the client's `attach` before its first instruction.
 `--dap-gdb PATH` chooses the GDB the adapter runs.
 
 The `program` it prints is the host file the guest is about to execute.
-`hermit run` finds the guest's path the way the guest does (its working
-directory, its `PATH`), follows it through the guest's own symbolic links,
-and maps it through the run's mounts to a host file. It then checks that
+`hermit run` looks for it in the guest's own view, through the root of the
+waiting guest process: the path the command names (against the guest's
+working directory), or the first executable candidate on the guest's
+`PATH`, so a mount that makes a candidate executable counts as it does for
+the guest. It follows that path through the guest's symbolic links and maps
+it through the run's mounts to a host file. It then checks that
 answer against the waiting guest process: the file the guest opens at that
 path must be the same file (device and inode), readable, and an ELF
 executable, because a debugger can load nothing else. Otherwise it ends the

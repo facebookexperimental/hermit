@@ -16778,7 +16778,8 @@ fn tcp_listener_commands(port: u16) -> Vec<String> {
 /// (`--namespace-only`), one whose gdbserver port the system would pick
 /// (`--gdbserver-port=0`), an address that does not parse or is already
 /// taken, and a run that the internal mark of a supervised run claims, from
-/// the environment, without that supervisor being its parent. Each fails,
+/// the environment, without that supervisor being its parent: a value that
+/// names no parent, and a shell that names itself as the parent. Each fails,
 /// says why, and never prints the adapter's start line.
 #[test]
 fn hermit_run_dap_listen_refusals_start_no_adapter() {
@@ -16868,6 +16869,61 @@ fn hermit_run_dap_listen_refusals_start_no_adapter() {
              got {status:?}\nstderr:\n{stderr}"
         );
     }
+    // A parent whose process ID the mark does name, but which is a shell, not
+    // a supervising `hermit run --dap-listen`. `; exit` keeps the shell from
+    // replacing itself with hermit, so it stays the parent.
+    let hermit = hermit_command(&["run", "--dap-listen", "127.0.0.1:0", "--", "/bin/true"]);
+    let stderr_file = tempfile::NamedTempFile::new_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create a stderr file");
+    let mut shell = Command::new("/bin/sh");
+    // Its own process group, so a hermit that is wrongly admitted, and waits
+    // for a debugger, is killed with the shell below.
+    std::os::unix::process::CommandExt::process_group(&mut shell, 0);
+    shell
+        .arg("-c")
+        .arg(r#"HERMIT_DAP_LISTEN_INNER=$$ "$0" "$@"; exit $?"#)
+        .arg(hermit.get_program())
+        .args(hermit.get_args());
+    for (name, value) in hermit.get_envs() {
+        match value {
+            Some(value) => shell.env(name, value),
+            None => shell.env_remove(name),
+        };
+    }
+    let mut child = KillOnDrop(
+        shell
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(
+                stderr_file
+                    .reopen()
+                    .expect("failed to reopen the stderr file"),
+            )
+            .spawn()
+            .expect("failed to run the shell"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().expect("failed to poll the shell") {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    if status.is_none() {
+        // SAFETY: kill has no pointer arguments; the group is the shell's own.
+        unsafe { libc::kill(-(child.0.id() as libc::pid_t), libc::SIGKILL) };
+    }
+    let stderr = fs::read_to_string(stderr_file.path()).unwrap_or_default();
+    assert!(
+        status.is_some_and(|status| status.code() == Some(HERMIT_INTERNAL_FAILURE_EXIT))
+            && stderr.contains("unset HERMIT_DAP_LISTEN_INNER")
+            && !stderr.contains("starting hermit-dap"),
+        "a shell naming itself in the mark must be refused within 30 s, got {status:?}\n\
+         stderr:\n{stderr}"
+    );
 }
 
 /// The attach request's `program` is the file the guest actually runs: a bare
@@ -17178,7 +17234,10 @@ fn hermit_run_dap_listen_refuses_a_script() {
 /// is a symbolic link to DIR/real, and a different executable is mounted at
 /// DIR/real/prog, so the guest's DIR/link/prog is that mounted file, not the
 /// host's DIR/real/prog. A link with an absolute target leads to the same
-/// file.
+/// file. So does a bare name on the guest's `PATH` of DIR/link:DIR/other,
+/// where on the host DIR/real/prog is not executable and the search would
+/// pass on to DIR/other/prog, another executable; in the guest the mounted
+/// file makes the first candidate executable, and that is the one it runs.
 #[test]
 fn hermit_run_dap_listen_names_the_file_a_guest_symlink_reaches() {
     const TEST: &str = "hermit_run_dap_listen_names_the_file_a_guest_symlink_reaches";
@@ -17199,26 +17258,58 @@ fn hermit_run_dap_listen_names_the_file_a_guest_symlink_reaches() {
         mounted.display(),
         dir.join("real/prog").display()
     );
-    for link in ["link", "absolute-link"] {
-        let program = dir.join(link).join("prog");
-        let program_arg = program.to_str().expect("program path should be UTF-8");
+    // The PATH case: on the host, DIR/real/prog is not executable.
+    let path_dir = work.path().join("path");
+    fs::create_dir_all(path_dir.join("real")).expect("failed to create PATH/real");
+    fs::write(path_dir.join("real/prog"), "not a program\n")
+        .expect("failed to write PATH/real/prog");
+    fs::set_permissions(
+        path_dir.join("real/prog"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .expect("failed to make PATH/real/prog non-executable");
+    std::os::unix::fs::symlink("real", path_dir.join("link")).expect("failed to link PATH/link");
+    fs::create_dir_all(path_dir.join("other")).expect("failed to create PATH/other");
+    fs::copy("/bin/true", path_dir.join("other/prog")).expect("failed to copy /bin/true");
+    let path_mount = format!(
+        "--mount=type=bind,source={},target={}",
+        mounted.display(),
+        path_dir.join("real/prog").display()
+    );
+    let path_env = format!(
+        "--env=PATH={}:{}",
+        path_dir.join("link").display(),
+        path_dir.join("other").display()
+    );
+    let link_program = dir.join("link/prog");
+    let absolute_program = dir.join("absolute-link/prog");
+    for (case, options, program) in [
+        ("link", vec![mount.as_str()], link_program.to_str()),
+        (
+            "absolute-link",
+            vec![mount.as_str()],
+            absolute_program.to_str(),
+        ),
+        (
+            "PATH",
+            vec![path_mount.as_str(), path_env.as_str()],
+            Some("prog"),
+        ),
+    ] {
+        let link = case;
+        let program_arg = program.expect("program path should be UTF-8");
         let gdbserver_arg = format!("--gdbserver-port={}", unused_local_port());
         let stderr_path = work.path().join("hermit-run.stderr");
+        let mut argv = vec!["run", gdbserver_arg.as_str()];
+        argv.extend(options);
+        argv.extend(["--dap-listen", "127.0.0.1:0", "--", program_arg]);
         let mut run = KillOnDrop(
-            hermit_command(&[
-                "run",
-                &gdbserver_arg,
-                &mount,
-                "--dap-listen",
-                "127.0.0.1:0",
-                "--",
-                program_arg,
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(fs::File::create(&stderr_path).expect("failed to create stderr file"))
-            .spawn()
-            .expect("failed to run hermit"),
+            hermit_command(&argv)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(fs::File::create(&stderr_path).expect("failed to create stderr file"))
+                .spawn()
+                .expect("failed to run hermit"),
         );
         let deadline = Instant::now() + Duration::from_secs(40);
         let hint = loop {
