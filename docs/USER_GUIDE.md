@@ -426,7 +426,16 @@ Hermit runs the guest twice and compares observable output, including stdout,
 stderr, and its internal deterministic execution log. Verification fails if
 the compared observations differ or if the guest exit status is not allowed.
 
-The default log comparison is `Stripped`: it can erase numbers, addresses,
+The verifier emits the first run's guest stdout and stderr once when verification
+succeeds, or when both runs agree on both output streams. This also applies to
+DBT: a log-only or branch-count divergence no longer suppresses agreed guest
+output. The divergence remains a failure. If either stream differs, the labelled
+comparison shows the difference instead of choosing one run's output. Errors
+writing the agreed output are still errors, even if the comparison report was
+already written.
+
+The default log comparison is `Stripped` (DBT retains its `Canonical` comparison):
+it can erase numbers, addresses,
 temporary paths, and time values from selected messages. It is a fast
 diagnostic, not strict determinism. Use
 `--verify-strict --verify-json REPORT.json` when a canonical strict result is
@@ -468,11 +477,13 @@ The default `--record-envelope=all-records-v1` preserves every parsed record.
 For a DBT evidence log, select
 `--record-envelope=dbt-evidence-transport-v1` explicitly to exclude only the
 transport's self-description records. This is an offline inspection option;
-live `--backend=dbt run --verify` goes through its dedicated DBT adapter,
-which compares its two runs with `all-records-v1` and publishes its own verdict
-when `--verify-json` is requested. Selecting this envelope there would exclude
-records that adapter compares today, so it is offered here for offline
-inspection rather than applied to a live run.
+live `--backend=dbt run --verify` uses the common verifier with the existing DBT
+execution and evidence adapter. It compares both runs with `all-records-v1` and
+includes DBT's branch counts and process statistics before publishing the common
+verdict. Selecting the narrower envelope there would exclude records compared
+today, so it remains an offline inspection option. A decode, materialization, or
+statistics failure after a physical DBT run records that run as failed, never as
+a match; failure in run 1 prevents run 2 from starting.
 `hermit log-diff LEFT RIGHT --json REPORT.json` compares
 the same canonical INFO stream and atomically records a one-line result. Its
 `comparison.record_envelope` field names that versioned policy, alongside the

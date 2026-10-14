@@ -5127,6 +5127,131 @@ fn run_dbt_strict_returns_with_blocked_stdin_source() {
     assert!(stderr(&output).contains("unsupported syscall"));
 }
 
+/// A producer that stays open must not be drained before run 1 or joined at
+/// guest exit. A completed typed comparison proves run 2 also finished; this
+/// stdin-lifetime test does not turn a real parity divergence into a match.
+#[test]
+fn run_dbt_verify_returns_with_blocked_stdin_source_after_both_runs() {
+    if dbt_unavailable("run_dbt_verify_returns_with_blocked_stdin_source_after_both_runs") {
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let root = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let report_path = root.path().join("verdict.json");
+    let (reader, writer) = std::io::pipe().unwrap();
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after", "2s", "30s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"));
+    append_hermit_args(
+        &mut command,
+        &[
+            "--backend=dbt",
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+        ],
+    );
+    command.arg(&report_path);
+    append_hermit_args(&mut command, &["--", "/bin/true"]);
+    let output = command
+        .stdin(reader)
+        .output()
+        .expect("run DBT verification with held-open input");
+    // The writer is intentionally still open when both executions return.
+    drop(writer);
+    assert_ne!(
+        output.status.code(),
+        Some(124),
+        "DBT verify hung on stdin: {}",
+        stderr(&output)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report_path).unwrap()).unwrap();
+    let verdict = report["verdict"].as_str().unwrap();
+    assert!(
+        matches!(verdict, "matched" | "diverged"),
+        "both runs must reach comparison: {report}; {}",
+        stderr(&output)
+    );
+    assert_eq!(
+        output.status.success(),
+        verdict == "matched",
+        "{report}; {}",
+        stderr(&output)
+    );
+    assert!(
+        report["compared_log_messages"]["left"].as_u64().unwrap() > 0,
+        "{report}"
+    );
+    assert!(
+        report["compared_log_messages"]["right"].as_u64().unwrap() > 0,
+        "{report}"
+    );
+    assert!(
+        report["dbt_counted_branches"]["left"].as_u64().unwrap() > 0,
+        "{report}"
+    );
+    assert!(
+        report["dbt_counted_branches"]["right"].as_u64().unwrap() > 0,
+        "{report}"
+    );
+    assert_eq!(report["comparison"]["strictness"], "canonical");
+    assert_eq!(report["comparison"]["compare_io_buffers"], true);
+}
+
+#[test]
+fn run_dbt_verify_replays_stdin_bytes_and_eof() {
+    if dbt_unavailable("run_dbt_verify_replays_stdin_bytes_and_eof") {
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let root = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let report_path = root.path().join("verdict.json");
+    let args = [
+        "--backend=dbt",
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        report_path.to_str().unwrap(),
+        "--",
+        "/bin/cat",
+    ];
+    // The existing pipe helper closes its writer after these bytes. Cat must
+    // read that EOF in both executions; output must be emitted only once.
+    let input = b"first\0line\nlast-without-newline\xff";
+    let output = hermit_with_stdin(&args, input);
+    assert_success(&output, &args);
+    assert_eq!(output.stdout, input);
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(report_path).unwrap()).unwrap();
+    assert_eq!(report["verdict"], "matched", "{report}");
+    assert_eq!(report["bitwise_parity"], true, "{report}");
+    assert_eq!(report["comparison"]["strictness"], "canonical");
+    assert_eq!(report["comparison"]["compare_io_buffers"], true);
+    for side in ["left", "right"] {
+        assert_eq!(report["compared_outputs"][side]["exit_code"], 0, "{report}");
+        assert_eq!(
+            report["compared_outputs"][side]["stdout_bytes"],
+            input.len(),
+            "{report}"
+        );
+        assert_eq!(
+            report["compared_outputs"][side]["stdout_sha256"],
+            detcore::Digest::new(input).to_string(),
+            "{report}"
+        );
+        assert!(
+            report["compared_log_messages"][side].as_u64().unwrap() > 0,
+            "{report}"
+        );
+    }
+}
+
 /// Backend statistics are a HARNESS record and must stay out of the INFO parity
 /// envelope, while remaining available to anyone who asks for DEBUG.
 ///

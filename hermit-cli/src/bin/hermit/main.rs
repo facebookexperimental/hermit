@@ -565,8 +565,8 @@ impl Subcommand {
         //     reservation, `validate_args`, backend availability, PMU config,
         //     mount-source and program validation, happens-before resolution,
         //     e9patch preparation;
-        //   * the DBT arm, which returns `run_dbt(..)` and therefore must
-        //     publish its verdict through that dedicated path;
+        //   * DBT physical-invocation preparation, before a run reaches the
+        //     common verifier's completion boundary;
         //   * `--namespace-only`, which likewise bypasses `verify()`;
         //   * `StartOpts::main`'s own pre-validation before `record_verify`.
         //
@@ -1829,90 +1829,104 @@ mod tests {
     // What DID need restoring from that deletion is the ordering premise
     // immediately below.
 
-    /// `RunOpts::main` returns through the dedicated DBT adapter BEFORE the
-    /// generic `verify()` dispatch. That ordering is the whole reason `run_dbt`
-    /// has to carry the verdict-artifact path itself: if the generic dispatch
-    /// ran first, it would not.
-    ///
-    /// The next test's doc comment has asserted this in prose since #2359 while
-    /// nothing checked it, which is the worse failure mode — a reader trusts a
-    /// documented guarantee. Restored rather than deleted because reading
-    /// `run.rs` confirms the property still holds. Only the OTHER half of the
-    /// original assertion, that a DBT run therefore keeps `no_result`, was made
-    /// false by `f0584c1aac` (which gave `run_dbt` a `verify_json` path, a
-    /// `ComparisonOptions`, and a real `compare_two_runs` outcome), and that
-    /// half is deliberately not restored.
-    ///
-    /// Both needles must appear EXACTLY once. A bare `find` is satisfied by a
-    /// comment quoting the string, and #2359's own round-2 review caught
-    /// precisely that: a text assertion a comment can satisfy is not a pin.
-    /// Requiring uniqueness turns such a quote into a loud failure.
+    /// Live verification must reach the common owner. Ordinary and saved
+    /// single runs retain the physical DBT launcher before that dispatch.
     #[test]
-    fn dbt_arm_returns_before_the_generic_verify_dispatch() {
+    fn dbt_verification_joins_the_generic_verify_dispatch() {
         let source = include_str!("run.rs");
         let sole_offset = |needle: &str| -> usize {
-            let hits: Vec<usize> = source.match_indices(needle).map(|(i, _)| i).collect();
+            let hits: Vec<_> = source
+                .match_indices(needle)
+                .map(|(offset, _)| offset)
+                .collect();
             assert_eq!(
                 hits.len(),
                 1,
-                "expected exactly one occurrence of {needle:?} in run.rs, found {}. Zero means \
-                 the shape this check reads has moved or gone, so it can no longer see the \
-                 ordering; two or more (including one inside a comment) would make the check \
-                 meaningless rather than merely wrong",
-                hits.len()
+                "expected one production occurrence of {needle:?}"
             );
             hits[0]
         };
-        let dbt_return = sole_offset("return super::backends::run_dbt(");
-        let generic_verify = sole_offset("self.verify(global)");
-        assert!(
-            dbt_return < generic_verify,
-            "RunOpts::main must return through the dedicated DBT adapter before the generic \
-             verify() dispatch; if that order ever reverses, run_dbt no longer needs to carry \
-             the verdict-artifact path and dbt_arm_has_a_channel_to_publish_a_verdict is \
-             asserting something that no longer follows"
+        let ordinary = sole_offset("if backend == Backend::Dbt && !self.verify");
+        let saved = sole_offset("return invocation.verify_run(");
+        let physical = sole_offset("return invocation.run(");
+        let verify = sole_offset("self.verify(global, dbt_verification_stdin)");
+        assert!(ordinary < saved && saved < physical && physical < verify);
+        let common = source
+            .split_once("    fn verify(")
+            .unwrap()
+            .1
+            .split_once("    /// The `--bind`s")
+            .unwrap()
+            .0;
+        assert!(common.contains("self.dbt_invocation()?.verification(_dbt_stdin)"));
+        assert_eq!(common.matches("options.run_verify(").count(), 1);
+        assert_eq!(common.matches("                execute(").count(), 2);
+        assert_eq!(common.matches("&run1_options,").count(), 1);
+        assert_eq!(common.matches("&run2_options,").count(), 1);
+        assert_eq!(
+            common
+                .matches("let outcome = conclude_verification(")
+                .count(),
+            1
         );
+        let conclusion = source
+            .split_once("pub(super) fn conclude_verification(")
+            .unwrap()
+            .1
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("run.rs has a test module")
+            .0;
+        assert_eq!(
+            conclusion
+                .matches("let mut outcome = compare_two_runs(")
+                .count(),
+            1
+        );
+        let physical = include_str!("backends.rs")
+            .split_once("impl DbtVerification {")
+            .unwrap()
+            .1
+            .split_once("/// Stats are consumed")
+            .unwrap()
+            .0;
+        assert!(!physical.contains("compare_two_runs("));
+        assert!(source.contains("self.verify_run(directory, global)"));
     }
 
-    /// The DBT arm of `RunOpts::main` returns `run_dbt(..)` and never reaches
-    /// the common `verify()` function, so both cfg arms of `run_dbt` must carry
-    /// the verdict-artifact path explicitly. The ordering that makes that true
-    /// is pinned by `dbt_arm_returns_before_the_generic_verify_dispatch`.
-    ///
-    /// Asserted structurally rather than by executing the arm so this focused
-    /// test cannot block on the harness stdin or require DynamoRIO.
+    /// DBT completion and evidence errors return to the same run-labelled
+    /// publisher as every other backend; the physical adapter has no verdict loop.
     #[test]
     fn dbt_arm_has_a_channel_to_publish_a_verdict() {
-        let source = include_str!("backends.rs");
-        let production = source
-            .split_once("#[cfg(test)]")
-            .expect("backends test module")
+        let source = include_str!("run.rs");
+        let common = source
+            .split_once("    fn verify(")
+            .unwrap()
+            .1
+            .split_once("    /// The `--bind`s")
+            .unwrap()
             .0;
-        let signatures: Vec<&str> = production
-            .match_indices("fn run_dbt(")
-            .map(|(i, _)| {
-                let rest = &production[i..];
-                &rest[..rest
-                    .find(") -> Result<ExitStatus, Error>")
-                    .expect("run_dbt signature")]
-            })
-            .collect();
-        assert_eq!(signatures.len(), 2, "expected both cfg arms of run_dbt");
-        for signature in signatures {
-            assert!(
-                signature.contains("verify"),
-                "run_dbt should still receive the verify flag"
-            );
-            assert!(
-                signature.contains("verify_json"),
-                "run_dbt must receive the verdict-artifact path because the DBT arm bypasses \
-                 the common verify() function:\n{signature}"
-            );
+        for run in ["Run1", "Run2"] {
+            let label = format!("VerificationRun::{run}");
+            assert!(common.contains(&label));
         }
+        assert!(common.contains("publish_run_failure(self.verify_json.as_deref()"));
+        let conclusion = source
+            .split_once("pub(super) fn conclude_verification(")
+            .unwrap()
+            .1;
+        assert!(conclusion.contains("write_verification_json(path, &outcome)"));
+        let physical = source
+            .split_once("    fn run_verify(")
+            .unwrap()
+            .1
+            .split_once("    fn merge_from_env_settings")
+            .unwrap()
+            .0;
+        assert!(physical.contains("return dbt.run("));
+        assert!(physical.contains("self.verify_json.as_deref()"));
     }
 
-    /// The DBT arm builds its own [`verify::ComparisonOptions`], so the record
-    /// envelope it names is not covered by the generic verifier's tests. Pin it
+    /// DBT now uses the common [`verify::ComparisonOptions`]. Pin its envelope
     /// to `all_records_v1`, the envelope the schema-10 ledger accepts: the DBT
     /// log holds every authenticated record, initialization records included at
     /// the positions Reverie's collector gives them. An opaque `caller_defined` predicate here would
@@ -1922,15 +1936,16 @@ mod tests {
     /// that the log and the verdict carry that stream.
     #[test]
     fn dbt_verdict_names_a_canonical_record_envelope() {
+        let common = include_str!("run.rs");
+        let options = common
+            .split_once("    fn verification_comparison_options(")
+            .unwrap()
+            .1
+            .split_once("    /// The `--verify-json`")
+            .unwrap()
+            .0;
+        let block = options;
         let source = include_str!("backends.rs");
-        let start = source
-            .find("= compare_two_runs(")
-            .expect("DBT arm must compare two runs");
-        let options = source[start..]
-            .find("ComparisonOptions {")
-            .map(|offset| &source[start + offset..])
-            .expect("DBT comparison must build ComparisonOptions");
-        let block = &options[..options.find("\n        },").expect("options block end")];
 
         let record_envelope_literal = || {
             block
@@ -1990,38 +2005,51 @@ mod tests {
     /// verdict is a divergence. `--keep-logs` keeps a single golden log after a
     /// match, so the DBT arm must mark such a match overridden with exactly the
     /// predicates that later turn the verdict into a divergence
-    /// (`finalize_dbt_verification` for the clock, `DbtSummaryComparison::apply`
-    /// for the statistics). Otherwise run 2's log of a divergent run would be
+    /// (`record_dbt_branch_clock_comparison` and `DbtSummaryComparison::apply`). Otherwise run 2's log of a divergent run would be
     /// deleted. DBT cannot execute in unit tests, so the wiring is pinned here
     /// and `verify::tests::an_overridden_match_keeps_both_logs_in_the_failure_directory`
     /// proves what an overridden match retains.
     #[test]
     fn dbt_backend_divergence_overrides_a_log_match_for_retention() {
         let source = include_str!("backends.rs");
-        let start = source
-            .find("= compare_two_runs(")
-            .expect("DBT arm must compare two runs");
-        let options = source[start..]
-            .find("ComparisonOptions {")
-            .map(|offset| &source[start + offset..])
-            .expect("DBT comparison must build ComparisonOptions");
-        let block = &options[..options.find("\n        },").expect("options block end")];
-        let normalized = block.split_whitespace().collect::<Vec<_>>().join(" ");
-        let backend_divergence =
-            "branch_clock_diverged || summary_comparison.requires_log_retention(),";
-        for field in [
-            format!("keep_logs: keep_logs || {backend_divergence}"),
-            format!("match_overridden: {backend_divergence}"),
-        ] {
-            assert_eq!(
-                normalized.matches(&field).count(),
-                1,
-                "the DBT comparison must state `{field}` exactly once"
-            );
-        }
+        let comparison = source
+            .split_once("impl DbtVerificationComparison {")
+            .unwrap()
+            .1
+            .split_once("/// Where DynamoRIO")
+            .unwrap()
+            .0;
+        let normalized = comparison.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(normalized.contains(
+            "let mismatch = !self.branches.matched() || self.summary.requires_log_retention();"
+        ));
+        assert_eq!(
+            normalized.matches("options.keep_logs |= mismatch;").count(),
+            1
+        );
+        assert_eq!(
+            normalized
+                .matches("options.match_overridden |= mismatch;")
+                .count(),
+            1
+        );
+        assert!(normalized.contains("self.summary.apply(outcome)"));
+        assert!(normalized.contains("record_dbt_branch_clock_comparison(outcome, self.branches)"));
+        let common = include_str!("run.rs")
+            .split_once("pub(super) fn conclude_verification(")
+            .unwrap()
+            .1;
         assert!(
-            source.contains("let branch_clock_diverged = !branch_clock_comparison.matched();"),
-            "the retention predicate must be the same clock comparison the verdict uses"
+            common
+                .find("comparison.configure(&mut comparison_options)")
+                .unwrap()
+                < common.find("let mut outcome = compare_two_runs(").unwrap()
+        );
+        assert!(
+            common.find("comparison.apply(&mut outcome)").unwrap()
+                < common
+                    .find("write_verification_json(path, &outcome)")
+                    .unwrap()
         );
     }
 

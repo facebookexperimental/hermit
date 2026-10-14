@@ -729,6 +729,16 @@ pub(super) struct RunLatches {
     pub(super) log_sink_failure: Option<String>,
 }
 
+/// One completed physical verification run. DBT's typed statistics remain
+/// deferred until the common owner has checked the run's latches and status.
+pub(super) struct VerificationRunOutput {
+    pub(super) output: Output,
+    pub(super) skid_overshoots: u64,
+    pub(super) latches: RunLatches,
+    #[cfg(feature = "dbt")]
+    pub(super) dbt: Option<super::backends::DbtRunCompletion>,
+}
+
 /// A verification run recorded a determinism loss ([`RunLatches`]), so it is
 /// not compared. A type rather than a message so `run --verify` records the
 /// run as failed by a determinism loss instead of leaving the `not_run` stamp.
@@ -2488,9 +2498,7 @@ fn every_backend_keeps_io_buffer_checking_on_by_default() {
             "{backend} disabled syscall output-buffer checking while the ordinary strict-verify \
              request left it enabled"
         );
-        if run.selected_backend() != Backend::Dbt {
-            // DBT has its own production comparator in `backends.rs`; the
-            // no-JSON content-mutation integration test exercises that path.
+        {
             assert_eq!(
                 run.verification_comparison_options().compare_io_buffers,
                 prepared.detlog_io_buffers,
@@ -2517,7 +2525,7 @@ fn every_backend_keeps_io_buffer_checking_on_by_default() {
             !prepared_opt_out.detlog_io_buffers,
             "{backend} ignored the explicit --no-detlog-io-buffers relaxation"
         );
-        if opted_out.selected_backend() != Backend::Dbt {
+        {
             assert_eq!(
                 opted_out
                     .verification_comparison_options()
@@ -5514,9 +5522,9 @@ impl RunOpts {
         self.refuse_liteinst_without_the_feature()?;
         let verification = self.verify || self.verify_run.is_some();
         let dbt_verification_stdin = if verification && self.selected_backend() == Backend::Dbt {
-            // DBT owns its two-run adapter and replays this descriptor there.
-            // The common output-capturing backends reserve the same input in
-            // `hermit` because their execution path lives in the library.
+            // DBT streams this reservation during live or saved-run execution.
+            // The common live owner replays it without pre-draining stdin;
+            // library output-capturing backends reserve their input below.
             super::startup_stdin()?
         } else if verification {
             // `--verify` runs the guest twice through the output-capturing
@@ -5568,8 +5576,8 @@ impl RunOpts {
                 explicit_backend.as_str()
             );
         }
-        // ⚠️ HERE, NOT IN `run()`. The DBT arm below RETURNS `run_dbt(..)` and
-        // never reaches `RunOpts::run`, so a check placed there covers every
+        // ⚠️ HERE, NOT IN `run()`. The DBT single-run arm below returns through
+        // its physical launcher, so a check placed in `run()` covers every
         // backend except the one measured furthest from working. Same shape as
         // the `--namespace-only` second launch path documented in `run()`: the
         // first placement worked and was not yet complete. Measured: with the
@@ -5641,45 +5649,37 @@ impl RunOpts {
         // Last, so that a run refused above creates no directory.
         self.open_fatal_core_dir()?;
 
-        // DBT uses its dedicated CLI launch adapter. SaBRe, LiteInst, KVM,
-        // e9patch, and ptrace use the common container and run/verify machinery.
-        match backend {
-            Backend::Ptrace
-            | Backend::Liteinst
-            | Backend::InGuestTrap
-            | Backend::Sabre
-            | Backend::Kvm
-            | Backend::E9patch => {}
-            Backend::Dbt => {
-                self.warn_no_namespace();
-                let environment = self.guest_command()?.get_captured_envs();
-                // Keep the dedicated DynamoRIO launcher, but give it the same
-                // backend capability configuration as the public library path.
-                let config = hermit::prepare_backend_config(self.effective_det_config(), backend);
-                let retained_log_dir = self.retained_verify_log_dir()?;
-                return super::backends::run_dbt(
-                    &self.program,
-                    &self.args,
-                    self.verify,
-                    self.verify_verbose,
-                    self.verify_allow,
-                    self.print_verify_logs,
-                    self.keep_logs,
-                    retained_log_dir.as_deref(),
-                    self.verify_json.as_deref(),
-                    self.verify_run.as_deref(),
+        // Ordinary DBT execution keeps its physical launcher. Verification
+        // joins the common two-run owner through the same launcher's one-run seam.
+        if backend == Backend::Dbt && !self.verify {
+            self.warn_no_namespace();
+            #[cfg(feature = "dbt")]
+            {
+                if super::backends::dbt_log_file_is_refused(
+                    global.log_file.is_some(),
+                    self.verify_run.is_some(),
+                ) {
+                    return Err(Error::msg(super::backends::DBT_LOG_FILE_REFUSAL));
+                }
+                let invocation = self.dbt_invocation()?;
+                if let Some(directory) = &self.verify_run {
+                    return invocation.verify_run(
+                        directory,
+                        global.log,
+                        self.verify_verbose,
+                        dbt_verification_stdin,
+                        self,
+                    );
+                }
+                return invocation.run(
                     self.summary,
                     self.backend_engagement_json.as_deref(),
                     global.log,
                     global.log_file.as_deref(),
-                    &config,
-                    environment,
-                    self.workdir.as_deref().map(Path::new),
-                    self.dbt_binds(),
-                    dbt_verification_stdin,
-                    self,
                 );
             }
+            #[cfg(not(feature = "dbt"))]
+            return Err(Error::msg("DBT support was not included in this build"));
         }
 
         if backend == Backend::Liteinst && self.uses_in_guest_liteinst() {
@@ -5701,7 +5701,7 @@ impl RunOpts {
         if self.namespace_only {
             self.run_with_namespace_only(global)
         } else if self.verify {
-            self.verify(global)
+            self.verify(global, dbt_verification_stdin)
         } else if let Some(directory) = &self.verify_run {
             self.verify_run(directory, global)
         } else {
@@ -7279,14 +7279,29 @@ impl RunOpts {
             .arms_reverie_ptrace_pmu_timer()
             .then(branch_counter_verdict);
 
-        let completed = options.run_verify(log_file, forwarded, global).and_then(
-            |(mut output, skid_overshoots, latches)| {
+        let completed = options
+            .run_verify(
+                log_file,
+                &log_path,
+                forwarded,
+                global,
+                VerificationRun::Run1,
+                #[cfg(feature = "dbt")]
+                None,
+            )
+            .and_then(|completed| {
+                let VerificationRunOutput {
+                    mut output,
+                    skid_overshoots,
+                    latches,
+                    #[cfg(feature = "dbt")]
+                        dbt: _,
+                } = completed;
                 latches.refuse_comparison("run")?;
                 let forwarded_syscalls =
                     self.take_forwarded_detlogs(&log_path, &mut output.stderr, socket)?;
                 Ok((output, skid_overshoots, forwarded_syscalls))
-            },
-        );
+            });
         let (outcome, result) = match completed {
             Ok((output, skid_overshoots, forwarded_syscalls)) => {
                 writer.write(verify_run::STDOUT, &output.stdout)?;
@@ -7338,7 +7353,11 @@ impl RunOpts {
     }
 
     // Execution mode corresponding to `run --verify`:
-    fn verify(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+    fn verify(
+        &self,
+        global: &GlobalOpts,
+        _dbt_stdin: Option<fs::File>,
+    ) -> Result<ExitStatus, Error> {
         // Stamp an explicit no-result BEFORE any fallible work. Several exits
         // below (a run that fails to start, a rejected first-run status, a SaBRe
         // capture with zero DETLOG) return early without ever reaching
@@ -7348,6 +7367,38 @@ impl RunOpts {
         if let Some(path) = &self.verify_json {
             write_pending_verification_json(path)?;
         }
+        #[cfg(feature = "dbt")]
+        let mut dbt = if self.selected_backend() == Backend::Dbt {
+            Some(self.dbt_invocation()?.verification(_dbt_stdin)?)
+        } else {
+            None
+        };
+        self.verify_with_execution(|options, log, path, forwarded, run| {
+            options.run_verify(
+                log,
+                path,
+                forwarded,
+                global,
+                run,
+                #[cfg(feature = "dbt")]
+                dbt.as_mut(),
+            )
+        })
+    }
+
+    /// The common two-run owner, after the invocation has been stamped and
+    /// its physical adapter prepared. The callback returns a completed run;
+    /// disposition, deferred facts, comparison and reporting stay here.
+    pub(super) fn verify_with_execution(
+        &self,
+        mut execute: impl FnMut(
+            &Self,
+            fs::File,
+            &Path,
+            Option<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)>,
+            VerificationRun,
+        ) -> Result<VerificationRunOutput, Error>,
+    ) -> Result<ExitStatus, Error> {
         let retained_log_dir = self.retained_verify_log_dir()?;
         let (log1, log2) = temp_log_files_in("run1", "run2", retained_log_dir.as_deref())
             .context("Failed to create verification log files")?;
@@ -7374,13 +7425,21 @@ impl RunOpts {
         // container when the working directory is under the host /tmp. See
         // private_summary_descriptor_path. `summary1_file` stays open, and so
         // the spelling stays valid, until this function returns.
-        let summary1_file = private_verify_summary()?;
-        let summary1_path = private_summary_descriptor_path(&summary1_file);
-        let summary2_path = self.summary_json.as_deref().unwrap_or(&summary1_path);
+        // The current physical DBT adapter produces typed native facts, not
+        // RunSummary or host-input files. Do not read an old public summary or
+        // create a new checkout-path dependency on that path's behalf.
+        let records_run_metadata = self.selected_backend() != Backend::Dbt;
+        let summary1_file = records_run_metadata
+            .then(private_verify_summary)
+            .transpose()?;
+        let summary1_path = summary1_file.as_ref().map(private_summary_descriptor_path);
+        let summary2_path = records_run_metadata
+            .then(|| self.summary_json.as_deref().or(summary1_path.as_deref()))
+            .flatten();
         let mut run1_options = self.clone();
-        run1_options.summary_json = Some(summary1_path.clone());
+        run1_options.summary_json = summary1_path.clone();
         let mut run2_options = self.clone();
-        run2_options.summary_json = Some(summary2_path.to_owned());
+        run2_options.summary_json = summary2_path.map(Path::to_owned);
 
         // Each run records the host files its guest opens, so that a
         // divergence caused by a host file changing during a run can be named
@@ -7389,10 +7448,13 @@ impl RunOpts {
         // is. Detcore writes it only when a run ends, and it is read and
         // emptied before run 2, so it is empty while either guest runs: a
         // guest that finds it through /proc sees the same thing in both runs.
-        let host_inputs_file = tempfile::tempfile().context("creating the host-input record")?;
-        let host_inputs_path = descriptor_path(&host_inputs_file);
-        run1_options.host_input_log = Some(host_inputs_path.clone());
-        run2_options.host_input_log = Some(host_inputs_path.clone());
+        let host_inputs_file = records_run_metadata
+            .then(tempfile::tempfile)
+            .transpose()
+            .context("creating the host-input record")?;
+        let host_inputs_path = host_inputs_file.as_ref().map(descriptor_path);
+        run1_options.host_input_log = host_inputs_path.clone();
+        run2_options.host_input_log = host_inputs_path.clone();
         run1_options.fatal_core_run_label = Some("run1");
         run2_options.fatal_core_run_label = Some("run2");
 
@@ -7402,17 +7464,31 @@ impl RunOpts {
 
         crate::tracing::diagnostic_eprintln!(":: {}", "Run1...".yellow().bold());
 
-        let (out1, skid_overshoots_run1, latches1) = match run_verification_execution(
+        let VerificationRunOutput {
+            output: out1,
+            skid_overshoots: skid_overshoots_run1,
+            latches: latches1,
+            #[cfg(feature = "dbt")]
+                dbt: dbt1,
+        } = match run_verification_execution(
             self.verify_json.as_deref(),
             VerificationRun::Run1,
-            || run1_options.run_verify(log1_file, forwarded1_for_run, global),
+            || {
+                execute(
+                    &run1_options,
+                    log1_file,
+                    &log1_path,
+                    forwarded1_for_run,
+                    VerificationRun::Run1,
+                )
+            },
         ) {
             Ok(result) => result,
             Err(mut error) => {
                 if let Some(overshoot) = error.downcast_ref::<SkidOvershootError>()
                     && let Some(path) = &self.verify_json
                 {
-                    let summary1 = read_verify_summary(&summary1_path);
+                    let summary1 = summary1_path.as_deref().and_then(read_verify_summary);
                     if let Err(report_error) = write_skid_overshoot_without_comparison_json(
                         path,
                         overshoot.count(),
@@ -7437,6 +7513,10 @@ impl RunOpts {
             }
         };
         let mut out1 = out1;
+        let mut signal_reports = SignalTerminationReports::default();
+        if self.selected_backend() == Backend::Dbt {
+            signal_reports.prepare("run 1", out1.status, &log1_path);
+        }
         // The latches first: a determinism loss is named as one, even when its
         // loss notice also reached the forwarded records.
         if let Err(error) = latches1.refuse_comparison("run 1") {
@@ -7459,8 +7539,9 @@ impl RunOpts {
             };
         // Prepared now, with the forwarded records in place: the comparison
         // consumes the log. Written if the verification ends unverified.
-        let mut signal_reports = SignalTerminationReports::default();
-        signal_reports.prepare("run 1", out1.status, &log1_path);
+        if self.selected_backend() != Backend::Dbt {
+            signal_reports.prepare("run 1", out1.status, &log1_path);
+        }
 
         // With --verify the first run's `--log` output was diverted to a
         // temporary file for later comparison rather than shown to the user.
@@ -7493,7 +7574,10 @@ impl RunOpts {
             self.verify_allow,
             &out1,
             skid_overshoots_run1,
-            read_verify_summary(&summary1_path).as_ref(),
+            summary1_path
+                .as_deref()
+                .and_then(read_verify_summary)
+                .as_ref(),
         ) {
             // Queued here; `main` writes it after everything else.
             drop(signal_reports);
@@ -7503,11 +7587,32 @@ impl RunOpts {
             return Err(error);
         }
 
-        let summary1 = take_verify_summary_before_next_run(&summary1_path)?;
-        let host_inputs1 = read_host_inputs(&host_inputs_path);
-        host_inputs_file
-            .set_len(0)
-            .context("emptying the host-input record before run 2")?;
+        #[cfg(feature = "dbt")]
+        let dbt1 = match dbt1
+            .map(|facts| facts.finish(&out1, VerificationRun::Run1))
+            .transpose()
+        {
+            Ok(facts) => facts,
+            Err(error) => {
+                let mut error =
+                    publish_run_failure(self.verify_json.as_deref(), VerificationRun::Run1, error);
+                if self.keep_logs {
+                    error = retain_logs_after_verification_error(error, [("run 1", log1_path)]);
+                }
+                return Err(error);
+            }
+        };
+
+        let summary1 = summary1_path
+            .as_deref()
+            .map(take_verify_summary_before_next_run)
+            .transpose()?
+            .flatten();
+        let host_inputs1 = host_inputs_path.as_deref().map(read_host_inputs);
+        if let Some(file) = &host_inputs_file {
+            file.set_len(0)
+                .context("emptying the host-input record before run 2")?;
+        }
         if skid_overshoots_run1 > 0
             && let Some(path) = &self.verify_json
         {
@@ -7556,17 +7661,31 @@ impl RunOpts {
         restore_standard_fd_status_flags(fd_flags_before_run1);
 
         crate::tracing::diagnostic_eprintln!(":: {}", "Run2...".yellow().bold());
-        let (out2, skid_overshoots_run2, latches2) = match run_verification_execution(
+        let VerificationRunOutput {
+            output: out2,
+            skid_overshoots: skid_overshoots_run2,
+            latches: latches2,
+            #[cfg(feature = "dbt")]
+                dbt: dbt2,
+        } = match run_verification_execution(
             self.verify_json.as_deref(),
             VerificationRun::Run2,
-            || run2_options.run_verify(log2_file, forwarded2_for_run, global),
+            || {
+                execute(
+                    &run2_options,
+                    log2_file,
+                    &log2_path,
+                    forwarded2_for_run,
+                    VerificationRun::Run2,
+                )
+            },
         ) {
             Ok(result) => result,
             Err(mut error) => {
                 if let Some(overshoot) = error.downcast_ref::<SkidOvershootError>()
                     && let Some(path) = &self.verify_json
                 {
-                    let summary2 = read_verify_summary(summary2_path);
+                    let summary2 = summary2_path.and_then(read_verify_summary);
                     let count = skid_overshoots_run1.saturating_add(overshoot.count());
                     if let Err(report_error) = write_skid_overshoot_without_comparison_json(
                         path,
@@ -7593,6 +7712,9 @@ impl RunOpts {
             }
         };
         let mut out2 = out2;
+        if self.selected_backend() == Backend::Dbt {
+            signal_reports.prepare("run 2", out2.status, &log2_path);
+        }
         if let Err(error) = latches2.refuse_comparison("run 2") {
             let error =
                 publish_run_failure(self.verify_json.as_deref(), VerificationRun::Run2, error);
@@ -7633,13 +7755,41 @@ impl RunOpts {
             );
         }
 
-        signal_reports.prepare("run 2", out2.status, &log2_path);
+        if self.selected_backend() != Backend::Dbt {
+            signal_reports.prepare("run 2", out2.status, &log2_path);
+        }
 
-        let summary2 = read_verify_summary(summary2_path);
+        #[cfg(feature = "dbt")]
+        let dbt2 = match dbt2
+            .map(|facts| facts.finish(&out2, VerificationRun::Run2))
+            .transpose()
+        {
+            Ok(facts) => facts,
+            Err(error) => {
+                let mut error =
+                    publish_run_failure(self.verify_json.as_deref(), VerificationRun::Run2, error);
+                if self.keep_logs {
+                    error = retain_logs_after_verification_error(
+                        error,
+                        [("run 1", log1_path), ("run 2", log2_path)],
+                    );
+                }
+                return Err(error);
+            }
+        };
+        #[cfg(feature = "dbt")]
+        let dbt_comparison = dbt1
+            .as_ref()
+            .zip(dbt2.as_ref())
+            .map(|(first, second)| super::backends::DbtVerificationComparison::new(first, second));
+
+        let summary2 = summary2_path.and_then(read_verify_summary);
         let outcome = conclude_verification(
             VerificationConclusion {
                 verify_json: self.verify_json.as_deref(),
                 comparison_options: self.verification_comparison_options(),
+                #[cfg(feature = "dbt")]
+                dbt: dbt_comparison,
                 backend: self.selected_backend(),
                 passthru_opt: self.det_opts.det_config.passthru_opt,
             },
@@ -7655,7 +7805,7 @@ impl RunOpts {
                 log: log2_path,
                 skid_overshoots: skid_overshoots_run2,
                 summary: summary2,
-                host_inputs: read_host_inputs(&host_inputs_path),
+                host_inputs: host_inputs_path.as_deref().map(read_host_inputs),
             },
         )?;
         drop(host_inputs_file);
@@ -7712,6 +7862,7 @@ impl RunOpts {
     /// with a target under guest `/tmp`, which is where [`Self::mounts`] applies
     /// binds for every backend. It warns about any other bind, which has no
     /// effect.
+    #[cfg(feature = "dbt")]
     fn dbt_binds(&self) -> Vec<(PathBuf, PathBuf)> {
         let mut binds = Vec::with_capacity(self.bind.len());
         for bind in &self.bind {
@@ -7869,12 +8020,39 @@ impl RunOpts {
         Ok((container, identity_sources))
     }
 
+    #[cfg(feature = "dbt")]
+    fn dbt_invocation(&self) -> Result<super::backends::DbtInvocation, Error> {
+        super::backends::DbtInvocation::new(
+            &self.program,
+            &self.args,
+            &hermit::prepare_backend_config(self.effective_det_config(), Backend::Dbt),
+            self.guest_command()?.get_captured_envs(),
+            self.workdir.as_deref().map(Path::new),
+            self.dbt_binds(),
+            self,
+        )
+    }
+
     fn run_verify(
         &self,
         log_file: fs::File,
+        _log_path: &Path,
         forwarded_detlogs: Option<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)>,
         global: &GlobalOpts,
-    ) -> Result<(Output, u64, RunLatches), Error> {
+        _run: VerificationRun,
+        #[cfg(feature = "dbt")] dbt: Option<&mut super::backends::DbtVerification>,
+    ) -> Result<VerificationRunOutput, Error> {
+        #[cfg(feature = "dbt")]
+        if let Some(dbt) = dbt {
+            return dbt.run(
+                log_file,
+                _log_path,
+                _run,
+                global.log,
+                self.verify_verbose,
+                self.verify_json.as_deref(),
+            );
+        }
         let mut options = self.clone();
         let network_trace = options.open_network_trace()?;
         let global = global.clone();
@@ -7899,7 +8077,15 @@ impl RunOpts {
                 options.run_verify_in_container(log, forwarded, &global, identity)
             },
         )
-        .map(|(value, _guards)| value)
+        .map(
+            |((output, skid_overshoots, latches), _guards)| VerificationRunOutput {
+                output,
+                skid_overshoots,
+                latches,
+                #[cfg(feature = "dbt")]
+                dbt: None,
+            },
+        )
     }
 
     fn merge_from_env_settings(&self, command: &mut Command) -> anyhow::Result<()> {
@@ -8751,13 +8937,16 @@ pub(super) struct CompletedVerificationRun<'a> {
     pub(super) skid_overshoots: u64,
     pub(super) summary: Option<RunSummary>,
     /// The host files the run's guest opened (`hermit::host_input_change`).
-    pub(super) host_inputs: std::io::Result<HostInputs>,
+    pub(super) host_inputs: Option<std::io::Result<HostInputs>>,
 }
 
 /// How a two-run verification is concluded once both runs completed.
 pub(super) struct VerificationConclusion<'a> {
     pub(super) verify_json: Option<&'a Path>,
     pub(super) comparison_options: ComparisonOptions,
+    /// Completed backend facts supplement the common comparison.
+    #[cfg(feature = "dbt")]
+    pub(super) dbt: Option<super::backends::DbtVerificationComparison>,
     /// The backend both runs used.
     pub(super) backend: Backend,
     /// Whether both runs used `--passthru-opt`.
@@ -8778,6 +8967,8 @@ pub(super) fn conclude_verification(
     let VerificationConclusion {
         verify_json,
         mut comparison_options,
+        #[cfg(feature = "dbt")]
+        dbt,
         backend,
         passthru_opt,
     } = conclusion;
@@ -8831,11 +9022,19 @@ pub(super) fn conclude_verification(
     // below, whatever the comparison finds, so a log match is not the
     // verdict. `--keep-logs` then retains both logs, as every other error
     // path does, instead of the single golden log kept after a match.
-    comparison_options.match_overridden = skid_overshoots > 0;
+    comparison_options.match_overridden |= skid_overshoots > 0;
+    #[cfg(feature = "dbt")]
+    if let Some(comparison) = &dbt {
+        comparison.configure(&mut comparison_options);
+    }
     // The comparison consumes both logs, so a host file change is placed
     // in its run's log now, and judged against the divergence below.
     let host_input_change = if skid_overshoots == 0 {
-        place_host_input_change(run1.host_inputs, run2.host_inputs, [&log1_path, &log2_path])
+        run1.host_inputs
+            .zip(run2.host_inputs)
+            .and_then(|(first, second)| {
+                place_host_input_change(first, second, [&log1_path, &log2_path])
+            })
     } else {
         None
     };
@@ -8856,6 +9055,8 @@ pub(super) fn conclude_verification(
         },
         comparison_options,
     )?;
+    #[cfg(feature = "dbt")]
+    let dbt_messages = dbt.map(|comparison| comparison.apply(&mut outcome));
     outcome.runtime = verification_runtime_from_summaries(summary1.as_ref(), summary2.as_ref());
 
     // A divergence that a host file changing during one run explains is
@@ -8898,6 +9099,13 @@ pub(super) fn conclude_verification(
     }
     if skid_overshoots > 0 {
         return Err(Error::new(SkidOvershootError::new(skid_overshoots)));
+    }
+    #[cfg(feature = "dbt")]
+    if let Some(messages) = dbt_messages {
+        for message in messages {
+            eprintln!(":: {message}");
+        }
+        eprintln!(":: DBT path confirmed: DynamoRIO client reported tool=Detcore");
     }
     announce_verification_outcome(&outcome, SecondRun::Rerun, success_message, failure_message);
     if let Some(change) = &host_input_change {
@@ -9363,7 +9571,7 @@ mod tests {
             .0;
         let total =
             "let skid_overshoots = run1.skid_overshoots.saturating_add(run2.skid_overshoots);";
-        let overridden = "comparison_options.match_overridden = skid_overshoots > 0;";
+        let overridden = "comparison_options.match_overridden |= skid_overshoots > 0;";
         let compared = "let mut outcome = compare_two_runs(";
         for statement in [total, overridden, compared] {
             assert_eq!(
@@ -9379,10 +9587,17 @@ mod tests {
             total_at < overridden_at && overridden_at < compared_at,
             "the skid total must mark the match overridden before the runs are compared"
         );
+        // The DBT facts may add an override but must preserve a prior one;
+        // the facts test exercises both initial values. No other mutation of
+        // the comparison options belongs between the skid override and use.
+        let between = &production[overridden_at + overridden.len()..compared_at];
+        let add_backend_facts = "comparison.configure(&mut comparison_options);";
+        assert_eq!(between.matches(add_backend_facts).count(), 1);
         assert!(
-            !production[overridden_at + overridden.len()..compared_at]
+            !between
+                .replace(add_backend_facts, "")
                 .contains("comparison_options"),
-            "nothing may replace the options between the override and the comparison"
+            "only the OR-preserving backend facts may update the options before comparison"
         );
         let call = &production[compared_at..];
         let call = &call[..call.find(")?;").expect("the comparison call ends")];

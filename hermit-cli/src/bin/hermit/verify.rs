@@ -889,10 +889,25 @@ pub(crate) fn emit_compared_guest_output(
     first: &Output,
     second: &Output,
 ) -> io::Result<()> {
-    use std::io::Write;
+    emit_compared_guest_output_to(
+        verified,
+        first,
+        second,
+        &mut std::io::stdout(),
+        &mut std::io::stderr(),
+    )
+}
+
+fn emit_compared_guest_output_to(
+    verified: bool,
+    first: &Output,
+    second: &Output,
+    stdout: &mut impl io::Write,
+    stderr: &mut impl io::Write,
+) -> io::Result<()> {
     if verified || (first.stdout == second.stdout && first.stderr == second.stderr) {
-        std::io::stdout().write_all(&first.stdout)?;
-        std::io::stderr().write_all(&first.stderr)?;
+        stdout.write_all(&first.stdout)?;
+        stderr.write_all(&first.stderr)?;
     }
     Ok(())
 }
@@ -3240,6 +3255,80 @@ mod tests {
             stdout: stdout.to_vec(),
             stderr: stderr.to_vec(),
         }
+    }
+
+    #[test]
+    fn compared_guest_output_uses_the_common_agreement_policy() {
+        let first = output(0, b"stdout\0without newline", b"stderr\xff");
+        for verified in [true, false] {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            // The verdict/status need not match for these output bytes to be
+            // unambiguous. A log-only divergence still emits them once.
+            let second = output(23, &first.stdout, &first.stderr);
+            emit_compared_guest_output_to(verified, &first, &second, &mut stdout, &mut stderr)
+                .unwrap();
+            assert_eq!(stdout, first.stdout);
+            assert_eq!(stderr, first.stderr);
+        }
+        for second in [
+            output(0, b"different stdout", &first.stderr),
+            output(0, &first.stdout, b"different stderr"),
+        ] {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            emit_compared_guest_output_to(false, &first, &second, &mut stdout, &mut stderr)
+                .unwrap();
+            assert!(stdout.is_empty());
+            assert!(stderr.is_empty());
+        }
+    }
+
+    #[test]
+    fn compared_guest_output_preserves_write_error_order() {
+        struct FailAfterByte {
+            bytes: Vec<u8>,
+            errno: i32,
+        }
+        impl io::Write for FailAfterByte {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if bytes.is_empty() {
+                    return Ok(0);
+                }
+                if self.bytes.is_empty() {
+                    self.bytes.push(bytes[0]);
+                    Ok(1)
+                } else {
+                    Err(io::Error::from_raw_os_error(self.errno))
+                }
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                panic!("the common output policy does not add a flush")
+            }
+        }
+        let first = output(0, b"out", b"err");
+        let mut stdout = FailAfterByte {
+            bytes: Vec::new(),
+            errno: libc::EPIPE,
+        };
+        let mut stderr = Vec::new();
+        let error = emit_compared_guest_output_to(false, &first, &first, &mut stdout, &mut stderr)
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EPIPE));
+        assert_eq!(stdout.bytes, b"o");
+        assert!(stderr.is_empty(), "stdout failure must stop before stderr");
+
+        let mut stdout = Vec::new();
+        let mut stderr = FailAfterByte {
+            bytes: Vec::new(),
+            errno: libc::ENOSPC,
+        };
+        let error = emit_compared_guest_output_to(true, &first, &first, &mut stdout, &mut stderr)
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+        assert_eq!(stdout, first.stdout);
+        assert_eq!(stderr.bytes, b"e");
     }
 
     fn empty_logs() -> (TempPath, TempPath) {

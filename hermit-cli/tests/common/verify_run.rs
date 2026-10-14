@@ -47,7 +47,13 @@ fn hermit_run(global: &[&str], run_flags: &[&str], guest: &[&str], epoch: &str) 
 }
 
 fn log_diff(report: &Path, directories: [&Path; 2], extra: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_hermit"))
+    // Offline comparison borrows its inputs, including on refusal and
+    // divergence. A saved run may be compared again after this command.
+    let original_logs = directories.map(|directory| {
+        let path = directory.join("run.log");
+        path.exists().then(|| fs::read(path).unwrap())
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
         .arg("log-diff")
         .arg("--verify-json")
         .arg(report)
@@ -55,7 +61,18 @@ fn log_diff(report: &Path, directories: [&Path; 2], extra: &[&str]) -> Output {
         .arg(directories[0])
         .arg(directories[1])
         .output()
-        .expect("failed to run hermit log-diff --verify-json")
+        .expect("failed to run hermit log-diff --verify-json");
+    for (directory, original) in directories.into_iter().zip(original_logs) {
+        if let Some(original) = original {
+            assert_eq!(
+                fs::read(directory.join("run.log")).unwrap(),
+                original,
+                "offline comparison changed the caller's log in {}",
+                directory.display()
+            );
+        }
+    }
+    output
 }
 
 fn report(path: &Path) -> serde_json::Value {

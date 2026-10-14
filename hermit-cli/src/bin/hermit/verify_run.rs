@@ -591,6 +591,8 @@ pub(crate) fn compare(
             VerificationConclusion {
                 verify_json,
                 comparison_options: record1.comparison.options(),
+                #[cfg(feature = "dbt")]
+                dbt: None,
                 backend,
                 passthru_opt: record1.passthru_opt,
             },
@@ -599,14 +601,14 @@ pub(crate) fn compare(
                 log: log1,
                 skid_overshoots: skid1,
                 summary: summary1,
-                host_inputs: read_host_inputs(&run1.directory.join(HOST_INPUTS)),
+                host_inputs: Some(read_host_inputs(&run1.directory.join(HOST_INPUTS))),
             },
             CompletedVerificationRun {
                 output: &out2,
                 log: log2,
                 skid_overshoots: skid2,
                 summary: summary2,
-                host_inputs: read_host_inputs(&run2.directory.join(HOST_INPUTS)),
+                host_inputs: Some(read_host_inputs(&run2.directory.join(HOST_INPUTS))),
             },
         )?
     };
