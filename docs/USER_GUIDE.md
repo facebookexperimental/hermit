@@ -826,7 +826,19 @@ $ hermit run --from ~/.cache/hermit/04cba9fc...
   recordings. `hermit replay` replays syscall recordings only and points at
   `hermit run --from` for a manifest. A data directory keeps the newest 1000
   manifest-only recordings.
-- A run with `--record-networking` writes no manifest yet.
+- A network recording, `hermit run --record-networking=TRACE`, always writes
+  a manifest beside its trace, `TRACE.manifest.json` (kind `network`): the
+  run's options with any host-drawn epoch or seed written out, and the
+  trace's format version, size and SHA-256. The trace itself does not hold
+  the seeds or the command, so `hermit run --from TRACE.manifest.json`
+  replays the recording offline without retyping them; a trace that does not
+  match the manifest's size and digest is refused.
+- A syscall recording, `hermit record`, writes `manifest.json` (kind
+  `full-syscall`) beside its `metadata.json`: the guest command, how it
+  ended, and the recording's `RECORD_VERSION`. `hermit replay` still reads
+  `metadata.json`, which stays as a compatibility copy for one
+  `RECORD_VERSION`; `--from` refuses such a manifest and names the
+  `hermit replay` command instead.
 
 ## Signals To Hermit's Own Process
 

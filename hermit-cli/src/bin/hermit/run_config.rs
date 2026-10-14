@@ -93,6 +93,7 @@ const ARGS_ID: &str = "args";
 pub(crate) const EPOCH_KEY: &str = "epoch";
 pub(crate) const SEED_KEY: &str = "seed";
 pub(crate) const SEED_FROM_KEY: &str = "seed-from";
+const REPLAY_NETWORKING_KEY: &str = "replay-networking";
 
 /// One run config document. See the module documentation for the format.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -225,6 +226,36 @@ fn note_another_directory(manifest: &crate::manifest::Manifest) {
              in it resolve against the current directory"
         );
     }
+}
+
+/// [`from_manifest`] for the manifest read from `path`. A network
+/// recording's rerun replays its trace: the trace the manifest names,
+/// checked against the digest it recorded, becomes `--replay-networking`. A
+/// syscall recording is replayed with `hermit replay`, not rerun.
+pub(crate) fn from_manifest_at(
+    manifest: &crate::manifest::Manifest,
+    path: &Path,
+) -> Result<RunConfig, Error> {
+    use crate::manifest::Kind;
+    let mut config = from_manifest(manifest)?;
+    match manifest.kind {
+        Kind::InputsOnly | Kind::History => {}
+        Kind::Network => {
+            let trace = crate::manifest::checked_network_trace(manifest, path)?;
+            let trace = trace.to_str().ok_or_else(|| {
+                anyhow::anyhow!("network trace path {} is not UTF-8", trace.display())
+            })?;
+            config
+                .run
+                .insert(REPLAY_NETWORKING_KEY.to_owned(), trace.into());
+        }
+        Kind::FullSyscall => anyhow::bail!(
+            "{} describes a syscall recording; replay it with `hermit replay {}`",
+            path.display(),
+            manifest.id
+        ),
+    }
+    Ok(config)
 }
 
 /// The run config a manifest's `inputs` and `command` stand for, which
@@ -475,7 +506,10 @@ pub(crate) fn expand_argv(
         ([], [path]) => {
             let manifest = crate::manifest::read(Path::new(path))?;
             note_another_directory(&manifest);
-            (Path::new(path), from_manifest(&manifest)?)
+            (
+                Path::new(path),
+                from_manifest_at(&manifest, Path::new(path))?,
+            )
         }
         ([_, ..], [_, ..]) => {
             anyhow::bail!("--config and --from both name a run's options; give one of them")
@@ -1196,6 +1230,53 @@ mod tests {
                 "{entry}"
             );
         }
+    }
+
+    /// A network manifest's rerun replays the trace it names, resolved
+    /// against the manifest's directory; a syscall recording's manifest is
+    /// refused with the `hermit replay` command to use instead.
+    #[test]
+    fn from_a_network_manifest_replays_its_trace() {
+        use crate::manifest;
+        let directory = tempfile::tempdir().unwrap();
+        let trace = directory.path().join("net.trace");
+        std::fs::write(&trace, b"HERMIT-NET-TRACE\x04\0\0\0").unwrap();
+        let (sha256, bytes) = manifest::digest_and_size(&trace).unwrap();
+        let mut document = manifest::Manifest::new(
+            hermit::Id::unique(),
+            manifest::Kind::Network,
+            manifest::Command {
+                program: Some("/bin/true".to_owned()),
+                args: Vec::new(),
+                cwd: None,
+            },
+            manifest::Inputs {
+                global: BTreeMap::new(),
+                run: BTreeMap::from([("seed".to_owned(), 7.into())]),
+                host_drawn: BTreeMap::new(),
+            },
+        );
+        document.artifacts = Some(manifest::Artifacts {
+            network_trace: Some(manifest::NetworkTrace {
+                path: "net.trace".to_owned(),
+                format: manifest::NETWORK_TRACE_FORMAT.to_owned(),
+                version: Some(4),
+                sha256: Some(sha256),
+                bytes: Some(bytes),
+            }),
+            syscall_recording: None,
+        });
+        let path = manifest::network_manifest_path(&trace);
+        let config = from_manifest_at(&document, &path).unwrap();
+        assert_eq!(
+            config.run[REPLAY_NETWORKING_KEY],
+            Value::from(trace.to_str().unwrap())
+        );
+        assert_eq!(config.run["seed"], Value::from(7));
+
+        document.kind = manifest::Kind::FullSyscall;
+        let error = from_manifest_at(&document, &path).unwrap_err();
+        assert!(format!("{error:#}").contains("hermit replay"), "{error:#}");
     }
 
     /// `--from` and `--config` together are refused, as two sources for one

@@ -896,6 +896,118 @@ fn tcp_backpressure_records_the_bytes_each_resumed_send_injected() {
 /// Records the fixture's `match` client against a live controller, which
 /// checks the exact outbound stream. Returns the trace, its bytes, and the
 /// controller port the recording connected to, which replay must name.
+/// A network recording writes `TRACE.manifest.json` beside its trace
+/// (https://github.com/rrnewton/hermit/issues/4271): the run's options with
+/// the epoch it drew from the host clock written out, and the trace's
+/// version, size and digest. `hermit run --from` that manifest replays the
+/// recording offline, with no server and no retyped options, and gives the
+/// recording's output; a trace that changed since is refused.
+fn assert_network_manifest_reruns_offline(
+    fixture: &Path,
+    evidence: &Path,
+    trace: &Path,
+    original_trace: &[u8],
+    port: &str,
+) {
+    use detcore_model::network_trace::NETWORK_TRACE_MAGIC;
+
+    let manifest_path = trace.with_file_name("network.trace.manifest.json");
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(&manifest_path).expect("a network recording writes its manifest"),
+    )
+    .unwrap();
+    assert_eq!(manifest["kind"], "network", "{manifest}");
+    let recorded = &manifest["artifacts"]["network_trace"];
+    assert_eq!(recorded["path"], "network.trace", "{manifest}");
+    assert_eq!(recorded["format"], "hermit-net-trace", "{manifest}");
+    assert_eq!(recorded["bytes"], original_trace.len() as u64, "{manifest}");
+    assert_eq!(
+        recorded["version"],
+        u32::from_le_bytes(
+            original_trace[NETWORK_TRACE_MAGIC.len()..NETWORK_TRACE_MAGIC.len() + 4]
+                .try_into()
+                .unwrap()
+        ),
+        "{manifest}"
+    );
+    assert_eq!(
+        recorded["sha256"],
+        detcore::Digest::new(original_trace).to_string(),
+        "{manifest}"
+    );
+    assert_eq!(
+        manifest["inputs"]["host_drawn"]["epoch"], "host-now",
+        "{manifest}"
+    );
+    assert!(
+        manifest["inputs"]["run"].get("record-networking").is_none(),
+        "the trace path is an output, not an input: {manifest}"
+    );
+
+    // A bare `--from`: the guest command and every option come from the
+    // manifest. The recording and its manifest also move together: the
+    // manifest names its trace relative to its own directory.
+    let moved = evidence.join("moved");
+    fs::create_dir(&moved).unwrap();
+    fs::copy(trace, moved.join("network.trace")).unwrap();
+    fs::copy(&manifest_path, moved.join("network.trace.manifest.json")).unwrap();
+    for (label, from) in [
+        ("rerun-from-network-manifest", manifest_path.clone()),
+        (
+            "rerun-from-a-moved-network-manifest",
+            moved.join("network.trace.manifest.json"),
+        ),
+    ] {
+        let mut command = Command::new("timeout");
+        command
+            .args(["--kill-after=5s", &format!("{OUTER_WALL_SECONDS}s")])
+            .env_remove("LD_LIBRARY_PATH")
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .arg("run")
+            .arg("--from")
+            .arg(&from)
+            .current_dir(evidence)
+            .stdin(std::process::Stdio::null());
+        let rerun = command.output().expect("hermit should start");
+        fs::write(evidence.join(format!("{label}.stdout")), &rerun.stdout).unwrap();
+        fs::write(evidence.join(format!("{label}.stderr")), &rerun.stderr).unwrap();
+        assert_success(&rerun, label);
+        assert_guest_invariants(&rerun.stdout, label);
+    }
+    assert_eq!(
+        fs::read(trace).unwrap(),
+        original_trace,
+        "a rerun replays the trace and leaves it alone"
+    );
+
+    // A trace that is not the one the manifest recorded is refused before
+    // the guest starts.
+    let copy = evidence.join("changed");
+    fs::create_dir(&copy).unwrap();
+    let mut changed = original_trace.to_vec();
+    *changed.last_mut().unwrap() ^= 1;
+    fs::write(copy.join("network.trace"), &changed).unwrap();
+    fs::copy(&manifest_path, copy.join("network.trace.manifest.json")).unwrap();
+    let refused = hermit_command(
+        evidence,
+        "rerun-from-a-changed-trace",
+        &[
+            "run".into(),
+            "--from".into(),
+            copy.join("network.trace.manifest.json")
+                .display()
+                .to_string(),
+        ],
+        fixture,
+        &["client", port, "match"],
+    );
+    assert_fails_naming(
+        &refused,
+        "rerun from a changed trace",
+        "is not the one its manifest recorded",
+    );
+}
+
 fn record_match_trace(fixture: &Path, evidence: &Path) -> (PathBuf, Vec<u8>, String) {
     let trace = evidence.join("network.trace");
     let record_directory = evidence.join("record-controller");
@@ -1005,6 +1117,7 @@ fn tcp_recording_replays_offline_across_schedules_and_refuses_mismatch() {
     unused_controller.stop_without_connection();
 
     let (trace, original_trace, port) = record_match_trace(fixture, evidence);
+    assert_network_manifest_reruns_offline(fixture, evidence, &trace, &original_trace, &port);
 
     // Replay with no server. Each cell verifies twice under one fixed seed;
     // across cells the race winner must change while the input does not.

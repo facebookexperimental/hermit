@@ -1470,6 +1470,11 @@ pub struct RunOpts {
     #[clap(skip)]
     manifest_path: Option<PathBuf>,
 
+    /// Runtime-only: a network recording's manifest, written only once the
+    /// run has written its trace (`finish_manifest`).
+    #[clap(skip)]
+    pending_network_manifest: Option<crate::manifest::Manifest>,
+
     /// Read-only overlay that exposes the rewritten ELF at its original guest path.
     #[clap(skip)]
     e9patch_overlay: Option<E9patchOverlay>,
@@ -2299,6 +2304,7 @@ impl RunOpts {
         options.save_config = None;
         options.manifest = None;
         options.manifest_path = None;
+        options.pending_network_manifest = None;
         format!("{options:#?}")
     }
 }
@@ -8301,10 +8307,7 @@ impl RunOpts {
     fn begin_manifest(&mut self, global: &GlobalOpts) -> Result<(), Error> {
         use crate::manifest;
 
-        // A network recording's manifest is slice 2 of
-        // https://github.com/rrnewton/hermit/issues/4271; until then such a
-        // run writes none, rather than one whose rerun would use the network.
-        if self.config_capture.is_none() || self.record_networking.is_some() {
+        if self.config_capture.is_none() {
             return Ok(());
         }
         let user_config = match manifest::user_config_path() {
@@ -8317,11 +8320,21 @@ impl RunOpts {
             std::env::var(manifest::POLICY_ENV).ok().as_deref(),
         )?;
         let host_drawn = self.host_drawn_inputs();
-        let kind = match (policy, host_drawn.is_empty()) {
-            (manifest::ManifestPolicy::Never, _)
-            | (manifest::ManifestPolicy::NonreproducibleOnly, true) => return Ok(()),
-            (_, false) => manifest::Kind::InputsOnly,
-            (manifest::ManifestPolicy::Always, true) => manifest::Kind::History,
+        // A network recording is one the user asked for: it always gets its
+        // manifest, which names the trace and holds the seeds and command
+        // the trace itself does not (the design note's section 5).
+        let network_trace = self
+            .record_networking
+            .as_deref()
+            .map(std::path::absolute)
+            .transpose()
+            .context("cannot resolve the network trace path")?;
+        let kind = match (&network_trace, policy, host_drawn.is_empty()) {
+            (Some(_), _, _) => manifest::Kind::Network,
+            (None, manifest::ManifestPolicy::Never, _)
+            | (None, manifest::ManifestPolicy::NonreproducibleOnly, true) => return Ok(()),
+            (None, _, false) => manifest::Kind::InputsOnly,
+            (None, manifest::ManifestPolicy::Always, true) => manifest::Kind::History,
         };
         let config = self.saved_run_config()?;
         let (mut global_inputs, mut run_inputs) = crate::run_config::to_manifest_parts(&config)?;
@@ -8333,7 +8346,7 @@ impl RunOpts {
             );
         }
         let id = hermit::Id::unique();
-        let document = manifest::Manifest::new(
+        let mut document = manifest::Manifest::new(
             id,
             kind,
             manifest::Command {
@@ -8349,12 +8362,55 @@ impl RunOpts {
                 host_drawn,
             },
         );
-        let path = manifest::data_dir()
-            .join(id.to_string())
-            .join(manifest::MANIFEST_NAME);
-        manifest::write(&path, &document)?;
-        manifest::prune(&manifest::data_dir(), manifest::KEEP_MANIFEST_ONLY);
-        if kind == manifest::Kind::InputsOnly {
+        let path = match &network_trace {
+            // The trace stays where its user named it, with its manifest
+            // beside it (a coordinator default for the design note's open
+            // choice 3).
+            Some(trace) => {
+                document.artifacts = Some(manifest::Artifacts {
+                    network_trace: Some(manifest::NetworkTrace {
+                        path: trace
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "network trace name {} is not UTF-8",
+                                    trace.display()
+                                )
+                            })?
+                            .to_owned(),
+                        format: manifest::NETWORK_TRACE_FORMAT.to_owned(),
+                        version: None,
+                        sha256: None,
+                        bytes: None,
+                    }),
+                    syscall_recording: None,
+                });
+                manifest::network_manifest_path(trace)
+            }
+            None => manifest::data_dir()
+                .join(id.to_string())
+                .join(manifest::MANIFEST_NAME),
+        };
+        // A network recording's manifest is written once its trace is: a
+        // run that fails before writing one must not replace the manifest of
+        // a trace still at that path.
+        if kind == manifest::Kind::Network {
+            self.pending_network_manifest = Some(document.clone());
+        } else {
+            manifest::write(&path, &document)?;
+        }
+        if kind.pruned() {
+            manifest::prune(&manifest::data_dir(), manifest::KEEP_MANIFEST_ONLY);
+        }
+        if kind == manifest::Kind::Network {
+            global.write_controller_diagnostic(format_args!(
+                "hermit: the network recording's manifest is written to {} when the run ends; \
+                 replay it offline with: hermit run --from {}",
+                path.display(),
+                path.display()
+            ))?;
+        } else if kind == manifest::Kind::InputsOnly {
             global.write_controller_diagnostic(format_args!(
                 "hermit: this run drew {} from the host; its inputs are saved as recording {id}; \
                  rerun it with: hermit run --from {}",
@@ -8378,22 +8434,27 @@ impl RunOpts {
         let Some(path) = self.manifest_path.take() else {
             return;
         };
-        let exit = match status {
-            ExitStatus::Exited(code) => crate::manifest::Exit {
-                code: Some(code),
-                signal: None,
-            },
-            ExitStatus::Signaled(signal, _) => crate::manifest::Exit {
-                code: None,
-                signal: Some(signal as i32),
-            },
-            ExitStatus::SignaledRaw(signal, _) => crate::manifest::Exit {
-                code: None,
-                signal: Some(signal),
-            },
+        let exit = crate::manifest::Exit::from_status(status);
+        let pending = self.pending_network_manifest.take();
+        let document = match pending {
+            Some(document) => Ok(document),
+            None => crate::manifest::read(&path),
         };
-        let result = crate::manifest::read(&path).and_then(|mut document| {
+        let result = document.and_then(|mut document| {
             document.exit = Some(exit);
+            // The tracer writes a network trace once the run ends; record
+            // what it wrote, so a rerun can tell a truncated or replaced one.
+            if let Some(trace) = document
+                .artifacts
+                .as_mut()
+                .and_then(|artifacts| artifacts.network_trace.as_mut())
+            {
+                let file = path.with_file_name(&trace.path);
+                let (sha256, bytes) = crate::manifest::digest_and_size(&file)?;
+                trace.version = Some(crate::manifest::network_trace_version(&file)?);
+                trace.sha256 = Some(sha256);
+                trace.bytes = Some(bytes);
+            }
             crate::manifest::write(&path, &document)
         });
         if let Err(error) = result {

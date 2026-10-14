@@ -99,6 +99,7 @@ pub(crate) const MAX_TIMESLICE_KEY: &str = "max-timeslice";
 const GLOBAL_OUTPUTS: &[&str] = &["log-file"];
 const RUN_OUTPUTS: &[&str] = &[
     "backend-engagement-json",
+    "record-networking",
     "fatal-core-dir",
     "guest-stderr",
     "guest-stdout",
@@ -224,6 +225,65 @@ pub(crate) enum Kind {
     InputsOnly,
     /// A reproducible run, kept under the `always` policy.
     History,
+    /// A `hermit run --record-networking` recording: the manifest and the
+    /// network trace it names (`artifacts.network_trace`).
+    Network,
+    /// A `hermit record` syscall recording: the manifest beside the
+    /// recording it describes (`artifacts.syscall_recording`).
+    FullSyscall,
+}
+
+impl Kind {
+    /// Whether a data directory prunes recordings of this kind
+    /// ([`KEEP_MANIFEST_ONLY`]). Recordings a user asked for are never
+    /// pruned.
+    pub(crate) fn pruned(self) -> bool {
+        matches!(self, Kind::InputsOnly | Kind::History)
+    }
+}
+
+/// The format name of a network trace (`artifacts.network_trace.format`).
+pub(crate) const NETWORK_TRACE_FORMAT: &str = "hermit-net-trace";
+
+/// A network trace a manifest names.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NetworkTrace {
+    /// The trace's path, relative to the manifest's directory.
+    pub(crate) path: String,
+    /// Always [`NETWORK_TRACE_FORMAT`].
+    pub(crate) format: String,
+    /// The trace's format version, its SHA-256 and its size, filled in once
+    /// the run has written the trace. A rerun refuses a trace that does not
+    /// match them, or a manifest without them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) bytes: Option<u64>,
+}
+
+/// The syscall recording a `full-syscall` manifest describes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SyscallRecording {
+    /// The recording's `RECORD_VERSION`, as its `metadata.json` holds it.
+    pub(crate) record_version: serde_json::Value,
+    /// The recording's metadata file, relative to the manifest's directory.
+    /// `hermit replay` still reads it; it stays beside the manifest as a
+    /// compatibility copy for one `RECORD_VERSION`.
+    pub(crate) metadata: String,
+}
+
+/// The heavier artifacts a manifest names.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Artifacts {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) network_trace: Option<NetworkTrace>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) syscall_recording: Option<SyscallRecording>,
 }
 
 /// The `hermit` that wrote a manifest.
@@ -274,6 +334,26 @@ pub(crate) struct Exit {
     pub(crate) signal: Option<i32>,
 }
 
+impl Exit {
+    /// How a guest that ended with `status` ended.
+    pub(crate) fn from_status(status: hermit::ExitStatus) -> Self {
+        match status {
+            hermit::ExitStatus::Exited(code) => Exit {
+                code: Some(code),
+                signal: None,
+            },
+            hermit::ExitStatus::Signaled(signal, _) => Exit {
+                code: None,
+                signal: Some(signal as i32),
+            },
+            hermit::ExitStatus::SignaledRaw(signal, _) => Exit {
+                code: None,
+                signal: Some(signal),
+            },
+        }
+    }
+}
+
 /// One manifest document.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -289,6 +369,8 @@ pub(crate) struct Manifest {
     pub(crate) inputs: Inputs,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) exit: Option<Exit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) artifacts: Option<Artifacts>,
 }
 
 impl Manifest {
@@ -305,8 +387,85 @@ impl Manifest {
             command,
             inputs,
             exit: None,
+            artifacts: None,
         }
     }
+}
+
+/// Where a network recording's manifest goes: beside its trace, named after
+/// it, `TRACE.manifest.json`. The trace stays at the path its user named.
+pub(crate) fn network_manifest_path(trace: &Path) -> PathBuf {
+    let mut name = trace.file_name().unwrap_or_default().to_owned();
+    name.push(".manifest.json");
+    trace.with_file_name(name)
+}
+
+/// The format version in a network trace's header: the 16-byte magic, then
+/// a little-endian `u32`.
+pub(crate) fn network_trace_version(trace: &Path) -> Result<u32, Error> {
+    use std::io::Read;
+    let magic = detcore_model::network_trace::NETWORK_TRACE_MAGIC;
+    let mut header = vec![0u8; magic.len() + 4];
+    std::fs::File::open(trace)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .with_context(|| {
+            format!(
+                "cannot read the header of network trace {}",
+                trace.display()
+            )
+        })?;
+    anyhow::ensure!(
+        header.starts_with(&magic),
+        "{} is not a hermit network trace",
+        trace.display()
+    );
+    Ok(u32::from_le_bytes(
+        header[magic.len()..].try_into().unwrap(),
+    ))
+}
+
+/// The SHA-256 (lowercase hex) and size of the file at `path`.
+pub(crate) fn digest_and_size(path: &Path) -> Result<(String, u64), Error> {
+    let digest = detcore::Digest::digest_path(path)
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    let bytes = std::fs::metadata(path)
+        .with_context(|| format!("cannot read {}", path.display()))?
+        .len();
+    Ok((digest.to_string(), bytes))
+}
+
+/// The network trace a `network` manifest at `manifest_path` names, resolved
+/// against the manifest's directory and checked against the size and digest
+/// the manifest recorded.
+pub(crate) fn checked_network_trace(
+    manifest: &Manifest,
+    manifest_path: &Path,
+) -> Result<PathBuf, Error> {
+    let trace = manifest
+        .artifacts
+        .as_ref()
+        .and_then(|artifacts| artifacts.network_trace.as_ref())
+        .ok_or_else(|| anyhow::anyhow!("this network manifest names no network trace"))?;
+    let directory = if manifest_path.is_dir() {
+        manifest_path
+    } else {
+        manifest_path.parent().unwrap_or(Path::new("."))
+    };
+    let path = directory.join(&trace.path);
+    let (Some(sha256), Some(bytes)) = (&trace.sha256, trace.bytes) else {
+        anyhow::bail!(
+            "the network recording {} never finished: its manifest has no digest for it",
+            path.display()
+        );
+    };
+    let (actual, actual_bytes) = digest_and_size(&path)?;
+    anyhow::ensure!(
+        actual_bytes == bytes && actual == *sha256,
+        "network trace {} is not the one its manifest recorded ({actual_bytes} bytes, sha256 \
+         {actual}; the manifest says {bytes} bytes, sha256 {sha256})",
+        path.display()
+    );
+    Ok(path)
 }
 
 /// `time` as RFC 3339 in UTC with microseconds, `YYYY-MM-DDTHH:MM:SS.ffffffZ`.
@@ -417,7 +576,10 @@ pub(crate) fn prune(data_dir: &Path, keep: usize) {
         })
         .filter_map(|directory| {
             let manifest = read(&directory).ok()?;
-            Some((manifest.created, directory))
+            manifest
+                .kind
+                .pruned()
+                .then_some((manifest.created, directory))
         })
         .collect();
     if found.len() <= keep {
@@ -539,6 +701,78 @@ mod tests {
         drop_outputs(&mut global, &mut run_inputs);
         assert_eq!(global.keys().collect::<Vec<_>>(), ["log"]);
         assert_eq!(run_inputs.keys().collect::<Vec<_>>(), ["seed"]);
+    }
+
+    /// A network recording's manifest goes beside its trace, and a rerun
+    /// accepts the trace only with the size and digest the manifest
+    /// recorded; a manifest written before the run ended has none.
+    #[test]
+    fn a_network_manifest_names_and_checks_its_trace() {
+        let directory = tempfile::tempdir().unwrap();
+        let trace = directory.path().join("net.trace");
+        assert_eq!(
+            network_manifest_path(&trace),
+            directory.path().join("net.trace.manifest.json")
+        );
+        let mut bytes = detcore_model::network_trace::NETWORK_TRACE_MAGIC.to_vec();
+        bytes.extend(4u32.to_le_bytes());
+        bytes.extend([0u8; 8]);
+        std::fs::write(&trace, &bytes).unwrap();
+        assert_eq!(network_trace_version(&trace).unwrap(), 4);
+
+        let mut manifest = sample();
+        manifest.kind = Kind::Network;
+        let mut named = NetworkTrace {
+            path: "net.trace".to_owned(),
+            format: NETWORK_TRACE_FORMAT.to_owned(),
+            version: None,
+            sha256: None,
+            bytes: None,
+        };
+        manifest.artifacts = Some(Artifacts {
+            network_trace: Some(named.clone()),
+            syscall_recording: None,
+        });
+        let path = network_manifest_path(&trace);
+        assert!(
+            checked_network_trace(&manifest, &path).is_err(),
+            "no digest yet"
+        );
+        let (sha256, size) = digest_and_size(&trace).unwrap();
+        named.version = Some(4);
+        named.sha256 = Some(sha256);
+        named.bytes = Some(size);
+        manifest.artifacts.as_mut().unwrap().network_trace = Some(named);
+        assert_eq!(checked_network_trace(&manifest, &path).unwrap(), trace);
+        bytes.push(1);
+        std::fs::write(&trace, &bytes).unwrap();
+        assert!(
+            checked_network_trace(&manifest, &path).is_err(),
+            "changed trace"
+        );
+    }
+
+    /// Only manifest-only kinds are pruned: network and syscall recordings
+    /// were asked for, and stay.
+    #[test]
+    fn pruning_spares_recordings_the_user_asked_for() {
+        assert!(Kind::InputsOnly.pruned() && Kind::History.pruned());
+        assert!(!Kind::Network.pruned() && !Kind::FullSyscall.pruned());
+        let directory = tempfile::tempdir().unwrap();
+        let mut network = sample();
+        network.kind = Kind::Network;
+        network.created = "2000-01-01T00:00:00.000000Z".to_owned();
+        let kept = network.id.clone();
+        write(&directory.path().join(&kept).join(MANIFEST_NAME), &network).unwrap();
+        let newer = sample();
+        write(
+            &directory.path().join(&newer.id).join(MANIFEST_NAME),
+            &newer,
+        )
+        .unwrap();
+        prune(directory.path(), 0);
+        assert!(directory.path().join(&kept).exists());
+        assert!(!directory.path().join(&newer.id).exists());
     }
 
     #[test]

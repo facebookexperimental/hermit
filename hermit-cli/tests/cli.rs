@@ -3124,6 +3124,32 @@ fn readonly_proc_metadata_detects_replay_mismatch_and_accepts_older_recordings()
         serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
     assert_eq!(metadata["proc_readonly"], true, "{metadata}");
 
+    // The recording also carries its manifest, beside metadata.json, which
+    // replay still reads (https://github.com/rrnewton/hermit/issues/4271).
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(data.path().join(id.trim()).join("manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        manifest["schema"], "hermit-recording-manifest/v1",
+        "{manifest}"
+    );
+    assert_eq!(manifest["kind"], "full-syscall", "{manifest}");
+    assert_eq!(manifest["id"], id.trim(), "{manifest}");
+    assert_eq!(
+        manifest["command"]["program"], metadata["program"],
+        "{manifest}"
+    );
+    assert_eq!(manifest["exit"]["code"], 0, "{manifest}");
+    assert_eq!(
+        manifest["artifacts"]["syscall_recording"]["record_version"], metadata["version"],
+        "{manifest}"
+    );
+    assert_eq!(
+        manifest["artifacts"]["syscall_recording"]["metadata"], "metadata.json",
+        "{manifest}"
+    );
+
     // Model a recording from a writable-proc host, while replay's real mount
     // remains read-only. A mismatch is diagnostic, not an event-format change.
     metadata["proc_readonly"] = false.into();

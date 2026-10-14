@@ -558,6 +558,16 @@ impl StartOpts {
                 },
             )?;
             let recording = hermit.commit_recording(data, exit_status)?;
+            // The recording also gets a manifest, the one format every kind of
+            // recording shares (https://github.com/rrnewton/hermit/issues/4271).
+            // `hermit replay` still reads metadata.json, which stays beside it.
+            if let Err(error) =
+                write_full_record_manifest(&hermit, recording.id, recording.exit_status)
+            {
+                eprintln!(
+                    "hermit record: WARNING: the recording's manifest was not written: {error:#}"
+                );
+            }
 
             eprintln!("\n{}\n", "RECORDING COMPLETE!".yellow().bold());
             for (label, command) in
@@ -855,6 +865,48 @@ impl StartOpts {
 /// recording made with `--data-dir` (or `HERMIT_DATA_DIR`) is only found by a
 /// replay given the same directory, so the directory is repeated in every
 /// command.
+/// Writes `DATA/<id>/manifest.json` for the syscall recording `id`, from its
+/// metadata: the guest command, the recording's `RECORD_VERSION`, and how the
+/// guest ended. A syscall recording draws no input from the host that it
+/// does not record, so its `inputs` are empty.
+fn write_full_record_manifest(
+    hermit: &HermitData,
+    id: hermit::Id,
+    exit_status: ExitStatus,
+) -> Result<(), Error> {
+    use super::manifest;
+    let metadata = hermit.recording_metadata(id)?;
+    let mut document = manifest::Manifest::new(
+        id,
+        manifest::Kind::FullSyscall,
+        manifest::Command {
+            program: Some(metadata.program.clone()),
+            args: metadata.args.clone(),
+            cwd: metadata.current_dir.to_str().map(str::to_owned),
+        },
+        manifest::Inputs {
+            global: Default::default(),
+            run: Default::default(),
+            host_drawn: Default::default(),
+        },
+    );
+    document.exit = Some(manifest::Exit::from_status(exit_status));
+    document.artifacts = Some(manifest::Artifacts {
+        network_trace: None,
+        syscall_recording: Some(manifest::SyscallRecording {
+            record_version: serde_json::to_value(metadata.version)?,
+            metadata: hermit::RECORDING_METADATA_NAME.to_owned(),
+        }),
+    });
+    manifest::write(
+        &hermit
+            .data_dir()
+            .join(id.to_string())
+            .join(manifest::MANIFEST_NAME),
+        &document,
+    )
+}
+
 fn replay_hint_commands(id: &str, data_dir: Option<&Path>) -> [(&'static str, String); 3] {
     let data_dir = data_dir.map_or_else(String::new, |dir| {
         format!(" --data-dir={}", shell_words::quote(&dir.to_string_lossy()))
