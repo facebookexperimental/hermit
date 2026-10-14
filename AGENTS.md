@@ -278,10 +278,6 @@ before reading source:
   quantity; [docs/TIMEOUT_LADDER.md](docs/TIMEOUT_LADDER.md) describes each rung,
   why an exit code cannot say which one fired, and how the stderr class line
   distinguishes them.
-- A rare flake in Hermit's own host-timed handling, such as a backgrounded call
-  racing the scheduler, can be forced with race probes (`HERMIT_RACE_PROBE`, off
-  by default); [docs/RACE_PROBES.md](docs/RACE_PROBES.md) lists the points and
-  why an outcome under a probe is one host timing alone could produce.
 
 When a symptom depends on PMU access, CPUID interception, or specific CPU
 features, capture the host environment in the report; those are host

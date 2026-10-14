@@ -294,9 +294,6 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_request(guest, rsrcs).await;
         }
         after_grant(guest);
-        // Race probes (docs/RACE_PROBES.md) may delay the call or its rejoin;
-        // both are host timing this protocol already treats as nondeterministic.
-        crate::race_probe::delay(crate::race_probe::BG_PRE_CALL).await;
         tracing::trace!(
             "Guest proceeding to execute potentially blocking call {}...",
             call.name()
@@ -304,7 +301,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         let res = self
             .record_or_replay_preserving_tool_errors(guest, call)
             .await;
-        crate::race_probe::delay(crate::race_probe::BG_POST_CALL).await;
         // N.B. BlockingExternalIO is a "oneshot" resource, so no need to release
         // explicitly here:
         {
