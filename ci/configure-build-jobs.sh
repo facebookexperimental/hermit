@@ -1636,8 +1636,9 @@ fi
 # Re-parented onto Reverie main ccf6b58a as 9bff68ac24c4e0a41a39bab2c6e6f14f3d0acf40; the added commit changes only safeptrace.
 # KVM K-DUP SDK-BUDGET CARRY (2026-10-14): advance from 9bff68ac to 193968de57cdc3aaf2f6eb63c75743503218a657 (KVM deletes its copies of the Detcore-rendered /proc files; changes only reverie-kvm, inventory unchanged), so the budgets above carry.
 # KVM IMMEDIATE-EXIT SDK-BUDGET CARRY (2026-10-14): advance from 193968de to d60812b68751ef4b11ba8ae222c38781fda98cde (KVM entries stop with immediate_exit instead of per-entry signal syscalls; changes only reverie-kvm, inventory unchanged), so the budgets above carry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != d60812b68751ef4b11ba8ae222c38781fda98cde ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie d60812b68751ef4b11ba8ae222c38781fda98cde (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# KVM CHEAP-COPY SDK-BUDGET CARRY (2026-10-14): advance from d60812b6 to 502bea229f32ce7bdb50d73c7b8d2572bdf2688a (cheaper KVM guest-memory copies and entry checks; changes only reverie-kvm, inventory unchanged), so the budgets above carry.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 502bea229f32ce7bdb50d73c7b8d2572bdf2688a ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 502bea229f32ce7bdb50d73c7b8d2572bdf2688a (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
