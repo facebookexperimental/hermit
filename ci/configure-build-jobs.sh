@@ -1610,7 +1610,7 @@ fi
 # The added commits change only reverie-kvm (vm.rs, executor.rs and a test); every SDK recipe
 # input, build.rs and the vendored DynamoRIO tree are unchanged, and no
 # reverie-dbt file is added (inventory 950), so the budgets above carry.
-# LITEINST SHARED-HANDLER + DEVBIG030 BUILD-FIX SDK-BUDGET CARRY (2026-10-14): advance from 2777e813 to
+# LITEINST SHARED-HANDLER + REVERIE BUILD-FIX SDK-BUDGET CARRY (2026-10-14): advance from 2777e813 to
 # afa7e5e191d8561fd9e4fd0c2231d49d07eb45dc. The added commits change reverie-inguest, reverie-liteinst, scripts/m1_artifact.rs,
 # reverie-process (tokio 1.53.3 lint fixes) and one line of reverie-dbt/src/launcher.rs; no SDK recipe
 # input, build.rs or vendored DynamoRIO file changes and no reverie-dbt file is added, so the budgets carry.
