@@ -1557,7 +1557,8 @@ fi
 # SDK recipe inputs, build.rs, native CMake and vendored DynamoRIO are unchanged, so these budgets
 # carry by source equality. This does not reuse or qualify an old native client/runtime artifact.
 # Re-parented onto Reverie main ccf6b58a as 9bff68ac24c4e0a41a39bab2c6e6f14f3d0acf40; the added commit changes only safeptrace.
-expected_pin=9bff68ac24c4e0a41a39bab2c6e6f14f3d0acf40
+# KVM K-DUP SDK-BUDGET CARRY (2026-10-14): advance from 9bff68ac to 193968de57cdc3aaf2f6eb63c75743503218a657 (KVM deletes its copies of the Detcore-rendered /proc files; changes only reverie-kvm, inventory unchanged), so the budgets above carry.
+expected_pin=193968de57cdc3aaf2f6eb63c75743503218a657
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
