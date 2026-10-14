@@ -357,6 +357,14 @@ fn rcb_timer_overshot(delta_rcbs: u64, last_timer: u64) -> bool {
     delta_rcbs > last_timer
 }
 
+/// The branches from `now` to the point the last handler armed the thread's
+/// timer for: `armed` branches past `committed`, that handler's clock value
+/// (`keep_timer_across_dropped_signal`). At least one: a stop at or past the
+/// point fires the event at once, where the backend records any overshoot.
+fn kept_timer_rcbs(committed: u64, armed: u64, now: u64) -> u64 {
+    committed.saturating_add(armed).saturating_sub(now).max(1)
+}
+
 fn choose_rcb_timer(
     max_rcbs_remaining: u64,
     current_rcbs: u64,
@@ -906,6 +914,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 && self.cfg.backend.reports_child_exit_publication
                 && !self.child_exit_sigchld_delivers(guest).await
             {
+                self.keep_timer_across_dropped_signal(guest);
                 return Ok(None);
             }
             // The kernel dequeued `signal` before this stop: a hold for it ends
@@ -1027,6 +1036,39 @@ impl<T: RecordOrReplay> Detcore<T> {
             tool_global::unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
                 .await;
         }
+    }
+
+    /// After a dropped signal's delivery stop, which made no other hook run:
+    /// request the thread's timer event again for the same point of its
+    /// branch clock as the last handler armed it (`post_handler_hook`). The
+    /// stop is a Tool callback, which cancels the event, and nothing else
+    /// re-arms it, so a thread spinning in user code would run on unpreempted
+    /// until its next system call: measured, a chaos schedule whose sibling
+    /// took a dropped kernel `SIGCHLD` spun about 4e10 branches past its
+    /// 2e7-branch slice (https://github.com/rrnewton/hermit/issues/4304). The
+    /// point is fixed by the clock value of that handler, not by when the
+    /// host-timed stop came, and no logical time is charged here, so the stop
+    /// stays invisible to the schedule.
+    fn keep_timer_across_dropped_signal<G: Guest<Self>>(&self, guest: &mut G) {
+        if self.cfg.max_timeslice.is_none() {
+            return;
+        }
+        let thread_state = guest.thread_state();
+        let Some(armed) = thread_state.last_rcb_timer else {
+            return;
+        };
+        let thread_state_committed = thread_state.committed_clock_value;
+        // The stop cancelled the event: an unreadable clock leaves the thread
+        // unpreempted, so it fails closed, as every handler's clock read does.
+        let now = guest.read_clock().expect("Couldn't read clock");
+        assert!(thread_state_committed <= now);
+        let schedule = TimerSchedule::Rcbs(kept_timer_rcbs(thread_state_committed, armed, now));
+        let armed = if guest.config().imprecise_timers {
+            guest.set_timer(schedule)
+        } else {
+            guest.set_timer_precise(schedule)
+        };
+        armed.expect("Failed to set timer");
     }
 
     /// Whether a `SIGCHLD` that stopped this thread is delivered, on a backend
@@ -4569,6 +4611,20 @@ mod rcb_overshoot_tests {
 #[cfg(test)]
 mod timeslice_timer_tests {
     use super::*;
+
+    /// A dropped signal's stop re-requests the timer event for the point the
+    /// last handler armed, whenever the host-timed stop came: before it, the
+    /// remaining branches; at or past it, at once
+    /// (https://github.com/rrnewton/hermit/issues/4304).
+    #[test]
+    fn a_kept_timer_aims_at_the_armed_point() {
+        assert_eq!(kept_timer_rcbs(1_000, 500, 1_000), 500);
+        assert_eq!(kept_timer_rcbs(1_000, 500, 1_200), 300);
+        assert_eq!(kept_timer_rcbs(1_000, 500, 1_499), 1);
+        assert_eq!(kept_timer_rcbs(1_000, 500, 1_500), 1);
+        assert_eq!(kept_timer_rcbs(1_000, 500, 40_000_000_000), 1);
+        assert_eq!(kept_timer_rcbs(u64::MAX - 10, 500, u64::MAX - 5), 5);
+    }
 
     #[test]
     fn manual_interrupts_can_shorten_but_not_extend_maximum() {
