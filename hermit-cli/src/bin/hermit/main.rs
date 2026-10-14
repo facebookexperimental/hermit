@@ -20,6 +20,7 @@ mod bisect;
 mod clean;
 mod cli_owned_lifecycle;
 mod container;
+mod dap_adapter;
 mod gdb_client;
 mod gdb_watch_helper;
 mod global_opts;

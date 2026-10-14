@@ -6,10 +6,11 @@
 # LICENSE file in the root directory of this source tree.
 #
 # Runs the Hermit debug type in a real VS Code, headless (no display needed),
-# against two sessions:
-#   forward  VS Code starts hermit-dap on stdio and attaches it to
-#            `hermit run --gdbserver`.
-#   reverse  VS Code connects to `hermit replay --dap-listen` and steps back.
+# against three sessions:
+#   forward     VS Code starts hermit-dap on stdio and attaches it to
+#               `hermit run --gdbserver`.
+#   run-listen  VS Code connects to `hermit run --dap-listen`.
+#   reverse     VS Code connects to `hermit replay --dap-listen` and steps back.
 # See README.md in this directory.
 
 set -euo pipefail
@@ -200,6 +201,29 @@ if run_code forward forward "{\"type\": \"hermit\", \"request\": \"attach\", \"n
     \"dapPath\": \"$hermit_dap\"}"; then
     grace=300
 else
+    grace=0
+    failed=1
+fi
+stop_server "$server" "$grace" || failed=1
+
+# run-listen: VS Code connects to hermit run --dap-listen.
+gdb_port=$(free_port)
+dap_port=$(free_port)
+"${hermit_cmd[@]}" run --gdbserver-port="$gdb_port" --dap-listen="$dap_port" -- "$work/squares" \
+    </dev/null >"$work/run-listen-hermit.log" 2>&1 &
+server=$!
+background+=("$server")
+if wait_for_line "$work/run-listen-hermit.log" "hermit-dap: listening on"; then
+    if run_code run-listen forward "{\"type\": \"hermit\", \"request\": \"attach\",
+        \"name\": \"run-listen\", \"port\": $dap_port, \"program\": \"$work/squares\",
+        \"target\": \"127.0.0.1:$gdb_port\"}"; then
+        grace=300
+    else
+        grace=0
+        failed=1
+    fi
+else
+    echo "FAIL run-listen: hermit run --dap-listen never listened; see $work/run-listen-hermit.log" >&2
     grace=0
     failed=1
 fi

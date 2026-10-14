@@ -907,6 +907,18 @@ pub struct RunOpts {
     #[clap(value_name = "ARGS")]
     args: Vec<String>,
 
+    /// Serve this run to one Debug Adapter Protocol client, such as an
+    /// editor, on the TCP address [HOST:]PORT (HOST defaults to 127.0.0.1).
+    /// Implies --gdbserver: it starts `hermit-dap --listen` from beside this
+    /// executable, and the client's attach request names the program and the
+    /// GDB server, as printed. See DEBUGGING.md.
+    #[clap(long, value_name = "[HOST:]PORT")]
+    dap_listen: Option<String>,
+
+    /// The adapter `--dap-listen` started, kept until the run ends.
+    #[clap(skip)]
+    dap_adapter: Option<std::sync::Arc<super::dap_adapter::ListeningAdapter>>,
+
     /// Path to a happens-before specification (JSON; see RFC #1146) that places
     /// deterministic ordering edges between anchored events. Anchor code
     /// locations (`func`, `file:line`) are resolved against the guest program's
@@ -5476,7 +5488,13 @@ impl RunOpts {
     }
 
     pub fn main(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        if self.dap_listen.is_some() {
+            // Before validation, so every --gdbserver refusal applies.
+            self.det_opts.det_config.gdbserver = true;
+        }
         let result = self.main_without_core_cleanup(global);
+        // Stops the adapter if its client never came or is still connected.
+        drop(self.dap_adapter.take());
         if let Ok(status) = &result {
             self.finish_manifest(*status);
         }
@@ -5484,6 +5502,41 @@ impl RunOpts {
             self.discard_fatal_cores_after_success();
         }
         result
+    }
+
+    /// For `--dap-listen` (which [`RunOpts::main`] turned into `--gdbserver`):
+    /// starts `hermit-dap --listen` and tells the user what the client's
+    /// attach request needs.
+    fn start_dap_adapter(&self) -> Result<Option<super::dap_adapter::ListeningAdapter>, Error> {
+        let Some(address) = &self.dap_listen else {
+            return Ok(None);
+        };
+        let adapter = super::dap_adapter::ListeningAdapter::spawn(address)?;
+        eprintln!(
+            "hermit run: starting hermit-dap to serve this run to one DAP client; {}",
+            super::dap_adapter::attach_hint(
+                &self.host_program_path(),
+                self.det_opts.det_config.gdbserver_port
+            )
+        );
+        Ok(Some(adapter))
+    }
+
+    /// The program as a host path, for a debugger outside the guest: a path
+    /// with a `/` made absolute, a bare name looked up on the host's PATH, or
+    /// the name itself if it is not found there.
+    fn host_program_path(&self) -> PathBuf {
+        let program = &self.program;
+        if program.components().count() > 1 || program.is_absolute() {
+            return std::path::absolute(program).unwrap_or_else(|_| program.clone());
+        }
+        std::env::var_os("PATH")
+            .and_then(|path| {
+                std::env::split_paths(&path)
+                    .map(|directory| directory.join(program))
+                    .find(|candidate| candidate.is_file())
+            })
+            .unwrap_or_else(|| program.clone())
     }
 
     fn main_without_core_cleanup(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
@@ -5528,6 +5581,8 @@ impl RunOpts {
         // Right after validation, which may have turned the preemption timer
         // off, and still before stdin is read or anything is launched.
         self.refuse_happens_before_without_preemption()?;
+        // After the refusals above, so a refused run starts no adapter.
+        self.dap_adapter = self.start_dap_adapter()?.map(std::sync::Arc::new);
         self.adopt_replayed_schedule_epoch()?;
         // Once every implicit input it records is resolved, and before the
         // guest starts, so a run that fails or hangs still leaves it.
@@ -6179,6 +6234,12 @@ impl RunOpts {
                 "--gdbserver",
                 "it moves every trial to the host network and makes each one wait for a debugger \
                  on the same port",
+            ),
+            (
+                self.dap_listen.is_some(),
+                "--dap-listen",
+                "it makes every trial wait for a debugger, and only the first trial could take \
+                 the adapter's port",
             ),
             (
                 config.record_preemptions_to.is_some(),

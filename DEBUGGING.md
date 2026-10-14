@@ -20,7 +20,8 @@ exactly what works and what does not yet.
 | --- | --- | --- |
 | GDB on a deterministic run | `hermit run --gdbserver -- PROGRAM`, then `gdb PROGRAM -ex 'target remote :1234'` | No |
 | GDB on a recording | `hermit replay [ID]` (starts GDB itself) | No |
-| DAP client on a deterministic run | `hermit run --gdbserver -- PROGRAM`, then a DAP client running `hermit-dap` | No |
+| DAP client on a deterministic run, over TCP | `hermit run --dap-listen=4711 -- PROGRAM` | No |
+| DAP client on a deterministic run, over stdio | `hermit run --gdbserver -- PROGRAM`, then a DAP client running `hermit-dap` | No |
 | DAP client on a recording, over TCP | `hermit replay [ID] --dap-listen=4711` | `stepBack`, `reverseContinue` |
 | DAP client on a recording, over stdio | a DAP client running `hermit-dap --replay ID` | `stepBack`, `reverseContinue` |
 
@@ -161,6 +162,33 @@ The session ends when that client disconnects.
 Anyone who can connect to the port controls a debugger running as you, so
 keep the default loopback address unless you mean otherwise. Hermit's GDB
 server port is exposed the same way.
+
+### On a deterministic run, from a terminal
+
+```bash
+hermit run --epoch=2026-01-01T00:00:00Z --dap-listen=4711 -- ./squares
+```
+
+```text
+hermit run: starting hermit-dap to serve this run to one DAP client; its attach request needs "program": "/home/me/squares" and "target": "127.0.0.1:1234"
+hermit-dap: listening on 127.0.0.1:4711
+```
+
+`--dap-listen` implies `--gdbserver`, so everything said above about
+`--gdbserver` holds, and a run whose `--gdbserver` would be refused (under
+`--strict`, for example) is refused the same way, before an adapter starts.
+`hermit run` starts `hermit-dap --listen ADDRESS` beside itself, outside the
+guest, and the program waits for the client's `attach` before its first
+instruction. When the run ends, `hermit run` waits up to 5 seconds for the
+adapter to finish its session, then stops it; an adapter that no client
+connected to is stopped at once. The `program` it prints is the path given,
+made absolute, or a bare name found on the host's `PATH`.
+
+As with `--gdbserver`, a client that disconnects without attaching leaves
+the program waiting for a debugger; stop the run with Ctrl-C. `--dap-listen`
+also combines with `--from`, so `hermit run --from last-run --dap-listen=4711`
+reruns a recorded run under a DAP client; `hermit replay --dap-listen` on such
+a recording says so.
 
 ### Reverse execution on a recording
 
@@ -310,9 +338,10 @@ contributes, so `hermit-dap` cannot be named in `launch.json` on its own. A
 prototype extension in [editors/vscode](editors/vscode/README.md) contributes a
 `hermit` debug type with two `attach` configurations: one that starts
 `hermit-dap` on stdio against `hermit run --gdbserver`, and one that connects
-to `hermit replay --dap-listen`, with Step Back and Reverse Continue.
+to `hermit run --dap-listen` or to `hermit replay --dap-listen`, the latter
+with Step Back and Reverse Continue.
 
-Its test, `editors/vscode/test/run.sh`, drives both sessions through a real
+Its test, `editors/vscode/test/run.sh`, drives all three sessions through a real
 VS Code (1.141.1) running headless, with no display: breakpoints, continue,
 the call stack and variables, and on the recording `stepBack` and
 `reverseContinue`. It also checks that VS Code's breakpoint list holds only
@@ -324,8 +353,9 @@ What the extension relies on:
 - `hermit-dap`, over stdio (`DebugAdapterExecutable`) or TCP (`--listen`,
   `DebugAdapterServer`). Its `attach` request needs only `program` and
   `target`.
-- `hermit replay --dap-listen`, which starts a reverse-capable session from a
-  terminal and prints the attach request's `program` and `target`.
+- `hermit run --dap-listen` and `hermit replay --dap-listen` (reverse-capable),
+  which start a session from a terminal and print the attach request's
+  `program` and `target`.
 - `hermit-dap` not reporting its hidden line breakpoints, so a client's
   breakpoint list holds only the breakpoints the user set.
 - When a managed replay fails to start, for example on a recording made by an
@@ -367,7 +397,7 @@ through a real GDB, with no editor: `initialize`, `attach`,
 `setBreakpoints`, `configurationDone`, `continue`, `threads`, `stackTrace`,
 `evaluate`, `next`, `stepOut`, `stepBack`,
 `reverseContinue` and `disconnect`, over stdio and, through
-`hermit replay --dap-listen`, over TCP.
+`hermit run --dap-listen` and `hermit replay --dap-listen`, over TCP.
 
 ```bash
 HERMIT_REQUIRE_DAP=1 HERMIT_REQUIRE_DAP_GDB=1 \
@@ -375,8 +405,8 @@ HERMIT_REQUIRE_DAP=1 HERMIT_REQUIRE_DAP_GDB=1 \
 ```
 
 Without `HERMIT_REQUIRE_DAP_GDB`, the end-to-end tests skip, loudly, when no
-GDB with a DAP interpreter is installed. The 23 tests take about 7 to 10
-seconds with GDB 17.2. The VS Code extension's test, which needs a VS Code
+GDB with a DAP interpreter is installed. The 27 tests take about 9 seconds
+with GDB 17.2. The VS Code extension's test, which needs a VS Code
 download and so is not part of validation, is described in
 [editors/vscode](editors/vscode/README.md).
 

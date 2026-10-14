@@ -1174,6 +1174,7 @@ mod tests {
             ("--network=host", "--network=host"),
             ("--no-namespace", "--no-namespace"),
             ("--gdbserver", "--gdbserver"),
+            ("--dap-listen=127.0.0.1:0", "--dap-listen"),
             (
                 "--record-preemptions-to=requested.preempts",
                 "--record-preemptions-to",
@@ -1311,6 +1312,11 @@ mod tests {
                 None,
                 "--gdbserver",
                 "refuse --gdbserver in the run arguments",
+            ),
+            (
+                None,
+                "--dap-listen=127.0.0.1:0",
+                "refuse --dap-listen in the run arguments",
             ),
             (
                 None,

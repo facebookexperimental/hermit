@@ -45,6 +45,12 @@ case "$1" in
         echo "hermit-dap: listening on 127.0.0.1:1" >&2
         wait_for_session_end
         ;;
+    run)
+        case " $* " in
+            *" --dap-listen="*) echo "hermit-dap: listening on 127.0.0.1:1" >&2 ;;
+        esac
+        wait_for_session_end
+        ;;
     *)
         wait_for_session_end
         ;;
@@ -94,12 +100,12 @@ check() {
 editor="editor-good"
 work="$repo/target/vscode-selftest-$editor"
 mkdir -p "$work"
-check "$editor" 0 2
+check "$editor" 0 3
 
 editor="editor-good"
 work="$repo/target/vscode-selftest-record-hangs"
 mkdir -p "$work"
-STUB_RECORD_HANGS=1 check record-hangs 1 1
+STUB_RECORD_HANGS=1 check record-hangs 1 2
 
 for editor in editor-exits-0 editor-exits-1 editor-hangs; do
     work="$repo/target/vscode-selftest-$editor"
@@ -109,6 +115,7 @@ for editor in editor-exits-0 editor-exits-1 editor-hangs; do
     printf '%s\n' '{"expect": "forward", "nonce": "stale", "failures": [],
       "steps": [{"action": "attach"}, {"action": "continue"}, {"action": "continue"}]}' \
         >"$work/forward.json"
+    cp "$work/forward.json" "$work/run-listen.json"
     printf '%s\n' '{"expect": "reverse", "nonce": "stale", "failures": [],
       "steps": [{"action": "attach"}, {"action": "continue"}, {"action": "continue"},
                 {"action": "stepBack"}, {"action": "reverseContinue"}]}' >"$work/reverse.json"

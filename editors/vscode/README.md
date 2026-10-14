@@ -27,7 +27,9 @@ starts `hermit-dap` on stdio:
 ```
 
 Connect to `hermit replay --dap-listen=4711`, which prints the `program` and
-`target` to use; this session supports Step Back and Reverse Continue:
+`target` to use; this session supports Step Back and Reverse Continue. The
+same configuration, with `hermit run --dap-listen=4711 -- ./program`'s
+printed `program` and `target`, connects to a deterministic run:
 
 ```json
 {
@@ -50,12 +52,14 @@ or package it with `npx @vscode/vsce package`.
 ## Test
 
 `test/run.sh` runs the extension in a real VS Code, headless (Electron's
-`--ozone-platform=headless`, so no display or Xvfb is needed), through two
+`--ozone-platform=headless`, so no display or Xvfb is needed), through three
 sessions on `test/fixtures/squares.c`:
 
 - forward: VS Code starts `hermit-dap` on stdio against
   `hermit run --gdbserver`; two breakpoint stops in `square`, with `x = 0`
   and `x = 1`.
+- run-listen: VS Code connects to `hermit run --dap-listen`; the same two
+  stops.
 - reverse: VS Code connects to `hermit replay --dap-listen`; the same two
   stops, then Step Back to line 11 in `main` with `i = 1`, then Reverse
   Continue to `x = 0`.
@@ -75,7 +79,7 @@ editors/vscode/test/run.sh --code /path/to/VSCode-linux-x64/code
 ```
 
 It needs GDB with the DAP interpreter (tested with GDB 17.2), `cc` and
-`node`. With VS Code 1.141.1 both sessions pass in about 75 seconds. Each VS
+`node`. With VS Code 1.141.1 the three sessions pass in about 110 seconds. Each VS
 Code run, and recording the guest, is bounded by `--timeout` (default
 300 s), and a session passes only
 on the result file that run wrote, matched by a per-run nonce, with every
@@ -84,7 +88,7 @@ because it needs a VS Code download.
 
 `test/selftest.sh` checks the harness itself without VS Code or Hermit,
 using stand-ins for both. An editor that writes a correct result for the run
-and ends the session must make `run.sh` pass both sessions. `run.sh` must
+and ends the session must make `run.sh` pass all three sessions. `run.sh` must
 fail, in bounded time, with an editor that exits 0 without running the test,
 one that exits 1, and one that hangs, each with a stale passing-looking
 result file left in the work directory, and when recording the guest hangs.

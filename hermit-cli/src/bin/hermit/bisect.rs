@@ -270,6 +270,10 @@ mod tests {
                 "refuse --gdbserver in the run arguments",
             ),
             (
+                &["--dap-listen=127.0.0.1:0"][..],
+                "refuse --dap-listen in the run arguments",
+            ),
+            (
                 &["--record-preemptions-to=requested.preempts"][..],
                 "refuse --record-preemptions-to in the run arguments",
             ),

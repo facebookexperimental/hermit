@@ -86,6 +86,11 @@ impl ReplayOpts {
         use crate::manifest::Kind;
         use crate::manifest::Target;
 
+        if self.dap_listen.is_some() {
+            // Before resolving the recording, so a missing adapter is named
+            // first, whatever the recording turns out to be.
+            super::dap_adapter::hermit_dap_beside_hermit()?;
+        }
         let store = HermitData::from(self.data_dir.as_ref());
         let spec = self
             .recording
@@ -232,7 +237,15 @@ impl ReplayOpts {
 
         let id = &manifest.id;
         let kind = manifest.kind.name();
-        if self.serve_only || !self.gdbex.is_empty() || self.dap_listen.is_some() {
+        if let Some(address) = &self.dap_listen {
+            return anyhow::anyhow!(
+                "recording {id} is of kind {kind}, which replays by rerunning its program \
+                 rather than under gdb, so it has no reverse execution; serve the rerun to a \
+                 DAP client with: hermit run --from {} --dap-listen={address}",
+                path.display()
+            );
+        }
+        if self.serve_only || !self.gdbex.is_empty() {
             return anyhow::anyhow!(
                 "recording {id} is of kind {kind}, which replays by rerunning its program \
                  rather than under gdb; serve the rerun to gdb with: hermit run --from {} \
@@ -265,24 +278,15 @@ impl ReplayOpts {
     fn exec_dap_adapter(&self, hermit: &HermitData, id: Id, address: &str) -> Error {
         use std::os::unix::process::CommandExt;
 
-        let adapter = match std::env::current_exe() {
-            Ok(exe) => exe.with_file_name("hermit-dap"),
-            Err(error) => return Error::from(error).context("Failed to locate hermit"),
+        let adapter = match super::dap_adapter::hermit_dap_beside_hermit() {
+            Ok(adapter) => adapter,
+            Err(error) => return error,
         };
-        if !adapter.is_file() {
-            return Error::msg(format!(
-                "--dap-listen needs hermit-dap beside hermit, and {} does not exist; \
-                 build it with `cargo build -p hermit --bin hermit --bin hermit-dap`",
-                adapter.display()
-            ));
-        }
         let exe = hermit.data_dir().join(format!("{}/exe", id));
         let program = Shebang::new(&exe).map_or(exe, |s| s.interpreter().into());
         eprintln!(
-            "hermit replay: starting hermit-dap to serve recording {id} to one DAP client; \
-             its attach request needs \"program\": {:?} and \"target\": \"127.0.0.1:{}\"",
-            program.display().to_string(),
-            self.gdbserver_port
+            "hermit replay: starting hermit-dap to serve recording {id} to one DAP client; {}",
+            super::dap_adapter::attach_hint(&program, self.gdbserver_port)
         );
         let error = std::process::Command::new(&adapter)
             .arg("--listen")
