@@ -545,6 +545,13 @@ impl StartOpts {
     pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         if !self.cpu_profile.is_default() {
             super::verify::CPU_PROFILE_V3_RAN.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Qualify here, before any container: a refusal ends the command at
+            // once, and the recorder and replayer reuse the result.
+            let request = hermit::cpu_profile_admission::record_or_replay_request(false);
+            hermit::cpu_profile_admission::admit(&request).map_err(|refusal| {
+                Error::new(crate::container::PolicyRefusal)
+                    .context(format!("--cpu-profile x86-64-v3 refused: {refusal}"))
+            })?;
         }
         if self.verify {
             validate_log_level(global)?;

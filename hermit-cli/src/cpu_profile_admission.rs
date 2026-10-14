@@ -304,12 +304,23 @@ fn capture(probe: &xstate_probe::ProbeReport) -> Result<HostXstate, AdmissionRef
     })
 }
 
+/// This process's successful qualification. A recording or replay qualifies
+/// in the CLI process, before its container child is forked, so the child
+/// reuses this result instead of probing again from inside the container,
+/// whose CPU affinity can be one busy CPU.
+static ADMITTED: std::sync::OnceLock<(xstate_probe::ProbeReport, HostXstate)> =
+    std::sync::OnceLock::new();
+
 /// Admits a v3 run on this host, or names why not. On success the probe report
-/// and the host facts to bind are returned.
+/// and the host facts to bind are returned. The request's own refusals are
+/// checked every time; the host qualification runs once per process.
 pub fn admit(
     request: &AdmissionRequest<'_>,
 ) -> Result<(xstate_probe::ProbeReport, HostXstate), AdmissionRefusal> {
     check_request(request)?;
+    if let Some(admitted) = ADMITTED.get() {
+        return Ok(admitted.clone());
+    }
     let release = nix::sys::utsname::uname()
         .map_err(|e| format!("uname failed: {e}"))?
         .release()
@@ -324,7 +335,7 @@ pub fn admit(
     }
     let probe = xstate_probe::qualify(xstate_probe::ProbeOptions::default())?;
     let host = capture(&probe)?;
-    Ok((probe, host))
+    Ok(ADMITTED.get_or_init(|| (probe, host)).clone())
 }
 
 #[cfg(test)]

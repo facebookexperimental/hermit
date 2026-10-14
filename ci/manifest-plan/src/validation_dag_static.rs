@@ -3117,7 +3117,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And hermit_run_dap_listen_serves_a_run_config: 411.
     // And a_claimed_sigchld_survives_another_signal_and_a_dropped_copy
     // (https://github.com/rrnewton/hermit/issues/4346): 412, listed.
-    ("test.cli", 412),
+    // And the four cpu_profile_v3 tests
+    // (https://github.com/rrnewton/hermit/issues/4243): 416, listed with this
+    // node's arguments.
+    ("test.cli", 416),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3461,7 +3464,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the guest-symlink test: 346.
     // And the run-config test: 347.
     // And the claim-fault SIGCHLD test (https://github.com/rrnewton/hermit/issues/4346): 348, listed.
-    ("test.cli_on_host", 348),
+    // And the four cpu_profile_v3 tests: 352, listed with this node's arguments.
+    ("test.cli_on_host", 352),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux

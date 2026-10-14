@@ -224,6 +224,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/cpuid_profile_v3.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/cpuid_profile_v3.c is owned by hermit-cli/tests/cli.rs: cpu_profile_v3_guest_sees_the_v3_cpu_at_bitwise_parity runs it under --cpu-profile x86-64-v2 and x86-64-v3 and requires each check line to be ok at bitwise parity (or, on a host that does not qualify, the named refusal), cpu_profile_v3_records_and_replays_the_v3_guest records and replays it, and cpu_profile_v3_refuses_backends_and_flags_it_cannot_qualify requires refusals before it runs (https://github.com/rrnewton/hermit/issues/4243). It stays a fixture because a generic manifest cannot assert per-profile output or a host-dependent refusal."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/cpuinfo_matches_cpuid.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/cpuinfo_matches_cpuid.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test cpuinfo_matches_cpuid compiles this guest, which compares /proc/cpuinfo's vendor, family, model, stepping, model name and 22 feature flags with what the CPUID instruction reports and prints only whether each matches, and requires every line to match at bitwise parity under hermit run --strict --verify --verify-strict (https://github.com/rrnewton/hermit/issues/4161: /proc/cpuinfo showed the host CPU while CPUID showed the virtual one); it remains a guest fixture because a generic manifest cannot assert this exact output."

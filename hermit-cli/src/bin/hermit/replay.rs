@@ -118,7 +118,19 @@ impl ReplayOpts {
             return Err(self.exec_dap_adapter(&hermit, id, address));
         }
 
-        let recorded_local = hermit.recording_metadata(id)?.local_networking == Some(true);
+        let metadata = hermit.recording_metadata(id)?;
+        if !metadata.cpu_profile.is_default() {
+            // A v3 recording replays only on a qualifying host; qualify before
+            // the container, as `record start` does. The replayer compares the
+            // host facts (https://github.com/rrnewton/hermit/issues/4243).
+            let gdb_served = !self.autopilot;
+            let request = hermit::cpu_profile_admission::record_or_replay_request(gdb_served);
+            hermit::cpu_profile_admission::admit(&request).map_err(|refusal| {
+                Error::new(super::container::PolicyRefusal)
+                    .context(format!("--cpu-profile x86-64-v3 refused: {refusal}"))
+            })?;
+        }
+        let recorded_local = metadata.local_networking == Some(true);
         let network = replay_network(self.autopilot, recorded_local);
         if recorded_local && network == NetworkingMode::Host {
             // Same override, and same warning, as `hermit run --gdbserver`.

@@ -210,7 +210,7 @@ impl Layout {
             size: d0.ebx as usize,
             components,
         };
-        if layout.size == 0 || layout.size + 64 > AREA_BYTES {
+        if layout.size == 0 || layout.size + 64 > USED_BYTES {
             return Err(format!(
                 "the XSAVE area for XCR0 {xcr0:#x} is {} bytes, outside what the probe holds",
                 layout.size
@@ -257,9 +257,19 @@ impl Area {
     }
 }
 
+/// Zeroes the part of an area any enabled-component image can use: the host's
+/// XSAVE size (at most [`USED_BYTES`]) plus RDPKRU's slot.
+fn clear(area: &mut Area) {
+    area.0[..USED_BYTES].fill(0);
+}
+
+/// The bytes of an area the probe uses; [`Layout::host`] refuses a save area
+/// that does not fit.
+const USED_BYTES: usize = 8192;
+
 /// A standard-format image of initial values with `header` as XSTATE_BV.
 fn fill_standard_image(area: &mut Area, mxcsr: u32, header: u64) {
-    area.0.fill(0);
+    clear(area);
     area.0[0..2].copy_from_slice(&0x37fu16.to_le_bytes());
     area.0[24..28].copy_from_slice(&mxcsr.to_le_bytes());
     area.0[28..32].copy_from_slice(&0xffffu32.to_le_bytes()); // MXCSR_MASK
@@ -268,7 +278,7 @@ fn fill_standard_image(area: &mut Area, mxcsr: u32, header: u64) {
 
 /// A compacted-format image whose header clears every XSTATE_BV bit.
 fn fill_compacted_image(area: &mut Area, mxcsr: u32, xcr0: u64) {
-    area.0.fill(0);
+    clear(area);
     area.0[0..2].copy_from_slice(&0x37fu16.to_le_bytes());
     area.0[24..28].copy_from_slice(&mxcsr.to_le_bytes());
     area.0[520..528].copy_from_slice(&((1u64 << 63) | xcr0).to_le_bytes());
@@ -276,7 +286,7 @@ fn fill_compacted_image(area: &mut Area, mxcsr: u32, xcr0: u64) {
 
 /// An FXSAVE image of initial x87 and SSE values.
 fn fill_fx_image(area: &mut Area, mxcsr: u32) {
-    area.0.fill(0);
+    clear(area);
     area.0[0..2].copy_from_slice(&0x37fu16.to_le_bytes());
     area.0[24..28].copy_from_slice(&mxcsr.to_le_bytes());
 }
@@ -311,9 +321,25 @@ fn switches_and_faults() -> Result<i64, ProbeRefusal> {
 }
 
 /// The timeslices that have started on `cpu`, from `/proc/schedstat`.
+///
+/// The file is about 200 KB on a 316-CPU machine and costs a millisecond to
+/// generate whole; reading stops at `cpu`'s line, so for the low-numbered CPU
+/// the probe pins itself to, the kernel generates only the first few lines.
 fn cpu_timeslices(cpu: usize) -> Result<u64, ProbeRefusal> {
-    let text = std::fs::read_to_string("/proc/schedstat")
+    use std::io::BufRead;
+    let file = std::fs::File::open("/proc/schedstat")
         .map_err(|e| format!("cannot read /proc/schedstat: {e}"))?;
+    let want = format!("cpu{cpu} ");
+    let mut text = String::new();
+    for line in std::io::BufReader::with_capacity(4096, file).lines() {
+        let line = line.map_err(|e| format!("cannot read /proc/schedstat: {e}"))?;
+        let done = line.starts_with(&want);
+        text.push_str(&line);
+        text.push('\n');
+        if done {
+            break;
+        }
+    }
     parse_schedstat_timeslices(&text, cpu)
 }
 
@@ -384,7 +410,7 @@ impl Default for ProbeOptions {
     }
 }
 
-/// Runs the qualification on a new thread pinned to the CPU this one is on.
+/// Runs the qualification on a new thread pinned to the lowest-numbered CPU it may use.
 /// Returns the report, or the reason v3 cannot be offered on this host.
 pub fn qualify(options: ProbeOptions) -> Result<ProbeReport, ProbeRefusal> {
     if !(MIN_REPETITIONS..=MAX_REPETITIONS).contains(&options.repetitions) {
@@ -393,12 +419,45 @@ pub fn qualify(options: ProbeOptions) -> Result<ProbeReport, ProbeRefusal> {
             options.repetitions
         ));
     }
+    // Probes pin themselves to the same CPU, so two at once would switch each
+    // other out until both refused. One at a time per user: the others wait.
+    let _serialized = ProbeLock::acquire()?;
     std::thread::Builder::new()
         .name("xinuse-probe".into())
         .spawn(move || Probe::run(options))
         .map_err(|e| format!("cannot start the probe thread: {e}"))?
         .join()
         .map_err(|_| "the probe thread panicked".to_owned())?
+}
+
+/// An exclusive `flock` on a per-user file in the temporary directory, held
+/// for one probe.
+struct ProbeLock {
+    _file: std::fs::File,
+}
+
+impl ProbeLock {
+    fn acquire() -> Result<Self, ProbeRefusal> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: getuid has no preconditions.
+        let uid = unsafe { libc::getuid() };
+        let path = std::env::temp_dir().join(format!("hermit-xinuse-probe-{uid}.lock"));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(|e| format!("cannot open the probe lock {}: {e}", path.display()))?;
+        // SAFETY: the descriptor is open for the duration of the call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(format!(
+                "cannot lock {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(ProbeLock { _file: file })
+    }
 }
 
 fn pin_to(cpu: usize) -> Result<(), ProbeRefusal> {
@@ -414,6 +473,24 @@ fn pin_to(cpu: usize) -> Result<(), ProbeRefusal> {
         }
     }
     Ok(())
+}
+
+/// The lowest-numbered CPU this thread may run on. The probe pins itself
+/// there, so that the schedstat line it reads each reload trial comes first.
+fn first_allowed_cpu() -> Result<usize, ProbeRefusal> {
+    // SAFETY: cpu_set_t is plain data that sched_getaffinity fills.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, std::mem::size_of_val(&set), &mut set) != 0 {
+            return Err(format!(
+                "cannot read the probe's CPU affinity: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        (0..libc::CPU_SETSIZE as usize)
+            .find(|cpu| libc::CPU_ISSET(*cpu, &set))
+            .ok_or_else(|| "the probe may run on no CPU".to_owned())
+    }
 }
 
 fn current_cpu() -> Result<usize, ProbeRefusal> {
@@ -448,7 +525,7 @@ struct Probe {
 
 impl Probe {
     fn run(options: ProbeOptions) -> Result<ProbeReport, ProbeRefusal> {
-        let cpu = current_cpu()?;
+        let cpu = first_allowed_cpu()?;
         pin_to(cpu)?;
         let layout = Layout::host()?;
         let cases = case_list(layout.xcr0)?;
@@ -557,7 +634,20 @@ impl Probe {
             forced_exit,
             reload_bound,
         };
+        tracing::info!(
+            "xinuse probe: calibrated on CPU {cpu} ({}); reload bound {reload_bound} cycles",
+            probe.report.calibration
+        );
+        let started = std::time::Instant::now();
         let result = probe.with_peer(|probe| probe.matrix(&cases, options.repetitions));
+        tracing::info!(
+            "xinuse probe: matrix took {:?}: {} cells, retried {} reference, {} reload and {} exit trials",
+            started.elapsed(),
+            probe.report.cells,
+            probe.report.retried_references,
+            probe.report.retried_reloads,
+            probe.report.retried_exits
+        );
         for fd in to_peer.into_iter().chain(from_peer) {
             // SAFETY: these descriptors were created above and are not used again.
             unsafe { libc::close(fd) };
@@ -702,7 +792,7 @@ impl Probe {
         for _attempt in 0..MAX_ATTEMPTS {
             self.prepare_image(case, mxcsr);
             self.prepare_peer(peer);
-            self.save[slot].0.fill(0);
+            clear(&mut self.save[slot]);
             self.seq = (self.seq + 1) % asm::PEER_EXIT;
             let mut ctx = ArmCtx {
                 kind: case.kind as u32,

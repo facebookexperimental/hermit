@@ -171,6 +171,7 @@ static TIMER_SIGEV_THREAD_ID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_EXEC_FLUSH_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LEADER_PTHREAD_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static THREAD_JOIN_AFTER_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static CPUID_PROFILE_V3_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static NESTED_VFORK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_CHILD_WAITS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static GET_MEMPOLICY_ONE_NODE_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1315,6 +1316,87 @@ fn leader_pthread_exit_guest() -> &'static Path {
         );
         guest
     })
+}
+
+fn cpuid_profile_v3_guest() -> &'static Path {
+    CPUID_PROFILE_V3_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("cpuid-profile-v3");
+        fs::create_dir_all(&build_root).expect("failed to create cpuid-profile-v3 directory");
+        let guest = build_root.join("cpuid_profile_v3");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/cpuid_profile_v3.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile cpuid-profile-v3 guest");
+        assert!(
+            output.status.success(),
+            "cpuid-profile-v3 guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+/// Whether this host qualifies for `--cpu-profile x86-64-v3`, by
+/// `hermit host-capabilities --cpu-profile x86-64-v3`: `Ok(())`, or the
+/// refusal reason it printed.
+fn cpu_profile_v3_qualification() -> Result<(), String> {
+    let output = hermit_command(&["host-capabilities", "--cpu-profile", "x86-64-v3"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run hermit host-capabilities");
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    match output.status.code() {
+        Some(0) => {
+            assert!(text.starts_with("x86-64-v3: QUALIFIED"), "{text}");
+            Ok(())
+        }
+        Some(HERMIT_POLICY_REFUSAL_EXIT) => {
+            let reason = text
+                .strip_prefix("x86-64-v3: REFUSED — ")
+                .unwrap_or_else(|| panic!("unexpected refusal line: {text}"));
+            Err(reason.lines().next().unwrap_or_default().to_owned())
+        }
+        other => panic!("host-capabilities --cpu-profile exited {other:?}: {text}"),
+    }
+}
+
+/// Runs a v3 command through `attempt`, which returns its exit code, stdout,
+/// stderr and anything else the caller needs. Returns `Some` when the run
+/// qualified and exited 0, and `None` when it was refused by name on a host that
+/// `hermit host-capabilities --cpu-profile x86-64-v3` also refuses. The
+/// qualification fails closed under transient load, so a refusal on a host
+/// that does qualify gets one more attempt; a second refusal fails the test.
+fn v3_run_or_refusal<T>(
+    mut attempt: impl FnMut() -> (Option<i32>, String, String, T),
+) -> Option<(String, String, T)> {
+    for retry in [false, true] {
+        let (status, stdout, log, extra) = attempt();
+        match status {
+            Some(0) => return Some((stdout, log, extra)),
+            Some(HERMIT_POLICY_REFUSAL_EXIT) => {
+                assert!(
+                    log.contains("--cpu-profile x86-64-v3 refused:"),
+                    "exit 122 without the profile's refusal:\nstdout:\n{stdout}\nstderr:\n{log}"
+                );
+                match cpu_profile_v3_qualification() {
+                    Err(_) => return None,
+                    Ok(()) if !retry => continue,
+                    Ok(()) => panic!(
+                        "a qualifying host refused v3 twice:\nstdout:\n{stdout}\nstderr:\n{log}"
+                    ),
+                }
+            }
+            other => panic!("v3 run exited {other:?}:\nstdout:\n{stdout}\nstderr:\n{log}"),
+        }
+    }
+    unreachable!()
 }
 
 fn virtual_kernel_files_guest() -> &'static Path {
@@ -29648,6 +29730,230 @@ fn a_leader_pthread_exit_leaves_its_group_running_at_bitwise_parity() {
                 .expect("the verdict must be JSON");
         assert_eq!(report["bitwise_parity"], true, "{mode}: {report}");
     }
+}
+
+/// The x86-64-v3 CPU profile refuses by name every run it cannot qualify,
+/// before any host probe, and never falls back to v2
+/// (https://github.com/rrnewton/hermit/issues/4243).
+#[test]
+fn cpu_profile_v3_refuses_backends_and_flags_it_cannot_qualify() {
+    let guest = cpuid_profile_v3_guest().to_str().unwrap().to_owned();
+    let cases: [(&[&str], &[&str], &str); 4] = [
+        (&["--backend=kvm"], &[], "--backend=kvm"),
+        (&["--backend=dbt"], &[], "no x86-64-v3 rows"),
+        (&[], &["--gdbserver"], "--gdbserver"),
+        (&[], &["--no-virtualize-cpuid"], "does not virtualize CPUID"),
+    ];
+    for (global, run, reason) in cases {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let mut args: Vec<&str> = global.to_vec();
+        args.extend(["run", "--cpu-profile", "x86-64-v3"]);
+        args.extend(run);
+        args.extend(["--", guest.as_str()]);
+        let (status, log) = run_with_deadline(
+            hermit_command(&args),
+            directory.path(),
+            Duration::from_secs(60),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{args:?}:\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert!(
+            log.contains("--cpu-profile x86-64-v3 refused:") && log.contains(reason),
+            "{args:?}: stderr:\n{log}"
+        );
+        assert!(stdout.is_empty(), "{args:?}: the guest ran: {stdout}");
+    }
+}
+
+/// Under `--cpu-profile x86-64-v3` the guest sees the v3 CPU: every v3 feature
+/// advertised and executable, the hypervisor bit, HLE and RTM clear, leaf 0xD
+/// matching XGETBV with XSAVEOPT and the rest of 0xD.1 hidden, an XSAVE of
+/// exactly 0xD.0 EBX bytes, and Linux's xstate queries answering, all at
+/// bitwise parity under the ptrace backend. A host that does not qualify must
+/// refuse the run with the reason `hermit host-capabilities` gives, so the test
+/// checks one or the other (https://github.com/rrnewton/hermit/issues/4243).
+#[test]
+fn cpu_profile_v3_guest_sees_the_v3_cpu_at_bitwise_parity() {
+    let guest = cpuid_profile_v3_guest().to_str().unwrap().to_owned();
+    for profile in ["x86-64-v2", "x86-64-v3"] {
+        let attempt = || {
+            let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+            let verdict = directory.path().join("verify.json");
+            let (status, log) = run_with_deadline(
+                hermit_command(&[
+                    "--log=info",
+                    "run",
+                    "--strict",
+                    "--verify",
+                    "--verify-strict",
+                    "--verify-json",
+                    verdict.to_str().unwrap(),
+                    "--cpu-profile",
+                    profile,
+                    "--timeout",
+                    "60",
+                    "--",
+                    guest.as_str(),
+                ]),
+                directory.path(),
+                Duration::from_secs(300),
+                false,
+            );
+            let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+                .expect("failed to read the guest's stdout");
+            let report = fs::read(&verdict).unwrap_or_default();
+            (status.and_then(|status| status.code()), stdout, log, report)
+        };
+        let (stdout, log, report) = if profile == "x86-64-v3" {
+            match v3_run_or_refusal(attempt) {
+                Some(outcome) => outcome,
+                None => continue,
+            }
+        } else {
+            let (status, stdout, log, report) = attempt();
+            assert_eq!(
+                status,
+                Some(0),
+                "{profile}:\nstdout:\n{stdout}\nstderr:\n{log}"
+            );
+            (stdout, log, report)
+        };
+        let mut lines = stdout.lines();
+        assert_eq!(lines.next(), Some(&profile[7..]), "{profile}: {stdout}");
+        let checks: Vec<&str> = lines.collect();
+        assert_eq!(
+            checks.len(),
+            if profile == "x86-64-v2" { 2 } else { 19 },
+            "{stdout}"
+        );
+        assert!(
+            checks.iter().all(|line| line.ends_with(": ok")),
+            "{profile}: {stdout}"
+        );
+        let report: serde_json::Value =
+            serde_json::from_slice(&report).expect("the verdict must be JSON");
+        assert_eq!(report["bitwise_parity"], true, "{profile}: {report}");
+        assert_eq!(
+            log.contains("With --cpu-profile x86-64-v3, Hermit checks at startup"),
+            profile == "x86-64-v3",
+            "{profile}: the residual line belongs exactly to v3 runs:\n{log}"
+        );
+    }
+}
+
+/// The host glibc's own loader is the oracle the design names
+/// (https://github.com/rrnewton/hermit/issues/4243): under v3 it must select
+/// exactly x86-64-v3 (isa_1 = 0x7, so no v4 leak), list v3 and not v4 as
+/// supported, see RTM inactive (so no `*_avx2_rtm` string functions), and size
+/// its lazy-binding XSAVE area from leaf 0xD: nonzero, equal to the full size,
+/// and ALIGN_UP(0xD.0 EBX + 64, 64) for the host's enabled components. On a
+/// host that does not qualify, the run must be refused with the qualification's
+/// reason; a glibc too old for --list-diagnostics (before 2.33) cannot be
+/// checked here.
+#[test]
+fn cpu_profile_v3_host_loader_sees_exactly_x86_64_v3() {
+    let loader = "/lib64/ld-linux-x86-64.so.2";
+    let native = Command::new(loader)
+        .arg("--list-diagnostics")
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run the host loader");
+    if !native.status.success() {
+        eprintln!("the host glibc has no --list-diagnostics (before 2.33); nothing to check");
+        return;
+    }
+    let run = |args: &[&str]| {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let mut argv = vec!["run", "--cpu-profile", "x86-64-v3", "--", loader];
+        argv.extend(args);
+        let (status, log) = run_with_deadline(
+            hermit_command(&argv),
+            directory.path(),
+            Duration::from_secs(120),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the loader's stdout");
+        (status.and_then(|status| status.code()), stdout, log, ())
+    };
+    let Some((diagnostics, _, ())) = v3_run_or_refusal(|| run(&["--list-diagnostics"])) else {
+        return;
+    };
+    let value = |key: &str| -> u64 {
+        let line = diagnostics
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{key}=")))
+            .unwrap_or_else(|| panic!("{key} missing from:\n{diagnostics}"));
+        u64::from_str_radix(line.trim_start_matches("0x"), 16).unwrap()
+    };
+    assert_eq!(value("x86.cpu_features.isa_1"), 0x7, "{diagnostics}");
+    let size = value("x86.cpu_features.xsave_state_size");
+    let full = value("x86.cpu_features.xsave_state_full_size");
+    let ebx = u64::from(std::arch::x86_64::__cpuid_count(0xd, 0).ebx);
+    assert_ne!(size, 0, "{diagnostics}");
+    assert_eq!(size, full, "{diagnostics}");
+    assert_eq!(full, (ebx + 64).div_ceil(64) * 64, "{diagnostics}");
+    // Leaf 7 is glibc's feature word 1; its EBX bit 11 is RTM.
+    let leaf7_ebx_active = value("x86.cpu_features.features[0x1].active[0x1]");
+    assert_eq!(
+        leaf7_ebx_active & (1 << 11),
+        0,
+        "RTM is active:\n{diagnostics}"
+    );
+    let Some((help, _, ())) = v3_run_or_refusal(|| run(&["--help"])) else {
+        return;
+    };
+    assert!(help.contains("x86-64-v3 (supported, searched)"), "{help}");
+    assert!(
+        help.lines().any(|line| line.trim() == "x86-64-v4"),
+        "x86-64-v4 must be listed as not supported:\n{help}"
+    );
+}
+
+/// A v3 recording replays to the same guest output, and the recording binds
+/// the host facts (https://github.com/rrnewton/hermit/issues/4243). On a host
+/// that does not qualify, the recording is refused with the qualification's
+/// reason.
+#[test]
+fn cpu_profile_v3_records_and_replays_the_v3_guest() {
+    let guest = cpuid_profile_v3_guest().to_str().unwrap().to_owned();
+    let outcome = v3_run_or_refusal(|| {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let data_dir = format!(
+            "--data-dir={}",
+            directory.path().join("recording").display()
+        );
+        let (status, log) = run_with_deadline(
+            hermit_command(&[
+                "record",
+                "start",
+                data_dir.as_str(),
+                "--verify",
+                "--cpu-profile",
+                "x86-64-v3",
+                "--",
+                guest.as_str(),
+            ]),
+            directory.path(),
+            Duration::from_secs(300),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        (status.and_then(|status| status.code()), stdout, log, ())
+    });
+    let Some((stdout, log, ())) = outcome else {
+        return;
+    };
+    assert!(log.contains("Success: replay matched recording."), "{log}");
+    assert!(stdout.starts_with("v3\n"), "{stdout}");
+    assert!(!stdout.contains("FAIL"), "{stdout}");
 }
 
 /// `hermit record` refuses by name a process whose thread-group leader
