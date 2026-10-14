@@ -1529,7 +1529,11 @@ fi
 # the coordinator onto DBT D1). The added commit changes only reverie-kvm (guest-memory
 # deferred-failure check); every SDK recipe input, build.rs and the vendored DynamoRIO tree are
 # unchanged, and no reverie-dbt file is added, so the budgets above carry.
-expected_pin=ea20a636c2999320d4d31979f3a6d04577273bae
+# KVM GROUP-EXIT-ORDER SDK-BUDGET CARRY (2026-10-14): advance from ea20a636 to 2777e813fcaa35431eb83b10ba57a964f2907c25.
+# The added commits change only reverie-kvm (vm.rs, executor.rs and a test); every SDK recipe
+# input, build.rs and the vendored DynamoRIO tree are unchanged, and no
+# reverie-dbt file is added (inventory 950), so the budgets above carry.
+expected_pin=2777e813fcaa35431eb83b10ba57a964f2907c25
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
