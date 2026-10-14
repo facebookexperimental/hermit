@@ -1492,7 +1492,12 @@ fi
 # KVM clock commit, which changes only reverie-kvm/src/clock.rs and its tests; every
 # SDK recipe input, build.rs and the vendored DynamoRIO tree are unchanged, and
 # no reverie-dbt file is added (inventory 950), so the budgets above carry.
-expected_pin=b866896f688bb27db6e29efd6696451e60ca20be
+# KVM ENTRY-WAKE SDK-BUDGET CARRY (2026-10-14): advance from b866896f to 0b22d5b13b562c65122e6928d2ebbcefd5104f3f.
+# The added commits are b87385e1f921 (reverie-ptrace test only) and the KVM
+# entry-gate commit (reverie-kvm/src/entry.rs only). Every SDK recipe input,
+# build.rs and the vendored DynamoRIO tree are unchanged, and no reverie-dbt
+# file is added (inventory 950), so the budgets above carry.
+expected_pin=0b22d5b13b562c65122e6928d2ebbcefd5104f3f
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
