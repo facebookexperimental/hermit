@@ -3069,7 +3069,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // hermit_run_dap_listen_killed_supervisor_leaves_no_run_or_adapter: 409.
     // And hermit_run_dap_listen_names_the_file_a_guest_symlink_reaches: 410.
     // And hermit_run_dap_listen_serves_a_run_config: 411.
-    ("test.cli", 411),
+    // And a_claimed_sigchld_survives_another_signal_and_a_dropped_copy
+    // (https://github.com/rrnewton/hermit/issues/4346): 412, listed.
+    ("test.cli", 412),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3408,7 +3410,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And one more: 345.
     // And the guest-symlink test: 346.
     // And the run-config test: 347.
-    ("test.cli_on_host", 347),
+    // And the claim-fault SIGCHLD test (https://github.com/rrnewton/hermit/issues/4346): 348, listed.
+    ("test.cli_on_host", 348),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux

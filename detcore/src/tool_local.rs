@@ -2726,16 +2726,6 @@ pub struct ThreadState<T> {
     #[serde(default)]
     pub chaos_slowdown_active: bool,
 
-    /// The absolute deadline of a relative `nanosleep` that ended for a
-    /// `SIGCHLD` it claimed (`SleepSignal::Claimed`) and returned
-    /// `ERESTARTNOHAND`. If no handler runs for that signal, the kernel restarts
-    /// the call with its original arguments, and the restarted call sleeps until
-    /// this deadline instead of for the whole interval again. Delivering a
-    /// signal to the thread clears it: a handler ran, the call returned EINTR,
-    /// and the next `nanosleep` is a new call.
-    #[serde(default)]
-    pub(crate) nanosleep_restart: Option<crate::types::LogicalTime>,
-
     /// This thread claimed a `SIGCHLD` for a sleep (`SleepSignal::Claimed`),
     /// and the claimed copy's delivery stop has not come yet. That stop places
     /// the delivery (`ChildExitSigchldControl::ClaimedDelivery`) just before
@@ -3234,7 +3224,6 @@ impl<T> ThreadState<T> {
             // TODO-HUMAN-REVIEW(PR-1151)
             chaos_slowdown_factor: RcbTimeMultiplier::ONE,
             chaos_slowdown_active: false,
-            nanosleep_restart: None,
             claimed_sigchld: false,
             pending_chaos_epochs: Vec::new(),
             max_timeslice_end: None,

@@ -93,6 +93,19 @@
  *                  100 ms in and pauses or sleeps 5 s. Nothing else can take
  *                  the SIGCHLD, so the main thread's handler does and its sleep
  *                  ends with EINTR (https://github.com/rrnewton/hermit/issues/4229).
+ *                  For HERMIT_TEST_SIGCHLD_CLAIM_FAULT
+ *                  (https://github.com/rrnewton/hermit/issues/4346): with
+ *                  "usr1ign", SIGUSR1 is SIG_IGN; with "usr1mask", it is
+ *                  caught by a handler whose mask holds SIGCHLD and which makes
+ *                  a system call; with "usr1sleep", that handler's first call
+ *                  is a 10 ms nanosleep, and the line says whether the call
+ *                  returned within 1 s; with "quietchld", the SIGCHLD handler
+ *                  makes no system call; with "usr1block", the main thread
+ *                  blocks SIGUSR1; with "again", the same frame sleeps
+ *                  10 ms more right after the sleep returns, and the line says
+ *                  whether that call returned 0 and both ended within 1 s; with "zeroreq", another thread zeroes
+ *                  the nanosleep's request 50 ms in, and the line says whether
+ *                  the sleep lasted its full 5 s of CLOCK_MONOTONIC.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -642,9 +655,59 @@ static void* usr2_sibling(void* arg) {
   return NULL;
 }
 
-static int sfdheld(const char* mode, int restart, int yielding) {
+/* The nanosleep request of sfdheld, which "zeroreq" changes while it sleeps. */
+static struct timespec sfdheld_request = {5, 0};
+
+static void on_usr1_making_a_call(int sig) {
+  (void)sig;
+  syscall(SYS_getpid);
+  got_usr1++;
+}
+
+static void on_usr1_sleeping(int sig) {
+  (void)sig;
+  struct timespec ten_ms = {0, 10000000};
+  nanosleep(&ten_ms, NULL);
+  got_usr1++;
+}
+
+static void on_chld_quietly(int sig) {
+  (void)sig;
+  handled++;
+  atomic_fetch_add(&chld_handled, 1);
+}
+
+static void* request_zeroer(void* arg) {
+  (void)arg;
+  msleep(50);
+  sfdheld_request.tv_sec = 0;
+  sfdheld_request.tv_nsec = 0;
+  return NULL;
+}
+
+static int sfdheld(const char* mode, int restart, int yielding, int usr1, int zeroreq, int quietchld,
+                   int again) {
   int pausing = !strcmp(mode, "sfdheld-pause");
   catch_chld();
+  if (quietchld) {
+    signal(SIGCHLD, on_chld_quietly);
+  }
+  if (usr1 == 4) {
+    sigset_t usr1_set;
+    sigemptyset(&usr1_set);
+    sigaddset(&usr1_set, SIGUSR1);
+    pthread_sigmask(SIG_BLOCK, &usr1_set, NULL);
+  }
+  if (usr1 == 1) {
+    signal(SIGUSR1, SIG_IGN);
+  } else if (usr1 == 2 || usr1 == 3) {
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = usr1 == 2 ? on_usr1_making_a_call : on_usr1_sleeping;
+    sigemptyset(&action.sa_mask);
+    sigaddset(&action.sa_mask, SIGCHLD);
+    sigaction(SIGUSR1, &action, NULL);
+  }
   if (restart) {
     struct sigaction action;
     memset(&action, 0, sizeof(action));
@@ -678,16 +741,40 @@ static int sfdheld(const char* mode, int restart, int yielding) {
       syscall(SYS_sched_yield);
     }
   }
+  pthread_t zeroer;
+  if (zeroreq) {
+    pthread_create(&zeroer, NULL, request_zeroer, NULL);
+  }
+  /* Timed only where the line reports the time, so that every other mode reads
+   * `handled` with no system call after the sleep returned. */
+  int timed = zeroreq || usr1 == 3 || again;
+  struct timespec start = {0, 0}, end = {0, 0};
+  if (timed) {
+    clock_gettime(CLOCK_MONOTONIC, &start);
+  }
   pid_t child = spawn(100, 0);
   int ret;
   if (pausing) {
     ret = pause();
   } else {
-    struct timespec request = {5, 0};
-    ret = nanosleep(&request, NULL);
+    ret = nanosleep(&sfdheld_request, NULL);
   }
   int error = errno;
-  int in_main = handled;
+  int in_main = handled, usr1_handled = got_usr1, again_ok = 1;
+  if (again) {
+    /* A new call from this frame, through the same wrapper: it sleeps its own
+     * 10 ms, not until the interrupted call's deadline. */
+    sfdheld_request.tv_sec = 0;
+    sfdheld_request.tv_nsec = 10000000;
+    again_ok = nanosleep(&sfdheld_request, NULL) == 0;
+  }
+  if (timed) {
+    clock_gettime(CLOCK_MONOTONIC, &end);
+  }
+  long slept_ms = (end.tv_sec - start.tv_sec) * 1000 + (end.tv_nsec - start.tv_nsec) / 1000000;
+  if (zeroreq) {
+    pthread_join(zeroer, NULL);
+  }
   pthread_kill(thread, SIGUSR2);
   pthread_join(thread, NULL);
   if (yielding) {
@@ -695,11 +782,30 @@ static int sfdheld(const char* mode, int restart, int yielding) {
   }
   waitpid(child, NULL, 0);
   close(held);
-  printf("%s%s%s: %s %s, main handler %d", mode, restart ? " restart" : "", yielding ? " yield" : "",
-         pausing ? "pause" : "nanosleep", ret == 0 ? "0" : error == EINTR ? "EINTR" : strerror(error),
-         in_main);
+  printf("%s%s%s%s%s%s%s: %s %s, main handler %d", mode, restart ? " restart" : "",
+         yielding ? " yield" : "",
+         usr1 == 1   ? " usr1ign"
+         : usr1 == 2 ? " usr1mask"
+         : usr1 == 3 ? " usr1sleep"
+         : usr1 == 4 ? " usr1block"
+                     : "",
+         zeroreq ? " zeroreq" : "", quietchld ? " quietchld" : "", again ? " again" : "",
+         pausing ? "pause" : "nanosleep",
+         ret == 0 ? "0" : error == EINTR ? "EINTR" : strerror(error), in_main);
   if (yielding) {
     printf(", yielder gave up %d", atomic_load(&yielder_gave_up));
+  }
+  if (usr1 == 2 || usr1 == 3) {
+    printf(", usr1 handler %d", usr1_handled);
+  }
+  if (usr1 == 3) {
+    printf(", returned within 1 s %d", slept_ms < 1000);
+  }
+  if (zeroreq) {
+    printf(", slept the full 5 s %d", slept_ms >= 5000);
+  }
+  if (again) {
+    printf(", both within 1 s %d", again_ok && slept_ms < 1000);
   }
   printf("\n");
   return 0;
@@ -763,12 +869,24 @@ int main(int argc, char** argv) {
     return efwide(mode);
   }
   if (!strncmp(mode, "sfdheld-", 8)) {
-    int restart = 0, yielding = 0;
+    int restart = 0, yielding = 0, usr1 = 0, zeroreq = 0, quietchld = 0, again = 0;
     for (int i = 2; i < argc; i++) {
       restart |= !strcmp(argv[i], "restart");
       yielding |= !strcmp(argv[i], "yield");
+      if (!strcmp(argv[i], "usr1ign")) {
+        usr1 = 1;
+      } else if (!strcmp(argv[i], "usr1mask")) {
+        usr1 = 2;
+      } else if (!strcmp(argv[i], "usr1sleep")) {
+        usr1 = 3;
+      } else if (!strcmp(argv[i], "usr1block")) {
+        usr1 = 4;
+      }
+      zeroreq |= !strcmp(argv[i], "zeroreq");
+      quietchld |= !strcmp(argv[i], "quietchld");
+      again |= !strcmp(argv[i], "again");
     }
-    return sfdheld(mode, restart, yielding);
+    return sfdheld(mode, restart, yielding, usr1, zeroreq, quietchld, again);
   }
   if (!strncmp(mode, "sfdsib-", 7)) {
     int late = 0, rt = 0, poll = 0;

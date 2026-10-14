@@ -781,13 +781,42 @@ impl<T: RecordOrReplay> Detcore<T> {
             info!("[interrupted] nanosleep rem argument is null, not writing it.")
         }
         if claimed {
-            // A claimed `SIGCHLD` is held for delivery as the thread resumes:
-            // `EINTR` if a handler runs, else a restart that keeps this
-            // deadline (`SleepSignal::Claimed`).
-            guest.thread_state_mut().nanosleep_restart = Some(target_time);
-            return Err(reverie::Error::Errno(Errno::ERESTARTNOHAND));
+            // A claimed `SIGCHLD` is held for delivery as the thread resumes
+            // (`SleepSignal::Claimed`): `EINTR` if a handler runs, else the
+            // kernel's restart. As Linux's own `nanosleep`, a relative sleep
+            // returns `ERESTART_RESTARTBLOCK` and keeps its deadline for the
+            // `restart_syscall` the kernel runs only when no handler ran
+            // (`helpers::RestartBlock`, `resume_nanosleep`), so a new call,
+            // from a handler or a retry, cannot take it. An absolute one
+            // returns `ERESTARTNOHAND`: re-executed, it reads the same target.
+            if call.flags() & libc::TIMER_ABSTIME != 0 {
+                return Err(reverie::Error::Errno(Errno::ERESTARTNOHAND));
+            }
+            let result = Err(reverie::Error::Errno(Errno::ERESTART_RESTARTBLOCK));
+            crate::syscalls::helpers::keep_restart_block(
+                guest,
+                &result,
+                crate::syscalls::helpers::RestartCall::Nanosleep(call),
+                Some(target_time),
+            )
+            .await;
+            return result;
         }
         Err(reverie::Error::Errno(Errno::EINTR))
+    }
+
+    /// The kernel's `restart_syscall` of a relative `nanosleep` that ended for
+    /// a claimed `SIGCHLD` no handler ran for (`helpers::RestartCall::Nanosleep`).
+    /// Like Linux's restart block, it keeps the deadline it already has and
+    /// does not read the request again, which another thread may have changed.
+    pub(crate) async fn resume_nanosleep<R: Guest<Self>>(
+        &self,
+        guest: &mut R,
+        call: NanosleepFamily,
+        deadline: LogicalTime,
+    ) -> Result<i64, Error> {
+        let request = Self::sleep_request_abs(guest, deadline).await;
+        self.wait_and_return(guest, request, call).await
     }
 
     /// clock_nanosleep and nanosleep
@@ -799,19 +828,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         if call.flags() > libc::TIMER_ABSTIME {
             trace!("Unhandled clock_nanosleep flags, letting syscall through...");
             return Ok(guest.inject(Syscall::from(call)).await?);
-        }
-
-        // The kernel's restart of a relative call that ended for a claimed
-        // `SIGCHLD` no handler ran for (`ThreadState::nanosleep_restart`). Like
-        // Linux's restart block, it keeps the deadline it already has and does
-        // not read the request again, which another thread may have changed.
-        let restart = guest.thread_state_mut().nanosleep_restart.take();
-        if let Some(deadline) = restart
-            && call.flags() == 0
-            && self.cfg.sequentialize_threads
-        {
-            let request = Self::sleep_request_abs(guest, deadline).await;
-            return self.wait_and_return(guest, request, call).await;
         }
 
         let addr = call.req().ok_or(Errno::EFAULT)?;

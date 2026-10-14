@@ -1857,6 +1857,9 @@ pub(crate) struct RestartBlock {
 pub(crate) enum RestartCall {
     Poll(syscalls::Poll),
     Futex(syscalls::Futex),
+    /// A relative `nanosleep` or `clock_nanosleep` that ended for a claimed
+    /// `SIGCHLD` (`syscalls::signal::SleepSignal::Claimed`).
+    Nanosleep(reverie::syscalls::family::NanosleepFamily),
 }
 
 impl RestartBlock {
@@ -1903,6 +1906,12 @@ pub(crate) async fn keep_restart_block<T, G>(
 /// leaves no restart. The difference is a stop, which `SIGSTOP` alone can be here:
 /// a default job-control stop does not end a wait whose restart keeps its deadline
 /// (`KernelSignalState::interrupting_wait`).
+///
+/// A claimed relative `nanosleep` makes the opposite choice on purpose
+/// (`syscalls::time`, `RestartCall::Nanosleep`): it returns
+/// `ERESTART_RESTARTBLOCK`, so the held `SIGCHLD` is passed on unreported, and
+/// the kernel's `restart_syscall` alone says no handler ran
+/// (https://github.com/rrnewton/hermit/issues/4346).
 fn held_signal_restart_errno(restart_errno: Errno, signal: i32) -> Errno {
     if restart_errno == Errno::ERESTART_RESTARTBLOCK && signal != libc::SIGSTOP {
         Errno::ERESTARTNOHAND

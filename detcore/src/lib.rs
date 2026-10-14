@@ -727,6 +727,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 )
                 .await
             }
+            syscalls::helpers::RestartCall::Nanosleep(call) => {
+                let deadline = block
+                    .deadline
+                    .expect("a claimed nanosleep keeps its absolute deadline");
+                self.resume_nanosleep(guest, call, deadline).await
+            }
         }
     }
 
@@ -940,6 +946,20 @@ impl<T: RecordOrReplay> Detcore<T> {
                 self.keep_timer_across_dropped_signal(guest);
                 return Ok(None);
             }
+            // The test-only claim fault drops the claimed copy here, as the
+            // ledger drops a duplicate above (`syscalls::signal::take_claim_fault`).
+            if signal.signal() == Some(Signal::SIGCHLD)
+                && guest.thread_state().claimed_sigchld
+                && crate::syscalls::take_claim_fault(crate::syscalls::ClaimFault::DropClaimed)
+            {
+                warn!(
+                    "[dtid {}] claim fault hook: dropped the claimed SIGCHLD",
+                    guest.thread_state().dettid
+                );
+                guest.thread_state_mut().claimed_sigchld = false;
+                self.keep_timer_across_dropped_signal(guest);
+                return Ok(None);
+            }
             // The kernel dequeued `signal` before this stop: a hold for it ends
             // here, and this stop's hooks may end the slice
             // (`own_signal_turn_hold`).
@@ -1020,17 +1040,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                 dettid, mycount, signal
             );
             self.record_handler_restore_mask(guest, signal).await;
-            // A handler runs for a caught signal, so the call it ended returns
-            // EINTR rather than restarting; an ignored one restarts it, which
-            // keeps the deadline (`ThreadState::nanosleep_restart`).
-            if guest.thread_state().nanosleep_restart.is_some()
-                && crate::syscalls::read_thread_signal_state(guest.pid(), guest.tid())
-                    .map_or(true, |state| {
-                        state.caught & (1u64 << (signal.raw() - 1)) != 0
-                    })
-            {
-                guest.thread_state_mut().nanosleep_restart = None;
-            }
 
             self.post_handler_hook(guest, CheckIn::Event).await;
             Ok(Some(signal))
@@ -2264,6 +2273,18 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         rpc: &R,
         unreported: reverie::UnreportedSignal,
     ) -> bool {
+        // The test-only claim fault drops the claimed copy here too, where a
+        // relative `nanosleep`'s restart code makes the backend pass it on
+        // unreported (`syscalls::signal::take_claim_fault`).
+        if unreported.signal() == Signal::SIGCHLD
+            && crate::syscalls::take_claim_fault(crate::syscalls::ClaimFault::DropClaimed)
+        {
+            warn!(
+                "[tid {}] claim fault hook: dropped the claimed SIGCHLD",
+                unreported.tid()
+            );
+            return false;
+        }
         if unreported.signal() != Signal::SIGCHLD
             || !self.cfg.backend.reports_child_exit_publication
         {
@@ -2497,7 +2518,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     chaos_epoch: tool_local::chaos_epoch_sentinel(),
                     chaos_slowdown_factor: RcbTimeMultiplier::ONE,
                     chaos_slowdown_active: false,
-                    nanosleep_restart: None,
                     claimed_sigchld: false,
                     pending_chaos_epochs: Vec::new(),
                     max_timeslice_end: None,

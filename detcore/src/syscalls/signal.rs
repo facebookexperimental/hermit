@@ -326,6 +326,79 @@ where
     }
 }
 
+/// Test-only fault hook, like `HERMIT_TEST_TIMERFD_FAULT`, acting once per run
+/// at the first claim of a `SIGCHLD` (`claim_pending_sigchld`), for the orders
+/// of https://github.com/rrnewton/hermit/issues/4346 that host timing alone
+/// gives too rarely to test:
+/// - `usr1-before-claim`: just before the claim, Detcore sends the claiming
+///   thread SIGUSR1 from its own process (an injected send would itself
+///   dequeue the pending SIGCHLD), so the thread's own queue holds a lower
+///   signal and the claim takes SIGUSR1 instead;
+/// - `usr1-after-claim`: just after the claim, Detcore sends the claiming
+///   thread SIGUSR1, which a guest that blocks it leaves pending, so the
+///   backend passes the claimed SIGCHLD on unreported;
+/// - `drop-claimed`: the claimed copy is dropped, as the ledger drops a
+///   duplicate (`Detcore::child_exit_sigchld_delivers`), at its delivery stop
+///   or where the backend passes it on unreported
+///   (`Tool::filter_unreported_signal`), so no handler runs and the sleep
+///   restarts: a relative `nanosleep` through the kernel's `restart_syscall`
+///   (`helpers::RestartCall::Nanosleep`).
+///
+/// Unset, nothing changes.
+const CLAIM_FAULT_ENV: &str = "HERMIT_TEST_SIGCHLD_CLAIM_FAULT";
+
+/// Whether the claim fault hook has fired in this process. It fires once.
+static CLAIM_FAULT_FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A fault `HERMIT_TEST_SIGCHLD_CLAIM_FAULT` asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClaimFault {
+    Usr1BeforeClaim,
+    Usr1AfterClaim,
+    DropClaimed,
+}
+
+/// Whether the hook asks for `fault` now: at most once per process.
+pub(crate) fn take_claim_fault(fault: ClaimFault) -> bool {
+    let asked = match std::env::var(CLAIM_FAULT_ENV).as_deref() {
+        Ok("usr1-before-claim") => ClaimFault::Usr1BeforeClaim,
+        Ok("usr1-after-claim") => ClaimFault::Usr1AfterClaim,
+        Ok("drop-claimed") => ClaimFault::DropClaimed,
+        _ => return false,
+    };
+    asked == fault && !CLAIM_FAULT_FIRED.swap(true, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// For `usr1-before-claim` or `usr1-after-claim` (`fault`,
+/// `take_claim_fault`): send the claiming thread SIGUSR1 from Detcore's
+/// process, which shares the guest's pid namespace.
+fn send_claim_fault_signal<G, T>(guest: &G, fault: ClaimFault)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if take_claim_fault(fault) {
+        // SAFETY: tgkill only sends a signal.
+        let sent = unsafe {
+            libc::syscall(
+                libc::SYS_tgkill,
+                guest.pid().as_raw(),
+                guest.tid().as_raw(),
+                libc::SIGUSR1,
+            )
+        };
+        if sent == 0 {
+            tracing::warn!("claim fault hook: sent SIGUSR1 {:?}", fault);
+        } else {
+            tracing::error!(
+                "claim fault hook: could not send SIGUSR1 {:?}: {}",
+                fault,
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
 /// Whether `errno` is a restart errno, which an injection returns when a signal
 /// stop ended it before it ran (`claim_pending_sigchld`).
 fn is_restart_errno(errno: Errno) -> bool {
@@ -2826,10 +2899,13 @@ pub(crate) enum SleepSignal {
     /// The scheduler's `SIGCHLD`, in a process whose send window is unusable,
     /// that this thread claimed (`claim_pending_sigchld`): it is held for
     /// delivery to this thread as it resumes, so a signal is always pending
-    /// then. Both calls return `ERESTARTNOHAND`: `EINTR` when a handler runs,
-    /// whatever its `SA_RESTART`, and a restart when none does (the child-exit
-    /// ledger drops a duplicate copy). A `nanosleep` keeps its deadline for that
-    /// restart (`ThreadState::nanosleep_restart`).
+    /// then. Each call returns its restart code, as Linux's does: `EINTR` when
+    /// a handler runs, whatever its `SA_RESTART`, and a restart when none does
+    /// (the child-exit ledger drops a duplicate copy). `pause` and an absolute
+    /// `clock_nanosleep` return `ERESTARTNOHAND`, and the kernel re-executes
+    /// them. A relative `nanosleep` returns `ERESTART_RESTARTBLOCK` and keeps
+    /// its deadline for the kernel's `restart_syscall`, which only a restart
+    /// makes (`helpers::RestartCall::Nanosleep`).
     Claimed,
 }
 
@@ -2981,7 +3057,14 @@ where
                 crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer::Placed(true)
             )
             && state.next_dequeued(state.blocked).map(|(signal, _)| signal) == Some(libc::SIGCHLD)
-            && claim_pending_sigchld(guest).await?
+            && {
+                send_claim_fault_signal(guest, ClaimFault::Usr1BeforeClaim);
+                let claimed = claim_pending_sigchld(guest).await?;
+                if claimed {
+                    send_claim_fault_signal(guest, ClaimFault::Usr1AfterClaim);
+                }
+                claimed
+            }
         {
             // Its delivery stop places it, so it is not deferred behind a
             // runnable sibling (`ThreadState::claimed_sigchld`).

@@ -27961,6 +27961,121 @@ fn a_childs_sigchld_ends_a_sleep_only_when_caught_and_unblocked() {
     }
 }
 
+/// The orders of https://github.com/rrnewton/hermit/issues/4346 that host
+/// timing alone gives too rarely to test, forced by the test-only fault hook
+/// `HERMIT_TEST_SIGCHLD_CLAIM_FAULT`, in the `sfdheld` setup, where a woken
+/// sleep claims the scheduler's SIGCHLD in its own turn. A claimed relative
+/// `nanosleep` returns `ERESTART_RESTARTBLOCK`, as Linux's does, and keeps its
+/// deadline only for the kernel's `restart_syscall`, which the kernel makes
+/// only when no handler ran.
+/// - `usr1-before-claim`: SIGUSR1 reaches the sleeper's own queue just before
+///   the claim, so the claim takes it first, ahead of SIGCHLD.
+///   - Ignored, Linux's signal loop skips it and delivers SIGCHLD in the same
+///     return.
+///   - Caught by a handler whose mask holds SIGCHLD and which makes a system
+///     call, SIGCHLD is delivered after that handler returns. The claim stays
+///     open across the handler's call, and the delivery is placed. Cleared at
+///     that call, the delivery was deferred behind the yielding sibling, which
+///     waits for its handler: both rows hung (measured).
+///   - Caught by such a handler whose first call is a 10 ms `nanosleep`, that
+///     sleep lasts 10 ms. With the deadline kept for any re-entered
+///     `nanosleep`, the handler's sleep ran until the interrupted call's 5 s
+///     deadline (measured, the Claude review of the change for 4346).
+///   - Both handlers making no call, then a new 10 ms `nanosleep` from the
+///     same frame, which re-enters at the same instruction and stack pointer:
+///     that call sleeps 10 ms, since it is not a `restart_syscall`.
+///
+///   Either way the sleep ends with EINTR and the handler on main.
+/// - `usr1-after-claim`: SIGUSR1, which the sleeper blocks, becomes pending just
+///   after the claim takes SIGCHLD, and the backend passes the claimed SIGCHLD
+///   on unreported. Its handler makes no call, and a new 10 ms `nanosleep`
+///   from the same frame follows: that call sleeps 10 ms.
+/// - `drop-claimed`: the claimed copy is dropped, as the ledger drops a
+///   duplicate, so no handler runs and the kernel restarts the `nanosleep`
+///   with `restart_syscall`. The restart keeps its original deadline and does
+///   not read the request again: another thread zeroed it 50 ms in, and the
+///   sleep still lasts its full 5 s. Reading it again, the restart returned at
+///   once (measured).
+#[test]
+fn a_claimed_sigchld_survives_another_signal_and_a_dropped_copy() {
+    let guest = sigchld_bookkeeping_guest().to_str().unwrap().to_owned();
+    // What the hook logs once it has forced its order: the send succeeded, or
+    // the claimed copy was dropped.
+    let forced = |fault: &str| match fault {
+        "usr1-before-claim" => "claim fault hook: sent SIGUSR1 Usr1BeforeClaim",
+        "usr1-after-claim" => "claim fault hook: sent SIGUSR1 Usr1AfterClaim",
+        "drop-claimed" => "claim fault hook: dropped the claimed SIGCHLD",
+        _ => unreachable!("unknown claim fault {fault}"),
+    };
+    for (fault, args, expected) in [
+        (
+            "usr1-before-claim",
+            &["sfdheld-nano", "yield", "usr1ign"][..],
+            "sfdheld-nano yield usr1ign: nanosleep EINTR, main handler 1, yielder gave up 0\n",
+        ),
+        (
+            "usr1-before-claim",
+            &["sfdheld-pause", "yield", "usr1ign"],
+            "sfdheld-pause yield usr1ign: pause EINTR, main handler 1, yielder gave up 0\n",
+        ),
+        (
+            "usr1-before-claim",
+            &["sfdheld-nano", "yield", "usr1mask"],
+            "sfdheld-nano yield usr1mask: nanosleep EINTR, main handler 1, yielder gave up 0, usr1 handler 1\n",
+        ),
+        (
+            "usr1-before-claim",
+            &["sfdheld-pause", "yield", "usr1mask"],
+            "sfdheld-pause yield usr1mask: pause EINTR, main handler 1, yielder gave up 0, usr1 handler 1\n",
+        ),
+        (
+            "usr1-before-claim",
+            &["sfdheld-nano", "yield", "usr1sleep"],
+            "sfdheld-nano yield usr1sleep: nanosleep EINTR, main handler 1, yielder gave up 0, usr1 handler 1, returned within 1 s 1\n",
+        ),
+        (
+            "usr1-before-claim",
+            &["sfdheld-pause", "yield", "usr1sleep"],
+            "sfdheld-pause yield usr1sleep: pause EINTR, main handler 1, yielder gave up 0, usr1 handler 1, returned within 1 s 1\n",
+        ),
+        (
+            "usr1-before-claim",
+            &["sfdheld-nano", "yield", "usr1mask", "quietchld", "again"],
+            "sfdheld-nano yield usr1mask quietchld again: nanosleep EINTR, main handler 1, yielder gave up 0, usr1 handler 1, both within 1 s 1\n",
+        ),
+        (
+            "usr1-after-claim",
+            &["sfdheld-nano", "quietchld", "usr1block", "again"],
+            "sfdheld-nano usr1block quietchld again: nanosleep EINTR, main handler 1, both within 1 s 1\n",
+        ),
+        (
+            "drop-claimed",
+            &["sfdheld-nano", "zeroreq"],
+            "sfdheld-nano zeroreq: nanosleep 0, main handler 0, slept the full 5 s 1\n",
+        ),
+    ] {
+        let mut argv = vec!["run", "--strict", "--timeout", "60", "--", guest.as_str()];
+        argv.extend_from_slice(args);
+        let mut command = hermit_command(&argv);
+        command.env("HERMIT_TEST_SIGCHLD_CLAIM_FAULT", fault);
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let (status, log) =
+            run_with_deadline(command, directory.path(), Duration::from_secs(120), false);
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{fault} {args:?}: {status:?}\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert_eq!(stdout, expected, "{fault} {args:?}: stderr:\n{log}");
+        assert!(
+            log.contains(forced(fault)),
+            "{fault} {args:?}: the hook did not force its order:\n{log}"
+        );
+    }
+}
+
 /// Each SIGCHLD copy is accounted for as Linux does (the re-checks of
 /// https://github.com/rrnewton/hermit/pull/4131): a sibling in `sigsuspend`
 /// whose mask blocks SIGCHLD cannot take the child's copy, so the main
@@ -28048,6 +28163,16 @@ fn every_sigchld_copy_is_accounted_for_as_on_linux() {
         (
             &["sfdheld-nano", "restart"],
             "sfdheld-nano restart: nanosleep EINTR, main handler 1\n",
+        ),
+        // A handler that makes no call returns through an `rt_sigreturn` the
+        // backend does not trace, so the next call, a new 10 ms `nanosleep`
+        // from the same frame, is the interrupted call's first syscall since:
+        // it sleeps its own 10 ms, not until the interrupted call's deadline
+        // (5001 ms before the fix; the Claude and Codex reviews of the change
+        // for https://github.com/rrnewton/hermit/issues/4346).
+        (
+            &["sfdheld-nano", "quietchld", "again"],
+            "sfdheld-nano quietchld again: nanosleep EINTR, main handler 1, both within 1 s 1\n",
         ),
         // With a sibling that blocks SIGCHLD and keeps yielding until a handler
         // has run, so it is always runnable: the claimed copy's delivery is
