@@ -11,6 +11,7 @@
 pub(crate) mod child_exit_sigchld;
 #[cfg(test)]
 pub(crate) mod exec_teardown_tests;
+pub(crate) mod itimer_coalesce;
 pub(crate) mod parked;
 #[cfg(test)]
 mod parked_tests;
@@ -1487,9 +1488,12 @@ pub struct Scheduler {
     /// `SIGCHLD` (`child_exit_sigchld`).
     child_exit_sigchld: child_exit_sigchld::ChildExitSigchldLedger,
 
-    /// The guest's own signal mask for each thread Detcore currently holds
-    /// under a private blocking mask (`block_signals_for_disposition`). The
-    /// child-exit classification reads it instead of the kernel's mask.
+    /// The mask Linux's `blocked` holds for each thread whose kernel `SigBlk`
+    /// does not show it: the guest's own mask while Detcore holds the thread
+    /// under a private blocking mask (`block_signals_for_disposition`,
+    /// `KernelSignalWait::block`), or a masked wait's temporary mask
+    /// (`publish_wait_mask`). Readers of a thread's mask use it in place of
+    /// the kernel's.
     saved_guest_sigmasks: BTreeMap<DetTid, u64>,
 
     /// The real-time signals of POSIX timers that expired while every live
@@ -1531,6 +1535,25 @@ pub struct Scheduler {
     /// such a process is never kept pending (`real_time_expiration_fate`).
     /// Recorded in the thread's own turn; never cleared.
     background_call_processes: BTreeSet<DetPid>,
+
+    /// Processes whose shared-queue SIGALRM dequeues the scheduler cannot
+    /// see at a committed point (`alarm_observable`), so their periodic
+    /// `ITIMER_REAL` forwards at each pop instead of waiting for a dequeue
+    /// (<https://github.com/rrnewton/hermit/issues/4139>). Never cleared.
+    alarm_unobservable: BTreeSet<DetPid>,
+
+    /// Whether the last `send_guest_signal` landed: `Some(false)` when the
+    /// target had already exited (ESRCH). Reset by a caller that needs it.
+    guest_send_landed: Option<bool>,
+
+    /// `ITIMER_REAL` expiries that popped while their process's exec barrier
+    /// was up, with the thread and signal to send, decided when the barrier
+    /// ends (`finish_exec_alarm`).
+    alarm_exec_deferred: BTreeMap<DetPid, (DetTid, Signal)>,
+
+    /// Unit tests: treat every guest send as landed without a host syscall.
+    #[cfg(test)]
+    test_guest_sends_land: bool,
 
     /// The set each thread polling `rt_sigtimedwait` waits for: a signal in
     /// it is taken at the thread's next poll whatever its mask, so the
@@ -3445,6 +3468,11 @@ impl Scheduler {
             signalfd_masks: Default::default(),
             handler_restore_unblocked: Default::default(),
             background_call_processes: Default::default(),
+            alarm_unobservable: Default::default(),
+            guest_send_landed: None,
+            alarm_exec_deferred: Default::default(),
+            #[cfg(test)]
+            test_guest_sends_land: false,
             sigtimedwait_sets: Default::default(),
             undelivered_scheduler_signals: Default::default(),
             thread_timer_copies: Default::default(),
@@ -4114,6 +4142,7 @@ impl Scheduler {
             self.timeslices.remove(tid);
         }
         self.remove_exec_vfork_barriers(&retired);
+        self.finish_exec_alarm(process);
         retired
     }
 
@@ -5181,9 +5210,9 @@ impl Scheduler {
         self.release_vfork_child(process);
     }
 
-    /// Record (`Some`) or clear (`None`) the guest's own signal mask while
-    /// Detcore holds `dettid` under a private blocking mask. Returns false for
-    /// a thread the scheduler no longer knows.
+    /// Record (`Some`) or clear (`None`) the mask Linux's `blocked` holds for
+    /// `dettid` while its kernel `SigBlk` differs (`saved_guest_sigmasks`).
+    /// Returns false for a thread the scheduler no longer knows.
     pub(crate) fn set_saved_guest_sigmask(&mut self, dettid: DetTid, mask: Option<u64>) -> bool {
         if !self.next_turns.contains_key(&dettid) {
             return false;
@@ -6697,8 +6726,15 @@ impl Scheduler {
             .into_iter()
             .next()
             .and_then(|reader| self.read_shared_pending(reader));
+        self.guest_send_landed = None;
         if !self.fire_alarm_with(process, tid, sig, None) {
             return;
+        }
+        // Rule 4: a scheduler send of SIGALRM into the shared queue gives a
+        // copy-less Inactive ITIMER_REAL its copy, whose dequeue restarts it
+        // as on Linux (https://github.com/rrnewton/hermit/issues/4139).
+        if sig == Signal::SIGALRM && self.guest_send_landed != Some(false) {
+            self.note_guest_sigalrm(tid, itimer_coalesce::GuestSigalrmTarget::Process(process));
         }
         if pending.is_some_and(|pending| pending & bit != 0) {
             return;
@@ -7573,6 +7609,11 @@ impl Scheduler {
             "[dtid {}] deliver signal {} physically to guest thread.",
             dettid, signal
         );
+        #[cfg(test)]
+        if self.test_guest_sends_land {
+            self.guest_send_landed = Some(true);
+            return;
+        }
         // Whether a SIGCHLD is already pending in the shared queue, read before
         // the send: no guest thread holds the turn at a committed send, so
         // only a host-timed copy could change it (`fire_process_timer`).
@@ -7607,6 +7648,7 @@ impl Scheduler {
                     signal, dettid,
                 )
             });
+            self.guest_send_landed = Some(false);
             return;
         } else if let Some(process) = thread_of {
             let rc = unsafe {
@@ -7674,10 +7716,12 @@ impl Scheduler {
                      Expected race; nothing to deliver and nothing to wake.",
                     dettid, signal
                 );
+                self.guest_send_landed = Some(false);
                 return;
             }
             Err(errno) => panic!("signal::kill to go through, got {errno}"),
         }
+        self.guest_send_landed = Some(true);
         self.wake_signaled_guest(dettid, signal);
     }
 
@@ -11087,6 +11131,9 @@ impl Scheduler {
                 self.committed_time = snapshot;
             }
         }
+        // O3: every turn of an observable process has quiesced, and no pop or
+        // grant of the next pass has run yet.
+        self.reconcile_inactive_alarms(self.committed_time);
     }
 
     /// Step 4: unblock enabled actions to actually, physically run.
@@ -12285,6 +12332,10 @@ impl Scheduler {
         interval: LogicalTime,
         sig: Signal,
     ) -> (LogicalTime, LogicalTime) {
+        let was_inactive = matches!(
+            self.blocked.timed_waiters.alarm_phase(detpid),
+            Some(timed_waiters::AlarmPhase::Inactive { .. })
+        );
         let old = if duration == LogicalTime::ZERO {
             // Alarm of 0 cancels any pending signal.
             self.blocked.timed_waiters.remove_alarm(detpid)
@@ -12295,7 +12346,13 @@ impl Scheduler {
                 .insert_alarm(target_time, detpid, dettid, sig, interval)
         };
         if let Some((old_target_time, old_interval)) = old {
-            let remain_ns = old_target_time.as_nanos().saturating_sub(now.as_nanos());
+            if was_inactive {
+                // A timer waiting for the dequeue of its last expiry's copy
+                // has no time left, as Linux's `itimer_get_remtime` reports
+                // an inactive hrtimer (https://github.com/rrnewton/hermit/issues/4139).
+                return (LogicalTime::ZERO, old_interval);
+            }
+            let remain_ns = self.active_alarm_remaining_ns(old_target_time, now);
             (LogicalTime::from_nanos(remain_ns), old_interval)
         } else {
             // Return 0 if no previous alarm, as per https://man7.org/linux/man-pages/man2/alarm.2.html
@@ -12331,10 +12388,22 @@ impl Scheduler {
         self.blocked
             .timed_waiters
             .alarm_time(detpid)
-            .map(|deadline| {
-                LogicalTime::from_nanos(deadline.as_nanos().saturating_sub(now.as_nanos()))
-            })
+            .map(|deadline| LogicalTime::from_nanos(self.active_alarm_remaining_ns(deadline, now)))
             .unwrap_or(LogicalTime::ZERO)
+    }
+
+    /// The time left before an Active `ITIMER_REAL` deadline. One whose
+    /// deadline has already passed (its pop waits for a turn boundary) reads
+    /// 1 us, as Linux's `itimer_get_remtime` floors an active hrtimer, so a
+    /// running timer never reads as disarmed. Record and replay keep the
+    /// saturating 0 they recorded with (https://github.com/rrnewton/hermit/issues/4139).
+    fn active_alarm_remaining_ns(&self, deadline: LogicalTime, now: LogicalTime) -> u64 {
+        let remaining = deadline.as_nanos().saturating_sub(now.as_nanos());
+        if remaining == 0 && !self.recordreplay_modes {
+            1_000
+        } else {
+            remaining
+        }
     }
 }
 
@@ -22645,9 +22714,12 @@ mod test {
             scheduler.alarm_remaining(detpid, LogicalTime::from_nanos(1_100)),
             LogicalTime::from_nanos(150)
         );
+        // Overdue but not yet popped: an active timer reads 1 us, as Linux's
+        // `itimer_get_remtime` floors it, not 0 (which means a disarmed or
+        // inactive timer; https://github.com/rrnewton/hermit/issues/4139).
         assert_eq!(
             scheduler.alarm_remaining(detpid, LogicalTime::from_nanos(1_300)),
-            LogicalTime::ZERO
+            LogicalTime::from_nanos(1_000)
         );
 
         let cancel_time = LogicalTime::from_nanos(1_100);

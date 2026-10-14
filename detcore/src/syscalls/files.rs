@@ -3993,6 +3993,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 self.execute_nonblockable_fd_syscall(guest, call).await
             }
         };
+        // O2: a signalfd read (even one that faulted copying out a record
+        // it had already dequeued) may have taken the process's ITIMER_REAL
+        // copy (https://github.com/rrnewton/hermit/issues/4139).
+        if fd_type == FdType::Signalfd {
+            crate::tool_global::reconcile_alarm(guest).await;
+        }
         resource_release_all(guest).await;
         res
     }
@@ -5104,6 +5110,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await
         };
 
+        // O2: a signalfd read (even one that faulted copying out a record
+        // it had already dequeued) may have taken the process's ITIMER_REAL
+        // copy (https://github.com/rrnewton/hermit/issues/4139).
+        if fd_type == FdType::Signalfd {
+            crate::tool_global::reconcile_alarm(guest).await;
+        }
         resource_release_all(guest).await;
         res
     }
@@ -5289,6 +5301,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             self.record_or_replay_preserving_tool_errors(guest, call)
                 .await
         };
+        // O2: a signalfd read (even one that faulted copying out a record
+        // it had already dequeued) may have taken the process's ITIMER_REAL
+        // copy (https://github.com/rrnewton/hermit/issues/4139).
+        if detfd.ty() == FdType::Signalfd {
+            crate::tool_global::reconcile_alarm(guest).await;
+        }
         resource_release_all(guest).await;
         res
     }

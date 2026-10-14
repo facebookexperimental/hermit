@@ -303,6 +303,7 @@ pub use util::punch_out_print;
 
 use crate::resources::Permission;
 use crate::resources::ResourceID;
+use crate::scheduler::itimer_coalesce::GuestSigalrmTarget;
 use crate::syscall_classification::SyscallClassification;
 use crate::syscall_classification::classify_syscall;
 use crate::syscall_classification::is_credential_identity_noop_syscall;
@@ -409,6 +410,18 @@ enum CheckIn {
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
+    /// Rule 4 for the coalescing ITIMER_REAL: tell the scheduler about a
+    /// committed guest SIGALRM send (https://github.com/rrnewton/hermit/issues/4139).
+    async fn note_guest_sigalrm<G: Guest<Self>>(&self, guest: &mut G, target: GuestSigalrmTarget) {
+        if guest.config().sequentialize_threads {
+            crate::tool_global::note_sigalrm_event(
+                guest,
+                crate::tool_global::GlobalRequest::NoteGuestSigalrm(target),
+            )
+            .await;
+        }
+    }
+
     /// The table Detcore answers a guest's CPUID instruction from. Both the
     /// instruction (`handle_cpuid_event`) and `/proc/cpuinfo` take it from
     /// here, so a CPU profile such as
@@ -3141,14 +3154,20 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             SyscallClassification::Determinized if call.number() == Sysno::pidfd_send_signal => {
                 match call {
                     Syscall::Other(_, args) => {
-                        self.handle_pidfd_send_signal(
-                            guest,
-                            call,
-                            args.arg0 as RawFd,
-                            args.arg1 as i32,
-                            args.arg3 as u32,
-                        )
-                        .await
+                        let result = self
+                            .handle_pidfd_send_signal(
+                                guest,
+                                call,
+                                args.arg0 as RawFd,
+                                args.arg1 as i32,
+                                args.arg3 as u32,
+                            )
+                            .await;
+                        if args.arg1 as i32 == libc::SIGALRM && result.is_ok() {
+                            self.note_guest_sigalrm(guest, GuestSigalrmTarget::Unclassified)
+                                .await;
+                        }
+                        result
                     }
                     _ => unreachable!("pidfd_send_signal unexpectedly gained a typed variant"),
                 }
@@ -3827,7 +3846,30 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::RtSigpending(s) => self.handle_rt_sigpending(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#663)
-                Syscall::Kill(s) => self.handle_kill(guest, s).await,
+                Syscall::Kill(s) => {
+                    let result = self.handle_kill(guest, s).await;
+                    if s.sig() == libc::SIGALRM && result.is_ok() {
+                        let target = if guest.thread_state().nested_pid_namespace {
+                            Some(GuestSigalrmTarget::Unclassified)
+                        } else {
+                            match s.pid() {
+                                pid if pid > 0 => {
+                                    Some(GuestSigalrmTarget::Process(DetPid::from_raw(pid)))
+                                }
+                                0 => Some(GuestSigalrmTarget::Group(None)),
+                                -1 => Some(GuestSigalrmTarget::All),
+                                libc::pid_t::MIN => None,
+                                pid => {
+                                    Some(GuestSigalrmTarget::Group(Some(DetPid::from_raw(-pid))))
+                                }
+                            }
+                        };
+                        if let Some(target) = target {
+                            self.note_guest_sigalrm(guest, target).await;
+                        }
+                    }
+                    result
+                }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#663)
                 Syscall::Tgkill(s) => self.handle_tgkill(guest, s).await,
@@ -3836,7 +3878,18 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Tkill(s) => self.handle_tkill(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#812)
-                Syscall::RtSigqueueinfo(s) => self.handle_rt_sigqueueinfo(guest, s).await,
+                Syscall::RtSigqueueinfo(s) => {
+                    let result = self.handle_rt_sigqueueinfo(guest, s).await;
+                    if s.sig() == libc::SIGALRM && result.is_ok() {
+                        let target = if guest.thread_state().nested_pid_namespace {
+                            GuestSigalrmTarget::Unclassified
+                        } else {
+                            GuestSigalrmTarget::Process(DetPid::from_raw(s.tgid()))
+                        };
+                        self.note_guest_sigalrm(guest, target).await;
+                    }
+                    result
+                }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#812)
                 Syscall::RtTgsigqueueinfo(s) => self.handle_rt_tgsigqueueinfo(guest, s).await,
@@ -3862,7 +3915,23 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Getresuid(s) => self.handle_getresuid(guest, s).await,
                 Syscall::Getresgid(s) => self.handle_getresgid(guest, s).await,
                 Syscall::RtSigprocmask(s) => self.handle_rt_sigprocmask(guest, s).await,
-                Syscall::RtSigaction(s) => self.handle_rt_sigaction(guest, s).await,
+                Syscall::RtSigaction(s) => {
+                    let result = self.handle_rt_sigaction(guest, s).await;
+                    // Rule 5, decided from the installed disposition: an
+                    // old-action fault after the install still installed it
+                    // (https://github.com/rrnewton/hermit/issues/4139).
+                    if s.signum() == libc::SIGALRM
+                        && s.action().is_some()
+                        && guest.config().sequentialize_threads
+                    {
+                        crate::tool_global::note_sigalrm_event(
+                            guest,
+                            crate::tool_global::GlobalRequest::NoteSigalrmDisposition,
+                        )
+                        .await;
+                    }
+                    result
+                }
                 Syscall::Alarm(s) => self.handle_alarm(guest, s).await,
                 Syscall::Pause(s) => self.handle_pause(guest, s).await,
 

@@ -65,8 +65,42 @@ impl SignalTimerId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SignalTimerState {
+    /// The pending deadline while `Active`; the last expiry while `Inactive`.
     deadline: LogicalTime,
     interval: LogicalTime,
+    phase: AlarmPhase,
+    target: SignalTarget,
+    sig: TimerSignal,
+}
+
+/// Whether a periodic `ITIMER_REAL` waits for its next expiry or for the
+/// dequeue of the copy its last expiry sent
+/// (https://github.com/rrnewton/hermit/issues/4139).
+///
+/// Linux's `it_real_fn` returns `HRTIMER_NORESTART`: an expiry stops the
+/// timer, and only a dequeue of a SIGALRM from the process's shared queue
+/// restarts it (`posixtimer_rearm_itimer`), on the original grid. So at most
+/// one timer SIGALRM is ever outstanding, and missed periods are dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AlarmPhase {
+    /// A deadline is queued in the timed map.
+    Active,
+    /// The last expiry fired and the timer waits for a shared-queue dequeue;
+    /// no deadline is queued. `copy` records that a SIGALRM is known to be in
+    /// the process's shared queue.
+    Inactive { copy: bool },
+}
+
+/// The first point after `t` on the grid `last + k * interval` (k >= 1).
+pub(crate) fn grid_after(last: LogicalTime, interval: LogicalTime, t: LogicalTime) -> LogicalTime {
+    let interval_ns = interval.as_nanos().max(1);
+    let last_ns = last.as_nanos();
+    let k = if t.as_nanos() >= last_ns {
+        (t.as_nanos() - last_ns) / interval_ns + 1
+    } else {
+        1
+    };
+    LogicalTime::from_nanos(last_ns.saturating_add(k.saturating_mul(interval_ns)))
 }
 
 /// What a signal timer does when it expires.
@@ -175,6 +209,9 @@ impl TimedEvents {
             SignalTimerState {
                 deadline: ns,
                 interval,
+                phase: AlarmPhase::Active,
+                target,
+                sig,
             },
         );
         self.clear_old_signal_timer(id, old);
@@ -235,6 +272,9 @@ impl TimedEvents {
             .map(|deadline| SignalTimerState {
                 deadline,
                 interval: LogicalTime::ZERO,
+                phase: AlarmPhase::Active,
+                target: SignalTarget::Process(pid),
+                sig: Signal::SIGALRM.into(),
             });
         self.clear_old_signal_timer(SignalTimerId::Alarm(pid), old);
     }
@@ -256,7 +296,7 @@ impl TimedEvents {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#869)
     fn clear_old_signal_timer(&mut self, id: SignalTimerId, old: Option<SignalTimerState>) {
-        if let Some(state) = old {
+        if let Some(state) = old.filter(|state| state.phase == AlarmPhase::Active) {
             // The `map` entry may already be gone if the alarm fired (was
             // popped by `pop_if_before`) before being cleared. Clearing an
             // already-fired alarm is a no-op rather than an invariant break.
@@ -373,7 +413,94 @@ impl TimedEvents {
     pub fn alarm_time(&self, dp: DetPid) -> Option<LogicalTime> {
         self.signal_timers
             .get(&SignalTimerId::Alarm(dp))
+            .filter(|state| state.phase == AlarmPhase::Active)
             .map(|state| state.deadline)
+    }
+
+    /// The phase of `dp`'s `ITIMER_REAL`, if one is armed.
+    pub(crate) fn alarm_phase(&self, dp: DetPid) -> Option<AlarmPhase> {
+        self.signal_timers
+            .get(&SignalTimerId::Alarm(dp))
+            .map(|state| state.phase)
+    }
+
+    /// After the pop at `fired_at` of `dp`'s periodic `ITIMER_REAL` (which
+    /// `pop_if_before` re-armed at `fired_at + interval`), replace that
+    /// legacy recurrence: `Some(copy)` makes the timer `Inactive`, waiting for
+    /// a dequeue; `None` forwards it to the first grid point after `now`
+    /// (dropping missed periods). Does nothing unless the timer is still the
+    /// one that fired.
+    pub(crate) fn alarm_after_fire(
+        &mut self,
+        dp: DetPid,
+        fired_at: LogicalTime,
+        inactive_with_copy: Option<bool>,
+        now: LogicalTime,
+    ) {
+        let id = SignalTimerId::Alarm(dp);
+        let Some(state) = self.signal_timers.get(&id).copied() else {
+            return;
+        };
+        if state.phase != AlarmPhase::Active
+            || state.interval == LogicalTime::ZERO
+            || state.deadline != fired_at + state.interval
+        {
+            return;
+        }
+        self.clear_old_signal_timer(id, Some(state));
+        let entry = self.signal_timers.get_mut(&id).unwrap();
+        match inactive_with_copy {
+            Some(copy) => {
+                entry.deadline = fired_at;
+                entry.phase = AlarmPhase::Inactive { copy };
+            }
+            None => {
+                let next = grid_after(fired_at, state.interval, now);
+                entry.deadline = next;
+                self.map
+                    .entry(next)
+                    .or_default()
+                    .insert(TimedEvent::SignalEvt(id, state.target, state.sig));
+            }
+        }
+    }
+
+    /// Restart an `Inactive` `ITIMER_REAL` of `dp` at the first grid point
+    /// after `t`. Returns the new deadline, or `None` if the timer is not
+    /// `Inactive`.
+    pub(crate) fn alarm_rearm_after(&mut self, dp: DetPid, t: LogicalTime) -> Option<LogicalTime> {
+        let id = SignalTimerId::Alarm(dp);
+        let state = self.signal_timers.get_mut(&id)?;
+        let AlarmPhase::Inactive { .. } = state.phase else {
+            return None;
+        };
+        let next = grid_after(state.deadline, state.interval, t);
+        state.deadline = next;
+        state.phase = AlarmPhase::Active;
+        let evt = TimedEvent::SignalEvt(id, state.target, state.sig);
+        self.map.entry(next).or_default().insert(evt);
+        Some(next)
+    }
+
+    /// The processes whose `ITIMER_REAL` is `Inactive`, in process order.
+    pub(crate) fn inactive_alarm_processes(&self) -> Vec<DetPid> {
+        self.signal_timers
+            .iter()
+            .filter_map(|(id, state)| match (id, state.phase) {
+                (SignalTimerId::Alarm(pid), AlarmPhase::Inactive { .. }) => Some(*pid),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Record whether a SIGALRM is known to be in `dp`'s shared queue while
+    /// its `ITIMER_REAL` is `Inactive`.
+    pub(crate) fn alarm_set_copy(&mut self, dp: DetPid, copy: bool) {
+        if let Some(state) = self.signal_timers.get_mut(&SignalTimerId::Alarm(dp))
+            && let AlarmPhase::Inactive { .. } = state.phase
+        {
+            state.phase = AlarmPhase::Inactive { copy };
+        }
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -929,5 +1056,92 @@ mod test {
             ))
         );
         assert!(ev.is_empty());
+    }
+
+    /// The re-arm grid of https://github.com/rrnewton/hermit/issues/4139: the
+    /// first point after `t` on `last + k * interval`, k at least 1, so missed
+    /// periods are dropped and the phase is kept.
+    #[test]
+    fn grid_after_is_the_first_grid_point_after_t() {
+        let i = at(1_000);
+        assert_eq!(grid_after(at(5_000), i, at(5_000)), at(6_000));
+        assert_eq!(grid_after(at(5_000), i, at(5_400)), at(6_000));
+        assert_eq!(grid_after(at(5_000), i, at(11_999)), at(12_000));
+        assert_eq!(grid_after(at(5_000), i, at(12_000)), at(13_000));
+        // A t before the last expiry still gives the next grid point.
+        assert_eq!(grid_after(at(5_000), i, at(4_000)), at(6_000));
+    }
+
+    /// After a periodic alarm's pop, `alarm_after_fire` replaces the legacy
+    /// re-arm at `deadline + interval`: `Some(copy)` leaves it `Inactive` with
+    /// no queued deadline, `None` forwards it past `now` on the grid.
+    #[test]
+    fn alarm_after_fire_goes_inactive_or_forwards() {
+        let p = pid(100);
+        let mut ev = TimedEvents::default();
+        ev.insert_alarm(at(1_000), p, tid(100), Signal::SIGALRM, at(1_000));
+        assert_eq!(ev.pop_if_before(at(5_500)).map(|(t, _)| t), Some(at(1_000)));
+        ev.alarm_after_fire(p, at(1_000), Some(true), at(5_500));
+        assert_eq!(ev.alarm_phase(p), Some(AlarmPhase::Inactive { copy: true }));
+        assert_eq!(ev.alarm_time(p), None);
+        assert_eq!(ev.alarm_state(p), Some((at(1_000), at(1_000))));
+        assert!(ev.is_empty(), "an Inactive timer queues no deadline");
+        assert_eq!(ev.inactive_alarm_processes(), vec![p]);
+        assert_eq!(ev.alarm_rearm_after(p, at(5_500)), Some(at(6_000)));
+        assert_eq!(ev.alarm_phase(p), Some(AlarmPhase::Active));
+        assert_eq!(ev.next_deadline(), Some(at(6_000)));
+        assert_eq!(
+            ev.alarm_rearm_after(p, at(9_000)),
+            None,
+            "only an Inactive timer re-arms"
+        );
+
+        let mut ev = TimedEvents::default();
+        ev.insert_alarm(at(1_000), p, tid(100), Signal::SIGALRM, at(1_000));
+        ev.pop_if_before(at(5_500));
+        ev.alarm_after_fire(p, at(1_000), None, at(5_500));
+        assert_eq!(ev.alarm_phase(p), Some(AlarmPhase::Active));
+        assert_eq!(
+            ev.next_deadline(),
+            Some(at(6_000)),
+            "missed periods are dropped"
+        );
+        assert_eq!(ev.iter().count(), 1);
+    }
+
+    /// Replacing or cancelling an `Inactive` alarm, which has no queued
+    /// deadline, neither panics nor leaves a stray event.
+    #[test]
+    fn an_inactive_alarm_is_replaced_and_cancelled_cleanly() {
+        let p = pid(100);
+        let mut ev = TimedEvents::default();
+        ev.insert_alarm(at(1_000), p, tid(100), Signal::SIGALRM, at(1_000));
+        ev.pop_if_before(at(1_000));
+        ev.alarm_after_fire(p, at(1_000), Some(false), at(1_000));
+        ev.alarm_set_copy(p, true);
+        assert_eq!(ev.alarm_phase(p), Some(AlarmPhase::Inactive { copy: true }));
+        ev.insert_alarm(at(9_000), p, tid(100), Signal::SIGALRM, LogicalTime::ZERO);
+        assert_eq!(ev.alarm_phase(p), Some(AlarmPhase::Active));
+        assert_eq!(ev.iter().count(), 1);
+        ev.remove_alarm(p);
+        assert!(ev.is_empty());
+        assert_eq!(ev.alarm_phase(p), None);
+    }
+
+    /// A POSIX timer keeps the legacy recurrence; only ITIMER_REAL coalesces.
+    #[test]
+    fn a_posix_timer_keeps_its_recurrence() {
+        let p = pid(100);
+        let mut ev = TimedEvents::default();
+        ev.insert_posix_timer(
+            at(1_000),
+            p,
+            SignalTarget::Process(tid(100)),
+            7,
+            Signal::SIGUSR1.into(),
+            at(1_000),
+        );
+        ev.pop_if_before(at(5_500));
+        assert_eq!(ev.next_deadline(), Some(at(2_000)));
     }
 }

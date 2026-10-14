@@ -2173,6 +2173,39 @@ fn committed_signals(resumed: &ResumeStatus) -> KernelSigset {
     }
 }
 
+/// The waiting thread's mask as last told to the scheduler
+/// (`publish_wait_mask`). It is deliberately not `Copy`: a wait loop in an
+/// `async move` block must reborrow it, or the block would publish into a
+/// copy and the clear after the block would see nothing to clear.
+#[derive(Debug, Default)]
+pub(crate) struct PublishedWaitMask(Option<KernelSigset>);
+
+/// Tell the scheduler the waiting thread's effective mask
+/// (`KernelSignalWait::effective_mask`, or `None` once the wait is over) if it
+/// differs from `published`, the last one told. The scheduler reads it in
+/// place of the thread's `SigBlk` (`set_saved_guest_sigmask`), for example to
+/// decide whether a leader ignores an `ITIMER_REAL` expiry at generation
+/// (https://github.com/rrnewton/hermit/issues/4139). Only under signal-target
+/// modelling, the only configuration whose scheduler reads it for a wait.
+pub(crate) async fn publish_wait_mask<T, G>(
+    guest: &mut G,
+    mask: Option<KernelSigset>,
+    published: &mut PublishedWaitMask,
+) where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let models_signal_targets = guest.config().sequentialize_threads
+        && guest
+            .config()
+            .backend_supports_blocked_wait_signal_interruption;
+    if mask == published.0 || !models_signal_targets {
+        return;
+    }
+    crate::tool_global::set_saved_guest_sigmask(guest, mask).await;
+    published.0 = mask;
+}
+
 async fn retry_blocking_wait_with_kernel_signal_state<T, G, C>(
     guest: &mut G,
     call0: C,
@@ -2220,6 +2253,8 @@ where
     .with_wait_mask(wait_mask);
     // Set when a signal that only `wait_mask` lets in ends the wait.
     let mut deliver_under_wait_mask = false;
+    let mut published = PublishedWaitMask::default();
+    publish_wait_mask(guest, signals.effective_mask(), &mut published).await;
     let mut rsrc = rsrc.clone();
     rsrc.poll_deadline = poll_deadline_for(guest, maybe_timeout.map(|(deadline, _)| deadline));
     let (mut call, mut guard) = call0.into_nonblocking(guest).await;
@@ -2361,6 +2396,7 @@ where
             if let Err(error) = signals.block(guest, None).await {
                 break Err(error);
             }
+            publish_wait_mask(guest, signals.effective_mask(), &mut published).await;
             (call, guard) = call0.into_nonblocking(guest).await;
         }
         rsrc.poll_attempt += 1;
@@ -2393,7 +2429,9 @@ where
     };
 
     drop(guard);
-    let result = match result_after_restore(signals.restore(guest, None).await, result) {
+    let restored = signals.restore(guest, None).await;
+    publish_wait_mask(guest, None, &mut published).await;
+    let result = match result_after_restore(restored, result) {
         Ok(result) => result,
         Err(error) => return (Err(error), false),
     };
@@ -2906,6 +2944,14 @@ impl KernelSignalWait {
             wait_mask: mask,
             ..self
         }
+    }
+
+    /// The mask Linux's `blocked` holds for the waiting thread when the
+    /// kernel's `SigBlk` does not show it: the wait's temporary mask
+    /// (`wait_mask`), or else the guest's own mask once `block` has replaced
+    /// it (`saved_mask`). `None` while `SigBlk` is the guest's own mask.
+    pub(crate) fn effective_mask(&self) -> Option<KernelSigset> {
+        self.wait_mask.or(self.saved_mask)
     }
 
     /// Whether the backend holds a signal from a stop of one of this wait's

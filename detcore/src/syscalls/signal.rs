@@ -416,6 +416,19 @@ fn logical_time_to_alarm_seconds(value: LogicalTime) -> i64 {
     value.as_nanos().div_ceil(1_000_000_000) as i64
 }
 
+/// `alarm()`'s return as Linux computes it (`alarm_setitimer`,
+/// `kernel/time/itimer.c`): the whole seconds left, plus one when the
+/// remainder is at least half a second, or when no whole second is left but
+/// the timer is still active. So an active timer, even one with less than a
+/// microsecond left, returns at least 1
+/// (https://github.com/rrnewton/hermit/issues/4139).
+fn linux_alarm_seconds(value: LogicalTime) -> i64 {
+    let ns = value.as_nanos();
+    let (secs, rem) = (ns / 1_000_000_000, ns % 1_000_000_000);
+    let round_up = (secs == 0 && rem != 0) || rem >= 500_000_000;
+    (secs + u64::from(round_up)) as i64
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#663)
 /// A pid no task can have: above the largest `pid_max` Linux allows (2^22).
@@ -589,7 +602,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Signal::SIGALRM,
             )
             .await;
-            Ok(logical_time_to_alarm_seconds(remaining.0))
+            // Record and replay keep the rounding they recorded with.
+            Ok(if self.cfg.recordreplay_modes {
+                logical_time_to_alarm_seconds(remaining.0)
+            } else {
+                linux_alarm_seconds(remaining.0)
+            })
         } else {
             info!(
                 "[dtid {}] Running without scheduler, so letting alarm call through...",
@@ -1152,6 +1170,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         if waited.is_some() {
             set_sigtimedwait_set(guest, None).await;
+        }
+        // O2: any completion of a wait for SIGALRM may have dequeued the
+        // process's ITIMER_REAL copy, including one that then failed copying
+        // out the siginfo (https://github.com/rrnewton/hermit/issues/4139).
+        if waited.is_some_and(|set| {
+            set & crate::syscalls::threads::kernel_sigset_bit(libc::SIGALRM) != 0
+        }) {
+            crate::tool_global::reconcile_alarm(guest).await;
         }
         result
     }
@@ -3964,6 +3990,29 @@ mod tests {
                 "invalid timeval should return EINVAL"
             );
         }
+    }
+
+    #[test]
+    fn alarm_seconds_round_as_linux_does() {
+        assert_eq!(linux_alarm_seconds(LogicalTime::ZERO), 0);
+        assert_eq!(linux_alarm_seconds(LogicalTime::from_nanos(1)), 1);
+        assert_eq!(linux_alarm_seconds(LogicalTime::from_nanos(1_000)), 1);
+        assert_eq!(
+            linux_alarm_seconds(LogicalTime::from_nanos(1_000_000_000)),
+            1
+        );
+        assert_eq!(
+            linux_alarm_seconds(LogicalTime::from_nanos(1_499_999_999)),
+            1
+        );
+        assert_eq!(
+            linux_alarm_seconds(LogicalTime::from_nanos(1_500_000_000)),
+            2
+        );
+        assert_eq!(
+            linux_alarm_seconds(LogicalTime::from_nanos(2_000_000_001)),
+            2
+        );
     }
 
     #[test]

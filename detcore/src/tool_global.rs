@@ -2750,6 +2750,10 @@ impl GlobalState {
             // TODO-HUMAN-REVIEW(#869)
             GlobalRequest::RegisterAlarm(dpid, dtid, duration, interval, sig) => {
                 let now = self.global_time.lock().unwrap().as_nanos();
+                // O1: a dequeue earlier in this turn restarted the timer, so
+                // the old value reports that restart
+                // (https://github.com/rrnewton/hermit/issues/4139).
+                self.sched.lock().unwrap().reconcile_alarm(dpid, now);
                 let response = match self
                     .recv_register_alarm(
                         dpid,
@@ -2775,6 +2779,12 @@ impl GlobalState {
             GlobalRequest::AlarmRemaining(dpid) => {
                 let now = self.global_time.lock().unwrap().as_nanos();
                 let mut sched = self.lock_rpc_scheduler(false).await;
+                // O1: reconcile a dequeue earlier in this turn first, and end
+                // the caller's slice at a deadline it restarts
+                // (https://github.com/rrnewton/hermit/issues/4139).
+                if sched.reconcile_alarm(dpid, now).is_some() {
+                    sched.note_arming_hint(dtid, now);
+                }
                 match sched.itimer_snapshot(dpid, now) {
                     Ok(snapshot) => R::AlarmRemaining(snapshot),
                     Err(error) => {
@@ -2782,6 +2792,25 @@ impl GlobalState {
                         R::ThreadExited
                     }
                 }
+            }
+            // O2: a signalfd read or `rt_sigtimedwait` completion in this
+            // turn may have dequeued the process's ITIMER_REAL copy
+            // (https://github.com/rrnewton/hermit/issues/4139).
+            GlobalRequest::NoteGuestSigalrm(target) => {
+                self.sched.lock().unwrap().note_guest_sigalrm(dtid, target);
+                R::NoteGuestSigalrm
+            }
+            GlobalRequest::NoteSigalrmDisposition => {
+                self.sched.lock().unwrap().note_sigalrm_disposition(dtid);
+                R::NoteGuestSigalrm
+            }
+            GlobalRequest::ReconcileAlarm(dpid) => {
+                let now = self.global_time.lock().unwrap().as_nanos();
+                let mut sched = self.sched.lock().unwrap();
+                if sched.reconcile_alarm(dpid, now).is_some() {
+                    sched.note_arming_hint(dtid, now);
+                }
+                R::ReconcileAlarm
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#869)
@@ -4693,6 +4722,13 @@ pub enum GlobalRequest {
     // TODO-HUMAN-REVIEW(PR-841): Review logical alarm query RPC.
     /// Return the logical time remaining on a process's one-shot alarm.
     AlarmRemaining(DetPid),
+    /// Reconcile the process's `Inactive` ITIMER_REAL after a call that may
+    /// have dequeued its SIGALRM (`Scheduler::reconcile_alarm`).
+    ReconcileAlarm(DetPid),
+    /// A guest's committed SIGALRM send (rule 4, `Scheduler::note_guest_sigalrm`).
+    NoteGuestSigalrm(crate::scheduler::itimer_coalesce::GuestSigalrmTarget),
+    /// The caller changed SIGALRM's disposition (rule 5).
+    NoteSigalrmDisposition,
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
@@ -4924,6 +4960,8 @@ pub enum GlobalResponse {
     SetProcessGroup(bool),
     CreateSession(bool),
     AlarmRemaining(ItimerSnapshot),
+    ReconcileAlarm,
+    NoteGuestSigalrm,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     ResolveKillTargets(Vec<DetTid>, Option<bool>),
@@ -5384,6 +5422,8 @@ fn resumes_from_grant(request: &GlobalRequest) -> bool {
         | GlobalRequest::FutexAction(..)
         | GlobalRequest::TraceSchedEvent(..)
         | GlobalRequest::RegisterAlarm(..)
+        | GlobalRequest::AlarmRemaining(..)
+        | GlobalRequest::ReconcileAlarm(..)
         | GlobalRequest::RegisterPosixTimer(..) => true,
         _ => false,
     }
@@ -6298,6 +6338,38 @@ where
     let resp = send_and_update_time(guest, GlobalRequest::AlarmRemaining(detpid)).await;
     match resp.1 {
         GlobalResponse::AlarmRemaining(remaining) => remaining,
+        _ => unreachable!(),
+    }
+}
+
+/// Rule 4/5 notifications for the coalescing ITIMER_REAL
+/// (<https://github.com/rrnewton/hermit/issues/4139>): a committed guest
+/// SIGALRM send, or a change of SIGALRM's disposition.
+pub async fn note_sigalrm_event<G, T>(guest: &mut G, request: GlobalRequest)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let resp = send_and_update_time(guest, request).await;
+    match resp.1 {
+        GlobalResponse::NoteGuestSigalrm => {}
+        _ => unreachable!(),
+    }
+}
+
+/// O2: after a call that may have dequeued a SIGALRM from this process's
+/// shared queue (a signalfd read, an `rt_sigtimedwait` completion), let the
+/// scheduler restart an `Inactive` ITIMER_REAL at this point in the turn
+/// (<https://github.com/rrnewton/hermit/issues/4139>).
+pub async fn reconcile_alarm<G, T>(guest: &mut G)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let detpid = guest.thread_state().detpid.expect("detpid unset");
+    let resp = send_and_update_time(guest, GlobalRequest::ReconcileAlarm(detpid)).await;
+    match resp.1 {
+        GlobalResponse::ReconcileAlarm => {}
         _ => unreachable!(),
     }
 }

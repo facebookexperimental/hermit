@@ -43,6 +43,7 @@ use crate::resources::Resources;
 use crate::scheduler::runqueue::FIRST_PRIORITY;
 use crate::syscalls::helpers::KernelSignalWait;
 use crate::syscalls::helpers::NonblockableSyscall;
+use crate::syscalls::helpers::PublishedWaitMask;
 use crate::syscalls::helpers::REAL_TIME_SIGNALS;
 use crate::syscalls::helpers::RestartCall;
 use crate::syscalls::helpers::act_on_pending_real_time;
@@ -52,6 +53,7 @@ use crate::syscalls::helpers::millis_duration_to_absolute_timeout;
 use crate::syscalls::helpers::observe_under_mask;
 use crate::syscalls::helpers::pending_real_time_among;
 use crate::syscalls::helpers::poll_deadline_for;
+use crate::syscalls::helpers::publish_wait_mask;
 use crate::syscalls::helpers::record_retry_event;
 use crate::syscalls::helpers::refuse_held_signal_loss;
 use crate::syscalls::helpers::result_after_restore;
@@ -1315,6 +1317,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         // (`crate::syscalls::timerfd::publish_expired_in`).
         let timerfd_scratch = crate::syscalls::timerfd::reserve_scratch(&mut stack);
         let _guard = stack.commit()?;
+        // The scheduler reads the effective mask while the wait parks
+        // (`publish_wait_mask`).
+        let mut published = PublishedWaitMask::default();
+        if let Some(signals) = signals.as_ref() {
+            publish_wait_mask(guest, signals.effective_mask(), &mut published).await;
+        }
         let probe = call
             .with_readfds(readfds)
             .with_writefds(writefds)
@@ -1339,6 +1347,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             let guest = &mut *guest;
             let signals = &mut signals;
             let resources = &mut resources;
+            let published = &mut published;
             let deliver_under_temporary_mask = &mut deliver_under_temporary_mask;
             async move {
                 loop {
@@ -1449,6 +1458,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                         self.write_pselect6_remaining(guest, call, deadline).await?;
                         break Err(error);
                     }
+                    if let Some(signals) = signals.as_ref() {
+                        publish_wait_mask(guest, signals.effective_mask(), published).await;
+                    }
 
                     resources.poll_attempt += 1;
                     if let Some(deadline) = deadline
@@ -1471,7 +1483,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await
         };
         let result = match &mut signals {
-            Some(signals) => result_after_restore(signals.restore(guest, mask_cell).await, result)?,
+            Some(signals) => {
+                let restored = signals.restore(guest, mask_cell).await;
+                publish_wait_mask(guest, None, &mut published).await;
+                result_after_restore(restored, result)?
+            }
             None => result,
         };
         // Restoring the guest's mask cannot deliver that signal, which the mask
@@ -1675,6 +1691,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         // (`crate::syscalls::timerfd::publish_expired_in`).
         let timerfd_scratch = crate::syscalls::timerfd::reserve_scratch(&mut stack);
         let _guard = stack.commit()?;
+        // The scheduler reads the effective mask while the wait parks
+        // (`publish_wait_mask`).
+        let mut published = PublishedWaitMask::default();
+        if let Some(signals) = signals.as_ref() {
+            publish_wait_mask(guest, signals.effective_mask(), &mut published).await;
+        }
         let probe = call
             .with_readfds(readfds)
             .with_writefds(writefds)
@@ -1698,6 +1720,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             let guest = &mut *guest;
             let signals = &mut signals;
             let resources = &mut resources;
+            let published = &mut published;
             async move {
                 loop {
                     let signaled = matches!(
@@ -1793,6 +1816,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                         self.write_select_remaining(guest, call, deadline).await?;
                         break Err(error);
                     }
+                    if let Some(signals) = signals.as_ref() {
+                        publish_wait_mask(guest, signals.effective_mask(), published).await;
+                    }
 
                     resources.poll_attempt += 1;
                     if let Some(deadline) = deadline
@@ -1815,7 +1841,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await
         };
         let result = match &mut signals {
-            Some(signals) => result_after_restore(signals.restore(guest, mask_cell).await, result)?,
+            Some(signals) => {
+                let restored = signals.restore(guest, mask_cell).await;
+                publish_wait_mask(guest, None, &mut published).await;
+                result_after_restore(restored, result)?
+            }
             None => result,
         };
         refuse_held_signal_loss(guest, Sysno::select, result).await
@@ -2233,6 +2263,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         // As for pselect6: a scheduler `Signaled` answer wakes the wait, and
         // the probe and the kernel's state decide whether a signal ends it.
         rsrc.set_signal_interrupt_errno(Errno::EINTR);
+        // Between probes the kernel holds the guest's own mask, while Linux's
+        // `blocked` is the temporary one for the whole call.
+        let mut published = PublishedWaitMask::default();
+        publish_wait_mask(guest, signals.effective_mask(), &mut published).await;
         let result = loop {
             resource_request(guest, rsrc.clone()).await;
             // Virtual timerfds first (`crate::syscalls::timerfd`), in the
@@ -2274,6 +2308,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             record_retry_event(guest, probe).await;
         };
+        publish_wait_mask(guest, None, &mut published).await;
         refuse_held_signal_loss(guest, Sysno::ppoll, result).await
     }
 
