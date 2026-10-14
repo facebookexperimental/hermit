@@ -123,6 +123,15 @@ impl ReplayOpts {
             // A v3 recording replays only on a qualifying host; qualify before
             // the container, as `record start` does. The replayer compares the
             // host facts (https://github.com/rrnewton/hermit/issues/4243).
+            let policy = |refusal: hermit::cpu_profile_admission::CpuProfileRefusal| {
+                Error::new(super::container::PolicyRefusal).context(refusal.to_string())
+            };
+            hermit::cpu_profile_admission::precheck_replay(
+                metadata.cpu_profile,
+                metadata.cpu_profile_host.as_ref(),
+                metadata.cpu_table_digest.as_deref(),
+            )
+            .map_err(policy)?;
             let gdb_served = !self.autopilot;
             let request = hermit::cpu_profile_admission::record_or_replay_request(gdb_served);
             hermit::cpu_profile_admission::admit(&request).map_err(|refusal| {

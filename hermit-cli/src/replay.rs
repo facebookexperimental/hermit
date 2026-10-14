@@ -98,9 +98,11 @@ impl Replay {
         // (https://github.com/rrnewton/hermit/issues/4243).
         if !metadata.cpu_profile.is_default() {
             let refuse = |why: String| crate::cpu_profile_admission::CpuProfileRefusal(why);
-            let recorded = metadata.cpu_profile_host.clone().ok_or_else(|| {
-                refuse("the recording names the profile but carries no host facts".into())
-            })?;
+            let recorded = crate::cpu_profile_admission::precheck_replay(
+                metadata.cpu_profile,
+                metadata.cpu_profile_host.as_ref(),
+                metadata.cpu_table_digest.as_deref(),
+            )?;
             let request =
                 crate::cpu_profile_admission::record_or_replay_request(gdbserver.is_some());
             let (_probe, host) = crate::cpu_profile_admission::admit(&request).map_err(refuse)?;
@@ -113,14 +115,6 @@ impl Replay {
             }
             config.cpu_profile = metadata.cpu_profile;
             config.cpu_profile_host = Some(recorded);
-            let digest = crate::record::hex_digest(&detcore::virtual_cpuid_digest(&config));
-            if metadata.cpu_table_digest.as_deref() != Some(digest.as_str()) {
-                return Err(refuse(format!(
-                    "the recording's CPUID table digest {:?} is not this replayer's {digest}",
-                    metadata.cpu_table_digest
-                ))
-                .into());
-            }
         }
         // Recorder events contain the raw bytes from the recording namespace.
         // Reapply Detcore's sanitizer with the recording-time mount IDs, not

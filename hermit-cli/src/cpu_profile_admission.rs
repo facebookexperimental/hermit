@@ -12,6 +12,7 @@
 //! Every class the startup qualification cannot cover is refused by name; the
 //! run never falls back to v2.
 
+use detcore_model::cpu_profile::CpuProfile;
 use detcore_model::cpu_profile::HostXstate;
 
 use crate::xstate_probe;
@@ -265,16 +266,23 @@ fn xfeature_max() -> Result<u32, AdmissionRefusal> {
 
 /// The host facts a qualified v3 run binds.
 fn capture(probe: &xstate_probe::ProbeReport) -> Result<HostXstate, AdmissionRefusal> {
+    let host = host_facts(probe.cases as u32, probe.forced_exit)?;
+    if host.xcr0 != probe.xcr0 {
+        return Err(format!(
+            "XCR0 changed during admission ({:#x}, then {:#x})",
+            probe.xcr0, host.xcr0
+        ));
+    }
+    Ok(host)
+}
+
+/// This host's facts, with the qualification fields given rather than probed.
+/// The caller has checked OSXSAVE.
+fn host_facts(probe_cases: u32, probe_forced_exit: bool) -> Result<HostXstate, AdmissionRefusal> {
     let host = NativeCpuid;
     let leaf0 = host.cpuid(0, 0);
     // SAFETY: XGETBV with ECX 0 is available because OSXSAVE was checked.
     let xcr0 = unsafe { std::arch::x86_64::_xgetbv(0) };
-    if xcr0 != probe.xcr0 {
-        return Err(format!(
-            "XCR0 changed during admission ({:#x}, then {xcr0:#x})",
-            probe.xcr0
-        ));
-    }
     let mut xsave_leaves = Vec::new();
     for subleaf in std::iter::once(0).chain(2..64) {
         if subleaf == 0 || xcr0 & (1 << subleaf) != 0 {
@@ -299,9 +307,47 @@ fn capture(probe: &xstate_probe::ProbeReport) -> Result<HostXstate, AdmissionRef
         xcomp_perm: arch_prctl_mask(ARCH_GET_XCOMP_PERM)?,
         xcomp_guest_perm: arch_prctl_mask(ARCH_GET_XCOMP_GUEST_PERM)?,
         xfeature_max: xfeature_max()?,
-        probe_cases: probe.cases as u32,
-        probe_forced_exit: probe.forced_exit,
+        probe_cases,
+        probe_forced_exit,
     })
+}
+
+/// Refuses a v3 replay before the qualification probe runs when the recording
+/// carries no host facts, when this host differs in one of the facts it bound
+/// (the qualification itself aside), or when its CPUID table digest is not the
+/// one this replayer computes from them. The probe costs seconds of CPU, and a
+/// replay on a different CPU, or of an altered recording, needs none of it to
+/// be refused. Returns the recorded facts.
+pub fn precheck_replay(
+    profile: CpuProfile,
+    recorded: Option<&HostXstate>,
+    recorded_digest: Option<&str>,
+) -> Result<HostXstate, CpuProfileRefusal> {
+    let refuse = |why: String| CpuProfileRefusal(why);
+    let recorded = recorded.cloned().ok_or_else(|| {
+        refuse("the recording names the profile but carries no host facts".into())
+    })?;
+    check_host_cpuid(&NativeCpuid, &detcore::v3_feature_words()).map_err(refuse)?;
+    let host = host_facts(recorded.probe_cases, recorded.probe_forced_exit).map_err(refuse)?;
+    if let Some(fact) = first_difference(&recorded, &host) {
+        return Err(refuse(format!(
+            "this host differs from the recording's in {fact}, so the guest would see a \
+             different CPU"
+        )));
+    }
+    let config = detcore::Config {
+        cpu_profile: profile,
+        cpu_profile_host: Some(recorded.clone()),
+        ..Default::default()
+    };
+    let digest = crate::record::hex_digest(&detcore::virtual_cpuid_digest(&config));
+    if recorded_digest != Some(digest.as_str()) {
+        return Err(refuse(format!(
+            "the recording's CPUID table digest {recorded_digest:?} is not this replayer's \
+             {digest}"
+        )));
+    }
+    Ok(recorded)
 }
 
 /// This process's successful qualification. A recording or replay qualifies
