@@ -29847,6 +29847,53 @@ fn cpu_profile_v3_guest_sees_the_v3_cpu_at_bitwise_parity() {
     }
 }
 
+/// Under v3, glibc's lazy-binding trampoline saves the guest's vector state
+/// with XSAVE onto the stack at every PLT resolution, header bits included. A
+/// run with `--detlog-stack` hashes those stack bytes into the log, so two runs
+/// at bitwise parity show the XSAVE headers a host save and restore could have
+/// changed are the same (https://github.com/rrnewton/hermit/issues/4243). The
+/// guest is /bin/ls with lazy binding (LD_BIND_NOW unset) and preemption on.
+#[test]
+fn cpu_profile_v3_lazy_binding_xsave_is_identical_on_the_hashed_stack() {
+    let outcome = v3_run_or_refusal(|| {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let verdict = directory.path().join("verify.json");
+        let (status, log) = run_with_deadline(
+            hermit_command(&[
+                "--log=info",
+                "run",
+                "--strict",
+                "--verify",
+                "--verify-strict",
+                "--verify-json",
+                verdict.to_str().unwrap(),
+                "--detlog-stack",
+                "--cpu-profile",
+                "x86-64-v3",
+                "--timeout",
+                "60",
+                "--",
+                "/bin/ls",
+                "/usr",
+            ]),
+            directory.path(),
+            Duration::from_secs(300),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        let report = fs::read(&verdict).unwrap_or_default();
+        (status.and_then(|status| status.code()), stdout, log, report)
+    });
+    let Some((stdout, log, report)) = outcome else {
+        return;
+    };
+    assert!(!stdout.is_empty(), "{log}");
+    let report: serde_json::Value =
+        serde_json::from_slice(&report).expect("the verdict must be JSON");
+    assert_eq!(report["bitwise_parity"], true, "{report}");
+}
+
 /// The host glibc's own loader is the oracle the design names
 /// (https://github.com/rrnewton/hermit/issues/4243): under v3 it must select
 /// exactly x86-64-v3 (isa_1 = 0x7, so no v4 leak), list v3 and not v4 as
@@ -29954,6 +30001,101 @@ fn cpu_profile_v3_records_and_replays_the_v3_guest() {
     assert!(log.contains("Success: replay matched recording."), "{log}");
     assert!(stdout.starts_with("v3\n"), "{stdout}");
     assert!(!stdout.contains("FAIL"), "{stdout}");
+}
+
+/// Replay refuses a v3 recording whose bound host facts or table digest this
+/// host does not match, naming what differs, instead of replaying the guest
+/// against a different CPU (https://github.com/rrnewton/hermit/issues/4243).
+/// The recording is made here, so the untouched copy must replay; each
+/// tampered copy changes one bound fact.
+#[test]
+fn cpu_profile_v3_replay_refuses_a_recording_from_a_different_cpu() {
+    let guest = cpuid_profile_v3_guest().to_str().unwrap().to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let data = directory.path().join("recording");
+    let data_dir = format!("--data-dir={}", data.display());
+    let recorded = v3_run_or_refusal(|| {
+        let (status, log) = run_with_deadline(
+            hermit_command(&[
+                "record",
+                "start",
+                data_dir.as_str(),
+                "--cpu-profile",
+                "x86-64-v3",
+                "--",
+                guest.as_str(),
+            ]),
+            directory.path(),
+            Duration::from_secs(300),
+            false,
+        );
+        let stdout =
+            fs::read_to_string(directory.path().join("deadline-run.stdout")).unwrap_or_default();
+        (status.and_then(|status| status.code()), stdout, log, ())
+    });
+    if recorded.is_none() {
+        return;
+    }
+    let metadata_path = fs::read_dir(&data)
+        .expect("failed to read the recording directory")
+        .map(|entry| entry.unwrap().path().join("metadata.json"))
+        .find(|path| path.is_file())
+        .expect("no recording metadata.json");
+    let id = metadata_path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .unwrap()
+        .to_owned();
+    let original = fs::read_to_string(&metadata_path).unwrap();
+    let replay = || {
+        let (status, log) = run_with_deadline(
+            hermit_command(&["replay", data_dir.as_str(), "--autopilot", id.as_str()]),
+            directory.path(),
+            Duration::from_secs(300),
+            false,
+        );
+        (status.and_then(|status| status.code()), log)
+    };
+    let (status, log) = replay();
+    assert_eq!(
+        status,
+        Some(0),
+        "the untouched recording must replay:\n{log}"
+    );
+    let tamper = |edit: fn(&mut serde_json::Value)| {
+        let mut metadata: serde_json::Value = serde_json::from_str(&original).unwrap();
+        edit(&mut metadata);
+        fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
+    };
+    type Edit = fn(&mut serde_json::Value);
+    let cases: [(Edit, &str); 3] = [
+        (
+            |m| m["cpu_profile_host"]["xcr0"] = serde_json::json!(0x207),
+            "differs from the recording's in XCR0",
+        ),
+        (
+            |m| {
+                let signature = m["cpu_profile_host"]["signature"].as_u64().unwrap();
+                m["cpu_profile_host"]["signature"] = serde_json::json!(signature ^ 1);
+            },
+            "differs from the recording's in the CPU family, model or stepping",
+        ),
+        (
+            |m| m["cpu_table_digest"] = serde_json::json!("00".repeat(32)),
+            "CPUID table digest",
+        ),
+    ];
+    for (edit, reason) in cases {
+        tamper(edit);
+        let (status, log) = replay();
+        assert_eq!(status, Some(HERMIT_POLICY_REFUSAL_EXIT), "{reason}:\n{log}");
+        assert!(
+            log.contains("--cpu-profile x86-64-v3 refused:") && log.contains(reason),
+            "{reason} not in:\n{log}"
+        );
+    }
+    fs::write(&metadata_path, &original).unwrap();
 }
 
 /// `hermit record` refuses by name a process whose thread-group leader
