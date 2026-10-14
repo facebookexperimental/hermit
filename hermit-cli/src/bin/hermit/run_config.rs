@@ -1020,6 +1020,7 @@ mod tests {
             &["--verify", "--keep-logs", "--verify-log-dir=/tmp/vl"],
         ),
         ("verify-json", &["--verify", "--verify-json=/tmp/v.json"]),
+        ("verify-run", &["--verify-run=/tmp/vr"]),
         ("summary", &["-u"]),
         ("summary-json", &["--summary-json=/tmp/s.json"]),
         (

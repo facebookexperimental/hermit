@@ -282,7 +282,21 @@ impl DbtStatsCapture {
     }
 
     fn finish(self) -> Result<DbtBackendStatsSnapshot, Error> {
-        let bytes = match fs::read(&self.path) {
+        read_dbt_stats(&self.path)
+    }
+
+    /// The typed whole-process statistics stream this capture configures.
+    fn records(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Decode a typed whole-process statistics stream that a DBT run wrote to
+/// `path` (`DbtStatsCapture`).
+#[cfg(feature = "dbt")]
+pub(super) fn read_dbt_stats(path: &Path) -> Result<DbtBackendStatsSnapshot, Error> {
+    {
+        let bytes = match fs::read(path) {
             Ok(bytes) if !bytes.is_empty() => bytes,
             Ok(_) => {
                 return Err(Error::msg(
@@ -974,6 +988,7 @@ pub(super) fn run_dbt(
     keep_logs: bool,
     verify_log_dir: Option<&Path>,
     verify_json: Option<&Path>,
+    verify_run: Option<&Path>,
     summary: bool,
     backend_engagement_json: Option<&Path>,
     log: Option<LevelFilter>,
@@ -988,7 +1003,10 @@ pub(super) fn run_dbt(
     if let Some(path) = verify_json.filter(|_| verify) {
         write_pending_verification_json(path)?;
     }
-    if dbt_log_file_is_refused(log_file.is_some(), verify) {
+    // `--verify-run` is one of `--verify`'s two runs, set up as `--verify`
+    // sets up each.
+    let verification = verify || verify_run.is_some();
+    if dbt_log_file_is_refused(log_file.is_some(), verification) {
         return Err(Error::msg(DBT_LOG_FILE_REFUSAL));
     }
     // The DBT backend drives a single Detcore external scheduler, so it cannot
@@ -1051,7 +1069,7 @@ pub(super) fn run_dbt(
     // prints or exports them: a child's backend failure is found there. Only a
     // run that asked for them fails when they cannot be set up; any other run
     // warns, as it does when they cannot be read afterwards.
-    let single_run_stats = if verify {
+    let single_run_stats = if verification {
         None
     } else {
         match execution.stats_capture() {
@@ -1090,7 +1108,7 @@ pub(super) fn run_dbt(
 
     let _unsupported_report = DbtUnsupportedSyscallReport::new()?;
     let mut guest = StdCommand::new(program);
-    if !verify && let Some(level) = log {
+    if !verification && let Some(level) = log {
         environment.insert("HERMIT_LOG".into(), level.to_string().into());
     }
     environment.remove(OsStr::new("HERMIT_LOG_FILE"));
@@ -1099,6 +1117,20 @@ pub(super) fn run_dbt(
     guest.args(args);
     apply_dbt_workdir(&mut guest, workdir);
 
+    if let Some(directory) = verify_run {
+        return dbt_verify_run(
+            directory,
+            &execution,
+            runner,
+            &guest,
+            &drrun,
+            config,
+            dbt_evidence_log_level(log, verify_verbose),
+            verify_verbose,
+            verification_stdin,
+            options,
+        );
+    }
     if !verify {
         if stdin_is_terminal {
             let status = run_status(&execution, &runner, &guest, &drrun, config)?;
@@ -1375,26 +1407,222 @@ pub(super) fn run_dbt(
     };
     let second = dbt_verification_output(second_raw);
 
+    let outcome = conclude_dbt_verification(
+        DbtCompletedRun {
+            output: &first,
+            log: log1_path,
+            stats: first_stats,
+            initialization_records: first_evidence.initialization_records(),
+        },
+        DbtCompletedRun {
+            output: &second,
+            log: log2_path,
+            stats: second_stats,
+            initialization_records: second_evidence.initialization_records(),
+        },
+        DbtConclusion {
+            verify_json,
+            verify_verbose,
+            compare_io_buffers: config.detlog_io_buffers,
+            virtualize_time: config.virtualize_time,
+            keep_logs,
+            caller_owns_logs: false,
+        },
+    )?;
+    if !outcome.verified() {
+        return outcome.into_exit_status();
+    }
+    signal_reports.verified();
+
+    std::io::stdout().write_all(&first.stdout)?;
+    std::io::stderr().write_all(&first.stderr)?;
+    Ok(outcome.guest_status)
+}
+
+/// `run --verify-run DIR` on DBT: one of `run_dbt`'s two verification runs,
+/// run as `run_dbt` runs each, with what its comparison reads written to DIR
+/// (`verify_run`): the log materialized from the run's evidence, the guest's
+/// output and status, the typed whole-process statistics, and the count of
+/// initialization records. `hermit log-diff --verify-json` compares two such
+/// directories with [`conclude_dbt_verification`].
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "dbt")]
+fn dbt_verify_run(
+    directory: &Path,
+    execution: &DbtExecution,
+    runner: DbtRunner,
+    guest: &StdCommand,
+    drrun: &Path,
+    config: &Config,
+    evidence_level: DbtEvidenceLogLevel,
+    verify_verbose: bool,
+    verification_stdin: Option<std::fs::File>,
+    options: &super::run::RunOpts,
+) -> Result<ExitStatus, Error> {
+    use super::verify_run;
+
+    let writer = verify_run::VerifyRunWriter::create(directory)?;
+    let log_path = writer.path(verify_run::LOG);
+    let log_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&log_path)
+        .map_err(|error| {
+            Error::msg(format!(
+                "creating the verification log {}: {error}",
+                log_path.display()
+            ))
+        })?;
+    let comparison = verify_run::RecordedComparison {
+        strictness: LogCompareStrictness::Canonical,
+        diagnostic_full_trace: verify_verbose,
+        compare_io_buffers: config.detlog_io_buffers,
+        virtualize_time: config.virtualize_time,
+    };
+    let mut evidence = tempfile::tempfile()?;
+    let stats = execution.stats_capture()?;
+    let runner = stats.configure(runner);
+    let run_evidence = Some(DbtRunEvidence {
+        file: &evidence,
+        log_level: evidence_level,
+        label: "run",
+    });
+    let terminal_stdin = verification_stdin.as_ref().is_some_and(|file| {
+        // SAFETY: `as_raw_fd` borrows a live descriptor for this check.
+        (unsafe { libc::isatty(file.as_raw_fd()) }) == 1
+    });
+
+    eprintln!(":: DBT run...");
+    let raw = if terminal_stdin {
+        run_once_with_terminal_input(execution, &runner, guest, drrun, config, run_evidence)
+    } else {
+        match verification_stdin {
+            Some(input) => run_once(
+                execution,
+                &runner,
+                guest,
+                drrun,
+                config,
+                run_evidence,
+                input,
+            ),
+            None => run_once(
+                execution,
+                &runner,
+                guest,
+                drrun,
+                config,
+                run_evidence,
+                std::io::empty(),
+            ),
+        }
+    };
+    // Each step in the order `run_dbt` takes it for each of its runs, so the
+    // comparison meets a failure where `run --verify` meets it.
+    let completed = raw.and_then(|raw| {
+        let evidence = decode_dbt_evidence(&mut evidence)?;
+        materialize_dbt_evidence_log(&evidence, log_file, &log_path)?;
+        dbt_run_latches(&evidence).refuse_comparison("run")?;
+        let snapshot = read_dbt_stats(stats.records())?;
+        if terminal_stdin && snapshot.stdin_reads() != 0 {
+            return Err(Error::msg(format!(
+                "DBT verification cannot replay terminal stdin: guest attempted {} fd-0 read \
+                 syscall(s)",
+                snapshot.stdin_reads()
+            )));
+        }
+        let records = fs::read(stats.records()).map_err(|error| {
+            Error::msg(format!(
+                "reading the DBT whole-process statistics stream: {error}"
+            ))
+        })?;
+        Ok((dbt_verification_output(raw), evidence, records))
+    });
+    let (outcome, dbt, result) = match completed {
+        Ok((output, evidence, records)) => {
+            writer.write(verify_run::STDOUT, &output.stdout)?;
+            writer.write(verify_run::STDERR, &output.stderr)?;
+            writer.write(verify_run::DBT_STATS, &records)?;
+            (
+                verify_run::VerifyRunOutcome::Completed {
+                    status: verify_run::RecordedStatus::of(output.status),
+                    skid_overshoots: 0,
+                    forwarded_syscalls: None,
+                },
+                Some(verify_run::DbtRunRecord {
+                    initialization_records: evidence.initialization_records() as u64,
+                }),
+                Ok(output.status),
+            )
+        }
+        Err(error) => (super::run::verify_run_outcome_of(&error), None, Err(error)),
+    };
+    writer.commit(&options.verify_run_record(comparison, None, outcome, dbt))?;
+    result
+}
+
+/// One completed DBT verification run: what [`conclude_dbt_verification`]
+/// compares.
+#[cfg(feature = "dbt")]
+pub(super) struct DbtCompletedRun<'a> {
+    pub(super) output: &'a reverie::process::Output,
+    /// The run's comparison log (`materialize_dbt_evidence_log`).
+    pub(super) log: tempfile::TempPath,
+    pub(super) stats: DbtBackendStatsSnapshot,
+    pub(super) initialization_records: usize,
+}
+
+/// How a DBT verification is concluded once both runs completed.
+#[cfg(feature = "dbt")]
+pub(super) struct DbtConclusion<'a> {
+    pub(super) verify_json: Option<&'a Path>,
+    pub(super) verify_verbose: bool,
+    pub(super) compare_io_buffers: bool,
+    pub(super) virtualize_time: bool,
+    pub(super) keep_logs: bool,
+    /// The logs are links to the caller's (`ComparisonOptions::caller_owns_logs`).
+    pub(super) caller_owns_logs: bool,
+}
+
+/// Compare two completed DBT verification runs: the common comparison, then
+/// the counted-branch clocks and the typed native statistics, publish the
+/// report, and announce it. `run --verify` on DBT reaches it after its second
+/// run, and `hermit log-diff --verify-json` after reading two `--verify-run`
+/// directories.
+#[cfg(feature = "dbt")]
+pub(super) fn conclude_dbt_verification(
+    first: DbtCompletedRun<'_>,
+    second: DbtCompletedRun<'_>,
+    conclusion: DbtConclusion<'_>,
+) -> Result<VerificationOutcome, Error> {
+    let DbtConclusion {
+        verify_json,
+        verify_verbose,
+        compare_io_buffers,
+        virtualize_time,
+        keep_logs,
+        caller_owns_logs,
+    } = conclusion;
     let branch_clock_comparison = DbtCountedBranchComparison {
-        left: first_stats.counted_branches(),
-        right: second_stats.counted_branches(),
+        left: first.stats.counted_branches(),
+        right: second.stats.counted_branches(),
     };
     let branch_clock_diverged = !branch_clock_comparison.matched();
     let summary_comparison = DbtSummaryComparison::compare(
-        &first_stats,
-        &second_stats,
-        first_evidence.initialization_records(),
-        second_evidence.initialization_records(),
+        &first.stats,
+        &second.stats,
+        first.initialization_records,
+        second.initialization_records,
     );
     let mut outcome = compare_two_runs(
         ComparedRun {
-            output: &first,
-            log: log1_path,
+            output: first.output,
+            log: first.log,
             label: "run 1",
         },
         ComparedRun {
-            output: &second,
-            log: log2_path,
+            output: second.output,
+            log: second.log,
             label: "run 2",
         },
         ComparisonOptions {
@@ -1402,11 +1630,11 @@ pub(super) fn run_dbt(
             strictness: LogCompareStrictness::Canonical,
             compare_logs: true,
             diagnostic_full_trace: verify_verbose,
-            compare_io_buffers: config.detlog_io_buffers,
+            compare_io_buffers,
             // Read from the LIVE config, for the same reason the run path does:
             // this is a genuine runtime setting, so a hard-coded value would
             // publish a time policy the run did not use.
-            virtualize_time: config.virtualize_time,
+            virtualize_time,
             // A backend-observed divergence needs the same retained evidence
             // as a divergence found by the ordinary comparator.
             keep_logs: keep_logs
@@ -1432,6 +1660,7 @@ pub(super) fn run_dbt(
             // only `DbtEvidence::records()`, so a stream holding nothing but
             // initialization records is refused before this comparison.
             record_envelope: RecordEnvelope::all_records_v1(),
+            caller_owns_logs,
         },
     )?;
     let summary_failure = summary_comparison.apply(&mut outcome);
@@ -1447,7 +1676,7 @@ pub(super) fn run_dbt(
         eprintln!(":: {message}");
     }
     eprintln!(":: DBT path confirmed: DynamoRIO client reported tool=Detcore");
-    let success_message = if config.detlog_io_buffers {
+    let success_message = if compare_io_buffers {
         "Success: deterministic. Determinism verified."
     } else {
         "Success: deterministic. Determinism verified. NOTE: syscall \
@@ -1461,14 +1690,7 @@ pub(super) fn run_dbt(
         success_message,
         "Failure: nondeterministic.",
     );
-    if !outcome.verified() {
-        return outcome.into_exit_status();
-    }
-    signal_reports.verified();
-
-    std::io::stdout().write_all(&first.stdout)?;
-    std::io::stderr().write_all(&first.stderr)?;
-    Ok(outcome.guest_status)
+    Ok(outcome)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1483,6 +1705,7 @@ pub(super) fn run_dbt(
     _keep_logs: bool,
     _verify_log_dir: Option<&Path>,
     _verify_json: Option<&Path>,
+    _verify_run: Option<&Path>,
     _summary: bool,
     _backend_engagement_json: Option<&Path>,
     _log: Option<LevelFilter>,
@@ -2238,6 +2461,7 @@ mod tests {
                     failed_log_retention: None,
                     record_envelope: RecordEnvelope::all_records_v1(),
                     virtualize_time: true,
+                    caller_owns_logs: false,
                 },
             )
             .unwrap()
@@ -2447,49 +2671,64 @@ mod tests {
             "DBT verification must not bypass protected INFO evidence when no JSON output path \
              was requested"
         );
+        // `run_dbt` collects both runs' typed stats, then concludes through
+        // `conclude_dbt_verification` (which `log-diff --verify-json` also
+        // calls), and only then converts the terminal status.
         let first_stats = canonical
             .find("let first_stats = match stats1.finish()")
             .expect("run-1 typed stats");
         let second_stats = canonical
             .find("let second_stats = match stats2.finish()")
             .expect("run-2 typed stats");
-        let comparison = canonical
-            .find("let branch_clock_comparison = DbtCountedBranchComparison")
-            .expect("typed branch-clock comparison");
-        let summary_comparison = canonical
-            .find("let summary_comparison = DbtSummaryComparison::compare(")
-            .expect("typed summary and initialization comparison");
-        let force_branch_logs = canonical
-            .find("|| branch_clock_diverged")
-            .expect("branch divergence forces log retention");
-        let force_summary_logs = canonical
-            .find("|| summary_comparison.requires_log_retention()")
-            .expect("summary divergence forces log retention");
-        let apply_summary = canonical
-            .find("let summary_failure = summary_comparison.apply(&mut outcome)")
-            .expect("summary divergence updates the terminal outcome");
-        let finalize = canonical
-            .find("finalize_dbt_verification(outcome, branch_clock_comparison, verify_json)")
-            .expect("terminal typed finalization");
-        let announce = canonical
-            .find("if let Some(message) = branch_clock_failure")
-            .expect("branch-specific terminal announcement");
+        let conclude = canonical
+            .find("let outcome = conclude_dbt_verification(")
+            .expect("the shared DBT conclusion");
         let exit = canonical
             .find("return outcome.into_exit_status()")
             .expect("terminal nonzero conversion");
         assert!(
-            first_stats < second_stats
-                && second_stats < comparison
-                && comparison < summary_comparison
+            first_stats < second_stats && second_stats < conclude && conclude < exit,
+            "canonical verification must collect both stats and authenticated initialization \
+             counts before the shared conclusion, and convert the terminal status after it"
+        );
+        let conclusion_marker = concat!("pub(super) fn ", "conclude_dbt_verification(");
+        let conclusion = source
+            .split_once(conclusion_marker)
+            .expect("shared DBT conclusion")
+            .1
+            .split_once("\n}\n")
+            .expect("end of shared DBT conclusion")
+            .0;
+        let comparison = conclusion
+            .find("let branch_clock_comparison = DbtCountedBranchComparison")
+            .expect("typed branch-clock comparison");
+        let summary_comparison = conclusion
+            .find("let summary_comparison = DbtSummaryComparison::compare(")
+            .expect("typed summary and initialization comparison");
+        let force_branch_logs = conclusion
+            .find("|| branch_clock_diverged")
+            .expect("branch divergence forces log retention");
+        let force_summary_logs = conclusion
+            .find("|| summary_comparison.requires_log_retention()")
+            .expect("summary divergence forces log retention");
+        let apply_summary = conclusion
+            .find("let summary_failure = summary_comparison.apply(&mut outcome)")
+            .expect("summary divergence updates the terminal outcome");
+        let finalize = conclusion
+            .find("finalize_dbt_verification(outcome, branch_clock_comparison, verify_json)")
+            .expect("terminal typed finalization");
+        let announce = conclusion
+            .find("if let Some(message) = branch_clock_failure")
+            .expect("branch-specific terminal announcement");
+        assert!(
+            comparison < summary_comparison
                 && summary_comparison < force_branch_logs
                 && force_branch_logs < force_summary_logs
                 && force_summary_logs < apply_summary
                 && apply_summary < finalize
-                && finalize < announce
-                && announce < exit,
-            "canonical verification must collect both stats and authenticated initialization \
-             counts, compute both comparisons, force logs, apply summary divergence, publish \
-             through the finalizer, and only then announce or convert the terminal status"
+                && finalize < announce,
+            "the shared conclusion must compute both comparisons, force logs, apply summary \
+             divergence, publish through the finalizer, and only then announce"
         );
 
         for (stats, next) in [
@@ -2575,7 +2814,7 @@ mod tests {
              statistics can return an error"
         );
         assert!(
-            prepared2 < comparison && exit < verified,
+            prepared2 < conclude && exit < verified,
             "the signal reports must be discarded only after an unverified outcome returned"
         );
         assert!(

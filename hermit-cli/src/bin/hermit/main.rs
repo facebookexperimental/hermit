@@ -48,6 +48,7 @@ mod staged_summary;
 mod strace;
 mod tracing;
 mod verify;
+mod verify_run;
 mod version;
 use std::fs::File;
 use std::io;
@@ -584,7 +585,7 @@ impl Subcommand {
             Subcommand::Strace(x) => x.main(global),
             Subcommand::Record(x) => x.main(global),
             Subcommand::Replay(x) => x.main(global),
-            Subcommand::LogDiff(x) => Ok(x.main(global)),
+            Subcommand::LogDiff(x) => x.run(global),
             Subcommand::Analyze(x) => x.main(global),
             Subcommand::Bisect(x) => x.main(global),
             Subcommand::InstructionMap(x) => x.main(global),

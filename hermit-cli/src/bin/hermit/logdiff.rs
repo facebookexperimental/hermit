@@ -30,7 +30,9 @@ use super::global_opts::GlobalOpts;
 use super::record_envelope::RecordEnvelope;
 use super::record_envelope::RecordEnvelopeArg;
 use super::record_envelope::RecordEnvelopePolicy;
+use super::run::VerifyAllow;
 use super::verify::lock_failed_verification_logs_for_read;
+use super::verify_run;
 
 fn write_canonical_info(
     file: &Path,
@@ -184,6 +186,29 @@ pub struct LogDiffCLIOpts {
     #[clap(long, value_name = "POLLS", default_value = "3")]
     follow_settle_polls: u32,
 
+    /// Compare two `hermit run --verify-run` directories, given as the two
+    /// inputs, the way `hermit run --verify` compares its two runs, and write
+    /// that comparison's report (the report `--verify --verify-json` writes)
+    /// to FILE. The exit status is the one `hermit run --verify` would exit
+    /// with, and the guest's output is shown as it would show it. The comparison is the one both runs' flags chose; runs that chose
+    /// different ones are refused.
+    #[clap(
+        long,
+        value_name = "FILE",
+        conflicts_with_all = ["json", "canonical_info", "follow"]
+    )]
+    verify_json: Option<PathBuf>,
+
+    /// With --verify-json, the guest exit status run 1 must have, as `hermit
+    /// run --verify-allow` requires it.
+    #[clap(
+        long,
+        value_name = "success|failure|both",
+        default_value = "success",
+        requires = "verify_json"
+    )]
+    verify_allow: VerifyAllow,
+
     #[clap(flatten)]
     pub more: logdiff::LogDiffOpts,
 }
@@ -201,8 +226,28 @@ impl LogDiffCLIOpts {
             follow_interval_ms: 500,
             follow_timeout_secs: 300,
             follow_settle_polls: 3,
+            verify_json: None,
+            verify_allow: VerifyAllow::Success,
             more: Default::default(),
         }
+    }
+
+    /// Compare two `--verify-run` directories (`--verify-json`), or else print
+    /// or compare logs ([`Self::main`]).
+    pub fn run(&self, global: &GlobalOpts) -> Result<ExitStatus, hermit::Error> {
+        let Some(report) = &self.verify_json else {
+            return Ok(self.main(global));
+        };
+        let Some(file_b) = &self.file_b else {
+            return Err(hermit::Error::msg(
+                "hermit log-diff --verify-json compares two --verify-run directories",
+            ));
+        };
+        verify_run::compare(
+            [self.file_a.as_path(), file_b.as_path()],
+            Some(report),
+            self.verify_allow,
+        )
     }
 
     fn one_input_uses_only_canonical_options(&self) -> bool {

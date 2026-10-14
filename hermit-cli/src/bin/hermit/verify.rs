@@ -145,6 +145,13 @@ pub(crate) struct ComparisonOptions {
     /// This is absent when the caller explicitly requested `--keep-logs`; an
     /// explicit evidence directory remains entirely caller-owned.
     pub failed_log_retention: Option<FailedVerifyLogRetention>,
+    /// The logs belong to the caller (two `hermit run --verify-run`
+    /// directories): the comparison neither moves, deletes nor announces
+    /// them, whatever it finds, and [`Self::keep_logs`] and
+    /// [`Self::failed_log_retention`] do not apply. The caller hands the
+    /// comparison links to them, so a log the comparison drops on an early
+    /// error is only the link.
+    pub caller_owns_logs: bool,
     /// Typed, versioned record envelope applied before selecting messages.
     /// Its policy identity is serialized beside the verdict.
     pub record_envelope: RecordEnvelope,
@@ -899,29 +906,11 @@ pub(crate) fn run_verification_execution<T>(
     execute: impl FnOnce() -> Result<T, Error>,
 ) -> Result<T, Error> {
     execute().map_err(|error| {
-        let Some(super::container::ContainerChildExit(status)) =
-            error.downcast_ref::<super::container::ContainerChildExit>()
-        else {
+        let Some(disposition) = container_failure_of(&error) else {
             return error;
         };
         let Some(path) = path else { return error };
-        let disposition = match *status {
-            ExitStatus::Exited(code) => ContainerDisposition::Exited { code },
-            ExitStatus::Signaled(signal, core_dumped) => ContainerDisposition::Signaled {
-                signal: signal as i32,
-                core_dumped,
-            },
-            ExitStatus::SignaledRaw(signal, core_dumped) => ContainerDisposition::Signaled {
-                signal,
-                core_dumped,
-            },
-        };
-        let mut report = VerificationReport::no_result();
-        report.no_result_reason = Some(NoResultReason::ContainerFailed(ContainerFailure {
-            run,
-            disposition,
-        }));
-        match write_report_json(path, &report) {
+        match write_report_json(path, &container_failed_report(run, disposition)) {
             Ok(()) => error,
             Err(secondary) => {
                 retain_verification_error(error, "publishing container failure", secondary)
@@ -930,12 +919,45 @@ pub(crate) fn run_verification_execution<T>(
     })
 }
 
+/// The disposition of the container child whose unexpected exit `error`
+/// reports ([`super::container::ContainerChildExit`]), or `None` for any other
+/// error.
+pub(crate) fn container_failure_of(error: &Error) -> Option<ContainerDisposition> {
+    let super::container::ContainerChildExit(status) =
+        error.downcast_ref::<super::container::ContainerChildExit>()?;
+    Some(match *status {
+        ExitStatus::Exited(code) => ContainerDisposition::Exited { code },
+        ExitStatus::Signaled(signal, core_dumped) => ContainerDisposition::Signaled {
+            signal: signal as i32,
+            core_dumped,
+        },
+        ExitStatus::SignaledRaw(signal, core_dumped) => ContainerDisposition::Signaled {
+            signal,
+            core_dumped,
+        },
+    })
+}
+
+/// The no-result report of verification run `run`, whose container child
+/// exited with `disposition` before returning the guest's output.
+pub(crate) fn container_failed_report(
+    run: VerificationRun,
+    disposition: ContainerDisposition,
+) -> VerificationReport {
+    let mut report = VerificationReport::no_result();
+    report.no_result_reason = Some(NoResultReason::ContainerFailed(ContainerFailure {
+        run,
+        disposition,
+    }));
+    report
+}
+
 /// The typed failure, if any, of a verification run Hermit had started.
 ///
 /// A skid overshoot is not one: it already published its infrastructure
 /// error. Neither is an untyped error (a bad flag, an unreadable path), which
 /// leaves the pending stamp.
-fn run_failure_of(error: &Error) -> Option<RunFailure> {
+pub(crate) fn run_failure_of(error: &Error) -> Option<RunFailure> {
     if error.downcast_ref::<hermit::SkidOvershootError>().is_some() {
         None
     } else if error
@@ -978,7 +1000,7 @@ pub(crate) fn publish_run_failure(
     }
 }
 
-fn run_failed_report(
+pub(crate) fn run_failed_report(
     run: VerificationRun,
     failure: RunFailure,
     mut detail: String,
@@ -2002,49 +2024,55 @@ fn compare_two_runs_with_unsupported_scan(
         Ok(())
     })();
 
-    if let Err(error) = log_processing_result {
-        if options.keep_logs || failed {
+    if options.caller_owns_logs {
+        // Links to the caller's logs: dropping them leaves the logs.
+        drop((log1, log2));
+        log_processing_result?;
+    } else {
+        if let Err(error) = log_processing_result {
+            if options.keep_logs || failed {
+                if let Some(retention) = &options.failed_log_retention {
+                    eprintln!(":: Verification logs retained:");
+                    retain_failed_verification_logs([(label1, log1), (label2, log2)], retention)?;
+                } else {
+                    retain_verification_logs([(label1, log1), (label2, log2)])?;
+                }
+            }
+            return Err(error);
+        }
+
+        // Divergence historically retained both diagnostics, and it still does.
+        // `--keep-logs` extends retention to successful comparisons, but a match
+        // needs only one log: once the two logs compared equal under the selected
+        // policy, the first is kept as the golden log and the second is deleted.
+        // It is deleted only when the logs were actually compared and no result
+        // the caller already observed overrides the match; every other outcome
+        // keeps both, as the failure path always has.
+        let keep_golden_log_only = options.keep_logs
+            && !failed
+            && !options.match_overridden
+            && compared_log_messages.is_some();
+        if keep_golden_log_only {
+            retain_verification_logs([(label1, log1)])?;
+            let matched_log = log2.to_path_buf();
+            log2.close().with_context(|| {
+                format!(
+                    "could not delete {label2}'s log {}, which matched {label1}'s",
+                    matched_log.display()
+                )
+            })?;
+            // Deliberately not in the `::   <label>: <path>` shape printed for a
+            // retained log: the deleted file has no path left to report.
+            eprintln!(
+                ":: Deleted {label2}'s log: it matched {label1}'s, which is kept as the golden log"
+            );
+        } else if options.keep_logs || failed {
             if let Some(retention) = &options.failed_log_retention {
                 eprintln!(":: Verification logs retained:");
                 retain_failed_verification_logs([(label1, log1), (label2, log2)], retention)?;
             } else {
                 retain_verification_logs([(label1, log1), (label2, log2)])?;
             }
-        }
-        return Err(error);
-    }
-
-    // Divergence historically retained both diagnostics, and it still does.
-    // `--keep-logs` extends retention to successful comparisons, but a match
-    // needs only one log: once the two logs compared equal under the selected
-    // policy, the first is kept as the golden log and the second is deleted.
-    // It is deleted only when the logs were actually compared and no result
-    // the caller already observed overrides the match; every other outcome
-    // keeps both, as the failure path always has.
-    let keep_golden_log_only = options.keep_logs
-        && !failed
-        && !options.match_overridden
-        && compared_log_messages.is_some();
-    if keep_golden_log_only {
-        retain_verification_logs([(label1, log1)])?;
-        let matched_log = log2.to_path_buf();
-        log2.close().with_context(|| {
-            format!(
-                "could not delete {label2}'s log {}, which matched {label1}'s",
-                matched_log.display()
-            )
-        })?;
-        // Deliberately not in the `::   <label>: <path>` shape printed for a
-        // retained log: the deleted file has no path left to report.
-        eprintln!(
-            ":: Deleted {label2}'s log: it matched {label1}'s, which is kept as the golden log"
-        );
-    } else if options.keep_logs || failed {
-        if let Some(retention) = &options.failed_log_retention {
-            eprintln!(":: Verification logs retained:");
-            retain_failed_verification_logs([(label1, log1), (label2, log2)], retention)?;
-        } else {
-            retain_verification_logs([(label1, log1), (label2, log2)])?;
         }
     }
 
@@ -3364,6 +3392,7 @@ mod tests {
                 failed_log_retention: None,
                 record_envelope,
                 virtualize_time: true,
+                caller_owns_logs: false,
             },
         )
     }
@@ -3637,6 +3666,7 @@ mod tests {
                 failed_log_retention: None,
                 record_envelope: RecordEnvelope::all_records_v1(),
                 virtualize_time: true,
+                caller_owns_logs: false,
             },
         )
         .unwrap();
@@ -3852,6 +3882,7 @@ mod tests {
                 failed_log_retention: None,
                 record_envelope: RecordEnvelope::all_records_v1(),
                 virtualize_time: true,
+                caller_owns_logs: false,
             },
         )
         .unwrap();
@@ -4107,6 +4138,7 @@ mod tests {
                 failed_log_retention: None,
                 record_envelope: RecordEnvelope::all_records_v1(),
                 virtualize_time: true,
+                caller_owns_logs: false,
             },
         )
         .unwrap();
@@ -4265,6 +4297,7 @@ mod tests {
                 failed_log_retention: Some(FailedVerifyLogRetention::new(root.clone(), 2)),
                 record_envelope: RecordEnvelope::all_records_v1(),
                 virtualize_time: true,
+                caller_owns_logs: false,
             },
         )
         .unwrap();
@@ -4304,6 +4337,7 @@ mod tests {
                 failed_log_retention: Some(retention),
                 record_envelope: RecordEnvelope::all_records_v1(),
                 virtualize_time: true,
+                caller_owns_logs: false,
             },
         )
         .unwrap();
@@ -4445,6 +4479,7 @@ mod tests {
                 failed_log_retention: None,
                 record_envelope: RecordEnvelope::all_records_v1(),
                 virtualize_time: true,
+                caller_owns_logs: false,
             },
             |_| Err(io::Error::other("injected unsupported-syscall scan error")),
         )
@@ -4511,6 +4546,7 @@ mod tests {
                 failed_log_retention: None,
                 record_envelope: RecordEnvelope::all_records_v1(),
                 virtualize_time: true,
+                caller_owns_logs: false,
             },
         );
 

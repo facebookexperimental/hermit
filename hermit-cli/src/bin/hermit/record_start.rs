@@ -702,6 +702,7 @@ impl StartOpts {
                 match_overridden: false,
                 failed_log_retention: Some(super::verify::default_failed_verify_log_retention()),
                 record_envelope: RecordEnvelope::all_records_v1(),
+                caller_owns_logs: false,
             },
         )?;
 

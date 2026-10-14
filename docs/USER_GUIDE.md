@@ -510,6 +510,26 @@ hermit run --verify --verify-allow=both -- PROGRAM
 does not turn a nonzero guest status into a successful guest exit status for
 calling scripts.
 
+The two runs can also be started separately, for example in parallel, and
+compared afterwards:
+
+```bash
+export HERMIT_EPOCH=2026-01-01T00:00:00Z
+hermit run --strict --verify-strict --verify-run run1 -- PROGRAM &
+hermit run --strict --verify-strict --verify-run run2 -- PROGRAM &
+wait
+hermit log-diff --verify-json report.json run1 run2
+```
+
+Each `--verify-run` writes one execution's evidence to a new directory: its
+verification log, the guest's output, and a `verify-run.json` record of how it
+ended. `log-diff --verify-json` compares two such directories exactly as
+`--verify` compares its two runs, writes the same report, shows the guest's
+output as `--verify` shows it, and exits with the same status; it accepts
+`--verify-allow`. Both runs must use the same
+comparison flags and the same epoch, which `--verify` would have given both;
+the comparison refuses directories that differ in either.
+
 ### Record And Replay
 
 Record/replay is experimental. Unlike deterministic `run`, record mode captures

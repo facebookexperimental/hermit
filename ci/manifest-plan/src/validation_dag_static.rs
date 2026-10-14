@@ -1471,7 +1471,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the fixed-kernel-procfs record-version test (B2a, https://github.com/rrnewton/hermit/issues/4266): 1081.
     // And the three manifest unit tests of network and syscall recordings
     // (https://github.com/rrnewton/hermit/issues/4271): 1084.
-    ("test.hermit_unit", 1084),
+    // And +3 from ce6d9a4f: 1087.
+    ("test.hermit_unit", 1087),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2886,7 +2887,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // record_refuses_a_leader_that_exits_while_its_threads_run_on
     // (https://github.com/rrnewton/hermit/issues/4100): 366.
     // And detcore_fixes_the_virtual_kernel_files_on_every_backend (B2a, https://github.com/rrnewton/hermit/issues/4266): 367.
-    ("test.cli", 367),
+    // And +5 from ce6d9a4f: 372.
+    ("test.cli", 372),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3182,7 +3184,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // arguments.
     // So do the three leader pthread_exit tests: 302.
     // And detcore_fixes_the_virtual_kernel_files_on_every_backend (B2a, https://github.com/rrnewton/hermit/issues/4266): 303.
-    ("test.cli_on_host", 303),
+    // And +5 from ce6d9a4f: 308.
+    ("test.cli_on_host", 308),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -3545,7 +3548,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the fixed-kernel-procfs record-version test (B2a, https://github.com/rrnewton/hermit/issues/4266): 1081.
     // And the three manifest unit tests of network and syscall recordings
     // (https://github.com/rrnewton/hermit/issues/4271): 1084.
-    ("test.hermit_unit_on_host", 1084),
+    // And +3 from ce6d9a4f: 1087.
+    ("test.hermit_unit_on_host", 1087),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

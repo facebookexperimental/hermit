@@ -69,6 +69,10 @@ mod run2_log;
 #[path = "common/nonleader_exec.rs"]
 mod nonleader_exec;
 
+// `run --verify-run` twice and `log-diff --verify-json`, against `run --verify`.
+#[path = "common/verify_run.rs"]
+mod verify_run;
+
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs;

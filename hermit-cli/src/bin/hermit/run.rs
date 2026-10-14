@@ -93,6 +93,7 @@ use super::verify::LogCompareStrictness;
 use super::verify::NoResultReason;
 use super::verify::SecondRun;
 use super::verify::SignalTerminationReports;
+use super::verify::VerificationOutcome;
 use super::verify::VerificationReport;
 use super::verify::VerificationRun;
 use super::verify::VerificationRuntime;
@@ -115,6 +116,7 @@ use super::verify::write_report_json;
 use super::verify::write_skid_overshoot_verification_json;
 use super::verify::write_skid_overshoot_without_comparison_json;
 use super::verify::write_verification_json;
+use super::verify_run;
 
 const TMP_DIR: &str = "/tmp";
 
@@ -335,12 +337,10 @@ fn descriptor_path(file: &fs::File) -> PathBuf {
 
 /// The first host-input pattern difference between the runs and where its
 /// open sits in each run's log (see `hermit::host_input_change`), or `None`
-/// when the runs' records show none or cannot be read. `run1` is run 1's
-/// records, read before the shared record was emptied for run 2, and `path`
-/// now holds run 2's.
+/// when the runs' records show none or cannot be read.
 fn place_host_input_change(
     run1: std::io::Result<HostInputs>,
-    path: &Path,
+    run2: std::io::Result<HostInputs>,
     logs: [&Path; 2],
 ) -> Option<(PatternDifference, [Option<usize>; 2])> {
     let read = |result: std::io::Result<HostInputs>| {
@@ -354,7 +354,7 @@ fn place_host_input_change(
             .ok()
     };
     let run1 = read(run1)?;
-    let run2 = read(read_host_inputs(path))?;
+    let run2 = read(run2)?;
     let difference = find_pattern_difference(&run1, &run2)?;
     let place = |log: &Path, label: &str| {
         fs::read(log)
@@ -884,6 +884,7 @@ fn remove_fatal_core_files(dir: &Path, owner: &str) -> usize {
 
 /// Command-line options for the "run" subcommand.
 #[derive(Debug, Parser, Clone)]
+#[clap(group(clap::ArgGroup::new("verification").args(["verify", "verify_run"])))]
 pub struct RunOpts {
     /// The process instrumentation backend. It is selected only by the global
     /// option (`hermit --backend <BACKEND> run ...`); `run` does not accept
@@ -1231,7 +1232,7 @@ pub struct RunOpts {
     /// of substantially larger logs and stricter comparison. Implies the strict,
     /// bitwise comparison of --verify-strict, and additionally raises the diff
     /// verbosity (larger logs, more syscall history).
-    #[clap(long, requires = "verify")]
+    #[clap(long, requires = "verification")]
     verify_verbose: bool,
 
     /// Compare the internal logs under the CANONICAL parity policy: strip only
@@ -1249,7 +1250,7 @@ pub struct RunOpts {
     /// Unlike --verify-verbose this stays quiet: it changes only the comparison,
     /// not the diff output volume, so a determinism ratchet can require parity
     /// without drowning in trace logs.
-    #[clap(long, requires = "verify")]
+    #[clap(long, requires = "verification")]
     verify_strict: bool,
 
     /// If --verify is specified, indicates what guest exit status is required for
@@ -1330,6 +1331,27 @@ pub struct RunOpts {
     /// a stripped, content-blind, or opaque filtered compare.
     #[clap(long, requires = "verify", value_name = "PATH")]
     verify_json: Option<PathBuf>,
+
+    /// Run the guest once, as one of the two executions of `--verify`, and
+    /// write that execution's evidence to NEW_DIR, which must not exist: its
+    /// verification log, the guest's standard output and error, its run
+    /// summary, the host files its guest opened, and a verify-run.json record
+    /// of how it ended. `hermit log-diff --verify-json REPORT DIR1 DIR2`
+    /// compares two such directories and writes the report that `--verify
+    /// --verify-json` writes, so a caller can start the two runs itself, in
+    /// parallel if it likes, and keep both logs. `--verify-strict`,
+    /// `--verify-verbose` and `--no-detlog-io-buffers` choose the comparison
+    /// as they do for `--verify`, and both runs must choose the same one. Give
+    /// both runs one `--epoch` (or HERMIT_EPOCH): the comparison refuses runs
+    /// whose virtual clocks started at different epochs. On DBT the directory
+    /// also holds DynamoRIO's typed statistics stream. The exit status is the
+    /// guest's when the run completed.
+    #[clap(
+        long,
+        value_name = "NEW_DIR",
+        conflicts_with_all = ["verify", "run_evidence_dir", "namespace_only"]
+    )]
+    verify_run: Option<PathBuf>,
 
     /// Print a summary of the process tree's execution to stderr before exiting.
     #[clap(long, short = 'u')]
@@ -1840,6 +1862,10 @@ impl fmt::Display for RunOpts {
         if let Some(p) = &self.verify_json {
             let s = p.to_str().expect("valid unicode path");
             write!(f, " --verify-json={}", shell_words::quote(s))?;
+        }
+        if let Some(p) = &self.verify_run {
+            let s = p.to_str().expect("valid unicode path");
+            write!(f, " --verify-run={}", shell_words::quote(s))?;
         }
         if let Some(p) = &self.tmp {
             let s = p.to_str().expect("valid unicode path");
@@ -5494,6 +5520,7 @@ impl RunOpts {
             // record/replay path is a fixed decision instead and names it once, as
             // `RECORD_REPLAY_VIRTUALIZES_TIME`.
             virtualize_time: config.virtualize_time,
+            caller_owns_logs: false,
         }
     }
 
@@ -5575,7 +5602,7 @@ impl RunOpts {
         // happens-before spec this launch cannot enforce needs neither, so it
         // is refused at once rather than after input or availability checks.
         self.refuse_unenforceable_happens_before()?;
-        if self.verify {
+        if self.verify || self.verify_run.is_some() {
             validate_log_level(global)?;
         }
 
@@ -5606,12 +5633,13 @@ impl RunOpts {
         // without the feature refuses those runs the way a feature build does;
         // and before stdin is read.
         self.refuse_liteinst_without_the_feature()?;
-        let dbt_verification_stdin = if self.verify && self.selected_backend() == Backend::Dbt {
+        let verification = self.verify || self.verify_run.is_some();
+        let dbt_verification_stdin = if verification && self.selected_backend() == Backend::Dbt {
             // DBT owns its two-run adapter and replays this descriptor there.
             // The common output-capturing backends reserve the same input in
             // `hermit` because their execution path lives in the library.
             super::startup_stdin()?
-        } else if self.verify {
+        } else if verification {
             // `--verify` runs the guest twice through the output-capturing
             // backend, which otherwise feeds the guest an empty stdin. Snapshot
             // the real stdin now so both runs replay identical input; without
@@ -5775,6 +5803,7 @@ impl RunOpts {
                     self.keep_logs,
                     retained_log_dir.as_deref(),
                     self.verify_json.as_deref(),
+                    self.verify_run.as_deref(),
                     self.summary,
                     self.backend_engagement_json.as_deref(),
                     global.log,
@@ -5809,6 +5838,8 @@ impl RunOpts {
             self.run_with_namespace_only(global)
         } else if self.verify {
             self.verify(global)
+        } else if let Some(directory) = &self.verify_run {
+            self.verify_run(directory, global)
         } else {
             let (status, _) = self.run_with_guest_capture(global, false, guest_capture.as_ref())?;
             if let Some(capture) = &mut guest_capture {
@@ -7424,6 +7455,95 @@ impl RunOpts {
         Ok(exit_status)
     }
 
+    // Execution mode corresponding to `run --verify-run DIR`: one of
+    // `verify`'s two executions, run the way `verify` runs each (the same
+    // `run_verify`, log level, private summary, host-input record, latches and
+    // forwarded-record count), with what `verify` would hand its comparison
+    // written to DIR instead of compared. `hermit log-diff --verify-json`
+    // compares two such directories (`verify_run::compare`).
+    fn verify_run(&self, directory: &Path, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        let writer = verify_run::VerifyRunWriter::create(directory)?;
+        let log_path = writer.path(verify_run::LOG);
+        let log_file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&log_path)
+            .with_context(|| format!("creating the verification log {}", log_path.display()))?;
+        let forwarded = self.forwarded_detlog_channel()?;
+        let socket = forwarded.is_some();
+        // Both reached through the controller's descriptors, as `verify`
+        // reaches its own (see private_summary_descriptor_path).
+        let summary_file = private_verify_summary()?;
+        let summary_path = private_summary_descriptor_path(&summary_file);
+        let host_inputs_file = tempfile::tempfile().context("creating the host-input record")?;
+        let host_inputs_path = descriptor_path(&host_inputs_file);
+        let mut options = self.clone();
+        options.summary_json = Some(summary_path.clone());
+        options.host_input_log = Some(host_inputs_path.clone());
+        options.fatal_core_run_label = Some("run");
+        let comparison =
+            verify_run::RecordedComparison::from_options(&self.verification_comparison_options());
+        let exact_branch_counter = self
+            .arms_reverie_ptrace_pmu_timer()
+            .then(branch_counter_verdict);
+
+        let completed = options.run_verify(log_file, forwarded, global).and_then(
+            |(mut output, skid_overshoots, latches)| {
+                latches.refuse_comparison("run")?;
+                let forwarded_syscalls =
+                    self.take_forwarded_detlogs(&log_path, &mut output.stderr, socket)?;
+                Ok((output, skid_overshoots, forwarded_syscalls))
+            },
+        );
+        let (outcome, result) = match completed {
+            Ok((output, skid_overshoots, forwarded_syscalls)) => {
+                writer.write(verify_run::STDOUT, &output.stdout)?;
+                writer.write(verify_run::STDERR, &output.stderr)?;
+                (
+                    verify_run::VerifyRunOutcome::Completed {
+                        status: verify_run::RecordedStatus::of(output.status),
+                        skid_overshoots,
+                        forwarded_syscalls: forwarded_syscalls.map(|count| count as u64),
+                    },
+                    Ok(output.status),
+                )
+            }
+            Err(error) => (verify_run_outcome_of(&error), Err(error)),
+        };
+        let summary = fs::read(&summary_path).unwrap_or_default();
+        if !summary.is_empty() {
+            writer.write(verify_run::SUMMARY, &summary)?;
+            if let Some(public) = &self.summary_json {
+                fs::write(public, &summary)
+                    .with_context(|| format!("writing the run summary {}", public.display()))?;
+            }
+        }
+        let host_inputs = fs::read(&host_inputs_path).context("reading the host-input record")?;
+        writer.write(verify_run::HOST_INPUTS, &host_inputs)?;
+        writer.commit(&self.verify_run_record(comparison, exact_branch_counter, outcome, None))?;
+        result
+    }
+
+    /// The record a `--verify-run` execution of these options commits.
+    pub(super) fn verify_run_record(
+        &self,
+        comparison: verify_run::RecordedComparison,
+        exact_branch_counter: Option<hermit::canonical_verdict::BranchCounterVerdict>,
+        outcome: verify_run::VerifyRunOutcome,
+        dbt: Option<verify_run::DbtRunRecord>,
+    ) -> verify_run::VerifyRunRecord {
+        verify_run::VerifyRunRecord {
+            schema: verify_run::SCHEMA,
+            backend: self.selected_backend().as_str().to_string(),
+            comparison,
+            passthru_opt: self.det_opts.det_config.passthru_opt,
+            epoch: self.epoch_rfc3339(),
+            exact_branch_counter,
+            dbt,
+            outcome,
+        }
+    }
+
     // Execution mode corresponding to `run --verify`:
     fn verify(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         // Stamp an explicit no-result BEFORE any fallible work. Several exits
@@ -7575,56 +7695,19 @@ impl RunOpts {
             }
         }
 
-        if !self.verify_allow.satisfies(out1.status) {
-            if skid_overshoots_run1 > 0 {
-                if let Some(path) = &self.verify_json {
-                    let summary1 = read_verify_summary(&summary1_path);
-                    write_skid_overshoot_without_comparison_json(
-                        path,
-                        skid_overshoots_run1,
-                        verification_runtime_from_summaries(summary1.as_ref(), None),
-                        Some(out1.status),
-                    )?;
-                }
-                if self.keep_logs {
-                    retain_verification_logs([("run 1", log1_path)])?;
-                }
-                return Err(Error::new(SkidOvershootError::new(skid_overshoots_run1)));
-            }
-            let status = describe_exit_status(out1.status);
-            eprintln!(
-                "First run errored during --verify, not continuing to a second.\nExit status: {status}\nStdout:\n{}\nStderr:\n{}",
-                String::from_utf8_lossy(&out1.stdout),
-                String::from_utf8_lossy(&out1.stderr),
-            );
+        if let Some(error) = reject_first_run(
+            self.verify_json.as_deref(),
+            self.verify_allow,
+            &out1,
+            skid_overshoots_run1,
+            read_verify_summary(&summary1_path).as_ref(),
+        ) {
             // Queued here; `main` writes it after everything else.
             drop(signal_reports);
-            // ⚠️ RECORD THE DISPOSITION HERE, WHERE IT IS KNOWN. `out1.status`
-            // is in hand, yet the pre-stamped `no_result` record was previously
-            // left untouched on this path -- so the artifact reported
-            // `guest_exit_code: null` for a guest whose exit code we had. That
-            // made this refusal byte-identical to a container that never ran the
-            // guest, and 14 rotating e2e failures were undiagnosable as a direct
-            // result. A best-effort write: an unwritable artifact must not
-            // convert a rejected first run into a different error.
-            if let Some(path) = &self.verify_json {
-                let summary1 = read_verify_summary(&summary1_path);
-                let report = first_run_rejected_report(
-                    &out1,
-                    verification_runtime_from_summaries(summary1.as_ref(), None),
-                );
-                if let Err(error) = write_report_json(path, &report) {
-                    eprintln!(
-                        "WARNING: could not record the rejected first run in {}: {}",
-                        path.display(),
-                        error
-                    );
-                }
-            }
             if self.keep_logs {
                 retain_verification_logs([("run 1", log1_path)])?;
             }
-            return Err(Error::msg(format!("First run during --verify {status}")));
+            return Err(error);
         }
 
         let summary1 = take_verify_summary_before_next_run(&summary1_path)?;
@@ -7759,129 +7842,30 @@ impl RunOpts {
 
         signal_reports.prepare("run 2", out2.status, &log2_path);
 
-        // Say what was actually established. Buffer hashing is ON BY DEFAULT, so
-        // this qualification is now reachable only when the caller has asked for
-        // the weaker comparison with `--no-detlog-io-buffers`. With it, the
-        // compared records carry no syscall output-buffer CONTENT -- Reverie
-        // types many output buffers as bare pointers, so the record shows the
-        // address and not the bytes -- and two runs whose buffers differ while
-        // their return values agree compare equal. Measured on a netlink
-        // `recvmsg` that returns a stable `Ok(1468)` while four payload bytes
-        // vary, back when hashing was opt-in: this path reported "Determinism
-        // verified" on a run that the same command with hashing enabled
-        // reports as diverged. Claiming
-        // determinism there was the defect, so the sentence now names its limit.
-        let mut comparison_options = self.verification_comparison_options();
-        let success_message = if !comparison_options.compare_io_buffers {
-            // The "Determinism verified" marker is RETAINED verbatim and the
-            // qualification appended after it. That is not politeness: ~95
-            // Rust integration-test files under hermit-cli/tests assert on
-            // that exact substring, so replacing the sentence would be a
-            // project-wide contract change rather than a wording fix. Appending
-            // keeps every consumer working while the reader still learns the
-            // limit.
-            "Success: deterministic. Determinism verified. NOTE: syscall \
-             output-buffer CONTENT was not compared because \
-             --no-detlog-io-buffers was given, so a divergence confined to a \
-             buffer whose length is stable would not have been seen; drop that \
-             flag to include it."
-        } else {
-            "Success: deterministic. Determinism verified."
-        };
-        let failure_message = "Failure: nondeterministic.";
         let summary2 = read_verify_summary(summary2_path);
-        let skid_overshoots = skid_overshoots_run1.saturating_add(skid_overshoots_run2);
-        if skid_overshoots > 0
-            && let Some(path) = &self.verify_json
-        {
-            write_skid_overshoot_without_comparison_json(
-                path,
-                skid_overshoots,
-                verification_runtime_from_summaries(summary1.as_ref(), summary2.as_ref()),
-                Some(out1.status),
-            )?;
-        }
-        // A skid overshoot makes this verification an infrastructure error
-        // below, whatever the comparison finds, so a log match is not the
-        // verdict. `--keep-logs` then retains both logs, as every other error
-        // path does, instead of the single golden log kept after a match.
-        comparison_options.match_overridden = skid_overshoots > 0;
-        // The comparison consumes both logs, so a host file change is placed
-        // in its run's log now, and judged against the divergence below.
-        let host_input_change = if skid_overshoots == 0 {
-            place_host_input_change(host_inputs1, &host_inputs_path, [&log1_path, &log2_path])
-        } else {
-            None
-        };
-        drop(host_inputs_file);
-        let mut outcome = compare_two_runs(
-            ComparedRun {
+        let outcome = conclude_verification(
+            VerificationConclusion {
+                verify_json: self.verify_json.as_deref(),
+                comparison_options: self.verification_comparison_options(),
+                backend: self.selected_backend(),
+                passthru_opt: self.det_opts.det_config.passthru_opt,
+            },
+            CompletedVerificationRun {
                 output: &out1,
                 log: log1_path,
-                // Accurate on this path: `verify` calls `run_verify` twice, and
-                // each call builds its own container and guest command and
-                // reaches a separate tracer spawn, so these really are two
-                // fresh executions of the guest.
-                label: "run 1",
+                skid_overshoots: skid_overshoots_run1,
+                summary: summary1,
+                host_inputs: host_inputs1,
             },
-            ComparedRun {
+            CompletedVerificationRun {
                 output: &out2,
                 log: log2_path,
-                label: "run 2",
+                skid_overshoots: skid_overshoots_run2,
+                summary: summary2,
+                host_inputs: read_host_inputs(&host_inputs_path),
             },
-            comparison_options,
         )?;
-        outcome.runtime = verification_runtime_from_summaries(summary1.as_ref(), summary2.as_ref());
-
-        // A divergence that a host file changing during one run explains is
-        // named as such: only a divergence is examined, and only a change
-        // found before the divergence, by a comparison that compared
-        // everything, explains it. On a backend that can run guest code
-        // before Hermit observes it, an identical log prefix does not show
-        // that the guest did not make the change itself, so the change is
-        // reported without being named as the cause.
-        let host_input_change = host_input_change
-            .filter(|_| outcome.verdict == Verdict::Diverged)
-            .filter(|(_, positions)| {
-                explains_divergence(
-                    outcome.comparison.is_bitwise_parity(),
-                    *positions,
-                    outcome.first_divergent_record_positions,
-                )
-            })
-            .map(|(difference, _)| difference.into_infrastructure_error())
-            .filter(|change| {
-                let unobserved = unobserved_guest_execution(
-                    self.selected_backend(),
-                    self.det_opts.det_config.passthru_opt,
-                );
-                if let Some(reason) = unobserved {
-                    eprintln!("HERMIT_HOST_INPUT_CHANGE_UNATTRIBUTED {change}; not named as the cause: {reason}");
-                }
-                unobserved.is_none()
-            });
-
-        // Emit the machine-readable verdict (if requested) before collapsing the
-        // outcome to the historical exit-code convention. The verdict is recorded
-        // whether or not the runs matched, and independent of the guest's own
-        // exit status.
-        if let Some(path) = &self.verify_json {
-            if skid_overshoots > 0 {
-                write_skid_overshoot_verification_json(path, &outcome, skid_overshoots)?;
-            } else if let Some(change) = &host_input_change {
-                write_host_input_change_verification_json(path, &outcome, change.clone())?;
-            } else {
-                write_verification_json(path, &outcome)?;
-            }
-        }
-        if skid_overshoots > 0 {
-            return Err(Error::new(SkidOvershootError::new(skid_overshoots)));
-        }
-        announce_verification_outcome(&outcome, SecondRun::Rerun, success_message, failure_message);
-        if let Some(change) = &host_input_change {
-            // The divergence stays a failure; this names its cause.
-            eprintln!("HERMIT_HOST_INPUT_CHANGED {change}");
-        }
+        drop(host_inputs_file);
 
         // On divergence, still return the nonzero status and skip
         // the backend banner — but EMIT THE GUEST'S OUTPUT FIRST when both runs
@@ -8621,6 +8605,7 @@ impl RunOpts {
     /// - `--run-result-json`, `--guest-stdout`, `--guest-stderr`: only `main`
     ///   opens the guest capture.
     /// - `--run-evidence-dir`: only `hermit run`'s top level arms it.
+    /// - `--verify-run`: only `main` dispatches to `verify_run()`.
     /// - `--backend-engagement-json`: only `main` writes it.
     ///
     /// `--skid-margin` is not listed: `hermit analyze` and `hermit bisect`
@@ -8629,6 +8614,7 @@ impl RunOpts {
         [
             (self.namespace_only, "--namespace-only"),
             (self.verify, "--verify"),
+            (self.verify_run.is_some(), "--verify-run"),
             (self.happens_before.is_some(), "--happens-before"),
             (self.run_result_json.is_some(), "--run-result-json"),
             (self.guest_stdout.is_some(), "--guest-stdout"),
@@ -8896,6 +8882,253 @@ impl RunOpts {
         };
         Ok((output, skid_overshoots, latches))
     }
+}
+
+/// The error that ends a verification whose first run's status `verify_allow`
+/// rejects, after publishing its report to `verify_json`, or `None` when the
+/// status is allowed. A rejected run that overshot its PMU skid is that
+/// infrastructure error; otherwise the report records the rejected
+/// disposition, so it is not mistaken for a run that never started. Shared by
+/// `run --verify`, which then does not start a second run, and `hermit
+/// log-diff --verify-json`, which then does not compare.
+pub(super) fn reject_first_run(
+    verify_json: Option<&Path>,
+    verify_allow: VerifyAllow,
+    out1: &Output,
+    skid_overshoots_run1: u64,
+    summary1: Option<&RunSummary>,
+) -> Option<Error> {
+    if verify_allow.satisfies(out1.status) {
+        return None;
+    }
+    if skid_overshoots_run1 > 0 {
+        if let Some(path) = verify_json
+            && let Err(error) = write_skid_overshoot_without_comparison_json(
+                path,
+                skid_overshoots_run1,
+                verification_runtime_from_summaries(summary1, None),
+                Some(out1.status),
+            )
+        {
+            return Some(error);
+        }
+        return Some(Error::new(SkidOvershootError::new(skid_overshoots_run1)));
+    }
+    let status = describe_exit_status(out1.status);
+    eprintln!(
+        "First run errored during --verify, not continuing to a second.\nExit status: {status}\nStdout:\n{}\nStderr:\n{}",
+        String::from_utf8_lossy(&out1.stdout),
+        String::from_utf8_lossy(&out1.stderr),
+    );
+    // ⚠️ RECORD THE DISPOSITION HERE, WHERE IT IS KNOWN. The pre-stamped
+    // `no_result` record was previously left untouched on this path -- so the
+    // artifact reported `guest_exit_code: null` for a guest whose exit code we
+    // had. That made this refusal byte-identical to a container that never
+    // ran the guest, and 14 rotating e2e failures were undiagnosable as a
+    // direct result. A best-effort write: an unwritable artifact must not
+    // convert a rejected first run into a different error.
+    if let Some(path) = verify_json {
+        let report =
+            first_run_rejected_report(out1, verification_runtime_from_summaries(summary1, None));
+        if let Err(error) = write_report_json(path, &report) {
+            eprintln!(
+                "WARNING: could not record the rejected first run in {}: {}",
+                path.display(),
+                error
+            );
+        }
+    }
+    Some(Error::msg(format!("First run during --verify {status}")))
+}
+
+/// How a `--verify-run` execution that returned `error` ended, classified as
+/// `run --verify` classifies the same error of one of its runs.
+pub(super) fn verify_run_outcome_of(error: &Error) -> verify_run::VerifyRunOutcome {
+    if let Some(overshoot) = error.downcast_ref::<SkidOvershootError>() {
+        return verify_run::VerifyRunOutcome::SkidOvershoot {
+            count: overshoot.count(),
+        };
+    }
+    if let Some(disposition) = super::verify::container_failure_of(error) {
+        return verify_run::VerifyRunOutcome::ContainerFailed { disposition };
+    }
+    if let Some(failure) = super::verify::run_failure_of(error) {
+        // A determinism loss names its run (`RunLatches::refuse_comparison`);
+        // the comparison names it again by its place in the pair.
+        let detail = match error.downcast_ref::<DeterminismLossRecorded>() {
+            Some(loss) => format!("determinism loss recorded: {}", loss.reason),
+            None => format!("{error:#}"),
+        };
+        return verify_run::VerifyRunOutcome::RunFailed { failure, detail };
+    }
+    verify_run::VerifyRunOutcome::Error {
+        detail: format!("{error:#}"),
+    }
+}
+
+/// One completed execution of a two-run verification: what
+/// [`conclude_verification`] compares.
+pub(super) struct CompletedVerificationRun<'a> {
+    pub(super) output: &'a Output,
+    /// The run's verification log, which the comparison consumes.
+    pub(super) log: tempfile::TempPath,
+    pub(super) skid_overshoots: u64,
+    pub(super) summary: Option<RunSummary>,
+    /// The host files the run's guest opened (`hermit::host_input_change`).
+    pub(super) host_inputs: std::io::Result<HostInputs>,
+}
+
+/// How a two-run verification is concluded once both runs completed.
+pub(super) struct VerificationConclusion<'a> {
+    pub(super) verify_json: Option<&'a Path>,
+    pub(super) comparison_options: ComparisonOptions,
+    /// The backend both runs used.
+    pub(super) backend: Backend,
+    /// Whether both runs used `--passthru-opt`.
+    pub(super) passthru_opt: bool,
+}
+
+/// Compare two completed verification runs, publish the report to the
+/// conclusion's `verify_json`, and announce the outcome. This is the one
+/// conclusion of a verification whose two runs completed: `run --verify`
+/// reaches it after its second run, and `hermit log-diff --verify-json` after
+/// reading two `--verify-run` directories. A skid overshoot in either run is
+/// published as the infrastructure error it is and returned as one.
+pub(super) fn conclude_verification(
+    conclusion: VerificationConclusion<'_>,
+    run1: CompletedVerificationRun<'_>,
+    run2: CompletedVerificationRun<'_>,
+) -> Result<VerificationOutcome, Error> {
+    let VerificationConclusion {
+        verify_json,
+        mut comparison_options,
+        backend,
+        passthru_opt,
+    } = conclusion;
+    let out1 = run1.output;
+    let out2 = run2.output;
+    let log1_path = run1.log;
+    let log2_path = run2.log;
+    let summary1 = run1.summary;
+    let summary2 = run2.summary;
+    // Say what was actually established. Buffer hashing is ON BY DEFAULT, so
+    // this qualification is now reachable only when the caller has asked for
+    // the weaker comparison with `--no-detlog-io-buffers`. With it, the
+    // compared records carry no syscall output-buffer CONTENT -- Reverie
+    // types many output buffers as bare pointers, so the record shows the
+    // address and not the bytes -- and two runs whose buffers differ while
+    // their return values agree compare equal. Measured on a netlink
+    // `recvmsg` that returns a stable `Ok(1468)` while four payload bytes
+    // vary, back when hashing was opt-in: this path reported "Determinism
+    // verified" on a run that the same command with hashing enabled
+    // reports as diverged. Claiming
+    // determinism there was the defect, so the sentence now names its limit.
+    let success_message = if !comparison_options.compare_io_buffers {
+        // The "Determinism verified" marker is RETAINED verbatim and the
+        // qualification appended after it. That is not politeness: ~95
+        // Rust integration-test files under hermit-cli/tests assert on
+        // that exact substring, so replacing the sentence would be a
+        // project-wide contract change rather than a wording fix. Appending
+        // keeps every consumer working while the reader still learns the
+        // limit.
+        "Success: deterministic. Determinism verified. NOTE: syscall \
+         output-buffer CONTENT was not compared because \
+         --no-detlog-io-buffers was given, so a divergence confined to a \
+         buffer whose length is stable would not have been seen; drop that \
+         flag to include it."
+    } else {
+        "Success: deterministic. Determinism verified."
+    };
+    let failure_message = "Failure: nondeterministic.";
+    let skid_overshoots = run1.skid_overshoots.saturating_add(run2.skid_overshoots);
+    if skid_overshoots > 0
+        && let Some(path) = verify_json
+    {
+        write_skid_overshoot_without_comparison_json(
+            path,
+            skid_overshoots,
+            verification_runtime_from_summaries(summary1.as_ref(), summary2.as_ref()),
+            Some(out1.status),
+        )?;
+    }
+    // A skid overshoot makes this verification an infrastructure error
+    // below, whatever the comparison finds, so a log match is not the
+    // verdict. `--keep-logs` then retains both logs, as every other error
+    // path does, instead of the single golden log kept after a match.
+    comparison_options.match_overridden = skid_overshoots > 0;
+    // The comparison consumes both logs, so a host file change is placed
+    // in its run's log now, and judged against the divergence below.
+    let host_input_change = if skid_overshoots == 0 {
+        place_host_input_change(run1.host_inputs, run2.host_inputs, [&log1_path, &log2_path])
+    } else {
+        None
+    };
+    let mut outcome = compare_two_runs(
+        ComparedRun {
+            output: out1,
+            log: log1_path,
+            // Accurate on this path: `verify` calls `run_verify` twice, and
+            // each call builds its own container and guest command and
+            // reaches a separate tracer spawn, so these really are two
+            // fresh executions of the guest.
+            label: "run 1",
+        },
+        ComparedRun {
+            output: out2,
+            log: log2_path,
+            label: "run 2",
+        },
+        comparison_options,
+    )?;
+    outcome.runtime = verification_runtime_from_summaries(summary1.as_ref(), summary2.as_ref());
+
+    // A divergence that a host file changing during one run explains is
+    // named as such: only a divergence is examined, and only a change
+    // found before the divergence, by a comparison that compared
+    // everything, explains it. On a backend that can run guest code
+    // before Hermit observes it, an identical log prefix does not show
+    // that the guest did not make the change itself, so the change is
+    // reported without being named as the cause.
+    let host_input_change = host_input_change
+        .filter(|_| outcome.verdict == Verdict::Diverged)
+        .filter(|(_, positions)| {
+            explains_divergence(
+                outcome.comparison.is_bitwise_parity(),
+                *positions,
+                outcome.first_divergent_record_positions,
+            )
+        })
+        .map(|(difference, _)| difference.into_infrastructure_error())
+        .filter(|change| {
+            let unobserved = unobserved_guest_execution(backend, passthru_opt);
+            if let Some(reason) = unobserved {
+                eprintln!("HERMIT_HOST_INPUT_CHANGE_UNATTRIBUTED {change}; not named as the cause: {reason}");
+            }
+            unobserved.is_none()
+        });
+
+    // Emit the machine-readable verdict (if requested) before collapsing the
+    // outcome to the historical exit-code convention. The verdict is recorded
+    // whether or not the runs matched, and independent of the guest's own
+    // exit status.
+    if let Some(path) = verify_json {
+        if skid_overshoots > 0 {
+            write_skid_overshoot_verification_json(path, &outcome, skid_overshoots)?;
+        } else if let Some(change) = &host_input_change {
+            write_host_input_change_verification_json(path, &outcome, change.clone())?;
+        } else {
+            write_verification_json(path, &outcome)?;
+        }
+    }
+    if skid_overshoots > 0 {
+        return Err(Error::new(SkidOvershootError::new(skid_overshoots)));
+    }
+    announce_verification_outcome(&outcome, SecondRun::Rerun, success_message, failure_message);
+    if let Some(change) = &host_input_change {
+        // The divergence stays a failure; this names its cause.
+        eprintln!("HERMIT_HOST_INPUT_CHANGED {change}");
+    }
+    Ok(outcome)
 }
 
 /// Represents a tmpfs location. There are different ways to construct `/tmp` for
@@ -9308,7 +9541,7 @@ mod tests {
             .expect("run.rs has a test module")
             .0;
         let total =
-            "let skid_overshoots = skid_overshoots_run1.saturating_add(skid_overshoots_run2);";
+            "let skid_overshoots = run1.skid_overshoots.saturating_add(run2.skid_overshoots);";
         let overridden = "comparison_options.match_overridden = skid_overshoots > 0;";
         let compared = "let mut outcome = compare_two_runs(";
         for statement in [total, overridden, compared] {
