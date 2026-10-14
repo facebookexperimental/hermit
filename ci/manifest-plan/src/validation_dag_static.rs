@@ -3068,7 +3068,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The mounted-interpreter test becomes
     // hermit_run_dap_listen_refuses_a_script, and
     // hermit_run_dap_listen_killed_supervisor_leaves_no_run_or_adapter: 409.
-    ("test.cli", 409),
+    // And hermit_run_dap_listen_names_the_file_a_guest_symlink_reaches: 410.
+    ("test.cli", 410),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3405,7 +3406,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the four hermit run --dap-listen tests: 341.
     // And three more: 344.
     // And one more: 345.
-    ("test.cli_on_host", 345),
+    // And the guest-symlink test: 346.
+    ("test.cli_on_host", 346),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux

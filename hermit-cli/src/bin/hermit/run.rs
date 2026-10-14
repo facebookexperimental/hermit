@@ -888,30 +888,10 @@ fn remove_fatal_core_files(dir: &Path, owner: &str) -> usize {
     removed
 }
 
-/// Set in the run that `hermit run --dap-listen` starts and supervises, which
-/// is the same command run as a plain `--gdbserver` run.
+/// Set, to the supervising process's ID, in the run that
+/// `hermit run --dap-listen` starts and supervises, which is the same command
+/// run as a plain `--gdbserver` run.
 const DAP_LISTEN_INNER_ENV: &str = "HERMIT_DAP_LISTEN_INNER";
-
-/// `--dap-listen` debugs an executable. Refuses a `#!` script, naming the way
-/// to debug its interpreter instead: which file that is depends on the guest's
-/// own exec path resolution, which the debugger hint cannot reproduce.
-fn refuse_debugging_a_script(host: &Path) -> Result<(), Error> {
-    let mut head = [0u8; 2];
-    let is_script = std::fs::File::open(host)
-        .and_then(|mut file| file.read_exact(&mut head))
-        .is_ok()
-        && head == *b"#!";
-    if is_script {
-        anyhow::bail!(
-            "--dap-listen debugs an executable, and {} is a #! script; to debug its \
-             interpreter, run the interpreter with the script as its argument, for example \
-             hermit run --dap-listen=ADDRESS -- /bin/sh {}",
-            host.display(),
-            host.display()
-        );
-    }
-    Ok(())
-}
 
 /// Command-line options for the "run" subcommand.
 #[derive(Debug, Parser, Clone)]
@@ -5526,8 +5506,16 @@ impl RunOpts {
         if self.dap_listen.is_some() {
             // Before validation, so every --gdbserver refusal applies.
             self.det_opts.det_config.gdbserver = true;
-            if std::env::var_os(DAP_LISTEN_INNER_ENV).is_none() {
-                return self.serve_dap();
+            match std::env::var_os(DAP_LISTEN_INNER_ENV) {
+                None => return self.serve_dap(),
+                // The run a supervising `hermit run --dap-listen` started.
+                Some(owner)
+                    if owner.to_str().and_then(|owner| owner.parse().ok())
+                        == Some(std::os::unix::process::parent_id()) => {}
+                Some(owner) => anyhow::bail!(
+                    "{DAP_LISTEN_INNER_ENV}={owner:?} is set, but its parent did not start this \
+                     hermit run --dap-listen; unset {DAP_LISTEN_INNER_ENV}"
+                ),
             }
         }
         let result = self.main_without_core_cleanup(global);
@@ -5544,37 +5532,54 @@ impl RunOpts {
     /// (this same command, as a plain `--gdbserver` run) and, once the run's
     /// gdbserver is listening, `hermit-dap` on a socket this process bound.
     /// A run that is refused, or whose program is not found, ends before any
-    /// adapter starts, with its own message and status. If the adapter ends
+    /// adapter starts, with its own message and status. Before the adapter
+    /// starts, the host file named to the debugger is checked against the
+    /// file the waiting guest process sees (see
+    /// [`super::dap_adapter::identify_debuggee`]). If the adapter ends
     /// for any reason while the gdbserver still waits for its one connection,
     /// no debugger can ever attach, so this ends the run instead of leaving it
     /// waiting. Both children die with this process.
     fn serve_dap(&self) -> Result<ExitStatus, Error> {
         let argument = self.dap_listen.as_deref().unwrap_or_default();
+        let gdbserver_port = self.det_opts.det_config.gdbserver_port;
+        anyhow::ensure!(
+            gdbserver_port != 0,
+            "--dap-listen needs a fixed --gdbserver-port, so it can tell when the run's \
+             gdbserver listens and give that port to the debugger; pass another port than 0"
+        );
         let listener = super::dap_adapter::bind(argument)?;
-        // The host file the debugger loads symbols from: the executable the
-        // guest command selects (guest working directory, PATH, mounts). A
-        // program that cannot be resolved is left to the run, which reports
-        // it with its own status (127 if it is not found).
-        let program = self
+        // The guest path the guest command selects (guest working directory,
+        // PATH, mounts). A program that cannot be resolved is left to the
+        // run, which reports it with its own status (127 if it is not
+        // found); hermit-dap is looked for only once the run gets that far.
+        let guest = self
             .resolve_guest_and_host_program()
             .ok()
-            .map(|(_, host)| host);
-        if let Some(host) = &program {
-            refuse_debugging_a_script(host)?;
-        }
-        // Before the run starts, so a missing adapter costs nothing.
-        super::dap_adapter::hermit_dap_beside_hermit()?;
+            .map(|(guest, _)| guest);
         let run = super::dap_adapter::spawn_owned(
             std::process::Command::new(std::env::current_exe().context("Failed to locate hermit")?)
                 .args(std::env::args_os().skip(1))
-                .env(DAP_LISTEN_INNER_ENV, "1"),
+                .env(DAP_LISTEN_INNER_ENV, std::process::id().to_string()),
         )
         .context("Failed to start the run")?;
         super::dap_adapter::supervise(
             run,
             listener,
-            self.det_opts.det_config.gdbserver_port,
-            program.as_deref().unwrap_or(&self.program),
+            gdbserver_port,
+            |guest_pid| {
+                let guest = guest.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--dap-listen cannot tell which file the guest runs for {}",
+                        self.program.display()
+                    )
+                })?;
+                super::dap_adapter::identify_debuggee(guest_pid, guest, |path| {
+                    // Rebuilt from its components: a file mounted at exactly
+                    // `path` maps to its source with a trailing '/'.
+                    self.mapped_or_visible_host_program(path)
+                        .map(|host| host.components().collect())
+                })
+            },
             self.dap_gdb.as_deref(),
         )
     }

@@ -16775,8 +16775,11 @@ fn tcp_listener_commands(port: u16) -> Vec<String> {
 /// `hermit run --dap-listen` refuses, before any adapter starts, every run it
 /// could not serve: one whose `--gdbserver` is refused (`--strict`), one that
 /// runs the program twice (`--verify`) or without a GDB server
-/// (`--namespace-only`), and an address that does not parse or is already
-/// taken. Each fails, says why, and never prints the adapter's start line.
+/// (`--namespace-only`), one whose gdbserver port the system would pick
+/// (`--gdbserver-port=0`), an address that does not parse or is already
+/// taken, and a run that the internal mark of a supervised run claims, from
+/// the environment, without that supervisor being its parent. Each fails,
+/// says why, and never prints the adapter's start line.
 #[test]
 fn hermit_run_dap_listen_refusals_start_no_adapter() {
     let taken = std::net::TcpListener::bind("127.0.0.1:0").expect("failed to take a loopback port");
@@ -16786,26 +16789,41 @@ fn hermit_run_dap_listen_refusals_start_no_adapter() {
         .to_string();
     // Each refusal must name every one of its causes: --strict's names the
     // --gdbserver that --dap-listen turns on.
-    for (args, reasons) in [
+    for (args, marker, reasons) in [
         (
             vec!["--strict", "--dap-listen", "127.0.0.1:0"],
+            None,
             &["--strict", "--gdbserver"][..],
         ),
         (
             vec!["--verify", "--dap-listen", "127.0.0.1:0"],
+            None,
             &["--verify"][..],
         ),
         (
             vec!["--namespace-only", "--dap-listen", "127.0.0.1:0"],
+            None,
             &["--namespace-only"][..],
         ),
         (
+            vec!["--gdbserver-port=0", "--dap-listen", "127.0.0.1:0"],
+            None,
+            &["needs a fixed --gdbserver-port"][..],
+        ),
+        (
             vec!["--dap-listen", "70000"],
+            None,
             &["needs a port from 0 to 65535"][..],
         ),
         (
             vec!["--dap-listen", taken.as_str()],
+            None,
             &["--dap-listen cannot listen on"][..],
+        ),
+        (
+            vec!["--dap-listen", "127.0.0.1:0"],
+            Some("unexpected-host-value"),
+            &["unset HERMIT_DAP_LISTEN_INNER"][..],
         ),
     ] {
         let mut argv = vec!["run"];
@@ -16814,8 +16832,12 @@ fn hermit_run_dap_listen_refusals_start_no_adapter() {
         // Bounded: a run that is wrongly admitted waits for a debugger forever.
         let stderr_file = tempfile::NamedTempFile::new_in(env!("CARGO_TARGET_TMPDIR"))
             .expect("failed to create a stderr file");
+        let mut command = hermit_command(&argv);
+        if let Some(marker) = marker {
+            command.env("HERMIT_DAP_LISTEN_INNER", marker);
+        }
         let mut child = KillOnDrop(
-            hermit_command(&argv)
+            command
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(
@@ -16842,8 +16864,8 @@ fn hermit_run_dap_listen_refusals_start_no_adapter() {
                 && reasons.iter().all(|reason| stderr.contains(reason))
                 && !stderr.contains("starting hermit-dap")
                 && !stderr.contains("hermit-dap: listening"),
-            "hermit {argv:?} must be refused naming {reasons:?} within 30 s, got {status:?}\n\
-             stderr:\n{stderr}"
+            "hermit {argv:?} (marker {marker:?}) must be refused naming {reasons:?} within 30 s, \
+             got {status:?}\nstderr:\n{stderr}"
         );
     }
 }
@@ -16865,6 +16887,7 @@ fn hermit_run_dap_listen_names_the_program_the_guest_runs() {
     let run = hermit_command(&[
         "run",
         &format!("--env=PATH={guest_path}"),
+        &format!("--gdbserver-port={}", unused_local_port()),
         "--dap-listen",
         "127.0.0.1:0",
         "--",
@@ -16965,7 +16988,7 @@ fn hermit_run_dap_listen_ends_the_run_when_its_debugger_cannot_attach() {
         };
         let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
         assert!(
-            status.is_some_and(|status| !status.success())
+            status.is_some_and(|status| status.code() == Some(HERMIT_INTERNAL_FAILURE_EXIT))
                 && stderr.contains("before a debugger connected to this run's gdbserver")
                 && stderr.contains("ended the run"),
             "{case}: hermit run must end, with the reason, once its debugger is gone; \
@@ -17079,28 +17102,146 @@ fn hermit_run_dap_listen_killed_supervisor_leaves_no_run_or_adapter() {
     );
 }
 
-/// `--dap-listen` debugs an executable: a `#!` script is refused before
-/// anything starts, naming how to debug its interpreter instead.
+/// `--dap-listen` debugs an ELF executable that the debugger can read: a `#!`
+/// script is refused, naming how to debug its interpreter instead, and so is
+/// an execute-only script, which Linux runs but nothing can read to tell what
+/// it is. Neither starts an adapter.
 #[test]
 fn hermit_run_dap_listen_refuses_a_script() {
+    const TEST: &str = "hermit_run_dap_listen_refuses_a_script";
+    let Some(_hermit_dap) = hermit_dap_binary(TEST) else {
+        return;
+    };
     let work =
         tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("failed to create the work dir");
     let script = work.path().join("script");
     fs::write(&script, "#!/bin/true\n").expect("failed to write the script");
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
         .expect("failed to make the script executable");
-    let script_arg = script.to_str().expect("script path should be UTF-8");
-    let output = hermit(&["run", "--dap-listen", "127.0.0.1:0", "--", script_arg]);
-    let stderr = stderr(&output);
+    let execute_only = work.path().join("execute-only");
+    fs::write(&execute_only, "#!/bin/true\n").expect("failed to write the script");
+    fs::set_permissions(&execute_only, fs::Permissions::from_mode(0o111))
+        .expect("failed to make the script execute-only");
+    // The native control: Linux runs it. Without privilege to read any file,
+    // it also cannot be read; with it, it is refused as a script.
     assert!(
-        !output.status.success()
-            && stderr.contains("is a #! script")
-            && stderr.contains("run the interpreter with the script as its argument")
-            && !stderr.contains("starting hermit-dap")
-            && !stderr.contains("hermit-dap: listening"),
-        "hermit run --dap-listen on a script: {}\nstderr:\n{stderr}",
-        output.status
+        Command::new(&execute_only)
+            .status()
+            .expect("failed to run the execute-only script")
+            .success(),
+        "the execute-only script must run natively"
     );
+    let unreadable = fs::File::open(&execute_only).is_err();
+    for (program, reasons) in [
+        (
+            &script,
+            &[
+                "is a #! script",
+                "run the interpreter with the script as its argument",
+            ][..],
+        ),
+        (
+            &execute_only,
+            if unreadable {
+                &["cannot read", "make it readable"][..]
+            } else {
+                &["is a #! script"][..]
+            },
+        ),
+    ] {
+        let program_arg = program.to_str().expect("script path should be UTF-8");
+        // Its own port: the refusal comes once the run's gdbserver listens.
+        let gdbserver_arg = format!("--gdbserver-port={}", unused_local_port());
+        let output = hermit(&[
+            "run",
+            &gdbserver_arg,
+            "--dap-listen",
+            "127.0.0.1:0",
+            "--",
+            program_arg,
+        ]);
+        let stderr = stderr(&output);
+        assert!(
+            output.status.code() == Some(HERMIT_INTERNAL_FAILURE_EXIT)
+                && reasons.iter().all(|reason| stderr.contains(reason))
+                && !stderr.contains("starting hermit-dap")
+                && !stderr.contains("hermit-dap: listening"),
+            "hermit run --dap-listen on {program_arg} must be refused naming {reasons:?}: {}\n\
+             stderr:\n{stderr}",
+            output.status
+        );
+    }
+}
+
+/// The attach request's `program` is the host file the guest actually runs,
+/// followed through the guest's own symbolic links and mounts: here DIR/link
+/// is a symbolic link to DIR/real, and a different executable is mounted at
+/// DIR/real/prog, so the guest's DIR/link/prog is that mounted file, not the
+/// host's DIR/real/prog. A link with an absolute target leads to the same
+/// file.
+#[test]
+fn hermit_run_dap_listen_names_the_file_a_guest_symlink_reaches() {
+    const TEST: &str = "hermit_run_dap_listen_names_the_file_a_guest_symlink_reaches";
+    let Some(_hermit_dap) = hermit_dap_binary(TEST) else {
+        return;
+    };
+    let work = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the hermit-dap work dir");
+    let (_source, mounted) = dap_guest(work.path());
+    let dir = work.path().join("dir");
+    fs::create_dir_all(dir.join("real")).expect("failed to create DIR/real");
+    fs::copy("/bin/true", dir.join("real/prog")).expect("failed to copy /bin/true");
+    std::os::unix::fs::symlink("real", dir.join("link")).expect("failed to link DIR/link");
+    std::os::unix::fs::symlink(dir.join("real"), dir.join("absolute-link"))
+        .expect("failed to link DIR/absolute-link");
+    let mount = format!(
+        "--mount=type=bind,source={},target={}",
+        mounted.display(),
+        dir.join("real/prog").display()
+    );
+    for link in ["link", "absolute-link"] {
+        let program = dir.join(link).join("prog");
+        let program_arg = program.to_str().expect("program path should be UTF-8");
+        let gdbserver_arg = format!("--gdbserver-port={}", unused_local_port());
+        let stderr_path = work.path().join("hermit-run.stderr");
+        let mut run = KillOnDrop(
+            hermit_command(&[
+                "run",
+                &gdbserver_arg,
+                &mount,
+                "--dap-listen",
+                "127.0.0.1:0",
+                "--",
+                program_arg,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(fs::File::create(&stderr_path).expect("failed to create stderr file"))
+            .spawn()
+            .expect("failed to run hermit"),
+        );
+        let deadline = Instant::now() + Duration::from_secs(40);
+        let hint = loop {
+            let text = fs::read_to_string(&stderr_path).unwrap_or_default();
+            if let Some(line) = text
+                .lines()
+                .find(|line| line.contains("starting hermit-dap"))
+            {
+                break line.to_owned();
+            }
+            assert!(
+                Instant::now() < deadline && run.0.try_wait().ok().flatten().is_none(),
+                "{link}: hermit run never named the program:\n{text}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+        let expected = format!("\"program\": {:?}", mounted.display().to_string());
+        assert!(
+            hint.contains(&expected),
+            "{link}: the hint must name the mounted file the guest runs, {expected}: {hint}"
+        );
+        drop(run);
+    }
 }
 
 /// A program that is not found gets the same status with `--dap-listen` as
@@ -17123,7 +17264,9 @@ fn hermit_run_dap_listen_keeps_the_not_found_status() {
 }
 
 /// Without a `hermit-dap` beside `hermit`, `--dap-listen` fails and says how
-/// to build it.
+/// to build it. A run that fails before it needs the adapter fails as it
+/// would with one: a program that is not found exits 127, and `--strict` is
+/// refused naming `--strict` and `--gdbserver`.
 #[test]
 fn hermit_dap_listen_without_an_adapter_names_the_build_command() {
     let work =
@@ -17132,8 +17275,17 @@ fn hermit_dap_listen_without_an_adapter_names_the_build_command() {
     fs::hard_link(env!("CARGO_BIN_EXE_hermit"), &lonely)
         .or_else(|_| fs::copy(env!("CARGO_BIN_EXE_hermit"), &lonely).map(|_| ()))
         .expect("failed to put a hermit without hermit-dap beside it");
+    // Its own port: the adapter is looked for once the run's gdbserver listens.
+    let gdbserver_arg = format!("--gdbserver-port={}", unused_local_port());
     for args in [
-        &["run", "--dap-listen", "127.0.0.1:0", "--", "/bin/true"][..],
+        &[
+            "run",
+            &gdbserver_arg,
+            "--dap-listen",
+            "127.0.0.1:0",
+            "--",
+            "/bin/true",
+        ][..],
         &[
             "replay",
             "0123456789abcdef0123456789abcdef",
@@ -17157,6 +17309,48 @@ fn hermit_dap_listen_without_an_adapter_names_the_build_command() {
                 && stderr.contains("--dap-listen needs hermit-dap beside hermit")
                 && stderr.contains("cargo build -p hermit --bin hermit --bin hermit-dap"),
             "{args:?}: {}\nstderr:\n{stderr}",
+            output.status
+        );
+    }
+    for (args, code, reasons) in [
+        (
+            &[
+                "run",
+                "--dap-listen",
+                "127.0.0.1:0",
+                "--",
+                "hermit-no-such-program-for-dap-listen",
+            ][..],
+            Some(GUEST_PROGRAM_NOT_FOUND_EXIT),
+            &[][..],
+        ),
+        (
+            &[
+                "run",
+                "--strict",
+                "--dap-listen",
+                "127.0.0.1:0",
+                "--",
+                "/bin/true",
+            ][..],
+            None,
+            &["--strict", "--gdbserver"][..],
+        ),
+    ] {
+        let mut command = Command::new(&lonely);
+        append_hermit_args(&mut command, args);
+        let output = command
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run the lone hermit");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success()
+                && code.is_none_or(|code| output.status.code() == Some(code))
+                && reasons.iter().all(|reason| stderr.contains(reason))
+                && !stderr.contains("needs hermit-dap beside hermit"),
+            "{args:?} must fail as without --dap-listen, not for the missing adapter: {}\n\
+             stderr:\n{stderr}",
             output.status
         );
     }

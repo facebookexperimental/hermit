@@ -9,8 +9,14 @@
 //! Starting `hermit-dap`, the Debug Adapter Protocol adapter that is built
 //! beside `hermit`, for `run --dap-listen` and `replay --dap-listen`.
 
+use std::ffi::CString;
 use std::net::TcpListener;
 use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
+use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -121,18 +127,224 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// it is killed.
 const RUN_STOP_GRACE: Duration = Duration::from_secs(10);
 
+/// The process of `run` that its gdbserver serves: its one traced
+/// descendant, which waits, stopped, for the debugger before it executes the
+/// guest program, already inside the guest's namespaces.
+fn traced_descendant(run: u32) -> Option<i32> {
+    // Each process's parent, from /proc/PID/stat ("PID (COMM) STATE PPID ...").
+    let parents: Vec<(i32, i32)> = std::fs::read_dir("/proc")
+        .ok()?
+        .filter_map(|entry| {
+            let pid: i32 = entry.ok()?.file_name().to_str()?.parse().ok()?;
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            let (_, rest) = stat.rsplit_once(") ")?;
+            Some((pid, rest.split_whitespace().nth(1)?.parse().ok()?))
+        })
+        .collect();
+    let mut family = vec![run as i32];
+    let mut index = 0;
+    while index < family.len() {
+        let parent = family[index];
+        family.extend(
+            parents
+                .iter()
+                .filter(|(_, ppid)| *ppid == parent)
+                .map(|(pid, _)| *pid),
+        );
+        index += 1;
+    }
+    let mut traced = family.into_iter().skip(1).filter(|pid| {
+        std::fs::read_to_string(format!("/proc/{pid}/status")).is_ok_and(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("TracerPid:"))
+                .is_some_and(|tracer| tracer.trim() != "0")
+        })
+    });
+    let first = traced.next()?;
+    traced.next().is_none().then_some(first)
+}
+
+/// `openat2(dir, path, flags, RESOLVE_IN_ROOT)`: `path` resolved as if `dir`
+/// were the root, so absolute symbolic links and `..` stay inside it.
+fn open_in_root(dir: &OwnedFd, path: &Path, flags: i32) -> std::io::Result<OwnedFd> {
+    let relative = path.strip_prefix("/").unwrap_or(path);
+    let relative = if relative.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        relative
+    };
+    let path = CString::new(relative.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    // SAFETY: `open_how` holds only integers, and zero is the value the
+    // kernel requires of every field this call does not set.
+    let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+    how.flags = (flags | libc::O_CLOEXEC) as u64;
+    how.resolve = libc::RESOLVE_IN_ROOT | libc::RESOLVE_NO_MAGICLINKS;
+    // SAFETY: `path` is NUL-terminated, and `how` is an `open_how` of the
+    // size passed. glibc has no wrapper for openat2.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            dir.as_raw_fd(),
+            path.as_ptr(),
+            &how as *const libc::open_how,
+            std::mem::size_of::<libc::open_how>(),
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: openat2 returned a new descriptor that nothing else owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
+}
+
+/// `path` with every symbolic link resolved as the guest whose root is `root`
+/// sees it, the way exec resolves it: absolute links lead from that root.
+fn canonical_in_root(root: &OwnedFd, path: &Path) -> std::io::Result<PathBuf> {
+    let mut pending: std::collections::VecDeque<std::ffi::OsString> = path
+        .components()
+        .map(|component| component.as_os_str().to_owned())
+        .collect();
+    let mut resolved = PathBuf::from("/");
+    let mut links = 0;
+    while let Some(component) = pending.pop_front() {
+        match component.as_bytes() {
+            b"/" | b"." => continue,
+            b".." => {
+                resolved.pop();
+                continue;
+            }
+            _ => {}
+        }
+        let candidate = resolved.join(&component);
+        let fd = open_in_root(root, &candidate, libc::O_PATH | libc::O_NOFOLLOW)?;
+        let metadata = std::fs::File::from(fd.try_clone()?).metadata()?;
+        if !metadata.file_type().is_symlink() {
+            resolved = candidate;
+            continue;
+        }
+        links += 1;
+        if links > 40 {
+            return Err(std::io::Error::from_raw_os_error(libc::ELOOP));
+        }
+        let mut target = vec![0u8; libc::PATH_MAX as usize];
+        // SAFETY: an empty path reads the link `fd` itself names, which an
+        // O_PATH | O_NOFOLLOW descriptor allows, into `target`'s bytes.
+        let length = unsafe {
+            libc::readlinkat(
+                fd.as_raw_fd(),
+                c"".as_ptr(),
+                target.as_mut_ptr().cast(),
+                target.len(),
+            )
+        };
+        if length < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        target.truncate(length as usize);
+        let target = PathBuf::from(std::ffi::OsString::from_vec(target));
+        if target.is_absolute() {
+            resolved = PathBuf::from("/");
+        }
+        for component in target.components().rev() {
+            pending.push_front(component.as_os_str().to_owned());
+        }
+    }
+    Ok(resolved)
+}
+
+/// The host file a debugger must load for the program the guest of process
+/// `guest_pid` is about to execute, `guest_program` (a guest path), with
+/// `to_host` mapping a guest path without symbolic links to the host file the
+/// run's mounts make it. The answer is checked against the guest's own view:
+/// the file the guest opens there must be that same host file (device and
+/// inode), readable, and an ELF executable, since a debugger can load nothing
+/// else. Anything else is refused with the reason, before any hint is given.
+pub fn identify_debuggee(
+    guest_pid: i32,
+    guest_program: &Path,
+    to_host: impl Fn(&Path) -> Option<PathBuf>,
+) -> Result<PathBuf, Error> {
+    let root = std::fs::File::open(format!("/proc/{guest_pid}/root"))
+        .map(OwnedFd::from)
+        .with_context(|| format!("Failed to open the root of the guest's process {guest_pid}"))?;
+    let canonical = canonical_in_root(&root, guest_program).with_context(|| {
+        format!(
+            "--dap-listen cannot follow {} through the guest's file system",
+            guest_program.display()
+        )
+    })?;
+    let host = to_host(&canonical).ok_or_else(|| {
+        anyhow::anyhow!(
+            "--dap-listen cannot tell the debugger which host file is the guest's {} ({}): \
+             no mount of this run maps it to one",
+            guest_program.display(),
+            canonical.display()
+        )
+    })?;
+    let guest_file = match open_in_root(&root, &canonical, libc::O_RDONLY) {
+        Ok(fd) => std::fs::File::from(fd),
+        Err(error) if error.raw_os_error() == Some(libc::EACCES) => anyhow::bail!(
+            "--dap-listen cannot read {}, so a debugger could not load it either; \
+             make it readable",
+            guest_program.display()
+        ),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "--dap-listen cannot open the guest's {}",
+                    guest_program.display()
+                )
+            });
+        }
+    };
+    let mut magic = [0u8; 4];
+    let read = std::io::Read::read(&mut (&guest_file), &mut magic).unwrap_or(0);
+    if magic.starts_with(b"#!") {
+        anyhow::bail!(
+            "--dap-listen debugs an executable, and the guest's {} is a #! script; to debug \
+             its interpreter, run the interpreter with the script as its argument, for \
+             example hermit run --dap-listen=ADDRESS -- /bin/sh {}",
+            guest_program.display(),
+            guest_program.display()
+        );
+    }
+    anyhow::ensure!(
+        read == magic.len() && &magic == b"\x7fELF",
+        "--dap-listen debugs an ELF executable, and the guest's {} is not one",
+        guest_program.display()
+    );
+    let guest_metadata = guest_file
+        .metadata()
+        .context("Failed to stat the guest's program")?;
+    let host_metadata =
+        std::fs::metadata(&host).with_context(|| format!("Failed to stat {}", host.display()))?;
+    anyhow::ensure!(
+        (guest_metadata.dev(), guest_metadata.ino()) == (host_metadata.dev(), host_metadata.ino()),
+        "--dap-listen cannot tell the debugger which host file the guest runs: the guest's {} \
+         ({}) is not the host's {}",
+        guest_program.display(),
+        canonical.display(),
+        host.display()
+    );
+    Ok(host)
+}
+
 /// Supervises `run`, a `hermit run --gdbserver` on `gdbserver_port`. Once its
-/// gdbserver listens, starts `hermit-dap` on `listener` and prints the attach
-/// hint naming `program`. Returns the run's status when it ends. If the
-/// adapter ends, for any reason, while the gdbserver still waits for its one
-/// connection, no debugger can ever attach, so this ends the run and fails.
-/// An adapter whose debugger connected and later left is
+/// gdbserver listens and its guest process is waiting, names the host file the
+/// debugger must load with `identify` (given that process), then starts
+/// `hermit-dap` on `listener` and prints the attach hint. Returns the run's
+/// status when it ends. If the adapter ends, for any reason, while the
+/// gdbserver still waits for its one connection, no debugger can ever attach,
+/// so this ends the run and fails; so does a refusal of `identify`, or a
+/// missing `hermit-dap`. An adapter whose debugger connected and later left is
 /// <https://github.com/rrnewton/hermit/issues/4313>.
 pub fn supervise(
     mut run: Child,
     listener: TcpListener,
     gdbserver_port: u16,
-    program: &Path,
+    identify: impl Fn(i32) -> Result<PathBuf, Error>,
     gdb: Option<&Path>,
 ) -> Result<reverie::process::ExitStatus, Error> {
     let mut listener = Some(listener);
@@ -147,17 +359,24 @@ pub fn supervise(
         let listening = tcp_port_is_listening(gdbserver_port);
         match adapter.as_mut() {
             None if listening => {
-                // Said in one write before hermit-dap shares this stderr, so
-                // its own lines never land in the middle of this one.
-                let line = format!(
-                    "hermit run: starting hermit-dap to serve this run to one DAP client; {}\n",
-                    attach_hint(program, gdbserver_port)
-                );
-                let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
-                let started = listener
-                    .take()
-                    .context("the DAP listener was already used")
-                    .and_then(|listener| ListeningAdapter::spawn(listener, gdb));
+                let Some(guest) = traced_descendant(run.id()) else {
+                    std::thread::sleep(POLL_INTERVAL);
+                    continue;
+                };
+                let started = hermit_dap_beside_hermit().and_then(|path| {
+                    let program = identify(guest)?;
+                    // Said in one write before hermit-dap shares this stderr,
+                    // so its own lines never land in the middle of this one.
+                    let line = format!(
+                        "hermit run: starting hermit-dap to serve this run to one DAP client; {}\n",
+                        attach_hint(&program, gdbserver_port)
+                    );
+                    let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
+                    let listener = listener
+                        .take()
+                        .context("the DAP listener was already used")?;
+                    ListeningAdapter::spawn(&path, listener, gdb)
+                });
                 match started {
                     Ok(started) => adapter = Some(started),
                     Err(error) => {
@@ -217,12 +436,11 @@ pub struct ListeningAdapter {
 }
 
 impl ListeningAdapter {
-    /// Starts the adapter on `listener`, which it inherits as [`LISTEN_FD`],
+    /// Starts `adapter` on `listener`, which it inherits as [`LISTEN_FD`],
     /// running `gdb` if given.
-    pub fn spawn(listener: TcpListener, gdb: Option<&Path>) -> Result<Self, Error> {
-        let adapter = hermit_dap_beside_hermit()?;
+    pub fn spawn(adapter: &Path, listener: TcpListener, gdb: Option<&Path>) -> Result<Self, Error> {
         let listener_fd = listener.as_raw_fd();
-        let mut command = Command::new(&adapter);
+        let mut command = Command::new(adapter);
         command
             .arg("--listen-fd")
             .arg(LISTEN_FD.to_string())
