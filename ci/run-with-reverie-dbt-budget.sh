@@ -1549,7 +1549,10 @@ fi
 # binding, re-parented by the coordinator onto KVM slice 3). It adds reverie/src/inherited_input.rs and a
 # reverie-dbt launcher test (inventory 951 -> 952) and edits reverie-dbt/src/launcher.rs; no SDK recipe
 # input, build.rs or vendored DynamoRIO file changes, so the budgets above carry.
-expected_pin=e1ecaeb31a0bb1f8b86f36e769296ab6a7de3782
+# KVM RDPMC SDK-BUDGET CARRY (2026-10-14): advance from e1ecaeb3 to 16ffab7c558c47c78c43aa8e0e4242eb2deeeb3d (the KVM lane's rdpmc counter
+# reads, re-parented by the coordinator onto DBT D3). The added commit changes only reverie-kvm; no SDK
+# recipe input, build.rs or vendored DynamoRIO file changes and no reverie-dbt file is added.
+expected_pin=16ffab7c558c47c78c43aa8e0e4242eb2deeeb3d
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
