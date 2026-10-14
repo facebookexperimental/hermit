@@ -658,11 +658,13 @@ fn proc_interrupt_accounting_is_deterministic() {
 
 #[test]
 fn proc_schedstat_uses_virtual_zero_values() {
+    // The machine has one CPU (https://github.com/rrnewton/hermit/issues/4266):
+    // one zeroed `cpu0` line and, as Linux shows for one CPU, no scheduling
+    // domains.
     assert_deterministic("/proc/schedstat", |contents| {
         let text = std::str::from_utf8(contents).expect("schedstat should be UTF-8");
         let mut saw_timestamp = false;
-        let mut saw_cpu = false;
-        let mut saw_domain = false;
+        let mut cpus = Vec::new();
 
         for line in text.lines() {
             let fields = line.split_whitespace().collect::<Vec<_>>();
@@ -677,12 +679,7 @@ fn proc_schedstat_uses_virtual_zero_values() {
                 }
                 Some(label) if is_numbered_label(label, "cpu") => {
                     assert!(fields[1..].iter().all(|field| *field == "0"));
-                    saw_cpu = true;
-                }
-                Some(label) if is_numbered_label(label, "domain") => {
-                    assert!(fields.len() >= 3);
-                    assert!(fields[3..].iter().all(|field| *field == "0"));
-                    saw_domain = true;
+                    cpus.push(label.to_owned());
                 }
                 Some(label) => panic!("unexpected schedstat row {label}: {line}"),
                 None => {}
@@ -690,8 +687,7 @@ fn proc_schedstat_uses_virtual_zero_values() {
         }
 
         assert!(saw_timestamp);
-        assert!(saw_cpu);
-        assert!(saw_domain);
+        assert_eq!(cpus, ["cpu0"], "{text}");
     });
 }
 

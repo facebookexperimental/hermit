@@ -870,6 +870,24 @@ impl DetFd {
         self.with_description(|d| d.procfs.as_ref().and_then(ProcfsFile::rendered_path))
     }
 
+    /// Whether Linux reads this procfs file through `read_iter`
+    /// (`ProcfsFile::has_read_iter`).
+    pub(crate) fn procfs_has_read_iter(&self) -> bool {
+        self.with_description(|d| d.procfs.as_ref().is_none_or(ProcfsFile::has_read_iter))
+    }
+
+    /// Whether Detcore keeps this procfs file's kernel position at its own
+    /// cursor: a placeholder, or a fixed file the kernel opened (whose
+    /// snapshot Detcore renders without reading the kernel's file). A backend
+    /// that rediscovers descriptors after `exec` reads the position back.
+    pub(crate) fn procfs_keeps_kernel_position(&self) -> bool {
+        self.with_description(|d| {
+            d.procfs
+                .as_ref()
+                .is_some_and(|procfs| procfs.is_rendered() || procfs.snapshot_is_fixed())
+        })
+    }
+
     /// Whether a short copy of a read of this procfs file is `EFAULT`
     /// (`ProcfsFile::faults_on_a_short_copy`).
     pub(crate) fn procfs_faults_on_a_short_copy(&self) -> bool {
@@ -880,14 +898,23 @@ impl DetFd {
         })
     }
 
-    /// The bytes a rendered procfs file's snapshot starts from in place of a
-    /// capture (`ProcfsFile::rendering_template`), if this is one.
+    /// The bytes a procfs file's snapshot starts from in place of a capture
+    /// of the kernel's file, if it takes none: a rendered file's template
+    /// (`ProcfsFile::rendering_template`), or nothing for a fixed file the
+    /// kernel opened (through a symbolic link, after `chroot`, under record
+    /// and replay), whose bytes are the description's whatever the kernel's
+    /// file holds (`ProcfsFile::snapshot_is_fixed`).
     pub(crate) fn procfs_rendering_template(&self) -> Option<&'static [u8]> {
         self.with_description(|d| {
-            d.procfs
-                .as_ref()
-                .filter(|procfs| procfs.is_rendered())
-                .map(ProcfsFile::rendering_template)
+            d.procfs.as_ref().and_then(|procfs| {
+                if procfs.is_rendered() {
+                    Some(procfs.rendering_template())
+                } else if procfs.snapshot_is_fixed() {
+                    Some(&b""[..])
+                } else {
+                    None
+                }
+            })
         })
     }
 
@@ -1730,9 +1757,10 @@ mod tests {
             FdType::Regular,
             OpenFileId::new(owner, 0),
         );
-        original.set_procfs(ProcfsFile::from_path(Path::new("/proc/sys/fs/file-nr")).unwrap());
+        // A `seq_file` file, which serves reads at any position.
+        original.set_procfs(ProcfsFile::from_path(Path::new("/proc/version")).unwrap());
         original.initialize_procfs(
-            b"15\t0\t1000\n".to_vec(),
+            Vec::new(),
             ProcfsSnapshotContext {
                 virtual_pid: 1,
                 ..ProcfsSnapshotContext::default()
@@ -1740,11 +1768,11 @@ mod tests {
         );
         let duplicate = original.clone().with_fd(4);
 
-        assert_eq!(original.preview_procfs(2).unwrap(), (0, b"0\t".to_vec()));
+        assert_eq!(original.preview_procfs(2).unwrap(), (0, b"Li".to_vec()));
         assert_eq!(duplicate.procfs_position().unwrap().0, 0);
         original.commit_procfs_read(0, 2);
         assert_eq!(duplicate.procfs_position().unwrap().0, 2);
-        assert_eq!(duplicate.take_procfs_at(4, 1).unwrap(), b"9");
+        assert_eq!(duplicate.take_procfs_at(4, 1).unwrap(), b"x");
         assert_eq!(original.procfs_position().unwrap().0, 2);
 
         // A read that copied nothing leaves the shared cursor in place.
@@ -1755,7 +1783,11 @@ mod tests {
         duplicate.set_procfs_offset(0);
         assert_eq!(
             original.preview_procfs(128).unwrap(),
-            (0, b"0\t0\t9223372036854775807\n".to_vec())
+            (
+                0,
+                crate::procfs::FixedProcfsFile::Version
+                    .contents(&crate::machine::MachineDescription::default())
+            )
         );
     }
 

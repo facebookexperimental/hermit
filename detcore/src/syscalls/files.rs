@@ -299,6 +299,13 @@ fn copy_procfs_output<M: MemoryAccess>(
     }
 }
 
+/// Whether a descriptor with status flags `status` can read: not `O_PATH`,
+/// and opened for reading (`O_RDONLY` or `O_RDWR`; not `O_WRONLY`, nor access
+/// mode 3, which grants neither).
+fn can_read(status: i32) -> bool {
+    status & libc::O_PATH == 0 && matches!(status & libc::O_ACCMODE, libc::O_RDONLY | libc::O_RDWR)
+}
+
 /// Copy the bytes of a read of a procfs file as its read handler does: a
 /// `seq_file` copies up to the first byte it cannot write, and a sysctl
 /// (`faults_on_a_short_copy`) copies all of them or fails with `EFAULT`, so
@@ -321,8 +328,17 @@ fn copy_procfs_read<M: MemoryAccess>(
 /// `FMODE_NOWAIT` or `FOP_DONTCACHE`: an unknown flag, then `RWF_APPEND` with
 /// `RWF_NOAPPEND` (`EINVAL`), then `RWF_NOWAIT`, `RWF_ATOMIC` (a read) and
 /// `RWF_DONTCACHE` (`EOPNOTSUPP`). Measured on Linux 7.1 for `/proc/version`
-/// and the sysctls, which also accept `RWF_NOSIGNAL`.
-fn validate_procfs_vector_flags(flags: i32) -> Result<(), Errno> {
+/// and the sysctls, which also accept `RWF_NOSIGNAL`. A file without
+/// `read_iter` (`/proc/modules`, `/proc/swaps`) is read by
+/// `do_loop_readv_writev`, which refuses every flag but `RWF_HIPRI`.
+fn validate_procfs_vector_flags(flags: i32, read_iter: bool) -> Result<(), Errno> {
+    if !read_iter {
+        return if flags & !libc::RWF_HIPRI != 0 {
+            Err(Errno::EOPNOTSUPP)
+        } else {
+            Ok(())
+        };
+    }
     // Linux 7.1's RWF_NOSIGNAL is newer than the pinned libc crate.
     const RWF_NOSIGNAL: i32 = 0x100;
     const KNOWN: i32 = libc::RWF_HIPRI
@@ -1558,7 +1574,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let status = guest
             .thread_state()
             .with_detfd(fd, |detfd| detfd.status_flags())?;
-        if status & libc::O_PATH != 0 || status & libc::O_ACCMODE == libc::O_WRONLY {
+        if !can_read(status) {
             return Err(Errno::EBADF.into());
         }
         let iovecs = crate::iovecs::import_read_iovecs(&guest.memory(), address, count, || {
@@ -1573,7 +1589,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return Err(Errno::EINVAL.into());
         }
-        validate_procfs_vector_flags(flags)?;
+        let read_iter = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.procfs_has_read_iter())?;
+        validate_procfs_vector_flags(flags, read_iter)?;
         // A file the kernel opened takes its snapshot at its first read.
         if guest
             .thread_state()
@@ -2648,11 +2667,23 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // classifies as nothing lexically -- and scoping it this way
                 // makes the fallback MONOTONE: it can only add a classification
                 // where there was none, never change one that already existed.
-                let mut procfs = ProcfsFile::from_path(&observed_path).or_else(|| {
-                    resolved_open_path(guest.pid().as_raw(), fd)
+                //
+                // Under record and replay the descriptor's link is read through
+                // the recording: replay holds the descriptor's number with an
+                // eventfd, which resolves to no procfs file, so both runs must
+                // classify the open by the link the recording read
+                // (`recorded_open_path`).
+                let mut procfs = ProcfsFile::from_path(&observed_path);
+                if procfs.is_none() {
+                    let resolved = if self.cfg.recordreplay_modes {
+                        self.recorded_open_path(guest, fd).await?
+                    } else {
+                        resolved_open_path(guest.pid().as_raw(), fd)
+                    };
+                    procfs = resolved
                         .filter(|resolved| resolved != &observed_path)
-                        .and_then(|resolved| ProcfsFile::from_path(&resolved))
-                });
+                        .and_then(|resolved| ProcfsFile::from_path(&resolved));
+                }
                 if procfs
                     .as_ref()
                     .is_some_and(ProcfsFile::needs_bound_thread_identity)
@@ -3193,6 +3224,129 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// What descriptor `fd` of the calling process names, as its
+    /// `/proc/self/fd` link reads, through the recording: the recording reads
+    /// the kernel's link and keeps its bytes, and replay, whose descriptor is
+    /// an eventfd, returns the same bytes. `None` for a deleted or anonymous
+    /// target, a link that cannot be read, or one too long for the 256 bytes
+    /// read: every path Detcore classifies is far shorter, and a truncated
+    /// one must not match.
+    ///
+    /// The link's name and the buffer go in the guest stack scratch, below the
+    /// red zone, or, where that memory is not writable (a stack pointer just
+    /// above a guard page or the lowest page of the main-thread stack), in a
+    /// transient private page, as `inject_fstat` does
+    /// (<https://github.com/rrnewton/hermit/issues/3328>): Detcore's
+    /// bookkeeping must never fail the guest's open.
+    async fn recorded_open_path<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Result<Option<PathBuf>, Error> {
+        const LINK_CAPACITY: usize = 32;
+        const TARGET_CAPACITY: usize = 256;
+        let link_name =
+            rendered_procfs::c_string::<LINK_CAPACITY>(format!("/proc/self/fd/{fd}").as_bytes());
+        let mut stack = guest.stack().await;
+        let link = stack.push(link_name);
+        let target = stack.reserve::<[u8; TARGET_CAPACITY]>();
+        let bytes = match stack.commit() {
+            Ok(stack_guard) => {
+                let bytes = self
+                    .recorded_readlink(guest, link.as_raw(), target.as_raw(), TARGET_CAPACITY)
+                    .await;
+                drop(stack_guard);
+                bytes
+            }
+            Err(_) => {
+                info!(
+                    "Guest stack scratch cannot hold the link of fd {}; using a transient page \
+                     instead.",
+                    fd
+                );
+                let len = LINK_CAPACITY + TARGET_CAPACITY;
+                let mapped = guest
+                    .inject_with_retry(Syscall::Mmap(
+                        syscalls::Mmap::new()
+                            .with_addr(None)
+                            .with_len(len)
+                            .with_prot(ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
+                            .with_flags(MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS)
+                            .with_fd(-1)
+                            .with_offset(0),
+                    ))
+                    .await;
+                let Some(page) = mapped
+                    .ok()
+                    .and_then(|mapped| usize::try_from(mapped).ok())
+                    .and_then(AddrMut::<u8>::from_raw)
+                else {
+                    return Ok(None);
+                };
+                let bytes = if guest.memory().write_exact(page, &link_name).is_ok() {
+                    self.recorded_readlink(
+                        guest,
+                        page.as_raw(),
+                        page.as_raw() + LINK_CAPACITY,
+                        TARGET_CAPACITY,
+                    )
+                    .await
+                } else {
+                    None
+                };
+                if let Err(errno) = guest
+                    .inject_with_retry(Syscall::Munmap(
+                        syscalls::Munmap::new()
+                            .with_addr(Some(page.cast::<libc::c_void>().into()))
+                            .with_len(len),
+                    ))
+                    .await
+                {
+                    warn!(
+                        "[detcore] could not unmap the transient link page: {}",
+                        errno
+                    );
+                }
+                bytes
+            }
+        };
+        Ok(bytes.and_then(|bytes| {
+            let path = PathBuf::from(
+                <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(bytes),
+            );
+            path.is_absolute().then_some(path)
+        }))
+    }
+
+    /// `readlink(link, target, capacity)` through the recording, both at guest
+    /// addresses: the bytes it read, or `None` if it failed or filled the
+    /// buffer (a link that may be truncated).
+    async fn recorded_readlink<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        link: usize,
+        target: usize,
+        capacity: usize,
+    ) -> Option<Vec<u8>> {
+        let target = AddrMut::<u8>::from_raw(target)?;
+        let length = self
+            .record_or_replay(
+                guest,
+                syscalls::Readlink::new()
+                    .with_path(PathPtr::from_ptr(link as *const libc::c_char))
+                    .with_buf(Some(target.cast::<libc::c_char>()))
+                    .with_bufsize(capacity),
+            )
+            .await
+            .ok()?;
+        let length = usize::try_from(length)
+            .ok()
+            .filter(|length| *length < capacity)?;
+        let mut bytes = vec![0; length];
+        guest.memory().read_exact(target, &mut bytes).ok()?;
+        Some(bytes)
+    }
+
     async fn initialize_procfs_snapshot<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -3202,13 +3356,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_rendering_template())?;
         let raw_contents = match template {
-            // An `O_PATH` descriptor reads nothing.
+            // A descriptor that cannot read (`O_PATH`, write-only, or access
+            // mode 3) reads nothing (EBADF), as the kernel's read of it,
+            // which a rendered snapshot does not make, would answer.
             Some(_)
-                if guest
-                    .thread_state()
-                    .with_detfd(call.fd(), |detfd| detfd.status_flags())?
-                    & libc::O_PATH
-                    != 0 =>
+                if !can_read(
+                    guest
+                        .thread_state()
+                        .with_detfd(call.fd(), |detfd| detfd.status_flags())?,
+                ) =>
             {
                 return Err(Errno::EBADF.into());
             }
@@ -3241,8 +3397,6 @@ impl<T: RecordOrReplay> Detcore<T> {
             .transpose()?;
         let virtual_realtime_seconds = i64::try_from(thread_observe_time(guest).await.as_secs())
             .map_err(|_| Errno::EOVERFLOW)?;
-        // TODO-HUMAN-REVIEW(PR-863): Use configured guest memory for meminfo.
-        let virtual_memory_kb = guest.config().memory / 1024;
         // TODO-HUMAN-REVIEW(PR-723): Review injected identity snapshot reads.
         let virtual_pid = guest.inject(syscalls::Getpid::new()).await? as i32;
         let virtual_ppid = guest.inject(syscalls::Getppid::new()).await? as i32;
@@ -3611,7 +3765,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                     virtual_uptime_seconds,
                     virtual_boot_time_seconds,
                     virtual_realtime_seconds,
-                    virtual_memory_kb,
                     virtual_pid,
                     virtual_ppid,
                     virtual_pty_count,
@@ -3666,17 +3819,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await;
         }
 
-        let (needs_procfs_snapshot, serves_procfs_snapshot, opened_for_path) =
+        let (needs_procfs_snapshot, serves_procfs_snapshot, cannot_read) =
             guest.thread_state().with_detfd(call.fd(), |detfd| {
                 (
                     detfd.procfs_needs_snapshot(),
                     detfd.procfs_serves_snapshot(),
-                    detfd.status_flags() & libc::O_PATH != 0,
+                    !can_read(detfd.status_flags()),
                 )
             })?;
-        // An `O_PATH` descriptor reads nothing (EBADF), before its buffer is
-        // looked at; a rendered file's snapshot exists from its open.
-        if serves_procfs_snapshot && opened_for_path {
+        // A descriptor that cannot read (`O_PATH`, write-only, access mode 3)
+        // reads nothing (EBADF), before its buffer is looked at, as Linux's
+        // `vfs_read` checks; a rendered file's snapshot exists from its open.
+        if serves_procfs_snapshot && cannot_read {
             return Err(Errno::EBADF.into());
         }
         if serves_procfs_snapshot {
@@ -3862,17 +4016,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let offset = usize::try_from(call.offset()).map_err(|_| Errno::EINVAL)?;
-        let (needs_procfs_snapshot, serves_procfs_snapshot, opened_for_path) =
+        let (needs_procfs_snapshot, serves_procfs_snapshot, cannot_read) =
             guest.thread_state().with_detfd(call.fd(), |detfd| {
                 (
                     detfd.procfs_needs_snapshot(),
                     detfd.procfs_serves_snapshot(),
-                    detfd.status_flags() & libc::O_PATH != 0,
+                    !can_read(detfd.status_flags()),
                 )
             })?;
-        // An `O_PATH` descriptor reads nothing (EBADF), before its buffer is
-        // looked at; a rendered file's snapshot exists from its open.
-        if serves_procfs_snapshot && opened_for_path {
+        // A descriptor that cannot read (`O_PATH`, write-only, access mode 3)
+        // reads nothing (EBADF), before its buffer is looked at, as Linux's
+        // `vfs_read` checks; a rendered file's snapshot exists from its open.
+        if serves_procfs_snapshot && cannot_read {
             return Err(Errno::EBADF.into());
         }
         if serves_procfs_snapshot {
@@ -10508,6 +10663,16 @@ mod test {
         assert_eq!(read(b"", true), Ok(0));
     }
 
+    /// A procfs read is EBADF unless the descriptor was opened for reading.
+    #[test]
+    fn only_a_descriptor_opened_for_reading_reads_procfs() {
+        assert!(super::can_read(libc::O_RDONLY));
+        assert!(super::can_read(libc::O_RDWR | libc::O_CLOEXEC));
+        assert!(!super::can_read(libc::O_WRONLY));
+        assert!(!super::can_read(libc::O_ACCMODE));
+        assert!(!super::can_read(libc::O_PATH));
+    }
+
     /// `kiocb_set_rw_flags` for a procfs file, in Linux 7.1's order.
     #[test]
     fn procfs_vector_flags_are_refused_in_linux_order() {
@@ -10523,7 +10688,7 @@ mod test {
             libc::RWF_NOAPPEND,
             NOSIGNAL,
         ] {
-            assert_eq!(super::validate_procfs_vector_flags(accepted), Ok(()));
+            assert_eq!(super::validate_procfs_vector_flags(accepted, true), Ok(()));
         }
         for (flags, errno) in [
             (libc::RWF_NOWAIT, Errno::EOPNOTSUPP),
@@ -10546,8 +10711,27 @@ mod test {
             ),
         ] {
             assert_eq!(
-                super::validate_procfs_vector_flags(flags),
+                super::validate_procfs_vector_flags(flags, true),
                 Err(errno),
+                "{flags:#x}"
+            );
+        }
+        // A file without `read_iter` (`/proc/modules`, `/proc/swaps`) takes
+        // `RWF_HIPRI` alone, and refuses even the conflicting pair with
+        // EOPNOTSUPP.
+        assert_eq!(
+            super::validate_procfs_vector_flags(libc::RWF_HIPRI, false),
+            Ok(())
+        );
+        for flags in [
+            libc::RWF_DSYNC,
+            libc::RWF_APPEND,
+            NOSIGNAL,
+            libc::RWF_APPEND | libc::RWF_NOAPPEND,
+        ] {
+            assert_eq!(
+                super::validate_procfs_vector_flags(flags, false),
+                Err(Errno::EOPNOTSUPP),
                 "{flags:#x}"
             );
         }

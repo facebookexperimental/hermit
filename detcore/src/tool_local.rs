@@ -977,6 +977,32 @@ impl FileMetadata {
                 detfd.set_procfs_offset(offset);
             })?;
         }
+        // A fixed procfs file the kernel opened (through a symbolic link),
+        // which the old image read from Detcore's rendering: the file again,
+        // at the position Detcore kept in the kernel
+        // (`DetFd::procfs_keeps_kernel_position`), so the new image does not
+        // read the host's file. procfs files report size 0.
+        else if raw_stat.st_mode & libc::S_IFMT == libc::S_IFREG
+            && raw_stat.st_size == 0
+            && let Some(procfs) = fixed_procfs_behind(fd)
+        {
+            // SAFETY: lseek only reads the descriptor's position.
+            let offset = unsafe {
+                crate::util::raw_syscall(
+                    libc::SYS_lseek,
+                    [fd as u64, 0, libc::SEEK_CUR as u64, 0, 0, 0],
+                )
+            };
+            let offset = usize::try_from(offset).unwrap_or(0);
+            let path = procfs
+                .rendered_path()
+                .expect("a fixed procfs file has a path");
+            self.with_detfd(fd, |detfd| {
+                detfd.set_path(path);
+                detfd.set_procfs(procfs.clone());
+                detfd.set_procfs_offset(offset);
+            })?;
+        }
         if let Some(resource) = stdio_resource(fd) {
             self.with_detfd(fd, |detfd| detfd.set_resource(resource.clone()))?;
         }
@@ -5316,6 +5342,34 @@ fn thread_rng_from_parent_entropy_labeled(
 /// <https://github.com/rrnewton/hermit/issues/4263>). Read with raw
 /// system calls (under in-guest backends the tool shares the guest's C
 /// library).
+/// The fixed procfs file the kernel opened at `fd`, if its descriptor link
+/// names one (`ProcfsFile::snapshot_is_fixed`).
+fn fixed_procfs_behind(fd: RawFd) -> Option<crate::procfs::ProcfsFile> {
+    let link = std::ffi::CString::new(format!("/proc/self/fd/{fd}")).ok()?;
+    let mut target = [0_u8; 256];
+    // SAFETY: the path is NUL-terminated and `target` is writable.
+    let length = unsafe {
+        crate::util::raw_syscall(
+            libc::SYS_readlinkat,
+            [
+                libc::AT_FDCWD as u64,
+                link.as_ptr() as u64,
+                target.as_mut_ptr() as u64,
+                target.len() as u64,
+                0,
+                0,
+            ],
+        )
+    };
+    let length = usize::try_from(length)
+        .ok()
+        .filter(|length| *length < target.len())?;
+    let path = std::path::Path::new(
+        <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&target[..length]),
+    );
+    crate::procfs::ProcfsFile::from_path(path).filter(crate::procfs::ProcfsFile::snapshot_is_fixed)
+}
+
 fn placeholder_behind(fd: RawFd) -> Option<(&'static std::path::Path, Vec<u8>)> {
     // SAFETY: F_GET_SEALS only reads the descriptor's seals.
     let seals = unsafe {

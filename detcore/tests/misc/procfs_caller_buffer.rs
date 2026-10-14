@@ -12,11 +12,13 @@
 //! and then hands the caller sanitized bytes. Each test uses a fresh
 //! descriptor, so its call is the one that performs the capture.
 //!
-//! - `/proc/modules` sanitizes to an empty file
-//!   (https://github.com/rrnewton/hermit/issues/3815), so the first read
-//!   returns 0, and no host module table may be left in the caller's buffer.
-//!   The write-only cases cover a destination the kernel may write but a
-//!   tracer's protection-respecting read cannot see.
+//! - `/proc/diskstats` sanitizes to fewer bytes than the host's file (each
+//!   disk's counters become single digits), so after a first read the
+//!   caller's buffer past the returned count must hold none of the host
+//!   table the capture read. The write-only cases cover a destination the
+//!   kernel may write but a tracer's protection-respecting read cannot see.
+//!   (`/proc/modules`, which these tests used before, is now a file Detcore
+//!   renders with no capture: https://github.com/rrnewton/hermit/issues/4266.)
 //! - The copy to the caller checks the destination as the kernel's
 //!   `copy_to_user` does: a read-only, inaccessible or unmapped destination
 //!   gets `EFAULT` and is not written, and a destination that becomes
@@ -35,26 +37,41 @@
 use std::fs::File;
 use std::os::fd::AsRawFd;
 
-/// Larger than the host `/proc/modules` on a typical machine, so the capture
-/// takes the whole file in one read and would leave all of it behind.
+/// Larger than the host `/proc/diskstats` on a typical machine, so the capture
+/// takes the whole file in one read and would leave its tail behind.
 const LEN: usize = 64 * 1024;
 const SENTINEL: u8 = 0xa5;
 
-/// The leak can only show when the host file has contents to leave behind.
-fn require_host_modules() {
-    let host = std::fs::read("/proc/modules").unwrap();
+/// The host's `/proc/diskstats`, which must have contents to leave behind.
+fn require_host_disks() -> usize {
+    let host = std::fs::read("/proc/diskstats").unwrap();
     assert!(
-        !host.is_empty(),
-        "this host has no loaded modules, so the capture writes nothing and \
-         these tests cannot detect a leak; run them on a host with modules"
+        !host.is_empty() && host.len() < LEN,
+        "this host's /proc/diskstats has {} bytes; these tests need a nonempty file \
+         that fits their {LEN}-byte buffer",
+        host.len()
+    );
+    host.len()
+}
+
+/// A leak shows only past the bytes a read published and within what the
+/// capture wrote: the host's file must be longer than the sanitized one.
+fn assert_detectable(host: usize, returned: isize, call: &str) {
+    assert!(
+        returned > 0 && (returned as usize) < host,
+        "{call} returned {returned} of a {host}-byte host file, so a leftover host byte \
+         could not show"
     );
 }
 
-fn assert_untouched(buf: &[u8], call: &str) {
-    if let Some(at) = buf.iter().position(|&byte| byte != SENTINEL) {
+/// The bytes past the `returned` a read published are as the caller left
+/// them.
+fn assert_untouched(buf: &[u8], returned: usize, call: &str) {
+    if let Some(at) = buf[returned..].iter().position(|&byte| byte != SENTINEL) {
+        let at = returned + at;
         let end = buf.len().min(at + 64);
         panic!(
-            "{call} of the empty /proc/modules returned 0 but changed the caller's buffer at \
+            "{call} of /proc/diskstats returned {returned} but changed the caller's buffer at \
              byte {at}: {:?}",
             String::from_utf8_lossy(&buf[at..end])
         );
@@ -63,38 +80,39 @@ fn assert_untouched(buf: &[u8], call: &str) {
 
 #[test]
 fn procfs_read_leaves_no_host_bytes_in_the_caller_buffer() {
-    require_host_modules();
+    let host = require_host_disks();
     super::det_test_fn_without_pmu(|| {
-        let file = File::open("/proc/modules").unwrap();
+        let file = File::open("/proc/diskstats").unwrap();
         let mut buf = vec![SENTINEL; LEN];
         let n = unsafe { libc::read(file.as_raw_fd(), buf.as_mut_ptr().cast(), LEN) };
-        assert_eq!(n, 0);
-        assert_untouched(&buf, "read");
+        assert_detectable(host, n, "read");
+        assert_untouched(&buf, n as usize, "read");
     });
 }
 
 #[test]
 fn procfs_pread_leaves_no_host_bytes_in_the_caller_buffer() {
-    require_host_modules();
+    let host = require_host_disks();
     super::det_test_fn_without_pmu(|| {
-        let file = File::open("/proc/modules").unwrap();
+        let file = File::open("/proc/diskstats").unwrap();
         let mut buf = vec![SENTINEL; LEN];
         let n = unsafe { libc::pread(file.as_raw_fd(), buf.as_mut_ptr().cast(), LEN, 0) };
-        assert_eq!(n, 0);
-        assert_untouched(&buf, "pread");
+        assert_detectable(host, n, "pread");
+        assert_untouched(&buf, n as usize, "pread");
     });
 }
 
-/// A short read into a page the guest made PROT_WRITE-only. The kernel's read
-/// may write it, but `process_vm_readv` cannot read it, so a save of the
-/// caller's buffer would come back empty.
-const WRITE_ONLY_COUNT: usize = 8;
+/// A read into pages the guest made PROT_WRITE-only, larger than the host's
+/// file. The kernel's read may write them, but `process_vm_readv` cannot read
+/// them, so a save of the caller's buffer would come back empty.
+const WRITE_ONLY_COUNT: usize = LEN;
 
 fn assert_write_only_destination_untouched(
+    host: usize,
     call: &str,
     read: impl FnOnce(libc::c_int, *mut libc::c_void) -> isize,
 ) {
-    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    let page = WRITE_ONLY_COUNT;
     let mapping = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -111,23 +129,23 @@ fn assert_write_only_destination_untouched(
         unsafe { libc::mprotect(mapping, page, libc::PROT_WRITE) },
         0
     );
-    let file = File::open("/proc/modules").unwrap();
+    let file = File::open("/proc/diskstats").unwrap();
     let n = read(file.as_raw_fd(), mapping);
     assert_eq!(
         unsafe { libc::mprotect(mapping, page, libc::PROT_READ | libc::PROT_WRITE) },
         0
     );
     let buf = unsafe { std::slice::from_raw_parts(mapping.cast::<u8>(), page) };
-    assert_eq!(n, 0);
-    assert_untouched(buf, call);
+    assert_detectable(host, n, call);
+    assert_untouched(buf, n as usize, call);
     assert_eq!(unsafe { libc::munmap(mapping, page) }, 0);
 }
 
 #[test]
 fn procfs_read_leaves_no_host_bytes_in_a_write_only_buffer() {
-    require_host_modules();
+    let host = require_host_disks();
     super::det_test_fn_without_pmu(|| {
-        assert_write_only_destination_untouched("write-only read", |fd, buf| unsafe {
+        assert_write_only_destination_untouched(host, "write-only read", |fd, buf| unsafe {
             libc::read(fd, buf, WRITE_ONLY_COUNT)
         });
     });
@@ -135,9 +153,9 @@ fn procfs_read_leaves_no_host_bytes_in_a_write_only_buffer() {
 
 #[test]
 fn procfs_pread_leaves_no_host_bytes_in_a_write_only_buffer() {
-    require_host_modules();
+    let host = require_host_disks();
     super::det_test_fn_without_pmu(|| {
-        assert_write_only_destination_untouched("write-only pread", |fd, buf| unsafe {
+        assert_write_only_destination_untouched(host, "write-only pread", |fd, buf| unsafe {
             libc::pread(fd, buf, WRITE_ONLY_COUNT, 0)
         });
     });
@@ -692,7 +710,8 @@ fn assert_eof_ranges(fd: libc::c_int, positioned: bool, offset: i64) {
 #[test]
 fn procfs_read_beyond_the_user_address_limit_fails_efault_at_eof() {
     super::det_test_fn_without_pmu(|| {
-        // Sanitized /proc/modules is empty, so its first read is at EOF.
+        // /proc/modules, which Detcore renders, is empty, so its first read
+        // is at EOF.
         for positioned in [false, true] {
             let file = File::open("/proc/modules").unwrap();
             assert_eof_ranges(file.as_raw_fd(), positioned, 0);

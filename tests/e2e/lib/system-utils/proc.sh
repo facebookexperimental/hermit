@@ -47,17 +47,13 @@ EOF
 run_strict_verify /bin/bash -c "$guest_probe"
 assert_stdout_matches '^processors=[1-9][0-9]*$'
 assert_stdout_contains 'cpu_mhz=1000.000'
-if [[ $SYSTEM_UTIL_BACKEND == kvm ]]; then
-    assert_stdout_contains 'mem_total_kb=2097152'
-    assert_stdout_contains 'mem_free_kb=1048576'
-    assert_stdout_contains 'mem_available_kb=1572864'
-    assert_stdout_contains 'uptime=0.00 0.00'
-else
-    assert_stdout_contains 'mem_total_kb=976562'
-    assert_stdout_contains 'mem_free_kb=976562'
-    assert_stdout_contains 'mem_available_kb=976562'
-    assert_stdout_contains 'uptime=120.00 0.00'
-fi
+# Detcore renders /proc/meminfo and /proc/uptime on every backend
+# (https://github.com/rrnewton/hermit/issues/4266); KVM no longer shows its
+# executor's own values.
+assert_stdout_contains 'mem_total_kb=976562'
+assert_stdout_contains 'mem_free_kb=976562'
+assert_stdout_contains 'mem_available_kb=976562'
+assert_stdout_contains 'uptime=120.00 0.00'
 assert_stdout_contains 'cached_kb=0'
 assert_stdout_contains 'swap_total_kb=0'
 pass_test

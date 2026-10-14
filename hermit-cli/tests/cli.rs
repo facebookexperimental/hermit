@@ -3057,6 +3057,40 @@ fn run_verify_uses_readonly_proc_after_permission_denial() {
     );
 }
 
+/// Under record and replay, a procfs file opened through a symbolic link keeps
+/// the view Detcore gives its own spelling, and replays as recorded. Replay
+/// holds the descriptor's number with an eventfd, which names no procfs file,
+/// so Detcore reads the descriptor's link through the recording; classifying
+/// the open differently in the two runs made replay serve the recording's
+/// capture as a guest read (https://github.com/rrnewton/hermit/issues/4266).
+/// One-byte and whole reads of fixed files, a table and a sanitized file.
+#[test]
+fn record_replay_reads_procfs_files_through_a_symbolic_link() {
+    let _guard = hermit_run_guard();
+    let script = "set -e; d=$(mktemp -d); \
+        for f in /proc/filesystems /proc/tty/drivers /proc/meminfo /proc/version /proc/uptime; do \
+          ln -s $f $d/link; head -c 1 $d/link; echo; cat $d/link; rm $d/link; \
+        done; rmdir $d";
+    let args = ["record", "--verify", "--", "/bin/sh", "-c", script];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert!(
+        stderr(&output).contains("Success: replay matched recording."),
+        "replay must match the recording: {output:?}"
+    );
+    // The machine description's values, not the host's.
+    let text = stdout(&output);
+    assert!(text.contains("Linux version 5.2.0 "), "{text}");
+    assert!(
+        text.lines().any(
+            |line| line.split_whitespace().collect::<Vec<_>>() == ["MemTotal:", "976562", "kB"]
+        ),
+        "{text}"
+    );
+    assert!(text.contains("pty_slave            /dev/pts"), "{text}");
+    assert!(!text.contains("usbserial"), "{text}");
+}
+
 #[test]
 fn record_replay_uses_readonly_proc_after_permission_denial() {
     let _guard = hermit_run_guard();
@@ -3701,21 +3735,69 @@ fn run_dbt_binds_in_a_user_namespace_of_its_own() {
     assert_eq!(lines.next(), None, "{text}");
 }
 
+/// The files of `tests/c/virtual_kernel_files.c`, in its order: those that
+/// describe the kernel and its limits, then the kernel's tables
+/// (https://github.com/rrnewton/hermit/issues/4266).
+const VIRTUAL_KERNEL_FILES: [&str; 35] = [
+    "/proc/version",
+    "/proc/cmdline",
+    "/proc/sys/kernel/osrelease",
+    "/proc/sys/kernel/ostype",
+    "/proc/sys/kernel/version",
+    "/proc/sys/kernel/random/boot_id",
+    "/proc/sys/kernel/random/entropy_avail",
+    "/proc/sys/kernel/overflowuid",
+    "/proc/sys/kernel/overflowgid",
+    "/proc/sys/kernel/pid_max",
+    "/proc/sys/kernel/cap_last_cap",
+    "/proc/sys/vm/overcommit_memory",
+    "/proc/sys/vm/max_map_count",
+    "/proc/sys/vm/mmap_min_addr",
+    "/proc/modules",
+    "/proc/filesystems",
+    "/proc/interrupts",
+    "/proc/softirqs",
+    "/proc/swaps",
+    "/proc/buddyinfo",
+    "/proc/zoneinfo",
+    "/proc/schedstat",
+    "/proc/key-users",
+    "/proc/vmstat",
+    "/proc/cgroups",
+    "/proc/tty/drivers",
+    "/proc/meminfo",
+    "/proc/sys/fs/file-nr",
+    "/proc/sys/fs/file-max",
+    "/proc/sys/fs/inode-nr",
+    "/proc/sys/fs/inode-state",
+    "/proc/sys/fs/dentry-state",
+    "/proc/sys/fs/aio-nr",
+    "/proc/sys/fs/aio-max-nr",
+    "/proc/sys/fs/pipe-max-size",
+];
+
 /// The procfs files that describe the kernel and its fixed limits hold one
-/// value each, the same on every backend and host, and agree with `uname`
+/// value each, and the kernel's tables hold fixed ones, the same on every
+/// backend and host; they agree with `uname` and with each other
 /// (https://github.com/rrnewton/hermit/issues/4266). Before, the host-process
-/// backends passed the host's bytes through and KVM made up its own, which
-/// disagreed with `uname`. Linux's own invariants are checked natively first.
-/// A backend that is not available here is named as not compared.
+/// backends passed the kernel's files through and kept each table's host
+/// shape, and KVM made up its own files or refused them. Linux's own
+/// invariants are checked natively first. A backend that is not available
+/// here is named as not compared.
 #[test]
 fn detcore_fixes_the_virtual_kernel_files_on_every_backend() {
     let guest = virtual_kernel_files_guest();
     let native = Command::new(guest)
+        .arg("--host")
         .output()
         .expect("run virtual-kernel-files natively");
     assert!(native.status.success(), "native: {native:?}");
+    // The files that describe the kernel and its limits, written out; then
+    // the tables, as Detcore renders them on the run's machine (their bytes
+    // are pinned by Detcore's unit tests). A file of one line prints as its
+    // contents, any other as its size, line count and FNV-1a digest.
     let version = "#1 SMP Thu Jan 01 00:00:00 UTC 2026";
-    let expected = [
+    let scalars: [(&str, &str, String); 14] = [
         (
             "/proc/version",
             "0444",
@@ -3747,6 +3829,40 @@ fn detcore_fixes_the_virtual_kernel_files_on_every_backend() {
         ("/proc/sys/vm/max_map_count", "0644", "65530".into()),
         ("/proc/sys/vm/mmap_min_addr", "0644", "65536".into()),
     ];
+    let machine = detcore::machine::MachineDescription::default();
+    let writable = [
+        "/proc/sys/fs/file-max",
+        "/proc/sys/fs/aio-max-nr",
+        "/proc/sys/fs/pipe-max-size",
+    ];
+    let tables = VIRTUAL_KERNEL_FILES[scalars.len()..].iter().map(|path| {
+        let bytes = machine
+            .procfs_file(path)
+            .unwrap_or_else(|| panic!("{path} is not a fixed file"));
+        let lines = bytes.iter().filter(|byte| **byte == b'\n').count();
+        let contents = if lines == 1 && bytes.ends_with(b"\n") {
+            String::from_utf8(bytes[..bytes.len() - 1].to_vec()).unwrap()
+        } else {
+            let fnv = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+            });
+            format!("bytes={} lines={lines} fnv={fnv:016x}", bytes.len())
+        };
+        let mode = if writable.contains(path) {
+            "0644"
+        } else {
+            "0444"
+        };
+        (*path, mode, contents)
+    });
+    let expected = scalars.into_iter().chain(tables).collect::<Vec<_>>();
+    assert_eq!(
+        expected
+            .iter()
+            .map(|(path, _, _)| *path)
+            .collect::<Vec<_>>(),
+        VIRTUAL_KERNEL_FILES
+    );
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let mut outputs = Vec::new();
     for backend in ["ptrace", "dbt", "kvm"] {

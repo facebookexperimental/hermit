@@ -408,7 +408,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             guest
                 .thread_state()
                 .with_detfd(fd, |detfd| FdFacts {
-                    ty: detfd.ty(),
+                    // A procfs file Detcore renders is, to the kernel, the
+                    // empty sealed memfd that holds its place: Detcore serves
+                    // its reads, and its last close waits for nothing.
+                    ty: if detfd.procfs_rendered_path().is_some() {
+                        FdType::Memfd
+                    } else {
+                        detfd.ty()
+                    },
                     container_stdin: matches!(
                         detfd.resource(),
                         Some(ResourceID::Device(Device::ContainerStdin))

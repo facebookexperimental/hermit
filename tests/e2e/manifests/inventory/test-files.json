@@ -2566,7 +2566,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/virtual_kernel_files.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/virtual_kernel_files.c is owned by hermit-cli/tests/cli.rs: the CLI test detcore_fixes_the_virtual_kernel_files_on_every_backend runs it natively and on ptrace, DBT and KVM, requires the procfs files that describe the kernel and its fixed limits (/proc/version, /proc/cmdline, the kernel and vm scalars) to agree with uname as Linux guarantees, and requires every backend to show the same fixed contents, device and inode (https://github.com/rrnewton/hermit/issues/4266). It stays a fixture because a generic manifest cannot compare stdout across backends."
+      "why": "tests/c/virtual_kernel_files.c is owned by hermit-cli/tests/cli.rs: the CLI test detcore_fixes_the_virtual_kernel_files_on_every_backend runs it natively and on ptrace, DBT and KVM, requires the procfs files that describe the kernel and its fixed limits (/proc/version, /proc/cmdline, the kernel and vm scalars) to agree with uname, and the kernel's tables (interrupts, softirqs, zoneinfo, meminfo and the others) to describe one machine, as Linux guarantees, and requires every backend to show the same fixed contents, device and inode (https://github.com/rrnewton/hermit/issues/4266). It stays a fixture because a generic manifest cannot compare stdout across backends."
     },
     {
       "disposition": "manifest-test",

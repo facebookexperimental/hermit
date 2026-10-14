@@ -11,25 +11,50 @@
 //! same story on every backend and every host
 //! (<https://github.com/rrnewton/hermit/issues/4266>).
 //!
-//! Today `uname` and the fixed procfs files (`procfs::fixed`) read it. The
-//! virtual CPU (CPUID, `/proc/cpuinfo`, the CPU files under `/sys`,
-//! `sched_getaffinity`) and the memory size still have their own sources,
-//! which this description is to absorb; the design lists every source that
-//! must agree.
+//! Today `uname`, `sysinfo` and the fixed procfs files (`procfs::fixed`)
+//! read it. The virtual CPU (CPUID, `/proc/cpuinfo`, the CPU files under
+//! `/sys`, `sched_getaffinity`) still has its own sources, which this
+//! description is to absorb; the design lists every source that must agree.
 //!
 //! The values are fixed. They may come only from Hermit's configuration
-//! (today: the epoch), never from the host.
+//! (today: the epoch and the memory size), never from the host.
 
 use chrono::DateTime;
 use chrono::Utc;
 
 /// The machine a guest sees.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MachineDescription {
     /// The running kernel.
     pub kernel: Kernel,
     /// The kernel's fixed limits and settings.
     pub limits: KernelLimits,
+    /// The number of CPUs: 1. Detcore runs a guest's threads one at a time,
+    /// as on one CPU, and `/proc/stat`, the CPU files under `/sys` and
+    /// `sched_getaffinity` already report one; the tables that have a column
+    /// or block per CPU (`/proc/interrupts`, `/proc/softirqs`,
+    /// `/proc/schedstat`, `/proc/zoneinfo`) render this many.
+    pub cpus: u32,
+    /// The memory size in bytes, which `/proc/meminfo` (in kB, rounded
+    /// down) and `sysinfo` report: the configured `--memory` (1 GB by
+    /// default). Linux counts memory in whole pages, so its two reports
+    /// agree exactly; here they differ by the size modulo 1024 (512 bytes
+    /// for the default), as they did before this description.
+    pub memory: u64,
+}
+
+/// `--memory`'s default, 1 GB (`bytesize` reads "1GB" as 10^9 bytes).
+const DEFAULT_MEMORY: u64 = 1_000_000_000;
+
+impl Default for MachineDescription {
+    fn default() -> Self {
+        Self {
+            kernel: Kernel::default(),
+            limits: KernelLimits::default(),
+            cpus: 1,
+            memory: DEFAULT_MEMORY,
+        }
+    }
 }
 
 impl MachineDescription {
@@ -40,13 +65,22 @@ impl MachineDescription {
                 built: epoch,
                 ..Kernel::default()
             },
-            limits: KernelLimits::default(),
+            ..Self::default()
         }
+    }
+
+    /// The contents of the fixed procfs file at `path` on this machine, if
+    /// `path` names one (`procfs::fixed`).
+    pub fn procfs_file(&self, path: &str) -> Option<Vec<u8>> {
+        crate::procfs::FixedProcfsFile::from_path(path).map(|file| file.contents(self))
     }
 
     /// The machine of a run with configuration `config`.
     pub fn of(config: &crate::config::Config) -> Self {
-        Self::new(config.epoch)
+        Self {
+            memory: config.memory,
+            ..Self::new(config.epoch)
+        }
     }
 }
 
@@ -132,6 +166,15 @@ pub struct KernelLimits {
     pub max_map_count: u32,
     /// `vm/mmap_min_addr`: 65536, the default of the common distributions.
     pub mmap_min_addr: u64,
+    /// `fs/file-max`: `LONG_MAX`, what Linux 5.0 and later default to.
+    pub file_max: u64,
+    /// `fs/aio-max-nr`: 65536, Linux's default. (Before, the guest read 0,
+    /// which says that no asynchronous I/O context can be set up.)
+    pub aio_max_nr: u64,
+    /// `fs/pipe-max-size`: the capacity Detcore pins every pipe at
+    /// (`DETERMINISTIC_PIPE_CAPACITY_BYTES`), which is also the most that
+    /// `F_SETPIPE_SZ` allows.
+    pub pipe_max_size: u32,
 }
 
 impl Default for KernelLimits {
@@ -145,6 +188,9 @@ impl Default for KernelLimits {
             overcommit_memory: 0,
             max_map_count: 65530,
             mmap_min_addr: 65536,
+            file_max: i64::MAX as u64,
+            aio_max_nr: 65536,
+            pipe_max_size: crate::syscalls::DETERMINISTIC_PIPE_CAPACITY_BYTES as u32,
         }
     }
 }

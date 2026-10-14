@@ -724,7 +724,7 @@ fn xattr_get_answer(name: &[u8]) -> Result<i64, Errno> {
 }
 
 /// A NUL-terminated string in a fixed buffer, to push on the guest's stack.
-fn c_string<const N: usize>(text: &[u8]) -> [u8; N] {
+pub(super) fn c_string<const N: usize>(text: &[u8]) -> [u8; N] {
     assert!(text.len() < N, "{} bytes do not fit in {N}", text.len());
     let mut buffer = [0; N];
     buffer[..text.len()].copy_from_slice(text);
@@ -1094,11 +1094,17 @@ impl<T: RecordOrReplay> Detcore<T> {
             .rendered_path()
             .expect("an opened rendered procfs file has a path");
         // The snapshot this open takes, which its placeholder's name carries,
-        // so that every backend has it after `exec`.
+        // so that every backend has it after `exec`; a fixed file's is
+        // rendered again there.
         let procfs = target.procfs.into_rendered();
         let snapshot = self.render_snapshot(guest, &procfs);
+        let carried: &[u8] = if procfs.snapshot_is_fixed() {
+            &[]
+        } else {
+            &snapshot
+        };
         let fd = self
-            .inject_placeholder(guest, path, &snapshot, reopen)
+            .inject_placeholder(guest, path, carried, reopen)
             .await?;
         // The status flags Linux keeps, which include `O_NOFOLLOW`: the
         // placeholder cannot be reopened with it through its link.
@@ -1265,11 +1271,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         if !self.cfg.backend.tool_shares_guest_descriptor_table {
             return Ok(());
         }
-        let rendered = guest
+        let kept = guest
             .thread_state()
-            .with_detfd(fd, |detfd| detfd.procfs_rendered_path().is_some())
+            .with_detfd(fd, |detfd| detfd.procfs_keeps_kernel_position())
             .unwrap_or(false);
-        if !rendered {
+        if !kept {
             return Ok(());
         }
         // An `O_PATH` descriptor has no position (EBADF): nothing to adopt.
@@ -1297,19 +1303,28 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         fd: RawFd,
     ) -> Result<(), Error> {
-        let offset = guest.thread_state().with_detfd(fd, |detfd| {
-            detfd.procfs_rendered_path()?;
-            detfd.procfs_position().map(|(offset, _)| offset)
+        let (offset, placeholder) = guest.thread_state().with_detfd(fd, |detfd| {
+            let offset = detfd
+                .procfs_keeps_kernel_position()
+                .then(|| detfd.procfs_position().map(|(offset, _)| offset))
+                .flatten();
+            (offset, detfd.procfs_rendered_path().is_some())
         })?;
         if let Some(offset) = offset {
-            guest
+            let moved = guest
                 .inject(
                     syscalls::Lseek::new()
                         .with_fd(fd)
                         .with_offset(offset as libc::off_t)
                         .with_whence(syscalls::Whence::SEEK_SET),
                 )
-                .await?;
+                .await;
+            // A placeholder takes any position. The kernel's own file may
+            // refuse one past its contents, which differ from Detcore's;
+            // Detcore's cursor still answers the guest.
+            if placeholder {
+                moved?;
+            }
         }
         Ok(())
     }

@@ -482,7 +482,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         &self,
         guest: &mut G,
     ) -> Result<syscalls::SysInfo, Error> {
-        let memory = configured_memory(self.cfg.memory);
+        let memory = configured_memory(crate::machine::MachineDescription::of(&self.cfg).memory);
         let now = thread_observe_time(guest).await;
         let epoch = crate::types::DetTime::new(&self.cfg).as_nanos();
         Ok(syscalls::SysInfo {

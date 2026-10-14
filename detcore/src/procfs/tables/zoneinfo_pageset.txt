@@ -1,0 +1,7 @@
+    cpu: @CPU@
+              count:    0
+              high:     0
+              batch:    0
+              high_min: 0
+              high_max: 0
+  vm stats threshold: 0

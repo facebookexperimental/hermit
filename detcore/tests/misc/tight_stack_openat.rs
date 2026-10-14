@@ -113,7 +113,31 @@ pub(super) fn tight_stack(
 
 #[test]
 fn openat_succeeds_without_writable_stack_below_rsp() {
-    super::det_test_fn_sequential_without_pmu(|| {
+    super::det_test_fn_sequential_without_pmu(tight_stack_opens);
+}
+
+/// The same opens under record and replay, where Detcore also reads each
+/// new descriptor's `/proc/self/fd` link through the recording to classify
+/// an open its spelling does not (https://github.com/rrnewton/hermit/issues/4266).
+/// That read's scratch must not fail the open either.
+#[test]
+fn openat_succeeds_without_writable_stack_below_rsp_under_record() {
+    let config = detcore::Config {
+        max_timeslice: None,
+        sequentialize_threads: true,
+        recordreplay_modes: true,
+        ..Default::default()
+    };
+    detcore_testutils::det_test_fn_with_config(
+        true,
+        tight_stack_opens,
+        config,
+        detcore_testutils::expect_success,
+    );
+}
+
+fn tight_stack_opens() {
+    {
         // The descriptor and metadata an ordinary open of the same file yields.
         let expected = unsafe { libc::open(PATH.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
         assert!(expected >= 0, "ordinary open of {PATH:?} failed");
@@ -162,5 +186,5 @@ fn openat_succeeds_without_writable_stack_below_rsp() {
         let again = unsafe { libc::open(PATH.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
         assert_eq!(again, expected, "a descriptor leaked");
         assert_eq!(unsafe { libc::close(again) }, 0);
-    });
+    }
 }

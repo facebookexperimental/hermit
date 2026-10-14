@@ -26,7 +26,6 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::machine::MachineDescription;
-use crate::syscalls::DETERMINISTIC_PIPE_CAPACITY_BYTES;
 use crate::syscalls::VIRTUAL_CPUSET_BYTES;
 
 mod fixed;
@@ -58,9 +57,6 @@ enum ProcfsKind {
     Loadavg,
     ProcessIo,
     Uptime,
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-863): Review canonical guest memory accounting.
-    Meminfo,
     BlockStat,
     NodeMeminfo,
     NodeNumastat,
@@ -70,9 +66,6 @@ enum ProcfsKind {
     PtyNr,
     SelfSched,
     Fdinfo,
-    AioNr,
-    AioMaxNr,
-    PipeMaxSize,
     NumaMaps,
     SmapsRollup,
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -85,30 +78,15 @@ enum ProcfsKind {
     /// so leaving it raw lets a guest read two different identities for one
     /// file depending on which route it asks through.
     Maps,
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-951): Review key-user resource normalization.
-    KeyUsers,
     Pressure,
-    Buddyinfo,
-    Schedstat,
     SelfSchedstat,
     SoftnetStat,
-    FileNr,
-    FileMax,
-    Zoneinfo,
-    InodeNr,
-    InodeState,
     Protocols,
-    Cgroups,
     BtrfsBytesReserved,
     BtrfsBytesPinned,
     Rtc,
-    DentryState,
     Mountinfo,
     RandomUuid,
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-945): Review host swap-usage normalization.
-    Swaps,
     Locks,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-941): Review transparent-hugepage counter normalization.
@@ -139,15 +117,9 @@ enum ProcfsKind {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-960): Review per-CPU host interrupt normalization.
     IrqPerCpuCount,
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-883): Review interrupt and module accounting snapshots.
-    InterruptCounters,
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-883): Review module reference-count normalization.
-    Modules,
     /// `/sys/module/<name>/refcnt`. Carries the module name so the value can be
-    /// derived from the SAME module table that `sanitize_modules` publishes for
-    /// `/proc/modules`.
+    /// derived from the SAME module table that `/proc/modules` shows
+    /// (`FixedProcfsFile::Modules`).
     ModuleRefcnt(String),
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-958): Review host-global uevent sequence normalization.
@@ -167,9 +139,6 @@ enum ProcfsKind {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-956): Review host block queue-depth normalization.
     BlockInflight,
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-938): Review host VM accounting normalization.
-    Vmstat,
     /// A system-wide file with one fixed value, rendered by Detcore (see
     /// [`FixedProcfsFile`]).
     Fixed(FixedProcfsFile),
@@ -370,7 +339,9 @@ pub(crate) const PLACEHOLDER_LINK_CAPACITY: usize = 288;
 /// The memfd name of a placeholder for the rendered file `path` holding the
 /// snapshot `snapshot`: `PLACEHOLDER_NAME_PREFIX`, the path, `@`, and the
 /// snapshot in hexadecimal. The name carries the snapshot across `exec` to a
-/// backend that rediscovers its descriptors; the file itself stays empty.
+/// backend that rediscovers its descriptors; the file itself stays empty. A
+/// fixed file's placeholder carries none (`ProcfsFile::snapshot_is_fixed`):
+/// the new image renders the same bytes, which for a table would not fit.
 pub(crate) fn placeholder_name(path: &Path, snapshot: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut name = format!("{PLACEHOLDER_NAME_PREFIX}{}@", path.display());
@@ -709,7 +680,6 @@ pub(crate) struct ProcfsSnapshotContext {
     /// an unrepresentable boot instant refuses `/proc/stat` alone.
     pub(crate) virtual_boot_time_seconds: Option<i64>,
     pub(crate) virtual_realtime_seconds: i64,
-    pub(crate) virtual_memory_kb: u64,
     pub(crate) virtual_pid: i32,
     pub(crate) virtual_ppid: i32,
     pub(crate) virtual_pty_count: usize,
@@ -749,7 +719,7 @@ impl ProcfsFile {
             self.kind,
             ProcfsKind::Uptime
                 | ProcfsKind::SystemStat
-                | ProcfsKind::InterruptCounters
+                | ProcfsKind::Fixed(FixedProcfsFile::Interrupts | FixedProcfsFile::Softirqs)
                 | ProcfsKind::ProcessStat
                 | ProcfsKind::ProcessStatus
                 | ProcfsKind::SelfSchedstat
@@ -785,40 +755,15 @@ impl ProcfsFile {
             "/proc/uptime" => ProcfsKind::Uptime,
             "/proc/stat" => ProcfsKind::SystemStat,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-863): Review canonical guest memory accounting.
-            "/proc/meminfo" => ProcfsKind::Meminfo,
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-914): Review host-global inode counter normalization.
-            "/proc/sys/fs/inode-nr" => ProcfsKind::InodeNr,
-            "/proc/sys/fs/inode-state" => ProcfsKind::InodeState,
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-918): Review host-global dentry counter normalization.
-            "/proc/sys/fs/dentry-state" => ProcfsKind::DentryState,
-            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-873): Review deterministic kernel pseudo-file snapshots.
             other if is_process_file_path(other, "mountinfo") => ProcfsKind::Mountinfo,
             "/proc/sys/kernel/random/uuid" => ProcfsKind::RandomUuid,
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-933): Review host-global AIO count normalization.
-            "/proc/sys/fs/aio-nr" => ProcfsKind::AioNr,
-            "/proc/sys/fs/aio-max-nr" => ProcfsKind::AioMaxNr,
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-2568): Review determinizing the pipe ceiling read.
-            // The ceiling that decides whether a guest may raise a pipe above
-            // the pinned capacity. Reported raw it is the HOST's sysctl, so a
-            // guest that reads it and acts on it branches on the machine.
-            // Reported as the pinned capacity, it agrees with what
-            // `F_SETPIPE_SZ` actually allows.
-            "/proc/sys/fs/pipe-max-size" => ProcfsKind::PipeMaxSize,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-927): Review host-global PTY count normalization.
             "/proc/sys/kernel/pty/nr" => ProcfsKind::PtyNr,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-938): Review host VM accounting normalization.
-            "/proc/vmstat" => ProcfsKind::Vmstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-958): Review host-global uevent sequence normalization.
             "/sys/kernel/uevent_seqnum" => ProcfsKind::UeventSeqnum,
@@ -849,36 +794,21 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-944): Review AVX-512 elapsed-time normalization.
             other if is_process_file_path(other, "arch_status") => ProcfsKind::ArchStatus,
-            "/proc/swaps" => ProcfsKind::Swaps,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-949): Review per-mapping memory accounting normalization.
             other if is_process_file_path(other, "smaps") => ProcfsKind::Smaps,
             other if is_process_file_path(other, "maps") => ProcfsKind::Maps,
-            "/proc/key-users" => ProcfsKind::KeyUsers,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-903): Review host pressure accounting normalization.
             "/proc/pressure/cpu" | "/proc/pressure/io" | "/proc/pressure/memory" => {
                 ProcfsKind::Pressure
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-905): Review buddy allocator normalization.
-            "/proc/buddyinfo" => ProcfsKind::Buddyinfo,
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-907): Review host scheduler accounting normalization.
-            "/proc/schedstat" => ProcfsKind::Schedstat,
-            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-922): Review per-process host scheduler normalization.
             other if is_process_schedstat_path(other) => ProcfsKind::SelfSchedstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-909): Review softnet counter normalization.
             "/proc/net/softnet_stat" => ProcfsKind::SoftnetStat,
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-910): Review host file-table normalization.
-            "/proc/sys/fs/file-nr" => ProcfsKind::FileNr,
-            "/proc/sys/fs/file-max" => ProcfsKind::FileMax,
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-913): Review host memory-zone accounting normalization.
-            "/proc/zoneinfo" => ProcfsKind::Zoneinfo,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-865): Review deterministic NUMA and hwmon snapshots.
             other if is_numa_node_file(other, "meminfo") => ProcfsKind::NodeMeminfo,
@@ -887,11 +817,6 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-916): Review live protocol allocation counter normalization.
             "/proc/net/protocols" => ProcfsKind::Protocols,
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-3996): Review host cgroup count normalization.
-            // HotSpot reads this at JVM start to detect its container
-            // (https://github.com/rrnewton/hermit/issues/3987).
-            "/proc/cgroups" => ProcfsKind::Cgroups,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-926): Review kernel lock identity normalization.
             "/proc/locks" => ProcfsKind::Locks,
@@ -915,10 +840,6 @@ impl ProcfsFile {
             "/proc/net/tcp" | "/proc/net/tcp6" | "/proc/net/udp" | "/proc/net/udp6" => {
                 ProcfsKind::InetSockets
             }
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-883): Review interrupt and module accounting snapshots.
-            "/proc/interrupts" | "/proc/softirqs" => ProcfsKind::InterruptCounters,
-            "/proc/modules" => ProcfsKind::Modules,
             other if let Some(module) = module_refcnt_name(Path::new(other)) => {
                 ProcfsKind::ModuleRefcnt(module)
             }
@@ -1009,6 +930,24 @@ impl ProcfsFile {
             contents: Some(snapshot),
             ..self
         }
+    }
+
+    /// Whether Linux reads this file through `read_iter`
+    /// (`FixedProcfsFile::has_read_iter`), which decides the `RWF_` flags a
+    /// vectored read of it accepts.
+    pub(crate) fn has_read_iter(&self) -> bool {
+        match self.kind {
+            ProcfsKind::Fixed(file) => file.has_read_iter(),
+            _ => true,
+        }
+    }
+
+    /// Whether this file's every snapshot is the same, a fact of the run's
+    /// [`MachineDescription`](crate::machine::MachineDescription), so that a
+    /// placeholder need not carry it across `exec`: the new image renders it
+    /// again (`placeholder_name`).
+    pub(crate) fn snapshot_is_fixed(&self) -> bool {
+        matches!(self.kind, ProcfsKind::Fixed(_))
     }
 
     /// The kernel-shaped bytes a rendered file's snapshot starts from in place
@@ -1125,7 +1064,6 @@ impl ProcfsFile {
             virtual_uptime_seconds,
             virtual_boot_time_seconds,
             virtual_realtime_seconds,
-            virtual_memory_kb,
             virtual_pid,
             virtual_ppid,
             virtual_pty_count,
@@ -1170,14 +1108,12 @@ impl ProcfsFile {
             ProcfsKind::Loadavg => sanitize_loadavg(&contents),
             ProcfsKind::ProcessIo => sanitize_process_io(&contents),
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
-            ProcfsKind::Meminfo => sanitize_meminfo(&contents, virtual_memory_kb),
             ProcfsKind::BlockStat => sanitize_block_stat(&contents),
             ProcfsKind::NodeMeminfo => sanitize_node_meminfo(&contents),
             ProcfsKind::NodeNumastat => sanitize_node_numastat(&contents),
             ProcfsKind::HwmonInput => sanitize_numeric_scalar(&contents),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
-            ProcfsKind::Vmstat => sanitize_vmstat(&contents),
             ProcfsKind::UeventSeqnum => sanitize_uevent_seqnum(&contents),
             ProcfsKind::CpuList => sanitize_cpu_list(&contents),
             ProcfsKind::CpuMask => sanitize_cpu_mask(&contents),
@@ -1189,33 +1125,19 @@ impl ProcfsFile {
             ProcfsKind::PtyNr => sanitize_pty_nr(&contents, virtual_pty_count),
             ProcfsKind::SelfSched => sanitize_self_sched(&contents),
             ProcfsKind::Fdinfo => sanitize_fdinfo(&contents, fdinfo_identity),
-            ProcfsKind::AioNr => sanitize_aio_nr(&contents),
-            ProcfsKind::AioMaxNr => sanitize_aio_nr(&contents),
-            ProcfsKind::PipeMaxSize => sanitize_pipe_max_size(&contents),
             ProcfsKind::NumaMaps => sanitize_numa_maps(&contents),
             ProcfsKind::SmapsRollup => sanitize_smaps_rollup(&contents),
             ProcfsKind::ArchStatus => sanitize_arch_status(&contents),
-            ProcfsKind::Swaps => sanitize_swaps(&contents),
             ProcfsKind::CpuidleCounter => sanitize_cpuidle_counter(&contents),
             ProcfsKind::Smaps => sanitize_smaps(&contents, mapping_identities),
             ProcfsKind::Maps => sanitize_maps(&contents, mapping_identities),
-            ProcfsKind::KeyUsers => sanitize_key_users(&contents),
             ProcfsKind::Pressure => sanitize_pressure(&contents),
-            ProcfsKind::Buddyinfo => sanitize_buddyinfo(&contents),
-            ProcfsKind::Schedstat => sanitize_schedstat(&contents),
             ProcfsKind::SelfSchedstat => sanitize_self_schedstat(&contents),
             ProcfsKind::SoftnetStat => sanitize_softnet_stat(&contents),
-            ProcfsKind::FileNr => sanitize_file_nr(&contents),
-            ProcfsKind::FileMax => sanitize_file_max(&contents),
-            ProcfsKind::Zoneinfo => sanitize_zoneinfo(&contents),
-            ProcfsKind::InodeNr => sanitize_inode_nr(&contents),
-            ProcfsKind::InodeState => sanitize_inode_state(&contents),
             ProcfsKind::Protocols => sanitize_protocols(&contents),
-            ProcfsKind::Cgroups => sanitize_cgroups(&contents),
             ProcfsKind::BtrfsBytesReserved => sanitize_btrfs_bytes_reserved(&contents),
             ProcfsKind::BtrfsBytesPinned => sanitize_btrfs_bytes_pinned(&contents),
             ProcfsKind::Rtc => sanitize_rtc(&contents, virtual_realtime_seconds),
-            ProcfsKind::DentryState => sanitize_dentry_state(&contents),
             ProcfsKind::NetlinkSockets => sanitize_netlink_sockets(&contents),
             ProcfsKind::Locks => sanitize_locks(&contents),
             ProcfsKind::NodeVmstat => sanitize_node_vmstat(&contents),
@@ -1227,8 +1149,6 @@ impl ProcfsFile {
                 sanitize_sysfs_rtc_attribute(&contents, self.kind.clone(), virtual_realtime_seconds)
             }
             ProcfsKind::ThpCounter => sanitize_thp_counter(&contents),
-            ProcfsKind::InterruptCounters => sanitize_interrupt_counters(&contents),
-            ProcfsKind::Modules => sanitize_modules(&contents),
             ProcfsKind::ModuleRefcnt(module) => sanitize_module_refcnt(&contents, module.as_str()),
             ProcfsKind::Mountinfo => sanitize_mountinfo(
                 &contents,
@@ -2364,232 +2284,6 @@ fn sanitize_named_counters(
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-863): Review canonical /proc/meminfo guest accounting.
-/// Replaces host-global memory pressure with Hermit's configured guest memory.
-fn sanitize_meminfo(contents: &[u8], virtual_memory_kb: u64) -> Vec<u8> {
-    if contents.is_empty() {
-        return Vec::new();
-    }
-    format!(
-        "MemTotal:       {virtual_memory_kb} kB\n\
-         MemFree:        {virtual_memory_kb} kB\n\
-         MemAvailable:   {virtual_memory_kb} kB\n\
-         Buffers:        0 kB\n\
-         Cached:         0 kB\n\
-         SwapCached:     0 kB\n\
-         Active:         0 kB\n\
-         Inactive:       0 kB\n\
-         Shmem:          0 kB\n\
-         SReclaimable:   0 kB\n\
-         SwapTotal:      0 kB\n\
-         SwapFree:       0 kB\n"
-    )
-    .into_bytes()
-}
-
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-951): Review the /proc/key-users quota accounting policy.
-fn sanitize_key_users(contents: &[u8]) -> Vec<u8> {
-    let Ok(text) = std::str::from_utf8(contents) else {
-        return contents.to_vec();
-    };
-
-    let mut normalized = Vec::with_capacity(contents.len());
-    for line in text.split_inclusive('\n') {
-        let has_newline = line.ends_with('\n');
-        let body = line.strip_suffix('\n').unwrap_or(line);
-        let fields = body.split_whitespace().collect::<Vec<_>>();
-        let [uid, usage, key_counts, key_quota, byte_quota] = fields.as_slice() else {
-            return contents.to_vec();
-        };
-        let Some(uid) = uid
-            .strip_suffix(':')
-            .filter(|uid| uid.parse::<u32>().is_ok())
-        else {
-            return contents.to_vec();
-        };
-        if usage.parse::<u64>().is_err() || parse_key_user_pair(key_counts).is_none() {
-            return contents.to_vec();
-        }
-        let Some((_, max_keys)) = parse_key_user_pair(key_quota) else {
-            return contents.to_vec();
-        };
-        let Some((_, max_bytes)) = parse_key_user_pair(byte_quota) else {
-            return contents.to_vec();
-        };
-
-        normalized.extend_from_slice(format!("{uid}: 0 0/0 0/{max_keys} 0/{max_bytes}").as_bytes());
-        if has_newline {
-            normalized.push(b'\n');
-        }
-    }
-    normalized
-}
-
-fn parse_key_user_pair(field: &str) -> Option<(u64, u64)> {
-    let (current, maximum) = field.split_once('/')?;
-    Some((current.parse().ok()?, maximum.parse().ok()?))
-}
-
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-905): Review the /proc/buddyinfo field policy.
-fn sanitize_buddyinfo(contents: &[u8]) -> Vec<u8> {
-    let Ok(text) = std::str::from_utf8(contents) else {
-        return contents.to_vec();
-    };
-
-    let mut normalized = Vec::with_capacity(contents.len());
-    for line in text.split_inclusive('\n') {
-        let has_newline = line.ends_with('\n');
-        let body = line.strip_suffix('\n').unwrap_or(line);
-        let fields = body.split_whitespace().collect::<Vec<_>>();
-        let is_buddy_row = fields.len() >= 5
-            && fields[0] == "Node"
-            && fields[1].ends_with(',')
-            && fields[2] == "zone"
-            && fields[4..].iter().all(|field| field.parse::<u64>().is_ok());
-
-        if is_buddy_row {
-            normalized.extend_from_slice(fields[..4].join(" ").as_bytes());
-            for _ in &fields[4..] {
-                normalized.extend_from_slice(b" 0");
-            }
-        } else {
-            normalized.extend_from_slice(body.as_bytes());
-        }
-        if has_newline {
-            normalized.push(b'\n');
-        }
-    }
-    normalized
-}
-
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-910): Review the /proc/sys/fs/file-nr policy.
-const VIRTUAL_FILE_MAX: u64 = i64::MAX as u64;
-
-fn sanitize_file_nr(contents: &[u8]) -> Vec<u8> {
-    if contents.is_empty() {
-        Vec::new()
-    } else {
-        format!("0\t0\t{VIRTUAL_FILE_MAX}\n").into_bytes()
-    }
-}
-
-fn sanitize_file_max(contents: &[u8]) -> Vec<u8> {
-    if contents.is_empty() {
-        Vec::new()
-    } else {
-        format!("{VIRTUAL_FILE_MAX}\n").into_bytes()
-    }
-}
-
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-914): Review the /proc/sys/fs/inode-nr field policy.
-fn sanitize_inode_nr(contents: &[u8]) -> Vec<u8> {
-    if contents.is_empty() {
-        Vec::new()
-    } else {
-        b"0\t0\n".to_vec()
-    }
-}
-
-fn sanitize_inode_state(contents: &[u8]) -> Vec<u8> {
-    if contents.is_empty() {
-        Vec::new()
-    } else {
-        b"0\t0\t0\t0\t0\t0\t0\n".to_vec()
-    }
-}
-
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-918): Review the /proc/sys/fs/dentry-state field policy.
-fn sanitize_dentry_state(contents: &[u8]) -> Vec<u8> {
-    if contents.is_empty() {
-        Vec::new()
-    } else {
-        b"0\t0\t45\t0\t0\t0\n".to_vec()
-    }
-}
-
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-945): Review the zeroed /proc/swaps Used column policy.
-fn sanitize_swaps(contents: &[u8]) -> Vec<u8> {
-    const HEADER: [&str; 5] = ["Filename", "Type", "Size", "Used", "Priority"];
-
-    let Ok(text) = std::str::from_utf8(contents) else {
-        return contents.to_vec();
-    };
-    let mut lines = text.split_inclusive('\n');
-    let Some(header) = lines.next() else {
-        return Vec::new();
-    };
-    if !header.split_whitespace().eq(HEADER) {
-        return contents.to_vec();
-    }
-
-    let mut normalized = Vec::with_capacity(contents.len());
-    normalized.extend_from_slice(header.as_bytes());
-    for line in lines {
-        let has_newline = line.ends_with('\n');
-        let body = line.strip_suffix('\n').unwrap_or(line);
-        let fields = body.split_whitespace().collect::<Vec<_>>();
-        let [filename, swap_type, size, used, priority] = fields.as_slice() else {
-            return contents.to_vec();
-        };
-        if size.parse::<u64>().is_err()
-            || used.parse::<u64>().is_err()
-            || priority.parse::<i32>().is_err()
-        {
-            return contents.to_vec();
-        }
-
-        normalized.extend_from_slice(
-            format!("{filename}\t{swap_type}\t{size}\t0\t{priority}").as_bytes(),
-        );
-        if has_newline {
-            normalized.push(b'\n');
-        }
-    }
-    normalized
-}
-
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-933): Review the /proc/sys/fs/aio-nr policy.
-/// Report the deterministic pipe ceiling rather than the host's sysctl.
-///
-/// `/proc/sys/fs/pipe-max-size` is host-global and commonly differs by a factor
-/// of sixteen between a default host (1048576) and a hardened one (65536). A
-/// guest that reads it branches on the machine it happens to be running on.
-///
-/// The value returned is [`DETERMINISTIC_PIPE_CAPACITY_BYTES`], which is also
-/// the ceiling `F_SETPIPE_SZ` enforces, so what the guest is told and what the
-/// guest is allowed are the same number by construction rather than by two
-/// constants agreeing today.
-///
-/// A file whose contents are not a plain integer is not this sysctl; return
-/// empty rather than inventing a value, matching `sanitize_aio_nr`.
-fn sanitize_pipe_max_size(contents: &[u8]) -> Vec<u8> {
-    let Ok(value) = std::str::from_utf8(contents) else {
-        return Vec::new();
-    };
-    value.trim().parse::<u64>().ok().map_or_else(Vec::new, |_| {
-        format!("{DETERMINISTIC_PIPE_CAPACITY_BYTES}\n").into_bytes()
-    })
-}
-
-fn sanitize_aio_nr(contents: &[u8]) -> Vec<u8> {
-    let Ok(value) = std::str::from_utf8(contents) else {
-        return Vec::new();
-    };
-    value
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .map_or_else(Vec::new, |_| b"0\n".to_vec())
-}
-
-// AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-927): Review the /proc/sys/kernel/pty/nr policy.
 fn sanitize_pty_nr(contents: &[u8], virtual_count: usize) -> Vec<u8> {
     let Ok(value) = std::str::from_utf8(contents) else {
@@ -3032,38 +2726,6 @@ fn sanitize_block_inflight(contents: &[u8]) -> Vec<u8> {
         b"0 0\n".to_vec()
     } else {
         b"0 0".to_vec()
-    }
-}
-
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-938): Review the /proc/vmstat field policy.
-fn sanitize_vmstat(contents: &[u8]) -> Vec<u8> {
-    let Ok(text) = std::str::from_utf8(contents) else {
-        return contents.to_vec();
-    };
-    let mut normalized = Vec::with_capacity(contents.len());
-    let mut row_count = 0;
-
-    for line in text.split_inclusive('\n') {
-        let has_newline = line.ends_with('\n');
-        let body = line.strip_suffix('\n').unwrap_or(line);
-        let fields = body.split_whitespace().collect::<Vec<_>>();
-        if fields.len() != 2 || fields[0].is_empty() || fields[1].parse::<u64>().is_err() {
-            return contents.to_vec();
-        }
-
-        normalized.extend_from_slice(fields[0].as_bytes());
-        normalized.extend_from_slice(b" 0");
-        if has_newline {
-            normalized.push(b'\n');
-        }
-        row_count += 1;
-    }
-
-    if row_count == 0 {
-        contents.to_vec()
-    } else {
-        normalized
     }
 }
 
@@ -3760,105 +3422,6 @@ fn sanitize_pressure(contents: &[u8]) -> Vec<u8> {
     normalized
 }
 
-fn sanitize_zoneinfo(contents: &[u8]) -> Vec<u8> {
-    let Ok(text) = std::str::from_utf8(contents) else {
-        return contents.to_vec();
-    };
-
-    let mut normalized = Vec::with_capacity(contents.len());
-    for line in text.split_inclusive('\n') {
-        let has_newline = line.ends_with('\n');
-        let body = line.strip_suffix('\n').unwrap_or(line);
-        let trimmed = body.trim_start();
-        if trimmed.starts_with("Node ") || trimmed.starts_with("cpu: ") {
-            normalized.extend_from_slice(body.as_bytes());
-        } else {
-            normalized.extend_from_slice(zero_decimal_runs(body).as_bytes());
-        }
-        if has_newline {
-            normalized.push(b'\n');
-        }
-    }
-    normalized
-}
-
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-883): Review synthetic interrupt and module accounting values.
-/// `/proc/interrupts` and `/proc/softirqs` have one counter column per CPU.
-/// Hermit has one virtual CPU, so the header names only `CPU0` (as the
-/// kernel's `CPU%-8d`) and each row keeps one zeroed counter at the kernel's
-/// `" %10u"` width, which `lsirq` and other column-cutting readers rely on.
-/// The columns after the counters (chip, hardware IRQ, action) are kept.
-/// The set of rows is still the host's: per-queue device interrupts (NVMe,
-/// network) scale with the host CPU count, and the label width follows the
-/// host's interrupt count (https://github.com/rrnewton/hermit/issues/4160).
-fn sanitize_interrupt_counters(contents: &[u8]) -> Vec<u8> {
-    let mut normalized = Vec::with_capacity(contents.len());
-    for line in contents.split_inclusive(|byte| *byte == b'\n') {
-        let has_newline = line.last() == Some(&b'\n');
-        let body = line.strip_suffix(b"\n").unwrap_or(line);
-        let Some(colon) = body.iter().position(|byte| *byte == b':') else {
-            let names = body
-                .split(u8::is_ascii_whitespace)
-                .filter(|field| !field.is_empty())
-                .collect::<Vec<_>>();
-            if !names.is_empty() && names.iter().all(|name| name.starts_with(b"CPU")) {
-                let indent = body.iter().take_while(|byte| **byte == b' ').count();
-                normalized.extend_from_slice(&body[..indent]);
-                // The kernel prints each CPU as `CPU%-8d`.
-                normalized.extend_from_slice(b"CPU0       ");
-                if has_newline {
-                    normalized.push(b'\n');
-                }
-            } else {
-                normalized.extend_from_slice(line);
-            }
-            continue;
-        };
-        let fields = body[colon + 1..]
-            .split(u8::is_ascii_whitespace)
-            .filter(|field| !field.is_empty())
-            .collect::<Vec<_>>();
-        let counter_count = fields
-            .iter()
-            .take_while(|field| field.iter().all(u8::is_ascii_digit))
-            .count();
-        if counter_count == 0 {
-            normalized.extend_from_slice(line);
-            continue;
-        }
-
-        normalized.extend_from_slice(&body[..=colon]);
-        // The kernel prints each counter as `" %10u"`.
-        normalized.extend_from_slice(b"          0");
-        for field in &fields[counter_count..] {
-            normalized.push(b' ');
-            normalized.extend_from_slice(field);
-        }
-        if has_newline {
-            normalized.push(b'\n');
-        }
-    }
-    normalized
-}
-
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3815): Review the
-// empty module table.
-/// The guest sees no loaded modules: an empty `/proc/modules`, which is what
-/// Linux shows when no module is loaded.
-///
-/// Every row of the host table is host state that can change while the guest
-/// runs: loading one module adds a row (about 48 bytes), and unloading removes
-/// one. A verify run diverged exactly this way
-/// (https://github.com/rrnewton/hermit/issues/3815). Normalizing the use count
-/// alone did not help, because the set of rows, their sizes and their holder
-/// lists all come from the host. An empty table is the only content that does
-/// not depend on the host.
-fn sanitize_modules(_contents: &[u8]) -> Vec<u8> {
-    Vec::new()
-}
-
 /// `/sys/module/<name>/refcnt` agrees with the published `/proc/modules`: that
 /// table lists no module, so nothing holds `module` and its count is 0.
 /// Deriving the count from the host holder list would leak the same host
@@ -3874,40 +3437,6 @@ fn sanitize_module_refcnt(contents: &[u8], _module: &str) -> Vec<u8> {
     let mut normalized = b"0".to_vec();
     if has_newline {
         normalized.push(b'\n');
-    }
-    normalized
-}
-
-fn sanitize_schedstat(contents: &[u8]) -> Vec<u8> {
-    let Ok(text) = std::str::from_utf8(contents) else {
-        return contents.to_vec();
-    };
-
-    let mut normalized = Vec::with_capacity(contents.len());
-    for line in text.split_inclusive('\n') {
-        let has_newline = line.ends_with('\n');
-        let body = line.strip_suffix('\n').unwrap_or(line);
-        let mut fields = body
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-
-        let preserved_fields = match fields.first().map(String::as_str) {
-            Some("timestamp") => 1,
-            Some(label) if numbered_label(label, "cpu") => 1,
-            Some(label) if numbered_label(label, "domain") => 3,
-            _ => fields.len(),
-        };
-        for field in fields.iter_mut().skip(preserved_fields) {
-            if field.parse::<u128>().is_ok() {
-                *field = "0".to_owned();
-            }
-        }
-
-        normalized.extend_from_slice(fields.join(" ").as_bytes());
-        if has_newline {
-            normalized.push(b'\n');
-        }
     }
     normalized
 }
@@ -4057,12 +3586,6 @@ fn sanitize_random_uuid(contents: &[u8], mut random: [u8; 16]) -> Vec<u8> {
     .into_bytes()
 }
 
-fn numbered_label(label: &str, prefix: &str) -> bool {
-    label.strip_prefix(prefix).is_some_and(|suffix| {
-        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
-    })
-}
-
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-922): Review the /proc/self/schedstat field policy.
 fn sanitize_self_schedstat(contents: &[u8]) -> Vec<u8> {
@@ -4088,68 +3611,6 @@ fn sanitize_softnet_stat(_contents: &[u8]) -> Vec<u8> {
     const VIRTUAL_SOFTNET_STAT: &[u8] =
         b"00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000\n";
     VIRTUAL_SOFTNET_STAT.to_vec()
-}
-
-fn zero_decimal_runs(text: &str) -> String {
-    let mut normalized = String::with_capacity(text.len());
-    let mut in_digits = false;
-    for character in text.chars() {
-        if character.is_ascii_digit() {
-            if !in_digits {
-                normalized.push('0');
-                in_digits = true;
-            }
-        } else {
-            in_digits = false;
-            normalized.push(character);
-        }
-    }
-    normalized
-}
-
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-3996): Review the /proc/cgroups field policy.
-/// `/proc/cgroups` lists each cgroup controller with its hierarchy ID, the
-/// number of cgroups in that hierarchy, and whether it is enabled. The count is
-/// host-global: it changes whenever any service, session or container on the
-/// host creates or removes a cgroup, so two runs read different bytes
-/// (https://github.com/rrnewton/hermit/issues/3987). The controller list, the
-/// hierarchy IDs and the enabled flags describe the kernel's configuration and
-/// are kept; each count is reported as 1, the root cgroup alone. The kernel's
-/// tab-separated layout is preserved. Anything that does not have the kernel's
-/// header and four integer-valued columns is returned unchanged.
-fn sanitize_cgroups(contents: &[u8]) -> Vec<u8> {
-    const HEADER: &str = "#subsys_name\thierarchy\tnum_cgroups\tenabled";
-
-    let Ok(text) = std::str::from_utf8(contents) else {
-        return contents.to_vec();
-    };
-    let mut lines = text.lines();
-    if lines.next() != Some(HEADER) {
-        return contents.to_vec();
-    }
-
-    let mut normalized = vec![HEADER.to_owned()];
-    for line in lines {
-        let fields = line.split('\t').collect::<Vec<_>>();
-        let [name, hierarchy, count, enabled] = fields[..] else {
-            return contents.to_vec();
-        };
-        if name.is_empty()
-            || hierarchy.parse::<u32>().is_err()
-            || count.parse::<u64>().is_err()
-            || enabled.parse::<u32>().is_err()
-        {
-            return contents.to_vec();
-        }
-        normalized.push(format!("{name}\t{hierarchy}\t1\t{enabled}"));
-    }
-
-    let mut output = normalized.join("\n").into_bytes();
-    if text.ends_with('\n') {
-        output.push(b'\n');
-    }
-    output
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -4551,7 +4012,7 @@ mod tests {
             ProcfsFile::from_path(Path::new("/proc/meminfo"))
                 .unwrap()
                 .kind,
-            ProcfsKind::Meminfo
+            ProcfsKind::Fixed(FixedProcfsFile::Meminfo)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/net/sockstat"))
@@ -4563,7 +4024,7 @@ mod tests {
             ProcfsFile::from_path(Path::new("/proc/vmstat"))
                 .unwrap()
                 .kind,
-            ProcfsKind::Vmstat
+            ProcfsKind::Fixed(FixedProcfsFile::Vmstat)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/sys/block/md0/inflight"))
@@ -4624,13 +4085,13 @@ mod tests {
             ProcfsFile::from_path(Path::new("/proc/sys/fs/aio-nr"))
                 .unwrap()
                 .kind,
-            ProcfsKind::AioNr
+            ProcfsKind::Fixed(FixedProcfsFile::AioNr)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/sys/fs/aio-max-nr"))
                 .unwrap()
                 .kind,
-            ProcfsKind::AioMaxNr
+            ProcfsKind::Fixed(FixedProcfsFile::AioMaxNr)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/self/numa_maps"))
@@ -4654,13 +4115,13 @@ mod tests {
             ProcfsFile::from_path(Path::new("/proc/swaps"))
                 .unwrap()
                 .kind,
-            ProcfsKind::Swaps
+            ProcfsKind::Fixed(FixedProcfsFile::Swaps)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/key-users"))
                 .unwrap()
                 .kind,
-            ProcfsKind::KeyUsers
+            ProcfsKind::Fixed(FixedProcfsFile::KeyUsers)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/123/io"))
@@ -4690,13 +4151,13 @@ mod tests {
             ProcfsFile::from_path(Path::new("/proc/buddyinfo"))
                 .unwrap()
                 .kind,
-            ProcfsKind::Buddyinfo
+            ProcfsKind::Fixed(FixedProcfsFile::Buddyinfo)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/schedstat"))
                 .unwrap()
                 .kind,
-            ProcfsKind::Schedstat
+            ProcfsKind::Fixed(FixedProcfsFile::Schedstat)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/net/softnet_stat"))
@@ -4708,31 +4169,31 @@ mod tests {
             ProcfsFile::from_path(Path::new("/proc/sys/fs/file-nr"))
                 .unwrap()
                 .kind,
-            ProcfsKind::FileNr
+            ProcfsKind::Fixed(FixedProcfsFile::FileNr)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/sys/fs/file-max"))
                 .unwrap()
                 .kind,
-            ProcfsKind::FileMax
+            ProcfsKind::Fixed(FixedProcfsFile::FileMax)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/zoneinfo"))
                 .unwrap()
                 .kind,
-            ProcfsKind::Zoneinfo
+            ProcfsKind::Fixed(FixedProcfsFile::Zoneinfo)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/sys/fs/inode-nr"))
                 .unwrap()
                 .kind,
-            ProcfsKind::InodeNr
+            ProcfsKind::Fixed(FixedProcfsFile::InodeNr)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/sys/fs/inode-state"))
                 .unwrap()
                 .kind,
-            ProcfsKind::InodeState
+            ProcfsKind::Fixed(FixedProcfsFile::InodeState)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/net/protocols"))
@@ -4744,7 +4205,7 @@ mod tests {
             ProcfsFile::from_path(Path::new("/proc/cgroups"))
                 .unwrap()
                 .kind,
-            ProcfsKind::Cgroups
+            ProcfsKind::Fixed(FixedProcfsFile::Cgroups)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/locks"))
@@ -4774,7 +4235,7 @@ mod tests {
             ProcfsFile::from_path(Path::new("/proc/sys/fs/dentry-state"))
                 .unwrap()
                 .kind,
-            ProcfsKind::DentryState
+            ProcfsKind::Fixed(FixedProcfsFile::DentryState)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/net/netlink"))
@@ -5655,7 +5116,7 @@ Rss:                   4 kB\n" as &[u8];
         );
         assert!(ProcfsFile::from_path(Path::new("node/vmstat")).is_none());
         assert!(ProcfsFile::from_path(Path::new("node0/meminfo")).is_none());
-        // /proc/vmstat is now recognized as ProcfsKind::Vmstat (PR-938).
+        // /proc/vmstat is now recognized as ProcfsKind::Fixed(FixedProcfsFile::Vmstat) (PR-938).
     }
 
     #[test]
@@ -5706,48 +5167,6 @@ Rss:                   4 kB\n" as &[u8];
     fn scaling_cur_freq_is_fixed() {
         assert_eq!(sanitize_scaling_cur_freq(b"2483951\n"), b"1000000\n");
         assert!(sanitize_scaling_cur_freq(b"").is_empty());
-    }
-
-    #[test]
-    fn swaps_preserves_configuration_and_zeros_usage() {
-        let contents = b"Filename\tType\tSize\tUsed\tPriority\n\
-/dev/nvme1n1p3 partition 2000892 0 5\n\
-/data/swapvol/swapfile file 134217724 69308912 -2\n";
-        assert_eq!(
-            sanitize_swaps(contents),
-            b"Filename\tType\tSize\tUsed\tPriority\n\
-/dev/nvme1n1p3\tpartition\t2000892\t0\t5\n\
-/data/swapvol/swapfile\tfile\t134217724\t0\t-2\n"
-        );
-        assert!(sanitize_swaps(b"").is_empty());
-        assert_eq!(
-            sanitize_swaps(b"Filename Type Size Used Priority\n/swap file 12 3 1 extra\n"),
-            b"Filename Type Size Used Priority\n/swap file 12 3 1 extra\n"
-        );
-        assert_eq!(
-            sanitize_swaps(b"Filename Type Size Used Priority\n/swap file 12 unknown\n"),
-            b"Filename Type Size Used Priority\n/swap file 12 unknown\n"
-        );
-    }
-
-    #[test]
-    fn key_users_preserves_uids_and_quota_limits() {
-        let contents = b"0: 15 15/15 15/1000000 2499/25000000\n\
-1000: 2 1/2 1/200 77/20000\n";
-        assert_eq!(
-            sanitize_key_users(contents),
-            b"0: 0 0/0 0/1000000 0/25000000\n\
-1000: 0 0/0 0/200 0/20000\n"
-        );
-        assert!(sanitize_key_users(b"").is_empty());
-        assert_eq!(
-            sanitize_key_users(b"0: 15 15/15 invalid 2499/25000000\n"),
-            b"0: 15 15/15 invalid 2499/25000000\n"
-        );
-        assert_eq!(
-            sanitize_key_users(b"0: 15 15/15 15/1000000 2499/25000000 extra\n"),
-            b"0: 15 15/15 15/1000000 2499/25000000 extra\n"
-        );
     }
 
     #[test]
@@ -6431,85 +5850,6 @@ Rss:                   4 kB\n" as &[u8];
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-914): Review inode counter fixture coverage.
-    #[test]
-    fn inode_nr_hides_host_global_allocation_counters() {
-        assert_eq!(sanitize_inode_nr(b"13929543\t1109179\n"), b"0\t0\n");
-        assert_eq!(
-            sanitize_inode_state(b"13929543\t1109179\t0\t0\t0\t0\t0\n"),
-            b"0\t0\t0\t0\t0\t0\t0\n"
-        );
-        assert!(sanitize_inode_nr(b"").is_empty());
-        assert!(sanitize_inode_state(b"").is_empty());
-    }
-
-    #[test]
-    fn buddyinfo_preserves_topology_and_zeros_free_lists() {
-        let contents = b"Node 0, zone DMA 0 1 2 3\n\
-Node 1, zone Normal 42 17 5 1\n\
-malformed buddy row\n";
-        assert_eq!(
-            sanitize_buddyinfo(contents),
-            b"Node 0, zone DMA 0 0 0 0\n\
-Node 1, zone Normal 0 0 0 0\n\
-malformed buddy row\n"
-        );
-    }
-
-    #[test]
-    fn file_nr_hides_host_global_allocations() {
-        assert_eq!(
-            sanitize_file_nr(b"245853\t0\t9223372036854775807\n"),
-            b"0\t0\t9223372036854775807\n"
-        );
-        assert_eq!(sanitize_file_max(b"1048576\n"), b"9223372036854775807\n");
-        assert!(sanitize_file_nr(b"").is_empty());
-        assert!(sanitize_file_max(b"").is_empty());
-    }
-
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-918): Review dentry counter fixture coverage.
-    #[test]
-    fn dentry_state_hides_host_global_cache_counters() {
-        assert_eq!(
-            sanitize_dentry_state(b"1888773\t1374220\t45\t0\t212904\t0\n"),
-            b"0\t0\t45\t0\t0\t0\n"
-        );
-        assert!(sanitize_dentry_state(b"").is_empty());
-    }
-
-    /// The advertised ceiling must be the ENFORCED ceiling, not the host's.
-    ///
-    /// A default host reports 1048576 and a hardened one 65536 -- a factor of
-    /// sixteen. A guest that reads this and branches on it was branching on the
-    /// machine. Both now read as the pinned capacity, which is the same number
-    /// `F_SETPIPE_SZ` will actually grant.
-    #[test]
-    fn pipe_max_size_reports_the_enforced_ceiling_not_the_host() {
-        let expected = format!("{DETERMINISTIC_PIPE_CAPACITY_BYTES}\n").into_bytes();
-        assert_eq!(sanitize_pipe_max_size(b"1048576\n"), expected);
-        assert_eq!(sanitize_pipe_max_size(b"65536\n"), expected);
-        assert_eq!(sanitize_pipe_max_size(b"4096\n"), expected);
-    }
-
-    /// Contents that are not a plain integer are not this sysctl. Return empty
-    /// rather than inventing a ceiling, matching `sanitize_aio_nr`.
-    #[test]
-    fn pipe_max_size_invents_nothing_from_unparsable_contents() {
-        assert!(sanitize_pipe_max_size(b"").is_empty());
-        assert!(sanitize_pipe_max_size(b"not a number\n").is_empty());
-        assert!(sanitize_pipe_max_size(&[0xff, 0xfe]).is_empty());
-    }
-
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-933): Review AIO count fixture coverage.
-    #[test]
-    fn aio_nr_hides_host_global_reservations() {
-        assert_eq!(sanitize_aio_nr(b"3040\n"), b"0\n");
-        assert!(sanitize_aio_nr(b"").is_empty());
-    }
-
-    // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-927): Review PTY count fixture coverage.
     #[test]
     fn pty_nr_hides_host_global_allocations() {
@@ -6540,19 +5880,19 @@ RAW: inuse 5\n"
             ProcfsFile::from_path(Path::new("/proc/interrupts"))
                 .unwrap()
                 .kind,
-            ProcfsKind::InterruptCounters
+            ProcfsKind::Fixed(FixedProcfsFile::Interrupts)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/softirqs"))
                 .unwrap()
                 .kind,
-            ProcfsKind::InterruptCounters
+            ProcfsKind::Fixed(FixedProcfsFile::Softirqs)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/modules"))
                 .unwrap()
                 .kind,
-            ProcfsKind::Modules
+            ProcfsKind::Fixed(FixedProcfsFile::Modules)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/sys/module/ipmi_si/refcnt"))
@@ -6564,62 +5904,6 @@ RAW: inuse 5\n"
         assert!(ProcfsFile::from_path(Path::new("/sys/module/ipmi_si/coresize")).is_none());
         assert!(ProcfsFile::from_path(Path::new("/sys/module/refcnt")).is_none());
         assert!(ProcfsFile::from_path(Path::new("/sys/module/ipmi_si/holders/refcnt")).is_none());
-    }
-
-    #[test]
-    fn interrupt_and_module_accounting_is_synthetic() {
-        let interrupts = b"           CPU0       CPU1\n  9:        123          4 IR-PCI-MSI 0-edge acpi\nNMI:          8          9 Non-maskable interrupts\nERR:          5\n";
-        assert_eq!(
-            sanitize_interrupt_counters(interrupts),
-            b"           CPU0       \n  9:          0 IR-PCI-MSI 0-edge acpi\nNMI:          0 Non-maskable interrupts\nERR:          0\n"
-        );
-        // /proc/softirqs: an indented header and rows with no trailing columns.
-        assert_eq!(
-            sanitize_interrupt_counters(b"                    CPU0       CPU1       CPU2\n          HI:          1          2          3\n"),
-            b"                    CPU0       \n          HI:          0\n"
-        );
-        assert_eq!(
-            sanitize_interrupt_counters(b"  9: 9 99 IR-PCI-MSI 0-edge acpi\nERR: 999999\n"),
-            sanitize_interrupt_counters(b"  9: 123456789 4 IR-PCI-MSI 0-edge acpi\nERR: 5\n"),
-            "native counter width and padding must not affect the snapshot"
-        );
-
-        let modules = b"kvm_amd 212992 95 - Live 0x0\nkvm 1200128 1 kvm_amd, Live 0x0\nllc 20480 2 bridge,stp, Live 0x0\n";
-        assert!(sanitize_modules(modules).is_empty());
-        assert!(sanitize_modules(b"").is_empty());
-        // No module is published, so nothing holds any module: every refcnt is 0.
-        assert_eq!(sanitize_module_refcnt(b"7\n", "kvm_amd"), b"0\n");
-        assert_eq!(sanitize_module_refcnt(b"12", "kvm_amd"), b"0");
-        assert_eq!(sanitize_module_refcnt(b"7\n", "kvm"), b"0\n");
-        assert_eq!(sanitize_module_refcnt(b"9", "llc"), b"0");
-        // Malformed contents still pass through untouched (fail open, unchanged).
-        assert_eq!(
-            sanitize_module_refcnt(b"not-a-count\n", "kvm"),
-            b"not-a-count\n"
-        );
-        assert!(sanitize_module_refcnt(b"", "kvm").is_empty());
-    }
-
-    /// https://github.com/rrnewton/hermit/issues/3815: a verify run read
-    /// `/proc/modules` as 1995 bytes in run 1 and 2043 bytes in run 2, because
-    /// the host loaded one module (one 48-byte row) between the runs. The
-    /// published table must not depend on which modules the host has loaded,
-    /// nor on their sizes, holders, state or addresses.
-    #[test]
-    fn proc_modules_does_not_depend_on_the_host_module_set() {
-        let before = b"nf_nat 61440 1 nft_chain_nat, Live 0x0000000000000000\n\
-                       kvm 1200128 0 - Live 0x0000000000000000\n";
-        let after = b"nft_chain_nat 12288 0 - Live 0x0000000000000000\n\
-                      nf_nat 61440 2 nft_chain_nat,xt_MASQUERADE, Live 0x0000000000000000\n\
-                      kvm 1200128 0 - Loading 0xffffffffc0a00000\n";
-        assert_eq!(sanitize_modules(before), sanitize_modules(after));
-        for module in ["nf_nat", "kvm", "nft_chain_nat"] {
-            assert_eq!(
-                sanitize_module_refcnt(b"1\n", module),
-                sanitize_module_refcnt(b"3\n", module),
-                "{module}: refcnt must not follow the host holder list"
-            );
-        }
     }
 
     #[test]
@@ -6673,22 +5957,6 @@ RAW 1008 0 -1 NI 0 yes kernel y y\n"
     }
 
     #[test]
-    fn schedstat_hides_host_scheduler_accounting() {
-        let contents = b"version 17\n\
-timestamp 4671819092\n\
-cpu0 1 2 3 4 5 6 129488086714063 39956207684532 545893933\n\
-domain0 SMT 00000003 1 2 3\n";
-
-        assert_eq!(
-            sanitize_schedstat(contents),
-            b"version 17\n\
-timestamp 0\n\
-cpu0 0 0 0 0 0 0 0 0 0\n\
-domain0 SMT 00000003 0 0 0\n"
-        );
-    }
-
-    #[test]
     fn self_schedstat_hides_host_scheduler_accounting() {
         assert_eq!(
             sanitize_self_schedstat(b"3029609 1559338 150\n"),
@@ -6704,70 +5972,6 @@ domain0 SMT 00000003 0 0 0\n"
 
         let invalid_counter = b"3029609 waiting 150\n";
         assert_eq!(sanitize_self_schedstat(invalid_counter), invalid_counter);
-    }
-
-    #[test]
-    fn zoneinfo_hides_host_memory_accounting() {
-        let contents = b"Node 3, zone    DMA32\n\
-  pages free     2816\n\
-      nr_inactive_anon 39937459\n\
-        protection: (0, 2117, 772897)\n\
-    cpu: 7\n\
-              count:    12\n";
-
-        assert_eq!(
-            sanitize_zoneinfo(contents),
-            b"Node 3, zone    DMA32\n\
-  pages free     0\n\
-      nr_inactive_anon 0\n\
-        protection: (0, 0, 0)\n\
-    cpu: 7\n\
-              count:    0\n"
-        );
-    }
-
-    #[test]
-    fn cgroups_hides_the_host_cgroup_counts() {
-        // Modelled on two reads of a cgroup v2 host while other units came and
-        // went; one real read prints the same count on every line.
-        let contents = b"#subsys_name\thierarchy\tnum_cgroups\tenabled\n\
-cpu\t0\t6409\t1\n\
-cpuacct\t0\t6409\t1\n\
-memory\t0\t6399\t1\n\
-pids\t0\t6409\t0\n";
-
-        assert_eq!(
-            sanitize_cgroups(contents),
-            b"#subsys_name\thierarchy\tnum_cgroups\tenabled\n\
-cpu\t0\t1\t1\n\
-cpuacct\t0\t1\t1\n\
-memory\t0\t1\t1\n\
-pids\t0\t1\t0\n"
-        );
-        // A cgroup v1 host keeps its hierarchy IDs; two hosts that differ
-        // only in how many cgroups exist read the same bytes.
-        let v1_busy = b"#subsys_name\thierarchy\tnum_cgroups\tenabled\n\
-cpuset\t3\t42\t1\nmemory\t7\t180\t1\n";
-        let v1_idle = b"#subsys_name\thierarchy\tnum_cgroups\tenabled\n\
-cpuset\t3\t1\t1\nmemory\t7\t2\t1\n";
-        assert_eq!(sanitize_cgroups(v1_busy), sanitize_cgroups(v1_idle));
-        assert_eq!(
-            sanitize_cgroups(v1_busy),
-            b"#subsys_name\thierarchy\tnum_cgroups\tenabled\n\
-cpuset\t3\t1\t1\nmemory\t7\t1\t1\n"
-        );
-    }
-
-    #[test]
-    fn cgroups_leaves_unknown_formats_untouched() {
-        let other_header = b"#subsys_name hierarchy num_cgroups enabled\ncpu 0 6409 1\n";
-        assert_eq!(sanitize_cgroups(other_header), other_header);
-
-        let missing_column = b"#subsys_name\thierarchy\tnum_cgroups\tenabled\ncpu\t0\t6409\n";
-        assert_eq!(sanitize_cgroups(missing_column), missing_column);
-
-        let invalid_count = b"#subsys_name\thierarchy\tnum_cgroups\tenabled\ncpu\t0\tmany\t1\n";
-        assert_eq!(sanitize_cgroups(invalid_count), invalid_count);
     }
 
     #[test]
@@ -7452,48 +6656,6 @@ total_commit_ms 0\n"
         assert_eq!(sanitize_block_inflight(extra_row), extra_row);
     }
 
-    #[test]
-    fn vmstat_hides_host_vm_accounting() {
-        let contents = b"nr_free_pages 4587515\npgfault 175926829665\noom_kill 30\n";
-        assert_eq!(
-            sanitize_vmstat(contents),
-            b"nr_free_pages 0\npgfault 0\noom_kill 0\n"
-        );
-        assert_eq!(
-            sanitize_vmstat(b"nr_free_pages 4587515"),
-            b"nr_free_pages 0"
-        );
-    }
-
-    #[test]
-    fn vmstat_leaves_unknown_formats_untouched() {
-        let extra_field = b"nr_free_pages 4587515 pages\n";
-        assert_eq!(sanitize_vmstat(extra_field), extra_field);
-
-        let invalid_counter = b"nr_free_pages many\n";
-        assert_eq!(sanitize_vmstat(invalid_counter), invalid_counter);
-    }
-
-    #[test]
-    fn meminfo_uses_configured_guest_memory() {
-        assert_eq!(
-            sanitize_meminfo(b"MemTotal: 791462432 kB\n", 1_048_576),
-            b"MemTotal:       1048576 kB\n\
-              MemFree:        1048576 kB\n\
-              MemAvailable:   1048576 kB\n\
-              Buffers:        0 kB\n\
-              Cached:         0 kB\n\
-              SwapCached:     0 kB\n\
-              Active:         0 kB\n\
-              Inactive:       0 kB\n\
-              Shmem:          0 kB\n\
-              SReclaimable:   0 kB\n\
-              SwapTotal:      0 kB\n\
-              SwapFree:       0 kB\n"
-        );
-        assert!(sanitize_meminfo(b"", 1_048_576).is_empty());
-    }
-
     /// The sysctls Detcore renders fault on a short copy; its `seq_file`
     /// files and the files whose bytes come from the kernel do not.
     #[test]
@@ -7536,20 +6698,24 @@ total_commit_ms 0\n"
 
     #[test]
     fn snapshot_supports_positional_reads_and_rewinds() {
-        let mut file = ProcfsFile::from_path(Path::new("/proc/sys/fs/file-nr")).unwrap();
+        // A `seq_file` file, which serves reads at any position.
+        let mut file = ProcfsFile::from_path(Path::new("/proc/version")).unwrap();
         file.initialize(
-            b"245853\t0\t1048576\n".to_vec(),
+            Vec::new(),
             ProcfsSnapshotContext {
                 virtual_pid: 1,
                 ..ProcfsSnapshotContext::default()
             },
         );
 
-        assert_eq!(file.take(2).unwrap(), b"0\t");
-        assert_eq!(file.take_at(4, 1).unwrap(), b"9");
+        assert_eq!(file.take(2).unwrap(), b"Li");
+        assert_eq!(file.take_at(4, 1).unwrap(), b"x");
         assert_eq!(file.position().0, 2, "pread must not move the cursor");
         file.set_offset(0);
-        assert_eq!(file.take(128).unwrap(), b"0\t0\t9223372036854775807\n");
+        assert_eq!(
+            file.take(128).unwrap(),
+            FixedProcfsFile::Version.contents(&crate::machine::MachineDescription::default())
+        );
     }
 
     /// Two-sided coverage for the #1558 fix-forward, counted on both sides.
@@ -7622,13 +6788,25 @@ total_commit_ms 0\n"
     /// is held and every sysfs refcnt must be 0, never a host-derived count.
     #[test]
     fn sysfs_refcnt_agrees_with_proc_modules_use_count() {
-        let modules = "kvm_amd 212992 95 - Live 0x0\n\
-                       kvm 1200128 1 kvm_amd, Live 0x0\n\
-                       llc 20480 2 bridge,stp, Live 0x0\n";
-        assert!(sanitize_modules(modules.as_bytes()).is_empty());
+        // `/proc/modules` lists no module, so nothing holds any module:
+        // every refcnt is 0.
+        assert!(
+            FixedProcfsFile::Modules
+                .contents(&crate::machine::MachineDescription::default())
+                .is_empty()
+        );
         for module in ["kvm_amd", "kvm", "llc"] {
             assert_eq!(sanitize_module_refcnt(b"999\n", module), b"0\n");
         }
+        assert_eq!(sanitize_module_refcnt(b"7\n", "kvm_amd"), b"0\n");
+        assert_eq!(sanitize_module_refcnt(b"12", "kvm_amd"), b"0");
+        assert_eq!(sanitize_module_refcnt(b"9", "llc"), b"0");
+        // Malformed contents still pass through untouched (fail open, unchanged).
+        assert_eq!(
+            sanitize_module_refcnt(b"not-a-count\n", "kvm"),
+            b"not-a-count\n"
+        );
+        assert!(sanitize_module_refcnt(b"", "kvm").is_empty());
     }
 
     /// ROUND-2 REGRESSION GUARD for the scoped fd-resolution fallback.

@@ -449,7 +449,16 @@ impl RecordVersion {
 // follows (https://github.com/rrnewton/hermit/issues/4211). An older recording
 // has no rejoin entry for such a readmission, so this replay could not follow
 // it.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x14c);
+// 0x14c -> 0x14d: the kernel's tables (/proc/interrupts, softirqs, zoneinfo,
+// meminfo, modules and 16 others) are fixed files that Detcore renders from
+// its machine description with no kernel read
+// (https://github.com/rrnewton/hermit/issues/4266), where Detcore sanitized
+// the host's file and kept its shape: its interrupt names, zones and one
+// column per host CPU. And every open whose spelling Detcore does not
+// classify (nearly every open outside /proc and /sys) now records a readlink
+// of the descriptor, which replay answers, so both runs classify it alike. An
+// older recording would replay with different bytes and events.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x14d);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -474,7 +483,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x14c);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x14c;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x14d;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1367,6 +1376,14 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_from_before_logged_vfork_rejoins() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x14b)));
+    }
+
+    /// A recording older than 0x14d recorded the kernel's tables in the
+    /// host's shape, where Detcore now renders fixed ones
+    /// (https://github.com/rrnewton/hermit/issues/4266).
+    #[test]
+    fn record_version_rejects_streams_from_before_fixed_kernel_tables() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x14c)));
     }
 
     #[test]

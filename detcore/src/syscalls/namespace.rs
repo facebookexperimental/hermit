@@ -1089,13 +1089,13 @@ mod tests {
         // (249 bytes) in `/memfd:<name> (deleted)`.
         let longest = format!("/memfd:{} (deleted)", "x".repeat(249));
         assert!(longest.len() < ANONYMOUS_PROC_FD_TARGET_CAPACITY);
-        // Each rendered file's placeholder, with its snapshot, fits a memfd
-        // name and is read back from its link.
-        let machine = crate::machine::MachineDescription::default();
+        // Each rendered file's placeholder, with the snapshot it carries,
+        // fits a memfd name and is read back from its link. A fixed file's
+        // carries none (`ProcfsFile::snapshot_is_fixed`).
         for path in crate::syscalls::rendered_procfs::rendered_paths() {
             let path = std::path::Path::new(path.to_str().unwrap());
             let snapshot = match crate::procfs::FixedProcfsFile::from_path(path.to_str().unwrap()) {
-                Some(file) => file.contents(&machine),
+                Some(_) => Vec::new(),
                 None => b"00000000-0000-4000-8000-000000000000\n".to_vec(),
             };
             let name = crate::procfs::placeholder_name(path, &snapshot);
