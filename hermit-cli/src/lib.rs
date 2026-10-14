@@ -399,6 +399,8 @@ use std::time::Instant;
 
 use anyhow::anyhow;
 use clap::ValueEnum;
+pub use consts::LAST;
+pub use consts::LAST_RUN;
 use consts::MANIFEST_NAME as RUN_MANIFEST_NAME;
 pub use consts::MANIFEST_NAME;
 use consts::METADATA_NAME;
@@ -4554,8 +4556,8 @@ impl HermitData {
         // Atomically move the temporary recording to its final location.
         fs::rename(data.keep(), self.data_dir.join(id.to_string()))?;
 
-        self.update_last_id(&id)
-            .with_context(|| format!("Failed to update {:?}", self.data_dir.join("last")))?;
+        self.note_latest(&id, true)
+            .with_context(|| format!("Failed to update {:?}", self.data_dir.join(LAST)))?;
 
         Ok(Recording { id, exit_status })
     }
@@ -4647,14 +4649,27 @@ impl HermitData {
 
     /// Returns the last recorded ID.
     pub fn last_id(&self) -> Result<Id, Error> {
-        Ok(fs::read_to_string(self.data_dir.join("last"))?.parse()?)
+        Ok(fs::read_to_string(self.data_dir.join(LAST))?.parse()?)
     }
 
-    /// Atomically updates the last recording ID.
-    fn update_last_id(&self, id: &Id) -> Result<(), Error> {
-        let mut file = tempfile::NamedTempFile::new_in(self.data_dir.join("tmp"))?;
-        write!(file, "{}", id)?;
-        file.persist(self.data_dir.join("last"))?;
+    /// Atomically names `id` as the newest recording: `last-run` always,
+    /// and `last`, which a bare `hermit replay` replays, when the user
+    /// `asked` for the recording (`hermit record`, `hermit run
+    /// --record-networking`) rather than a run leaving its manifest; see
+    /// <https://github.com/rrnewton/hermit/issues/4271>.
+    pub fn note_latest(&self, id: &Id, asked: bool) -> Result<(), Error> {
+        let tmp = self.data_dir.join("tmp");
+        fs::create_dir_all(&tmp)?;
+        let names = if asked {
+            &[LAST_RUN, LAST][..]
+        } else {
+            &[LAST_RUN][..]
+        };
+        for name in names {
+            let mut file = tempfile::NamedTempFile::new_in(&tmp)?;
+            write!(file, "{}", id)?;
+            file.persist(self.data_dir.join(name))?;
+        }
         Ok(())
     }
 }

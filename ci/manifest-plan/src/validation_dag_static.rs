@@ -1475,7 +1475,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +3 from ce6d9a4f: 1087.
     // And metadata::tests::record_version_rejects_streams_from_before_private_sigchld_ends_a_wait
     // (https://github.com/rrnewton/hermit/issues/4132): 1088.
-    ("test.hermit_unit", 1088),
+    // And the recording-name and inventory unit tests of the rr-style
+    // command line (https://github.com/rrnewton/hermit/issues/4271): 1090.
+    ("test.hermit_unit", 1090),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3578,7 +3580,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4271): 1084.
     // And +3 from ce6d9a4f: 1087.
     // And the private-SIGCHLD wait record-epoch test: 1088.
-    ("test.hermit_unit_on_host", 1088),
+    // And the recording-name and inventory unit tests of the rr-style
+    // command line (https://github.com/rrnewton/hermit/issues/4271): 1090.
+    ("test.hermit_unit_on_host", 1090),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

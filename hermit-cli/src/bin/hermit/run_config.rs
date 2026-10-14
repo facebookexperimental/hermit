@@ -64,6 +64,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::path::Path;
+use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::Arg;
@@ -250,9 +251,10 @@ pub(crate) fn from_manifest_at(
                 .insert(REPLAY_NETWORKING_KEY.to_owned(), trace.into());
         }
         Kind::FullSyscall => anyhow::bail!(
-            "{} describes a syscall recording; replay it with `hermit replay {}`",
+            "{} describes a syscall recording, which `hermit run --from` does not rerun; replay \
+             it with: hermit replay {}",
             path.display(),
-            manifest.id
+            crate::manifest::directory_of(path).display()
         ),
     }
     Ok(config)
@@ -414,6 +416,24 @@ pub(crate) fn capture(
     Ok(config)
 }
 
+/// The global options `matches` took from the command line, respelled as
+/// `--long[=VALUE]` tokens, for a command that reruns as `hermit [GLOBAL]
+/// run --from` (`hermit replay`). Options from the environment are left to
+/// the environment the rerun inherits.
+pub(crate) fn global_tokens(
+    command: &Command,
+    matches: &ArgMatches,
+) -> Result<Vec<OsString>, Error> {
+    let specs = option_specs(command);
+    let mut section = capture_section(command, matches)?;
+    section.retain(|long, _| {
+        specs.iter().any(|spec| {
+            spec.long == *long && matches.value_source(&spec.id) == Some(ValueSource::CommandLine)
+        })
+    });
+    file_tokens(Section::Global, &section, command, |_| false)
+}
+
 fn capture_section(
     command: &Command,
     matches: &ArgMatches,
@@ -502,14 +522,22 @@ pub(crate) fn expand_argv(
     let (configs, manifests) = (given_paths(CONFIG_ID), given_paths(FROM_ID));
     let (path, config) = match (configs.as_slice(), manifests.as_slice()) {
         ([], []) => return Ok(None),
-        ([path], []) => (Path::new(path), read(Path::new(path))?),
-        ([], [path]) => {
-            let manifest = crate::manifest::read(Path::new(path))?;
+        ([path], []) => (PathBuf::from(path), read(Path::new(path))?),
+        ([], [spec]) => {
+            use crate::manifest::Target;
+            let path = match crate::manifest::resolve(&crate::manifest::data_dir(), spec)? {
+                Target::Manifest(path) => path,
+                Target::Recording { data_dir, id } => anyhow::bail!(
+                    "{} is a syscall recording, which `hermit run --from` does not rerun; \
+                     replay it with: hermit replay {}",
+                    spec.to_string_lossy(),
+                    data_dir.join(id.to_string()).display()
+                ),
+            };
+            let manifest = crate::manifest::read(&path)?;
             note_another_directory(&manifest);
-            (
-                Path::new(path),
-                from_manifest_at(&manifest, Path::new(path))?,
-            )
+            let config = from_manifest_at(&manifest, &path)?;
+            (path, config)
         }
         ([_, ..], [_, ..]) => {
             anyhow::bail!("--config and --from both name a run's options; give one of them")

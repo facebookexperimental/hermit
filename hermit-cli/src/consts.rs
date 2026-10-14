@@ -13,6 +13,15 @@ pub const METADATA_NAME: &str = "metadata.json";
 /// (<https://github.com/rrnewton/hermit/issues/4271>).
 pub const MANIFEST_NAME: &str = "manifest.json";
 
+/// The file in the data directory naming the newest recording a user asked
+/// for (`hermit record`, `hermit run --record-networking`), which a bare
+/// `hermit replay` replays.
+pub const LAST: &str = "last";
+
+/// The file in the data directory naming the newest recording of any kind,
+/// the manifest of a plain `hermit run` included.
+pub const LAST_RUN: &str = "last-run";
+
 /// The name of the root executable.
 pub const EXE_NAME: &str = "exe";
 

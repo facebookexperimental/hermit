@@ -7,11 +7,12 @@
  */
 
 use std::cell::RefCell;
+use std::ffi::OsString;
+use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
 
 use clap::Parser;
-use hermit::Context;
 use hermit::Error;
 use hermit::HermitData;
 use hermit::Id;
@@ -27,11 +28,25 @@ use super::run::NetworkingMode;
 /// Command-line options for the "replay" subcommand.
 #[derive(Debug, Parser, Clone)]
 pub struct ReplayOpts {
-    /// The ID of the recording to replay. This is obtained by first running
-    /// `hermit record`. This is optional. Defaults to the last successful
-    /// recording.
-    #[clap(value_name = "ID")]
-    id: Option<Id>,
+    /// The recording to replay, by default `last`: the newest one `hermit
+    /// record` or `hermit run --record-networking` made, as a bare `rr
+    /// replay` replays the newest rr recording. It may be `last`, `last-run`
+    /// (the newest of any kind, including the manifest a plain `hermit run`
+    /// leaves when it draws an input from the host), a recording ID or a unique prefix
+    /// of at least 6 hex digits, or the path of a manifest.json or of its
+    /// directory; `hermit list` lists them. A syscall recording (`hermit
+    /// record`) replays under gdb, or to the end with `--autopilot`. Any
+    /// other recording replays by rerunning its program from its manifest,
+    /// as `hermit run --from RECORDING` does, to the end: a network
+    /// recording offline from its trace, a run that drew an input from the
+    /// host with the values it drew. To serve such a rerun to gdb, run
+    /// `hermit run --from RECORDING --gdbserver`.
+    #[clap(value_name = "RECORDING")]
+    recording: Option<OsString>,
+
+    /// The global options this invocation gave, which a rerun passes on.
+    #[clap(skip)]
+    global_argv: Vec<OsString>,
 
     /// Directory where recorded syscall data is stored.
     #[clap(long, value_name = "DIR", env = "HERMIT_DATA_DIR")]
@@ -68,28 +83,32 @@ pub struct ReplayOpts {
 
 impl ReplayOpts {
     pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
-        let hermit = HermitData::from(self.data_dir.as_ref());
+        use crate::manifest::Kind;
+        use crate::manifest::Target;
 
-        let id = match self.id {
-            Some(id) => id,
-            None => hermit
-                .last_id()
-                .context("Failed to find last recording ID")?,
+        let store = HermitData::from(self.data_dir.as_ref());
+        let spec = self
+            .recording
+            .clone()
+            .unwrap_or_else(|| hermit::LAST.into());
+        // Every kind of recording has one name and one verb
+        // (https://github.com/rrnewton/hermit/issues/4271): a syscall
+        // recording replays here; any other reruns from its manifest.
+        let (hermit, id) = match crate::manifest::resolve(store.data_dir(), &spec)? {
+            Target::Recording { data_dir, id } => (HermitData::with_dir(data_dir), id),
+            Target::Manifest(path) => {
+                let manifest = crate::manifest::read(&path)?;
+                if manifest.kind != Kind::FullSyscall {
+                    return Err(self.rerun(&path, &manifest, store.data_dir()));
+                }
+                // The directory named, as the replayer finds it: its parent
+                // and its name.
+                let directory = std::path::absolute(crate::manifest::directory_of(&path))?;
+                let (data_dir, id) =
+                    crate::manifest::recording_location(&directory, Some(&manifest.id))?;
+                (HermitData::with_dir(data_dir), id)
+            }
         };
-
-        // A run that drew an input from the host leaves only a manifest,
-        // which `hermit run --from` reruns; this command replays syscall
-        // recordings (https://github.com/rrnewton/hermit/issues/4271).
-        let directory = hermit.data_dir().join(id.to_string());
-        if !directory.join(hermit::RECORDING_METADATA_NAME).exists()
-            && directory.join(crate::manifest::MANIFEST_NAME).exists()
-        {
-            anyhow::bail!(
-                "recording {id} is a run manifest, not a syscall recording; rerun it with: \
-                 hermit run --from {}",
-                directory.display()
-            );
-        }
         if let Some(address) = &self.dap_listen {
             return Err(self.exec_dap_adapter(&hermit, id, address));
         }
@@ -197,6 +216,47 @@ impl ReplayOpts {
                 (Err(primary), Ok(false)) => Err(primary),
             }
         }
+    }
+
+    /// Sets the global options this invocation gave, which a rerun passes on.
+    pub(crate) fn set_global_argv(&mut self, global_argv: Vec<OsString>) {
+        self.global_argv = global_argv;
+    }
+
+    /// Replaces this process with `hermit [GLOBAL] run --from MANIFEST`, the
+    /// replay of a recording that is not a syscall recording, run in the
+    /// data directory it came from. Returns only the error that kept it
+    /// from doing so.
+    fn rerun(&self, path: &Path, manifest: &crate::manifest::Manifest, data_dir: &Path) -> Error {
+        use std::os::unix::process::CommandExt;
+
+        let id = &manifest.id;
+        let kind = manifest.kind.name();
+        if self.serve_only || !self.gdbex.is_empty() || self.dap_listen.is_some() {
+            return anyhow::anyhow!(
+                "recording {id} is of kind {kind}, which replays by rerunning its program \
+                 rather than under gdb; serve the rerun to gdb with: hermit run --from {} \
+                 --gdbserver",
+                path.display()
+            );
+        }
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(error) => return Error::from(error).context("Failed to locate hermit"),
+        };
+        eprintln!(
+            "hermit replay: recording {id} is of kind {kind}; rerunning it with: hermit run \
+             --from {}",
+            path.display()
+        );
+        let error = std::process::Command::new(&exe)
+            .args(&self.global_argv)
+            .arg("run")
+            .arg("--from")
+            .arg(path)
+            .env("HERMIT_DATA_DIR", data_dir)
+            .exec();
+        Error::from(error).context(format!("Failed to execute {}", exe.display()))
     }
 
     /// Replaces this process with `hermit-dap --listen ADDRESS --replay ID`,

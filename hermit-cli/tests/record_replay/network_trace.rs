@@ -244,6 +244,25 @@ fn assert_controller_report(report: &str) {
     );
 }
 
+/// Runs Hermit with `arguments` alone, which name the guest themselves (a
+/// rerun from a manifest), in `evidence` with the test's data directory and
+/// no stdin, and keeps its stdout and stderr there.
+fn bare_hermit(evidence: &Path, label: &str, arguments: &[&std::ffi::OsStr]) -> Output {
+    let output = Command::new("timeout")
+        .args(["--kill-after=5s", &format!("{OUTER_WALL_SECONDS}s")])
+        .env_remove("LD_LIBRARY_PATH")
+        .env("HERMIT_DATA_DIR", evidence.join("data"))
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(arguments)
+        .current_dir(evidence)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap_or_else(|error| panic!("failed to start {label}: {error}"));
+    fs::write(evidence.join(format!("{label}.stdout")), &output.stdout).unwrap();
+    fs::write(evidence.join(format!("{label}.stderr")), &output.stderr).unwrap();
+    output
+}
+
 /// Runs Hermit with `arguments`, through `HERMIT_SAFEHERMIT` when it is set,
 /// and keeps its stdout and stderr in `evidence`.
 fn hermit_command(
@@ -265,8 +284,11 @@ fn hermit_command(
     // validation nodes write there, so one run of a `--verify` pair could see
     // a directory size the other did not
     // (https://github.com/rrnewton/hermit/issues/3846). Hermit does not use it.
+    // Each test keeps the recordings and manifests its runs write in its
+    // own data directory.
     command
         .env_remove("LD_LIBRARY_PATH")
+        .env("HERMIT_DATA_DIR", evidence.join("data"))
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args(arguments)
         .arg("--")
@@ -958,22 +980,60 @@ fn assert_network_manifest_reruns_offline(
             moved.join("network.trace.manifest.json"),
         ),
     ] {
-        let mut command = Command::new("timeout");
-        command
-            .args(["--kill-after=5s", &format!("{OUTER_WALL_SECONDS}s")])
-            .env_remove("LD_LIBRARY_PATH")
-            .arg(env!("CARGO_BIN_EXE_hermit"))
-            .arg("run")
-            .arg("--from")
-            .arg(&from)
-            .current_dir(evidence)
-            .stdin(std::process::Stdio::null());
-        let rerun = command.output().expect("hermit should start");
-        fs::write(evidence.join(format!("{label}.stdout")), &rerun.stdout).unwrap();
-        fs::write(evidence.join(format!("{label}.stderr")), &rerun.stderr).unwrap();
+        let rerun = bare_hermit(
+            evidence,
+            label,
+            &["run".as_ref(), "--from".as_ref(), from.as_os_str()],
+        );
         assert_success(&rerun, label);
         assert_guest_invariants(&rerun.stdout, label);
     }
+
+    // The data directory keeps a copy that names the trace by its absolute
+    // path, so the recording has an ID that `hermit list` shows, and a bare
+    // `hermit replay`, as `rr replay` does, reruns the newest recording,
+    // this one, offline.
+    let data = evidence.join("data");
+    let id = manifest["id"].as_str().expect("a manifest names its id");
+    let stored: serde_json::Value = serde_json::from_slice(
+        &fs::read(data.join(id).join("manifest.json"))
+            .expect("a network recording adds its manifest to the data directory"),
+    )
+    .unwrap();
+    assert_eq!(
+        stored["artifacts"]["network_trace"]["path"],
+        std::path::absolute(trace).unwrap().to_str().unwrap(),
+        "{stored}"
+    );
+    assert_eq!(
+        stored["artifacts"]["network_trace"]["sha256"],
+        recorded["sha256"]
+    );
+    assert_eq!(fs::read_to_string(data.join("last")).unwrap(), id);
+    let listed = bare_hermit(
+        evidence,
+        "list-recordings",
+        &["list".as_ref(), "--json".as_ref()],
+    );
+    assert_success(&listed, "list-recordings");
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(
+        listed[0]["id"], id,
+        "the newest recording comes first: {listed}"
+    );
+    assert_eq!(listed[0]["kind"], "network", "{listed}");
+    let replayed = bare_hermit(
+        evidence,
+        "replay-last-network-recording",
+        &["replay".as_ref()],
+    );
+    assert_success(&replayed, "replay-last-network-recording");
+    assert_guest_invariants(&replayed.stdout, "replay-last-network-recording");
+    let stderr = String::from_utf8_lossy(&replayed.stderr);
+    assert!(
+        stderr.contains(&format!("recording {id} is of kind network")),
+        "{stderr}"
+    );
     assert_eq!(
         fs::read(trace).unwrap(),
         original_trace,

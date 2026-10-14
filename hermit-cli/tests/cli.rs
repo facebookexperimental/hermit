@@ -8513,11 +8513,15 @@ fn a_run_with_host_drawn_inputs_reruns_bitwise_from_its_manifest() {
     assert!(manifest["inputs"]["run"]["seed"].is_u64(), "{manifest:#}");
     assert_eq!(manifest["exit"]["code"], 3);
     let recording = written[0].parent().unwrap();
+    let id = manifest["id"].as_str().unwrap().to_owned();
     // With --log-file, Hermit's diagnostics go to the log.
     let diagnostics = fs::read_to_string(&left_log).unwrap();
     assert!(
-        diagnostics.contains(&format!("hermit run --from {}", recording.display())),
-        "the diagnostic names the manifest:\n{diagnostics}"
+        diagnostics.contains(&format!(
+            "saved as recording {id} in {}; rerun it with: hermit replay {id}",
+            recording.display()
+        )),
+        "the diagnostic names the recording and its replay:\n{diagnostics}"
     );
 
     let rerun = run(
@@ -8572,6 +8576,127 @@ fn a_run_with_host_drawn_inputs_reruns_bitwise_from_its_manifest() {
         "{verdict:#}"
     );
 
+    // One name and one verb for every kind of recording, as rr has. A
+    // run's manifest is `last-run`, not `last`, which only a recording the
+    // user asked for becomes, so a bare `hermit replay` refuses here and
+    // says so. `hermit replay last-run` reruns the run from its manifest,
+    // passing on the global options it was given, with the same INFO stream.
+    let refused = run(&["replay"], &data);
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("has no `last`")
+            && stderr(&refused).contains("`last-run` names the newest of any kind"),
+        "{}",
+        stderr(&refused)
+    );
+    let replay_log = path("replay.log");
+    let replayed = run(
+        &[
+            "--log=info",
+            &format!("--log-file={replay_log}"),
+            "replay",
+            "last-run",
+        ],
+        &data,
+    );
+    assert_eq!(replayed.status.code(), Some(3), "{}", stderr(&replayed));
+    assert_eq!(stdout(&replayed), stdout(&original));
+    assert!(
+        stderr(&replayed).contains(&format!(
+            "recording {id} is of kind inputs-only; rerunning it with: hermit run --from"
+        )),
+        "{}",
+        stderr(&replayed)
+    );
+    let diff = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(["log-diff", "--canonical-info", &left_log, &replay_log])
+        .output()
+        .expect("hermit log-diff should run");
+    assert!(diff.status.success(), "{}{}", stdout(&diff), stderr(&diff));
+    // An ID prefix and `run --from last-run` name the same recording.
+    for args in [
+        &["replay", &id[..8]][..],
+        &["run", "--from", "last-run"][..],
+        &["run", "--from", &id[..6]][..],
+    ] {
+        let output = run(args, &data);
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+        assert_eq!(stdout(&output), stdout(&original), "{args:?}");
+    }
+    assert_eq!(manifests(&data).len(), 1, "a replay writes no manifest");
+    // A rerun is not a gdb replay: the refusal names the command that is.
+    let refused = run(&["replay", "--serve-only", "last-run"], &data);
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains(&format!(
+            "serve the rerun to gdb with: hermit run --from {} --gdbserver",
+            written[0].display()
+        )),
+        "{}",
+        stderr(&refused)
+    );
+    let missing = run(&["run", "--from", "0123456789"], &data);
+    assert!(!missing.status.success());
+    assert!(
+        stderr(&missing)
+            .contains("has an ID starting with 0123456789; list them with: hermit list"),
+        "{}",
+        stderr(&missing)
+    );
+    // `hermit list` lists recordings of every kind; `hermit show` prints one.
+    let listed = run(&["list"], &data);
+    assert!(listed.status.success(), "{}", stderr(&listed));
+    let listed = stdout(&listed);
+    let rows: Vec<&str> = listed.lines().collect();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(rows[0].starts_with("ID "), "{rows:?}");
+    assert!(
+        rows[1].starts_with(&format!("{}  inputs-only  ", &id[..8])) && rows[1].ends_with(guest),
+        "{rows:?}"
+    );
+    let listed = run(&["list", "--json"], &data);
+    let listed: serde_json::Value = serde_json::from_str(&stdout(&listed)).unwrap();
+    assert_eq!(listed[0]["id"], id.as_str(), "{listed}");
+    assert_eq!(listed[0]["exit"]["code"], 3, "{listed}");
+    let shown = run(&["show", &id[..8]], &data);
+    assert!(shown.status.success(), "{}", stderr(&shown));
+    assert_eq!(stdout(&shown), fs::read_to_string(&written[0]).unwrap());
+
+    // `last` is the recording the user made, as with `rr record` and then
+    // `rr replay`: a later plain run, which leaves its own manifest, moves
+    // only `last-run`, and a bare `hermit replay` still replays the
+    // recording.
+    let guest_line = |output: &Output| {
+        stdout(output)
+            .lines()
+            .find(|line| line.starts_with("now "))
+            .map(str::to_owned)
+    };
+    let recorded = run(&["record", "start", "--", guest], &data);
+    assert_eq!(recorded.status.code(), Some(3), "{}", stderr(&recorded));
+    let later = run(&["run", "--", guest], &data);
+    assert_eq!(later.status.code(), Some(3), "{}", stderr(&later));
+    let replayed = run(&["replay", "--autopilot"], &data);
+    assert_eq!(replayed.status.code(), Some(3), "{}", stderr(&replayed));
+    assert!(guest_line(&recorded).is_some(), "{}", stdout(&recorded));
+    assert_eq!(guest_line(&replayed), guest_line(&recorded));
+    assert!(
+        !stderr(&replayed).contains("rerunning it"),
+        "{}",
+        stderr(&replayed)
+    );
+    let shown = run(&["show", "last-run"], &data);
+    assert!(
+        stdout(&shown).contains("\"kind\": \"inputs-only\""),
+        "{}",
+        stdout(&shown)
+    );
+
     // The policies.
     let explicit = temp.path().join("explicit");
     let output = run(
@@ -8594,6 +8719,18 @@ fn a_run_with_host_drawn_inputs_reruns_bitwise_from_its_manifest() {
         fs::read_to_string(&history[0])
             .unwrap()
             .contains("\"kind\": \"history\"")
+    );
+    // A reproducible run's manifest is `last-run`, never `last`, so a bare
+    // `hermit replay` does not rerun it; the refusal says what is there.
+    let shown = run(&["show", "last-run"], &explicit);
+    assert_eq!(stdout(&shown), fs::read_to_string(&history[0]).unwrap());
+    let refused = run(&["replay"], &explicit);
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("has no `last`")
+            && stderr(&refused).contains("It holds 1 recording, which `hermit list` lists"),
+        "{}",
+        stderr(&refused)
     );
     let never = temp.path().join("never");
     let output = run(

@@ -571,7 +571,9 @@ Replay a recording to completion without a debugger:
 hermit replay --autopilot RECORDING_ID
 ```
 
-Omit the ID to replay the last successful recording:
+Omit the ID to replay `last`, the newest `hermit record` (or `hermit run
+--record-networking`) recording; see "Run Manifests" for every way to name a
+recording:
 
 ```bash
 hermit replay --autopilot
@@ -807,8 +809,12 @@ run manifest, a small recording of those inputs, and names it in a diagnostic
 
 ```text
 $ hermit run --seed-from=SystemRandom -- PROGRAM ARGS
-hermit: this run drew epoch and seed from the host; its inputs are saved as recording 04cba9fc...; rerun it with: hermit run --from ~/.cache/hermit/04cba9fc...
-$ hermit run --from ~/.cache/hermit/04cba9fc...
+hermit: this run drew epoch and seed from the host; its inputs are saved as recording 04cba9fc... in ~/.cache/hermit/04cba9fc...; rerun it with: hermit replay 04cba9fc...
+$ hermit replay last-run             # rerun the newest run from its manifest
+$ hermit run --from last-run --sched-seed=7   # the same inputs, another schedule
+$ hermit list
+ID        KIND          CREATED               EXIT        COMMAND
+04cba9fc  inputs-only   2026-10-13T19:55:00Z  0           PROGRAM ARGS
 ```
 
 - The manifest is `DATA/<id>/manifest.json`, where `DATA` is the data
@@ -829,11 +835,35 @@ $ hermit run --from ~/.cache/hermit/04cba9fc...
   usable performance counter, the preemption timer turned off is recorded
   as `max-timeslice: disabled`. Option values are written as given, `--env`
   values included; the file is mode 0600.
-- `hermit run --from PATH` reruns it: PATH is the manifest or its directory.
-  Options and a guest command on that command line replace the manifest's, as
-  with `--config`, so `hermit run --from PATH --sched-seed=7` explores another
-  schedule from the same inputs. A rerun's inputs are all explicit, so it
-  writes no manifest of its own.
+- Every kind of recording has one name, which `hermit replay`,
+  `hermit run --from` and `hermit show` take. It is one of:
+  - `last` (`DATA/last`): the newest recording you asked for, by
+    `hermit record` or `hermit run --record-networking`. A bare
+    `hermit replay` replays it, as `rr replay` replays the newest
+    `rr record`.
+  - `last-run` (`DATA/last-run`): the newest of any kind, including the
+    manifest a plain run leaves. A run without `--epoch` draws its epoch from
+    the host and so leaves a manifest. It moves only `last-run`, so it never
+    takes a bare `hermit replay` away from your recording.
+  - a recording ID, or a unique prefix of at least 6 hex digits, as git
+    takes a commit;
+  - the path of a `manifest.json` or of its directory. An existing path is
+    read as a path before an ID; write `./last` for a file called `last`.
+- `hermit replay [RECORDING]` replays any kind, by default `last`. A syscall
+  recording replays as before, under gdb or to the end with `--autopilot`.
+  Any other kind replays by rerunning its program from its manifest, to the
+  end, exactly as `hermit run --from RECORDING`, with the global options
+  given before `replay` passed on. Such a rerun is not served to gdb:
+  `hermit run --from RECORDING --gdbserver` does that, and `--serve-only`,
+  `--gdbex` and `--dap-listen` with such a recording are refused naming it.
+- `hermit run --from RECORDING` reruns it. Options and a guest command on
+  that command line replace the manifest's, as with `--config`, so
+  `hermit run --from last-run --sched-seed=7` explores another schedule from
+  the same inputs. A rerun's inputs are all explicit, so it writes no manifest of
+  its own.
+- `hermit list` lists the recordings of every kind, newest first (`--json`
+  for the full IDs, kinds, times, exit statuses, commands and paths), and
+  `hermit show [RECORDING]` prints one's manifest.
 - A run with no host-drawn input writes nothing. `--manifest=POLICY` chooses
   otherwise: `nonreproducible-only` (the default), `always` (a reproducible run
   also writes a `history` manifest, a local record of what ran), or `never`.
@@ -847,19 +877,23 @@ $ hermit run --from ~/.cache/hermit/04cba9fc...
 
 - `hermit record list` lists syscall recordings only. `hermit record rm` and
   `hermit record clean` delete manifest directories as they delete
-  recordings. `hermit replay` replays syscall recordings only and points at
-  `hermit run --from` for a manifest. A data directory keeps the newest 1000
-  manifest-only recordings.
+  recordings. A data directory keeps the newest 1000 manifest-only
+  recordings.
 - A network recording, `hermit run --record-networking=TRACE`, always writes
   a manifest beside its trace, `TRACE.manifest.json` (kind `network`): the
   run's options with any host-drawn epoch or seed written out, and the
   trace's format version, size and SHA-256. The trace itself does not hold
   the seeds or the command, so `hermit run --from TRACE.manifest.json`
   replays the recording offline without retyping them; a trace that does not
-  match the manifest's size and digest is refused.
+  match the manifest's size and digest is refused. The data directory keeps
+  a copy of that manifest naming the trace by its absolute path, so the
+  recording also has an ID and becomes `last`: `hermit replay` alone replays
+  it offline. A pruned copy takes that ID with it; `hermit run --from
+  TRACE.manifest.json` still replays the recording. Those copies are pruned with the manifest-only recordings; the
+  trace and the manifest beside it never are.
 - A syscall recording, `hermit record`, writes `manifest.json` (kind
   `full-syscall`) beside its `metadata.json`: the guest command, how it
-  ended, and the recording's `RECORD_VERSION`. `hermit replay` still reads
+  ended, and the recording's `RECORD_VERSION`. The replayer still reads
   `metadata.json`, which stays as a compatibility copy for one
   `RECORD_VERSION`; `--from` refuses such a manifest and names the
   `hermit replay` command instead.

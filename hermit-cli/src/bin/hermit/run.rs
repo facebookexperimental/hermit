@@ -1471,15 +1471,19 @@ pub struct RunOpts {
     pub save_config: Option<PathBuf>,
 
     /// Rerun the run a manifest records: load its options and guest command as `--config` loads a
-    /// run config. PATH is a `manifest.json` or the recording directory holding one; options and a
-    /// guest command given on this command line replace the manifest's. A run that draws an input
-    /// from the host (an epoch from the host clock, a seed from `--seed-from=SystemRandom`) writes
-    /// such a manifest under the data directory (`HERMIT_DATA_DIR`, else `~/.cache/hermit`) and
-    /// names it in a diagnostic (https://github.com/rrnewton/hermit/issues/4271). Like a run
-    /// config, a manifest does not hold the host environment `--base-env=host` passes through, the
-    /// files the guest reads, or the working directory (relative paths resolve against this one),
-    /// and it leaves out output destinations such as `--log-file`.
-    #[clap(long, value_name = "PATH", conflicts_with = "config")]
+    /// run config. RECORDING is `last` (the newest `hermit record` or `--record-networking`
+    /// recording), `last-run` (the newest of any kind, a plain run's manifest included), a recording ID or a unique prefix of at least 6 hex digits, or the
+    /// path of a `manifest.json` or of its directory; `hermit list` lists them. Options and a guest
+    /// command given on this command line replace the manifest's, so `hermit run --from last-run
+    /// --sched-seed=7` reruns the newest run under another schedule. A run that draws an
+    /// input from the host (an epoch from the host clock, a seed from `--seed-from=SystemRandom`)
+    /// writes such a manifest under the data directory (`HERMIT_DATA_DIR`, else
+    /// `~/.cache/hermit`) and names it in a diagnostic
+    /// (https://github.com/rrnewton/hermit/issues/4271). Like a run config, a manifest does not
+    /// hold the host environment `--base-env=host` passes through, the files the guest reads, or
+    /// the working directory (relative paths resolve against this one), and it leaves out output
+    /// destinations such as `--log-file`.
+    #[clap(long, value_name = "RECORDING", conflicts_with = "config")]
     from: Option<PathBuf>,
 
     /// When to write a run manifest, the small recording that reruns this execution with
@@ -8391,15 +8395,14 @@ impl RunOpts {
         }
         if kind == manifest::Kind::Network {
             global.write_controller_diagnostic(format_args!(
-                "hermit: the network recording's manifest is written to {} when the run ends; \
-                 replay it offline with: hermit run --from {}",
+                "hermit: the network recording's manifest is written to {} when the run ends, \
+                 as recording {id}; replay it offline with: hermit replay {id}",
                 path.display(),
-                path.display()
             ))?;
         } else if kind == manifest::Kind::InputsOnly {
             global.write_controller_diagnostic(format_args!(
-                "hermit: this run drew {} from the host; its inputs are saved as recording {id}; \
-                 rerun it with: hermit run --from {}",
+                "hermit: this run drew {} from the host; its inputs are saved as recording {id} \
+                 in {}; rerun it with: hermit replay {id}",
                 document
                     .inputs
                     .host_drawn
@@ -8441,11 +8444,36 @@ impl RunOpts {
                 trace.sha256 = Some(sha256);
                 trace.bytes = Some(bytes);
             }
-            crate::manifest::write(&path, &document)
+            crate::manifest::write(&path, &document)?;
+            Ok(document)
         });
-        if let Err(error) = result {
+        let document = match result {
+            Ok(document) => document,
+            Err(error) => {
+                crate::tracing::diagnostic_eprintln!(
+                    "hermit: could not record the exit status in {}: {error:#}",
+                    path.display()
+                );
+                return;
+            }
+        };
+        if document.kind != crate::manifest::Kind::Network {
+            // A run's manifest is the newest run, `last-run`, once the run
+            // has ended; `last` stays with the recording the user made.
+            if let Ok(id) = document.id.parse() {
+                note_latest(&crate::manifest::data_dir(), id, document.kind.moves_last());
+            }
+            return;
+        }
+        // A copy in the data directory, naming the trace by its absolute
+        // path, makes the recording one that `hermit replay`, `hermit list`
+        // and `last` know by its ID.
+        let data_dir = crate::manifest::data_dir();
+        if let Err(error) = store_network_manifest(&data_dir, &path, document) {
             crate::tracing::diagnostic_eprintln!(
-                "hermit: could not record the exit status in {}: {error:#}",
+                "hermit: could not add the network recording to {}: {error:#}; replay it with: \
+                 hermit run --from {}",
+                data_dir.display(),
                 path.display()
             );
         }
@@ -9170,6 +9198,51 @@ pub(super) fn complete_container_config(
     config.mountinfo_mount_ids_captured = identity_sources.is_some();
     config.mount_id_assignment_order.clear();
     Ok(config)
+}
+
+/// Names recording `id` as the newest in `data_dir` (see
+/// [`hermit::HermitData::note_latest`]). Best effort: the recording stays
+/// reachable by its ID.
+fn note_latest(data_dir: &Path, id: hermit::Id, asked: bool) {
+    if let Err(error) = hermit::HermitData::with_dir(data_dir).note_latest(&id, asked) {
+        crate::tracing::diagnostic_eprintln!(
+            "hermit: could not name recording {id} as the newest in {}: {error:#}",
+            data_dir.display()
+        );
+    }
+}
+
+/// Writes `DATA/<id>/manifest.json` for the network recording whose
+/// manifest is `sibling`, naming its trace by absolute path, and names it
+/// the newest recording.
+fn store_network_manifest(
+    data_dir: &Path,
+    sibling: &Path,
+    mut document: crate::manifest::Manifest,
+) -> Result<(), Error> {
+    let trace = document
+        .artifacts
+        .as_mut()
+        .and_then(|artifacts| artifacts.network_trace.as_mut())
+        .ok_or_else(|| anyhow::anyhow!("the network manifest names no trace"))?;
+    let file = std::path::absolute(sibling.with_file_name(&trace.path))?;
+    trace.path = file
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("network trace path {} is not UTF-8", file.display()))?
+        .to_owned();
+    let id: hermit::Id = document
+        .id
+        .parse()
+        .with_context(|| format!("the manifest's id {:?} is not a recording ID", document.id))?;
+    crate::manifest::write(
+        &data_dir
+            .join(id.to_string())
+            .join(crate::manifest::MANIFEST_NAME),
+        &document,
+    )?;
+    note_latest(data_dir, id, document.kind.moves_last());
+    crate::manifest::prune(data_dir, crate::manifest::KEEP_MANIFEST_ONLY);
+    Ok(())
 }
 
 #[cfg(test)]

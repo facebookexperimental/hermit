@@ -28,6 +28,7 @@ mod host_capabilities;
 mod host_seccomp;
 mod image;
 mod instruction_map;
+mod inventory;
 mod list;
 mod logdiff;
 mod manifest;
@@ -243,6 +244,17 @@ fn args_from_matches_with_clock(
             Err(_) => {}
         }
     }
+    // A `hermit replay` of a recording other than a syscall recording reruns
+    // it, passing on the global options given here.
+    if let Subcommand::Replay(replay) = &mut args.command {
+        let tokens = run_config::global_tokens(&Args::command(), matches).map_err(|error| {
+            Args::command().error(
+                clap::error::ErrorKind::ValueValidation,
+                format!("{error:#}"),
+            )
+        })?;
+        replay.set_global_argv(tokens);
+    }
     Ok(args)
 }
 
@@ -385,9 +397,17 @@ enum Subcommand {
     #[clap(name = "record", trailing_var_arg = true)]
     Record(Box<RecordOpts>),
 
-    /// Replay the execution of a program.
+    /// Replay a recording: by default the newest, as `rr replay` does.
     #[clap(name = "replay")]
     Replay(ReplayOpts),
+
+    /// List the recordings of every kind, newest first.
+    #[clap(name = "list")]
+    List(inventory::ListOpts),
+
+    /// Print a recording's manifest.
+    #[clap(name = "show")]
+    Show(inventory::ShowOpts),
 
     /// Print one log canonically, or compare two run/record logs.
     ///
@@ -519,6 +539,8 @@ impl Subcommand {
             Subcommand::Record(record) => record.starts_recording(),
             Subcommand::Oci(oci) => oci.starts_guest(),
             Subcommand::HostCapabilities(_)
+            | Subcommand::List(_)
+            | Subcommand::Show(_)
             | Subcommand::Version(_)
             | Subcommand::LogDiff(_)
             | Subcommand::InstructionMap(_) => false,
@@ -585,6 +607,8 @@ impl Subcommand {
             Subcommand::Strace(x) => x.main(global),
             Subcommand::Record(x) => x.main(global),
             Subcommand::Replay(x) => x.main(global),
+            Subcommand::List(x) => x.main(),
+            Subcommand::Show(x) => x.main(),
             Subcommand::LogDiff(x) => x.run(global),
             Subcommand::Analyze(x) => x.main(global),
             Subcommand::Bisect(x) => x.main(global),

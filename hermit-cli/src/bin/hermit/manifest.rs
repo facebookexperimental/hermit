@@ -236,9 +236,33 @@ pub(crate) enum Kind {
 impl Kind {
     /// Whether a data directory prunes recordings of this kind
     /// ([`KEEP_MANIFEST_ONLY`]). Recordings a user asked for are never
-    /// pruned.
+    /// pruned: a syscall recording is not, and a network recording's trace
+    /// and the manifest beside it stay at the path its user named. Only the
+    /// data directory's copy of that manifest, which `hermit replay` finds
+    /// by ID, is pruned.
     pub(crate) fn pruned(self) -> bool {
-        matches!(self, Kind::InputsOnly | Kind::History)
+        matches!(self, Kind::InputsOnly | Kind::History | Kind::Network)
+    }
+
+    /// Whether a recording of this kind becomes `DATA/last`, which a bare
+    /// `hermit replay` replays: a recording the user asked for. A run's own
+    /// manifest moves only `DATA/last-run`. Without `--epoch` every `hermit
+    /// run` draws its epoch from the host and leaves an `inputs-only`
+    /// manifest, so if those moved `last`, any run, in any terminal, would
+    /// take a bare `hermit replay` away from the recording just made, which
+    /// is not what `rr record` then `rr replay` does.
+    pub(crate) fn moves_last(self) -> bool {
+        matches!(self, Kind::Network | Kind::FullSyscall)
+    }
+
+    /// The kind as the manifest spells it.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Kind::InputsOnly => "inputs-only",
+            Kind::History => "history",
+            Kind::Network => "network",
+            Kind::FullSyscall => "full-syscall",
+        }
     }
 }
 
@@ -308,7 +332,7 @@ pub(crate) struct Command {
 }
 
 /// The run's options, with every input Hermit resolved written out.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Inputs {
     /// Options before the subcommand, by long name.
@@ -424,6 +448,17 @@ pub(crate) fn network_trace_version(trace: &Path) -> Result<u32, Error> {
     ))
 }
 
+/// The directory a manifest path names: the path itself when it is a
+/// directory, else its parent, `.` for a bare file name.
+pub(crate) fn directory_of(path: &Path) -> &Path {
+    if path.is_dir() {
+        return path;
+    }
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
 /// The SHA-256 (lowercase hex) and size of the file at `path`.
 pub(crate) fn digest_and_size(path: &Path) -> Result<(String, u64), Error> {
     let digest = detcore::Digest::digest_path(path)
@@ -446,12 +481,7 @@ pub(crate) fn checked_network_trace(
         .as_ref()
         .and_then(|artifacts| artifacts.network_trace.as_ref())
         .ok_or_else(|| anyhow::anyhow!("this network manifest names no network trace"))?;
-    let directory = if manifest_path.is_dir() {
-        manifest_path
-    } else {
-        manifest_path.parent().unwrap_or(Path::new("."))
-    };
-    let path = directory.join(&trace.path);
+    let path = directory_of(manifest_path).join(&trace.path);
     let (Some(sha256), Some(bytes)) = (&trace.sha256, trace.bytes) else {
         anyhow::bail!(
             "the network recording {} never finished: its manifest has no digest for it",
@@ -549,10 +579,11 @@ pub(crate) fn read(path: &Path) -> Result<Manifest, Error> {
     parse(&text).with_context(|| format!("cannot load manifest {}", file.display()))
 }
 
-/// How many manifest-only recordings (`inputs-only` and `history`) a data
-/// directory keeps; writing one more deletes the oldest. Each is a few KB,
-/// so the data directory holds at most a few MB of them. Syscall and network
-/// recordings are never pruned.
+/// How many manifest-only recordings (`inputs-only`, `history`, and the
+/// copies of `network` manifests) a data directory keeps; writing one more
+/// deletes the oldest. Each is a few KB, so the data directory holds at most
+/// a few MB of them. Syscall recordings, network traces, and the manifests
+/// beside those traces are never pruned.
 pub(crate) const KEEP_MANIFEST_ONLY: usize = 1000;
 
 /// Deletes the oldest manifest-only recordings in `data_dir` beyond `keep`,
@@ -588,6 +619,200 @@ pub(crate) fn prune(data_dir: &Path, keep: usize) {
     found.sort();
     for (_, directory) in &found[..found.len() - keep] {
         let _ = std::fs::remove_dir_all(directory);
+    }
+}
+
+/// The fewest hex digits that name a recording by ID prefix.
+pub(crate) const MIN_ID_PREFIX: usize = 6;
+
+/// What a recording name resolves to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Target {
+    /// A manifest, of any kind.
+    Manifest(PathBuf),
+    /// A syscall recording without a manifest: `hermit record` wrote none
+    /// before <https://github.com/rrnewton/hermit/issues/4271>.
+    Recording { data_dir: PathBuf, id: Id },
+}
+
+/// How a command that takes a recording names one, for its help.
+pub(crate) const TARGET_HELP: &str = "`last` (the newest `hermit record` or `--record-networking` \
+     recording), `last-run` (the newest of any kind, a plain run's manifest included), a \
+     recording ID or a unique prefix of at least 6 hex digits, or the path of a manifest.json \
+     or of its directory. To name a file called `last`, write `./last`";
+
+/// Resolves a recording name against `data_dir`: `last` or `last-run`, an
+/// existing path (a manifest, or a recording directory), or an ID or a
+/// unique prefix of at least [`MIN_ID_PREFIX`] hex digits, as git accepts
+/// commit prefixes. Each refusal names what to run instead.
+pub(crate) fn resolve(data_dir: &Path, spec: &std::ffi::OsStr) -> Result<Target, Error> {
+    let text = spec.to_str();
+    if let Some(name @ (hermit::LAST | hermit::LAST_RUN)) = text {
+        let file = data_dir.join(name);
+        let id = match std::fs::read_to_string(&file) {
+            Ok(id) => id,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(no_latest(data_dir, name));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("cannot read {}", file.display()));
+            }
+        };
+        let id: Id = id
+            .trim()
+            .parse()
+            .with_context(|| format!("{} does not hold a recording ID", file.display()))?;
+        return target_of_id(data_dir, id).with_context(|| format!("cannot replay `{name}`"));
+    }
+    let path = Path::new(spec);
+    if path.is_file() {
+        // An existing path is read as a path, before an ID prefix; say so
+        // when it is not a manifest.
+        read(path).with_context(|| {
+            format!(
+                "{} names the file {} here, which is read as a path before any recording ID \
+                 and is not a manifest; to name a recording, give more digits of its ID or the \
+                 whole ID, which `hermit list --json` prints",
+                spec.to_string_lossy(),
+                path.display()
+            )
+        })?;
+        return Ok(Target::Manifest(path.to_owned()));
+    }
+    if path.is_dir() {
+        if path.join(MANIFEST_NAME).is_file() {
+            return Ok(Target::Manifest(path.join(MANIFEST_NAME)));
+        }
+        if !path.join(hermit::RECORDING_METADATA_NAME).is_file() {
+            anyhow::bail!(
+                "{} is not a recording: it holds neither {MANIFEST_NAME} nor {}; list \
+                 recordings with: hermit list",
+                path.display(),
+                hermit::RECORDING_METADATA_NAME
+            );
+        }
+        let (data_dir, id) = recording_location(&std::path::absolute(path)?, None)?;
+        return Ok(Target::Recording { data_dir, id });
+    }
+    if let Some(id) = text.and_then(|text| text.parse::<Id>().ok()) {
+        return target_of_id(data_dir, id);
+    }
+    let Some(prefix) = text
+        .filter(|text| {
+            (MIN_ID_PREFIX..=32).contains(&text.len())
+                && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        .map(str::to_ascii_lowercase)
+    else {
+        anyhow::bail!(
+            "{} names no recording: give {TARGET_HELP}; list recordings with: hermit list",
+            path.display()
+        );
+    };
+    let ids = hermit::HermitData::with_dir(data_dir).try_recordings()?;
+    let mut matching: Vec<Id> = ids
+        .into_iter()
+        .filter(|id| id.to_string().starts_with(&prefix))
+        .collect();
+    matching.sort_by_key(Id::to_string);
+    match matching.as_slice() {
+        [id] => target_of_id(data_dir, *id),
+        [] => anyhow::bail!(
+            "no recording in {} has an ID starting with {prefix}; list them with: hermit list",
+            data_dir.display()
+        ),
+        several => anyhow::bail!(
+            "{} recordings in {} have an ID starting with {prefix} ({}); give more digits",
+            several.len(),
+            data_dir.display(),
+            several
+                .iter()
+                .map(Id::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// The refusal for a data directory without a `last` or `last-run` file,
+/// saying what that file names and what the directory does hold.
+fn no_latest(data_dir: &Path, name: &str) -> Error {
+    let held = hermit::HermitData::with_dir(data_dir)
+        .try_recordings()
+        .map_or(0, |ids| ids.len());
+    if held == 0 {
+        return anyhow::anyhow!(
+            "{} has no recordings yet: `hermit record`, `hermit run --record-networking`, and a \
+             `hermit run` that draws an input from the host each make one; list them with: \
+             hermit list",
+            data_dir.display()
+        );
+    }
+    let (names, instead) = if name == hermit::LAST {
+        (
+            "the newest `hermit record` or `--record-networking` recording, and none has been \
+             made here",
+            "; `last-run` names the newest of any kind",
+        )
+    } else {
+        (
+            "the newest recording of any kind; hermit writes it with each recording, and none \
+             of the recordings here was made since it began to",
+            "",
+        )
+    };
+    anyhow::anyhow!(
+        "{} has no `{name}`, which names {names}. It holds {held} {}, which `hermit list` \
+         lists; name one by its ID{instead}",
+        data_dir.display(),
+        if held == 1 { "recording" } else { "recordings" }
+    )
+}
+
+/// Where the syscall recording in `directory` is, as the replayer finds a
+/// recording: a data directory and an ID, the directory's name. A recording
+/// copied to a directory with another name is refused with the name to give
+/// it (`id`, from its manifest, when it has one).
+pub(crate) fn recording_location(
+    directory: &Path,
+    id: Option<&str>,
+) -> Result<(PathBuf, Id), Error> {
+    let name = directory.file_name().and_then(|name| name.to_str());
+    match (name.and_then(|name| name.parse().ok()), directory.parent()) {
+        (Some(id), Some(parent)) => Ok((parent.to_owned(), id)),
+        _ => anyhow::bail!(
+            "{} holds a syscall recording, but `hermit replay` finds one by its directory's \
+             name, which must be a recording ID, and this directory is named {:?}; rename it to \
+             {}",
+            directory.display(),
+            name.unwrap_or_default(),
+            id.map_or_else(
+                || "a recording ID (32 hex digits; any unused one will do)".to_owned(),
+                str::to_owned
+            )
+        ),
+    }
+}
+
+/// The recording `id` in `data_dir`: its manifest, else its syscall
+/// recording.
+fn target_of_id(data_dir: &Path, id: Id) -> Result<Target, Error> {
+    let directory = data_dir.join(id.to_string());
+    if directory.join(MANIFEST_NAME).is_file() {
+        Ok(Target::Manifest(directory.join(MANIFEST_NAME)))
+    } else if directory.join(hermit::RECORDING_METADATA_NAME).is_file() {
+        Ok(Target::Recording {
+            data_dir: data_dir.to_owned(),
+            id,
+        })
+    } else {
+        anyhow::bail!(
+            "{} has no recording {id}: there is no {id}/{MANIFEST_NAME} or {id}/{} in it. A \
+             data directory keeps only the newest {KEEP_MANIFEST_ONLY} manifests of runs, and \
+             `hermit record rm` deletes a recording; list what it holds with: hermit list",
+            data_dir.display(),
+            hermit::RECORDING_METADATA_NAME
+        )
     }
 }
 
@@ -756,14 +981,23 @@ mod tests {
     /// were asked for, and stay.
     #[test]
     fn pruning_spares_recordings_the_user_asked_for() {
-        assert!(Kind::InputsOnly.pruned() && Kind::History.pruned());
-        assert!(!Kind::Network.pruned() && !Kind::FullSyscall.pruned());
+        assert!(Kind::InputsOnly.pruned() && Kind::History.pruned() && Kind::Network.pruned());
+        assert!(!Kind::FullSyscall.pruned());
         let directory = tempfile::tempdir().unwrap();
+        let mut syscall = sample();
+        syscall.kind = Kind::FullSyscall;
+        syscall.created = "2000-01-01T00:00:00.000000Z".to_owned();
+        let kept = syscall.id.clone();
+        write(&directory.path().join(&kept).join(MANIFEST_NAME), &syscall).unwrap();
+        // The data directory's copy of a network manifest; its trace and the
+        // manifest beside it live elsewhere, where pruning never looks.
         let mut network = sample();
         network.kind = Kind::Network;
-        network.created = "2000-01-01T00:00:00.000000Z".to_owned();
-        let kept = network.id.clone();
-        write(&directory.path().join(&kept).join(MANIFEST_NAME), &network).unwrap();
+        write(
+            &directory.path().join(&network.id).join(MANIFEST_NAME),
+            &network,
+        )
+        .unwrap();
         let newer = sample();
         write(
             &directory.path().join(&newer.id).join(MANIFEST_NAME),
@@ -772,6 +1006,7 @@ mod tests {
         .unwrap();
         prune(directory.path(), 0);
         assert!(directory.path().join(&kept).exists());
+        assert!(!directory.path().join(&network.id).exists());
         assert!(!directory.path().join(&newer.id).exists());
     }
 
@@ -823,5 +1058,125 @@ mod tests {
         );
         std::fs::write(&path, "manifest: always\ncolour: blue\n").unwrap();
         assert!(read_user_config(&path).is_err());
+    }
+
+    /// Writes a manifest of `kind` as recording `id` in `data_dir` and
+    /// notes it as `hermit run` does.
+    fn store(data_dir: &Path, id: Id, kind: Kind) {
+        let mut manifest = sample();
+        manifest.id = id.to_string();
+        manifest.kind = kind;
+        write(
+            &data_dir.join(id.to_string()).join(MANIFEST_NAME),
+            &manifest,
+        )
+        .unwrap();
+        hermit::HermitData::with_dir(data_dir)
+            .note_latest(&id, kind.moves_last())
+            .unwrap();
+    }
+
+    #[test]
+    fn a_recording_is_named_by_last_by_prefix_or_by_path() {
+        let data = tempfile::tempdir().unwrap();
+        let resolve = |spec: &str| resolve(data.path(), std::ffi::OsStr::new(spec));
+        let error = resolve("last").unwrap_err().to_string();
+        assert!(
+            error.contains("has no recordings yet") && error.contains("hermit list"),
+            "{error}"
+        );
+
+        let inputs: Id = "3f2a91c40000400080000000000000a1".parse().unwrap();
+        let history: Id = "3f2a91c50000400080000000000000a2".parse().unwrap();
+        let network: Id = "7aedacba0000400080000000000000a3".parse().unwrap();
+        store(data.path(), inputs, Kind::InputsOnly);
+        store(data.path(), history, Kind::History);
+        let manifest_of =
+            |id: Id| Target::Manifest(data.path().join(id.to_string()).join(MANIFEST_NAME));
+        // A run's own manifest moves `last-run`, never `last`; the refusal
+        // says what `last` names and that there are other recordings.
+        assert_eq!(resolve("last-run").unwrap(), manifest_of(history));
+        let error = resolve("last").unwrap_err().to_string();
+        assert!(
+            error.contains("has no `last`")
+                && error.contains("It holds 2 recordings")
+                && error.contains("`last-run`"),
+            "{error}"
+        );
+        // A recording the user asked for moves both.
+        store(data.path(), network, Kind::Network);
+        assert_eq!(resolve("last").unwrap(), manifest_of(network));
+        assert_eq!(resolve("last-run").unwrap(), manifest_of(network));
+        store(data.path(), history, Kind::History);
+        assert_eq!(resolve("last").unwrap(), manifest_of(network));
+        assert_eq!(resolve("last-run").unwrap(), manifest_of(history));
+
+        assert_eq!(resolve("3F2A91C4").unwrap(), manifest_of(inputs));
+        assert_eq!(resolve(&history.to_string()).unwrap(), manifest_of(history));
+        let error = resolve("3f2a91").unwrap_err().to_string();
+        assert!(
+            error.contains("2 recordings") && error.contains("give more digits"),
+            "{error}"
+        );
+        let error = resolve("abcdef").unwrap_err().to_string();
+        assert!(
+            error.contains("no recording in") && error.contains("hermit list"),
+            "{error}"
+        );
+        // Five digits are too few to be a prefix, and not a path either.
+        let error = resolve("3f2a9").unwrap_err().to_string();
+        assert!(
+            error.contains("names no recording") && error.contains("hermit list"),
+            "{error}"
+        );
+        let directory = data.path().join(inputs.to_string());
+        assert_eq!(
+            resolve(directory.to_str().unwrap()).unwrap(),
+            manifest_of(inputs)
+        );
+        // An existing file is read as a path; one that is not a manifest is
+        // refused saying so.
+        let stray = data.path().join("7aedacba");
+        std::fs::write(&stray, "not a manifest").unwrap();
+        let error = format!("{:#}", resolve(stray.to_str().unwrap()).unwrap_err());
+        assert!(
+            error.contains("is read as a path before any recording ID"),
+            "{error}"
+        );
+
+        // A syscall recording without a manifest, by path and by ID.
+        let recording = Id::unique();
+        let directory = data.path().join(recording.to_string());
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join(hermit::RECORDING_METADATA_NAME), "{}").unwrap();
+        let expected = Target::Recording {
+            data_dir: data.path().to_owned(),
+            id: recording,
+        };
+        assert_eq!(resolve(directory.to_str().unwrap()).unwrap(), expected);
+        assert_eq!(resolve(&recording.to_string()).unwrap(), expected);
+        // Copied under another name, it is refused with the true reason.
+        let renamed = data.path().join("myrec");
+        std::fs::create_dir_all(&renamed).unwrap();
+        std::fs::write(renamed.join(hermit::RECORDING_METADATA_NAME), "{}").unwrap();
+        let error = resolve(renamed.to_str().unwrap()).unwrap_err().to_string();
+        assert!(
+            error.contains("holds a syscall recording")
+                && error.contains("named \"myrec\"")
+                && error.contains("rename it to"),
+            "{error}"
+        );
+
+        // A bare file name's directory is the current one.
+        assert_eq!(directory_of(Path::new(MANIFEST_NAME)), Path::new("."));
+        assert_eq!(directory_of(data.path()), data.path());
+
+        // A recording `last` names that is gone.
+        std::fs::remove_dir_all(data.path().join(network.to_string())).unwrap();
+        let error = resolve("last").unwrap_err();
+        assert!(
+            format!("{error:#}").contains(&format!("has no recording {network}")),
+            "{error:#}"
+        );
     }
 }
