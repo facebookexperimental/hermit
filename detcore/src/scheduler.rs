@@ -9023,6 +9023,9 @@ impl Scheduler {
                         .expect("internal invariant broken");
                     if let Some(Ok(req)) = nt.req.try_read() {
                         blocking_request_is_ready(&req, *op_id, *signal_can_complete)
+                            // A race probe may report it unfinished for this check
+                            // (docs/RACE_PROBES.md); off unless configured.
+                            && !crate::race_probe::perturb(crate::race_probe::BG_HARVEST_SKIP)
                     } else {
                         false
                     }

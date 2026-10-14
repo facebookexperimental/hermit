@@ -2157,7 +2157,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And robust_list's two owner-death walk tests, tool_local's five
     // exit_group hold tests, and the exit_group grant-hold and owner-death-path
     // tests (https://github.com/rrnewton/hermit/issues/4238): 1594, by listing.
-    ("test.detcore_unit", 1594),
+    // And race_probe::tests::{race_probes_are_off_unless_configured,
+    // race_probe_settings_parse_as_documented,
+    // race_probe_choices_follow_probability_range_and_seed} (docs/RACE_PROBES.md):
+    // 1597, run.
+    ("test.detcore_unit", 1597),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3524,7 +3528,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from 0288b4fe: 1585.
     // And the nine owner-death unit tests of
     // https://github.com/rrnewton/hermit/issues/4238: 1594.
-    ("test.detcore_unit_on_host", 1594),
+    // And the three race-probe tests (docs/RACE_PROBES.md): 1597.
+    ("test.detcore_unit_on_host", 1597),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
