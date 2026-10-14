@@ -1231,7 +1231,7 @@ fn ptrace_records_a_self_aliased_word_woken_once_and_refuses_older_recordings() 
     )
     .expect("recording metadata is not JSON");
     assert_eq!(
-        metadata["version"], 0x150,
+        metadata["version"], 0x153,
         "RECORD_VERSION moved; point this test at the current version and the one before"
     );
     metadata["version"] = serde_json::json!(0x14f);
