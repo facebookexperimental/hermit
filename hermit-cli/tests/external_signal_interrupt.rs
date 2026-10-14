@@ -191,7 +191,7 @@ const HANDLED_BY_SIBLING: &str = "HANDLER main=0 sibling=1";
 const STEAL_WAKE_MS: u64 = 2 * SIGNAL_DELAY_MS;
 /// Upper bound on the spin role's wake. Natively the wait ends at the child's
 /// death, about 100 ms in. Under Hermit the spinning sibling takes the SIGCHLD
-/// and then wakes the futex: the wait ended at 456-457 ms for the `spin` and
+/// (https://github.com/rrnewton/hermit/issues/4304) and then wakes the futex: the wait ended at 456-457 ms for the `spin` and
 /// `spinthrexit` deaths and at 254 ms for `spinkill` on 2026-10-05. Before
 /// round 9 of https://github.com/rrnewton/hermit/pull/3361, when the SIGCHLD
 /// ended the main thread's wait with EINTR, it ended at 450-652 ms on
@@ -2601,7 +2601,9 @@ fn ptrace_futex_wait_of_the_thread_that_forked_the_child_takes_its_sigchld() {
 }
 
 /// The thread that forked the child does not take its SIGCHLD while it waits,
-/// although Linux offers the signal to that thread first. Here the main thread
+/// although Linux offers the signal to that thread first: a deviation from
+/// Linux, tracked as https://github.com/rrnewton/hermit/issues/4304, whose fix
+/// moves these expectations to Linux's EINTR. Here the main thread
 /// forks a child that dies after 100 ms and waits, while a sibling that does
 /// not block SIGCHLD spins in user code, with no system calls, until a handler
 /// has run. The handler runs once, on the sibling, before the main thread's
@@ -2654,7 +2656,9 @@ fn assert_waiting_forker_leaves_the_sigchld_to_the_sibling(backend: &str, timed:
             (
                 untimed_args.as_slice(),
                 // The woken wait is still off the waiter list when the
-                // sibling's wake comes (see above).
+                // sibling's wake comes (see above). Linux gives EINTR and the
+                // main thread's handler instead
+                // (https://github.com/rrnewton/hermit/issues/4304).
                 "RESULT call=futex ret=-1 errno=EAGAIN handler=1",
                 EXIT_WAKE_FLOOR_MS..SPIN_WAKE_BOUND_MS,
             )
