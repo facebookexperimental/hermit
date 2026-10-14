@@ -47,12 +47,26 @@ impl Record {
         mountinfo_mount_ids: Option<Vec<u64>>,
         local_networking: Option<bool>,
         proc_level: Option<detcore_model::config::ProcLevel>,
+        cpu_profile: detcore_model::cpu_profile::CpuProfile,
     ) -> Result<Self, Error> {
         let mut metadata = Metadata::new(&command)?;
         metadata.local_networking = local_networking;
         // A recording always names its level, so its replay does not depend
         // on the replaying Hermit's default.
         metadata.proc_level = Some(proc_level.unwrap_or_default());
+        // Under x86-64-v3 the host must qualify, and the recording binds the
+        // host facts the guest's answers come from
+        // (https://github.com/rrnewton/hermit/issues/4243).
+        let cpu_profile_host = if cpu_profile.is_default() {
+            None
+        } else {
+            let request = crate::cpu_profile_admission::record_or_replay_request(false);
+            let (_probe, host) = crate::cpu_profile_admission::admit(&request)
+                .map_err(crate::cpu_profile_admission::CpuProfileRefusal)?;
+            Some(host)
+        };
+        metadata.cpu_profile = cpu_profile;
+        metadata.cpu_profile_host = cpu_profile_host.clone();
         metadata.mountinfo_root_rewrites = mountinfo_root_rewrites;
         metadata.mountinfo_mount_ids_captured = mountinfo_mount_ids.is_some();
         metadata.mountinfo_mount_ids = mountinfo_mount_ids.unwrap_or_default();
@@ -65,11 +79,17 @@ impl Record {
         fs::copy(&metadata.exe, &exe)
             .with_context(|| format!("Failed to record {:?}", metadata.exe))?;
 
+        let mut config = record_or_replay_config(dir);
+        config.cpu_profile = cpu_profile;
+        config.cpu_profile_host = cpu_profile_host;
+        if !cpu_profile.is_default() {
+            metadata.cpu_table_digest = Some(hex_digest(&detcore::virtual_cpuid_digest(&config)));
+        }
+
         let metadata_path = dir.join(METADATA_NAME);
         serde_json::to_writer_pretty(fs::File::create(&metadata_path)?, &metadata)
             .context("Failed to serialize metadata")?;
 
-        let mut config = record_or_replay_config(dir);
         config.mountinfo_root_rewrites = metadata.mountinfo_root_rewrites.clone();
         config.mountinfo_mount_ids = metadata.mountinfo_mount_ids.clone();
         config.mountinfo_mount_ids_captured = metadata.mountinfo_mount_ids_captured;
@@ -153,4 +173,9 @@ impl Record {
         Self::persist_completed_metadata(&mut metadata, &metadata_path, provenance?)?;
         Ok(output)
     }
+}
+
+/// The lowercase hex form of a digest, as the recording stores it.
+pub(crate) fn hex_digest(digest: &[u8; 32]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }

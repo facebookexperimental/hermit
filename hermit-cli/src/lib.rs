@@ -4505,9 +4505,17 @@ impl HermitData {
         };
         ptrace_completion::run(None, move |control| async move {
             let data = store.create_recording_dir()?;
-            let exit_status =
-                record_to_async(command, data.path(), Vec::new(), None, None, None, control)
-                    .await?;
+            let exit_status = record_to_async(
+                command,
+                data.path(),
+                Vec::new(),
+                None,
+                None,
+                None,
+                detcore_model::cpu_profile::CpuProfile::default(),
+                control,
+            )
+            .await?;
             store.commit_recording(data, exit_status)
         })
     }
@@ -4531,6 +4539,7 @@ impl HermitData {
                 Some(mount_ids),
                 None,
                 None,
+                detcore_model::cpu_profile::CpuProfile::default(),
                 control,
             )
             .await?;
@@ -4730,7 +4739,17 @@ impl<'a> From<Option<&'a PathBuf>> for HermitData {
 pub fn record_to(command: Command, dir: &Path) -> Result<ExitStatus, Error> {
     let dir = dir.to_owned();
     ptrace_completion::run(None, move |control| async move {
-        record_to_async(command, &dir, Vec::new(), None, None, None, control).await
+        record_to_async(
+            command,
+            &dir,
+            Vec::new(),
+            None,
+            None,
+            None,
+            detcore_model::cpu_profile::CpuProfile::default(),
+            control,
+        )
+        .await
     })
 }
 
@@ -4744,6 +4763,7 @@ pub fn record_to_with_mountinfo(
     mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
     local_networking: bool,
     proc_level: detcore_model::config::ProcLevel,
+    cpu_profile: detcore_model::cpu_profile::CpuProfile,
 ) -> Result<ExitStatus, Error> {
     let dir = dir.to_owned();
     ptrace_completion::run(None, move |control| async move {
@@ -4755,12 +4775,16 @@ pub fn record_to_with_mountinfo(
             Some(mount_ids),
             Some(local_networking),
             Some(proc_level),
+            cpu_profile,
             control,
         )
         .await
     })
 }
 
+// Private plumbing: Record::spawn_with_mountinfo's parameters plus the
+// ptrace completion control.
+#[allow(clippy::too_many_arguments)]
 async fn record_to_async(
     command: Command,
     dir: &Path,
@@ -4768,6 +4792,7 @@ async fn record_to_async(
     mountinfo_mount_ids: Option<Vec<u64>>,
     local_networking: Option<bool>,
     proc_level: Option<detcore_model::config::ProcLevel>,
+    cpu_profile: detcore_model::cpu_profile::CpuProfile,
     control: std::rc::Rc<ptrace_completion::Control>,
 ) -> Result<ExitStatus, Error> {
     let report = SkidOvershootReport::begin(true);
@@ -4779,6 +4804,7 @@ async fn record_to_async(
             mountinfo_mount_ids,
             local_networking,
             proc_level,
+            cpu_profile,
         )
         .await?
         .wait(control)
@@ -4793,7 +4819,17 @@ async fn record_to_async(
 pub fn record_with_output(command: Command, dir: &Path) -> Result<Output, Error> {
     let dir = dir.to_owned();
     ptrace_completion::run(None, move |control| async move {
-        record_with_output_async(command, &dir, Vec::new(), None, None, None, control).await
+        record_with_output_async(
+            command,
+            &dir,
+            Vec::new(),
+            None,
+            None,
+            None,
+            detcore_model::cpu_profile::CpuProfile::default(),
+            control,
+        )
+        .await
     })
 }
 
@@ -4805,6 +4841,7 @@ pub fn record_with_output_with_mountinfo(
     mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
     local_networking: bool,
     proc_level: detcore_model::config::ProcLevel,
+    cpu_profile: detcore_model::cpu_profile::CpuProfile,
 ) -> Result<Output, Error> {
     let dir = dir.to_owned();
     ptrace_completion::run(None, move |control| async move {
@@ -4816,12 +4853,16 @@ pub fn record_with_output_with_mountinfo(
             Some(mount_ids),
             Some(local_networking),
             Some(proc_level),
+            cpu_profile,
             control,
         )
         .await
     })
 }
 
+// Private plumbing: Record::spawn_with_mountinfo's parameters plus the
+// ptrace completion control.
+#[allow(clippy::too_many_arguments)]
 async fn record_with_output_async(
     mut command: Command,
     dir: &Path,
@@ -4829,6 +4870,7 @@ async fn record_with_output_async(
     mountinfo_mount_ids: Option<Vec<u64>>,
     local_networking: Option<bool>,
     proc_level: Option<detcore_model::config::ProcLevel>,
+    cpu_profile: detcore_model::cpu_profile::CpuProfile,
     control: std::rc::Rc<ptrace_completion::Control>,
 ) -> Result<Output, Error> {
     let report = SkidOvershootReport::begin(true);
@@ -4843,6 +4885,7 @@ async fn record_with_output_async(
             mountinfo_mount_ids,
             local_networking,
             proc_level,
+            cpu_profile,
         )
         .await?
         .wait_with_output(control)

@@ -20,6 +20,63 @@ use crate::xstate_probe;
 /// refused: ".
 pub type AdmissionRefusal = String;
 
+/// A refused x86-64-v3 recording or replay, carried as an error so that it
+/// crosses the container boundary as a policy refusal (exit 122).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CpuProfileRefusal(pub AdmissionRefusal);
+
+impl std::fmt::Display for CpuProfileRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "--cpu-profile x86-64-v3 refused: {}", self.0)
+    }
+}
+
+impl std::error::Error for CpuProfileRefusal {}
+
+/// The admission request of a recording or replay, which always runs on the
+/// ptrace backend with virtual CPUID.
+pub fn record_or_replay_request(gdbserver: bool) -> AdmissionRequest<'static> {
+    AdmissionRequest {
+        backend: "ptrace",
+        ptrace: true,
+        virtualize_cpuid: true,
+        strace_only: false,
+        gdbserver,
+    }
+}
+
+/// The first host fact in which `replay` differs from `recorded`, by name, or
+/// `None` when they are equal.
+pub fn first_difference(recorded: &HostXstate, replay: &HostXstate) -> Option<&'static str> {
+    if recorded.vendor != replay.vendor {
+        Some("the CPU vendor")
+    } else if recorded.signature != replay.signature {
+        Some("the CPU family, model or stepping")
+    } else if recorded.xcr0 != replay.xcr0 {
+        Some("XCR0")
+    } else if recorded.xsave_leaves != replay.xsave_leaves {
+        Some("the XSAVE layout (CPUID leaf 0xD)")
+    } else if (
+        recorded.xcomp_supp,
+        recorded.xcomp_perm,
+        recorded.xcomp_guest_perm,
+    ) != (
+        replay.xcomp_supp,
+        replay.xcomp_perm,
+        replay.xcomp_guest_perm,
+    ) {
+        Some("the ARCH_GET_XCOMP masks")
+    } else if recorded.xfeature_max != replay.xfeature_max {
+        Some("XFEATURE_MAX")
+    } else if (recorded.probe_cases, recorded.probe_forced_exit)
+        != (replay.probe_cases, replay.probe_forced_exit)
+    {
+        Some("the qualification it passed")
+    } else {
+        None
+    }
+}
+
 /// What the run asks for, as far as admission is concerned.
 #[derive(Clone, Copy, Debug)]
 pub struct AdmissionRequest<'a> {
@@ -318,6 +375,51 @@ mod tests {
         let mut r = request("ptrace");
         r.gdbserver = true;
         assert!(check_request(&r).unwrap_err().contains("--gdbserver"));
+    }
+
+    #[test]
+    fn a_replay_host_is_compared_fact_by_fact() {
+        let recorded = HostXstate {
+            vendor: [1, 2, 3],
+            signature: 0x00b1_0f11,
+            xcr0: 0x2e7,
+            xsave_leaves: vec![[0, 0x2e7, 0x988, 0x988, 0]],
+            xcomp_supp: 0x2e7,
+            xcomp_perm: 0x2e7,
+            xcomp_guest_perm: 0x2e7,
+            xfeature_max: 20,
+            probe_cases: 33,
+            probe_forced_exit: false,
+        };
+        assert_eq!(first_difference(&recorded, &recorded.clone()), None);
+        let differs = |f: fn(&mut HostXstate)| {
+            let mut other = recorded.clone();
+            f(&mut other);
+            first_difference(&recorded, &other)
+        };
+        assert_eq!(differs(|h| h.vendor[0] = 9), Some("the CPU vendor"));
+        assert_eq!(
+            differs(|h| h.signature = 0x00a1_0f11),
+            Some("the CPU family, model or stepping")
+        );
+        assert_eq!(differs(|h| h.xcr0 = 0x207), Some("XCR0"));
+        assert_eq!(
+            differs(|h| h.xsave_leaves[0][2] = 0xa88),
+            Some("the XSAVE layout (CPUID leaf 0xD)")
+        );
+        assert_eq!(
+            differs(|h| h.xcomp_perm = 0x207),
+            Some("the ARCH_GET_XCOMP masks")
+        );
+        assert_eq!(differs(|h| h.xfeature_max = 19), Some("XFEATURE_MAX"));
+        assert_eq!(
+            differs(|h| h.probe_forced_exit = true),
+            Some("the qualification it passed")
+        );
+        assert_eq!(
+            CpuProfileRefusal("why".into()).to_string(),
+            "--cpu-profile x86-64-v3 refused: why"
+        );
     }
 
     #[test]

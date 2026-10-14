@@ -188,6 +188,14 @@ pub struct StartOpts {
     #[clap(value_name = "PROGRAM", required = true)]
     program: Option<PathBuf>,
 
+    /// The CPU the recorded guest sees: x86-64-v2 (the default) or x86-64-v3.
+    /// v3 records only on a host that passes the startup qualification
+    /// (`hermit host-capabilities --cpu-profile x86-64-v3`); the recording binds
+    /// the host facts its guest's answers come from, and replay refuses a host
+    /// where any of them differs (<https://github.com/rrnewton/hermit/issues/4243>).
+    #[clap(long, value_enum, default_value_t)]
+    cpu_profile: detcore_model::cpu_profile::CpuProfile,
+
     /// Refuse to record (exit 122) on a host whose retired-conditional-branch counter
     /// fails Reverie's performance-counter validation, as `hermit run --strict` does: the
     /// ptrace record runtime reads its virtual clock and preemption points from that
@@ -584,6 +592,7 @@ impl StartOpts {
                                 mountinfo,
                                 local_networking,
                                 proc_level,
+                                options.cpu_profile,
                             )
                         }),
                         None => hermit::record_to_with_mountinfo(
@@ -592,6 +601,7 @@ impl StartOpts {
                             mountinfo,
                             local_networking,
                             proc_level,
+                            options.cpu_profile,
                         ),
                     }
                 },
@@ -680,6 +690,7 @@ impl StartOpts {
                                 mountinfo,
                                 local_networking,
                                 proc_level,
+                                options.cpu_profile,
                             )
                         }),
                         None => hermit::record_with_output_with_mountinfo(
@@ -688,6 +699,7 @@ impl StartOpts {
                             mountinfo,
                             local_networking,
                             proc_level,
+                            options.cpu_profile,
                         ),
                     }
                 },
@@ -839,6 +851,7 @@ impl StartOpts {
                             mountinfo,
                             local_networking,
                             proc_level,
+                            options.cpu_profile,
                         )
                     }),
                     None => hermit::record_with_output_with_mountinfo(
@@ -847,6 +860,7 @@ impl StartOpts {
                         mountinfo,
                         local_networking,
                         proc_level,
+                        options.cpu_profile,
                     ),
                 }
             },
@@ -917,6 +931,7 @@ impl StartOpts {
                             mountinfo,
                             local_networking,
                             proc_level,
+                            options.cpu_profile,
                         )
                     }),
                     None => hermit::record_to_with_mountinfo(
@@ -925,6 +940,7 @@ impl StartOpts {
                         mountinfo,
                         local_networking,
                         proc_level,
+                        options.cpu_profile,
                     ),
                 }
             },
@@ -1223,6 +1239,7 @@ mod tests {
     fn start_options(env: Vec<(String, Option<String>)>) -> StartOpts {
         StartOpts {
             program: Some(PathBuf::from("/bin/true")),
+            cpu_profile: Default::default(),
             strict: false,
             args: Vec::new(),
             env,
@@ -1508,6 +1525,7 @@ mod tests {
     fn e9patch_record_target_rejects_proc_magic_links() {
         let options = StartOpts {
             program: Some(PathBuf::from("/proc/self/exe")),
+            cpu_profile: Default::default(),
             strict: false,
             args: Vec::new(),
             env: Vec::new(),

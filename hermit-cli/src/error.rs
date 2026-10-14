@@ -182,6 +182,9 @@ fn classify_unwrapped(error: &Error) -> FailureKind {
         || error
             .downcast_ref::<crate::LiteinstInGuestRefusal>()
             .is_some()
+        || error
+            .chain()
+            .any(|cause| cause.is::<crate::cpu_profile_admission::CpuProfileRefusal>())
     {
         FailureKind::PolicyRefusal
     } else if error.downcast_ref::<crate::GuestTimedOut>().is_some() {
