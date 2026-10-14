@@ -1891,9 +1891,12 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
 /// can express, which includes every backend's own constant except for
 /// capabilities added after the legacy form froze: those never enter it, as
 /// `record_host_inputs` does not, and read back as their default. There are
-/// two, `process_exits_complete_asynchronously` and
-/// `virtualizes_guest_sigalrm`, both true only for in-guest LiteInst, which
+/// three. `process_exits_complete_asynchronously` and
+/// `virtualizes_guest_sigalrm` are true only for in-guest LiteInst, which
 /// never travels through this DBT-only form.
+/// `supports_guest_memory_compare_exchange` is true for DBT, so a DBT
+/// configuration needs the versioned envelope of
+/// [`encode_backend_config_json`] to carry it.
 ///
 /// `kvm_shared_dequeue_timers` supplies no capability. It was read into a
 /// `Config` field that chose the controlled signal path, and that choice is
@@ -2718,6 +2721,7 @@ mod tests {
     fn legacy_expressible(mut backend: BackendCapabilities) -> BackendCapabilities {
         backend.process_exits_complete_asynchronously = false;
         backend.virtualizes_guest_sigalrm = false;
+        backend.supports_guest_memory_compare_exchange = false;
         // The legacy discover_live_file_metadata bit couples four facts.
         backend.rediscovers_descriptors_after_exec = backend.tool_shares_guest_descriptor_table;
         backend.internal_pipe_turns_are_host_timed = backend.tool_shares_guest_descriptor_table;
