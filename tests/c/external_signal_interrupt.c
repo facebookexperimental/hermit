@@ -85,9 +85,12 @@
  *               signal it ignores), where only the waiter can take it; then
  *               pthread_kill(SIGUSR1). The waiter has a caught signal and a
  *               default-ignored SIGCHLD pending together.
- * chldkill and chldthrexit end the child without exit_group, so Hermit's
- * scheduler sends no child-exit SIGCHLD of its own: the only SIGCHLD is the
- * kernel's, which the scheduler makes eligible at the child's logical death.
+ * chldkill and chldthrexit end the child without exit_group. Hermit's
+ * scheduler still commits the child's end at its exit grant and sends the
+ * child-exit SIGCHLD of its own, as for chldlate: a self-SIGKILL since
+ * https://github.com/rrnewton/hermit/issues/3994, and the exit of a child's
+ * last thread, which ends the process as exit_group does, since
+ * https://github.com/rrnewton/hermit/issues/3895.
  * ign2caught, chldlate, chldkill, chldthrexit and chldpend must end the wait
  * with EINTR near 100 ms; the sibling wakes the futex (and writes the pipe)
  * only after the handler ran.
