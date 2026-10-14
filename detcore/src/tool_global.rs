@@ -10140,6 +10140,241 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reloaded_post_exec_restores_prepared_input_aliases_once() {
+        use nix::fcntl::OFlag;
+        use reverie::Tool;
+
+        async fn start_image(
+            tool: &Detcore,
+            guest: &mut ExternalRegistrationGuest<'_>,
+            expected_grants: &[ResourceID],
+        ) {
+            let state = guest.global;
+            let tid = guest.thread.dettid;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                let mut start = std::pin::pin!(tool.handle_thread_start(guest));
+                assert!(futures::poll!(start.as_mut()).is_pending());
+                // Initial self-registration requests ParentContinue before
+                // StartNewThread. Reload registration has no parent turn.
+                // Drive these actual grants, without fabricating responses.
+                let grants = async {
+                    let mut last = Err(crate::scheduler::SkipTurn);
+                    for expected in expected_grants {
+                        let granted = crate::scheduler::do_a_turn_blocking(
+                            state.sched.clone(),
+                            state.global_time.clone(),
+                            &last,
+                        )
+                        .await
+                        .expect("image admission must receive its scheduler grant");
+                        assert_eq!(granted.tid, tid);
+                        assert!(granted.resources.contains_key(expected));
+                        last = Ok(granted);
+                    }
+                };
+                let (started, ()) = tokio::join!(start, grants);
+                started.unwrap();
+            })
+            .await
+            .expect("image admission must finish without guest instructions");
+        }
+
+        let config = Config {
+            sequentialize_threads: true,
+            max_timeslice: None,
+            ..Config::default()
+        }
+        .with_backend(|backend| {
+            backend.needs_killed_thread_rpc_cancellation = true;
+            backend.tool_shares_guest_descriptor_table = true;
+        });
+        let mut state = GlobalState::initialize(&config, false);
+        let leader = super::ROOT_DETPID;
+        let tool = Detcore::new(reverie::Pid::from_raw(leader.as_raw()), &config);
+
+        // Use the real launch-input owner and its registered-root seed, in a
+        // privately owned slot rather than the test harness's stdin.
+        let reader: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+        let fd = reader.as_raw_fd();
+        let input = reverie::InheritedInput::pipe(fd).unwrap();
+        let identity = input.identity().clone();
+        state.install_inherited_input(input.lease().unwrap());
+        let (source, _writer) = input.into_reader_and_writer();
+        // SAFETY: dup2 replaces only this test's owned destination.
+        assert_eq!(unsafe { libc::dup2(source.as_raw_fd(), fd) }, fd);
+        drop(source);
+        let alias = reader.try_clone().unwrap();
+        let cloexec = reader.try_clone().unwrap();
+        let alias_fd = alias.as_raw_fd();
+        let cloexec_fd = cloexec.as_raw_fd();
+        // SAFETY: only the test-owned alias's descriptor flag is changed.
+        assert_eq!(unsafe { libc::fcntl(alias_fd, libc::F_SETFD, 0) }, 0);
+        let flags = |fd| {
+            // SAFETY: both no-argument queries inspect owned descriptors.
+            let result = unsafe {
+                (
+                    libc::fcntl(fd, libc::F_GETFL),
+                    libc::fcntl(fd, libc::F_GETFD),
+                )
+            };
+            assert!(result.0 >= 0 && result.1 >= 0);
+            result
+        };
+        let kernel_before = [flags(fd), flags(alias_fd)];
+        assert_eq!(
+            kernel_before[0].0 & (libc::O_ACCMODE | libc::O_NONBLOCK),
+            libc::O_RDONLY
+        );
+        assert_eq!(flags(cloexec_fd).1 & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
+
+        let mut old = ExternalRegistrationGuest {
+            global: &state,
+            config: &config,
+            thread: tool.init_thread_state(Tid::from_raw(leader.as_raw()), None),
+            requests: Mutex::new(Vec::new()),
+            post_exec: true,
+        };
+        old.thread.detpid = Some(leader);
+        start_image(
+            &tool,
+            &mut old,
+            &[
+                ResourceID::ParentContinue {
+                    parent: leader,
+                    child: leader,
+                },
+                ResourceID::MemAddrSpace(leader),
+            ],
+        )
+        .await;
+        tool.handle_post_exec(&mut old).await.unwrap();
+        assert!(state.inherited_input.lock().unwrap().is_none());
+        old.thread.dup_fd(fd, alias_fd, OFlag::empty()).unwrap();
+        old.thread.dup_fd(fd, cloexec_fd, OFlag::O_CLOEXEC).unwrap();
+        let origin = old.thread.file_metadata.lock().unwrap().file_handles[&fd]
+            .inherited_external_read()
+            .expect("the actual registered launch seed must establish read provenance");
+        assert_eq!(
+            (origin.dev, origin.inode, origin.rdev),
+            (identity.dev(), identity.inode(), identity.rdev())
+        );
+        let old_mm = old.thread.mm_id;
+        super::prepare_exec(&mut old, old_mm, Default::default()).await;
+        {
+            let pending = state.pending_exec_states.lock().unwrap();
+            let prepared = &pending[&leader].fd_blocking.inherited_reads;
+            assert_eq!(
+                prepared.keys().copied().collect::<BTreeSet<_>>(),
+                BTreeSet::from([fd, alias_fd])
+            );
+            assert!(prepared.values().all(|entry| entry == &origin));
+            assert!(!prepared.contains_key(&cloexec_fd));
+        }
+        // Model the physical successful-exec boundary: the old Tool state is
+        // gone and Linux has closed the CLOEXEC alias. No native exec is claimed.
+        drop(old);
+        drop(cloexec);
+        let mut successor = ExternalRegistrationGuest {
+            global: &state,
+            config: &config,
+            thread: tool.init_thread_state(Tid::from_raw(leader.as_raw()), None),
+            requests: Mutex::new(Vec::new()),
+            post_exec: true,
+        };
+        successor.thread.detpid = Some(leader);
+        start_image(&tool, &mut successor, &[ResourceID::MemAddrSpace(leader)]).await;
+        assert_eq!(successor.thread.mm_id, old_mm.for_exec(leader));
+        assert!(state.pending_exec_states.lock().unwrap().is_empty());
+        assert_eq!(
+            state.post_exec_fd_blocking.lock().unwrap()[&leader]
+                .inherited_reads
+                .len(),
+            2
+        );
+        assert!(
+            !successor
+                .thread
+                .file_metadata
+                .lock()
+                .unwrap()
+                .file_handles
+                .contains_key(&fd)
+        );
+
+        // This is the actual Tool callback, not a raw completion-RPC check or
+        // a direct metadata restore. Empty auxv deliberately excludes AT_RANDOM.
+        tool.handle_post_exec(&mut successor).await.unwrap();
+        assert!(state.post_exec_fd_blocking.lock().unwrap().is_empty());
+        {
+            let metadata = successor.thread.file_metadata.lock().unwrap();
+            for slot in [fd, alias_fd] {
+                let entry = metadata
+                    .file_handles
+                    .get(&slot)
+                    .expect("post-exec must restore every prepared surviving input alias");
+                assert_eq!(
+                    entry.inherited_external_read(),
+                    Some(origin.clone()),
+                    "post-exec must restore transferred origin, not plain pipe discovery"
+                );
+                assert_eq!(entry.ty(), crate::fd::FdType::Pipe);
+                assert!(!entry.is_nonblocking());
+                assert!(!entry.physically_nonblocking());
+                assert!(!entry.is_cloexec());
+                assert_eq!(entry.resource(), origin.resource);
+            }
+            assert_eq!(
+                metadata.file_handles[&fd].open_file_id(),
+                metadata.file_handles[&alias_fd].open_file_id()
+            );
+            assert_eq!(metadata.file_handles[&fd].open_file_alias_count(), 2);
+            assert!(!metadata.file_handles.contains_key(&cloexec_fd));
+        }
+        assert_eq!([flags(fd), flags(alias_fd)], kernel_before);
+        let snapshot =
+            || serde_json::to_value(&*successor.thread.file_metadata.lock().unwrap()).unwrap();
+        let before_rpc = snapshot();
+        let response = successor
+            .send_rpc((
+                successor.thread.thread_logical_time.clone(),
+                successor.thread.mm_id,
+                GlobalRequest::GlobalTimeLowerBound,
+            ))
+            .await;
+        assert!(matches!(
+            response.1,
+            GlobalResponse::GlobalTimeLowerBound(_)
+        ));
+        assert_eq!(
+            snapshot(),
+            before_rpc,
+            "ordinary admitted RPC must leave restored metadata unchanged"
+        );
+        assert!(state.post_exec_fd_blocking.lock().unwrap().is_empty());
+        assert!(state.pending_exec_states.lock().unwrap().is_empty());
+        let requests = successor.requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| matches!(r, GlobalRequest::MarkPastFirstExecve(..)))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            requests.first(),
+            Some(GlobalRequest::CreateChildThread(..))
+        ));
+        assert!(matches!(
+            requests.get(1),
+            Some(GlobalRequest::StartNewThread(..))
+        ));
+        assert!(matches!(
+            requests.last(),
+            Some(GlobalRequest::GlobalTimeLowerBound)
+        ));
+    }
+
+    #[tokio::test]
     async fn post_exec_deletes_armed_disarmed_and_non_notifying_timers() {
         use reverie::Tool;
 
