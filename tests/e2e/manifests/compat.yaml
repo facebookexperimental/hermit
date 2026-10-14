@@ -1579,7 +1579,7 @@ corpus:
         ]
     - backend: ptrace
       result: crash-error
-      evidence: https://github.com/rrnewton/hermit/issues/2110
+      evidence: https://github.com/rrnewton/hermit/issues/3789
       reason: >-
         Detcore panics with "signal_guest: thread should be parked in the
         scheduler" while timeout waits in rt_sigsuspend for its child (1 of
