@@ -2969,6 +2969,9 @@ pub async fn do_a_turn_blocking(
                         // due check leaves the one-event budget available; an
                         // actual pop consumes it until this turn returns.
                         state.bump_global_time(&global_time, &Err(SkipTurn));
+                        if state.replay_waits_before_maintenance() {
+                            return Err(SkipTurn);
+                        }
                         if !timed_event_processed {
                             timed_event_processed = state.step2b_process_timed(&global_time);
                         }
@@ -2991,6 +2994,9 @@ pub async fn do_a_turn_blocking(
                             continue;
                         }
                         1 => {
+                            if state.replay_waits_before_maintenance() {
+                                return Err(SkipTurn);
+                            }
                             if !timed_event_processed {
                                 timed_event_processed = state.step2b_process_timed(&global_time);
                             }
@@ -6065,6 +6071,11 @@ impl Scheduler {
         if !self.blocked.signaled_background.is_empty() {
             return Err(SkipTurn);
         }
+        // Replay waits for a readmission due now before anything that changes
+        // the schedule, so the pass that readmits does what record's did.
+        if self.replay_waits_before_maintenance() {
+            return Err(SkipTurn);
+        }
         self.step2b_process_timed(global_time);
         self.step2b_restore_due_pollers();
         // A timed signal that just armed a background thread is followed by an
@@ -8525,8 +8536,20 @@ impl Scheduler {
     /// The choice does not depend on which background calls have finished, so
     /// waiting for that one child and readmitting it alone keeps the schedule
     /// independent of host timing: no turn can commit until it is readmitted.
+    ///
+    /// Under `hermit record` and `hermit replay` there is no such child: the
+    /// rejoin log makes the turn of every readmission part of the recording
+    /// (`log_rejoin`, `step2c_replay_rejoin`), so the child is readmitted like
+    /// any other backgrounded call and other threads run meanwhile, as Linux
+    /// runs every thread but the vfork parent. Waiting there instead hung a
+    /// vfork child that polls a pipe another process writes: record
+    /// backgrounds that poll, and the writer never ran
+    /// (<https://github.com/rrnewton/hermit/issues/4211>).
     fn vfork_gated_background_child(&self) -> Option<DetTid> {
-        if self.vfork_barriers.is_empty() {
+        if self.vfork_barriers.is_empty()
+            || self.rejoin_writer.is_some()
+            || self.rejoin_replay.is_some()
+        {
             return None;
         }
         let mut children = self.vfork_barriers.values().flatten();
@@ -8542,6 +8565,116 @@ impl Scheduler {
                     && !self.vfork_barriers.contains_key(*child)
             })
             .copied()
+    }
+
+    /// The vfork barriers' children whose call runs in the background
+    /// (`external_io_blockers`), in thread order. Under the rejoin log
+    /// `step2c_process_io_blockers` readmits each as soon as its call finishes
+    /// and logs the turn (<https://github.com/rrnewton/hermit/issues/4211>).
+    fn backgrounded_vfork_children(&self) -> impl Iterator<Item = DetTid> + '_ {
+        let mut children: Vec<DetTid> = self
+            .vfork_barriers
+            .values()
+            .flatten()
+            .copied()
+            .filter(|child| self.blocked.external_io_blockers.contains_key(child))
+            .collect();
+        children.sort();
+        children.dedup();
+        children.into_iter()
+    }
+
+    /// Whether `dtid`'s backgrounded call, or signal-less wait, has finished,
+    /// by the test `step2c_process_io_blockers` applies to each blocker.
+    fn blocker_has_finished(&self, dtid: DetTid) -> bool {
+        let (op_id, signal_can_complete) =
+            if let Some(op_id) = self.blocked.external_io_blockers.get(&dtid) {
+                (*op_id, !self.vfork_barriers.contains_key(&dtid))
+            } else if let Some(op_id) = self.blocked.rt_sigsuspend_blockers.get(&dtid) {
+                (*op_id, true)
+            } else {
+                return false;
+            };
+        self.next_turns.get(&dtid).is_some_and(|next| {
+            matches!(next.req.try_read(), Some(Ok(req))
+                if blocking_request_is_ready(&req, op_id, signal_can_complete))
+        })
+    }
+
+    /// `hermit replay`: whether this scheduler pass must wait, before it pops a
+    /// timed event or restores a poller, for calls that replay readmits now
+    /// but that have not finished on the host yet: the calls of a logged
+    /// readmission due at this point, or a call replay serves from the
+    /// recording (`replay_log_served`).
+    ///
+    /// Record readmits such a call in the first pass of its turn that finds it
+    /// finished, so it pops at most one timed event before the readmission.
+    /// Replay can reach that turn before the call finishes and then spins.
+    /// If each spinning pass popped a timed event, several due events would
+    /// fire at the same turn, where record fired one per turn (Claude review of
+    /// https://github.com/rrnewton/hermit/pull/4298). Waiting here makes the
+    /// pass that proceeds do what record's did: at most one pop, then the
+    /// readmission.
+    ///
+    /// A logged call that is not parked as logged is left to
+    /// `step2c_process_io_blockers`, which refuses it, and so is a wait past
+    /// `REJOIN_STALL_VALVE`.
+    fn replay_waits_before_maintenance(&mut self) -> bool {
+        if self.rejoin_replay.is_none() {
+            return false;
+        }
+        let log_served_waiting = self
+            .blocked
+            .replay_log_served
+            .iter()
+            .any(|dtid| !self.blocker_has_finished(*dtid));
+        let point = (self.turn, self.empty_queue_wakes);
+        let due_waiting = self
+            .rejoin_replay
+            .as_ref()
+            .and_then(|rejoins| rejoins.front())
+            .filter(|next| next.point() == point)
+            .is_some_and(|next| {
+                next.calls.iter().all(|(dtid, sequence)| {
+                    self.blocked
+                        .external_io_blockers
+                        .get(dtid)
+                        .map(|op| op.sequence)
+                        == Some(*sequence)
+                        || self
+                            .blocked
+                            .rt_sigsuspend_blockers
+                            .get(dtid)
+                            .map(|op| op.sequence)
+                            == Some(*sequence)
+                }) && next
+                    .calls
+                    .iter()
+                    .any(|(dtid, _)| !self.blocker_has_finished(*dtid))
+            });
+        if due_waiting {
+            let since = *self
+                .rejoin_stalled_since
+                .get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() >= Self::REJOIN_STALL_VALVE {
+                return false;
+            }
+        }
+        if due_waiting || log_served_waiting {
+            std::thread::yield_now();
+            return true;
+        }
+        false
+    }
+
+    /// `hermit replay`: whether the next logged readmission is due at this
+    /// point of the schedule or already behind it, which
+    /// `step2c_replay_rejoin` then applies or refuses.
+    fn rejoin_due_now(&self) -> bool {
+        self.rejoin_replay
+            .as_ref()
+            .and_then(|rejoins| rejoins.front())
+            .is_some_and(|next| next.point() <= (self.turn, self.empty_queue_wakes))
     }
 
     /// Whether a vfork barrier's child is queued to run a turn (not only
@@ -8663,16 +8796,40 @@ impl Scheduler {
                 // cannot complete clone while an existing worker blocks indefinitely in
                 // epoll_wait.
                 //
-                // The vfork-gated child is readmitted here in replay too, and
-                // not logged: until it is readmitted no turn can commit (step 3
-                // waits for it, see `vfork_gated_background_child`), so the
-                // turn of its readmission does not depend on when its call
-                // finished.
+                // With the rejoin log active there is no vfork-gated child
+                // (`vfork_gated_background_child`): a backgrounded vfork child
+                // is readmitted below and logged like any other call. Without
+                // it, the gated child is readmitted here unlogged: until then
+                // no turn can commit (step 3 waits for it), so the turn of its
+                // readmission does not depend on when its call finished.
                 if !self.run_queue.is_empty() && !only_pollers {
                     if let Some(child) = self.vfork_gated_background_child()
                         && ready.contains(&child)
                     {
                         requeue_ready(self, &[child]);
+                    }
+                    // With the rejoin log active, a backgrounded vfork child is
+                    // readmitted as soon as its call finishes, even though other
+                    // work is runnable, and the turn is logged: a sibling of the
+                    // vfork parent can spin until the child is done, and deferring
+                    // the child behind it would never readmit it. Replay follows
+                    // the log here too, so a readmission due now is applied in the
+                    // same branch the recording took (the schedules agree up to
+                    // this turn, so the run queue is the same)
+                    // (https://github.com/rrnewton/hermit/issues/4211).
+                    if self.rejoin_replay.is_some() {
+                        if self.rejoin_due_now() {
+                            return self.step2c_replay_rejoin(&blockers, &ready, requeue_ready);
+                        }
+                    } else if self.rejoin_writer.is_some() {
+                        let children: Vec<DetTid> = self
+                            .backgrounded_vfork_children()
+                            .filter(|child| ready.contains(child))
+                            .collect();
+                        if !children.is_empty() {
+                            self.log_rejoin(&blockers, &children);
+                            requeue_ready(self, &children);
+                        }
                     }
                     return Ok(());
                 }
@@ -9619,6 +9776,10 @@ impl Scheduler {
             // stays out of the run queue until step 2a has seen its release,
             // and such a child cannot exec or exit before another thread's turn
             // makes its call ready, so no host-timed event ends the interval.
+            // Under `hermit record` and `hermit replay` a backgrounded child is
+            // not waited for either: the other threads run, and the child's
+            // host-timed completion ends the interval at a turn the rejoin log
+            // records (https://github.com/rrnewton/hermit/issues/4211).
             let gated_child = self
                 .vfork_barriers
                 .values()
@@ -14989,6 +15150,510 @@ mod test {
 
     fn replaying(scheduler: &mut Scheduler, rejoins: &[Rejoin]) {
         scheduler.rejoin_replay = Some(rejoins.iter().cloned().collect());
+    }
+
+    /// Queue `tid` as an ordinary (non-polling) thread with no request posted.
+    fn queue_worker(scheduler: &mut Scheduler, tid: DetTid) {
+        scheduler.priorities.insert(tid, DEFAULT_PRIORITY);
+        scheduler.next_turns.insert(
+            tid,
+            ThreadNextTurn {
+                dettid: tid,
+                child_tid_addr: 0,
+                req: Ivar::new(),
+                resp: Ivar::new(),
+                protocol: Default::default(),
+            },
+        );
+        scheduler.runqueue_push_back(tid);
+    }
+
+    /// Background `tid` on call `op_id`, finished when `finished`.
+    fn background(scheduler: &mut Scheduler, op_id: ExternalOpId, finished: bool) {
+        let tid = op_id.tid;
+        scheduler.priorities.insert(tid, DEFAULT_PRIORITY);
+        scheduler.blocked.external_io_blockers.insert(tid, op_id);
+        let mut continuation = Resources::new(tid);
+        continuation.insert(ResourceID::BlockedExternalContinue(op_id), Permission::RW);
+        scheduler.next_turns.insert(
+            tid,
+            ThreadNextTurn {
+                dettid: tid,
+                child_tid_addr: 0,
+                req: if finished {
+                    Ivar::full(Ok(continuation))
+                } else {
+                    Ivar::new()
+                },
+                resp: Ivar::new(),
+                protocol: Default::default(),
+            },
+        );
+    }
+
+    /// With the rejoin log active, record or replay, a backgrounded vfork child
+    /// stops no other thread; without it (`hermit run`) step 3 still waits for
+    /// it (https://github.com/rrnewton/hermit/issues/4211).
+    #[test]
+    fn the_rejoin_log_lifts_the_backgrounded_vfork_child_stall() {
+        let parent = DetTid::from_raw(7);
+        let child = DetTid::from_raw(25);
+        let worker = DetTid::from_raw(9);
+        let make = || {
+            let mut scheduler = Scheduler::new(&Config::default());
+            scheduler.vfork_barriers.insert(parent, Some(child));
+            background(&mut scheduler, ExternalOpId::new(child, 1), false);
+            queue_worker(&mut scheduler, worker);
+            scheduler
+        };
+        assert_eq!(make().vfork_gated_background_child(), Some(child));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut recording = make();
+        recording.rejoin_writer = Some(RejoinWriter::create(dir.path()).unwrap());
+        assert_eq!(recording.vfork_gated_background_child(), None);
+
+        let mut replay = make();
+        replaying(&mut replay, &[]);
+        assert_eq!(replay.vfork_gated_background_child(), None);
+    }
+
+    /// Record readmits a backgrounded vfork child as soon as its call finishes,
+    /// though other work is runnable, and logs the turn; a finished blocker that
+    /// is not a vfork child still waits for the queue to hold only pollers.
+    #[test]
+    fn record_readmits_and_logs_a_finished_vfork_child_while_work_is_runnable() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = DetTid::from_raw(7);
+        let child = ExternalOpId::new(DetTid::from_raw(25), 4);
+        let other = ExternalOpId::new(DetTid::from_raw(21), 9);
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.recordreplay_modes = true;
+        scheduler.vfork_barriers.insert(parent, Some(child.tid));
+        background(&mut scheduler, child, true);
+        background(&mut scheduler, other, true);
+        queue_worker(&mut scheduler, DetTid::from_raw(9));
+        scheduler.rejoin_writer = Some(RejoinWriter::create(dir.path()).unwrap());
+        scheduler.turn = 12;
+
+        assert!(scheduler.step2c_process_io_blockers().is_ok());
+        assert!(
+            !scheduler
+                .blocked
+                .external_io_blockers
+                .contains_key(&child.tid)
+        );
+        assert!(scheduler.run_queue.contains_tid(child.tid));
+        assert!(
+            scheduler
+                .blocked
+                .external_io_blockers
+                .contains_key(&other.tid)
+        );
+        assert_eq!(
+            rejoin_log::read(dir.path()).unwrap(),
+            std::collections::VecDeque::from([Rejoin {
+                turn: 12,
+                wakes: 0,
+                calls: vec![(child.tid, 4)],
+            }])
+        );
+    }
+
+    /// A middle child of a nested vfork (P vforks C, C vforks G) is backgrounded
+    /// in its own vfork; record readmits it when that call finishes, with work
+    /// runnable, and logs it like any vfork child.
+    #[test]
+    fn record_readmits_a_nested_vfork_child_on_its_own_continuation() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = DetTid::from_raw(7);
+        let middle = ExternalOpId::new(DetTid::from_raw(25), 2);
+        let grandchild = DetTid::from_raw(27);
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.recordreplay_modes = true;
+        scheduler.vfork_barriers.insert(parent, Some(middle.tid));
+        scheduler
+            .vfork_barriers
+            .insert(middle.tid, Some(grandchild));
+        background(&mut scheduler, middle, false);
+        queue_worker(&mut scheduler, DetTid::from_raw(9));
+        scheduler.rejoin_writer = Some(RejoinWriter::create(dir.path()).unwrap());
+        scheduler.turn = 5;
+
+        // Not finished: it stays parked and nothing is logged.
+        assert!(scheduler.step2c_process_io_blockers().is_ok());
+        assert!(
+            scheduler
+                .blocked
+                .external_io_blockers
+                .contains_key(&middle.tid)
+        );
+        assert!(rejoin_log::read(dir.path()).unwrap().is_empty());
+
+        // Its own vfork returns: readmitted and logged at this turn.
+        let mut continuation = Resources::new(middle.tid);
+        continuation.insert(ResourceID::BlockedExternalContinue(middle), Permission::RW);
+        scheduler.next_turns[&middle.tid].req.put(Ok(continuation));
+        scheduler.turn = 6;
+        assert!(scheduler.step2c_process_io_blockers().is_ok());
+        assert!(scheduler.run_queue.contains_tid(middle.tid));
+        assert_eq!(
+            rejoin_log::read(dir.path()).unwrap(),
+            std::collections::VecDeque::from([Rejoin {
+                turn: 6,
+                wakes: 0,
+                calls: vec![(middle.tid, 2)],
+            }])
+        );
+    }
+
+    /// Replay, with work runnable, keeps a finished vfork child parked until its
+    /// logged turn, readmits it there, and refuses a logged turn it has passed.
+    #[test]
+    fn replay_follows_a_vfork_child_rejoin_while_work_is_runnable() {
+        let parent = DetTid::from_raw(7);
+        let child = ExternalOpId::new(DetTid::from_raw(25), 4);
+        let logged = Rejoin {
+            turn: 12,
+            wakes: 0,
+            calls: vec![(child.tid, 4)],
+        };
+        let make = || {
+            let mut scheduler = Scheduler::new(&Config::default());
+            scheduler.recordreplay_modes = true;
+            scheduler.vfork_barriers.insert(parent, Some(child.tid));
+            background(&mut scheduler, child, true);
+            queue_worker(&mut scheduler, DetTid::from_raw(9));
+            replaying(&mut scheduler, std::slice::from_ref(&logged));
+            scheduler
+        };
+
+        let mut scheduler = make();
+        scheduler.turn = 11;
+        assert!(scheduler.step2c_process_io_blockers().is_ok());
+        assert!(
+            scheduler
+                .blocked
+                .external_io_blockers
+                .contains_key(&child.tid)
+        );
+        scheduler.turn = 12;
+        assert!(scheduler.step2c_process_io_blockers().is_ok());
+        assert!(scheduler.run_queue.contains_tid(child.tid));
+        assert!(scheduler.rejoin_replay.as_ref().unwrap().is_empty());
+        assert!(scheduler.rejoin_refusal.is_none());
+
+        let mut passed = make();
+        passed.turn = 13;
+        assert!(passed.step2c_process_io_blockers().is_err());
+        assert!(passed.rejoin_refusal.is_some());
+        assert!(passed.blocked.external_io_blockers.contains_key(&child.tid));
+    }
+
+    fn fence_queue(scheduler: &mut Scheduler, tid: DetTid, poller: bool) {
+        scheduler.priorities.insert(tid, DEFAULT_PRIORITY);
+        scheduler.next_turns.insert(
+            tid,
+            ThreadNextTurn {
+                dettid: tid,
+                child_tid_addr: 0,
+                req: Ivar::new(),
+                resp: Ivar::new(),
+                protocol: Default::default(),
+            },
+        );
+        if poller {
+            scheduler
+                .run_queue
+                .push_poller(tid, DEFAULT_PRIORITY, u32::MAX);
+        } else {
+            scheduler.runqueue_push_back(tid);
+        }
+    }
+
+    fn fence_sleepers(scheduler: &mut Scheduler) -> Arc<Mutex<GlobalTime>> {
+        let config = Config::default();
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let now = global_time.lock().unwrap().as_nanos();
+        for (raw, offset) in [(31, 10), (33, 20), (35, 30)] {
+            let sleeper = DetTid::from_raw(raw);
+            scheduler
+                .blocked
+                .timed_waiters
+                .insert(now + LogicalTime::from_nanos(offset), sleeper);
+            scheduler.priorities.insert(sleeper, DEFAULT_PRIORITY);
+            scheduler.next_turns.insert(
+                sleeper,
+                ThreadNextTurn {
+                    dettid: sleeper,
+                    child_tid_addr: 0,
+                    req: Ivar::new(),
+                    resp: Ivar::new(),
+                    protocol: Default::default(),
+                },
+            );
+        }
+        scheduler.committed_time = now + LogicalTime::from_nanos(1_000);
+        global_time
+    }
+
+    fn fence_woken(scheduler: &Scheduler) -> Vec<i32> {
+        [31, 33, 35]
+            .into_iter()
+            .filter(|raw| scheduler.run_queue.contains_tid(DetTid::from_raw(*raw)))
+            .collect()
+    }
+
+    fn fence_finish(scheduler: &mut Scheduler, op_id: ExternalOpId) {
+        let mut continuation = Resources::new(op_id.tid);
+        continuation.insert(ResourceID::BlockedExternalContinue(op_id), Permission::RW);
+        scheduler.next_turns[&op_id.tid].req.put(Ok(continuation));
+    }
+
+    /// Wait 3 passes, finish, then one pass per "turn"; report the turn at which each sleeper woke.
+    fn fence_wake_turns(
+        scheduler: &mut Scheduler,
+        global_time: &Arc<Mutex<GlobalTime>>,
+        op_id: ExternalOpId,
+        _label: &str,
+    ) -> (Vec<i32>, Vec<(i32, u64)>) {
+        for _ in 0..3 {
+            assert!(scheduler.step2_process_blocked(global_time).is_err());
+        }
+        let during_wait = fence_woken(scheduler);
+        fence_finish(scheduler, op_id);
+        let mut at = Vec::new();
+        let mut seen: Vec<i32> = during_wait.clone();
+        for raw in &during_wait {
+            at.push((*raw, scheduler.turn));
+        }
+        for _ in 0..4 {
+            let _ = scheduler.step2_process_blocked(global_time);
+            for raw in fence_woken(scheduler) {
+                if !seen.contains(&raw) {
+                    seen.push(raw);
+                    at.push((raw, scheduler.turn));
+                }
+            }
+            // stand-in for step 3 committing a turn
+            scheduler.turn += 1;
+        }
+        (during_wait, at)
+    }
+
+    /// With work runnable, replay waiting at a due vfork-child rejoin wakes no
+    /// sleeper; once the call finishes, the three due sleepers wake one per
+    /// turn, as in record (Claude re-check of
+    /// https://github.com/rrnewton/hermit/pull/4298).
+    #[test]
+    fn replay_fires_due_timers_one_per_turn_around_a_runnable_branch_rejoin() {
+        let parent = DetTid::from_raw(7);
+        let op_id = ExternalOpId::new(DetTid::from_raw(25), 4);
+        let mut scheduler = rejoin_fixture(op_id, None, false);
+        scheduler.vfork_barriers.insert(parent, Some(op_id.tid));
+        fence_queue(&mut scheduler, DetTid::from_raw(9), false);
+        let gt = fence_sleepers(&mut scheduler);
+        replaying(
+            &mut scheduler,
+            &[Rejoin {
+                turn: 12,
+                wakes: 0,
+                calls: vec![(op_id.tid, 4)],
+            }],
+        );
+        scheduler.turn = 12;
+        let (during, at) = fence_wake_turns(&mut scheduler, &gt, op_id, "runnable");
+        assert!(during.is_empty());
+        assert_eq!(at, vec![(31, 12), (33, 13), (35, 14)]);
+    }
+
+    /// The same in the pollers-only branch, the wait that predates the rejoin
+    /// of a vfork child with work runnable.
+    #[test]
+    fn replay_fires_due_timers_one_per_turn_around_a_pollers_only_rejoin() {
+        let op_id = ExternalOpId::new(DetTid::from_raw(25), 4);
+        let mut scheduler = rejoin_fixture(op_id, Some(DetTid::from_raw(9)), false);
+        let gt = fence_sleepers(&mut scheduler);
+        replaying(
+            &mut scheduler,
+            &[Rejoin {
+                turn: 12,
+                wakes: 0,
+                calls: vec![(op_id.tid, 4)],
+            }],
+        );
+        scheduler.turn = 12;
+        let (during, at) = fence_wake_turns(&mut scheduler, &gt, op_id, "pollers-only");
+        assert!(during.is_empty());
+        assert_eq!(at, vec![(31, 12), (33, 13), (35, 14)]);
+    }
+
+    /// The same while a call replay serves from the recording is unfinished.
+    #[test]
+    fn replay_fires_due_timers_one_per_turn_around_a_log_served_call() {
+        let op_id = ExternalOpId::new(DetTid::from_raw(25), 4);
+        let mut scheduler = rejoin_fixture(op_id, None, false);
+        scheduler.blocked.replay_log_served.insert(op_id.tid);
+        fence_queue(&mut scheduler, DetTid::from_raw(9), false);
+        let gt = fence_sleepers(&mut scheduler);
+        replaying(&mut scheduler, &[]);
+        scheduler.turn = 12;
+        let (during, at) = fence_wake_turns(&mut scheduler, &gt, op_id, "log-served");
+        assert!(during.is_empty());
+        assert_eq!(at, vec![(31, 12), (33, 13), (35, 14)]);
+    }
+
+    /// Past `REJOIN_STALL_VALVE` the wait ends in a refusal, not a silent hang.
+    #[test]
+    fn replay_refuses_a_due_rejoin_once_the_stall_valve_passes() {
+        let parent = DetTid::from_raw(7);
+        let op_id = ExternalOpId::new(DetTid::from_raw(25), 4);
+        let mut scheduler = rejoin_fixture(op_id, None, false);
+        scheduler.vfork_barriers.insert(parent, Some(op_id.tid));
+        fence_queue(&mut scheduler, DetTid::from_raw(9), false);
+        let gt = fence_sleepers(&mut scheduler);
+        replaying(
+            &mut scheduler,
+            &[Rejoin {
+                turn: 12,
+                wakes: 0,
+                calls: vec![(op_id.tid, 4)],
+            }],
+        );
+        scheduler.turn = 12;
+        assert!(scheduler.step2_process_blocked(&gt).is_err());
+        assert!(scheduler.rejoin_refusal.is_none());
+        scheduler.rejoin_stalled_since =
+            std::time::Instant::now().checked_sub(Scheduler::REJOIN_STALL_VALVE);
+        let mut refused_after = None;
+        for pass in 1..=5 {
+            let _ = scheduler.step2_process_blocked(&gt);
+            if scheduler.rejoin_refusal.is_some() {
+                refused_after = Some(pass);
+                break;
+            }
+        }
+        assert_eq!(refused_after, Some(1));
+    }
+
+    /// A due rejoin whose call is parked under another sequence is refused at once.
+    #[test]
+    fn replay_refuses_at_once_a_due_rejoin_parked_under_another_sequence() {
+        let parent = DetTid::from_raw(7);
+        let op_id = ExternalOpId::new(DetTid::from_raw(25), 4);
+        let mut scheduler = rejoin_fixture(op_id, None, false);
+        scheduler.vfork_barriers.insert(parent, Some(op_id.tid));
+        fence_queue(&mut scheduler, DetTid::from_raw(9), false);
+        let gt = fence_sleepers(&mut scheduler);
+        replaying(
+            &mut scheduler,
+            &[Rejoin {
+                turn: 12,
+                wakes: 0,
+                calls: vec![(op_id.tid, 5)],
+            }],
+        );
+        scheduler.turn = 12;
+        let _ = scheduler.step2_process_blocked(&gt);
+        assert!(scheduler.rejoin_refusal.is_some());
+    }
+
+    /// Record and run mode never wait: one timed event pops per pass, as before.
+    #[test]
+    fn record_and_run_are_never_fenced() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = DetTid::from_raw(7);
+        let op_id = ExternalOpId::new(DetTid::from_raw(25), 4);
+        // Record has no calls served from a recording (`replay_log_served`
+        // is filled only by replay), so only the vfork child is unfinished.
+        let mut scheduler = rejoin_fixture(op_id, None, false);
+        scheduler.vfork_barriers.insert(parent, Some(op_id.tid));
+        fence_queue(&mut scheduler, DetTid::from_raw(9), false);
+        let gt = fence_sleepers(&mut scheduler);
+        scheduler.rejoin_writer = Some(RejoinWriter::create(dir.path()).unwrap());
+        scheduler.turn = 12;
+        assert!(!scheduler.replay_waits_before_maintenance());
+        let r = scheduler.step2_process_blocked(&gt);
+        assert!(r.is_ok());
+        assert_eq!(fence_woken(&scheduler), vec![31]);
+        // run mode
+        let mut run = Scheduler::new(&Config::default());
+        run.blocked.replay_log_served.insert(op_id.tid);
+        assert!(!run.replay_waits_before_maintenance());
+    }
+
+    /// Replay that reaches a due readmission before the call has finished
+    /// pops no timed event while it waits, so the pass that readmits pops at
+    /// most one, as record's single pass did (Claude review of
+    /// https://github.com/rrnewton/hermit/pull/4298).
+    #[test]
+    fn replay_pops_no_timed_event_while_it_waits_at_a_due_rejoin() {
+        let parent = DetTid::from_raw(7);
+        let child = ExternalOpId::new(DetTid::from_raw(25), 4);
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.recordreplay_modes = true;
+        scheduler.vfork_barriers.insert(parent, Some(child.tid));
+        background(&mut scheduler, child, false);
+        queue_worker(&mut scheduler, DetTid::from_raw(9));
+        let config = Config::default();
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let now = global_time.lock().unwrap().as_nanos();
+        let sleepers = [31, 33, 35].map(DetTid::from_raw);
+        for (sleeper, offset) in sleepers.iter().zip([10, 20, 30]) {
+            scheduler
+                .blocked
+                .timed_waiters
+                .insert(now + LogicalTime::from_nanos(offset), *sleeper);
+            scheduler.priorities.insert(*sleeper, DEFAULT_PRIORITY);
+            scheduler.next_turns.insert(
+                *sleeper,
+                ThreadNextTurn {
+                    dettid: *sleeper,
+                    child_tid_addr: 0,
+                    req: Ivar::new(),
+                    resp: Ivar::new(),
+                    protocol: Default::default(),
+                },
+            );
+        }
+        scheduler.committed_time = now + LogicalTime::from_nanos(1_000);
+        replaying(
+            &mut scheduler,
+            &[Rejoin {
+                turn: 12,
+                wakes: 0,
+                calls: vec![(child.tid, 4)],
+            }],
+        );
+        scheduler.turn = 12;
+        let woken = |scheduler: &Scheduler| {
+            sleepers
+                .iter()
+                .filter(|sleeper| scheduler.run_queue.contains_tid(**sleeper))
+                .count()
+        };
+
+        for _ in 0..3 {
+            assert!(scheduler.step2_process_blocked(&global_time).is_err());
+        }
+        assert_eq!(woken(&scheduler), 0, "a waiting pass popped a timed event");
+        assert!(
+            scheduler
+                .blocked
+                .external_io_blockers
+                .contains_key(&child.tid)
+        );
+
+        let mut continuation = Resources::new(child.tid);
+        continuation.insert(ResourceID::BlockedExternalContinue(child), Permission::RW);
+        scheduler.next_turns[&child.tid].req.put(Ok(continuation));
+        let _ = scheduler.step2_process_blocked(&global_time);
+        assert!(scheduler.run_queue.contains_tid(child.tid));
+        assert!(
+            woken(&scheduler) <= 1,
+            "the readmitting pass popped more than one"
+        );
+        assert_eq!(scheduler.turn, 12);
     }
 
     /// Replay keeps a finished call parked until its logged turn, letting the

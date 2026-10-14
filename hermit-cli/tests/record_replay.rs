@@ -2678,13 +2678,22 @@ fn record_nested_vfork_chains() {
 
 /// A vfork child that waits for a thread other than its own vfork child
 /// records and replays at bitwise parity
-/// (https://github.com/rrnewton/hermit/issues/4194), and so does one whose
-/// calls the host times while a sibling thread spins: its readmission is not
-/// logged, so the scheduler must commit no other turn while it is in the
-/// background (Claude review of https://github.com/rrnewton/hermit/pull/4205).
+/// (https://github.com/rrnewton/hermit/issues/4194). So does one that polls a
+/// pipe a forked writer fills (sibling-poll, with no timeout or with one):
+/// record runs that poll in the background, and while a backgrounded vfork
+/// child stood, no other thread ran, so the writer never wrote and the child
+/// hung or timed out (https://github.com/rrnewton/hermit/issues/4211). And so
+/// does one whose calls the host times while a sibling thread of the vfork
+/// parent spins: the child is readmitted as soon as each call finishes, even
+/// while the sibling is runnable, and record logs that turn for replay to
+/// follow (Claude review of https://github.com/rrnewton/hermit/pull/4205).
+/// That mode hangs if record defers the child behind the runnable sibling; it
+/// does not show that other threads run, since it also passes, with progress 0,
+/// under the old stall. The sibling-poll modes are what show it
+/// (Claude review of https://github.com/rrnewton/hermit/pull/4298).
 /// Only that spinning case retries an attempt that ends in a PMU skid-overshoot
 /// refusal (at most 3 attempts), as the spinning sibling makes one possible;
-/// the other two modes get one attempt.
+/// the other modes get one attempt.
 #[test]
 fn record_vfork_child_waiting_for_another_thread() {
     let _guard = hermit_record_lock();
@@ -2711,6 +2720,16 @@ fn record_vfork_child_waiting_for_another_thread() {
         (
             "sibling-pipe",
             "sibling-pipe done, child status 0, writer status 0\n",
+            1,
+        ),
+        (
+            "sibling-poll",
+            "sibling-poll done, child status 0, writer status 0\n",
+            1,
+        ),
+        (
+            "sibling-poll-timeout",
+            "sibling-poll-timeout done, child status 0, writer status 0\n",
             1,
         ),
         (

@@ -443,7 +443,13 @@ impl RecordVersion {
 // with no bump of its own; this one covers both. Replay recomputes both
 // results, so an older recording of such a send would replay with the wait or
 // the sleep ended early: a successful replay with different output.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x14b);
+// 0x14b -> 0x14c: under record, a vfork child whose call runs in the
+// background no longer stops every other thread; it is readmitted as soon as
+// the call finishes and the turn is written to the rejoin log, which replay
+// follows (https://github.com/rrnewton/hermit/issues/4211). An older recording
+// has no rejoin entry for such a readmission, so this replay could not follow
+// it.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x14c);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -468,7 +474,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x14b);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x14b;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x14c;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1353,6 +1359,14 @@ mod tests {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x14a)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x149)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x148)));
+    }
+
+    /// A recording older than 0x14c stopped every thread while a vfork child's
+    /// call ran in the background and logged no rejoin for its readmission
+    /// (https://github.com/rrnewton/hermit/issues/4211).
+    #[test]
+    fn record_version_rejects_streams_from_before_logged_vfork_rejoins() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x14b)));
     }
 
     #[test]

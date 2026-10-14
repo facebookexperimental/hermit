@@ -12,6 +12,10 @@
 //   for it;
 // - sibling-pipe: the parent forks a writer that sleeps briefly and writes to
 //   a pipe, then vforks a child that reads that pipe before it execs;
+// - sibling-poll, sibling-poll-timeout: as sibling-pipe, but the child first
+//   polls the pipe, with no timeout or with a 5 s one. Under `hermit record`
+//   that poll runs in the background, and the writer must still run
+//   (https://github.com/rrnewton/hermit/issues/4211);
 // - background-sibling: a sibling thread of the parent spins while the vfork
 //   child makes calls whose completion the host times (poll with a timeout),
 //   and the child reports how far the sibling got meanwhile, which must be the
@@ -21,7 +25,8 @@
 // A status is printed only for a child that exited; a child killed by a
 // signal is reported as such.
 //
-// Usage: vfork_child_waits fork-wait|sibling-pipe|background-sibling
+// Usage: vfork_child_waits
+//   fork-wait|sibling-pipe|sibling-poll|sibling-poll-timeout|background-sibling
 #include <poll.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -55,7 +60,9 @@ static int fork_wait(void) {
     return 0;
 }
 
-static int sibling_pipe(void) {
+// `poll_ms` < -1 reads the pipe at once; otherwise the child polls it first
+// with that timeout (-1: none).
+static int sibling_pipe_mode(const char *name, int poll_ms) {
     int fds[2];
     if (pipe(fds) != 0) {
         perror("pipe");
@@ -70,6 +77,13 @@ static int sibling_pipe(void) {
     close(fds[1]);
     pid_t child = vfork();
     if (child == 0) {
+        if (poll_ms >= -1) {
+            struct pollfd readable = {fds[0], POLLIN, 0};
+            int ready = poll(&readable, 1, poll_ms);
+            if (ready != 1) {
+                _exit(ready == 0 ? 4 : 3);
+            }
+        }
         char byte = 0;
         if (read(fds[0], &byte, 1) == 1 && byte == 'x') {
             execl("/bin/true", "true", (char *)NULL);
@@ -77,7 +91,7 @@ static int sibling_pipe(void) {
         _exit(2);
     }
     int child_status = exit_status(child);
-    printf("sibling-pipe done, child status %d, writer status %d\n", child_status,
+    printf("%s done, child status %d, writer status %d\n", name, child_status,
            exit_status(writer));
     return 0;
 }
@@ -124,11 +138,19 @@ int main(int argc, char **argv) {
         return fork_wait();
     }
     if (argc == 2 && strcmp(argv[1], "sibling-pipe") == 0) {
-        return sibling_pipe();
+        return sibling_pipe_mode("sibling-pipe", -2);
+    }
+    if (argc == 2 && strcmp(argv[1], "sibling-poll") == 0) {
+        return sibling_pipe_mode("sibling-poll", -1);
+    }
+    if (argc == 2 && strcmp(argv[1], "sibling-poll-timeout") == 0) {
+        return sibling_pipe_mode("sibling-poll-timeout", 5000);
     }
     if (argc == 2 && strcmp(argv[1], "background-sibling") == 0) {
         return background_sibling();
     }
-    fprintf(stderr, "usage: vfork_child_waits fork-wait|sibling-pipe|background-sibling\n");
+    fprintf(stderr, "usage: vfork_child_waits "
+                    "fork-wait|sibling-pipe|sibling-poll|sibling-poll-timeout|"
+                    "background-sibling\n");
     return 2;
 }

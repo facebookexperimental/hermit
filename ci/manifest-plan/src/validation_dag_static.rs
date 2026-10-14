@@ -1482,7 +1482,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4132): 1088.
     // And the recording-name and inventory unit tests of the rr-style
     // command line (https://github.com/rrnewton/hermit/issues/4271): 1090.
-    ("test.hermit_unit", 1090),
+    // And metadata::tests::record_version_rejects_streams_from_before_logged_vfork_rejoins
+    // (https://github.com/rrnewton/hermit/issues/4211): 1091, listed.
+    ("test.hermit_unit", 1091),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2114,7 +2116,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (the Claude review of https://github.com/rrnewton/hermit/pull/4290): 1561, listed.
     // Four inherited-terminal provenance regressions: 1565, measured by the
     // complete Cargo nextest lib/bin selection.
-    ("test.detcore_unit", 1565),
+    // And the five vfork-rejoin scheduler tests of
+    // https://github.com/rrnewton/hermit/issues/4211 (the_rejoin_log_lifts_*,
+    // record_readmits_and_logs_*, record_readmits_a_nested_*,
+    // replay_follows_a_vfork_child_rejoin_*, replay_pops_no_timed_event_*): 1566, listed.
+    // And the six replay-fence tests adopted from the Claude re-check of
+    // https://github.com/rrnewton/hermit/pull/4298 (replay_fires_due_timers_one_per_turn_*
+    // three times, replay_refuses_a_due_rejoin_once_the_stall_valve_passes,
+    // replay_refuses_at_once_*, record_and_run_are_never_fenced): 1572, listed.
+    ("test.detcore_unit", 1576),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3426,7 +3436,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the discarded-when-sent futex admission test: 1561.
     // The same four inherited-terminal regressions: 1565, measured by the
     // complete Cargo nextest lib/bin selection; integration cases are separate.
-    ("test.detcore_unit_on_host", 1565),
+    // And the five vfork-rejoin scheduler tests: 1566.
+    // And the six adopted replay-fence tests: 1576.
+    ("test.detcore_unit_on_host", 1576),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -3602,7 +3614,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the private-SIGCHLD wait record-epoch test: 1088.
     // And the recording-name and inventory unit tests of the rr-style
     // command line (https://github.com/rrnewton/hermit/issues/4271): 1090.
-    ("test.hermit_unit_on_host", 1090),
+    // And the logged-vfork-rejoin record-epoch test: 1091.
+    ("test.hermit_unit_on_host", 1091),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
