@@ -26557,6 +26557,76 @@ fn a_guests_sigchld_to_a_futex_waiter_has_a_linux_outcome_under_chaos() {
     }
 }
 
+/// The futex rows of `a_guests_sigchld_to_a_futex_waiting_sibling_ends_its_wait_as_on_linux`
+/// with a sibling that spins with no syscall, which Hermit can only preempt
+/// with the PMU timer: the woken waiter's restart-errno turn is requeued behind
+/// it, so the handler runs a round later than at the front, and main's wait for
+/// it keeps the line native (the design check of
+/// https://github.com/rrnewton/hermit/issues/4132 measured "before the wake 0"
+/// and, under `SA_RESTART`, EAGAIN, when main did not wait). Each line is
+/// native output and each run reaches canonical bitwise parity.
+///
+/// PMU REQUIRED. Its spinner can make a run end in a typed skid-overshoot
+/// refusal, a measurement of the host's PMU interrupt latency, so the run is
+/// retried through `run_pmu_spinner_retrying_skid`; test.cli and
+/// test.cli_on_host skip it by exact name, and privileged-test.pmu_cli_cases
+/// runs it under that node's larger budgets. It ran in test.cli in
+/// https://github.com/rrnewton/hermit/pull/4290 until one full validate drew
+/// the refusal there.
+#[test]
+fn a_guests_sigchld_to_a_futex_waiting_sibling_beside_a_cpu_bound_one_ends_its_wait() {
+    let _guard = hermit_run_guard();
+    let guest = guest_sigchld_guest().to_str().unwrap().to_owned();
+    for (mode, result) in [
+        ("futex-cond-busy", "cond_wait"),
+        ("futex-restart-busy", "futex 0"),
+    ] {
+        let expected = format!(
+            "{mode}: {result}, handler in waiter before the wake 1, in waiter 1, in all 1\n"
+        );
+        // A refused attempt stops before the guest prints, or after it
+        // printed the whole line.
+        let check = |stdout: &str| {
+            assert!(
+                stdout.is_empty() || stdout == expected,
+                "{mode}: a refused attempt printed {stdout:?}"
+            );
+        };
+        let SpinnerRun {
+            status,
+            stdout,
+            stderr: log,
+        } = run_pmu_spinner_retrying_skid(
+            "a_guests_sigchld_to_a_futex_waiting_sibling_beside_a_cpu_bound_one_ends_its_wait",
+            &[
+                "run",
+                "--strict",
+                "--verify",
+                "--verify-strict",
+                "--",
+                guest.as_str(),
+                mode,
+            ],
+            Duration::from_secs(120),
+            check,
+        );
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{mode}: stdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert_eq!(stdout, expected, "{mode}: stderr:\n{log}");
+        assert!(
+            log.contains(":: comparison=BitwiseInfoV1 relaxations=none"),
+            "{mode}: comparison was not canonical:\n{log}"
+        );
+        assert!(
+            log.contains(":: Success: deterministic. Determinism verified."),
+            "{mode}: verification failed:\n{log}"
+        );
+    }
+}
+
 /// Runs each `guest_sigchld` futex mode under `--verify --verify-strict` and
 /// checks its native line and canonical bitwise parity.
 fn verify_futex_sigchld_modes(modes: &[(&str, &str, u8, u8)]) {
