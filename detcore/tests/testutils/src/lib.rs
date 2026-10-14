@@ -159,6 +159,7 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     detlog_regs_cadence: 1,
     sysinfo_uptime_offset: 60,
     memory: 1024 * 1024 * 1024, //1 GiB
+    proc_level: Default::default(),
     interrupt_at: vec![],
     happens_before: None,
     record_host_inputs: false,
@@ -247,6 +248,7 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     detlog_regs_cadence: 1,
     sysinfo_uptime_offset: 60,
     memory: 1024 * 1024 * 1024, //1 GiB
+    proc_level: Default::default(),
     interrupt_at: vec![],
     happens_before: None,
     record_host_inputs: false,
@@ -335,6 +337,7 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     detlog_regs_cadence: 1,
     sysinfo_uptime_offset: 60,
     memory: 1024 * 1024 * 1024, //1 GiB
+    proc_level: Default::default(),
     interrupt_at: vec![],
     happens_before: None,
     record_host_inputs: false,

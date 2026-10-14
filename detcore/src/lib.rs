@@ -3128,15 +3128,23 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         } else {
             None
         };
-        // A procfs file Detcore renders answers, as Linux does, the calls
-        // that would reach the placeholder standing in for it.
+        // A `/proc` name outside the run's `--proc` level does not exist. A
+        // procfs file Detcore renders answers, as Linux does, the calls that
+        // would reach the placeholder standing in for it.
         let rendered_procfs_answer = if sigalrm_refusal.is_none() {
-            match self.answer_rendered_procfs_operation(guest, &call) {
-                Some(answer) => Some(answer),
-                None => self
-                    .answer_rendered_procfs_path_call(guest, &call)
-                    .await
-                    .transpose(),
+            match self
+                .refuse_procfs_name_outside_level(guest, &call)
+                .await
+                .transpose()
+            {
+                Some(refusal) => Some(refusal),
+                None => match self.answer_rendered_procfs_operation(guest, &call) {
+                    Some(answer) => Some(answer),
+                    None => self
+                        .answer_rendered_procfs_path_call(guest, &call)
+                        .await
+                        .transpose(),
+                },
             }
         } else {
             None

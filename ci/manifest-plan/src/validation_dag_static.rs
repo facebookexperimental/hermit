@@ -1039,7 +1039,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Four retained LiteInst initial-image wire and policy tests: 1092.
     // And runner::tests::verify_guests_name_fixtures_and_checkout_files_at_fixed_guest_paths
     // (https://github.com/rrnewton/hermit/issues/4337): 1093.
-    ("test.regular_crates", 1093),
+    // And +1 from bd38bb81: 1094.
+    ("test.regular_crates", 1094),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1502,7 +1503,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And metadata::tests::record_version_rejects_streams_from_before_a_woken_sleep_takes_its_sigchld
     // (https://github.com/rrnewton/hermit/issues/4333): 1047, listed.
     // And +1 from 4afd3a3e: 1047.
-    ("test.hermit_unit", 1047),
+    // And +1 from bd38bb81: 1048.
+    ("test.hermit_unit", 1048),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2180,7 +2182,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4229): 1620, listed.
     // And +3 from 8475d18e: 1623.
     // And +1 from 4afd3a3e: 1624.
-    ("test.detcore_unit", 1624),
+    // And +7 from bd38bb81: 1631.
+    ("test.detcore_unit", 1631),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3026,7 +3029,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/issues/4275): 390, listed.
     // And an_inherited_pipe_reads_the_same_capacity_whatever_the_host_gave_it
     // (the F_GETPIPE_SZ host-capacity leak): 391, by listing.
-    ("test.cli", 391),
+    // And +1 from bd38bb81: 392.
+    ("test.cli", 392),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3357,7 +3361,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the armer-blocks and sleeper timer tests: 324.
     // And the same two verify_inputs CLI tests: 326.
     // And the inherited-pipe capacity test: 327, by listing.
-    ("test.cli_on_host", 327),
+    // And +1 from bd38bb81: 328.
+    ("test.cli_on_host", 328),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -3577,7 +3582,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the three claimed-delivery tests (https://github.com/rrnewton/hermit/issues/4229): 1620.
     // And +3 from 8475d18e: 1623.
     // And +1 from 4afd3a3e: 1624.
-    ("test.detcore_unit_on_host", 1624),
+    // And +7 from bd38bb81: 1631.
+    ("test.detcore_unit_on_host", 1631),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -3772,7 +3778,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same three verify_inputs unit tests: 1046.
     // And the woken-sleep record-version test (https://github.com/rrnewton/hermit/issues/4333): 1047.
     // And +1 from 4afd3a3e: 1047.
-    ("test.hermit_unit_on_host", 1047),
+    // And +1 from bd38bb81: 1048.
+    ("test.hermit_unit_on_host", 1048),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -3904,7 +3911,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Four retained LiteInst initial-image wire and policy tests: 1092.
     // And runner::tests::verify_guests_name_fixtures_and_checkout_files_at_fixed_guest_paths
     // (https://github.com/rrnewton/hermit/issues/4337): 1093.
-    ("test.regular_crates_on_host", 1093),
+    // And +1 from bd38bb81: 1094.
+    ("test.regular_crates_on_host", 1094),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).

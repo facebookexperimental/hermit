@@ -489,7 +489,14 @@ impl RecordVersion {
 // (https://github.com/rrnewton/hermit/issues/4333). Replay recomputes the
 // schedule, so an older recording of such an exit would replay with the
 // handler in another thread and the sleep still asleep.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x151);
+// 0x151 -> 0x152 (taken at land time, as the reservation file's land-time
+// numbering rule gives a ready change HIGHEST_SHIPPED + 1): a call that looks
+// up a /proc name outside the --proc level (kallsyms, sysvipc,
+// sys/kernel/core_pattern, ...) is issued with that name replaced by one
+// procfs cannot hold, so its recorded answer is Linux's for a missing name
+// (https://github.com/rrnewton/hermit/issues/4266). An older recording holds
+// the kernel's answer for the name itself.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x152);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -514,7 +521,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x151);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x151;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x152;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -813,6 +820,7 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         detlog_regs_cadence: 1,
         sysinfo_uptime_offset: 120,
         memory: default_config.memory,
+        proc_level: default_config.proc_level,
         interrupt_at: vec![],
         happens_before: None,
         record_host_inputs: false,
@@ -1452,6 +1460,14 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_from_before_mask_aware_timer_targets() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x14e)));
+    }
+
+    /// A recording older than 0x152 holds the kernel's answers for /proc
+    /// names that Detcore now has the kernel answer as missing
+    /// (https://github.com/rrnewton/hermit/issues/4266).
+    #[test]
+    fn record_version_rejects_streams_from_before_procfs_levels() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x151)));
     }
 
     #[test]

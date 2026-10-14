@@ -29,6 +29,7 @@ use crate::machine::MachineDescription;
 use crate::syscalls::VIRTUAL_CPUSET_BYTES;
 
 mod fixed;
+pub(crate) mod levels;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum ProcfsKind {

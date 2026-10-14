@@ -172,6 +172,7 @@ static GET_MEMPOLICY_ONE_NODE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PID_NAMESPACE_NESTED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RENDERED_PROCFS_FILES_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VIRTUAL_KERNEL_FILES_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static OMITTED_PROCFS_NAMES_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KERNEL_MAX_AFFINITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPU_DIRECTORY_READS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUINFO_MATCHES_CPUID_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1328,6 +1329,31 @@ fn virtual_kernel_files_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "virtual-kernel-files guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn omitted_procfs_names_guest() -> &'static Path {
+    OMITTED_PROCFS_NAMES_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("omitted-procfs-names");
+        fs::create_dir_all(&build_root).expect("failed to create omitted-procfs-names directory");
+        let guest = build_root.join("omitted_procfs_names");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/omitted_procfs_names.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile omitted-procfs-names guest");
+        assert!(
+            output.status.success(),
+            "omitted-procfs-names guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -4142,6 +4168,229 @@ fn host_kernel_at_least(major: u32, minor: u32) -> bool {
         .filter_map(|part| part.parse::<u32>().ok());
     let found = (parts.next().unwrap_or(0), parts.next().unwrap_or(0));
     found >= (major, minor)
+}
+
+/// The `/proc` names in no `--proc` level do not exist on any backend: every
+/// lookup of one fails with ENOENT, by any spelling, and no listing shows it
+/// (https://github.com/rrnewton/hermit/issues/4266). The level's names stay.
+/// Natively the host has the names, so Hermit hides names that exist. At
+/// `--proc=minimal` the standard level's names go too. A backend that is not
+/// available here is named as not compared.
+#[test]
+fn detcore_omits_the_procfs_names_outside_the_level_on_every_backend() {
+    let guest = omitted_procfs_names_guest();
+    let native = Command::new(guest)
+        .arg("--host")
+        .output()
+        .expect("run omitted-procfs-names natively");
+    assert!(native.status.success(), "native: {native:?}");
+    let native = String::from_utf8_lossy(&native.stdout);
+    for path in [
+        "/proc/kallsyms",
+        "/proc/sys/kernel/core_pattern",
+        "/proc/sys/kernel/ngroups_max",
+        "/proc/sys/fs/binfmt_misc",
+    ] {
+        assert!(
+            native.lines().any(|line| line == format!("exists {path}")),
+            "the host has no {path}: {native}"
+        );
+    }
+    let omitted = [
+        "/proc/kallsyms",
+        "/proc/kcore",
+        "/proc/sysvipc",
+        "/proc/slabinfo",
+        "/proc/bus",
+        "/proc/fs",
+        "/proc/sys/kernel/core_pattern",
+        "/proc/sys/kernel/ngroups_max",
+        "/proc/sys/kernel/random/poolsize",
+        "/proc/sys/fs/binfmt_misc",
+        "/proc/sys/user",
+    ];
+    let standard_only = [
+        "/proc/interrupts",
+        "/proc/sys/fs",
+        "/proc/sys/fs/file-nr",
+        "/proc/sys/kernel/random/entropy_avail",
+    ];
+    let minimal = [
+        "/proc/version",
+        "/proc/sys/kernel/osrelease",
+        "/proc/sys/vm/overcommit_memory",
+    ];
+    // What KVM's own /proc (until slice B4 of
+    // https://github.com/rrnewton/hermit/issues/4266 removes it) and its
+    // missing inotify leave unchecked, which the guest names in its output.
+    // How a run is checked: verified at L2; without virtualized metadata
+    // (getdents is then the kernel's, and the two runs need not agree, so it
+    // is not verified); or recorded and replayed, where only the check
+    // before a call applies.
+    // A chroot into /proc, where Hermit's tool does not find /proc, as the
+    // whole guest: verified on ptrace; on DBT unverified, as a verified DBT
+    // run writes its evidence outside that root.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Mode {
+        Verified,
+        NoMetadata,
+        Recorded,
+        IntoProc,
+        IntoProcUnverified,
+    }
+    let expected = |level_is_minimal: bool, backend: &str, mode: Mode| {
+        let kvm = backend == "kvm";
+        let standard = |path: &str| match (level_is_minimal, kvm && path == "/proc/sys/fs") {
+            (true, _) => "absent",
+            (false, true) => "unchecked (KVM's own /proc refuses directories)",
+            (false, false) => "present",
+        };
+        let mut lines = omitted
+            .iter()
+            .map(|path| format!("absent {path}\n"))
+            .chain(
+                standard_only
+                    .iter()
+                    .map(|path| format!("{} {path}\n", standard(path))),
+            )
+            .chain(minimal.iter().map(|path| format!("present {path}\n")))
+            .collect::<String>();
+        lines.push_str("creating, removing, renaming and linking: as Linux\n");
+        lines.push_str("arguments and lookups in Linux's order: as Linux\n");
+        lines.push_str("socket addresses: absent\n");
+        if mode == Mode::NoMetadata {
+            lines.push_str("unchecked: listings (no virtualized metadata)\n");
+        }
+        lines.push_str(if mode == Mode::Recorded {
+            "unchecked: listings, spellings through a link or `..`, datagram sends, a thread \
+             with its own descriptor table, chroot (record and replay)\n"
+        } else if kvm {
+            "unchecked: listings, /proc as the working directory, renames and links (KVM's \
+             own /proc); stat sync flags (KVM's executor, \
+             https://github.com/rrnewton/reverie/issues/1047); inotify, a thread with its \
+             own descriptor table, chroot (no KVM support)\n"
+        } else {
+            "a thread with its own descriptor table: absent\nafter chroot(\"/\"): absent\n"
+        });
+        lines
+    };
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mut compared = Vec::new();
+    for (backend, level, mode) in [
+        ("ptrace", "standard", Mode::Verified),
+        ("dbt", "standard", Mode::Verified),
+        ("kvm", "standard", Mode::Verified),
+        ("ptrace", "minimal", Mode::Verified),
+        ("dbt", "minimal", Mode::Verified),
+        ("kvm", "minimal", Mode::Verified),
+        ("ptrace", "standard", Mode::NoMetadata),
+        ("ptrace", "standard", Mode::Recorded),
+        ("ptrace", "standard", Mode::IntoProc),
+        ("dbt", "standard", Mode::IntoProcUnverified),
+    ] {
+        let test = "detcore_omits_the_procfs_names_outside_the_level_on_every_backend";
+        if (backend == "dbt" && dbt_unavailable(test))
+            || (backend == "kvm" && kvm_unavailable(test))
+        {
+            eprintln!(
+                "{test}: NOT COMPARED: {backend} is not available on this host or in this build"
+            );
+            continue;
+        }
+        let report = directory.path().join(format!("{backend}-{level}.json"));
+        let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
+        let level_arg = format!("--proc={level}");
+        let mut args = match mode {
+            Mode::Verified | Mode::IntoProc => vec![
+                "--backend",
+                backend,
+                "run",
+                "--strict",
+                &level_arg,
+                "--verify",
+                "--verify-strict",
+                "--verify-json",
+                &report_arg,
+                "--base-env=minimal",
+            ],
+            Mode::IntoProcUnverified => vec![
+                "--backend",
+                backend,
+                "run",
+                "--strict",
+                &level_arg,
+                "--base-env=minimal",
+            ],
+            Mode::NoMetadata => vec![
+                "--backend",
+                backend,
+                "run",
+                "--strict",
+                &level_arg,
+                "--no-virtualize-metadata",
+                "--base-env=minimal",
+            ],
+            // Recording takes the default level, standard.
+            Mode::Recorded => vec!["record", "--verify"],
+        };
+        args.extend(["--", guest.to_str().expect("guest path is UTF-8")]);
+        if level == "minimal" {
+            args.push("--minimal");
+        }
+        if backend == "kvm" {
+            args.push("--kvm-local-procfs");
+        }
+        match mode {
+            Mode::Verified => {}
+            Mode::NoMetadata => args.push("--kernel-listings"),
+            Mode::Recorded => args.push("--recorded"),
+            Mode::IntoProc | Mode::IntoProcUnverified => args.push("--chroot-into-proc"),
+        }
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        match mode {
+            Mode::Verified | Mode::IntoProc => {
+                let verdict: serde_json::Value = serde_json::from_slice(
+                    &fs::read(&report).expect("read the verification report"),
+                )
+                .expect("parse the verification report");
+                assert_eq!(verdict["bitwise_parity"], true, "{backend}: {verdict}");
+                let messages = &verdict["compared_log_messages"];
+                assert!(
+                    messages["left"].as_u64().is_some_and(|count| count > 0)
+                        && messages["left"] == messages["right"],
+                    "{backend} compared no INFO messages: {verdict}"
+                );
+            }
+            Mode::IntoProcUnverified | Mode::NoMetadata => {}
+            Mode::Recorded => assert!(
+                stderr(&output).contains("Success: replay matched recording."),
+                "replay must match the recording: {output:?}"
+            ),
+        }
+        let expected = match mode {
+            Mode::IntoProc | Mode::IntoProcUnverified => String::new(),
+            _ => expected(level == "minimal", backend, mode),
+        };
+        assert_eq!(stdout(&output), expected, "{backend} at {level}");
+        compared.push(format!(
+            "{backend}/{level}{}",
+            match mode {
+                Mode::Verified => "",
+                Mode::IntoProc => "/chroot-into-proc",
+                Mode::IntoProcUnverified => "/chroot-into-proc-unverified",
+                Mode::NoMetadata => "/no-virtualize-metadata",
+                Mode::Recorded => "/record",
+            }
+        ));
+    }
+    assert!(
+        compared.len() > 4 || !cfg!(feature = "dbt"),
+        "only ptrace was compared"
+    );
+    eprintln!(
+        "detcore_omits_the_procfs_names_outside_the_level_on_every_backend compared {compared:?}"
+    );
 }
 
 /// Detcore renders `/proc/sys/kernel/random/uuid` and `/proc/sys/kernel/pty/nr`

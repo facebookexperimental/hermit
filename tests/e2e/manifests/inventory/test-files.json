@@ -1171,6 +1171,12 @@
       "why": "tests/c/o_tmpfile_anon.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/omitted_procfs_names.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/omitted_procfs_names.c is owned by hermit-cli/tests/cli.rs: the CLI test detcore_omits_the_procfs_names_outside_the_level_on_every_backend runs it natively, to show that the host has the omitted names, then on ptrace, DBT and KVM at --proc=standard and --proc=minimal (verified at L2), on ptrace without virtualized metadata, and under record and replay. It requires /proc names in no level (kallsyms, kcore, sysvipc, sys/kernel/core_pattern and others), and at minimal the standard level's names, to fail as Linux fails a missing procfs name through the calls and spellings it tries, listings to leave them out, and the level's names to stay (https://github.com/rrnewton/hermit/issues/4266). Each run's expected output names the checks it cannot make there (KVM's own /proc, the KVM backend's missing calls, record and replay, the kernel's listings without virtualized metadata). It stays a fixture because a generic manifest cannot compare one guest across backends, levels and modes."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/openat2_refusal.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

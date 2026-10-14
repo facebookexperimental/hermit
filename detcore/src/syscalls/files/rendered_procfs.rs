@@ -207,7 +207,7 @@ static NOT_RENDERED: std::sync::Mutex<std::collections::BTreeSet<(u64, u64)>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
 /// The device of the guest's procfs mount, read once.
-fn proc_device() -> Option<u64> {
+pub(super) fn proc_device() -> Option<u64> {
     static PROC_DEVICE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *PROC_DEVICE.get_or_init(|| GuestProcfs::stat(c"/proc").ok().map(|stat| stat.st_dev))
 }

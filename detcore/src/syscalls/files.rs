@@ -60,6 +60,7 @@ use crate::procfs::MountInfoSnapshot;
 use crate::procfs::ProcfsFile;
 use crate::procfs::ProcfsSnapshotContext;
 use crate::procfs::is_absent_cpu_entry;
+use crate::procfs::levels;
 use crate::procfs_inode;
 use crate::procfs_inode::DirectoryInodes;
 use crate::procfs_inode::ProcfsDirectory;
@@ -81,6 +82,7 @@ use crate::tool_local::Detcore;
 use crate::tool_local::finish_partial_record_or_replay_write;
 use crate::types::*;
 
+pub(crate) mod procfs_levels;
 pub(crate) mod rendered_procfs;
 
 /// A conversion from SOCK_* flags to O_* flags which makes unsafe (but checked during testing) assumptions.
@@ -2582,6 +2584,23 @@ impl<T: RecordOrReplay> Detcore<T> {
                     resource_release_all(guest).await;
                     return result;
                 }
+                // A `/proc` name outside the run's level that the kernel
+                // reached through a spelling the lookup check does not
+                // resolve (a symbolic link, `..`), named by the kernel's path
+                // for the descriptor (see `refuse_procfs_name_outside_level`).
+                if self
+                    .opened_procfs_name_outside_level(
+                        guest,
+                        fd,
+                        identity.as_ref().map(|stat| (stat.st_dev, stat.st_ino)),
+                    )
+                    .await
+                {
+                    guest.thread_state().remove_fd(fd);
+                    let _ = guest.inject(syscalls::Close::new().with_fd(fd)).await;
+                    resource_release_all(guest).await;
+                    return Err(Errno::ENOENT.into());
+                }
                 // A FIFO (a named one, or a pipe reached by path that the
                 // check above left `Regular`) stays `Regular` and physically
                 // blocking, so a FIFO whose other end is on the host blocks as
@@ -2709,6 +2728,29 @@ impl<T: RecordOrReplay> Detcore<T> {
                     } else {
                         resolved_open_path(guest.pid().as_raw(), fd)
                     };
+                    // Under record and replay, a `/proc` name outside the
+                    // run's level that a spelling the lookup check does not
+                    // resolve reached, named by the link the recording read,
+                    // so both runs refuse it alike (outside record and replay
+                    // the check after the open above does it). Not after a
+                    // `chroot`, where `/proc` need not be procfs.
+                    if self.cfg.recordreplay_modes
+                        && !guest
+                            .thread_state()
+                            .changed_root
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                        && resolved.as_deref().is_some_and(|resolved| {
+                            levels::procfs_name(resolved)
+                                .is_some_and(|name| name.absent_at(self.cfg.proc_level))
+                        })
+                    {
+                        guest.thread_state().remove_fd(fd);
+                        let _ = self
+                            .record_or_replay(guest, syscalls::Close::new().with_fd(fd))
+                            .await;
+                        resource_release_all(guest).await;
+                        return Err(Errno::ENOENT.into());
+                    }
                     procfs = resolved
                         .filter(|resolved| resolved != &observed_path)
                         .and_then(|resolved| ProcfsFile::from_path(&resolved));
@@ -2780,6 +2822,19 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             // TODO: audit for error-nondeterminism:
             Err(e) => {
+                // A root-only `/proc` name outside the run's level, reached
+                // through a spelling the lookup check does not resolve,
+                // refuses the open before its descriptor can be named; and
+                // the KVM executor refuses whatever reaches procfs.
+                let e = if matches!(e, Errno::EACCES | Errno::EPERM)
+                    && self
+                        .refused_open_reaches_procfs_name_outside_level(guest, &call)
+                        .await
+                {
+                    Errno::ENOENT
+                } else {
+                    e
+                };
                 resource_release_all(guest).await;
                 Err(e.into())
             }
@@ -8894,14 +8949,16 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// [`is_absent_cpu_entry`]), so that a guest counting
     /// `/sys/devices/system/cpu/cpuN` finds one CPU, as `online` and
     /// `sched_getaffinity` report
-    /// (<https://github.com/rrnewton/hermit/issues/4160>).
+    /// (<https://github.com/rrnewton/hermit/issues/4160>); and the `/proc`
+    /// names outside the run's `--proc` level, which lookups refuse (see
+    /// [`levels::absent_entry`]).
     ///
     /// The directory is named by the kernel's path for the descriptor, so a
     /// relative or symlinked spelling is recognized too. Not under record and
     /// replay, where the replayer's descriptor does not name the recorded
     /// directory, so the two runs would not drop alike; Detcore names no
     /// procfs entry there either (see [`Self::procfs_entry`]).
-    fn drop_absent_cpu_entries<G: Guest<Self>>(
+    fn drop_absent_entries<G: Guest<Self>>(
         &self,
         guest: &G,
         fd: RawFd,
@@ -8910,8 +8967,26 @@ impl<T: RecordOrReplay> Detcore<T> {
         if self.cfg.recordreplay_modes {
             return;
         }
-        if let Some(directory) = resolved_open_path(guest.pid().as_raw(), fd) {
-            entries.retain(|entry| !is_absent_cpu_entry(&directory, &entry.name));
+        // The kernel's path for the descriptor; or, where the tool cannot
+        // read it (after a `chroot` into a root without `/proc`, where the
+        // tool runs inside the guest), the path the guest opened it by.
+        let directory =
+            std::fs::read_link(format!("{}/fd/{fd}", self.caller_proc_directory(guest)))
+                .ok()
+                .or_else(|| {
+                    guest
+                        .thread_state()
+                        .with_detfd(fd, |detfd| detfd.path())
+                        .ok()
+                        .flatten()
+                })
+                .filter(|path| path.is_absolute());
+        if let Some(directory) = directory {
+            let level = self.cfg.proc_level;
+            entries.retain(|entry| {
+                !is_absent_cpu_entry(&directory, &entry.name)
+                    && !levels::absent_entry(&directory, &entry.name, level)
+            });
         }
     }
 
@@ -8922,7 +8997,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// sorted runs whose boundaries depend on the host.
     ///
     /// A buffer whose every entry is dropped (see
-    /// [`Self::drop_absent_cpu_entries`]) is not returned empty, which would
+    /// [`Self::drop_absent_entries`]) is not returned empty, which would
     /// end the directory: the call is issued again from where the kernel
     /// left off. The bytes the kernel wrote past the entries returned, by this
     /// call or one it reissued, are zeroed, as they may name the entries
@@ -8946,7 +9021,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             written = written.max(len);
             let mut entries = read_records(&guest.memory(), call.buf, len, call.format)?;
-            self.drop_absent_cpu_entries(guest, call.fd, &mut entries);
+            self.drop_absent_entries(guest, call.fd, &mut entries);
             if !entries.is_empty() {
                 break (len, entries);
             }
@@ -8981,7 +9056,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Read the whole host directory behind `call.fd` into a private mapping
     /// (see [`Self::snapshot_directory`]), and return its entries in host
     /// order, less the CPUs and nodes Hermit's single virtual CPU and node
-    /// leave out (see [`Self::drop_absent_cpu_entries`]). Every directory
+    /// leave out and the `/proc` names outside the run's level (see
+    /// [`Self::drop_absent_entries`]). Every directory
     /// snapshot a stream stores comes from here, so none holds them.
     ///
     /// Linux writes into guest memory only the records a call returns and the
@@ -9049,7 +9125,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         unmapped?;
         let mut snapshot = snapshot?;
         if let Some(entries) = &mut snapshot {
-            self.drop_absent_cpu_entries(guest, call.fd, entries);
+            self.drop_absent_entries(guest, call.fd, entries);
         }
         Ok(snapshot)
     }

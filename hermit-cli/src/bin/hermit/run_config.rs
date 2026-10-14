@@ -1005,6 +1005,7 @@ mod tests {
         ("detlog-regs-cadence", &["--detlog-regs-cadence=2"]),
         ("sysinfo-uptime-offset", &["--sysinfo-uptime-offset=60"]),
         ("memory", &["--memory=2GB"]),
+        ("proc", &["--proc=minimal"]),
         (
             "interrupt-at",
             &["--interrupt-at=1:100", "--interrupt-at", "2:200"],

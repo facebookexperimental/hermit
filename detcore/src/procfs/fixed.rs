@@ -681,7 +681,7 @@ mod tests {
         for (file, text) in expected {
             assert_eq!(contents(file), text, "{file:?}");
         }
-        // The three tables too long to write out here have their own tests.
+        // The four tables too long to write out here have their own tests.
         let long = [Filesystems, Zoneinfo, Vmstat, TtyDrivers];
         assert_eq!(expected.len() + long.len(), FixedProcfsFile::ALL.len());
     }
