@@ -284,3 +284,62 @@ async fn cancelled_transferred_exec_retires_unobserved_peer_before_late_callback
     );
     assert_eq!(sched.turn, 0);
 }
+
+#[tokio::test]
+async fn inherited_terminal_initialization_is_once_only_across_failed_exec_retry() {
+    let (mut state, time) = state(&[LEADER]);
+    state.cfg.backend.tool_shares_guest_descriptor_table = true;
+    let sender = Tid::from_raw(LEADER.as_raw());
+    let mm0 = MmId::initial(LEADER);
+    // The pre-exec logging flag is not authority to initialize descriptors.
+    state
+        .past_first_execve
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let first = state
+        .receive_rpc(
+            sender,
+            (
+                time.clone(),
+                mm0,
+                GlobalRequest::MarkPastFirstExecve(LEADER, None),
+            ),
+        )
+        .await;
+    let GlobalResponse::MarkPastFirstExecve(first) = first.1 else {
+        panic!("first image completion refused")
+    };
+    assert!(first.initialize_inherited_stdio);
+    let mm1 = mm0.for_exec(LEADER);
+    for (mm, request, expected) in [
+        (
+            mm0,
+            GlobalRequest::PrepareExec(LEADER, mm0, Default::default()),
+            GlobalResponse::PrepareExec(()),
+        ),
+        (
+            mm1,
+            GlobalRequest::CancelExec(LEADER),
+            GlobalResponse::CancelExec(()),
+        ),
+        (
+            mm0,
+            GlobalRequest::PrepareExec(LEADER, mm0, Default::default()),
+            GlobalResponse::PrepareExec(()),
+        ),
+        (
+            mm1,
+            GlobalRequest::MarkPastFirstExecve(LEADER, None),
+            GlobalResponse::MarkPastFirstExecve(Default::default()),
+        ),
+    ] {
+        assert_eq!(
+            state
+                .receive_rpc(sender, (time.clone(), mm, request))
+                .await
+                .1,
+            expected
+        );
+    }
+    assert!(state.pending_exec_states.lock().unwrap().is_empty());
+    assert!(state.post_exec_fd_blocking.lock().unwrap().is_empty());
+}

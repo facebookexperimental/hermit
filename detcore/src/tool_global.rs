@@ -117,6 +117,7 @@ use crate::shared_open_files::OpenFileControlReply;
 use crate::shared_open_files::SharedOpenFileStore;
 use crate::tool_local::Detcore;
 use crate::tool_local::ExecFdBlockingOverrides;
+use crate::tool_local::ExecFdState;
 use crate::tool_local::RobustListWake;
 use crate::types::*;
 
@@ -329,7 +330,7 @@ struct PendingExecState {
     caller: DetTid,
     process: DetPid,
     mm: MmId,
-    fd_blocking: ExecFdBlockingOverrides,
+    fd_blocking: ExecFdState,
 }
 
 /// Separate terminal cleanup outcomes; neither replaces the backend failure.
@@ -1087,6 +1088,8 @@ pub struct GlobalState {
 
     // False initially after fork, and true when we begin executing the guest binary.
     past_first_execve: AtomicBool,
+    /// Unlike the logging flag above, this changes only at successful image completion.
+    initial_descriptor_image_complete: AtomicBool,
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1154): Review the SaBRe exec descriptor-status handoff.
@@ -1100,7 +1103,7 @@ pub struct GlobalState {
     completed_exec_transfers: Mutex<BTreeMap<DetPid, exec_identity::ExecTransferReceipt>>,
 
     /// Descriptor state retained after the one-shot scheduler transition is consumed.
-    post_exec_fd_blocking: Mutex<BTreeMap<DetTid, ExecFdBlockingOverrides>>,
+    post_exec_fd_blocking: Mutex<BTreeMap<DetTid, ExecFdState>>,
 
     sched_handle: Option<tokio::task::JoinHandle<()>>,
 
@@ -1270,6 +1273,7 @@ impl GlobalState {
             port_end_range: AtomicU16::new(range[1]),
             open_file_to_port: Mutex::new(HashMap::new()),
             past_first_execve: AtomicBool::new(false),
+            initial_descriptor_image_complete: AtomicBool::new(false),
             pending_exec_states: Mutex::new(BTreeMap::new()),
             completed_exec_transfers: Mutex::new(BTreeMap::new()),
             post_exec_fd_blocking: Mutex::new(BTreeMap::new()),
@@ -2335,7 +2339,7 @@ impl GlobalState {
             }
             GlobalRequest::PrepareExec(process, mm, fd_blocking) => {
                 let mut sched = self.lock_rpc_scheduler(false).await;
-                if mm != request_mm {
+                if mm != request_mm || fd_blocking.initialize_inherited_stdio {
                     return (None, R::ThreadExited);
                 }
                 if self.cfg.sequentialize_threads && !sched.prepare_exec_teardown(dtid, process, mm)
@@ -2437,7 +2441,8 @@ impl GlobalState {
                     self.pending_exec_states.lock().unwrap().remove(&dtid);
                 }
                 self.past_first_execve.store(true, SeqCst);
-                let overrides = self
+                let first_image = !self.initial_descriptor_image_complete.swap(true, SeqCst);
+                let mut overrides = self
                     .post_exec_fd_blocking
                     .lock()
                     .unwrap()
@@ -2447,6 +2452,8 @@ impl GlobalState {
                     "[detcore, dtid {}] restoring logically blocking descriptors after exec: {:?}",
                     dtid, overrides,
                 );
+                overrides.initialize_inherited_stdio =
+                    first_image && self.cfg.backend.tool_shares_guest_descriptor_table;
                 R::MarkPastFirstExecve(overrides)
             }
             // Requested by the parent thread:
@@ -4469,7 +4476,7 @@ pub enum GlobalRequest {
     // TODO-HUMAN-REVIEW(PR-1154): Review the SaBRe exec descriptor-status handoff.
     /// Save the caller, address-space identity, and logically blocking descriptors before exec.
     /// A successful backend may reload the Tool or preserve and transfer its thread state.
-    PrepareExec(DetPid, MmId, ExecFdBlockingOverrides),
+    PrepareExec(DetPid, MmId, ExecFdState),
 
     /// Clear the saved transition after an exec attempt returns with an error.
     CancelExec(DetPid),
@@ -4827,7 +4834,7 @@ pub enum GlobalResponse {
     ReconnectExec(bool),
     ResumeExec(ResumeStatus, Option<LogicalTime>),
     RetireExec(bool),
-    MarkPastFirstExecve(ExecFdBlockingOverrides),
+    MarkPastFirstExecve(ExecFdState),
     CreateChildThread(Option<MmId>),
     /// Includes optional preemption points for the new thread.
     StartNewThread(Option<ThreadHistory>),
@@ -5003,8 +5010,13 @@ where
     T: RecordOrReplay,
 {
     let detpid = guest.thread_state().detpid.expect("detpid unset");
+    let fd_state = ExecFdState {
+        blocking: fd_blocking,
+        terminals: guest.thread_state().inherited_terminals_for_exec(),
+        initialize_inherited_stdio: false,
+    };
     let (_, response) =
-        send_and_update_time(guest, GlobalRequest::PrepareExec(detpid, mm, fd_blocking)).await;
+        send_and_update_time(guest, GlobalRequest::PrepareExec(detpid, mm, fd_state)).await;
     assert_eq!(response, GlobalResponse::PrepareExec(()));
 }
 
@@ -5048,7 +5060,12 @@ where
         metadata
             .lock()
             .unwrap()
-            .apply_exec_blocking_overrides(dettid, overrides);
+            .apply_exec_fd_state(
+                dettid,
+                overrides,
+                guest.config().backend.tool_shares_guest_descriptor_table,
+            )
+            .expect("prepared exec descriptor provenance no longer matches the guest table");
     }
 }
 
@@ -7338,6 +7355,7 @@ mod tests {
     use crate::scheduler::SchedValue;
     use crate::scheduler::ThreadNextTurn;
     use crate::tool_local::ExecFdBlockingOverrides;
+    use crate::tool_local::ExecFdState;
     use crate::types::DetPid;
     use crate::types::DetTid;
     use crate::types::DetTime;
@@ -7641,11 +7659,10 @@ mod tests {
                     fd_blocking: Default::default(),
                 },
             );
-            state
-                .post_exec_fd_blocking
-                .lock()
-                .unwrap()
-                .insert(leader, [42].into_iter().collect());
+            state.post_exec_fd_blocking.lock().unwrap().insert(
+                leader,
+                ExecFdState::from([42].into_iter().collect::<ExecFdBlockingOverrides>()),
+            );
             {
                 let mut sched = state.sched.lock().unwrap();
                 sched.install_test_child_exit_publication_hold(detpid);
@@ -9727,7 +9744,20 @@ mod tests {
             global_time.update_global_time(worker, worker_clock.as_nanos(), LogicalTime::ZERO);
         }
         let total_before = state.global_time.lock().unwrap().as_nanos();
-        let fd_blocking: ExecFdBlockingOverrides = [42].into_iter().collect();
+        let fd_blocking = ExecFdState {
+            blocking: [42].into_iter().collect(),
+            terminals: std::collections::BTreeMap::from([(
+                43,
+                crate::fd::InheritedTerminal {
+                    origin: crate::types::OpenFileId::new(leader, 0),
+                    dev: 1,
+                    inode: 2,
+                    rdev: 3,
+                    resource: Some(ResourceID::Device(crate::resources::Device::ContainerStdin)),
+                },
+            )]),
+            initialize_inherited_stdio: false,
+        };
         state.pending_exec_states.lock().unwrap().insert(
             detpid,
             PendingExecState {
@@ -10151,11 +10181,10 @@ mod tests {
                 fd_blocking: Default::default(),
             },
         );
-        state
-            .post_exec_fd_blocking
-            .lock()
-            .unwrap()
-            .insert(leader, [42].into_iter().collect());
+        state.post_exec_fd_blocking.lock().unwrap().insert(
+            leader,
+            ExecFdState::from([42].into_iter().collect::<ExecFdBlockingOverrides>()),
+        );
         state
             .recv_deregister_thread(
                 reverie::Tid::from_raw(leader.as_raw()),
@@ -10207,11 +10236,10 @@ mod tests {
                 fd_blocking: Default::default(),
             },
         );
-        state
-            .post_exec_fd_blocking
-            .lock()
-            .unwrap()
-            .insert(leader, [42].into_iter().collect());
+        state.post_exec_fd_blocking.lock().unwrap().insert(
+            leader,
+            ExecFdState::from([42].into_iter().collect::<ExecFdBlockingOverrides>()),
+        );
         state.complete_physical_process_exit(detpid.as_raw());
         assert!(state.pending_exec_states.lock().unwrap().is_empty());
         assert!(state.post_exec_fd_blocking.lock().unwrap().is_empty());

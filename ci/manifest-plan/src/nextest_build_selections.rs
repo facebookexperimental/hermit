@@ -28,6 +28,14 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--bins",
         ]),
         "test.detcore_unit" => Some(&["-p", "hermit-detcore", "--lib", "--bins"]),
+        "test.inherited_terminal_read" => Some(&[
+            "-p",
+            "hermit",
+            "--features",
+            "third-party-backends",
+            "--test",
+            "inherited_terminal_read",
+        ]),
         "test.detcore_misc"
         | "privileged-build.privileged_tests"
         | "privileged-cpuid.faulting"
@@ -924,7 +932,39 @@ mod tests {
         let hardware_key = crate::nextest_binaries::selection_key(&hardware);
         assert_eq!(full.get(&hardware_key), Some(&hardware));
         assert!(!portable.contains_key(&hardware_key));
-        assert_eq!(full.len(), portable.len() + 1);
+        let terminal = graph
+            .steps
+            .iter()
+            .find(|step| step.tag() == "test.inherited_terminal_read")
+            .unwrap();
+        assert_command_selection(terminal).unwrap();
+        assert_eq!(
+            dagrun::model::command_with_inner_jobs(terminal, "-j", Some(8)),
+            terminal.cmd,
+            "the eight-CPU terminal node must preserve its single -j 1 argument"
+        );
+        assert_eq!(
+            dagrun::model::env_with_inner_jobs(terminal, "", Some(8)),
+            Some(("CARGO_BUILD_JOBS".into(), "8".into()))
+        );
+        let terminal_selection: Vec<String> =
+            serde_json::from_str(&terminal.env[SELECTION_ENV]).unwrap();
+        assert_eq!(
+            terminal_selection,
+            [
+                "-p",
+                "hermit",
+                "--features",
+                "third-party-backends",
+                "--test",
+                "inherited_terminal_read",
+            ]
+        );
+        let terminal_key = crate::nextest_binaries::selection_key(&terminal_selection);
+        assert_ne!(terminal_key, hardware_key);
+        assert_eq!(full.get(&terminal_key), Some(&terminal_selection));
+        assert!(!portable.contains_key(&terminal_key));
+        assert_eq!(full.len(), portable.len() + 2);
         for (key, selection) in &portable {
             assert_eq!(full.get(key), Some(selection));
         }

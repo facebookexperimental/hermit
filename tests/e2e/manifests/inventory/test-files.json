@@ -751,6 +751,18 @@
       "why": "tests/c/host_identity.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify mode; ci=true on ptrace and dbi): Host-identity contract guest emitting the OBSERVED virtualized uname/gethostname/sysinfo/CPU values so cross-backend parity is checkable and a backend leaking the real host identity is caught; runs in blocking CI on the two backends that execute it"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/inherited_terminal_peer_flags.c",
+      "runner": "hermit-cli/tests/inherited_terminal_read.rs via test.inherited_terminal_read",
+      "why": "Native and DBT terminal alias regression in which a fork peer changes the shared kernel nonblocking flag across exec; checks real empty EAGAIN and post-clear short reads without claiming the broader logical F_GETFL alias repair. Driven only by the dedicated six-case integration target, not a newly enabled manifest cell."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/inherited_terminal_read.c",
+      "runner": "hermit-cli/tests/inherited_terminal_read.rs via test.inherited_terminal_read",
+      "why": "Native and DBT causal terminal short-read and failed/successful exec alias regressions; the host waits for parent readiness before writing input. Driven only by the dedicated six-case integration target, not a newly enabled manifest cell."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/inline_syscall_sites.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",

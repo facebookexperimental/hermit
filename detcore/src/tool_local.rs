@@ -184,6 +184,32 @@ pub(crate) fn pidfd_getfd_targets_calling_task(
 /// blocking to the guest. SaBRe carries this narrow status set across an exec plugin reload.
 pub type ExecFdBlockingOverrides = BTreeSet<RawFd>;
 
+/// Metadata carried by the existing exec preparation/completion exchange.
+/// Descriptor numbers are authorized by that exchange's process/image fence,
+/// not by rediscovering whichever object later occupies a numeric stdio slot.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecFdState {
+    pub(crate) blocking: ExecFdBlockingOverrides,
+    pub(crate) terminals: BTreeMap<RawFd, crate::fd::InheritedTerminal>,
+    /// Set only by the global first-image completion, never by a preparation.
+    pub(crate) initialize_inherited_stdio: bool,
+}
+
+impl ExecFdState {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.blocking.is_empty() && self.terminals.is_empty() && !self.initialize_inherited_stdio
+    }
+}
+
+impl From<ExecFdBlockingOverrides> for ExecFdState {
+    fn from(blocking: ExecFdBlockingOverrides) -> Self {
+        Self {
+            blocking,
+            ..Self::default()
+        }
+    }
+}
+
 /// A single POSIX per-process interval timer created by `timer_create(2)`.
 ///
 /// Detcore records arming against virtual time and schedules supported
@@ -702,6 +728,94 @@ impl FileMetadata {
         }
     }
 
+    fn inherited_terminals_for_exec(&self) -> BTreeMap<RawFd, crate::fd::InheritedTerminal> {
+        self.file_handles
+            .iter()
+            .filter(|(_, detfd)| !detfd.is_cloexec())
+            .filter_map(|(&fd, detfd)| detfd.inherited_terminal().map(|terminal| (fd, terminal)))
+            .collect()
+    }
+
+    /// Called only in the actual shared guest descriptor table, after the
+    /// global state confirms this is the container's first image. TCGETS is
+    /// read-only: neither terminal settings nor OFD flags are changed.
+    fn discover_inherited_terminals(&mut self, descriptors: impl IntoIterator<Item = RawFd>) {
+        for fd in descriptors {
+            let Some(detfd) = self.file_handles.get(&fd) else {
+                continue;
+            };
+            let Some(stat) = detfd.stat() else { continue };
+            if stat.mode & libc::S_IFMT != libc::S_IFCHR {
+                continue;
+            }
+            let mut settings: libc::termios = unsafe { std::mem::zeroed() };
+            // SAFETY: TCGETS writes only to this live, adequately sized buffer.
+            if unsafe { libc::ioctl(fd, libc::TCGETS, &raw mut settings) } != 0 {
+                continue;
+            }
+            detfd.set_inherited_terminal(crate::fd::InheritedTerminal {
+                origin: detfd.open_file_id(),
+                dev: stat.dev,
+                inode: stat.inode,
+                rdev: stat.rdev,
+                resource: detfd.resource(),
+            });
+        }
+    }
+
+    /// Restore only terminals proven to survive the prepared exec. Unknown
+    /// descriptors and guest-created PTYs are not promoted by rediscovery.
+    fn restore_inherited_terminals(
+        &mut self,
+        owner: DetTid,
+        terminals: BTreeMap<RawFd, crate::fd::InheritedTerminal>,
+    ) -> Result<(), Errno> {
+        let mut aliases: HashMap<OpenFileId, DetFd> = HashMap::new();
+        for (fd, terminal) in terminals {
+            self.discover_fd_from_current_process(owner, fd)?;
+            let detfd = self.file_handles.get_mut(&fd).ok_or(Errno::EBADF)?;
+            let stat =
+                stat::fstat(unsafe { BorrowedFd::borrow_raw(fd) }).map_err(|_| Errno::last())?;
+            if stat.st_mode & libc::S_IFMT != libc::S_IFCHR
+                || (stat.st_dev, stat.st_ino, stat.st_rdev)
+                    != (terminal.dev, terminal.inode, terminal.rdev)
+            {
+                return Err(Errno::EIO);
+            }
+            // Do not repeat TCGETS here: a hung-up terminal may return EIO
+            // from that query while still being the inherited open file.
+            if let Some(alias) = aliases.get(&terminal.origin) {
+                if detfd.status_flags() != alias.status_flags() {
+                    return Err(Errno::EIO);
+                }
+                detfd.share_open_file_with(alias);
+            } else {
+                detfd.set_resource(terminal.resource.clone());
+                detfd.set_inherited_terminal(terminal.clone());
+                aliases.insert(terminal.origin, detfd.clone());
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn apply_exec_fd_state(
+        &mut self,
+        owner: DetTid,
+        state: ExecFdState,
+        shared_guest_table: bool,
+    ) -> Result<(), Errno> {
+        self.apply_exec_blocking_overrides(owner, state.blocking);
+        if !shared_guest_table {
+            return Ok(());
+        }
+        if state.initialize_inherited_stdio {
+            self.discover_inherited_terminals(0..=2);
+        } else {
+            self.restore_inherited_terminals(owner, state.terminals)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn open_files_closed_on_exec(&self, table_is_shared: bool) -> Vec<OpenFileId> {
         if table_is_shared {
             return Vec::new();
@@ -1153,6 +1267,188 @@ mod file_metadata_tests {
     use std::os::fd::AsRawFd;
 
     use super::*;
+
+    fn terminal_pair() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+        use std::os::fd::FromRawFd;
+        let (mut master, mut slave) = (-1, -1);
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &raw mut master,
+                    &raw mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        unsafe {
+            (
+                std::os::fd::OwnedFd::from_raw_fd(master),
+                std::os::fd::OwnedFd::from_raw_fd(slave),
+            )
+        }
+    }
+
+    #[test]
+    fn inherited_terminal_discovery_keeps_kernel_flags_and_nonterminal_types() {
+        let owner = DetTid::from_raw(9);
+        let (_master, slave) = terminal_pair();
+        let regular = tempfile::tempfile().unwrap();
+        let zero = std::fs::File::open("/dev/zero").unwrap();
+        let null = std::fs::File::open("/dev/null").unwrap();
+        let (pipe, _writer) = nix::unistd::pipe().unwrap();
+        let fds = [
+            slave.as_raw_fd(),
+            regular.as_raw_fd(),
+            zero.as_raw_fd(),
+            null.as_raw_fd(),
+            pipe.as_raw_fd(),
+        ];
+        let before: Vec<_> = fds
+            .iter()
+            .map(|fd| unsafe {
+                (
+                    libc::fcntl(*fd, libc::F_GETFL),
+                    libc::fcntl(*fd, libc::F_GETFD),
+                )
+            })
+            .collect();
+        let mut metadata = FileMetadata::new(owner);
+        for fd in fds {
+            metadata
+                .discover_fd_from_current_process(owner, fd)
+                .unwrap();
+        }
+        metadata.discover_inherited_terminals(fds);
+        for (index, fd) in fds.into_iter().enumerate() {
+            let detfd = &metadata.file_handles[&fd];
+            assert_eq!(detfd.inherited_terminal().is_some(), index == 0);
+            assert_eq!(
+                detfd.ty(),
+                if index == 4 {
+                    FdType::Pipe
+                } else {
+                    FdType::Regular
+                }
+            );
+            assert_eq!(
+                unsafe {
+                    (
+                        libc::fcntl(fd, libc::F_GETFL),
+                        libc::fcntl(fd, libc::F_GETFD),
+                    )
+                },
+                before[index]
+            );
+        }
+    }
+
+    #[test]
+    fn inherited_terminal_aliases_survive_fork_serialization_and_exec_handoff() {
+        use std::os::fd::FromRawFd;
+        let owner = DetTid::from_raw(9);
+        let (_master, slave) = terminal_pair();
+        let fd = slave.as_raw_fd();
+        let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+        assert!(duplicate >= 0);
+        let duplicate = unsafe { std::os::fd::OwnedFd::from_raw_fd(duplicate) };
+        let alias = duplicate.as_raw_fd();
+        // Make this alias survive the real descriptor boundary as the model does.
+        assert_eq!(unsafe { libc::fcntl(alias, libc::F_SETFD, 0) }, 0);
+        let mut metadata = FileMetadata::new(owner);
+        metadata
+            .discover_fd_from_current_process(owner, fd)
+            .unwrap();
+        metadata.file_handles[&fd].set_resource(ResourceID::Device(Device::ContainerStdin));
+        metadata.discover_inherited_terminals([fd]);
+        metadata.dup_fd(fd, alias, OFlag::empty()).unwrap();
+        metadata.dup_fd(fd, 100_000, OFlag::O_CLOEXEC).unwrap();
+        let child = metadata.fork_for(DetTid::from_raw(10));
+        let encoded = serde_json::to_vec(&child).unwrap();
+        let child: FileMetadata = serde_json::from_slice(&encoded).unwrap();
+        let state = ExecFdState {
+            terminals: child.inherited_terminals_for_exec(),
+            ..Default::default()
+        };
+        assert_eq!(state.terminals.len(), 2, "CLOEXEC alias is not transferred");
+        assert_eq!(state.terminals[&fd], state.terminals[&alias]);
+        let mut restored = FileMetadata::new(owner);
+        restored
+            .apply_exec_fd_state(
+                owner,
+                serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap(),
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            restored.file_handles[&fd].open_file_id(),
+            restored.file_handles[&alias].open_file_id()
+        );
+        assert_eq!(
+            restored.file_handles[&alias].resource(),
+            Some(ResourceID::Device(Device::ContainerStdin))
+        );
+        let flags = unsafe { libc::fcntl(alias, libc::F_GETFL) };
+        assert_eq!(
+            unsafe { libc::fcntl(alias, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        restored.file_handles[&alias].set_status_flags(flags | libc::O_NONBLOCK);
+        assert!(restored.file_handles[&fd].is_nonblocking());
+        assert!(restored.file_handles[&fd].physically_nonblocking());
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_GETFL) },
+            flags | libc::O_NONBLOCK
+        );
+        let mut byte = 0_u8;
+        assert_eq!(unsafe { libc::read(fd, (&raw mut byte).cast(), 1) }, -1);
+        assert_eq!(Errno::last(), Errno::EAGAIN);
+    }
+
+    #[test]
+    fn guest_created_terminal_and_reused_descriptor_do_not_gain_inherited_provenance() {
+        let owner = DetTid::from_raw(9);
+        let (_master, slave) = terminal_pair();
+        let fd = slave.as_raw_fd();
+        let mut guest_created = FileMetadata::new(owner);
+        guest_created
+            .discover_fd_from_current_process(owner, fd)
+            .unwrap();
+        guest_created.dup_fd(fd, 0, OFlag::empty()).unwrap();
+        assert!(guest_created.inherited_terminals_for_exec().is_empty());
+        let mut fresh = FileMetadata::new(owner);
+        fresh
+            .apply_exec_fd_state(owner, ExecFdState::default(), true)
+            .unwrap();
+        fresh.discover_fd_from_current_process(owner, fd).unwrap();
+        assert!(fresh.file_handles[&fd].inherited_terminal().is_none());
+
+        guest_created.discover_inherited_terminals([fd]);
+        let state = ExecFdState {
+            terminals: guest_created.inherited_terminals_for_exec(),
+            ..Default::default()
+        };
+        // Remove the synthetic slot; only the actual owned fd enters this check.
+        let state = ExecFdState {
+            terminals: state
+                .terminals
+                .into_iter()
+                .filter(|(number, _)| *number == fd)
+                .collect(),
+            ..Default::default()
+        };
+        guest_created.remove_fd(fd);
+        let zero = std::fs::File::open("/dev/zero").unwrap();
+        assert_eq!(unsafe { libc::dup2(zero.as_raw_fd(), fd) }, fd);
+        let mut reused = FileMetadata::new(owner);
+        assert_eq!(
+            reused.apply_exec_fd_state(owner, state, true),
+            Err(Errno::EIO)
+        );
+        assert!(reused.file_handles[&fd].inherited_terminal().is_none());
+    }
 
     #[test]
     fn on_demand_discovery_finds_a_live_descriptor() {
@@ -3211,6 +3507,12 @@ impl<T> ThreadState<T> {
     /// replaces an in-process tool and its descriptor metadata.
     pub fn exec_blocking_overrides(&self) -> ExecFdBlockingOverrides {
         self.metadata().exec_blocking_overrides()
+    }
+
+    pub(crate) fn inherited_terminals_for_exec(
+        &self,
+    ) -> BTreeMap<RawFd, crate::fd::InheritedTerminal> {
+        self.metadata().inherited_terminals_for_exec()
     }
 
     /// Descriptors in this table that Detcore manages as internal pipes: typed

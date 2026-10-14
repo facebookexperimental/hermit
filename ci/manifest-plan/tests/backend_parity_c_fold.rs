@@ -527,7 +527,11 @@ fn every_manifest_node_with_a_dbt_cell_orders_after_the_dbt_runtime_abi_check() 
             "privileged-e2e.manifest_c_programs".to_string(),
         ])
     );
-    assert_eq!(has, needs);
+    // This counted integration target runs real DBT cases outside the
+    // manifest buckets, so it must also wait for the same ABI check.
+    let mut expected_dependents = needs;
+    expected_dependents.insert("test.inherited_terminal_read".to_string());
+    assert_eq!(has, expected_dependents);
 }
 
 /// The privileged c-programs nodes describe their selection by count and

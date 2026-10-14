@@ -92,6 +92,20 @@ pub(crate) enum NetworkSocketKind {
     InetOther,
 }
 
+/// Provenance of a terminal inherited at the container's first image.
+///
+/// The original open-file identity distinguishes aliases from separate opens
+/// of the same tty. The raw identity is used only to validate an exec handoff;
+/// it is never a guest-visible inode or a scheduler resource.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct InheritedTerminal {
+    pub(crate) origin: OpenFileId,
+    pub(crate) dev: u64,
+    pub(crate) inode: u64,
+    pub(crate) rdev: u64,
+    pub(crate) resource: Option<ResourceID>,
+}
+
 /// Deterministic file descriptor
 ///
 /// Notice `statbuf` can be cached here, this is because
@@ -291,6 +305,10 @@ struct OpenFileDescription {
     id: OpenFileId,
     /// fd type
     ty: FdType,
+    /// Read provenance for a terminal inherited from the container launcher.
+    /// Guest-created PTYs never acquire this fact merely by becoming stdio.
+    #[serde(default)]
+    inherited_terminal: Option<InheritedTerminal>,
     /// Process named by a pidfd created through `pidfd_open`.
     ///
     /// This is shared by descriptor aliases just like the kernel pidfd object.
@@ -568,6 +586,7 @@ impl DetFd {
                 id,
                 ty,
                 pidfd_target: None,
+                inherited_terminal: None,
                 status_flags: bits & !OFlag::O_CLOEXEC.bits(),
                 path: None,
                 inode: None,
@@ -666,6 +685,14 @@ impl DetFd {
         self.with_description(|d| d.resource = resource);
     }
 
+    pub(crate) fn inherited_terminal(&self) -> Option<InheritedTerminal> {
+        self.with_description(|d| d.inherited_terminal.clone())
+    }
+
+    pub(crate) fn set_inherited_terminal(&self, terminal: InheritedTerminal) {
+        self.with_description(|d| d.inherited_terminal = Some(terminal));
+    }
+
     /// If fd is non blocking
     pub fn is_nonblocking(&self) -> bool {
         self.with_description(|d| oflags_nonblocking(d.status_flags))
@@ -712,7 +739,7 @@ impl DetFd {
     }
 
     /// Makes this descriptor refer to `other`'s open file description object.
-    fn share_open_file_with(&mut self, other: &DetFd) {
+    pub(crate) fn share_open_file_with(&mut self, other: &DetFd) {
         self.open_file = Arc::clone(&other.open_file);
     }
 

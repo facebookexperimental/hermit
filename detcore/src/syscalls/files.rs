@@ -3717,7 +3717,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         self.fifo_polls_if_a_guest_holds_its_peer(guest, call.fd(), FifoPeer::Writer)
             .await;
-        let (fd_type, physically_nonblocking, logically_nonblocking, resource, random_device) =
+        let (fd_type, physically_nonblocking, logically_nonblocking, resource, descriptor) =
             guest.thread_state_mut().with_detfd(call.fd(), |detfd| {
                 (
                     detfd.ty(),
@@ -3744,14 +3744,24 @@ impl<T: RecordOrReplay> Detcore<T> {
         let res = match fd_type {
             FdType::Rng => {
                 trace!("Read call RNG fd {}, simulating...", call.fd());
-                let status_flags = random_device.status_flags();
-                random_device
+                let status_flags = descriptor.status_flags();
+                descriptor
                     .with_random_device_stream(|offset| {
                         require_random_device_read_access(status_flags)?;
                         let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
                         self.fill_random_device_bytes(guest, remote_buf, call.len(), offset)
                     })
                     .map(|n| n as i64)
+            }
+            FdType::Regular if descriptor.inherited_terminal().is_some() => {
+                // A host-driven terminal can block after this Device grant.
+                // Announce one external kernel read even when our cached flags
+                // say nonblocking: a fork/exec peer can change the shared OFD's
+                // flags while the process-local model remains stale (the
+                // pre-existing https://github.com/rrnewton/hermit/issues/3520).
+                // The kernel keeps its actual O_NONBLOCK semantics, including
+                // immediate EAGAIN. Never fill a terminal short read to len.
+                self.record_or_replay_blocking(guest, call.into()).await
             }
             FdType::Regular => {
                 if guest.config().deterministic_io {
