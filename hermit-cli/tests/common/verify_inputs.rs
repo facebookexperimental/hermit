@@ -11,6 +11,8 @@ use std::path::Path;
 use std::process::Command;
 use std::process::Output;
 
+use hermit::HERMIT_INTERNAL_FAILURE_EXIT;
+
 use super::append_hermit_args;
 use super::hermit_run_guard;
 use super::stderr;
@@ -167,7 +169,7 @@ fn a_run_refuses_lost_substituted_or_unsealed_shared_inputs() {
         let output = under_verify_inputs(&data, &stdin, &script);
         assert_eq!(
             output.status.code(),
-            Some(125),
+            Some(HERMIT_INTERNAL_FAILURE_EXIT),
             "{label}: {}",
             stderr(&output)
         );

@@ -217,6 +217,17 @@ fn suite_population(
         }
         return Ok(test_count);
     }
+    // A third shape from the same adapter, captured from nextest 0.9.100 in
+    // test.pmu_integration_cases: a suite whose one ordinary test the filter
+    // left out while its two `#[ignore]` tests were selected (hermit's
+    // leveldb) reports `test_count` 2, `ignored` 2, nothing executed, and
+    // `filtered_out` 0 - 1. Nothing ran and every counted test was ignored,
+    // so `test_count` is again the typed population; admit only a wrapped
+    // deficit smaller than that ignored count.
+    let deficit = 0u64.wrapping_sub(filtered_out);
+    if executed == 0 && ignored == test_count && deficit != 0 && deficit < ignored {
+        return Ok(test_count);
+    }
     let population = executed
         .checked_add(ignored)
         .and_then(|count| count.checked_add(filtered_out))
@@ -1173,6 +1184,19 @@ mod tests {
         let parsed = parse_event_text(events).unwrap();
         assert_eq!(parsed.executed_tests, 0);
         assert_eq!(parsed.filtered_tests, 3);
+    }
+
+    #[test]
+    fn a_filtered_ordinary_test_beside_selected_ignored_ones_keeps_the_typed_count() {
+        // Captured from nextest 0.9.100 in test.pmu_integration_cases.
+        let events = concat!(
+            r#"{"type":"suite","event":"started","test_count":2,"nextest":{"crate":"hermit","test_binary":"leveldb","kind":"test"}}"#,
+            "\n",
+            r#"{"type":"suite","event":"ok","passed":0,"failed":0,"ignored":2,"measured":0,"filtered_out":18446744073709551615,"exec_time":0,"nextest":{"crate":"hermit","test_binary":"leveldb","kind":"test"}}"#,
+        );
+        let parsed = parse_event_text(events).unwrap();
+        assert_eq!(parsed.executed_tests, 0);
+        assert_eq!(parsed.filtered_tests, 2);
     }
 
     #[test]
