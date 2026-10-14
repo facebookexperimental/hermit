@@ -627,8 +627,13 @@ impl StartOpts {
             }
 
             eprintln!("\n{}\n", "RECORDING COMPLETE!".yellow().bold());
+            // A v3 recording replays only to the end: a GDB- or DAP-served
+            // replay runs a gdbserver, which v3 refuses.
+            let autopilot_only = !self.cpu_profile.is_default();
             for (label, command) in
                 replay_hint_commands(&recording.id.to_string(), self.data_dir.as_deref())
+                    .into_iter()
+                    .take(if autopilot_only { 1 } else { 3 })
             {
                 eprintln!(
                     "{}:\n\n    {}\n",

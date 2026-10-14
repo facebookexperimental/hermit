@@ -163,8 +163,14 @@ pub struct IrqCounter {
 const PERF_TYPE_RAW: u32 = 4;
 const PERF_FORMAT_TOTAL_TIME_ENABLED: u64 = 1 << 0;
 const PERF_FORMAT_TOTAL_TIME_RUNNING: u64 = 1 << 1;
-/// Bit 1 of the flag word: "must always be on PMU".
-const ATTR_FLAG_PINNED: u64 = 1 << 1;
+/// The flag word's bitfields in `perf_event_attr` order: `disabled` (bit 0),
+/// `inherit` (bit 1), `pinned` (bit 2, "must always be on PMU").
+const ATTR_FLAG_DISABLED: u64 = 1 << 0;
+const ATTR_FLAG_INHERIT: u64 = 1 << 1;
+const ATTR_FLAG_PINNED: u64 = 1 << 2;
+/// The counter's flag word: enabled, not inherited by threads this thread
+/// starts (the peer), pinned, and with no mode excluded.
+const COUNTER_FLAGS: u64 = ATTR_FLAG_PINNED & !(ATTR_FLAG_DISABLED | ATTR_FLAG_INHERIT);
 const PERF_ATTR_SIZE_VER0: u32 = 64;
 const PERF_FLAG_FD_CLOEXEC: libc::c_ulong = 1 << 3;
 
@@ -193,8 +199,7 @@ impl IrqCounter {
             size: PERF_ATTR_SIZE_VER0,
             config,
             read_format: PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING,
-            // Not disabled, kernel and hypervisor not excluded, pinned.
-            flags: ATTR_FLAG_PINNED,
+            flags: COUNTER_FLAGS,
             ..Default::default()
         };
         // SAFETY: `attr` is a valid PERF_ATTR_SIZE_VER0 structure that outlives
@@ -250,7 +255,7 @@ fn check_read(n: isize, [value, enabled, running]: [u64; 3]) -> Result<u64, Coun
 }
 
 /// One CPU's local-timer count and its column total in `/proc/interrupts`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CpuInterrupts {
     pub local_timer: u64,
     pub total: u64,
@@ -299,15 +304,20 @@ pub fn interrupts_of(text: &str, cpu: usize) -> Result<CpuInterrupts, CounterRef
     })
 }
 
-/// The fewest local-timer interrupts a calibration spin must see. A tickless
-/// (`nohz_full`) CPU sees almost none, and there the binding says nothing.
-pub const MIN_CALIBRATION_TICKS: u64 = 50;
+/// The fewest local-timer interrupts a calibration must see, summed over its
+/// clean spins. [`CALIBRATION_SLACK`] is absolute, so this floor is what keeps
+/// the binding tight: at 190 interrupts the counter must see at least 180 of
+/// them, about 95%, when the reads around the spins take no time. (A single
+/// 70 ms spin sees about 70, where the slack alone would admit about 86%.) A
+/// tickless (`nohz_full`) CPU sees almost none, and there the binding says
+/// nothing.
+pub const MIN_CALIBRATION_TICKS: u64 = 190;
 /// A fixed allowance on top of the proportional one in [`calibration_verdict`].
 pub const CALIBRATION_SLACK: u64 = 10;
 
-/// Whether one calibration spin binds the counter to the kernel's count: the
-/// counter must see at least this CPU's local-timer interrupts and no more than
-/// all of its interrupts.
+/// Whether a calibration binds the counter to the kernel's count: over its
+/// clean spins, summed, the counter must see at least this CPU's local-timer
+/// interrupts and no more than all of its interrupts.
 ///
 /// The `/proc/interrupts` reads around the spin lie outside the counter's
 /// interval, and reading the file takes milliseconds on a large machine, so
@@ -324,8 +334,8 @@ pub fn calibration_verdict(
         (kernel.total as f64 * outside.clamp(0.0, 1.0)).ceil() as u64 + CALIBRATION_SLACK;
     if kernel.local_timer < MIN_CALIBRATION_TICKS {
         return Err(format!(
-            "only {} local-timer interrupts during the spin (need {MIN_CALIBRATION_TICKS}); \
-             a tickless CPU cannot bind the counter",
+            "only {} local-timer interrupts during the calibration (need \
+             {MIN_CALIBRATION_TICKS}); a tickless CPU cannot bind the counter",
             kernel.local_timer
         ));
     }
@@ -482,5 +492,42 @@ mod tests {
             .is_err(),
             "tickless CPU"
         );
+    }
+
+    /// The counter is pinned and counts only the calling thread: bit 2 of the
+    /// flag word is `pinned` and bit 1 is `inherit` in `perf_event_attr`'s
+    /// bitfield order (`disabled`, `inherit`, `pinned`, `exclusive`, ...).
+    #[test]
+    fn the_counter_is_pinned_enabled_and_not_inherited() {
+        assert_eq!(
+            (ATTR_FLAG_DISABLED, ATTR_FLAG_INHERIT, ATTR_FLAG_PINNED),
+            (1, 2, 4)
+        );
+        assert_eq!(COUNTER_FLAGS & ATTR_FLAG_PINNED, ATTR_FLAG_PINNED);
+        assert_eq!(COUNTER_FLAGS & (ATTR_FLAG_INHERIT | ATTR_FLAG_DISABLED), 0);
+        // Bits 4-9 clear: no exclude_* bit (4-7), so user, kernel, hypervisor
+        // and idle all count, and no mmap or comm records (8-9).
+        assert_eq!(COUNTER_FLAGS & (0x3f << 4), 0);
+    }
+
+    /// The tightest the binding is, pinned: at the 190-interrupt floor with no
+    /// time outside the counter, 180 passes and 179 does not. And one short
+    /// spin cannot pass on its own, however its counts line up: a 70 ms spin
+    /// measured counter 72, LOC 73, total 74 with 4.7% outside, where the slack
+    /// alone would admit a counter of 59 (81%).
+    #[test]
+    fn calibration_needs_about_95_percent_of_the_timer_interrupts() {
+        let floor = CpuInterrupts {
+            local_timer: MIN_CALIBRATION_TICKS,
+            total: MIN_CALIBRATION_TICKS,
+        };
+        assert_eq!(calibration_verdict(180, floor, 0.0), Ok(()));
+        assert!(calibration_verdict(179, floor, 0.0).is_err());
+        let one_short_spin = CpuInterrupts {
+            local_timer: 73,
+            total: 74,
+        };
+        assert!(calibration_verdict(72, one_short_spin, 0.047).is_err());
+        assert!(calibration_verdict(59, one_short_spin, 0.047).is_err());
     }
 }

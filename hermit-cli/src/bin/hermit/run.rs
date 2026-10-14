@@ -5320,6 +5320,7 @@ impl RunOpts {
             virtualize_cpuid: config.virtualize_cpuid,
             strace_only: self.strace_only,
             gdbserver: config.gdbserver,
+            namespace_only: self.namespace_only,
         };
         match hermit::cpu_profile_admission::admit(&request) {
             Ok((probe, host)) => {
@@ -8905,6 +8906,8 @@ impl RunOpts {
     ///   specification, so `run` hands the scheduler none.
     /// - `--verify-run`: only `main` dispatches to `verify_run()`.
     /// - `--backend-engagement-json`: only `main` writes it.
+    /// - `--cpu-profile x86-64-v3`: only `main` runs the host qualification
+    ///   and admits the profile (<https://github.com/rrnewton/hermit/issues/4243>).
     ///
     /// `--skid-margin` is not listed: `hermit analyze` and `hermit bisect`
     /// install it for their trials themselves (`install_pmu_config`).
@@ -8912,6 +8915,11 @@ impl RunOpts {
         [
             (self.namespace_only, "--namespace-only"),
             (self.verify, "--verify"),
+            // Only `main` runs the host qualification the profile admits with.
+            (
+                !self.det_opts.det_config.cpu_profile.is_default(),
+                "--cpu-profile x86-64-v3",
+            ),
             (self.verify_run.is_some(), "--verify-run"),
             (self.happens_before.is_some(), "--happens-before"),
             (

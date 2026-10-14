@@ -14,8 +14,12 @@
 // under v3 it also executes one instruction of each new feature, compares
 // XGETBV with leaf 0xD, writes an XSAVE area of exactly the advertised size
 // between guard bytes, and compares Linux's xstate queries with leaf 0xD.
+// One line under v3 does carry a host value: XSTATE_BV as the guest's first
+// XSAVE finds it, so that two runs on one host compared at bitwise parity
+// show the same in-use components.
 
 #include <cpuid.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -91,11 +95,26 @@ static long arch_prctl_u64(int cmd, uint64_t* out) {
   return syscall(SYS_arch_prctl, cmd, out);
 }
 
+// XSTATE_BV from an XSAVE of every XCR0 component, before anything else in
+// main touches vector state. Valid only under v3 (OSXSAVE).
+static uint64_t xstate_bv_now(void) {
+  static unsigned char area[16384] __attribute__((aligned(64)));
+  uint64_t xcr0 = xgetbv0();
+  __asm__ volatile("xsave (%0)"
+                   :
+                   : "r"(area), "a"((uint32_t)xcr0), "d"((uint32_t)(xcr0 >> 32))
+                   : "memory");
+  uint64_t bv;
+  memcpy(&bv, area + 512, sizeof bv);
+  return bv;
+}
+
 int main(void) {
   unsigned r[4];
   leaf(1, 0, r);
   unsigned ecx1 = r[2];
   int v3 = (ecx1 >> 27) & 1; // OSXSAVE: the profile's XSAVE support
+  uint64_t start_bv = v3 ? xstate_bv_now() : 0;
   printf("%s\n", v3 ? "v3" : "v2");
 
   leaf(7, 0, r);
@@ -107,6 +126,7 @@ int main(void) {
     return failures ? 1 : 0;
   }
 
+  printf("xstate_bv 0x%llx at start: ok\n", (unsigned long long)start_bv);
   check(
       "fma movbe xsave osxsave avx f16c advertised",
       ((ecx1 >> 12) & 1) && ((ecx1 >> 22) & 1) && ((ecx1 >> 26) & 1) &&
@@ -158,8 +178,14 @@ int main(void) {
           arch_prctl_u64(ARCH_GET_XCOMP_PERM, &perm) == 0 &&
           arch_prctl_u64(ARCH_GET_XCOMP_GUEST_PERM, &guest) == 0);
   check("xcomp perm covers xcr0", (perm & xcr0) == xcr0);
+  errno = 0;
   long req = syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, 63);
-  check("xcomp request beyond the last feature is refused", req == -1);
+  check("xcomp request beyond the last feature is EINVAL", req == -1 && errno == EINVAL);
+  errno = 0;
+  req = syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, 0);
+  check(
+      "xcomp request for a static feature is EOPNOTSUPP",
+      req == -1 && errno == EOPNOTSUPP);
 
   return failures ? 1 : 0;
 }

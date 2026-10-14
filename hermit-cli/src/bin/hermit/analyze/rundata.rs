@@ -1062,6 +1062,10 @@ mod tests {
                 &["--verify", "--happens-before=hb.txt"][..],
                 &["--verify", "--happens-before"][..],
             ),
+            (
+                &["--cpu-profile", "x86-64-v3"][..],
+                &["--cpu-profile x86-64-v3"][..],
+            ),
         ] {
             let mut argv = vec!["hermit", "analyze", "--"];
             argv.extend(run_args);

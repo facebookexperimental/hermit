@@ -173,8 +173,9 @@ fn qualify_cpu_profile(profile: CpuProfile) -> Result<ExitStatus, Error> {
         )?;
         return Ok(ExitStatus::Exited(0));
     }
-    match hermit::xstate_probe::qualify(hermit::xstate_probe::ProbeOptions::default()) {
-        Ok(report) => {
+    // The whole host qualification a v3 run admits with, not the probe alone.
+    match hermit::cpu_profile_admission::qualify_host() {
+        Ok((report, _host)) => {
             writeln!(
                 stdout,
                 "{profile}: QUALIFIED — XINUSE probe on CPU {}: XCR0 {:#x}, {} cases, {} cells, \

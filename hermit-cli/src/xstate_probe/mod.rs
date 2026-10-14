@@ -36,6 +36,8 @@
 pub mod asm;
 pub mod irq_counter;
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicI32;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
@@ -114,6 +116,27 @@ pub fn check_xcr0(xcr0: u64) -> Result<(), ProbeRefusal> {
         ));
     }
     Ok(())
+}
+
+/// Whether the probe may run RDPKRU and WRPKRU: exactly when XCR0 enables the
+/// PKRU component and the kernel enables protection keys (CPUID.7.0:ECX.OSPKE,
+/// from CR4.PKE); either instruction raises #UD without the latter. A host
+/// whose XCR0 has PKRU but whose kernel does not enable it is refused, since
+/// the PKRU cases could not run there.
+pub fn pkru_usable(xcr0: u64, ospke: bool) -> Result<bool, ProbeRefusal> {
+    let component = xcr0 & (1 << PKRU_COMPONENT) != 0;
+    if component && !ospke {
+        return Err(format!(
+            "XCR0 {xcr0:#x} enables PKRU but the kernel has not enabled protection keys \
+             (OSPKE is clear)"
+        ));
+    }
+    Ok(component)
+}
+
+/// CPUID.7.0:ECX.OSPKE on this CPU.
+fn native_ospke() -> bool {
+    std::arch::x86_64::__cpuid_count(7, 0).ecx & (1 << 4) != 0
 }
 
 /// The closed case list for an admitted XCR0 (condition C6): every case whose
@@ -558,6 +581,37 @@ fn current_cpu() -> Result<usize, ProbeRefusal> {
     usize::try_from(cpu).map_err(|_| "sched_getcpu failed".to_owned())
 }
 
+/// Waits until the peer thread has published its tid. A peer that ended
+/// before that (it could not pin itself, say) is joined and refused, so that
+/// the probe never waits for replies from a thread that is gone.
+fn await_peer_start(
+    tid: &AtomicU64,
+    handle: std::thread::JoinHandle<Result<u32, ProbeRefusal>>,
+) -> Result<std::thread::JoinHandle<Result<u32, ProbeRefusal>>, ProbeRefusal> {
+    while tid.load(Ordering::SeqCst) == 0 && !handle.is_finished() {
+        std::thread::yield_now();
+    }
+    if tid.load(Ordering::SeqCst) != 0 {
+        return Ok(handle);
+    }
+    let ended = handle
+        .join()
+        .map_err(|_| "the peer thread panicked".to_owned())?;
+    Err(match ended {
+        Err(why) => format!("the peer thread did not start: {why}"),
+        Ok(status) => format!("the peer thread ended at once: {status}"),
+    })
+}
+
+/// Closes the peer's reply descriptor, at most once.
+fn close_peer_reply(fd: &AtomicI32) {
+    let fd = fd.swap(-1, Ordering::SeqCst);
+    if fd >= 0 {
+        // SAFETY: the swap hands the descriptor to exactly one closer.
+        unsafe { libc::close(fd) };
+    }
+}
+
 fn minimum(samples: usize, f: impl Fn() -> u64) -> u64 {
     (0..samples).map(|_| f()).min().unwrap_or(u64::MAX)
 }
@@ -573,6 +627,12 @@ struct Probe {
     ones: Box<Area>,
     to_peer: [i32; 2],
     from_peer: [i32; 2],
+    /// The write end of `from_peer`, which the peer closes when its loop fails,
+    /// so that a probe arm waiting for a reply reads end-of-file instead of
+    /// blocking; -1 once closed.
+    peer_reply_fd: Arc<AtomicI32>,
+    /// Whether RDPKRU and WRPKRU may run (see [`pkru_usable`]).
+    pkru: bool,
     peer: Box<PeerCtx>,
     tgid: i32,
     tid: i32,
@@ -587,6 +647,7 @@ impl Probe {
         let cpu = probe_cpu()?;
         pin_to(cpu)?;
         let layout = Layout::host()?;
+        let pkru = pkru_usable(layout.xcr0, native_ospke())?;
         let cases = case_list(layout.xcr0)?;
         if cases.len() != expected_case_count(layout.xcr0) {
             return Err(format!(
@@ -654,7 +715,8 @@ impl Probe {
             rounds: 0,
             byte: 0,
             reply: 0,
-            _pad: [0; 2],
+            pkru: u8::from(pkru),
+            _pad: 0,
             cpu_out: 0,
             saved_pkru: 0,
             saved_mxcsr: 0,
@@ -686,6 +748,8 @@ impl Probe {
             ones,
             to_peer,
             from_peer,
+            peer_reply_fd: Arc::new(AtomicI32::new(from_peer[1])),
+            pkru,
             peer,
             tgid,
             tid,
@@ -707,7 +771,8 @@ impl Probe {
             probe.report.retried_reloads,
             probe.report.retried_exits
         );
-        for fd in to_peer.into_iter().chain(from_peer) {
+        close_peer_reply(&probe.peer_reply_fd);
+        for fd in to_peer.into_iter().chain([from_peer[0]]) {
             // SAFETY: these descriptors were created above and are not used again.
             unsafe { libc::close(fd) };
         }
@@ -723,6 +788,7 @@ impl Probe {
         let peer = &mut *self.peer as *mut PeerCtx as usize;
         let tid_slot = std::sync::Arc::new(AtomicU64::new(0));
         let tid_out = tid_slot.clone();
+        let reply_fd = self.peer_reply_fd.clone();
         let handle = std::thread::Builder::new()
             .name("xinuse-peer".into())
             .spawn(move || -> Result<u32, ProbeRefusal> {
@@ -735,12 +801,17 @@ impl Probe {
                 // blocked in its handshake read.
                 unsafe { (*peer).tid = tid };
                 tid_out.store(tid as u64, Ordering::SeqCst);
-                Ok(unsafe { asm::hermit_xinuse_peer_loop(peer) })
+                // SAFETY: as above.
+                let status = unsafe { asm::hermit_xinuse_peer_loop(peer) };
+                if ArmStatus::from_raw(status) != Some(ArmStatus::Ok) {
+                    // A probe arm may be waiting for this peer's reply: close
+                    // the only write end so that its read ends.
+                    close_peer_reply(&reply_fd);
+                }
+                Ok(status)
             })
             .map_err(|e| format!("cannot start the peer thread: {e}"))?;
-        while tid_slot.load(Ordering::SeqCst) == 0 && !handle.is_finished() {
-            std::thread::yield_now();
-        }
+        let handle = await_peer_start(&tid_slot, handle)?;
         let result = f(self);
         let exit = [asm::PEER_EXIT];
         // SAFETY: writes one byte from a live buffer to our pipe.
@@ -871,7 +942,8 @@ impl Probe {
                 cpuid_cycles: 0,
                 seq: self.seq,
                 reply: 0,
-                _pad: [0; 2],
+                pkru: u8::from(self.pkru),
+                _pad: 0,
                 status: 0,
                 saved_pkru: 0,
                 saved_mxcsr: 0,
@@ -1100,24 +1172,28 @@ enum CalibrationFailure {
     Refused(ProbeRefusal),
 }
 
-/// Condition C11's binding calibration: over a spin with no context switch or
-/// fault, the counter sees at least this CPU's local-timer interrupts and no
-/// more than all of them.
+/// Condition C11's binding calibration: over spins with no context switch or
+/// fault, summed, the counter sees at least this CPU's local-timer interrupts
+/// and no more than all of them.
 ///
-/// On a busy machine a spin is often preempted, by per-CPU kernel work if
+/// On a busy machine a long spin is often preempted, by per-CPU kernel work if
 /// nothing else, and a preempted spin says nothing. So each spin is short,
 /// [`CALIBRATION_SPIN`] at first, and starts after a short sleep, which lets
-/// pending work on the CPU run first; up to [`CALIBRATION_ATTEMPTS`] spins are
-/// tried. A clean spin that saw fewer than
-/// [`irq_counter::MIN_CALIBRATION_TICKS`] local-timer interrupts (a host with a
-/// lower timer frequency) is repeated at twice the length, up to
-/// [`CALIBRATION_SPIN_MAX`]; past that, the verdict refuses it as tickless.
+/// pending work on the CPU run first. The clean spins' counts are summed until
+/// they hold [`irq_counter::MIN_CALIBRATION_TICKS`] local-timer interrupts, and
+/// the verdict judges the sums, so its absolute slack is as tight a share as
+/// one long spin's was. Up to [`CALIBRATION_ATTEMPTS`] spins are tried. A clean
+/// spin that saw fewer than [`SHORT_SPIN_TICKS`] interrupts (a host with a
+/// lower timer frequency) makes the next spins twice as long, up to
+/// [`CALIBRATION_SPIN_MAX`]; a tickless CPU never reaches the floor and is
+/// refused.
 fn calibrate(counter: &IrqCounter, cpu: usize) -> Result<String, CalibrationFailure> {
     let refused = |e: irq_counter::CounterRefusal| CalibrationFailure::Refused(e.to_string());
     let lost = CalibrationFailure::CounterLost;
     let mut spin = CALIBRATION_SPIN;
     let mut lost_spins = Switches::default();
-    let (mut switched, mut slow_reads) = (0, 0);
+    let (mut switched, mut slow_reads, mut clean) = (0, 0, 0);
+    let mut sum = CalibrationSum::default();
     for _attempt in 0..CALIBRATION_ATTEMPTS {
         std::thread::sleep(CALIBRATION_PAUSE);
         // SAFETY: RDTSC is available on every x86_64 processor.
@@ -1154,40 +1230,82 @@ fn calibrate(counter: &IrqCounter, cpu: usize) -> Result<String, CalibrationFail
             local_timer: after.local_timer - before.local_timer,
             total: after.total - before.total,
         };
-        if kernel.local_timer < irq_counter::MIN_CALIBRATION_TICKS && spin < CALIBRATION_SPIN_MAX {
+        clean += 1;
+        sum.add(end_count - start_count, kernel, outside);
+        if kernel.local_timer < SHORT_SPIN_TICKS {
             spin = (spin * 2).min(CALIBRATION_SPIN_MAX);
+        }
+        if sum.kernel.local_timer < irq_counter::MIN_CALIBRATION_TICKS {
             continue;
         }
-        let count = end_count - start_count;
-        irq_counter::calibration_verdict(count, kernel, outside).map_err(|why| {
+        let outside = sum.outside();
+        irq_counter::calibration_verdict(sum.counter, sum.kernel, outside).map_err(|why| {
             CalibrationFailure::Refused(irq_counter::CounterRefusal::Calibration(why).to_string())
         })?;
         return Ok(format!(
-            "counter {count}, local timer {}, CPU total {} over a {} ms spin \
+            "counter {}, local timer {}, CPU total {} over {clean} clean spins \
              ({:.1}% of the interval outside the counter)",
-            kernel.local_timer,
-            kernel.total,
-            spin.as_millis(),
+            sum.counter,
+            sum.kernel.local_timer,
+            sum.kernel.total,
             outside * 100.0
         ));
     }
     Err(CalibrationFailure::Refused(format!(
-        "no interrupt-counter calibration spin on CPU {cpu} was usable in \
-         {CALIBRATION_ATTEMPTS} attempts: {switched} were switched out or faulted \
-         ({} involuntary and {} voluntary context switches and {} page faults in all), \
-         {slow_reads} spent over 30% of their interval reading /proc/interrupts",
-        lost_spins.involuntary, lost_spins.voluntary, lost_spins.faults
+        "the interrupt-counter calibration on CPU {cpu} did not finish in \
+         {CALIBRATION_ATTEMPTS} spins: {clean} clean spins saw {} local-timer interrupts \
+         (need {}), {switched} were switched out or faulted ({} involuntary and {} \
+         voluntary context switches and {} page faults in all), and {slow_reads} spent \
+         over 30% of their interval reading /proc/interrupts",
+        sum.kernel.local_timer,
+        irq_counter::MIN_CALIBRATION_TICKS,
+        lost_spins.involuntary,
+        lost_spins.voluntary,
+        lost_spins.faults
     )))
+}
+
+/// The clean calibration spins' counts, summed.
+#[derive(Clone, Copy, Debug, Default)]
+struct CalibrationSum {
+    counter: u64,
+    kernel: irq_counter::CpuInterrupts,
+    /// The kernel's interrupts during the reads around each spin, estimated
+    /// as that spin's total times its share of time outside the counter.
+    outside_interrupts: f64,
+}
+
+impl CalibrationSum {
+    fn add(&mut self, counter: u64, kernel: irq_counter::CpuInterrupts, outside: f64) {
+        self.counter += counter;
+        self.kernel.local_timer += kernel.local_timer;
+        self.kernel.total += kernel.total;
+        self.outside_interrupts += kernel.total as f64 * outside;
+    }
+
+    /// The share of the summed interval the counter did not cover, weighted by
+    /// each spin's interrupts, for [`irq_counter::calibration_verdict`].
+    fn outside(&self) -> f64 {
+        if self.kernel.total == 0 {
+            0.0
+        } else {
+            self.outside_interrupts / self.kernel.total as f64
+        }
+    }
 }
 
 /// How long a calibration spin lasts at first: about 70 local-timer
 /// interrupts at 1000 Hz.
 const CALIBRATION_SPIN: std::time::Duration = std::time::Duration::from_millis(70);
 /// The longest a calibration spin may grow to on a host with a lower timer
-/// frequency: 50 interrupts at 100 Hz, plus a margin.
+/// frequency: 56 interrupts at 100 Hz.
 const CALIBRATION_SPIN_MAX: std::time::Duration = std::time::Duration::from_millis(560);
-/// How many calibration spins are tried.
-const CALIBRATION_ATTEMPTS: usize = 60;
+/// A clean spin with fewer local-timer interrupts than this doubles the next
+/// spins' length.
+const SHORT_SPIN_TICKS: u64 = 30;
+/// How many calibration spins are tried. At 1000 Hz three clean spins reach the
+/// floor.
+const CALIBRATION_ATTEMPTS: usize = 100;
 /// The sleep before each calibration spin.
 const CALIBRATION_PAUSE: std::time::Duration = std::time::Duration::from_millis(2);
 
@@ -1236,6 +1354,117 @@ impl Switches {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PKRU instructions run only with both the XCR0 component and OSPKE; the
+    /// subsets without PKRU (C6) run with neither, and a host with the
+    /// component but without OSPKE is refused.
+    #[test]
+    fn pkru_instructions_need_the_component_and_ospke() {
+        assert_eq!(pkru_usable(0x2e7, true), Ok(true));
+        assert_eq!(pkru_usable(0xe7, true), Ok(false));
+        assert_eq!(pkru_usable(0xe7, false), Ok(false));
+        assert_eq!(pkru_usable(0x7, false), Ok(false));
+        assert!(pkru_usable(0x2e7, false).unwrap_err().contains("OSPKE"));
+        assert!(pkru_usable(0x207, false).is_err());
+    }
+
+    /// The arm's PKRU guards in the assembly, both ways: with the flag clear it
+    /// runs neither RDPKRU nor WRPKRU (and reports PKRU 0), which is how a host
+    /// without protection keys runs the subset cases; with it set (where this
+    /// host has OSPKE) it sets the probe's PKRU and restores the caller's.
+    #[test]
+    fn an_arm_runs_with_and_without_pkru_instructions() {
+        if std::arch::x86_64::__cpuid(1).ecx & (1 << 27) == 0 {
+            return; // no OSXSAVE: not an x86-64-v3 host
+        }
+        // SAFETY: OSXSAVE is set.
+        let xcr0 = unsafe { std::arch::x86_64::_xgetbv(0) };
+        let ospke = native_ospke();
+        for pkru in [false, true] {
+            if pkru && !ospke {
+                continue;
+            }
+            let mut save = Area::boxed();
+            let image = Area::boxed();
+            let mut ones = Area::boxed();
+            ones.0[..64].fill(0xa5);
+            let mut ctx = ArmCtx {
+                kind: Kind::Vzeroupper as u32,
+                component: 0,
+                mxcsr: 0x1f80,
+                mode: Mode::Reference as u32,
+                xcr0,
+                save_area: save.0.as_mut_ptr(),
+                image: image.0.as_ptr(),
+                fd_to_peer: -1,
+                fd_from_peer: -1,
+                tgid: 0,
+                tid: 0,
+                ones: ones.0.as_ptr(),
+                pkru_out: 0xdead,
+                avx512: (xcr0 & AVX512_COMPONENTS != 0) as u32,
+                cpuid_cycles: 0,
+                seq: 0,
+                reply: 0,
+                pkru: u8::from(pkru),
+                _pad: 0,
+                status: 0,
+                saved_pkru: 0,
+                saved_mxcsr: 0,
+            };
+            // SAFETY: the context and its buffers outlive the call; Reference
+            // mode uses no descriptor.
+            let status = unsafe { asm::hermit_xinuse_arm(&mut ctx) };
+            assert_eq!(
+                ArmStatus::from_raw(status),
+                Some(ArmStatus::Ok),
+                "pkru {pkru}"
+            );
+            assert_eq!(
+                ctx.pkru_out,
+                if pkru { 0x5555_5554 } else { 0 },
+                "pkru {pkru}"
+            );
+        }
+    }
+
+    /// A peer that fails before it serves a handshake is refused, not waited
+    /// on.
+    #[test]
+    fn a_peer_that_cannot_start_is_refused() {
+        let tid = AtomicU64::new(0);
+        let handle = std::thread::spawn(|| -> Result<u32, ProbeRefusal> {
+            Err("cannot pin the probe to CPU 7: Invalid argument".into())
+        });
+        let refusal = await_peer_start(&tid, handle).unwrap_err();
+        assert!(refusal.contains("did not start"), "{refusal}");
+        assert!(refusal.contains("cannot pin"), "{refusal}");
+    }
+
+    /// When a failed peer closes its reply descriptor, an arm blocked reading
+    /// a reply sees end-of-file instead of waiting forever; and the
+    /// descriptor is closed only once.
+    #[test]
+    fn a_failed_peer_ends_a_pending_reply_read() {
+        let mut fds = [0i32; 2];
+        // SAFETY: `fds` has room for the two descriptors.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let reply = Arc::new(AtomicI32::new(fds[1]));
+        let peer = reply.clone();
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            close_peer_reply(&peer);
+        });
+        let mut byte = [0u8; 1];
+        // SAFETY: reads at most one byte into a live buffer.
+        let read = unsafe { libc::read(fds[0], byte.as_mut_ptr().cast(), 1) };
+        closer.join().unwrap();
+        assert_eq!(read, 0);
+        close_peer_reply(&reply);
+        assert_eq!(reply.load(Ordering::SeqCst), -1);
+        // SAFETY: the read end was created above and is not used again.
+        unsafe { libc::close(fds[0]) };
+    }
 
     /// A /proc/stat text whose cpuN lines have the given (busy, idle) jiffies.
     fn proc_stat(cpus: &[(usize, u64, u64)]) -> String {

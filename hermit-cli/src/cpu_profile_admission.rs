@@ -43,6 +43,7 @@ pub fn record_or_replay_request(gdbserver: bool) -> AdmissionRequest<'static> {
         virtualize_cpuid: true,
         strace_only: false,
         gdbserver,
+        namespace_only: false,
     }
 }
 
@@ -87,6 +88,8 @@ pub struct AdmissionRequest<'a> {
     pub virtualize_cpuid: bool,
     pub strace_only: bool,
     pub gdbserver: bool,
+    /// `--namespace-only`, which runs the guest with no Detcore at all.
+    pub namespace_only: bool,
 }
 
 /// The refusals that need no host probe, in the order they are checked.
@@ -104,6 +107,11 @@ pub fn check_request(request: &AdmissionRequest<'_>) -> Result<(), AdmissionRefu
             _ => "only the ptrace backend is qualified",
         };
         return Err(format!("--backend={}: {why}", request.backend));
+    }
+    if request.namespace_only {
+        return Err(
+            "--namespace-only runs the guest without Detcore, so nothing answers its CPUID".into(),
+        );
     }
     if !request.virtualize_cpuid || request.strace_only {
         return Err(
@@ -291,13 +299,7 @@ fn host_facts(probe_cases: u32, probe_forced_exit: bool) -> Result<HostXstate, A
         }
     }
     let xcomp_supp = arch_prctl_mask(ARCH_GET_XCOMP_SUPP)?;
-    if (xcomp_supp | xcr0) & XFEATURE_TILEDATA != 0 {
-        return Err(
-            "the host has a user-dynamic xstate feature (AMX TILEDATA), whose permission \
-             requests change process state"
-                .into(),
-        );
-    }
+    refuse_dynamic_features(xcr0, xcomp_supp)?;
     Ok(HostXstate {
         vendor: [leaf0[1], leaf0[3], leaf0[2]],
         signature: host.cpuid(1, 0)[0],
@@ -382,6 +384,8 @@ fn admit_with(
             ADMITTED.get_or_init(|| qualified).clone()
         }
     };
+    // Detcore refuses a v3 guest whose host facts this process did not admit.
+    detcore::admit_cpu_profile_host(&admitted.1);
     // The qualification covers the XSTATE_BV a guest's own instructions
     // produce. A tracer write of its floating-point registers (PTRACE_SETFPREGS
     // or PTRACE_SETREGSET NT_X86_XSTATE) sets that header from the tracer's
@@ -392,8 +396,10 @@ fn admit_with(
     Ok(admitted)
 }
 
-/// The host half of [`admit`], run once per process.
-fn qualify_host() -> Result<(xstate_probe::ProbeReport, HostXstate), AdmissionRefusal> {
+/// The host half of [`admit`], run once per process: the kernel, the
+/// every-bit CPUID check, the dynamic-feature refusal, the probe and the host
+/// facts. `hermit host-capabilities --cpu-profile x86-64-v3` runs it alone.
+pub fn qualify_host() -> Result<(xstate_probe::ProbeReport, HostXstate), AdmissionRefusal> {
     let release = nix::sys::utsname::uname()
         .map_err(|e| format!("uname failed: {e}"))?
         .release()
@@ -403,17 +409,44 @@ fn qualify_host() -> Result<(xstate_probe::ProbeReport, HostXstate), AdmissionRe
     check_host_cpuid(&NativeCpuid, &detcore::v3_feature_words())?;
     // SAFETY: OSXSAVE was checked above.
     let xcr0 = unsafe { std::arch::x86_64::_xgetbv(0) };
-    if xcr0 & XFEATURE_TILEDATA != 0 {
-        return Err("the host enables a user-dynamic xstate feature (AMX TILEDATA) in XCR0".into());
-    }
+    refuse_dynamic_features(xcr0, 0)?;
     let probe = xstate_probe::qualify(xstate_probe::ProbeOptions::default())?;
     let host = capture(&probe)?;
     Ok((probe, host))
 }
 
+/// Refuses a host with a user-dynamic xstate feature (AMX TILEDATA, bit 18) in
+/// XCR0 or in ARCH_GET_XCOMP_SUPP: a guest's permission request for it changes
+/// process state, which the profile cannot bind.
+fn refuse_dynamic_features(xcr0: u64, xcomp_supp: u64) -> Result<(), AdmissionRefusal> {
+    if (xcr0 | xcomp_supp) & XFEATURE_TILEDATA != 0 {
+        return Err(
+            "the host has a user-dynamic xstate feature (AMX TILEDATA), whose permission \
+             requests change process state"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+
+    /// A host with AMX TILEDATA in XCR0 or in the supported mask is refused by
+    /// name; one without it is not.
+    #[test]
+    fn a_dynamic_xstate_feature_is_refused() {
+        assert_eq!(super::refuse_dynamic_features(0x2e7, 0x2e7), Ok(()));
+        for (xcr0, supp) in [(0x602e7, 0x2e7), (0x2e7, 0x602e7), (0x402e7, 0x402e7)] {
+            assert!(
+                super::refuse_dynamic_features(xcr0, supp)
+                    .unwrap_err()
+                    .contains("AMX TILEDATA"),
+                "{xcr0:#x} {supp:#x}"
+            );
+        }
+    }
 
     use super::*;
 
@@ -424,6 +457,7 @@ mod tests {
             virtualize_cpuid: true,
             strace_only: false,
             gdbserver: false,
+            namespace_only: false,
         }
     }
 
@@ -459,6 +493,9 @@ mod tests {
         let mut r = request("ptrace");
         r.gdbserver = true;
         assert!(check_request(&r).unwrap_err().contains("--gdbserver"));
+        let mut r = request("ptrace");
+        r.namespace_only = true;
+        assert!(check_request(&r).unwrap_err().contains("--namespace-only"));
     }
 
     /// An admitted v3 run refuses ptrace floating-point register writes, and

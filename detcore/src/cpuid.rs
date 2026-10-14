@@ -938,6 +938,33 @@ mod tests {
         }
     }
 
+    /// A v3 configuration runs only with the very host facts this process's
+    /// admission recorded: none, unadmitted, or different facts are refused.
+    /// Nothing else in this test binary admits, so the record starts empty.
+    #[test]
+    fn a_v3_configuration_runs_only_with_the_admitted_host_facts() {
+        use crate::cpu_profile_admission_refusal as refusal;
+        let v2 = crate::Config::default();
+        assert_eq!(refusal(&v2), None);
+        let mut v3 = crate::Config {
+            cpu_profile: CpuProfile::X86_64V3,
+            ..Default::default()
+        };
+        assert!(refusal(&v3).unwrap().contains("no qualified host facts"));
+        v3.cpu_profile_host = Some(epyc_9d85());
+        assert!(refusal(&v3).unwrap().contains("did not qualify"));
+        crate::admit_cpu_profile_host(&epyc_9d85());
+        assert_eq!(refusal(&v3), None);
+        let mut other = epyc_9d85();
+        other.probe_cases = 0;
+        v3.cpu_profile_host = Some(other);
+        assert!(
+            refusal(&v3)
+                .unwrap()
+                .contains("not the ones this process qualified")
+        );
+    }
+
     /// The host facts of an AMD EPYC 9D85 (XCR0 0x2e7, Linux 7.1.3), as the
     /// CLI captures them.
     fn epyc_9d85() -> HostXstate {

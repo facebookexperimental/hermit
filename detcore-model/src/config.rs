@@ -1192,6 +1192,9 @@ impl fmt::Display for Config {
         if !self.virtualize_cpuid {
             write!(f, " --no-virtualize-cpuid")?;
         }
+        if !self.cpu_profile.is_default() {
+            write!(f, " --cpu-profile={}", self.cpu_profile)?;
+        }
         if !self.virtualize_metadata {
             write!(f, " --no-virtualize-metadata")?;
         }

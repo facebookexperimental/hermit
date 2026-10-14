@@ -418,6 +418,37 @@ pub fn v3_feature_words() -> Vec<(u32, u32, usize, u32)> {
     cpuid::v3_feature_words()
 }
 
+/// The host xstate facts this process's x86-64-v3 admission bound
+/// (<https://github.com/rrnewton/hermit/issues/4243>). A v3 guest runs only
+/// when its configuration carries exactly these facts, so a caller cannot
+/// substitute facts of its own for the qualification, and the admission that
+/// set them has also forbidden ptrace floating-point register writes.
+static ADMITTED_CPU_PROFILE_HOST: std::sync::OnceLock<detcore_model::cpu_profile::HostXstate> =
+    std::sync::OnceLock::new();
+
+/// Records the host facts a successful x86-64-v3 admission bound. Only
+/// Hermit's admission calls this, after the host qualified; a later call with
+/// other facts does not replace them.
+pub fn admit_cpu_profile_host(host: &detcore_model::cpu_profile::HostXstate) {
+    let _ = ADMITTED_CPU_PROFILE_HOST.set(host.clone());
+}
+
+/// Why a v3 configuration may not run here, or `None` when its host facts are
+/// the ones this process admitted.
+pub fn cpu_profile_admission_refusal(cfg: &Config) -> Option<&'static str> {
+    if cfg.cpu_profile.is_default() {
+        return None;
+    }
+    match (&cfg.cpu_profile_host, ADMITTED_CPU_PROFILE_HOST.get()) {
+        (None, _) => Some("the configuration carries no qualified host facts"),
+        (Some(_), None) => Some("this process did not qualify the host"),
+        (Some(facts), Some(admitted)) if facts != admitted => {
+            Some("the configuration's host facts are not the ones this process qualified")
+        }
+        _ => None,
+    }
+}
+
 /// The digest of the CPUID table and bound host xstate facts `cfg` selects,
 /// which a recording carries so that replay can refuse a different table
 /// (<https://github.com/rrnewton/hermit/issues/4243>).
@@ -2674,6 +2705,17 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         {
             let message = "--cpu-profile x86-64-v3 refused: CPUID faulting is not active for \
                            this image, so the guest would see the host's CPUID";
+            error!("{message}");
+            let _ = writeln!(crate::util::RetryingStderr, "{message}");
+            tool_global::unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
+                .await;
+        }
+        // Every launch path reaches this before the guest's first instruction:
+        // a v3 configuration that this process's admission did not produce
+        // (a library caller's own facts, a path that skipped the
+        // qualification) ends here, by name, with the policy-refusal status.
+        if let Some(why) = cpu_profile_admission_refusal(&self.cfg) {
+            let message = format!("--cpu-profile x86-64-v3 refused: {why}");
             error!("{message}");
             let _ = writeln!(crate::util::RetryingStderr, "{message}");
             tool_global::unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT)

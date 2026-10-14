@@ -172,6 +172,7 @@ static TIMER_EXEC_FLUSH_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LEADER_PTHREAD_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static THREAD_JOIN_AFTER_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUID_PROFILE_V3_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static CPUID_PROFILE_V3_LAZY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static NESTED_VFORK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_CHILD_WAITS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static GET_MEMPOLICY_ONE_NODE_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1341,6 +1342,109 @@ fn cpuid_profile_v3_guest() -> &'static Path {
         );
         guest
     })
+}
+
+/// The same guest linked with lazy binding (`-z lazy`), for the XSAVE in
+/// glibc's lazy-binding trampoline. Asserted to carry no BIND_NOW, NOW or
+/// DT_BIND_NOW, so that the test using it cannot pass without the trampoline.
+fn cpuid_profile_v3_lazy_guest() -> &'static Path {
+    CPUID_PROFILE_V3_LAZY_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("cpuid-profile-v3-lazy");
+        fs::create_dir_all(&build_root).expect("failed to create cpuid-profile-v3-lazy directory");
+        let guest = build_root.join("cpuid_profile_v3_lazy");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-Wl,-z,lazy"])
+            .arg(repository.join("tests/c/cpuid_profile_v3.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the lazily bound cpuid-profile-v3 guest");
+        assert!(
+            output.status.success(),
+            "lazily bound cpuid-profile-v3 guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert_lazily_bound(&guest);
+        guest
+    })
+}
+
+/// Panics unless the ELF file at `path` lets the dynamic loader bind lazily:
+/// it has PLT relocations (DT_PLTRELSZ nonzero, so a `-fno-plt` build cannot
+/// pass), and no DT_BIND_NOW, no DF_BIND_NOW in DT_FLAGS and no DF_1_NOW in
+/// DT_FLAGS_1.
+fn assert_lazily_bound(path: &Path) {
+    use object::read::elf::Dyn;
+    use object::read::elf::FileHeader;
+    let data = fs::read(path).expect("failed to read the guest");
+    let header = object::elf::FileHeader64::<object::Endianness>::parse(&*data)
+        .expect("the guest is not a 64-bit ELF file");
+    let endian = header.endian().expect("the guest's ELF endianness");
+    let sections = header
+        .sections(endian, &*data)
+        .expect("the guest's ELF section table");
+    let (dynamic, _) = sections
+        .dynamic(endian, &*data)
+        .expect("the guest's dynamic section")
+        .expect("the guest has no dynamic section");
+    let mut plt_relocations = 0;
+    for entry in dynamic {
+        let tag = entry.d_tag(endian);
+        let value = entry.d_val(endian);
+        if tag == object::elf::DT_PLTRELSZ {
+            plt_relocations = value;
+        }
+        assert!(
+            tag != object::elf::DT_BIND_NOW,
+            "{} has DT_BIND_NOW",
+            path.display()
+        );
+        assert!(
+            tag != object::elf::DT_FLAGS || value & object::elf::DF_BIND_NOW.0 == 0,
+            "{} has DF_BIND_NOW",
+            path.display()
+        );
+        assert!(
+            tag != object::elf::DT_FLAGS_1 || value & object::elf::DF_1_NOW.0 == 0,
+            "{} has DF_1_NOW",
+            path.display()
+        );
+    }
+    assert!(
+        plt_relocations > 0,
+        "{} has no PLT relocations",
+        path.display()
+    );
+}
+
+/// The lazy-binding check bites: the lazily bound guest passes it, and the
+/// same source linked `-z now` is refused.
+#[test]
+fn the_lazy_binding_check_refuses_a_bind_now_guest() {
+    assert_lazily_bound(cpuid_profile_v3_lazy_guest());
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build_root = process_build_root("cpuid-profile-v3-now");
+    fs::create_dir_all(&build_root).expect("failed to create cpuid-profile-v3-now directory");
+    let eager = build_root.join("cpuid_profile_v3_now");
+    let output = Command::new("cc")
+        .args(["-O0", "-Wl,-z,now"])
+        .arg(repository.join("tests/c/cpuid_profile_v3.c"))
+        .arg("-o")
+        .arg(&eager)
+        .output()
+        .expect("failed to compile the eagerly bound guest");
+    assert!(output.status.success(), "{output:?}");
+    let refused = std::panic::catch_unwind(|| assert_lazily_bound(&eager));
+    assert!(
+        refused.is_err(),
+        "a -z now guest passed the lazy-binding check"
+    );
 }
 
 /// Whether this host qualifies for `--cpu-profile x86-64-v3`, by
@@ -29779,11 +29883,16 @@ fn a_leader_pthread_exit_leaves_its_group_running_at_bitwise_parity() {
 #[test]
 fn cpu_profile_v3_refuses_backends_and_flags_it_cannot_qualify() {
     let guest = cpuid_profile_v3_guest().to_str().unwrap().to_owned();
-    let cases: [(&[&str], &[&str], &str); 4] = [
+    let cases: [(&[&str], &[&str], &str); 5] = [
         (&["--backend=kvm"], &[], "--backend=kvm"),
         (&["--backend=dbt"], &[], "no x86-64-v3 rows"),
         (&[], &["--gdbserver"], "--gdbserver"),
         (&[], &["--no-virtualize-cpuid"], "does not virtualize CPUID"),
+        (
+            &[],
+            &["--namespace-only"],
+            "--namespace-only runs the guest without Detcore",
+        ),
     ];
     for (global, run, reason) in cases {
         let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -29810,6 +29919,63 @@ fn cpu_profile_v3_refuses_backends_and_flags_it_cannot_qualify() {
         );
         assert!(stdout.is_empty(), "{args:?}: the guest ran: {stdout}");
     }
+}
+
+/// A library caller cannot run a v3 guest by supplying host facts of its own:
+/// this process never ran the qualification, so Detcore refuses the guest by
+/// name with the policy-refusal status before its first instruction, whatever
+/// the facts say. (`hermit run` qualifies first; the library does not.) The
+/// refusal ends the whole process, as the library's tracer runs in it, so the
+/// library call runs in a child of this test.
+#[test]
+fn cpu_profile_v3_library_run_with_unqualified_facts_is_refused() {
+    const CHILD: &str = "HERMIT_TEST_V3_LIBRARY_CHILD";
+    let guest = cpuid_profile_v3_guest();
+    if std::env::var_os(CHILD).is_some() {
+        let facts = detcore_model::cpu_profile::HostXstate {
+            vendor: [0x756e_6547, 0x4965_6e69, 0x6c65_746e],
+            signature: 0x0009_06ea,
+            xcr0: 0x2e7,
+            xsave_leaves: vec![[0, 0x2e7, 0x988, 0x988, 0]],
+            xcomp_supp: 0x2e7,
+            xcomp_perm: 0x2e7,
+            xcomp_guest_perm: 0x2e7,
+            xfeature_max: 20,
+            probe_cases: 0,
+            probe_forced_exit: false,
+        };
+        let config = hermit::DetConfig {
+            cpu_profile: detcore_model::cpu_profile::CpuProfile::X86_64V3,
+            cpu_profile_host: Some(facts),
+            max_timeslice: None,
+            ..Default::default()
+        };
+        let output =
+            hermit::run_with_output(reverie::process::Command::new(guest), config, false, &None);
+        panic!("the library run returned instead of refusing: {output:?}");
+    }
+    let child = Command::new(std::env::current_exe().expect("find the test binary"))
+        .args([
+            "--exact",
+            "cpu_profile_v3_library_run_with_unqualified_facts_is_refused",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run the library child");
+    let stdout = String::from_utf8_lossy(&child.stdout);
+    let stderr = String::from_utf8_lossy(&child.stderr);
+    assert_eq!(
+        child.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("--cpu-profile x86-64-v3 refused:"),
+        "stderr:\n{stderr}"
+    );
+    assert!(!stdout.contains("xcomp"), "the guest ran:\n{stdout}");
 }
 
 /// Under `--cpu-profile x86-64-v3` the guest sees the v3 CPU: every v3 feature
@@ -29870,7 +30036,7 @@ fn cpu_profile_v3_guest_sees_the_v3_cpu_at_bitwise_parity() {
         let checks: Vec<&str> = lines.collect();
         assert_eq!(
             checks.len(),
-            if profile == "x86-64-v2" { 2 } else { 19 },
+            if profile == "x86-64-v2" { 2 } else { 21 },
             "{stdout}"
         );
         assert!(
@@ -29893,30 +30059,37 @@ fn cpu_profile_v3_guest_sees_the_v3_cpu_at_bitwise_parity() {
 /// run with `--detlog-stack` hashes those stack bytes into the log, so two runs
 /// at bitwise parity show the XSAVE headers a host save and restore could have
 /// changed are the same (https://github.com/rrnewton/hermit/issues/4243). The
-/// guest is /bin/ls with lazy binding (LD_BIND_NOW unset) and preemption on.
+/// guest is the cpuid_profile_v3 guest linked with `-z lazy` and checked to
+/// carry no BIND_NOW flag, run with LD_BIND_NOW unset, so its PLT calls
+/// resolve through the trampoline. (A distribution's /bin/ls is typically
+/// linked BIND_NOW and never reaches it.)
 #[test]
 fn cpu_profile_v3_lazy_binding_xsave_is_identical_on_the_hashed_stack() {
+    let guest = cpuid_profile_v3_lazy_guest().to_str().unwrap().to_owned();
     let outcome = v3_run_or_refusal(|| {
         let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
         let verdict = directory.path().join("verify.json");
         let (status, log) = run_with_deadline(
-            hermit_command(&[
-                "--log=info",
-                "run",
-                "--strict",
-                "--verify",
-                "--verify-strict",
-                "--verify-json",
-                verdict.to_str().unwrap(),
-                "--detlog-stack",
-                "--cpu-profile",
-                "x86-64-v3",
-                "--timeout",
-                "60",
-                "--",
-                "/bin/ls",
-                "/usr",
-            ]),
+            {
+                let mut command = hermit_command(&[
+                    "--log=info",
+                    "run",
+                    "--strict",
+                    "--verify",
+                    "--verify-strict",
+                    "--verify-json",
+                    verdict.to_str().unwrap(),
+                    "--detlog-stack",
+                    "--cpu-profile",
+                    "x86-64-v3",
+                    "--timeout",
+                    "60",
+                    "--",
+                    guest.as_str(),
+                ]);
+                command.env_remove("LD_BIND_NOW");
+                command
+            },
             directory.path(),
             Duration::from_secs(300),
             false,
@@ -29929,7 +30102,7 @@ fn cpu_profile_v3_lazy_binding_xsave_is_identical_on_the_hashed_stack() {
     let Some((stdout, log, report)) = outcome else {
         return;
     };
-    assert!(!stdout.is_empty(), "{log}");
+    assert!(stdout.starts_with("v3\n"), "{stdout}\n{log}");
     let report: serde_json::Value =
         serde_json::from_slice(&report).expect("the verdict must be JSON");
     assert_eq!(report["bitwise_parity"], true, "{report}");
@@ -29953,6 +30126,13 @@ fn cpu_profile_v3_host_loader_sees_exactly_x86_64_v3() {
         .output()
         .expect("failed to run the host loader");
     if !native.status.success() {
+        // A lane that must qualify must also check: there this is a failure,
+        // not a pass.
+        assert!(
+            std::env::var("HERMIT_TEST_REQUIRE_CPU_PROFILE_V3").as_deref() != Ok("1"),
+            "HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1 but the host glibc has no \
+             --list-diagnostics (before 2.33), so the loader oracle cannot run"
+        );
         eprintln!("the host glibc has no --list-diagnostics (before 2.33); nothing to check");
         return;
     }

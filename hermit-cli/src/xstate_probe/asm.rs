@@ -92,7 +92,8 @@ pub struct ArmCtx {
     pub cpuid_cycles: u64,  // 72: the forced exit's CPUID round trip
     pub seq: u8,            // 80: handshake byte sent
     pub reply: u8,          // 81: handshake byte received
-    pub _pad: [u8; 2],      // 82
+    pub pkru: u8,           // 82: nonzero when RDPKRU and WRPKRU may run
+    pub _pad: u8,           // 83
     pub status: u32,        // 84: an `ArmStatus`
     pub saved_pkru: u32,    // 88: scratch
     pub saved_mxcsr: u32,   // 92: scratch
@@ -159,7 +160,8 @@ pub struct PeerCtx {
     pub rounds: u32,       // 60
     pub byte: u8,          // 64: received
     pub reply: u8,         // 65: sent
-    pub _pad: [u8; 2],     // 66
+    pub pkru: u8,          // 66: nonzero when RDPKRU and WRPKRU may run
+    pub _pad: u8,          // 67
     pub cpu_out: u32,      // 68: getcpu result
     pub saved_pkru: u32,   // 72
     pub saved_mxcsr: u32,  // 76
@@ -211,11 +213,36 @@ global_asm!(
     fldl2e
 .endm
 
-.macro XINUSE_WRPKRU value
+// WRPKRU and RDPKRU raise #UD unless the kernel enables protection keys
+// (CR4.PKE), so both run only when the context's PKRU byte is set; without it
+// the PKRU value read is 0.
+.macro XINUSE_WRPKRU value, ctxreg, flagoff
+    cmp byte ptr [\ctxreg + \flagoff], 0
+    je 91f
     mov eax, \value
     xor ecx, ecx
     xor edx, edx
     wrpkru
+91:
+.endm
+
+.macro XINUSE_RDPKRU ctxreg, flagoff
+    xor eax, eax
+    cmp byte ptr [\ctxreg + \flagoff], 0
+    je 92f
+    xor ecx, ecx
+    rdpkru
+92:
+.endm
+
+.macro XINUSE_RESTORE_PKRU ctxreg, flagoff, savedoff
+    cmp byte ptr [\ctxreg + \flagoff], 0
+    je 93f
+    mov eax, [\ctxreg + \savedoff]
+    xor ecx, ecx
+    xor edx, edx
+    wrpkru
+93:
 .endm
 
 .macro XINUSE_XRSTOR_MASK ctxreg, imgoff, maskreg
@@ -238,11 +265,10 @@ hermit_xinuse_arm:
     push r12
     push r13
     mov r12, rdi
-    xor ecx, ecx
-    rdpkru
+    XINUSE_RDPKRU r12, 82
     mov [r12 + 88], eax
     stmxcsr dword ptr [r12 + 92]
-    XINUSE_WRPKRU 0x55555554
+    XINUSE_WRPKRU 0x55555554, r12, 82
     XINUSE_DIRTY r12, 68, 56
     ldmxcsr dword ptr [r12 + 8]
 
@@ -286,10 +312,10 @@ hermit_xinuse_arm:
     XINUSE_XRSTOR_MASK r12, 32, r13
     jmp .Larm_mode
 .Larm_wrpkru:
-    XINUSE_WRPKRU 0
+    XINUSE_WRPKRU 0, r12, 82
     jmp .Larm_mode
 .Larm_sigreturn:
-    XINUSE_WRPKRU 0
+    XINUSE_WRPKRU 0, r12, 82
     mov eax, 234
     movsxd rdi, dword ptr [r12 + 48]
     movsxd rsi, dword ptr [r12 + 52]
@@ -407,15 +433,11 @@ hermit_xinuse_arm:
     shr rdx, 32
     mov r8, [r12 + 24]
     xsave [r8]
-    xor ecx, ecx
-    rdpkru
+    XINUSE_RDPKRU r12, 82
     mov [r12 + 64], eax
 
 .Larm_finish:
-    mov eax, [r12 + 88]
-    xor ecx, ecx
-    xor edx, edx
-    wrpkru
+    XINUSE_RESTORE_PKRU r12, 82, 88
     ldmxcsr dword ptr [r12 + 92]
     fninit
     vzeroupper
@@ -433,8 +455,7 @@ hermit_xinuse_peer_loop:
     push r12
     push r13
     mov r12, rdi
-    xor ecx, ecx
-    rdpkru
+    XINUSE_RDPKRU r12, 66
     mov [r12 + 72], eax
     stmxcsr dword ptr [r12 + 76]
 .Lpeer_round:
@@ -466,14 +487,14 @@ hermit_xinuse_peer_loop:
 
 .Lpeer_dirty_differs:
     XINUSE_DIRTY r12, 12, 32
-    XINUSE_WRPKRU 0x55555550
+    XINUSE_WRPKRU 0x55555550, r12, 66
     jmp .Lpeer_reply
 .Lpeer_dirty_wrpkru:
     XINUSE_DIRTY r12, 12, 32
-    XINUSE_WRPKRU 0
+    XINUSE_WRPKRU 0, r12, 66
     jmp .Lpeer_reply
 .Lpeer_xrstor_all:
-    XINUSE_WRPKRU 0x55555550
+    XINUSE_WRPKRU 0x55555550, r12, 66
     mov r13, [r12 + 24]
     XINUSE_XRSTOR_MASK r12, 16, r13
     jmp .Lpeer_reply
@@ -484,7 +505,7 @@ hermit_xinuse_peer_loop:
     jmp .Lpeer_reply
 .Lpeer_sigreturn:
     XINUSE_DIRTY r12, 12, 32
-    XINUSE_WRPKRU 0
+    XINUSE_WRPKRU 0, r12, 66
     mov eax, 234
     movsxd rdi, dword ptr [r12 + 40]
     movsxd rsi, dword ptr [r12 + 44]
@@ -523,10 +544,7 @@ hermit_xinuse_peer_loop:
     mov dword ptr [r12 + 56], 1
 
 .Lpeer_finish:
-    mov eax, [r12 + 72]
-    xor ecx, ecx
-    xor edx, edx
-    wrpkru
+    XINUSE_RESTORE_PKRU r12, 66, 72
     ldmxcsr dword ptr [r12 + 76]
     fninit
     vzeroupper
@@ -625,6 +643,7 @@ mod tests {
         assert_eq!(offset_of!(ArmCtx, avx512), 68);
         assert_eq!(offset_of!(ArmCtx, cpuid_cycles), 72);
         assert_eq!(offset_of!(ArmCtx, seq), 80);
+        assert_eq!(offset_of!(ArmCtx, pkru), 82);
         assert_eq!(offset_of!(ArmCtx, reply), 81);
         assert_eq!(offset_of!(ArmCtx, status), 84);
         assert_eq!(offset_of!(ArmCtx, saved_pkru), 88);
@@ -648,6 +667,7 @@ mod tests {
         assert_eq!(offset_of!(PeerCtx, rounds), 60);
         assert_eq!(offset_of!(PeerCtx, byte), 64);
         assert_eq!(offset_of!(PeerCtx, reply), 65);
+        assert_eq!(offset_of!(PeerCtx, pkru), 66);
         assert_eq!(offset_of!(PeerCtx, cpu_out), 68);
         assert_eq!(offset_of!(PeerCtx, saved_pkru), 72);
         assert_eq!(offset_of!(PeerCtx, saved_mxcsr), 76);
