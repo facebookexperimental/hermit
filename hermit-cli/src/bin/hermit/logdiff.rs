@@ -190,8 +190,10 @@ pub struct LogDiffCLIOpts {
     /// inputs, the way `hermit run --verify` compares its two runs, and write
     /// that comparison's report (the report `--verify --verify-json` writes)
     /// to FILE. The exit status is the one `hermit run --verify` would exit
-    /// with, and the guest's output is shown as it would show it. The comparison is the one both runs' flags chose; runs that chose
-    /// different ones are refused.
+    /// with, and the guest's output is shown as it would show it. The
+    /// comparison is the one both runs' flags chose; runs that chose different
+    /// ones are refused. Where `run --verify` would not have started its
+    /// second run, the second directory need not exist.
     #[clap(
         long,
         value_name = "FILE",
@@ -208,6 +210,13 @@ pub struct LogDiffCLIOpts {
         requires = "verify_json"
     )]
     verify_allow: VerifyAllow,
+
+    /// With --verify-json, keep the compared logs in DIR as `hermit run
+    /// --verify --keep-logs --verify-log-dir DIR` keeps them: run 1's alone
+    /// after a match, both otherwise. They are links; the --verify-run
+    /// directories keep their own.
+    #[clap(long = "verify-log-dir", value_name = "DIR", requires = "verify_json")]
+    verify_log_dir: Option<PathBuf>,
 
     #[clap(flatten)]
     pub more: logdiff::LogDiffOpts,
@@ -228,6 +237,7 @@ impl LogDiffCLIOpts {
             follow_settle_polls: 3,
             verify_json: None,
             verify_allow: VerifyAllow::Success,
+            verify_log_dir: None,
             more: Default::default(),
         }
     }
@@ -247,6 +257,7 @@ impl LogDiffCLIOpts {
             [self.file_a.as_path(), file_b.as_path()],
             Some(report),
             self.verify_allow,
+            self.verify_log_dir.as_deref(),
         )
     }
 

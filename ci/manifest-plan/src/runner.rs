@@ -2635,6 +2635,10 @@ pub struct CellRunSpec {
     pub timeout_seconds: u64,
     pub verdict_path: Option<PathBuf>,
     pub verification_log_dir: Option<PathBuf>,
+    /// The `verify-runs/<attempt>` directory holding a verify or chaos
+    /// attempt's two `--verify-run` directories (see `VERIFY_PAIR_SCRIPT`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verify_runs: Option<PathBuf>,
     pub sabre_path_evidence: Option<PathBuf>,
     pub cell_dir: PathBuf,
     /// The exact nonzero guest disposition this attempt requires, if any.
@@ -4392,7 +4396,26 @@ fn verify_attempt_invocation_error(
     expects_exit: bool,
     comparator: Comparator,
 ) -> Result<(), String> {
-    let argv = &attempt.argv;
+    // The paired program ([`VERIFY_PAIR_SCRIPT`]): the comparison, then the
+    // run command.
+    let paired = &attempt.argv;
+    let program = ["bash", "-c", VERIFY_PAIR_SCRIPT, VERIFY_PAIR_NAME];
+    if paired
+        .get(..program.len())
+        .is_none_or(|words| words.iter().map(String::as_str).ne(program))
+    {
+        return Err("is not the paired verification program the executor runs".into());
+    }
+    // Both commands start with the Hermit binary; the run starts at its
+    // second appearance, as the script finds it.
+    let commands = &paired[program.len()..];
+    let run_start = commands
+        .iter()
+        .skip(1)
+        .position(|word| Some(word) == commands.first())
+        .map(|offset| offset + 1)
+        .ok_or("has no run command after its comparison")?;
+    let (comparison, argv) = commands.split_at(run_start);
     let head = ["--log", "info", "--backend", backend, "run"];
     if argv
         .get(1..=head.len())
@@ -4442,26 +4465,13 @@ fn verify_attempt_invocation_error(
             "carries the run flags {run_flags:?}, not the ones the row's relaxations record ({relaxation_flags:?})"
         ));
     }
-    tokens.require("--verify")?;
-    if tokens.flag("--verify-allow=failure") != expects_exit {
+    if tokens.value("--verify-run")? != Some(VERIFY_RUN_DIR_PLACEHOLDER) {
         return Err(format!(
-            "{} `--verify-allow=failure`, but the row {} an expected guest exit",
-            if expects_exit { "lacks" } else { "carries" },
-            if expects_exit {
-                "records"
-            } else {
-                "records no"
-            },
+            "lacks `--verify-run {VERIFY_RUN_DIR_PLACEHOLDER}` where the executor writes it"
         ));
     }
-    tokens
-        .value("--verify-json")?
-        .ok_or("lacks `--verify-json <path>` where the executor writes it")?;
-    if tokens.flag("--keep-logs") {
-        tokens
-            .value("--verify-log-dir")?
-            .ok_or("keeps logs without `--verify-log-dir <path>`")?;
-    }
+    paired_comparison_error(comparison, &argv[0], expects_exit)
+        .map_err(|error| format!("compares with a command that {error}"))?;
     // The execution root (`append_execution_root_args`): a tmpfs mounted at
     // the workdir, a workdir alone, a per-attempt directory bound at the fixed
     // guest workdir, or none.
@@ -4494,6 +4504,51 @@ fn verify_attempt_invocation_error(
         )),
         None => Ok(()),
     }
+}
+
+/// Why `comparison` is not the `hermit log-diff --verify-json` command
+/// [`verified_invocation_argv`] writes for a paired verify attempt run with
+/// the Hermit binary `hermit`, which expects a guest exit when
+/// `expects_exit`.
+fn paired_comparison_error(
+    comparison: &[String],
+    hermit: &str,
+    expects_exit: bool,
+) -> Result<(), String> {
+    if comparison.first().map(String::as_str) != Some(hermit)
+        || comparison.get(1).map(String::as_str) != Some("log-diff")
+    {
+        return Err("does not start `<hermit> log-diff` with the run's Hermit".into());
+    }
+    let mut tokens = InvocationTokens(&comparison[2..]);
+    tokens
+        .value("--verify-json")?
+        .ok_or("lacks `--verify-json <path>` where the executor writes it")?;
+    if tokens.flag("--verify-allow=failure") != expects_exit {
+        return Err(format!(
+            "{} `--verify-allow=failure`, but the row {} an expected guest exit",
+            if expects_exit { "lacks" } else { "carries" },
+            if expects_exit {
+                "records"
+            } else {
+                "records no"
+            },
+        ));
+    }
+    tokens.value("--verify-log-dir")?;
+    let [first, second] = tokens.0 else {
+        return Err(format!(
+            "does not end with exactly the two run directories ({:?})",
+            tokens.0
+        ));
+    };
+    let first = Path::new(first);
+    if !first.ends_with("run1")
+        || first.parent().map(|parent| parent.join("run2")).as_deref() != Some(Path::new(second))
+    {
+        return Err("does not compare the attempt's run1 and run2 directories".into());
+    }
+    Ok(())
 }
 
 /// The Hermit options of a retained command line, read front to back by
@@ -4962,6 +5017,8 @@ pub fn build_spec(
     let isolated = context.isolated_workdir.is_some();
     let verdict = dir.join(format!("verify-{attempt}.json"));
     let mut verification_log_dir = None;
+    let verify_runs = matches!(cell.id.mode.as_str(), "verify" | "chaos")
+        .then(|| dir.join("verify-runs").join(attempt));
     let (argv, verdict_path) = match cell.id.mode.as_str() {
         "naked" => (guest_argv.clone(), None),
         mode @ ("verify" | "replay" | "chaos") => {
@@ -4989,6 +5046,7 @@ pub fn build_spec(
                 invocation,
                 verdict: &verdict,
                 verification_log_dir: verification_log_dir.as_deref(),
+                verify_runs: verify_runs.as_deref(),
                 bound_workdir_source,
                 equalized_inputs_dir: equalized_inputs.then_some(dir.as_path()),
                 env: &env,
@@ -5036,6 +5094,7 @@ pub fn build_spec(
         timeout_seconds,
         verdict_path,
         verification_log_dir,
+        verify_runs,
         sabre_path_evidence,
         cell_dir: dir,
         expected_guest_exit: cell_expected_guest_exit(cell),
@@ -5053,14 +5112,15 @@ pub fn build_spec(
 
 /// The Hermit subcommand a verified cell runs and the arguments only it takes.
 enum VerifiedInvocation {
-    /// `hermit run --verify`: two runs compared.
+    /// Two `hermit run --verify-run` runs, compared by `hermit log-diff
+    /// --verify-json` ([`VERIFY_PAIR_SCRIPT`]).
     Verify,
     /// `hermit record start --verify`: a recording and its replay compared.
     Replay {
         data_dir: PathBuf,
         record_timeout_seconds: u64,
     },
-    /// `hermit run --verify --chaos`: two runs under one random schedule.
+    /// The same pair, each run under one random schedule (`--chaos`).
     Chaos { seed: i64 },
 }
 
@@ -5071,6 +5131,9 @@ struct VerifiedInvocationArgs<'a> {
     invocation: VerifiedInvocation,
     verdict: &'a Path,
     verification_log_dir: Option<&'a Path>,
+    /// The attempt's `verify-runs/<attempt>` directory, for a verify or chaos
+    /// attempt ([`VERIFY_PAIR_SCRIPT`]).
+    verify_runs: Option<&'a Path>,
     bound_workdir_source: Option<&'a Path>,
     /// The cell directory whose inputs are bound at their guest paths, for an
     /// equalized cell.
@@ -5109,13 +5172,91 @@ fn probe_relaxation(cell: &SelectedCell, backend: &str) -> Option<&'static str> 
     .then_some("--max-timeslice=disabled")
 }
 
+/// The program a verify or chaos attempt runs: two `hermit run --verify-run`
+/// executions of the guest, then `hermit log-diff --verify-json` over their
+/// two directories (https://github.com/rrnewton/hermit/issues/4275).
+///
+/// It is run as `bash -c VERIFY_PAIR_SCRIPT VERIFY_PAIR_NAME COMPARISON...
+/// RUN...`, so the attempt is one process tree: the executor's CPU budget,
+/// timeout and CPU evidence cover all three commands, as they covered the
+/// single `run --verify` they replace. COMPARISON is the `log-diff` command,
+/// whose last two words are the run directories; RUN is the `run` command,
+/// with [`VERIFY_RUN_DIR_PLACEHOLDER`] where each execution's directory goes.
+/// Both start with the Hermit binary, which no other word of COMPARISON is,
+/// so its second appearance is where RUN starts.
+///
+/// It follows `run --verify`: run 2 starts only when run 1 left a record and
+/// its exit status is one `--verify-allow` admits, and when a run leaves no
+/// record (Hermit refused it before it started) the attempt ends with that
+/// run's status and output, after the comparison has stamped its report. Each
+/// run's own stderr is passed on, run 1's first. The two runs execute one
+/// after the other, on the same workdir and inputs, as `run --verify`'s do: a
+/// bind source's host path is visible to the guest in /proc/self/mountinfo,
+/// so two concurrent runs could not each have their own without the guest
+/// seeing the difference.
+const VERIFY_PAIR_SCRIPT: &str = r#"set -u
+for ((start = 2; start <= $#; start++)); do
+  [[ ${!start} == "$1" ]] && break
+done
+comparison=("${@:1:start-1}")
+run=("${@:start}")
+directories=("${comparison[@]: -2}")
+allow=success
+for word in "${comparison[@]}"; do
+  case $word in --verify-allow=*) allow=${word#--verify-allow=} ;; esac
+done
+verify_run() {
+  local directory=$1 word words=()
+  for word in "${run[@]}"; do
+    [[ $word == @VERIFY_RUN_DIR@ ]] && word=$directory
+    words+=("$word")
+  done
+  "${words[@]}" >"$directory.stdout" 2>"$directory.stderr"
+}
+end_without_comparison() {
+  cat "$1.stdout"
+  "${comparison[@]}" >/dev/null 2>&1
+  exit "$2"
+}
+verify_run "${directories[0]}"
+status=$?
+cat "${directories[0]}.stderr" >&2
+[[ -e ${directories[0]}/verify-run.json ]] || end_without_comparison "${directories[0]}" "$status"
+case $allow in
+  success) admitted=$((status == 0)) ;;
+  failure) admitted=$((status != 0)) ;;
+  *) admitted=1 ;;
+esac
+if ((admitted)); then
+  verify_run "${directories[1]}"
+  status=$?
+  cat "${directories[1]}.stderr" >&2
+  [[ -e ${directories[1]}/verify-run.json ]] || end_without_comparison "${directories[1]}" "$status"
+fi
+exec "${comparison[@]}"
+"#;
+
+/// `$0` of [`VERIFY_PAIR_SCRIPT`], which names it in the shell's own messages.
+const VERIFY_PAIR_NAME: &str = "hermit-verify-pair";
+
+/// The word of a paired run command that [`VERIFY_PAIR_SCRIPT`] replaces with
+/// each execution's `--verify-run` directory.
+const VERIFY_RUN_DIR_PLACEHOLDER: &str = "@VERIFY_RUN_DIR@";
+
+/// The `--verify-run` directories of a paired attempt, below its
+/// `verify-runs/<attempt>` directory.
+fn verify_run_directories(verify_runs: &Path) -> [PathBuf; 2] {
+    [verify_runs.join("run1"), verify_runs.join("run2")]
+}
+
 /// The one argv builder for verify, replay and chaos cells.
 ///
 /// The three modes run the same guest under the same base environment,
 /// strictness, execution root and guest environment; only the subcommand and
 /// the arguments in [`VerifiedInvocation`] differ. Building them in one place is
 /// what keeps a replay cell from silently running a different guest than the
-/// verify cell it records.
+/// verify cell it records. A verify or chaos cell runs the guest command under
+/// [`VERIFY_PAIR_SCRIPT`]; a replay cell runs `record start --verify`.
 fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
     let VerifiedInvocationArgs {
         context,
@@ -5124,14 +5265,16 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
         invocation,
         verdict,
         verification_log_dir,
+        verify_runs,
         bound_workdir_source,
         equalized_inputs_dir,
         env,
         guest_argv,
     } = args;
     let mode_recipe = &cell.test.modes[&cell.id.mode];
+    let hermit = context.hermit_bin.to_string_lossy().into_owned();
     let mut argv = vec![
-        context.hermit_bin.to_string_lossy().into_owned(),
+        hermit.clone(),
         "--log".into(),
         "info".into(),
         "--backend".into(),
@@ -5169,45 +5312,75 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
     if mode_recipe.rcb_time == Some(false) {
         argv.push("--no-rcb-time".into());
     }
-    argv.push("--verify".into());
-    match &invocation {
-        VerifiedInvocation::Chaos { .. } => argv.push("--verify-allow=both".into()),
+    // The allowance `run --verify` would take, which the paired comparison
+    // takes in its place.
+    let verify_allow = match &invocation {
+        VerifiedInvocation::Chaos { .. } => Some("--verify-allow=both"),
         // The exact disposition is enforced on the report after the
         // comparison; this only lets a failing first run be compared.
         // `record start --verify` always compares and returns the guest's
         // status on a match, so it needs no allowance.
         VerifiedInvocation::Verify if cell_expected_guest_exit(cell).is_some() => {
-            argv.push("--verify-allow=failure".into());
+            Some("--verify-allow=failure")
         }
-        VerifiedInvocation::Verify | VerifiedInvocation::Replay { .. } => {}
-    }
-    argv.extend([
-        "--verify-json".into(),
-        verdict.to_string_lossy().into_owned(),
-    ]);
-    if let Some(logs) = verification_log_dir {
-        argv.extend([
-            "--keep-logs".into(),
-            "--verify-log-dir".into(),
-            logs.to_string_lossy().into_owned(),
-        ]);
-    }
+        VerifiedInvocation::Verify | VerifiedInvocation::Replay { .. } => None,
+    };
+    let mut comparison = None;
     match invocation {
-        VerifiedInvocation::Verify => {}
         VerifiedInvocation::Replay {
             data_dir,
             record_timeout_seconds,
-        } => argv.extend([
-            "--data-dir".into(),
-            data_dir.to_string_lossy().into_owned(),
-            "--record-timeout".into(),
-            record_timeout_seconds.to_string(),
-        ]),
-        VerifiedInvocation::Chaos { seed } => argv.extend([
-            "--chaos".into(),
-            "--sched-heuristic=random".into(),
-            format!("--seed={seed}"),
-        ]),
+        } => {
+            argv.push("--verify".into());
+            argv.extend([
+                "--verify-json".into(),
+                verdict.to_string_lossy().into_owned(),
+            ]);
+            if let Some(logs) = verification_log_dir {
+                argv.extend([
+                    "--keep-logs".into(),
+                    "--verify-log-dir".into(),
+                    logs.to_string_lossy().into_owned(),
+                ]);
+            }
+            argv.extend([
+                "--data-dir".into(),
+                data_dir.to_string_lossy().into_owned(),
+                "--record-timeout".into(),
+                record_timeout_seconds.to_string(),
+            ]);
+        }
+        VerifiedInvocation::Verify | VerifiedInvocation::Chaos { .. } => {
+            argv.extend(["--verify-run".into(), VERIFY_RUN_DIR_PLACEHOLDER.into()]);
+            if let VerifiedInvocation::Chaos { seed } = invocation {
+                argv.extend([
+                    "--chaos".into(),
+                    "--sched-heuristic=random".into(),
+                    format!("--seed={seed}"),
+                ]);
+            }
+            let mut words = vec![
+                hermit,
+                "log-diff".into(),
+                "--verify-json".into(),
+                verdict.to_string_lossy().into_owned(),
+            ];
+            words.extend(verify_allow.map(str::to_string));
+            if let Some(logs) = verification_log_dir {
+                words.extend([
+                    "--verify-log-dir".into(),
+                    logs.to_string_lossy().into_owned(),
+                ]);
+            }
+            let verify_runs =
+                verify_runs.expect("a verify or chaos attempt has its verify-run directories");
+            words.extend(
+                verify_run_directories(verify_runs)
+                    .iter()
+                    .map(|directory| directory.to_string_lossy().into_owned()),
+            );
+            comparison = Some(words);
+        }
     }
     append_execution_root_args(
         &mut argv,
@@ -5228,7 +5401,20 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
     }
     argv.push("--".into());
     argv.extend(guest_argv.iter().cloned());
-    argv
+    match comparison {
+        None => argv,
+        Some(comparison) => {
+            let mut paired = vec![
+                "bash".into(),
+                "-c".into(),
+                VERIFY_PAIR_SCRIPT.into(),
+                VERIFY_PAIR_NAME.into(),
+            ];
+            paired.extend(comparison);
+            paired.extend(argv);
+            paired
+        }
+    }
 }
 
 fn current_verification_report(bytes: &[u8]) -> Result<VerificationReport, String> {
@@ -5437,6 +5623,16 @@ fn execute_spec_until(
             .map_err(|e| format!("cannot reset {}: {e}", workdir.display()))?;
     }
     fs::create_dir_all(workdir).map_err(|e| format!("cannot create {}: {e}", workdir.display()))?;
+    // Each `--verify-run` directory must be new, so no earlier attempt's
+    // evidence can be read as this one's.
+    if let Some(verify_runs) = &spec.verify_runs {
+        if verify_runs.exists() {
+            fs::remove_dir_all(verify_runs)
+                .map_err(|e| format!("cannot reset {}: {e}", verify_runs.display()))?;
+        }
+        fs::create_dir_all(verify_runs)
+            .map_err(|e| format!("cannot create {}: {e}", verify_runs.display()))?;
+    }
     let captures = spec.cell_dir.join("captures");
     fs::create_dir_all(&captures).map_err(|e| e.to_string())?;
     let stdout_path = captures.join(format!("{}-{index}.stdout", spec.id.mode));
@@ -5912,6 +6108,18 @@ fn execute_spec_until(
     if let Some(timeout) = output.timeout {
         error_kind = Some(timeout.error_kind().into());
         reason = Some(timeout.reason(cpu_timeout_seconds, wall_timeout_seconds));
+    }
+    // After a match the two `--verify-run` directories hold nothing the
+    // report and any retained golden log do not, so they go, as `run
+    // --verify` deletes its logs after a match; otherwise they stay beside
+    // the report as its evidence.
+    let matched = report_json.as_deref().is_some_and(|json| {
+        current_verification_report(json.as_bytes())
+            .is_ok_and(|report| report.verdict == Verdict::Matched)
+    });
+    if let Some(verify_runs) = spec.verify_runs.as_ref().filter(|_| matched) {
+        fs::remove_dir_all(verify_runs)
+            .map_err(|e| format!("cannot remove {}: {e}", verify_runs.display()))?;
     }
     Ok(AttemptResult {
         index: index.into(),
@@ -8279,7 +8487,11 @@ pub(crate) fn summarize_sabre_path_evidence(
         // otherwise-valid SaBRe parity measurement into an incomplete path.
         .filter(|attempt| argv_selects_sabre(&attempt.argv))
         .map(|attempt| {
-            if attempt.argv.iter().any(|arg| arg == "--verify") {
+            if attempt
+                .argv
+                .iter()
+                .any(|arg| arg == "--verify" || arg == "--verify-run")
+            {
                 2
             } else {
                 1
@@ -10639,7 +10851,11 @@ corpus:
                     "--max-timeslice=disabled: {PROBE_RELAXATION_REASON}"
                 )]
             );
-            let verify = probed.argv.iter().position(|a| a == "--verify").unwrap();
+            let verify = probed
+                .argv
+                .iter()
+                .position(|a| a == "--verify-run")
+                .unwrap();
             let flag = probed
                 .argv
                 .iter()
@@ -10665,6 +10881,149 @@ corpus:
         assert_eq!(probe_relaxation(&sabre, "sabre"), None);
     }
 
+    /// [`VERIFY_PAIR_SCRIPT`] follows `run --verify`: run 2 starts only when
+    /// run 1 left a record with a status `--verify-allow` admits; a run that
+    /// leaves no record ends the attempt with its own status and output, its
+    /// stderr first, after the comparison has stamped its report; otherwise
+    /// the comparison's status, stdout and stderr end it, after each run's
+    /// stderr.
+    #[test]
+    fn the_paired_program_runs_and_compares_as_run_verify_does() {
+        let root_dir = std::env::temp_dir().join(format!(
+            "hermit-runner-paired-program-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root_dir);
+        fs::create_dir_all(&root_dir).unwrap();
+        struct Root(PathBuf);
+        impl Root {
+            fn path(&self) -> &Path {
+                &self.0
+            }
+        }
+        impl Drop for Root {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = Root(root_dir);
+        let hermit = root.path().join("hermit");
+        // A run's behaviour is `$FAKE_RUN<n>`: `record:<status>` commits a
+        // record and exits with the status, `refuse` exits 122 with a class
+        // line and no record. Each call is logged.
+        fs::write(
+            &hermit,
+            r#"#!/bin/sh
+log="$(dirname "$0")/calls"
+if [ "$1" = log-diff ]; then
+  printf 'compare %s\n' "$*" >> "$log"
+  echo "comparison stdout"
+  echo "comparison stderr" >&2
+  exit 9
+fi
+while [ "$#" -gt 0 ]; do
+  [ "$1" = --verify-run ] && directory=$2
+  shift
+done
+n=$(grep -c '^run' "$log" 2>/dev/null)
+n=$((n + 1))
+printf 'run%s %s\n' "$n" "$directory" >> "$log"
+eval "behaviour=\$FAKE_RUN$n"
+echo "run $n stderr" >&2
+case $behaviour in
+  refuse) echo "HERMIT_POLICY_REFUSAL class=policy-refusal" >&2; exit 122 ;;
+  record:*) mkdir "$directory"; : > "$directory/verify-run.json"; exit "${behaviour#record:}" ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&hermit, fs::Permissions::from_mode(0o755)).unwrap();
+        let hermit = hermit.to_string_lossy().into_owned();
+        let pair = |label: &str, allow: Option<&str>, runs: [&str; 2]| {
+            let runs_dir = root.path().join(label);
+            fs::create_dir(&runs_dir).unwrap();
+            let [first, second] = verify_run_directories(&runs_dir);
+            let mut argv = vec![
+                "-c".to_string(),
+                VERIFY_PAIR_SCRIPT.into(),
+                VERIFY_PAIR_NAME.into(),
+                hermit.clone(),
+                "log-diff".into(),
+                "--verify-json".into(),
+                "report.json".into(),
+            ];
+            argv.extend(allow.map(str::to_string));
+            argv.extend([
+                first.to_string_lossy().into_owned(),
+                second.to_string_lossy().into_owned(),
+                hermit.clone(),
+                "run".into(),
+                "--verify-run".into(),
+                VERIFY_RUN_DIR_PLACEHOLDER.into(),
+                "--".into(),
+                "guest".into(),
+            ]);
+            let _ = fs::remove_file(root.path().join("calls"));
+            let output = Command::new("bash")
+                .args(&argv)
+                .env("FAKE_RUN1", runs[0])
+                .env("FAKE_RUN2", runs[1])
+                .output()
+                .unwrap();
+            let calls = fs::read_to_string(root.path().join("calls")).unwrap();
+            (output, calls, first, second)
+        };
+        let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+
+        // Both runs complete: the comparison ends the attempt.
+        let (output, calls, first, second) = pair("both", None, ["record:0", "record:0"]);
+        assert_eq!(output.status.code(), Some(9));
+        assert_eq!(text(&output.stdout), "comparison stdout\n");
+        assert_eq!(
+            text(&output.stderr),
+            "run 1 stderr\nrun 2 stderr\ncomparison stderr\n"
+        );
+        let lines: Vec<&str> = calls.lines().collect();
+        assert_eq!(lines[0], format!("run1 {}", first.display()));
+        assert_eq!(lines[1], format!("run2 {}", second.display()));
+        assert!(lines[2].ends_with(&format!("{} {}", first.display(), second.display())));
+        assert_eq!(lines.len(), 3);
+
+        // A status the allowance refuses: no run 2, as `run --verify`.
+        let (output, calls, ..) = pair("rejected", None, ["record:3", "record:0"]);
+        assert_eq!(output.status.code(), Some(9));
+        assert_eq!(
+            calls.lines().filter(|line| line.starts_with("run")).count(),
+            1
+        );
+        // ... which `--verify-allow=failure` admits, and `both` too.
+        for allow in ["--verify-allow=failure", "--verify-allow=both"] {
+            let (_, calls, ..) = pair(allow, Some(allow), ["record:3", "record:3"]);
+            assert_eq!(
+                calls.lines().filter(|line| line.starts_with("run")).count(),
+                2
+            );
+        }
+
+        // A refused run 1: its status and stderr, first line first, and the
+        // comparison still stamps its report but says nothing.
+        let (output, calls, ..) = pair("refused", None, ["refuse", "record:0"]);
+        assert_eq!(output.status.code(), Some(122));
+        assert_eq!(
+            text(&output.stderr),
+            "run 1 stderr\nHERMIT_POLICY_REFUSAL class=policy-refusal\n"
+        );
+        assert_eq!(text(&output.stdout), "");
+        let lines: Vec<&str> = calls.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].starts_with("compare "));
+
+        // A run 2 that leaves no record ends the attempt likewise.
+        let (output, ..) = pair("refused-second", None, ["record:0", "refuse"]);
+        assert_eq!(output.status.code(), Some(122));
+    }
+
     #[test]
     fn a_verify_cell_carries_its_hermit_args_env_and_comparator() {
         let strict = extended_verify_spec(None);
@@ -10673,7 +11032,7 @@ corpus:
         let flag = at(&strict.argv, "--no-virtualize-cpuid").unwrap();
         assert!(
             at(&strict.argv, "--strict").unwrap() < flag
-                && flag < at(&strict.argv, "--verify").unwrap()
+                && flag < at(&strict.argv, "--verify-run").unwrap()
         );
         let env = strict
             .argv
@@ -10695,7 +11054,7 @@ corpus:
             "{:?}",
             stripped.argv
         );
-        assert!(at(&stripped.argv, "--verify").is_some());
+        assert!(at(&stripped.argv, "--verify-run").is_some());
         assert_eq!(stripped.comparator, Comparator::Stripped);
     }
 
@@ -10847,7 +11206,7 @@ corpus:
             at(&["--verify-strict"]),
             at(&["--no-virtualize-cpuid"]),
             at(&["--max-timeslice=disabled"]),
-            at(&["--verify"]),
+            at(&["--verify-run", VERIFY_RUN_DIR_PLACEHOLDER]),
             at(&["--mount=type=tmpfs,target=/test"]),
             at(&["--workdir", "/test"]),
             at(&["--env", "TMPDIR=/tmp"]),
@@ -12242,6 +12601,7 @@ corpus:
             timeout_seconds: 15,
             verdict_path: Some(root.join("verdict.json")),
             verification_log_dir: None,
+            verify_runs: None,
             sabre_path_evidence: None,
             cell_dir: root.clone(),
             expected_guest_exit: None,
@@ -13413,6 +13773,7 @@ corpus:
             timeout_seconds: 1,
             verdict_path: None,
             verification_log_dir: None,
+            verify_runs: None,
             sabre_path_evidence: None,
             cell_dir: root.join(label),
             expected_guest_exit: None,
@@ -18152,7 +18513,7 @@ backends_disabled:
             &hermit,
             r#"#!/bin/sh
 set -eu
-if [ "${1-}" = "log-diff" ]; then
+if [ "${1-}" = "log-diff" ] && [ "${2-}" != "--verify-json" ]; then
   printf 'log-diff\n' >> "$PWD/invocations"
   exit 3
 fi
@@ -18160,26 +18521,34 @@ fi
 backend=
 verdict=
 logdir=
+rundir=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --backend) backend=$2; shift 2 ;;
     --verify-json) verdict=$2; shift 2 ;;
     --verify-log-dir) logdir=$2; shift 2 ;;
+    --verify-run) rundir=$2; shift 2 ;;
     *) shift ;;
   esac
 done
-printf 'run:%s\n' "$backend" >> "$PWD/invocations"
+
+if [ -n "$rundir" ]; then
+  # One run of the pair ([`VERIFY_PAIR_SCRIPT`]).
+  printf 'run:%s\n' "$backend" >> "$PWD/invocations"
+  mkdir "$rundir"
+  printf '{}\n' > "$rundir/verify-run.json"
+  if [ -n "${HERMIT_SABRE_PATH_EVIDENCE-}" ]; then
+    printf '%s\n' '{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' >> "$HERMIT_SABRE_PATH_EVIDENCE"
+  fi
+  exit 0
+fi
+printf 'compare\n' >> "$PWD/invocations"
 
 # This log differs from anything a ptrace run of the same guest would write.
 # Before https://github.com/rrnewton/hermit/issues/3301 that difference was a
 # ParityFailure; now nothing compares it with another backend.
 mkdir -p "$logdir"
-printf 'INFO detcore: %s-only\n' "$backend" > "$logdir/run1_log_fixture.log"
-
-if [ -n "${HERMIT_SABRE_PATH_EVIDENCE-}" ]; then
-  evidence='{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}'
-  printf '%s\n%s\n' "$evidence" "$evidence" > "$HERMIT_SABRE_PATH_EVIDENCE"
-fi
+printf 'INFO detcore: only\n' > "$logdir/run1_log_fixture.log"
 
 cp "$PWD/verification.json" "$verdict"
 exit "$(cat "$PWD/exit-status")"
@@ -18335,7 +18704,10 @@ exit "$(cat "$PWD/exit-status")"
                 Some(Verdict::Matched),
                 "{backend}"
             );
-            assert_eq!(invocations, format!("run:{backend}\n"));
+            assert_eq!(
+                invocations,
+                format!("run:{backend}\nrun:{backend}\ncompare\n")
+            );
             let observations = &result.cpu_observations.as_ref().unwrap().invocations;
             assert_eq!(observations.len(), 1, "{backend}: {observations:#?}");
             assert!(
@@ -18382,7 +18754,10 @@ exit "$(cat "$PWD/exit-status")"
                 Some(Verdict::Diverged),
                 "{backend}"
             );
-            assert_eq!(invocations, format!("run:{backend}\n"));
+            assert_eq!(
+                invocations,
+                format!("run:{backend}\nrun:{backend}\ncompare\n")
+            );
             assert_eq!(result.first_divergent_scheduler_turn, Some(7), "{backend}");
             assert_eq!(
                 result.first_divergent_virtual_nanoseconds,
@@ -18438,6 +18813,7 @@ exit "$(cat "$PWD/exit-status")"
             timeout_seconds: 5,
             verdict_path: Some(verdict),
             verification_log_dir: None,
+            verify_runs: None,
             sabre_path_evidence: None,
             cell_dir: dir.clone(),
             expected_guest_exit: None,
@@ -18486,6 +18862,7 @@ exit "$(cat "$PWD/exit-status")"
             timeout_seconds: 10,
             verdict_path: Some(verdict),
             verification_log_dir: None,
+            verify_runs: None,
             sabre_path_evidence: None,
             cell_dir: dir.clone(),
             expected_guest_exit: None,
@@ -18789,7 +19166,7 @@ exit "$(cat "$PWD/exit-status")"
 
         // Every shape the executor writes.
         let base = verify_row_from_attempts(vec![skid("1")]);
-        assert!(has(&base, "--verify-strict") && base.argv[4] == "ptrace");
+        assert!(has(&base, "--verify-strict") && has_pair(&base, "--backend", "ptrace"));
         accepted_skid("the fixture row", &base, 2);
         let unprobed = rendered(
             &base,
@@ -18807,7 +19184,7 @@ exit "$(cat "$PWD/exit-status")"
             &context(&|context| context.keep_logs = true),
             &|_| {},
         );
-        assert!(has(&kept, "--keep-logs") && has(&kept, "--verify-log-dir"));
+        assert!(has(&kept, "--verify-log-dir"));
         accepted_skid("a row whose verify logs were kept", &kept, 2);
         let test = cell_recorded_by(&base).id.test;
         let parity = rendered(
@@ -18819,7 +19196,7 @@ exit "$(cat "$PWD/exit-status")"
             }),
             &|_| {},
         );
-        assert!(has(&parity, "--keep-logs"));
+        assert!(has(&parity, "--verify-log-dir"));
         accepted_skid("a row whose logs the parity post-pass kept", &parity, 2);
         let isolated = rendered(
             &base,
@@ -18869,7 +19246,7 @@ exit "$(cat "$PWD/exit-status")"
         let mut native = base.clone();
         native.backend = None;
         let native = with_executor_invocation(native);
-        assert_eq!(native.argv[4], "native");
+        assert!(has_pair(&native, "--backend", "native"));
         accepted("a row recording no backend", &native);
         let mut dbt = base.clone();
         dbt.backend = Some("dbt".into());
@@ -18898,7 +19275,7 @@ exit "$(cat "$PWD/exit-status")"
         // The backend.
         refused(
             "a ptrace row whose command line selects liteinst",
-            &with_argv(&base, |argv| argv[4] = "liteinst".into()),
+            &with_argv(&base, replace_after("--backend", "liteinst")),
             "does not start `<hermit> --log info --backend ptrace run`",
         );
         refused(
@@ -18924,7 +19301,7 @@ exit "$(cat "$PWD/exit-status")"
             "selects a backend again after `run` (--backend)",
         );
         let mut second = two.clone();
-        second.attempts[1].argv[4] = "liteinst".into();
+        replace_after("--backend", "liteinst")(&mut second.attempts[1].argv);
         second.attempts[1].shell_command = shell_command(
             &second.attempts[1].cwd,
             &second.attempts[1].env,
@@ -18950,22 +19327,35 @@ exit "$(cat "$PWD/exit-status")"
             "lacks `--base-env=minimal`",
         );
         refused(
-            "a command line without `--verify`",
-            &with_argv(&base, without("--verify", 0)),
-            "lacks `--verify` where",
+            "a command line without `--verify-run`",
+            &with_argv(&base, without("--verify-run", 1)),
+            "lacks `--verify-run @VERIFY_RUN_DIR@` where",
+        );
+        refused(
+            "a run that writes its evidence somewhere else",
+            &with_argv(&base, replace_after("--verify-run", "/elsewhere")),
+            "lacks `--verify-run @VERIFY_RUN_DIR@` where",
+        );
+        refused(
+            "another program than the paired verification",
+            &with_argv(&base, |argv| argv[2] = "exec \"$@\"".into()),
+            "is not the paired verification program",
         );
         refused(
             "the canonical comparison flag after the run flags",
             &with_argv(&relaxed, |argv| {
                 let flag = argv.remove(at(argv, "--verify-strict"));
-                let index = at(argv, "--verify");
+                let index = at(argv, "--verify-run");
                 argv.insert(index, flag);
             }),
-            "lacks `--verify` where",
+            "lacks `--verify-run @VERIFY_RUN_DIR@` where",
         );
         refused(
             "the canonical comparison flag on a stripped row",
-            &with_argv(&stripped, insert_before("--verify", &["--verify-strict"])),
+            &with_argv(
+                &stripped,
+                insert_before("--verify-run", &["--verify-strict"]),
+            ),
             "under the stripped comparator",
         );
         // The run flags the relaxations record.
@@ -18973,18 +19363,21 @@ exit "$(cat "$PWD/exit-status")"
             "a run flag the executor never writes",
             &with_argv(
                 &base,
-                insert_before("--verify", &["--no-sequentialize-threads"]),
+                insert_before("--verify-run", &["--no-sequentialize-threads"]),
             ),
-            "lacks `--verify` where",
+            "lacks `--verify-run @VERIFY_RUN_DIR@` where",
         );
         refused(
             "a run flag the row does not record",
-            &with_argv(&base, insert_before("--verify", &["--no-rcb-time"])),
+            &with_argv(&base, insert_before("--verify-run", &["--no-rcb-time"])),
             "carries the run flags [\"--no-rcb-time\"]",
         );
         refused(
             "a Hermit argument the row does not record",
-            &with_argv(&base, insert_before("--verify", &["--max-timeslice=1000"])),
+            &with_argv(
+                &base,
+                insert_before("--verify-run", &["--max-timeslice=1000"]),
+            ),
             "carries the run flags [\"--max-timeslice=1000\"]",
         );
         refused(
@@ -19014,10 +19407,10 @@ exit "$(cat "$PWD/exit-status")"
         // The expected-exit allowance and the valued flags.
         refused(
             "an expected-exit allowance the row does not declare",
-            &with_argv(
-                &base,
-                insert_before("--verify-json", &["--verify-allow=failure"]),
-            ),
+            &with_argv(&base, |argv| {
+                let index = at(argv, "--verify-json") + 2;
+                argv.insert(index, "--verify-allow=failure".into());
+            }),
             "carries `--verify-allow=failure`",
         );
         refused(
@@ -19041,9 +19434,25 @@ exit "$(cat "$PWD/exit-status")"
             "gives `--verify-json` no value",
         );
         refused(
-            "kept logs without their directory",
-            &with_argv(&kept, without("--verify-log-dir", 1)),
-            "keeps logs without `--verify-log-dir <path>`",
+            "a log directory Hermit would read as a flag",
+            &with_argv(&kept, replace_after("--verify-log-dir", "-x")),
+            "gives `--verify-log-dir` no value",
+        );
+        refused(
+            "a comparison of other directories",
+            &with_argv(&base, |argv| {
+                let index = at(argv, "--verify-json") + 3;
+                argv[index] = "/elsewhere/run1".into();
+            }),
+            "does not compare the attempt's run1 and run2 directories",
+        );
+        refused(
+            "a comparison by another Hermit",
+            &with_argv(&base, |argv| {
+                let index = at(argv, "log-diff") - 1;
+                argv[index] = "/other/hermit".into();
+            }),
+            "has no run command after its comparison",
         );
         refused(
             "a workdir Hermit would read as a flag",
@@ -19170,13 +19579,13 @@ exit "$(cat "$PWD/exit-status")"
         // A retained PASS is refused by the same check.
         let none = DeclaredStdout::default();
         let (plain, _) = expected_exit_row(None, canonical_verification_report(), "exit 0");
-        assert_eq!(plain.argv[4], "ptrace");
+        assert!(has_pair(&plain, "--backend", "ptrace"));
         accepted("a verify PASS the executor wrote", &plain);
         assert_eq!(retained_verify_pass_error(&plain, &none), None);
         for (label, row) in [
             (
                 "a ptrace PASS whose command line selects liteinst",
-                with_argv(&plain, |argv| argv[4] = "liteinst".into()),
+                with_argv(&plain, replace_after("--backend", "liteinst")),
             ),
             (
                 "a PASS that selects a second backend",
@@ -19184,7 +19593,7 @@ exit "$(cat "$PWD/exit-status")"
             ),
             (
                 "a PASS with a run flag its row does not record",
-                with_argv(&plain, insert_before("--verify", &["--no-rcb-time"])),
+                with_argv(&plain, insert_before("--verify-run", &["--no-rcb-time"])),
             ),
         ] {
             let error = retained_verify_pass_error(&row, &none)
@@ -19434,7 +19843,8 @@ exit "$(cat "$PWD/exit-status")"
         let mut guest_args = with_executor_invocation(guest_args);
         let argv = &guest_args.attempts[0].argv;
         let separator = argv.iter().position(|arg| arg == "--").unwrap();
-        assert_eq!(argv[1..5], ["--log", "info", "--backend", "ptrace"]);
+        let log = argv.iter().position(|arg| arg == "--log").unwrap();
+        assert_eq!(argv[log..log + 4], ["--log", "info", "--backend", "ptrace"]);
         assert_eq!(argv[separator + 1..], ["fixture", "--backend", "sabre"]);
         guest_args.execution_path = summarize_sabre_path_evidence(&guest_args.attempts).unwrap();
         assert_eq!(guest_args.execution_path, None);
@@ -20639,6 +21049,7 @@ exit "$(cat "$PWD/exit-status")"
             timeout_seconds,
             verdict_path: Some(verdict),
             verification_log_dir: None,
+            verify_runs: None,
             sabre_path_evidence: None,
             cell_dir: dir.clone(),
             expected_guest_exit: expected,
@@ -20847,13 +21258,24 @@ exit "$(cat "$PWD/exit-status")"
 set -eu
 verdict=
 logdir=
+rundir=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --verify-json) verdict=$2; shift 2 ;;
     --verify-log-dir) logdir=$2; shift 2 ;;
+    --verify-run) rundir=$2; shift 2 ;;
     *) shift ;;
   esac
 done
+if [ -n "$rundir" ]; then
+  # One run of the pair: its record, then its status; the comparison below
+  # says what `run --verify` would have said.
+  mkdir "$rundir"
+  printf '{{}}\n' > "$rundir/verify-run.json"
+  status=0
+  ( {ending} ) >/dev/null 2>&1 || status=$?
+  exit "$status"
+fi
 if [ -n "$logdir" ]; then
   mkdir -p "$logdir"
   printf 'INFO detcore: shared\n' > "$logdir/run1_log_fixture.log"
@@ -21827,6 +22249,7 @@ cp "{}" "$verdict"
             timeout_seconds: 5,
             verdict_path: Some(verdict),
             verification_log_dir: None,
+            verify_runs: None,
             sabre_path_evidence: None,
             cell_dir: dir.clone(),
             expected_guest_exit: None,
@@ -22746,6 +23169,7 @@ cp "{}" "$verdict"
             timeout_seconds: 5,
             verdict_path: Some(verdict),
             verification_log_dir: None,
+            verify_runs: None,
             sabre_path_evidence: None,
             cell_dir: dir.clone(),
             expected_guest_exit: None,

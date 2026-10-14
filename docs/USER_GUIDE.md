@@ -526,9 +526,13 @@ verification log, the guest's output, and a `verify-run.json` record of how it
 ended. `log-diff --verify-json` compares two such directories exactly as
 `--verify` compares its two runs, writes the same report, shows the guest's
 output as `--verify` shows it, and exits with the same status; it accepts
-`--verify-allow`. Both runs must use the same
-comparison flags and the same epoch, which `--verify` would have given both;
-the comparison refuses directories that differ in either.
+`--verify-allow`, and `--verify-log-dir DIR` keeps the compared logs in DIR as
+`--verify --keep-logs --verify-log-dir DIR` keeps them. Both runs must use
+the same comparison flags and the same epoch, which `--verify` would have
+given both; the comparison refuses directories that differ in either. Where
+`--verify` would not have started its second run (the first failed, or its
+status is not one `--verify-allow` admits), the second directory need not
+exist.
 
 ### Record And Replay
 

@@ -1031,7 +1031,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // import_mode_keeps_a_relaxed_row_from_a_worker_whose_counter_miscounts
     // (hermit-manifest-plan, https://github.com/rrnewton/hermit/issues/4291)
     // retain all 1085: 1087.
-    ("test.regular_crates", 1087),
+    // And +1 from 843b8e10: 1088.
+    ("test.regular_crates", 1088),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -2888,7 +2889,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4100): 366.
     // And detcore_fixes_the_virtual_kernel_files_on_every_backend (B2a, https://github.com/rrnewton/hermit/issues/4266): 367.
     // And +5 from ce6d9a4f: 372.
-    ("test.cli", 372),
+    // And +1 from 843b8e10: 373.
+    ("test.cli", 373),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3185,7 +3187,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // So do the three leader pthread_exit tests: 302.
     // And detcore_fixes_the_virtual_kernel_files_on_every_backend (B2a, https://github.com/rrnewton/hermit/issues/4266): 303.
     // And +5 from ce6d9a4f: 308.
-    ("test.cli_on_host", 308),
+    // And +1 from 843b8e10: 309.
+    ("test.cli_on_host", 309),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -3677,7 +3680,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same heavy-label test: 1085.
     // And the same two tests of a run without a timeslice on an inexact
     // counter: 1087.
-    ("test.regular_crates_on_host", 1087),
+    // And +1 from 843b8e10: 1088.
+    ("test.regular_crates_on_host", 1088),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).

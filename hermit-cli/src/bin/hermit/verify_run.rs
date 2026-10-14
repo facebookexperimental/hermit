@@ -379,11 +379,17 @@ fn failed_run(
 
 /// Compare two `--verify-run` directories as `run --verify` compares its two
 /// runs, publish the report to `verify_json`, and return the status `run
-/// --verify` would exit with. `verify_allow` is `--verify-allow`.
+/// --verify` would exit with. `verify_allow` is `--verify-allow`, and
+/// `verify_log_dir` is `--keep-logs --verify-log-dir`.
+///
+/// Run 2's directory is read only once run 1 is admitted to a comparison:
+/// where `run --verify` would not have started run 2 (run 1 failed, or its
+/// status is not allowed), a caller need not have run it either.
 pub(crate) fn compare(
     directories: [&Path; 2],
     verify_json: Option<&Path>,
     verify_allow: VerifyAllow,
+    verify_log_dir: Option<&Path>,
 ) -> Result<ExitStatus, Error> {
     // Stamp the invocation-bound no-result first, as `run --verify` does, so
     // a reused path never shows an earlier verdict.
@@ -391,8 +397,62 @@ pub(crate) fn compare(
         write_pending_verification_json(path)?;
     }
     let run1 = VerifyRunDirectory::read(directories[0])?;
-    let run2 = VerifyRunDirectory::read(directories[1])?;
-    let (record1, record2) = (&run1.record, &run2.record);
+    let record1 = &run1.record;
+    let backend = <Backend as clap::ValueEnum>::from_str(&record1.backend, false)
+        .map_err(|error| Error::msg(format!("unknown backend {}: {error}", record1.backend)))?;
+    if let Some(verdict) = record1.exact_branch_counter.clone() {
+        record_exact_branch_counter(verdict);
+        // The pending stamp predates the verdict; restamp it with the verdict,
+        // as `run --verify` does once it knows it.
+        if let Some(path) = verify_json {
+            write_pending_verification_json(path)?;
+        }
+    }
+    // `--keep-logs`: what `run --verify --keep-logs` retains on each path.
+    let retain = |runs: &[&VerifyRunDirectory]| -> Result<(), Error> {
+        let Some(logs) = verify_log_dir else {
+            return Ok(());
+        };
+        retain_logs(logs, runs)
+    };
+    let summary1 = run1.summary();
+
+    let VerifyRunOutcome::Completed {
+        status: status1,
+        skid_overshoots: skid1,
+        forwarded_syscalls: forwarded1,
+    } = record1.outcome
+    else {
+        retain(&[&run1])?;
+        return Err(failed_run(
+            verify_json,
+            VerificationRun::Run1,
+            "run 1",
+            &record1.outcome,
+            (summary1.as_ref(), None),
+            None,
+        )?);
+    };
+    let out1 = run1.output(status1)?;
+    // Prepared where `run --verify` prepares them, and queued the same way:
+    // by every return below that does not verify the runs.
+    let mut signal_reports = SignalTerminationReports::default();
+    signal_reports.prepare("run 1", out1.status, &run1.directory.join(LOG));
+    if let Some(error) =
+        reject_first_run(verify_json, verify_allow, &out1, skid1, summary1.as_ref())
+    {
+        retain(&[&run1])?;
+        return Err(error);
+    }
+
+    let run2 = match VerifyRunDirectory::read(directories[1]) {
+        Ok(run2) => run2,
+        Err(error) => {
+            retain(&[&run1])?;
+            return Err(error);
+        }
+    };
+    let record2 = &run2.record;
     if record1.epoch != record2.epoch {
         anyhow::bail!(
             "the two --verify-run directories started their virtual clocks at different epochs \
@@ -419,44 +479,7 @@ pub(crate) fn compare(
             record2.passthru_opt,
         );
     }
-    let backend = <Backend as clap::ValueEnum>::from_str(&record1.backend, false)
-        .map_err(|error| Error::msg(format!("unknown backend {}: {error}", record1.backend)))?;
-    if let Some(verdict) = record1.exact_branch_counter.clone() {
-        record_exact_branch_counter(verdict);
-        // The pending stamp predates the verdict; restamp it with the verdict,
-        // as `run --verify` does once it knows it.
-        if let Some(path) = verify_json {
-            write_pending_verification_json(path)?;
-        }
-    }
-    let summary1 = run1.summary();
     let summary2 = run2.summary();
-
-    let VerifyRunOutcome::Completed {
-        status: status1,
-        skid_overshoots: skid1,
-        forwarded_syscalls: forwarded1,
-    } = record1.outcome
-    else {
-        return Err(failed_run(
-            verify_json,
-            VerificationRun::Run1,
-            "run 1",
-            &record1.outcome,
-            (summary1.as_ref(), None),
-            None,
-        )?);
-    };
-    let out1 = run1.output(status1)?;
-    // Prepared where `run --verify` prepares them, and queued the same way:
-    // by every return below that does not verify the runs.
-    let mut signal_reports = SignalTerminationReports::default();
-    signal_reports.prepare("run 1", out1.status, &run1.directory.join(LOG));
-    if let Some(error) =
-        reject_first_run(verify_json, verify_allow, &out1, skid1, summary1.as_ref())
-    {
-        return Err(error);
-    }
 
     let VerifyRunOutcome::Completed {
         status: status2,
@@ -464,6 +487,7 @@ pub(crate) fn compare(
         forwarded_syscalls: forwarded2,
     } = record2.outcome
     else {
+        retain(&[&run1, &run2])?;
         return Err(failed_run(
             verify_json,
             VerificationRun::Run2,
@@ -534,6 +558,13 @@ pub(crate) fn compare(
             },
         )?
     };
+    // After a match run 1's log is kept as the golden log, as `--keep-logs`
+    // keeps it; otherwise both.
+    if outcome.verified() {
+        retain(&[&run1])?;
+    } else {
+        retain(&[&run1, &run2])?;
+    }
     // What `run --verify` shows of the guest after its comparison: DBT's
     // adapter shows run 1's output after a match, and the others also after
     // a divergence where both runs' output agreed.
@@ -549,6 +580,26 @@ pub(crate) fn compare(
     }
     emit_compared_guest_output(true, &out1, &out2)?;
     Ok(outcome.guest_status)
+}
+
+/// Keep the logs of `runs` in `logs` under the names `run --verify
+/// --keep-logs` gives them (`run1_log_*`, `run2_log_*`), as links, so the
+/// directories keep theirs.
+fn retain_logs(logs: &Path, runs: &[&VerifyRunDirectory]) -> Result<(), Error> {
+    fs::create_dir_all(logs).with_context(|| format!("creating {}", logs.display()))?;
+    eprintln!(":: Verification logs retained:");
+    for (index, run) in runs.iter().enumerate() {
+        let source = run.directory.join(LOG);
+        let retained = tempfile::Builder::new()
+            .prefix(&format!("run{}_log_", index + 1))
+            .make_in(logs, |path| fs::hard_link(&source, path))
+            .with_context(|| format!("retaining {} in {}", source.display(), logs.display()))?
+            .into_temp_path()
+            .keep()
+            .context("keeping a retained log")?;
+        eprintln!("::   run {}: {}", index + 1, retained.display());
+    }
+    Ok(())
 }
 
 /// Compare two completed DBT runs as `run_dbt` compares its two

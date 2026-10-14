@@ -242,3 +242,79 @@ fn paired_verify_runs_refuse_unlike_runs_and_find_a_difference() {
     assert!(fs::metadata(base.join("run.log")).unwrap().len() > 0);
     assert!(fs::metadata(same.join("run.log")).unwrap().len() > 0);
 }
+
+/// `log-diff --verify-json --verify-log-dir` keeps the compared logs as `run
+/// --verify --keep-logs --verify-log-dir` keeps them: run 1's alone after a
+/// match, both after a divergence, as links that leave the directories whole.
+/// And where `run --verify` would not have started run 2 (run 1's status is
+/// not allowed), the comparison needs no run 2 directory.
+#[test]
+fn paired_verify_runs_keep_logs_and_need_no_run_two_after_a_rejected_run_one() {
+    let _guard = hermit_run_guard();
+    let root = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let run = |name: &str, guest: &[&str]| {
+        let directory = root.path().join(name);
+        let output = hermit_run(
+            &[],
+            &["--strict", "--verify-run", directory.to_str().unwrap()],
+            guest,
+            EPOCH,
+        );
+        assert!(
+            directory.join("verify-run.json").exists(),
+            "{name}: {}",
+            stderr(&output)
+        );
+        directory
+    };
+    let retained = |logs: &Path| {
+        let mut names = fs::read_dir(logs)
+            .unwrap()
+            .map(|entry| {
+                let name = entry.unwrap().file_name().into_string().unwrap();
+                name[..name.find("_log_").unwrap()].to_owned()
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    let echo = ["/bin/echo", "paired"];
+    let (first, second) = (run("first", &echo), run("second", &echo));
+
+    let logs = root.path().join("matched-logs");
+    let output = log_diff(
+        &root.path().join("matched.json"),
+        [&first, &second],
+        &["--verify-log-dir", logs.to_str().unwrap()],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(retained(&logs), ["run1"]);
+    assert!(first.join("run.log").exists() && second.join("run.log").exists());
+
+    fs::write(second.join("stdout"), b"something else\n").unwrap();
+    let logs = root.path().join("diverged-logs");
+    let output = log_diff(
+        &root.path().join("diverged.json"),
+        [&first, &second],
+        &["--verify-log-dir", logs.to_str().unwrap()],
+    );
+    assert!(!output.status.success());
+    assert_eq!(retained(&logs), ["run1", "run2"]);
+
+    let failing = run("failing", &["/bin/sh", "-c", "exit 3"]);
+    let logs = root.path().join("rejected-logs");
+    let verdict = root.path().join("rejected.json");
+    let output = log_diff(
+        &verdict,
+        [&failing, &root.path().join("never-run")],
+        &["--verify-log-dir", logs.to_str().unwrap()],
+    );
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("First run errored during --verify"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(report(&verdict)["guest_exit_code"], 3);
+    assert_eq!(retained(&logs), ["run1"]);
+}

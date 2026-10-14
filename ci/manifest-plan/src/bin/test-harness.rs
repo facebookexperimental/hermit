@@ -4314,23 +4314,32 @@ scenario=(root/'scenario').read_text()
 def record(value):
  with (root/'invocations').open('a') as f:f.write(json.dumps(value)+'\n')
 if a[0]=='log-diff':
+ if '--verify-json' in a:
+  # The comparison of a verify cell's two runs, which plays the scenario.
+  run1=pathlib.Path(a[-2])
+  backend=json.loads((run1/'verify-run.json').read_text())['backend']
+  report=pathlib.Path(a[a.index('--verify-json')+1])
+  logdir=pathlib.Path(a[a.index('--verify-log-dir')+1])
+  record({'kind':'verify-compare','backend':backend,'argv':a})
+  logdir.mkdir(parents=True,exist_ok=True)
+  value='different' if scenario=='diverged' and backend=='kvm' else 'shared'
+  (logdir/'run1_log_fixture.log').write_text('INFO detcore: '+value+'\nINFO detcore: complete\n')
+  report.write_bytes((root/'verification.json').read_bytes())
+  sys.exit(0)
  if len(a)==2:
   record({'kind':'normalize','argv':a});sys.stdout.buffer.write(pathlib.Path(a[1]).read_bytes());sys.exit(0)
  record({'kind':'compare','argv':a});sys.exit(3)
 # `--backend` is a global option, so it precedes `run`.
 backend=full[full.index('--backend')+1]
-if '--verify-json' not in a:
+if '--verify-run' not in a:
  assert '--verify' not in a and '--verify-strict' not in a,a
  record({'kind':'custom','backend':backend,'argv':a});sys.exit(0)
-report=pathlib.Path(a[a.index('--verify-json')+1])
-logdir=pathlib.Path(a[a.index('--verify-log-dir')+1])
-reference='parity-reference' in str(logdir)
+rundir=pathlib.Path(a[a.index('--verify-run')+1])
+reference='parity-reference' in str(rundir)
 record({'kind':'run','backend':backend,'reference':reference,'argv':a})
-assert '--verify-strict' in a and '--verify' in a,a
-logdir.mkdir(parents=True,exist_ok=True)
-value='different' if scenario=='diverged' and backend=='kvm' else 'shared'
-(logdir/'run1_log_fixture.log').write_text('INFO detcore: '+value+'\nINFO detcore: complete\n')
-report.write_bytes((root/'verification.json').read_bytes())
+assert '--verify-strict' in a and '--verify' not in a,a
+rundir.mkdir()
+(rundir/'verify-run.json').write_text(json.dumps({'backend':backend}))
 "#,
             )
             .unwrap();
@@ -4418,13 +4427,17 @@ report.write_bytes((root/'verification.json').read_bytes())
             // removed: parity canonicalizes run 1's log when it compares. The
             // fake still records a single-log call as "normalize" and a
             // two-log comparison as "compare", so either would fail this.
-            assert_eq!(calls.len(), 3, "{scenario}: {calls:#?}");
+            // Each verify cell runs its guest twice and compares the two
+            // runs (`VERIFY_PAIR_SCRIPT`); the custom cell runs once.
+            assert_eq!(calls.len(), 7, "{scenario}: {calls:#?}");
             assert_eq!(
                 kinds,
                 BTreeSet::from([
                     "custom:kvm:false".to_string(),
                     "run:kvm:false".to_string(),
                     "run:ptrace:false".to_string(),
+                    "verify-compare:kvm:false".to_string(),
+                    "verify-compare:ptrace:false".to_string(),
                 ]),
                 "{scenario}: no ptrace reference run and no log-diff comparison"
             );
@@ -4682,8 +4695,15 @@ root=pathlib.Path(__file__).parent
 a=sys.argv[1:]
 if '--help' in a:
  print('--verify-strict');sys.exit(0)
-if 'run' in a:a=a[a.index('run'):]
-if not a or a[0]!='run':sys.exit(0)
+evidence=os.environ.get('HERMIT_SABRE_PATH_EVIDENCE')
+if 'run' in a and '--verify-run' in a:
+ # One run of the pair: its record; the comparison below plays the scenario.
+ d=pathlib.Path(a[a.index('--verify-run')+1]);d.mkdir();(d/'verify-run.json').write_text('{}\n')
+ if evidence:
+  with open(evidence,'a') as f:f.write('{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}\n')
+ sys.exit(0)
+if 'log-diff' not in a:sys.exit(0)
+a=a[a.index('log-diff'):]
 calls=root/'invocations'
 n=len(calls.read_text().splitlines()) if calls.exists() else 0
 with calls.open('a') as f:f.write(json.dumps(a)+'\n')
@@ -4699,10 +4719,6 @@ logdir=pathlib.Path(a[a.index('--verify-log-dir')+1])
 logdir.mkdir(parents=True,exist_ok=True)
 (logdir/'run1_log_fixture.log').write_text('INFO detcore: shared\nINFO detcore: complete\n')
 report.write_bytes((root/({'unmarked':'skid','unmarked-diverged':'diverged'}.get(kind,kind)+'.json')).read_bytes())
-evidence=os.environ.get('HERMIT_SABRE_PATH_EVIDENCE')
-if evidence:
- line='{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}\n'
- pathlib.Path(evidence).write_text(line+line)
 if kind in ('skid','diverged','rejected','crashed'):
  sys.stderr.write('HERMIT_SKID_OVERSHOOT rcb_actual=39951476 rcb_target=39950647 skid_margin=1000 overshoot=829\n'
   'HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=2\n')
@@ -4929,24 +4945,24 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                     });
                     redeclared.attempts[0].verification_report = Some(sevens);
                     // The executor writes `--verify-allow=failure` after
-                    // `--verify` for a cell that declares an expected exit,
-                    // and records the shell command and the row's copies from
-                    // that argv; without it the command line is not one a
-                    // declaring cell runs.
+                    // the comparison's report path for a cell that declares
+                    // an expected exit, and records the shell command and the
+                    // row's copies from that argv; without it the command
+                    // line is not one a declaring cell runs.
                     assert_eq!(
                         super::skid_overshoot_only_reports(&redeclared),
                         None,
                         "{redeclared:#?}"
                     );
                     for attempt in &mut redeclared.attempts {
-                        let verify = attempt
+                        let report = attempt
                             .argv
                             .iter()
-                            .position(|arg| arg == "--verify")
+                            .position(|arg| arg == "--verify-json")
                             .unwrap();
                         attempt
                             .argv
-                            .insert(verify + 1, "--verify-allow=failure".into());
+                            .insert(report + 2, "--verify-allow=failure".into());
                         attempt.shell_command = hermit_manifest_plan::runner::shell_command(
                             &attempt.cwd,
                             &attempt.env,
@@ -6774,7 +6790,8 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
             include_str!("../../tests/fixtures/fake-parity-log-diff.py"),
         )
         .unwrap();
-        // One fake hermit: `run` is a guest execution and is counted; a
+        // One fake hermit: the comparison of a verify cell's two runs
+        // (`log-diff --verify-json`) is its guest execution and is counted; a
         // single-log `log-diff`, the ptrace golden normalization removed for
         // https://github.com/rrnewton/hermit/issues/3301, is counted so that
         // its return fails the test; a two-log `log-diff` is a parity
@@ -6804,18 +6821,24 @@ import os
 root=os.path.dirname(os.path.realpath(__file__))
 def record(line):
  with open(os.path.join(root,'invocations'),'a') as f:f.write(line+'\n')
-if a[0]=='log-diff':
+if a[0]=='run':
+ # One run of a verify cell's pair: its record, naming its backend. The
+ # comparison of the pair below is the cell's guest execution.
+ assert '--verify-strict' in a and '--verify' not in a,a
+ rundir=a[a.index('--verify-run')+1]
+ os.mkdir(rundir)
+ with open(os.path.join(rundir,'verify-run.json'),'w') as f:f.write(full[full.index('--backend')+1])
+ sys.exit(0)
+if '--verify-json' not in a:
  if len(a)==2:
   record('{"kind": "normalize"}');sys.stdout.buffer.write(open(a[1],'rb').read());sys.exit(0)
  record('{"kind": "compare"}')
  os.execv(sys.executable,[sys.executable,'-IS',os.path.join(root,'fake-parity-log-diff.py')]+a)
-# `--backend` is a global option, so it precedes `run`.
-backend=full[full.index('--backend')+1]
+backend=open(os.path.join(a[-2],'verify-run.json')).read()
 report=a[a.index('--verify-json')+1]
 cell=os.path.basename(os.path.dirname(report))
 record('{"kind": "run", "cell": "%s"}'%cell)
 scenario=open(os.path.join(root,'scenario')).read().split()
-assert '--verify-strict' in a and '--verify' in a,a
 if '--verify-log-dir' in a:
  logdir=a[a.index('--verify-log-dir')+1]
  os.makedirs(logdir,exist_ok=True)
@@ -6972,51 +6995,42 @@ sys.exit(1 if failed else 0)
                 .map(|record| format!("{}@{}={:?}", record.test_id, record.backend, record.verdict))
                 .collect::<Vec<_>>()
         };
-        // `without_timings` output with exactly the `--keep-logs
-        // --verify-log-dir <dir>` that retains a cell's logs removed from each
-        // row's argv, effective_args and shell_command, and from each
-        // attempt's argv and shell_command, and the number of rows that had it.
+        // `without_timings` output with exactly the `--verify-log-dir <dir>`
+        // that retains a cell's logs removed from each row's argv,
+        // effective_args and shell_command, and from each attempt's argv and
+        // shell_command, and the number of rows that had it.
         fn drop_kept_logs(value: &mut Value, rows: &mut usize) {
-            const KEEP: [&str; 2] = ["--keep-logs", "--verify-log-dir"];
-            fn drop_triple(args: &mut Vec<Value>) -> Option<String> {
-                let at = args.iter().position(|arg| arg == KEEP[0])?;
-                assert_eq!(args.get(at + 1).and_then(Value::as_str), Some(KEEP[1]));
-                let dir = args[at + 2].as_str().unwrap().to_string();
-                args.drain(at..at + 3);
-                assert!(
-                    !args
-                        .iter()
-                        .any(|arg| KEEP.contains(&arg.as_str().unwrap_or("")))
-                );
+            const KEEP: &str = "--verify-log-dir";
+            fn drop_pair(args: &mut Vec<Value>) -> Option<String> {
+                let at = args.iter().position(|arg| arg == KEEP)?;
+                let dir = args[at + 1].as_str().unwrap().to_string();
+                args.drain(at..at + 2);
+                assert!(!args.iter().any(|arg| arg == KEEP));
                 Some(dir)
             }
             if let Value::Object(map) = value {
                 let dir = map
                     .get_mut("argv")
                     .and_then(Value::as_array_mut)
-                    .and_then(drop_triple);
+                    .and_then(drop_pair);
                 if let Some(dir) = dir {
                     let quoted = hermit_manifest_plan::runner::shell_command(
                         ".",
                         &BTreeMap::new(),
                         std::slice::from_ref(&dir),
                     );
-                    let segment = format!(
-                        " {} {} {}",
-                        KEEP[0],
-                        KEEP[1],
-                        quoted.strip_prefix("cd . && env ").unwrap()
-                    );
+                    let segment =
+                        format!(" {KEEP} {}", quoted.strip_prefix("cd . && env ").unwrap());
                     let command = map["shell_command"].as_str().unwrap();
                     assert_eq!(command.matches(&segment).count(), 1, "{command}");
                     map["shell_command"] = Value::String(command.replacen(&segment, "", 1));
                     if let Some(args) = map.get_mut("effective_args") {
                         *rows += 1;
-                        let effective = drop_triple(args.as_array_mut().unwrap());
+                        let effective = drop_pair(args.as_array_mut().unwrap());
                         assert_eq!(effective.as_deref(), Some(dir.as_str()));
                     }
                 } else if let Some(command) = map.get("shell_command").and_then(Value::as_str) {
-                    assert!(!command.contains(KEEP[1]), "{command}");
+                    assert!(!command.contains(KEEP), "{command}");
                 }
                 map.values_mut()
                     .for_each(|value| drop_kept_logs(value, rows));
