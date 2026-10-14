@@ -475,15 +475,34 @@ fn pin_to(cpu: usize) -> Result<(), ProbeRefusal> {
     Ok(())
 }
 
-/// The CPU the probe pins itself to: the idlest, over 100 ms of /proc/stat, of
-/// the first [`CPU_CANDIDATES`] CPUs this thread may run on. Low-numbered, so
-/// that the schedstat line each reload trial reads comes early in the file;
-/// idle, so that the calibration spins and the trials are not switched out by
-/// other work, which on a loaded machine made every spin fail on one busy CPU.
+/// The CPU the probe pins itself to: over 100 ms of /proc/stat, the
+/// lowest-numbered allowed CPU that was idle for at least [`IDLE_ENOUGH`] of the
+/// interval, or, when none was, the idlest allowed CPU. Idle, so that the
+/// calibration spins and the trials are not switched out by other work: with
+/// all of a loaded machine's low-numbered CPUs busy, every spin failed.
+/// Low-numbered among those, because each reload trial reads /proc/schedstat
+/// up to the chosen CPU's line, which costs about 80 us at CPU 15 and 1.3 ms at
+/// CPU 300.
 fn probe_cpu() -> Result<usize, ProbeRefusal> {
     let allowed = allowed_cpus()?;
-    let candidates: Vec<usize> = allowed.iter().copied().take(CPU_CANDIDATES).collect();
-    let idle = |text: &str, cpu: usize| -> Option<u64> {
+    let read = || {
+        std::fs::read_to_string("/proc/stat").map_err(|e| format!("cannot read /proc/stat: {e}"))
+    };
+    let before = read()?;
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let after = read()?;
+    choose_probe_cpu(&allowed, &before, &after)
+        .ok_or_else(|| "the probe may run on no CPU".to_owned())
+}
+
+/// The fraction of the sampled interval a CPU must have been idle for
+/// [`probe_cpu`] to prefer it by number rather than by idleness.
+const IDLE_ENOUGH: f64 = 0.95;
+
+/// [`probe_cpu`]'s choice among `allowed`, from two /proc/stat texts.
+fn choose_probe_cpu(allowed: &[usize], before: &str, after: &str) -> Option<usize> {
+    // (idle and iowait, all fields) jiffies of one CPU line.
+    let times = |text: &str, cpu: usize| -> Option<(u64, u64)> {
         let want = format!("cpu{cpu} ");
         let line = text.lines().find(|line| line.starts_with(&want))?;
         let fields: Vec<u64> = line
@@ -491,28 +510,30 @@ fn probe_cpu() -> Result<usize, ProbeRefusal> {
             .skip(1)
             .filter_map(|field| field.parse().ok())
             .collect();
-        // idle and iowait
-        Some(fields.get(3)? + fields.get(4)?)
+        Some((fields.get(3)? + fields.get(4)?, fields.iter().sum()))
     };
-    let read = || {
-        std::fs::read_to_string("/proc/stat").map_err(|e| format!("cannot read /proc/stat: {e}"))
+    let idle = |cpu: usize| -> (u64, u64) {
+        match (times(after, cpu), times(before, cpu)) {
+            (Some((idle_a, all_a)), Some((idle_b, all_b))) => {
+                (idle_a.saturating_sub(idle_b), all_a.saturating_sub(all_b))
+            }
+            _ => (0, 0),
+        }
     };
-    let before = read()?;
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    let after = read()?;
-    candidates
+    allowed
         .iter()
         .copied()
-        .max_by_key(|cpu| {
-            idle(&after, *cpu)
-                .zip(idle(&before, *cpu))
-                .map_or(0, |(a, b)| a.saturating_sub(b))
+        .find(|cpu| {
+            let (idle, all) = idle(*cpu);
+            all > 0 && idle as f64 >= IDLE_ENOUGH * all as f64
         })
-        .ok_or_else(|| "the probe may run on no CPU".to_owned())
+        .or_else(|| {
+            allowed
+                .iter()
+                .copied()
+                .max_by_key(|cpu| (idle(*cpu).0, std::cmp::Reverse(*cpu)))
+        })
 }
-
-/// How many of the lowest-numbered allowed CPUs [`probe_cpu`] chooses among.
-const CPU_CANDIDATES: usize = 16;
 
 /// The CPUs this thread may run on, in order.
 fn allowed_cpus() -> Result<Vec<usize>, ProbeRefusal> {
@@ -1081,29 +1102,38 @@ enum CalibrationFailure {
 
 /// Condition C11's binding calibration: over a spin with no context switch or
 /// fault, the counter sees at least this CPU's local-timer interrupts and no
-/// more than all of them. Retried up to ten times for a spin that was switched
-/// out.
+/// more than all of them.
+///
+/// On a busy machine a spin is often preempted, by per-CPU kernel work if
+/// nothing else, and a preempted spin says nothing. So each spin is short,
+/// [`CALIBRATION_SPIN`] at first, and starts after a short sleep, which lets
+/// pending work on the CPU run first; up to [`CALIBRATION_ATTEMPTS`] spins are
+/// tried. A clean spin that saw fewer than
+/// [`irq_counter::MIN_CALIBRATION_TICKS`] local-timer interrupts (a host with a
+/// lower timer frequency) is repeated at twice the length, up to
+/// [`CALIBRATION_SPIN_MAX`]; past that, the verdict refuses it as tickless.
 fn calibrate(counter: &IrqCounter, cpu: usize) -> Result<String, CalibrationFailure> {
     let refused = |e: irq_counter::CounterRefusal| CalibrationFailure::Refused(e.to_string());
     let lost = CalibrationFailure::CounterLost;
-    const SPIN_TSC_TICKS: u64 = 300_000_000;
-    const ATTEMPTS: usize = 20;
+    let mut spin = CALIBRATION_SPIN;
+    let mut lost_spins = Switches::default();
     let (mut switched, mut slow_reads) = (0, 0);
-    for _attempt in 0..ATTEMPTS {
+    for _attempt in 0..CALIBRATION_ATTEMPTS {
+        std::thread::sleep(CALIBRATION_PAUSE);
         // SAFETY: RDTSC is available on every x86_64 processor.
         let tsc = || unsafe { std::arch::x86_64::_rdtsc() };
         let measured_from = tsc();
         let before = irq_counter::snapshot_proc_interrupts().map_err(refused)?;
-        let switches = switches_and_faults().map_err(CalibrationFailure::Refused)?;
+        let switches = Switches::now().map_err(CalibrationFailure::Refused)?;
         let start_count = counter.read().map_err(lost)?;
         let start = tsc();
-        // SAFETY: as above.
-        while unsafe { std::arch::x86_64::_rdtsc() } - start < SPIN_TSC_TICKS {
+        let spin_start = std::time::Instant::now();
+        while spin_start.elapsed() < spin {
             std::hint::spin_loop();
         }
         let end_count = counter.read().map_err(lost)?;
         let end = tsc();
-        let switches_after = switches_and_faults().map_err(CalibrationFailure::Refused)?;
+        let switches_after = Switches::now().map_err(CalibrationFailure::Refused)?;
         let after = irq_counter::snapshot_proc_interrupts().map_err(refused)?;
         let measured_to = tsc();
         let outside = 1.0 - (end - start) as f64 / (measured_to - measured_from) as f64;
@@ -1111,6 +1141,7 @@ fn calibrate(counter: &IrqCounter, cpu: usize) -> Result<String, CalibrationFail
         // surrounding reads took over 30% of the interval binds loosely.
         if switches_after != switches {
             switched += 1;
+            lost_spins.add(&switches_after.since(&switches));
             continue;
         }
         if outside > 0.3 {
@@ -1123,28 +1154,111 @@ fn calibrate(counter: &IrqCounter, cpu: usize) -> Result<String, CalibrationFail
             local_timer: after.local_timer - before.local_timer,
             total: after.total - before.total,
         };
+        if kernel.local_timer < irq_counter::MIN_CALIBRATION_TICKS && spin < CALIBRATION_SPIN_MAX {
+            spin = (spin * 2).min(CALIBRATION_SPIN_MAX);
+            continue;
+        }
         let count = end_count - start_count;
         irq_counter::calibration_verdict(count, kernel, outside).map_err(|why| {
             CalibrationFailure::Refused(irq_counter::CounterRefusal::Calibration(why).to_string())
         })?;
         return Ok(format!(
-            "counter {count}, local timer {}, CPU total {} over {SPIN_TSC_TICKS} TSC ticks \
+            "counter {count}, local timer {}, CPU total {} over a {} ms spin \
              ({:.1}% of the interval outside the counter)",
             kernel.local_timer,
             kernel.total,
+            spin.as_millis(),
             outside * 100.0
         ));
     }
     Err(CalibrationFailure::Refused(format!(
-        "no interrupt-counter calibration spin was usable in {ATTEMPTS} attempts: \
-         {switched} were switched out or faulted, {slow_reads} spent over 30% of their \
-         interval reading /proc/interrupts"
+        "no interrupt-counter calibration spin on CPU {cpu} was usable in \
+         {CALIBRATION_ATTEMPTS} attempts: {switched} were switched out or faulted \
+         ({} involuntary and {} voluntary context switches and {} page faults in all), \
+         {slow_reads} spent over 30% of their interval reading /proc/interrupts",
+        lost_spins.involuntary, lost_spins.voluntary, lost_spins.faults
     )))
+}
+
+/// How long a calibration spin lasts at first: about 70 local-timer
+/// interrupts at 1000 Hz.
+const CALIBRATION_SPIN: std::time::Duration = std::time::Duration::from_millis(70);
+/// The longest a calibration spin may grow to on a host with a lower timer
+/// frequency: 50 interrupts at 100 Hz, plus a margin.
+const CALIBRATION_SPIN_MAX: std::time::Duration = std::time::Duration::from_millis(560);
+/// How many calibration spins are tried.
+const CALIBRATION_ATTEMPTS: usize = 60;
+/// The sleep before each calibration spin.
+const CALIBRATION_PAUSE: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// This thread's context switches and page faults, from getrusage.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Switches {
+    voluntary: i64,
+    involuntary: i64,
+    faults: i64,
+}
+
+impl Switches {
+    fn now() -> Result<Self, ProbeRefusal> {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        // SAFETY: `usage` is writable and RUSAGE_THREAD names the calling thread.
+        if unsafe { libc::getrusage(libc::RUSAGE_THREAD, usage.as_mut_ptr()) } != 0 {
+            return Err(format!(
+                "getrusage failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: getrusage succeeded and initialized it.
+        let u = unsafe { usage.assume_init() };
+        Ok(Self {
+            voluntary: u.ru_nvcsw,
+            involuntary: u.ru_nivcsw,
+            faults: u.ru_minflt + u.ru_majflt,
+        })
+    }
+
+    fn since(&self, earlier: &Self) -> Self {
+        Self {
+            voluntary: self.voluntary - earlier.voluntary,
+            involuntary: self.involuntary - earlier.involuntary,
+            faults: self.faults - earlier.faults,
+        }
+    }
+
+    fn add(&mut self, other: &Self) {
+        self.voluntary += other.voluntary;
+        self.involuntary += other.involuntary;
+        self.faults += other.faults;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A /proc/stat text whose cpuN lines have the given (busy, idle) jiffies.
+    fn proc_stat(cpus: &[(usize, u64, u64)]) -> String {
+        let mut text = String::from("cpu  0 0 0 0 0 0 0 0 0 0\n");
+        for (cpu, busy, idle) in cpus {
+            text.push_str(&format!("cpu{cpu} {busy} 0 0 {idle} 0 0 0 0 0 0\n"));
+        }
+        text
+    }
+
+    #[test]
+    fn the_probe_takes_the_lowest_idle_cpu_and_otherwise_the_idlest() {
+        let before = proc_stat(&[(1, 0, 0), (2, 0, 0), (40, 0, 0), (41, 0, 0)]);
+        // CPUs 1 and 2 busy, 40 and 41 idle: the lowest idle one, 40.
+        let after = proc_stat(&[(1, 10, 0), (2, 9, 1), (40, 0, 10), (41, 0, 10)]);
+        assert_eq!(choose_probe_cpu(&[1, 2, 40, 41], &before, &after), Some(40));
+        // Every CPU at least partly busy: the idlest, the lower on a tie.
+        let after = proc_stat(&[(1, 10, 0), (2, 5, 5), (40, 2, 8), (41, 2, 8)]);
+        assert_eq!(choose_probe_cpu(&[1, 2, 40, 41], &before, &after), Some(40));
+        // Only allowed CPUs are considered.
+        assert_eq!(choose_probe_cpu(&[1, 2], &before, &after), Some(2));
+        assert_eq!(choose_probe_cpu(&[], &before, &after), None);
+    }
 
     #[test]
     fn only_covered_component_sets_are_admitted() {
