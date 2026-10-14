@@ -101,6 +101,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "copy_file_range_refusal",
             "--test",
+            "cppc_feedback_determinism",
+            "--test",
             "cpufreq_avg_determinism",
             "--test",
             "cpuidle_determinism",
@@ -154,6 +156,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "leveldb",
             "--test",
             "madvise",
+            "--test",
+            "meminfo_determinism",
             "--test",
             "mmap_determinism",
             "--test",
@@ -799,8 +803,10 @@ mod tests {
             // plus the 67 tests of the 55 binaries no node ran before that pass on the
             // host and in the pinned root
             // (https://github.com/rrnewton/hermit/issues/2791), plus the 32
-            // tests of the six DBT binaries that now take the hermetic workdir.
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "400");
+            // tests of the six DBT binaries that now take the hermetic workdir,
+            // plus cppc_feedback_determinism's and meminfo_determinism's one each
+            // (https://github.com/rrnewton/hermit/issues/4355).
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "402");
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

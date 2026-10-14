@@ -71,10 +71,12 @@ fn meminfo_fields_and_free_use_guest_memory() {
         verify_guest(&guest, &format!("{name} strict verification"));
     }
 
-    let free = Path::new("/usr/bin/free");
-    assert!(
-        free.is_file(),
-        "free(1) is required by the compatibility corpus"
-    );
+    // The pinned root has procps at /bin only
+    // (https://github.com/rrnewton/hermit/issues/4355).
+    let free = ["/usr/bin/free", "/bin/free"]
+        .into_iter()
+        .map(Path::new)
+        .find(|path| path.is_file())
+        .expect("free(1) is required by the compatibility corpus: neither /usr/bin/free nor /bin/free exists");
     verify_guest(free, "free strict verification");
 }

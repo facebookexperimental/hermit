@@ -42,7 +42,14 @@ fn hermit_command() -> Command {
 
 fn assert_normalized_feedback() {
     let mut command = hermit_command();
-    command.args(["/usr/bin/cat", FEEDBACK_COUNTERS]);
+    // The pinned root has coreutils at /bin only
+    // (https://github.com/rrnewton/hermit/issues/4355).
+    let cat = required_program(&ProgramCase {
+        name: "cat CPPC feedback counters",
+        candidates: &["/usr/bin/cat", "/bin/cat"],
+        args: &[],
+    });
+    command.arg(cat).arg(FEEDBACK_COUNTERS);
     let rendered = format!("{command:?}");
     let output = command
         .output()
