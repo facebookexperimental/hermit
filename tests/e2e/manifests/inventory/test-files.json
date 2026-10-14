@@ -2125,6 +2125,12 @@
       "why": "tests/c/simple/racewrite_nostdlib.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/sleep_sigchld_taker.c",
+      "runner": "hermit-cli/tests/external_signal_interrupt.rs",
+      "why": "tests/c/sleep_sigchld_taker.c is owned by hermit-cli/tests/external_signal_interrupt.rs: The integration suite compiles this guest and checks that a pause or nanosleep of the thread that forked a child, beside a sibling spinning without system calls, takes the child's SIGCHLD and returns EINTR with the handler on the sleeping thread, as on Linux."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/so_incoming_cpu_tcp4.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

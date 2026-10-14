@@ -7988,6 +7988,8 @@ impl Scheduler {
                     let woken = self.force_unblock_thread_at(dettid, rsrcs, true);
                     self.mark_placed_delivery(dettid, signal, woken);
                 } else if is_queued_sleep && self.run_queue.contains_tid(dettid) {
+                    // Read before the wake replaces the sleep request.
+                    let ends = self.scheduler_sigchld_ends_sleep(dettid, signal);
                     assert!(self.run_queue.remove_tid(dettid));
                     // The child-exit timer may already have marked the real
                     // delivery as placed (`sigchld_ready`); the requeue clears
@@ -8003,10 +8005,17 @@ impl Scheduler {
                     // ptrace-stopped thread. Behind a running sibling, the
                     // sibling took the handler while the sleep still answered
                     // EINTR.
-                    self.force_unblock_thread_at(dettid, rsrcs, true);
+                    let woken = self.force_unblock_thread_at(dettid, rsrcs, true);
                     if delivery_placed {
                         self.blocked.sigchld_ready.insert(dettid);
                     }
+                    // Resumed first, as a woken futex waiter is: at the front of
+                    // its band it still followed a sibling of a higher band or a
+                    // chaos draw, which took the process-directed copy
+                    // (https://github.com/rrnewton/hermit/issues/4333). Only
+                    // when the signal will end the sleep in its own turn: a sleep
+                    // that parks again keeps no mark.
+                    self.mark_woken_sleep_taker(dettid, signal, woken && ends);
                     // Granted at its turn without consuming `sigchld_ready`
                     // (`woken_sleeps`): deferred, a `nanosleep` the
                     // signal does not end never reached its deadline while a
@@ -8077,13 +8086,22 @@ impl Scheduler {
                 // A parked `pause` or `nanosleep` woken for the scheduler's own
                 // signal: its turn is granted at once, as a queued one's is
                 // (`woken_sleeps`), so it decides in its own turn, not after a
-                // sibling that never blocks.
+                // sibling that never blocks. Like a woken futex waiter, it goes
+                // to the front of its band and is resumed first for a `SIGCHLD`
+                // (`mark_woken_sleep_taker`): behind a running sibling, the
+                // sibling took the process-directed copy, and a `pause` that
+                // found no signal for itself never returned
+                // (https://github.com/rrnewton/hermit/issues/4333).
                 let parked_sleep = self.signal_sleep(dettid).is_some();
+                let ends = parked_sleep && self.scheduler_sigchld_ends_sleep(dettid, signal);
                 let mut rsrcs = Resources::new(dettid);
                 rsrcs.insert(ResourceID::InboundSignal(signal), Permission::W);
-                self.force_unblock_thread(dettid, rsrcs);
                 if parked_sleep {
+                    let woken = self.force_unblock_thread_at(dettid, rsrcs, true);
+                    self.mark_woken_sleep_taker(dettid, signal, woken && ends);
                     self.blocked.woken_sleeps.insert(dettid);
+                } else {
+                    self.force_unblock_thread(dettid, rsrcs);
                 }
             }
         }
@@ -8104,6 +8122,66 @@ impl Scheduler {
             self.blocked.sigchld_ready.insert(dettid);
             self.blocked.sigchld_takers.insert(dettid);
         }
+    }
+
+    /// For a `pause` or `nanosleep` that `wake_signaled_guest` unblocked and
+    /// whose own turn takes the scheduler's `SIGCHLD`
+    /// (`scheduler_sigchld_ends_sleep`, `takes`): it is a `sigchld_takers`
+    /// thread, resumed first, as a woken futex waiter is
+    /// (`mark_placed_delivery`). Its delivery is placed (`sigchld_ready`) only
+    /// when the copy is committed to it (`committed_sigchld_pending`). Where
+    /// host timing alone decides (SIGCHLD host-timed for it, with no committed
+    /// copy), a thread outside the schedule may take the copy, no delivery
+    /// follows the sleep's turn to consume the mark, and a later host-timed
+    /// delivery would skip its deferral (the Codex review of the rebase of
+    /// https://github.com/rrnewton/hermit/issues/4333).
+    fn mark_woken_sleep_taker(&mut self, dettid: DetTid, signal: SigWrapper, takes: bool) {
+        if takes && signal.raw() == libc::SIGCHLD {
+            self.blocked.sigchld_takers.insert(dettid);
+            if self.committed_sigchld_pending(dettid) {
+                self.blocked.sigchld_ready.insert(dettid);
+            }
+        }
+    }
+
+    /// Whether a `SIGCHLD` the scheduler sends `dettid` at this commit point,
+    /// which wakes the `pause` or `nanosleep` its request is, ends that sleep in
+    /// its own turn (`syscalls::signal::sleep_signal`). That turn ends it for a
+    /// `SIGCHLD` it was woken for when the sleeper's mask leaves it interrupting
+    /// (`KernelSignalState::interrupting`) and either the copy is committed to
+    /// it by the schedule (`committed_sigchld_pending`, its `PlacedPending`
+    /// answer) or `SIGCHLD` is host-timed for it, so the wake itself decides
+    /// (`held_wake_ends_sleep`); and a `nanosleep`'s deadline must not have
+    /// passed. Only such a sleep takes the signal. One that parks again must
+    /// keep no `sigchld_ready` mark that a later, host-timed delivery could use
+    /// (the Codex reviews of https://github.com/rrnewton/hermit/issues/4333):
+    /// a `SIGCHLD` the sleeper blocks or leaves at its ignoring default, or one
+    /// with no committed copy (a process whose send window is unusable, a
+    /// thread-directed send). Where the window is unusable, the sleep's own
+    /// turn may instead claim the copy (`syscalls::signal::claim_pending_sigchld`);
+    /// that claim places its own delivery (`ThreadState::claimed_sigchld`),
+    /// not this mark. An unreadable state ends nothing here, so no mark
+    /// is made. Read while no guest thread holds the turn, as
+    /// `sleep_interrupting_signals` is. Any other signal: false, since only a
+    /// `SIGCHLD` is marked.
+    fn scheduler_sigchld_ends_sleep(&self, dettid: DetTid, signal: SigWrapper) -> bool {
+        if signal.raw() != libc::SIGCHLD {
+            return false;
+        }
+        let live = match self.signal_sleep(dettid) {
+            Some(sleep_signal::SignalSleep::Pause) => true,
+            Some(sleep_signal::SignalSleep::Nanosleep { deadline }) => {
+                deadline > self.committed_time
+            }
+            None => false,
+        };
+        let bit = kernel_signal_bit(libc::SIGCHLD);
+        let decided =
+            self.host_timed_signals(dettid) & bit != 0 || self.committed_sigchld_pending(dettid);
+        live && decided
+            && self
+                .read_sleeper_signal_state(dettid)
+                .is_ok_and(|state| state.interrupting(state.blocked) & bit != 0)
     }
 
     /// Whether `dettid`'s filed request is a `SIGCHLD` delivery
@@ -26581,8 +26659,10 @@ mod test {
     /// still queued, not yet parked, ends it in place: its request becomes the
     /// signal and it is requeued at the front of its band, ahead of a sibling
     /// already queued, so it is the next to resume and dequeue the signal. That
-    /// turn is granted at once (`woken_sleeps`), and a `sigchld_ready`
-    /// mark the child-exit timer set for the real delivery survives it. Its own
+    /// turn is granted at once (`woken_sleeps`). Its `SIGCHLD` delivery is
+    /// placed (`sigchld_ready`, which a mark the child-exit timer set survives
+    /// too) and it is a `sigchld_takers` thread, resumed first, as a woken
+    /// futex waiter is (https://github.com/rrnewton/hermit/issues/4333). Its own
     /// turn then decides whether the signal ends the call (`sleep_signal`).
     /// Before, the queued sleep was left alone, and a pause parked with the
     /// signal gone by, a false deadlock
@@ -26613,12 +26693,19 @@ mod test {
             let mut scheduler = gated_scheduler();
             scheduler.models_signal_targets = models_signal_targets;
             let target = filed_sleep(&mut scheduler, deadline, fyi, true);
+            scheduler.test_kernel_signal_states.insert(
+                target,
+                sleeper_state(kernel_signal_bit(libc::SIGCHLD), 0, 0, 0),
+            );
             let sibling = DetTid::from_raw(101);
             register_known_thread(&mut scheduler, sibling);
             scheduler.runqueue_push_back(sibling);
             if delivery_placed {
                 scheduler.blocked.sigchld_ready.insert(target);
             }
+            // The send, as `send_guest_signal` makes it: its copy is committed
+            // to the shared queue (the send window).
+            assert!(scheduler.note_group_send(target, Signal::SIGCHLD, false));
             scheduler.wake_signaled_guest(target, Signal::SIGCHLD);
             assert_eq!(
                 scheduler.run_queue.tids().copied().collect::<Vec<_>>(),
@@ -26627,7 +26714,12 @@ mod test {
             );
             assert_eq!(
                 scheduler.blocked.sigchld_ready.contains(&target),
-                delivery_placed,
+                delivery_placed || woken,
+                "{case}"
+            );
+            assert_eq!(
+                scheduler.blocked.sigchld_takers.contains(&target),
+                woken,
                 "{case}"
             );
             if woken {
@@ -26641,6 +26733,201 @@ mod test {
                 assert_eq!(scheduler.inbound_signals(target), vec![], "{case}");
                 assert!(!scheduler.blocked.woken_sleeps.contains(&target), "{case}");
             }
+        }
+    }
+
+    /// A parked `pause` or `nanosleep` that the scheduler's own `SIGCHLD` wakes,
+    /// caught and unblocked, with its copy committed to the sleeper by the
+    /// schedule, is resumed first, ahead of a sibling in a higher band, so it is
+    /// the thread that takes the process-directed copy. Before, it was requeued
+    /// at the back of its band and unmarked: the sibling resumed first and took
+    /// the copy, and a `pause` that then found no signal for itself never
+    /// returned (https://github.com/rrnewton/hermit/issues/4333). So is one
+    /// woken for a host-timed `SIGCHLD`, which its own turn ends on the wake.
+    ///
+    /// Its delivery is placed only when the copy is committed to it: one woken
+    /// for a host-timed `SIGCHLD` with no committed copy is a taker but keeps
+    /// no `sigchld_ready` mark, since a thread outside the schedule may take
+    /// that copy and leave no delivery to consume it. With a committed copy it
+    /// is placed whether or not `SIGCHLD` is also host-timed.
+    ///
+    /// Every case wakes the sleep to the front of its band, ahead of a peer
+    /// queued earlier there, but these make it no taker and leave no mark,
+    /// because the sleep's own turn does not end for them and parks it again
+    /// (the Codex reviews of 4333): a `SIGALRM`; a `SIGCHLD` its mask blocks,
+    /// or one left at its default action, which ignores it; and a `SIGCHLD`
+    /// with no committed copy, whether the process's send window is unusable
+    /// (a thread could take it outside the schedule) or no send entered it.
+    /// Where the window is unusable the sleep's own turn may still claim the
+    /// copy (`syscalls::signal::claim_pending_sigchld`), which places its
+    /// delivery itself rather than through this mark.
+    #[test]
+    fn a_scheduler_sigchld_resumes_a_parked_sleep_first() {
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        enum Copy {
+            /// A group send noted in a usable send window.
+            Committed,
+            /// A group send while a thread could take SIGCHLD outside the
+            /// schedule: the window is unusable.
+            Unusable,
+            /// No send entered the window.
+            Uncommitted,
+            /// No send entered the window, but SIGCHLD is host-timed for the
+            /// sleeper.
+            HostTimed,
+            /// SIGCHLD is host-timed for the sleeper, and a group send came
+            /// while the window is unusable: no copy is committed.
+            HostTimedUnusable,
+            /// SIGCHLD is host-timed for the sleeper, and a group send was
+            /// noted in a usable window: the copy is committed.
+            HostTimedCommitted,
+        }
+        let chld = kernel_signal_bit(libc::SIGCHLD);
+        let alrm = kernel_signal_bit(libc::SIGALRM);
+        let pause = (PAUSE_FYI, LogicalTime::INDEFINITE);
+        let nanosleep = (NANOSLEEP_FYI, LogicalTime::from_nanos(10_000_000_000));
+        for ((fyi, deadline), signal, state, copy, takes) in [
+            (
+                pause,
+                Signal::SIGCHLD,
+                sleeper_state(chld, 0, 0, 0),
+                Copy::Committed,
+                true,
+            ),
+            (
+                nanosleep,
+                Signal::SIGCHLD,
+                sleeper_state(chld, 0, 0, 0),
+                Copy::Committed,
+                true,
+            ),
+            (
+                pause,
+                Signal::SIGCHLD,
+                sleeper_state(chld, 0, 0, 0),
+                Copy::HostTimed,
+                true,
+            ),
+            (
+                nanosleep,
+                Signal::SIGCHLD,
+                sleeper_state(chld, 0, 0, 0),
+                Copy::HostTimedUnusable,
+                true,
+            ),
+            (
+                pause,
+                Signal::SIGCHLD,
+                sleeper_state(chld, 0, 0, 0),
+                Copy::HostTimedCommitted,
+                true,
+            ),
+            (
+                pause,
+                Signal::SIGALRM,
+                sleeper_state(alrm, 0, 0, 0),
+                Copy::Uncommitted,
+                false,
+            ),
+            (
+                pause,
+                Signal::SIGCHLD,
+                sleeper_state(chld, 0, chld, 0),
+                Copy::Committed,
+                false,
+            ),
+            (
+                pause,
+                Signal::SIGCHLD,
+                sleeper_state(0, 0, 0, 0),
+                Copy::Committed,
+                false,
+            ),
+            (
+                pause,
+                Signal::SIGCHLD,
+                sleeper_state(chld, 0, 0, 0),
+                Copy::Unusable,
+                false,
+            ),
+            (
+                pause,
+                Signal::SIGCHLD,
+                sleeper_state(chld, 0, 0, 0),
+                Copy::Uncommitted,
+                false,
+            ),
+        ] {
+            let case = format!(
+                "{fyi} woken by {signal:?}, caught {:#x} blocked {:#x}, {copy:?}",
+                state.caught, state.blocked
+            );
+            let mut scheduler = gated_scheduler();
+            let target = filed_sleep(&mut scheduler, deadline, fyi, false);
+            scheduler.test_kernel_signal_states.insert(target, state);
+            match copy {
+                Copy::Committed => {
+                    assert!(scheduler.note_group_send(target, signal, false), "{case}");
+                }
+                Copy::Unusable => {
+                    scheduler.note_outside_blocker(target, Some(0), false);
+                    assert!(scheduler.note_group_send(target, signal, false), "{case}");
+                }
+                Copy::Uncommitted => {}
+                Copy::HostTimed => {
+                    scheduler.record_host_timed_signals(target, HostTimedSignalScope::Caller, chld);
+                }
+                Copy::HostTimedUnusable => {
+                    scheduler.record_host_timed_signals(target, HostTimedSignalScope::Caller, chld);
+                    scheduler.note_outside_blocker(target, Some(0), false);
+                    assert!(scheduler.note_group_send(target, signal, false), "{case}");
+                }
+                Copy::HostTimedCommitted => {
+                    scheduler.record_host_timed_signals(target, HostTimedSignalScope::Caller, chld);
+                    assert!(scheduler.note_group_send(target, signal, false), "{case}");
+                }
+            }
+            // A sibling queued earlier in the sleeper's own band, which the
+            // wake must not follow, and one in a higher band.
+            let peer = DetTid::from_raw(102);
+            register_known_thread(&mut scheduler, peer);
+            scheduler.runqueue_push_back(peer);
+            let sibling = DetTid::from_raw(101);
+            register_known_thread(&mut scheduler, sibling);
+            scheduler
+                .priorities
+                .insert(sibling, runqueue::FIRST_PRIORITY);
+            scheduler.runqueue_push_back(sibling);
+            scheduler.wake_signaled_guest(target, signal);
+            assert_eq!(
+                scheduler.inbound_signals(target),
+                vec![SigWrapper::from(signal)],
+                "{case}"
+            );
+            assert!(scheduler.blocked.woken_sleeps.contains(&target), "{case}");
+            let band: Vec<DetTid> = scheduler
+                .run_queue
+                .tids()
+                .copied()
+                .filter(|tid| *tid != sibling)
+                .collect();
+            assert_eq!(band, vec![target, peer], "{case}: front of its band");
+            assert_eq!(
+                scheduler.blocked.sigchld_takers.contains(&target),
+                takes,
+                "{case}"
+            );
+            // Placed only for a committed copy: a host-timed one with no
+            // committed copy may be taken outside the schedule, leaving no
+            // delivery to consume the mark.
+            assert_eq!(
+                scheduler.blocked.sigchld_ready.contains(&target),
+                takes && matches!(copy, Copy::Committed | Copy::HostTimedCommitted),
+                "{case}"
+            );
+            let (selected, _, _) = scheduler.step3_peek().expect("a thread is runnable");
+            assert_eq!(selected, if takes { target } else { sibling }, "{case}");
+            scheduler.run_queue.undo_tentative_pop();
         }
     }
 

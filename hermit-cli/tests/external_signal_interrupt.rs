@@ -2057,6 +2057,83 @@ fn ptrace_rt_sigtimedwait_is_ended_by_the_sigchld_of_an_exiting_child() {
     let _ = fs::remove_file(&witness);
 }
 
+/// A `pause` or a 10 s `nanosleep` of the thread that forked a child, beside a
+/// sibling spinning without system calls until a SIGCHLD handler has run
+/// (tests/c/sleep_sigchld_taker.c), under `run --strict --verify
+/// --verify-strict`. Linux gives the child's SIGCHLD to the sleeping forker:
+/// the sleep ends with EINTR and the handler runs on it. Hermit woke the sleep
+/// but resumed the sibling first, which took the process-directed copy: the
+/// `pause` never returned and the `nanosleep` ran its full 10 s and returned 0,
+/// at the default schedule and under `--chaos --sched-seed=2`
+/// (https://github.com/rrnewton/hermit/issues/4333).
+#[test]
+fn ptrace_a_sleep_takes_the_sigchld_of_a_child_that_exits_beside_a_running_sibling() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let root = build_root();
+    fs::create_dir_all(&root).expect("failed to create guest build directory");
+    let witness = root.join(format!("sleep_sigchld_taker.{}", std::process::id()));
+    let compiled = Command::new("cc")
+        .args(["-O2", "-Wall", "-Wextra", "-Werror", "-pthread"])
+        .arg(repository.join("tests/c/sleep_sigchld_taker.c"))
+        .arg("-o")
+        .arg(&witness)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to start the witness's compiler");
+    assert!(
+        compiled.status.success(),
+        "failed to compile the witness: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    for mode in ["pause", "nanosleep"] {
+        for schedule in [&[][..], &["--chaos", "--sched-seed=2"][..]] {
+            let trial = tempfile::Builder::new()
+                .prefix("trial-")
+                .tempdir_in(&root)
+                .expect("failed to create trial directory");
+            let report = trial.path().join("verify.json");
+            let output = Command::new("timeout")
+                .args(["--kill-after=5s", "120s"])
+                .arg(hermit_binary::hermit_binary())
+                .env_remove("LD_LIBRARY_PATH")
+                .arg("--log=info")
+                .args(cell_run_args("ptrace"))
+                .args(schedule)
+                .args(["--verify", "--verify-strict", "--verify-json"])
+                .arg(&report)
+                .arg("--")
+                .arg(&witness)
+                .arg(mode)
+                .stdin(Stdio::null())
+                .output()
+                .expect("failed to run hermit");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let expected = format!(
+                "mode={mode} result=-1 errno={} handler_main=1 handler_sibling=0",
+                libc::EINTR
+            );
+            assert!(
+                output.status.success() && stdout.contains(&expected),
+                "{mode} {schedule:?}: expected `{expected}`, as Linux gives, with exit 0; got {}\nstdout:\n{stdout}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let verdict: serde_json::Value = serde_json::from_slice(
+                &fs::read(&report).expect("strict verification wrote no verdict"),
+            )
+            .expect("strict verification verdict is valid JSON");
+            if let Some(gap) = strict_verification_gap(&verdict) {
+                panic!(
+                    "{mode} {schedule:?}: strict verification is not determinism evidence: {gap}"
+                );
+            }
+        }
+    }
+    let _ = fs::remove_file(&witness);
+}
+
 /// The parent catches SIGCHLD and waits in `rt_sigtimedwait` for a blocked
 /// SIGUSR1, which its child sends before it calls `exit_group`
 /// (tests/c/sigtimedwait_queued_signal_before_child_exit.c). Linux returns the
