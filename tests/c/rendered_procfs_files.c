@@ -26,7 +26,8 @@
  *
  * usage: rendered_procfs_files [--no-foreign-fd-links] [--kvm-local-procfs]
  *                              [--no-maps-or-chroot] [--chroot-only]
- *                              [--require-chroot]
+ *                              [--require-chroot] [--xattr-arguments-first]
+ *                              [--detcore-xattr-order]
  *        rendered_procfs_files --inherited <fd> <ino> <offset>
  *
  * The program must be started by its absolute path, which it execs again.
@@ -50,6 +51,12 @@
  *   --require-chroot fails a chroot check that could not chroot (EPERM),
  *     which a run without privilege otherwise skips; Hermit's container is
  *     privileged.
+ *   --xattr-arguments-first checks that an extended-attribute call's name,
+ *     size and value are refused before its path is looked up, as Linux 6.13
+ *     and later do; an older kernel looks the path up first.
+ *   --detcore-xattr-order checks the same order only for the spellings
+ *     Detcore resolves itself (a rendered file's name, or a descriptor
+ *     number), which Detcore answers in that order on any host.
  *   --chroot-only runs only the process chroot checks, for a run that
  *     cannot verify them (see the previous option); not a thread's chroot,
  *     which hangs under DBT (https://github.com/rrnewton/hermit/issues/4254).
@@ -78,6 +85,10 @@
 #include <sys/xattr.h>
 #include <unistd.h>
 
+#ifndef SYS_faccessat2
+#define SYS_faccessat2 439
+#endif
+
 #define PROC_SUPER_MAGIC 0x9fa0
 
 static int failures;
@@ -89,6 +100,8 @@ static int no_bypass_capabilities;
 static int no_maps_or_chroot;
 static int chroot_only;
 static int require_chroot;
+static int xattr_arguments_first;
+static int detcore_xattr_order;
 static const char* program;
 
 #define CHECK(condition, ...)                              \
@@ -374,6 +387,26 @@ static void check_descriptor_refusals(const char* path, int fd) {
   REFUSED(fcntl(fd, 1036 /* F_SET_RW_HINT */, &hint), EPERM, path);
 }
 
+/* Whether Detcore resolves `spelling` itself: its last component is the
+ * name of a rendered file this program checks, or a descriptor number
+ * (Detcore's `could_name_rendered`). */
+static int detcore_resolves(const char* spelling) {
+  const char* last = strrchr(spelling, '/');
+  last = last ? last + 1 : spelling;
+  if (strcmp(last, "uuid") == 0 || strcmp(last, "nr") == 0) {
+    return 1;
+  }
+  if (*last == 0) {
+    return 0;
+  }
+  for (const char* c = last; *c; c++) {
+    if (*c < '0' || *c > '9') {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 /* The calls a 0444 procfs sysctl file answers by path, through `spelling`. */
 static void check_path_calls(const char* path, const char* spelling) {
   char value[16];
@@ -382,12 +415,65 @@ static void check_path_calls(const char* path, const char* spelling) {
   REFUSED(access(spelling, W_OK), EACCES, spelling);
   REFUSED(access(spelling, X_OK), EACCES, spelling);
   REFUSED(faccessat(AT_FDCWD, spelling, W_OK, AT_EACCESS), EACCES, spelling);
+  /* Linux reads mode and flags as int, ignoring the upper bits of the raw
+     registers, and refuses invalid ones before it looks at the path or the
+     descriptor. */
+  CHECK(syscall(SYS_access, spelling, 0x100000004UL) == 0, "%s raw access(R_OK): %s", spelling,
+        strerror(errno));
+  CHECK(syscall(SYS_faccessat, AT_FDCWD, spelling, 0x100000004UL, 0) == 0,
+        "%s raw faccessat(R_OK): %s", spelling, strerror(errno));
+  CHECK(syscall(SYS_faccessat2, AT_FDCWD, spelling, 0x100000004UL, 0x100000000UL) == 0,
+        "%s raw faccessat2(R_OK): %s", spelling, strerror(errno));
+  const char* base = strrchr(path, '/') + 1;
+  REFUSED(syscall(SYS_faccessat, -1, base, 8, 0), EINVAL, spelling);
+  REFUSED(syscall(SYS_faccessat2, -1, base, R_OK, 0x10000), EINVAL, spelling);
   REFUSED(getxattr(spelling, "user.x", value, sizeof(value)), EOPNOTSUPP, spelling);
   REFUSED(getxattr(spelling, "trusted.x", value, sizeof(value)), ENODATA, spelling);
   REFUSED(setxattr(spelling, "foo.x", "1", 1, 0), EACCES, spelling);
   CHECK(listxattr(spelling, value, sizeof(value)) == 0, "%s listxattr", spelling);
   REFUSED(setxattr(spelling, "user.x", "1", 1, 0), EACCES, spelling);
   REFUSED(removexattr(spelling, "user.x"), EACCES, spelling);
+  /* setxattr flags are an int: an upper register bit is ignored. Invalid
+     flags are refused before the name is read; a name is read for at most
+     XATTR_NAME_MAX + 1 bytes, so 256 bytes with no NUL before an unmapped
+     page are too long, not a fault. */
+  REFUSED(syscall(SYS_setxattr, spelling, "user.x", "1", 1, 0x100000000UL), EACCES, spelling);
+  REFUSED(syscall(SYS_setxattr, spelling, (char*)1, "1", 1, 4), EINVAL, spelling);
+  if (xattr_arguments_first || (detcore_xattr_order && detcore_resolves(spelling))) {
+    /* The name, the size and the value are checked before the path is
+       looked up, so a path error (a trailing slash: ENOTDIR) cannot hide
+       them. */
+    char slashed_spelling[512];
+    snprintf(slashed_spelling, sizeof(slashed_spelling), "%s/", spelling);
+    REFUSED(setxattr(slashed_spelling, "user.x", (void*)1, 65537, 0), E2BIG, spelling);
+    REFUSED(setxattr(slashed_spelling, "user.x", (void*)1, 1, 0), EFAULT, spelling);
+    REFUSED(getxattr(slashed_spelling, (char*)1, value, sizeof(value)), EFAULT, spelling);
+    REFUSED(removexattr(slashed_spelling, ""), ERANGE, spelling);
+  }
+  {
+    long page = sysconf(_SC_PAGESIZE);
+    char* pages = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(pages != MAP_FAILED, "mmap name pages: %s", strerror(errno));
+    CHECK(munmap(pages + page, page) == 0, "munmap name page: %s", strerror(errno));
+    char* long_name = pages + page - 256;
+    memset(long_name, 'u', 256);
+    REFUSED(getxattr(spelling, long_name, value, sizeof(value)), ERANGE, spelling);
+    REFUSED(setxattr(spelling, long_name, "1", 1, 0), ERANGE, spelling);
+    REFUSED(removexattr(spelling, long_name), ERANGE, spelling);
+    /* A short value ending just before the unmapped page is readable: the
+       refusal is the file's (EACCES), not a fault. */
+    char* short_value = pages + page - 6;
+    memcpy(short_value, "abc", 3);
+    REFUSED(setxattr(spelling, "user.x", short_value, 3, 0), EACCES, spelling);
+    /* A whole name, or a short value, on a page the guest may not read is a
+       fault, even though the page is mapped. */
+    char* protected_bytes = pages + 128;
+    memcpy(protected_bytes, "user.x", sizeof("user.x"));
+    CHECK(mprotect(pages, page, PROT_NONE) == 0, "mprotect name page: %s", strerror(errno));
+    REFUSED(getxattr(spelling, protected_bytes, value, sizeof(value)), EFAULT, spelling);
+    REFUSED(setxattr(spelling, "user.x", protected_bytes, 3, 0), EFAULT, spelling);
+    CHECK(munmap(pages, page) == 0, "munmap name pages: %s", strerror(errno));
+  }
   REFUSED(chmod(spelling, 0644), EPERM, spelling);
   struct timeval bad_times[2] = {{.tv_usec = 2000000}, {0}};
   REFUSED(syscall(SYS_utimes, spelling, bad_times), EINVAL, spelling);
@@ -926,6 +1012,10 @@ int main(int argc, char** argv) {
       chroot_only = 1;
     } else if (strcmp(argv[i], "--require-chroot") == 0) {
       require_chroot = 1;
+    } else if (strcmp(argv[i], "--xattr-arguments-first") == 0) {
+      xattr_arguments_first = 1;
+    } else if (strcmp(argv[i], "--detcore-xattr-order") == 0) {
+      detcore_xattr_order = 1;
     } else if (strcmp(argv[i], "--no-bypass-capabilities") == 0) {
       no_bypass_capabilities = 1;
     } else {
@@ -936,7 +1026,8 @@ int main(int argc, char** argv) {
     fprintf(stderr,
             "usage: /path/to/rendered_procfs_files [--no-foreign-fd-links] "
             "[--kvm-local-procfs] [--no-maps-or-chroot] [--chroot-only] "
-            "[--require-chroot] [--no-bypass-capabilities]\n");
+            "[--require-chroot] [--no-bypass-capabilities] [--xattr-arguments-first] "
+            "[--detcore-xattr-order]\n");
     return 2;
   }
   if (no_bypass_capabilities && !lacks_bypass_capabilities()) {

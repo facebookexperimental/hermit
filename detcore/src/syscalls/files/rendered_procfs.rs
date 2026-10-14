@@ -84,6 +84,9 @@ use crate::util::raw_syscall;
 /// The largest extended attribute value Linux accepts (`XATTR_SIZE_MAX`).
 const XATTR_SIZE_MAX: usize = 65536;
 
+/// Linux's longest extended-attribute name.
+const XATTR_NAME_MAX: usize = 255;
+
 /// The rendered path a path within a procfs mount names, if it names one.
 /// Detcore names procfs files by their path within the mount
 /// (`ProcfsEntry::At`), as `/sys/kernel/random/uuid`.
@@ -1716,10 +1719,7 @@ fn path_request_answer(
 ) -> Result<i64, Errno> {
     match request {
         PathRequest::Access { mode, flags } => {
-            if flags & !(libc::AT_EACCESS | libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH) as u64
-                != 0
-                || mode & !7 != 0
-            {
+            if access_arguments_invalid(mode, flags) {
                 Err(Errno::EINVAL)
             } else if mode & (libc::W_OK | libc::X_OK) as u64 != 0 {
                 Err(Errno::EACCES)
@@ -1774,6 +1774,14 @@ fn utimens_request(times: Option<[libc::timespec; 2]>) -> Option<bool> {
     }
 }
 
+/// Whether Linux refuses an access probe's mode or flags. It checks them
+/// before it looks up the path (`do_faccessat`), with both already narrowed
+/// to `int`.
+fn access_arguments_invalid(mode: u64, flags: u64) -> bool {
+    flags & !(libc::AT_EACCESS | libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH) as u64 != 0
+        || mode & !7 != 0
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     /// Answer a path call (or an `AT_EMPTY_PATH`/NULL-path call on a
     /// descriptor) if it names a procfs file Detcore renders, as Linux
@@ -1801,15 +1809,35 @@ impl<T: RecordOrReplay> Detcore<T> {
         // first (unknown flags).
         let mut decided_before_descriptor = false;
         let (dirfd, path, flags, request, name) = match sysno {
-            Sysno::access => (at, a0, 0, PathRequest::Access { mode: a1, flags: 0 }, 0),
-            Sysno::faccessat => (a0, a1, 0, PathRequest::Access { mode: a2, flags: 0 }, 0),
+            // Linux declares mode and flags `int`: it ignores the upper bits
+            // of the raw registers.
+            Sysno::access => (
+                at,
+                a0,
+                0,
+                PathRequest::Access {
+                    mode: u64::from(a1 as u32),
+                    flags: 0,
+                },
+                0,
+            ),
+            Sysno::faccessat => (
+                a0,
+                a1,
+                0,
+                PathRequest::Access {
+                    mode: u64::from(a2 as u32),
+                    flags: 0,
+                },
+                0,
+            ),
             Sysno::faccessat2 => (
                 a0,
                 a1,
-                a3,
+                u64::from(a3 as u32),
                 PathRequest::Access {
-                    mode: a2,
-                    flags: a3,
+                    mode: u64::from(a2 as u32),
+                    flags: u64::from(a3 as u32),
                 },
                 0,
             ),
@@ -1828,7 +1856,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 PathRequest::ChangeXattr {
                     size: Some(a3 as usize),
                     value: a2,
-                    flags: a4,
+                    // Linux declares the flags `int`.
+                    flags: u64::from(a4 as u32),
                 },
                 a1,
             ),
@@ -1920,6 +1949,22 @@ impl<T: RecordOrReplay> Detcore<T> {
             Sysno::chdir => (at, a0, 0, PathRequest::Chdir, 0),
             _ => return Ok(None),
         };
+        // Linux refuses invalid access arguments before it looks up the path
+        // or the descriptor, for every file; leave that order to the backend.
+        if let PathRequest::Access { mode, flags } = request
+            && access_arguments_invalid(mode, flags)
+        {
+            return Ok(None);
+        }
+        // Likewise invalid setxattr flags, before the name, the value or the
+        // path, for every file (`setxattr_copy`). KVM's executor reads the
+        // name first, so answer here rather than leave it to the backend.
+        if let PathRequest::ChangeXattr { flags, .. } = request
+            && flags & !(libc::XATTR_CREATE | libc::XATTR_REPLACE) as u64 != 0
+            && self.renders_procfs(guest)
+        {
+            return Err(Errno::EINVAL.into());
+        }
         let dirfd = dirfd as i32;
         let empty_path_allowed = flags & libc::AT_EMPTY_PATH as u64 != 0;
         // An unreadable path is the kernel's EFAULT to report.
@@ -1935,6 +1980,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         let by_descriptor = match &path_text {
             None => sysno == Sysno::utimensat,
             Some(path) => path.as_os_str().is_empty() && empty_path_allowed,
+        };
+        // Linux then copies and checks the attribute name, the size and the
+        // value, still before it looks up the path (`setxattr_copy`,
+        // `import_xattr_name`), so a path error cannot hide them. Detcore
+        // checks them first where it may answer: a spelling that could name
+        // a rendered file. Any other path goes to the kernel untouched.
+        let xattr_arguments = if self.renders_procfs(guest)
+            && (by_descriptor || path_text.as_deref().is_some_and(could_name_rendered))
+        {
+            checked_xattr_arguments(&guest.memory(), request, name)?
+        } else {
+            None
         };
         let rendered = if by_descriptor {
             let rendered = guest
@@ -1997,29 +2054,97 @@ impl<T: RecordOrReplay> Detcore<T> {
         if rendered.is_none() {
             return Ok(None);
         }
-        let name = match name {
-            0 => None,
-            address => match syscalls::CStrPtr::from_ptr(address as *const libc::c_char) {
-                Some(name) => Some(name.read(&guest.memory())?),
-                None => return Err(Errno::EFAULT.into()),
-            },
+        // A spelling that reached a rendered file another way (a link) has
+        // its attribute arguments checked here, after the path.
+        let xattr_arguments = match xattr_arguments {
+            Some(arguments) => Some(arguments),
+            None => checked_xattr_arguments(&guest.memory(), request, name)?,
         };
-        let value = match request {
-            PathRequest::ChangeXattr {
-                size: Some(size),
-                value,
-                ..
-            } => read_value(&guest.memory(), value, size),
-            _ => None,
+        let (name, value) = match xattr_arguments {
+            Some((name, value)) => (Some(name), value),
+            None => (None, None),
         };
-        path_request_answer(
-            request,
-            name.as_ref().map(|name| name.as_bytes()),
-            value.as_deref(),
-        )
-        .map(Some)
-        .map_err(Into::into)
+        path_request_answer(request, name.as_deref(), value.as_deref())
+            .map(Some)
+            .map_err(Into::into)
     }
+}
+
+/// An extended attribute's name, and the value a change sets.
+type XattrArguments = (Vec<u8>, Option<Vec<u8>>);
+
+/// An extended-attribute call's name and value, checked as Linux checks them
+/// before the path (`setxattr_copy`, `import_xattr_name`): the name (EFAULT,
+/// or ERANGE when empty or longer than `XATTR_NAME_MAX`), then the size
+/// (E2BIG), then the value (EFAULT). None for any other request.
+fn checked_xattr_arguments<M: MemoryAccess>(
+    memory: &M,
+    request: PathRequest,
+    name: u64,
+) -> Result<Option<XattrArguments>, Errno> {
+    if !matches!(
+        request,
+        PathRequest::GetXattr | PathRequest::ChangeXattr { .. }
+    ) {
+        return Ok(None);
+    }
+    let name = read_xattr_name(memory, name)?;
+    if name.is_empty() || name.len() > XATTR_NAME_MAX {
+        return Err(Errno::ERANGE);
+    }
+    let value = match request {
+        PathRequest::ChangeXattr {
+            size: Some(size),
+            value,
+            ..
+        } => {
+            if size > XATTR_SIZE_MAX {
+                return Err(Errno::E2BIG);
+            }
+            let read = read_value(memory, value, size);
+            if size > 0 && read.is_none() {
+                return Err(Errno::EFAULT);
+            }
+            read
+        }
+        _ => None,
+    };
+    Ok(Some((name, value)))
+}
+
+/// An extended attribute's name at guest address `address`, imported as
+/// Linux does (`import_xattr_name`): at most `XATTR_NAME_MAX + 1` bytes are
+/// read, so a name with no NUL within them is too long (ERANGE) even when
+/// the bytes after them cannot be read, and only a fault within them is
+/// EFAULT. The answer checks the length.
+///
+/// Each read stays within one page and uses the guest's own access rights
+/// (`read_exact_with_user_access`): an exact read that faults only when a
+/// needed byte does, as the kernel's copy faults.
+fn read_xattr_name<M: MemoryAccess>(memory: &M, address: u64) -> Result<Vec<u8>, Errno> {
+    const PAGE: u64 = 4096;
+    let mut name = Vec::new();
+    let limit = XATTR_NAME_MAX + 1;
+    while name.len() < limit {
+        let start = address
+            .checked_add(name.len() as u64)
+            .ok_or(Errno::EFAULT)?;
+        let page_left = (PAGE - start % PAGE) as usize;
+        let mut chunk = vec![0u8; page_left.min(limit - name.len())];
+        let chunk_address =
+            reverie::syscalls::Addr::<u8>::from_raw(start as usize).ok_or(Errno::EFAULT)?;
+        memory
+            .read_exact_with_user_access(chunk_address, &mut chunk)
+            .map_err(|_| Errno::EFAULT)?;
+        match chunk.iter().position(|byte| *byte == 0) {
+            Some(end) => {
+                name.extend_from_slice(&chunk[..end]);
+                return Ok(name);
+            }
+            None => name.extend_from_slice(&chunk),
+        }
+    }
+    Ok(name)
 }
 
 /// `AT_SYMLINK_NOFOLLOW`, as the path-call table records `l*` calls.
@@ -2048,7 +2173,10 @@ fn read_value<M: MemoryAccess>(memory: &M, address: u64, size: usize) -> Option<
     }
     let address = reverie::syscalls::Addr::<u8>::from_raw(address as usize)?;
     let mut value = vec![0; size];
-    memory.read_exact(address, &mut value).ok()?;
+    // Exact, with the guest's own access rights, as the kernel copies it.
+    memory
+        .read_exact_with_user_access(address, &mut value)
+        .ok()?;
     Some(value)
 }
 

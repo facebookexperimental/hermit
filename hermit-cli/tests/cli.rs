@@ -3811,6 +3811,11 @@ const VIRTUAL_KERNEL_FILES: [&str; 35] = [
 /// shape, and KVM made up its own files or refused them. Linux's own
 /// invariants are checked natively first. A backend that is not available
 /// here is named as not compared.
+// Carried verbatim from reverie-kvm's removed regression test of its own copies of
+// these files, which Detcore's renderings replace (https://github.com/rrnewton/hermit/issues/4213):
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-224): regression coverage for the /proc/vmstat
+// and /proc/sys/kernel/osrelease synthetic surfaces.
 #[test]
 fn detcore_fixes_the_virtual_kernel_files_on_every_backend() {
     let guest = virtual_kernel_files_guest();
@@ -3971,6 +3976,23 @@ fn detcore_fixes_the_virtual_kernel_files_on_every_backend() {
     }
 }
 
+/// Whether the host kernel's release is at least `major.minor`.
+fn host_kernel_at_least(major: u32, minor: u32) -> bool {
+    // SAFETY: uname fills the zeroed structure it is given.
+    let release = unsafe {
+        let mut name: libc::utsname = std::mem::zeroed();
+        assert_eq!(libc::uname(&mut name), 0);
+        std::ffi::CStr::from_ptr(name.release.as_ptr())
+            .to_string_lossy()
+            .into_owned()
+    };
+    let mut parts = release
+        .split(|c: char| !c.is_ascii_digit())
+        .filter_map(|part| part.parse::<u32>().ok());
+    let found = (parts.next().unwrap_or(0), parts.next().unwrap_or(0));
+    found >= (major, minor)
+}
+
 /// Detcore renders `/proc/sys/kernel/random/uuid` and `/proc/sys/kernel/pty/nr`
 /// without the backend opening them (https://github.com/rrnewton/hermit/issues/4213).
 /// Every backend gives the guest Linux's answers for both files, which the
@@ -3991,6 +4013,14 @@ fn detcore_renders_its_procfs_files_on_every_backend() {
     // unprivileged caller cannot drop them and never had them.
     let mut native = Command::new(guest);
     native.arg("--no-bypass-capabilities");
+    // Linux 6.13 and later refuse an extended-attribute call's bad name,
+    // size or value before they look up its path; an older host kernel looks
+    // the path up first. Detcore answers in the newer order for the
+    // spellings it resolves itself, on any host.
+    let xattr_arguments_first = host_kernel_at_least(6, 13);
+    if xattr_arguments_first {
+        native.arg("--xattr-arguments-first");
+    }
     // SAFETY: prctl is async-signal-safe and touches only this child.
     unsafe {
         native.pre_exec(|| {
@@ -4054,6 +4084,10 @@ fn detcore_renders_its_procfs_files_on_every_backend() {
             "kvm" => args.push("--kvm-local-procfs"),
             // Hermit's container may chroot, so the chroot checks must run.
             _ => args.push("--require-chroot"),
+        }
+        args.push("--detcore-xattr-order");
+        if xattr_arguments_first {
+            args.push("--xattr-arguments-first");
         }
         let output = hermit(&args);
         assert_success(&output, &args);

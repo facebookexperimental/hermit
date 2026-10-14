@@ -38,6 +38,13 @@ pub(crate) enum FixedProcfsFile {
     Version,
     /// `/proc/cmdline`: the kernel's command line.
     Cmdline,
+    // Carried verbatim from reverie-kvm's removed copy of this file, which Detcore's
+    // rendering replaces (https://github.com/rrnewton/hermit/issues/4213):
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-224): deterministic
+    // /proc/sys/kernel/osrelease so `sysctl -n kernel.osrelease` resolves
+    // synthetically. The value matches the KVM `uname(2)` release field
+    // ("6.0.0", see fn uname) and /proc/version above.
     Osrelease,
     Ostype,
     /// `kernel/version`.
@@ -105,6 +112,14 @@ pub(crate) enum FixedProcfsFile {
     // TODO-HUMAN-REVIEW(PR-938): Review host VM accounting normalization.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-938): Review the /proc/vmstat field policy.
+    // Carried verbatim from reverie-kvm's removed copy of this file, which Detcore's
+    // rendering replaces (https://github.com/rrnewton/hermit/issues/4213):
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-224): deterministic /proc/vmstat surface so
+    // procps `vmstat` reads its counters synthetically instead of hitting
+    // the fail-closed real-procfs refusal. All counters are fixed at 0
+    // (memory is not virtualized under KVM), matching the zeroed
+    // /proc/stat and /proc/meminfo surfaces above.
     Vmstat,
     /// `/proc/cgroups`: the controllers, all on the unified hierarchy.
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -124,6 +139,10 @@ pub(crate) enum FixedProcfsFile {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-863): Review canonical /proc/meminfo guest accounting.
     // TODO-HUMAN-REVIEW(PR-863): Use configured guest memory for meminfo.
+    // Carried verbatim from reverie-kvm's removed copy of this file, which Detcore's
+    // rendering replaces (https://github.com/rrnewton/hermit/issues/4213):
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-231): Review parity with Hermit's configured memory persona.
     Meminfo,
     /// `fs/file-nr`.
     // AUTONOMOUS-BOT-IMPLEMENTED

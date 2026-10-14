@@ -1863,6 +1863,21 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::openat,
                 Sysno::open,
                 Sysno::creat,
+                // Detcore answers access and extended-attribute requests on the
+                // procfs files it renders
+                // (https://github.com/rrnewton/hermit/issues/4213); a backend
+                // keeps no copy of them, so these must not bypass Detcore.
+                Sysno::access,
+                Sysno::faccessat,
+                Sysno::faccessat2,
+                Sysno::getxattr,
+                Sysno::lgetxattr,
+                Sysno::setxattr,
+                Sysno::lsetxattr,
+                Sysno::removexattr,
+                Sysno::lremovexattr,
+                Sysno::listxattr,
+                Sysno::llistxattr,
                 Sysno::close,
                 Sysno::read,
                 Sysno::pread64,
@@ -4296,6 +4311,24 @@ mod subscription_tests {
             delivered.contains(&Sysno::syslog),
             "syslog must reach its deterministic Detcore handler"
         );
+        for sysno in [
+            Sysno::access,
+            Sysno::faccessat,
+            Sysno::faccessat2,
+            Sysno::getxattr,
+            Sysno::lgetxattr,
+            Sysno::setxattr,
+            Sysno::lsetxattr,
+            Sysno::removexattr,
+            Sysno::lremovexattr,
+            Sysno::listxattr,
+            Sysno::llistxattr,
+        ] {
+            assert!(
+                delivered.contains(&sysno),
+                "{sysno} must reach Detcore, which answers it for the procfs files it renders"
+            );
+        }
     }
 
     #[test]
