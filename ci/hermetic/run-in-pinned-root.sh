@@ -483,6 +483,18 @@ fi
 # guarantee is void. CARGO_NET_OFFLINE in the image makes that fail loudly.
 # --pull=never: the exact digest must already be in the local store; the run
 # never fetches it, so a missing image fails here rather than being pulled.
+
+# A container runtime can widen the task affinity even with cgroups disabled.
+# Restore the actual caller's set inside the container before executing the
+# command; util-linux/taskset is already in the pinned image. This preserves
+# placement as well as the outer cgroup limits. Calibration still independently
+# compares the resulting live affinity with its earlier host observation.
+caller_affinity=$(python3 -c 'import os; print(",".join(map(str, sorted(os.sched_getaffinity(0)))))')
+[[ $caller_affinity =~ ^[0-9]+(,[0-9]+)*$ ]] || {
+    echo "run-in-pinned-root: cannot read a nonempty caller CPU affinity" >&2
+    exit 2
+}
+
 exec podman run --rm \
     --pull=never \
     --cgroups=disabled \
@@ -508,4 +520,5 @@ exec podman run --rm \
     -e CARGO_TARGET_DIR=/src/target \
     -w /src \
     "$digest" \
+    /bin/taskset --cpu-list "$caller_affinity" \
     "$@"

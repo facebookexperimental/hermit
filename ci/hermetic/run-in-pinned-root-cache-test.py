@@ -83,6 +83,10 @@ class CargoCacheMounts(unittest.TestCase):
             "    by_destination = {dict(field.split('=', 1) for field in mount.split(','))['destination']: dict(field.split('=', 1) for field in mount.split(','))['source'] for mount in mounts}\n"
             "    for destination in ['/src/agent-utils/rs/target', '/src/agent-utils/rs/.agent-utils-locks', '/src/agent-utils/rs/.agent-utils-snapshots']:\n"
             "        pathlib.Path(by_destination[destination], 'container-write').write_text(destination + '\\n')\n"
+            "if sys.argv[1] == 'run' and os.environ.get('PINNED_ROOT_EXEC_PAYLOAD') == '1':\n"
+            "    os.sched_setaffinity(0, json.loads(os.environ['PINNED_ROOT_RUNTIME_AFFINITY']))\n"
+            "    image = next(i for i, arg in enumerate(sys.argv) if arg.startswith('fixture@sha256:'))\n"
+            "    os.execv(sys.argv[image + 1], sys.argv[image + 1:])\n"
             "if sys.argv[1:3] == ['image', 'inspect']: print('c' * 64); sys.exit(0)\n"
             "sys.exit(0 if sys.argv[1:3] == ['image', 'exists'] or sys.argv[1] == 'run' else 90)\n"
         )
@@ -97,6 +101,8 @@ class CargoCacheMounts(unittest.TestCase):
         proc_locks_runtime=None,
         calibration=False,
         git_location=None,
+        command=None,
+        caller_affinity=None,
     ):
         # The wrapper gets this process's environment, as it does in
         # production, so an inherited Git location variable reaches it.
@@ -128,14 +134,18 @@ class CargoCacheMounts(unittest.TestCase):
                 "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000",
                 *forwarded,
                 "--",
-                "/not-executed/command",
-                "literal argument",
+                *(command or ["/not-executed/command", "literal argument"]),
             ],
             cwd=self.root,
             env=env,
             capture_output=True,
             text=True,
             timeout=10,
+            preexec_fn=(
+                None
+                if caller_affinity is None
+                else lambda: os.sched_setaffinity(0, caller_affinity)
+            ),
         )
         calls = [json.loads(line) for line in self.capture.read_text().splitlines()]
         return result, calls
@@ -176,7 +186,7 @@ class CargoCacheMounts(unittest.TestCase):
             self.assertEqual(
                 calls[1], ["image", "inspect", "--format", "{{.Id}}", calls[0][-1]]
             )
-            self.assertEqual(calls[2][-3], calls[0][-1])
+            self.assertEqual(calls[2][-6], calls[0][-1])
             mounts = [
                 calls[2][i + 1]
                 for i, value in enumerate(calls[2])
@@ -302,13 +312,44 @@ class CargoCacheMounts(unittest.TestCase):
         self.assertIn("--network=none", argv)
         self.assertIn("--http-proxy=false", argv)
         self.assertEqual(
-            argv[-3:],
+            argv[-6:],
             [
                 "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                "/bin/taskset",
+                "--cpu-list",
+                ",".join(map(str, sorted(os.sched_getaffinity(0)))),
                 "/not-executed/command",
                 "literal argument",
             ],
         )
+
+    def test_payload_keeps_caller_affinity_when_runtime_widens_it(self):
+        available = sorted(os.sched_getaffinity(0))
+        if len(available) < 2:
+            self.skipTest("affinity expansion requires two available CPUs")
+        inherited = available[::2]
+        os.environ["PINNED_ROOT_EXEC_PAYLOAD"] = "1"
+        os.environ["PINNED_ROOT_RUNTIME_AFFINITY"] = json.dumps(available)
+        self.addCleanup(os.environ.pop, "PINNED_ROOT_EXEC_PAYLOAD", None)
+        self.addCleanup(os.environ.pop, "PINNED_ROOT_RUNTIME_AFFINITY", None)
+        # The fake runtime really widens its own affinity before exec. The
+        # original payload must inherit the wrapper's narrower set, preserve
+        # its literal argument, and return its own nonzero status unchanged.
+        result, calls = self.invoke(
+            caller_affinity=inherited,
+            command=[
+                sys.executable,
+                "-c",
+                "import json, os, sys; "
+                "print(json.dumps([sorted(os.sched_getaffinity(0)), sys.argv[1:]])); "
+                "sys.exit(23)",
+                "literal argument",
+            ],
+        )
+        self.assertEqual(result.returncode, 23, result.stderr)
+        self.assertEqual(json.loads(result.stdout), [inherited, ["literal argument"]])
+        self.assertEqual(sorted(os.sched_getaffinity(0)), available)
+        self.assertEqual(len(calls), 2)
 
     def test_agent_utils_writable_state_is_confined_to_the_pinned_output(self):
         host_state = self.root / "source/agent-utils/rs"
@@ -474,9 +515,12 @@ class CargoCacheMounts(unittest.TestCase):
         self.assertIn("--network=none", argv)
         self.assertIn("--http-proxy=false", argv)
         self.assertEqual(
-            argv[-3:],
+            argv[-6:],
             [
                 "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                "/bin/taskset",
+                "--cpu-list",
+                ",".join(map(str, sorted(os.sched_getaffinity(0)))),
                 "/not-executed/command",
                 "literal argument",
             ],
@@ -1118,9 +1162,12 @@ class CargoCacheMounts(unittest.TestCase):
                     "/src/nested module",
                 )
                 self.assertEqual(
-                    argv[-3:],
+                    argv[-6:],
                     [
                         "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                        "/bin/taskset",
+                        "--cpu-list",
+                        ",".join(map(str, sorted(os.sched_getaffinity(0)))),
                         "/not-executed/command",
                         "literal argument",
                     ],

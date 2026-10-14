@@ -4867,6 +4867,11 @@ if args == ['image', 'exists', 'fixture@sha256:000000000000000000000000000000000
 assert args[0] == 'run', args
 boundary = args.index('fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000')
 command = args[boundary + 1:]
+# Authenticate and execute the real affinity prefix before checking the
+# unchanged guard/payload tail; accepting any CPU list would hide widening.
+expected_affinity = ','.join(map(str, sorted(os.sched_getaffinity(0))))
+assert command[:3] == ['/bin/taskset', '--cpu-list', expected_affinity], command
+affinity_prefix, command = command[:3], command[3:]
 assert command[:2] == ['bash', '-c'] and command[3] == 'bash', command
 assert command[2] in json.loads((root / 'guards.json').read_text()), command
 # No ambient NEXTEST_TEST_THREADS leakage: emulate only explicitly forwarded
@@ -4884,7 +4889,7 @@ for name in ['assert-no-network.sh', 'assert-build-dependencies.sh']:
     original = '/src/ci/hermetic/' + name
     assert command[2].count(original) == 1
     command[2] = command[2].replace(original, shlex.quote(str(root / 'ci/hermetic' / name)))
-completed = subprocess.run(command, cwd=root, env=env, timeout=5)
+completed = subprocess.run(affinity_prefix + command, cwd=root, env=env, timeout=5)
 sys.exit(completed.returncode)
 "##,
         );
@@ -4892,7 +4897,8 @@ sys.exit(completed.returncode)
             root.join("capture.py"),
             br#"import json, os, pathlib, sys
 pathlib.Path('capture.json').write_text(json.dumps({
-    'args': sys.argv[1:], 'width': os.environ.get('NEXTEST_TEST_THREADS')
+    'args': sys.argv[1:], 'width': os.environ.get('NEXTEST_TEST_THREADS'),
+    'affinity': sorted(os.sched_getaffinity(0))
 }))
 print('literal-payload-status-37')
 sys.exit(37)
@@ -4959,7 +4965,10 @@ sys.exit(37)
                 .iter()
                 .position(|arg| arg == "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000")
                 .unwrap();
-            assert_eq!(calls[1][boundary + 5], unwrapped);
+            // The fake Podman authenticates and executes all three taskset
+            // arguments; these assertions still address the original payload.
+            let payload = &calls[1][boundary + 4..];
+            assert_eq!(payload[4], unwrapped);
             if step.jobs_env.as_deref() == Some("NEXTEST_TEST_THREADS") {
                 assert_eq!(
                     calls[1][..boundary]
@@ -4969,7 +4978,7 @@ sys.exit(37)
                     1,
                     "the wrapper must explicitly forward the admitted width",
                 );
-                assert_eq!(calls[1].len(), boundary + 6, "no trailing jobs argv");
+                assert_eq!(payload.len(), 5, "no trailing jobs argv");
             }
         }
         serde_json::from_slice(&fs::read(root.join("capture.json")).unwrap()).unwrap()
