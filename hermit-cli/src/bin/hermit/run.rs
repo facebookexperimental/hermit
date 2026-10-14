@@ -888,6 +888,31 @@ fn remove_fatal_core_files(dir: &Path, owner: &str) -> usize {
     removed
 }
 
+/// Set in the run that `hermit run --dap-listen` starts and supervises, which
+/// is the same command run as a plain `--gdbserver` run.
+const DAP_LISTEN_INNER_ENV: &str = "HERMIT_DAP_LISTEN_INNER";
+
+/// `--dap-listen` debugs an executable. Refuses a `#!` script, naming the way
+/// to debug its interpreter instead: which file that is depends on the guest's
+/// own exec path resolution, which the debugger hint cannot reproduce.
+fn refuse_debugging_a_script(host: &Path) -> Result<(), Error> {
+    let mut head = [0u8; 2];
+    let is_script = std::fs::File::open(host)
+        .and_then(|mut file| file.read_exact(&mut head))
+        .is_ok()
+        && head == *b"#!";
+    if is_script {
+        anyhow::bail!(
+            "--dap-listen debugs an executable, and {} is a #! script; to debug its \
+             interpreter, run the interpreter with the script as its argument, for example \
+             hermit run --dap-listen=ADDRESS -- /bin/sh {}",
+            host.display(),
+            host.display()
+        );
+    }
+    Ok(())
+}
+
 /// Command-line options for the "run" subcommand.
 #[derive(Debug, Parser, Clone)]
 #[clap(group(clap::ArgGroup::new("verification").args(["verify", "verify_run"])))]
@@ -925,10 +950,6 @@ pub struct RunOpts {
     /// (default: /usr/bin/gdb, else gdb on PATH).
     #[clap(long, value_name = "PATH", requires = "dap_listen")]
     dap_gdb: Option<PathBuf>,
-
-    /// The adapter `--dap-listen` started, kept until the run ends.
-    #[clap(skip)]
-    dap_adapter: Option<std::sync::Arc<super::dap_adapter::ListeningAdapter>>,
 
     /// Path to a happens-before specification (JSON; see RFC #1146) that places
     /// deterministic ordering edges between anchored events. Anchor code
@@ -1560,10 +1581,13 @@ fn apply_base_and_explicit_environment(
         }
         BaseEnv::Host => {
             // Hermit's own settings, not the guest's: where its verify logs go,
-            // and its race probes, which must not change what the guest sees.
+            // its race probes, which must not change what the guest sees, and
+            // the mark on the run that `--dap-listen` supervises, so the
+            // guest's environment is that of the same run without it.
             command.env_remove(super::verify::VERIFY_TMPDIR_ENV);
             command.env_remove(detcore::race_probe::RACE_PROBE_ENV);
             command.env_remove(detcore::race_probe::RACE_PROBE_SEED_ENV);
+            command.env_remove(DAP_LISTEN_INNER_ENV);
         }
     }
     for (name, value) in env {
@@ -5502,10 +5526,11 @@ impl RunOpts {
         if self.dap_listen.is_some() {
             // Before validation, so every --gdbserver refusal applies.
             self.det_opts.det_config.gdbserver = true;
+            if std::env::var_os(DAP_LISTEN_INNER_ENV).is_none() {
+                return self.serve_dap();
+            }
         }
         let result = self.main_without_core_cleanup(global);
-        // Stops the adapter if its client never came or is still connected.
-        drop(self.dap_adapter.take());
         if let Ok(status) = &result {
             self.finish_manifest(*status);
         }
@@ -5515,65 +5540,42 @@ impl RunOpts {
         result
     }
 
-    /// For `--dap-listen` (which [`RunOpts::main`] turned into `--gdbserver`):
-    /// starts `hermit-dap` on a socket this process bound, and tells the user
-    /// what the client's attach request needs. The address and the program's
-    /// host file are checked first, so neither failure starts anything.
-    fn start_dap_adapter(&self) -> Result<Option<super::dap_adapter::ListeningAdapter>, Error> {
-        let Some(argument) = &self.dap_listen else {
-            return Ok(None);
-        };
+    /// `--dap-listen`: this process supervises two children, the run itself
+    /// (this same command, as a plain `--gdbserver` run) and, once the run's
+    /// gdbserver is listening, `hermit-dap` on a socket this process bound.
+    /// A run that is refused, or whose program is not found, ends before any
+    /// adapter starts, with its own message and status. If the adapter ends
+    /// for any reason while the gdbserver still waits for its one connection,
+    /// no debugger can ever attach, so this ends the run instead of leaving it
+    /// waiting. Both children die with this process.
+    fn serve_dap(&self) -> Result<ExitStatus, Error> {
+        let argument = self.dap_listen.as_deref().unwrap_or_default();
         let listener = super::dap_adapter::bind(argument)?;
-        // The checks and errors (and exit statuses, 127 for a program that is
-        // not found) of an ordinary run, before this path adds its own.
-        self.validate_program()?;
-        let program = self.debuggee_host_file()?;
-        let port = self.det_opts.det_config.gdbserver_port;
-        let adapter =
-            super::dap_adapter::ListeningAdapter::spawn(listener, port, self.dap_gdb.as_deref())?;
-        eprintln!(
-            "hermit run: started hermit-dap to serve this run to one DAP client; {}",
-            super::dap_adapter::attach_hint(&program, port)
-        );
-        Ok(Some(adapter))
-    }
-
-    /// The host file the debugger loads symbols from: the executable the guest
-    /// command selects (guest working directory, guest PATH, mounts), and for a
-    /// `#!` script its interpreter, found through the same mounts, as the
-    /// kernel would (it follows at most 4 interpreters).
-    fn debuggee_host_file(&self) -> Result<PathBuf, Error> {
-        let (mut guest, mut host) = self
+        // The host file the debugger loads symbols from: the executable the
+        // guest command selects (guest working directory, PATH, mounts). A
+        // program that cannot be resolved is left to the run, which reports
+        // it with its own status (127 if it is not found).
+        let program = self
             .resolve_guest_and_host_program()
-            .context("--dap-listen needs the program's file on the host for the debugger")?;
-        for _ in 0..4 {
-            // The `#!` line only: the interpreter it names is a guest path,
-            // which need not exist on the host as named.
-            let mut head = Vec::new();
-            std::fs::File::open(&host)
-                .and_then(|file| std::io::Read::read_to_end(&mut file.take(256), &mut head))
-                .with_context(|| format!("--dap-listen cannot read {}", host.display()))?;
-            let Some(interpreter) = Shebang::interpreter_from_buf(&head) else {
-                return Ok(host);
-            };
-            let interpreter = normalize_guest_path(&interpreter)?;
-            host = self
-                .mapped_or_visible_host_program(&interpreter)
-                // A file mounted at exactly this path maps to its source
-                // joined with an empty remainder, a trailing '/'; drop it.
-                .map(|host| host.components().collect::<PathBuf>())
-                .ok_or_else(|| {
-                    Error::msg(format!(
-                        "--dap-listen cannot find the host file of {}, the interpreter of {}",
-                        interpreter.display(),
-                        guest.display()
-                    ))
-                })?;
-            guest = interpreter;
+            .ok()
+            .map(|(_, host)| host);
+        if let Some(host) = &program {
+            refuse_debugging_a_script(host)?;
         }
-        anyhow::bail!(
-            "--dap-listen cannot debug {}: its interpreters nest more than 4 deep",
-            guest.display()
+        // Before the run starts, so a missing adapter costs nothing.
+        super::dap_adapter::hermit_dap_beside_hermit()?;
+        let run = super::dap_adapter::spawn_owned(
+            std::process::Command::new(std::env::current_exe().context("Failed to locate hermit")?)
+                .args(std::env::args_os().skip(1))
+                .env(DAP_LISTEN_INNER_ENV, "1"),
+        )
+        .context("Failed to start the run")?;
+        super::dap_adapter::supervise(
+            run,
+            listener,
+            self.det_opts.det_config.gdbserver_port,
+            program.as_deref().unwrap_or(&self.program),
+            self.dap_gdb.as_deref(),
         )
     }
 
@@ -5619,8 +5621,6 @@ impl RunOpts {
         // Right after validation, which may have turned the preemption timer
         // off, and still before stdin is read or anything is launched.
         self.refuse_happens_before_without_preemption()?;
-        // After the refusals above, so a refused run starts no adapter.
-        self.dap_adapter = self.start_dap_adapter()?.map(std::sync::Arc::new);
         self.adopt_replayed_schedule_epoch()?;
         // Once every implicit input it records is resolved, and before the
         // guest starts, so a run that fails or hangs still leaves it.
@@ -9329,6 +9329,26 @@ mod tests {
     use clap::CommandFactory;
 
     use super::*;
+
+    #[test]
+    fn host_base_env_keeps_hermits_own_variables_from_the_guest() {
+        let mut command = Command::new("/bin/true");
+        apply_base_and_explicit_environment(&mut command, &BaseEnv::Host, &[]).unwrap();
+        let removed: Vec<_> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name.to_owned())
+            .collect();
+        for name in [
+            super::super::verify::VERIFY_TMPDIR_ENV,
+            DAP_LISTEN_INNER_ENV,
+        ] {
+            assert!(
+                removed.iter().any(|removed| removed == name),
+                "{name} must not reach a guest with the host environment: removed {removed:?}"
+            );
+        }
+    }
 
     #[test]
     fn a_green_run_removes_only_its_own_fatal_cores() {

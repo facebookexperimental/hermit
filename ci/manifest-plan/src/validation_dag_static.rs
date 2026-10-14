@@ -1508,7 +1508,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from f4e27a59: 1049.
     // And metadata::tests::record_version_rejects_streams_from_before_armed_waiting_signal_calls
     // (https://github.com/rrnewton/hermit/issues/4234): 1050, run.
-    ("test.hermit_unit", 1050),
+    // And host_base_env_keeps_hermits_own_variables_from_the_guest
+    // (hermit run --dap-listen): 1051.
+    ("test.hermit_unit", 1051),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3063,7 +3065,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And hermit_run_dap_listen_ends_the_run_when_its_debugger_cannot_attach,
     // hermit_run_dap_listen_names_a_mounted_interpreter and
     // hermit_run_dap_listen_keeps_the_not_found_status: 408.
-    ("test.cli", 408),
+    // The mounted-interpreter test becomes
+    // hermit_run_dap_listen_refuses_a_script, and
+    // hermit_run_dap_listen_killed_supervisor_leaves_no_run_or_adapter: 409.
+    ("test.cli", 409),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3399,7 +3404,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the three hermit run --dap-listen tests: 340.
     // And the four hermit run --dap-listen tests: 341.
     // And three more: 344.
-    ("test.cli_on_host", 344),
+    // And one more: 345.
+    ("test.cli_on_host", 345),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -3824,7 +3830,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from bd38bb81: 1048.
     // And +1 from f4e27a59: 1049.
     // And the armed-waiting-signal record-epoch test: 1050.
-    ("test.hermit_unit_on_host", 1050),
+    // And the host-environment test for hermit run --dap-listen: 1051.
+    ("test.hermit_unit_on_host", 1051),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

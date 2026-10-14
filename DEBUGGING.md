@@ -170,7 +170,7 @@ hermit run --epoch=2026-01-01T00:00:00Z --dap-listen=4711 -- ./squares
 ```
 
 ```text
-hermit run: started hermit-dap to serve this run to one DAP client; its attach request needs "program": "/home/me/squares" and "target": "127.0.0.1:1234"
+hermit run: starting hermit-dap to serve this run to one DAP client; its attach request needs "program": "/home/me/squares" and "target": "127.0.0.1:1234"
 hermit-dap: listening on 127.0.0.1:4711
 ```
 
@@ -180,21 +180,27 @@ could not serve: one whose `--gdbserver` would be refused (under `--strict`,
 for example), one with `--verify` (which runs the program twice, and the
 adapter serves one session), `--namespace-only` (which has no GDB server) or
 `--image` (whose program lives in the image), and an address that does not
-parse or cannot be listened on. A program that does not exist is reported
-as in any run, with status 127. It binds the address itself and hands the
-listening socket to `hermit-dap`, which runs beside `hermit`, outside the
-guest, and dies with it; the program waits for the client's `attach` before
-its first instruction. `--dap-gdb PATH` chooses the GDB the adapter runs.
+parse or cannot be listened on. It also refuses a script that starts with
+`#!`: debug its interpreter instead, with the script as its argument, as in
+`hermit run --dap-listen=4711 -- /bin/sh ./script.sh`. A program that does
+not exist is reported as in any run, with status 127.
+
+`hermit run` binds the address itself and supervises two children: the run,
+and, once the run's GDB server listens, `hermit-dap`, to which it hands the
+listening socket. `hermit-dap` runs beside `hermit`, outside the guest; the
+program waits for the client's `attach` before its first instruction.
+`--dap-gdb PATH` chooses the GDB the adapter runs.
 
 The `program` it prints is the executable the guest command actually runs,
 found the way the guest finds it (its working directory, its `PATH`, the
-run's mounts), as a path on the host. For a script that starts with `#!`, it
-is the script's interpreter, found through the same mounts.
+run's mounts), as a path on the host.
 
-If the debugger ends before it has connected to the run's GDB server
-(GDB cannot start, fails, or the DAP client leaves before attaching), no
-debugger can attach any more, so `hermit-dap` says so and ends the run with
-SIGTERM (a shell reports status 143) instead of leaving it waiting.
+If `hermit-dap` ends, for any reason, before a debugger has connected to the
+run's GDB server (GDB cannot start or fails, the DAP client leaves before
+attaching, or `hermit-dap` is killed), no debugger can attach any more, so
+`hermit run` ends the run and exits with status 125, saying why, instead of
+leaving it waiting. If `hermit run` itself is killed, the run and
+`hermit-dap` die with it.
 
 When the run ends, `hermit run` waits up to 5 seconds for the adapter to
 finish its session, then stops it, so a client that stays connected sees its
@@ -425,7 +431,7 @@ HERMIT_REQUIRE_DAP=1 HERMIT_REQUIRE_DAP_GDB=1 \
 ```
 
 Without `HERMIT_REQUIRE_DAP_GDB`, the end-to-end tests skip, loudly, when no
-GDB with a DAP interpreter is installed. The 27 tests take about 9 seconds
+GDB with a DAP interpreter is installed. The 32 tests take about 7 seconds
 with GDB 17.2. The VS Code extension's test, which needs a VS Code
 download and so is not part of validation, is described in
 [editors/vscode](editors/vscode/README.md).

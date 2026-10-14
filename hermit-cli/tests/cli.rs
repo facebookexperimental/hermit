@@ -16840,7 +16840,7 @@ fn hermit_run_dap_listen_refusals_start_no_adapter() {
         assert!(
             status.is_some_and(|status| !status.success())
                 && reasons.iter().all(|reason| stderr.contains(reason))
-                && !stderr.contains("started hermit-dap")
+                && !stderr.contains("starting hermit-dap")
                 && !stderr.contains("hermit-dap: listening"),
             "hermit {argv:?} must be refused naming {reasons:?} within 30 s, got {status:?}\n\
              stderr:\n{stderr}"
@@ -16886,8 +16886,8 @@ fn hermit_run_dap_listen_names_the_program_the_guest_runs() {
 /// A `--dap-listen` run whose debugger ends before it connects to the run's
 /// gdbserver is ended, in bounded time, with the reason, instead of waiting
 /// for a debugger that can never come: when GDB cannot be executed, when it
-/// starts and fails at once, and when the DAP client leaves before attaching
-/// (the adapter serves one client).
+/// starts and fails at once, when the DAP client leaves before attaching (the
+/// adapter serves one client), and when the adapter itself is killed.
 #[test]
 fn hermit_run_dap_listen_ends_the_run_when_its_debugger_cannot_attach() {
     const TEST: &str = "hermit_run_dap_listen_ends_the_run_when_its_debugger_cannot_attach";
@@ -16901,10 +16901,11 @@ fn hermit_run_dap_listen_ends_the_run_when_its_debugger_cannot_attach() {
         .expect("failed to create the hermit-dap work dir");
     let (_source, program) = dap_guest(work.path());
     let program_arg = program.to_str().expect("guest path should be UTF-8");
-    for (case, gdb) in [
-        ("GDB cannot be executed", Some("/nonexistent/gdb")),
-        ("GDB fails at once", Some("/bin/false")),
-        ("the client leaves before attaching", None),
+    for (case, gdb, kill_the_adapter) in [
+        ("GDB cannot be executed", Some("/nonexistent/gdb"), false),
+        ("GDB fails at once", Some("/bin/false"), false),
+        ("the client leaves before attaching", None, false),
+        ("the adapter is killed", None, true),
     ] {
         let gdbserver_port = unused_local_port().to_string();
         let mut args = vec![
@@ -16942,8 +16943,17 @@ fn hermit_run_dap_listen_ends_the_run_when_its_debugger_cannot_attach() {
             );
             thread::sleep(Duration::from_millis(20));
         };
-        // A client that connects and leaves at once, sending nothing.
-        drop(std::net::TcpStream::connect(&address).expect("failed to reach hermit-dap"));
+        if kill_the_adapter {
+            let hermit_pid = run.0.id();
+            let adapter = *children_named(hermit_pid, "hermit-dap")
+                .first()
+                .unwrap_or_else(|| panic!("{case}: no hermit-dap child of hermit {hermit_pid}"));
+            // SAFETY: kill has no pointer arguments.
+            assert_eq!(unsafe { libc::kill(adapter, libc::SIGKILL) }, 0, "{case}");
+        } else {
+            // A client that connects and leaves at once, sending nothing.
+            drop(std::net::TcpStream::connect(&address).expect("failed to reach hermit-dap"));
+        }
         let status = loop {
             if let Some(status) = run.0.try_wait().expect("failed to poll hermit") {
                 break Some(status);
@@ -16956,53 +16966,141 @@ fn hermit_run_dap_listen_ends_the_run_when_its_debugger_cannot_attach() {
         let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
         assert!(
             status.is_some_and(|status| !status.success())
-                && stderr.contains("before connecting to the run's gdbserver")
-                && stderr.contains("ending hermit run"),
+                && stderr.contains("before a debugger connected to this run's gdbserver")
+                && stderr.contains("ended the run"),
             "{case}: hermit run must end, with the reason, once its debugger is gone; \
              got {status:?}\nstderr:\n{stderr}"
         );
     }
 }
 
-/// For a `#!` script, the attach request's `program` is its interpreter as
-/// the guest sees it: here guest `/bin/true` is a mount of another file, and
-/// that file, not the host's `/bin/true`, is what the guest runs.
+/// The live children of `parent` whose command name is `comm`; the kernel
+/// here has no /proc/PID/task/TID/children, so this reads each
+/// /proc/PID/stat, which is "PID (COMM) STATE PPID ...".
+fn children_named(parent: u32, comm: &str) -> Vec<i32> {
+    let infix = format!(" ({comm}) ");
+    fs::read_dir("/proc")
+        .expect("failed to list /proc")
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<i32>().ok())
+        .filter(|pid| {
+            fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                stat.split_once(&infix).is_some_and(|(_, rest)| {
+                    let mut fields = rest.split_whitespace();
+                    let state = fields.next();
+                    state != Some("Z") && fields.next() == Some(&parent.to_string())
+                })
+            })
+        })
+        .collect()
+}
+
+/// When the `hermit run --dap-listen` that supervises the run and its adapter
+/// is itself killed, the run and the adapter go with it: nothing is left
+/// waiting for a debugger, and the gdbserver port is free again.
 #[test]
-fn hermit_run_dap_listen_names_a_mounted_interpreter() {
-    const TEST: &str = "hermit_run_dap_listen_names_a_mounted_interpreter";
+fn hermit_run_dap_listen_killed_supervisor_leaves_no_run_or_adapter() {
+    const TEST: &str = "hermit_run_dap_listen_killed_supervisor_leaves_no_run_or_adapter";
     let Some(_hermit_dap) = hermit_dap_binary(TEST) else {
         return;
     };
     let work = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("failed to create the hermit-dap work dir");
-    let interpreter = work.path().join("interpreter");
-    fs::copy("/bin/echo", &interpreter).expect("failed to copy an interpreter");
+    let (_source, program) = dap_guest(work.path());
+    let program_arg = program.to_str().expect("guest path should be UTF-8");
+    let gdbserver_port = unused_local_port();
+    let gdbserver_arg = format!("--gdbserver-port={gdbserver_port}");
+    let stderr_path = work.path().join("hermit-run.stderr");
+    let mut run = KillOnDrop(
+        hermit_command(&[
+            "run",
+            &gdbserver_arg,
+            "--dap-listen",
+            "127.0.0.1:0",
+            "--",
+            program_arg,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(&stderr_path).expect("failed to create stderr file"))
+        .spawn()
+        .expect("failed to run hermit"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(40);
+    while !fs::read_to_string(&stderr_path)
+        .unwrap_or_default()
+        .contains("hermit-dap: listening on ")
+    {
+        assert!(
+            Instant::now() < deadline && run.0.try_wait().ok().flatten().is_none(),
+            "hermit-dap never listened:\n{}",
+            fs::read_to_string(&stderr_path).unwrap_or_default()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let supervisor = run.0.id();
+    let adapters = children_named(supervisor, "hermit-dap");
+    let runs = children_named(supervisor, "hermit");
+    assert!(
+        adapters.len() == 1 && runs.len() == 1,
+        "expected one adapter and one run under hermit {supervisor}, found {adapters:?} and {runs:?}"
+    );
+    run.0.kill().expect("failed to kill the supervising hermit");
+    run.0.wait().expect("failed to reap the supervising hermit");
+    let gone = |pid: i32| {
+        fs::read_to_string(format!("/proc/{pid}/stat"))
+            .map_or(true, |stat| stat.split_whitespace().nth(2) == Some("Z"))
+    };
+    let leftover = loop {
+        let leftover: Vec<i32> = adapters
+            .iter()
+            .chain(&runs)
+            .copied()
+            .filter(|&pid| !gone(pid))
+            .collect();
+        if leftover.is_empty() || Instant::now() >= deadline {
+            break leftover;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        leftover.is_empty(),
+        "killing hermit {supervisor} left {leftover:?} of adapter {adapters:?} and run {runs:?}"
+    );
+    let port_free = loop {
+        let free = std::net::TcpListener::bind(("127.0.0.1", gdbserver_port)).is_ok();
+        if free || Instant::now() >= deadline {
+            break free;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        port_free,
+        "the run's gdbserver port {gdbserver_port} is still taken"
+    );
+}
+
+/// `--dap-listen` debugs an executable: a `#!` script is refused before
+/// anything starts, naming how to debug its interpreter instead.
+#[test]
+fn hermit_run_dap_listen_refuses_a_script() {
+    let work =
+        tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("failed to create the work dir");
     let script = work.path().join("script");
     fs::write(&script, "#!/bin/true\n").expect("failed to write the script");
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
         .expect("failed to make the script executable");
-    let mount = format!(
-        "--mount=type=bind,source={},target=/bin/true",
-        interpreter.display()
+    let script_arg = script.to_str().expect("script path should be UTF-8");
+    let output = hermit(&["run", "--dap-listen", "127.0.0.1:0", "--", script_arg]);
+    let stderr = stderr(&output);
+    assert!(
+        !output.status.success()
+            && stderr.contains("is a #! script")
+            && stderr.contains("run the interpreter with the script as its argument")
+            && !stderr.contains("starting hermit-dap")
+            && !stderr.contains("hermit-dap: listening"),
+        "hermit run --dap-listen on a script: {}\nstderr:\n{stderr}",
+        output.status
     );
-    let run = hermit_command(&[
-        "run",
-        &mount,
-        "--dap-listen",
-        "127.0.0.1:0",
-        "--",
-        script.to_str().expect("script path should be UTF-8"),
-    ]);
-    let stderr_path = work.path().join("hermit-run.stderr");
-    // Dropping the client kills hermit, and the adapter dies with it.
-    let dap = DapClient::connect(run, stderr_path.clone());
-    let told = fs::read_to_string(&stderr_path).unwrap_or_default();
-    let expected = format!("\"program\": {:?}", interpreter.display().to_string());
-    if !told.contains(&expected) {
-        dap.fail(&format!(
-            "hermit run --dap-listen must name the mounted interpreter, {expected}"
-        ));
-    }
 }
 
 /// A program that is not found gets the same status with `--dap-listen` as
