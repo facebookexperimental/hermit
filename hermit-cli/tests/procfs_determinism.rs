@@ -1133,7 +1133,7 @@ fn user_binds_with_different_sources_show_identical_mountinfo() {
 }
 
 /// A user bind rewrites only its own rows. Host /tmp may be the root of a
-/// btrfs subvolume (`/tmpvol` on devbig hosts), as other host mounts are;
+/// btrfs subvolume (`/tmpvol` on the development hosts), as other host mounts are;
 /// binding it at a directory the test makes must not change the root of any
 /// other row.
 #[test]
