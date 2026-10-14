@@ -215,6 +215,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "random_uuid_determinism",
             "--test",
+            "redis_strict",
+            "--test",
             "relaxed_flag_matrix",
             "--test",
             "remap_file_pages_refusal",
@@ -805,8 +807,9 @@ mod tests {
             // (https://github.com/rrnewton/hermit/issues/2791), plus the 32
             // tests of the six DBT binaries that now take the hermetic workdir,
             // plus cppc_feedback_determinism's and meminfo_determinism's one each
-            // (https://github.com/rrnewton/hermit/issues/4355).
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "402");
+            // (https://github.com/rrnewton/hermit/issues/4355), plus redis_strict's
+            // three.
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "405");
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

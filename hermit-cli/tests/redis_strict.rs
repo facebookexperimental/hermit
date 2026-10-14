@@ -85,10 +85,19 @@ fn unused_loopback_port() -> u16 {
 }
 
 fn system_redis() -> (PathBuf, PathBuf) {
-    let redis_server = executable(&["/usr/bin/redis-server", "/usr/local/bin/redis-server"])
-        .expect("redis-server is required; the portable CI job installs it");
-    let redis_cli = executable(&["/usr/bin/redis-cli", "/usr/local/bin/redis-cli"])
-        .expect("redis-cli is required; the portable CI job installs it");
+    // The pinned root has redis at /bin only.
+    let redis_server = executable(&[
+        "/usr/bin/redis-server",
+        "/usr/local/bin/redis-server",
+        "/bin/redis-server",
+    ])
+    .expect("redis-server is required; the portable CI job installs it");
+    let redis_cli = executable(&[
+        "/usr/bin/redis-cli",
+        "/usr/local/bin/redis-cli",
+        "/bin/redis-cli",
+    ])
+    .expect("redis-cli is required; the portable CI job installs it");
     (redis_server, redis_cli)
 }
 
