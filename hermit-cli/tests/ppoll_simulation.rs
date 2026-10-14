@@ -474,16 +474,24 @@ fn ppoll_waits_use_nonblocking_probes_and_verify() {
         "masked ppoll did not wait outside the turn\nstdout:\n{record_trace_stdout}\nstderr:\n{record_trace_stderr}",
     );
 
+    // The default workload at L2 on both backends. DBT ran only the lossy
+    // default comparator until its clone SETTID words held the virtual TID
+    // (https://github.com/rrnewton/hermit/issues/3147).
     for backend in ["ptrace", "dbt"] {
+        let verdict_directory =
+            tempfile::tempdir().expect("failed to create ppoll verdict directory");
+        let verdict = verdict_directory.path().join("verify.json");
         let mut verify_command = Command::new("timeout");
         verify_command
-            .args(["--kill-after", "5s", "30s"])
+            .args(["--kill-after", "5s", "60s"])
             .arg(env!("CARGO_BIN_EXE_hermit"))
             .arg("--log=info")
             .arg(format!("--backend={backend}"))
-            .arg("run")
-            .args(["--strict", "--verify", "--base-env=minimal", "--"])
+            .args(["run", "--strict", "--verify", "--verify-strict"])
+            .arg(format!("--verify-json={}", verdict.display()))
+            .args(["--base-env=minimal", "--"])
             .arg(&guest);
+        hermit_test::configure_guest_execution(&mut verify_command);
         let verify_output = command_output(
             verify_command,
             &format!("strict {backend} ppoll verification"),
@@ -491,9 +499,19 @@ fn ppoll_waits_use_nonblocking_probes_and_verify() {
         let verify_stdout = String::from_utf8_lossy(&verify_output.stdout);
         let verify_stderr = String::from_utf8_lossy(&verify_output.stderr);
         assert!(
-            verify_stdout.contains("Determinism verified")
-                || verify_stderr.contains("Determinism verified"),
-            "Hermit omitted its {backend} determinism marker\nstdout:\n{verify_stdout}\nstderr:\n{verify_stderr}",
+            verify_stdout.contains("ppoll-simulation-ok"),
+            "{backend} ppoll guest failed under Hermit\nstdout:\n{verify_stdout}\nstderr:\n{verify_stderr}",
+        );
+        let verdict: serde_json::Value =
+            serde_json::from_slice(&fs::read(&verdict).expect("failed to read the ppoll verdict"))
+                .expect("the ppoll verdict must be JSON");
+        assert_eq!(verdict["verdict"], "matched", "{backend}: {verdict}");
+        assert_eq!(verdict["bitwise_parity"], true, "{backend}: {verdict}");
+        assert!(
+            verdict["compared_log_messages"]["left"]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "{backend}: {verdict}"
         );
     }
 
