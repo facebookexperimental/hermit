@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -36,7 +39,7 @@ fn hermit_output(case: &ProgramCase, verify: bool) -> std::process::Output {
     let mut command = Command::new("timeout");
     command
         .args(["--kill-after", "10s", "90s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test::hermit_binary())
         .args(["--log", "DEBUG", "--backend=ptrace", "run", "--strict"]);
     if verify {
         command.arg("--verify");
@@ -45,6 +48,7 @@ fn hermit_output(case: &ProgramCase, verify: bool) -> std::process::Output {
         .arg("--")
         .arg(required_program(case))
         .args(case.args);
+    hermit_test::configure_guest_execution(&mut command);
 
     let rendered = format!("{command:?}");
     command
@@ -152,16 +156,17 @@ fn proc_fd_link_aliases_and_truncation_verify() {
         "readlinkat=/tmp/hermit-proc-fd-link-aliases\n",
     );
     for backend in ["ptrace", "dbt"] {
-        let output = Command::new("timeout")
+        let mut command = Command::new("timeout");
+        command
             .args(["--kill-after", "10s", "90s"])
-            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .arg(hermit_test::hermit_binary())
             .args(["--log", "DEBUG"])
             .arg(format!("--backend={backend}"))
             .arg("run")
             .args(["--strict", "--verify", "--"])
-            .arg(&guest)
-            .output()
-            .expect("failed to start Hermit");
+            .arg(&guest);
+        hermit_test::configure_guest_execution(&mut command);
+        let output = command.output().expect("failed to start Hermit");
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -183,14 +188,15 @@ fn proc_fd_link_aliases_and_truncation_verify() {
     // has none, and it does not pass `--verify` yet.
     #[cfg(feature = "liteinst")]
     {
-        let output = Command::new("timeout")
+        let mut command = Command::new("timeout");
+        command
             .args(["--kill-after", "10s", "90s"])
-            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .arg(hermit_test::hermit_binary())
             .args(["--log", "DEBUG", "--backend=liteinst", "run"])
             .args(["--strict", "--max-timeslice=disabled", "--"])
-            .arg(&guest)
-            .output()
-            .expect("failed to start Hermit");
+            .arg(&guest);
+        hermit_test::configure_guest_execution(&mut command);
+        let output = command.output().expect("failed to start Hermit");
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(

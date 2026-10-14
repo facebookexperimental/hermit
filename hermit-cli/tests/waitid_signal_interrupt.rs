@@ -14,6 +14,9 @@
 //! read. A dedicated reader drains Hermit's stderr while this thread polls the
 //! process and an independent wall-clock deadline.
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::io::BufRead;
 use std::io::BufReader;
@@ -235,7 +238,7 @@ fn run_bounded_for_backend_with_limits(
         .reopen()
         .expect("failed to reopen guest stdout file");
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    let mut command = Command::new(hermit_test::hermit_binary());
     if args.contains(&"--wait4-live-sibling-signal-blocked") {
         // The regression is an internal ERESTARTSYS followed by a transparent
         // kernel restart, so guest exit alone cannot distinguish old from new.
@@ -261,10 +264,9 @@ fn run_bounded_for_backend_with_limits(
             .arg("--verify-json")
             .arg(report_name);
     }
+    command.arg("--").arg(waitid_guest()).args(args);
+    hermit_test::configure_guest_execution(&mut command);
     command
-        .arg("--")
-        .arg(waitid_guest())
-        .args(args)
         .process_group(0)
         .stdout(Stdio::from(stdout_writer))
         .stderr(Stdio::piped());

@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::path::Path;
 use std::process::Command;
 
@@ -25,9 +28,10 @@ const IN_GUEST_SELECTED: &str =
 #[cfg(feature = "liteinst")]
 fn run_in_guest_liteinst_twice(guest: &Path, args: &[&str], label: &str) -> String {
     let run = || {
-        let output = Command::new("timeout")
+        let mut command = Command::new("timeout");
+        command
             .args(["--kill-after", "5s", "90s"])
-            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .arg(hermit_test::hermit_binary())
             .args([
                 "--log=info",
                 "--backend=liteinst",
@@ -41,7 +45,9 @@ fn run_in_guest_liteinst_twice(guest: &Path, args: &[&str], label: &str) -> Stri
                 "--",
             ])
             .arg(guest)
-            .args(args)
+            .args(args);
+        hermit_test::configure_guest_execution(&mut command);
+        let output = command
             .output()
             .unwrap_or_else(|error| panic!("failed to run liteinst/{label}: {error}"));
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -101,14 +107,17 @@ fn socket_timestamp_edge_cases_hold_at_every_epoch_fraction() {
             Some("--max-timeslice=disabled"),
         ),
     ] {
-        let verify = Command::new("timeout")
+        let mut command = Command::new("timeout");
+        command
             .args(["--kill-after", "5s", "90s"])
-            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .arg(hermit_test::hermit_binary())
             .args(["--log=info", "--backend=ptrace", "run"])
             .arg(format!("--epoch={epoch}"))
             .args(timeslice)
             .args(["--strict", "--verify", "--base-env=minimal", "--"])
-            .arg(&guest)
+            .arg(&guest);
+        hermit_test::configure_guest_execution(&mut command);
+        let verify = command
             .output()
             .expect("failed to run socket_timestamp_edge_cases");
         let stdout = String::from_utf8_lossy(&verify.stdout);
@@ -150,14 +159,17 @@ fn socket_receive_timestamps_use_logical_time() {
         );
 
         for backend in ["ptrace", "dbt"] {
-            let verify = Command::new("timeout")
+            let mut command = Command::new("timeout");
+            command
                 .args(["--kill-after", "5s", "90s"])
-                .arg(env!("CARGO_BIN_EXE_hermit"))
+                .arg(hermit_test::hermit_binary())
                 .arg("--log=info")
                 .arg(format!("--backend={backend}"))
                 .arg("run")
                 .args(["--strict", "--verify", "--base-env=minimal", "--"])
-                .arg(&guest)
+                .arg(&guest);
+            hermit_test::configure_guest_execution(&mut command);
+            let verify = command
                 .output()
                 .unwrap_or_else(|error| panic!("failed to run {backend}/{name}: {error}"));
             let stdout = String::from_utf8_lossy(&verify.stdout);
@@ -174,9 +186,10 @@ fn socket_receive_timestamps_use_logical_time() {
         }
 
         if name == "socket_timestamp_timeval" {
-            let realtime = Command::new("timeout")
+            let mut command = Command::new("timeout");
+            command
                 .args(["--kill-after", "5s", "90s"])
-                .arg(env!("CARGO_BIN_EXE_hermit"))
+                .arg(hermit_test::hermit_binary())
                 .args([
                     "--log=off",
                     "--backend=ptrace",
@@ -186,7 +199,9 @@ fn socket_receive_timestamps_use_logical_time() {
                     "--base-env=minimal",
                     "--",
                 ])
-                .arg(&guest)
+                .arg(&guest);
+            hermit_test::configure_guest_execution(&mut command);
+            let realtime = command
                 .output()
                 .expect("failed to run host-clock socket timestamp case");
             assert!(

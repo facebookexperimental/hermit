@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -33,7 +36,8 @@ fn compile_guest(output: &Path) {
 }
 
 fn run_guest(guest: &Path, seed: u64) -> Vec<u8> {
-    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+    let mut command = Command::new(hermit_test::hermit_binary());
+    command
         .args([
             "run",
             "--base-env=minimal",
@@ -41,7 +45,9 @@ fn run_guest(guest: &Path, seed: u64) -> Vec<u8> {
             "--max-timeslice=disabled",
         ])
         .arg(format!("--rng-seed={seed}"))
-        .arg(guest)
+        .arg(guest);
+    hermit_test::configure_guest_execution(&mut command);
+    let output = command
         .output()
         .expect("failed to run random guest under Hermit");
     assert!(
@@ -57,13 +63,13 @@ fn assert_guest_l2(guest: &Path, backend: Option<&str>) {
     let mut command = Command::new("timeout");
     command
         .args(["--kill-after", "10s", "60s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test::hermit_binary())
         .arg("--log=info");
     if let Some(backend) = backend {
         command.args(["--backend", backend]);
     }
     command.arg("run");
-    let output = command
+    command
         .args([
             "--strict",
             "--verify",
@@ -71,7 +77,9 @@ fn assert_guest_l2(guest: &Path, backend: Option<&str>) {
             "--preemption-timeout=disabled",
             "--",
         ])
-        .arg(guest)
+        .arg(guest);
+    hermit_test::configure_guest_execution(&mut command);
+    let output = command
         .output()
         .expect("failed to run random guest under strict verification");
     let stdout = String::from_utf8_lossy(&output.stdout);

@@ -105,6 +105,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "cpuidle_determinism",
             "--test",
+            "dbt_copied_tty",
+            "--test",
             "deadline_slice_cap",
             "--test",
             "dentry_state_determinism",
@@ -181,6 +183,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "privileged_observation",
             "--test",
+            "proc_fd_link_determinism",
+            "--test",
             "proc_fdinfo_determinism",
             "--test",
             "proc_locks_determinism",
@@ -202,6 +206,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "pty_nr_determinism",
             "--test",
             "python_stdlib",
+            "--test",
+            "random_determinism",
             "--test",
             "random_uuid_determinism",
             "--test",
@@ -236,6 +242,10 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "so_incoming_cpu",
             "--test",
             "socket_cookie_determinism",
+            "--test",
+            "socket_ioctl_timestamp_determinism",
+            "--test",
+            "socket_timestamp_determinism",
             "--test",
             "sockstat_determinism",
             "--test",
@@ -278,6 +288,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "version_provenance",
             "--test",
             "vmstat_determinism",
+            "--test",
+            "waitid_signal_interrupt",
             "--test",
             "writev_determinism",
             "--test",
@@ -786,8 +798,9 @@ mod tests {
             // (https://github.com/rrnewton/hermit/issues/4238),
             // plus the 67 tests of the 55 binaries no node ran before that pass on the
             // host and in the pinned root
-            // (https://github.com/rrnewton/hermit/issues/2791).
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "368");
+            // (https://github.com/rrnewton/hermit/issues/2791), plus the 32
+            // tests of the six DBT binaries that now take the hermetic workdir.
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "400");
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(
