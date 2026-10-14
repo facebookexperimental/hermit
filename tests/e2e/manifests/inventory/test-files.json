@@ -868,7 +868,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/leader_pthread_exit.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/leader_pthread_exit.c is owned by hermit-cli/tests/cli.rs: a_leader_pthread_exit_leaves_its_group_running_at_bitwise_parity runs each mode (the thread-group leader calls pthread_exit while a worker sleeps, yields, takes a process-directed kill, joins the exited main thread, leaves by its own pthread_exit, execs before or after joining it, joins a leader with a non-UTF-8 name, or ends a child its parent reaps, and 16 children in turn join their exited main thread) and requires Linux's output at bitwise parity, and a_worker_exit_code_ends_a_process_whose_leader_called_pthread_exit requires the worker's exit code (https://github.com/rrnewton/hermit/issues/4100). It stays a fixture because a generic manifest cannot assert these per-mode outputs and a nonzero exit."
+      "why": "tests/c/leader_pthread_exit.c is owned by hermit-cli/tests/cli.rs: a_leader_pthread_exit_leaves_its_group_running_at_bitwise_parity runs each mode (the thread-group leader calls pthread_exit while a worker sleeps, yields, takes a process-directed kill, joins the exited main thread, leaves by its own pthread_exit, execs before or after joining it, joins a leader with a non-UTF-8 name, or ends a child its parent reaps, and 16 children in turn join their exited main thread) and requires Linux's output at bitwise parity, a_worker_exit_code_ends_a_process_whose_leader_called_pthread_exit requires the worker's exit code (https://github.com/rrnewton/hermit/issues/4100), and run_dbt_leader_pthread_exit_leaves_its_group_running_at_bitwise_parity runs six of the modes under DBT, whose exited-thread hold must accept the zombie leader (https://github.com/rrnewton/hermit/issues/4246). It stays a fixture because a generic manifest cannot assert these per-mode outputs and a nonzero exit."
     },
     {
       "disposition": "manifest-test",
@@ -2381,6 +2381,12 @@
       "path": "tests/c/threadExhaustion.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/threadExhaustion.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/thread_join_after_exit.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/thread_join_after_exit.c is owned by hermit-cli/tests/cli.rs: run_dbt_joins_exited_threads_at_bitwise_parity, run_dbt_join_returns_after_robust_owner_death_as_linux and run_dbt_join_never_clears_a_reused_stacks_live_tid run its join, robust-owner and reused-stack modes under DBT and require bitwise parity under --verify-strict, which holds only if no sibling turn runs before the kernel has finished a joined thread's exit: its robust-list walk, CLONE_CHILD_CLEARTID store and wake (https://github.com/rrnewton/hermit/issues/4246). It stays a fixture because a generic manifest cannot select only the DBT strict-verify cells."
     },
     {
       "disposition": "manifest-test",

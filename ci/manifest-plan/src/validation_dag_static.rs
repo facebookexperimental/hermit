@@ -2136,7 +2136,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And fifo_peer::tests::guest_descriptors_are_visible_only_under_a_host_task_tracer
     // and fifo_peer::tests::a_fifo_is_seen_only_where_guest_descriptors_are_visible
     // (https://github.com/rrnewton/hermit/pull/4318): 1563, listed.
-    ("test.detcore_unit", 1563),
+    // And the four exited-thread barrier tests of
+    // https://github.com/rrnewton/hermit/issues/4246: 1567, by listing.
+    ("test.detcore_unit", 1567),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2956,7 +2958,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4275): 378, by listing.
     // And record_replay_reads_procfs_files_through_a_symbolic_link (B2b,
     // https://github.com/rrnewton/hermit/issues/4266): 379.
-    ("test.cli", 379),
+    // And run_dbt_joins_exited_threads_at_bitwise_parity,
+    // run_dbt_join_returns_after_robust_owner_death_as_linux,
+    // run_dbt_join_never_clears_a_reused_stacks_live_tid and
+    // run_dbt_leader_pthread_exit_leaves_its_group_running_at_bitwise_parity
+    // (https://github.com/rrnewton/hermit/issues/4246): 383.
+    ("test.cli", 383),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3268,7 +3275,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the paired recording-and-replay test: 314.
     // So does record_replay_reads_procfs_files_through_a_symbolic_link
     // (B2b): 315.
-    ("test.cli_on_host", 315),
+    // And the three DBT thread-join tests and the DBT leader-exit test: 319.
+    ("test.cli_on_host", 319),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -3473,7 +3481,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // B2b: eighteen sanitizer tests go, two table tests come: 1560.
     // And the procfs read-access test: 1561.
     // And the two FIFO descriptor-visibility tests: 1563.
-    ("test.detcore_unit_on_host", 1563),
+    // And the four exited-thread barrier tests: 1567.
+    ("test.detcore_unit_on_host", 1567),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

@@ -160,6 +160,7 @@ static VDSO_SYMBOL_VERSIONS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_SIGEV_THREAD_ID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_EXEC_FLUSH_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LEADER_PTHREAD_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static THREAD_JOIN_AFTER_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static NESTED_VFORK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_CHILD_WAITS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static GET_MEMPOLICY_ONE_NODE_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1247,6 +1248,31 @@ fn rendered_procfs_files_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "rendered-procfs-files guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn thread_join_after_exit_guest() -> &'static Path {
+    THREAD_JOIN_AFTER_EXIT_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("thread-join-after-exit");
+        fs::create_dir_all(&build_root).expect("failed to create thread-join-after-exit directory");
+        let guest = build_root.join("thread_join_after_exit");
+        let output = Command::new("cc")
+            .args(["-O2", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/thread_join_after_exit.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile thread-join-after-exit guest");
+        assert!(
+            output.status.success(),
+            "thread-join-after-exit guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -5787,6 +5813,137 @@ fn run_dbt_verifies_application_mmap() {
         "DBT confirmation missing:\n{}",
         stderr(&output),
     );
+}
+
+/// Runs the thread-join guest in `mode` under DBT at L2 (`--strict --verify
+/// --verify-strict`) and requires `expected` on stdout, a matched verdict,
+/// bitwise parity and nonzero compared INFO messages.
+fn assert_dbt_thread_join_mode_at_l2(test: &str, mode: &str, expected: &str) {
+    if dbt_unavailable(test) {
+        return;
+    }
+    assert_dbt_guest_mode_at_l2(thread_join_after_exit_guest(), mode, expected);
+}
+
+/// Runs `guest` in `mode` under DBT at L2 (`--strict --verify
+/// --verify-strict`) and requires `expected` on stdout, a matched verdict,
+/// bitwise parity and nonzero compared INFO messages.
+fn assert_dbt_guest_mode_at_l2(guest: &Path, mode: &str, expected: &str) {
+    let program = guest.to_str().expect("guest path should be UTF-8");
+    let name = guest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("guest file name should be UTF-8");
+    let directory = process_build_root(&format!("dbt-{name}-{mode}"));
+    fs::create_dir_all(&directory).expect("failed to create the verification directory");
+    let verdict = directory.join("verify.json");
+    let _ = fs::remove_file(&verdict);
+    let args = [
+        "--backend",
+        "dbt",
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        verdict.to_str().unwrap(),
+        "--",
+        program,
+        mode,
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), expected, "{mode}");
+    let report = read_terminal_dbt_verdict(&verdict);
+    assert_eq!(report["verdict"], "matched", "{mode}: {report}");
+    assert_eq!(report["bitwise_parity"], true, "{mode}: {report}");
+    assert!(
+        report["compared_log_messages"]["left"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "{report}"
+    );
+}
+
+/// `pthread_join` of a thread that is exiting waits on the thread's
+/// CLONE_CHILD_CLEARTID word, which Linux stores 0 to and wakes in the thread's
+/// exit. On DBT the backend reports the exit before the native exit runs, so a
+/// joiner could run before or after that store depending on host timing:
+/// `--verify-strict` diverged in 6 of 8 runs of this 200-join guest. The
+/// scheduler now commits no turn until the kernel has ended the thread
+/// (https://github.com/rrnewton/hermit/issues/4246).
+#[test]
+fn run_dbt_joins_exited_threads_at_bitwise_parity() {
+    assert_dbt_thread_join_mode_at_l2(
+        "run_dbt_joins_exited_threads_at_bitwise_parity",
+        "join",
+        "JOINED: 200 threads\n",
+    );
+}
+
+/// Linux walks a dying thread's robust list before it clears its TID, so once
+/// `pthread_join` returns, a robust mutex the thread died holding is already
+/// marked FUTEX_OWNER_DIED and trylock returns EOWNERDEAD at once. Storing the
+/// TID early on DBT returned EBUSY in round 0 (Claude review of
+/// https://github.com/rrnewton/hermit/pull/4315).
+#[test]
+fn run_dbt_join_returns_after_robust_owner_death_as_linux() {
+    assert_dbt_thread_join_mode_at_l2(
+        "run_dbt_join_returns_after_robust_owner_death_as_linux",
+        "robust-owner",
+        "EOWNERDEAD AFTER JOIN: 200 of 200\n",
+    );
+}
+
+/// Once a join returns, glibc may reuse the joined thread's stack for the next
+/// thread, so nothing of the old thread's exit may store to it later: the new
+/// thread's TID word must keep its TID while it lives. A native CLEARTID store
+/// after an early one zeroed it on DBT (Claude review of
+/// https://github.com/rrnewton/hermit/pull/4315).
+#[test]
+fn run_dbt_join_never_clears_a_reused_stacks_live_tid() {
+    assert_dbt_thread_join_mode_at_l2(
+        "run_dbt_join_never_clears_a_reused_stacks_live_tid",
+        "reused-stack",
+        "LIVE TID WORDS KEPT: 50 rounds\n",
+    );
+}
+
+/// A thread-group leader that calls `pthread_exit` while its threads run on is
+/// a zombie whose pidfd stays unreadable until the group empties, so the
+/// exited-thread hold must also accept the kernel's zombie state; with only
+/// the pidfd, every mode below waited out the 30 s valve (Claude re-review of
+/// https://github.com/rrnewton/hermit/pull/4315 at 4c08c669). `join16` joins
+/// the exited leader in 16 children, the leader form of
+/// https://github.com/rrnewton/hermit/issues/4246. The modes whose DBT output
+/// differs from Linux's on main as well (`kill`, `procself`, `procself16`) and
+/// `rawname`, whose raw thread name the DBT verifier cannot carry, are left to
+/// the ptrace test `a_leader_pthread_exit_leaves_its_group_running_at_bitwise_parity`
+/// (https://github.com/rrnewton/hermit/issues/4322). `yield` and `exec` match
+/// at L2 on DBT too but are left out for time: `yield` spins on `sched_yield`
+/// and its verify pair alone takes about 14 s, and `joinexec` already covers
+/// an exec after the leader's exit.
+#[test]
+fn run_dbt_leader_pthread_exit_leaves_its_group_running_at_bitwise_parity() {
+    if dbt_unavailable("run_dbt_leader_pthread_exit_leaves_its_group_running_at_bitwise_parity") {
+        return;
+    }
+    for (mode, expected) in [
+        ("sleep", "sleep worker survived the leader's exit\n"),
+        ("join", "join rc=0\n"),
+        ("join16", "join16 ok=16\n"),
+        ("lastexit", "lastexit worker leaving by pthread_exit\n"),
+        (
+            "joinexec",
+            "joinexec join=0\nexec after the leader's exit\n",
+        ),
+        (
+            "child",
+            "code worker exits 7\nchild reaped=1 exited=1 code=7\n",
+        ),
+    ] {
+        assert_dbt_guest_mode_at_l2(leader_pthread_exit_guest(), mode, expected);
+    }
 }
 
 #[test]

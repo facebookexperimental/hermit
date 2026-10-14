@@ -1151,6 +1151,18 @@ pub struct Scheduler {
     /// <https://github.com/rrnewton/hermit/pull/4245>). So step2 commits no
     /// turn while an entry is pending (`step2a_wait_for_exited_leaders`).
     exited_leader_barriers: BTreeMap<DetTid, std::time::Instant>,
+    /// Threads that deregistered after their own `Exit` grant while the kernel
+    /// had not yet carried out the exit, until the kernel shows each one
+    /// exited (`ExitedThreadBarrier`). Only a backend whose scheduler
+    /// identities do not name host tasks registers host thread pidfds
+    /// (`physical_thread_pidfds`); DBT is one, and it reports a thread's exit
+    /// before the native exit runs. That native exit walks the thread's robust
+    /// list, stores 0 to its `clear_child_tid` word and wakes it, in that
+    /// order, then releases its files, and a sibling turn before it finishes
+    /// would observe those changes at host-chosen points
+    /// (<https://github.com/rrnewton/hermit/issues/4246>). So step2 commits no
+    /// turn while an entry is pending (`step2a_wait_for_exited_threads`).
+    exited_thread_barriers: BTreeMap<DetTid, ExitedThreadBarrier>,
     /// How long an `exited_leader_barriers` entry may wait before the run
     /// ends with a named refusal.
     exited_leader_valve: Duration,
@@ -3332,6 +3344,7 @@ impl Scheduler {
             committed_exits: Default::default(),
             retired_exited_leaders: Default::default(),
             exited_leader_barriers: Default::default(),
+            exited_thread_barriers: Default::default(),
             exited_leader_valve: Duration::from_secs(30),
             #[cfg(test)]
             test_task_states: Default::default(),
@@ -5021,10 +5034,48 @@ impl Scheduler {
         if self.take_retired_exited_leader(dettid) {
             return;
         }
+        self.hold_turns_until_the_kernel_ends(dettid, mm);
         if !self.defer_exec_sibling_retirement(dettid, detpid, mm)
             && !self.thread_is_logically_killed(dettid)
         {
             self.logically_kill_thread(&dettid, &detpid, mm);
+        }
+    }
+
+    /// After `dettid`'s own `Exit` was granted, its deregistration may come
+    /// before the kernel carries out the exit; on DBT it always does. Hold
+    /// turns until the kernel shows the thread exited
+    /// (`exited_thread_barriers`). The pidfd must name this incarnation: an
+    /// exec's earlier image deregisters while the same host thread lives on.
+    fn hold_turns_until_the_kernel_ends(&mut self, dettid: DetTid, mm: MmId) {
+        if !self.committed_exits.contains(&dettid) {
+            return;
+        }
+        let Some((_, physical_pid, physical_tid, pidfd)) = self
+            .physical_thread_pidfds
+            .get(&dettid)
+            .filter(|(registered_mm, ..)| *registered_mm == mm)
+        else {
+            return;
+        };
+        match pidfd.try_clone() {
+            Ok(pidfd) => {
+                let barrier = ExitedThreadBarrier {
+                    pidfd,
+                    physical_pid: *physical_pid,
+                    physical_tid: *physical_tid,
+                    since: std::time::Instant::now(),
+                };
+                self.exited_thread_barriers.insert(dettid, barrier);
+            }
+            Err(error) => {
+                let reason = format!(
+                    "HERMIT_DEADLOCK: cannot hold turns until exited thread {dettid} is gone: \
+                     duplicating its pidfd failed: {error}"
+                );
+                tracing::error!("[step2] {reason}");
+                self.terminal_deadlock.get_or_insert(reason);
+            }
         }
     }
 
@@ -5898,7 +5949,55 @@ impl Scheduler {
         self.step2a_wait_for_vfork_barrier()?;
         self.step2a_wait_for_background_entry()?;
         self.step2a_wait_for_exited_leaders()?;
+        self.step2a_wait_for_exited_threads()?;
         Ok(())
+    }
+
+    /// Waits, committing no turn, until every thread that deregistered after
+    /// its own `Exit` grant (`exited_thread_barriers`) has exited in the
+    /// kernel (`ExitedThreadBarrier::settled`). Linux sets a thread's exit
+    /// state in `exit_notify`, after `exit_mm` has walked the robust list,
+    /// stored 0 to `clear_child_tid` and woken it, and after `exit_files`, so
+    /// every sibling turn sees all of that done. When that happens is
+    /// host-timed; waiting for it decides only how long the scheduler spins,
+    /// never which turn comes next or what a sibling observes
+    /// (<https://github.com/rrnewton/hermit/issues/4246>).
+    fn step2a_wait_for_exited_threads(&mut self) -> Result<(), SkipTurn> {
+        if self.exited_thread_barriers.is_empty() {
+            return Ok(());
+        }
+        let mut settled = Vec::new();
+        let mut stuck = None;
+        for (thread, barrier) in &self.exited_thread_barriers {
+            let observed = match barrier.settled() {
+                Ok(()) => {
+                    settled.push(*thread);
+                    continue;
+                }
+                Err(observed) => observed,
+            };
+            if stuck.is_none() && barrier.since.elapsed() >= self.exited_leader_valve {
+                stuck = Some(format!(
+                    "HERMIT_DEADLOCK: thread {thread} deregistered after its exit was granted, \
+                     and after {:?} the kernel has not ended it: {observed}",
+                    self.exited_leader_valve
+                ));
+            }
+        }
+        for thread in settled {
+            self.exited_thread_barriers.remove(&thread);
+        }
+        if let Some(reason) = stuck {
+            tracing::error!("[step2] {reason}");
+            self.terminal_deadlock.get_or_insert(reason);
+            return Err(SkipTurn);
+        }
+        if self.exited_thread_barriers.is_empty() {
+            Ok(())
+        } else {
+            std::thread::yield_now();
+            Err(SkipTurn)
+        }
     }
 
     /// Waits, committing no turn, until the kernel shows every leader
@@ -12016,6 +12115,62 @@ impl Scheduler {
     }
 }
 
+/// An `exited_thread_barriers` entry: a duplicate of the thread's pidfd, its
+/// host process and thread IDs, and when it deregistered, which bounds the
+/// wait (`exited_leader_valve`).
+#[derive(Debug)]
+struct ExitedThreadBarrier {
+    pidfd: OwnedFd,
+    physical_pid: i32,
+    physical_tid: i32,
+    since: std::time::Instant,
+}
+
+impl ExitedThreadBarrier {
+    /// Whether the kernel shows the thread exited, or else what it shows.
+    ///
+    /// The pidfd polls readable once the thread is gone, or once it has an
+    /// exit state, except for a thread-group leader whose group still has
+    /// other threads (`pidfd_poll` checks `delay_group_leader`, fs/pidfs.c):
+    /// that leader is a zombie, and its pidfd turns readable only when the
+    /// group empties, which would need sibling turns this barrier withholds.
+    /// So a zombie (`Z`) or dead (`X`) state in its `/proc` stat counts too, as
+    /// for `step2a_wait_for_exited_leaders`. The pidfd is polled first: a
+    /// thread already gone may have had its TID reused by another task, whose
+    /// stat says nothing about this one.
+    fn settled(&self) -> Result<(), String> {
+        let mut poll = libc::pollfd {
+            fd: self.pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd, and a zero timeout never blocks.
+        let ready = unsafe { libc::poll(&mut poll, 1, 0) };
+        if ready > 0 {
+            return Ok(());
+        }
+        let polled = if ready < 0 {
+            format!(
+                "polling its pidfd failed: {}",
+                std::io::Error::last_os_error()
+            )
+        } else {
+            "its pidfd does not report it exited".to_string()
+        };
+        match std::fs::read(format!(
+            "/proc/{}/task/{}/stat",
+            self.physical_pid, self.physical_tid
+        )) {
+            Ok(stat) => match task_state_of_stat(&stat) {
+                Some('Z' | 'X') => Ok(()),
+                Some(state) => Err(format!("{polled}, and its state is {state}")),
+                None => Err(format!("{polled}, and its stat cannot be parsed")),
+            },
+            Err(error) => Err(format!("{polled}, and its stat cannot be read ({error})")),
+        }
+    }
+}
+
 /// The state letter in the contents of a `/proc/<pid>/task/<tid>/stat` file:
 /// the first non-blank byte after the last `)`. The command name before it is
 /// raw bytes, not necessarily UTF-8 (`PR_SET_NAME`, or a UTF-8 name the
@@ -12217,6 +12372,215 @@ mod test {
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert!(scheduler.physical_thread_pidfds.is_empty());
+    }
+
+    /// A host thread that reports its TID and then waits until it is told to
+    /// exit, for the exited-thread barrier tests.
+    fn spawn_host_thread_until_told() -> (
+        std::thread::JoinHandle<()>,
+        std::sync::mpsc::Sender<()>,
+        i32,
+    ) {
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            tid_tx
+                .send(unsafe { libc::syscall(libc::SYS_gettid) as i32 })
+                .unwrap();
+            let _ = exit_rx.recv();
+        });
+        let tid = tid_rx.recv().unwrap();
+        (handle, exit_tx, tid)
+    }
+
+    #[test]
+    fn turns_wait_until_the_kernel_ends_a_thread_that_exited_by_its_own_grant() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let leader = DetTid::from_raw(36);
+        let dettid = DetTid::from_raw(37);
+        let detpid = DetPid::from_raw(36);
+        let mm = MmId::initial(detpid);
+        let (handle, exit_tx, tid) = spawn_host_thread_until_told();
+        scheduler.thread_tree.add_child(leader, leader, true);
+        scheduler.thread_tree.add_child(leader, dettid, false);
+        register_known_thread(&mut scheduler, leader);
+        register_known_thread(&mut scheduler, dettid);
+        scheduler
+            .register_physical_thread(dettid, mm, std::process::id() as i32, tid)
+            .unwrap();
+        scheduler.committed_exits.insert(dettid);
+
+        // The backend reports the exit before the kernel carries it out.
+        scheduler.retire_deregistered_thread(dettid, detpid, mm);
+        assert!(!scheduler.next_turns.contains_key(&dettid));
+        assert!(!scheduler.physical_thread_pidfds.contains_key(&dettid));
+        assert!(scheduler.exited_thread_barriers.contains_key(&dettid));
+        assert!(scheduler.step2a_wait_for_exited_threads().is_err());
+        assert!(scheduler.step2a_wait_for_exited_threads().is_err());
+
+        exit_tx.send(()).unwrap();
+        handle.join().unwrap();
+        // The join returns at the CLEARTID wake; the kernel sets the exit
+        // state, which the pidfd reports, a little later.
+        let started = std::time::Instant::now();
+        while scheduler.step2a_wait_for_exited_threads().is_err() {
+            assert!(started.elapsed() < Duration::from_secs(10));
+        }
+        assert!(scheduler.exited_thread_barriers.is_empty());
+        assert!(scheduler.terminal_deadlock.is_none());
+    }
+
+    /// The body of the helper process's second thread: it waits for a signal
+    /// until the test kills the process.
+    extern "C" fn pause_forever(_: *mut libc::c_void) -> libc::c_int {
+        loop {
+            // SAFETY: pause has no arguments and only waits for a signal.
+            unsafe { libc::syscall(libc::SYS_pause) };
+        }
+    }
+
+    /// A thread-group leader that exits while another thread of its group
+    /// lives is a zombie whose pidfd stays unreadable until the group empties
+    /// (`delay_group_leader` in fs/pidfs.c). Its siblings need turns to empty
+    /// it, so the zombie state itself must settle the barrier, or a DBT
+    /// `pthread_exit` from main deadlocks (Claude re-review of
+    /// https://github.com/rrnewton/hermit/pull/4315 at 4c08c669).
+    #[test]
+    fn a_zombie_leader_with_a_live_sibling_settles_its_exit_barrier() {
+        // SAFETY: the child runs only raw system calls and the clone wrapper
+        // before it exits, never returning into the test harness.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            unsafe {
+                let stack_size = 64 * 1024;
+                let stack = libc::mmap(
+                    std::ptr::null_mut(),
+                    stack_size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                );
+                if stack == libc::MAP_FAILED {
+                    libc::_exit(2);
+                }
+                let flags = libc::CLONE_VM
+                    | libc::CLONE_FS
+                    | libc::CLONE_FILES
+                    | libc::CLONE_SIGHAND
+                    | libc::CLONE_THREAD
+                    | libc::CLONE_SYSVSEM;
+                if libc::clone(
+                    pause_forever,
+                    stack.cast::<u8>().add(stack_size).cast(),
+                    flags,
+                    std::ptr::null_mut(),
+                ) < 0
+                {
+                    libc::_exit(3);
+                }
+                // The leader alone exits; its sibling keeps the group alive.
+                libc::syscall(libc::SYS_exit, 0);
+            }
+            unreachable!();
+        }
+        /// Kills and reaps the helper even when an assertion fails first.
+        struct Reap(libc::pid_t);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                // SAFETY: the helper is this test's own child.
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                    libc::waitpid(self.0, std::ptr::null_mut(), 0);
+                }
+            }
+        }
+        let _reap = Reap(child);
+        let started = std::time::Instant::now();
+        loop {
+            let stat = std::fs::read(format!("/proc/{child}/task/{child}/stat")).unwrap();
+            if task_state_of_stat(&stat) == Some('Z') {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the leader never exited"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let mut scheduler = Scheduler::new(&Config::default());
+        let dettid = DetTid::from_raw(37);
+        let mm = MmId::initial(DetPid::from_raw(37));
+        scheduler
+            .register_physical_thread(dettid, mm, child, child)
+            .unwrap();
+        scheduler.committed_exits.insert(dettid);
+        scheduler.hold_turns_until_the_kernel_ends(dettid, mm);
+        let barrier = &scheduler.exited_thread_barriers[&dettid];
+        let mut poll = libc::pollfd {
+            fd: barrier.pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // The pidfd alone would hold the barrier.
+        assert_eq!(unsafe { libc::poll(&mut poll, 1, 0) }, 0);
+        assert!(scheduler.step2a_wait_for_exited_threads().is_ok());
+        assert!(scheduler.exited_thread_barriers.is_empty());
+        assert!(scheduler.terminal_deadlock.is_none());
+    }
+
+    #[test]
+    fn turns_are_not_held_for_a_thread_without_its_own_grant_or_of_another_image() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let dettid = DetTid::from_raw(37);
+        let detpid = DetPid::from_raw(37);
+        let mm = MmId::initial(detpid);
+        let (handle, exit_tx, tid) = spawn_host_thread_until_told();
+        scheduler
+            .register_physical_thread(dettid, mm, std::process::id() as i32, tid)
+            .unwrap();
+
+        // Killed with its group, or by a signal: no Exit grant of its own.
+        scheduler.hold_turns_until_the_kernel_ends(dettid, mm);
+        assert!(scheduler.exited_thread_barriers.is_empty());
+        // An exec's earlier image deregisters while the host thread lives on.
+        scheduler.committed_exits.insert(dettid);
+        scheduler.hold_turns_until_the_kernel_ends(dettid, mm.for_exec(detpid));
+        assert!(scheduler.exited_thread_barriers.is_empty());
+        // No host thread is registered for it (ptrace).
+        scheduler.hold_turns_until_the_kernel_ends(DetTid::from_raw(38), mm);
+        assert!(scheduler.exited_thread_barriers.is_empty());
+        assert!(scheduler.step2a_wait_for_exited_threads().is_ok());
+
+        exit_tx.send(()).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_thread_the_kernel_never_ends_is_refused_by_name_past_the_valve() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.exited_leader_valve = Duration::ZERO;
+        let dettid = DetTid::from_raw(37);
+        let mm = MmId::initial(DetPid::from_raw(37));
+        let (handle, exit_tx, tid) = spawn_host_thread_until_told();
+        scheduler
+            .register_physical_thread(dettid, mm, std::process::id() as i32, tid)
+            .unwrap();
+        scheduler.committed_exits.insert(dettid);
+        scheduler.hold_turns_until_the_kernel_ends(dettid, mm);
+
+        assert!(scheduler.step2a_wait_for_exited_threads().is_err());
+        let reason = scheduler.terminal_deadlock.clone().unwrap();
+        assert!(
+            reason
+                .starts_with("HERMIT_DEADLOCK: thread 37 deregistered after its exit was granted"),
+            "{reason}"
+        );
+
+        exit_tx.send(()).unwrap();
+        handle.join().unwrap();
     }
 
     #[test]
