@@ -3318,7 +3318,10 @@ mod dbt_detconfig_tests {
         let encoded = dbt_detconfig_json(&config).unwrap();
         assert!(detcore::from_legacy_backend_json(&encoded).is_err());
         let decoded = detcore::decode_backend_config_json(&encoded).unwrap();
-        assert_eq!(decoded.backend, reverie::BackendCapabilities::DBT);
+        assert_eq!(
+            decoded.backend,
+            detcore::hermit_consumed_capabilities(reverie::BackendCapabilities::DBT)
+        );
         assert_eq!(decoded.backend, config.backend);
     }
 
@@ -3774,7 +3777,7 @@ pub fn backend_capabilities(backend: Backend) -> reverie::BackendCapabilities {
         // Tool host can do, so in-guest-trap has in-guest LiteInst's capabilities.
         Backend::Liteinst | Backend::InGuestTrap => reverie::BackendCapabilities::LITEINST_IN_GUEST,
         Backend::Sabre => reverie::BackendCapabilities::SABRE,
-        Backend::Dbt => reverie::BackendCapabilities::DBT,
+        Backend::Dbt => detcore::hermit_consumed_capabilities(reverie::BackendCapabilities::DBT),
     }
 }
 
@@ -6555,6 +6558,9 @@ mod tests {
                 matches!(backend, Backend::Ptrace | Backend::E9patch),
             "provides_process_signal_control": kvm,
             "emulates_child_waits": kvm,
+            // Reverie reports it for DBT (ABI 8); Hermit withholds it until a
+            // Detcore consumer lands (`detcore::hermit_consumed_capabilities`).
+            "supports_guest_memory_compare_exchange": false,
         })
     }
 
@@ -6611,9 +6617,10 @@ mod tests {
         }
         #[cfg(feature = "dbt")]
         {
+            // Less the capabilities Detcore does not consume yet.
             assert_eq!(
                 super::backend_capabilities(Backend::Dbt),
-                reverie_dbt::DbtRunner::capabilities()
+                detcore::hermit_consumed_capabilities(reverie_dbt::DbtRunner::capabilities())
             );
             // The DBT runtime re-asserts the same value when it loads the
             // configuration this crate serializes for it.

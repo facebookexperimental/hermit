@@ -102,6 +102,18 @@ pub use config::decode_backend_config_json;
 pub use config::encode_backend_config_json;
 pub use config::from_legacy_backend_json;
 pub use config::to_legacy_backend_json;
+
+/// The capabilities a backend reports, less the ones Detcore does not consume
+/// yet. `supports_guest_memory_compare_exchange` (DBT, Reverie ABI 8) has no
+/// Detcore consumer until the robust-futex owner-death change lands
+/// (<https://github.com/rrnewton/hermit/pull/4277>), and the DBT runtime does not
+/// install the exchange, so Hermit reports it as false for every backend.
+pub const fn hermit_consumed_capabilities(
+    mut capabilities: reverie::BackendCapabilities,
+) -> reverie::BackendCapabilities {
+    capabilities.supports_guest_memory_compare_exchange = false;
+    capabilities
+}
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-1120): Review the public canonical Detcore root identity.
 pub use consts::ROOT_DETPID;

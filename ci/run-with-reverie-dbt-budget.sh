@@ -1476,7 +1476,18 @@ fi
 # recipe input: build.rs, the vendored DynamoRIO tree, third-party/, the root
 # Cargo.toml and rust-toolchain.toml are unchanged. The two fixtures raise the
 # reverie-dbt inventory from 947 to 949. No new timing sample is claimed.
-expected_pin=48e78557804772b7e0d2f988504ca9ae2ab6115c
+# DBT ABI 8 SDK-BUDGET CARRY (2026-10-14): advance from 48e78557 to aad2ccd89d462d4e1bd9194e405d2adab1a728f3.
+# The added commits are cb1fd8be05f2 (BACKENDS.md), 57b25878e8ea and
+# bb510cd10a75 (native LiteInst kernel registrations and state payloads),
+# c710d37a287e (shared preload launcher), 60a68e8bce06 (DBT guest
+# compare-and-exchange: reverie-dbt/native/client.c, src/lib.rs, src/tools.rs,
+# the thread_start_live test and one new fixture), 62ce9e128be0 (shared vDSO
+# rewriting), efa88bd1a6ab (reverie-ptrace guest int3 delivery) and
+# aad2ccd89d46 (scripts/m1_artifact.rs allocator TLS route). None is an SDK
+# recipe input: build.rs, the vendored DynamoRIO tree, third-party/, the root
+# Cargo.toml and rust-toolchain.toml are unchanged. The new fixture raises the
+# reverie-dbt inventory from 949 to 950. No new timing sample is claimed.
+expected_pin=aad2ccd89d462d4e1bd9194e405d2adab1a728f3
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

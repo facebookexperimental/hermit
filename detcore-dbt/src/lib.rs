@@ -80,10 +80,14 @@ const RANDOM_FILL_CHUNK_BYTES: usize = 4096;
 const GETRANDOM_MAX_BYTES: usize = (i32::MAX as usize) & !4095;
 const GETRANDOM_ALLOWED_FLAGS: u32 = libc::GRND_NONBLOCK | libc::GRND_RANDOM | libc::GRND_INSECURE;
 /// Version 6 adds the initialized native mode and returned startup status.
-/// Version 7 adds `reverie_dbt_runtime_signal_event`. The 48-byte callback
-/// layout and version-5 RDTSC entry remain unchanged.
-const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 7;
-const IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE: usize = 48;
+/// Version 7 adds `reverie_dbt_runtime_signal_event`. Version 8 appends the
+/// native client's atomic guest-word compare-and-exchange to the callbacks,
+/// growing them from 48 to 56 bytes; the version-5 RDTSC entry is unchanged.
+/// This runtime accepts the version-8 layout but does not install the
+/// exchange yet, and Hermit reports DBT's
+/// `supports_guest_memory_compare_exchange` as false, so nothing calls it.
+const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 8;
+const IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE: usize = 56;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review the inherited DBT report descriptor.
@@ -114,7 +118,19 @@ fn upgrade_runtime_callbacks_v1(
         emit_stdout: callbacks.emit_stdout,
         emit_evidence: callbacks.emit,
         evidence_log_level: 0,
+        compare_exchange_u32: unsupported_compare_exchange,
     }
+}
+
+/// Stands in for the compare-and-exchange that callbacks older than ABI
+/// version 8 do not carry. Only refusing initialization paths read those.
+unsafe extern "C" fn unsupported_compare_exchange(
+    _address: usize,
+    _expected: u32,
+    _desired: u32,
+    _observed: *mut u32,
+) -> i32 {
+    -libc::ENOSYS
 }
 
 fn runtime_callback_channels(
@@ -376,7 +392,7 @@ fn default_dbt_config() -> Config {
 /// The coordinator frame retains that value; the stable [`DETCONFIG_ENV`]
 /// producer also encodes it for the existing standalone fallback.
 pub const fn backend_capabilities() -> reverie::BackendCapabilities {
-    reverie_dbt::DbtRunner::capabilities()
+    detcore::hermit_consumed_capabilities(reverie_dbt::DbtRunner::capabilities())
 }
 
 /// Builds the admitted standalone Detcore [`Config`] fallback.
@@ -2982,7 +2998,15 @@ mod tests {
 
     #[test]
     fn dbt_execution_model_reads_the_dbt_backend_capabilities() {
-        assert_eq!(backend_capabilities(), reverie::BackendCapabilities::DBT);
+        assert_eq!(
+            backend_capabilities(),
+            detcore::hermit_consumed_capabilities(reverie::BackendCapabilities::DBT)
+        );
+        // Reverie reports the ABI 8 exchange for DBT; this runtime withholds it.
+        let reverie_reports = std::hint::black_box(reverie::BackendCapabilities::DBT);
+        let hermit_reports = std::hint::black_box(backend_capabilities());
+        assert!(reverie_reports.supports_guest_memory_compare_exchange);
+        assert!(!hermit_reports.supports_guest_memory_compare_exchange);
         let (_, json) = hermit_run_dbt_detconfig();
         let (config, source) = dbt_config_from(Some(&json));
         assert!(matches!(source, ConfigSource::Cli));
@@ -3110,7 +3134,7 @@ mod tests {
 
     #[test]
     fn exported_runtime_identity_matches_the_pinned_reverie_abi() {
-        assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 7);
+        assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 8);
         // The native client's dbt_signal_event_t (ABI version 7).
         assert_eq!(std::mem::size_of::<DbtSignalEvent>(), 200);
         assert_eq!(std::mem::align_of::<DbtSignalEvent>(), 8);
@@ -3166,6 +3190,7 @@ mod tests {
             emit_stdout: test_stdout,
             emit_evidence: test_emit_evidence,
             evidence_log_level: 3,
+            compare_exchange_u32: unsupported_compare_exchange,
         };
         let (diagnostic, evidence, level) = runtime_callback_channels(&callbacks);
 
