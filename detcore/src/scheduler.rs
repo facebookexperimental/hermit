@@ -1376,6 +1376,14 @@ pub struct Scheduler {
     /// Set when replay cannot follow the rejoin log; the scheduler loop ends
     /// the run with it (`exit_on_scheduler_refusal`).
     rejoin_refusal: Option<RejoinRefusal>,
+    /// Per process, the signals the scheduler sent it that every thread
+    /// blocked when sent, so they wait in its shared queue for the first
+    /// thread that unblocks one (`note_signal_left_in_shared_queue`). Cleared
+    /// when a thread of the process takes the signal
+    /// (`note_process_signal_taken`). A call that begins under a mask that
+    /// admits one of them is ended by it at once, so its readmission is fixed
+    /// by the schedule (`arm_for_waiting_scheduler_signal`).
+    shared_queue_scheduler_signals: BTreeMap<DetPid, u64>,
     /// When replay began waiting with nothing runnable and no readmission due
     /// (`step2c_replay_rejoin`); `None` otherwise.
     rejoin_stalled_since: Option<std::time::Instant>,
@@ -1519,6 +1527,10 @@ pub struct Scheduler {
     /// process; a real-time timer expiration such a descriptor could read is
     /// never kept pending (`real_time_expiration_fate`).
     signalfd_masks: BTreeMap<DetPid, u64>,
+    /// Threads whose background call (`BlockingExternalIO`, the op named) reads
+    /// a signalfd (`Resources::reads_signalfd`). An entry counts only while
+    /// that op is still the thread's `external_io_blockers` entry.
+    background_signalfd_reads: BTreeMap<DetTid, ExternalOpId>,
 
     /// The real-time signals (a kernel sigset) that the mask a signal handler's
     /// return restores leaves unblocked, by process: the thread's mask when a
@@ -2660,10 +2672,11 @@ pub struct SkipTurn;
 
 /// The release barrier's watchdog expired (`step2_release_signaled_background`):
 /// committed signals armed these background threads, and they had still not
-/// posted their continuations when it fired. Their admission point can no
-/// longer be fixed by the scheduler, so the run is refused instead of being
-/// continued with an order that host delivery time decides
-/// (<https://github.com/rrnewton/hermit/pull/3361>).
+/// posted their continuations when it fired. Either the signal reached them
+/// later than the barrier waits, or it never ended their calls (the arming
+/// was wrong). Either way their admission point can no longer be fixed by the
+/// scheduler, so the run is refused instead of being continued with an order
+/// that host timing decides (<https://github.com/rrnewton/hermit/pull/3361>).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignaledBackgroundRefusal {
     /// The armed threads that posted no continuation, in `DetTid` order.
@@ -2677,8 +2690,9 @@ impl std::fmt::Display for SignaledBackgroundRefusal {
         write!(
             f,
             "hermit refused to continue the run: the signaled background threads {:?} \
-             posted no continuation within {:?} of the release barrier, so their \
-             admission order would depend on host signal delivery time",
+             posted no continuation within {:?} of the release barrier (the signal \
+             that armed them did not end their calls in that time), so their admission \
+             order would depend on host timing",
             self.unposted.iter().map(|t| t.as_raw()).collect::<Vec<_>>(),
             self.waited
         )
@@ -3432,6 +3446,7 @@ impl Scheduler {
                 _ => None,
             },
             rejoin_refusal: None,
+            shared_queue_scheduler_signals: Default::default(),
             rejoin_stalled_since: None,
             empty_queue_wakes: 0,
             #[cfg(test)]
@@ -3466,6 +3481,7 @@ impl Scheduler {
             pending_real_time_expirations: Default::default(),
             sending_child_exit: None,
             signalfd_masks: Default::default(),
+            background_signalfd_reads: Default::default(),
             handler_restore_unblocked: Default::default(),
             background_call_processes: Default::default(),
             alarm_unobservable: Default::default(),
@@ -4165,6 +4181,14 @@ impl Scheduler {
         // Remove from all non-runnable pools:
         self.remove_blocking_entries(dtid);
         self.retire_sigalrm_thread(*dtid, *detpid);
+        // The process's last thread: its shared queue goes with it.
+        if self
+            .process_signal_targets(*detpid)
+            .iter()
+            .all(|thread| thread == dtid)
+        {
+            self.shared_queue_scheduler_signals.remove(detpid);
+        }
         // Its own queue goes with it; a later thread with its tid starts empty.
         self.thread_timer_copies
             .retain(|(thread, _), _| thread != dtid);
@@ -6634,7 +6658,166 @@ impl Scheduler {
         let target = self
             .select_signal_target(dpid, Some(dtid))
             .map(|preferred| self.timer_signal_target(dpid, preferred, sig));
-        self.fire_alarm_at(dpid, target, sig, info)
+        // Decided before the send, whose wake may change pools and masks.
+        let every_thread_blocks = self.models_signal_targets
+            && target.is_some_and(|target| {
+                self.kernel_signal_target(dpid, target, sig as libc::c_int)
+                    .is_none()
+            });
+        let sent = self.fire_alarm_at(dpid, target, sig, info);
+        if sent && every_thread_blocks {
+            self.note_signal_left_in_shared_queue(dpid, sig as libc::c_int);
+        }
+        sent
+    }
+
+    /// Record that the scheduler sent `process` the signal `signo` while
+    /// every thread blocked it (`shared_queue_scheduler_signals`). Linux then
+    /// keeps it in the process's shared queue, and the first thread to
+    /// unblock it takes it.
+    fn note_signal_left_in_shared_queue(&mut self, process: DetPid, signo: libc::c_int) {
+        *self
+            .shared_queue_scheduler_signals
+            .entry(process)
+            .or_default() |= kernel_signal_bit(signo);
+    }
+
+    /// At the grant of a call outside the schedule whose sleeping mask is
+    /// `mask`: if a signal the scheduler left in the process's shared queue
+    /// (`shared_queue_scheduler_signals`) is still there, is one the mask
+    /// admits and the process catches, and no `rt_sigtimedwait` set or
+    /// signalfd could take it first, the call is ended by it as soon as it
+    /// begins. Arm the thread so that the release barrier readmits it at a
+    /// fixed point (`arm_signaled_background`), as when the signal is sent
+    /// while the thread already sleeps.
+    ///
+    /// The record keeps the signal. Linux may end the call with another one
+    /// (the thread's own queue is dequeued first, and the lowest-numbered
+    /// signal within a queue), leaving this one pending to end the next call
+    /// that admits it, which must be armed too; clearing the bit here held
+    /// that call behind a spinner forever (Claude re-check of
+    /// https://github.com/rrnewton/hermit/pull/4314). No second grant comes
+    /// before the armed call posts its continuation, since the barrier
+    /// commits no turn until then, and if that call took the signal the next
+    /// grant's read of the shared queue forgets it.
+    ///
+    /// Before, nothing armed it, so the call's end was a completion only the
+    /// host observed, and run mode held it behind any runnable thread. Under
+    /// `--chaos-target-races` the child-exit SIGCHLD often fires before the
+    /// parent's `sigsuspend` begins, while every thread still blocks it, so a
+    /// sibling spinning on `sched_yield` for the parent's wake kept it out
+    /// forever (https://github.com/rrnewton/hermit/issues/4234).
+    ///
+    /// "Still there" is read from the process's shared pending set
+    /// (`ShdPnd`), not assumed from the record. Linux removes a pending signal
+    /// in many ways the scheduler does not see as a take: a disposition of
+    /// SIG_IGN or a default-ignore SIG_DFL, `sigwaitinfo`, a signalfd read,
+    /// the flush of a timer's signal at exec, and a sibling's dequeue before
+    /// its delivery stop is granted. Arming for a signal one of them had
+    /// already removed held the release barrier for a continuation that
+    /// never came, and refused the run (Claude review of
+    /// https://github.com/rrnewton/hermit/pull/4314). The read is ordered by
+    /// the scheduler lock: every thread in the schedule is stopped at its
+    /// posted request, and the granted thread, already released, cannot issue
+    /// its call until `finish_resource_response` takes the lock
+    /// (`lock_rpc_scheduler`), which this step holds. So each of those
+    /// removals, and every send the record counts, has happened by then, and
+    /// none can happen during the read; moving the read out from under the
+    /// lock would lose this. Threads in background calls do run meanwhile;
+    /// those that could take the signal keep it from being armed
+    /// (`another_call_may_take_waiting_signal`). A kernel
+    /// SIGCHLD copy, raised when the host releases a child, coalesces with the
+    /// scheduler's own while that one is pending, so it changes the read only
+    /// after the scheduler's copy has gone, a residual of the host-timed copy.
+    /// The record and the grant are committed points, and the caught set
+    /// changes only in a guest turn, so the arming is a function of the
+    /// schedule. The barrier waits with no deadline for the call to post its
+    /// continuation, and refuses the run if it never does
+    /// (`SIGNALED_BACKGROUND_VALVE`).
+    fn arm_for_waiting_scheduler_signal(&mut self, dettid: DetTid, mask: u64) {
+        let process = self.sigchld_process(dettid);
+        let recorded = self
+            .shared_queue_scheduler_signals
+            .get(&process)
+            .copied()
+            .unwrap_or(0);
+        if recorded == 0 {
+            return;
+        }
+        // A signal no longer pending in the shared queue was removed
+        // without a delivery: forget it.
+        let Some(pending) = self.read_shared_pending(dettid) else {
+            return;
+        };
+        let recorded = recorded & pending;
+        self.shared_queue_scheduler_signals
+            .insert(process, recorded);
+        let Some(caught) = self.signal_mask_field(process, None, "SigCgt") else {
+            return;
+        };
+        let Some(signo) = (1..=64).find(|signo: &i32| {
+            let bit = kernel_signal_bit(*signo);
+            recorded & !mask & caught & bit != 0
+                && !self.another_call_may_take_waiting_signal(dettid, process, bit)
+        }) else {
+            return;
+        };
+        info!(
+            "[dtid {}] its call begins with scheduler signal {} waiting in the shared queue",
+            dettid, signo
+        );
+        self.arm_signaled_background(dettid, SigWrapper(signo));
+    }
+
+    /// Whether a call other than `dettid`'s, by another thread of `process`,
+    /// could take the shared-queue signal `bit` before `dettid`'s call does: a
+    /// thread polling an `rt_sigtimedwait` set holding it, or a background call
+    /// reading a signalfd (`background_signalfd_reads`) while a signalfd may
+    /// read the signal. While the release barrier holds every turn, only a call
+    /// already running outside the schedule can take it; and a signalfd read
+    /// or `rt_sigtimedwait` dequeues from the caller's own process, so other
+    /// processes' calls cannot. If one took the signal, the armed call would
+    /// never post and the run would be refused, so `dettid`'s call is not
+    /// armed then.
+    ///
+    /// The signalfd masks (`signalfd_may_read`) only accumulate, so they are
+    /// only a filter. Counting them beside any background call, in any process,
+    /// kept a wait from being armed beside a closed or unread signalfd and an
+    /// unrelated `select` or vfork (Claude and Codex re-checks of
+    /// https://github.com/rrnewton/hermit/pull/4314). A read is tagged only
+    /// on a descriptor Detcore's table still holds as a signalfd.
+    fn another_call_may_take_waiting_signal(
+        &self,
+        dettid: DetTid,
+        process: DetPid,
+        bit: u64,
+    ) -> bool {
+        let sigtimedwait = self
+            .thread_tree
+            .my_thread_group(&process)
+            .iter()
+            .any(|thread| {
+                *thread != dettid
+                    && self
+                        .sigtimedwait_sets
+                        .get(thread)
+                        .is_some_and(|set| set & bit != 0)
+            });
+        let signalfd_read = self.signalfd_may_read(bit)
+            && self
+                .thread_tree
+                .my_thread_group(&process)
+                .iter()
+                .any(|thread| {
+                    *thread != dettid
+                        && self
+                            .background_signalfd_reads
+                            .get(thread)
+                            .is_some_and(|op| {
+                                self.blocked.external_io_blockers.get(thread) == Some(op)
+                            })
+                });
+        sigtimedwait || signalfd_read
     }
 
     /// The thread of `process` that a timer's process-directed `sig` is sent
@@ -6775,9 +6958,26 @@ impl Scheduler {
 
     /// `dettid` took a copy of `signo` at its delivery stop: if the copy a
     /// `SIGEV_SIGNAL` timer left in its process's shared queue is gone, so is
-    /// the record of it (`process_timer_copies`). The thread's own queue is
-    /// dequeued first, so the copy taken may be another.
+    /// the record of it (`process_timer_copies`), and so is the record of a
+    /// scheduler signal left there (`shared_queue_scheduler_signals`). The
+    /// thread's own queue is dequeued first, so the copy taken may be another:
+    /// a private take leaves the shared copy, and its record, in place (Codex
+    /// review of https://github.com/rrnewton/hermit/pull/4314).
     fn note_process_signal_taken(&mut self, dettid: DetTid, signo: i32) {
+        let process = self.sigchld_process(dettid);
+        let bit = kernel_signal_bit(signo);
+        let recorded = self
+            .shared_queue_scheduler_signals
+            .get(&process)
+            .is_some_and(|waiting| waiting & bit != 0);
+        if recorded
+            && self
+                .read_shared_pending(dettid)
+                .is_none_or(|pending| pending & bit == 0)
+            && let Some(waiting) = self.shared_queue_scheduler_signals.get_mut(&process)
+        {
+            *waiting &= !bit;
+        }
         if self.models_signal_targets
             && self.unproven_thread_timer_copies.contains(&(dettid, signo))
             && self
@@ -8711,10 +8911,14 @@ impl Scheduler {
                 .fire_alarm_at(parent, target, sig, info)
                 .then_some(target)?;
         }
+        let every_thread_blocks = self.kernel_sigchld_target(parent, creator).is_none();
         let target = self.child_exit_sigchld_target(parent, creator);
         let target = self.live_signal_target(parent, Some(target));
-        self.fire_alarm_at(parent, target, sig, info)
-            .then_some(target)?
+        let sent = self.fire_alarm_at(parent, target, sig, info);
+        if sent && every_thread_blocks {
+            self.note_signal_left_in_shared_queue(parent, libc::SIGCHLD);
+        }
+        sent.then_some(target)?
     }
 
     /// The thread of `parent` that a `ChildExit` timer's `SIGCHLD` is sent to
@@ -10363,6 +10567,15 @@ impl Scheduler {
                     {
                         self.blocked.replay_log_served.insert(dettid);
                     }
+                    if let ResourceID::BlockingExternalIO(op) = rid {
+                        if rs.reads_signalfd
+                            && self.blocked.external_io_blockers.get(&dettid) == Some(op)
+                        {
+                            self.background_signalfd_reads.insert(dettid, *op);
+                        } else {
+                            self.background_signalfd_reads.remove(&dettid);
+                        }
+                    }
                     if rs.blocked_signal_mask_unknown
                         && matches!(rid, ResourceID::BlockingExternalIO(_))
                         && let Some(recorded) = self.blocked.out_of_scheduler_masks.get_mut(&dettid)
@@ -10550,6 +10763,8 @@ impl Scheduler {
                 }
                 if let Some(signal) = self.blocked.signaled_sigsuspend_requests.remove(&dettid) {
                     self.arm_signaled_background(dettid, signal);
+                } else if let Some(Some(mask)) = sleeping_mask {
+                    self.arm_for_waiting_scheduler_signal(dettid, mask);
                 }
                 Err(SkipTurn)
             }
@@ -15786,8 +16001,9 @@ mod test {
             scheduler.blocked.external_io_blockers.insert(c, op_id);
             scheduler.run_queue.push_back(d, runqueue::LAST_PRIORITY);
             assert!(
-                scheduler.run_queue.only_pollers(),
-                "the band alone reads as a poller"
+                !scheduler.run_queue.only_pollers(),
+                "the band alone no longer reads as a poller \
+                 (https://github.com/rrnewton/hermit/issues/4234)"
             );
 
             assert!(scheduler.step2c_process_io_blockers().is_ok());
@@ -15818,8 +16034,9 @@ mod test {
             .run_queue
             .push_back(child, runqueue::LAST_PRIORITY);
         assert!(
-            scheduler.run_queue.only_pollers(),
-            "the band alone reads as a poller"
+            !scheduler.run_queue.only_pollers(),
+            "the band alone no longer reads as a poller \
+             (https://github.com/rrnewton/hermit/issues/4234)"
         );
         scheduler.blocked.sigchld_deferred.insert(waiter);
 
@@ -15832,6 +16049,61 @@ mod test {
         assert!(scheduler.run_queue.remove_tid(child));
         scheduler.step2e_process_signal_deferred();
         assert!(scheduler.blocked.sigchld_ready.contains(&waiter));
+    }
+
+    /// In run mode, neither a finished background call nor a deferred SIGCHLD
+    /// is admitted while an ordinary thread in the last priority band is
+    /// runnable, as at any other priority; with only a backed-off poller queued
+    /// both are (https://github.com/rrnewton/hermit/issues/4234). Before, the
+    /// band alone counted as a poller, so the turn of the admission depended on
+    /// when the host finished the call or delivered the signal.
+    #[test]
+    fn run_mode_admits_nothing_host_timed_while_a_last_band_thread_is_runnable() {
+        let worker = DetTid::from_raw(9);
+        let poller = DetTid::from_raw(11);
+        let waiter = DetTid::from_raw(13);
+        let client = DetTid::from_raw(21);
+        let op_id = ExternalOpId::new(client, 3);
+        let make = |queued: &[(DetTid, bool)]| {
+            let mut scheduler = Scheduler::new(&Config::default());
+            scheduler.priorities.insert(client, DEFAULT_PRIORITY);
+            scheduler.blocked.external_io_blockers.insert(client, op_id);
+            let mut continuation = Resources::new(client);
+            continuation.insert(ResourceID::BlockedExternalContinue(op_id), Permission::RW);
+            scheduler.next_turns.insert(
+                client,
+                ThreadNextTurn {
+                    dettid: client,
+                    child_tid_addr: 0,
+                    req: Ivar::full(Ok(continuation)),
+                    resp: Ivar::new(),
+                    protocol: Default::default(),
+                },
+            );
+            for (tid, polls) in queued {
+                scheduler.priorities.insert(*tid, DEFAULT_PRIORITY);
+                if *polls {
+                    scheduler
+                        .run_queue
+                        .push_poller(*tid, DEFAULT_PRIORITY, u32::MAX);
+                } else {
+                    scheduler.run_queue.push_back(*tid, runqueue::LAST_PRIORITY);
+                }
+            }
+            scheduler.blocked.sigchld_deferred.insert(waiter);
+            scheduler
+        };
+
+        let mut busy = make(&[(worker, false)]);
+        assert!(busy.step2c_process_io_blockers().is_ok());
+        assert!(busy.blocked.external_io_blockers.contains_key(&client));
+        busy.step2e_process_signal_deferred();
+        assert!(busy.blocked.sigchld_deferred.contains(&waiter));
+
+        let mut polling = make(&[(poller, true)]);
+        assert!(polling.step2c_process_io_blockers().is_ok());
+        assert!(!polling.blocked.external_io_blockers.contains_key(&client));
+        assert!(polling.run_queue.contains_tid(client));
     }
 
     #[test]
@@ -19404,6 +19676,209 @@ mod test {
                 .load(std::sync::atomic::Ordering::Relaxed),
             reads,
             "and no mask is read"
+        );
+    }
+
+    /// A signal the scheduler sent while every thread blocked it waits in the
+    /// process's shared queue, and a call that begins under a mask admitting
+    /// it is ended by it at once. Such a call is armed for the release
+    /// barrier, so it rejoins at a fixed point rather than as a completion
+    /// only the host observes, which run mode held behind a thread spinning
+    /// on `sched_yield` (https://github.com/rrnewton/hermit/issues/4234).
+    ///
+    /// Not armed:
+    /// - when the call's mask blocks the signal;
+    /// - when the process does not catch it (it does not end `sigsuspend`);
+    /// - when a thread has taken it, or the shared queue no longer holds it,
+    ///   as after SIG_IGN, `sigwaitinfo`, a signalfd read, an exec or a
+    ///   sibling's dequeue; arming then held the barrier for a continuation
+    ///   that never came (Claude review of
+    ///   https://github.com/rrnewton/hermit/pull/4314);
+    /// - when a sibling's `rt_sigtimedwait` set could take it first, or a
+    ///   signalfd covers it and a sibling's background call reads a signalfd.
+    ///   A signalfd that only exists, a background call that reads none, an
+    ///   ended read, or another process's read does not count (Claude and
+    ///   Codex re-checks of https://github.com/rrnewton/hermit/pull/4314);
+    /// - for a later call once the armed call took it.
+    ///
+    /// Still armed after a thread took a copy from its own queue, which Linux
+    /// dequeues first: the shared copy remains (Codex review of the same). And
+    /// a later call is armed again while the signal is still pending, as when
+    /// another signal ended the first (Claude re-check of the same).
+    #[test]
+    fn a_call_that_begins_with_a_scheduler_signal_waiting_is_armed() {
+        let chld = kernel_signal_bit(libc::SIGCHLD);
+        let family = |caught: u64, pending: u64| {
+            let (mut scheduler, parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+            scheduler
+                .test_signal_masks
+                .insert((parent, None, "SigCgt"), caught);
+            for thread in [parent, creator] {
+                scheduler.test_kernel_signal_states.insert(
+                    thread,
+                    KernelSignalState {
+                        blocked: chld,
+                        shared_pending: pending,
+                        ..signal_state(caught, 0)
+                    },
+                );
+            }
+            scheduler.note_signal_left_in_shared_queue(parent, libc::SIGCHLD);
+            (scheduler, parent, creator)
+        };
+        let begin = |scheduler: &mut Scheduler, thread: DetTid, mask: u64| {
+            let op = ExternalOpId::new(thread, 1);
+            commit_out_of_scheduler_call(
+                scheduler,
+                thread,
+                ResourceID::BlockingRtSigsuspend(op),
+                Some(mask),
+            );
+            assert_eq!(
+                scheduler.blocked.rt_sigsuspend_blockers.get(&thread),
+                Some(&op)
+            );
+            let armed = scheduler.blocked.signaled_background.contains(&thread);
+            assert_eq!(armed, scheduler.blocked.sigchld_ready.contains(&thread));
+            armed
+        };
+
+        let (mut scheduler, parent, creator) = family(chld, chld);
+        assert!(
+            begin(&mut scheduler, creator, 0),
+            "caught, admitted, pending: armed"
+        );
+        for thread in [parent, creator] {
+            if let Some(state) = scheduler.test_kernel_signal_states.get_mut(&thread) {
+                state.shared_pending = 0;
+            }
+        }
+        assert!(
+            !begin(&mut scheduler, parent, 0),
+            "the armed call took the signal: a later call is not armed"
+        );
+        assert_eq!(
+            scheduler.shared_queue_scheduler_signals.get(&parent),
+            Some(&0),
+            "and the record forgets it"
+        );
+
+        let (mut scheduler, parent, creator) = family(chld, chld);
+        assert!(begin(&mut scheduler, creator, 0), "armed");
+        assert!(
+            begin(&mut scheduler, parent, 0),
+            "another signal ended the armed call and this one is still pending: \
+             the later call it ends is armed too"
+        );
+
+        let (mut scheduler, _, creator) = family(chld, chld);
+        assert!(
+            !begin(&mut scheduler, creator, chld),
+            "its mask blocks the signal"
+        );
+
+        let (mut scheduler, _, creator) = family(0, chld);
+        assert!(
+            !begin(&mut scheduler, creator, 0),
+            "not caught: it does not end sigsuspend"
+        );
+
+        let (mut scheduler, parent, creator) = family(chld, chld);
+        for thread in [parent, creator] {
+            if let Some(state) = scheduler.test_kernel_signal_states.get_mut(&thread) {
+                state.shared_pending = 0;
+            }
+        }
+        scheduler.note_process_signal_taken(parent, libc::SIGCHLD);
+        assert_eq!(
+            scheduler.shared_queue_scheduler_signals.get(&parent),
+            Some(&0),
+            "a thread has taken it from the shared queue: the record forgets it"
+        );
+        assert!(!begin(&mut scheduler, creator, 0), "a thread has taken it");
+
+        let (mut scheduler, parent, creator) = family(chld, chld);
+        scheduler.note_process_signal_taken(parent, libc::SIGCHLD);
+        assert_eq!(
+            scheduler.shared_queue_scheduler_signals.get(&parent),
+            Some(&chld),
+            "a thread took its own copy: the shared one, and the record, remain"
+        );
+        assert!(
+            begin(&mut scheduler, creator, 0),
+            "after a private take the shared copy still ends the call: armed"
+        );
+
+        let (mut scheduler, parent, creator) = family(chld, 0);
+        assert!(
+            !begin(&mut scheduler, creator, 0),
+            "the shared queue no longer holds it"
+        );
+        assert_eq!(
+            scheduler.shared_queue_scheduler_signals.get(&parent),
+            Some(&0),
+            "and the record forgets it"
+        );
+
+        let (mut scheduler, parent, creator) = family(chld, chld);
+        scheduler.sigtimedwait_sets.insert(parent, chld);
+        assert!(
+            !begin(&mut scheduler, creator, 0),
+            "an rt_sigtimedwait set could take it first"
+        );
+
+        let (mut scheduler, parent, creator) = family(chld, chld);
+        scheduler.signalfd_masks.insert(parent, chld);
+        assert!(
+            begin(&mut scheduler, creator, 0),
+            "a signalfd covers it, but no other call runs outside the schedule: armed"
+        );
+
+        let reading = |tagged: bool, live: bool| {
+            let (mut scheduler, parent, creator) = family(chld, chld);
+            scheduler.signalfd_masks.insert(parent, chld);
+            let op = ExternalOpId::new(parent, 7);
+            scheduler.blocked.external_io_blockers.insert(parent, op);
+            if tagged {
+                let tag = if live {
+                    op
+                } else {
+                    ExternalOpId::new(parent, 6)
+                };
+                scheduler.background_signalfd_reads.insert(parent, tag);
+            }
+            (scheduler, creator)
+        };
+        let (mut scheduler, creator) = reading(true, true);
+        assert!(
+            !begin(&mut scheduler, creator, 0),
+            "a signalfd covers it and a sibling's background call reads a signalfd"
+        );
+        let (mut scheduler, creator) = reading(false, false);
+        assert!(
+            begin(&mut scheduler, creator, 0),
+            "a sibling's background call that reads no signalfd (a select, a vfork): armed"
+        );
+        let (mut scheduler, creator) = reading(true, false);
+        assert!(
+            begin(&mut scheduler, creator, 0),
+            "a signalfd read that has ended, the sibling now in another call: armed"
+        );
+
+        let (mut scheduler, parent, creator) = family(chld, chld);
+        let other_process = DetTid::from_raw(parent.as_raw() + 100);
+        let op = ExternalOpId::new(other_process, 7);
+        scheduler.signalfd_masks.insert(other_process, chld);
+        scheduler
+            .blocked
+            .external_io_blockers
+            .insert(other_process, op);
+        scheduler
+            .background_signalfd_reads
+            .insert(other_process, op);
+        assert!(
+            begin(&mut scheduler, creator, 0),
+            "another process's signalfd read takes from its own queue: armed"
         );
     }
 

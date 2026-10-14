@@ -1230,8 +1230,11 @@ fn ptrace_records_a_self_aliased_word_woken_once_and_refuses_older_recordings() 
         &fs::read(&metadata_path).expect("failed to read the recording metadata"),
     )
     .expect("recording metadata is not JSON");
+    // 0x150 made this change; later changes moved the version on (0x154 is
+    // https://github.com/rrnewton/hermit/pull/4314), and a recording from
+    // before the change, 0x14f, is still refused by the exact-match gate.
     assert_eq!(
-        metadata["version"], 0x153,
+        metadata["version"], 0x154,
         "RECORD_VERSION moved; point this test at the current version and the one before"
     );
     metadata["version"] = serde_json::json!(0x14f);

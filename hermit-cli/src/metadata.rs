@@ -503,7 +503,15 @@ impl RecordVersion {
 // (https://github.com/rrnewton/hermit/issues/4266). An older recording ran at
 // `standard` without saying so, and would replay at `minimal`, where the
 // standard level's names are missing.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x153);
+// 0x153 -> 0x154 (taken at land time, as the reservation file's land-time
+// numbering rule gives a ready change HIGHEST_SHIPPED + 1): a call outside the
+// schedule that begins while a signal the scheduler sent, and every thread
+// blocked, waits in the shared queue, and that the call's mask admits and the
+// process catches, is armed for the release barrier at its grant and rejoins
+// at a fixed point (https://github.com/rrnewton/hermit/issues/4234). Under
+// record it was readmitted through the rejoin log instead, so an older
+// recording would replay with that call rejoining at another turn.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x154);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -528,7 +536,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x153);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x153;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x154;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1491,6 +1499,14 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_from_before_the_minimal_default() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x152)));
+    }
+
+    /// A recording older than 0x154 readmitted a call that began with a
+    /// scheduler signal waiting in the shared queue through the rejoin log
+    /// (https://github.com/rrnewton/hermit/issues/4234).
+    #[test]
+    fn record_version_rejects_streams_from_before_armed_waiting_signal_calls() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x153)));
     }
 
     #[test]

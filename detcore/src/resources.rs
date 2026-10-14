@@ -487,6 +487,17 @@ pub struct Resources {
     /// `false` outside replay.
     #[serde(default)]
     pub(crate) replay_served_from_log: bool,
+    /// Set on a `BlockingExternalIO` request whose call reads a descriptor
+    /// Detcore records as a signalfd (`read`, `readv`, `preadv2`): run outside
+    /// the schedule, it can dequeue a pending signal of its own process at a
+    /// host-timed moment (`signalfd_dequeue` reads the calling task's queues).
+    /// The scheduler then does not arm another thread of that process for a
+    /// shared-queue signal the signalfd may read
+    /// (`Scheduler::another_call_may_take_waiting_signal`). Detcore's
+    /// descriptor table follows close, dup and close-on-exec, so a closed
+    /// signalfd sets nothing. `false` for every other request.
+    #[serde(default)]
+    pub(crate) reads_signalfd: bool,
     /// The absolute virtual deadline of the timed wait that a polling request
     /// (`poll_attempt > 0`) retries: `ppoll`, `poll`, `epoll_wait`,
     /// `epoll_pwait`, `rt_sigtimedwait`, `select`, `pselect6` or a polling
@@ -576,6 +587,7 @@ impl Resources {
             blocked_signal_mask: None,
             blocked_signal_mask_unknown: false,
             replay_served_from_log: false,
+            reads_signalfd: false,
             poll_deadline: None,
             in_guest_sleep_sigalrm: None,
             signal_state_task: None,

@@ -178,9 +178,15 @@ struct QueueValue {
 
 impl QueueValue {
     /// Whether this entry counts as a poller for the deterministic-work-first
-    /// gates, given its queue priority.
+    /// gates, given its queue priority: a polling thread whose backoff has
+    /// reached the last band, or one `restore_poller_priority` restored from
+    /// it. The band alone does not make a poller: under chaos, or a
+    /// scheduling heuristic, an ordinary runnable thread can sit at
+    /// `LAST_PRIORITY`, and counting it as a poller let run mode admit a
+    /// host-timed completion between its turns
+    /// (<https://github.com/rrnewton/hermit/issues/4234>).
     fn counts_as_poller(&self, priority: Priority) -> bool {
-        priority >= LAST_PRIORITY || self.deadline_restored
+        self.is_fully_backed_off_poller(priority) || self.deadline_restored
     }
 
     /// Whether this entry is a polling thread whose backoff has reached the
@@ -248,10 +254,11 @@ pub struct RunQueue {
     /// [`PLAIN_YIELDS_BEFORE_EPOCH`] are plain requeues; the next joins the
     /// epoch.
     yield_streaks: BTreeMap<DetTid, u32>,
-    /// Every queued thread that is queued because it yielded (`push_yielded`)
-    /// and has not run since. Unlike `yielded_skip`, which only the latest
-    /// yielder holds, this keeps every one of several threads spinning on
-    /// `sched_yield` (`only_pollers_or_yielders`).
+    /// Every queued thread that is queued because it yielded (`push_yielded`,
+    /// or `push_yielded_into_epoch` under chaos) and has not run since. Unlike
+    /// `yielded_skip`, which only the latest yielder holds, this keeps every
+    /// one of several threads spinning on `sched_yield`
+    /// (`only_pollers_or_yielders`).
     queued_by_yield: BTreeSet<DetTid>,
 
     // TODO: The following fields need to be properly abstracted into separate types of run queues.
@@ -330,8 +337,10 @@ impl RunQueue {
 
     /// True when every queued thread is a poller (or the queue is empty): the
     /// "no deterministic work is runnable" test of the deterministic-work-first
-    /// gates. A poller is an entry at `LAST_PRIORITY`, or one that
-    /// `restore_poller_priority` restored and that has not run since. Read-only.
+    /// gates. A poller is a polling entry (`push_poller`) whose backoff has
+    /// reached `LAST_PRIORITY`, or one that `restore_poller_priority` restored
+    /// and that has not run since; an ordinary thread at `LAST_PRIORITY` is
+    /// work (<https://github.com/rrnewton/hermit/issues/4234>). Read-only.
     pub fn only_pollers(&self) -> bool {
         self.queue
             .iter()
@@ -339,7 +348,7 @@ impl RunQueue {
     }
 
     /// `only_pollers`, also counting every thread queued because it yielded
-    /// and not run since (`queued_by_yield`). A thread that calls
+    /// and not run since (`queued_by_yield`), by either requeue. A thread that calls
     /// `sched_yield` asks for another thread to run first, so, like a poller,
     /// it is not work that a finished background call must wait behind.
     /// Counting it as such work starved the background call forever whenever
@@ -414,6 +423,7 @@ impl RunQueue {
                     .insert(tid);
             }
         }
+        self.queued_by_yield.insert(tid);
         self.push_back(tid, priority)
     }
 
@@ -903,6 +913,15 @@ impl RunQueue {
         // can use a range query rather than iterating over all threads in the
         // run queue:
         for (key, upgrade_prio) in upgrades {
+            // A poller whose normal priority is the last band has nowhere to
+            // be upgraded to. Clearing its marker would only make it ordinary
+            // work for the gates, and with `POLLING_UPGRADE_INTERVAL` pollers
+            // like it queued, every one could lose the marker again before
+            // the next push restored it, so that no gate ever opened (Codex
+            // review of https://github.com/rrnewton/hermit/pull/4314).
+            if upgrade_prio >= LAST_PRIORITY {
+                continue;
+            }
             let mut new_key = key;
             new_key.priority = upgrade_prio;
             let mut qval = self.queue.remove(&key).unwrap();
@@ -913,9 +932,12 @@ impl RunQueue {
         // An upgrade makes every backed-off poller ordinary work for the
         // deterministic-work-first gates. A poller its deadline restored
         // earlier would have been upgraded here too, so it stops counting as
-        // a poller now as well (https://github.com/rrnewton/hermit/issues/3952).
-        for value in self.queue.values_mut() {
-            value.deadline_restored = false;
+        // a poller now as well (https://github.com/rrnewton/hermit/issues/3952),
+        // unless it is already in the last band, where an upgrade is a no-op.
+        for (key, value) in self.queue.iter_mut() {
+            if key.priority < LAST_PRIORITY {
+                value.deadline_restored = false;
+            }
         }
     }
 }
@@ -986,6 +1008,37 @@ mod tests {
         );
     }
 
+    /// An ordinary thread queued at `LAST_PRIORITY` is work for the
+    /// deterministic-work-first gates, as at any other priority; only a
+    /// polling thread whose backoff reached the last band is a poller
+    /// (<https://github.com/rrnewton/hermit/issues/4234>).
+    #[test]
+    fn an_ordinary_thread_in_the_last_band_is_not_a_poller() {
+        let worker = DetTid::from_raw(1);
+        let poller = DetTid::from_raw(2);
+        let other = DetTid::from_raw(3);
+
+        let mut queue = RunQueue::new(SchedHeuristic::None, 0, 0.0);
+        queue.push_back(worker, LAST_PRIORITY);
+        assert!(!queue.only_pollers());
+        assert!(!queue.only_pollers_or_yielders());
+        assert!(queue.has_runnable_besides(other));
+
+        let mut queue = RunQueue::new(SchedHeuristic::None, 0, 0.0);
+        queue.push_poller(poller, DEFAULT_PRIORITY, u32::MAX);
+        assert!(
+            queue.only_pollers(),
+            "a fully backed-off poller is a poller"
+        );
+        assert!(!queue.has_runnable_besides(other));
+        queue.push_back(worker, LAST_PRIORITY);
+        assert!(
+            !queue.only_pollers(),
+            "the ordinary thread beside it is work"
+        );
+        assert!(queue.has_runnable_besides(poller));
+    }
+
     /// A poller backed off to `LAST_PRIORITY` and restored by its deadline
     /// still counts as a poller for the deterministic-work-first gates until
     /// it runs; requeued after its turn, it is ordinary work. One backed off
@@ -1043,6 +1096,71 @@ mod tests {
             !queue.only_pollers(),
             "upgraded like every backed-off poller"
         );
+    }
+
+    /// A poller whose normal priority is the last band is still a poller
+    /// after a poll upgrade, which has nowhere to move it, and so is one its
+    /// deadline restored there. With `POLLING_UPGRADE_INTERVAL` such pollers
+    /// queued, clearing their markers at every upgrade kept at least one of
+    /// them reading as ordinary work at every gate query, so no gate ever
+    /// opened (Codex review of https://github.com/rrnewton/hermit/pull/4314).
+    #[test]
+    fn a_last_band_pollers_upgrade_keeps_it_a_poller() {
+        let poller = DetTid::from_raw(1);
+        let mut queue = RunQueue::default();
+        queue.push_poller(poller, LAST_PRIORITY, 0);
+        assert!(queue.only_pollers());
+        queue.do_poll_upgrade();
+        assert!(
+            queue.only_pollers(),
+            "an upgrade to the same band is a no-op"
+        );
+        assert_eq!(queue.queued_priority(poller), Some(LAST_PRIORITY));
+
+        let restored = DetTid::from_raw(2);
+        let mut queue = RunQueue::default();
+        queue.push_poller(restored, LAST_PRIORITY, 3);
+        assert_eq!(
+            queue.restore_poller_priority(restored),
+            PollerRestore::Restored
+        );
+        queue.do_poll_upgrade();
+        assert!(
+            queue.only_pollers(),
+            "so is one its deadline restored there"
+        );
+
+        let count = POLLING_UPGRADE_INTERVAL as i32;
+        let mut queue = RunQueue::default();
+        for raw in 1..=count {
+            queue.push_poller(DetTid::from_raw(raw), LAST_PRIORITY, 0);
+        }
+        for cycle in 0..20 * count {
+            assert!(queue.only_pollers(), "cycle {cycle}");
+            let tid = queue.tentative_pop_next().expect("a queued poller");
+            assert_eq!(queue.commit_tentative_pop(), tid);
+            queue.push_poller(tid, LAST_PRIORITY, 1);
+        }
+        assert!(queue.only_pollers());
+    }
+
+    /// A chaos `sched_yield` requeue marks its thread as a yielder, as the
+    /// plain one does, until it runs again.
+    #[test]
+    fn a_chaos_yield_marks_its_thread_as_a_yielder() {
+        let yielder = DetTid::from_raw(1);
+        let other = DetTid::from_raw(2);
+        let mut queue = RunQueue::default();
+        queue.push_back(yielder, LAST_PRIORITY);
+        yield_turn(&mut queue, yielder, LAST_PRIORITY);
+        assert!(!queue.only_pollers(), "a yielder is not a poller");
+        assert!(queue.only_pollers_or_yielders());
+        queue.push_back(other, DEFAULT_PRIORITY);
+        assert!(!queue.only_pollers_or_yielders());
+        assert!(queue.remove_tid(other));
+        assert_eq!(take_turn(&mut queue), yielder);
+        queue.push_back(yielder, LAST_PRIORITY);
+        assert!(!queue.only_pollers_or_yielders(), "it ran without yielding");
     }
 
     #[test]

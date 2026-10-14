@@ -154,6 +154,11 @@ static FUTEX_KEYED_ACCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_WAKE_OP_FILE_SHARED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_REWAIT_CHANGED_WORD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_SIGNAL_MASKED_THREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static CHAOS_LAST_BAND_ADMISSION_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static YIELD_LOOP_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static LAST_BAND_BACKGROUND_CALL_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SCHEDULER_SIGNAL_WAITING_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SIGNAL_WAITING_BESIDE_BACKGROUND_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_WAIT_UNREADABLE_WORD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PIDFD_SEND_SIGNAL_MULTITHREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PIDFD_SEND_SIGNAL_FLAGS_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -29158,6 +29163,454 @@ fn a_timer_signal_and_an_rt_sigsuspend_sleeper_verify_under_chaos() {
         .expect("the verify verdict is not JSON");
         assert_eq!(report["verdict"], "matched", "seed {seed}: {report}");
         assert_eq!(report["bitwise_parity"], true, "seed {seed}: {report}");
+    }
+}
+
+/// Under `--chaos --chaos-target-races` main's sigsuspend for SIGCHLD rejoins
+/// at a turn the schedule fixes, beside a worker that may sit in the last
+/// band. The child-exit SIGCHLD is sent while every thread blocks it, so it
+/// waits in the shared queue and ends main's sigsuspend as soon as it begins;
+/// the call is armed at its grant (`arm_for_waiting_scheduler_signal`), so
+/// seed 2 prints progress 399 and seed 4 progress 0 in every run. Before
+/// https://github.com/rrnewton/hermit/issues/4234 the wake was admitted when
+/// the host finished the call: seed 2 printed 150 in 23 of 24 runs and 200 in
+/// one, and seed 4 printed 399 in 1 of 8.
+#[test]
+fn a_sigsuspend_wake_beside_a_last_band_worker_lands_at_a_fixed_turn_under_chaos() {
+    let guest = futex_c_guest(
+        &CHAOS_LAST_BAND_ADMISSION_GUEST,
+        "chaos_last_band_admission",
+    )
+    .to_str()
+    .unwrap()
+    .to_owned();
+    for (seed, progress) in [("2", 399), ("4", 0)] {
+        for attempt in 0..3 {
+            let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+            let args = [
+                "run",
+                "--strict",
+                "--timeout",
+                "60",
+                "--chaos",
+                "--chaos-target-races",
+                "--seed",
+                seed,
+                "--",
+                guest.as_str(),
+            ];
+            let (status, log) = run_with_deadline(
+                hermit_command(&args),
+                directory.path(),
+                Duration::from_secs(120),
+                false,
+            );
+            let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+                .expect("failed to read the guest's stdout");
+            assert_eq!(
+                status.and_then(|status| status.code()),
+                Some(0),
+                "seed {seed}, run {attempt}: the run must finish and exit 0:\n\
+                 stdout:\n{stdout}\nstderr:\n{log}"
+            );
+            assert_eq!(
+                stdout,
+                format!("main woke, worker progress {progress}\ndone\n"),
+                "seed {seed}, run {attempt}"
+            );
+        }
+    }
+}
+
+/// Main's background call (connect on a bad descriptor) finishes at once, a
+/// completion only the host observes and no signal ends, while a worker takes
+/// 400 sched_yield turns. Under `--chaos --chaos-target-races` the worker can
+/// sit in the last band; while that band alone counted as a poller, run mode
+/// readmitted the call between the worker's turns whenever the host finished
+/// it (https://github.com/rrnewton/hermit/issues/4234). Now the worker is
+/// ordinary work and the call waits until it is done, so every run prints
+/// progress 399. With the old rule this printed 2 to 4, varying, at seed 2
+/// and 0 at seed 4.
+#[test]
+fn a_last_band_worker_holds_back_a_host_observed_completion_under_chaos() {
+    let guest = futex_c_guest(
+        &LAST_BAND_BACKGROUND_CALL_GUEST,
+        "last_band_background_call",
+    )
+    .to_str()
+    .unwrap()
+    .to_owned();
+    for seed in ["2", "4"] {
+        for attempt in 0..3 {
+            let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+            let args = [
+                "run",
+                "--strict",
+                "--timeout",
+                "60",
+                "--chaos",
+                "--chaos-target-races",
+                "--seed",
+                seed,
+                "--",
+                guest.as_str(),
+            ];
+            let (status, log) = run_with_deadline(
+                hermit_command(&args),
+                directory.path(),
+                Duration::from_secs(120),
+                false,
+            );
+            let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+                .expect("failed to read the guest's stdout");
+            assert_eq!(
+                status.and_then(|status| status.code()),
+                Some(0),
+                "seed {seed}, run {attempt}: the run must finish and exit 0:\n\
+                 stdout:\n{stdout}\nstderr:\n{log}"
+            );
+            assert_eq!(
+                stdout, "connect -1 errno 9, worker progress 399\n",
+                "seed {seed}, run {attempt}: the call rejoined between the worker's turns"
+            );
+        }
+    }
+}
+
+/// Run tests/c/scheduler_signal_waiting.c under `run --strict` in each mode
+/// with the scheduler signal from `source` (`chld` or `alrm`), requiring the
+/// line Linux prints, then record and replay the `replayed` mode.
+fn assert_scheduler_signal_waiting_matches_linux(
+    source: &str,
+    expected: &[(&str, &str)],
+    replayed: &str,
+) {
+    let guest = futex_c_guest(&SCHEDULER_SIGNAL_WAITING_GUEST, "scheduler_signal_waiting")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    for (mode, line) in expected {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let args = [
+            "run",
+            "--strict",
+            "--timeout",
+            "40",
+            "--",
+            guest.as_str(),
+            mode,
+            source,
+        ];
+        let (status, log) = run_with_deadline(
+            hermit_command(&args),
+            directory.path(),
+            Duration::from_secs(60),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{mode} {source}: the run must finish and exit 0:\nstdout:\n{stdout}\n\
+             stderr:\n{log}"
+        );
+        assert_eq!(
+            stdout,
+            format!("{mode} {source}: {line}\n"),
+            "{mode} {source}"
+        );
+    }
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&["record", "--verify", "--", guest.as_str(), replayed, source]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "record --verify of {replayed} {source} must succeed:\nstderr:\n{log}"
+    );
+    assert!(
+        log.contains("Success: replay matched recording."),
+        "the replay must match the recording:\nstderr:\n{log}"
+    );
+}
+
+/// A SIGCHLD the scheduler sent while every thread blocked it, and that
+/// Linux then removed without a delivery, arms no call: SIG_DFL or SIG_IGN,
+/// `sigwaitinfo`, a signalfd read, a handler that took it, or a sibling's
+/// dequeue while another thread's sigsuspend began. Arming one held the
+/// release barrier for a continuation that never came, and the run was
+/// refused after 30 s (Claude and Codex reviews of
+/// https://github.com/rrnewton/hermit/pull/4314). `control` leaves the signal
+/// pending, so main's sigsuspend takes it. In `private`, a thread's own copy
+/// taken first leaves the shared one, which must still end main's sigsuspend
+/// at once while a sibling yields; forgetting it held the call back until the
+/// sibling's 2000 yields were done ("saw done 0"). In `other`, a private
+/// SIGUSR1 ends the call armed for the SIGCHLD, which stays pending and must
+/// arm the next call it ends; forgetting it at the first arming held that
+/// call back the same way (Claude re-check of the same). In `sfd-idle` and
+/// `sfd-closed` a signalfd for SIGCHLD exists but is never read, or was closed
+/// before the child exited; a signalfd ever made kept the call from being
+/// armed (Codex re-check of the same). Each line is the one Linux prints.
+/// `dfl` is also recorded and replayed.
+#[test]
+fn a_scheduler_child_exit_signal_removed_without_a_delivery_arms_no_call() {
+    assert_scheduler_signal_waiting_matches_linux(
+        "chld",
+        &[
+            ("control", "pending before 1 after 1; woke sig 1 usr1 0"),
+            ("dfl", "pending before 1 after 0; woke sig 0 usr1 1"),
+            ("ign", "pending before 1 after 0; woke sig 0 usr1 1"),
+            ("sigwait", "pending before 1 after 0; woke sig 0 usr1 1"),
+            ("signalfd", "pending before 1 after 0; woke sig 0 usr1 1"),
+            ("handler", "pending before 1 after 0; woke sig 0 usr1 1"),
+            ("race", "pending before 1; taken 1"),
+            (
+                "private",
+                "queued own 1 shared 1; first take tkill 1, then own 0 shared 1; \
+                 taken 1 then 2; sibling saw done 1",
+            ),
+            (
+                "other",
+                "pending before 1; first woke usr1 1 sig 0, then pending 1; \
+                 second woke sig 1; sibling saw done 1",
+            ),
+            (
+                "sfd-idle",
+                "pending before 1; woke sig 1; sibling saw done 1",
+            ),
+            (
+                "sfd-closed",
+                "pending before 1; woke sig 1; sibling saw done 1",
+            ),
+        ],
+        "dfl",
+    );
+}
+
+/// Run tests/c/signal_waiting_beside_background.c in each mode under
+/// `run --strict` with `extra` arguments, requiring the line Linux prints:
+/// main's sigsuspend, ended at once by a scheduler SIGCHLD waiting in the
+/// shared queue, rejoins before the sibling's 20000 yields are done.
+fn assert_signal_waiting_beside_background_matches_linux(extra: &[&str]) {
+    let guest = futex_c_guest(
+        &SIGNAL_WAITING_BESIDE_BACKGROUND_GUEST,
+        "signal_waiting_beside_background",
+    )
+    .to_str()
+    .unwrap()
+    .to_owned();
+    for mode in ["bg", "bg-closed", "bg-otherproc", "select-closed"] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let mut args = vec!["run", "--strict", "--timeout", "40"];
+        args.extend_from_slice(extra);
+        args.extend(["--", guest.as_str(), mode]);
+        let (status, log) = run_with_deadline(
+            hermit_command(&args),
+            directory.path(),
+            Duration::from_secs(60),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{mode} {extra:?}: the run must finish and exit 0:\nstdout:\n{stdout}\n\
+             stderr:\n{log}"
+        );
+        assert_eq!(
+            stdout,
+            format!("{mode}: woke chld 1; sibling saw done 1\n"),
+            "{mode} {extra:?}"
+        );
+    }
+}
+
+/// A scheduler SIGCHLD waits in main's shared queue while a call that cannot
+/// take it runs outside the schedule: a sibling's vfork, the same after a
+/// signalfd was made and closed, another process's signalfd and vfork, or a
+/// sibling's `select` beside a closed signalfd. Main's sigsuspend must still
+/// be armed and rejoin at once. Counting any background call anywhere beside
+/// a signalfd ever made held it behind the yielding sibling ("saw done 0"),
+/// and a parent whose SIGCHLD delivery was deferred behind runnable work was
+/// reported gone, so the next child-exit SIGCHLD panicked Hermit (Claude and
+/// Codex re-checks of https://github.com/rrnewton/hermit/pull/4314).
+#[test]
+fn a_scheduler_signal_wait_beside_a_background_call_is_armed() {
+    assert_signal_waiting_beside_background_matches_linux(&[]);
+}
+
+/// As `a_scheduler_signal_wait_beside_a_background_call_is_armed`, under
+/// `--chaos --chaos-target-races` at seed 4, where `bg-otherproc` panicked.
+#[test]
+fn a_scheduler_signal_wait_beside_a_background_call_is_armed_under_chaos() {
+    assert_signal_waiting_beside_background_matches_linux(&[
+        "--chaos",
+        "--chaos-target-races",
+        "--seed",
+        "4",
+    ]);
+}
+
+/// As `a_scheduler_child_exit_signal_removed_without_a_delivery_arms_no_call`,
+/// for the SIGALRM a one-shot ITIMER_REAL makes the scheduler send. SIGALRM's
+/// default action does not ignore it, so `dfl` leaves it pending and main's
+/// sigsuspend takes it. `ign` is also recorded and replayed.
+#[test]
+fn a_scheduler_timer_signal_removed_without_a_delivery_arms_no_call() {
+    assert_scheduler_signal_waiting_matches_linux(
+        "alrm",
+        &[
+            ("control", "pending before 1 after 1; woke sig 1 usr1 0"),
+            ("dfl", "pending before 1 after 1; woke sig 1 usr1 0"),
+            ("ign", "pending before 1 after 0; woke sig 0 usr1 1"),
+            ("sigwait", "pending before 1 after 0; woke sig 0 usr1 1"),
+            ("signalfd", "pending before 1 after 0; woke sig 0 usr1 1"),
+            ("handler", "pending before 1 after 0; woke sig 0 usr1 1"),
+            ("race", "pending before 1; taken 1"),
+            (
+                "private",
+                "queued own 1 shared 1; first take tkill 1, then own 0 shared 1; \
+                 taken 1 then 2; sibling saw done 1",
+            ),
+            (
+                "other",
+                "pending before 1; first woke usr1 1 sig 0, then pending 1; \
+                 second woke sig 1; sibling saw done 1",
+            ),
+            (
+                "sfd-idle",
+                "pending before 1; woke sig 1; sibling saw done 1",
+            ),
+            (
+                "sfd-closed",
+                "pending before 1; woke sig 1; sibling saw done 1",
+            ),
+        ],
+        "ign",
+    );
+}
+
+/// Runs `tests/c/yield_loop_wait.c` in `mode` under `run --strict` with
+/// `extra` flags, returning its exit code, stdout and Hermit's stderr.
+fn run_yield_loop_guest(mode: &str, extra: &[&str]) -> (Option<i32>, String, String) {
+    let guest = futex_c_guest(&YIELD_LOOP_WAIT_GUEST, "yield_loop_wait")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mut args = vec!["run", "--strict", "--timeout", "60"];
+    args.extend_from_slice(extra);
+    args.extend_from_slice(&["--", guest.as_str(), mode]);
+    let (status, log) = run_with_deadline(
+        hermit_command(&args),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    (status.and_then(|status| status.code()), stdout, log)
+}
+
+/// Runs `yield_loop_wait` in `mode` twice at chaos `seed`, requiring both
+/// runs to finish and print the same spin count.
+fn assert_yield_loop_repeats_under_chaos(mode: &str, seed: &str) {
+    let chaos = ["--chaos", "--chaos-target-races", "--seed", seed];
+    let runs: Vec<String> = (0..2)
+        .map(|attempt| {
+            let (code, stdout, log) = run_yield_loop_guest(mode, &chaos);
+            assert_eq!(
+                code,
+                Some(0),
+                "{mode}, seed {seed}, run {attempt}: the run must finish and exit 0:\n\
+                 stdout:\n{stdout}\nstderr:\n{log}"
+            );
+            assert!(
+                stdout.starts_with("done, "),
+                "{mode}, seed {seed}: {stdout:?}"
+            );
+            stdout
+        })
+        .collect();
+    assert_eq!(runs[0], runs[1], "{mode}, seed {seed}: the runs disagree");
+}
+
+/// A `sched_yield` loop that waits for main's sigsuspend to end used to hang
+/// under `--chaos --chaos-target-races`. The child-exit SIGCHLD was sent while
+/// every thread blocked it, so it waited in the shared queue and ended the
+/// sigsuspend as soon as it began; nothing fixed that wake to a turn, and run
+/// mode held it behind the yielder forever. Main's call is now armed at its
+/// grant and rejoins at the release barrier
+/// (`arm_for_waiting_scheduler_signal`; Claude and Codex reviews of
+/// https://github.com/rrnewton/hermit/pull/4314). `timer` adds a 1 ms periodic
+/// timer whose signal every thread blocks; `wait-idle` adds a thread waiting
+/// in sigsuspend for a signal nobody sends.
+#[test]
+fn a_yield_loop_waiting_for_a_finished_call_completes_under_chaos() {
+    for (mode, seed) in [
+        ("wait", "2"),
+        ("wait", "4"),
+        ("timer", "2"),
+        ("timer", "4"),
+        ("wait-idle", "2"),
+        ("wait-idle", "4"),
+    ] {
+        assert_yield_loop_repeats_under_chaos(mode, seed);
+    }
+}
+
+/// The same wake checked under `--verify --verify-strict`: bitwise parity.
+#[test]
+fn a_yield_loop_waiting_for_a_finished_call_verifies_under_chaos() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let verdict = directory.path().join("verify.json");
+    let verdict_arg = verdict.to_str().unwrap().to_owned();
+    let extra = [
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        verdict_arg.as_str(),
+        "--chaos",
+        "--chaos-target-races",
+        "--seed",
+        "2",
+    ];
+    let (code, stdout, log) = run_yield_loop_guest("wait-idle", &extra);
+    assert_eq!(
+        code,
+        Some(0),
+        "the run must verify and exit 0:\nstdout:\n{stdout}\nstderr:\n{log}"
+    );
+    let report: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&verdict).expect("failed to read the verify verdict"),
+    )
+    .expect("the verify verdict is not JSON");
+    assert_eq!(report["verdict"], "matched", "{report}");
+    assert_eq!(report["bitwise_parity"], true, "{report}");
+}
+
+/// A yield loop beside a call that only the yielder or an alarm can end
+/// completes without chaos too. `signal`: the worker yields 20000 times and
+/// then signals main's sigsuspend. `alarm`: main's sigsuspend waits for
+/// SIGALRM, which only advancing virtual time brings. Both finish on Linux;
+/// an earlier version of this change refused the first
+/// (https://github.com/rrnewton/hermit/issues/4325).
+#[test]
+fn a_yield_loop_beside_a_signal_or_alarm_wait_completes() {
+    for mode in ["signal", "alarm"] {
+        let (code, stdout, log) = run_yield_loop_guest(mode, &[]);
+        assert_eq!(
+            code,
+            Some(0),
+            "{mode}: the run must finish and exit 0:\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert!(stdout.starts_with("done, "), "{mode}: {stdout:?}");
     }
 }
 

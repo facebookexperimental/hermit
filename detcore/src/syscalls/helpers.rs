@@ -286,6 +286,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             let mut rsrcs = Resources::new(dettid);
             // With sequentialization enabled, only truly EXTERNAL endpoints reach here.
             // Without it, resource_request is a no-op and internal fds may block directly.
+            rsrcs.reads_signalfd = matches!(blocking_resource, ResourceID::BlockingExternalIO(_))
+                && call_reads_signalfd(guest, call);
             rsrcs.insert(blocking_resource, Permission::RW);
             rsrcs.fyi(call.name());
             rsrcs.blocked_signal_mask = blocked_signal_mask;
@@ -996,6 +998,25 @@ pub fn syscall_targets_internal_fd<G: Guest<Detcore<T>>, T: RecordOrReplay>(
             .unwrap_or(false),
         None => false,
     }
+}
+
+/// Does `call` read a descriptor Detcore records as a signalfd
+/// (`Resources::reads_signalfd`)? Only `read`, `readv` and `preadv2` at the
+/// current offset can: a positioned read of a signalfd fails with ESPIPE.
+fn call_reads_signalfd<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+    guest: &mut G,
+    call: Syscall,
+) -> bool {
+    let fd = match call {
+        Syscall::Read(c) => c.fd(),
+        Syscall::Readv(c) => c.fd(),
+        Syscall::Preadv2(c) => c.fd(),
+        _ => return false,
+    };
+    guest
+        .thread_state()
+        .with_detfd(fd, |detfd| detfd.ty() == crate::fd::FdType::Signalfd)
+        .unwrap_or(false)
 }
 
 /// Does replay answer this call from the recording rather than by running it?

@@ -115,6 +115,12 @@
       "why": "tests/c/cachestat_refusal.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/chaos_last_band_admission.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/chaos_last_band_admission.c is owned by hermit-cli/tests/cli.rs: The integration test a_sigsuspend_wake_beside_a_last_band_worker_lands_at_a_fixed_turn_under_chaos runs this guest under run --strict --chaos --chaos-target-races three times at each of two seeds and requires the progress line each seed fixes, 399 at seed 2 and 0 at seed 4, because main's sigsuspend is armed for the SIGCHLD waiting in the shared queue (https://github.com/rrnewton/hermit/issues/4234); a generic manifest cannot assert a seed-specific progress line across repeated chaos runs."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/child_subreaper_refusal.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
@@ -863,6 +869,12 @@
       "path": "tests/c/kvm_exact_child_waits.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/kvm_exact_child_waits.c is owned by hermit-cli/tests/cli.rs: The CLI integration suite compiles this workload and exercises KVM-specific child completion for exact wait ordering plus exact-self SIGKILL through kill, tkill, and tgkill; it remains coupled to that dedicated driver rather than a generic manifest cell."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/last_band_background_call.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/last_band_background_call.c is owned by hermit-cli/tests/cli.rs: The integration test a_last_band_worker_holds_back_a_host_observed_completion_under_chaos runs this guest under run --strict --chaos --chaos-target-races three times at each of two seeds and requires the background connect to rejoin only after the worker's 400 sched_yield turns, so a last-band yielder no longer counts as a poller (https://github.com/rrnewton/hermit/issues/4234); a generic manifest cannot assert the exact progress line across repeated chaos runs."
     },
     {
       "disposition": "guest-fixture",
@@ -1909,6 +1921,12 @@
       "why": "tests/c/scheduler_policy_queries.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/scheduler_signal_waiting.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/scheduler_signal_waiting.c is owned by hermit-cli/tests/cli.rs: The integration tests a_scheduler_child_exit_signal_removed_without_a_delivery_arms_no_call and a_scheduler_timer_signal_removed_without_a_delivery_arms_no_call run each of its eleven modes under run --strict, with the scheduler's SIGCHLD from a child exit and its SIGALRM from ITIMER_REAL, require the line Linux prints, and record and replay one mode each: a signal every thread blocked that SIG_DFL, SIG_IGN, sigwaitinfo, a signalfd read, a handler or a sibling removed must not arm a later sigsuspend, a shared copy left after a thread took its own must still end one, a signal still pending after another ended the call armed for it must arm the next, and an idle or closed signalfd must not stop the arming (https://github.com/rrnewton/hermit/pull/4314); a generic manifest cannot assert per-mode output or the replay verdict."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/seccomp_refusal.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
@@ -2021,6 +2039,12 @@
       "path": "tests/c/signal_hermit_tasks.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/signal_hermit_tasks.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration tests signals_to_hermits_own_tasks_are_dropped_in_every_mode, a_nested_pid_namespace_signals_its_own_tasks and a_signal_to_a_newborn_thread_is_never_taken_for_hermits compile this guest, which signals Hermit's own container init (PID 1) and one of its threads through kill, rt_sigqueueinfo, tkill, tgkill and rt_tgsigqueueinfo and requires each to return 0 with Hermit surviving, requires pidfd_open(1) to fail with EPERM, then signals itself, a child, a sibling thread, its own tasks in a nested PID namespace and just-created threads, each of which must be delivered (https://github.com/rrnewton/hermit/issues/4066); it remains a guest fixture because a generic manifest cannot start Hermit in its own session or compare the per-call answers."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/signal_waiting_beside_background.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/signal_waiting_beside_background.c is owned by hermit-cli/tests/cli.rs: The integration tests a_scheduler_signal_wait_beside_a_background_call_is_armed and a_scheduler_signal_wait_beside_a_background_call_is_armed_under_chaos run its four modes under run --strict, plain and at chaos seed 4, and require the line Linux prints: a scheduler SIGCHLD waiting in the shared queue beside a vfork, a closed signalfd, another process's signalfd or an unrelated select must still arm main's sigsuspend, and a parent whose SIGCHLD delivery was deferred must not panic Hermit (https://github.com/rrnewton/hermit/pull/4314); a generic manifest cannot assert per-mode output under chaos."
     },
     {
       "disposition": "manifest-test",
@@ -2621,6 +2645,12 @@
       "path": "tests/c/writev_determinism.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/writev_determinism.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/yield_loop_wait.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/yield_loop_wait.c is owned by hermit-cli/tests/cli.rs: The integration tests a_yield_loop_waiting_for_a_finished_call_completes_under_chaos, a_yield_loop_waiting_for_a_finished_call_verifies_under_chaos and a_yield_loop_beside_a_signal_or_alarm_wait_completes run this guest under run --strict: a sched_yield loop waiting for main's sigsuspend must complete with the same output in repeated chaos runs, beside a periodic timer or an idle signal thread too, verify at bitwise parity, and complete when the wait needs the yielder or an alarm (https://github.com/rrnewton/hermit/issues/4234); a generic manifest cannot assert repeated-run equality, the verify verdict or these modes."
     },
     {
       "disposition": "cargo-binary",

@@ -1506,7 +1506,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from 4afd3a3e: 1047.
     // And +1 from bd38bb81: 1048.
     // And +1 from f4e27a59: 1049.
-    ("test.hermit_unit", 1049),
+    // And metadata::tests::record_version_rejects_streams_from_before_armed_waiting_signal_calls
+    // (https://github.com/rrnewton/hermit/issues/4234): 1050, run.
+    ("test.hermit_unit", 1050),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2185,7 +2187,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +3 from 8475d18e: 1623.
     // And +1 from 4afd3a3e: 1624.
     // And +7 from bd38bb81: 1631.
-    ("test.detcore_unit", 1631),
+    // And three runqueue tests (an ordinary thread in the last band is work, the
+    // LAST-to-LAST poll upgrade, the chaos yield mark),
+    // scheduler::test::run_mode_admits_nothing_host_timed_while_a_last_band_thread_is_runnable
+    // and scheduler::test::a_call_that_begins_with_a_scheduler_signal_waiting_is_armed
+    // (https://github.com/rrnewton/hermit/issues/4234): 1636, run.
+    ("test.detcore_unit", 1636),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3036,7 +3043,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And an_inherited_pipe_reads_the_same_capacity_whatever_the_host_gave_it
     // (the F_GETPIPE_SZ host-capacity leak): 391, by listing.
     // And +1 from bd38bb81: 392.
-    ("test.cli", 392),
+    // And the nine CLI tests of https://github.com/rrnewton/hermit/issues/4234
+    // (https://github.com/rrnewton/hermit/pull/4314): the fixed-turn sigsuspend
+    // wake and the host-observed completion beside a last-band worker, the three
+    // yield-loop tests, the two scheduler-signal removal tests and the two
+    // background-call waiting-signal tests: 401.
+    ("test.cli", 401),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3368,7 +3380,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two verify_inputs CLI tests: 326.
     // And the inherited-pipe capacity test: 327, by listing.
     // And +1 from bd38bb81: 328.
-    ("test.cli_on_host", 328),
+    // And the same nine last-band and waiting-signal tests: 337.
+    ("test.cli_on_host", 337),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -3589,7 +3602,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +3 from 8475d18e: 1623.
     // And +1 from 4afd3a3e: 1624.
     // And +7 from bd38bb81: 1631.
-    ("test.detcore_unit_on_host", 1631),
+    // And the five last-band poller and waiting-signal tests: 1636.
+    ("test.detcore_unit_on_host", 1636),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -3788,7 +3802,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from 4afd3a3e: 1047.
     // And +1 from bd38bb81: 1048.
     // And +1 from f4e27a59: 1049.
-    ("test.hermit_unit_on_host", 1049),
+    // And the armed-waiting-signal record-epoch test: 1050.
+    ("test.hermit_unit_on_host", 1050),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
