@@ -111,6 +111,8 @@
 
 #[path = "common/hermit_binary.rs"]
 mod hermit_binary;
+#[path = "common/skid_overshoot.rs"]
+mod skid_overshoot;
 
 use std::cell::Cell;
 use std::fs;
@@ -2087,28 +2089,44 @@ fn ptrace_a_sleep_takes_the_sigchld_of_a_child_that_exits_beside_a_running_sibli
         "failed to compile the witness: {}",
         String::from_utf8_lossy(&compiled.stderr)
     );
+    // The sibling spins without system calls, so each run takes many precise
+    // PMU stops, and a late PMU interrupt makes Hermit refuse it (exit 122):
+    // a property of the host's interrupt latency, not of the guest. Such a
+    // typed skid-overshoot refusal, and nothing else, is run again, as the
+    // other PMU-node cases do (https://github.com/rrnewton/hermit/issues/1845);
+    // any other outcome is checked in full. Measured at load averages of
+    // 332-340 on 316 CPUs: 11 of 91 attempts refused, about 1 in 8, and two
+    // cells refused twice in a row. So this test allows five attempts, not the
+    // usual three: three would leave about 0.7% of runs of its four cells
+    // failing on the host alone. The validate of hermit 3aae303a failed on one.
+    const SKID_ATTEMPTS: u32 = 5;
     for mode in ["pause", "nanosleep"] {
         for schedule in [&[][..], &["--chaos", "--sched-seed=2"][..]] {
-            let trial = tempfile::Builder::new()
-                .prefix("trial-")
-                .tempdir_in(&root)
-                .expect("failed to create trial directory");
-            let report = trial.path().join("verify.json");
-            let output = Command::new("timeout")
-                .args(["--kill-after=5s", "120s"])
-                .arg(hermit_binary::hermit_binary())
-                .env_remove("LD_LIBRARY_PATH")
-                .arg("--log=info")
-                .args(cell_run_args("ptrace"))
-                .args(schedule)
-                .args(["--verify", "--verify-strict", "--verify-json"])
-                .arg(&report)
-                .arg("--")
-                .arg(&witness)
-                .arg(mode)
-                .stdin(Stdio::null())
-                .output()
-                .expect("failed to run hermit");
+            let name = format!("{mode} {schedule:?}");
+            let (_, output, (_trial, report)) =
+                skid_overshoot::retry_typed_skid_refusal(&name, SKID_ATTEMPTS, || {
+                    let trial = tempfile::Builder::new()
+                        .prefix("trial-")
+                        .tempdir_in(&root)
+                        .expect("failed to create trial directory");
+                    let report = trial.path().join("verify.json");
+                    let output = Command::new("timeout")
+                        .args(["--kill-after=5s", "120s"])
+                        .arg(hermit_binary::hermit_binary())
+                        .env_remove("LD_LIBRARY_PATH")
+                        .arg("--log=info")
+                        .args(cell_run_args("ptrace"))
+                        .args(schedule)
+                        .args(["--verify", "--verify-strict", "--verify-json"])
+                        .arg(&report)
+                        .arg("--")
+                        .arg(&witness)
+                        .arg(mode)
+                        .stdin(Stdio::null())
+                        .output()
+                        .expect("failed to run hermit");
+                    (output, (trial, report))
+                });
             let stdout = String::from_utf8_lossy(&output.stdout);
             let expected = format!(
                 "mode={mode} result=-1 errno={} handler_main=1 handler_sibling=0",
