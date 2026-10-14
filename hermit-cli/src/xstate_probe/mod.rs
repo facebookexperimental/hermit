@@ -410,7 +410,7 @@ impl Default for ProbeOptions {
     }
 }
 
-/// Runs the qualification on a new thread pinned to the lowest-numbered CPU it may use.
+/// Runs the qualification on a new thread pinned to an idle, low-numbered CPU.
 /// Returns the report, or the reason v3 cannot be offered on this host.
 pub fn qualify(options: ProbeOptions) -> Result<ProbeReport, ProbeRefusal> {
     if !(MIN_REPETITIONS..=MAX_REPETITIONS).contains(&options.repetitions) {
@@ -475,9 +475,47 @@ fn pin_to(cpu: usize) -> Result<(), ProbeRefusal> {
     Ok(())
 }
 
-/// The lowest-numbered CPU this thread may run on. The probe pins itself
-/// there, so that the schedstat line it reads each reload trial comes first.
-fn first_allowed_cpu() -> Result<usize, ProbeRefusal> {
+/// The CPU the probe pins itself to: the idlest, over 100 ms of /proc/stat, of
+/// the first [`CPU_CANDIDATES`] CPUs this thread may run on. Low-numbered, so
+/// that the schedstat line each reload trial reads comes early in the file;
+/// idle, so that the calibration spins and the trials are not switched out by
+/// other work, which on a loaded machine made every spin fail on one busy CPU.
+fn probe_cpu() -> Result<usize, ProbeRefusal> {
+    let allowed = allowed_cpus()?;
+    let candidates: Vec<usize> = allowed.iter().copied().take(CPU_CANDIDATES).collect();
+    let idle = |text: &str, cpu: usize| -> Option<u64> {
+        let want = format!("cpu{cpu} ");
+        let line = text.lines().find(|line| line.starts_with(&want))?;
+        let fields: Vec<u64> = line
+            .split_whitespace()
+            .skip(1)
+            .filter_map(|field| field.parse().ok())
+            .collect();
+        // idle and iowait
+        Some(fields.get(3)? + fields.get(4)?)
+    };
+    let read = || {
+        std::fs::read_to_string("/proc/stat").map_err(|e| format!("cannot read /proc/stat: {e}"))
+    };
+    let before = read()?;
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let after = read()?;
+    candidates
+        .iter()
+        .copied()
+        .max_by_key(|cpu| {
+            idle(&after, *cpu)
+                .zip(idle(&before, *cpu))
+                .map_or(0, |(a, b)| a.saturating_sub(b))
+        })
+        .ok_or_else(|| "the probe may run on no CPU".to_owned())
+}
+
+/// How many of the lowest-numbered allowed CPUs [`probe_cpu`] chooses among.
+const CPU_CANDIDATES: usize = 16;
+
+/// The CPUs this thread may run on, in order.
+fn allowed_cpus() -> Result<Vec<usize>, ProbeRefusal> {
     // SAFETY: cpu_set_t is plain data that sched_getaffinity fills.
     unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
@@ -487,9 +525,9 @@ fn first_allowed_cpu() -> Result<usize, ProbeRefusal> {
                 std::io::Error::last_os_error()
             ));
         }
-        (0..libc::CPU_SETSIZE as usize)
-            .find(|cpu| libc::CPU_ISSET(*cpu, &set))
-            .ok_or_else(|| "the probe may run on no CPU".to_owned())
+        Ok((0..libc::CPU_SETSIZE as usize)
+            .filter(|cpu| libc::CPU_ISSET(*cpu, &set))
+            .collect())
     }
 }
 
@@ -525,7 +563,7 @@ struct Probe {
 
 impl Probe {
     fn run(options: ProbeOptions) -> Result<ProbeReport, ProbeRefusal> {
-        let cpu = first_allowed_cpu()?;
+        let cpu = probe_cpu()?;
         pin_to(cpu)?;
         let layout = Layout::host()?;
         let cases = case_list(layout.xcr0)?;

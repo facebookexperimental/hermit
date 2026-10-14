@@ -1373,6 +1373,10 @@ fn cpu_profile_v3_qualification() -> Result<(), String> {
 /// `hermit host-capabilities --cpu-profile x86-64-v3` also refuses. The
 /// qualification fails closed under transient load, so a refusal on a host
 /// that does qualify gets one more attempt; a second refusal fails the test.
+///
+/// With HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1, as a lane on hosts that must
+/// qualify sets it, any refusal fails the test: there an unqualified host is a
+/// failure, never a pass.
 fn v3_run_or_refusal<T>(
     mut attempt: impl FnMut() -> (Option<i32>, String, String, T),
 ) -> Option<(String, String, T)> {
@@ -1385,7 +1389,13 @@ fn v3_run_or_refusal<T>(
                     log.contains("--cpu-profile x86-64-v3 refused:"),
                     "exit 122 without the profile's refusal:\nstdout:\n{stdout}\nstderr:\n{log}"
                 );
+                let required =
+                    std::env::var("HERMIT_TEST_REQUIRE_CPU_PROFILE_V3").as_deref() == Ok("1");
                 match cpu_profile_v3_qualification() {
+                    Err(reason) if required => panic!(
+                        "HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1 but the host does not qualify: \
+                         {reason}\nstderr:\n{log}"
+                    ),
                     Err(_) => return None,
                     Ok(()) if !retry => continue,
                     Ok(()) => panic!(
