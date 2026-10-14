@@ -194,8 +194,6 @@ impl RunData {
             max_log_bytes: self.analyze_opts.max_log_bytes,
             log_budget: self.analyze_opts.log_budget.clone(),
             log_file_handle: None,
-            run_evidence_log_handle: None,
-            run_evidence_write_error: None,
             unsafe_ignore_host_seccomp: false,
         }
     }
@@ -1055,20 +1053,7 @@ mod tests {
             (&["--lite"][..], &["--namespace-only"][..]),
             (&["--verify"][..], &["--verify"][..]),
             (&["--verify", "--verify-strict"][..], &["--verify"][..]),
-            (
-                &[
-                    "--run-result-json=r.json",
-                    "--guest-stdout=o",
-                    "--guest-stderr=e",
-                    "--run-evidence-dir=ev",
-                ][..],
-                &[
-                    "--run-result-json",
-                    "--guest-stdout",
-                    "--guest-stderr",
-                    "--run-evidence-dir",
-                ][..],
-            ),
+            (&["--verify-run=vr"][..], &["--verify-run"][..]),
             (
                 &["--backend-engagement-json=b.json"][..],
                 &["--backend-engagement-json"][..],

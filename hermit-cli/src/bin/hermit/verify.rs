@@ -3267,8 +3267,6 @@ mod tests {
             max_log_bytes: None,
             log_budget: None,
             log_file_handle: None,
-            run_evidence_log_handle: None,
-            run_evidence_write_error: None,
             unsafe_ignore_host_seccomp: false,
             backend: None,
         }

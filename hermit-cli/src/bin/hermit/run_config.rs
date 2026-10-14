@@ -1055,34 +1055,6 @@ mod tests {
             "backend-engagement-json",
             &["--backend-engagement-json=/tmp/be.json"],
         ),
-        ("run-evidence-dir", &["--run-evidence-dir=/tmp/ev"]),
-        (
-            "run-result-json",
-            &[
-                "--run-evidence-dir=/tmp/ev",
-                "--run-result-json=/tmp/r.json",
-                "--guest-stdout=/tmp/o",
-                "--guest-stderr=/tmp/e",
-            ],
-        ),
-        (
-            "guest-stdout",
-            &[
-                "--guest-stdout=/tmp/o",
-                "--run-evidence-dir=/tmp/ev",
-                "--run-result-json=/tmp/r.json",
-                "--guest-stderr=/tmp/e",
-            ],
-        ),
-        (
-            "guest-stderr",
-            &[
-                "--guest-stderr=/tmp/e",
-                "--run-evidence-dir=/tmp/ev",
-                "--run-result-json=/tmp/r.json",
-                "--guest-stdout=/tmp/o",
-            ],
-        ),
         ("analyze-networking", &["--analyze-networking"]),
         ("base-env", &["--base-env=empty"]),
         (

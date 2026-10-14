@@ -29,8 +29,6 @@ use hermit::nonwaiting_write::write_without_waiting;
 use tracing::Subscriber;
 use tracing::metadata::LevelFilter;
 use tracing_subscriber::EnvFilter;
-use tracing_subscriber::Layer;
-use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 const DEFAULT_TRACE_LEVEL: LevelFilter = LevelFilter::WARN;
@@ -104,117 +102,6 @@ pub struct BoundedWriter<W: Write> {
     remaining: u64,
     bounded: bool,
     announced: bool,
-}
-
-#[derive(Debug)]
-struct SharedWriteError {
-    address: NonNull<AtomicBool>,
-}
-
-// SAFETY: address points to one initialized atomic in a MAP_SHARED mapping.
-// AtomicBool supplies synchronization, and the mapping remains live while any
-// clone of WriteErrorLatch exists in this process.
-unsafe impl Send for SharedWriteError {}
-unsafe impl Sync for SharedWriteError {}
-
-impl Drop for SharedWriteError {
-    fn drop(&mut self) {
-        // SAFETY: this process owns this mapping, created with exactly this
-        // address and length in WriteErrorLatch::new. A fork receives its own
-        // Arc refcount and unmaps only its own process mapping on drop.
-        unsafe {
-            libc::munmap(self.address.as_ptr().cast(), mem::size_of::<AtomicBool>());
-        }
-    }
-}
-
-/// A process-shared latch for errors a tracing formatter otherwise discards.
-///
-/// Ordinary runs initialize tracing after the container fork. A heap atomic
-/// would therefore be copy-on-write: the writer child could record an error
-/// that the parent publishing the manifest never observes. This anonymous
-/// MAP_SHARED cell is created before that fork and is not inherited across the
-/// guest exec.
-#[derive(Clone, Debug)]
-pub struct WriteErrorLatch {
-    shared: Arc<SharedWriteError>,
-}
-
-impl WriteErrorLatch {
-    pub fn new() -> io::Result<Self> {
-        // SAFETY: anonymous shared mapping, no fixed address and no backing fd.
-        let address = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                mem::size_of::<AtomicBool>(),
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        if address == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
-        }
-        let address = NonNull::new(address.cast::<AtomicBool>())
-            .expect("mmap returned a non-null non-failure address");
-        // SAFETY: the fresh mapping is writable and suitably page-aligned.
-        unsafe { address.as_ptr().write(AtomicBool::new(false)) };
-        Ok(Self {
-            shared: Arc::new(SharedWriteError { address }),
-        })
-    }
-
-    fn cell(&self) -> &AtomicBool {
-        // SAFETY: the Arc keeps the initialized mapping live in this process.
-        unsafe { self.shared.address.as_ref() }
-    }
-
-    fn record_failure(&self) {
-        self.cell().store(true, Ordering::Release);
-    }
-
-    pub fn failed(&self) -> bool {
-        self.cell().load(Ordering::Acquire)
-    }
-}
-
-/// Records every write or flush error before returning it to tracing.
-///
-/// tracing-subscriber intentionally treats formatter I/O as diagnostic-only
-/// and discards these errors. Evidence cannot: a valid prefix with a lost tail
-/// is incomplete even when that prefix still parses.
-pub struct LatchedWriter<W> {
-    inner: W,
-    latch: WriteErrorLatch,
-}
-
-impl<W> LatchedWriter<W> {
-    pub fn new(inner: W, latch: WriteErrorLatch) -> Self {
-        Self { inner, latch }
-    }
-}
-
-impl<W: Write> Write for LatchedWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self.inner.write(buf) {
-            Ok(0) if !buf.is_empty() => {
-                self.latch.record_failure();
-                Ok(0)
-            }
-            Ok(written) => Ok(written),
-            Err(error) => {
-                self.latch.record_failure();
-                Err(error)
-            }
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush().inspect_err(|_| {
-            self.latch.record_failure();
-        })
-    }
 }
 
 impl<W: Write> BoundedWriter<W> {
@@ -538,8 +425,8 @@ struct SharedBudgetCells {
     address: NonNull<BudgetCells>,
 }
 
-// SAFETY: as for SharedWriteError -- initialized atomics in a MAP_SHARED
-// mapping that stays live while any clone of the owning LogBudget exists.
+// SAFETY: initialized atomics in a MAP_SHARED mapping that stays live while
+// any clone of the owning LogBudget exists; the atomics supply synchronization.
 unsafe impl Send for SharedBudgetCells {}
 unsafe impl Sync for SharedBudgetCells {}
 
@@ -555,8 +442,7 @@ impl Drop for SharedBudgetCells {
 /// The `--max-log-bytes` budget: a limit and a running total of the bytes
 /// hermit has offered to its public log sink.
 ///
-/// THE TOTAL IS PROCESS-SHARED FOR THE SAME REASON [`WriteErrorLatch`] IS.
-/// Tracing is initialized after the container fork, and `run --verify` forks
+/// THE TOTAL IS PROCESS-SHARED. Tracing is initialized after the container fork, and `run --verify` forks
 /// one container per run. A heap counter would be copied at each fork, so every
 /// run would get the full budget again; this MAP_SHARED cell, created in `main`
 /// before any fork, makes the cap a total for the invocation.
@@ -1149,37 +1035,6 @@ pub fn init_file_tracing<W: Write + Send + 'static>(
     }
 }
 
-/// Preserve the public file logger while synchronously duplicating INFO-and-
-/// higher events into a private evidence descriptor. This creates only the
-/// public logger's existing nonblocking worker; the evidence writer is direct.
-pub fn init_file_tracing_with_evidence<P, E>(
-    level: Option<LevelFilter>,
-    public: P,
-    evidence: E,
-) -> TracingGuard
-where
-    P: Write + Send + 'static,
-    E: Write + Send + 'static,
-{
-    let (public_writer, guard) = tracing_appender::non_blocking(public);
-    let public_layer = tracing_subscriber::fmt::layer()
-        .with_writer(public_writer)
-        .with_ansi(false)
-        .with_filter(env_filter(level.unwrap_or(DEFAULT_TRACE_LEVEL)));
-    let evidence_layer = tracing_subscriber::fmt::layer()
-        .with_writer(std::sync::Mutex::new(evidence))
-        .with_ansi(false)
-        .with_filter(LevelFilter::INFO);
-    tracing_subscriber::registry()
-        .with(public_layer)
-        .with(evidence_layer)
-        .try_init()
-        .expect("global tracing subscriber to install");
-    TracingGuard {
-        _worker: Some(guard),
-    }
-}
-
 /// Make the next guest task use the same identity as the asynchronous logger.
 ///
 /// `init_file_tracing` starts a nonblocking writer thread inside the fresh PID
@@ -1242,35 +1097,6 @@ fn align_tracing_pid_baseline(backend: Backend) {
         detcore::ROOT_DETPID.as_raw() - 1,
         "fresh PID namespace did not reserve the expected tracing slot"
     );
-}
-
-/// Preserve the public stderr logger while synchronously duplicating INFO-and-
-/// higher events into a private evidence descriptor. PID alignment uses the
-/// short-lived process reservation above and does not create a host thread.
-pub fn init_stderr_tracing_with_evidence<E>(
-    level: Option<LevelFilter>,
-    evidence: E,
-    backend: Backend,
-    budget: Option<LogBudget>,
-) -> TracingGuard
-where
-    E: Write + Send + 'static,
-{
-    align_tracing_pid_baseline(backend);
-    let public_layer = tracing_subscriber::fmt::layer()
-        .with_writer(move || CappedWriter::stderr(budget.clone()))
-        .with_ansi(stderr().is_terminal())
-        .with_filter(env_filter(level.unwrap_or(DEFAULT_TRACE_LEVEL)));
-    let evidence_layer = tracing_subscriber::fmt::layer()
-        .with_writer(std::sync::Mutex::new(evidence))
-        .with_ansi(false)
-        .with_filter(LevelFilter::INFO);
-    tracing_subscriber::registry()
-        .with(public_layer)
-        .with(evidence_layer)
-        .try_init()
-        .expect("global tracing subscriber to install");
-    TracingGuard::synchronous()
 }
 
 /// Returns a tracing subscriber that logs to `stderr`.
@@ -1486,64 +1312,6 @@ mod tests {
             .expect("KVM no-allocation namespace failed");
 
         assert_eq!(next_pid, 2);
-    }
-
-    struct FailingWriter {
-        fail_write: bool,
-    }
-
-    impl Write for FailingWriter {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            if self.fail_write {
-                Err(io::Error::other("injected write failure"))
-            } else {
-                Ok(buf.len())
-            }
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            if self.fail_write {
-                Ok(())
-            } else {
-                Err(io::Error::other("injected flush failure"))
-            }
-        }
-    }
-
-    #[test]
-    fn private_writer_latches_write_and_flush_errors() {
-        let write_latch = WriteErrorLatch::new().unwrap();
-        let mut write_fails =
-            LatchedWriter::new(FailingWriter { fail_write: true }, write_latch.clone());
-        assert!(write_fails.write_all(b"record").is_err());
-        assert!(write_latch.failed());
-
-        let flush_latch = WriteErrorLatch::new().unwrap();
-        let mut flush_fails =
-            LatchedWriter::new(FailingWriter { fail_write: false }, flush_latch.clone());
-        assert!(flush_fails.flush().is_err());
-        assert!(flush_latch.failed());
-    }
-
-    #[test]
-    fn private_writer_latch_is_visible_across_fork() {
-        let latch = WriteErrorLatch::new().unwrap();
-        // SAFETY: the child performs only an atomic store and _exit; it does no
-        // allocation and acquires no process-local lock after this threaded
-        // test harness forks.
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0, "fork failed");
-        if pid == 0 {
-            latch.record_failure();
-            unsafe { libc::_exit(0) };
-        }
-        let mut status = 0;
-        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
-        assert_eq!(status, 0);
-        assert!(
-            latch.failed(),
-            "a heap-only latch would lose the child writer failure"
-        );
     }
 
     /// Bracketed both ways on purpose: a bound that always fires would silently

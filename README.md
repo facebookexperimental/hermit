@@ -167,9 +167,8 @@ own shared libraries run before the constructor and are not monitored.
 
 The in-guest runtime cannot deliver Detcore's preemption timer yet, so Hermit
 refuses the run unless `--max-timeslice=disabled` is given. It also refuses
-`--verify`, `--run-evidence-dir`, `--timeout`, `--skid-margin` and
-`--gdbserver`, and guest programs it cannot monitor: statically linked,
-set-user-ID or non-x86-64 programs, programs with a `DT_PREINIT_ARRAY`, and
+`--verify`, `--timeout`, `--skid-margin` and `--gdbserver`, and guest programs
+it cannot monitor: statically linked, set-user-ID or non-x86-64 programs, programs with a `DT_PREINIT_ARRAY`, and
 anything other than a regular file. A guest may `fork`, and `vfork` runs as a copying fork; creating
 a thread and `exec` are not supported yet. The default Hermit namespace path is
 supported; `--no-namespace` remains an explicit option for trusted guests.

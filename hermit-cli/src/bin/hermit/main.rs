@@ -23,7 +23,6 @@ mod container;
 mod gdb_client;
 mod gdb_watch_helper;
 mod global_opts;
-mod guest_capture;
 mod host_capabilities;
 mod host_seccomp;
 mod image;
@@ -42,10 +41,8 @@ mod remove;
 mod replay;
 mod run;
 mod run_config;
-mod run_evidence;
 mod run_timeout;
 mod schedule_search;
-mod staged_summary;
 mod strace;
 mod tracing;
 mod verify;
@@ -165,7 +162,6 @@ use self::record::RecordOpts;
 use self::replay::ReplayOpts;
 use self::run::GuestProgramFault;
 use self::run::RunOpts;
-use self::run_evidence::RunEvidenceSession;
 use self::strace::StraceOpts;
 use self::verify::write_pending_verification_json;
 use self::version::Version;
@@ -558,16 +554,6 @@ impl Subcommand {
         }
     }
 
-    fn run_evidence_request(
-        &self,
-        global_backend: Option<hermit::Backend>,
-    ) -> Option<(&Path, hermit::Backend)> {
-        match self {
-            Subcommand::Run(run) => run.run_evidence_request(global_backend),
-            _ => None,
-        }
-    }
-
     fn main(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         // Stamp the invocation-bound NO-RESULT record BEFORE the first fallible
         // statement of the whole program. This is the outermost point at which
@@ -681,23 +667,6 @@ fn main() {
     } = args_from_matches_with_clock(&matches, std::time::SystemTime::now)
         .unwrap_or_else(|error| error.exit());
 
-    // Claim the evidence destination before any fallible run preflight. The
-    // directory itself is the invocation boundary: it must not exist, so no
-    // stale success can survive and no concurrent invocation can share it.
-    let evidence = match command.run_evidence_request(global.backend) {
-        Some((directory, backend)) => match RunEvidenceSession::create(directory, backend) {
-            Ok(session) => Some(session),
-            Err(error) => {
-                display_error(error);
-                ExitStatus::Exited(HERMIT_INTERNAL_FAILURE_EXIT).raise_or_exit();
-            }
-        },
-        None => None,
-    };
-    if let Some(session) = &evidence {
-        global.set_run_evidence_log_handle(session.log_handle(), session.write_error_latch());
-    }
-
     // Open --log-file HERE, in the host's filename namespace, before any container
     // exists. This is the moment a shell would perform `> file`, and doing it later
     // -- inside the container, where tracing must be initialized -- resolves the path
@@ -715,19 +684,11 @@ fn main() {
         .and_then(|()| global.open_log_file())
         .and_then(|()| command.main(&global));
 
-    // The manifest is the commit marker and is published only after the run
-    // result and private log are final. Evidence failure is reported but cannot
-    // replace the guest's status; a consumer observes the absent/no-result
-    // manifest and fails closed independently of the public CLI channel.
-    let evidence_error = evidence.and_then(|session| session.finish(result.as_ref()).err());
     let status = result.unwrap_or_else(|error| {
         let status = ExitStatus::Exited(failure_exit_code(&error));
         display_error(error);
         status
     });
-    if let Some(error) = evidence_error {
-        display_error(error);
-    }
     // From here on a write may fail but must not replace `status`.
     block_write_signals_until_exit();
     // Guest output agreed by both `--verify` runs can still be buffered (no

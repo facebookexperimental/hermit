@@ -101,15 +101,12 @@ const RUN_OUTPUTS: &[&str] = &[
     "backend-engagement-json",
     "record-networking",
     "fatal-core-dir",
-    "guest-stderr",
-    "guest-stdout",
     "preemption-stacktrace-log-file",
     "record-preemptions-to",
-    "run-evidence-dir",
-    "run-result-json",
     "summary-json",
     "verify-json",
     "verify-log-dir",
+    "verify-run",
 ];
 
 /// Removes the output destinations from a manifest's `global` and `run`

@@ -59,8 +59,6 @@ use hermit::host_input_change::explains_divergence;
 use hermit::host_input_change::find_pattern_difference;
 use hermit::host_input_change::open_position;
 use hermit::host_input_change::read_host_inputs;
-use hermit::run_evidence::GuestRunDeterminism;
-use reverie::Errno;
 use reverie::process::Bind;
 use reverie::process::Command;
 use reverie::process::Container;
@@ -77,8 +75,6 @@ use super::container::default_container;
 use super::container::identity_hardening_mounts;
 use super::container::image_container;
 use super::global_opts::GlobalOpts;
-use super::guest_capture::GuestRunCapturePaths;
-use super::guest_capture::GuestRunCaptureSession;
 use super::host_capabilities::cpu_identity;
 use super::host_capabilities::exact_branch_counter_verdict;
 use super::host_capabilities::host_inexact_branch_counter;
@@ -1349,7 +1345,7 @@ pub struct RunOpts {
     #[clap(
         long,
         value_name = "NEW_DIR",
-        conflicts_with_all = ["verify", "run_evidence_dir", "namespace_only"]
+        conflicts_with_all = ["verify", "namespace_only"]
     )]
     verify_run: Option<PathBuf>,
 
@@ -1376,57 +1372,6 @@ pub struct RunOpts {
         value_name = "PATH"
     )]
     backend_engagement_json: Option<PathBuf>,
-
-    /// Retain typed evidence for this one ordinary run in a newly created
-    /// directory. NEW_PATH must not exist. Hermit writes a private synchronous
-    /// INFO log without changing the guest's standard descriptors, validates it
-    /// under BitwiseInfoV1, publishes the log with a SHA-256 digest, and publishes
-    /// manifest.json last. A missing, malformed, truncated, or empty log is a
-    /// no-result, never successful evidence. This is currently supported by
-    /// ptrace, LiteInst, and KVM. DBT is refused because its authenticated evidence
-    /// transport currently implies isolated process-group policy that can change
-    /// guest setsid/setpgid results. SaBRe is refused because plugin DETLOG is
-    /// emitted only on shared stderr. KVM's manifest records its exit-code-only
-    /// disposition limitation.
-    #[clap(
-        long,
-        conflicts_with_all = ["verify", "namespace_only"],
-        value_name = "NEW_PATH"
-    )]
-    run_evidence_dir: Option<PathBuf>,
-
-    /// Harness-only terminal sidecar for one ordinary run's exact guest
-    /// stdout/stderr. All three capture paths must be new, distinct children of
-    /// one non-symlink directory shared with --run-evidence-dir. Supported only
-    /// by ptrace, LiteInst, and KVM. KVM copies its existing virtual-console
-    /// output into the held files because its guest has no host file descriptors.
-    #[clap(
-        long,
-        value_name = "NEW_PATH",
-        requires_all = ["guest_stdout", "guest_stderr", "run_evidence_dir"],
-        conflicts_with_all = ["verify", "namespace_only"]
-    )]
-    run_result_json: Option<PathBuf>,
-
-    /// Harness-only no-clobber regular file inherited as guest stdout.
-    /// Requires --run-result-json, --guest-stderr, and --run-evidence-dir.
-    #[clap(
-        long,
-        value_name = "NEW_PATH",
-        requires_all = ["run_result_json", "guest_stderr", "run_evidence_dir"],
-        conflicts_with_all = ["verify", "namespace_only"]
-    )]
-    guest_stdout: Option<PathBuf>,
-
-    /// Harness-only no-clobber regular file inherited as guest stderr.
-    /// Requires --run-result-json, --guest-stdout, and --run-evidence-dir.
-    #[clap(
-        long,
-        value_name = "NEW_PATH",
-        requires_all = ["run_result_json", "guest_stdout", "run_evidence_dir"],
-        conflicts_with_all = ["verify", "namespace_only"]
-    )]
-    guest_stderr: Option<PathBuf>,
 
     /// Diagnose non-zero network binds. Implies an isolated network namespace and conflicts with
     /// `--network=host`.
@@ -1823,23 +1768,6 @@ impl fmt::Display for RunOpts {
         if let Some(p) = &self.backend_engagement_json {
             let s = p.to_str().expect("valid unicode path");
             write!(f, " --backend-engagement-json={}", shell_words::quote(s))?;
-        }
-        if let Some(p) = &self.run_evidence_dir {
-            let s = p.to_str().expect("valid unicode path");
-            write!(f, " --run-evidence-dir={}", shell_words::quote(s))?;
-        }
-        for (name, path) in [
-            ("run-result-json", self.run_result_json.as_ref()),
-            ("guest-stdout", self.guest_stdout.as_ref()),
-            ("guest-stderr", self.guest_stderr.as_ref()),
-        ] {
-            if let Some(path) = path {
-                write!(
-                    f,
-                    " --{name}={}",
-                    shell_words::quote(&path.to_string_lossy())
-                )?;
-            }
         }
         if self.analyze_networking {
             write!(f, " --analyze-networking")?;
@@ -3722,12 +3650,7 @@ fn in_guest_trap_refuses_the_options_liteinst_refuses() {
             "{error:#}"
         );
     }
-    for option in [
-        "--run-evidence-dir=/unused/new-path",
-        "--timeout=3",
-        "--skid-margin=500",
-        "--gdbserver",
-    ] {
+    for option in ["--timeout=3", "--skid-margin=500", "--gdbserver"] {
         let options = ["--max-timeslice=disabled", option];
         let trap = in_guest_refusal("--backend=in-guest-trap", &options).unwrap_err();
         let liteinst = liteinst_in_guest_refusal(&options).unwrap_err();
@@ -3780,10 +3703,6 @@ fn liteinst_in_guest_refuses_options_it_cannot_honour() {
     }
     // The other refusals hold in every build.
     for (option, reason) in [
-        (
-            "--run-evidence-dir=/unused/new-path",
-            "--run-evidence-dir has not been qualified",
-        ),
         ("--timeout=3", "--timeout has not been qualified"),
         ("--skid-margin=500", "--skid-margin configures"),
         ("--gdbserver", "--gdbserver needs the ptrace tracer"),
@@ -5108,41 +5027,6 @@ impl RunOpts {
         self.image.as_deref()
     }
 
-    pub(crate) fn run_evidence_request(
-        &self,
-        global_backend: Option<Backend>,
-    ) -> Option<(&Path, Backend)> {
-        self.run_evidence_dir
-            .as_deref()
-            .map(|directory| (directory, global_backend.unwrap_or_default()))
-    }
-
-    fn guest_run_capture_paths(&self) -> Result<Option<GuestRunCapturePaths>, Error> {
-        match (
-            self.run_result_json.as_ref(),
-            self.guest_stdout.as_ref(),
-            self.guest_stderr.as_ref(),
-        ) {
-            (None, None, None) => Ok(None),
-            (Some(result), Some(stdout), Some(stderr)) => Ok(Some(GuestRunCapturePaths::new(
-                result.clone(),
-                stdout.clone(),
-                stderr.clone(),
-            ))),
-            _ => Err(Error::msg(
-                "--run-result-json, --guest-stdout, and --guest-stderr must be supplied together",
-            )),
-        }
-    }
-
-    fn check_capture_companions(&self, paths: &GuestRunCapturePaths) -> Result<(), Error> {
-        paths.require_distinct_from(
-            self.backend_engagement_json.as_deref(),
-            "--backend-engagement-json",
-        )?;
-        paths.check_host_summary(self.summary_json.as_deref())
-    }
-
     fn selected_backend(&self) -> Backend {
         self.backend.unwrap_or_default()
     }
@@ -5288,8 +5172,6 @@ impl RunOpts {
             "it cannot deliver Detcore's preemption timer yet (the in-guest Tool host refuses \
              set_timer with ENOSYS), so the run would fail at its first timeslice; pass \
              --max-timeslice=disabled"
-        } else if self.run_evidence_dir.is_some() {
-            "--run-evidence-dir has not been qualified for the in-guest runtime"
         } else if self.timeout.is_some() {
             "--timeout has not been qualified for the in-guest runtime, whose run future does \
              not kill the guest when it is dropped"
@@ -5584,13 +5466,6 @@ impl RunOpts {
         // place it can be given.
         self.backend = global.backend;
         self.refuse_unapplied_config()?;
-        let guest_capture_paths = self.guest_run_capture_paths()?;
-        if let Some(paths) = &guest_capture_paths {
-            // Evidence is intentionally claimed by main before this preflight.
-            // Refuse capture collisions before clearing engagement or creating
-            // streams; summary also requires a check in its writer namespace.
-            self.check_capture_companions(paths)?;
-        }
         if let Some(path) = &self.backend_engagement_json {
             clear_machine_record(path, "backend engagement")?;
         }
@@ -5749,29 +5624,14 @@ impl RunOpts {
         if backend == Backend::E9patch {
             self.prepare_e9patch_program()?;
         }
-        let mut guest_capture = guest_capture_paths
-            .map(|paths| {
-                let evidence = self.run_evidence_dir.as_deref().ok_or_else(|| {
-                    Error::msg("harness guest capture requires --run-evidence-dir")
-                })?;
-                GuestRunCaptureSession::create(&paths, evidence)
-            })
-            .transpose()?;
         let private_engagement_summary = if self.backend_engagement_json.is_some()
             && backend == Backend::Ptrace
             && self.summary_json.is_none()
         {
             let file = private_backend_engagement_summary()?;
-            // A captured run stages its summary through its own descriptor and
-            // then publishes it by renaming into this destination's directory,
-            // so it needs the directory entry itself; a `/proc/self/fd` name
-            // has no directory to rename into. Every other run hands the
-            // container the descriptor: see private_summary_descriptor_path.
-            self.summary_json = Some(if guest_capture.is_some() {
-                file.path().to_owned()
-            } else {
-                private_summary_descriptor_path(&file)
-            });
+            // The container is handed the descriptor: see
+            // private_summary_descriptor_path.
+            self.summary_json = Some(private_summary_descriptor_path(&file));
             Some(file)
         } else {
             None
@@ -5845,21 +5705,8 @@ impl RunOpts {
         } else if let Some(directory) = &self.verify_run {
             self.verify_run(directory, global)
         } else {
-            let (status, _) = self.run_with_guest_capture(global, false, guest_capture.as_ref())?;
-            if let Some(capture) = &mut guest_capture {
-                let config = hermit::prepare_backend_config(
-                    self.effective_det_config(),
-                    self.runtime_backend(),
-                );
-                capture.finish(
-                    status,
-                    GuestRunDeterminism {
-                        detlog_io_buffers: config.detlog_io_buffers,
-                        virtualize_time: config.virtualize_time,
-                    },
-                )?;
-            }
-            self.write_backend_engagement_after_run(guest_capture.as_ref())?;
+            let (status, _) = self.run(global, false)?;
+            self.write_backend_engagement_after_run()?;
             drop(private_engagement_summary);
             Ok(status)
         }
@@ -5917,29 +5764,6 @@ impl RunOpts {
         timer: Result<(), TimerUnavailable>,
     ) -> Result<(), Error> {
         let backend = self.selected_backend();
-        if self.run_evidence_dir.is_some() {
-            let limitation = match backend {
-                Backend::Ptrace | Backend::Liteinst | Backend::InGuestTrap | Backend::Kvm => None,
-                Backend::Dbt => Some(
-                    "authenticated DBT evidence currently implies an isolated process group, \
-                     which can change guest setsid/setpgid results",
-                ),
-                Backend::Sabre => Some(
-                    "the SaBRe plugin currently emits DETLOG only on shared stderr, which is not \
-                     an authoritative private evidence channel",
-                ),
-                Backend::E9patch => Some(
-                    "e9patch preprocessing has not been qualified for this evidence contract; \
-                     request the ptrace backend directly",
-                ),
-            };
-            if let Some(limitation) = limitation {
-                return Err(Error::new(PolicyRefusal).context(format!(
-                    "--run-evidence-dir is unavailable for backend `{}`: {limitation}",
-                    backend.as_str()
-                )));
-            }
-        }
         // LiteInst passes here so that the in-guest refusal, which names why
         // it cannot honour `--skid-margin`, is the one that stops the run.
         if self.skid_margin.is_some()
@@ -7137,10 +6961,7 @@ impl RunOpts {
         Ok(())
     }
 
-    fn write_backend_engagement_after_run(
-        &self,
-        guest_capture: Option<&GuestRunCaptureSession>,
-    ) -> Result<(), Error> {
+    fn write_backend_engagement_after_run(&self) -> Result<(), Error> {
         let Some(path) = &self.backend_engagement_json else {
             return Ok(());
         };
@@ -7179,9 +7000,6 @@ impl RunOpts {
                 )));
             }
         };
-        if let Some(capture) = guest_capture {
-            capture.require_distinct_from(path, "--backend-engagement-json")?;
-        }
         write_backend_engagement(path, engagement)
     }
 
@@ -7201,49 +7019,19 @@ impl RunOpts {
         global: &GlobalOpts,
         capture_output: bool,
     ) -> Result<(ExitStatus, Option<Output>), Error> {
-        self.run_with_guest_capture(global, capture_output, None)
-    }
-
-    fn run_with_guest_capture(
-        &self,
-        global: &GlobalOpts,
-        capture_output: bool,
-        guest_capture: Option<&GuestRunCaptureSession>,
-    ) -> Result<(ExitStatus, Option<Output>), Error> {
-        // main has reserved startup stdin before this can allocate a descriptor.
-        // Keep the unlinked output open through the real container fork; its
-        // controller-local proc-fd spelling is constructed only inside it.
-        let summary_output = if guest_capture.is_some() && self.summary_json.is_some() {
-            Some(super::staged_summary::private_output(
-                &private_summary_dir()?,
-            )?)
-        } else {
-            None
-        };
         let mut options = self.clone();
         let network_trace = options.open_network_trace()?;
         let global = global.clone();
-        let guest_capture = guest_capture
-            .map(GuestRunCaptureSession::try_clone_for_child)
-            .transpose()?;
         let resources = if network_trace.is_some() {
-            "summary/output and network trace descriptors"
+            "network trace descriptor"
         } else {
-            "summary/output descriptors"
+            "no descriptors"
         };
         self.launch_in_container(
-            (summary_output, network_trace),
+            network_trace,
             resources,
             self.run_timeout(),
-            move |(summary, _), identity| {
-                options.run_in_container(
-                    &global,
-                    capture_output,
-                    guest_capture.as_ref(),
-                    summary.as_ref(),
-                    identity,
-                )
-            },
+            move |_, identity| options.run_in_container(&global, capture_output, identity),
         )
         .map(|(value, _guards)| value)
     }
@@ -8631,9 +8419,6 @@ impl RunOpts {
     ///   dispatches to `verify()`; `run` is a single run.
     /// - `--happens-before` (and `--hb-list-events`): only `main` resolves the
     ///   specification, so `run` hands the scheduler none.
-    /// - `--run-result-json`, `--guest-stdout`, `--guest-stderr`: only `main`
-    ///   opens the guest capture.
-    /// - `--run-evidence-dir`: only `hermit run`'s top level arms it.
     /// - `--verify-run`: only `main` dispatches to `verify_run()`.
     /// - `--backend-engagement-json`: only `main` writes it.
     ///
@@ -8645,10 +8430,6 @@ impl RunOpts {
             (self.verify, "--verify"),
             (self.verify_run.is_some(), "--verify-run"),
             (self.happens_before.is_some(), "--happens-before"),
-            (self.run_result_json.is_some(), "--run-result-json"),
-            (self.guest_stdout.is_some(), "--guest-stdout"),
-            (self.guest_stderr.is_some(), "--guest-stderr"),
-            (self.run_evidence_dir.is_some(), "--run-evidence-dir"),
             (
                 self.backend_engagement_json.is_some(),
                 "--backend-engagement-json",
@@ -8740,85 +8521,42 @@ impl RunOpts {
         &self,
         global: &GlobalOpts,
         capture_output: bool,
-        guest_capture: Option<&GuestRunCaptureSession>,
-        summary_output: Option<&File>,
         identity_sources: Option<&IdentityGuard>,
     ) -> Result<(ExitStatus, Option<Output>), Error> {
         let _guard = global.init_tracing_for_backend(self.runtime_backend());
         hermit::proc_mount::warn_if_readonly_proc();
 
-        if capture_output && guest_capture.is_some() {
-            anyhow::bail!("internal output capture cannot be combined with harness guest capture");
-        }
-        if let (Some(capture), Some(summary)) = (guest_capture, self.summary_json.as_deref()) {
-            // Container mounts and chroot are complete here. Relative summary
-            // paths use this process's cwd, not the guest Command's --workdir.
-            capture.require_distinct_from(summary, "--summary-json")?;
-        }
         let backend = self.runtime_backend();
-        let mut command = self.guest_command()?;
-        if let Some(capture) = guest_capture.filter(|_| backend != Backend::Kvm) {
-            let stderr_fd = capture.stderr_fd_for_guest();
-            command.stdout(capture.stdout_for_guest()?);
-            // The pinned reverie-process `spawn_with` currently constructs
-            // child stderr from its stdout configuration. Restore the distinct
-            // harness-owned stderr descriptor after Reverie's stdio setup and
-            // before exec. The held descriptor survives fork despite CLOEXEC;
-            // dup2 both selects fd 2 and clears CLOEXEC on the new descriptor.
-            //
-            // SAFETY: this callback runs after fork. It captures one integer and
-            // calls only async-signal-safe dup2, without allocation or locks.
-            unsafe {
-                command.pre_exec(move || {
-                    if libc::dup2(stderr_fd, libc::STDERR_FILENO) == -1 {
-                        return Err(Errno::last());
-                    }
-                    Ok(())
-                });
-            }
-        }
-
-        // The only `pre_exec` callback of the command, above, installs no
-        // seccomp filter.
+        let command = self.guest_command()?;
+        // The command has no `pre_exec` callback, so it installs no seccomp
+        // filter.
         let config = complete_container_config(self.effective_det_config(), identity_sources)?;
 
         let timeout = self.run_timeout();
-        super::staged_summary::with_published_summary(
-            summary_output,
-            self.summary_json.as_deref(),
-            guest_capture,
-            |summary_json| {
-                let result =
-                    if capture_output || (guest_capture.is_some() && backend == Backend::Kvm) {
-                        let out = hermit::run_with_output_backend_timeout(
-                            command,
-                            config,
-                            self.summary,
-                            summary_json,
-                            backend,
-                            timeout,
-                        )?;
-                        if let Some(capture) = guest_capture {
-                            capture.write_kvm_virtual_console(&out.stdout, &out.stderr)?;
-                            (out.status, None)
-                        } else {
-                            (out.status, Some(out))
-                        }
-                    } else {
-                        let status = hermit::run_with_backend_timeout(
-                            command,
-                            config,
-                            self.summary,
-                            summary_json,
-                            backend,
-                            timeout,
-                        )?;
-                        (status, None)
-                    };
-                self.relabel_e9patch_dispatch_stats(summary_json)?;
-                Ok(result)
-            },
-        )
+        let summary_json = self.summary_json.clone();
+        let result = if capture_output {
+            let out = hermit::run_with_output_backend_timeout(
+                command,
+                config,
+                self.summary,
+                &summary_json,
+                backend,
+                timeout,
+            )?;
+            (out.status, Some(out))
+        } else {
+            let status = hermit::run_with_backend_timeout(
+                command,
+                config,
+                self.summary,
+                &summary_json,
+                backend,
+                timeout,
+            )?;
+            (status, None)
+        };
+        self.relabel_e9patch_dispatch_stats(&summary_json)?;
+        Ok(result)
     }
 
     /// The e9patch spelling runs on the ptrace runtime, which records its
@@ -9510,7 +9248,7 @@ mod tests {
                 ..Default::default()
             };
             fs::write(summary_file.path(), serde_json::to_vec(&summary).unwrap()).unwrap();
-            options.write_backend_engagement_after_run(None).unwrap();
+            options.write_backend_engagement_after_run().unwrap();
             let report: BackendEngagementReport =
                 serde_json::from_slice(&fs::read(engagement_file.path()).unwrap()).unwrap();
             assert_eq!(
@@ -9532,7 +9270,7 @@ mod tests {
                 mapped_sites,
                 b0_sites,
             });
-            options.write_backend_engagement_after_run(None).unwrap();
+            options.write_backend_engagement_after_run().unwrap();
             let report: BackendEngagementReport =
                 serde_json::from_slice(&fs::read(engagement_file.path()).unwrap()).unwrap();
             assert_eq!(
@@ -9702,261 +9440,6 @@ mod tests {
         assert_eq!(
             options.retained_verify_log_dir().unwrap(),
             Some(fs::canonicalize(requested).unwrap())
-        );
-    }
-
-    #[test]
-    fn run_evidence_backend_scope_matches_authoritative_private_sinks() {
-        for backend in [
-            Backend::Ptrace,
-            Backend::Liteinst,
-            Backend::InGuestTrap,
-            Backend::Kvm,
-        ] {
-            let mut options = run_opts_for(&[
-                "hermit",
-                &format!("--backend={}", backend.as_str()),
-                "run",
-                "--run-evidence-dir=/unused/new-path",
-                "/bin/true",
-            ]);
-            options
-                .validate_args_with_perf_support(true)
-                .unwrap_or_else(|error| panic!("{backend:?} should be supported: {error:#}"));
-        }
-
-        for (backend, limitation) in [
-            (Backend::Dbt, "isolated process group"),
-            (Backend::Sabre, "shared stderr"),
-            (Backend::E9patch, "not been qualified"),
-        ] {
-            let mut options = run_opts_for(&[
-                "hermit",
-                &format!("--backend={}", backend.as_str()),
-                "run",
-                "--run-evidence-dir=/unused/new-path",
-                "/bin/true",
-            ]);
-            let error = options.validate_args_with_perf_support(true).unwrap_err();
-            assert!(error.downcast_ref::<PolicyRefusal>().is_some());
-            assert!(error.to_string().contains(limitation), "{error:#}");
-        }
-    }
-
-    #[test]
-    fn run_evidence_is_only_an_ordinary_instrumented_run_option() {
-        for incompatible in ["--verify", "--namespace-only"] {
-            assert!(
-                RunOpts::try_parse_from([
-                    "run",
-                    "--run-evidence-dir=/unused/new-path",
-                    incompatible,
-                    "/bin/true",
-                ])
-                .is_err(),
-                "{incompatible} must remain incompatible with one-run evidence"
-            );
-        }
-    }
-
-    #[test]
-    fn harness_guest_capture_requires_all_paths_and_supported_ordinary_backend() {
-        let flags = [
-            "--run-evidence-dir=/unused/evidence",
-            "--run-result-json=/unused/result.json",
-            "--guest-stdout=/unused/stdout",
-            "--guest-stderr=/unused/stderr",
-        ];
-        let ordinary = RunOpts::parse_from(["run", "/bin/true"]);
-        assert!(ordinary.guest_run_capture_paths().unwrap().is_none());
-        for omitted in 0..flags.len() {
-            let mut args = vec!["run"];
-            args.extend(
-                flags
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, flag)| (index != omitted).then_some(*flag)),
-            );
-            args.push("/bin/true");
-            assert!(
-                RunOpts::try_parse_from(args).is_err(),
-                "accepted capture without {}",
-                flags[omitted]
-            );
-        }
-        for incompatible in ["--verify", "--namespace-only"] {
-            let mut args = vec!["run", incompatible];
-            args.extend(flags);
-            args.push("/bin/true");
-            assert!(RunOpts::try_parse_from(args).is_err());
-        }
-        for backend in [
-            Backend::Ptrace,
-            Backend::Liteinst,
-            Backend::InGuestTrap,
-            Backend::Kvm,
-            Backend::Dbt,
-            Backend::Sabre,
-            Backend::E9patch,
-        ] {
-            let backend_arg = format!("--backend={}", backend.as_str());
-            let mut args = vec!["hermit", backend_arg.as_str(), "run"];
-            args.extend(flags);
-            args.push("/bin/true");
-            let mut options = run_opts_for(&args);
-            let paths = options.guest_run_capture_paths().unwrap().unwrap();
-            assert_eq!(paths.result, PathBuf::from("/unused/result.json"));
-            assert_eq!(paths.stdout, PathBuf::from("/unused/stdout"));
-            assert_eq!(paths.stderr, PathBuf::from("/unused/stderr"));
-            let result = options.validate_args_with_perf_support(true);
-            if matches!(
-                backend,
-                Backend::Ptrace | Backend::Liteinst | Backend::InGuestTrap | Backend::Kvm
-            ) {
-                result.unwrap();
-            } else {
-                assert!(
-                    result
-                        .unwrap_err()
-                        .downcast_ref::<PolicyRefusal>()
-                        .is_some()
-                );
-            }
-        }
-
-        let paths = GuestRunCapturePaths::new(
-            PathBuf::from("/result"),
-            PathBuf::from("/stdout"),
-            PathBuf::from("/stderr"),
-        );
-        assert!(
-            paths
-                .require_distinct_from(Some(Path::new("/stdout")), "--summary-json")
-                .unwrap_err()
-                .to_string()
-                .contains("must not reuse the --summary-json path")
-        );
-    }
-
-    #[test]
-    fn capture_preflight_preserves_summary_and_engagement_collisions() {
-        use std::os::unix::fs::MetadataExt as _;
-        use std::os::unix::fs::symlink;
-
-        let global = GlobalOpts::parse_from(["hermit"]);
-        for option in ["--summary-json", "--backend-engagement-json"] {
-            for capture_name in ["result.json", "stdout", "stderr"] {
-                for alias in [false, true] {
-                    let directory = tempfile::tempdir().unwrap();
-                    let root = directory.path();
-                    let target = root.join(capture_name);
-                    fs::write(&target, b"preserve captured artifact").unwrap();
-                    let before = fs::metadata(&target).unwrap();
-                    let companion = if alias {
-                        let alias = root.join("alias");
-                        symlink(&target, &alias).unwrap();
-                        alias
-                    } else {
-                        target.clone()
-                    };
-                    let engagement = root.join("engagement");
-                    fs::write(&engagement, b"preserve engagement").unwrap();
-                    let evidence = root.join("evidence");
-                    fs::create_dir(&evidence).unwrap();
-                    fs::write(evidence.join("already-claimed"), b"preserve evidence").unwrap();
-                    let mut options =
-                        RunOpts::parse_from(["run", "/nonexistent-capture-preflight-guest"]);
-                    assert!(!options.program.exists());
-                    options.run_evidence_dir = Some(evidence.clone());
-                    options.run_result_json = Some(root.join("result.json"));
-                    options.guest_stdout = Some(root.join("stdout"));
-                    options.guest_stderr = Some(root.join("stderr"));
-                    options.backend_engagement_json = Some(engagement.clone());
-                    if option == "--summary-json" {
-                        options.summary_json = Some(companion);
-                    } else {
-                        options.backend_engagement_json = Some(companion);
-                    }
-                    let error = options.main(&global).unwrap_err();
-                    assert!(
-                        error
-                            .to_string()
-                            .contains(&format!("must not reuse the {option} path")),
-                        "{error:#}"
-                    );
-                    let after = fs::metadata(&target).unwrap();
-                    assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
-                    assert_eq!(fs::read(&target).unwrap(), b"preserve captured artifact");
-                    assert_eq!(fs::read(&engagement).unwrap(), b"preserve engagement");
-                    assert_eq!(
-                        fs::read(evidence.join("already-claimed")).unwrap(),
-                        b"preserve evidence"
-                    );
-                    for absent in ["result.json", "stdout", "stderr"]
-                        .into_iter()
-                        .filter(|name| *name != capture_name)
-                    {
-                        assert!(!root.join(absent).exists());
-                    }
-                }
-            }
-        }
-
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
-        let evidence = root.join("evidence");
-        fs::create_dir(&evidence).unwrap();
-        let paths = GuestRunCapturePaths::new(
-            root.join("result"),
-            root.join("stdout"),
-            root.join("stderr"),
-        );
-        let mut options = RunOpts::parse_from(["run", "/nonexistent-capture-preflight-guest"]);
-        options.summary_json = Some(root.join("summary"));
-        options.backend_engagement_json = Some(root.join("engagement"));
-        options.check_capture_companions(&paths).unwrap();
-        let mut capture = GuestRunCaptureSession::create(&paths, &evidence).unwrap();
-        capture
-            .finish(
-                ExitStatus::Exited(0),
-                GuestRunDeterminism {
-                    detlog_io_buffers: true,
-                    virtualize_time: true,
-                },
-            )
-            .unwrap();
-        fs::write(
-            options.summary_json.as_ref().unwrap(),
-            serde_json::to_vec(&RunSummary {
-                sched_turns: 12,
-                ..RunSummary::default()
-            })
-            .unwrap(),
-        )
-        .unwrap();
-        fs::hard_link(
-            &paths.result,
-            options.backend_engagement_json.as_ref().unwrap(),
-        )
-        .unwrap();
-        let result = fs::read(&paths.result).unwrap();
-        assert!(
-            options
-                .write_backend_engagement_after_run(Some(&capture))
-                .unwrap_err()
-                .to_string()
-                .contains("must not reuse the --backend-engagement-json path")
-        );
-        assert_eq!(fs::read(&paths.result).unwrap(), result);
-        fs::remove_file(options.backend_engagement_json.as_ref().unwrap()).unwrap();
-        options
-            .write_backend_engagement_after_run(Some(&capture))
-            .unwrap();
-        assert_eq!(fs::read(&paths.result).unwrap(), result);
-        assert!(
-            !fs::read(options.backend_engagement_json.as_ref().unwrap())
-                .unwrap()
-                .is_empty()
         );
     }
 

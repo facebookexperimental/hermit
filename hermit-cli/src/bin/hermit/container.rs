@@ -1654,21 +1654,6 @@ impl std::fmt::Display for ContainerChildPanic {
 
 impl std::error::Error for ContainerChildPanic {}
 
-/// Helper to run a function inside a container, taking care to display any
-/// errors and propagate the exit status.
-#[cfg(test)]
-pub fn with_container<F, T>(container: &mut Container, mut f: F) -> Result<T, Error>
-where
-    F: FnMut() -> Result<T, Error>,
-    T: serde::Serialize + serde::de::DeserializeOwned,
-{
-    classify_container_result(container.run(|| {
-        // Runs in the freshly forked container init, not in the caller.
-        arm_container_init_guards()?;
-        catch_child_panic(&mut f)
-    }))
-}
-
 /// Preserve the primary class from a settled container result. The owned CLI
 /// adapter also calls this for its strict error-only failed-child channel.
 pub fn classify_container_result<T>(

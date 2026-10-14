@@ -247,8 +247,7 @@ constructor still uses its caller's stack.
 The in-guest runtime cannot deliver Detcore's preemption timer yet, so Hermit
 refuses a LiteInst run unless `--max-timeslice=disabled` is given. It also
 refuses `--verify`, because the in-guest Tool does not forward its records to
-Hermit yet, and `--run-evidence-dir`, `--timeout`, `--skid-margin` and
-`--gdbserver`. It refuses guest programs it cannot monitor: statically linked,
+Hermit yet, and `--timeout`, `--skid-margin` and `--gdbserver`. It refuses guest programs it cannot monitor: statically linked,
 set-user-ID or non-x86-64 programs, programs with a `DT_PREINIT_ARRAY`, and
 anything other than a regular file. A guest may `fork`, and `vfork` runs as a
 copying fork; creating a thread and `exec` are not supported yet.
@@ -842,7 +841,7 @@ ID        KIND          CREATED               EXIT        COMMAND
   the guest reads, and the working directory, which is recorded in
   `command.cwd` but not applied (relative paths resolve against the rerun's
   directory, and `--from` notes a difference). Output destinations
-  (`--log-file`, `--verify-json`, `--guest-stdout`, ...) are left out, so a
+  (`--log-file`, `--verify-json`, `--verify-run`, ...) are left out, so a
   rerun does not overwrite the original run's files. On a host without a
   usable performance counter, the preemption timer turned off is recorded
   as `max-timeslice: disabled`. Option values are written as given, `--env`
@@ -951,8 +950,7 @@ names the mode and the filter count.
 - Or pass `--unsafe-ignore-host-seccomp` (before or after the subcommand; in a
   run config, `global: {unsafe-ignore-host-seccomp: true}`) to run anyway. The
   run may not reproduce wherever the filter differs. Hermit prints a warning
-  and records the filter's mode and count in the INFO log, including the
-  `--run-evidence-dir` log.
+  and records the filter's mode and count in the INFO log.
 
 Declaring an acknowledged host filter in the run config is tracked in
 <https://github.com/rrnewton/hermit/issues/3942> and not implemented.

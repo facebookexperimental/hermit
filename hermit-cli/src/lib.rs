@@ -47,7 +47,6 @@ pub use detcore::nonwaiting_write;
 pub mod physical_exit_watch;
 pub mod proc_mount;
 mod ptrace_completion;
-pub mod run_evidence;
 
 pub use canonical_verdict::Verdict;
 

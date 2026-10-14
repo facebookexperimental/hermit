@@ -143,8 +143,6 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "robust_futex_owner_death",
             "--test",
-            "run_evidence",
-            "--test",
             "self_sched_determinism",
             "--test",
             "self_schedstat_determinism",
@@ -667,8 +665,10 @@ mod tests {
             // ppoll_simulation tests (https://github.com/rrnewton/hermit/issues/4042),
             // plus the masked epoll_pwait test
             // (https://github.com/rrnewton/hermit/issues/4041), plus the
-            // epoll_pwait2 run test (https://github.com/rrnewton/hermit/issues/4228).
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "300");
+            // epoll_pwait2 run test (https://github.com/rrnewton/hermit/issues/4228),
+            // less the 13 tests of the retired run_evidence target
+            // (https://github.com/rrnewton/hermit/issues/4275).
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "287");
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(
