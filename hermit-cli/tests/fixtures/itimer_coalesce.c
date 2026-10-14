@@ -643,11 +643,12 @@ static int mixed(int argc, char** argv) {
 }
 
 /* The mixed-mask case sampled: the leader reads getitimer every half period
- * for 10 periods. Under Hermit the worker, the first unblocked thread
- * resumed after each expiry, always dequeues before the leader can see the
- * copy, so the acknowledged protocol of `mixed` never observes a generation;
- * a timer that keeps running reads positive at some sample, a dead one never
- * does. */
+ * for 10 periods. A timer that keeps running reads positive at most samples;
+ * one can read 0 in the window between an expiry and the worker's dequeue,
+ * as on Linux, and how many do depends on where this binary's preemption
+ * points fall. A timer stopped at generation reads positive only before its
+ * first expiry. Under Hermit the worker usually dequeues before the leader
+ * looks, so the acknowledged protocol of `mixed` runs only natively. */
 static int mixedsample(int argc, char** argv) {
   if (argc != 3) {
     return 2;
