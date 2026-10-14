@@ -294,7 +294,7 @@ pub fn self_test() -> Result<String, String> {
         ),
         (
             "focused compat profile",
-            eligible(0, 0, true, true, false, "strict-compat-only", "cargo"),
+            eligible(0, 0, true, true, false, "sabre-compat-only", "cargo"),
         ),
         (
             "cell requalification profile",

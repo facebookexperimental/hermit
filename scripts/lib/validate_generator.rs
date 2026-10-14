@@ -148,22 +148,6 @@ pub(crate) fn generated_partition_steps(
     sabre_prep.labels = vec!["sabre-compat-only".into()];
     steps.push(sabre_prep);
 
-    // The strict run type's rows are the compat.yaml cells labelled
-    // strict-compat-only, run the same way by strictcompat.manifest_compat.
-    let mut strict_prep = prepare_fixtures_node_dep(
-        "strictcompatprep.fixtures",
-        &portable_fixtures,
-        "build.host_hermit_link",
-    );
-    strict_prep.group = "strictcompatprep".into();
-    strict_prep.desc = "Prepare the fixture files the strict run type's compat cells read".into();
-    strict_prep.description = format!(
-        "Runs tests/compat/prepare_real_compat_fixtures.sh into {} on the host, once build.host_hermit_link has linked the validation's one Hermit build: {REAL_COMPAT_FIXTURE_CONTENTS}, the run-owned files the compat.yaml rows of strictcompat.manifest_compat read. A fixture that fails to build or a missing host tool stops the run type before the bucket runs.",
-        portable_fixtures.display()
-    );
-    strict_prep.labels = vec!["strict-compat-only".into()];
-    steps.push(strict_prep);
-
     // The rr run type's rows are the compat.yaml replay cells labelled
     // rr-compat-only, run the same way by rrcompat.manifest_compat.
     let mut rr_prep = prepare_fixtures_node_dep(

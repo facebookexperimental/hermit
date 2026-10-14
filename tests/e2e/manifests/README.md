@@ -33,9 +33,9 @@ Seven buckets currently contain calibrated blocking workloads:
   `corpus` section; five of its rows are diagnostics; 63 of its rows also
   have a verify cell on liteinst and on in-guest-trap that the full run type
   runs (`additional`); it also holds the
-  `sabre-compat-only` run type's SaBRe cells and its 27 extra rows, the
-  `rr-compat-only` run type's 139 replay cells, and the
-  `strict-compat-only` run type's 219 strict variant tests)
+  `sabre-compat-only` run type's SaBRe cells and its 27 extra rows, and the
+  `rr-compat-only` run type's 139 replay cells. Each row is one test: its
+  ptrace verify cell runs at the host's strictness level, below)
 
 Eight additional `*-c.yaml`/`c-programs.yaml` buckets make 180 more C guests
 centrally discoverable. Eight `c-programs.yaml` entries have calibrated

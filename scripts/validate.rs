@@ -808,12 +808,18 @@ impl Level {
     }
 }
 
+/// The refusal of the retired `--strict-compat-only` run type.
+const STRICT_COMPAT_ONLY_RETIRED: &str = "--strict-compat-only was retired on 2026-10-13 with the 219 \
+     compat/strict-<row> tests (https://github.com/rrnewton/hermit/issues/4276): every compat row \
+     is now one test whose ptrace verify cell runs at the host's strictness level, strict on a \
+     host with CPUID faulting and an exact branch counter, so the full validation runs what this \
+     run type ran; --portable-strict-compat-only runs the compat bucket alone";
+
 /// A focused mode runs exactly one matrix/lane and exits. At most one may be
 /// active, and none may combine with an explicit level — the same two-way
 /// exclusion `validate.sh` enforces (validate.sh:360-367).
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum Focused {
-    StrictCompat,
     PortableStrictCompat,
     RrCompat,
     SabreCompat,
@@ -846,7 +852,6 @@ impl Focused {
     /// validate.sh:381-392 so history for a profile stays continuous.
     fn profile(&self) -> String {
         match self {
-            Focused::StrictCompat => "strict-compat-only".into(),
             Focused::PortableStrictCompat => "portable-strict-compat-only".into(),
             Focused::RrCompat => "rr-compat-only".into(),
             Focused::SabreCompat => "sabre-compat-only".into(),
@@ -868,7 +873,6 @@ impl Focused {
     /// name used in that refusal message.
     fn cli_name(&self) -> &'static str {
         match self {
-            Focused::StrictCompat => "strict-compat-only",
             Focused::PortableStrictCompat => "portable-strict-compat-only",
             Focused::RrCompat => "rr-compat-only",
             Focused::SabreCompat => "sabre-compat-only",
@@ -1262,7 +1266,6 @@ fn usage() -> &'static str {
      \x20 --portable       Alias for the portable-only level.\n\
      \n\
      Focused gates (run one matrix/lane and exit):\n\
-     \x20 --strict-compat-only          Only the compat bucket's strict cells (label strict-compat-only).\n\
      \x20 --portable-strict-compat-only Only the strict compatibility bucket (compat.yaml), release Hermit.\n\
      \x20 --rr-compat-only              Only the compat bucket's record/replay cells (label rr-compat-only).\n\
      \x20 --sabre-compat-only           Only the compat bucket's SaBRe cells (label sabre-compat-only).\n\
@@ -1484,7 +1487,12 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
             }
             "--quick" => set_level(&mut args, Level::Quick)?,
             "--portable" | "--portable-only" => set_level(&mut args, Level::PortableOnly)?,
-            "--strict-compat-only" => focused.push(Focused::StrictCompat),
+            // Retired with the compat/strict-<row> tests: each compat row is
+            // one test that runs strict wherever the host can.
+            "--strict-compat-only" => {
+                eprintln!("validate: {STRICT_COMPAT_ONLY_RETIRED}");
+                return Err(2);
+            }
             "--portable-strict-compat-only" => focused.push(Focused::PortableStrictCompat),
             "--rr-compat-only" => focused.push(Focused::RrCompat),
             "--sabre-compat-only" => focused.push(Focused::SabreCompat),
@@ -4705,7 +4713,6 @@ fn self_test() -> Result<(), String> {
     }
     for m in [
         "envelope-only",
-        "strict-compat-only",
         "portable-strict-compat-only",
         "rr-compat-only",
         "sabre-compat-only",
@@ -12729,7 +12736,6 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
         (Some(Focused::PrivilegedOnly), _) => Some("privileged"),
         (Some(Focused::HostedPortable), _) => Some("hosted-portable"),
         (Some(Focused::HostedPrivileged), _) => Some("hosted-privileged"),
-        (Some(Focused::StrictCompat), _) => Some("strict-compat-only"),
         (Some(Focused::PortableStrictCompat), _) => Some("portable-strict-compat-only"),
         (Some(Focused::RrCompat), _) => Some("rr-compat-only"),
         (Some(Focused::SabreCompat), _) => Some("sabre-compat-only"),
@@ -18301,8 +18307,10 @@ printf 'FORWARDED_CPU=%s\nFORWARDED_WALL=%s\n' "$cpu_value" "$wall_value"
         // full-buck-e2e import twins (<bucket>_buck), which only
         // scripts/validate.rs --e2e-runner buck-local|buck-hybrid selects,
         // each publish the cells of their bucket from the rows
-        // e2e.buck_cells wrote.
-        assert_eq!(steps.len(), 56);
+        // e2e.buck_cells wrote. 55 since strictcompat.manifest_compat was
+        // retired with the compat/strict-<row> tests
+        // (https://github.com/rrnewton/hermit/issues/4276).
+        assert_eq!(steps.len(), 55);
         for step in steps {
             let (selection, prebuilt) = manifest_step_policy(step).unwrap();
             assert_eq!(prebuilt, step.tag() != "quick.e2e_verify", "{}", step.tag());
@@ -21576,7 +21584,7 @@ fn product_front_door_bracket() -> Result<(), String> {
         &parent,
         &checkout,
         commit,
-        "--strict-compat-only",
+        "--sabre-compat-only",
         true,
         false,
     )
@@ -21596,7 +21604,7 @@ fn product_front_door_bracket() -> Result<(), String> {
         &parent,
         &checkout,
         commit,
-        "--strict-compat-only",
+        "--sabre-compat-only",
         true,
         true,
     )
@@ -21609,7 +21617,7 @@ fn product_front_door_bracket() -> Result<(), String> {
         &parent,
         &checkout,
         commit,
-        "--strict-compat-only",
+        "--sabre-compat-only",
         false,
         false,
     )
@@ -21727,7 +21735,7 @@ fn product_front_door_process_bracket() -> Result<(), String> {
             (
                 "focused-invalid-authority",
                 &[
-                    "--strict-compat-only",
+                    "--sabre-compat-only",
                     SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_OPTION,
                 ],
                 false,
@@ -21738,7 +21746,7 @@ fn product_front_door_process_bracket() -> Result<(), String> {
             (
                 "nested-marker-invalid-authority",
                 &[
-                    "--strict-compat-only",
+                    "--sabre-compat-only",
                     SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_OPTION,
                 ],
                 true,
@@ -26366,10 +26374,10 @@ fn run_state_path_bracket() -> Result<(), String> {
             }
         }
     }
-    if validation_run_state_path(root, "strict-compat-only", None, None, true, 41, 99).is_ok() {
+    if validation_run_state_path(root, "sabre-compat-only", None, None, true, 41, 99).is_ok() {
         return Err("a nested execution accepted missing outer run state".into());
     }
-    let profiles = ["full", "portable", "quick", "strict-compat-only"];
+    let profiles = ["full", "portable", "quick", "sabre-compat-only"];
     let mut observed = BTreeSet::new();
     for (index, profile) in profiles.iter().enumerate() {
         let path =
@@ -26402,7 +26410,7 @@ fn run_state_path_bracket() -> Result<(), String> {
     }
     let inherited = validation_run_state_path(
         root,
-        "strict-compat-only",
+        "sabre-compat-only",
         None,
         Some(OsStr::new("/repo/target/validation/outer")),
         true,
@@ -26414,7 +26422,7 @@ fn run_state_path_bracket() -> Result<(), String> {
     }
     if validation_run_state_path(
         root,
-        "strict-compat-only",
+        "sabre-compat-only",
         None,
         Some(OsStr::new("/caller/chosen")),
         true,
@@ -34001,8 +34009,10 @@ mod raw_census_publication_tests {
         // full-buck-e2e import twins (<bucket>_buck), which only
         // scripts/validate.rs --e2e-runner buck-local|buck-hybrid selects,
         // each publish the cells of their bucket from the rows
-        // e2e.buck_cells wrote.
-        assert_eq!(publishers.len(), 56);
+        // e2e.buck_cells wrote. 55 since strictcompat.manifest_compat was
+        // retired with the compat/strict-<row> tests
+        // (https://github.com/rrnewton/hermit/issues/4276).
+        assert_eq!(publishers.len(), 55);
         for step in publishers {
             let path = normal_raw_result_path(step, "fixture-run").unwrap();
             // Only the full-buck-e2e label admits the import launcher.

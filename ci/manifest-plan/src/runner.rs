@@ -10714,11 +10714,14 @@ corpus:
     /// https://github.com/rrnewton/hermit/issues/3448 moved it into
     /// compat.yaml; the shipped row, built the way the runner builds it under
     /// e2e.manifest_compat's HERMIT_E2E_EMPTY_WORKDIR=/test, still carries
-    /// every one of those flags, now with the strict comparator
-    /// (--verify-strict, since 2026-10-07), and the guest argv with its
-    /// run-owned fixture path.
+    /// every one of those flags on a host at the relaxed strictness level,
+    /// now with the strict comparator (--verify-strict, since 2026-10-07),
+    /// and the guest argv with its run-owned fixture path. On a host at the
+    /// strict level it carries neither relaxation: since 2026-10-13 the
+    /// level, not the row, owns them
+    /// (https://github.com/rrnewton/hermit/issues/4276).
     #[test]
-    fn a_shipped_compat_row_keeps_the_strict_compatibility_probe_flags() {
+    fn a_shipped_compat_row_runs_at_the_hosts_strictness_level() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let cells = ManifestSet::load(&root)
             .unwrap()
@@ -10781,16 +10784,32 @@ corpus:
             isolated_workdir: Some(PathBuf::from("/test")),
             exact_branch_counter: None,
         };
-        let spec = build_spec(
-            &context,
-            cell,
-            PathBuf::from("/repo/results/cell"),
-            guest.clone(),
-            "1",
-            None,
-            cell.timeout_seconds,
-        )
-        .unwrap();
+        let spec_on = |cell: &SelectedCell| {
+            build_spec(
+                &context,
+                cell,
+                PathBuf::from("/repo/results/cell"),
+                guest.clone(),
+                "1",
+                None,
+                cell.timeout_seconds,
+            )
+            .unwrap()
+        };
+        let strict_spec = spec_on(cell);
+        for flag in RELAXED_LEVEL_ARGS {
+            assert!(
+                !strict_spec.argv.iter().any(|arg| arg == flag),
+                "{flag} in {:?}",
+                strict_spec.argv
+            );
+        }
+        let mut relaxed_cell = cell.clone();
+        relaxed_cell.host_level = HostLevel {
+            level: StrictnessLevel::Relaxed,
+            reason: Some("this host has no CPUID faulting (fixture)".into()),
+        };
+        let spec = spec_on(&relaxed_cell);
         let argv = &spec.argv;
         let at = |want: &[&str]| {
             argv.windows(want.len())

@@ -1534,7 +1534,7 @@ test:
         for (test, mode, backend) in [
             ("compat/java", "verify", "ptrace"),
             ("compat/comm", "verify", "sabre"),
-            ("compat/strict-du", "verify", "sabre"),
+            ("compat/java", "verify", "dbt"),
             ("compat/comm", "verify", "ptrace"),
         ] {
             let argv = &reproducer(test, mode, backend).argv;

@@ -563,7 +563,7 @@ struct Profile {
 // full-buck-e2e is only the Buck E2E nodes; a Buck full run selects it with a
 // pruned full (buck_e2e_selection), which assert_buck_e2e_selection counts.
 // It gained e2e.buck_stage when the staging left e2e.buck_cells: 18/23 before.
-const PROFILES: [Profile; 12] = [
+const PROFILES: [Profile; 11] = [
     // full and portable each lost test.liteinst_strict, hosted-portable lost
     // its twin test.liteinst_strict_on_host, and super lost
     // super.liteinst_python3_verify_diagnostics when the LiteInst host hybrid
@@ -633,12 +633,6 @@ const PROFILES: [Profile; 12] = [
     // 2/13 before. The strict and rr run types gained the same ancestor.
     Profile {
         label: "sabre-compat-only",
-        direct_steps: 2,
-        selected_steps: 14,
-    },
-    // The strict run type: the same shape as the SaBRe run type.
-    Profile {
-        label: "strict-compat-only",
         direct_steps: 2,
         selected_steps: 14,
     },
@@ -981,7 +975,6 @@ pub const HOST_MANIFEST_RUNS: &[&str] = &[
     "e2e.manifest_compat",
     "portablecompat.manifest_compat",
     "sabrecompat.manifest_compat",
-    "strictcompat.manifest_compat",
     "rrcompat.manifest_compat",
 ];
 
@@ -2354,7 +2347,6 @@ fn materialize_regular_calibration_launch(cfg: &mut DagConfig) -> Result<(), Str
 enum GeneratedPartition {
     PortableCompat,
     PortableFocusedCompat,
-    StrictCompat,
     SabreCompat,
     E9patchCompat,
     RrCompat,
@@ -2369,10 +2361,6 @@ fn generated_partition(step: &Step) -> Option<GeneratedPartition> {
         "portablecompatprep" => {
             return Some(GeneratedPartition::PortableFocusedCompat);
         }
-        // The strict lane's rows are the compat.yaml cells labelled
-        // strict-compat-only, run by the static node
-        // strictcompat.manifest_compat; only its fixtures are generated.
-        "strictcompatprep" => return Some(GeneratedPartition::StrictCompat),
         // The SaBRe lane's rows are the compat.yaml cells labelled
         // sabre-compat-only, run by the static node
         // sabrecompat.manifest_compat; only its fixtures are generated.
@@ -2431,9 +2419,6 @@ fn refresh_generated_partitions(
         // 1 since the focused portable lane runs the same bucket through the
         // static node portablecompat.manifest_compat: only its fixtures remain.
         (GeneratedPartition::PortableFocusedCompat, 1usize),
-        // 1 since the strict lane's 193 probes became compat.yaml cells run by
-        // the static node strictcompat.manifest_compat: only its fixtures remain.
-        (GeneratedPartition::StrictCompat, 1usize),
         // 1 since the SaBRe lane's 212 probes became compat.yaml cells run by
         // the static node sabrecompat.manifest_compat: only its fixtures remain.
         (GeneratedPartition::SabreCompat, 1usize),
@@ -2480,7 +2465,6 @@ fn refresh_generated_partitions(
     for partition in [
         GeneratedPartition::PortableCompat,
         GeneratedPartition::PortableFocusedCompat,
-        GeneratedPartition::StrictCompat,
         GeneratedPartition::SabreCompat,
         GeneratedPartition::E9patchCompat,
         GeneratedPartition::RrCompat,
@@ -2495,9 +2479,9 @@ fn refresh_generated_partitions(
             );
         }
     }
-    if inserted.len() != 8 {
+    if inserted.len() != 7 {
         return Err(format!(
-            "committed DAG has anchors for {} of 8 generated partitions",
+            "committed DAG has anchors for {} of 7 generated partitions",
             inserted.len()
         ));
     }
@@ -2567,9 +2551,11 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // ptrace cases that need the PMU timer.
     // One required local M1 target adds one Nextest result producer.
     // 137 with the additive required M2 stack consumer; all 136 prior producers remain.
-    if expected.len() != 137 {
+    // 136 since strictcompat.manifest_compat was retired with the
+    // compat/strict-<row> tests (https://github.com/rrnewton/hermit/issues/4276).
+    if expected.len() != 136 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 137",
+            "structured result producer registry has {} entries, expected 136",
             expected.len()
         ));
     }
@@ -2726,7 +2712,9 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // (https://github.com/rrnewton/hermit/issues/3520), and 69 with
     // test.record_replay, and 70 with test.pmu_integration_cases.
     // The local required allocator and stack consumers each add one Nextest writer.
-    if actual_group_counts != [72, 56, 7, 2] {
+    // TestHarness 55 since strictcompat.manifest_compat was retired
+    // (https://github.com/rrnewton/hermit/issues/4276).
+    if actual_group_counts != [72, 55, 7, 2] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
         ));
@@ -3886,9 +3874,13 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // external_signal_interrupt ptrace cases that need the PMU timer (434 + 1).
     // M1 adds one diagnostic pinned producer and one required local consumer.
     // M2 adds one consumer of the same producer; all 437 prior nodes remain.
-    if cfg.steps.len() != 438 {
+    // 436 since the strict-compat-only run type was retired with the
+    // compat/strict-<row> tests: strictcompatprep.fixtures and
+    // strictcompat.manifest_compat (438 - 2;
+    // https://github.com/rrnewton/hermit/issues/4276).
+    if cfg.steps.len() != 436 {
         return Err(format!(
-            "superset has {} steps, expected 438",
+            "superset has {} steps, expected 436",
             cfg.steps.len()
         ));
     }
@@ -4097,18 +4089,17 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     }
     for group in [
         "portablecompatprep",
-        "strictcompatprep",
         "sabrecompatprep",
         "e9patchcompatprep",
         "rrcompatprep",
     ] {
         let prep = step(&format!("{group}.fixtures"))?;
-        // The SaBRe, strict and rr run types take the validation's one build,
+        // The SaBRe and rr run types take the validation's one build,
         // linked on the host by build.host_hermit_link, instead of a dedicated
         // release build.
         let producer = match group {
             "portablecompatprep" => "compatprep.hermit_release_in_pinned_root",
-            "sabrecompatprep" | "strictcompatprep" | "rrcompatprep" => HOST_HERMIT_LINK_TAG,
+            "sabrecompatprep" | "rrcompatprep" => HOST_HERMIT_LINK_TAG,
             _ => "compatprep.hermit_release",
         };
         if !prep.deps.iter().any(|dependency| dependency == producer)
@@ -5513,9 +5504,9 @@ sys.exit(37)
     #[test]
     fn steps_sharing_a_result_file_never_run_in_one_run_type() {
         // e2e.manifest_compat, portablecompat.manifest_compat,
-        // sabrecompat.manifest_compat, strictcompat.manifest_compat,
-        // rrcompat.manifest_compat, e2e.manifest_compat_on_host and the
-        // full-buck-e2e import twin e2e.manifest_compat_buck all write
+        // sabrecompat.manifest_compat, rrcompat.manifest_compat,
+        // e2e.manifest_compat_on_host and the full-buck-e2e import twin
+        // e2e.manifest_compat_buck all write
         // $E2E_RESULT_ROOT/portable/manifest_compat/results.jsonl. That is safe
         // only while no run type selects two of them: a run selects one label,
         // so their label sets must be non-empty and pairwise disjoint.
@@ -5533,8 +5524,8 @@ sys.exit(37)
             .get("$E2E_RESULT_ROOT/portable/manifest_compat/results.jsonl")
             .map_or(0, Vec::len);
         assert_eq!(
-            shared, 7,
-            "the six manifest_compat buckets and the Buck import twin share one result file"
+            shared, 6,
+            "the five manifest_compat buckets and the Buck import twin share one result file"
         );
         for (path, steps) in &writers {
             for (index, first) in steps.iter().enumerate() {

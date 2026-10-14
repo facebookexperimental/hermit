@@ -7750,7 +7750,9 @@ sys.exit(1 if failed else 0)
         // for rrcompat.manifest_compat, the rr run type's. +16 direct for
         // the full-buck-e2e import twins (<bucket>_buck), which import the
         // rows e2e.buck_cells wrote on the host and so run outside the root.
-        assert_eq!((pinned, direct), (19, 37));
+        // -1 direct when strictcompat.manifest_compat was retired with the
+        // compat/strict-<row> tests (https://github.com/rrnewton/hermit/issues/4276).
+        assert_eq!((pinned, direct), (19, 36));
     }
 
     /// The full profile's harness nodes together report each cell of the

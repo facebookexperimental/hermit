@@ -13100,16 +13100,17 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
     Ok(())
 }
 
-/// Red cells the default run type does not select: a test-level label
-/// (compat/strict-du), a row label on the verify cells (compat/java on
-/// ptrace, compat/comm on SaBRe), and the rr-compat replay cell of a row's
-/// own test (compat/awk, whose verify cell on ptrace is of the default run
-/// type). [`focused_red_cells`] puts an [`ordinary_red_cell`] beside them.
-const FOCUSED_LABELLED_RED_CELLS: [(&str, &str, &str); 4] = [
+/// Red cells the default run type does not select: a row label on the verify
+/// cells (compat/java on ptrace, compat/comm on SaBRe) and the rr-compat
+/// replay cell of a row's own test (compat/awk, whose verify cell on ptrace is
+/// of the default run type). No test carries a test-level label since the
+/// compat/strict-<row> tests were retired
+/// (<https://github.com/rrnewton/hermit/issues/4276>).
+/// [`focused_red_cells`] puts an [`ordinary_red_cell`] beside them.
+const FOCUSED_LABELLED_RED_CELLS: [(&str, &str, &str); 3] = [
     ("compat/awk", "replay", "ptrace"),
     ("compat/comm", "verify", "sabre"),
     ("compat/java", "verify", "ptrace"),
-    ("compat/strict-du", "verify", "ptrace"),
 ];
 
 /// A cell as the self-tests name one: (test, mode, backend).
@@ -13203,11 +13204,12 @@ fn named_cells(cells: &[NamedCell]) -> Vec<(&str, &str, &str)> {
         .map(|(test, mode, backend)| (test.as_str(), mode.as_str(), backend.as_str()))
         .collect()
 }
-/// Disabled SaBRe cells: one of a labelled test, one of a default-run-type test.
-const FOCUSED_DISABLED_SABRE_CELLS: [(&str, &str, &str); 2] = [
-    ("compat/comm", "replay", "sabre"),
-    ("compat/strict-du", "verify", "sabre"),
-];
+/// A disabled SaBRe cell of a default-run-type test. The disabled SaBRe cell
+/// of a labelled test this list also held, compat/strict-du's, went with the
+/// compat/strict-<row> tests (<https://github.com/rrnewton/hermit/issues/4276>);
+/// no labelled test has a disabled SaBRe cell now.
+const FOCUSED_DISABLED_SABRE_CELLS: [(&str, &str, &str); 1] =
+    [("compat/comm", "replay", "sabre")];
 
 /// The `test-harness` subcommand of a generated command and the selection it
 /// applies, parsed as `test-harness` parses them: `--include-manual` selects

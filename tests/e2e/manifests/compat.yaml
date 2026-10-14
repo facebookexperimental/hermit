@@ -10,9 +10,13 @@ bucket: compat
 # compares them), and the liteinst and in-guest-trap verify cells of the rows
 # each `additional` entry names. The rr lane's rows also have a replay cell
 # (`replay`) that records and replays the program on ptrace, for the rr run
-# type alone. The `variants` entry repeats the strict corpus's rows as
-# strict-<row> tests for the strict run type alone, on ptrace with none of the
-# relaxations below.
+# type alone. Each row is one test: its ptrace verify cell runs at the
+# host's strictness level (tests/e2e/manifests/README.md, "Strictness level"),
+# strict with CPUID virtualization and the preemption timer on where the host
+# has CPUID faulting and an exact branch counter, relaxed elsewhere. Until
+# 2026-10-13 the `variants` entry repeated every row as a second test,
+# compat/strict-<row>, for a strict run type, while this cell always ran
+# relaxed (https://github.com/rrnewton/hermit/issues/4276).
 # The scheduled super suite still runs its four heavy rows (rustc, javac, java,
 # node) on ptrace from ci/compat/corpus-strict.json. Lane settings are stated
 # once below and every row is expanded into an ordinary test recipe
@@ -29,12 +33,6 @@ corpus:
   requires: [linux, x86_64, userns, ptrace]
   backend: ptrace
   verify:
-    hermit_args: [--no-virtualize-cpuid, --max-timeslice=disabled]
-    hermit_args_reason: >-
-      The portable strict corpus measures each program with CPUID
-      virtualization and the preemption timeslice off
-      (PORTABLE_STRICT_PROBE_ARGS in validate.sh), so it runs on hosts
-      without CPUID faulting or a usable PMU
     env: {TMPDIR: /tmp}
     no_retry_reason: >-
       Each program ran once per validation as its own compat.<program> node,
@@ -96,9 +94,8 @@ corpus:
   # sabre-compat-only rows (df-direct, lua-direct and perl-direct) too. Each
   # row left off names the failure class of its first run in the second
   # survey; the 27 sabre-compat-only rows that survey did not run keep the
-  # first survey's result. The strict-compat-only variant stays off: it exists
-  # to run with preemption on, which neither survey measured. python3 stays
-  # off by coordinator ruling (its `disabled` entries say why).
+  # first survey's result. python3 stays off by coordinator ruling (its
+  # `disabled` entries say why).
   additional:
     - backend: liteinst
       hermit_args: [--max-timeslice=disabled]
@@ -121,9 +118,9 @@ corpus:
           sysctl-random-uuid, test, "true", uname, uptime, users, vmstat,
           vmstat-disk, wc, wc-lines, whoami
         ]
-      # These settings belong to exactly these two ordinary LiteInst cells.
-      # Strict variants retain their preemption requirement. Other rows and
-      # backends retain their existing environments and interception routes.
+      # These settings belong to exactly these two LiteInst cells. Other rows
+      # and backends retain their existing environments and interception
+      # routes.
       row_env:
         mpstat-softirqs:
           REVERIE_LITEINST_SITE_PATCHING: '0'
@@ -1637,32 +1634,6 @@ corpus:
           Replay reads a different 11-byte readlink target than the recording
           at scheduler turn 112, in 3 of 3 runs
         rows: [lsof]
-  # The strict run type (scripts/validate.rs --strict-compat-only): every row
-  # of ci/compat/corpus-strict.json once more on ptrace, under --strict and
-  # Hermit's strict --verify with none of the corpus's relaxations, so
-  # CPUID virtualization and the preemption timeslice stay on. Until
-  # 2026-10-02 these were 193 separate strictcompat.<program> validation
-  # nodes running the same argv.
-  variants:
-    - label: strict-compat-only
-      id_prefix: strict-
-      description: Real program under strict Hermit with no relaxations
-      timeout_seconds: 60
-      cpu_timeout_seconds: 59
-      slow_reason: >-
-        The strict lane gives every program 60 wall seconds
-        (STRICT_COMPAT_TIMEOUT in validate.sh), heavy rows included: the
-        wall bound its generated strictcompat.<program> validation nodes
-        carried. Their 120 CPU seconds cannot be stated: a cell's CPU
-        budget must stay below its wall bound, so it is 59. Measured on
-        2026-10-02 with the release Hermit built at 03bbb8358: the slowest
-        passing program (rustc) used 4.0 s wall and 3.5 s CPU, and the two
-        red JVM rows at most 19.6 s wall and 19.2 s CPU
-      no_retry_reason: >-
-        Each program ran once per strict validation as its own
-        strictcompat.<program> node, and a failure of that one run failed
-        the validation; a second attempt would let a nondeterministic
-        program pass
   rows:
     - {label: "echo", argv: ["/bin/echo", "hermit-compat"]}
     - {label: "true", argv: ["/usr/bin/true"]}
