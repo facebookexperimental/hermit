@@ -29093,7 +29093,12 @@ fn run_kvm_fifo_with_a_host_peer_waits_in_the_kernel_as_on_linux() {
             &fifo,
         ];
         let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-        // The host acts on its own thread while the run is bounded here.
+        // The host acts on its own thread while the run is bounded here. It
+        // hands its end back rather than closing it, so the FIFO stays open
+        // until the run is over: a guest that starts more slowly than the
+        // host writes, as a KVM guest under load does, still finds the byte.
+        // Closed, the last open end took the byte with it, and the guest's
+        // read returned 0 (https://github.com/rrnewton/hermit/issues/4327).
         let host = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(500));
             if mode == "host-reader" {
@@ -29105,6 +29110,7 @@ fn run_kvm_fifo_with_a_host_peer_waits_in_the_kernel_as_on_linux() {
                     .write_all(b"h")
                     .expect("failed to write the host end of the FIFO");
             }
+            host_end
         });
         let (status, log) = run_with_deadline(
             hermit_command(&args),
@@ -29119,7 +29125,7 @@ fn run_kvm_fifo_with_a_host_peer_waits_in_the_kernel_as_on_linux() {
             Some(0),
             "{args:?}: the KVM run must finish and exit 0:\nstdout:\n{output}\nstderr:\n{log}"
         );
-        host.join().expect("the host end of the FIFO failed");
+        drop(host.join().expect("the host end of the FIFO failed"));
         assert_eq!(output, expected, "{args:?}\nstderr:\n{log}");
         assert!(
             !log.contains("is a FIFO with a guest at its other end"),
