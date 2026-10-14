@@ -196,6 +196,14 @@ pub struct ExecFdState {
     /// Offered only to the registered root's initial image by its launcher.
     #[serde(default)]
     pub(crate) initial_input: Option<reverie::InheritedInputIdentity>,
+    /// The owner-death wakes a successful exec makes Linux deliver, read
+    /// before the exec where the backend runs the native execve outside
+    /// Detcore's handler (DBT). The coordinator delivers them at the new
+    /// image's reconnect, or when the caller's thread ends without one (an
+    /// exec that ends its group), and drops them with an exec cancelled before
+    /// its point of no return (<https://github.com/rrnewton/hermit/issues/4268>).
+    #[serde(default)]
+    pub(crate) robust_wakes: Vec<(DetTid, FutexID)>,
 }
 
 impl ExecFdState {
@@ -214,6 +222,20 @@ impl From<ExecFdBlockingOverrides> for ExecFdState {
             ..Self::default()
         }
     }
+}
+
+/// The wakes an exec's walk of each owner's list found, in delivery order:
+/// owners in walk order, each owner's words in futex-key order.
+pub(crate) fn flatten_exec_robust_list_wakes(
+    wakes: Vec<(DetTid, Vec<RobustListWake>)>,
+) -> Vec<(DetTid, RobustListWake)> {
+    wakes
+        .into_iter()
+        .flat_map(|(owner, mut wakes)| {
+            wakes.sort_by_key(|wake| format!("{:?}", wake.futex));
+            wakes.into_iter().map(move |wake| (owner, wake))
+        })
+        .collect()
 }
 
 /// A single POSIX per-process interval timer created by `timer_create(2)`.
@@ -3448,6 +3470,7 @@ impl<T> ThreadState<T> {
             .collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn robust_list_heads(&self) -> Vec<(DetTid, usize)> {
         self.robust_list_process
             .lock()
@@ -3550,13 +3573,7 @@ impl<T> ThreadState<T> {
             .robust_list_process
             .lock()
             .expect("robust-list process state mutex poisoned");
-        process.exec_pending = wakes
-            .into_iter()
-            .flat_map(|(owner, mut wakes)| {
-                wakes.sort_by_key(|wake| format!("{:?}", wake.futex));
-                wakes.into_iter().map(move |wake| (owner, wake))
-            })
-            .collect();
+        process.exec_pending = flatten_exec_robust_list_wakes(wakes);
     }
 
     /// Take the wakes staged at the exec's entry: to deliver them once it has

@@ -549,6 +549,7 @@ fn run_ready<F: Future>(future: F) -> F::Output {
 
 #[allow(clippy::too_many_arguments)]
 fn send_dbt_prepare_exec(
+    tool: &Detcore,
     context: *mut c_void,
     scheduler_tid: Pid,
     physical_pid: i32,
@@ -575,7 +576,18 @@ fn send_dbt_prepare_exec(
         read_registers,
         write_registers,
     );
-    run_ready(prepare_exec(&mut guest, mm, blocking_overrides));
+    // Linux walks the old thread group's robust lists in the exec and marks
+    // the owner words; Detcore's parked waiters need its wakes, which the new
+    // image's fresh runtime cannot stage. Read them now, while the old image
+    // is mapped and before the client rewrites owner TIDs, and hand them to
+    // the coordinator (https://github.com/rrnewton/hermit/issues/4268).
+    let robust_wakes = run_ready(tool.exec_robust_list_wakes(&mut guest));
+    run_ready(prepare_exec(
+        &mut guest,
+        mm,
+        blocking_overrides,
+        robust_wakes,
+    ));
     PreparedExec {
         context: context as usize,
         branches,
@@ -2668,6 +2680,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
                 let thread = unsafe { &mut *scratch.runtime_state };
                 if should_send_dbt_prepare_exec(thread.initialized, tid, pid) {
                     let prepared = send_dbt_prepare_exec(
+                        tool,
                         context,
                         thread.tid,
                         pid,

@@ -962,6 +962,99 @@ static int reversed_owner_main(void) {
   return 0;
 }
 
+/*
+ * exec-two-waiters (Claude review of https://github.com/rrnewton/hermit/pull/4352,
+ * F1): a forked owner holds one process-shared robust mutex and execs. Two raw
+ * FUTEX_WAIT waiters in other processes, each with a 3 s timeout, wait on its
+ * word. Linux marks the word FUTEX_OWNER_DIED and wakes exactly one waiter;
+ * the other times out.
+ */
+struct two_waiters_state {
+  pthread_mutex_t mutex;
+  _Atomic int ready;
+  _Atomic int trigger;
+  _Atomic int parked;
+  _Atomic int woken;
+  _Atomic int timed_out;
+};
+static struct two_waiters_state* tw;
+
+static void two_waiters_raw_waiter(void) {
+  _Atomic uint32_t* word = (_Atomic uint32_t*)&tw->mutex;
+  uint32_t value = atomic_load(word);
+  while (!(value & FUTEX_WAITERS)) {
+    if (atomic_compare_exchange_strong(word, &value, value | FUTEX_WAITERS)) {
+      value |= FUTEX_WAITERS;
+    }
+  }
+  atomic_fetch_add(&tw->parked, 1);
+  struct timespec timeout = {3, 0};
+  long r = syscall(SYS_futex, word, FUTEX_WAIT, value, &timeout, NULL, 0);
+  if (r == 0) {
+    atomic_fetch_add(&tw->woken, 1);
+  } else if (errno == ETIMEDOUT) {
+    atomic_fetch_add(&tw->timed_out, 1);
+  }
+  _exit(0);
+}
+
+static int exec_two_waiters_main(void) {
+  tw = mmap(NULL, sizeof(*tw), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+  if (tw == MAP_FAILED) {
+    die("two-waiters mmap");
+  }
+  pthread_mutexattr_t attr;
+  if (pthread_mutexattr_init(&attr) != 0 ||
+      pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED) != 0 ||
+      pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST) != 0 ||
+      pthread_mutex_init(&tw->mutex, &attr) != 0) {
+    die("two-waiters mutex");
+  }
+  pid_t owner = fork();
+  if (owner < 0) {
+    die("fork owner");
+  }
+  if (owner == 0) {
+    if (pthread_mutex_lock(&tw->mutex) != 0) {
+      die("owner lock");
+    }
+    atomic_store(&tw->ready, 1);
+    boundary_spin_until(&tw->trigger, 1);
+    execl(self_path, self_path, "after-exec", NULL);
+    die("execl");
+  }
+  boundary_spin_until(&tw->ready, 1);
+  pid_t waiters[2];
+  for (int i = 0; i < 2; ++i) {
+    waiters[i] = fork();
+    if (waiters[i] < 0) {
+      die("fork waiter");
+    }
+    if (waiters[i] == 0) {
+      two_waiters_raw_waiter();
+    }
+    boundary_spin_until(&tw->parked, i + 1);
+    for (int y = 0; y < 50; ++y) {
+      sched_yield();
+    }
+  }
+  atomic_store(&tw->trigger, 1);
+  for (int i = 0; i < 2; ++i) {
+    if (waitpid(waiters[i], NULL, 0) != waiters[i]) {
+      die("wait waiter");
+    }
+  }
+  if (waitpid(owner, NULL, 0) != owner) {
+    die("wait owner");
+  }
+  printf(
+      "EXEC-TWO-WAITERS: woken=%d timed_out=%d word=%#x\n",
+      atomic_load(&tw->woken),
+      atomic_load(&tw->timed_out),
+      atomic_load((_Atomic unsigned*)&tw->mutex));
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc == 2 && strcmp(argv[1], "after-exec") == 0) {
     return 0;
@@ -973,7 +1066,7 @@ int main(int argc, char** argv) {
         "shared-alias|self-alias|two-pending|pending-marked|pending-marked-quiet|"
         "pending-owner|concurrent-exit-group|reversed-owner|de-thread|owner-exec|"
         "leader-exec|"
-        "thread-owner-exec|thread-tgid-exec|failed-exec\n",
+        "thread-owner-exec|thread-tgid-exec|failed-exec|exec-two-waiters\n",
         argv[0]);
     return 64;
   }
@@ -994,6 +1087,9 @@ int main(int argc, char** argv) {
     return reversed_owner_main();
   }
   self_path = argv[0];
+  if (strcmp(argv[1], "exec-two-waiters") == 0) {
+    return exec_two_waiters_main();
+  }
   state = mmap(
       NULL,
       sizeof(*state),

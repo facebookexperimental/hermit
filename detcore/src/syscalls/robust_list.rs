@@ -54,10 +54,20 @@
 //! Guest-bearing callback. A successful exec reads the group's lists at its
 //! entry and delivers their wakes after it returns
 //! (`ThreadState::stage_robust_list_wakes_for_exec`). DBT models an owner's
-//! exit and an exit_group, but not yet an exec
-//! (<https://github.com/rrnewton/hermit/issues/4268>) or a fatal signal
-//! (<https://github.com/rrnewton/hermit/issues/4278>); KVM and SaBRe model
-//! none of them.
+//! exit, an exit_group and a successful exec. For an exec, Detcore reads the
+//! lists before the native exec and the coordinator delivers the wakes when
+//! the new image reconnects; an exec that fails before its point of no return
+//! drops them (<https://github.com/rrnewton/hermit/issues/4268>). An exec
+//! whose target the kernel cannot load (it kills the process with SIGSEGV)
+//! hangs a DBT run for any guest, robust mutex or not: DynamoRIO's own exec
+//! succeeds and the new image reconnects, which queues the wakes, but that
+//! image then dies without an exit hook and is never retired, so no thread
+//! gets another turn (<https://github.com/rrnewton/hermit/issues/4362>). The
+//! delivery at the caller's deregistration covers an old image that
+//! deregisters before any reconnect. Ptrace loses those wakes
+//! (<https://github.com/rrnewton/hermit/issues/4363>). DBT does not yet model
+//! a fatal signal (<https://github.com/rrnewton/hermit/issues/4278>); KVM and
+//! SaBRe model none of them.
 //!
 //! # Structure
 //!

@@ -5156,7 +5156,7 @@ impl Scheduler {
     /// thread of `process` whose host thread has a registered pidfd
     /// (`exited_thread_barriers`). The threads the grant kills have no Exit
     /// grant of their own, so their deregistrations add no hold.
-    fn hold_turns_until_the_group_ends(&mut self, process: DetPid) {
+    pub(crate) fn hold_turns_until_the_group_ends(&mut self, process: DetPid) {
         for thread in self.thread_tree.my_thread_group(&process) {
             self.hold_turns_until_gone(thread);
         }
@@ -5900,6 +5900,18 @@ impl Scheduler {
             from, to, num_woken, num_moved
         );
         (num_woken, num_moved)
+    }
+
+    /// Whether `tid` waits for admission at the next deterministic drain.
+    #[cfg(test)]
+    pub(crate) fn admission_pending(&self, tid: DetTid) -> bool {
+        self.pending_run_queue_admissions.contains_key(&tid)
+    }
+
+    /// Whether turns are held until the kernel has ended `tid`.
+    #[cfg(test)]
+    pub(crate) fn holds_turns_until_gone(&self, tid: DetTid) -> bool {
+        self.exited_thread_barriers.contains_key(&tid)
     }
 
     /// Record futex wakes delivered by a physical-exit callback for the next

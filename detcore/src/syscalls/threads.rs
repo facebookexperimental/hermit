@@ -2021,6 +2021,28 @@ impl<T: RecordOrReplay> Detcore<T> {
         owner_death_path(&self.cfg)
     }
 
+    /// The owner-death wakes a successful execve makes Linux deliver, in
+    /// delivery order, for a backend that runs the native execve outside
+    /// Detcore's handler and so cannot stage them in this thread's state (DBT,
+    /// whose new image starts a fresh runtime). Read while the old image is
+    /// mapped, before the native exec; none where Detcore does not model
+    /// owner death (<https://github.com/rrnewton/hermit/issues/4268>).
+    pub async fn exec_robust_list_wakes<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+    ) -> Vec<(DetTid, FutexID)> {
+        if self.robust_owner_death_path().is_none() {
+            return Vec::new();
+        }
+        let wakes = self
+            .read_thread_group_robust_list_wakes(guest, OwnerDeath::Exec)
+            .await;
+        crate::tool_local::flatten_exec_robust_list_wakes(wakes)
+            .into_iter()
+            .map(|(owner, wake)| (owner, wake.futex))
+            .collect()
+    }
+
     /// The owner-death wakes Linux's `exit_robust_list` would make for every
     /// registered robust list in the current thread group, read without
     /// changing guest memory: Linux makes the owner-word transitions. Callers
@@ -2040,7 +2062,16 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Vec<(DetTid, Vec<RobustListWake>)> {
         let caller = guest.thread_state().dettid;
         let tgid = guest.thread_state().detpid.expect("detpid unset");
-        let mut heads = guest.thread_state().robust_list_heads();
+        // A thread whose own exit Detcore already walked (its head stays
+        // registered while an exit_group is filed) is left out, as an
+        // exit_group's walk leaves it out, so no list is walked twice (Claude
+        // review of https://github.com/rrnewton/hermit/pull/4352, F4).
+        let mut heads: Vec<(DetTid, usize)> = guest
+            .thread_state()
+            .robust_list_owners_for_exit_group()
+            .into_iter()
+            .map(|owner| (owner.dettid, owner.head))
+            .collect();
         if death == OwnerDeath::Exec {
             // de_thread waits until every other thread has exited, each walking
             // its own list, before exec_mm_release walks the caller's; with
@@ -2889,6 +2920,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             } else {
                 Default::default()
             },
+            // This handler stages the exec's owner-death wakes itself, below.
+            Vec::new(),
         )
         .await;
 

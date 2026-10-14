@@ -2451,6 +2451,15 @@ impl GlobalState {
                     && prepared.process == dtid
                     && prepared.mm.for_exec(dtid) == request_mm
                 {
+                    // Only a reloading backend (DBT) carries owner-death
+                    // wakes with its preparation, and it delivered them at
+                    // its reconnect; ptrace delivers its own after the exec
+                    // (Claude review of
+                    // https://github.com/rrnewton/hermit/pull/4352, F5).
+                    assert!(
+                        prepared.fd_blocking.robust_wakes.is_empty(),
+                        "a state-preserving exec carried robust-list wakes to the coordinator"
+                    );
                     sched.reconnect_after_exec(ExecReconnect {
                         caller: dtid,
                         new_leader: dtid,
@@ -2504,7 +2513,7 @@ impl GlobalState {
             ) => {
                 if let Some(prepared) = &exec_reconnect {
                     let mut sched = self.lock_rpc_scheduler(false).await;
-                    let (pending, post_exec_mm) = {
+                    let (mut pending, post_exec_mm) = {
                         let mut states = self.pending_exec_states.lock().unwrap();
                         let Some(pending) = states.remove(&parent_detpid) else {
                             return (None, R::ThreadExited);
@@ -2543,6 +2552,16 @@ impl GlobalState {
                             .unwrap()
                             .reassign_thread(pending.caller, dettid);
                     }
+                    // Linux marked the old thread group's robust-list words
+                    // during the exec, which this message from the new image
+                    // follows, and the reconnect has retired the threads the
+                    // exec killed. Wake one waiter per marked word now, under
+                    // the same lock: the scheduler commits no turn between the
+                    // exec's grant and this reconnect, and the admissions are
+                    // drained in canonical order
+                    // (https://github.com/rrnewton/hermit/issues/4268).
+                    let robust_wakes = std::mem::take(&mut pending.fd_blocking.robust_wakes);
+                    wake_exec_robust_waiters(&mut sched, &robust_wakes, "exec");
                     if !pending.fd_blocking.is_empty() {
                         self.post_exec_fd_blocking
                             .lock()
@@ -3830,6 +3849,29 @@ impl GlobalState {
             state.caller == *dettid && (*mm == state.mm || *mm == state.mm.for_exec(state.process))
         }) {
             let prepared = pending.remove(detpid).unwrap();
+            // Unlike a recoverable failure (CancelExec), the caller's old image
+            // deregistered before any reconnect: its group is dying, and Linux
+            // walks every robust list of the group, in the exec or in each
+            // thread's exit. On DBT this takes a fatal signal during the exec.
+            // An exec whose target the kernel cannot load does not get here:
+            // DynamoRIO's own exec succeeds, the new image reconnects and its
+            // wakes are queued there, and the run then hangs on that image's
+            // unretired death (https://github.com/rrnewton/hermit/issues/4362).
+            // Hold turns until the kernel has ended the group, as an
+            // exit_group's grant does, and wake the prepared waiters now, while
+            // the caller's outstanding exec request still withholds every turn;
+            // they run at the drain after the hold. A group that outlives this
+            // is ended by the exited-thread valve with a named HERMIT_DEADLOCK
+            // rather than losing the wakes (Codex review of
+            // https://github.com/rrnewton/hermit/pull/4352, P2).
+            if !prepared.fd_blocking.robust_wakes.is_empty() {
+                sched.hold_turns_until_the_group_ends(*detpid);
+                wake_exec_robust_waiters(
+                    &mut sched,
+                    &prepared.fd_blocking.robust_wakes,
+                    "terminal exec",
+                );
+            }
             sched.finish_exec_teardown(prepared.caller, *detpid, prepared.mm, false);
             // The local caller can have installed its candidate exec MmId
             // before cancellation. It still owns the original registration;
@@ -5092,8 +5134,19 @@ pub fn format_unsupported_syscall_warning(syscalls: &BTreeSet<String>) -> Option
 /// backend that handles `execve` outside Detcore's syscall handler must call
 /// this before the native syscall so the next image reconnects to the existing
 /// scheduler identity and logical clock.
-pub async fn prepare_exec<G, T>(guest: &mut G, mm: MmId, fd_blocking: ExecFdBlockingOverrides)
-where
+///
+/// `robust_wakes` are the owner-death wakes a successful exec makes Linux
+/// deliver, from [`Detcore::exec_robust_list_wakes`], where the backend runs
+/// the native execve outside Detcore's handler; the coordinator delivers them
+/// at the new image's reconnect, or when the caller's thread ends without
+/// one, and drops them at [`cancel_exec`]. A backend whose execve Detcore handles stages
+/// them in its own thread state instead and passes none.
+pub async fn prepare_exec<G, T>(
+    guest: &mut G,
+    mm: MmId,
+    fd_blocking: ExecFdBlockingOverrides,
+    robust_wakes: Vec<(DetTid, FutexID)>,
+) where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
@@ -5103,6 +5156,7 @@ where
         inherited_reads: guest.thread_state().inherited_reads_for_exec(),
         initialize_inherited_stdio: false,
         initial_input: None,
+        robust_wakes,
     };
     let (_, response) =
         send_and_update_time(guest, GlobalRequest::PrepareExec(detpid, mm, fd_state)).await;
@@ -5403,6 +5457,24 @@ pub enum ResumeStatus {
 enum SchedulerRpcResult<T> {
     Continue(T),
     ThreadExited,
+}
+
+/// Wake one waiter per word an exec's owner death marked, for the next
+/// deterministic drain (https://github.com/rrnewton/hermit/issues/4268).
+/// The INFO record is not logged on DBT, whose coordinator has no tracing
+/// subscriber, so there an L2 run compares the guest's output only (Claude
+/// review of https://github.com/rrnewton/hermit/pull/4352, F2).
+fn wake_exec_robust_waiters(sched: &mut Scheduler, wakes: &[(DetTid, FutexID)], at: &str) {
+    if wakes.is_empty() {
+        return;
+    }
+    let counts = sched.wake_futex_waiters_after_exit(wakes);
+    for ((owner, futex), count) in wakes.iter().zip(counts) {
+        info!(
+            "[detcore, dtid {}] robust-list owner death woke {} waiter(s) on futex {:?} at {}",
+            owner, count, futex, at,
+        );
+    }
 }
 
 /// Whether the reply to `request` can resume its thread from a scheduler grant
@@ -9974,6 +10046,228 @@ mod tests {
         assert_eq!(global_time.threads_time(dettid), thread_before);
     }
 
+    /// A waiter in another process, parked on a robust word the exec's caller
+    /// owned, for the exec owner-death tests below.
+    fn park_exec_robust_waiter(state: &GlobalState, futex: FutexID) -> DetTid {
+        park_exec_robust_waiter_as(state, futex, 40)
+    }
+
+    /// [`park_exec_robust_waiter`] for the thread `raw`.
+    fn park_exec_robust_waiter_as(state: &GlobalState, futex: FutexID, raw: i32) -> DetTid {
+        let waiter = DetTid::from_raw(raw);
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .thread_tree
+            .add_child(waiter, waiter, true);
+        install_test_registration(state, waiter, Ivar::new());
+        let mut scheduler = state.sched.lock().unwrap();
+        scheduler.sleep_futex_waiter(&waiter, futex, None, u32::MAX, None);
+        assert!(scheduler.run_queue.remove_tid(waiter));
+        waiter
+    }
+
+    /// On a backend whose new image reconnects with a fresh runtime (DBT),
+    /// the owner-death wakes the exec's caller read before the native exec
+    /// travel with the prepared exec, and the reconnect admits their waiters
+    /// at the next deterministic drain
+    /// (https://github.com/rrnewton/hermit/issues/4268).
+    #[tokio::test]
+    async fn exec_reconnect_wakes_the_robust_waiters_its_exec_marked() {
+        let (config, state, dettid, detpid) = cancellation_test_state();
+        let old_mm = MmId::initial(detpid).for_exec(detpid);
+        install_test_registration(&state, dettid, Ivar::new());
+        let mut existing_time = DetTime::new(&config);
+        existing_time.add_syscall();
+        state.global_time.lock().unwrap().update_global_time(
+            dettid,
+            existing_time.as_nanos(),
+            LogicalTime::ZERO,
+        );
+        let futex = FutexID::private(old_mm, 0x4000);
+        let waiter = park_exec_robust_waiter(&state, futex);
+        state.pending_exec_states.lock().unwrap().insert(
+            detpid,
+            PendingExecState {
+                caller: dettid,
+                process: detpid,
+                mm: old_mm,
+                fd_blocking: ExecFdState {
+                    robust_wakes: vec![(dettid, futex)],
+                    ..Default::default()
+                },
+            },
+        );
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .install_test_exec_incarnation(dettid, old_mm);
+        assert!(!state.sched.lock().unwrap().admission_pending(waiter));
+
+        let create_response = state
+            .receive_rpc(
+                reverie::Tid::from_raw(dettid.as_raw()),
+                (
+                    DetTime::new(&config),
+                    MmId::initial(dettid),
+                    GlobalRequest::CreateChildThread(
+                        dettid,
+                        detpid,
+                        0,
+                        None,
+                        libc::SIGCHLD,
+                        None,
+                        Some(DEFAULT_PRIORITY),
+                    ),
+                ),
+            )
+            .await;
+        assert_eq!(
+            create_response.1,
+            GlobalResponse::CreateChildThread(Some(old_mm.for_exec(detpid)))
+        );
+        assert!(state.sched.lock().unwrap().admission_pending(waiter));
+        assert!(
+            state
+                .post_exec_fd_blocking
+                .lock()
+                .unwrap()
+                .get(&dettid)
+                .is_none_or(|carried| carried.robust_wakes.is_empty()),
+            "the wakes are delivered once, at the reconnect"
+        );
+    }
+
+    /// An exec that fails before its point of no return (here ENOENT, which
+    /// takes CancelExec) marks no robust word, so its prepared wakes are
+    /// dropped with the prepared exec and the waiter stays parked. An exec
+    /// that ends its group without a reconnect delivers them instead
+    /// (`a_terminal_exec_wakes_its_robust_waiters`).
+    #[tokio::test]
+    async fn a_failed_exec_drops_its_robust_wakes() {
+        let (config, state, leader, detpid) = cancellation_test_state();
+        install_test_registration(&state, leader, Ivar::new());
+        let futex = FutexID::private(MmId::initial(detpid), 0x4000);
+        let waiter = park_exec_robust_waiter(&state, futex);
+        let clock = DetTime::new(&config);
+        let prepared = state
+            .receive_rpc(
+                reverie::Tid::from_raw(leader.as_raw()),
+                (
+                    clock.clone(),
+                    MmId::initial(leader),
+                    GlobalRequest::PrepareExec(
+                        detpid,
+                        MmId::initial(detpid),
+                        ExecFdState {
+                            robust_wakes: vec![(leader, futex)],
+                            ..Default::default()
+                        },
+                    ),
+                ),
+            )
+            .await;
+        assert_eq!(prepared.1, GlobalResponse::PrepareExec(()));
+        let cancelled = state
+            .receive_rpc(
+                reverie::Tid::from_raw(leader.as_raw()),
+                (
+                    clock,
+                    MmId::initial(leader),
+                    GlobalRequest::CancelExec(detpid),
+                ),
+            )
+            .await;
+        assert_eq!(cancelled.1, GlobalResponse::CancelExec(()));
+        assert!(state.pending_exec_states.lock().unwrap().is_empty());
+        assert!(!state.sched.lock().unwrap().admission_pending(waiter));
+    }
+
+    /// An exec caller whose old image deregisters before any reconnect (its
+    /// group killed during the exec) still had Linux walk the group's robust
+    /// lists. The deregistration delivers the prepared wakes and holds turns
+    /// until the kernel has ended the group, instead of dropping them with
+    /// the preparation (Codex review of
+    /// https://github.com/rrnewton/hermit/pull/4352, P2). This builds the
+    /// deregistration directly: no guest action is known to reach it on DBT
+    /// (an exec whose target cannot be loaded reconnects first, then hangs
+    /// the run: <https://github.com/rrnewton/hermit/issues/4362>).
+    #[tokio::test]
+    async fn a_terminal_exec_wakes_its_robust_waiters() {
+        let (config, state, leader, detpid) = cancellation_test_state();
+        install_test_registration(&state, leader, Ivar::new());
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel::<()>();
+        let host_thread = std::thread::spawn(move || {
+            tid_tx
+                .send(unsafe { libc::syscall(libc::SYS_gettid) as i32 })
+                .unwrap();
+            let _ = exit_rx.recv();
+        });
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .register_physical_thread(
+                leader,
+                MmId::initial(detpid),
+                std::process::id() as i32,
+                tid_rx.recv().unwrap(),
+            )
+            .unwrap();
+        let futex = FutexID::private(MmId::initial(detpid), 0x4000);
+        let waiter = park_exec_robust_waiter(&state, futex);
+        // A second waiter on the same word stays parked: one wake per marked
+        // word (Claude re-check of
+        // https://github.com/rrnewton/hermit/pull/4352, N3).
+        let second = park_exec_robust_waiter_as(&state, futex, 41);
+        let prepared = state
+            .receive_rpc(
+                reverie::Tid::from_raw(leader.as_raw()),
+                (
+                    DetTime::new(&config),
+                    MmId::initial(leader),
+                    GlobalRequest::PrepareExec(
+                        detpid,
+                        MmId::initial(detpid),
+                        ExecFdState {
+                            robust_wakes: vec![(leader, futex)],
+                            ..Default::default()
+                        },
+                    ),
+                ),
+            )
+            .await;
+        assert_eq!(prepared.1, GlobalResponse::PrepareExec(()));
+        assert!(!state.sched.lock().unwrap().admission_pending(waiter));
+
+        state
+            .recv_deregister_thread(
+                reverie::Tid::from_raw(leader.as_raw()),
+                ThreadDeregistration {
+                    thread_start_entered: true,
+                    dettid: leader,
+                    detpid,
+                    mm: MmId::initial(detpid),
+                    timeslice_stats: TimesliceStats::default(),
+                    syscall_count: 0,
+                    chaos_epochs: Vec::new(),
+                },
+            )
+            .await;
+        assert!(state.pending_exec_states.lock().unwrap().is_empty());
+        {
+            let scheduler = state.sched.lock().unwrap();
+            assert!(scheduler.admission_pending(waiter));
+            assert!(!scheduler.admission_pending(second));
+            assert!(scheduler.holds_turns_until_gone(leader));
+        }
+        exit_tx.send(()).unwrap();
+        host_thread.join().unwrap();
+    }
+
     #[tokio::test]
     async fn nonleader_exec_rebinds_caller_to_leader_and_preserves_its_clock() {
         let (config, state, leader, detpid) = cancellation_test_state();
@@ -10032,6 +10326,7 @@ mod tests {
             )]),
             initialize_inherited_stdio: false,
             initial_input: None,
+            robust_wakes: Vec::new(),
         };
         state.pending_exec_states.lock().unwrap().insert(
             detpid,
@@ -10350,7 +10645,7 @@ mod tests {
             (identity.dev(), identity.inode(), identity.rdev())
         );
         let old_mm = old.thread.mm_id;
-        super::prepare_exec(&mut old, old_mm, Default::default()).await;
+        super::prepare_exec(&mut old, old_mm, Default::default(), Vec::new()).await;
         {
             let pending = state.pending_exec_states.lock().unwrap();
             let prepared = &pending[&leader].fd_blocking.inherited_reads;
@@ -10522,7 +10817,7 @@ mod tests {
         // A second successful exec also exercises deletion of an empty table.
         for _ in 0..2 {
             let old_mm = guest.thread.mm_id;
-            super::prepare_exec(&mut guest, old_mm, Default::default()).await;
+            super::prepare_exec(&mut guest, old_mm, Default::default(), Vec::new()).await;
             guest.thread.mm_id = old_mm.for_exec(detpid);
             let before = guest.thread.thread_logical_time.as_nanos();
             tokio::time::timeout(Duration::from_secs(2), tool.handle_post_exec(&mut guest))

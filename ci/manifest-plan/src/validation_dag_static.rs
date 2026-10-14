@@ -2195,7 +2195,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and scheduler::test::a_call_that_begins_with_a_scheduler_signal_waiting_is_armed
     // (https://github.com/rrnewton/hermit/issues/4234): 1636, run.
     // And +1 from 98cd5052: 1637.
-    ("test.detcore_unit", 1637),
+    // And the exec reconnect's robust-wake delivery, drop and terminal-exec
+    // tests (https://github.com/rrnewton/hermit/issues/4268): 1640, listed.
+    ("test.detcore_unit", 1640),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2443,7 +2445,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And mount_introspection's guest_mounts_receive_no_host_propagation and
     // host_mount_events_during_a_run_leave_the_guest_mountinfo_unchanged
     // (https://github.com/rrnewton/hermit/issues/4167): 409, run.
-    ("test.hermit_integration", 409),
+    // And the two DBT exec owner-death tests and the DBT and ptrace
+    // one-waiter-per-word exec tests
+    // (https://github.com/rrnewton/hermit/issues/4268): 413.
+    ("test.hermit_integration", 413),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -3637,7 +3642,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +7 from bd38bb81: 1631.
     // And the five last-band poller and waiting-signal tests: 1636.
     // And +1 from 98cd5052: 1637.
-    ("test.detcore_unit_on_host", 1637),
+    // And the three exec robust-wake tests: 1640, by listing.
+    ("test.detcore_unit_on_host", 1640),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -3694,7 +3700,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And redis_strict's three tests: 405.
     // And kvm_lifecycle_timing_log_level and sqlite_veryquick: 407.
     // And the two mount-propagation tests: 409.
-    ("test.hermit_integration_on_host", 409),
+    // And the four DBT and ptrace exec owner-death tests: 413.
+    ("test.hermit_integration_on_host", 413),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

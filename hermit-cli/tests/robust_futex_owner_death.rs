@@ -645,6 +645,108 @@ fn ptrace_wakes_nobody_when_an_exec_leaves_the_owner_word_alone() {
     }
 }
 
+/// The DBT leg of `ptrace_wakes_the_waiter_when_an_exec_ends_the_owner`. DBT
+/// runs the native execve outside Detcore's handler, and the new image starts a
+/// fresh runtime, so Detcore reads the group's lists before the exec and hands
+/// the wakes to the coordinator, which delivers them when the new image
+/// reconnects (https://github.com/rrnewton/hermit/issues/4268). Before, each of
+/// these modes left the waiter parked until the run timed out.
+/// `thread-tgid-exec` is left out: DBT's client does not rewrite a word that
+/// names the virtual thread group ID, so Linux never marks it
+/// (https://github.com/rrnewton/reverie/issues/1052).
+#[cfg(feature = "dbt")]
+#[test]
+fn dbt_wakes_the_waiter_when_an_exec_ends_the_owner() {
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("robust-futex-lifecycle-dbt-exec");
+    let guest = build_lifecycle_guest(&build_root);
+    for mode in ["de-thread", "owner-exec", "leader-exec"] {
+        for verify in [true, false] {
+            let run = run_dbt_lifecycle_mode(&build_root, &guest, mode, verify);
+            assert!(
+                run.stdout.contains("PASS: waiter received EOWNERDEAD"),
+                "DBT {mode} (verify {verify}) did not wake the waiter\nstdout:\n{}\nstderr:\n{}",
+                run.stdout,
+                run.stderr,
+            );
+        }
+    }
+}
+
+/// Linux's exec walk marks each owned word once and wakes one waiter on it;
+/// the second waiter on the word times out. With two raw waiters on one word,
+/// a second modeled wake would wake both (Claude review of
+/// https://github.com/rrnewton/hermit/pull/4352, F1: a mutant delivering every
+/// wake twice passed the single-waiter tests).
+fn assert_an_exec_wakes_one_waiter_per_word(backend: &str) {
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("robust-futex-exec-two-waiters-{backend}"));
+    let guest = build_lifecycle_guest(&build_root);
+    let expected = "EXEC-TWO-WAITERS: woken=1 timed_out=1 word=0xc0000000";
+    let mut native = Command::new(&guest);
+    native.arg("exec-two-waiters");
+    let native = run_captured(
+        native,
+        "native robust-futex exec-two-waiters",
+        &build_root.join("native.out"),
+        &build_root.join("native.err"),
+        true,
+    );
+    assert!(
+        native.stdout.contains(expected),
+        "native: {}",
+        native.stdout
+    );
+    for verify in [true, false] {
+        let run = run_lifecycle_mode(backend, &build_root, &guest, "exec-two-waiters", verify);
+        assert!(
+            run.stdout.contains(expected),
+            "{backend} exec-two-waiters (verify {verify}) differs from Linux\nstdout:\n{}\nstderr:\n{}",
+            run.stdout,
+            run.stderr,
+        );
+    }
+}
+
+#[cfg(feature = "dbt")]
+#[test]
+fn dbt_an_exec_wakes_one_waiter_per_word_it_marks() {
+    assert_an_exec_wakes_one_waiter_per_word("dbt");
+}
+
+#[test]
+fn ptrace_an_exec_wakes_one_waiter_per_word_it_marks() {
+    assert_an_exec_wakes_one_waiter_per_word("ptrace");
+}
+
+/// The DBT leg of `ptrace_wakes_nobody_when_an_exec_leaves_the_owner_word_alone`:
+/// an exec whose walk marks nothing (`thread-owner-exec`) and an exec that
+/// fails (`failed-exec`) wake nobody, as on Linux, at L2.
+#[cfg(feature = "dbt")]
+#[test]
+fn dbt_wakes_nobody_when_an_exec_leaves_the_owner_word_alone() {
+    let build_root =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join("robust-futex-lifecycle-dbt-exec-nowake");
+    let guest = build_lifecycle_guest(&build_root);
+    for (mode, required) in [
+        (
+            "thread-owner-exec",
+            "RAW: wait ETIMEDOUT, owner unlocked 0, OWNER_DIED 0",
+        ),
+        (
+            "failed-exec",
+            "RAW: wait woken, owner unlocked 1, OWNER_DIED 0",
+        ),
+    ] {
+        let run = run_dbt_lifecycle_mode(&build_root, &guest, mode, true);
+        assert!(
+            run.stdout.contains(required),
+            "DBT {mode} did not match Linux\nstdout:\n{}\nstderr:\n{}",
+            run.stdout,
+            run.stderr,
+        );
+    }
+}
+
 /// DBT reports a thread's exit to Detcore before the native exit runs. Detcore
 /// walks the list, leaves each owner word to Linux and wakes the modeled
 /// waiter, and the scheduler commits no turn until the kernel has ended the

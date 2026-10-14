@@ -815,8 +815,10 @@ mod tests {
             // three, plus kvm_lifecycle_timing_log_level's and sqlite_veryquick's
             // one each (https://github.com/rrnewton/hermit/issues/4321), plus the
             // two mount-propagation tests
-            // (https://github.com/rrnewton/hermit/issues/4167).
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "409");
+            // (https://github.com/rrnewton/hermit/issues/4167), plus the four DBT
+            // and ptrace exec owner-death tests
+            // (https://github.com/rrnewton/hermit/issues/4268).
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "413");
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(
