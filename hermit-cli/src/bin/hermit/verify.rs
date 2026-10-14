@@ -2257,6 +2257,12 @@ pub enum SecondRun {
 /// comparison can be read as that claim.
 pub(crate) const BITWISE_PARITY_CLAIM: &str = "bitwise parity established";
 
+/// Set when a run or recording in this process used `--cpu-profile
+/// x86-64-v3`, so that a match also states what that profile's qualification
+/// leaves uncovered.
+pub(crate) static CPU_PROFILE_V3_RAN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Write the announcement for `outcome` to `out`.
 ///
 /// On a match, the caller's success message is followed by a line that states
@@ -2288,6 +2294,11 @@ fn write_verification_announcement(
                 ":: {}",
                 matched_comparison_qualifier(outcome, second_run)
             )?;
+            // What a match under x86-64-v3 does not cover
+            // (https://github.com/rrnewton/hermit/issues/4243).
+            if CPU_PROFILE_V3_RAN.load(std::sync::atomic::Ordering::SeqCst) {
+                writeln!(out, ":: {}", detcore_model::cpu_profile::V3_RESIDUAL)?;
+            }
         }
         Verdict::Diverged => writeln!(out, ":: {}", failure_message.red().bold())?,
         Verdict::NoResult => writeln!(

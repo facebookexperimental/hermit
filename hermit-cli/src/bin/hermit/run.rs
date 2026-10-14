@@ -5332,6 +5332,7 @@ impl RunOpts {
                     probe.certified_pairs
                 );
                 self.det_opts.det_config.cpu_profile_host = Some(host);
+                super::verify::CPU_PROFILE_V3_RAN.store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok(())
             }
             Err(refusal) => Err(Error::new(PolicyRefusal)

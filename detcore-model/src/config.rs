@@ -133,14 +133,10 @@ pub struct Config {
     #[clap(long = "no-virtualize-cpuid", action = clap::ArgAction::SetFalse)]
     pub virtualize_cpuid: bool,
 
-    /// The CPU the guest sees: x86-64-v2 (the default) or x86-64-v3. v3 is
-    /// offered only on the ptrace backend, on hosts that pass a startup
-    /// qualification of the XSAVE in-use bits a guest can read; see
-    /// `hermit host-capabilities --cpu-profile x86-64-v3`
-    /// (<https://github.com/rrnewton/hermit/issues/4243>). Its check samples a
-    /// fixed set of cases, so it cannot exclude a CPU or hypervisor that
-    /// behaves differently on other paths.
-    #[clap(long, value_enum, default_value_t)]
+    /// The CPU the guest sees: x86-64-v2 (the default) or x86-64-v3, offered
+    /// only on qualified ptrace hosts. The long help states what the
+    /// qualification leaves uncovered.
+    #[clap(long, value_enum, default_value_t, long_help = crate::cpu_profile::CPU_PROFILE_LONG_HELP)]
     #[serde(default)]
     pub cpu_profile: crate::cpu_profile::CpuProfile,
 

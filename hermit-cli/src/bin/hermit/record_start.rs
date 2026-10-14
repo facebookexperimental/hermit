@@ -188,12 +188,10 @@ pub struct StartOpts {
     #[clap(value_name = "PROGRAM", required = true)]
     program: Option<PathBuf>,
 
-    /// The CPU the recorded guest sees: x86-64-v2 (the default) or x86-64-v3.
-    /// v3 records only on a host that passes the startup qualification
-    /// (`hermit host-capabilities --cpu-profile x86-64-v3`); the recording binds
-    /// the host facts its guest's answers come from, and replay refuses a host
-    /// where any of them differs (<https://github.com/rrnewton/hermit/issues/4243>).
-    #[clap(long, value_enum, default_value_t)]
+    /// The CPU the recorded guest sees: x86-64-v2 (the default) or x86-64-v3,
+    /// offered only on qualified ptrace hosts. The long help states what the
+    /// qualification leaves uncovered.
+    #[clap(long, value_enum, default_value_t, long_help = detcore_model::cpu_profile::CPU_PROFILE_LONG_HELP)]
     cpu_profile: detcore_model::cpu_profile::CpuProfile,
 
     /// Refuse to record (exit 122) on a host whose retired-conditional-branch counter
@@ -545,6 +543,9 @@ impl StartOpts {
     }
 
     pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        if !self.cpu_profile.is_default() {
+            super::verify::CPU_PROFILE_V3_RAN.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         if self.verify {
             validate_log_level(global)?;
             self.record_verify(global)

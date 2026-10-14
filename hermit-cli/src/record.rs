@@ -67,6 +67,8 @@ impl Record {
         };
         metadata.cpu_profile = cpu_profile;
         metadata.cpu_profile_host = cpu_profile_host.clone();
+        metadata.cpu_profile_residual =
+            (!cpu_profile.is_default()).then(|| detcore_model::cpu_profile::V3_RESIDUAL.to_owned());
         metadata.mountinfo_root_rewrites = mountinfo_root_rewrites;
         metadata.mountinfo_mount_ids_captured = mountinfo_mount_ids.is_some();
         metadata.mountinfo_mount_ids = mountinfo_mount_ids.unwrap_or_default();

@@ -687,9 +687,47 @@ the default equal-priority policy.
 | `--clock-multiplier=F` | Changes the rate of virtual time. |
 | `--no-virtualize-time` | Uses host time; also requires `--no-virtualize-metadata`. |
 | `--no-virtualize-cpuid` | Exposes host CPUID behavior. |
+| `--cpu-profile x86-64-v3` | Gives the guest an x86-64-v3 CPU instead of the default x86-64-v2; see below. |
 
 Disabling a virtualization feature introduces a host-dependent input. Do it to
 diagnose compatibility problems, not when asserting full reproducibility.
+
+#### The x86-64-v3 CPU profile
+
+By default every guest sees the same x86-64-v2 CPU, so software built for
+x86-64-v3 (CentOS Stream 10's glibc, for example) refuses to start.
+`--cpu-profile x86-64-v3`, on `hermit run` and `hermit record start`, adds the
+v3 features: AVX2, BMI1/2, FMA, F16C, LZCNT, MOVBE and XSAVE. RDRAND, RDSEED,
+TSX and AVX-512 stay hidden (<https://github.com/rrnewton/hermit/issues/4243>).
+
+With XSAVE, a guest can read processor state the host kernel saves and
+restores at moments Hermit does not control. So v3 is offered only where that
+is checked. `hermit host-capabilities --cpu-profile x86-64-v3` runs the check on
+its own and prints QUALIFIED, or REFUSED with the reason. A v3 run is refused
+by name (exit 122), and never falls back to v2:
+- on any backend but ptrace;
+- with `--no-virtualize-cpuid` or `--gdbserver`;
+- on Linux before 5.16;
+- on hybrid CPUs, on AMD CPUs without XSAVEERPTR, and on hosts with AMX;
+- where the host lacks a v3 feature natively;
+- where the PMU interrupt counter the check needs is unavailable (some VMs,
+  or `perf_event_paranoid` above 1);
+- wherever the check fails.
+
+The guest's CPUID leaf 0xD describes the host's real XSAVE layout, because a
+guest's XSAVE runs on the host. A recording therefore binds those host facts,
+and `hermit replay` refuses a host where any of them differs.
+
+What the check does not cover, which `--verify` also prints after a match under
+v3:
+
+> With --cpu-profile x86-64-v3, Hermit checks at startup that this host does not
+> change the XSTATE_BV bits a guest reads (with XSAVE, XSAVEC or XSAVEOPT, or in
+> a signal frame) when the host saves and restores the guest's registers. The
+> check samples a fixed set of cases and forces only CPUID exits, so a CPU or
+> hypervisor that behaves differently only on other instruction paths, or on VM
+> exits the guest cannot see, is not excluded. Firmware (SMM) entries cannot be
+> checked at all. Default runs use x86-64-v2, which this does not affect.
 
 ### File System, Environment, And Network
 

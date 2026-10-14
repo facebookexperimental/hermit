@@ -103,14 +103,34 @@ impl HostXstate {
     }
 }
 
+/// The residual as a literal, so that the command-line help can include it
+/// with `concat!` while [`V3_RESIDUAL`] stays the one source of its words.
+#[macro_export]
+macro_rules! v3_residual {
+    () => {
+        "With --cpu-profile x86-64-v3, Hermit checks at startup that this host does not \
+         change the XSTATE_BV bits a guest reads (with XSAVE, XSAVEC or XSAVEOPT, or in a \
+         signal frame) when the host saves and restores the guest's registers. The check \
+         samples a fixed set of cases and forces only CPUID exits, so a CPU or hypervisor \
+         that behaves differently only on other instruction paths, or on VM exits the guest \
+         cannot see, is not excluded. Firmware (SMM) entries cannot be checked at all. \
+         Default runs use x86-64-v2, which this does not affect."
+    };
+}
+
 /// What the host's XSAVE results can depend on, stated wherever v3 is offered:
 /// the `--cpu-profile` help, `--verify` output, the recording and the docs.
-pub const V3_RESIDUAL: &str = "With --cpu-profile x86-64-v3, Hermit checks at startup that this \
-host does not change the XSTATE_BV bits a guest reads (with XSAVE, XSAVEC or XSAVEOPT, or in a \
-signal frame) when the host saves and restores the guest's registers. The check samples a fixed \
-set of cases and forces only CPUID exits, so a CPU or hypervisor that behaves differently only on \
-other instruction paths, or on VM exits the guest cannot see, is not excluded. Firmware (SMM) \
-entries cannot be checked at all. Default runs use x86-64-v2, which this does not affect.";
+pub const V3_RESIDUAL: &str = v3_residual!();
+
+/// The long help of `--cpu-profile`, for `hermit run` and `hermit record start`.
+pub const CPU_PROFILE_LONG_HELP: &str = concat!(
+    "The CPU the guest sees: x86-64-v2 (the default) or x86-64-v3. v3 is offered only on \
+     the ptrace backend, on hosts that pass a startup qualification \
+     (`hermit host-capabilities --cpu-profile x86-64-v3` runs it alone). A recording binds \
+     the host facts its guest's answers come from, and replay refuses a host where any of \
+     them differs (<https://github.com/rrnewton/hermit/issues/4243>).\n\n",
+    v3_residual!()
+);
 
 #[cfg(test)]
 mod tests {

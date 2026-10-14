@@ -627,6 +627,11 @@ pub struct Metadata {
     /// host facts (`detcore::virtual_cpuid_digest`). Replay recomputes it.
     #[serde(default)]
     pub cpu_table_digest: Option<String>,
+    /// Under x86-64-v3, what the host qualification leaves uncovered
+    /// (`detcore_model::cpu_profile::V3_RESIDUAL`), so that a reader of the
+    /// recording sees it.
+    #[serde(default)]
+    pub cpu_profile_residual: Option<String>,
 }
 
 impl Metadata {
@@ -686,6 +691,7 @@ impl Metadata {
             cpu_profile: Default::default(),
             cpu_profile_host: None,
             cpu_table_digest: None,
+            cpu_profile_residual: None,
         })
     }
 
