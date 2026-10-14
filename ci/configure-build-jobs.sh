@@ -1564,8 +1564,13 @@ fi
 # recipe input: build.rs, the vendored DynamoRIO tree, third-party/, the root
 # Cargo.toml and rust-toolchain.toml are unchanged. The new fixture raises the
 # reverie-dbt inventory from 949 to 950. No new timing sample is claimed.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != aad2ccd89d462d4e1bd9194e405d2adab1a728f3 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie aad2ccd89d462d4e1bd9194e405d2adab1a728f3 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# KVM CLOCK SDK-BUDGET CARRY (2026-10-14): advance from aad2ccd8 to b866896f688bb27db6e29efd6696451e60ca20be (reverie main 41d4e683 plus one commit).
+# The added commits are 41d4e6839387 (scripts/m1_artifact.rs only) and the
+# KVM clock commit, which changes only reverie-kvm/src/clock.rs and its tests; every
+# SDK recipe input, build.rs and the vendored DynamoRIO tree are unchanged, and
+# no reverie-dbt file is added (inventory 950), so the budgets above carry.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != b866896f688bb27db6e29efd6696451e60ca20be ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie b866896f688bb27db6e29efd6696451e60ca20be (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
