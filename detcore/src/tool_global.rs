@@ -2936,6 +2936,11 @@ impl GlobalState {
                     .await
                     .take_exec_timer_flush(dtid, process),
             ),
+            GlobalRequest::RetireExitedLeader => R::RetireExitedLeader(
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .retire_exited_leader(dtid, request_mm),
+            ),
             GlobalRequest::GuestPid(caller, pid) => {
                 let sched = self.lock_rpc_scheduler(false).await;
                 R::GuestPid(sched.guest_pid(caller, pid))
@@ -3804,11 +3809,7 @@ impl GlobalState {
         {
             return;
         }
-        if !sched.defer_exec_sibling_retirement(dettid, detpid, mm)
-            && !sched.thread_is_logically_killed(dettid)
-        {
-            sched.logically_kill_thread(&dettid, &detpid, mm);
-        }
+        sched.retire_deregistered_thread(dettid, detpid, mm);
         trace!(
             "[detcore, dtid {}] thread deregistered, removed from sched structures.",
             dettid
@@ -4791,6 +4792,10 @@ pub enum GlobalRequest {
     /// (`Scheduler::take_exec_timer_flush`), asked by its surviving thread.
     /// Appended after `LocalPid`, for the same reason.
     ExecTimerFlush(DetPid),
+    /// The calling thread-group leader is about to complete its own `exit`
+    /// while its group lives on (`Scheduler::retire_exited_leader`).
+    /// Appended after `ExecTimerFlush`, for the same reason.
+    RetireExitedLeader,
 }
 
 /// Responses from the global object
@@ -4930,6 +4935,8 @@ pub enum GlobalResponse {
     LocalPid(Result<Option<i32>, String>),
     /// Appended after `LocalPid`, for the same reason.
     ExecTimerFlush(Result<crate::scheduler::ExecTimerFlush, String>),
+    /// Appended after `ExecTimerFlush`, for the same reason.
+    RetireExitedLeader(bool),
 }
 
 /// `request`, carrying the number of records this guest thread produced for
@@ -6639,6 +6646,21 @@ where
     let response = send_and_update_time(guest, GlobalRequest::ExecTimerFlush(process)).await;
     match response.1 {
         GlobalResponse::ExecTimerFlush(answer) => answer,
+        _ => unreachable!(),
+    }
+}
+
+/// Retire the calling thread-group leader, which has made its last request
+/// before completing its own `exit`, if its group lives on
+/// (`Scheduler::retire_exited_leader`). Returns whether it was retired.
+pub async fn retire_exited_leader<G, T>(guest: &mut G) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::RetireExitedLeader).await;
+    match response.1 {
+        GlobalResponse::RetireExitedLeader(retired) => retired,
         _ => unreachable!(),
     }
 }

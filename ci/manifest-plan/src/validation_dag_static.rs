@@ -2077,7 +2077,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (Claude re-check of https://github.com/rrnewton/hermit/pull/4249): 1528, by listing.
     // And the five FIFO peer-scan tests (https://github.com/rrnewton/hermit/issues/4200): 1533, by listing.
     // And the two raw-exit ChildExit tests (https://github.com/rrnewton/hermit/issues/3895): 1535.
-    ("test.detcore_unit", 1535),
+    // And an_exited_leader_with_a_live_sibling_leaves_the_scheduler_at_its_exit,
+    // turns_wait_until_a_retired_leader_is_a_zombie and
+    // a_retired_leaders_late_deregistration_does_not_end_its_process_again
+    // (https://github.com/rrnewton/hermit/issues/4100): 1538.
+    ("test.detcore_unit", 1538),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2870,7 +2874,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And a_run_with_host_drawn_inputs_reruns_bitwise_from_its_manifest
     // (https://github.com/rrnewton/hermit/issues/4271): 363, listed with this
     // node's arguments.
-    ("test.cli", 363),
+    // And a_leader_pthread_exit_leaves_its_group_running_at_bitwise_parity,
+    // a_worker_exit_code_ends_a_process_whose_leader_called_pthread_exit and
+    // record_refuses_a_leader_that_exits_while_its_threads_run_on
+    // (https://github.com/rrnewton/hermit/issues/4100): 366.
+    ("test.cli", 366),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3164,7 +3172,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the late managed-replay startup-failure test: 298.
     // Nor does the run-manifest rerun test: 299, listed with this node's
     // arguments.
-    ("test.cli_on_host", 299),
+    // So do the three leader pthread_exit tests: 302.
+    ("test.cli_on_host", 302),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -3352,7 +3361,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the get_mempolicy output-error test: 1528, by listing.
     // And the five FIFO peer-scan tests: 1533, by listing.
     // And the two raw-exit ChildExit tests: 1535.
-    ("test.detcore_unit_on_host", 1535),
+    // And the three exited-leader retirement tests: 1538.
+    ("test.detcore_unit_on_host", 1538),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

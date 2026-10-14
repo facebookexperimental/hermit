@@ -1122,6 +1122,28 @@ pub struct Scheduler {
     /// ([`Scheduler::child_waits_wait_only_on_held_children`]). Cleared when
     /// the tid is registered again.
     committed_exits: BTreeSet<DetTid>,
+    /// Thread-group leaders retired at their own `exit` while a sibling still
+    /// ran (`retire_exited_leader`). Linux keeps such a leader as a zombie
+    /// until its group is empty, so its backend deregistration comes only
+    /// then; that deregistration finds it here and changes nothing more
+    /// (<https://github.com/rrnewton/hermit/issues/4100>). Cleared when the tid
+    /// is registered again.
+    retired_exited_leaders: BTreeSet<DetTid>,
+    /// Leaders `retire_exited_leader` retired, until the kernel shows each
+    /// one a zombie, and when it was retired, which bounds the wait
+    /// (`exited_leader_valve`). The retirement comes before the leader's exit
+    /// is injected, and the kernel's exit then releases its address space and
+    /// files and moves its signal targeting; a sibling turn in that window
+    /// would observe those changes at host-chosen points (Claude review of
+    /// <https://github.com/rrnewton/hermit/pull/4245>). So step2 commits no
+    /// turn while an entry is pending (`step2a_wait_for_exited_leaders`).
+    exited_leader_barriers: BTreeMap<DetTid, std::time::Instant>,
+    /// How long an `exited_leader_barriers` entry may wait before the run
+    /// ends with a named refusal.
+    exited_leader_valve: Duration,
+    /// Task states `read_task_state` reports in unit tests.
+    #[cfg(test)]
+    test_task_states: BTreeMap<DetTid, char>,
     /// Set by a SIGKILL whose victim the scheduler cannot name (a pidfd with
     /// no recorded process): from then on no child wait counts as part of a
     /// deadlock ([`Scheduler::record_unresolved_sigkill`]).
@@ -3289,6 +3311,11 @@ impl Scheduler {
             released_vfork_barriers: Default::default(),
             sigkilled_processes: Default::default(),
             committed_exits: Default::default(),
+            retired_exited_leaders: Default::default(),
+            exited_leader_barriers: Default::default(),
+            exited_leader_valve: Duration::from_secs(30),
+            #[cfg(test)]
+            test_task_states: Default::default(),
             unresolved_sigkill: false,
             pending_run_queue_admissions: Default::default(),
             pending_run_queue_removals: Default::default(),
@@ -3534,6 +3561,7 @@ impl Scheduler {
     pub(crate) fn forget_committed_exit(&mut self, dettid: DetTid) {
         self.forget_sigkill_receipt(dettid);
         self.committed_exits.remove(&dettid);
+        self.retired_exited_leaders.remove(&dettid);
         // A reused pid names a new process, not one a namespace's end doomed.
         self.namespace_zap_victims.remove(&dettid);
     }
@@ -4561,6 +4589,7 @@ impl Scheduler {
         // raw-TID tombstones: the pending exec record proves why Linux reused it.
         self.logically_killed_threads.remove(&new_leader);
         self.deregistration_accounted.remove(&new_leader);
+        self.retired_exited_leaders.remove(&new_leader);
         self.pending_physical_process_exits.remove(&detpid);
         assert!(
             self.next_turns
@@ -4880,6 +4909,81 @@ impl Scheduler {
     /// consume a child before its parent has sent CreateChildThread.
     pub(crate) fn thread_was_registered(&self, dettid: DetTid) -> bool {
         self.thread_tree.thread_to_leader.contains_key(&dettid)
+    }
+
+    /// Retire the thread-group leader `leader` at its own `exit`, issued after
+    /// its granted `Exit` and its last request, while another thread of its
+    /// group is still registered. Linux leaves such a leader a zombie: it runs
+    /// no more code, its group lives on, and the group's last thread ends the
+    /// process. Its backend deregistration comes only when the whole group has
+    /// gone (ptrace reports a leader's exit status after its last sibling's),
+    /// so until then the scheduler would wait for a turn request that never
+    /// comes (<https://github.com/rrnewton/hermit/issues/4100>). The leader
+    /// leaves the scheduler here instead, in its own turn, and its later
+    /// deregistration only accounts it (`take_retired_exited_leader`).
+    /// Returns whether it was retired; a leader whose group has no other
+    /// registered thread is left to its deregistration as before.
+    ///
+    /// No turn is committed from here until the kernel shows the leader a
+    /// zombie (`exited_leader_barriers`): its exit, which the leader injects
+    /// after this request, releases its address space and files, zeroes its
+    /// `clear_child_tid` word and moves its signal targeting, and the
+    /// siblings must see all of that done. Only where the scheduler models
+    /// signal targets (ptrace) is a thread's `/proc` view its DetTid's, so
+    /// only there is the leader retired here; elsewhere it is left to its
+    /// deregistration, as before.
+    pub(crate) fn retire_exited_leader(&mut self, leader: DetTid, mm: MmId) -> bool {
+        if !self.leader_retires_at_exit(leader, mm) {
+            return false;
+        }
+        let process = DetPid::from_raw(leader.as_raw());
+        self.logically_kill_thread(&leader, &process, mm);
+        self.retired_exited_leaders.insert(leader);
+        self.exited_leader_barriers
+            .insert(leader, std::time::Instant::now());
+        true
+    }
+
+    /// Whether `retire_exited_leader` retires `leader`: on a backend whose
+    /// `/proc` view is the scheduler's, a thread-group leader, of this
+    /// incarnation, whose `Exit` was granted, while another thread of its
+    /// group is registered.
+    fn leader_retires_at_exit(&self, leader: DetTid, mm: MmId) -> bool {
+        let process = DetPid::from_raw(leader.as_raw());
+        self.models_signal_targets
+            && self.thread_tree.thread_group_leaders.contains(&process)
+            && self.committed_exits.contains(&leader)
+            && self.rpc_incarnation_matches(leader, mm)
+            && self.next_turns.contains_key(&leader)
+            && self
+                .thread_tree
+                .my_thread_group(&process)
+                .into_iter()
+                .any(|tid| tid != leader && self.next_turns.contains_key(&tid))
+    }
+
+    /// Whether `dettid` is a leader `retire_exited_leader` already retired;
+    /// its deregistration then retires nothing more. Consumes the record.
+    pub(crate) fn take_retired_exited_leader(&mut self, dettid: DetTid) -> bool {
+        self.retired_exited_leaders.remove(&dettid)
+    }
+
+    /// Retire `dettid` at its accounted deregistration, unless an exec
+    /// defers it or it is already logically killed. A leader retired at its
+    /// own exit while its group lived on (`retire_exited_leader`) was retired
+    /// then: by now its group may have ended, and retiring it again would run
+    /// its process's end a second time, at this host-timed moment (deciding
+    /// again whether its parent reaps it automatically, and waking the
+    /// parent's waiters again).
+    pub(crate) fn retire_deregistered_thread(&mut self, dettid: DetTid, detpid: DetPid, mm: MmId) {
+        if self.take_retired_exited_leader(dettid) {
+            return;
+        }
+        if !self.defer_exec_sibling_retirement(dettid, detpid, mm)
+            && !self.thread_is_logically_killed(dettid)
+        {
+            self.logically_kill_thread(&dettid, &detpid, mm);
+        }
     }
 
     /// Mark a physical exit cleanup as accounted. A transferred leader must
@@ -5750,7 +5854,79 @@ impl Scheduler {
         }
         self.step2a_wait_for_vfork_barrier()?;
         self.step2a_wait_for_background_entry()?;
+        self.step2a_wait_for_exited_leaders()?;
         Ok(())
+    }
+
+    /// Waits, committing no turn, until the kernel shows every leader
+    /// retired at its own exit (`exited_leader_barriers`) a zombie, or dead,
+    /// or gone. When the kernel finishes the leader's exit is host-timed;
+    /// waiting for it decides only how long the scheduler spins, never which
+    /// turn comes next or what a sibling observes
+    /// (<https://github.com/rrnewton/hermit/issues/4100>).
+    fn step2a_wait_for_exited_leaders(&mut self) -> Result<(), SkipTurn> {
+        if self.exited_leader_barriers.is_empty() {
+            return Ok(());
+        }
+        let mut settled = Vec::new();
+        let mut stuck = None;
+        for (leader, since) in &self.exited_leader_barriers {
+            let observed = match self.read_task_state(*leader) {
+                Ok('Z' | 'X') => {
+                    settled.push(*leader);
+                    continue;
+                }
+                Ok(state) => format!("its state is {state}"),
+                Err(errno) => {
+                    let pid = reverie::Pid::from_raw(leader.as_raw());
+                    if thread_is_gone(pid, pid) {
+                        settled.push(*leader);
+                        continue;
+                    }
+                    format!("its state cannot be read ({errno}) although it is alive")
+                }
+            };
+            if stuck.is_none() && since.elapsed() >= self.exited_leader_valve {
+                stuck = Some(format!(
+                    "HERMIT_DEADLOCK: thread-group leader {leader} was retired at its own exit, \
+                     and after {:?} the kernel does not show it a zombie: {observed}",
+                    self.exited_leader_valve
+                ));
+            }
+        }
+        for leader in settled {
+            self.exited_leader_barriers.remove(&leader);
+        }
+        if let Some(reason) = stuck {
+            tracing::error!("[step2] {reason}");
+            self.terminal_deadlock.get_or_insert(reason);
+            return Err(SkipTurn);
+        }
+        if self.exited_leader_barriers.is_empty() {
+            Ok(())
+        } else {
+            std::thread::yield_now();
+            Err(SkipTurn)
+        }
+    }
+
+    /// The state letter of thread `thread` of its process, from
+    /// `/proc/<pid>/task/<tid>/stat` (the field after the command name).
+    fn read_task_state(&self, thread: DetTid) -> Result<char, Errno> {
+        #[cfg(test)]
+        if let Some(state) = self.test_task_states.get(&thread) {
+            return Ok(*state);
+        }
+        let process = self.sigchld_process(thread);
+        let stat = std::fs::read_to_string(format!(
+            "/proc/{}/task/{}/stat",
+            process.as_raw(),
+            thread.as_raw()
+        ))
+        .map_err(|error| Errno::new(error.raw_os_error().unwrap_or(libc::EIO)))?;
+        stat.rsplit_once(')')
+            .and_then(|(_, rest)| rest.trim_start().chars().next())
+            .ok_or(Errno::EINVAL)
     }
 
     /// Waits, committing no turn, until every thread released into a
@@ -22860,6 +23036,156 @@ mod test {
             ),
             "{report}"
         );
+    }
+
+    /// A thread-group leader's own `exit` retires it while its group lives on,
+    /// so the scheduler stops waiting for a turn request from a zombie that
+    /// makes none (https://github.com/rrnewton/hermit/issues/4100). Only
+    /// where the scheduler models signal targets (ptrace), only a leader of
+    /// this incarnation that is still registered, only after its exit was
+    /// granted, and only while another thread of its group is registered. It
+    /// then holds turns until the kernel shows it a zombie; its process does
+    /// not end there, and its later deregistration finds it retired once. A
+    /// leader alone in its group is left to its deregistration, and a new
+    /// thread on its tid starts clean.
+    #[test]
+    fn an_exited_leader_with_a_live_sibling_leaves_the_scheduler_at_its_exit() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.models_signal_targets = true;
+        let leader = DetTid::from_raw(3);
+        let worker = DetTid::from_raw(5);
+        let process = DetPid::from_raw(3);
+        let mm = MmId::initial(process);
+        scheduler.thread_tree.add_child(leader, leader, true);
+        scheduler.thread_tree.add_child(leader, worker, false);
+        register_known_thread(&mut scheduler, leader);
+        register_known_thread(&mut scheduler, worker);
+
+        // No granted exit yet.
+        assert!(!scheduler.retire_exited_leader(leader, mm));
+        assert!(scheduler.next_turns.contains_key(&leader));
+        // A non-leader is not retired here, even with its exit granted.
+        scheduler.committed_exits.insert(worker);
+        assert!(!scheduler.retire_exited_leader(worker, mm));
+        assert!(scheduler.next_turns.contains_key(&worker));
+        scheduler.committed_exits.remove(&worker);
+        scheduler.committed_exits.insert(leader);
+        // Not where the scheduler does not model signal targets.
+        scheduler.models_signal_targets = false;
+        assert!(!scheduler.retire_exited_leader(leader, mm));
+        scheduler.models_signal_targets = true;
+        // Not from another incarnation of the leader's tid.
+        let other_image = mm.for_exec(leader);
+        scheduler.exec_incarnations.insert(leader, other_image);
+        assert!(!scheduler.retire_exited_leader(leader, mm));
+        scheduler.exec_incarnations.remove(&leader);
+        assert!(scheduler.exited_leader_barriers.is_empty());
+
+        assert!(scheduler.retire_exited_leader(leader, mm));
+        assert!(!scheduler.next_turns.contains_key(&leader));
+        assert!(scheduler.next_turns.contains_key(&worker));
+        assert!(scheduler.exited_leader_barriers.contains_key(&leader));
+        assert!(!scheduler.logically_exited_processes.contains(&process));
+        // A leader no longer registered is not retired again.
+        assert!(!scheduler.retire_exited_leader(leader, mm));
+        assert!(scheduler.take_retired_exited_leader(leader));
+        assert!(!scheduler.take_retired_exited_leader(leader));
+
+        // The worker's own exit then ends the process.
+        scheduler.logically_kill_thread(&worker, &process, mm);
+        assert!(scheduler.logically_exited_processes.contains(&process));
+
+        // A leader alone in its group is left to its deregistration.
+        let alone = DetTid::from_raw(7);
+        let alone_mm = MmId::initial(DetPid::from_raw(7));
+        scheduler.thread_tree.add_child(leader, alone, true);
+        register_known_thread(&mut scheduler, alone);
+        scheduler.committed_exits.insert(alone);
+        assert!(!scheduler.retire_exited_leader(alone, alone_mm));
+        assert!(scheduler.next_turns.contains_key(&alone));
+
+        // A retired leader's tid registered again starts with no record.
+        scheduler.retired_exited_leaders.insert(alone);
+        scheduler.forget_committed_exit(alone);
+        assert!(!scheduler.take_retired_exited_leader(alone));
+    }
+
+    /// After retiring a leader at its own exit, the scheduler commits no turn
+    /// until the kernel shows the leader a zombie (or dead): its exit, injected
+    /// after the retirement, releases what a sibling could observe
+    /// (https://github.com/rrnewton/hermit/issues/4100, Claude review of
+    /// https://github.com/rrnewton/hermit/pull/4245). A leader that never gets
+    /// there ends the run with a named refusal after the valve.
+    #[test]
+    fn turns_wait_until_a_retired_leader_is_a_zombie() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let leader = DetTid::from_raw(3);
+        scheduler
+            .exited_leader_barriers
+            .insert(leader, std::time::Instant::now());
+        scheduler.test_task_states.insert(leader, 'R');
+        assert!(scheduler.step2a_wait_for_exited_leaders().is_err());
+        assert!(scheduler.terminal_deadlock.is_none());
+        scheduler.test_task_states.insert(leader, 'Z');
+        assert!(scheduler.step2a_wait_for_exited_leaders().is_ok());
+        assert!(scheduler.exited_leader_barriers.is_empty());
+
+        scheduler
+            .exited_leader_barriers
+            .insert(leader, std::time::Instant::now());
+        scheduler.test_task_states.insert(leader, 'X');
+        assert!(scheduler.step2a_wait_for_exited_leaders().is_ok());
+
+        scheduler
+            .exited_leader_barriers
+            .insert(leader, std::time::Instant::now());
+        scheduler.test_task_states.insert(leader, 'S');
+        scheduler.exited_leader_valve = Duration::ZERO;
+        assert!(scheduler.step2a_wait_for_exited_leaders().is_err());
+        let reason = scheduler.terminal_deadlock.clone().unwrap();
+        assert!(
+            reason.contains("thread-group leader 3 was retired at its own exit")
+                && reason.contains("its state is S"),
+            "{reason}"
+        );
+    }
+
+    /// The late deregistration of a leader retired at its own exit, which
+    /// ptrace delivers only after its group has ended, does not end its
+    /// process again (<https://github.com/rrnewton/hermit/issues/4100>). Linux
+    /// decides at the group's end whether the parent reaps the child
+    /// automatically, and a later change of the parent's SIGCHLD disposition
+    /// does not change that.
+    #[test]
+    fn a_retired_leaders_late_deregistration_does_not_end_its_process_again() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.models_signal_targets = true;
+        let parent = DetTid::from_raw(2);
+        let leader = DetTid::from_raw(3);
+        let worker = DetTid::from_raw(5);
+        let process = DetPid::from_raw(3);
+        let mm = MmId::initial(process);
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.thread_tree.add_child(parent, leader, true);
+        scheduler.thread_tree.add_child(leader, worker, false);
+        register_known_thread(&mut scheduler, parent);
+        register_known_thread(&mut scheduler, leader);
+        register_known_thread(&mut scheduler, worker);
+        scheduler.committed_exits.insert(leader);
+        assert!(scheduler.retire_exited_leader(leader, mm));
+        // The worker's exit ends the process; the parent does not reap
+        // automatically.
+        scheduler.retire_deregistered_thread(worker, process, mm);
+        assert!(scheduler.logically_exited_processes.contains(&process));
+        assert!(!scheduler.autoreaped_exits.contains(&process));
+        // The parent then ignores SIGCHLD, and the leader's deregistration
+        // arrives.
+        scheduler
+            .thread_tree
+            .set_sigchld_disposition(DetPid::from_raw(2), true, false);
+        scheduler.retire_deregistered_thread(leader, process, mm);
+        assert!(!scheduler.autoreaped_exits.contains(&process));
+        assert!(!scheduler.take_retired_exited_leader(leader));
     }
 
     /// A child wait is part of a happens-before deadlock only when every child

@@ -155,6 +155,7 @@ static OWN_PROCESS_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VDSO_SYMBOL_VERSIONS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_SIGEV_THREAD_ID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_EXEC_FLUSH_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static LEADER_PTHREAD_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static NESTED_VFORK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_CHILD_WAITS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static GET_MEMPOLICY_ONE_NODE_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1241,6 +1242,31 @@ fn rendered_procfs_files_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "rendered-procfs-files guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn leader_pthread_exit_guest() -> &'static Path {
+    LEADER_PTHREAD_EXIT_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("leader-pthread-exit");
+        fs::create_dir_all(&build_root).expect("failed to create leader-pthread-exit directory");
+        let guest = build_root.join("leader_pthread_exit");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/leader_pthread_exit.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile leader-pthread-exit guest");
+        assert!(
+            output.status.success(),
+            "leader-pthread-exit guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -26616,6 +26642,158 @@ fn an_exec_with_an_unprovable_timer_copy_pending_is_refused_by_name() {
             "{mode}: {log}"
         );
     }
+}
+
+/// A thread-group leader that calls `pthread_exit` while another thread lives
+/// leaves the group running, as on Linux, where it stays a zombie until the
+/// group's last thread ends the process
+/// (https://github.com/rrnewton/hermit/issues/4100). Each mode of
+/// `tests/c/leader_pthread_exit.c` is strict-verified at bitwise parity and
+/// must print what Linux printed (5 native runs of each, identical,
+/// 2026-10-13): a worker that sleeps, one that yields, a process-directed
+/// kill a live thread takes, a join of the exited main thread, a last
+/// thread's own pthread_exit, an exec from the worker, and a parent reaping
+/// such a child with the worker's exit code. Before (main d9c8c3d0), every
+/// mode but `exec` ran into the `--timeout`: the scheduler waited for a turn
+/// request from the exited leader, whose exit ptrace reports only when the
+/// group is gone. The leader leaves the scheduler before its exit is
+/// injected, and no turn is committed until the kernel shows it a zombie:
+/// `procself` reads `/proc/self/exe`, `fd` and `maps` (the zombie leader's)
+/// right after joining it, and `join16` and `procself16` do that in 16 forked
+/// children in turn. Without the wait, the joiner saw the leader's exit
+/// half-done at host-chosen points: its exe link still readable in 2 of 12
+/// runs (Claude review of https://github.com/rrnewton/hermit/pull/4245), its
+/// `clear_child_tid` word not yet zeroed (`join16` diverged in 5 of 5).
+#[test]
+fn a_leader_pthread_exit_leaves_its_group_running_at_bitwise_parity() {
+    let guest = leader_pthread_exit_guest().to_str().unwrap().to_owned();
+    let cases = [
+        ("sleep", "sleep worker survived the leader's exit\n"),
+        ("yield", "yield worker survived the leader's exit\n"),
+        ("kill", "kill rc=0 receiver=sender\n"),
+        ("join", "join rc=0\n"),
+        ("join16", "join16 ok=16\n"),
+        (
+            "procself",
+            "procself join=0 exe_errno=2 fds=2 maps_nonempty=0\n",
+        ),
+        ("procself16", "procself16 ok=16\n"),
+        ("lastexit", "lastexit worker leaving by pthread_exit\n"),
+        ("exec", "exec after the leader's exit\n"),
+        (
+            "child",
+            "code worker exits 7\nchild reaped=1 exited=1 code=7\n",
+        ),
+    ];
+    for (mode, expected) in cases {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let verdict = directory.path().join("verify.json");
+        let (status, log) = run_with_deadline(
+            hermit_command(&[
+                "--log=info",
+                "run",
+                "--strict",
+                "--verify",
+                "--verify-strict",
+                "--verify-json",
+                verdict.to_str().unwrap(),
+                "--timeout",
+                "60",
+                "--",
+                guest.as_str(),
+                mode,
+            ]),
+            directory.path(),
+            Duration::from_secs(180),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{mode}:\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert_eq!(stdout, expected, "{mode}: stderr:\n{log}");
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
+                .expect("the verdict must be JSON");
+        assert_eq!(report["bitwise_parity"], true, "{mode}: {report}");
+    }
+}
+
+/// `hermit record` refuses by name a process whose thread-group leader
+/// exits while its threads run on: the recorder reads the descriptor table
+/// through the leader, a zombie from then on, and would record the group's
+/// later output as ordinary writes that replay drops
+/// (https://github.com/rrnewton/hermit/issues/4244; before this refusal,
+/// replay printed nothing where the recording printed the worker's line).
+#[test]
+fn record_refuses_a_leader_that_exits_while_its_threads_run_on() {
+    let guest = leader_pthread_exit_guest().to_str().unwrap().to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let data_dir = format!(
+        "--data-dir={}",
+        directory.path().join("recording").display()
+    );
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "record",
+            "start",
+            "--record-timeout=60",
+            data_dir.as_str(),
+            "--",
+            guest.as_str(),
+            "sleep",
+        ]),
+        directory.path(),
+        Duration::from_secs(180),
+        false,
+    );
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{log}"
+    );
+    assert!(
+        log.contains("exited while its threads run on, which record and replay cannot yet capture")
+            && log.contains("https://github.com/rrnewton/hermit/issues/4244"),
+        "{log}"
+    );
+}
+
+/// The exit code of the worker that ends a process whose leader called
+/// `pthread_exit` is the process's, as on Linux (native: `code worker exits
+/// 7`, exit 7, 5 runs). `--verify` refuses to compare a first run that exits
+/// nonzero, so this mode runs once under `run --strict`; the `child` mode of
+/// the parity test above checks the same exit code at bitwise parity
+/// (https://github.com/rrnewton/hermit/issues/4100).
+#[test]
+fn a_worker_exit_code_ends_a_process_whose_leader_called_pthread_exit() {
+    let guest = leader_pthread_exit_guest().to_str().unwrap().to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "run",
+            "--strict",
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+            "code",
+        ]),
+        directory.path(),
+        Duration::from_secs(180),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(7),
+        "stdout:\n{stdout}\nstderr:\n{log}"
+    );
+    assert_eq!(stdout, "code worker exits 7\n", "stderr:\n{log}");
 }
 
 /// A `SIGEV_THREAD_ID` expiration of a standard signal already pending on its

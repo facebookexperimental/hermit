@@ -1969,6 +1969,39 @@ impl<T: RecordOrReplay> Detcore<T> {
         );
         resource_request(guest, request).await;
         self.run_robust_list_owner_death(guest).await;
+        // A leader whose group lives on is a zombie from here until its last
+        // sibling leaves, and its backend reports its exit only then: it
+        // leaves the scheduler now, after its last request
+        // (https://github.com/rrnewton/hermit/issues/4100).
+        let state = guest.thread_state();
+        if self.cfg.sequentialize_threads
+            && state
+                .detpid
+                .is_some_and(|pid| pid.as_raw() == state.dettid.as_raw())
+            && crate::tool_global::retire_exited_leader(guest).await
+            && self.cfg.replay_data.is_some()
+        {
+            // The recorder reads the process's descriptor table through its
+            // leader, which is a zombie from here, so it would record the
+            // group's later output as ordinary writes that replay drops
+            // (https://github.com/rrnewton/hermit/issues/4244).
+            let message = format!(
+                "hermit: thread-group leader {} exited while its threads run on, which record \
+                 and replay cannot yet capture, so the run is refused \
+                 (https://github.com/rrnewton/hermit/issues/4244)",
+                guest.thread_state().dettid
+            );
+            tracing::error!("{message}");
+            let _ = std::io::Write::write_fmt(
+                &mut crate::util::RetryingStderr,
+                format_args!("{message}\n"),
+            );
+            crate::tool_global::unrecoverable_shutdown(
+                guest,
+                detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
+            )
+            .await;
+        }
         // It's ok here that we skip running the posthook:
         guest.tail_inject(call).await
     }
