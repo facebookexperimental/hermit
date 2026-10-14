@@ -144,9 +144,10 @@ fn copied_source_checks(case: &Path, original: &Path, runner: &mut Runner) -> Re
             .as_array()
             .unwrap()
             .len(),
-        // Reverie 74de8cf2 adds reverie-inguest/src/guest/tool_region_keyed.rs
-        // to the standalone runtime's declared sources: 15.
-        15
+        // Shared handler extraction adds installed_tool.rs, guest/mod.rs,
+        // guest/host.rs and LiteInst tool_host.rs to the declared source catalog.
+        // The existing 14 runtime inputs and the checker remain: 19 total.
+        19
     );
     let alias = case.join("cargo-alias");
     let private_home = case.join("cargo-home");
