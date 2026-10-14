@@ -76,12 +76,16 @@ editors/vscode/test/run.sh --code /path/to/VSCode-linux-x64/code
 
 It needs GDB with the DAP interpreter (tested with GDB 17.2), `cc` and
 `node`. With VS Code 1.141.1 both sessions pass in about 75 seconds. Each VS
-Code run is bounded by `--timeout` (default 300 s), and a session passes only
+Code run, and recording the guest, is bounded by `--timeout` (default
+300 s), and a session passes only
 on the result file that run wrote, matched by a per-run nonce, with every
 required step and no failures. The test is not part of Hermit's validation,
 because it needs a VS Code download.
 
-`test/selftest.sh` checks the harness itself without VS Code or Hermit: with
-an editor that exits 0 without running the test, one that exits 1, and one
-that hangs, each with a stale passing-looking result file left in the work
-directory, `run.sh` must fail in bounded time (about 20 seconds in all).
+`test/selftest.sh` checks the harness itself without VS Code or Hermit,
+using stand-ins for both. An editor that writes a correct result for the run
+and ends the session must make `run.sh` pass both sessions. `run.sh` must
+fail, in bounded time, with an editor that exits 0 without running the test,
+one that exits 1, and one that hangs, each with a stale passing-looking
+result file left in the work directory, and when recording the guest hangs.
+All five take about 30 seconds.

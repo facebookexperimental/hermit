@@ -29,8 +29,11 @@ Usage: editors/vscode/test/run.sh --code PATH [--hermit 'CMD ...'] [--hermit-dap
                      (default: target/debug/hermit-dap).
   --work DIR         Scratch directory, not under /tmp, where Hermit refuses
                      to run guests (default: target/vscode-test).
-  --timeout SECONDS  Bound on each VS Code run (default: 300). A run that
-                     takes longer is killed and counts as a failure.
+  --timeout SECONDS  Bound on each VS Code run and on recording the guest
+                     (default: 300). A step that takes longer is killed and
+                     counts as a failure. A --hermit wrapper with its own
+                     deadline (safehermit's --sh-deadline) should keep it
+                     shorter than this, so the wrapper ends its run first.
   -h, --help         Show this help.
 USAGE
 }
@@ -204,8 +207,14 @@ stop_server "$server" "$grace" || failed=1
 
 # reverse: VS Code connects to hermit replay --dap-listen.
 rm -rf "${work:?}/recordings"
-"${hermit_cmd[@]}" record start --data-dir "$work/recordings" -- "$work/squares" \
-    </dev/null >"$work/record.log" 2>&1
+record_status=0
+timeout --kill-after=10 "$trial_timeout" \
+    "${hermit_cmd[@]}" record start --data-dir "$work/recordings" -- "$work/squares" \
+    </dev/null >"$work/record.log" 2>&1 || record_status=$?
+if [ "$record_status" -ne 0 ] || [ ! -s "$work/recordings/last" ]; then
+    echo "FAIL reverse: hermit record start exited $record_status$([ "$record_status" -ge 124 ] && echo ", timed out after ${trial_timeout} s or killed"); see $work/record.log" >&2
+    exit 1
+fi
 recording=$(cat "$work/recordings/last")
 gdb_port=$(free_port)
 dap_port=$(free_port)
