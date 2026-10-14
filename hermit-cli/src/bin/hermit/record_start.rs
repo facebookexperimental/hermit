@@ -476,6 +476,9 @@ impl StartOpts {
         for mount in &self.mount {
             let user_target = mount.get_target();
             identity_guard.discard_mounts_shadowed_by(&mut identity_mounts, user_target);
+            if mount.get_source().is_some() && super::container::is_bind_mount(mount) {
+                identity_guard.add_user_bind(user_target, None);
+            }
         }
         container.mounts(identity_mounts);
         container.mounts(self.mount.clone());

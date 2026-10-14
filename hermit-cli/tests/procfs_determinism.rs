@@ -815,8 +815,13 @@ fn proc_self_mountinfo_is_deterministic() {
     }
 }
 
+/// A user's bind mount shows its target as its root, not the host source path
+/// (owner rule of Oct 13: Detcore is the only /proc authority and the guest
+/// never sees host paths, https://github.com/rrnewton/hermit/issues/4266).
+/// Before, this test required the source's name in the root; it still
+/// requires that the mount not be shown as one of Hermit's own.
 #[test]
-fn proc_self_mountinfo_preserves_user_mount_with_tempfile_shape() {
+fn proc_self_mountinfo_shows_a_user_mount_at_its_target_not_as_hermit_owned() {
     let _guard = hermit_run_lock();
     let mut user_group = tempfile::Builder::new()
         .prefix(".tmp")
@@ -842,11 +847,16 @@ fn proc_self_mountinfo_preserves_user_mount_with_tempfile_shape() {
             .all(|row| !row.contains("/tmpvol/.hermit/etc/group")),
         "a user-supplied mount must not be represented as Hermit-owned: {group_rows:?}"
     );
+    let source_name = user_group.path().file_name().unwrap().to_str().unwrap();
     assert!(
-        group_rows
-            .iter()
-            .any(|row| row.contains(user_group.path().file_name().unwrap().to_str().unwrap())),
-        "the user-supplied tempfile-shaped root must be preserved: {group_rows:?}"
+        group_rows.iter().all(|row| !row.contains(source_name)),
+        "the user mount's host source path reached the guest: {group_rows:?}"
+    );
+    let top = group_rows.last().unwrap();
+    assert_eq!(
+        top.split(' ').nth(3),
+        Some("/etc/group"),
+        "the user mount's root is not its target: {top}"
     );
 }
 
@@ -928,8 +938,10 @@ fn mountinfo_device_agrees_with_stat_with_and_without_metadata_virtualization() 
     }
 }
 
+/// A user mount over /tmp replaces the private /tmp and shows /tmp as its
+/// root, not the host source path (https://github.com/rrnewton/hermit/issues/4266).
 #[test]
-fn proc_self_mountinfo_preserves_user_mount_over_private_tmp() {
+fn proc_self_mountinfo_shows_a_user_mount_over_private_tmp_at_its_target() {
     let _guard = hermit_run_lock();
     let user_tmp = tempfile::Builder::new()
         .prefix(".tmp")
@@ -963,14 +975,22 @@ fn proc_self_mountinfo_preserves_user_mount_over_private_tmp() {
     let effective_tmp = tmp_rows
         .last()
         .expect("nonempty /tmp mount rows should have a top mount");
+    let source_name = user_tmp.path().file_name().unwrap().to_str().unwrap();
     assert!(
-        effective_tmp.contains(user_tmp.path().file_name().unwrap().to_str().unwrap()),
-        "the user-provided /tmp root must remain visible: {tmp_rows:?}"
+        tmp_rows.iter().all(|row| !row.contains(source_name)),
+        "the user mount's host source path reached the guest: {tmp_rows:?}"
+    );
+    assert_eq!(
+        effective_tmp.split(' ').nth(3),
+        Some("/tmp"),
+        "the user mount over /tmp does not show its target as its root: {effective_tmp}"
     );
 }
 
+/// A `--bind` over /tmp shows /tmp as its root and mountpoint, not the host
+/// source path or Hermit's staging path (https://github.com/rrnewton/hermit/issues/4266).
 #[test]
-fn proc_self_mountinfo_preserves_user_bind_over_private_tmp() {
+fn proc_self_mountinfo_shows_a_user_bind_over_private_tmp_at_its_target() {
     let _guard = hermit_run_lock();
     let user_tmp = tempfile::Builder::new()
         .prefix(".tmp")
@@ -989,15 +1009,227 @@ fn proc_self_mountinfo_preserves_user_bind_over_private_tmp() {
         .lines()
         .rfind(|line| line.split(' ').nth(4) == Some("/tmp"))
         .expect("mountinfo must expose /tmp");
+    let source_name = user_tmp.path().file_name().unwrap().to_str().unwrap();
     assert!(
-        effective_tmp.contains(user_tmp.path().file_name().unwrap().to_str().unwrap()),
-        "the exact /tmp bind root was not preserved: {effective_tmp}"
+        !text.contains(source_name),
+        "the bind's host source path reached the guest:\n{text}"
+    );
+    assert_eq!(
+        effective_tmp.split(' ').nth(3),
+        Some("/tmp"),
+        "the exact /tmp bind does not show its target as its root: {effective_tmp}"
     );
     assert_eq!(
         effective_tmp.split(' ').nth(4),
         Some("/tmp"),
         "the exact /tmp bind exposed Hermit's random staging mountpoint"
     );
+}
+
+/// Two runs whose user binds have different host sources see the same
+/// mountinfo, byte for byte: every row of each bind, including a layer a
+/// later bind covers and a copy staged under Hermit's private /tmp, shows the
+/// bind's target as its root (https://github.com/rrnewton/hermit/issues/4266).
+/// The binds: a `--bind` under /tmp, a `--bind` of a subdirectory of its
+/// source, the same source bound again elsewhere, two binds stacked at one
+/// target, a `--mount` of type bind under /tmp and one outside it.
+#[test]
+fn user_binds_with_different_sources_show_identical_mountinfo() {
+    let _guard = hermit_run_lock();
+    let first = tempfile::tempdir().expect("create the first run's sources");
+    let second = tempfile::tempdir().expect("create the second run's sources");
+    for sources in [&first, &second] {
+        for name in ["home/sub", "lower", "upper", "data", "staged"] {
+            fs::create_dir_all(sources.path().join(name)).expect("create a bind source");
+        }
+    }
+    let targets = [
+        "/tmp/e2e/home",
+        "/tmp/e2e/sub",
+        "/tmp/e2e/again",
+        "/tmp/e2e/layer",
+        "/tmp/e2e/mounted",
+        "/mnt",
+    ];
+    let read = |sources: &tempfile::TempDir| {
+        let source = |name: &str| sources.path().join(name).display().to_string();
+        read_procfs_with("/proc/self/mountinfo", None, |command| {
+            command
+                .arg(format!("--bind={}:/tmp/e2e/home", source("home")))
+                .arg(format!("--bind={}:/tmp/e2e/sub", source("home/sub")))
+                .arg(format!("--bind={}:/tmp/e2e/again", source("home")))
+                .arg(format!("--bind={}:/tmp/e2e/layer", source("lower")))
+                .arg(format!("--bind={}:/tmp/e2e/layer", source("upper")))
+                .arg(format!(
+                    "--mount=type=bind,source={},target=/tmp/e2e/mounted",
+                    source("staged")
+                ))
+                .arg(format!(
+                    "--mount=type=bind,source={},target=/mnt",
+                    source("data")
+                ));
+        })
+    };
+    let (one, two) = assert_runs_equal_while_host_mountinfo_stable(
+        || (read(&first), read(&second)),
+        "paired bind runs changed with the host mount table",
+    );
+    let one_text = std::str::from_utf8(&one).expect("mountinfo should be UTF-8");
+    let two_text = std::str::from_utf8(&two).expect("mountinfo should be UTF-8");
+    for (text, sources) in [(one_text, &first), (two_text, &second)] {
+        // The sources' unique directory name, which any spelling of a source
+        // path contains, whatever subvolume or mount it is reached through.
+        let source = sources.path().file_name().unwrap().to_str().unwrap();
+        assert!(
+            !text.contains(source),
+            "a bind's host source {source} reached the guest:\n{text}"
+        );
+        for target in targets {
+            let rows = text
+                .lines()
+                .filter(|line| line.split(' ').nth(4) == Some(target))
+                .collect::<Vec<_>>();
+            assert!(
+                !rows.is_empty(),
+                "mountinfo has no row at {target}:\n{text}"
+            );
+            // Under /tmp, Hermit's private /tmp holds only these binds, so
+            // every row at the target is one of them. /mnt may also be a host
+            // mountpoint, whose own row the bind covers: there the top row is
+            // the bind's.
+            let checked = if target.starts_with("/tmp/") {
+                &rows[..]
+            } else {
+                &rows[rows.len() - 1..]
+            };
+            for row in checked {
+                assert_eq!(row.split(' ').nth(3), Some(target), "{row}");
+            }
+        }
+        let layers = text
+            .lines()
+            .filter(|line| line.split(' ').nth(4) == Some("/tmp/e2e/layer"))
+            .count();
+        assert!(layers >= 2, "the covered bind's layer is missing:\n{text}");
+    }
+    assert_eq!(
+        one_text, two_text,
+        "mountinfo depends on the binds' host sources"
+    );
+}
+
+/// A user bind rewrites only its own rows. Host /tmp is the root of a btrfs
+/// subvolume here (`/tmpvol`), as other host mounts are; binding it at /mnt
+/// must not change the root of any other row.
+#[test]
+fn a_user_bind_changes_no_other_rows_root() {
+    let _guard = hermit_run_lock();
+    // Every row's root, in order, per mountpoint, covered layers included,
+    // outside /mnt (where the bind and the submounts it copies sit).
+    let roots = |text: &str| {
+        let mut roots = std::collections::BTreeMap::<String, Vec<String>>::new();
+        for line in text.lines() {
+            let fields = line.split(' ').collect::<Vec<_>>();
+            if fields[4] != "/mnt" && !fields[4].starts_with("/mnt/") {
+                roots
+                    .entry(fields[4].to_owned())
+                    .or_default()
+                    .push(fields[3].to_owned());
+            }
+        }
+        roots
+    };
+    let (plain, bound) = assert_runs_equal_while_host_mountinfo_stable(
+        || {
+            let plain = read_procfs_with("/proc/self/mountinfo", None, |_| {});
+            let bound = read_procfs_with("/proc/self/mountinfo", None, |command| {
+                command.arg("--mount=type=bind,source=/tmp,target=/mnt");
+            });
+            (plain, bound)
+        },
+        "the bind comparison changed with the host mount table",
+    );
+    let plain = std::str::from_utf8(&plain).expect("mountinfo should be UTF-8");
+    let bound = std::str::from_utf8(&bound).expect("mountinfo should be UTF-8");
+    assert_eq!(
+        roots(bound),
+        roots(plain),
+        "binding /tmp at /mnt changed another row:\n{bound}"
+    );
+    let mnt = bound
+        .lines()
+        .rfind(|line| line.split(' ').nth(4) == Some("/mnt"))
+        .unwrap_or_else(|| panic!("mountinfo has no row at /mnt:\n{bound}"));
+    assert_eq!(mnt.split(' ').nth(3), Some("/mnt"), "{mnt}");
+}
+
+/// User mounts are installed in order, so an earlier one can change what a
+/// later one's source names (review of the mountinfo bind change,
+/// https://github.com/rrnewton/hermit/issues/4266). The first bind, whose
+/// source is a symbolic link, covers /var/tmp; the second binds /var/tmp at
+/// /mnt, which then mounts the first bind's source, not the host's /var/tmp.
+/// Both show their targets as roots and never the host source. A tmpfs then
+/// mounted at /var/tmp keeps its own root, `/`, above the bind it covers.
+#[test]
+fn user_binds_show_their_targets_whatever_earlier_mounts_did() {
+    let _guard = hermit_run_lock();
+    let sources = tempfile::tempdir().expect("create bind sources");
+    fs::create_dir_all(sources.path().join("real")).expect("create a link target");
+    std::os::unix::fs::symlink("real", sources.path().join("link")).expect("create a link");
+    let (plain, text) = assert_runs_equal_while_host_mountinfo_stable(
+        || {
+            let plain = read_procfs_with("/proc/self/mountinfo", None, |_| {});
+            let bound = read_procfs_with("/proc/self/mountinfo", None, |command| {
+                command
+                    .arg(format!(
+                        "--mount=type=bind,source={},target=/var/tmp",
+                        sources.path().join("link").display()
+                    ))
+                    .arg("--mount=type=bind,source=/var/tmp,target=/mnt")
+                    .arg("--mount=type=tmpfs,target=/var/tmp");
+            });
+            (plain, bound)
+        },
+        "the ordered binds changed with the host mount table",
+    );
+    let plain = std::str::from_utf8(&plain).expect("mountinfo should be UTF-8");
+    let text = std::str::from_utf8(&text).expect("mountinfo should be UTF-8");
+    // The host's own rows at those mountpoints keep their roots: the binds
+    // only add layers above them.
+    for target in ["/var/tmp", "/mnt"] {
+        let roots = |text: &str| {
+            text.lines()
+                .filter(|line| line.split(' ').nth(4) == Some(target))
+                .map(|line| line.split(' ').nth(3).unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let (before, after) = (roots(plain), roots(text));
+        assert!(
+            after.starts_with(&before) && after.len() > before.len(),
+            "the binds changed the host's rows at {target}: {before:?} became {after:?}"
+        );
+    }
+    let name = sources.path().file_name().unwrap().to_str().unwrap();
+    assert!(
+        !text.contains(name),
+        "a host source reached the guest:\n{text}"
+    );
+    // Above the host's rows: at /mnt the bind; at /var/tmp the bind, then
+    // the tmpfs over it.
+    for (target, added) in [
+        ("/mnt", &["/mnt"][..]),
+        ("/var/tmp", &["/var/tmp", "/"][..]),
+    ] {
+        let roots = text
+            .lines()
+            .filter(|line| line.split(' ').nth(4) == Some(target))
+            .map(|line| line.split(' ').nth(3).unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            roots.ends_with(added),
+            "the mounts at {target} show roots {roots:?}, not ending {added:?}:\n{text}"
+        );
+    }
 }
 
 #[test]
@@ -1024,6 +1256,15 @@ fn ordered_nested_user_mounts_preserve_linux_stacking() {
         "ordered nested mounts changed across runs",
     );
     let text = std::str::from_utf8(&first).expect("mountinfo should be UTF-8");
+    // Each mount, the covered child included, shows its target as its root,
+    // not its host source (https://github.com/rrnewton/hermit/issues/4266).
+    for source in [&parent_source, &child_source] {
+        let name = source.path().file_name().unwrap().to_str().unwrap();
+        assert!(
+            !text.contains(name),
+            "a host source reached the guest:\n{text}"
+        );
+    }
     for target in ["/tmp/stack/child", "/tmp/stack"] {
         assert!(
             text.lines()

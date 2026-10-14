@@ -2354,7 +2354,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // evidence contract (https://github.com/rrnewton/hermit/issues/4275):
     // 287, listed with this node's arguments.
     // And -13 from e4508c8d: 287.
-    ("test.hermit_integration", 287),
+    // And procfs_determinism::user_binds_with_different_sources_show_identical_mountinfo,
+    // procfs_determinism::a_user_bind_changes_no_other_rows_root and
+    // procfs_determinism::user_binds_show_their_targets_whatever_earlier_mounts_did
+    // (https://github.com/rrnewton/hermit/issues/4266): 290.
+    ("test.hermit_integration", 290),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -3507,7 +3511,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the epoll_pwait2 run test: 300.
     // And the same retired run_evidence target: 287.
     // And -13 from e4508c8d: 287.
-    ("test.hermit_integration_on_host", 287),
+    // And the three user-bind mountinfo tests: 290.
+    ("test.hermit_integration_on_host", 290),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

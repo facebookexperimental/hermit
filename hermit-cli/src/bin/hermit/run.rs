@@ -7759,6 +7759,14 @@ impl RunOpts {
         for mount in &self.mount {
             let user_target = mount.get_target();
             identity_sources.discard_mounts_shadowed_by(&mut identity_mounts, user_target);
+            let staging = mount
+                .get_target()
+                .strip_prefix(TMP_DIR)
+                .ok()
+                .map(|path| tmpfs.join(path));
+            if mount.get_source().is_some() && super::container::is_bind_mount(mount) {
+                identity_sources.add_user_bind(user_target, staging.as_deref());
+            }
             if let Ok(path) = mount.get_target().strip_prefix(TMP_DIR) {
                 explicit_tmp_mount |= path.as_os_str().is_empty();
                 // If the target is in /tmp, change it so it goes to our
@@ -7782,6 +7790,7 @@ impl RunOpts {
                 identity_sources
                     .discard_mounts_shadowed_by(&mut identity_mounts, mount.get_target());
                 let target = tmpfs.join(relative_path);
+                identity_sources.add_user_bind(mount.get_target(), Some(&target));
                 user_mounts.push(mount.target(target).touch_target());
             } else {
                 warn_bind_outside_tmp(bind);

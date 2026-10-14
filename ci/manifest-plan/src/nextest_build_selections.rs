@@ -667,8 +667,12 @@ mod tests {
             // (https://github.com/rrnewton/hermit/issues/4041), plus the
             // epoll_pwait2 run test (https://github.com/rrnewton/hermit/issues/4228),
             // less the 13 tests of the retired run_evidence target
-            // (https://github.com/rrnewton/hermit/issues/4275).
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "287");
+            // (https://github.com/rrnewton/hermit/issues/4275),
+            // plus the paired user-bind mountinfo test, the test that a user
+            // bind changes no other row, and the test that user binds show their
+            // targets whatever earlier mounts did
+            // (https://github.com/rrnewton/hermit/issues/4266).
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "290");
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

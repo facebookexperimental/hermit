@@ -122,6 +122,161 @@ fn mountinfo_escape_path(path: &Path) -> Vec<u8> {
     encoded
 }
 
+/// One `/proc/self/mountinfo` row's mount ID, device (`major:minor`), root and
+/// mountpoint, the last two as the kernel escapes them.
+struct MountRow {
+    id: u64,
+    device: Vec<u8>,
+    root: Vec<u8>,
+    mountpoint: Vec<u8>,
+}
+
+/// This process's mount table, as [`MountRow`]s.
+fn mount_rows() -> io::Result<Vec<MountRow>> {
+    let contents = fs::read("/proc/self/mountinfo")?;
+    contents
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let fields = line.split(|byte| *byte == b' ').collect::<Vec<_>>();
+            let id = (fields.len() > 4)
+                .then(|| std::str::from_utf8(fields[0]).ok()?.parse().ok())
+                .flatten();
+            match id {
+                Some(id) => Ok(MountRow {
+                    id,
+                    device: fields[2].to_vec(),
+                    root: fields[3].to_vec(),
+                    mountpoint: fields[4].to_vec(),
+                }),
+                None => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "mountinfo has a malformed row",
+                )),
+            }
+        })
+        .collect()
+}
+
+/// Whether `field` is one Detcore's mountinfo sanitizer accepts: an absolute
+/// path with no ASCII control byte or space (the kernel escapes space, tab,
+/// newline and backslash; other control bytes it leaves, and the sanitizer
+/// refuses them).
+fn mountinfo_field_is_canonical(field: &[u8]) -> bool {
+    field.first() == Some(&b'/')
+        && field
+            .iter()
+            .all(|byte| !byte.is_ascii_control() && *byte != b' ')
+}
+
+/// A user's bind mount (`--bind`, or `--mount` of type bind), whose
+/// mountinfo rows show its target as their root rather than the host source
+/// path, which differs from run to run and host to host
+/// (https://github.com/rrnewton/hermit/issues/4266).
+///
+/// Its rows are those, in the completed guest namespace, at a mountpoint the
+/// kernel may show for the bind that are not the guest's copies of the host's
+/// own mounts ([`IdentityGuard::host_rows`]) and do not show a filesystem's
+/// own root, `/`, which names no host path (a mount of another type there,
+/// such as a tmpfs, keeps it). The mountpoints are the target as named, as
+/// the host resolves it before setup (earlier mounts may change that
+/// resolution), and as the guest resolves it after, and, for a bind under
+/// `/tmp`, its staging path in Hermit's private `/tmp`. A row at a bind's
+/// target or staging path as named belongs to that bind before any other
+/// bind's resolved spelling claims it. Every layer of the bind at its
+/// mountpoint matches, including one a later mount covers, whatever path
+/// the source was reached through. No row at another mountpoint changes. It
+/// claims no Hermit ownership: the root is the guest's own path, not a
+/// `/tmpvol/.hermit` name.
+struct UserBind {
+    /// The guest path the user named, which its rows show as their root.
+    target: PathBuf,
+    /// The mountpoints, escaped, at which the bind is installed as named:
+    /// its target and, under `/tmp`, its staging path.
+    named: Vec<Vec<u8>>,
+    /// Further mountpoints, escaped, the kernel may show for the bind, as the
+    /// host resolves the named ones before setup.
+    resolved: Vec<Vec<u8>>,
+}
+
+impl UserBind {
+    /// The bind at guest path `target`, staged at `staging` for a bind under
+    /// `/tmp`. `None` for a target this cannot show as a root: a relative
+    /// one, one with a `..`, or one the mountinfo grammar cannot carry.
+    fn new(target: &Path, staging: Option<&Path>) -> Option<Self> {
+        let named = |path: &Path| {
+            path.is_absolute()
+                && !path
+                    .components()
+                    .any(|component| component == std::path::Component::ParentDir)
+        };
+        if !named(target) || staging.is_some_and(|staging| !named(staging)) {
+            return None;
+        }
+        // As the kernel spells a mountpoint: no `.` and no trailing `/` (a
+        // bind at exactly `/tmp` is staged at the private tmp directory
+        // itself).
+        let target: PathBuf = target.components().collect();
+        if !mountinfo_field_is_canonical(&mountinfo_escape_path(&target)) {
+            return None;
+        }
+        let staging: Option<PathBuf> = staging.map(|staging| staging.components().collect());
+        let mut named = vec![mountinfo_escape_path(&target)];
+        named.extend(staging.as_deref().map(mountinfo_escape_path));
+        let mut resolved = vec![mountinfo_escape_path(&canonical_mount_target(&target))];
+        resolved.extend(
+            staging
+                .as_deref()
+                .map(|staging| mountinfo_escape_path(&canonical_mount_target(staging))),
+        );
+        resolved.retain(|mountpoint| !named.contains(mountpoint));
+        Some(Self {
+            target,
+            named,
+            resolved,
+        })
+    }
+
+    /// The rows of the completed guest namespace `rows` at this bind's
+    /// mountpoints as named (`named`) or as resolved, which are neither the
+    /// host's own (`host_rows`) nor a filesystem's root.
+    fn rows<'rows>(
+        &self,
+        rows: &'rows [MountRow],
+        host_rows: &[(Vec<u8>, Vec<u8>, Vec<u8>)],
+        named: bool,
+    ) -> impl Iterator<Item = &'rows MountRow> {
+        let mountpoints = if named {
+            self.named.clone()
+        } else {
+            let mut resolved = self.resolved.clone();
+            // The kernel shows a mountpoint with its symbolic links resolved.
+            if let Ok(target) = fs::canonicalize(&self.target) {
+                resolved.push(mountinfo_escape_path(&target));
+            }
+            resolved
+        };
+        let host_rows = host_rows.to_vec();
+        rows.iter().filter(move |row| {
+            mountpoints.contains(&row.mountpoint)
+                && row.root != b"/"
+                && !host_rows.iter().any(|(mountpoint, root, device)| {
+                    *mountpoint == row.mountpoint && *root == row.root && *device == row.device
+                })
+        })
+    }
+}
+
+/// Say that a user bind's mountinfo rows keep the host source path as their
+/// root: Hermit could not identify them, so the guest can see that path.
+fn warn_unrewritten_bind(target: &Path) {
+    crate::tracing::diagnostic_eprintln!(
+        "WARNING: /proc/self/mountinfo shows the host source path of the bind at {}: \
+         Hermit could not identify its rows (https://github.com/rrnewton/hermit/issues/4266).",
+        target.display()
+    );
+}
+
 impl MountInfoRootSource {
     fn new(source: &Path, target: &Path, deterministic_root: &[u8]) -> Result<Self, Error> {
         Ok(Self {
@@ -237,6 +392,10 @@ pub(super) struct IdentityGuard {
     _nscd_dir: Option<tempfile::TempDir>,
     mountinfo_roots: Vec<MountInfoRootSource>,
     user_mount_targets: Vec<PathBuf>,
+    user_binds: Vec<UserBind>,
+    /// The host's mount table before setup, as (mountpoint, root, device):
+    /// the guest's copies of these rows are not any user bind's.
+    host_rows: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>,
 }
 
 impl IdentityGuard {
@@ -249,6 +408,8 @@ impl IdentityGuard {
             _nscd_dir: None,
             mountinfo_roots: Vec::new(),
             user_mount_targets: Vec::new(),
+            user_binds: Vec::new(),
+            host_rows: Vec::new(),
         }
     }
 
@@ -258,6 +419,27 @@ impl IdentityGuard {
         self.mountinfo_roots
             .push(MountInfoRootSource::private_tmp(source)?);
         Ok(())
+    }
+
+    /// Show a user's bind at guest path `target` (staged at `staging` for a
+    /// bind under `/tmp`) with the target as its mountinfo root
+    /// ([`UserBind`]).
+    pub(super) fn add_user_bind(&mut self, target: &Path, staging: Option<&Path>) {
+        if self.user_binds.is_empty() {
+            match mount_rows() {
+                Ok(rows) => {
+                    self.host_rows = rows
+                        .into_iter()
+                        .map(|row| (row.mountpoint, row.root, row.device))
+                        .collect();
+                }
+                Err(_) => return warn_unrewritten_bind(target),
+            }
+        }
+        match UserBind::new(target, staging) {
+            Some(bind) => self.user_binds.push(bind),
+            None => warn_unrewritten_bind(target),
+        }
     }
 
     /// Translate the internal staging path used for an explicit user mount at
@@ -308,10 +490,55 @@ impl IdentityGuard {
     /// descriptors plus the target fd's `mnt_id` avoid both pathname TOCTOU and
     /// ambiguity from stacked mounts sharing one textual mountpoint.
     pub(super) fn mountinfo_root_rewrites(&self) -> Result<Vec<MountInfoRootRewrite>, Error> {
-        self.mountinfo_roots
+        let mut rewrites = self
+            .mountinfo_roots
             .iter()
             .map(MountInfoRootSource::resolve)
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        if self.user_binds.is_empty() {
+            return Ok(rewrites);
+        }
+        let rows = mount_rows().context("Failed to read the guest mount table")?;
+        // A row at a bind's target or staging path as named is that bind's;
+        // only a row no bind names may go to a bind's resolved spelling.
+        let mut found = std::collections::BTreeMap::<u64, Vec<u8>>::new();
+        for named in [true, false] {
+            for bind in &self.user_binds {
+                let root = mountinfo_escape_path(&bind.target);
+                for row in bind.rows(&rows, &self.host_rows, named) {
+                    found.entry(row.id).or_insert_with(|| root.clone());
+                }
+            }
+        }
+        for bind in &self.user_binds {
+            let root = mountinfo_escape_path(&bind.target);
+            if !found.values().any(|found| *found == root) {
+                warn_unrewritten_bind(&bind.target);
+            }
+        }
+        for (raw_mount_id, deterministic_root) in found {
+            // A row already carries a rewrite as one of Hermit's own mounts,
+            // which keeps its fixed name, or as the staging translation of a
+            // user mount at `/tmp`, which kept the mount's root: that root
+            // becomes the target. Two binds at one mountpoint name the same
+            // rows with the same root.
+            match rewrites
+                .iter_mut()
+                .find(|rewrite| rewrite.raw_mount_id == raw_mount_id)
+            {
+                Some(rewrite) if rewrite.deterministic_root.starts_with(b"/tmpvol/.hermit/") => {}
+                Some(rewrite) => rewrite.deterministic_root = deterministic_root,
+                None => rewrites.push(MountInfoRootRewrite {
+                    raw_mount_id,
+                    deterministic_root,
+                    raw_root_prefix: None,
+                    deterministic_root_prefix: None,
+                    raw_mountpoint_prefix: None,
+                    deterministic_mountpoint_prefix: None,
+                }),
+            }
+        }
+        Ok(rewrites)
     }
 
     /// Capture the exact raw mount-ID order used by Detcore's snapshot-local
@@ -320,6 +547,13 @@ impl IdentityGuard {
         capture_mountinfo_identity_order()
             .context("Failed to capture guest mountinfo identity order")
     }
+}
+
+/// Whether `mount` is a bind mount: `--mount` without a `type`, or of type
+/// `bind`, which sets `MS_BIND` (flags only accumulate, so adding it again
+/// changes nothing exactly when it is already there).
+pub(super) fn is_bind_mount(mount: &Mount) -> bool {
+    mount.clone().flags(MountFlags::MS_BIND) == *mount
 }
 
 fn canonical_mount_target(path: &Path) -> PathBuf {
@@ -425,6 +659,8 @@ pub(super) fn identity_hardening_mounts() -> Result<(Vec<Mount>, IdentityGuard),
             _nscd_dir: nscd_dir,
             mountinfo_roots,
             user_mount_targets: Vec::new(),
+            user_binds: Vec::new(),
+            host_rows: Vec::new(),
         },
     ))
 }
@@ -2360,6 +2596,8 @@ mod tests {
             _nscd_dir: None,
             mountinfo_roots: vec![matching],
             user_mount_targets: Vec::new(),
+            user_binds: Vec::new(),
+            host_rows: Vec::new(),
         };
 
         let rewrites = guard.mountinfo_root_rewrites().unwrap();
@@ -2431,6 +2669,8 @@ mod tests {
             _nscd_dir: None,
             mountinfo_roots: vec![same_target_wrong_source],
             user_mount_targets: Vec::new(),
+            user_binds: Vec::new(),
+            host_rows: Vec::new(),
         };
 
         let error = guard.mountinfo_root_rewrites().unwrap_err().to_string();
