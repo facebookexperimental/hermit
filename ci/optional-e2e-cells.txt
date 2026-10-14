@@ -13,7 +13,6 @@ c-programs/clock-adjtime-deterministic verify dbt
 c-programs/copy-file-range-refusal-probe verify dbt
 c-programs/dbt-execveat-unsupported verify dbt
 c-programs/dbt-execveat-unsupported verify sabre
-c-programs/dbt-pid-virtualization verify ptrace
 c-programs/dbt-self-sigqueue verify dbt
 c-programs/dbt-unsupported-syscall verify ptrace
 c-programs/futex-requeue-enosys verify dbt
@@ -48,7 +47,6 @@ c-programs/pthread-lifecycle verify sabre
 c-programs/ptrace-eperm verify dbt
 c-programs/ptrace-traceme-eperm verify dbt
 c-programs/record-replay-fd-close verify sabre
-c-programs/record-replay-file-state verify ptrace
 c-programs/remap-file-pages-anonymous-enosys verify dbt
 c-programs/remap-file-pages-memfd-enosys verify dbt
 c-programs/remap-file-pages-tmpfile-enosys verify dbt
@@ -67,7 +65,6 @@ c-programs/sysv-shm-enosys verify dbt
 c-programs/tee-enosys verify dbt
 c-programs/thread-self-procfs-handoff verify sabre
 c-programs/threadexhaustion verify sabre
-c-programs/userfaultfd-self-service verify ptrace
 c-programs/ustat-enosys verify dbt
 c-programs/vmsplice-enosys verify dbt
 c-programs/writev-determinism custom ptrace

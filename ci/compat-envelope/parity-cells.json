@@ -10,57 +10,57 @@
     "all": {
       "cells": 2990,
       "applicable": 1927,
-      "selectable": 1627,
-      "population": 2905,
-      "population_candidate_selected": 1627,
+      "selectable": 1633,
+      "population": 2920,
+      "population_candidate_selected": 1633,
       "population_candidate_not_selected": 283,
-      "population_candidate_disabled": 995
+      "population_candidate_disabled": 1004
     },
     "by_backend": {
       "dbt": {
         "cells": 598,
         "applicable": 252,
         "selectable": 205,
-        "population": 581,
+        "population": 584,
         "population_candidate_selected": 205,
         "population_candidate_not_selected": 46,
-        "population_candidate_disabled": 330
+        "population_candidate_disabled": 333
       },
       "in-guest-trap": {
         "cells": 598,
         "applicable": 319,
-        "selectable": 316,
-        "population": 581,
-        "population_candidate_selected": 316,
+        "selectable": 318,
+        "population": 584,
+        "population_candidate_selected": 318,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 265
+        "population_candidate_disabled": 266
       },
       "kvm": {
         "cells": 598,
         "applicable": 558,
-        "selectable": 550,
-        "population": 581,
-        "population_candidate_selected": 550,
+        "selectable": 552,
+        "population": 584,
+        "population_candidate_selected": 552,
         "population_candidate_not_selected": 3,
-        "population_candidate_disabled": 28
+        "population_candidate_disabled": 29
       },
       "liteinst": {
         "cells": 598,
         "applicable": 320,
-        "selectable": 317,
-        "population": 581,
-        "population_candidate_selected": 317,
+        "selectable": 319,
+        "population": 584,
+        "population_candidate_selected": 319,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 264
+        "population_candidate_disabled": 265
       },
       "sabre": {
         "cells": 598,
         "applicable": 478,
         "selectable": 239,
-        "population": 581,
+        "population": 584,
         "population_candidate_selected": 239,
         "population_candidate_not_selected": 234,
-        "population_candidate_disabled": 108
+        "population_candidate_disabled": 111
       }
     }
   },
@@ -225,11 +225,11 @@
     {"test_id":"c-programs/dbt-mmap-exec","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/dbt-mmap-exec","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/dbt-mmap-exec","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"c-programs/dbt-pid-virtualization","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit"},
-    {"test_id":"c-programs/dbt-pid-virtualization","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit"},
-    {"test_id":"c-programs/dbt-pid-virtualization","backend":"kvm","category":"c-programs","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit"},
-    {"test_id":"c-programs/dbt-pid-virtualization","backend":"liteinst","category":"c-programs","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit"},
-    {"test_id":"c-programs/dbt-pid-virtualization","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit"},
+    {"test_id":"c-programs/dbt-pid-virtualization","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"},
+    {"test_id":"c-programs/dbt-pid-virtualization","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/dbt-pid-virtualization","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/dbt-pid-virtualization","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/dbt-pid-virtualization","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"},
     {"test_id":"c-programs/dbt-prlimit-self","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"},
     {"test_id":"c-programs/dbt-prlimit-self","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/dbt-prlimit-self","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
@@ -1030,11 +1030,11 @@
     {"test_id":"c-programs/record-replay-fd-close","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/record-replay-fd-close","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"},
     {"test_id":"c-programs/record-replay-fd-close","backend":"sabre","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites"},
-    {"test_id":"c-programs/record-replay-file-state","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"},
-    {"test_id":"c-programs/record-replay-file-state","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"},
-    {"test_id":"c-programs/record-replay-file-state","backend":"kvm","category":"c-programs","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"},
-    {"test_id":"c-programs/record-replay-file-state","backend":"liteinst","category":"c-programs","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"},
-    {"test_id":"c-programs/record-replay-file-state","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"},
+    {"test_id":"c-programs/record-replay-file-state","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"},
+    {"test_id":"c-programs/record-replay-file-state","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/record-replay-file-state","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/record-replay-file-state","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/record-replay-file-state","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"},
     {"test_id":"c-programs/record-replay-file-state-regular-sink","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/record-replay-file-state-regular-sink","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/record-replay-file-state-regular-sink","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
@@ -1475,11 +1475,11 @@
     {"test_id":"c-programs/unix-autobind-stream","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/unix-autobind-stream","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/unix-autobind-stream","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"c-programs/userfaultfd-self-service","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: New coverage (coord ruling D.2); enters blocking CI after its first validation receipts"},
-    {"test_id":"c-programs/userfaultfd-self-service","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: New coverage (coord ruling D.2); enters blocking CI after its first validation receipts"},
-    {"test_id":"c-programs/userfaultfd-self-service","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: New coverage (coord ruling D.2); enters blocking CI after its first validation receipts"},
-    {"test_id":"c-programs/userfaultfd-self-service","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: New coverage (coord ruling D.2); enters blocking CI after its first validation receipts"},
-    {"test_id":"c-programs/userfaultfd-self-service","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: New coverage (coord ruling D.2); enters blocking CI after its first validation receipts"},
+    {"test_id":"c-programs/userfaultfd-self-service","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: userfaultfd has not been qualified on DBT"},
+    {"test_id":"c-programs/userfaultfd-self-service","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: This verify mode stays out of CI until its first validation receipts, so full validation would not run an in-guest cell here; it passed 10 of 10 verify runs with the maximum timeslice disabled in a local survey on 2026-10-08 and joins when the mode enters CI (https://github.com/rrnewton/hermit/issues/3745); in-guest LiteInst also runs this program in hermit-cli's liteinst_in_guest_serves_its_own_userfaultfd_and_exits_registered"},
+    {"test_id":"c-programs/userfaultfd-self-service","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: userfaultfd has not been qualified on KVM"},
+    {"test_id":"c-programs/userfaultfd-self-service","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: This verify mode stays out of CI until its first validation receipts, so full validation would not run an in-guest cell here; it passed 10 of 10 verify runs with the maximum timeslice disabled in a local survey on 2026-10-08 and joins when the mode enters CI (https://github.com/rrnewton/hermit/issues/3745); in-guest LiteInst also runs this program in hermit-cli's liteinst_in_guest_serves_its_own_userfaultfd_and_exits_registered"},
+    {"test_id":"c-programs/userfaultfd-self-service","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: userfaultfd has not been qualified on SaBRe"},
     {"test_id":"c-programs/ustat-enosys","backend":"dbt","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: dbt verify is not selected by full validation: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence."},
     {"test_id":"c-programs/ustat-enosys","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/ustat-enosys","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},

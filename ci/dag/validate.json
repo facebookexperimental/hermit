@@ -1979,6 +1979,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/dbt-pid-virtualization",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/dbt-prlimit-self",
           "mode": "verify",
           "backend": "in-guest-trap"
@@ -7866,6 +7873,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/record-replay-file-state",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/record-replay-lseek-seek-cur",
           "mode": "verify",
           "backend": "in-guest-trap"
@@ -10844,6 +10858,13 @@
           "test": "c-programs/unix-autobind-stream",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/userfaultfd-self-service",
+          "mode": "verify",
+          "backend": "ptrace"
         },
         {
           "lane": "portable",
@@ -24876,6 +24897,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/dbt-pid-virtualization",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/dbt-prlimit-self",
           "mode": "verify",
           "backend": "ptrace"
@@ -25996,6 +26024,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/record-replay-file-state",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/record-replay-lseek-seek-cur",
           "mode": "verify",
           "backend": "ptrace"
@@ -26599,6 +26634,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/unix-autobind-stream",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/userfaultfd-self-service",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -30261,6 +30303,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/dbt-pid-virtualization",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/dbt-prlimit-self",
           "mode": "verify",
           "backend": "ptrace"
@@ -33159,6 +33208,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/record-replay-file-state",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/record-replay-lseek-seek-cur",
           "mode": "verify",
           "backend": "ptrace"
@@ -34611,6 +34667,13 @@
           "test": "c-programs/unix-autobind-stream",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/userfaultfd-self-service",
+          "mode": "verify",
+          "backend": "ptrace"
         },
         {
           "lane": "portable",
@@ -46654,6 +46717,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/dbt-pid-virtualization",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/dbt-prlimit-self",
           "mode": "verify",
           "backend": "in-guest-trap"
@@ -52541,6 +52611,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/record-replay-file-state",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/record-replay-lseek-seek-cur",
           "mode": "verify",
           "backend": "in-guest-trap"
@@ -55519,6 +55596,13 @@
           "test": "c-programs/unix-autobind-stream",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/userfaultfd-self-service",
+          "mode": "verify",
+          "backend": "ptrace"
         },
         {
           "lane": "portable",

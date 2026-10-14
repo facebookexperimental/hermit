@@ -41038,6 +41038,57 @@
       ],
       "test": "compat/uuidgen",
       "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/dbt-pid-virtualization",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/record-replay-file-state",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/userfaultfd-self-service",
+      "timeout_seconds": 57
     }
   ],
   "schema": 1

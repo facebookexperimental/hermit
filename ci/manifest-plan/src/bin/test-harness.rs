@@ -10900,6 +10900,7 @@ sys.exit(1 if failed else 0)
         for per_backend in [
             "ci",
             "expected_stdout",
+            "expected_stdout_contains",
             "hermit_args",
             "hermit_args_reason",
             "env_by_backend",

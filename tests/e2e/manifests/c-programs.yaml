@@ -1130,7 +1130,7 @@ test:
     modes:
       verify:
         ci:
-          ptrace: false
+          ptrace: true
           liteinst: true
           in-guest-trap: true
           kvm: true
@@ -1142,8 +1142,6 @@ test:
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
-        ci_disabled_reason:
-          ptrace: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit", "result": "infrastructure-error"}
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -4363,8 +4361,8 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
-        ci_disabled_reason: New coverage (coord ruling D.2); enters blocking CI after its first validation receipts
+        ci:
+          ptrace: true
         backends_enabled:
           - ptrace
         backends_disabled:
@@ -8123,7 +8121,7 @@ test:
     modes:
       verify:
         ci:
-          ptrace: false
+          ptrace: true
           liteinst: true
           in-guest-trap: true
           kvm: true
@@ -8135,8 +8133,6 @@ test:
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
-        ci_disabled_reason:
-          ptrace: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
