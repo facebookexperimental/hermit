@@ -773,6 +773,61 @@ args: [-c, echo $FOO$BAR]
 - `hermit oci run`, `hermit analyze` and `hermit bisect` do not load run
   configs.
 
+## Run Manifests
+
+A run whose options give every input is reproduced by its command line. A run
+that draws an input from the host is not: an epoch taken from the host clock
+(no `--epoch`), or a seed from `--seed-from=SystemRandom`. Such a run writes a
+run manifest, a small recording of those inputs, and names it in a diagnostic
+(https://github.com/rrnewton/hermit/issues/4271):
+
+```text
+$ hermit run --seed-from=SystemRandom -- PROGRAM ARGS
+hermit: this run drew epoch and seed from the host; its inputs are saved as recording 04cba9fc...; rerun it with: hermit run --from ~/.cache/hermit/04cba9fc...
+$ hermit run --from ~/.cache/hermit/04cba9fc...
+```
+
+- The manifest is `DATA/<id>/manifest.json`, where `DATA` is the data
+  directory `hermit record` uses (`HERMIT_DATA_DIR`, else
+  `$XDG_CACHE_HOME/hermit`, usually `~/.cache/hermit`) and `<id>` a new
+  recording ID. It is JSON with `schema: hermit-recording-manifest/v1`: the
+  guest command, the run's options with the host-drawn inputs written out
+  (`inputs.global` and `inputs.run`, named as in a run config), which inputs
+  came from the host (`inputs.host_drawn`), and, once the guest ends, its exit
+  status (`exit`).
+- What a manifest does not hold, as a run config does not: the host
+  environment that `--base-env=host` (the default) passes through, the files
+  the guest reads, and the working directory, which is recorded in
+  `command.cwd` but not applied (relative paths resolve against the rerun's
+  directory, and `--from` notes a difference). Output destinations
+  (`--log-file`, `--verify-json`, `--guest-stdout`, ...) are left out, so a
+  rerun does not overwrite the original run's files. On a host without a
+  usable performance counter, the preemption timer turned off is recorded
+  as `max-timeslice: disabled`. Option values are written as given, `--env`
+  values included; the file is mode 0600.
+- `hermit run --from PATH` reruns it: PATH is the manifest or its directory.
+  Options and a guest command on that command line replace the manifest's, as
+  with `--config`, so `hermit run --from PATH --sched-seed=7` explores another
+  schedule from the same inputs. A rerun's inputs are all explicit, so it
+  writes no manifest of its own.
+- A run with no host-drawn input writes nothing. `--manifest=POLICY` chooses
+  otherwise: `nonreproducible-only` (the default), `always` (a reproducible run
+  also writes a `history` manifest, a local record of what ran), or `never`.
+  Without the option, the `manifest` key of the user config file
+  `~/.config/hermit/config.yaml` (`$XDG_CONFIG_HOME/hermit/config.yaml`)
+  decides, then the `HERMIT_MANIFEST` environment variable:
+
+  ```yaml
+  manifest: always
+  ```
+
+- `hermit record list` lists syscall recordings only. `hermit record rm` and
+  `hermit record clean` delete manifest directories as they delete
+  recordings. `hermit replay` replays syscall recordings only and points at
+  `hermit run --from` for a manifest. A data directory keeps the newest 1000
+  manifest-only recordings.
+- A run with `--record-networking` writes no manifest yet.
+
 ## Signals To Hermit's Own Process
 
 In a run with interception (the default ptrace backend), Hermit's container

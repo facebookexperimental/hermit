@@ -1458,7 +1458,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4161): 1068.
     // And hermit-dap's tests::listen_defaults_to_loopback (hermit-dap
     // --listen): 1069.
-    ("test.hermit_unit", 1069),
+    // And the eleven run-manifest unit tests (seven manifest::tests, three
+    // run_config::tests for --from and invocation-only options, and the
+    // library's a_manifest_only_recording_can_be_removed;
+    // https://github.com/rrnewton/hermit/issues/4271): 1080, listed with this
+    // node's arguments.
+    ("test.hermit_unit", 1080),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2857,7 +2862,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (hermit-dap --listen and hermit replay --dap-listen): 360.
     // And hermit_dap_replay_startup_failure_carries_the_replays_reason: 361.
     // And hermit_dap_replay_late_startup_failure_reaches_attach_with_its_reason: 362.
-    ("test.cli", 362),
+    // And a_run_with_host_drawn_inputs_reruns_bitwise_from_its_manifest
+    // (https://github.com/rrnewton/hermit/issues/4271): 363, listed with this
+    // node's arguments.
+    ("test.cli", 363),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3149,7 +3157,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // GDB but still execute: 296.
     // And the managed-replay startup-failure reason test: 297.
     // And the late managed-replay startup-failure test: 298.
-    ("test.cli_on_host", 298),
+    // Nor does the run-manifest rerun test: 299, listed with this node's
+    // arguments.
+    ("test.cli_on_host", 299),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -3505,7 +3515,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the one-node get_mempolicy record-epoch test: 1067.
     // And the virtual-cpuinfo record-epoch test: 1068.
     // And the hermit-dap --listen address test: 1069.
-    ("test.hermit_unit_on_host", 1069),
+    // And the eleven run-manifest unit tests: 1080.
+    ("test.hermit_unit_on_host", 1080),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

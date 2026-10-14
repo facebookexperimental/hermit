@@ -8208,6 +8208,199 @@ fn a_sigsuspend_mask_on_a_shared_stack_below_the_red_zone_is_copied_elsewhere() 
     );
 }
 
+/// A guest whose output depends on its virtual-time epoch and its seed: it
+/// prints the realtime clock and eight bytes from `getrandom`.
+const HOST_DRAWN_INPUTS_GUEST: &[u8] = br#"#include <stdio.h>
+#include <sys/random.h>
+#include <time.h>
+int main(void) {
+    struct timespec now;
+    unsigned long long random = 0;
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0) return 1;
+    if (getrandom(&random, sizeof random, 0) != sizeof random) return 2;
+    printf("now %lld.%09ld random %llu\n", (long long)now.tv_sec, now.tv_nsec, random);
+    return 3;
+}
+"#;
+
+/// The run manifest of https://github.com/rrnewton/hermit/issues/4271. A run
+/// that takes its epoch from the host clock and its seed from
+/// `--seed-from=SystemRandom` writes `DATA/<id>/manifest.json`, naming both
+/// inputs and where they came from, and `hermit run --from DATA/<id>` reruns
+/// it from the manifest alone: the same stdout and exit status, and the same
+/// INFO stream under the strict comparator `--verify-strict` uses
+/// (`hermit log-diff --canonical-info`). A run whose inputs are all explicit
+/// writes nothing, `HERMIT_MANIFEST=always` makes it write a `history`
+/// manifest, and `--manifest=never` writes none even with host-drawn inputs.
+#[test]
+fn a_run_with_host_drawn_inputs_reruns_bitwise_from_its_manifest() {
+    let _guard = hermit_run_guard();
+    let temp = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let source = temp.path().join("host_drawn_inputs.c");
+    let guest = temp.path().join("host_drawn_inputs");
+    fs::write(&source, HOST_DRAWN_INPUTS_GUEST).unwrap();
+    let compile = Command::new("cc")
+        .args(["-O2", "-Wall", "-Wextra", "-Werror", "-o"])
+        .arg(&guest)
+        .arg(&source)
+        .output()
+        .expect("cc should run");
+    assert!(
+        compile.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let guest = guest.to_str().unwrap();
+    let data = temp.path().join("data");
+    let path = |name: &str| temp.path().join(name).to_str().unwrap().to_owned();
+    // Sealed off from the developer's own user config, which outranks
+    // HERMIT_MANIFEST.
+    let config_home = temp.path().join("config-home");
+    let run = |args: &[&str], data: &Path| {
+        let mut command = hermit_command(args);
+        command
+            .env("HERMIT_DATA_DIR", data)
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env_remove("HERMIT_MANIFEST")
+            .env_remove("HERMIT_EPOCH")
+            .stdin(std::process::Stdio::null());
+        command.output().expect("hermit should run")
+    };
+    let manifests = |data: &Path| -> Vec<PathBuf> {
+        match fs::read_dir(data) {
+            Ok(entries) => {
+                let mut found: Vec<PathBuf> = entries
+                    .map(|entry| entry.unwrap().path().join("manifest.json"))
+                    .filter(|manifest| manifest.exists())
+                    .collect();
+                found.sort();
+                found
+            }
+            Err(_) => Vec::new(),
+        }
+    };
+
+    let (left_log, right_log) = (path("left.log"), path("right.log"));
+    let original = run(
+        &[
+            "--log=info",
+            &format!("--log-file={left_log}"),
+            "run",
+            "--seed-from=SystemRandom",
+            "--",
+            guest,
+        ],
+        &data,
+    );
+    assert_eq!(original.status.code(), Some(3), "{}", stderr(&original));
+    let written = manifests(&data);
+    assert_eq!(written.len(), 1, "{}", stderr(&original));
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&written[0]).unwrap()).unwrap();
+    assert_eq!(manifest["schema"], "hermit-recording-manifest/v1");
+    assert_eq!(manifest["kind"], "inputs-only");
+    assert_eq!(manifest["inputs"]["host_drawn"]["epoch"], "host-now");
+    assert_eq!(manifest["inputs"]["host_drawn"]["seed"], "SystemRandom");
+    assert!(manifest["inputs"]["run"]["seed"].is_u64(), "{manifest:#}");
+    assert_eq!(manifest["exit"]["code"], 3);
+    let recording = written[0].parent().unwrap();
+    // With --log-file, Hermit's diagnostics go to the log.
+    let diagnostics = fs::read_to_string(&left_log).unwrap();
+    assert!(
+        diagnostics.contains(&format!("hermit run --from {}", recording.display())),
+        "the diagnostic names the manifest:\n{diagnostics}"
+    );
+
+    let rerun = run(
+        &[
+            &format!("--log-file={right_log}"),
+            "run",
+            "--from",
+            recording.to_str().unwrap(),
+        ],
+        &data,
+    );
+    assert_eq!(rerun.status.code(), Some(3), "{}", stderr(&rerun));
+    assert_eq!(stdout(&rerun), stdout(&original));
+    assert_eq!(
+        manifests(&data).len(),
+        1,
+        "a rerun's inputs are all explicit, so it writes no manifest"
+    );
+    // A bare rerun leaves the original run's log alone: output destinations
+    // are not part of a manifest.
+    let original_log = fs::read(&left_log).unwrap();
+    let bare = run(&["run", "--from", recording.to_str().unwrap()], &data);
+    assert_eq!(bare.status.code(), Some(3), "{}", stderr(&bare));
+    assert_eq!(stdout(&bare), stdout(&original));
+    assert_eq!(fs::read(&left_log).unwrap(), original_log);
+    // `hermit record list` lists syscall recordings, not manifests.
+    let list = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(["record", "list", "--json"])
+        .env("HERMIT_DATA_DIR", &data)
+        .output()
+        .unwrap();
+    assert!(list.status.success(), "{}", stderr(&list));
+    assert_eq!(stdout(&list).trim(), "[]");
+    let comparison = path("comparison.json");
+    let diff = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "log-diff",
+            "--canonical-info",
+            "--json",
+            &comparison,
+            &left_log,
+            &right_log,
+        ])
+        .output()
+        .expect("hermit log-diff should run");
+    assert!(diff.status.success(), "{}", stderr(&diff));
+    let verdict: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&comparison).unwrap()).unwrap();
+    assert_eq!(verdict["verdict"], "matched", "{verdict:#}");
+    assert!(
+        verdict["selected_messages"]["left"].as_u64().unwrap() > 0,
+        "{verdict:#}"
+    );
+
+    // The policies.
+    let explicit = temp.path().join("explicit");
+    let output = run(
+        &["run", "--epoch=2026-01-01T00:00:00Z", "--", guest],
+        &explicit,
+    );
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert!(manifests(&explicit).is_empty());
+    let mut always = hermit_command(&["run", "--epoch=2026-01-01T00:00:00Z", "--", guest]);
+    always
+        .env("HERMIT_DATA_DIR", &explicit)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("HERMIT_MANIFEST", "always")
+        .stdin(std::process::Stdio::null());
+    let output = always.output().unwrap();
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    let history = manifests(&explicit);
+    assert_eq!(history.len(), 1);
+    assert!(
+        fs::read_to_string(&history[0])
+            .unwrap()
+            .contains("\"kind\": \"history\"")
+    );
+    let never = temp.path().join("never");
+    let output = run(
+        &[
+            "run",
+            "--manifest=never",
+            "--seed-from=SystemRandom",
+            "--",
+            guest,
+        ],
+        &never,
+    );
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert!(manifests(&never).is_empty());
+}
+
 /// tests/c/sigchld_once_per_child_exit.c: one SIGCHLD per child exit, with
 /// Linux's siginfo (https://github.com/rrnewton/hermit/issues/3895). The
 /// child exits with `_exit(7)` (`exit-group`), or its only thread calls the

@@ -399,7 +399,10 @@ use std::time::Instant;
 
 use anyhow::anyhow;
 use clap::ValueEnum;
+use consts::MANIFEST_NAME as RUN_MANIFEST_NAME;
+pub use consts::MANIFEST_NAME;
 use consts::METADATA_NAME;
+pub use consts::METADATA_NAME as RECORDING_METADATA_NAME;
 pub use detcore::Config as DetConfig;
 pub use detcore::Detcore;
 pub use detcore::RecordOrReplay;
@@ -4620,8 +4623,14 @@ impl HermitData {
         let path = self.data_dir.join(id.to_string());
 
         // Before deleting anything, make sure this file exists. This may not be a
-        // recording if this file does not exist.
-        let metadata_path = path.join(METADATA_NAME);
+        // recording if this file does not exist. A run manifest marks a
+        // recording too: a run that drew an input from the host leaves only
+        // that (https://github.com/rrnewton/hermit/issues/4271).
+        let metadata_path = [METADATA_NAME, RUN_MANIFEST_NAME]
+            .into_iter()
+            .map(|name| path.join(name))
+            .find(|marker| marker.exists())
+            .unwrap_or_else(|| path.join(METADATA_NAME));
         let metadata = fs::metadata(&metadata_path)
             .with_context(|| format!("Failed to find {:?}", metadata_path))?;
 
@@ -4875,6 +4884,23 @@ mod tests {
     use super::*;
 
     static SKID_OVERSHOOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A run that drew an input from the host leaves a recording directory
+    /// holding only `manifest.json`; `record rm` and `record clean` remove it
+    /// as they remove a syscall recording, and still refuse a directory with
+    /// neither marker (https://github.com/rrnewton/hermit/issues/4271).
+    #[test]
+    fn a_manifest_only_recording_can_be_removed() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = HermitData::with_dir(directory.path());
+        let id = Id::unique();
+        let recording = directory.path().join(id.to_string());
+        fs::create_dir_all(&recording).unwrap();
+        assert!(data.remove(id).is_err());
+        fs::write(recording.join(MANIFEST_NAME), "{}").unwrap();
+        data.remove(id).unwrap();
+        assert!(!recording.exists());
+    }
 
     /// The launch-time capture drops ephemeral host seed rows before ordering,
     /// so a seed's raw ID never enters the provenance Detcore checks guest

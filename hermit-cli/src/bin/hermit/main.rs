@@ -30,6 +30,7 @@ mod image;
 mod instruction_map;
 mod list;
 mod logdiff;
+mod manifest;
 mod oci;
 mod owned_container;
 mod podman_store;
@@ -223,18 +224,23 @@ fn args_from_matches_with_clock(
     }
     // `--save-config` records the options as given, which only the matches
     // still hold apart from defaults. `hermit oci run` refuses the option.
+    // A run manifest records them too, so every top-level `hermit run`
+    // captures them; only `--save-config` makes a failed capture (an option
+    // value that is not UTF-8) an error, and otherwise the run writes no
+    // manifest.
     if let (Subcommand::Run(run), Some(run_matches)) =
         (&mut args.command, matches.subcommand_matches("run"))
-        && run.saves_config()
     {
-        let config =
-            run_config::capture(&Args::command(), matches, run_matches).map_err(|error| {
-                Args::command().error(
+        match run_config::capture(&Args::command(), matches, run_matches) {
+            Ok(config) => run.set_config_capture(config),
+            Err(error) if run.saves_config() => {
+                return Err(Args::command().error(
                     clap::error::ErrorKind::ValueValidation,
                     format!("{error:#}"),
-                )
-            })?;
-        run.set_config_capture(config);
+                ));
+            }
+            Err(_) => {}
+        }
     }
     Ok(args)
 }

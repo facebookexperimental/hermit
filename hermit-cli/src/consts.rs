@@ -9,6 +9,10 @@
 /// The name of the JSON metadata file that is saved for each recording.
 pub const METADATA_NAME: &str = "metadata.json";
 
+/// The name of the run manifest a recording directory holds
+/// (<https://github.com/rrnewton/hermit/issues/4271>).
+pub const MANIFEST_NAME: &str = "manifest.json";
+
 /// The name of the root executable.
 pub const EXE_NAME: &str = "exe";
 

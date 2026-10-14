@@ -83,6 +83,8 @@ pub(crate) const SCHEMA: &str = "hermit-run-config/v1";
 const RUN: &str = "run";
 const CONFIG_ID: &str = "config";
 const SAVE_CONFIG_ID: &str = "save_config";
+const FROM_ID: &str = "from";
+const MANIFEST_ID: &str = "manifest";
 const PROGRAM_ID: &str = "program";
 const ARGS_ID: &str = "args";
 
@@ -211,6 +213,63 @@ pub(crate) fn read(path: &Path) -> Result<RunConfig, Error> {
     parse(&text).with_context(|| format!("cannot load run config {}", path.display()))
 }
 
+/// Says so when a manifest's run started in another directory: a rerun
+/// resolves relative paths against its own.
+fn note_another_directory(manifest: &crate::manifest::Manifest) {
+    let here = std::env::current_dir().ok();
+    if let Some(there) = &manifest.command.cwd
+        && here.as_deref() != Some(Path::new(there))
+    {
+        eprintln!(
+            "hermit: note: the run this manifest records started in {there}; relative paths \
+             in it resolve against the current directory"
+        );
+    }
+}
+
+/// The run config a manifest's `inputs` and `command` stand for, which
+/// `hermit run --from` loads as `--config` loads a file.
+pub(crate) fn from_manifest(manifest: &crate::manifest::Manifest) -> Result<RunConfig, Error> {
+    let section = |entries: &BTreeMap<String, serde_json::Value>| {
+        entries
+            .iter()
+            .map(|(long, value)| {
+                serde_json::from_value(value.clone())
+                    .map(|value| (long.clone(), value))
+                    .with_context(|| {
+                        format!("the manifest's value for {long} is not an option value")
+                    })
+            })
+            .collect::<Result<BTreeMap<String, Value>, Error>>()
+    };
+    let mut config = RunConfig::new();
+    config.hermit_version = Some(manifest.hermit.version.clone());
+    config.global = section(&manifest.inputs.global)?;
+    config.run = section(&manifest.inputs.run)?;
+    config.program = manifest.command.program.clone();
+    config.args = manifest.command.args.clone();
+    Ok(config)
+}
+
+/// One section of a manifest's `inputs`: option values by long name.
+pub(crate) type JsonSection = BTreeMap<String, serde_json::Value>;
+
+/// The `global` and `run` sections of a manifest's `inputs` for `config`,
+/// the run config `--save-config` would write for the run.
+pub(crate) fn to_manifest_parts(config: &RunConfig) -> Result<(JsonSection, JsonSection), Error> {
+    let section = |entries: &BTreeMap<String, Value>| {
+        entries
+            .iter()
+            .map(|(long, value)| {
+                serde_json::to_value(value)
+                    .map(|value| (long.clone(), value))
+                    .with_context(|| format!("cannot encode the value of {long} as JSON"))
+            })
+            .collect::<Result<BTreeMap<_, _>, Error>>()
+    };
+    Ok((section(&config.global)?, section(&config.run)?))
+}
+
 /// Writes `config` to `path` as `--save-config` does, and reads the text back
 /// so that a document that would not load is an error now rather than when
 /// someone tries to reproduce the run.
@@ -280,6 +339,11 @@ fn option_specs(command: &Command) -> Vec<OptionSpec> {
 fn invocation_only(id: &str) -> Option<&'static str> {
     match id {
         CONFIG_ID => Some("a run config cannot load another run config"),
+        FROM_ID => Some("a run config cannot load a manifest"),
+        MANIFEST_ID => Some(
+            "whether to write a manifest is a choice of the invocation, not part of the run; \
+             pass --manifest on the command line",
+        ),
         SAVE_CONFIG_ID => Some(
             "where to save a config is a choice of the invocation, not part of the run; pass \
              --save-config on the command line",
@@ -383,10 +447,12 @@ pub(crate) fn expand_argv(
     command: &Command,
     argv: &[OsString],
 ) -> Result<Option<Vec<OsString>>, Error> {
-    let names_config = argv.iter().any(|arg| {
-        arg == "--config" || arg.to_str().is_some_and(|arg| arg.starts_with("--config="))
-    });
-    if !names_config {
+    let names = |long: &str| {
+        let with_value = format!("{long}=");
+        argv.iter()
+            .any(|arg| arg == long || arg.to_str().is_some_and(|arg| arg.starts_with(&with_value)))
+    };
+    if !names("--config") && !names("--from") {
         return Ok(None);
     }
     let Ok(matches) = lenient_command(command).try_get_matches_from(argv) else {
@@ -395,20 +461,31 @@ pub(crate) fn expand_argv(
     let Some(run_matches) = matches.subcommand_matches(RUN) else {
         return Ok(None);
     };
-    let paths: Vec<&OsString> = run_matches
-        .get_many::<OsString>(CONFIG_ID)
-        .into_iter()
-        .flatten()
-        .collect();
-    let path = match paths.as_slice() {
-        [] => return Ok(None),
-        [path] => Path::new(path),
-        _ => anyhow::bail!(
-            "--config was given {} times; give one run config",
+    let given_paths = |id: &str| -> Vec<&OsString> {
+        run_matches
+            .get_many::<OsString>(id)
+            .into_iter()
+            .flatten()
+            .collect()
+    };
+    let (configs, manifests) = (given_paths(CONFIG_ID), given_paths(FROM_ID));
+    let (path, config) = match (configs.as_slice(), manifests.as_slice()) {
+        ([], []) => return Ok(None),
+        ([path], []) => (Path::new(path), read(Path::new(path))?),
+        ([], [path]) => {
+            let manifest = crate::manifest::read(Path::new(path))?;
+            note_another_directory(&manifest);
+            (Path::new(path), from_manifest(&manifest)?)
+        }
+        ([_, ..], [_, ..]) => {
+            anyhow::bail!("--config and --from both name a run's options; give one of them")
+        }
+        (paths, []) | ([], paths) => anyhow::bail!(
+            "--{} was given {} times; give one",
+            if configs.is_empty() { "from" } else { "config" },
             paths.len()
         ),
     };
-    let config = read(path)?;
     let run = run_command(command);
     let given =
         |matches: &ArgMatches, id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
@@ -514,7 +591,9 @@ fn lenient_command(command: &Command) -> Command {
 fn given_tokens(command: &Command, matches: &ArgMatches) -> Vec<OsString> {
     let mut tokens = Vec::new();
     for spec in option_specs(command) {
-        if spec.id == CONFIG_ID || matches.value_source(&spec.id) != Some(ValueSource::CommandLine)
+        if spec.id == CONFIG_ID
+            || spec.id == FROM_ID
+            || matches.value_source(&spec.id) != Some(ValueSource::CommandLine)
         {
             continue;
         }
@@ -949,6 +1028,7 @@ mod tests {
         ),
         ("workdir", &["--workdir=/tmp"]),
         ("save-config", &["--save-config=/tmp/x.yaml"]),
+        ("manifest", &["--manifest=never"]),
     ];
 
     /// Every sample row with its section.
@@ -1042,6 +1122,95 @@ mod tests {
         (parsed(&args), parsed(&reloaded), saved)
     }
 
+    /// A manifest stands for the run config `--save-config` would write: for
+    /// every option, a manifest made from an invocation that gives it, loaded
+    /// with `--from`, reproduces every parsed field, as `--config` does
+    /// (https://github.com/rrnewton/hermit/issues/4271).
+    #[test]
+    fn every_option_survives_a_manifest_and_from() {
+        for (section, long, tokens) in samples() {
+            let argv = sample_argv(section, tokens);
+            let (mut args, matches) = parse_at(&argv, SAVING_CLOCK);
+            let config = capture(
+                &crate::Args::command(),
+                &matches,
+                matches.subcommand_matches(RUN).unwrap(),
+            )
+            .unwrap();
+            let crate::Subcommand::Run(run) = &mut args.command else {
+                panic!("{argv:?} is not a `run` command");
+            };
+            run.set_config_capture(config);
+            let saved = run.saved_run_config().unwrap();
+            let (global, run_inputs) = to_manifest_parts(&saved).unwrap();
+            let manifest = crate::manifest::Manifest::new(
+                hermit::Id::unique(),
+                crate::manifest::Kind::InputsOnly,
+                crate::manifest::Command {
+                    program: saved.program.clone(),
+                    args: saved.args.clone(),
+                    cwd: None,
+                },
+                crate::manifest::Inputs {
+                    global,
+                    run: run_inputs,
+                    host_drawn: BTreeMap::new(),
+                },
+            );
+            assert_eq!(from_manifest(&manifest).unwrap().run, saved.run, "--{long}");
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory
+                .path()
+                .join("id")
+                .join(crate::manifest::MANIFEST_NAME);
+            crate::manifest::write(&path, &manifest).unwrap();
+            let command_line = argv_for_from(path.parent().unwrap());
+            let expanded = expand_argv(&crate::Args::command(), &command_line)
+                .unwrap()
+                .expect("--from expands");
+            let (reloaded, _) = parse_at(&expanded, LOADING_CLOCK);
+            assert_eq!(parsed(&args), parsed(&reloaded), "--{long}: {manifest:#?}");
+        }
+    }
+
+    fn argv_for_from(path: &Path) -> Vec<OsString> {
+        let mut command_line = argv(&[], &["--from"], &[]);
+        command_line.push(path.into());
+        command_line
+    }
+
+    /// A run config cannot hold `--from` or `--manifest`, which belong to
+    /// one invocation.
+    #[test]
+    fn a_run_config_refuses_from_and_manifest() {
+        let directory = tempfile::tempdir().unwrap();
+        for entry in ["from: /x", "manifest: always"] {
+            let path = config_file(
+                &directory,
+                &format!("schema: {SCHEMA}\nrun:\n  {entry}\nprogram: /bin/true\n"),
+            );
+            let mut command_line = argv(&[], &["--config"], &[]);
+            command_line.push(path.into());
+            assert!(
+                expand_argv(&crate::Args::command(), &command_line).is_err(),
+                "{entry}"
+            );
+        }
+    }
+
+    /// `--from` and `--config` together are refused, as two sources for one
+    /// run's options.
+    #[test]
+    fn from_and_config_together_are_refused() {
+        let mut command_line = argv(&[], &["--config=/nonexistent.yaml", "--from"], &[]);
+        command_line.push("/nonexistent".into());
+        let error = expand_argv(&crate::Args::command(), &command_line).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("give one of them"),
+            "{error:#}"
+        );
+    }
+
     #[test]
     fn every_option_has_a_round_trip_sample() {
         let hermit = crate::Args::command();
@@ -1050,7 +1219,7 @@ mod tests {
             .flat_map(|section| {
                 option_specs(section.command(&hermit))
                     .into_iter()
-                    .filter(|spec| spec.id != CONFIG_ID)
+                    .filter(|spec| spec.id != CONFIG_ID && spec.id != FROM_ID)
                     .map(move |spec| (section.name(), spec.long))
             })
             .collect();

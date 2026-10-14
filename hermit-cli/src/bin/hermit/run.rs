@@ -6,6 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::OsStr;
 use std::fmt;
@@ -1444,6 +1445,30 @@ pub struct RunOpts {
     #[clap(long, value_name = "FILE")]
     pub save_config: Option<PathBuf>,
 
+    /// Rerun the run a manifest records: load its options and guest command as `--config` loads a
+    /// run config. PATH is a `manifest.json` or the recording directory holding one; options and a
+    /// guest command given on this command line replace the manifest's. A run that draws an input
+    /// from the host (an epoch from the host clock, a seed from `--seed-from=SystemRandom`) writes
+    /// such a manifest under the data directory (`HERMIT_DATA_DIR`, else `~/.cache/hermit`) and
+    /// names it in a diagnostic (https://github.com/rrnewton/hermit/issues/4271). Like a run
+    /// config, a manifest does not hold the host environment `--base-env=host` passes through, the
+    /// files the guest reads, or the working directory (relative paths resolve against this one),
+    /// and it leaves out output destinations such as `--log-file`.
+    #[clap(long, value_name = "PATH", conflicts_with = "config")]
+    from: Option<PathBuf>,
+
+    /// When to write a run manifest, the small recording that reruns this execution with
+    /// `--from`: `nonreproducible-only` (the default) writes one only when the run draws an input
+    /// from the host; `always` also writes a `history` manifest for a reproducible run; `never`
+    /// writes none. Without this option, the `manifest` key of `~/.config/hermit/config.yaml`
+    /// decides, then the `HERMIT_MANIFEST` environment variable.
+    #[clap(long, value_name = "POLICY", value_enum)]
+    manifest: Option<crate::manifest::ManifestPolicy>,
+
+    /// Runtime-only: where this run's manifest was written, once it is.
+    #[clap(skip)]
+    manifest_path: Option<PathBuf>,
+
     /// Read-only overlay that exposes the rewritten ELF at its original guest path.
     #[clap(skip)]
     e9patch_overlay: Option<E9patchOverlay>,
@@ -2271,6 +2296,8 @@ impl RunOpts {
         options.epoch_from_recording = false;
         options.config_capture = None;
         options.save_config = None;
+        options.manifest = None;
+        options.manifest_path = None;
         format!("{options:#?}")
     }
 }
@@ -5483,6 +5510,9 @@ impl RunOpts {
 
     pub fn main(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         let result = self.main_without_core_cleanup(global);
+        if let Ok(status) = &result {
+            self.finish_manifest(*status);
+        }
         if matches!(result, Ok(ExitStatus::Exited(0))) {
             self.discard_fatal_cores_after_success();
         }
@@ -5537,6 +5567,14 @@ impl RunOpts {
         // Once every implicit input it records is resolved, and before the
         // guest starts, so a run that fails or hangs still leaves it.
         self.write_saved_config()?;
+        // For the same reason, the run manifest too. It is a convenience
+        // beside the diagnostic that already prints the inputs, so a data
+        // directory that cannot be written does not stop the run.
+        if let Err(error) = self.begin_manifest(global) {
+            crate::tracing::diagnostic_eprintln!(
+                "hermit: WARNING: this run's manifest was not written: {error:#}"
+            );
+        }
         // After every refusal above, which holds in every build, so a build
         // without the feature refuses those runs the way a feature build does;
         // and before stdin is read.
@@ -8204,6 +8242,146 @@ impl RunOpts {
         match &self.save_config {
             Some(path) => crate::run_config::write(path, &self.saved_run_config()?),
             None => Ok(()),
+        }
+    }
+
+    /// The inputs this run drew from the host, by option long name, each
+    /// with where it came from: an epoch from the host clock, a seed from
+    /// `--seed-from=SystemRandom`, and the preemption timer turned off
+    /// because this host has no usable performance counter. A seed derived
+    /// from the arguments (`--seed-from=Args`) is not drawn from the host.
+    fn host_drawn_inputs(&self) -> BTreeMap<String, String> {
+        let mut drawn = BTreeMap::new();
+        if self.timer_downgrade.is_some() {
+            drawn.insert(
+                crate::manifest::MAX_TIMESLICE_KEY.to_owned(),
+                "no-usable-performance-counter".to_owned(),
+            );
+        }
+        if self.epoch_captured_from_host {
+            drawn.insert(
+                crate::run_config::EPOCH_KEY.to_owned(),
+                "host-now".to_owned(),
+            );
+        }
+        if self.seed_from_resolved.is_some()
+            && matches!(self.seed_from, Some(SeedFrom::SystemRandom))
+        {
+            drawn.insert(
+                crate::run_config::SEED_KEY.to_owned(),
+                "SystemRandom".to_owned(),
+            );
+        }
+        drawn
+    }
+
+    /// Writes this run's manifest when the policy asks for one (see
+    /// `crate::manifest`), names it in a diagnostic, and remembers its path
+    /// for `finish_manifest`. Only a top-level `hermit run`, whose parser
+    /// captured the options it was given, writes one.
+    fn begin_manifest(&mut self, global: &GlobalOpts) -> Result<(), Error> {
+        use crate::manifest;
+
+        // A network recording's manifest is slice 2 of
+        // https://github.com/rrnewton/hermit/issues/4271; until then such a
+        // run writes none, rather than one whose rerun would use the network.
+        if self.config_capture.is_none() || self.record_networking.is_some() {
+            return Ok(());
+        }
+        let user_config = match manifest::user_config_path() {
+            Some(path) => manifest::read_user_config(&path)?,
+            None => manifest::UserConfig::default(),
+        };
+        let policy = manifest::resolve_policy(
+            self.manifest,
+            &user_config,
+            std::env::var(manifest::POLICY_ENV).ok().as_deref(),
+        )?;
+        let host_drawn = self.host_drawn_inputs();
+        let kind = match (policy, host_drawn.is_empty()) {
+            (manifest::ManifestPolicy::Never, _)
+            | (manifest::ManifestPolicy::NonreproducibleOnly, true) => return Ok(()),
+            (_, false) => manifest::Kind::InputsOnly,
+            (manifest::ManifestPolicy::Always, true) => manifest::Kind::History,
+        };
+        let config = self.saved_run_config()?;
+        let (mut global_inputs, mut run_inputs) = crate::run_config::to_manifest_parts(&config)?;
+        manifest::drop_outputs(&mut global_inputs, &mut run_inputs);
+        if self.timer_downgrade.is_some() {
+            run_inputs.insert(
+                manifest::MAX_TIMESLICE_KEY.to_owned(),
+                serde_json::Value::from("disabled"),
+            );
+        }
+        let id = hermit::Id::unique();
+        let document = manifest::Manifest::new(
+            id,
+            kind,
+            manifest::Command {
+                program: config.program.clone(),
+                args: config.args.clone(),
+                cwd: std::env::current_dir()
+                    .ok()
+                    .and_then(|dir| dir.to_str().map(str::to_owned)),
+            },
+            manifest::Inputs {
+                global: global_inputs,
+                run: run_inputs,
+                host_drawn,
+            },
+        );
+        let path = manifest::data_dir()
+            .join(id.to_string())
+            .join(manifest::MANIFEST_NAME);
+        manifest::write(&path, &document)?;
+        manifest::prune(&manifest::data_dir(), manifest::KEEP_MANIFEST_ONLY);
+        if kind == manifest::Kind::InputsOnly {
+            global.write_controller_diagnostic(format_args!(
+                "hermit: this run drew {} from the host; its inputs are saved as recording {id}; \
+                 rerun it with: hermit run --from {}",
+                document
+                    .inputs
+                    .host_drawn
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" and "),
+                path.parent().unwrap_or(&path).display()
+            ))?;
+        }
+        self.manifest_path = Some(path);
+        Ok(())
+    }
+
+    /// Records how the guest ended in this run's manifest, if it wrote one.
+    /// Best effort: the manifest without an exit already reproduces the run.
+    fn finish_manifest(&mut self, status: ExitStatus) {
+        let Some(path) = self.manifest_path.take() else {
+            return;
+        };
+        let exit = match status {
+            ExitStatus::Exited(code) => crate::manifest::Exit {
+                code: Some(code),
+                signal: None,
+            },
+            ExitStatus::Signaled(signal, _) => crate::manifest::Exit {
+                code: None,
+                signal: Some(signal as i32),
+            },
+            ExitStatus::SignaledRaw(signal, _) => crate::manifest::Exit {
+                code: None,
+                signal: Some(signal),
+            },
+        };
+        let result = crate::manifest::read(&path).and_then(|mut document| {
+            document.exit = Some(exit);
+            crate::manifest::write(&path, &document)
+        });
+        if let Err(error) = result {
+            crate::tracing::diagnostic_eprintln!(
+                "hermit: could not record the exit status in {}: {error:#}",
+                path.display()
+            );
         }
     }
 

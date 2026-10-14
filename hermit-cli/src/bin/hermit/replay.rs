@@ -77,6 +77,19 @@ impl ReplayOpts {
                 .context("Failed to find last recording ID")?,
         };
 
+        // A run that drew an input from the host leaves only a manifest,
+        // which `hermit run --from` reruns; this command replays syscall
+        // recordings (https://github.com/rrnewton/hermit/issues/4271).
+        let directory = hermit.data_dir().join(id.to_string());
+        if !directory.join(hermit::RECORDING_METADATA_NAME).exists()
+            && directory.join(crate::manifest::MANIFEST_NAME).exists()
+        {
+            anyhow::bail!(
+                "recording {id} is a run manifest, not a syscall recording; rerun it with: \
+                 hermit run --from {}",
+                directory.display()
+            );
+        }
         if let Some(address) = &self.dap_listen {
             return Err(self.exec_dap_adapter(&hermit, id, address));
         }
