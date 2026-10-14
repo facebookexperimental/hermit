@@ -343,6 +343,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         | "test.isolated_dbt_workdir"
         | "test.cli_on_host"
         | "privileged-test.pmu_cli_cases"
+        | "privileged-cpuid.cpu_profile_v3"
         | "super.dbt_pipe_backpressure_diagnostic"
         | "super.dbt_failed_exec_recovery_diagnostic"
         | "super.dbt_unsupported_syscall_aggregation_diagnostic"

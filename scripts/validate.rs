@@ -12005,6 +12005,7 @@ const EXPECTED_SHARED_INTEGRATION_TESTS: [(&str, &[&str]); 2] = [
     (
         "cli",
         &[
+            "privileged-cpuid.cpu_profile_v3",
             "privileged-test.cli_kvm",
             "privileged-test.pmu_cli_cases",
             "test.cli",
@@ -31877,6 +31878,7 @@ mod shared_consumer_tests {
         );
         for tag in [
             "test.cli",
+            "privileged-cpuid.cpu_profile_v3",
             "privileged-test.cli_kvm",
             "privileged-test.pmu_cli_cases",
             "test.isolated_dbt_workdir",
@@ -31901,6 +31903,7 @@ mod shared_consumer_tests {
             (
                 "integration_test_binaries.cli",
                 vec![
+                    "privileged-cpuid.cpu_profile_v3",
                     "privileged-test.cli_kvm",
                     "privileged-test.pmu_cli_cases",
                     "test.cli",

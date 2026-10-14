@@ -114,6 +114,7 @@ pub(super) const NEXTEST_RESULT_PRODUCERS: &[&str] = &[
     "test.inherited_terminal_read",
     "test.isolated_dbt_workdir",
     "test.isolated_detcore_workdir",
+    "privileged-cpuid.cpu_profile_v3",
     "privileged-only-test.cli_kvm",
     "privileged-only-test.cli_kvm_on_host",
     "privileged-only-test.pmu_buck_chaos_cases",
@@ -3182,6 +3183,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4132), whose sibling spins
     // with no syscall, joins them: 14 + 1 = 15.
     ("privileged-test.pmu_cli_cases", 15),
+    // The six x86-64-v3 CLI cases that run a guest, with
+    // HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1 so that a refusal fails
+    // (https://github.com/rrnewton/hermit/issues/4243): 6, listed with this
+    // node's filterset.
+    ("privileged-cpuid.cpu_profile_v3", 6),
     // The 29 tests_time cases that enable max_timeslice and therefore need the
     // PMU-backed RCB clock/timer, moved out of test.detcore_time and its hosted
     // twin (https://github.com/rrnewton/hermit/issues/3663); measured with the
@@ -7338,6 +7344,42 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         networkonly: false,
         engine_only: false,
         timeout: 40,
+        cpu_timeout: 7200,
+        jobs_flag: None,
+        jobs_env: None,
+    },
+    StaticStepSpec {
+        group: r########"privileged-cpuid"########,
+        job: r########"cpu_profile_v3"########,
+        desc: r########"Run the x86-64-v3 CPU-profile CLI cases on a host that must qualify"########,
+        description: r########"The six CLI cases that run a guest under --cpu-profile x86-64-v3 (https://github.com/rrnewton/hermit/issues/4243), with HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1. In test.cli and test.cli_on_host each of them accepts either outcome: a run when `hermit host-capabilities --cpu-profile x86-64-v3` qualifies the host, or the typed refusal (exit 122) when it does not, so a host that cannot qualify still runs them. That leaves nothing that fails when a host which should qualify stops qualifying, or when the qualification itself breaks. With the variable set, a refusal fails the case instead, so this node turns red rather than passing on refusals. It carries the cpuid-faulting label, which makes it host-inapplicable where arch_prctl(ARCH_SET_CPUID, 0) fails, because v3 needs Detcore to intercept the guest's CPUID. It depends on privileged-cpuid.faulting, which shows that interception works, and on privileged-pmu.preemption, because the qualification counts interrupts with a pinned PMU counter. The cases are not skipped in test.cli, so under the full label each runs twice, once in each mode. cpu_profile_v3_refuses_backends_and_flags_it_cannot_qualify asserts only refusals and does not depend on the host, so it stays only in test.cli. It consumes the shared cli binary published by privileged-build.privileged_tests and holds the integration_test_binaries.cli token like the other consumers."########,
+        labels: &[r########"full"########, r########"cpuid-faulting"########],
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; status=0; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(=cpu_profile_v3_guest_sees_the_v3_cpu_at_bitwise_parity) | test(=cpu_profile_v3_host_loader_sees_exactly_x86_64_v3) | test(=cpu_profile_v3_records_and_replays_the_v3_guest) | test(=cpu_profile_v3_lazy_binding_xsave_is_identical_on_the_hashed_stack) | test(=cpu_profile_v3_replay_refuses_a_recording_from_a_different_cpu) | test(=cpu_profile_v3_cpuinfo_matches_cpuid)' || status=$?; exit "$status""########,
+        cmdtype: CmdType::Unknown,
+        manifest: None,
+        integration_test_binaries: Some(&[r########"cli"########]),
+        deps: &[
+            r########"privileged-build.privileged_tests"########,
+            r########"privileged-cpuid.faulting"########,
+            r########"privileged-pmu.preemption"########,
+        ],
+        env: &[(
+            r########"HERMIT_TEST_REQUIRE_CPU_PROFILE_V3"########,
+            r########"1"########,
+        )],
+        hint: HintSpec {
+            resources: &[(r########"integration_test_binaries.cli"########, 1)],
+            est_duration_s: 60.0,
+            rss_baseline_bytes: Some(4294967296),
+            hard_mem_max_bytes: Some(8589934592),
+            classification: StepClass::CpuBound,
+            preferred_inner_jobs: None,
+            measured_effective_cores: None,
+            measured_cpu_utilization: None,
+        },
+        networkonly: false,
+        engine_only: false,
+        timeout: 600,
         cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
