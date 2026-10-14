@@ -6,8 +6,7 @@ bucket: compat
 # the SaBRe run type alone; the full validation runs the ptrace verify cells of
 # the other rows (since 2026-10-13 only rustc, javac, java, node and timeout
 # carry that label: https://github.com/rrnewton/hermit/issues/4269 moved 25
-# rows into the full run, and into ci/compat/corpus-strict.json, so that parity
-# compares them), and the liteinst and in-guest-trap verify cells of the rows
+# rows into the full run, so that parity compares them), and the liteinst and in-guest-trap verify cells of the rows
 # each `additional` entry names. The rr lane's rows also have a replay cell
 # (`replay`) that records and replays the program on ptrace, for the rr run
 # type alone. Each row is one test: its ptrace verify cell runs at the
@@ -17,14 +16,16 @@ bucket: compat
 # 2026-10-13 the `variants` entry repeated every row as a second test,
 # compat/strict-<row>, for a strict run type, while this cell always ran
 # relaxed (https://github.com/rrnewton/hermit/issues/4276).
-# The scheduled super suite still runs its four heavy rows (rustc, javac, java,
-# node) on ptrace from ci/compat/corpus-strict.json. Lane settings are stated
-# once below and every row is expanded into an ordinary test recipe
+# The scheduled super suite runs the four heavy rows' ptrace cells (rustc,
+# javac, java, node: the `heavy` section's `labels`) through
+# supercompat.manifest_compat, against the super run type's release Hermit. Lane settings are stated once below and every
+# row is expanded into an ordinary test recipe
 # (ci/manifest-plan/src/manifest_corpus.rs). The rows were moved verbatim from
-# ci/compat/corpus-strict.json, which was extracted mechanically from
-# validate.sh's run_compatibility_corpus. In an argv, `{{ROOT_DIR}}` is the
-# repository root and `{{VALIDATE_RUN_STATE}}` the validation's per-run state
-# directory; compatprep.fixtures fills its strict-compat/real-compat-fixtures.
+# ci/compat/corpus-strict.json (deleted 2026-10-13), which was extracted
+# mechanically from validate.sh's run_compatibility_corpus. In an argv,
+# `{{ROOT_DIR}}` is the repository root and `{{VALIDATE_RUN_STATE}}` the
+# validation's per-run state directory; compatprep.fixtures fills its
+# strict-compat/real-compat-fixtures.
 # `{{XDG_CONFIG_HOME}}` is the cell-owned configuration copy, equalized to
 # /tmp/e2e/xdg-config for verify and kept at its own host path for replay.
 corpus:
@@ -52,9 +53,15 @@ corpus:
     cpu_timeout_seconds: 599
     slow_reason: >-
       A full compile-link-run or JVM startup workload gets the 600-second
-      wall budget the scheduled super suite gives each of these rows
-      (validate_plan::compat_nodes_for's wall_override); its CPU budget stays
-      one second below it
+      wall budget the scheduled super suite gave each of these rows; its CPU
+      budget stays one second below it
+    # The super run type (scripts/validate.rs super) runs these rows' ptrace
+    # cells through supercompat.manifest_compat. Until 2026-10-13 it ran them
+    # as generated compat.<row> nodes from ci/compat/corpus-strict.json, with
+    # the corpus's two relaxations and Hermit's stripped comparison; now they
+    # run at the host's strictness level under --verify-strict, like every
+    # other compat cell (https://github.com/rrnewton/hermit/issues/4276).
+    labels: [super]
     rows:
       rustc: compiles and runs a Rust program
       javac: compiles a Java program
@@ -1829,8 +1836,8 @@ corpus:
     - {label: "cmp", argv: ["bash", "-c", "set -euo pipefail; d=$(mktemp -d); printf \"same\\n\" >\"$d/a\"; printf \"same\\n\" >\"$d/b\"; cmp -s \"$d/a\" \"$d/b\"; printf \"cmp-ok\\n\"; rm -rf \"$d\""]}
     - {label: "free", argv: ["/usr/bin/free", "-m"]}
     # Rows only the SaBRe run type runs, on ptrace and on SaBRe: the SaBRe
-    # corpus's programs this corpus lacks, and the four heavy rows the super
-    # suite still runs on ptrace from ci/compat/corpus-strict.json.
+    # corpus's programs this corpus lacks, and the four heavy rows, whose
+    # ptrace cells the super run type runs too (the `heavy` section's labels).
     - {label: "rustc", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "rustc"], labels: [sabre-compat-only]}
     - {label: "javac", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "javac"], labels: [sabre-compat-only]}
     - {label: "java", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "java"], labels: [sabre-compat-only]}

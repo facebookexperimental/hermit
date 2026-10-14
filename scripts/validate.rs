@@ -195,7 +195,6 @@ use hermit_manifest_plan::timeouts::scale_timeout_seconds;
 use hermit_manifest_plan::timeouts::timeout_multipliers_from_env;
 use sha2::Digest;
 use sha2::Sha256;
-use validate_plan::CompatDisposition;
 use validate_plan::CompatMode;
 
 /// Current receipt schema. Unknown scalar evidence is represented by explicit
@@ -807,6 +806,10 @@ impl Level {
         }
     }
 }
+
+/// The release Hermit the super run type builds (super.build_release_hermit)
+/// and its compat bucket, supercompat.manifest_compat, runs.
+const SUPER_HERMIT_BIN: &str = "target/release/hermit";
 
 /// The refusal of the retired `--strict-compat-only` run type.
 const STRICT_COMPAT_ONLY_RETIRED: &str = "--strict-compat-only was retired on 2026-10-13 with the 219 \
@@ -2495,8 +2498,7 @@ const STRICT_EXECUTION_FLAG: &str = "--strict";
 /// legacy stripped-verify mode (it rendered `record start --verify
 /// --verify-strict`), and since 2026-10-02 its rows are compat.yaml replay cells
 /// the harness runs, not a `CompatMode`.
-const LEGACY_BELOW_L2_STRICT_MODES: [CompatMode; 2] =
-    [CompatMode::PortableStrict, CompatMode::E9patch];
+const LEGACY_BELOW_L2_STRICT_MODES: [CompatMode; 1] = [CompatMode::E9patch];
 
 /// Whether a rendered plan is missing the literal strict flag from Hermit's
 /// option prefix.
@@ -2605,7 +2607,6 @@ fn assert_submodule_fixture_source(
 const SUBMODULE_SERVICE_FIXTURE_SOURCES: &[&str] = &[
     ".config/nextest.toml",
     "Makefile",
-    "ci/compat/corpus-strict.json",
     "ci/dag/validate.json",
     "ci/manifest-plan/src/runner.rs",
     "ci/manifest-plan/src/service_result.rs",
@@ -3663,127 +3664,12 @@ fn self_test() -> Result<(), String> {
     println!("  {}", raw_run_dag_engine_bracket(&repo_root())?);
     shard_coverage_resource_policy_bracket(&repo_root())?;
 
-    // ---- known-fail-closed disposition, as a pure decision table ----
+    // ---- the REAL summary consumer ----
     //
-    // The property under test is NOT "the listed rows get mentioned". It is that mentioning
-    // them did not quietly excuse them. Each row below pins BOTH the message class and the
-    // blocking verdict, so a future edit cannot improve the wording into an exemption.
+    // Bound to the shipped `compat_summary_with_attempts`, not a copy of its
+    // logic. Every measured failure blocks: the e9patch corpus has no
+    // exemption table.
     {
-        use validate_plan::CompatDisposition as D;
-        use validate_plan::classify_compat_outcome as classify;
-        // (mode, ok, listed_failclosed, listed_diagnostic, expected, expected_blocking)
-        let cases: &[(CompatMode, bool, bool, bool, D, bool)] = &[
-            // PortableStrict: the whole point of this change. A listed failure is REPORTED and
-            // STILL BLOCKS; a listed pass is reported as a stale expectation.
-            (
-                CompatMode::PortableStrict,
-                false,
-                true,
-                false,
-                D::KnownFailClosedBlocking,
-                true,
-            ),
-            (
-                CompatMode::PortableStrict,
-                true,
-                true,
-                false,
-                D::PassedButListedFailClosed,
-                false,
-            ),
-            // ...and an UNLISTED failure is unaffected.
-            (
-                CompatMode::PortableStrict,
-                false,
-                false,
-                false,
-                D::Blocking,
-                true,
-            ),
-            // Bounded portable diagnostics keep their existing nonblocking treatment.
-            (
-                CompatMode::PortableStrict,
-                false,
-                false,
-                true,
-                D::PortableDiagnostic,
-                false,
-            ),
-            // No other mode consults either table: a failure blocks whatever the tables say.
-            (CompatMode::E9patch, false, true, false, D::Blocking, true),
-            (CompatMode::E9patch, false, false, true, D::Blocking, true),
-            (CompatMode::E9patch, true, true, false, D::Passed, false),
-        ];
-        for (mode, ok, listed, diag, want, want_blocking) in cases.iter().copied() {
-            let got = classify(mode, ok, listed, diag);
-            if got != want {
-                return Err(format!(
-                    "compat disposition for mode={mode:?} ok={ok} listed_failclosed={listed} \
-                     listed_diagnostic={diag}: expected {want:?}, got {got:?}"
-                ));
-            }
-            if got.is_blocking() != want_blocking {
-                return Err(format!(
-                    "compat disposition {got:?} (mode={mode:?} ok={ok} listed={listed}) must \
-                     {} the run, but is_blocking() said {}",
-                    if want_blocking { "BLOCK" } else { "not block" },
-                    got.is_blocking()
-                ));
-            }
-        }
-    }
-
-    // ---- the shipped portable-diagnostic table, not a planted substitute ----
-    //
-    // RUN 1622 made ranlib a nonblocking PortableStrict diagnostic. Since the
-    // compat corpus became strict (2026-10-07) the table is empty: ranlib and
-    // the other four former diagnostics passed --verify-strict 4 of 4 and block
-    // like every other row, with the ordinary 60 s budget. Pin it empty so a
-    // nonblocking exception cannot silently return.
-    {
-        use validate_plan::CompatDisposition as D;
-        use validate_plan::classify_compat_outcome as classify;
-
-        let diagnostic = validate_corpus::portable_diagnostic();
-        if !diagnostic.is_empty() {
-            return Err(format!(
-                "portable compatibility diagnostic set must stay empty: got {:?}",
-                diagnostic.keys().collect::<Vec<_>>()
-            ));
-        }
-        for label in ["df", "ranlib", "top", "zstd", "zstd-roundtrip", "readelf"] {
-            let disposition = classify(
-                CompatMode::PortableStrict,
-                false,
-                false,
-                diagnostic.contains_key(label),
-            );
-            if disposition != D::Blocking
-                || !disposition.is_blocking()
-                || CompatMode::PortableStrict.timeout_for(label) != 60
-            {
-                return Err(format!(
-                    "compat.{label} failure must block with the 60 s budget: disposition={disposition:?}, timeout={}s",
-                    CompatMode::PortableStrict.timeout_for(label)
-                ));
-            }
-        }
-    }
-
-    // ---- the REAL summary consumer, against a PLANTED table ----
-    //
-    // Bound to the shipped `compat_summary_with_tables`, not a copy of its logic, so the two
-    // cannot drift. The table is planted rather than real because the shipped
-    // `known_failclosed()` holds NO rows today, which cannot express "one listed row blocks
-    // while another listed row is exempt" in a single run -- and the answer to that is a
-    // planted table in the bracket, never an invented row in production.
-    {
-        let planted_known: BTreeMap<&'static str, &'static str> = BTreeMap::from([
-            ("listed_fails", "planted: refused by fail-closed --strict"),
-            ("listed_passes", "planted: expected to be refused"),
-        ]);
-        let planted_diag: BTreeMap<&'static str, &'static str> =
-            BTreeMap::from([("bounded_diag", "planted: bounded portable diagnostic")]);
         let row = |label: &str, ok: bool| StepOutcome {
             tag: format!("compat.{label}"),
             ok,
@@ -3803,55 +3689,22 @@ fn self_test() -> Result<(), String> {
             aborted: false,
         };
         let outcomes = vec![
-            row("listed_fails", false),
-            row("listed_passes", true),
-            row("bounded_diag", false),
-            row("unlisted_fails", false),
-            row("plain_passes", true),
+            row("first_fails", false),
+            row("first_passes", true),
+            row("second_fails", false),
+            row("second_passes", true),
         ];
-        let (passed, measured, blocking, nonblocking) = compat_summary_with_tables(
-            CompatMode::PortableStrict,
-            "compat.",
-            &outcomes,
-            &planted_known,
-            &planted_diag,
-        );
-        if (passed, measured) != (2, 5) {
+        let (passed, measured, blocking, nonblocking) =
+            compat_summary_with_attempts(CompatMode::E9patch, "compat.", &outcomes, &[]);
+        if (passed, measured) != (2, 4) {
             return Err(format!(
-                "compatibility measurement: completed fixture population reported {passed}/{measured}, want 2/5"
+                "compatibility measurement: completed fixture population reported {passed}/{measured}, want 2/4"
             ));
         }
-        // THE LOAD-BEARING ASSERTION: a listed failure is still in the blocking set. If a future
-        // change makes PortableStrict exempt listed rows the way Strict does, this fails.
-        if !blocking.iter().any(|l| l == "listed_fails") {
+        if blocking != ["first_fails", "second_fails"] || !nonblocking.is_empty() {
             return Err(format!(
-                "PortableStrict dropped a listed known-fail-closed row from the blocking set, \
-                 which is the exemption this change exists to avoid: blocking={blocking:?}"
-            ));
-        }
-        if !blocking.iter().any(|l| l == "unlisted_fails") {
-            return Err(format!(
-                "PortableStrict dropped an UNLISTED failure from the blocking set: \
-                 blocking={blocking:?}"
-            ));
-        }
-        if blocking.iter().any(|l| l == "bounded_diag") {
-            return Err(format!(
-                "a bounded portable diagnostic became blocking, changing prior policy: \
-                 blocking={blocking:?}"
-            ));
-        }
-        if nonblocking != BTreeSet::from(["compat.bounded_diag".to_string()]) {
-            return Err(format!(
-                "PortableStrict nonblocking failures did not come from the same typed disposition as the verdict: {nonblocking:?}"
-            ));
-        }
-        if blocking
-            .iter()
-            .any(|l| l == "listed_passes" || l == "plain_passes")
-        {
-            return Err(format!(
-                "a PASSING row was reported as blocking: blocking={blocking:?}"
+                "compatibility summary: every measured failure must block and nothing may be \
+                 exempt: blocking={blocking:?} nonblocking={nonblocking:?}"
             ));
         }
 
@@ -3866,13 +3719,7 @@ fn self_test() -> Result<(), String> {
         let mut with_unknown = outcomes.clone();
         with_unknown.extend([unknown, aborted]);
         let (unknown_passed, unknown_measured, unknown_blocking, unknown_nonblocking) =
-            compat_summary_with_tables(
-                CompatMode::PortableStrict,
-                "compat.",
-                &with_unknown,
-                &planted_known,
-                &planted_diag,
-            );
+            compat_summary_with_attempts(CompatMode::E9patch, "compat.", &with_unknown, &[]);
         if (unknown_passed, unknown_measured) != (passed, measured)
             || unknown_blocking != blocking
             || unknown_nonblocking != nonblocking
@@ -3900,16 +3747,6 @@ fn self_test() -> Result<(), String> {
                 "{mode:?} rendered a compatibility plan WITHOUT the literal \
                  {STRICT_EXECUTION_FLAG} in Hermit's option prefix, so the \
                  legacy below-L2 run would not use strict execution: {rendered:?}"
-            ));
-        }
-        if mode == CompatMode::PortableStrict
-            && !rendered[..guest_separator]
-                .windows(2)
-                .any(|pair| pair == ["--env", "TMPDIR=/tmp"])
-        {
-            return Err(format!(
-                "{mode:?} did not override the inherited host TMPDIR with the guest-visible \
-                 /tmp before the guest argv separator: {rendered:?}"
             ));
         }
         if rendered[..guest_separator]
@@ -4841,14 +4678,15 @@ fn self_test() -> Result<(), String> {
     let count = |m: &str| -> Result<usize, String> {
         validate_corpus::load(&root, m, &paths).map(|r| r.len())
     };
-    // Exact: these two matched their declared totals at extraction time, and that
-    // exact agreement is the evidence the extraction was faithful.
-    let strict = count("strict")?;
-    if strict != validate_corpus::STRICT_COMPAT_TOTAL {
-        return Err(format!(
-            "strict corpus has {strict} rows, STRICT_COMPAT_TOTAL is {}",
-            validate_corpus::STRICT_COMPAT_TOTAL
-        ));
+    // The portable strict corpus that was the other extracted table is
+    // compat.yaml's since 2026-10-13
+    // (https://github.com/rrnewton/hermit/issues/4276); its file must not come
+    // back beside it.
+    if root.join("ci/compat/corpus-strict.json").exists() {
+        return Err(
+            "ci/compat/corpus-strict.json is back; the portable strict rows are compat.yaml's"
+                .into(),
+        );
     }
     // e9patch admits a superset of its gated total (rows gate only when the
     // program is installed), so the invariant is >=, not ==.
@@ -4859,7 +4697,7 @@ fn self_test() -> Result<(), String> {
             validate_corpus::E9PATCH_COMPAT_TOTAL
         ));
     }
-    println!("  corpora: strict={strict} e9patch={e9}");
+    println!("  corpora: e9patch={e9}; no corpus-strict.json");
     // Policy/data brackets are inert: none runs a gate, publishes a label,
     // writes the real ledger, or touches a PR. The one deliberate exception is
     // nested_scope_self_test: it uses a fresh disposable scope with strict
@@ -6903,7 +6741,7 @@ fn super_plan_bracket() -> Result<(), String> {
         "superstress.ptrace_strict_verify",
         "superstress.kvm_available",
         "super-compatprep.fixtures",
-        "compat.rustc",
+        "supercompat.manifest_compat",
     ] {
         if !tags.contains(want) {
             return Err(format!("super plan: node {want} is missing"));
@@ -8072,11 +7910,12 @@ fn normal_raw_result_path(step: &Step, run_id: &str) -> Result<PathBuf, String> 
         } else {
             ""
         };
-        // The second admitted launcher. The portable-strict-compat-only run
+        // The second and third admitted launchers. The portable-strict-compat-only run
         // type's one bucket runs the pinned-root release Hermit on the host,
         // named by exactly PORTABLE_FOCUSED_HERMIT_BIN, so it has no
         // e2e-artifact wrapper. Only a step labelled exactly with that run type
-        // takes this form, and no other publisher may set HERMIT_BIN, which
+        // takes this form, and so does a step labelled exactly super with
+        // SUPER_HERMIT_BIN; no other publisher may set HERMIT_BIN, which
         // the wrapper owns.
         let hermit_bin = step.env.get("HERMIT_BIN").map(String::as_str);
         let launcher = if step
@@ -8091,6 +7930,16 @@ fn normal_raw_result_path(step: &Step, run_id: &str) -> Result<PathBuf, String> 
                     "{tag} must run HERMIT_BIN={}",
                     hermit_manifest_plan::validation_dag::PORTABLE_FOCUSED_HERMIT_BIN
                 ));
+            }
+            String::new()
+        } else if step.labels.iter().map(String::as_str).eq(["super"]) {
+            // The super run type's one bucket, supercompat.manifest_compat,
+            // runs the release Hermit its own super.build_release_hermit
+            // builds, named by exactly SUPER_HERMIT_BIN, so the super suite
+            // does not pull in the full validation's e2e artifact and its
+            // producers (https://github.com/rrnewton/hermit/issues/4276).
+            if hermit_bin != Some(SUPER_HERMIT_BIN) {
+                return Err(format!("{tag} must run HERMIT_BIN={SUPER_HERMIT_BIN}"));
             }
             String::new()
         } else if step
@@ -12985,14 +12834,6 @@ fn build_release_hermit_node(gate: &str, bin: &str) -> dagrun::model::Step {
     step
 }
 
-/// One row of the strict compatibility corpus as e2e.manifest_compat runs it.
-struct CompatManifestRow {
-    /// The guest argv when the run's state directory is the given one.
-    argv: Vec<std::ffi::OsString>,
-    timeout_seconds: u64,
-    diagnostic: bool,
-}
-
 /// Each row of the strict compatibility corpus (tests/e2e/manifests/compat.yaml),
 /// keyed by its corpus label (the last backquoted word of the description the
 /// expansion writes; `g++` has the test id `compat/gxx`): the row's required
@@ -13002,7 +12843,7 @@ struct CompatManifestRow {
 fn compat_manifest_rows(
     root: &Path,
     run_state: &Path,
-) -> Result<BTreeMap<String, CompatManifestRow>, String> {
+) -> Result<BTreeMap<String, Vec<std::ffi::OsString>>, String> {
     let cells = ManifestSet::load(root)?.select(&hermit_manifest_plan::runner::Selection {
         category: Some("compat".into()),
         backend: Some("ptrace".into()),
@@ -13039,17 +12880,10 @@ fn compat_manifest_rows(
             .and_then(|text| text.rsplit_once(" `"))
             .map(|(_, label)| label.to_string())
             .ok_or_else(|| format!("{} does not name its corpus label", cell.test.id))?;
-        let diagnostic = cell
-            .test
-            .modes
-            .get(&cell.id.mode)
-            .is_some_and(|mode| !mode.diagnostic.is_empty());
-        let row = CompatManifestRow {
-            argv: argv.into_iter().map(Into::into).collect(),
-            timeout_seconds: cell.timeout_seconds,
-            diagnostic,
-        };
-        if rows.insert(label, row).is_some() {
+        if rows
+            .insert(label, argv.into_iter().map(Into::into).collect())
+            .is_some()
+        {
             return Err(format!("{} repeats a corpus label", cell.test.id));
         }
     }
@@ -13061,143 +12895,16 @@ fn compat_manifest_argv(
     root: &Path,
     run_state: &Path,
 ) -> Result<BTreeMap<String, Vec<std::ffi::OsString>>, String> {
-    Ok(compat_manifest_rows(root, run_state)?
-        .into_iter()
-        .map(|(label, row)| (label, row.argv))
-        .collect())
-}
-
-/// tests/e2e/manifests/compat.yaml and ci/compat/corpus-strict.json both hold
-/// the portable strict corpus until the focused compatibility lanes and the
-/// super rows move too. Bind the copies: the generator's expansion of every
-/// portable corpus row must equal the compat.yaml row's argv, wall budget and
-/// diagnostic status, and neither may hold a row the other lacks. (The
-/// diagnostic reasons are not compared: compat.yaml spells the tracking
-/// issues as full links.)
-fn compat_corpus_binding_bracket(root: &Path) -> Result<String, String> {
-    let fixture = tempfile::Builder::new()
-        .prefix("validate-compat-binding-")
-        .tempdir()
-        .map_err(|error| format!("compat corpus binding: cannot create fixture: {error}"))?;
-    // Like the generator's production input, $VALIDATE_RUN_STATE, the state
-    // path has no space: some corpus commands interpolate it unquoted.
-    let run_state = fixture.path().join("run-state");
-    let compat = run_state.join("strict-compat");
-    let fixtures = compat.join("real-compat-fixtures");
-    let shell_build = compat.join("shell-build");
-    let root_text = root.to_string_lossy();
-    let compat_text = compat.to_string_lossy();
-    let fixtures_text = fixtures.to_string_lossy();
-    let shell_build_text = shell_build.to_string_lossy();
-    let paths = validate_corpus::CorpusPaths {
-        root_dir: &root_text,
-        real_compat_fixtures: &fixtures_text,
-        validation_tmp_dir: &compat_text,
-        shell_build_dir: &shell_build_text,
-    };
-    let constructed = validate_plan::compat_nodes(
-        root,
-        CompatMode::PortableStrict,
-        "fixture-hermit",
-        "",
-        &paths,
-        None,
-    )?;
-    let mut manifest = compat_manifest_rows(root, &run_state)?;
-    let diagnostic_labels = validate_corpus::portable_diagnostic();
-    let check = |node: &Step, row: &CompatManifestRow| -> Result<(), String> {
-        let label = node.job.as_str();
-        let argv = expand_constructed_guest(node, &run_state)
-            .map_err(|error| format!("compat corpus binding: {error}"))?;
-        if argv != row.argv {
-            return Err(format!(
-                "compat corpus binding: {label} argv differs: corpus {argv:?}, compat.yaml {:?}",
-                row.argv
-            ));
-        }
-        let timeout = u64::try_from(CompatMode::PortableStrict.timeout_for(label))
-            .map_err(|_| format!("compat corpus binding: {label} has a negative timeout"))?;
-        let diagnostic = diagnostic_labels.contains_key(label);
-        if row.timeout_seconds != timeout || row.diagnostic != diagnostic {
-            return Err(format!(
-                "compat corpus binding: {label} budget or diagnostic status differs: corpus {timeout} s diagnostic={diagnostic}, compat.yaml {} s diagnostic={}",
-                row.timeout_seconds, row.diagnostic
-            ));
-        }
-        Ok(())
-    };
-    let mut compared = 0;
-    for (index, node) in constructed.iter().enumerate() {
-        let label = node.job.as_str();
-        let row = manifest.remove(label).ok_or_else(|| {
-            format!("compat corpus binding: compat.yaml lacks corpus row {label}")
-        })?;
-        check(node, &row)?;
-        if index == 0 {
-            // Planted drift on the first row must be refused.
-            let mut argv = row.argv.clone();
-            argv.push("--planted".into());
-            let changed_argv = CompatManifestRow { argv, ..row };
-            let flipped = CompatManifestRow {
-                argv: changed_argv.argv[..changed_argv.argv.len() - 1].to_vec(),
-                timeout_seconds: changed_argv.timeout_seconds,
-                diagnostic: !changed_argv.diagnostic,
-            };
-            if check(node, &changed_argv).is_ok() || check(node, &flipped).is_ok() {
-                return Err(format!(
-                    "compat corpus binding: a planted argv or diagnostic drift of {label} was accepted"
-                ));
-            }
-        }
-        compared += 1;
-    }
-    if let Some(label) = manifest.keys().next() {
-        return Err(format!(
-            "compat corpus binding: compat.yaml row {label} is not a portable corpus row"
-        ));
-    }
-    Ok(format!(
-        "compat corpus binding: {compared} compat.yaml rows equal the corpus generator's argv, wall budget and diagnostic status"
-    ))
-}
-
-/// Expand one generated corpus node's guest words the way its outer shell did,
-/// with `VALIDATE_RUN_STATE` set; NUL framing preserves spaces and
-/// metacharacters.
-fn expand_constructed_guest(
-    node: &Step,
-    run_state: &Path,
-) -> Result<Vec<std::ffi::OsString>, String> {
-    let (_, guest) = node
-        .cmd
-        .split_once(" -- ")
-        .ok_or_else(|| format!("missing guest boundary: {}", node.cmd))?;
-    let expanded = Command::new("bash")
-        .args(["-eu", "-c", &format!("printf '%s\\0' {guest}")])
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .env("VALIDATE_RUN_STATE", run_state)
-        .output()
-        .map_err(|error| format!("cannot expand {}: {error}", node.tag()))?;
-    if !expanded.status.success() || !expanded.stderr.is_empty() {
-        return Err(format!("cannot expand {}: {expanded:?}", node.tag()));
-    }
-    Ok(expanded
-        .stdout
-        .strip_suffix(&[0])
-        .ok_or_else(|| format!("{} has no final argv delimiter", node.tag()))?
-        .split(|byte| *byte == 0)
-        .map(|bytes| std::ffi::OsString::from(OsStr::from_bytes(bytes)))
-        .collect())
+    compat_manifest_rows(root, run_state)
 }
 
 /// Exercise both sides of the fixture-path boundary without a Hermit binary:
 /// the run state is resolved into a literal operand before the guest starts,
 /// and the guest runs with a cleared environment that does not carry it. This
 /// is an argv/environment bracket, not a substitute for the real strict-verify
-/// comparator. "constructed" is the generator that still builds the focused
-/// compatibility lanes from ci/compat/corpus-strict.json; "committed" is the
-/// compat.yaml row e2e.manifest_compat runs.
+/// comparator. "committed" is the compat.yaml row e2e.manifest_compat runs;
+/// the generator's copy built from ci/compat/corpus-strict.json was retired on
+/// 2026-10-13 (https://github.com/rrnewton/hermit/issues/4276).
 fn compat_fixture_operand_bracket(root: &Path) -> Result<String, String> {
     let fixture = tempfile::Builder::new()
         .prefix("validate-compat-operand-")
@@ -13215,58 +12922,28 @@ fn compat_fixture_operand_bracket(root: &Path) -> Result<String, String> {
         .map_err(|error| format!("compat fixture operand: cannot write README: {error}"))?;
     let metadata = std::fs::metadata(&readme)
         .map_err(|error| format!("compat fixture operand: cannot stat README: {error}"))?;
-    let root_text = root.to_string_lossy();
-    let fixtures_text = fixtures.to_string_lossy();
-    let tmp_text = guest_tmp.to_string_lossy();
-    let paths = validate_corpus::CorpusPaths {
-        root_dir: &root_text,
-        real_compat_fixtures: &fixtures_text,
-        validation_tmp_dir: &tmp_text,
-        shell_build_dir: &tmp_text,
-    };
-    let only = BTreeSet::from(["chown".to_string(), "install".to_string()]);
-    let constructed = validate_plan::compat_nodes_for(
-        root,
-        validate_plan::CompatMode::PortableStrict,
-        "fixture-hermit",
-        "unused",
-        &paths,
-        None,
-        Some(&only),
-        None,
-    )?;
     let committed = compat_manifest_argv(root, &run_state)?;
     let mut commands = Vec::new();
     for label in ["chown", "install"] {
-        let node = constructed
-            .iter()
-            .find(|node| node.job == label)
-            .ok_or_else(|| format!("compat fixture operand: missing constructed {label}"))?;
-        let constructed_argv = expand_constructed_guest(node, &run_state)
-            .map_err(|error| format!("compat fixture operand: {error}"))?;
-        let committed_argv = committed
+        let argv = committed
             .get(label)
             .cloned()
             .ok_or_else(|| format!("compat fixture operand: missing committed {label}"))?;
-        for (kind, argv) in [
-            ("constructed", constructed_argv),
-            ("committed", committed_argv),
-        ] {
-            // bash -c SCRIPT NAME FIXTURE: the script reads the fixture as its
-            // positional operand, and the operand is the literal run-owned path.
-            if argv.len() != 5
-                || argv[0] != "bash"
-                || argv[1] != "-c"
-                || !argv[2].to_string_lossy().contains("\"$1\"")
-                || argv[2].to_string_lossy().contains("VALIDATE_RUN_STATE")
-                || argv[4] != readme.as_os_str()
-            {
-                return Err(format!(
-                    "compat fixture operand: {kind} {label} lost its literal positional fixture: {argv:?}"
-                ));
-            }
-            commands.push((kind, label, argv));
+        let kind = "committed";
+        // bash -c SCRIPT NAME FIXTURE: the script reads the fixture as its
+        // positional operand, and the operand is the literal run-owned path.
+        if argv.len() != 5
+            || argv[0] != "bash"
+            || argv[1] != "-c"
+            || !argv[2].to_string_lossy().contains("\"$1\"")
+            || argv[2].to_string_lossy().contains("VALIDATE_RUN_STATE")
+            || argv[4] != readme.as_os_str()
+        {
+            return Err(format!(
+                "compat fixture operand: {kind} {label} lost its literal positional fixture: {argv:?}"
+            ));
         }
+        commands.push((kind, label, argv));
     }
     let run = |argv: &[std::ffi::OsString]| -> Result<std::process::Output, String> {
         Command::new(&argv[0])
@@ -13324,13 +13001,13 @@ fn compat_fixture_operand_bracket(root: &Path) -> Result<String, String> {
             ));
         }
     }
-    Ok("compat fixture operand: constructed + committed chown/install preserve clean guest environment, literal paths, owner/mode/size; old expansion and missing fixture fail".into())
+    Ok("compat fixture operand: compat.yaml chown/install preserve clean guest environment, literal paths, owner/mode/size; old expansion and missing fixture fail".into())
 }
 
 /// A digest of empty input is a successful hash operation, not proof that its
-/// compressor succeeded. Run the actual guest argv, both the generator's and the
-/// compat.yaml row's, under Minimal's cleared environment and compare against
-/// independently compressed real input.
+/// compressor succeeded. Run the compat.yaml row's actual guest argv under
+/// Minimal's cleared environment and compare against independently compressed
+/// real input.
 fn compat_compression_fixture_bracket(root: &Path) -> Result<String, String> {
     use std::os::unix::process::CommandExt;
 
@@ -13353,35 +13030,12 @@ fn compat_compression_fixture_bracket(root: &Path) -> Result<String, String> {
     }
     std::fs::write(&readme, &input)
         .map_err(|error| format!("compression fixture: write README: {error}"))?;
-    let root_text = root.to_string_lossy();
-    let fixtures_text = fixtures.to_string_lossy();
-    let tmp_text = fixture.path().to_string_lossy();
-    let paths = validate_corpus::CorpusPaths {
-        root_dir: &root_text,
-        real_compat_fixtures: &fixtures_text,
-        validation_tmp_dir: &tmp_text,
-        shell_build_dir: &tmp_text,
-    };
     let compressors: [(&str, &[&str]); 4] = [
         ("bzip2", &["-c"]),
         ("gzip", &["-cn"]),
         ("xz", &["-c"]),
         ("zstd", &["-q", "-c"]),
     ];
-    let only = compressors
-        .iter()
-        .map(|(label, _)| (*label).to_string())
-        .collect();
-    let constructed = validate_plan::compat_nodes_for(
-        root,
-        validate_plan::CompatMode::PortableStrict,
-        "fixture-hermit",
-        "unused",
-        &paths,
-        None,
-        Some(&only),
-        None,
-    )?;
     let committed = compat_manifest_argv(root, &run_state)?;
     let mut commands = Vec::new();
     let empty_digest = format!("{:x}  -\n", Sha256::digest([]));
@@ -13422,33 +13076,18 @@ fn compat_compression_fixture_bracket(root: &Path) -> Result<String, String> {
         )
         .and_then(|()| exec_safe_fs::set_executable(&stub, 0o755))
         .map_err(|error| format!("compression fixture: failing producer: {error}"))?;
-        let node = constructed
-            .iter()
-            .find(|node| node.job == label)
-            .ok_or_else(|| format!("compression fixture: missing constructed {label}"))?;
-        // Observe actual outer-shell expansion, not substring presence in the
-        // whole command: a path hidden inside bash -c is not an expanded operand.
-        let constructed_argv = expand_constructed_guest(node, &run_state)
-            .map_err(|error| format!("compression fixture: {error}"))?;
-        let committed_argv = committed
+        let argv = committed
             .get(label)
             .cloned()
             .ok_or_else(|| format!("compression fixture: missing committed {label}"))?;
-        for (kind, argv) in [
-            ("constructed", constructed_argv),
-            ("committed", committed_argv),
-        ] {
-            if argv.len() != 5
-                || argv[0] != "bash"
-                || argv[1] != "-c"
-                || argv[4] != readme.as_os_str()
-            {
-                return Err(format!(
-                    "compression fixture: {kind} {label} did not pass the actual fixture at the guest argv boundary: {argv:?}"
-                ));
-            }
-            commands.push((kind, label, argv, expected.clone()));
+        let kind = "committed";
+        if argv.len() != 5 || argv[0] != "bash" || argv[1] != "-c" || argv[4] != readme.as_os_str()
+        {
+            return Err(format!(
+                "compression fixture: {kind} {label} did not pass the actual fixture at the guest argv boundary: {argv:?}"
+            ));
         }
+        commands.push((kind, label, argv, expected.clone()));
     }
     let run = |argv: &[std::ffi::OsString], failed: bool, unreadable: bool| {
         let path = if failed {
@@ -13510,7 +13149,7 @@ fn compat_compression_fixture_bracket(root: &Path) -> Result<String, String> {
             ));
         }
     }
-    Ok("compression fixture: 4 old false passes reproduced; 8 constructed/committed argv preserve real input; 24 failed-producer/unreadable/missing cases fail".into())
+    Ok("compression fixture: 4 old false passes reproduced; 4 compat.yaml argv preserve real input; 12 failed-producer/unreadable/missing cases fail".into())
 }
 
 /// Require the canonicalization rows to exercise the checked-in nested file,
@@ -13676,11 +13315,14 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
     // state directory is /run-state.
     let run_state = Path::new("/run-state");
     let rows = compat_manifest_argv(root, run_state)?;
-    let expected =
-        validate_corpus::STRICT_COMPAT_TOTAL - validate_corpus::portable_super_only().len();
+    // The full run's compat rows: the 193 of the portable strict corpus
+    // extracted from validate.sh, the 25 of
+    // https://github.com/rrnewton/hermit/issues/4269, less the 4 heavy rows
+    // the super run type runs (218 - 4).
+    let expected = 214;
     if rows.len() != expected {
         return Err(format!(
-            "strict-compat bucket: compat.yaml has {} CI rows; the corpus has {expected} portable rows",
+            "strict-compat bucket: compat.yaml has {} CI rows; the full run has {expected}",
             rows.len()
         ));
     }
@@ -13688,7 +13330,6 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
         argv.iter()
             .any(|arg| arg.to_string_lossy().contains(needle))
     };
-    println!("  {}", compat_corpus_binding_bracket(root)?);
     println!("  {}", compat_fixture_operand_bracket(root)?);
     println!("  {}", compat_compression_fixture_bracket(root)?);
     let fixture_readme = "/run-state/strict-compat/real-compat-fixtures/README.md";
@@ -14644,7 +14285,7 @@ fn summary_listing_bracket() -> Result<String, String> {
     }
     // Compatibility is deliberately different: its policy owns the matrix
     // rows, while only failures outside that matrix are added.
-    if effective_failure_count(Some(CompatMode::PortableStrict), 99, 2, 1) != 3 {
+    if effective_failure_count(Some(CompatMode::E9patch), 99, 2, 1) != 3 {
         return Err(
             "failure count: compatibility matrix and structural failure populations were not kept separate"
                 .into(),
@@ -15005,47 +14646,26 @@ fn print_compat_summary(
     outcomes: &[StepOutcome],
     attempts: &[NodeAttempt],
 ) -> (usize, usize, Vec<String>, BTreeSet<String>) {
-    compat_summary_with_attempts(
-        mode,
-        prefix,
-        outcomes,
-        attempts,
-        &validate_corpus::known_failclosed(),
-        &validate_corpus::portable_diagnostic(),
-    )
+    compat_summary_with_attempts(mode, prefix, outcomes, attempts)
 }
 
-/// The real summary body, with its two policy tables passed in.
-///
-/// Production calls it through [`print_compat_summary`] with the REAL tables, so nothing is
-/// weakened; the tables are parameters purely so a bracket can exercise this exact code against
-/// a planted table. That matters here because the shipped `known_failclosed()` is currently
-/// empty, which is not enough to distinguish "listed and blocking" from "listed and
-/// exempt" in one run -- and the fix for that must not be to add a fake row to production.
-fn compat_summary_with_tables(
-    mode: CompatMode,
-    prefix: &str,
-    outcomes: &[StepOutcome],
-    known: &BTreeMap<&'static str, &'static str>,
-    diag: &BTreeMap<&'static str, &'static str>,
-) -> (usize, usize, Vec<String>, BTreeSet<String>) {
-    compat_summary_with_attempts(mode, prefix, outcomes, &[], known, diag)
-}
-
+/// The summary body. Every measured product failure blocks: the e9patch
+/// corpus, the one mode left, never had a known-failure or diagnostic table,
+/// and the portable strict corpus that had them (both empty since
+/// 2026-10-07) is compat.yaml's since 2026-10-13. The fourth value, the
+/// nonblocking failures, is therefore always empty; the caller still reads it
+/// so a future policy cannot add exemptions without it.
 fn compat_summary_with_attempts(
     mode: CompatMode,
     prefix: &str,
     outcomes: &[StepOutcome],
     attempts: &[NodeAttempt],
-    known: &BTreeMap<&'static str, &'static str>,
-    diag: &BTreeMap<&'static str, &'static str>,
 ) -> (usize, usize, Vec<String>, BTreeSet<String>) {
     let mut per_cat: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
     let mut passed = 0usize;
     let mut measured = 0usize;
     let mut blocking_failures: Vec<String> = Vec::new();
-    let mut nonblocking_failure_tags: BTreeSet<String> = BTreeSet::new();
-    let mut measured_labels: BTreeSet<String> = BTreeSet::new();
+    let nonblocking_failure_tags: BTreeSet<String> = BTreeSet::new();
     for o in outcomes {
         let Some(label) = o.tag.strip_prefix(prefix) else {
             continue;
@@ -15071,74 +14691,11 @@ fn compat_summary_with_attempts(
         let e = per_cat.entry(cat).or_insert((0, 0));
         e.1 += 1;
         measured += 1;
-        measured_labels.insert(label.to_string());
         if classification == NodeClassification::Pass {
             e.0 += 1;
             passed += 1;
-        }
-        // ONE decision, read twice: once for what to print and once for whether the row
-        // blocks. Before this the two were separate arms of the same `if`, which is how a
-        // reporting change can silently become an exemption.
-        let mode_label = match mode {
-            CompatMode::PortableStrict => "--portable-strict",
-            other => other.display_name(),
-        };
-        let disposition = validate_plan::classify_compat_outcome(
-            mode,
-            classification == NodeClassification::Pass,
-            known.contains_key(label),
-            diag.contains_key(label),
-        );
-        match disposition {
-            CompatDisposition::Passed => {}
-            CompatDisposition::PassedButListedFailClosed => {
-                println!(
-                    "  WARN {label} passed but is listed as known fail-closed under {} \
-                     ({}); the EXPECTATION is STALE -- drop it from the known-failure table",
-                    mode_label, known[label]
-                );
-            }
-            CompatDisposition::KnownFailClosedBlocking => {
-                // Reported AND still blocking. Naming the reason is not excusing the failure:
-                // the row is pushed onto `blocking_failures` below exactly as an unlisted
-                // failure would be.
-                println!(
-                    "  FAIL {label} known fail-closed under {} ({}); STILL BLOCKING -- \
-                     this mode does not exempt listed rows",
-                    mode_label, known[label]
-                );
-            }
-            CompatDisposition::PortableDiagnostic => {
-                println!(
-                    "  WARN {label} is a bounded portable diagnostic: {}",
-                    diag[label]
-                );
-            }
-            CompatDisposition::Blocking => {}
-        }
-        if disposition.is_blocking() {
+        } else {
             blocking_failures.push(label.to_string());
-        } else if classification == NodeClassification::ProductFailure {
-            nonblocking_failure_tags.insert(o.tag.clone());
-        }
-    }
-    // AUDIT: a listed row the selected corpus never measured. Such a row is silently carried
-    // forever -- it can neither fail (nothing ran it) nor be reported stale (it never passed),
-    // so the table grows entries no run can retire. Naming them is reporting only; it changes
-    // no verdict.
-    if mode == CompatMode::PortableStrict {
-        let unmeasured: Vec<&str> = known
-            .keys()
-            .copied()
-            .filter(|label| !measured_labels.contains(*label))
-            .collect();
-        if !unmeasured.is_empty() {
-            println!(
-                "  WARN {} known fail-closed row(s) not measured by this corpus, so no run can \
-                 confirm or retire them: {}",
-                unmeasured.len(),
-                unmeasured.join(", ")
-            );
         }
     }
     println!(
@@ -18309,8 +17866,10 @@ printf 'FORWARDED_CPU=%s\nFORWARDED_WALL=%s\n' "$cpu_value" "$wall_value"
         // each publish the cells of their bucket from the rows
         // e2e.buck_cells wrote. 55 since strictcompat.manifest_compat was
         // retired with the compat/strict-<row> tests
-        // (https://github.com/rrnewton/hermit/issues/4276).
-        assert_eq!(steps.len(), 55);
+        // (https://github.com/rrnewton/hermit/issues/4276). 56 with
+        // supercompat.manifest_compat, the super run type's heavy compat rows
+        // (same issue).
+        assert_eq!(steps.len(), 56);
         for step in steps {
             let (selection, prebuilt) = manifest_step_policy(step).unwrap();
             assert_eq!(prebuilt, step.tag() != "quick.e2e_verify", "{}", step.tag());
@@ -22344,7 +21903,7 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
             compat_fail.clone(),
         ],
         &compat_attempts,
-        Some(CompatMode::PortableStrict),
+        Some(CompatMode::E9patch),
         Some("compat."),
     )? != (Some(875), Some(874), Some(350))
     {
@@ -22356,7 +21915,7 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
     if run_test_counts(
         &[compat_pass.clone(), compat_fail.clone()],
         &compat_attempts,
-        Some(CompatMode::PortableStrict),
+        Some(CompatMode::E9patch),
         Some("compat."),
     )? != (Some(2), Some(1), Some(0))
     {
@@ -22367,7 +21926,7 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
     if run_test_counts(
         &[failed, compat_pass.clone(), compat_fail.clone()],
         &compat_attempts,
-        Some(CompatMode::PortableStrict),
+        Some(CompatMode::E9patch),
         Some("compat."),
     )? != (Some(25), None, Some(5))
     {
@@ -34011,8 +33570,10 @@ mod raw_census_publication_tests {
         // each publish the cells of their bucket from the rows
         // e2e.buck_cells wrote. 55 since strictcompat.manifest_compat was
         // retired with the compat/strict-<row> tests
-        // (https://github.com/rrnewton/hermit/issues/4276).
-        assert_eq!(publishers.len(), 55);
+        // (https://github.com/rrnewton/hermit/issues/4276). 56 with
+        // supercompat.manifest_compat, the super run type's heavy compat rows
+        // (same issue).
+        assert_eq!(publishers.len(), 56);
         for step in publishers {
             let path = normal_raw_result_path(step, "fixture-run").unwrap();
             // Only the full-buck-e2e label admits the import launcher.

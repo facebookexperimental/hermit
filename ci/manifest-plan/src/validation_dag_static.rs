@@ -242,6 +242,7 @@ pub(super) const TEST_HARNESS_RESULT_PRODUCERS: &[&str] = &[
     "quick.e2e_verify",
     "rrcompat.manifest_compat",
     "sabrecompat.manifest_compat",
+    "supercompat.manifest_compat",
 ];
 
 /// Nodes that write their rows through `ci/write-structured-test-counts.sh`:
@@ -1022,7 +1023,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // additional_row_env_keeps_sibling_rows_backends_and_strict_variants_unchanged
     // and runner::tests::a_shipped_compat_row_keeps_the_strict_compatibility_probe_flags
     // (hermit-manifest-plan: 772 -> 771): 1084.
-    ("test.regular_crates", 1084),
+    // manifest_corpus::tests::a_heavy_label_marks_only_the_corpus_backend_cell,
+    // added when the super run type's heavy compat rows moved from
+    // ci/compat/corpus-strict.json onto compat.yaml cells, retains all 1084: 1085.
+    ("test.regular_crates", 1085),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -3607,7 +3611,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same four backend-scoped environment tests: 1078.
     // And the same seven strictness-level tests: 1085.
     // And the same retirement of the strict variants' tests: 1084.
-    ("test.regular_crates_on_host", 1084),
+    // And the same heavy-label test: 1085.
+    ("test.regular_crates_on_host", 1085),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
@@ -5294,6 +5299,52 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         networkonly: false,
         engine_only: false,
         timeout: 600,
+        cpu_timeout: 1800,
+        jobs_flag: Some(r########"--jobs"########),
+        jobs_env: None,
+    },
+    StaticStepSpec {
+        group: r########"supercompat"########,
+        job: r########"manifest_compat"########,
+        desc: r########"The compatibility corpus's heavy rows for the super run type"########,
+        description: r########"The super run type's compatibility rows: `test-harness run --label super` over tests/e2e/manifests/compat.yaml, so it runs exactly the ptrace verify cells of the corpus's heavy rows, rustc, javac, java and node, which the `heavy` section labels with the super run type on the corpus backend alone, against the release Hermit super.build_release_hermit builds (HERMIT_BIN=target/release/hermit: the super run type keeps its own build rather than pulling in the full validation's e2e artifact and its producers) and the fixtures super-compatprep.fixtures writes. Each cell runs at the host's strictness level (strict on a host with CPUID faulting and an exact branch counter) under Hermit's strict --verify (--verify-strict), with the heavy rows' 600-second wall and 599-second CPU budgets. Until 2026-10-13 these four rows were generated compat.<row> nodes built from ci/compat/corpus-strict.json that ran with CPUID virtualization and the preemption timer off and compared the runs with Hermit's stripped comparison; that file and its generator are retired (https://github.com/rrnewton/hermit/issues/4276). A program that diverges, crashes or exceeds its budget turns the node red. The node's 2120-second wall bound is the 1820 seconds `scripts/validate.rs --self-test` requires of it as outer headroom (two modelled attempts of a 600-second cell scaled by the representative 1.5x multiplier, each with 10 seconds of termination grace: 2 x (900 + 10)), plus 300 seconds for the rest of the bucket; compat cells carry the manifest's no_retry_reason, so the harness never retries them."########,
+        labels: &[r########"super"########],
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; target/debug/test-harness run --lane portable --category compat --label super --ci-only --prebuilt --diagnostic-results --results "$E2E_RESULT_ROOT/portable/manifest_compat/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_compat/junit.xml""########,
+        cmdtype: CmdType::Unknown,
+        manifest: Some(ManifestSpec {
+            lane: r########"portable"########,
+            category: r########"compat"########,
+            test: None,
+            mode: None,
+            backend: None,
+            label: Some(r########"super"########),
+        }),
+        integration_test_binaries: None,
+        deps: &[
+            r########"build.rust_scripts"########,
+            r########"gate.manifest"########,
+            r########"pre.reverie_pin"########,
+            r########"setup.manifest_plan"########,
+            r########"super-compatprep.fixtures"########,
+            r########"super.build_release_hermit"########,
+        ],
+        env: &[
+            (r########"HERMIT_BIN"########, r########"target/release/hermit"########),
+            (r########"HERMIT_E2E_EMPTY_WORKDIR"########, r########"/test"########),
+        ],
+        hint: HintSpec {
+            resources: &[(r########"manifest_guest"########, 8)],
+            est_duration_s: 120.0,
+            rss_baseline_bytes: Some(4294967296),
+            hard_mem_max_bytes: Some(6442450944),
+            classification: StepClass::LatencyBound,
+            preferred_inner_jobs: Some(8),
+            measured_effective_cores: None,
+            measured_cpu_utilization: None,
+        },
+        networkonly: false,
+        engine_only: false,
+        timeout: 2120,
         cpu_timeout: 1800,
         jobs_flag: Some(r########"--jobs"########),
         jobs_env: None,

@@ -19665,6 +19665,87 @@
       "fail_fast_family": "rrcompat.manifest_compat"
     },
     {
+      "group": "supercompat",
+      "job": "manifest_compat",
+      "desc": "The compatibility corpus's heavy rows for the super run type",
+      "description": "The super run type's compatibility rows: `test-harness run --label super` over tests/e2e/manifests/compat.yaml, so it runs exactly the ptrace verify cells of the corpus's heavy rows, rustc, javac, java and node, which the `heavy` section labels with the super run type on the corpus backend alone, against the release Hermit super.build_release_hermit builds (HERMIT_BIN=target/release/hermit: the super run type keeps its own build rather than pulling in the full validation's e2e artifact and its producers) and the fixtures super-compatprep.fixtures writes. Each cell runs at the host's strictness level (strict on a host with CPUID faulting and an exact branch counter) under Hermit's strict --verify (--verify-strict), with the heavy rows' 600-second wall and 599-second CPU budgets. Until 2026-10-13 these four rows were generated compat.<row> nodes built from ci/compat/corpus-strict.json that ran with CPUID virtualization and the preemption timer off and compared the runs with Hermit's stripped comparison; that file and its generator are retired (https://github.com/rrnewton/hermit/issues/4276). A program that diverges, crashes or exceeds its budget turns the node red. The node's 2120-second wall bound is the 1820 seconds `scripts/validate.rs --self-test` requires of it as outer headroom (two modelled attempts of a 600-second cell scaled by the representative 1.5x multiplier, each with 10 seconds of termination grace: 2 x (900 + 10)), plus 300 seconds for the rest of the bucket; compat cells carry the manifest's no_retry_reason, so the harness never retries them.",
+      "labels": [
+        "super"
+      ],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; target/debug/test-harness run --lane portable --category compat --label super --ci-only --prebuilt --diagnostic-results --results \"$E2E_RESULT_ROOT/portable/manifest_compat/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_compat/junit.xml\"",
+      "manifest": {
+        "lane": "portable",
+        "category": "compat"
+      },
+      "result_manifests": [
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/java",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/javac",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/node",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/rustc",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "kind": "structured-test-results",
+          "schema": 4,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "supercompat.manifest_compat"
+        }
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-build.rust_scripts",
+        "quick-super-gate.manifest",
+        "quick-super-setup.manifest_plan",
+        "super-compatprep.fixtures",
+        "super.build_release_hermit"
+      ],
+      "env": {
+        "HERMIT_BIN": "target/release/hermit",
+        "HERMIT_E2E_EMPTY_WORKDIR": "/test"
+      },
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 2120,
+      "cpu_timeout": 1800,
+      "jobs_flag": "--jobs",
+      "jobs_env": null,
+      "hint": {
+        "resources": {
+          "manifest_guest": 8
+        },
+        "est_duration_s": 120.0,
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 6442450944,
+        "classification": "latency-bound",
+        "preferred_inner_jobs": 8,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "supercompat.manifest_compat"
+    },
+    {
       "group": "sabrecompat",
       "job": "manifest_compat",
       "desc": "The compatibility corpus on SaBRe",
@@ -22531,7 +22612,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1084",
+        "NEXTEST_EXPECTED_EXECUTED": "1085",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -44159,12 +44240,12 @@
     {
       "group": "super-compatprep",
       "job": "fixtures",
-      "desc": "Functional compatibility fixtures",
-      "description": "Runs tests/compat/prepare_real_compat_fixtures.sh into $VALIDATE_RUN_STATE/super-compat-fixtures on the host, after super.build_release_hermit: a copy of README.md, compiled binutils, gprof, gcov and lsof inputs, a loopback HTTP server, df's mount fixture, and cargo/rustc links into the active toolchain. The super-only compatibility rows (compat.java, compat.javac, compat.node, compat.rustc) depend on it; the rows that run tests/compat/real_compat_workload.sh read these files through REAL_COMPAT_FIXTURES, and rustc calls the toolchain link it makes because --base-env=minimal keeps the user's rustup directory off PATH. A fixture that fails to build or a missing host tool stops those rows.",
+      "desc": "Prepare the fixture files the super run type's compat cells read",
+      "description": "Runs tests/compat/prepare_real_compat_fixtures.sh into $VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures on the host, after super.build_release_hermit: a copy of README.md, compiled binutils, gprof, gcov and lsof inputs, a loopback HTTP server, df's mount fixture, and cargo/rustc links into the active toolchain, the run-owned files the compat.yaml heavy rows (rustc, javac, java and node) of supercompat.manifest_compat read; rustc calls the toolchain link it makes because --base-env=minimal keeps the user's rustup directory off PATH. A fixture that fails to build or a missing host tool stops the run type before the bucket runs.",
       "labels": [
         "super"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./tests/compat/prepare_real_compat_fixtures.sh $VALIDATE_RUN_STATE/super-compat-fixtures",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./tests/compat/prepare_real_compat_fixtures.sh $VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures",
       "result_manifests": [],
       "deps": [
         "pre.reverie_pin",
@@ -44189,142 +44270,6 @@
         "measured_cpu_utilization": null
       },
       "fail_fast_family": "super-compatprep.fixtures"
-    },
-    {
-      "group": "compat",
-      "job": "rustc",
-      "desc": "legacy below-L2 stripped verify compatibility: rustc",
-      "description": "Runs the rustc row of the portable strict compatibility corpus, a full compile-link-run workload, as `target/release/hermit run --strict --verify --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled` with a tmpfs /test working directory, stdin from /dev/null, on the default ptrace backend. Plain --verify runs the guest twice and compares the runs with the Stripped comparator, so the row establishes L1 with a lossy repeat check, not L2. The portable profile defers this row to the super profile because it is too heavy for the corpus's 60-second budget; here it gets 600 seconds and runs after super-compatprep.fixtures, which prepares the files the real_compat_workload.sh rows read. A missing toolchain or fixture, a syscall strict mode refuses, or output that differs between the two runs turns it red, and a failure fails the super run.",
-      "labels": [
-        "super"
-      ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/target/release/hermit run --strict --verify --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --mount=type=tmpfs,target=/test --workdir=/test --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=$VALIDATE_RUN_STATE/super-compat-fixtures bash $PWD/tests/compat/real_compat_workload.sh rustc </dev/null",
-      "result_manifests": [],
-      "deps": [
-        "pre.reverie_pin",
-        "quick-super-gate.manifest",
-        "super-compatprep.fixtures"
-      ],
-      "env": {},
-      "networkonly": false,
-      "engine_only": false,
-      "timeout": 600,
-      "cpu_timeout": 600,
-      "jobs_flag": null,
-      "jobs_env": null,
-      "hint": {
-        "resources": {},
-        "est_duration_s": 0.0,
-        "rss_baseline_bytes": 4294967296,
-        "hard_mem_max_bytes": 4294967296,
-        "classification": "light",
-        "preferred_inner_jobs": null,
-        "measured_effective_cores": null,
-        "measured_cpu_utilization": null
-      },
-      "fail_fast_family": "compat.rustc"
-    },
-    {
-      "group": "compat",
-      "job": "javac",
-      "desc": "legacy below-L2 stripped verify compatibility: javac",
-      "description": "Runs the javac row of the portable strict compatibility corpus, a JVM startup and compile-run workload, as `target/release/hermit run --strict --verify --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled` with a tmpfs /test working directory, stdin from /dev/null, on the default ptrace backend. Plain --verify runs the guest twice and compares the runs with the Stripped comparator, so the row establishes L1 with a lossy repeat check, not L2. The portable profile defers this row to the super profile because it is too heavy for the corpus's 60-second budget; here it gets 600 seconds and runs after super-compatprep.fixtures, which prepares the files the real_compat_workload.sh rows read. A missing toolchain or fixture, a syscall strict mode refuses, or output that differs between the two runs turns it red, and a failure fails the super run.",
-      "labels": [
-        "super"
-      ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/target/release/hermit run --strict --verify --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --mount=type=tmpfs,target=/test --workdir=/test --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=$VALIDATE_RUN_STATE/super-compat-fixtures bash $PWD/tests/compat/real_compat_workload.sh javac </dev/null",
-      "result_manifests": [],
-      "deps": [
-        "pre.reverie_pin",
-        "quick-super-gate.manifest",
-        "super-compatprep.fixtures"
-      ],
-      "env": {},
-      "networkonly": false,
-      "engine_only": false,
-      "timeout": 600,
-      "cpu_timeout": 600,
-      "jobs_flag": null,
-      "jobs_env": null,
-      "hint": {
-        "resources": {},
-        "est_duration_s": 0.0,
-        "rss_baseline_bytes": 4294967296,
-        "hard_mem_max_bytes": 4294967296,
-        "classification": "light",
-        "preferred_inner_jobs": null,
-        "measured_effective_cores": null,
-        "measured_cpu_utilization": null
-      },
-      "fail_fast_family": "compat.javac"
-    },
-    {
-      "group": "compat",
-      "job": "java",
-      "desc": "legacy below-L2 stripped verify compatibility: java",
-      "description": "Runs the java row of the portable strict compatibility corpus, a threaded JVM filesystem and digest workload, as `target/release/hermit run --strict --verify --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled` with a tmpfs /test working directory, stdin from /dev/null, on the default ptrace backend. Plain --verify runs the guest twice and compares the runs with the Stripped comparator, so the row establishes L1 with a lossy repeat check, not L2. The portable profile defers this row to the super profile because it is too heavy for the corpus's 60-second budget; here it gets 600 seconds and runs after super-compatprep.fixtures, which prepares the files the real_compat_workload.sh rows read. A missing toolchain or fixture, a syscall strict mode refuses, or output that differs between the two runs turns it red, and a failure fails the super run.",
-      "labels": [
-        "super"
-      ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/target/release/hermit run --strict --verify --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --mount=type=tmpfs,target=/test --workdir=/test --env TMPDIR=/tmp -- env REAL_COMPAT_FIXTURES=$VALIDATE_RUN_STATE/super-compat-fixtures bash $PWD/tests/compat/real_compat_workload.sh java </dev/null",
-      "result_manifests": [],
-      "deps": [
-        "pre.reverie_pin",
-        "quick-super-gate.manifest",
-        "super-compatprep.fixtures"
-      ],
-      "env": {},
-      "networkonly": false,
-      "engine_only": false,
-      "timeout": 600,
-      "cpu_timeout": 600,
-      "jobs_flag": null,
-      "jobs_env": null,
-      "hint": {
-        "resources": {},
-        "est_duration_s": 0.0,
-        "rss_baseline_bytes": 4294967296,
-        "hard_mem_max_bytes": 4294967296,
-        "classification": "light",
-        "preferred_inner_jobs": null,
-        "measured_effective_cores": null,
-        "measured_cpu_utilization": null
-      },
-      "fail_fast_family": "compat.java"
-    },
-    {
-      "group": "compat",
-      "job": "node",
-      "desc": "legacy below-L2 stripped verify compatibility: node",
-      "description": "Runs the node row of the portable strict compatibility corpus, a Node.js runtime startup workload, as `target/release/hermit run --strict --verify --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled` with a tmpfs /test working directory, stdin from /dev/null, on the default ptrace backend. Plain --verify runs the guest twice and compares the runs with the Stripped comparator, so the row establishes L1 with a lossy repeat check, not L2. The portable profile defers this row to the super profile because it is too heavy for the corpus's 60-second budget; here it gets 600 seconds and runs after super-compatprep.fixtures, which prepares the files the real_compat_workload.sh rows read. A missing toolchain or fixture, a syscall strict mode refuses, or output that differs between the two runs turns it red, and a failure fails the super run.",
-      "labels": [
-        "super"
-      ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/target/release/hermit run --strict --verify --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --mount=type=tmpfs,target=/test --workdir=/test --env TMPDIR=/tmp -- /bin/node -e 'console.log(42)' </dev/null",
-      "result_manifests": [],
-      "deps": [
-        "pre.reverie_pin",
-        "quick-super-gate.manifest",
-        "super-compatprep.fixtures"
-      ],
-      "env": {},
-      "networkonly": false,
-      "engine_only": false,
-      "timeout": 600,
-      "cpu_timeout": 600,
-      "jobs_flag": null,
-      "jobs_env": null,
-      "hint": {
-        "resources": {},
-        "est_duration_s": 0.0,
-        "rss_baseline_bytes": 4294967296,
-        "hard_mem_max_bytes": 4294967296,
-        "classification": "light",
-        "preferred_inner_jobs": null,
-        "measured_effective_cores": null,
-        "measured_cpu_utilization": null
-      },
-      "fail_fast_family": "compat.node"
     },
     {
       "group": "superstress",
@@ -44872,7 +44817,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1084",
+        "NEXTEST_EXPECTED_EXECUTED": "1085",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,

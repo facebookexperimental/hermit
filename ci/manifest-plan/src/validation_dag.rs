@@ -594,10 +594,12 @@ const PROFILES: [Profile; 11] = [
     },
     // 56/57 since the 100 superstress repetition nodes became one node per
     // probe (5), each running its 20 repetitions: 151/152 before.
+    // 52/53 since the four generated compat.<row> nodes became the one static
+    // supercompat.manifest_compat (https://github.com/rrnewton/hermit/issues/4276).
     Profile {
         label: "super",
-        direct_steps: 55,
-        selected_steps: 56,
+        direct_steps: 52,
+        selected_steps: 53,
     },
     Profile {
         label: "privileged",
@@ -975,6 +977,7 @@ pub const HOST_MANIFEST_RUNS: &[&str] = &[
     "e2e.manifest_compat",
     "portablecompat.manifest_compat",
     "sabrecompat.manifest_compat",
+    "supercompat.manifest_compat",
     "rrcompat.manifest_compat",
 ];
 
@@ -2377,9 +2380,10 @@ fn generated_partition(step: &Step) -> Option<GeneratedPartition> {
     if step.group == "superstress" {
         return Some(GeneratedPartition::SuperStress);
     }
-    if step.tag() == "super-compatprep.fixtures"
-        || (step.group == "compat" && step.labels.iter().any(|label| label == "super"))
-    {
+    // The super run type's compat rows are the compat.yaml heavy rows' ptrace
+    // cells, run by the static node supercompat.manifest_compat; only their
+    // fixtures are generated.
+    if step.tag() == "super-compatprep.fixtures" {
         return Some(GeneratedPartition::SuperCompat);
     }
     if step.tag() == "compatprep.fixtures"
@@ -2429,7 +2433,11 @@ fn refresh_generated_partitions(
         // 1 since the rr lane's 139 probes became compat.yaml replay cells run
         // by the static node rrcompat.manifest_compat: only its fixtures remain.
         (GeneratedPartition::RrCompat, 1usize),
-        (GeneratedPartition::SuperCompat, 5usize),
+        // 1 since the super run type's four heavy rows became compat.yaml
+        // cells run by the static node supercompat.manifest_compat
+        // (https://github.com/rrnewton/hermit/issues/4276): only its fixtures
+        // remain.
+        (GeneratedPartition::SuperCompat, 1usize),
         // 7 since each stress probe's 20 repetition nodes became one node that
         // runs the repetitions and reports each as a structured test result:
         // the 2 availability nodes plus 5 probe nodes.
@@ -2553,9 +2561,11 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // 137 with the additive required M2 stack consumer; all 136 prior producers remain.
     // 136 since strictcompat.manifest_compat was retired with the
     // compat/strict-<row> tests (https://github.com/rrnewton/hermit/issues/4276).
-    if expected.len() != 136 {
+    // 137 with supercompat.manifest_compat, which runs the super run type's
+    // heavy compat rows from compat.yaml (same issue).
+    if expected.len() != 137 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 136",
+            "structured result producer registry has {} entries, expected 137",
             expected.len()
         ));
     }
@@ -2713,8 +2723,9 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // test.record_replay, and 70 with test.pmu_integration_cases.
     // The local required allocator and stack consumers each add one Nextest writer.
     // TestHarness 55 since strictcompat.manifest_compat was retired
-    // (https://github.com/rrnewton/hermit/issues/4276).
-    if actual_group_counts != [72, 55, 7, 2] {
+    // (https://github.com/rrnewton/hermit/issues/4276), and 56 with
+    // supercompat.manifest_compat (same issue).
+    if actual_group_counts != [72, 56, 7, 2] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
         ));
@@ -3878,9 +3889,11 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // compat/strict-<row> tests: strictcompatprep.fixtures and
     // strictcompat.manifest_compat (438 - 2;
     // https://github.com/rrnewton/hermit/issues/4276).
-    if cfg.steps.len() != 436 {
+    // 433 since the super run type's four generated compat.<row> nodes became
+    // the one static supercompat.manifest_compat (436 - 4 + 1; same issue).
+    if cfg.steps.len() != 433 {
         return Err(format!(
-            "superset has {} steps, expected 436",
+            "superset has {} steps, expected 433",
             cfg.steps.len()
         ));
     }
@@ -4184,20 +4197,23 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
             is_manifest_run(step)
                 && !is_hosted_variant(step)
                 && !step.deps.iter().any(|dependency| {
+                    let quick_super = step
+                        .labels
+                        .iter()
+                        .any(|label| label == "quick" || label == "super");
                     dependency
-                        == if HOST_MANIFEST_RUNS.contains(&step.tag().as_str())
-                            || is_buck_import_twin(step)
-                        {
-                            // A host-run bucket reads the host's prepared scripts.
-                            "build.rust_scripts"
-                        } else if step
-                            .labels
-                            .iter()
-                            .any(|label| label == "quick" || label == "super")
-                        {
-                            "quick-super-build.rust_scripts_in_pinned_root"
-                        } else {
-                            "build.rust_scripts_in_pinned_root"
+                        == match (
+                            HOST_MANIFEST_RUNS.contains(&step.tag().as_str())
+                                || is_buck_import_twin(step),
+                            quick_super,
+                        ) {
+                            // A host-run bucket reads the host's prepared
+                            // scripts: the quick/super variant for the super
+                            // run type's supercompat.manifest_compat.
+                            (true, true) => "quick-super-build.rust_scripts",
+                            (true, false) => "build.rust_scripts",
+                            (false, true) => "quick-super-build.rust_scripts_in_pinned_root",
+                            (false, false) => "build.rust_scripts_in_pinned_root",
                         }
                 })
         })
@@ -4416,11 +4432,14 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
                 ));
             }
         }
+        // Only supercompat.manifest_compat, which runs the heavy compat rows'
+        // super-labelled cells, owns manifest result rows in the super run type
+        // (https://github.com/rrnewton/hermit/issues/4276).
         if profile.label == "super"
-            && selected
-                .steps
-                .iter()
-                .any(|step| !step.effective_result_manifests().is_empty())
+            && selected.steps.iter().any(|step| {
+                !step.effective_result_manifests().is_empty()
+                    && step.tag() != "supercompat.manifest_compat"
+            })
         {
             return Err("super selection unexpectedly owns manifest result rows".into());
         }
@@ -5504,9 +5523,9 @@ sys.exit(37)
     #[test]
     fn steps_sharing_a_result_file_never_run_in_one_run_type() {
         // e2e.manifest_compat, portablecompat.manifest_compat,
-        // sabrecompat.manifest_compat, rrcompat.manifest_compat,
-        // e2e.manifest_compat_on_host and the full-buck-e2e import twin
-        // e2e.manifest_compat_buck all write
+        // sabrecompat.manifest_compat, supercompat.manifest_compat,
+        // rrcompat.manifest_compat, e2e.manifest_compat_on_host and the
+        // full-buck-e2e import twin e2e.manifest_compat_buck all write
         // $E2E_RESULT_ROOT/portable/manifest_compat/results.jsonl. That is safe
         // only while no run type selects two of them: a run selects one label,
         // so their label sets must be non-empty and pairwise disjoint.
@@ -5524,8 +5543,8 @@ sys.exit(37)
             .get("$E2E_RESULT_ROOT/portable/manifest_compat/results.jsonl")
             .map_or(0, Vec::len);
         assert_eq!(
-            shared, 6,
-            "the five manifest_compat buckets and the Buck import twin share one result file"
+            shared, 7,
+            "the six manifest_compat buckets and the Buck import twin share one result file"
         );
         for (path, steps) in &writers {
             for (index, first) in steps.iter().enumerate() {

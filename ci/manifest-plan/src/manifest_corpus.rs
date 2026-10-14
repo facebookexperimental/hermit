@@ -188,6 +188,11 @@ struct CorpusRowPolicy {
     timeout_seconds: u64,
     cpu_timeout_seconds: u64,
     slow_reason: String,
+    /// Further run types of each named row's cell on the corpus backend, added
+    /// to the row's own labels on that cell alone: the scheduled super suite
+    /// runs the heavy rows' ptrace cells, and not their SaBRe cells.
+    #[serde(default)]
+    labels: Vec<String>,
     rows: BTreeMap<String, String>,
 }
 
@@ -373,11 +378,25 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
         }
         Ok(())
     };
+    let policy_labels = |what: &str, policy: &CorpusRowPolicy| -> Result<(), String> {
+        let mut run_types = BTreeSet::new();
+        for run_type in &policy.labels {
+            nonempty(bucket, &format!("{what} label"), run_type)?;
+            if !run_types.insert(run_type.as_str()) {
+                return Err(format!(
+                    "{bucket}: corpus {what} label `{run_type}` is repeated"
+                ));
+            }
+        }
+        Ok(())
+    };
     if let Some(diagnostic) = &corpus.diagnostic {
         policy_rows("diagnostic", &diagnostic.rows)?;
+        policy_labels("diagnostic", diagnostic)?;
     }
     if let Some(heavy) = &corpus.heavy {
         policy_rows("heavy", &heavy.rows)?;
+        policy_labels("heavy", heavy)?;
         if let Some(both) = heavy.rows.keys().find(|label| {
             corpus
                 .diagnostic
@@ -748,6 +767,17 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
                     CellKind::Additional => return None,
                     CellKind::Lane | CellKind::Focused(_) => row.labels.clone(),
                 };
+                if let CellKind::Lane = cell.kind {
+                    for policy in [&corpus.diagnostic, &corpus.heavy].into_iter().flatten() {
+                        if policy.rows.contains_key(&row.label) {
+                            for run_type in &policy.labels {
+                                if !labels.contains(run_type) {
+                                    labels.push(run_type.clone());
+                                }
+                            }
+                        }
+                    }
+                }
                 if let CellKind::Focused(focused) = cell.kind {
                     if !labels.iter().any(|label| label == focused) {
                         labels.push(focused.to_string());
@@ -1387,6 +1417,36 @@ mod tests {
                 "    - {label: \"slow\", argv: [\"/bin/true\"]}\n",
                 "    - {label: \"slow\", argv: [\"/bin/true\"]}\n    - {label: \"big\", argv: [\"/bin/true\"], labels: [sabre-compat-only]}\n",
             )
+    }
+
+    /// A row policy's `labels` add run types to each named row's cell on the
+    /// corpus backend alone: the super run type runs the heavy rows' ptrace
+    /// cells, and not their SaBRe cells.
+    #[test]
+    fn a_heavy_label_marks_only_the_corpus_backend_cell() {
+        let corpus = focused_corpus().replace(
+            "    slow_reason: heavy fixture budget\n",
+            "    slow_reason: heavy fixture budget\n    labels: [super]\n",
+        );
+        let expanded = expand_corpus(document(&corpus)).unwrap();
+        let big = tests_of(&expanded)
+            .iter()
+            .find(|test| test["id"] == "fixture/big")
+            .unwrap();
+        assert_eq!(
+            big["modes"]["verify"]["labels"],
+            serde_yaml::from_str::<Value>(
+                "{ptrace: [sabre-compat-only, super], sabre: [sabre-compat-only]}"
+            )
+            .unwrap()
+        );
+        for (from, to, needle) in [
+            ("labels: [super]", "labels: [super, super]", "is repeated"),
+            ("labels: [super]", "labels: [\" \"]", "nonempty"),
+        ] {
+            let error = expand_corpus(document(&corpus.replace(from, to))).unwrap_err();
+            assert!(error.contains(needle), "{error}");
+        }
     }
 
     #[test]

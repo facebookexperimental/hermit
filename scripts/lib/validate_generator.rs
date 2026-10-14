@@ -15,7 +15,6 @@
 //! `crate::validate_super`, which both crates include from `scripts/lib/`.
 
 use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 use std::path::Path;
 
 use dagrun::model::CmdType;
@@ -164,62 +163,50 @@ pub(crate) fn generated_partition_steps(
     rr_prep.labels = vec!["rr-compat-only".into()];
     steps.push(rr_prep);
 
-    for (mode, namespace, label) in [
-        (
-            CompatMode::PortableStrict,
-            "portablecompat",
-            "portable-strict-compat-only",
-        ),
-        (CompatMode::E9patch, "e9patchcompat", "e9patch-compat-only"),
-    ] {
-        steps.extend(generated_focused_compat_partition(
-            root, tmp, mode, namespace, label,
-        )?);
-    }
+    // The corpus-only run type's rows are tests/e2e/manifests/compat.yaml,
+    // run by the static bucket node portablecompat.manifest_compat against the
+    // lane's pinned-root release build; this node prepares the files they
+    // read, at the path the rows name.
+    let mut portable_focused_prep = prepare_fixtures_node_dep(
+        "portablecompatprep.fixtures",
+        &portable_fixtures,
+        "compatprep.hermit_release",
+    );
+    portable_focused_prep.group = "portablecompatprep".into();
+    portable_focused_prep.labels = vec!["portable-strict-compat-only".into()];
+    portable_focused_prep.desc =
+        "Prepare the fixture files the corpus-only lane's compat bucket reads".into();
+    portable_focused_prep.description = format!(
+        "Runs tests/compat/prepare_real_compat_fixtures.sh into {} on the host, after the lane's pinned-root release build: {REAL_COMPAT_FIXTURE_CONTENTS}, the run-owned files the compat.yaml rows of portablecompat.manifest_compat read. A fixture that fails to build or a missing host tool stops the lane before the bucket runs.",
+        portable_fixtures.display()
+    );
+    steps.push(portable_focused_prep);
+    steps.extend(generated_focused_compat_partition(
+        root,
+        tmp,
+        CompatMode::E9patch,
+        "e9patchcompat",
+        "e9patch-compat-only",
+    )?);
 
-    let super_fixtures = tmp.join("super-compat-fixtures");
-    let super_shell_build = tmp.join("super-compat-shell-build");
-    let super_paths = validate_corpus::CorpusPaths {
-        root_dir: &root.to_string_lossy(),
-        real_compat_fixtures: &super_fixtures.to_string_lossy(),
-        validation_tmp_dir: &tmp.to_string_lossy(),
-        shell_build_dir: &super_shell_build.to_string_lossy(),
-    };
+    // The super run type's compat rows are the compat.yaml heavy rows' ptrace
+    // cells, labelled super and run by the static node
+    // supercompat.manifest_compat against super.build_release_hermit's
+    // release Hermit; this node prepares the files those rows read, at the
+    // path the rows name.
     let mut super_prep = prepare_fixtures_node_dep(
         "super-compatprep.fixtures",
-        &super_fixtures,
+        &portable_fixtures,
         "super.build_release_hermit",
     );
     super_prep.group = "super-compatprep".into();
     super_prep.labels = vec!["super".into()];
+    super_prep.desc = "Prepare the fixture files the super run type's compat cells read".into();
     super_prep.description = format!(
-        "Runs tests/compat/prepare_real_compat_fixtures.sh into {} on the host, after super.build_release_hermit: {REAL_COMPAT_FIXTURE_CONTENTS}. The super-only compatibility rows ({}) depend on it; the rows that run tests/compat/real_compat_workload.sh read these files through REAL_COMPAT_FIXTURES, and rustc calls the toolchain link it makes because --base-env=minimal keeps the user's rustup directory off PATH. A fixture that fails to build or a missing host tool stops those rows.",
-        super_fixtures.display(),
-        validate_corpus::portable_super_only()
-            .keys()
-            .map(|label| format!("compat.{label}"))
-            .collect::<Vec<_>>()
-            .join(", ")
+        "Runs tests/compat/prepare_real_compat_fixtures.sh into {} on the host, after super.build_release_hermit: {REAL_COMPAT_FIXTURE_CONTENTS}, the run-owned files the compat.yaml heavy rows (rustc, javac, java and node) of supercompat.manifest_compat read; rustc calls the toolchain link it makes because --base-env=minimal keeps the user's rustup directory off PATH. A fixture that fails to build or a missing host tool stops the run type before the bucket runs.",
+        portable_fixtures.display()
     );
     steps.push(super_prep);
-    let only = validate_corpus::portable_super_only()
-        .keys()
-        .map(|label| label.to_string())
-        .collect::<BTreeSet<_>>();
-    let mut super_compat = validate_plan::compat_nodes_for(
-        root,
-        CompatMode::PortableStrict,
-        &root.join("target/release/hermit").to_string_lossy(),
-        "",
-        &super_paths,
-        Some("super-compatprep.fixtures"),
-        Some(&only),
-        Some(validate_super::DEFAULT_GATE_TIMEOUT_S),
-    )?;
-    for step in &mut super_compat {
-        step.labels = vec!["super".into()];
-    }
-    steps.extend(super_compat);
 
     let mut stress = validate_super::stress_nodes(
         &root.join("target/release/hermit").to_string_lossy(),
@@ -280,13 +267,7 @@ pub(crate) fn generated_focused_compat_partition(
     namespace: &str,
     label: &str,
 ) -> Result<Vec<Step>, String> {
-    // The portable focused lane runs the compat.yaml bucket, whose rows read
-    // their fixtures under $VALIDATE_RUN_STATE/strict-compat.
-    let run_root = if mode == CompatMode::PortableStrict {
-        tmp.join("strict-compat")
-    } else {
-        tmp.join(namespace)
-    };
+    let run_root = tmp.join(namespace);
     let fixtures = run_root.join("real-compat-fixtures");
     let shell_build = run_root.join("shell-build");
     let nsswitch = run_root.join("nsswitch.conf");
@@ -300,13 +281,7 @@ pub(crate) fn generated_focused_compat_partition(
     let mut prep = prepare_fixtures_node_dep(&prep_tag, &fixtures, "compatprep.hermit_release");
     prep.group = format!("{namespace}prep");
     prep.labels = vec![label.into()];
-    if mode == CompatMode::PortableStrict {
-        prep.desc = "Prepare the fixture files the corpus-only lane's compat bucket reads".into();
-        prep.description = format!(
-            "Runs tests/compat/prepare_real_compat_fixtures.sh into {} on the host, after the lane's pinned-root release build: {REAL_COMPAT_FIXTURE_CONTENTS}, the run-owned files the compat.yaml rows of portablecompat.manifest_compat read. A fixture that fails to build or a missing host tool stops the lane before the bucket runs.",
-            fixtures.display()
-        );
-    } else if mode == CompatMode::E9patch {
+    if mode == CompatMode::E9patch {
         prep.description = format!(
             "Runs tests/compat/prepare_real_compat_fixtures.sh into {} on the host, after compatprep.hermit_release and the files-only NSS fixture: {REAL_COMPAT_FIXTURE_CONTENTS}. Every {namespace} probe depends on it, and the rows that run tests/compat/real_compat_workload.sh read these run-owned files through REAL_COMPAT_FIXTURES instead of the checkout. A fixture that fails to build or a missing host tool stops the e9patch-compat-only profile before any probe runs.",
             fixtures.display()
@@ -349,11 +324,6 @@ pub(crate) fn generated_focused_compat_partition(
         steps.push(nss);
     }
     steps.push(prep);
-    if mode == CompatMode::PortableStrict {
-        // The rows themselves are tests/e2e/manifests/compat.yaml, run by the
-        // static bucket node portablecompat.manifest_compat.
-        return Ok(steps);
-    }
     let mut probes = validate_plan::compat_nodes(
         root,
         mode,

@@ -7751,8 +7751,10 @@ sys.exit(1 if failed else 0)
         // the full-buck-e2e import twins (<bucket>_buck), which import the
         // rows e2e.buck_cells wrote on the host and so run outside the root.
         // -1 direct when strictcompat.manifest_compat was retired with the
-        // compat/strict-<row> tests (https://github.com/rrnewton/hermit/issues/4276).
-        assert_eq!((pinned, direct), (19, 36));
+        // compat/strict-<row> tests (https://github.com/rrnewton/hermit/issues/4276),
+        // and +1 for supercompat.manifest_compat, the super run type's host
+        // bucket of the corpus's heavy rows (same issue).
+        assert_eq!((pinned, direct), (19, 37));
     }
 
     /// The full profile's harness nodes together report each cell of the

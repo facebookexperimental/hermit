@@ -20,10 +20,6 @@ use dagrun::model::StructuredTestResultsManifest;
 use crate::validate_plan::node;
 use crate::validate_plan::shell_quote;
 
-/// `GATE_TIMEOUT_SECONDS` (validate.sh:400). A generated super node without
-/// an explicit override inherits this historical default before it is committed.
-pub const DEFAULT_GATE_TIMEOUT_S: i64 = 600;
-
 /// `SUPER_REPETITIONS` (validate.sh:682).
 pub const SUPER_REPETITIONS_DEFAULT: i64 = 20;
 

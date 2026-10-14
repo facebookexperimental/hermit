@@ -73,8 +73,6 @@ const SYNTHETIC_DEFAULT_CPU_TIMEOUT_S: i64 = 7200;
 /// Wall budget for one compatibility probe. Mirrors `STRICT_COMPAT_TIMEOUT=60`
 /// (validate.sh:1091).
 const COMPAT_TIMEOUT_S: i64 = 60;
-/// Shortened budget for a bounded portable diagnostic row (validate.sh:2969).
-const COMPAT_PORTABLE_DIAGNOSTIC_TIMEOUT_S: i64 = 20;
 /// Extended budget for the two large internal executables under e9patch
 /// (validate.sh:2991).
 const COMPAT_E9PATCH_LARGE_TIMEOUT_S: i64 = 180;
@@ -85,20 +83,19 @@ const COMPAT_CPU_TIMEOUT_S: i64 = 120;
 const COMPAT_MEM_BYTES: i64 = 4 * 1024 * 1024 * 1024;
 
 /// Which compatibility corpus a focused mode runs, and how it is labelled.
+///
+/// One mode remains: the e9patch-compat-only profile's per-program probes from
+/// `ci/compat/corpus-e9patch.json`. The portable strict corpus that was the
+/// other mode is compat.yaml's (<https://github.com/rrnewton/hermit/issues/4276>).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CompatMode {
-    PortableStrict,
     E9patch,
 }
 
 impl CompatMode {
-    /// The `ci/compat/corpus-<mode>.json` file this mode reads. `PortableStrict`
-    /// reads the strict lane's corpus: `PORTABLE_STRICT_PROBE_ARGS` changes the
-    /// Hermit FLAGS, never corpus membership (validate.sh:2965). The strict lane
-    /// itself runs those rows as compat.yaml cells since 2026-10-02.
+    /// The `ci/compat/corpus-<mode>.json` file this mode reads.
     pub fn corpus_name(self) -> &'static str {
         match self {
-            CompatMode::PortableStrict => "strict",
             CompatMode::E9patch => "e9patch",
         }
     }
@@ -106,29 +103,15 @@ impl CompatMode {
     /// Plain-language name printed per row and in the summary.
     pub fn display_name(self) -> &'static str {
         match self {
-            CompatMode::PortableStrict => "legacy below-L2 stripped verify",
             CompatMode::E9patch => "e9patch legacy below-L2 stripped verify",
         }
     }
 
-    /// The `hermit run ...` flags preceding `--`, reproducing the `run_args`
+    /// The `hermit ...` arguments preceding `--`, reproducing the `run_args`
     /// selection in `strict_compatibility_probe` (validate.sh:2964-2994).
     pub fn run_args(self, label: &str, nsswitch: &str) -> Vec<String> {
         let s = |v: &str| v.to_string();
         match self {
-            CompatMode::PortableStrict => vec![
-                s("run"),
-                s("--strict"),
-                s("--verify"),
-                s("--base-env=minimal"),
-                s("--no-virtualize-cpuid"),
-                s("--max-timeslice=disabled"),
-                s("--mount=type=tmpfs,target=/test"),
-                s("--workdir=/test"),
-                s("--env"),
-                s("TMPDIR=/tmp"),
-                s("--"),
-            ],
             CompatMode::E9patch => {
                 let mut v = vec![s("--backend"), s("e9patch"), s("run")];
                 // These rows query owner names the host may delegate to an async
@@ -150,87 +133,13 @@ impl CompatMode {
         }
     }
 
-    /// Per-row wall budget, reproducing the two budget overrides the bash applies.
+    /// Per-row wall budget, reproducing the budget override the bash applies.
     pub fn timeout_for(self, label: &str) -> i64 {
-        if self == CompatMode::PortableStrict
-            && validate_corpus::portable_diagnostic().contains_key(label)
-        {
-            return COMPAT_PORTABLE_DIAGNOSTIC_TIMEOUT_S;
-        }
         if self == CompatMode::E9patch && matches!(label, "mysql" | "php") {
             return COMPAT_E9PATCH_LARGE_TIMEOUT_S;
         }
         COMPAT_TIMEOUT_S
     }
-}
-
-/// What the compatibility summary should DO about one measured row.
-///
-/// Extracted as a pure function of (mode, outcome, table membership) so the decision can be
-/// bracketed without running a guest, and so the reporting text and the blocking verdict cannot
-/// drift apart -- they are now two readings of the same value rather than two independent
-/// branches of one `if`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompatDisposition {
-    /// Passed, and nothing in the tables says otherwise.
-    Passed,
-    /// Passed while listed as known fail-closed. The EXPECTATION is stale, not the run.
-    PassedButListedFailClosed,
-    /// Failed while listed as known fail-closed, and STILL BLOCKING. Reporting the row's reason
-    /// is not the same as excusing it; this variant exists so the reason can be printed without
-    /// the failure being downgraded.
-    KnownFailClosedBlocking,
-    /// Failed as a bounded portable diagnostic: nonblocking by prior policy.
-    PortableDiagnostic,
-    /// Failed with nothing to say about it.
-    Blocking,
-}
-
-impl CompatDisposition {
-    /// Whether this row must fail the run.
-    ///
-    /// The ONE property that must not regress while reporting improves. `KnownFailClosedBlocking`
-    /// is deliberately blocking: a listed row under `PortableStrict` was already blocking before
-    /// the reason was printed, and printing it must not change that.
-    pub fn is_blocking(self) -> bool {
-        matches!(
-            self,
-            CompatDisposition::KnownFailClosedBlocking | CompatDisposition::Blocking
-        )
-    }
-}
-
-/// Classify one measured compatibility row.
-///
-/// Pure: it takes membership as booleans rather than the tables themselves, so a bracket can
-/// exercise every combination without constructing or planting a corpus, and so production
-/// keeps reading the real tables.
-///
-/// `PortableStrict` gains REPORTING ONLY. Every other mode --
-/// `E9patch` -- consults neither table and gains nothing: a failure there is
-/// blocking exactly as before.
-pub fn classify_compat_outcome(
-    mode: CompatMode,
-    ok: bool,
-    listed_failclosed: bool,
-    listed_diagnostic: bool,
-) -> CompatDisposition {
-    // Only the strict mode consults the fail-closed table at all; it describes what
-    // `--strict` refuses, which says nothing about the other backends.
-    let consults_failclosed = mode == CompatMode::PortableStrict && listed_failclosed;
-    if ok {
-        if consults_failclosed {
-            return CompatDisposition::PassedButListedFailClosed;
-        }
-        return CompatDisposition::Passed;
-    }
-    if consults_failclosed {
-        return CompatDisposition::KnownFailClosedBlocking;
-    }
-    if mode == CompatMode::PortableStrict && listed_diagnostic {
-        return CompatDisposition::PortableDiagnostic;
-    }
-    CompatDisposition::Blocking
 }
 
 /// Build a fully-declared node. This is the ONLY node constructor the plan
@@ -685,71 +594,17 @@ pub fn compat_nodes(
     paths: &CorpusPaths,
     gate_dep: Option<&str>,
 ) -> Result<Vec<Step>, String> {
-    compat_nodes_for(
-        root, mode, hermit_bin, nsswitch, paths, gate_dep, None, None,
-    )
-}
-
-/// [`compat_nodes`] with two extra knobs used by the `super` suite's
-/// `run_portable_slow_strict_diagnostics` port (validate.sh:4603).
-///
-/// * `only` restricts the corpus to an explicit label set AND suppresses the
-///   `PORTABLE_STRICT_SUPER_ONLY` skip — because that gate exists precisely to
-///   defer those four heavy rows *to this suite*, so the suite that runs them
-///   must not also honor the deferral.
-/// * `wall_override` replaces the per-row 60s corpus budget. The bash gave the
-///   whole group of four one 600s `run_check_with_timeout`; each of these rows
-///   is a full compile-link-run or JVM startup workload, so inheriting the
-///   group's budget per node is the faithful reading. The 60s corpus default
-///   would fail all four for lack of time and report it as a compatibility loss.
-#[allow(clippy::too_many_arguments)]
-pub fn compat_nodes_for(
-    root: &Path,
-    mode: CompatMode,
-    hermit_bin: &str,
-    nsswitch: &str,
-    paths: &CorpusPaths,
-    gate_dep: Option<&str>,
-    only: Option<&std::collections::BTreeSet<String>>,
-    wall_override: Option<i64>,
-) -> Result<Vec<Step>, String> {
     let rows = validate_corpus::load(root, mode.corpus_name(), paths)?;
-    let super_only = validate_corpus::portable_super_only();
     let mut out = Vec::new();
     for row in rows {
-        if let Some(keep) = only {
-            if !keep.contains(&row.label) {
-                continue;
-            }
-        }
-        // Heavy runtime workloads are deferred out of the portable profile to the
-        // scheduled super suite (validate.sh:3090) — unless this IS that suite,
-        // which names them explicitly through `only`.
-        if only.is_none()
-            && mode == CompatMode::PortableStrict
-            && super_only.contains_key(row.label.as_str())
-        {
-            continue;
-        }
         let mut argv: Vec<String> = vec![hermit_bin.to_string()];
         argv.extend(mode.run_args(&row.label, nsswitch));
-        let wall = wall_override.unwrap_or_else(|| mode.timeout_for(&row.label));
+        let wall = mode.timeout_for(&row.label);
         let description = match mode {
             CompatMode::E9patch => format!(
                 "One per-program probe of the e9patch-compat-only profile, generated from a row of ci/compat/{}. It runs `target/release/hermit --backend e9patch run --strict --verify -- <program>` with stdin from /dev/null. That is e9patch binary-rewriting preprocessing with the ptrace backend, not a backend of its own: Hermit rewrites the guest's main ELF with e9tool and e9patch, then runs the rewritten program on the ptrace backend under strict mode, twice, comparing the runs with the Stripped comparator of plain --verify, so no row establishes L2. The rows range from coreutils such as echo and cat to bash pipelines and tests/compat/real_compat_workload.sh workloads; whoami, groups, pinky, logname, tar and chown also bind the files-only nsswitch.conf over /etc/nsswitch.conf. The profile counts every failure as blocking, for example a rewritten binary that crashes or two runs whose output differs.",
                 mode.corpus_name()
             ),
-            CompatMode::PortableStrict => match super_only.get(row.label.as_str()) {
-                Some(workload) if only.is_some() => format!(
-                    "Runs the {label} row of the portable strict compatibility corpus, a {workload}, as `target/release/hermit run --strict --verify --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled` with a tmpfs /test working directory, stdin from /dev/null, on the default ptrace backend. Plain --verify runs the guest twice and compares the runs with the Stripped comparator, so the row establishes L1 with a lossy repeat check, not L2. The portable profile defers this row to the super profile because it is too heavy for the corpus's {COMPAT_TIMEOUT_S}-second budget; here it gets {wall} seconds and runs after {fixtures}, which prepares the files the real_compat_workload.sh rows read. A missing toolchain or fixture, a syscall strict mode refuses, or output that differs between the two runs turns it red, and a failure fails the super run.",
-                    label = row.label,
-                    fixtures = gate_dep.unwrap_or("its fixtures node"),
-                ),
-                _ => format!(
-                    "Runs the {label} row of the portable strict compatibility corpus as `target/release/hermit run --strict --verify --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled` with a tmpfs /test working directory, stdin from /dev/null, on the default ptrace backend, comparing the two runs with the Stripped comparator of plain --verify. A syscall strict mode refuses or output that differs between the runs turns it red.",
-                    label = row.label,
-                ),
-            },
         };
         let mut step = node(
             "compat",
