@@ -1561,7 +1561,8 @@ fi
 # KVM IMMEDIATE-EXIT SDK-BUDGET CARRY (2026-10-14): advance from 193968de to d60812b68751ef4b11ba8ae222c38781fda98cde (KVM entries stop with immediate_exit instead of per-entry signal syscalls; changes only reverie-kvm, inventory unchanged), so the budgets above carry.
 # KVM CHEAP-COPY SDK-BUDGET CARRY (2026-10-14): advance from d60812b6 to 502bea229f32ce7bdb50d73c7b8d2572bdf2688a (cheaper KVM guest-memory copies and entry checks; changes only reverie-kvm, inventory unchanged), so the budgets above carry.
 # ALLOCATOR-CHECKER CARRY (2026-10-14): advance from 502bea22 to 370eb86a01ec9fa316d90699bd64992906efade0 (LiteInst M1 checker admits the measured 0x128 Detcore TLS layout; changes only scripts/m1_artifact.rs, inventory unchanged), so the budgets above carry.
-expected_pin=370eb86a01ec9fa316d90699bd64992906efade0
+# KVM LAZY-WAKE SDK-BUDGET CARRY (2026-10-14): advance from 370eb86a to dfb68913256514f1550f67fb52271e5aba1e3655 (KVM stops subscribing and registering wakes on every guest syscall; changes only reverie-kvm, inventory unchanged), so the budgets above carry.
+expected_pin=dfb68913256514f1550f67fb52271e5aba1e3655
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
