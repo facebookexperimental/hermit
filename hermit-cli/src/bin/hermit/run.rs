@@ -911,8 +911,13 @@ pub struct RunOpts {
     /// editor, on the TCP address [HOST:]PORT (HOST defaults to 127.0.0.1).
     /// Implies --gdbserver: it starts `hermit-dap --listen` from beside this
     /// executable, and the client's attach request names the program and the
-    /// GDB server, as printed. See DEBUGGING.md.
-    #[clap(long, value_name = "[HOST:]PORT")]
+    /// GDB server, as printed. Not with --verify, which runs the program
+    /// twice, or --namespace-only, which has no GDB server. See DEBUGGING.md.
+    #[clap(
+        long,
+        value_name = "[HOST:]PORT",
+        conflicts_with_all = ["verify", "namespace_only"]
+    )]
     dap_listen: Option<String>,
 
     /// The adapter `--dap-listen` started, kept until the run ends.
@@ -5505,38 +5510,27 @@ impl RunOpts {
     }
 
     /// For `--dap-listen` (which [`RunOpts::main`] turned into `--gdbserver`):
-    /// starts `hermit-dap --listen` and tells the user what the client's
-    /// attach request needs.
+    /// starts `hermit-dap` on a socket this process bound, and tells the user
+    /// what the client's attach request needs. The address and the program's
+    /// host file are checked first, so neither failure starts anything.
     fn start_dap_adapter(&self) -> Result<Option<super::dap_adapter::ListeningAdapter>, Error> {
-        let Some(address) = &self.dap_listen else {
+        let Some(argument) = &self.dap_listen else {
             return Ok(None);
         };
-        let adapter = super::dap_adapter::ListeningAdapter::spawn(address)?;
+        let listener = super::dap_adapter::bind(argument)?;
+        // The executable the guest command actually selects (guest working
+        // directory, guest PATH, mounts), as the host sees it: the file the
+        // debugger loads symbols from.
+        let (_, host) = self
+            .resolve_guest_and_host_program()
+            .context("--dap-listen needs the program's file on the host for the debugger")?;
+        let program = Shebang::new(&host).map_or(host, |s| s.interpreter().into());
+        let adapter = super::dap_adapter::ListeningAdapter::spawn(listener)?;
         eprintln!(
-            "hermit run: starting hermit-dap to serve this run to one DAP client; {}",
-            super::dap_adapter::attach_hint(
-                &self.host_program_path(),
-                self.det_opts.det_config.gdbserver_port
-            )
+            "hermit run: started hermit-dap to serve this run to one DAP client; {}",
+            super::dap_adapter::attach_hint(&program, self.det_opts.det_config.gdbserver_port)
         );
         Ok(Some(adapter))
-    }
-
-    /// The program as a host path, for a debugger outside the guest: a path
-    /// with a `/` made absolute, a bare name looked up on the host's PATH, or
-    /// the name itself if it is not found there.
-    fn host_program_path(&self) -> PathBuf {
-        let program = &self.program;
-        if program.components().count() > 1 || program.is_absolute() {
-            return std::path::absolute(program).unwrap_or_else(|_| program.clone());
-        }
-        std::env::var_os("PATH")
-            .and_then(|path| {
-                std::env::split_paths(&path)
-                    .map(|directory| directory.join(program))
-                    .find(|candidate| candidate.is_file())
-            })
-            .unwrap_or_else(|| program.clone())
     }
 
     fn main_without_core_cleanup(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {

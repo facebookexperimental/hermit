@@ -15895,7 +15895,13 @@ impl DapClient {
                 loop {
                     let mut line = String::new();
                     match reader.read_line(&mut line) {
-                        Ok(0) | Err(_) => return,
+                        // End of stream: the channel's disconnection says so.
+                        Ok(0) => return,
+                        Err(error) => {
+                            let _ = sender
+                                .send(Err(format!("reading from the adapter failed: {error}")));
+                            return;
+                        }
                         Ok(_) => {}
                     }
                     let line = line.trim_end();
@@ -16105,8 +16111,10 @@ impl DapClient {
         }
     }
 
-    /// Whether the adapter closes its side of the connection within
-    /// `timeout`; messages that arrive first are only logged.
+    /// Whether the adapter closes its side of the connection (end of stream)
+    /// within `timeout`; messages that arrive first are only logged. A
+    /// message that cannot be decoded, or a failed read, is not an end of
+    /// stream: it fails the test.
     fn closed_within(&mut self, timeout: Duration) -> bool {
         let (bound, _) = self.session_bound(timeout);
         let deadline = Instant::now() + bound;
@@ -16114,7 +16122,10 @@ impl DapClient {
             let remaining = deadline.saturating_duration_since(Instant::now());
             match self.messages.recv_timeout(remaining) {
                 Ok(Ok(message)) => self.transcript.push(format!("<- {message}")),
-                Ok(Err(_)) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return true,
+                Ok(Err(problem)) => {
+                    self.fail(&format!("waiting for the adapter to close: {problem}"))
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return true,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return false,
             }
         }
@@ -16603,9 +16614,10 @@ fn hermit_dap_listen_refuses_a_busy_port_and_names_the_remedy() {
 
 /// `hermit run --dap-listen` serves a deterministic run to one DAP client over
 /// TCP: it tells the user the attach request's `program` and `target`, the
-/// client reaches breakpoints and lets the program finish, and when the run
-/// ends the adapter is gone (the client's connection closes) and nothing
-/// listens on its port any more.
+/// client reaches breakpoints and lets the program finish, and the run then
+/// ends although the client never disconnects: the adapter is stopped (the
+/// client's connection reaches end of stream) and nothing listens on its port
+/// any more.
 #[test]
 fn hermit_run_dap_listen_serves_one_tcp_client() {
     const TEST: &str = "hermit_run_dap_listen_serves_one_tcp_client";
@@ -16689,11 +16701,8 @@ fn hermit_run_dap_listen_serves_one_tcp_client() {
         message["type"] == "event"
             && matches!(message["event"].as_str(), Some("exited" | "terminated"))
     });
-    dap.call(
-        "disconnect",
-        serde_json::json!({"terminateDebuggee": false}),
-        DAP_TIMEOUT,
-    );
+    // The client stays connected, as an editor may: the run must still end,
+    // stopping the adapter, and the client must see its connection close.
     let status = dap.exit_status(DAP_TIMEOUT);
     if !status.success() {
         dap.fail(&format!(
@@ -16710,27 +16719,107 @@ fn hermit_run_dap_listen_serves_one_tcp_client() {
     }
 }
 
-/// `--dap-listen` implies `--gdbserver`, so a run whose `--gdbserver` would be
-/// refused is refused the same way, before any adapter starts.
+/// `hermit run --dap-listen` refuses, before any adapter starts, every run it
+/// could not serve: one whose `--gdbserver` is refused (`--strict`), one that
+/// runs the program twice (`--verify`) or without a GDB server
+/// (`--namespace-only`), and an address that does not parse or is already
+/// taken. Each fails, says why, and never prints the adapter's start line.
 #[test]
-fn hermit_run_dap_listen_is_refused_like_gdbserver_before_starting_an_adapter() {
-    let output = hermit(&[
+fn hermit_run_dap_listen_refusals_start_no_adapter() {
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").expect("failed to take a loopback port");
+    let taken = taken
+        .local_addr()
+        .expect("failed to read the taken address")
+        .to_string();
+    for (args, reason) in [
+        (vec!["--strict", "--dap-listen", "127.0.0.1:0"], "--strict"),
+        (vec!["--verify", "--dap-listen", "127.0.0.1:0"], "--verify"),
+        (
+            vec!["--namespace-only", "--dap-listen", "127.0.0.1:0"],
+            "--namespace-only",
+        ),
+        (
+            vec!["--dap-listen", "70000"],
+            "needs a port from 0 to 65535",
+        ),
+        (
+            vec!["--dap-listen", taken.as_str()],
+            "--dap-listen cannot listen on",
+        ),
+    ] {
+        let mut argv = vec!["run"];
+        argv.extend(&args);
+        argv.extend(["--", "/bin/true"]);
+        // Bounded: a run that is wrongly admitted waits for a debugger forever.
+        let stderr_file = tempfile::NamedTempFile::new_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("failed to create a stderr file");
+        let mut child = KillOnDrop(
+            hermit_command(&argv)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(
+                    stderr_file
+                        .reopen()
+                        .expect("failed to reopen the stderr file"),
+                )
+                .spawn()
+                .expect("failed to run hermit"),
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().expect("failed to poll hermit") {
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+        let stderr = fs::read_to_string(stderr_file.path()).unwrap_or_default();
+        assert!(
+            status.is_some_and(|status| !status.success())
+                && stderr.contains(reason)
+                && !stderr.contains("started hermit-dap")
+                && !stderr.contains("hermit-dap: listening"),
+            "hermit {argv:?} must be refused naming {reason:?} within 30 s, got {status:?}\n\
+             stderr:\n{stderr}"
+        );
+    }
+}
+
+/// The attach request's `program` is the file the guest actually runs: a bare
+/// program name is found on the guest's `PATH` (`--env PATH=DIR`), not on the
+/// `PATH` `hermit` itself was started with, which does not contain DIR.
+#[test]
+fn hermit_run_dap_listen_names_the_program_the_guest_runs() {
+    let Some(_hermit_dap) =
+        hermit_dap_binary("hermit_run_dap_listen_names_the_program_the_guest_runs")
+    else {
+        return;
+    };
+    let work = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the hermit-dap work dir");
+    let (_source, program) = dap_guest(work.path());
+    let guest_path = work.path().to_str().expect("work dir should be UTF-8");
+    let run = hermit_command(&[
         "run",
-        "--strict",
+        &format!("--env=PATH={guest_path}"),
         "--dap-listen",
         "127.0.0.1:0",
         "--",
-        "/bin/true",
+        "squares",
     ]);
-    let stderr = stderr(&output);
-    assert!(
-        !output.status.success()
-            && stderr.contains("--strict")
-            && stderr.contains("--gdbserver")
-            && !stderr.contains("hermit-dap"),
-        "hermit run --strict --dap-listen: {}\nstderr:\n{stderr}",
-        output.status
-    );
+    let stderr_path = work.path().join("hermit-run.stderr");
+    // Connecting is enough: the line is printed before the adapter listens.
+    // Dropping the client kills hermit, and the adapter dies with it.
+    let dap = DapClient::connect(run, stderr_path.clone());
+    let told = fs::read_to_string(&stderr_path).unwrap_or_default();
+    let expected = format!("\"program\": {:?}", program.display().to_string());
+    if !told.contains(&expected) {
+        dap.fail(&format!(
+            "hermit run --dap-listen must name the guest's program, {expected}"
+        ));
+    }
 }
 
 /// Without a `hermit-dap` beside `hermit`, `--dap-listen` fails and says how

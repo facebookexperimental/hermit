@@ -3055,10 +3055,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // yield-loop tests, the two scheduler-signal removal tests and the two
     // background-call waiting-signal tests: 401.
     // And hermit_run_dap_listen_serves_one_tcp_client,
-    // hermit_run_dap_listen_is_refused_like_gdbserver_before_starting_an_adapter
+    // hermit_run_dap_listen_refusals_start_no_adapter,
+    // hermit_run_dap_listen_names_the_program_the_guest_runs
     // and hermit_dap_listen_without_an_adapter_names_the_build_command
     // (hermit run --dap-listen): 404.
-    ("test.cli", 404),
+    // (hermit run --dap-listen): 405.
+    ("test.cli", 405),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3392,7 +3394,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from bd38bb81: 328.
     // And the same nine last-band and waiting-signal tests: 337.
     // And the three hermit run --dap-listen tests: 340.
-    ("test.cli_on_host", 340),
+    // And the four hermit run --dap-listen tests: 341.
+    ("test.cli_on_host", 341),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux

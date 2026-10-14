@@ -9,6 +9,8 @@
 //! Starting `hermit-dap`, the Debug Adapter Protocol adapter that is built
 //! beside `hermit`, for `run --dap-listen` and `replay --dap-listen`.
 
+use std::net::TcpListener;
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -25,6 +27,9 @@ use hermit::Error;
 /// once the DAP client has seen the program exit and disconnected, before
 /// stopping it.
 const ADAPTER_EXIT_GRACE: Duration = Duration::from_secs(5);
+
+/// The descriptor the adapter receives its listening socket on.
+const LISTEN_FD: i32 = 3;
 
 /// The `hermit-dap` beside this `hermit` executable.
 pub fn hermit_dap_beside_hermit() -> Result<PathBuf, Error> {
@@ -49,7 +54,29 @@ pub fn attach_hint(program: &Path, gdbserver_port: u16) -> String {
     )
 }
 
-/// A `hermit-dap --listen` serving a `hermit run --gdbserver` in this
+/// Binds `--dap-listen`'s [HOST:]PORT (`PORT` alone means loopback), so an
+/// address that does not parse or cannot be listened on is refused here,
+/// before the run starts, and the adapter is handed a socket already
+/// listening.
+pub fn bind(argument: &str) -> Result<TcpListener, Error> {
+    let (host, port) = argument.rsplit_once(':').unwrap_or(("127.0.0.1", argument));
+    let port: u16 = port.parse().map_err(|_| {
+        anyhow::anyhow!("--dap-listen {argument:?} needs a port from 0 to 65535, as [HOST:]PORT")
+    })?;
+    anyhow::ensure!(
+        !host.is_empty(),
+        "--dap-listen {argument:?} needs a host before ':', or just a port"
+    );
+    let address = format!("{host}:{port}");
+    TcpListener::bind(&address).map_err(|error| {
+        anyhow::anyhow!(
+            "--dap-listen cannot listen on {address}: {error}; pass another port, or port 0 \
+             to let the system pick a free one"
+        )
+    })
+}
+
+/// A `hermit-dap --listen-fd` serving a `hermit run --gdbserver` in this
 /// process. It runs outside the guest's namespaces, as the GDB client of a
 /// plain `--gdbserver` run does, and is stopped when this value is dropped:
 /// at once if no client ever connected, or after [`ADAPTER_EXIT_GRACE`] if its
@@ -60,29 +87,38 @@ pub struct ListeningAdapter {
 }
 
 impl ListeningAdapter {
-    /// Whether the adapter is still waiting for its client. `hermit-dap`
-    /// becomes GDB, by `exec`, once a client connects.
-    fn still_waiting_for_a_client(&self) -> bool {
-        std::fs::read_to_string(format!("/proc/{}/comm", self.child.id()))
-            .is_ok_and(|comm| comm.trim_end() == "hermit-dap")
-    }
-}
-
-impl ListeningAdapter {
-    pub fn spawn(address: &str) -> Result<Self, Error> {
+    /// Starts the adapter on `listener`, which it inherits as [`LISTEN_FD`].
+    pub fn spawn(listener: TcpListener) -> Result<Self, Error> {
         let adapter = hermit_dap_beside_hermit()?;
+        let listener_fd = listener.as_raw_fd();
+        // SAFETY: getpid has no arguments; read before fork, compared after.
+        let parent = unsafe { libc::getpid() };
         let mut command = Command::new(&adapter);
         command
-            .arg("--listen")
-            .arg(address)
+            .arg("--listen-fd")
+            .arg(LISTEN_FD.to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::null());
-        // SAFETY: prctl is async-signal-safe and touches no memory of the
-        // parent; it is the only work done between fork and exec.
+        // SAFETY: only async-signal-safe calls (dup2, fcntl, prctl, getppid)
+        // between fork and exec; they touch no memory of the parent.
         unsafe {
-            command.pre_exec(|| {
+            command.pre_exec(move || {
+                // dup2 clears close-on-exec on the copy; a socket already at
+                // LISTEN_FD needs it cleared by hand.
+                if listener_fd == LISTEN_FD {
+                    if libc::fcntl(LISTEN_FD, libc::F_SETFD, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                } else if libc::dup2(listener_fd, LISTEN_FD) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
                     return Err(std::io::Error::last_os_error());
+                }
+                // A parent that died before the line above never sends the
+                // signal: the child was already reparented. Notice that here.
+                if libc::getppid() != parent {
+                    return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
                 }
                 Ok(())
             });
@@ -90,7 +126,16 @@ impl ListeningAdapter {
         let child = command
             .spawn()
             .with_context(|| format!("Failed to start {}", adapter.display()))?;
+        // The adapter owns the socket now; this process's copy closes here.
+        drop(listener);
         Ok(Self { child })
+    }
+
+    /// Whether the adapter is still waiting for its client. `hermit-dap`
+    /// becomes GDB, by `exec`, once a client connects.
+    fn still_waiting_for_a_client(&self) -> bool {
+        std::fs::read_to_string(format!("/proc/{}/comm", self.child.id()))
+            .is_ok_and(|comm| comm.trim_end() == "hermit-dap")
     }
 }
 

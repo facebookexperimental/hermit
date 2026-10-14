@@ -170,25 +170,37 @@ hermit run --epoch=2026-01-01T00:00:00Z --dap-listen=4711 -- ./squares
 ```
 
 ```text
-hermit run: starting hermit-dap to serve this run to one DAP client; its attach request needs "program": "/home/me/squares" and "target": "127.0.0.1:1234"
+hermit run: started hermit-dap to serve this run to one DAP client; its attach request needs "program": "/home/me/squares" and "target": "127.0.0.1:1234"
 hermit-dap: listening on 127.0.0.1:4711
 ```
 
 `--dap-listen` implies `--gdbserver`, so everything said above about
-`--gdbserver` holds, and a run whose `--gdbserver` would be refused (under
-`--strict`, for example) is refused the same way, before an adapter starts.
-`hermit run` starts `hermit-dap --listen ADDRESS` beside itself, outside the
-guest, and the program waits for the client's `attach` before its first
-instruction. When the run ends, `hermit run` waits up to 5 seconds for the
-adapter to finish its session, then stops it; an adapter that no client
-connected to is stopped at once. The `program` it prints is the path given,
-made absolute, or a bare name found on the host's `PATH`.
+`--gdbserver` holds. Before anything starts, `hermit run` refuses a run it
+could not serve: one whose `--gdbserver` would be refused (under `--strict`,
+for example), one with `--verify` (which runs the program twice, and the
+adapter serves one session) or `--namespace-only` (which has no GDB server),
+and an address that does not parse or cannot be listened on. It binds the
+address itself and hands the listening socket to `hermit-dap`, which runs
+beside `hermit`, outside the guest, and dies with it; the program waits for
+the client's `attach` before its first instruction.
 
-As with `--gdbserver`, a client that disconnects without attaching leaves
-the program waiting for a debugger; stop the run with Ctrl-C. `--dap-listen`
-also combines with `--from`, so `hermit run --from last-run --dap-listen=4711`
-reruns a recorded run under a DAP client; `hermit replay --dap-listen` on such
-a recording says so.
+The `program` it prints is the executable the guest command actually runs,
+found the way the guest finds it (its working directory, its `PATH`, the
+run's mounts), as a path on the host. For a script that starts with `#!`, it
+is the script's interpreter.
+
+When the run ends, `hermit run` waits up to 5 seconds for the adapter to
+finish its session, then stops it, so a client that stays connected sees its
+connection close; an adapter that no client connected to is stopped at once.
+
+A client that disconnects before attaching leaves the program waiting for a
+debugger that cannot come: Hermit's GDB server takes one connection and then
+stops listening. This is true of `--gdbserver`, and of `hermit replay`
+under GDB, too; stop the run with Ctrl-C.
+
+`--dap-listen` also combines with `--from`, so
+`hermit run --from last-run --dap-listen=4711` reruns a recorded run under a
+DAP client; `hermit replay --dap-listen` on such a recording says so.
 
 ### Reverse execution on a recording
 
