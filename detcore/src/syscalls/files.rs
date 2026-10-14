@@ -2563,17 +2563,20 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // holding the other end makes it an internally polled pipe
                 // (`fifo_polls_if_a_guest_holds_its_peer`). Run mode only, as
                 // for a reopened pipe: Replayer's descriptor is a placeholder.
-                // Only where the tool is a separate tracer: the check reads
-                // the guest's descriptors through `/proc/<tid>`, which names
-                // the guest's own table only from outside it. A backend whose
-                // tool runs in the guest (DBT, in its PID container) keeps a
-                // FIFO as before.
+                // `is_fifo` answers yes only where it can read the guest's
+                // descriptors through `/proc/<tid>`: under a separate tracer
+                // (not DBT, in its PID container) whose guest thread IDs are
+                // host tasks (not KVM). Elsewhere a FIFO blocks as before.
                 if fd_type == FdType::Regular
                     && self.cfg.use_nonblocking_sockets()
                     && !self.cfg.recordreplay_modes
-                    && !self.cfg.backend.tool_shares_guest_descriptor_table
                     && !call.flags().contains(OFlag::O_PATH)
-                    && crate::fifo_peer::is_fifo(guest.tid().as_raw(), fd)
+                    && crate::fifo_peer::is_fifo(
+                        &self.cfg.backend,
+                        guest.thread_state().physical_tid,
+                        guest.tid().as_raw(),
+                        fd,
+                    )
                 {
                     guest
                         .thread_state()

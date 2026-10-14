@@ -28768,3 +28768,80 @@ fn a_fifo_shared_by_guests_does_not_hold_the_turn() {
     );
     drop(host_end);
 }
+
+/// On KVM a guest thread's ID is not a host task's, so `/proc/<tid>` cannot
+/// show the guest's descriptors, and Detcore never checks a FIFO's peers there:
+/// a FIFO with a host at its other end waits for the host in the kernel, as on
+/// Linux, and is never polled. `host`: the guest reads a byte the host writes;
+/// `host-reader`: the guest writes more than the FIFO holds, which the host
+/// reads. KVM refuses `--timeout`, so the harness bounds each run.
+#[test]
+fn run_kvm_fifo_with_a_host_peer_waits_in_the_kernel_as_on_linux() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+    let guest = fifo_peer_guest().to_str().unwrap();
+    let scratch = process_build_root("fifo-peer-kvm").join("runs");
+    fs::create_dir_all(&scratch).expect("failed to create the FIFO directory");
+    const FILL_BYTES: usize = 3 * 65536 + 123;
+    for (mode, expected) in [
+        ("host", "host read: 1 'h'\n".to_owned()),
+        ("host-reader", format!("host-reader wrote: {FILL_BYTES}\n")),
+    ] {
+        let fifo = scratch.join(format!("{mode}-fifo"));
+        let _ = fs::remove_file(&fifo);
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo failed");
+        // Read-write, so this open does not wait for the guest's.
+        let mut host_end = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo)
+            .expect("failed to open the host end of the FIFO");
+        let fifo = fifo.to_str().unwrap().to_owned();
+        let args = [
+            "--backend",
+            "kvm",
+            "--log",
+            "info",
+            "run",
+            "--strict",
+            "--",
+            guest,
+            mode,
+            &fifo,
+        ];
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        // The host acts on its own thread while the run is bounded here.
+        let host = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            if mode == "host-reader" {
+                let mut buffer = vec![0u8; FILL_BYTES];
+                std::io::Read::read_exact(&mut host_end, &mut buffer)
+                    .expect("failed to read what the guest wrote");
+            } else {
+                host_end
+                    .write_all(b"h")
+                    .expect("failed to write the host end of the FIFO");
+            }
+        });
+        let (status, log) = run_with_deadline(
+            hermit_command(&args),
+            directory.path(),
+            Duration::from_secs(120),
+            false,
+        );
+        let output = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{args:?}: the KVM run must finish and exit 0:\nstdout:\n{output}\nstderr:\n{log}"
+        );
+        host.join().expect("the host end of the FIFO failed");
+        assert_eq!(output, expected, "{args:?}\nstderr:\n{log}");
+        assert!(
+            !log.contains("is a FIFO with a guest at its other end"),
+            "{args:?}: a FIFO was polled on KVM:\n{log}"
+        );
+    }
+}

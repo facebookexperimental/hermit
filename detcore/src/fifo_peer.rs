@@ -67,11 +67,36 @@ fn fdinfo_flags(table: &Path, fd: &str) -> Option<i32> {
     i32::from_str_radix(flags.trim(), 8).ok()
 }
 
-/// Whether thread `tid`'s descriptor `fd` names a FIFO (a named FIFO, or a
-/// pipe reached by path). Read through the thread, whose descriptor table
-/// may not be its leader's (a thread cloned without CLONE_FILES).
-pub(crate) fn is_fifo(tid: i32, fd: i32) -> bool {
-    fs::metadata(format!("/proc/{tid}/fd/{fd}")).is_ok_and(|meta| meta.file_type().is_fifo())
+/// Whether Detcore can see a guest's descriptors through `/proc/<tid>` on
+/// `backend`, as every check here needs. Only where the tool is a separate
+/// tracer, outside the guest's descriptor table (not DBT, whose tool runs in
+/// the guest), and where a guest thread's ID is a host task's
+/// ([`crate::procfs_inode::guest_tids_name_host_tasks`]; not KVM, where
+/// `/proc/<tid>` is whatever host task has that ID). `physical_tid` is the
+/// guest thread's host ID where the backend supplies one beside its own.
+/// Elsewhere a FIFO keeps blocking, as before.
+pub(crate) fn guest_descriptors_are_visible(
+    backend: &reverie::BackendCapabilities,
+    physical_tid: Option<i32>,
+) -> bool {
+    !backend.tool_shares_guest_descriptor_table
+        && crate::procfs_inode::guest_tids_name_host_tasks(backend, physical_tid)
+}
+
+/// Whether guest thread `tid`'s descriptor `fd` names a FIFO (a named FIFO,
+/// or a pipe reached by path). Read through the thread, whose descriptor
+/// table may not be its leader's (a thread cloned without CLONE_FILES), and
+/// only where [`guest_descriptors_are_visible`]: elsewhere `/proc/<tid>` is
+/// not the guest's, and the answer is no. Every later check here runs only on
+/// a FIFO this said yes to.
+pub(crate) fn is_fifo(
+    backend: &reverie::BackendCapabilities,
+    physical_tid: Option<i32>,
+    tid: i32,
+    fd: i32,
+) -> bool {
+    guest_descriptors_are_visible(backend, physical_tid)
+        && fs::metadata(format!("/proc/{tid}/fd/{fd}")).is_ok_and(|meta| meta.file_type().is_fifo())
 }
 
 /// Whether the kernel's open file description behind thread `tid`'s `fd` is
@@ -224,6 +249,61 @@ mod tests {
     use std::os::unix::fs::OpenOptionsExt;
 
     use super::*;
+
+    /// The descriptor checks run only under a separate tracer whose guest
+    /// thread IDs are host tasks: ptrace and in-guest LiteInst (whose tool is
+    /// still a separate tracer), not DBT or SaBRe (their tool shares the
+    /// guest's table) nor KVM (`/proc/<tid>` there is an unrelated host task;
+    /// on one host it measured as a `kvm-nx-lpage-recovery` worker thread of
+    /// Hermit's own process), nor a thread whose host ID differs from its own.
+    #[test]
+    fn guest_descriptors_are_visible_only_under_a_host_task_tracer() {
+        use reverie::BackendCapabilities;
+        assert!(guest_descriptors_are_visible(
+            &BackendCapabilities::PTRACE,
+            None
+        ));
+        assert!(guest_descriptors_are_visible(
+            &BackendCapabilities::LITEINST_IN_GUEST,
+            None
+        ));
+        assert!(!guest_descriptors_are_visible(
+            &BackendCapabilities::KVM,
+            None
+        ));
+        assert!(!guest_descriptors_are_visible(
+            &BackendCapabilities::DBT,
+            Some(4_321)
+        ));
+        assert!(!guest_descriptors_are_visible(
+            &BackendCapabilities::SABRE,
+            None
+        ));
+        assert!(!guest_descriptors_are_visible(
+            &BackendCapabilities::PTRACE,
+            Some(4_321)
+        ));
+    }
+
+    /// A real FIFO, held by this test process: it is a FIFO only where the
+    /// backend's guest descriptors are visible, so no caller can read another
+    /// task's table on KVM.
+    #[test]
+    fn a_fifo_is_seen_only_where_guest_descriptors_are_visible() {
+        use reverie::BackendCapabilities;
+        let dir = tempfile::tempdir().unwrap();
+        let path = fifo_in(dir.path());
+        let end = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&end);
+        let tid = nix::unistd::gettid().as_raw();
+        assert!(is_fifo(&BackendCapabilities::PTRACE, None, tid, fd));
+        assert!(!is_fifo(&BackendCapabilities::KVM, None, tid, fd));
+        assert!(!is_fifo(&BackendCapabilities::DBT, Some(tid), tid, fd));
+    }
 
     fn fifo_in(dir: &Path) -> std::path::PathBuf {
         let path = dir.join("fifo");
@@ -407,7 +487,12 @@ mod tests {
             .unwrap();
         let fd = std::os::fd::AsRawFd::as_raw_fd(&reader);
         let pid = std::process::id() as i32;
-        assert!(is_fifo(pid, fd));
+        assert!(is_fifo(
+            &reverie::BackendCapabilities::PTRACE,
+            None,
+            pid,
+            fd
+        ));
         assert_eq!(kernel_nonblocking(pid, fd), Some(true));
         // SAFETY: plain fcntl on a descriptor this test owns.
         unsafe { libc::fcntl(fd, libc::F_SETFL, 0) };
