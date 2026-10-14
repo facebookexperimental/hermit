@@ -760,7 +760,8 @@ impl Scheduler {
             }
         } else if !self.divert_in_guest_fatal_alarm(deadline, id, tid, signal, observed_now) {
             if matches!(id, SignalTimerId::Posix(..)) {
-                self.fire_process_timer(id.process(), tid, signal);
+                let producer = self.posix_timer_producer(id);
+                self.fire_process_timer(id.process(), tid, signal, producer);
             } else if let SignalTimerId::Alarm(process) = id {
                 self.fire_itimer_real(deadline, process, tid, signal);
             } else {

@@ -141,6 +141,7 @@ static HB_KILL_HELD_CHILD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGNAL_HERMIT_TASKS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PAUSE_SIGCHLD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static GUEST_SIGCHLD_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static GUEST_DISCARD_AT_SEND_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGCHLD_BOOKKEEPING_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_POSTHOOK_FUTEX_INTERRUPT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_PIPE_READ_HELD_WRITER_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1631,6 +1632,31 @@ fn guest_sigchld_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "guest-sigchld guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn guest_discard_at_send_guest() -> &'static Path {
+    GUEST_DISCARD_AT_SEND_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("guest-discard-at-send");
+        fs::create_dir_all(&build_root).expect("failed to create guest-discard-at-send directory");
+        let guest = build_root.join("guest_discard_at_send");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/guest_discard_at_send.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile guest-discard-at-send guest");
+        assert!(
+            output.status.success(),
+            "guest-discard-at-send guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -33124,4 +33150,556 @@ fn a_blocking_fifo_open_with_a_host_peer_completes_as_on_linux() {
         drop(fs::File::open(&fifo).unwrap());
         writer.join().expect("the host writer failed");
     }
+}
+
+/// A standard signal Linux discards when it is sent (SIG_IGN, or the default
+/// action of a default-ignored signal, while unblocked) never ends a wait or
+/// reaches a take once a handler is installed, though ptrace still queues its
+/// copy: the scheduler records each send's fate in the sender's turn
+/// (https://github.com/rrnewton/hermit/issues/4293). Before, the futex wait,
+/// sleep, wait4, sigtimedwait and signalfd rows ended at once (EINTR, a
+/// signal, a record). Each row is the hermit line under
+/// `--strict --verify --verify-strict` (ptrace, canonical bitwise parity), and
+/// the native line (Linux 7.1.3, 3 of 3 each) where it differs: the wait or
+/// take result is identical, and only the handler count differs, because the
+/// discarded copy is still delivered as the waiter returns to user mode
+/// (item 2 of https://github.com/rrnewton/hermit/issues/3995, whose
+/// suppression is a follow-up). A periodic timer's discarded expiry is
+/// parked and queued again when the signal stops being ignored, only while
+/// the expiry is current (Linux's `it_signal_seq`): rearmed far ahead,
+/// disarmed or deleted, nothing comes. In `signalfd-inread` and the two
+/// `signalfd-eintr` rows the worker is woken out of a real signalfd `read`
+/// outside the schedule by main's discarded SIGUSR1, and a guest-sent signal
+/// does not fix where such a thread rejoins
+/// (https://github.com/rrnewton/hermit/issues/4359); one such row failed
+/// `--verify` once in 31 runs on a loaded host and passed 160 of 160 in the
+/// Claude re-check of https://github.com/rrnewton/hermit/pull/4351.
+#[test]
+fn a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take() {
+    let _guard = hermit_run_guard();
+    let guest = guest_discard_at_send_guest().to_str().unwrap().to_owned();
+    // (mode, hermit line, native line where it differs)
+    let rows: &[(&str, &str, Option<&str>)] = &[
+        (
+            "futex-dfl",
+            "futex -1 ETIMEDOUT, handled 1",
+            Some("futex -1 ETIMEDOUT, handled 0"),
+        ),
+        (
+            "futex-dfl-yield",
+            "futex -1 ETIMEDOUT, handled 1",
+            Some("futex -1 ETIMEDOUT, handled 0"),
+        ),
+        (
+            "futex-ign",
+            "futex -1 ETIMEDOUT, handled 1",
+            Some("futex -1 ETIMEDOUT, handled 0"),
+        ),
+        (
+            "futex-ign-yield",
+            "futex -1 ETIMEDOUT, handled 1",
+            Some("futex -1 ETIMEDOUT, handled 0"),
+        ),
+        (
+            "sleep-dfl",
+            "nanosleep 0 0, handled 1",
+            Some("nanosleep 0 0, handled 0"),
+        ),
+        (
+            "sleep-ign",
+            "nanosleep 0 0, handled 1",
+            Some("nanosleep 0 0, handled 0"),
+        ),
+        (
+            "wait4-dfl",
+            "wait4 child 0, status 7, handled 1",
+            Some("wait4 child 0, status 7, handled 0"),
+        ),
+        ("kept-after-discard", "futex -1 EINTR, handled 1", None),
+        ("blocked-keeps", "handled 1", None),
+        ("self-take", "sigtimedwait 10 0, handled 0", None),
+        (
+            "sigtimedwait-ign",
+            "sigtimedwait -1 EAGAIN, handled 1",
+            Some("sigtimedwait -1 EAGAIN, handled 0"),
+        ),
+        (
+            "sigtimedwait-ign-inwait",
+            "sigtimedwait -1 EAGAIN, handled 0",
+            None,
+        ),
+        (
+            "signalfd-ign",
+            "poll 0, read -1 EAGAIN, handled 1",
+            Some("poll 0, read -1 EAGAIN, handled 0"),
+        ),
+        (
+            "sigpipe-take",
+            "first -1 EAGAIN, write -1 EPIPE, second 13 0",
+            None,
+        ),
+        (
+            "sigpipe-signalfd",
+            "first -1 EAGAIN, write -1 EPIPE, second 13 0",
+            None,
+        ),
+        ("timer-unchanged", "sigtimedwait 10 0", None),
+        ("timer-rearm-far", "sigtimedwait -1 EAGAIN", None),
+        ("timer-rearm-near", "sigtimedwait 10 0", None),
+        ("timer-disarm", "sigtimedwait -1 EAGAIN", None),
+        ("timer-delete", "sigtimedwait -1 EAGAIN", None),
+        // A discarded POSIX timer send commits no wake to a wait4 (R4-1).
+        ("wait4-timer", "wait4 child 0, status 7, handled 0", None),
+        // ITIMER_REAL is classified against the leader, which blocks SIGALRM,
+        // not against the thread that armed it (C2).
+        ("itimer-leader", "sigtimedwait 14 0", None),
+        ("xproc", "futex -1 ETIMEDOUT, handled 0", None),
+        // A take faulting on its siginfo: EFAULT only for a kept copy (R5-4).
+        ("fault-empty", "sigtimedwait -1 EAGAIN", None),
+        ("fault-discarded", "sigtimedwait -1 EAGAIN", None),
+        ("fault-kept", "sigtimedwait -1 EFAULT", None),
+        // A blocking signalfd read returns what it has (C3), and a read
+        // whose next record faults returns the records before it.
+        ("signalfd-two", "read 128 0", None),
+        ("signalfd-partial", "read 128 0", None),
+        // The discarded copy is still queued when the take runs: the take
+        // drops it and forgets it, so the later kept SIGPIPE, which no send
+        // hook sees, is taken (Codex rev6 P2-1); and a signalfd read drops
+        // its record and goes on to the kept SIGUSR2.
+        (
+            "sigpipe-inwait",
+            "first -1 EAGAIN, write -1 EPIPE, second 13 0",
+            None,
+        ),
+        // A take with a siginfo buffer copies the kept copy's siginfo out.
+        ("take-info", "sigtimedwait 10 0, info signal 10", None),
+        // A kept SIGEV_THREAD_ID expiry sent after a discarded copy clears
+        // its bit (R5-3).
+        (
+            "kept-timer-after-discard",
+            "futex -1 EINTR, handled 1",
+            None,
+        ),
+        // Linux reads the task the sender names: the sole live thread, or
+        // the exited leader, whose frozen mask blocks the signal.
+        ("sole-nonleader", "sigtimedwait -1 EAGAIN", None),
+        ("exited-leader", "sigtimedwait 10 0", None),
+        // A PID namespace's init discards an uncaught SIG_DFL signal, whoever
+        // sends it; a caught one is kept (native lines from `unshare -Ur`).
+        ("init-dfl", "sigtimedwait -1 EAGAIN", None),
+        ("init-caught", "sigtimedwait 10 0", None),
+        ("init-own", "sigtimedwait -1 EAGAIN", None),
+        // The Codex implementation review of
+        // https://github.com/rrnewton/hermit/pull/4351: a take needs no
+        // stack below the guest's beyond the call's own; a faulting siginfo
+        // gets Linux's partial copy for a kept copy and nothing for a
+        // discarded one; and a dropped signalfd record leaves the caller's
+        // buffer untouched across a later EINTR.
+        ("tight-stack-null", "sigtimedwait 10, info signal -1", None),
+        ("tight-stack-info", "sigtimedwait 10, info signal 10", None),
+        (
+            "fault-partial-16",
+            "sigtimedwait -1 EFAULT, changed 16, next -1 EAGAIN",
+            None,
+        ),
+        (
+            "fault-partial-64",
+            "sigtimedwait -1 EFAULT, changed 64, next -1 EAGAIN",
+            None,
+        ),
+        (
+            "fault-partial-discarded",
+            "sigtimedwait -1 EAGAIN, changed 0",
+            None,
+        ),
+        (
+            "fault-partial-hole",
+            "sigtimedwait -1 EAGAIN, changed 0",
+            None,
+        ),
+        ("signalfd-inread", "read 128 0, signal 12", None),
+        (
+            "signalfd-eintr",
+            "read -1 EINTR, usr2 handled 1, changed 0",
+            None,
+        ),
+        (
+            "signalfd-eintr-8k",
+            "read -1 EINTR, usr2 handled 1, changed 0",
+            None,
+        ),
+    ];
+    for &(mode, line, native) in rows {
+        let args = [
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--",
+            guest.as_str(),
+            mode,
+        ];
+        let output = hermit(&args);
+        let log = stderr(&output);
+        assert_success(&output, &args);
+        assert_eq!(
+            stdout(&output),
+            format!("{mode}: {line}\n"),
+            "{mode} (native: {}): stderr:\n{log}",
+            native.unwrap_or(line)
+        );
+        assert!(
+            log.contains(":: comparison=BitwiseInfoV1 relaxations=none"),
+            "{mode}: comparison was not canonical:\n{log}"
+        );
+        assert!(
+            log.contains(":: Success: deterministic. Determinism verified."),
+            "{mode}: verification failed:\n{log}"
+        );
+    }
+}
+
+/// As `a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take`,
+/// with the discarded copy already pending when the waiter files its wait: a
+/// hard `--happens-before` edge holds the waiter (dettid 5) at the entry of
+/// its futex wait or nanosleep until main (dettid 3) enters its join, after
+/// its send and its handler install. So the waiter's own check before it
+/// parks decides, from `/proc`, where the copy shows pending and caught, and
+/// the record says Linux discarded it (`without_discarded`). Before, the
+/// wait or sleep ended at once (https://github.com/rrnewton/hermit/issues/4293).
+/// Native lines differ only in the handler count (item 2 of
+/// https://github.com/rrnewton/hermit/issues/3995).
+#[test]
+fn a_signal_linux_discarded_before_a_wait_files_does_not_end_it() {
+    let _guard = hermit_run_guard();
+    let guest = guest_discard_at_send_guest().to_str().unwrap().to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    for (mode, syscall, line) in [
+        ("futex-dfl", "futex", "futex -1 ETIMEDOUT, handled 1"),
+        ("futex-ign", "futex", "futex -1 ETIMEDOUT, handled 1"),
+        ("sleep-dfl", "clock_nanosleep", "nanosleep 0 0, handled 1"),
+        ("sleep-ign", "clock_nanosleep", "nanosleep 0 0, handled 1"),
+        // A kept SIGEV_THREAD_ID timer expiry lands on the discarded copy
+        // while the waiter is held: the scheduler's kept send clears the bit
+        // (R5-3), so the wait ends as natively.
+        (
+            "kept-timer-after-discard",
+            "futex",
+            "futex -1 EINTR, handled 1",
+        ),
+    ] {
+        let spec = directory.path().join(format!("{mode}.json"));
+        fs::write(
+            &spec,
+            format!(
+                r#"{{"version": 1,
+                    "events": {{"installed": {{"thread": "3", "syscall": "futex", "nth": 1}},
+                               "waits": {{"thread": "5", "syscall": "{syscall}", "nth": 1}}}},
+                    "edges": [{{"before": "installed", "after": "waits", "strength": "hard"}}]}}"#
+            ),
+        )
+        .unwrap();
+        let spec = spec.to_str().unwrap().to_owned();
+        let args = [
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--happens-before",
+            spec.as_str(),
+            "--",
+            guest.as_str(),
+            mode,
+        ];
+        let output = hermit(&args);
+        let log = stderr(&output);
+        assert_success(&output, &args);
+        assert_eq!(
+            stdout(&output),
+            format!("{mode}: {line}\n"),
+            "{mode}: stderr:\n{log}"
+        );
+        assert!(
+            log.contains(":: Success: deterministic. Determinism verified."),
+            "{mode}: verification failed:\n{log}"
+        );
+    }
+}
+
+/// The discarded-at-send rows record and replay:
+/// `record start --verify --verify-strict` replays 39 of the guest's modes
+/// with the recording's output (https://github.com/rrnewton/hermit/issues/4293).
+/// Replay rebuilds the record from the same sends and takes, and a take
+/// decides from the record alone (`DiscardedAtSend::take_from`). Left out:
+/// `signalfd-inread`, `signalfd-fault-inread` and `signalfd-eintr`, whose
+/// reader leaves the signal unblocked, which a replayed signalfd read does not dequeue
+/// (https://github.com/rrnewton/hermit/issues/4349); and `sole-nonleader` and
+/// `exited-leader`, whose leader exits while its thread runs on, which record
+/// refuses (https://github.com/rrnewton/hermit/issues/4244).
+#[test]
+fn the_discarded_at_send_rows_record_and_replay() {
+    let _guard = hermit_run_guard();
+    let guest = guest_discard_at_send_guest().to_str().unwrap().to_owned();
+    for (mode, line) in [
+        ("futex-dfl", "futex -1 ETIMEDOUT, handled 1"),
+        ("futex-dfl-yield", "futex -1 ETIMEDOUT, handled 1"),
+        ("futex-ign", "futex -1 ETIMEDOUT, handled 1"),
+        ("futex-ign-yield", "futex -1 ETIMEDOUT, handled 1"),
+        ("sleep-dfl", "nanosleep 0 0, handled 1"),
+        ("sleep-ign", "nanosleep 0 0, handled 1"),
+        ("wait4-dfl", "wait4 child 0, status 7, handled 1"),
+        ("kept-after-discard", "futex -1 EINTR, handled 1"),
+        ("blocked-keeps", "handled 1"),
+        ("self-take", "sigtimedwait 10 0, handled 0"),
+        ("sigtimedwait-ign", "sigtimedwait -1 EAGAIN, handled 1"),
+        (
+            "sigtimedwait-ign-inwait",
+            "sigtimedwait -1 EAGAIN, handled 0",
+        ),
+        ("signalfd-ign", "poll 0, read -1 EAGAIN, handled 1"),
+        (
+            "sigpipe-take",
+            "first -1 EAGAIN, write -1 EPIPE, second 13 0",
+        ),
+        (
+            "sigpipe-signalfd",
+            "first -1 EAGAIN, write -1 EPIPE, second 13 0",
+        ),
+        ("timer-unchanged", "sigtimedwait 10 0"),
+        ("timer-rearm-far", "sigtimedwait -1 EAGAIN"),
+        ("timer-rearm-near", "sigtimedwait 10 0"),
+        ("timer-disarm", "sigtimedwait -1 EAGAIN"),
+        ("timer-delete", "sigtimedwait -1 EAGAIN"),
+        ("wait4-timer", "wait4 child 0, status 7, handled 0"),
+        ("itimer-leader", "sigtimedwait 14 0"),
+        ("xproc", "futex -1 ETIMEDOUT, handled 0"),
+        ("fault-empty", "sigtimedwait -1 EAGAIN"),
+        ("fault-discarded", "sigtimedwait -1 EAGAIN"),
+        ("fault-kept", "sigtimedwait -1 EFAULT"),
+        ("signalfd-two", "read 128 0"),
+        ("signalfd-partial", "read 128 0"),
+        (
+            "sigpipe-inwait",
+            "first -1 EAGAIN, write -1 EPIPE, second 13 0",
+        ),
+        ("take-info", "sigtimedwait 10 0, info signal 10"),
+        ("kept-timer-after-discard", "futex -1 EINTR, handled 1"),
+        ("init-dfl", "sigtimedwait -1 EAGAIN"),
+        ("init-caught", "sigtimedwait 10 0"),
+        ("init-own", "sigtimedwait -1 EAGAIN"),
+        ("tight-stack-null", "sigtimedwait 10, info signal -1"),
+        ("tight-stack-info", "sigtimedwait 10, info signal 10"),
+        (
+            "fault-partial-16",
+            "sigtimedwait -1 EFAULT, changed 16, next -1 EAGAIN",
+        ),
+        (
+            "fault-partial-64",
+            "sigtimedwait -1 EFAULT, changed 64, next -1 EAGAIN",
+        ),
+        (
+            "fault-partial-discarded",
+            "sigtimedwait -1 EAGAIN, changed 0",
+        ),
+    ] {
+        let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let data_dir_arg = format!("--data-dir={}", data_dir.path().display());
+        let args = [
+            "record",
+            "start",
+            "--verify",
+            "--verify-strict",
+            data_dir_arg.as_str(),
+            "--",
+            guest.as_str(),
+            mode,
+        ];
+        let output = hermit(&args);
+        let log = stderr(&output);
+        assert_success(&output, &args);
+        assert_eq!(
+            stdout(&output),
+            format!("{mode}: {line}\n"),
+            "{mode}: stderr:\n{log}"
+        );
+        assert!(
+            log.contains(":: Success: replay matched recording."),
+            "{mode}: replay did not match:\n{log}"
+        );
+    }
+}
+
+/// On KVM, whose guest thread IDs do not name host tasks, the
+/// discarded-at-send record is not kept, and `rt_sigtimedwait` writes its
+/// siginfo as on ptrace: the Claude implementation review of
+/// https://github.com/rrnewton/hermit/pull/4351 found every take with a
+/// siginfo buffer returning EFAULT there, from a writability check that read
+/// an unrelated host task's `/proc` maps
+/// (https://github.com/rrnewton/hermit/issues/4293). The lines are native
+/// output and ptrace's.
+#[test]
+fn run_kvm_rt_sigtimedwait_writes_its_siginfo_as_ptrace_does() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping KVM rt_sigtimedwait siginfo: /dev/kvm is unavailable");
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let guest = guest_discard_at_send_guest().to_str().unwrap().to_owned();
+    for (mode, line) in [
+        ("take-info", "sigtimedwait 10 0, info signal 10"),
+        ("self-take", "sigtimedwait 10 0, handled 0"),
+        ("fault-kept", "sigtimedwait -1 EFAULT"),
+        ("fault-empty", "sigtimedwait -1 EAGAIN"),
+    ] {
+        let args = [
+            "--backend=kvm",
+            "run",
+            "--strict",
+            "--tmp=/tmp",
+            "--",
+            guest.as_str(),
+            mode,
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(
+            stdout(&output),
+            format!("{mode}: {line}\n"),
+            "{mode}: stderr:\n{}",
+            stderr(&output)
+        );
+    }
+}
+
+/// A kept SIGUSR1 wakes a precise futex wait, and before the waiter's turn
+/// the sender flushes it (`SIG_IGN`), sends a copy Linux discards, and
+/// installs a second handler: the wait must not end, because neither copy is
+/// one Linux delivers. The wake's answer names the first copy, and the
+/// record of discarded copies is applied to it too (the Claude re-check of
+/// the R2b-1 design, R4-1, https://github.com/rrnewton/hermit/issues/4273).
+/// Before, the answer exempted it and the wait ended with EINTR. Two chaos
+/// seeds put the waiter's turn after the sender's; `futex -1 EINTR, h1 1,
+/// h2 0` would be the other legal line. Native (Linux 7.1.3, 6 of 6):
+/// `futex -1 ETIMEDOUT, h1 0, h2 0`; Hermit's `h2 1` is the discarded copy
+/// still delivered as the waiter returns (item 2 of
+/// https://github.com/rrnewton/hermit/issues/3995).
+#[test]
+fn a_flushed_then_discarded_copy_does_not_end_a_woken_futex_wait() {
+    let _guard = hermit_run_guard();
+    let guest = guest_discard_at_send_guest().to_str().unwrap().to_owned();
+    for seed in ["11", "22"] {
+        let args = [
+            "run",
+            "--strict",
+            "--chaos",
+            "--seed",
+            seed,
+            "--verify",
+            "--verify-strict",
+            "--",
+            guest.as_str(),
+            "futex-flush-resend",
+        ];
+        let output = hermit(&args);
+        let log = stderr(&output);
+        assert_success(&output, &args);
+        assert_eq!(
+            stdout(&output),
+            "futex-flush-resend: futex -1 ETIMEDOUT, h1 0, h2 1\n",
+            "seed {seed}: stderr:\n{log}"
+        );
+        assert!(
+            log.contains(":: comparison=BitwiseInfoV1 relaxations=none"),
+            "seed {seed}: comparison was not canonical:\n{log}"
+        );
+        assert!(
+            log.contains(":: Success: deterministic. Determinism verified."),
+            "seed {seed}: verification failed:\n{log}"
+        );
+    }
+}
+
+/// A timer signal the scheduler sends while every thread blocks it waits in
+/// the process's shared queue, and main's later `sigsuspend`, which admits it,
+/// ends at once and rejoins while a sibling spins on `sched_yield`
+/// (https://github.com/rrnewton/hermit/pull/4314): `armed-posix` from a
+/// one-shot `SIGEV_SIGNAL` timer, `armed-itimer` from ITIMER_REAL (the
+/// control), and `armed-unignore` from the expiry Linux re-queues when the
+/// signal stops being ignored (https://github.com/rrnewton/hermit/issues/4293).
+/// The POSIX timer's send once left the shared-queue record out, and the run
+/// hung behind the spinner (Claude re-check of
+/// https://github.com/rrnewton/hermit/pull/4351, N1 and N2). Each line is
+/// Linux's (7.1.3, 3 of 3), under `--strict --verify --verify-strict`.
+#[test]
+fn a_timer_signal_waiting_in_the_shared_queue_ends_a_later_sigsuspend() {
+    let _guard = hermit_run_guard();
+    let guest = guest_discard_at_send_guest().to_str().unwrap().to_owned();
+    for mode in ["armed-posix", "armed-itimer", "armed-unignore"] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let args = [
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--",
+            guest.as_str(),
+            mode,
+        ];
+        let (status, log) = run_with_deadline(
+            hermit_command(&args),
+            directory.path(),
+            Duration::from_secs(120),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{mode}: the run must finish and exit 0:\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert_eq!(
+            stdout,
+            format!("{mode}: pending 1, sigsuspend -1 EINTR, handled 1\n"),
+            "{mode}: stderr:\n{log}"
+        );
+        assert!(
+            log.contains(":: comparison=BitwiseInfoV1 relaxations=none"),
+            "{mode}: comparison was not canonical:\n{log}"
+        );
+        assert!(
+            log.contains(":: Success: deterministic. Determinism verified."),
+            "{mode}: verification failed:\n{log}"
+        );
+    }
+}
+
+/// A signalfd read whose copy-out faults after a dequeue that may have taken
+/// a copy Linux discarded when it was sent is refused by name: Linux would
+/// not have dequeued that copy, and the lost record cannot be told
+/// (https://github.com/rrnewton/hermit/issues/4293). Natively the read
+/// dequeues the kept SIGUSR2 and fails with EFAULT.
+#[test]
+fn a_faulted_signalfd_read_that_may_have_taken_a_discarded_copy_is_refused() {
+    let _guard = hermit_run_guard();
+    let guest = guest_discard_at_send_guest().to_str().unwrap().to_owned();
+    let args = [
+        "run",
+        "--strict",
+        "--",
+        guest.as_str(),
+        "signalfd-fault-inread",
+    ];
+    let output = hermit(&args);
+    let log = stderr(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "stdout:\n{}\nstderr:\n{log}",
+        stdout(&output)
+    );
+    assert!(
+        log.contains("faulted copying out a record that may hold a signal Linux discarded"),
+        "the refusal was not named:\n{log}"
+    );
 }

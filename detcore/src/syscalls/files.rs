@@ -4644,33 +4644,52 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             FdType::Signalfd => loop {
                 trace!("Possibly blocking read call on signalfd {}", call.fd());
+                let extents = [(call.buf().map_or(0, |buf| buf.as_raw()), call.len())];
+                let before =
+                    crate::syscalls::signal::capture_signalfd_buffer(guest, &extents, call.len());
                 let result = self.execute_nonblockable_fd_syscall(guest, call).await;
                 // A SIGCHLD read here goes through the child-exit ledger as
                 // one delivered to a handler does. A read whose every record
                 // was a dropped duplicate reads again, as if those copies had
                 // never been queued.
-                let extents = [(call.buf().map_or(0, |buf| buf.as_raw()), call.len())];
                 match (result, call.buf()) {
                     (Ok(read), Some(buf))
                         if read > 0 && self.cfg.backend.reports_child_exit_publication =>
                     {
-                        let kept = self
-                            .reconcile_signalfd_records(guest, buf, read as usize)
-                            .await;
-                        self.settle_faulted_signalfd_record(
-                            guest,
-                            call.fd(),
-                            &extents,
-                            Some(read as usize),
-                        )
-                        .await;
+                        let Some(kept) = self
+                            .reconcile_signalfd_records(guest, buf, read as usize, &before)
+                            .await
+                        else {
+                            break self
+                                .refuse_unrestorable_signalfd_record(guest, Sysno::read)
+                                .await;
+                        };
+                        if self
+                            .settle_faulted_signalfd_record(
+                                guest,
+                                call.fd(),
+                                &extents,
+                                Some(read as usize),
+                            )
+                            .await
+                        {
+                            break self
+                                .refuse_faulted_signalfd_discard(guest, Sysno::read)
+                                .await;
+                        }
                         if kept > 0 {
                             break Ok(kept as i64);
                         }
                     }
                     (Err(Error::Errno(Errno::EFAULT)), _) => {
-                        self.settle_faulted_signalfd_record(guest, call.fd(), &extents, None)
-                            .await;
+                        if self
+                            .settle_faulted_signalfd_record(guest, call.fd(), &extents, None)
+                            .await
+                        {
+                            break self
+                                .refuse_faulted_signalfd_discard(guest, Sysno::read)
+                                .await;
+                        }
                         break Err(Errno::EFAULT.into());
                     }
                     (result, _) => break result,
@@ -5563,16 +5582,25 @@ impl<T: RecordOrReplay> Detcore<T> {
             })
             .collect();
         loop {
+            let before =
+                crate::syscalls::signal::capture_signalfd_buffer(guest, &extents, usize::MAX);
             let result = self
                 .record_or_replay_preserving_tool_errors(guest, call)
                 .await;
             match result {
                 Ok(read) if read > 0 => {
-                    let kept = self
-                        .reconcile_signalfd_extents(guest, &extents, read as usize)
-                        .await;
-                    self.settle_faulted_signalfd_record(guest, fd, &extents, Some(read as usize))
-                        .await;
+                    let Some(kept) = self
+                        .reconcile_signalfd_extents(guest, &extents, read as usize, &before)
+                        .await
+                    else {
+                        break self.refuse_unrestorable_signalfd_record(guest, sysno).await;
+                    };
+                    if self
+                        .settle_faulted_signalfd_record(guest, fd, &extents, Some(read as usize))
+                        .await
+                    {
+                        break self.refuse_faulted_signalfd_discard(guest, sysno).await;
+                    }
                     if kept > 0 {
                         *observed = Some(
                             crate::syscalls::signal::signalfd_extent_pieces(&extents, kept)
@@ -5592,8 +5620,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                     }
                 }
                 Err(Error::Errno(Errno::EFAULT)) => {
-                    self.settle_faulted_signalfd_record(guest, fd, &extents, None)
-                        .await;
+                    if self
+                        .settle_faulted_signalfd_record(guest, fd, &extents, None)
+                        .await
+                    {
+                        break self.refuse_faulted_signalfd_discard(guest, sysno).await;
+                    }
                     break Err(Errno::EFAULT.into());
                 }
                 result => break result,
@@ -5616,16 +5648,22 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// record was lost only if the buffers had room for another and some
     /// byte of it is not writable; even then no signal may have been left to
     /// take, so the shared queue's pending bit decides that case.
+    ///
+    /// Returns whether a record may have been lost that way, and its copy may
+    /// have been one Linux discarded when it was sent, which it would never
+    /// have dequeued: the caller refuses the call by name
+    /// (`refuse_faulted_signalfd_discard`), since the copy cannot be told
+    /// (<https://github.com/rrnewton/hermit/issues/4293>).
     async fn settle_faulted_signalfd_record<G: Guest<Self>>(
         &self,
         guest: &mut G,
         fd: i32,
         extents: &[(usize, usize)],
         read: Option<usize>,
-    ) {
+    ) -> bool {
         if !self.cfg.backend.reports_child_exit_publication || !guest.config().sequentialize_threads
         {
-            return;
+            return false;
         }
         match read {
             None => {
@@ -5633,35 +5671,45 @@ impl<T: RecordOrReplay> Detcore<T> {
                 if extents.iter().any(|(address, len)| {
                     address.checked_add(*len).is_none_or(|end| end > user_end)
                 }) {
-                    return;
+                    return false;
                 }
             }
             Some(read) => {
                 let Some(next) = signalfd_next_record(extents, read) else {
-                    return;
+                    return false;
                 };
                 let Ok(maps) =
                     std::fs::read_to_string(format!("/proc/{}/maps", guest.tid().as_raw()))
                 else {
-                    return;
+                    return false;
                 };
                 if next
                     .iter()
                     .all(|(address, len)| signalfd_range_is_writable(&maps, *address, *len))
                 {
-                    return;
+                    return false;
                 }
             }
         }
-        let sigchld = crate::syscalls::threads::kernel_sigset_bit(libc::SIGCHLD);
         let mask = signalfd_sigmask(guest.pid().as_raw(), fd);
+        let lost_a_discarded_copy = {
+            use crate::scheduler::discarded_at_send::DiscardedSignalAnswer;
+            use crate::scheduler::discarded_at_send::DiscardedSignalControl;
+            use crate::scheduler::discarded_at_send::STANDARD_SIGNALS;
+            matches!(
+                crate::tool_global::discarded_signal(guest, DiscardedSignalControl::Bits).await,
+                DiscardedSignalAnswer::Bits { thread, process }
+                    if (thread | process) & mask.unwrap_or(!0) & STANDARD_SIGNALS != 0
+            )
+        };
+        let sigchld = crate::syscalls::threads::kernel_sigset_bit(libc::SIGCHLD);
         if mask.is_some_and(|mask| mask & sigchld == 0) {
-            return;
+            return lost_a_discarded_copy;
         }
         let Ok(state) =
             crate::syscalls::threads::read_thread_wait_signal_state(guest.pid(), guest.tid())
         else {
-            return;
+            return lost_a_discarded_copy;
         };
         // A failed read of a descriptor for SIGCHLD alone took a SIGCHLD.
         let shared_pending = if read.is_none() && mask == Some(sigchld) {
@@ -5677,6 +5725,51 @@ impl<T: RecordOrReplay> Detcore<T> {
             },
         )
         .await;
+        lost_a_discarded_copy
+    }
+
+    /// Refuse by name a signalfd `sysno` whose copy-out faulted after a
+    /// dequeue that may have taken a copy Linux discarded when it was sent
+    /// (`settle_faulted_signalfd_record`): Linux would not have taken it, and
+    /// which copy the lost record held cannot be told.
+    async fn refuse_faulted_signalfd_discard<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+    ) -> Result<i64, Error> {
+        tracing::error!(
+            "[detcore, dtid {}] {} of a signalfd faulted copying out a record that may hold a \
+             signal Linux discarded when it was sent, which Linux would never have dequeued; \
+             Hermit cannot tell which copy was lost \
+             (https://github.com/rrnewton/hermit/issues/4293)",
+            guest.thread_state().dettid,
+            sysno,
+        );
+        self.refuse_unserviceable_operation(guest, sysno, Errno::ENOSYS)
+            .await
+    }
+
+    /// Refuse by name a signalfd `sysno` that read a record to drop (a copy
+    /// Linux discarded at send, or a duplicate child-exit copy) whose bytes
+    /// the capture before the read does not reach: more records than
+    /// `SIGNALFD_CAPTURED` holds, which only real-time signals can make.
+    /// Linux would leave those bytes as they were, and Hermit does not invent
+    /// them (the Codex re-check of https://github.com/rrnewton/hermit/pull/4351,
+    /// P2-2).
+    async fn refuse_unrestorable_signalfd_record<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+    ) -> Result<i64, Error> {
+        tracing::error!(
+            "[detcore, dtid {}] {} of a signalfd read a record Hermit drops, beyond the bytes \
+             captured before the read, so it cannot leave the caller's buffer as Linux would \
+             (https://github.com/rrnewton/hermit/issues/4293)",
+            guest.thread_state().dettid,
+            sysno,
+        );
+        self.refuse_unserviceable_operation(guest, sysno, Errno::ENOSYS)
+            .await
     }
 
     /// SYS_readv system call: the vectored form of `read`.
@@ -8920,6 +9013,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         signal,
                         Some(process),
                         true,
+                        DetTid::from_raw(thread.as_raw()),
                     )
                     .await?
                 }
@@ -8974,8 +9068,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let value = match receiver {
             Some((thread, process)) => {
-                self.send_guest_signal(guest, call, thread, signal, Some(process), false)
-                    .await?
+                // A process-scoped pidfd names the process's leader
+                // (`pidfd_send_signal` with `PIDTYPE_TGID`).
+                self.send_guest_signal(
+                    guest,
+                    call,
+                    thread,
+                    signal,
+                    Some(process),
+                    false,
+                    DetTid::from_raw(process.as_raw()),
+                )
+                .await?
             }
             None => self.record_or_replay(guest, call).await?,
         };

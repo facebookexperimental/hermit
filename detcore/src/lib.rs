@@ -187,6 +187,42 @@ fn select_thread_start_detpid(thread_detpid: Option<DetPid>, guest_pid: Pid) -> 
     thread_detpid.unwrap_or_else(|| DetPid::from_raw(guest_pid.into()))
 }
 
+/// What a stop of thread `tid` of `pid` did with a copy of the standard
+/// `signal` (`kept`: resumed into the thread, or else dropped), for the
+/// scheduler's record of copies Linux discarded when they were sent
+/// (`scheduler::discarded_at_send`, <https://github.com/rrnewton/hermit/issues/4293>).
+/// Reads, after the stop, the thread's queues and its mask, which decides
+/// whether a kept copy is requeued at the resume (`ptrace_signal`). `None`
+/// for a signal the record does not track, or a state that cannot be read,
+/// which changes nothing.
+fn consumed_signal_control(
+    pid: Pid,
+    tid: Pid,
+    signal: i32,
+    kept: bool,
+) -> Option<scheduler::discarded_at_send::DiscardedSignalControl> {
+    use scheduler::discarded_at_send::Consumption;
+    use scheduler::discarded_at_send::DiscardedSignalControl;
+    if !(1..32).contains(&signal) {
+        return None;
+    }
+    let state = syscalls::read_kernel_signal_state(pid, tid).ok()?;
+    let bit = scheduler::kernel_signal_bit(signal);
+    let how = if kept {
+        Consumption::KeptResume {
+            blocked: state.blocked & bit != 0,
+        }
+    } else {
+        Consumption::Dropped
+    };
+    Some(DiscardedSignalControl::Consumed {
+        signal,
+        how,
+        thread_holds: state.thread_pending & bit != 0,
+        process_holds: state.shared_pending & bit != 0,
+    })
+}
+
 fn is_root_thread_start(is_root_process: bool, dettid: DetTid, detpid: DetPid) -> bool {
     is_root_process && dettid == detpid
 }
@@ -2273,6 +2309,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         let delivered = self
             .handle_inbound_signal(guest, SigWrapper::from(signal))
             .await?;
+        if scheduler::discarded_at_send::records(&self.cfg)
+            && let Some(control) = consumed_signal_control(
+                guest.pid(),
+                guest.tid(),
+                signal as i32,
+                delivered.is_some(),
+            )
+        {
+            tool_global::discarded_signal(guest, control).await;
+        }
         Ok(delivered.map(|_| signal))
     }
 
@@ -2295,68 +2341,94 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     /// sends itself (`scheduler::child_exit_sigchld`). A copy the scheduler
     /// sent is kept, with the siginfo the tracer gave it: this hook cannot
     /// replace it.
+    ///
+    /// Either way, the scheduler's record of copies Linux discarded when they
+    /// were sent learns what became of the copy (`consumed_signal_control`,
+    /// <https://github.com/rrnewton/hermit/issues/4293>).
     async fn filter_unreported_signal<R: GlobalRPC<Self::GlobalState>>(
         &self,
         rpc: &R,
         unreported: reverie::UnreportedSignal,
     ) -> bool {
-        // The test-only claim fault drops the claimed copy here too, where a
-        // relative `nanosleep`'s restart code makes the backend pass it on
-        // unreported (`syscalls::signal::take_claim_fault`).
-        if unreported.signal() == Signal::SIGCHLD
-            && crate::syscalls::take_claim_fault(crate::syscalls::ClaimFault::DropClaimed)
-        {
-            warn!(
-                "[tid {}] claim fault hook: dropped the claimed SIGCHLD",
-                unreported.tid()
-            );
-            return false;
-        }
-        if unreported.signal() != Signal::SIGCHLD
-            || !self.cfg.backend.reports_child_exit_publication
-        {
-            return true;
-        }
-        let Some(info) = unreported.siginfo() else {
-            return true;
-        };
-        let tid = DetTid::from_raw(unreported.tid().as_raw());
-        // Passed on unreported, a kept copy makes no `InboundSignal` request.
-        match scheduler::child_exit_sigchld::control_for(&info, std::process::id(), false) {
-            None => true,
-            Some(control) => {
-                use scheduler::child_exit_sigchld::ChildExitSigchldAnswer;
-                use scheduler::child_exit_sigchld::OwnCopy;
-                // The control message carries no logical time; the scheduler answers
-                // it before any clock accounting.
-                let (_, response) = rpc
-                    .send_rpc((
-                        DetTime::default(),
-                        MmId::initial(tid),
-                        tool_global::GlobalRequest::ChildExitSigchld(control),
-                    ))
-                    .await;
-                match response {
-                    tool_global::GlobalResponse::ChildExitSigchld(
-                        ChildExitSigchldAnswer::Claimed(dropped),
-                    ) => !dropped,
-                    tool_global::GlobalResponse::ChildExitSigchld(
-                        ChildExitSigchldAnswer::OwnCopy(OwnCopy::Duplicate),
-                    ) => false,
-                    tool_global::GlobalResponse::ChildExitSigchld(
-                        ChildExitSigchldAnswer::OwnCopy(OwnCopy::Deliver(own))
-                        | ChildExitSigchldAnswer::ClaimedFor(own),
-                    ) => {
-                        warn!(
-                            "[dtid {}] the SIGCHLD for child {} passed on unreported keeps its delivered siginfo",
-                            tid, own.pid
-                        );
-                        true
+        let kept = async {
+            // The test-only claim fault drops the claimed copy here too, where a
+            // relative `nanosleep`'s restart code makes the backend pass it on
+            // unreported (`syscalls::signal::take_claim_fault`).
+            if unreported.signal() == Signal::SIGCHLD
+                && crate::syscalls::take_claim_fault(crate::syscalls::ClaimFault::DropClaimed)
+            {
+                warn!(
+                    "[tid {}] claim fault hook: dropped the claimed SIGCHLD",
+                    unreported.tid()
+                );
+                return false;
+            }
+            if unreported.signal() != Signal::SIGCHLD
+                || !self.cfg.backend.reports_child_exit_publication
+            {
+                return true;
+            }
+            let Some(info) = unreported.siginfo() else {
+                return true;
+            };
+            let tid = DetTid::from_raw(unreported.tid().as_raw());
+            // Passed on unreported, a kept copy makes no `InboundSignal` request.
+            match scheduler::child_exit_sigchld::control_for(&info, std::process::id(), false) {
+                None => true,
+                Some(control) => {
+                    use scheduler::child_exit_sigchld::ChildExitSigchldAnswer;
+                    use scheduler::child_exit_sigchld::OwnCopy;
+                    // The control message carries no logical time; the scheduler answers
+                    // it before any clock accounting.
+                    let (_, response) = rpc
+                        .send_rpc((
+                            DetTime::default(),
+                            MmId::initial(tid),
+                            tool_global::GlobalRequest::ChildExitSigchld(control),
+                        ))
+                        .await;
+                    match response {
+                        tool_global::GlobalResponse::ChildExitSigchld(
+                            ChildExitSigchldAnswer::Claimed(dropped),
+                        ) => !dropped,
+                        tool_global::GlobalResponse::ChildExitSigchld(
+                            ChildExitSigchldAnswer::OwnCopy(OwnCopy::Duplicate),
+                        ) => false,
+                        tool_global::GlobalResponse::ChildExitSigchld(
+                            ChildExitSigchldAnswer::OwnCopy(OwnCopy::Deliver(own))
+                            | ChildExitSigchldAnswer::ClaimedFor(own),
+                        ) => {
+                            warn!(
+                                "[dtid {}] the SIGCHLD for child {} passed on unreported keeps its delivered siginfo",
+                                tid, own.pid
+                            );
+                            true
+                        }
+                        _ => true,
                     }
-                    _ => true,
                 }
             }
+
         }
+        .await;
+        if scheduler::discarded_at_send::records(&self.cfg)
+            && let Some(control) = consumed_signal_control(
+                unreported.pid(),
+                unreported.tid(),
+                unreported.signal() as i32,
+                kept,
+            )
+        {
+            let tid = DetTid::from_raw(unreported.tid().as_raw());
+            // Carries no logical time; answered before any clock accounting.
+            rpc.send_rpc((
+                DetTime::default(),
+                MmId::initial(tid),
+                tool_global::GlobalRequest::DiscardedSignal(control),
+            ))
+            .await;
+        }
+        kept
     }
 
     fn init_thread_state(

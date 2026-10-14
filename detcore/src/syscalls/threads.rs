@@ -789,18 +789,25 @@ pub(crate) fn futex_wait_held_after_wake(
 /// it never saw this wait, so only this check can. `/proc` cannot tell it from
 /// a copy a host-timed source posted, so its bit only prompts the question
 /// (https://github.com/rrnewton/hermit/issues/4132).
+///
+/// A pending copy Linux discarded when it was sent does not end the wait,
+/// whatever handler exists now: the scheduler's record of such copies
+/// (`DiscardedSignalControl::Bits`) is subtracted, per queue, from every
+/// signal (`without_discarded`,
+/// <https://github.com/rrnewton/hermit/issues/4293>).
 pub(crate) async fn futex_wait_pending_signals<G, T>(
     guest: &mut G,
     state: &KernelSignalState,
     interrupting: KernelSigset,
     held: KernelSigset,
     host_timed: KernelSigset,
+    committed: KernelSigset,
 ) -> KernelSigset
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    let pending = interrupting & !held;
+    let pending = without_discarded(guest, state, interrupting & !held, committed).await;
     let sigchld = kernel_sigset_bit(libc::SIGCHLD) & !host_timed;
     if pending == 0
         && interrupting & state.thread_pending & held & sigchld != 0
@@ -816,6 +823,46 @@ where
         return sigchld;
     }
     pending
+}
+
+/// `pending`, a set of this thread's pending signals, without each one whose
+/// only pending copies Linux discarded when they were sent, as the scheduler
+/// recorded them (`scheduler::discarded_at_send`). Asks the scheduler only
+/// when such a signal could be there.
+///
+/// No signal is exempt, not even one the wake's answer names: that answer
+/// carries the drain's batch too, whose copy a sender may have flushed
+/// (`SIG_IGN`) and sent again, discarded, before this check; Linux then has
+/// no copy to deliver (the Claude re-check of the R2b-1 design, R4-1,
+/// https://github.com/rrnewton/hermit/issues/4273). A copy the scheduler
+/// itself sent kept clears its bit, so applying the record to it changes
+/// nothing. `committed` is kept for the callers' hold and is not used here.
+pub(crate) async fn without_discarded<G, T>(
+    guest: &mut G,
+    state: &KernelSignalState,
+    pending: KernelSigset,
+    committed: KernelSigset,
+) -> KernelSigset
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    use crate::scheduler::discarded_at_send::DiscardedSignalAnswer;
+    use crate::scheduler::discarded_at_send::DiscardedSignalControl;
+    use crate::scheduler::discarded_at_send::STANDARD_SIGNALS;
+    let _ = committed;
+    if pending & STANDARD_SIGNALS == 0
+        || !crate::scheduler::discarded_at_send::records(guest.config())
+    {
+        return pending;
+    }
+    let DiscardedSignalAnswer::Bits { thread, process } =
+        crate::tool_global::discarded_signal(guest, DiscardedSignalControl::Bits).await
+    else {
+        return pending;
+    };
+    let kept = (state.thread_pending & !thread) | (state.shared_pending & !process);
+    pending & kept
 }
 
 /// The one-bit kernel sigset for `raw_signal` (1-based), or 0 when out of range.
@@ -923,7 +970,15 @@ impl KernelSignalState {
     /// unblocked. Under ptrace the kernel queues even these for the tracer, so
     /// the pending set alone does not show the discard.
     pub(crate) fn discarded_at_generation(&self) -> KernelSigset {
-        (self.ignored | (default_ignored_signals() & !self.caught)) & !self.blocked
+        self.ignored_at_generation() & !self.blocked
+    }
+
+    /// The signals [`discarded_at_generation`](Self::discarded_at_generation)
+    /// names, before the mask: those set to `SIG_IGN`, and the default-ignored
+    /// ones with no handler. A caller that knows a better mask than `SigBlk`
+    /// (`scheduler::discarded_at_send`) applies its own.
+    pub(crate) fn ignored_at_generation(&self) -> KernelSigset {
+        self.ignored | (default_ignored_signals() & !self.caught)
     }
 
     /// The job-control stop signals `SIGTSTP`, `SIGTTIN`, and `SIGTTOU` whose
@@ -2489,16 +2544,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                             // wait for its deadline (`KernelSignalState::interrupting_wait`).
                             let defers_default_stops = call.restart_keeps_deadline();
                             let host_timed = host_timed_signals(guest).await;
-                            let held = futex_wait_held_after_wake(
-                                host_timed,
-                                std::mem::take(&mut committed_wake),
-                            );
+                            let committed = std::mem::take(&mut committed_wake);
+                            let held = futex_wait_held_after_wake(host_timed, committed);
                             let pending = futex_wait_pending_signals(
                                 guest,
                                 &state,
                                 state.pending_interrupting(state.blocked, defers_default_stops),
                                 held,
                                 host_timed,
+                                committed,
                             )
                             .await;
                             if pending != 0 {

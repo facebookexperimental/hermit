@@ -1441,6 +1441,23 @@ impl TimeoutableSyscall for reverie::syscalls::EpollPwait {
     }
 }
 
+/// Whether the copy of the standard `signal` this thread just took
+/// (`rt_sigtimedwait`, a signalfd record) is one Linux discarded when it was
+/// sent, as the scheduler recorded it; the record forgets it either way
+/// (`DiscardedSignalControl::Take`).
+pub(crate) async fn take_was_discarded<T, G>(guest: &mut G, signal: i32) -> bool
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    use crate::scheduler::discarded_at_send::DiscardedSignalAnswer;
+    use crate::scheduler::discarded_at_send::DiscardedSignalControl;
+    matches!(
+        crate::tool_global::discarded_signal(guest, DiscardedSignalControl::Take { signal }).await,
+        DiscardedSignalAnswer::Discarded(true)
+    )
+}
+
 async fn zero_timespec<'stack, T: RecordOrReplay, G: Guest<Detcore<T>>>(
     guest: &mut G,
 ) -> (Addr<'stack, Timespec>, <G::Stack as Stack>::StackGuard) {

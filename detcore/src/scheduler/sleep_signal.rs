@@ -129,7 +129,14 @@ impl Scheduler {
     /// sleep and decides like any other signal, from the record, not from
     /// `/proc` (<https://github.com/rrnewton/hermit/issues/4132>).
     pub(super) fn private_sigchld(&self, dettid: DetTid) -> u64 {
-        if self.child_exit_sigchld.private_sent.contains(&dettid) {
+        // A copy Linux discarded when it was sent is not counted
+        // (<https://github.com/rrnewton/hermit/issues/4293>).
+        if self.child_exit_sigchld.private_sent.contains(&dettid)
+            && !self.discarded_at_send.is_discarded(
+                super::discarded_at_send::QueueId::Thread(dettid),
+                libc::SIGCHLD,
+            )
+        {
             kernel_signal_bit(libc::SIGCHLD) & !self.host_timed_signals(dettid)
         } else {
             0

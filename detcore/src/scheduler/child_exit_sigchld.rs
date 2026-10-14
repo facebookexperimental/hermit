@@ -1056,7 +1056,14 @@ impl Scheduler {
         if !self.models_signal_targets {
             return true;
         }
-        if self.child_exit_sigchld.private_sent.contains(&dtid) {
+        // A private copy counts unless Linux discarded it when it was sent
+        // (<https://github.com/rrnewton/hermit/issues/4293>).
+        if self.child_exit_sigchld.private_sent.contains(&dtid)
+            && !self.discarded_at_send.is_discarded(
+                super::discarded_at_send::QueueId::Thread(dtid),
+                libc::SIGCHLD,
+            )
+        {
             return true;
         }
         let parent = self.sigchld_process(dtid);

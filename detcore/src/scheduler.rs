@@ -9,6 +9,7 @@
 //! Deterministic scheduling algorithm.
 
 pub(crate) mod child_exit_sigchld;
+pub(crate) mod discarded_at_send;
 #[cfg(test)]
 pub(crate) mod exec_teardown_tests;
 pub(crate) mod itimer_coalesce;
@@ -1519,6 +1520,15 @@ pub struct Scheduler {
     /// child-exit publication, where the scheduler and the kernel both send a
     /// `SIGCHLD` (`child_exit_sigchld`).
     child_exit_sigchld: child_exit_sigchld::ChildExitSigchldLedger,
+
+    /// Which pending standard signals Linux discarded when they were sent
+    /// (`discarded_at_send`, <https://github.com/rrnewton/hermit/issues/4293>).
+    discarded_at_send: discarded_at_send::DiscardedAtSend,
+
+    /// Each POSIX timer's arming generation, by process and kernel timer id
+    /// (`posix_timer_arm_generation`). Written only by `register_posix_timer`
+    /// and dropped with the process; read only through that accessor.
+    posix_timer_arm_generations: BTreeMap<(DetPid, i32), u64>,
 
     /// The mask Linux's `blocked` holds for each thread whose kernel `SigBlk`
     /// does not show it: the guest's own mask while Detcore holds the thread
@@ -3506,6 +3516,8 @@ impl Scheduler {
             child_exit_publications_pending: Default::default(),
             child_exit_publications_completed: Default::default(),
             child_exit_sigchld: Default::default(),
+            discarded_at_send: Default::default(),
+            posix_timer_arm_generations: Default::default(),
             saved_guest_sigmasks: Default::default(),
             pending_real_time_expirations: Default::default(),
             sending_child_exit: None,
@@ -4235,6 +4247,8 @@ impl Scheduler {
         self.release_vfork_child(*dtid);
         self.vfork_registration_origins.remove(dtid);
         self.saved_guest_sigmasks.remove(dtid);
+        self.discarded_at_send
+            .retire(discarded_at_send::QueueId::Thread(*dtid));
         // Its private queue dies with it, and so does a raw-exit status its
         // grant never settled (a thread killed between its report and its
         // grant).
@@ -4334,6 +4348,10 @@ impl Scheduler {
             // A dying process discards its pending signals.
             self.pending_real_time_expirations.remove(detpid);
             self.child_exit_sigchld.forget_process(*detpid);
+            self.discarded_at_send
+                .retire(discarded_at_send::QueueId::Process(*detpid));
+            self.posix_timer_arm_generations
+                .retain(|(owner, _), _| owner != detpid);
             self.process_timer_copies
                 .retain(|(owner, _), _| owner != detpid);
         }
@@ -4696,6 +4714,7 @@ impl Scheduler {
         // The caller's own queue survives under the leader's tid; the
         // leader's went with the leader (`logically_kill_thread` above).
         self.transfer_thread_timer_copies(caller, new_leader);
+        self.discarded_at_send.rekey_thread(caller, new_leader);
 
         let survivor_priority = match replay_resume {
             Some((next_tid, _)) if next_tid == new_leader => REPLAY_FOREGROUND_PRIORITY,
@@ -6716,6 +6735,25 @@ impl Scheduler {
         sig: Signal,
         info: Option<[u8; 128]>,
     ) -> bool {
+        self.fire_process_alarm(dpid, dtid, sig, info, None)
+    }
+
+    /// The one body of every scheduler send of a process-directed timer
+    /// signal (`fire_alarm_with`, `fire_posix_timer_alarm`), so that both
+    /// keep the shared-queue record (`note_signal_left_in_shared_queue`): a
+    /// `SIGEV_SIGNAL` timer that once copied this body without it left a
+    /// later `sigsuspend` unarmed behind a spinner (the Claude re-check of
+    /// https://github.com/rrnewton/hermit/pull/4351, N1). `producer` names a
+    /// periodic POSIX timer whose discarded expiry is parked
+    /// (`DiscardedAtSend::unignore`).
+    fn fire_process_alarm(
+        &mut self,
+        dpid: DetPid,
+        dtid: DetTid,
+        sig: Signal,
+        info: Option<[u8; 128]>,
+        producer: Option<discarded_at_send::TimerProducer>,
+    ) -> bool {
         // A guest-handled SIGALRM goes to the process's ledger, not the kernel.
         if self.divert_sigalrm(dpid, sig) {
             return false;
@@ -6733,7 +6771,10 @@ impl Scheduler {
                 self.kernel_signal_target(dpid, target, sig as libc::c_int)
                     .is_none()
             });
-        let sent = self.fire_alarm_at(dpid, target, sig, info);
+        // Linux classifies the send against the leader, whatever thread
+        // takes it: `it_real_fn` sends to the leader's pid, and a
+        // `SIGEV_SIGNAL` timer to the leader (`posixtimer_get_target`).
+        let sent = self.fire_alarm_at(dpid, target, sig, info, dpid, producer);
         if sent && every_thread_blocks {
             self.note_signal_left_in_shared_queue(dpid, sig as libc::c_int);
         }
@@ -6931,12 +6972,18 @@ impl Scheduler {
         }
     }
 
+    /// Send `sig` to `target` of `dpid`, classified against `named`, the task
+    /// Linux names (`discarded_when_sent_to`), never inferred from `target`,
+    /// which may be a thread Hermit chose. `producer`: the periodic POSIX timer
+    /// sending it.
     fn fire_alarm_at(
         &mut self,
         dpid: DetPid,
         target: Option<DetTid>,
         sig: Signal,
         info: Option<[u8; 128]>,
+        named: DetTid,
+        producer: Option<discarded_at_send::TimerProducer>,
     ) -> bool {
         let Some(target) = target else {
             info!(
@@ -6949,7 +6996,7 @@ impl Scheduler {
             "[dtid {}] Alarm fired, delivering signal {} to guest.",
             target, sig
         );
-        self.signal_guest(target, sig, info);
+        self.send_guest_signal(target, sig, None, info, named, producer);
         true
     }
 
@@ -6961,7 +7008,13 @@ impl Scheduler {
     /// host-timed signal could change it. A copy already there means the send
     /// merged: into this timer's own earlier copy, whose entry stays, or into
     /// another sender's, which Linux keeps beside the timer's and exec keeps.
-    fn fire_process_timer(&mut self, process: DetPid, tid: DetTid, sig: Signal) {
+    fn fire_process_timer(
+        &mut self,
+        process: DetPid,
+        tid: DetTid,
+        sig: Signal,
+        producer: Option<discarded_at_send::TimerProducer>,
+    ) {
         // Only where the scheduler models signal targets (ptrace) is a
         // thread's `/proc` view its DetTid's.
         if !self.models_signal_targets {
@@ -6973,13 +7026,19 @@ impl Scheduler {
         // The shared queue is the process's: read it through any live thread,
         // not the arming one, which may have exited (Codex review of
         // https://github.com/rrnewton/hermit/pull/4203).
+        // A pending copy Linux discarded when it was sent is not one the
+        // timer's merges into (<https://github.com/rrnewton/hermit/issues/4293>).
+        let discarded = self
+            .discarded_at_send
+            .discarded(discarded_at_send::QueueId::Process(process));
         let pending = self
             .process_signal_targets(process)
             .into_iter()
             .next()
-            .and_then(|reader| self.read_shared_pending(reader));
+            .and_then(|reader| self.read_shared_pending(reader))
+            .map(|pending| pending & !discarded);
         self.guest_send_landed = None;
-        if !self.fire_alarm_with(process, tid, sig, None) {
+        if !self.fire_posix_timer_alarm(process, tid, sig, producer) {
             return;
         }
         // Rule 4: a scheduler send of SIGALRM into the shared queue gives a
@@ -6997,6 +7056,19 @@ impl Scheduler {
             && self.process_signal_consumption_is_observed(process, bit);
         TIMER_COPIES_RECORDED.store(true, std::sync::atomic::Ordering::SeqCst);
         self.process_timer_copies.insert((process, signo), observed);
+    }
+
+    /// [`Self::fire_alarm_with`] for an expiration of a `SIGEV_SIGNAL` POSIX
+    /// timer, which names the leader and, when periodic, is the producer of a
+    /// discarded copy (`DiscardedAtSend::unignore`).
+    fn fire_posix_timer_alarm(
+        &mut self,
+        process: DetPid,
+        tid: DetTid,
+        sig: Signal,
+        producer: Option<discarded_at_send::TimerProducer>,
+    ) -> bool {
+        self.fire_process_alarm(process, tid, sig, None, producer)
     }
 
     /// Whether every consumption of a shared-queue copy of the signal `bit`
@@ -7247,7 +7319,8 @@ impl Scheduler {
             self.thread_timer_copies.remove(&(thread, signo));
             self.unproven_thread_timer_copies.insert((thread, signo));
         }
-        self.send_guest_signal(thread, sig, Some(process), None);
+        let producer = self.posix_timer_producer(id);
+        self.send_guest_signal(thread, sig, Some(process), None, thread, producer);
     }
 
     /// Whether timer `id`'s expiration can be sent to `thread` as signal
@@ -7263,8 +7336,14 @@ impl Scheduler {
         sig: Signal,
     ) -> ThreadTimerSend {
         let signo = sig as libc::c_int;
+        // A pending copy Linux discarded when it was sent is not one: the
+        // timer's copy is the only one Linux would hold
+        // (<https://github.com/rrnewton/hermit/issues/4293>).
+        let discarded = self
+            .discarded_at_send
+            .discarded(discarded_at_send::QueueId::Thread(thread));
         let pending = match self.read_sleeper_signal_state(thread) {
-            Ok(state) => state.thread_pending,
+            Ok(state) => state.thread_pending & !discarded,
             Err(_) => {
                 return ThreadTimerSend::Refuse(
                     "(its pending signals could not be read)".to_owned(),
@@ -7864,8 +7943,9 @@ impl Scheduler {
     /// continuation RPC becomes visible; other backends retain their existing immediate requeue.
     /// `info`, when there is one, is the raw siginfo sent in place of the
     /// kernel's `SI_USER` (it must carry a negative `si_code`).
+    #[cfg(test)]
     fn signal_guest(&mut self, dettid: DetTid, signal: Signal, info: Option<[u8; 128]>) {
-        self.send_guest_signal(dettid, signal, None, info);
+        self.send_guest_signal(dettid, signal, None, info, dettid, None);
     }
 
     /// [`Self::signal_guest`], or with `thread_of: Some(process)` a
@@ -7877,12 +7957,19 @@ impl Scheduler {
     /// left in the shared queue (`undelivered_scheduler_signals`): a
     /// thread-directed one waits in its thread's own queue, where the sender's
     /// check of its own pending set sees it.
+    ///
+    /// The send is classified against `named`, the task Linux names
+    /// (`discarded_when_sent_to`), and recorded once it succeeds
+    /// (`discard_note_send`), with `producer`, the periodic POSIX timer sending
+    /// it. A discarded send commits no wake (`wake_signaled_guest_as`).
     fn send_guest_signal(
         &mut self,
         dettid: DetTid,
         signal: Signal,
         thread_of: Option<DetPid>,
         info: Option<[u8; 128]>,
+        named: DetTid,
+        producer: Option<discarded_at_send::TimerProducer>,
     ) {
         debug!(
             "[dtid {}] deliver signal {} physically to guest thread.",
@@ -7893,6 +7980,15 @@ impl Scheduler {
             self.guest_send_landed = Some(true);
             return;
         }
+        // A thread's pidfd sends thread-directed either way.
+        let queue = if thread_of.is_some() || self.physical_thread_pidfds.contains_key(&dettid) {
+            discarded_at_send::QueueId::Thread(dettid)
+        } else {
+            discarded_at_send::QueueId::Process(self.sigchld_process(dettid))
+        };
+        let token = self
+            .models_signal_targets
+            .then(|| self.discard_pre_send(named, queue, signal as libc::c_int, None));
         // Whether a SIGCHLD is already pending in the shared queue, read before
         // the send: no guest thread holds the turn at a committed send, so
         // only a host-timed copy could change it (`fire_process_timer`).
@@ -7961,6 +8057,11 @@ impl Scheduler {
             let pid = Pid::from_raw(dettid.as_raw()); // TODO(T78538674): virtualize pid/tid:
             signal::kill(pid, signal)
         };
+        if result.is_ok()
+            && let Some(token) = token
+        {
+            self.discard_note_send(token, producer);
+        }
         match result {
             Ok(()) if thread_of.is_none() => {
                 if !self.note_group_send(dettid, signal, sigchld_pending_before) {
@@ -8000,8 +8101,15 @@ impl Scheduler {
             }
             Err(errno) => panic!("signal::kill to go through, got {errno}"),
         }
+        let discarded = token.is_some_and(|token| token.discarded);
+        if discarded {
+            info!(
+                "[dtid {}] signal {} is one Linux discards as sent to {}; committing no wake.",
+                dettid, signal, named
+            );
+        }
         self.guest_send_landed = Some(true);
-        self.wake_signaled_guest(dettid, signal);
+        self.wake_signaled_guest_as(dettid, signal, discarded);
     }
 
     /// Record a process-directed `signal` the scheduler just sent `dettid`
@@ -8126,6 +8234,25 @@ impl Scheduler {
     /// `nix`'s `Signal` cannot name, arms and notes a thread like a standard one
     /// (<https://github.com/rrnewton/hermit/issues/3941>).
     fn wake_signaled_guest(&mut self, dettid: DetTid, signal: impl Into<SigWrapper>) {
+        self.wake_signaled_guest_as(dettid, signal, false);
+    }
+
+    /// [`Self::wake_signaled_guest`] for a send Linux `discarded`
+    /// (`discarded_when_sent_to`): every branch that commits an
+    /// `InboundSignal`, or counts the signal as committed, is skipped (an
+    /// internal-IO poll, a queued sleep and its `woken_sleeps`, a drain-woken
+    /// futex waiter's `scheduler_sent`, a parked futex waiter, whatever its own
+    /// filter says, and a parked sleep or `waitid`). The physical copy still
+    /// wakes a thread blocked outside the schedule or in a filed
+    /// `rt_sigsuspend`, so `note_signaled_sigsuspend_request` and
+    /// `arm_signaled_background` still fix where its continuation rejoins
+    /// (<https://github.com/rrnewton/hermit/issues/4293>).
+    fn wake_signaled_guest_as(
+        &mut self,
+        dettid: DetTid,
+        signal: impl Into<SigWrapper>,
+        discarded: bool,
+    ) {
         let signal = signal.into();
         if self.in_guest_fatal_alarm_pending(dettid) {
             return;
@@ -8208,7 +8335,7 @@ impl Scheduler {
                 "signal_guest: thread should be parked in the scheduler"
             );
         }
-        if await_external_continuation {
+        if await_external_continuation || discarded {
             return;
         }
 
@@ -9002,13 +9129,24 @@ impl Scheduler {
         if !self.models_signal_targets {
             let target = self.select_signal_target(parent, Some(creator));
             return self
-                .fire_alarm_at(parent, target, sig, info)
+                .fire_alarm_at(parent, target, sig, info, creator, None)
                 .then_some(target)?;
         }
         let every_thread_blocks = self.kernel_sigchld_target(parent, creator).is_none();
         let target = self.child_exit_sigchld_target(parent, creator);
         let target = self.live_signal_target(parent, Some(target));
-        let sent = self.fire_alarm_at(parent, target, sig, info);
+        // Linux names the parent task (`do_notify_parent`): the creator, or,
+        // once it exited, the first live thread of its process, which took
+        // over its children (`forget_original_parent`, `find_alive_thread`).
+        let named = if self.next_turns.contains_key(&creator) {
+            creator
+        } else {
+            self.process_signal_targets(parent)
+                .into_iter()
+                .next()
+                .unwrap_or(creator)
+        };
+        let sent = self.fire_alarm_at(parent, target, sig, info, named, None);
         if sent && every_thread_blocks {
             self.note_signal_left_in_shared_queue(parent, libc::SIGCHLD);
         }
@@ -9109,7 +9247,11 @@ impl Scheduler {
     /// and a sleep on its request alone; the drain, the commit point, decides
     /// on the rest.
     pub(crate) fn notify_signal_pending(&mut self, dettid: DetTid, signal: SigWrapper) {
-        if self.waitid_signal_request(dettid).is_some()
+        // A waitid wait is decided here too, in the sender's turn: its drain
+        // works from a list with no queue identity (Claude N7 of
+        // <https://github.com/rrnewton/hermit/issues/4293>).
+        if (self.waitid_signal_request(dettid).is_some()
+            && !self.discarded_when_sent(dettid, signal))
             || self.restartable_internal_io_signals(dettid).is_some()
             || (self
                 .parked_futex_unblocked_signals(dettid)
@@ -9135,23 +9277,44 @@ impl Scheduler {
     /// https://github.com/rrnewton/hermit/pull/4290: a default SIGCHLD, then a
     /// handler, ended a futex wait with EINTR where Linux returns 0). A state
     /// that cannot be read is not discarded, and the drain decides.
+    ///
+    /// The sender recorded its send's fate in its turn, before this
+    /// (`discarded_at_send`), against the mask and dispositions Linux reads.
+    /// So `signal` is discarded for `dettid` when the record marks a queue it
+    /// takes from and no queue it takes from holds a copy the record does not
+    /// mark. Only standard signals are recorded, and only where the scheduler
+    /// models signal targets; any other is never discarded here.
     fn discarded_when_sent(&self, dettid: DetTid, signal: SigWrapper) -> bool {
-        let bit = kernel_signal_bit(signal.raw());
-        let Some(watch) = self
-            .parked_futex_waiter(dettid)
-            .and_then(|waiter| waiter.signal_watch)
-        else {
+        let bit = kernel_signal_bit(signal.raw()) & discarded_at_send::STANDARD_SIGNALS;
+        let (thread_bits, process_bits) = self.discarded_bits(dettid);
+        if (thread_bits | process_bits) & bit == 0 {
+            return false;
+        }
+        let state = {
+            #[cfg(test)]
+            {
+                self.test_kernel_signal_states.get(&dettid).copied()
+            }
+            #[cfg(not(test))]
+            {
+                None
+            }
+        };
+        let state = state.or_else(|| {
+            let (pid, tid) = match self
+                .parked_futex_waiter(dettid)
+                .and_then(|waiter| waiter.signal_watch)
+            {
+                Some(watch) => (watch.pid, watch.tid),
+                None => (self.sigchld_process(dettid).as_raw(), dettid.as_raw()),
+            };
+            read_kernel_signal_state(reverie::Pid::from_raw(pid), reverie::Pid::from_raw(tid)).ok()
+        });
+        let Some(state) = state else {
             return false;
         };
-        #[cfg(test)]
-        if let Some(state) = self.test_kernel_signal_states.get(&dettid) {
-            return state.discarded_at_generation() & bit != 0;
-        }
-        read_kernel_signal_state(
-            reverie::Pid::from_raw(watch.pid),
-            reverie::Pid::from_raw(watch.tid),
-        )
-        .is_ok_and(|state| state.discarded_at_generation() & bit != 0)
+        let kept = (state.thread_pending & !thread_bits) | (state.shared_pending & !process_bits);
+        kept & bit == 0
     }
 
     /// Whether `dettid` sleeps in a real `rt_sigsuspend` outside the run queue
@@ -12933,6 +13096,13 @@ impl Scheduler {
         interval: LogicalTime,
         sig: timed_waiters::TimerSignal,
     ) {
+        // Every set, arming or disarming, and the delete, which comes here
+        // with no deadline, makes an earlier expiry stale
+        // (`posix_timer_arm_generation`).
+        *self
+            .posix_timer_arm_generations
+            .entry((detpid, timer_id))
+            .or_default() += 1;
         if let Some(deadline) = deadline {
             self.blocked
                 .timed_waiters
@@ -12942,6 +13112,27 @@ impl Scheduler {
                 .timed_waiters
                 .remove_posix_timer(detpid, timer_id);
         }
+    }
+
+    /// The arming generation of POSIX timer `timer_id` of `detpid`: how many
+    /// times it has been set, by `timer_settime` (arming, rearming or
+    /// disarming) or `timer_delete`, each of which reaches
+    /// `register_posix_timer`; 0 for a timer never set. It is Linux's
+    /// `it_signal_seq`, which `do_timer_settime` bumps so that an expiry queued
+    /// before the set is dropped as stale at dequeue (kernel/time/posix-timers.c).
+    /// An expiry recorded with a generation older than this one is stale. A
+    /// process's generations are dropped when it is retired, so a reused
+    /// timer id starts again at 0 in a new process.
+    ///
+    /// The one counter for every consumer that tells a current expiry from a
+    /// stale one: the discarded-at-send record's parked expiries
+    /// (`DiscardedAtSend::unignore`, <https://github.com/rrnewton/hermit/issues/4293>).
+    /// A later consumer should read this rather than keep a counter of its own.
+    pub(crate) fn posix_timer_arm_generation(&self, detpid: DetPid, timer_id: i32) -> u64 {
+        self.posix_timer_arm_generations
+            .get(&(detpid, timer_id))
+            .copied()
+            .unwrap_or(0)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -18006,9 +18197,13 @@ mod test {
     /// signal was recorded and the drain decided from the dispositions then).
     /// The drain still decides from the dispositions it reads for a signal it
     /// did record (`a_signal_caught_after_a_futex_wait_began_ends_it`).
+    ///
+    /// The sender records each send's fate in its turn, before it notifies
+    /// (`discarded_at_send`, <https://github.com/rrnewton/hermit/issues/4293>),
+    /// and the admission reads that record.
     #[test]
     fn a_parked_futex_waiter_is_admitted_on_its_mask_and_the_disposition_at_the_send() {
-        let mut scheduler = Scheduler::new(&Config::default());
+        let mut scheduler = gated_scheduler();
         let (target, futex) = parked_futex_target(&mut scheduler);
         scheduler.sleep_futex_waiter(
             &target,
@@ -18028,15 +18223,176 @@ mod test {
             ),
         );
 
-        scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR1));
-        scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR2));
-        scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGTERM));
+        for signal in [Signal::SIGUSR1, Signal::SIGUSR2, Signal::SIGTERM] {
+            record_guest_send(&mut scheduler, target, signal as i32);
+            scheduler.notify_signal_pending(target, SigWrapper::from(signal));
+        }
 
         assert_eq!(
             scheduler.pending_cross_task_signals.get(&target),
             Some(&vec![SigWrapper::from(Signal::SIGTERM)])
         );
         assert!(scheduler.is_parked_futex_waiter(target));
+    }
+
+    /// C1 of the Claude approval of the design of
+    /// https://github.com/rrnewton/hermit/issues/4293: a scheduler send Linux
+    /// discards commits nothing to a parked futex waiter, whatever that
+    /// branch's own filter says. SIGUSR1 at its default action to a PID
+    /// namespace's init is discarded (`SIGNAL_UNKILLABLE`), which
+    /// `parked_futex_interrupting_signals` does not model: it calls SIGUSR1
+    /// interrupting.
+    #[test]
+    fn a_discarded_scheduler_send_to_a_namespace_init_commits_no_futex_wake() {
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        let mut scheduler = gated_scheduler();
+        let (target, futex) = parked_futex_target(&mut scheduler);
+        scheduler.sleep_futex_waiter(&target, futex, None, u32::MAX, Some(signal_watch(usr1)));
+        scheduler
+            .test_kernel_signal_states
+            .insert(target, signal_state(0, 0));
+        assert!(!scheduler.discarded_when_sent_to(target, libc::SIGUSR1, None));
+        scheduler
+            .thread_tree
+            .mark_pid_namespace_init(DetPid::from_raw(target.as_raw()));
+        assert!(scheduler.discarded_when_sent_to(target, libc::SIGUSR1, None));
+        assert_eq!(
+            scheduler
+                .parked_futex_interrupting_signals(target, 0)
+                .map(|signals| signals & usr1),
+            Some(usr1),
+            "the branch's own filter would wake it"
+        );
+        scheduler.wake_signaled_guest_as(target, Signal::SIGUSR1, true);
+        assert!(scheduler.is_parked_futex_waiter(target));
+        assert!(scheduler.inbound_signals(target).is_empty());
+    }
+
+    /// R5-1 of the design review of https://github.com/rrnewton/hermit/issues/4293:
+    /// a discarded scheduler send skips only the branches that commit an
+    /// `InboundSignal`. The physical copy still wakes a thread asleep in a real
+    /// `rt_sigsuspend` whose mask admits it, so that thread is still armed for
+    /// the release barrier, which fixes where its continuation rejoins.
+    #[test]
+    fn a_discarded_scheduler_send_still_arms_a_thread_asleep_outside_the_schedule() {
+        let mut scheduler = gated_scheduler();
+        let (target, _) = parked_futex_target(&mut scheduler);
+        let op = ExternalOpId {
+            tid: target,
+            sequence: 1,
+        };
+        scheduler.blocked.rt_sigsuspend_blockers.insert(target, op);
+        scheduler
+            .blocked
+            .out_of_scheduler_masks
+            .insert(target, Some(0));
+        scheduler.wake_signaled_guest_as(target, Signal::SIGUSR1, true);
+        assert!(scheduler.blocked.signaled_background.contains(&target));
+    }
+
+    /// A discarded scheduler send commits no `InboundSignal` to a parked
+    /// sleep (R4-1 of the design review of
+    /// https://github.com/rrnewton/hermit/issues/4293): the sleep stays parked,
+    /// where a kept send of the same signal wakes it.
+    #[test]
+    fn a_discarded_scheduler_send_leaves_a_parked_sleep_parked() {
+        for discarded in [true, false] {
+            let mut scheduler = gated_scheduler();
+            let target = filed_sleep(&mut scheduler, LogicalTime::INDEFINITE, PAUSE_FYI, false);
+            scheduler.wake_signaled_guest_as(target, Signal::SIGUSR1, discarded);
+            if discarded {
+                assert!(scheduler.inbound_signals(target).is_empty());
+                assert!(!scheduler.run_queue.contains_tid(target));
+            } else {
+                assert_eq!(
+                    scheduler.inbound_signals(target),
+                    vec![SigWrapper::from(Signal::SIGUSR1)]
+                );
+            }
+        }
+    }
+
+    /// The mask that decides a discard is the first source present: the
+    /// guest's own mask while Detcore holds a private one, a parked futex
+    /// waiter's watch, the mask recorded for a thread asleep outside the
+    /// schedule (an unknown one decides nothing), then `SigBlk`. A task the
+    /// scheduler does not know, such as an exited leader whose frozen mask
+    /// Detcore never read, is not discarded
+    /// (https://github.com/rrnewton/hermit/issues/4293).
+    #[test]
+    fn the_discard_mask_takes_the_first_source_present() {
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        let mut scheduler = gated_scheduler();
+        let (target, futex) = parked_futex_target(&mut scheduler);
+        let mut state = signal_state(0, usr1);
+        state.blocked = usr1;
+        scheduler.test_kernel_signal_states.insert(target, state);
+        let discarded =
+            |scheduler: &Scheduler| scheduler.discarded_when_sent_to(target, libc::SIGUSR1, None);
+        assert!(!discarded(&scheduler), "SigBlk blocks it");
+        // A filed rt_sigsuspend's temporary mask decides before SigBlk.
+        let mut request = Resources::new(target);
+        request.insert(
+            ResourceID::BlockingRtSigsuspend(ExternalOpId::new(target, 1)),
+            Permission::RW,
+        );
+        request.blocked_signal_mask = Some(0);
+        scheduler.next_turns.get_mut(&target).unwrap().req = Ivar::full(Ok(request));
+        assert!(
+            discarded(&scheduler),
+            "the filed rt_sigsuspend's mask before SigBlk"
+        );
+        scheduler
+            .blocked
+            .out_of_scheduler_masks
+            .insert(target, Some(usr1));
+        assert!(
+            !discarded(&scheduler),
+            "the sleeping mask before the filed rt_sigsuspend's"
+        );
+        scheduler
+            .blocked
+            .out_of_scheduler_masks
+            .insert(target, Some(0));
+        assert!(discarded(&scheduler), "the sleeping mask before SigBlk");
+        scheduler
+            .blocked
+            .out_of_scheduler_masks
+            .insert(target, None);
+        assert!(!discarded(&scheduler), "an unknown sleeping mask");
+        scheduler.blocked.out_of_scheduler_masks.remove(&target);
+        scheduler.next_turns.get_mut(&target).unwrap().req = Ivar::new();
+        scheduler.sleep_futex_waiter(&target, futex, None, u32::MAX, Some(signal_watch(usr1)));
+        assert!(discarded(&scheduler), "the futex watch before SigBlk");
+        assert!(scheduler.set_saved_guest_sigmask(target, Some(usr1)));
+        assert!(!discarded(&scheduler), "the guest's own mask first");
+        assert!(!scheduler.discarded_when_sent_to(DetTid::from_raw(999), libc::SIGUSR1, None));
+    }
+
+    /// A send of SIGCONT flushes the stop signals from every queue of the
+    /// process, as `prepare_signal` does, so a discarded stop signal's bit
+    /// goes with it (https://github.com/rrnewton/hermit/issues/4293).
+    #[test]
+    fn a_sigcont_send_flushes_a_discarded_stop_signal() {
+        let tstp = kernel_signal_bit(libc::SIGTSTP);
+        let mut scheduler = gated_scheduler();
+        let (target, _) = parked_futex_target(&mut scheduler);
+        scheduler
+            .test_kernel_signal_states
+            .insert(target, signal_state(0, tstp));
+        record_guest_send(&mut scheduler, target, libc::SIGTSTP);
+        assert_eq!(scheduler.discarded_bits(target).0 & tstp, tstp);
+        record_guest_send(&mut scheduler, target, libc::SIGCONT);
+        assert_eq!(scheduler.discarded_bits(target).0 & tstp, 0);
+    }
+
+    /// Record a guest's thread-directed send of `signal` to `target` in the
+    /// discarded-at-send record, as its sender does in its turn
+    /// (`DiscardedSignalControl::PreSend`, then `Sent`).
+    fn record_guest_send(scheduler: &mut Scheduler, target: DetTid, signal: i32) {
+        let queue = discarded_at_send::QueueId::Thread(target);
+        let token = scheduler.discard_pre_send(target, queue, signal, Some(target));
+        scheduler.discard_note_send(token, None);
     }
 
     /// A signal ignored by default with no handler when it is sent (here a
@@ -18061,6 +18417,8 @@ mod test {
                     ChildExitSigchldControl::PrivateSent { target },
                 );
             }
+            // The sender records the send's fate in its turn.
+            record_guest_send(&mut scheduler, target, signal as libc::c_int);
             scheduler.notify_signal_pending(target, SigWrapper::from(signal));
             // The handler arrives after the send, before the drain.
             scheduler

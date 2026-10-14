@@ -2040,6 +2040,18 @@ impl GlobalState {
                 .child_exit_sigchld_control_for_receiver(dtid, control);
             return (None, R::ChildExitSigchld(answer));
         }
+        // A discarded-at-send record message
+        // (`scheduler::discarded_at_send`): like the child-exit ledger's, it
+        // carries no logical time and its answer carries none back. It records
+        // a send in the sender's own turn, or a consumption at a signal stop.
+        if let GlobalRequest::DiscardedSignal(control) = request {
+            let answer = self
+                .sched
+                .lock()
+                .unwrap()
+                .discarded_signal_control(dtid, control);
+            return (None, R::DiscardedSignal(answer));
+        }
         if let GlobalRequest::SignalDequeued {
             detpid,
             identity,
@@ -2268,6 +2280,9 @@ impl GlobalState {
             }
             GlobalRequest::ChildExitSigchld(_) => {
                 unreachable!("child-exit SIGCHLD control answered before clock accounting")
+            }
+            GlobalRequest::DiscardedSignal(_) => {
+                unreachable!("discarded-at-send control answered before clock accounting")
             }
             GlobalRequest::RecordDeterminismLoss(_) => {
                 unreachable!("determinism loss answered before clock accounting")
@@ -4952,6 +4967,10 @@ pub enum GlobalRequest {
     /// while its group lives on (`Scheduler::retire_exited_leader`).
     /// Appended after `ExecTimerFlush`, for the same reason.
     RetireExitedLeader,
+    /// A discarded-at-send record message (`scheduler::discarded_at_send`),
+    /// answered before any clock or scheduler accounting. Appended after
+    /// `RetireExitedLeader`, for the same reason.
+    DiscardedSignal(crate::scheduler::discarded_at_send::DiscardedSignalControl),
 }
 
 /// Responses from the global object
@@ -5095,6 +5114,8 @@ pub enum GlobalResponse {
     ExecTimerFlush(Result<crate::scheduler::ExecTimerFlush, String>),
     /// Appended after `ExecTimerFlush`, for the same reason.
     RetireExitedLeader(bool),
+    /// Appended after `RetireExitedLeader`, for the same reason.
+    DiscardedSignal(crate::scheduler::discarded_at_send::DiscardedSignalAnswer),
 }
 
 /// `request`, carrying the number of records this guest thread produced for
@@ -6666,6 +6687,24 @@ where
     let response = send_and_update_time(guest, GlobalRequest::ChildExitSigchld(control)).await;
     match response.1 {
         GlobalResponse::ChildExitSigchld(answer) => answer,
+        _ => unreachable!(),
+    }
+}
+
+/// The scheduler's answer to a discarded-at-send record message from the
+/// calling thread (`Scheduler::discarded_signal_control`). It carries no
+/// logical time either way.
+pub(crate) async fn discarded_signal<G, T>(
+    guest: &mut G,
+    control: crate::scheduler::discarded_at_send::DiscardedSignalControl,
+) -> crate::scheduler::discarded_at_send::DiscardedSignalAnswer
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::DiscardedSignal(control)).await;
+    match response.1 {
+        GlobalResponse::DiscardedSignal(answer) => answer,
         _ => unreachable!(),
     }
 }
