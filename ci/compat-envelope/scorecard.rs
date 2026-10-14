@@ -16323,6 +16323,10 @@ fn validate_scorecard_snapshot(
         "machine_shortname",
         "kernel_version",
         "host_capabilities",
+        // How the cell ran (`CellStrictness`, whose own deny_unknown_fields
+        // refuses an unknown key inside it). The series writer copies it from
+        // the cell's results row when the harness recorded one.
+        "strictness",
     ];
     let allowed_series_fields = SERIES_FIELDS.iter().copied().collect::<BTreeSet<_>>();
     let mut rows = Vec::with_capacity(snapshot.rows.len());
@@ -24735,6 +24739,56 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
             write_scorecard_snapshot_fixture(&row_snapshot_path, &row_snapshot_value)?;
         HeldScorecardSeriesSnapshot::open(&row_snapshot_path, &row_snapshot_sha)
             .map_err(|error| format!("valid row-bearing combined snapshot was refused: {error}"))?;
+
+        // A row whose series records how the cell ran is admitted, in the exact
+        // bytes the harness writes and the series writer copies: a timeslice in
+        // nanoseconds, and "disabled".
+        for (label, strictness, expected) in [
+            (
+                "nanoseconds",
+                r#"{"level":"strict","virtualize_cpuid":true,"max_timeslice":200000000,"capped":false}"#,
+                hermit_manifest_plan::runner::CellStrictness {
+                    level: hermit_manifest_plan::runner::StrictnessLevel::Strict,
+                    virtualize_cpuid: true,
+                    max_timeslice: hermit_manifest_plan::runner::MaxTimeslice::Nanoseconds(
+                        200_000_000,
+                    ),
+                    capped: false,
+                },
+            ),
+            (
+                "disabled",
+                r#"{"level":"relaxed","virtualize_cpuid":false,"max_timeslice":"disabled","capped":false}"#,
+                hermit_manifest_plan::runner::CellStrictness {
+                    level: hermit_manifest_plan::runner::StrictnessLevel::Relaxed,
+                    virtualize_cpuid: false,
+                    max_timeslice: hermit_manifest_plan::runner::MaxTimeslice::Disabled,
+                    capped: false,
+                },
+            ),
+        ] {
+            let mut with_strictness = row_snapshot_value.clone();
+            with_strictness["rows"][0]["series"]["strictness"] =
+                serde_json::from_str(strictness).map_err(|error| error.to_string())?;
+            let rows = with_strictness["rows"]
+                .as_array()
+                .ok_or("strictness snapshot fixture lost its rows array")?;
+            let parsed: SeriesRow =
+                serde_json::from_value(rows[0].clone()).map_err(|error| error.to_string())?;
+            if parsed.series.strictness != Some(expected) {
+                return Err(format!(
+                    "series strictness {label} parsed as {:?}",
+                    parsed.series.strictness
+                ));
+            }
+            let rows_sha256 = format!("{:x}", Sha256::digest(canonical_snapshot_rows_bytes(rows)?));
+            with_strictness["rows_sha256"] = JsonValue::String(rows_sha256);
+            let path = snapshot_root.join(format!("with-strictness-{label}.json"));
+            let sha = write_scorecard_snapshot_fixture(&path, &with_strictness)?;
+            HeldScorecardSeriesSnapshot::open(&path, &sha).map_err(|error| {
+                format!("combined snapshot refused a row with series strictness ({label}): {error}")
+            })?;
+        }
 
         // Both digests must match the ambiguous original bytes, so rejection tests
         // duplicate-field validation rather than an unrelated checksum mismatch.
