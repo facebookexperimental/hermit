@@ -1039,7 +1039,9 @@ pub struct RunOpts {
     /// `--verify` reports it only when host time reaches the guest's output. On the ptrace and
     /// e9patch backends, `--strict` also refuses to run when the host's performance counters fail
     /// Reverie's validation, because the virtual clock counts retired branches and cannot be exact;
-    /// with `--max-timeslice=disabled` no branch is counted, so that run is not refused.
+    /// with `--max-timeslice=disabled` Detcore uses no branch count, so that run is not refused
+    /// (Reverie still sets up, calibrates and incidentally reads the counters, but none of
+    /// those reads reaches the virtual clock, a preemption point or the guest).
     #[clap(
         long,
         conflicts_with_all = ["no_sequentialize_threads", "no_deterministic_io", "strace_only"]
@@ -4163,7 +4165,7 @@ fn strict_refusal_needs_strict_a_pmu_backend_and_an_inexact_counter() {
         &["hermit", "run", "--strict", "--namespace-only", "fakeprog"],
         unreachable,
     );
-    // Without a timeslice Detcore reads no branch counter, so the relaxed
+    // Without a timeslice Detcore uses no branch count, so the relaxed
     // strictness level runs where the counter miscounts
     // (https://github.com/rrnewton/hermit/issues/4291).
     for backend in ["ptrace", "e9patch"] {
@@ -8564,10 +8566,14 @@ impl RunOpts {
     /// Runs without `--strict` go ahead, and Reverie logs the failed
     /// validation.
     ///
-    /// A run with `--max-timeslice=disabled` reads no branch counter at all:
-    /// Detcore reads it only to advance logical time and to place preemption
-    /// points, and does neither without a timeslice
-    /// (`DetConfig::use_rcb_time`, `Detcore::update_logical_time_rcbs`). So
+    /// A run with `--max-timeslice=disabled` does not depend on the counter
+    /// being exact: Detcore reads it only to advance logical time and to place
+    /// preemption points, and does neither without a timeslice
+    /// (`DetConfig::use_rcb_time`, `Detcore::update_logical_time_rcbs`).
+    /// Reverie still opens, calibrates and incidentally reads the counters,
+    /// but none of those reads reaches logical time, a preemption point or the
+    /// guest (the post-facto review of
+    /// <https://github.com/rrnewton/hermit/issues/4291>). So
     /// such a run is not refused; that is what lets a test run at the relaxed
     /// strictness level on a host whose counter miscounts
     /// (<https://github.com/rrnewton/hermit/issues/4291>).
