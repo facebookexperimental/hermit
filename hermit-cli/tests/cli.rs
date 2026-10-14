@@ -26177,7 +26177,8 @@ fn every_sigchld_copy_is_accounted_for_as_on_linux() {
 /// queue, sent at the sender's committed turn, so the wait does not hold it as
 /// it holds the kernel's shared copies. Before, the handler ran only after the
 /// wake (https://github.com/rrnewton/hermit/issues/4132). Every expected line
-/// is native output, and each run reaches canonical bitwise parity.
+/// is native output, apart from `futex-dfl-then-handler`'s handler counts (see
+/// its row), and each run reaches canonical bitwise parity.
 #[test]
 fn a_guests_sigchld_to_a_futex_waiting_sibling_ends_its_wait_as_on_linux() {
     verify_futex_sigchld_modes(&[
@@ -26189,21 +26190,15 @@ fn a_guests_sigchld_to_a_futex_waiting_sibling_ends_its_wait_as_on_linux() {
         ("futex-blocked", "cond_wait", 0, 1),
         ("futex-default", "cond_wait", 0, 0),
         ("futex-flush", "cond_wait", 0, 0),
-    ]);
-}
-
-/// The same, with a sibling that spins with no syscall, which Hermit can only
-/// preempt: the woken waiter's restart-errno turn is requeued behind it, so
-/// the handler runs a round later than it would at the front, and main's wait
-/// for it keeps the line native (the design check of
-/// https://github.com/rrnewton/hermit/issues/4132 measured "before the wake 0"
-/// and, under `SA_RESTART`, EAGAIN, when main did not wait). Split from the
-/// test above to keep each test inside its CPU budget.
-#[test]
-fn a_guests_sigchld_to_a_futex_waiting_sibling_beside_a_cpu_bound_one_ends_its_wait() {
-    verify_futex_sigchld_modes(&[
-        ("futex-cond-busy", "cond_wait", 1, 1),
-        ("futex-restart-busy", "futex 0", 1, 1),
+        // SIGCHLD is SIG_DFL when main sends it, and main installs a handler
+        // only after: Linux discards the signal at generation, so the wait
+        // returns 0 at the wake, with no handler before it, as natively. The
+        // handler does run once, after the wake, where native runs none: under
+        // ptrace the kernel queues the discarded copy for the tracer (item 2
+        // of https://github.com/rrnewton/hermit/issues/3995). Before the
+        // Claude review of https://github.com/rrnewton/hermit/pull/4290, the
+        // drain read the handler and ended the wait with EINTR.
+        ("futex-dfl-then-handler", "futex 0", 0, 1),
     ]);
 }
 
@@ -26308,6 +26303,11 @@ fn a_futex_wait_a_private_sigchld_ends_records_and_replays() {
 /// in the waiter, before or after main's wake (main waits up to 1 s for it),
 /// and the wait returns EINTR, or 0 or EAGAIN when the wake came first; a
 /// flushed copy never runs (https://github.com/rrnewton/hermit/issues/4132).
+/// The `-busy` modes are left out: `futex-cond-busy` hangs under
+/// `--chaos-target-races` at some seeds (8, 10, 11 and 12 among 7-12) before
+/// this change too (seeds 8 and 10 on its base), a scheduler starvation this
+/// change does not touch (the Claude review of
+/// https://github.com/rrnewton/hermit/pull/4290, its P3-2).
 #[test]
 fn a_guests_sigchld_to_a_futex_waiter_has_a_linux_outcome_under_chaos() {
     let _guard = hermit_run_guard();

@@ -8350,15 +8350,18 @@ impl Scheduler {
     /// for its grant (`in_rt_sigsuspend`), or in an emulated `pause` or
     /// `nanosleep` (`sleep_signal`). The
     /// request rewrite is deferred to step2 so an asynchronous backend cannot
-    /// mutate beneath a tentative selection. A futex waiter is admitted on its mask
-    /// alone, and a sleep on its request alone; the drain, the commit point,
-    /// decides on the rest.
+    /// mutate beneath a tentative selection. A futex waiter is admitted on its
+    /// mask and on what Linux does with the signal as it is sent (it discards
+    /// one that is ignored, or ignored by default, then: `discarded_when_sent`),
+    /// and a sleep on its request alone; the drain, the commit point, decides
+    /// on the rest.
     pub(crate) fn notify_signal_pending(&mut self, dettid: DetTid, signal: SigWrapper) {
         if self.waitid_signal_request(dettid).is_some()
             || self.restartable_internal_io_signals(dettid).is_some()
-            || self
+            || (self
                 .parked_futex_unblocked_signals(dettid)
                 .is_some_and(|signals| signals & kernel_signal_bit(signal.raw()) != 0)
+                && !self.discarded_when_sent(dettid, signal))
             || self.in_rt_sigsuspend(dettid)
             || self.admits_sleep_signal(dettid, signal)
         {
@@ -8367,6 +8370,35 @@ impl Scheduler {
                 signals.push(signal);
             }
         }
+    }
+
+    /// Whether Linux discards `signal`, sent now to the parked futex waiter
+    /// `dettid`, in the sender's turn: it is unblocked and ignored, or ignored
+    /// by default with no handler (`discarded_at_generation`). A handler
+    /// installed later does not bring it back. Read here, in the sender's turn,
+    /// from the waiter's task as `parked_futex_interrupting_signals` reads it,
+    /// because `rt_sigaction` takes no turn of its own, so by the drain a
+    /// sibling may have installed one (the Claude review of
+    /// https://github.com/rrnewton/hermit/pull/4290: a default SIGCHLD, then a
+    /// handler, ended a futex wait with EINTR where Linux returns 0). A state
+    /// that cannot be read is not discarded, and the drain decides.
+    fn discarded_when_sent(&self, dettid: DetTid, signal: SigWrapper) -> bool {
+        let bit = kernel_signal_bit(signal.raw());
+        let Some(watch) = self
+            .parked_futex_waiter(dettid)
+            .and_then(|waiter| waiter.signal_watch)
+        else {
+            return false;
+        };
+        #[cfg(test)]
+        if let Some(state) = self.test_kernel_signal_states.get(&dettid) {
+            return state.discarded_at_generation() & bit != 0;
+        }
+        read_kernel_signal_state(
+            reverie::Pid::from_raw(watch.pid),
+            reverie::Pid::from_raw(watch.tid),
+        )
+        .is_ok_and(|state| state.discarded_at_generation() & bit != 0)
     }
 
     /// Whether `dettid` sleeps in a real `rt_sigsuspend` outside the run queue
@@ -15736,12 +15768,17 @@ mod test {
         assert_woken(&scheduler, target, Signal::SIGTSTP);
     }
 
-    /// A precise-mode futex waiter is admitted on its mask alone. The dispositions
-    /// are not consulted until the drain commits the wake, so a signal that is
-    /// ignored now is still recorded, and a blocked one is not
-    /// (https://github.com/rrnewton/hermit/issues/3146).
+    /// A precise-mode futex waiter is admitted on its mask and on what Linux
+    /// does with the signal as it is sent: a blocked one is not recorded
+    /// (https://github.com/rrnewton/hermit/issues/3146), and neither is one that
+    /// is ignored now, which Linux discards at generation, so a handler
+    /// installed before the drain does not bring it back (the Claude review of
+    /// https://github.com/rrnewton/hermit/pull/4290; before it, an ignored
+    /// signal was recorded and the drain decided from the dispositions then).
+    /// The drain still decides from the dispositions it reads for a signal it
+    /// did record (`a_signal_caught_after_a_futex_wait_began_ends_it`).
     #[test]
-    fn a_parked_futex_waiter_is_admitted_on_its_mask_alone() {
+    fn a_parked_futex_waiter_is_admitted_on_its_mask_and_the_disposition_at_the_send() {
         let mut scheduler = Scheduler::new(&Config::default());
         let (target, futex) = parked_futex_target(&mut scheduler);
         scheduler.sleep_futex_waiter(
@@ -15749,20 +15786,61 @@ mod test {
             futex,
             None,
             u32::MAX,
-            Some(signal_watch(kernel_signal_bit(libc::SIGUSR1))),
+            Some(signal_watch(
+                kernel_signal_bit(libc::SIGUSR1) | kernel_signal_bit(libc::SIGTERM),
+            )),
         );
-        scheduler
-            .test_kernel_signal_states
-            .insert(target, signal_state(0, kernel_signal_bit(libc::SIGUSR1)));
+        // SIGUSR1 ignored, SIGTERM caught; SIGUSR2 blocked by the wait's mask.
+        scheduler.test_kernel_signal_states.insert(
+            target,
+            signal_state(
+                kernel_signal_bit(libc::SIGTERM),
+                kernel_signal_bit(libc::SIGUSR1),
+            ),
+        );
 
         scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR1));
         scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR2));
+        scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGTERM));
 
         assert_eq!(
             scheduler.pending_cross_task_signals.get(&target),
-            Some(&vec![SigWrapper::from(Signal::SIGUSR1)])
+            Some(&vec![SigWrapper::from(Signal::SIGTERM)])
         );
         assert!(scheduler.is_parked_futex_waiter(target));
+    }
+
+    /// A signal ignored by default with no handler when it is sent (here a
+    /// guest's recorded thread-directed SIGCHLD, and SIGURG) is discarded by
+    /// Linux then. A handler installed before the drain, which `rt_sigaction`
+    /// does without a turn, does not end the wait: it stays parked
+    /// (the Claude review of https://github.com/rrnewton/hermit/pull/4290).
+    #[test]
+    fn a_signal_discarded_when_sent_does_not_end_a_futex_wait_a_later_handler_could() {
+        use child_exit_sigchld::ChildExitSigchldControl;
+        for signal in [Signal::SIGCHLD, Signal::SIGURG] {
+            let bit = kernel_signal_bit(signal as libc::c_int);
+            let mut scheduler = gated_scheduler();
+            let (target, futex) = parked_futex_target(&mut scheduler);
+            scheduler.sleep_futex_waiter(&target, futex, None, u32::MAX, Some(signal_watch(bit)));
+            scheduler
+                .test_kernel_signal_states
+                .insert(target, signal_state(0, 0));
+            if signal == Signal::SIGCHLD {
+                scheduler.child_exit_sigchld_control(
+                    target,
+                    ChildExitSigchldControl::PrivateSent { target },
+                );
+            }
+            scheduler.notify_signal_pending(target, SigWrapper::from(signal));
+            // The handler arrives after the send, before the drain.
+            scheduler
+                .test_kernel_signal_states
+                .insert(target, signal_state(bit, 0));
+            scheduler.drain_pending_cross_task_signals();
+            assert!(scheduler.is_parked_futex_waiter(target), "{signal}");
+            assert!(scheduler.inbound_signals(target).is_empty(), "{signal}");
+        }
     }
 
     /// A handler a sibling installs over `SIG_IGN` after the wait began ends the

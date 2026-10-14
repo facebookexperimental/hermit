@@ -36,6 +36,11 @@
  *   futex-blocked, futex-default, futex-flush
  *                  As blocked-nano, default-nano and flush-nano, for a
  *                  pthread_cond_wait.
+ *   futex-dfl-then-handler
+ *                  A raw FUTEX_WAIT; SIGCHLD keeps its default action when
+ *                  main sends it, and main installs the handler only after:
+ *                  Linux discards the signal at generation, so the wait
+ *                  returns 0 at the wake and no handler runs.
  *   futex-cond-busy, futex-restart-busy
  *                  futex-cond and futex-restart with a sibling that spins
  *                  with no syscall, which Hermit can only preempt.
@@ -246,7 +251,7 @@ static void* futex_waiter(void* arg) {
     mask(SIG_UNBLOCK);
   }
   if (is_mode("futex-raw") || is_mode("futex-restart") || is_mode("futex-restart-busy") ||
-      is_mode("futex-bitset")) {
+      is_mode("futex-bitset") || is_mode("futex-dfl-then-handler")) {
     atomic_store(&ready, 1);
     int op = is_mode("futex-bitset") ? FUTEX_WAIT_BITSET_PRIVATE : FUTEX_WAIT_PRIVATE;
     fx_ret = syscall(SYS_futex, &fx_word, op, 0, NULL, NULL, FUTEX_BITSET_MATCH_ANY);
@@ -283,8 +288,9 @@ static void* futex_waiter(void* arg) {
 
 static int futex_main(void) {
   int restart = is_mode("futex-restart") || is_mode("futex-restart-busy");
-  int raw = restart || is_mode("futex-raw") || is_mode("futex-bitset");
-  if (!is_mode("futex-default")) {
+  int dfl_then_handler = is_mode("futex-dfl-then-handler");
+  int raw = restart || dfl_then_handler || is_mode("futex-raw") || is_mode("futex-bitset");
+  if (!is_mode("futex-default") && !dfl_then_handler) {
     struct sigaction action;
     memset(&action, 0, sizeof(action));
     action.sa_handler = on_chld;
@@ -306,11 +312,14 @@ static int futex_main(void) {
     set_handler(SIG_IGN);
     set_handler(on_chld);
   }
+  if (dfl_then_handler) {
+    set_handler(on_chld);
+  }
   atomic_store(&sent, 1);
   // Up to 1 s where the handler runs before the wake, 100 ms where it
   // does not.
-  int handler_expected =
-      !is_mode("futex-blocked") && !is_mode("futex-default") && !is_mode("futex-flush");
+  int handler_expected = !is_mode("futex-blocked") && !is_mode("futex-default") &&
+      !is_mode("futex-flush") && !dfl_then_handler;
   struct timespec step = {0, 10 * 1000 * 1000};
   for (int i = 0; i < (handler_expected ? 100 : 10) && !atomic_load(&in_sleeper); i++) {
     nanosleep(&step, NULL);
