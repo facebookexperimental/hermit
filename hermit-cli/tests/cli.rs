@@ -26739,6 +26739,35 @@ fn run_kvm_cpuinfo_matches_cpuid() {
 /// `--strict --verify --verify-strict` and requires every line to match at
 /// bitwise parity.
 fn assert_cpuinfo_matches_cpuid(backend: &[&str]) {
+    let (status, stdout, log, report) = cpuinfo_matches_cpuid_run(backend, &[]);
+    assert_eq!(
+        status,
+        Some(0),
+        "{backend:?}\nstdout:\n{stdout}\nstderr:\n{log}"
+    );
+    assert_cpuinfo_matches_cpuid_output(backend, &stdout, &log, &report);
+}
+
+/// [`cpuinfo_matches_cpuid`] under `--cpu-profile x86-64-v3`, whose /proc/cpuinfo
+/// is generated from the v3 table, so its flags must match the v3 CPUID
+/// (https://github.com/rrnewton/hermit/issues/4243). A host that does not
+/// qualify must refuse the run by name.
+#[test]
+fn cpu_profile_v3_cpuinfo_matches_cpuid() {
+    let Some((stdout, log, report)) =
+        v3_run_or_refusal(|| cpuinfo_matches_cpuid_run(&[], &["--cpu-profile", "x86-64-v3"]))
+    else {
+        return;
+    };
+    assert_cpuinfo_matches_cpuid_output(&[], &stdout, &log, &report);
+}
+
+/// One `--strict --verify --verify-strict` run of the cpuinfo-vs-CPUID guest:
+/// its exit code, stdout, stderr and the verdict JSON.
+fn cpuinfo_matches_cpuid_run(
+    backend: &[&str],
+    run_args: &[&str],
+) -> (Option<i32>, String, String, Vec<u8>) {
     let guest = futex_c_guest(&CPUINFO_MATCHES_CPUID_GUEST, "cpuinfo_matches_cpuid")
         .to_str()
         .unwrap()
@@ -26755,6 +26784,7 @@ fn assert_cpuinfo_matches_cpuid(backend: &[&str]) {
         "--verify-json",
         verdict.to_str().unwrap(),
     ]);
+    args.extend_from_slice(run_args);
     // KVM refuses a `--timeout` it cannot enforce; `run_with_deadline` bounds
     // the run either way.
     if backend.is_empty() {
@@ -26769,11 +26799,13 @@ fn assert_cpuinfo_matches_cpuid(backend: &[&str]) {
     );
     let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
         .expect("failed to read the guest's stdout");
-    assert_eq!(
-        status.and_then(|status| status.code()),
-        Some(0),
-        "{backend:?}\nstdout:\n{stdout}\nstderr:\n{log}"
-    );
+    let report = fs::read(&verdict).unwrap_or_default();
+    (status.and_then(|status| status.code()), stdout, log, report)
+}
+
+/// Every line of the cpuinfo-vs-CPUID guest's output is a match, at bitwise
+/// parity.
+fn assert_cpuinfo_matches_cpuid_output(backend: &[&str], stdout: &str, log: &str, report: &[u8]) {
     let mut expected = String::from(
         "vendor_id: match\n\
          cpu family: match\n\
@@ -26809,8 +26841,7 @@ fn assert_cpuinfo_matches_cpuid(backend: &[&str]) {
     }
     assert_eq!(stdout, expected, "{backend:?}\nstderr:\n{log}");
     let report: serde_json::Value =
-        serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
-            .expect("the verdict must be JSON");
+        serde_json::from_slice(report).expect("the verdict must be JSON");
     assert_eq!(report["bitwise_parity"], true, "{backend:?}: {report}");
 }
 
