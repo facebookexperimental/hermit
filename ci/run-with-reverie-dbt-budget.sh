@@ -1506,7 +1506,11 @@ fi
 # README and tests); every SDK recipe input, build.rs and the vendored DynamoRIO
 # tree are unchanged, and no reverie-dbt file is added (inventory 950), so the
 # budgets above carry.
-expected_pin=1d20e4f25ae32776482eae2083b66cc60c066133
+# KVM ONE-FRAME-READ SDK-BUDGET CARRY (2026-10-14): advance from 1d20e4f2 to 9d2eaaf69a7dfa39824a8b9ec50b45b51a17a216.
+# The added commits change only reverie-kvm (bootstrap.rs); every SDK recipe
+# input, build.rs and the vendored DynamoRIO tree are unchanged, and no
+# reverie-dbt file is added (inventory 950), so the budgets above carry.
+expected_pin=9d2eaaf69a7dfa39824a8b9ec50b45b51a17a216
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
