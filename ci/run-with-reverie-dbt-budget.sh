@@ -1562,7 +1562,8 @@ fi
 # KVM CHEAP-COPY SDK-BUDGET CARRY (2026-10-14): advance from d60812b6 to 502bea229f32ce7bdb50d73c7b8d2572bdf2688a (cheaper KVM guest-memory copies and entry checks; changes only reverie-kvm, inventory unchanged), so the budgets above carry.
 # ALLOCATOR-CHECKER CARRY (2026-10-14): advance from 502bea22 to 370eb86a01ec9fa316d90699bd64992906efade0 (LiteInst M1 checker admits the measured 0x128 Detcore TLS layout; changes only scripts/m1_artifact.rs, inventory unchanged), so the budgets above carry.
 # KVM LAZY-WAKE SDK-BUDGET CARRY (2026-10-14): advance from 370eb86a to dfb68913256514f1550f67fb52271e5aba1e3655 (KVM stops subscribing and registering wakes on every guest syscall; changes only reverie-kvm, inventory unchanged), so the budgets above carry.
-expected_pin=dfb68913256514f1550f67fb52271e5aba1e3655
+# KVM ENTRY-CHECK + SHARED-MOUNT SDK-BUDGET CARRY (2026-10-14): advance from dfb68913 to 9e0ce5768aae1e6c71697ef3dd7ce3d61a91a260 (4b633f7f: cheaper KVM per-syscall entry checks, adds one GlobalTool method skip_empty_signal_boundaries defaulting to false that Detcore does not opt into; 9e0ce576: LiteInst shared-mount setup fix for nested tmpfs targets and pinned bind restrictions in reverie-process; reverie-dbt sources and inventory unchanged), so the budgets above carry.
+expected_pin=9e0ce5768aae1e6c71697ef3dd7ce3d61a91a260
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
