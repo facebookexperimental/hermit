@@ -528,11 +528,13 @@ dependencies = [
 name = "detcore-liteinst"
 version = "0.4.0"
 dependencies = [
+ "detcore-model",
  "hermit-detcore",
  "libc",
  "reverie-core",
  "reverie-inguest",
  "reverie-liteinst",
+ "reverie-rpc-transport",
 ]
 
 [[package]]

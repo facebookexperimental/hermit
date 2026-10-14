@@ -41,6 +41,8 @@ mod consts;
 mod cpuid;
 mod digest;
 mod dirents;
+#[cfg(feature = "dispatch-observer")]
+pub mod dispatch_observer;
 /// Schedule-alignment and edit-distance algorithms shared by Hermit tools.
 #[allow(missing_docs)]
 pub mod edit_distance;
@@ -2740,6 +2742,28 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         guest: &mut G,
         call: Syscall,
     ) -> Result<i64, Error> {
+        #[cfg(feature = "dispatch-observer")]
+        if let Some(observer) = dispatch_observer::installed() {
+            // This is the genuine incoming event. An entry record does not
+            // establish that subsequent signal gates or handling completed.
+            let registers = guest.regs().await;
+            let (number, arguments) = call.into_parts();
+            observer(dispatch_observer::Entry {
+                pid: guest.pid().as_raw(),
+                tid: guest.tid().as_raw(),
+                dettid: guest.thread_state().dettid.as_raw(),
+                number: number as u64,
+                instruction_pointer: registers.rip,
+                arguments: [
+                    arguments.arg0 as u64,
+                    arguments.arg1 as u64,
+                    arguments.arg2 as u64,
+                    arguments.arg3 as u64,
+                    arguments.arg4 as u64,
+                    arguments.arg5 as u64,
+                ],
+            });
+        }
         // Signal phase 1: before this syscall's first scheduler request. A
         // delivery prepared here runs the guest's handler before the syscall,
         // which then starts again; what this returns is discarded.

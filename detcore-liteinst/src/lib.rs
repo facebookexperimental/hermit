@@ -31,6 +31,12 @@ reverie_liteinst::declare_fixed_tool_allocator!();
 // Errors are printed without the C library's errno messages: strerror_r can
 // allocate through the guest's malloc (see describe_io_error).
 use reverie_inguest::guest::support::describe_io_error;
+#[cfg(feature = "exec-private-init")]
+mod exec_initial;
+use std::ffi::OsString;
+
+#[cfg(feature = "exec-private-init")]
+pub use exec_initial::detcore_liteinst_exec_initialize;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-3635): Review the
@@ -62,6 +68,7 @@ pub const DETLOG_FORWARD_POLICY_ENV: &str = "HERMIT_LITEINST_FORWARD_DETLOG_POLI
 /// Hermit validates that this constructor is registered in `.init_array`
 /// before it preloads the library, so a DSO that would load without
 /// installing Detcore is refused instead of running the guest unmonitored.
+#[cfg(not(feature = "exec-private-init"))]
 #[used]
 #[unsafe(link_section = ".init_array")]
 static DETCORE_LITEINST_INIT: unsafe extern "C" fn() = detcore_liteinst_initialize;
@@ -109,6 +116,18 @@ core::arch::global_asm!(".protected detcore_liteinst_initialize");
 // interposable body or a dynamic-loader resolver using the caller's stack.
 core::arch::global_asm!(".hidden detcore_liteinst_initialize_body");
 
+// Captured before initialization so the common path does not select its
+// coordinator or DETLOG policy from the environment. The legacy constructor
+// owns environment acquisition and scrubbing.
+struct InitializationInputs {
+    coordinator_socket: OsString,
+    forward_request: Option<OsString>,
+    forward_policy: Option<OsString>,
+    coordinator_fingerprint: Option<OsString>,
+    #[cfg(feature = "exec-private-init")]
+    initial_image: Option<exec_initial::InitialImageInputs>,
+}
+
 #[inline(never)]
 #[unsafe(no_mangle)]
 unsafe extern "C" fn detcore_liteinst_initialize_body() {
@@ -141,6 +160,34 @@ unsafe extern "C" fn detcore_liteinst_initialize_body() {
         std::env::remove_var(DETLOG_FORWARD_ENV);
         std::env::remove_var(DETLOG_FORWARD_POLICY_ENV);
     }
+    // SAFETY: this is the loader's single-threaded constructor window, and
+    // its private allocation/dispatch scope remains live through installation.
+    unsafe {
+        initialize_detcore(InitializationInputs {
+            coordinator_socket: socket,
+            forward_request,
+            forward_policy,
+            coordinator_fingerprint,
+            #[cfg(feature = "exec-private-init")]
+            initial_image: None,
+        });
+    }
+}
+
+// Consume captured inputs while retaining the genuine Detcore installation,
+// descriptor checks and shared open-file channel on its one RPC connection.
+//
+// SAFETY: the caller must hold the private allocation/dispatch scope in the
+// single-threaded, pre-seccomp initialization window required by install_tool.
+unsafe fn initialize_detcore(inputs: InitializationInputs) {
+    let InitializationInputs {
+        coordinator_socket: socket,
+        forward_request,
+        forward_policy,
+        coordinator_fingerprint,
+        #[cfg(feature = "exec-private-init")]
+        initial_image,
+    } = inputs;
     // Checked before anything is decoded: the coordinator sends Detcore's
     // configuration as positional bincode, which a runtime built from another
     // tree decodes as garbage and reports only as a decoding error
@@ -210,8 +257,22 @@ unsafe extern "C" fn detcore_liteinst_initialize_body() {
         restore_signals(&blocked);
         match reserved {
             Ok(_) => {
-                let _ = TOOL_OUTPUT_IDENTITY.set(identity);
-                let _ = detcore::detlog::set_forwarder(forward_detlog, policy);
+                #[cfg(feature = "exec-private-init")]
+                if exec_initial::active() {
+                    if TOOL_OUTPUT_IDENTITY.set(identity).is_err()
+                        || detcore::detlog::set_forwarder(forward_detlog, policy).is_err()
+                    {
+                        fail("InitialImage DETLOG identity or forwarder installed twice");
+                    }
+                } else {
+                    let _ = TOOL_OUTPUT_IDENTITY.set(identity);
+                    let _ = detcore::detlog::set_forwarder(forward_detlog, policy);
+                }
+                #[cfg(not(feature = "exec-private-init"))]
+                {
+                    let _ = TOOL_OUTPUT_IDENTITY.set(identity);
+                    let _ = detcore::detlog::set_forwarder(forward_detlog, policy);
+                }
             }
             Err(error) => fail(&format!(
                 "cannot reserve the DETLOG forwarding descriptor {fd}: {error}"
@@ -243,8 +304,41 @@ unsafe extern "C" fn detcore_liteinst_initialize_body() {
     // SAFETY: the loader runs constructors before any application thread
     // exists and before the application can install a seccomp filter, which is
     // the window `install_tool` requires.
+    #[cfg(feature = "exec-private-init")]
+    let initial_control = match initial_image {
+        Some(initial) => Some(
+            unsafe {
+                reverie_liteinst::install_tool_initial_image::<detcore::Detcore>(
+                    Path::new(&socket),
+                    initial.prepared,
+                )
+            }
+            .unwrap_or_else(|error| fail(&describe_io_error(&error))),
+        ),
+        None => {
+            if let Err(error) =
+                unsafe { reverie_liteinst::install_tool::<detcore::Detcore>(socket) }
+            {
+                fail(&describe_io_error(&error));
+            }
+            None
+        }
+    };
+    #[cfg(not(feature = "exec-private-init"))]
     if let Err(error) = unsafe { reverie_liteinst::install_tool::<detcore::Detcore>(socket) } {
         fail(&describe_io_error(&error));
+    }
+    #[cfg(feature = "exec-private-init")]
+    if exec_initial::active() {
+        let identity = TOOL_OUTPUT_IDENTITY
+            .get()
+            .copied()
+            .unwrap_or_else(|| fail("InitialImage DETLOG identity is absent"));
+        if reverie_liteinst::tool_output_fd().and_then(detcore::detlog::socket_identity)
+            != Some(identity)
+        {
+            fail("InitialImage installed DETLOG socket identity changed");
+        }
     }
     // `--backend=in-guest-trap`: the Tool's constructor recorded the host's
     // request from the coordinator's configuration; compare it with the
@@ -262,9 +356,34 @@ unsafe extern "C" fn detcore_liteinst_initialize_body() {
     // A description a fork shares is reached through the coordinator, over
     // this process's one existing connection. The first installation in a
     // process image is the only one, and a forked child inherits it.
+    #[cfg(feature = "exec-private-init")]
+    if exec_initial::active() {
+        if detcore::install_shared_open_file_channel(Box::new(
+            detcore::ChunkedOpenFileChannel::new(CoordinatorOpenFiles),
+        ))
+        .is_err()
+        {
+            fail("InitialImage shared open-file channel installed twice");
+        }
+    } else {
+        let _ = detcore::install_shared_open_file_channel(Box::new(
+            detcore::ChunkedOpenFileChannel::new(CoordinatorOpenFiles),
+        ));
+    }
+    #[cfg(not(feature = "exec-private-init"))]
     let _ = detcore::install_shared_open_file_channel(Box::new(
         detcore::ChunkedOpenFileChannel::new(CoordinatorOpenFiles),
     ));
+    #[cfg(feature = "exec-private-init")]
+    if let Some(control) = initial_control {
+        exec_initial::install_dispatch_observer();
+        if let Err(error) = reverie_liteinst::initialize_initial_image_lifecycle(&control) {
+            fail(&describe_io_error(&error));
+        }
+        if let Err(error) = control.finish() {
+            fail(&describe_io_error(&error));
+        }
+    }
 }
 
 /// Observe the real constructor's retained bootstrap in diagnostic builds.
@@ -330,13 +449,39 @@ fn forward_detlog(target: &str, record_suffix: &str, index: u64, message: std::f
     }
 }
 
-/// Blocks every signal this thread can block; returns the mask it replaced.
-/// The raw rt_sigprocmask, not libc's pthread_sigmask, which the program or a
-/// preloaded library may define.
+/// Blocks ordinary asynchronous signals and returns the previous mask.
+/// The legacy constructor blocks every blockable signal. Explicit InitialImage
+/// initialization keeps SIGSYS deliverable for its owned bootstrap frontend.
+/// The raw rt_sigprocmask avoids an interposable pthread_sigmask.
 fn block_signals() -> u64 {
+    #[cfg(feature = "exec-private-init")]
+    let all = if exec_initial::active() {
+        !(1_u64 << (libc::SIGSYS - 1))
+    } else {
+        u64::MAX
+    };
+    #[cfg(not(feature = "exec-private-init"))]
     let all = u64::MAX;
     let mut previous = 0_u64;
     // SAFETY: the masks are valid for the call.
+    #[cfg(feature = "exec-private-init")]
+    {
+        let result = unsafe {
+            reverie_inguest::signal::raw_sigprocmask(
+                libc::SIG_BLOCK,
+                Some(&all),
+                Some(&mut previous),
+            )
+        };
+        if exec_initial::active()
+            && (result.is_err() || previous & (1_u64 << (libc::SIGSYS - 1)) != 0)
+        {
+            fail(&format!(
+                "InitialImage block-signals result={result:?}, previous={previous:#x}"
+            ));
+        }
+    }
+    #[cfg(not(feature = "exec-private-init"))]
     let _ = unsafe {
         reverie_inguest::signal::raw_sigprocmask(libc::SIG_BLOCK, Some(&all), Some(&mut previous))
     };
@@ -345,6 +490,16 @@ fn block_signals() -> u64 {
 
 fn restore_signals(previous: &u64) {
     // SAFETY: the mask is valid for the call.
+    #[cfg(feature = "exec-private-init")]
+    {
+        let result = unsafe {
+            reverie_inguest::signal::raw_sigprocmask(libc::SIG_SETMASK, Some(previous), None)
+        };
+        if exec_initial::active() && result.is_err() {
+            fail(&format!("InitialImage restore-signals result={result:?}"));
+        }
+    }
+    #[cfg(not(feature = "exec-private-init"))]
     let _ = unsafe {
         reverie_inguest::signal::raw_sigprocmask(libc::SIG_SETMASK, Some(previous), None)
     };
@@ -403,6 +558,11 @@ fn runtime_path() -> String {
 }
 
 fn fail(message: &str) -> ! {
+    #[cfg(feature = "exec-private-init")]
+    if exec_initial::active() {
+        exec_initial::report_initialization_error(message);
+        exec_initial::fail();
+    }
     eprintln!("detcore-liteinst: initialization failed: {message}");
     // libc's _exit, not a raw exit_group from this library: an exit_group
     // issued from the runtime's own code bypasses the runtime's exit path, so

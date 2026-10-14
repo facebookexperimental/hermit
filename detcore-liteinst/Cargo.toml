@@ -20,6 +20,8 @@ doctest = false
 [features]
 # Real-runtime allocation regression; never selects a different allocator.
 allocator-fixture = ["reverie-liteinst/allocator-fixture"]
+# Private InitialImage entry; ordinary builds retain the loader constructor.
+exec-private-init = ["detcore/dispatch-observer", "reverie-liteinst/exec-private-init", "reverie-inguest/exec-private-init", "dep:detcore-model", "dep:reverie-rpc-transport"]
 
 [dependencies]
 detcore = { package = "hermit-detcore", version = "0.4.0", path = "../detcore" }
@@ -27,3 +29,6 @@ libc = "0.2.186"
 reverie = { package = "reverie-core", version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "9d2eaaf69a7dfa39824a8b9ec50b45b51a17a216" }
 reverie-inguest = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "9d2eaaf69a7dfa39824a8b9ec50b45b51a17a216", default-features = false }
 reverie-liteinst = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "9d2eaaf69a7dfa39824a8b9ec50b45b51a17a216", default-features = false }
+
+detcore-model = { version = "0.4.1", path = "../detcore-model", optional = true }
+reverie-rpc-transport = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "9d2eaaf69a7dfa39824a8b9ec50b45b51a17a216", optional = true }

@@ -167,6 +167,7 @@ pub mod fd;
 pub mod futex;
 pub mod happens_before;
 pub mod host_input;
+pub mod liteinst_initial_image;
 pub mod logdiff_policy;
 pub mod network_engine;
 pub mod network_trace;

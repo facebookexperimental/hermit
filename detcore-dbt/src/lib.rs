@@ -3093,6 +3093,8 @@ mod tests {
         // whose typed capabilities would take precedence over their projection.
         sent.backend.tool_shares_guest_descriptor_table = false;
         sent.backend.rediscovers_descriptors_after_exec = false;
+        // The fifteen-key format predates the atomic guest-memory callback.
+        sent.backend.supports_guest_memory_compare_exchange = false;
         let json = detcore::to_legacy_backend_json(&sent).unwrap();
         let key = "\"backend_requires_thread_directed_process_signals\"";
         let edited = json.replacen(&format!("{key}:true"), &format!("{key}:false"), 1);
@@ -3135,6 +3137,7 @@ mod tests {
     #[test]
     fn exported_runtime_identity_matches_the_pinned_reverie_abi() {
         assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 8);
+        assert_eq!(IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE, 56);
         // The native client's dbt_signal_event_t (ABI version 7).
         assert_eq!(std::mem::size_of::<DbtSignalEvent>(), 200);
         assert_eq!(std::mem::align_of::<DbtSignalEvent>(), 8);
@@ -3178,6 +3181,26 @@ mod tests {
         assert_eq!(current.emit_stdout as *const (), test_stdout as *const ());
         assert_eq!(current.emit_evidence as *const (), test_emit as *const ());
         assert_eq!(current.evidence_log_level, 0);
+
+        let mut guest_word = 7_u32;
+        let mut observed = 0xa5a5_a5a5_u32;
+        assert_eq!(
+            unsafe {
+                (current.compare_exchange_u32)(
+                    (&raw mut guest_word) as usize,
+                    7,
+                    9,
+                    &raw mut observed,
+                )
+            },
+            -libc::ENOSYS
+        );
+        assert_eq!(guest_word, 7);
+        assert_eq!(observed, 0xa5a5_a5a5);
+        assert_eq!(
+            unsafe { (current.compare_exchange_u32)(1, 7, 9, std::ptr::null_mut()) },
+            -libc::ENOSYS
+        );
     }
 
     #[test]

@@ -56,6 +56,10 @@ path = "tests/parallelism/mod.rs"
 name = "tests_time"
 path = "tests/time/mod.rs"
 
+[features]
+# Explicit diagnostics only; absent from ordinary artifacts.
+dispatch-observer = []
+
 [dependencies]
 anyhow = "1.0.103"
 async-trait = "0.1.86"

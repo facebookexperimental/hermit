@@ -3281,9 +3281,11 @@ mod dbt_detconfig_tests {
     fn dbt_detconfig_matches_806cf2fa_bytes() {
         for ((name, mut config), (golden_name, golden)) in cases().into_iter().zip(GOLDEN) {
             // Keep the historical capability value as well as its byte oracle.
-            // Current DBT descriptor facts need the versioned transport below.
+            // Current DBT descriptor and atomic-memory facts need the
+            // versioned transport below.
             config.backend.tool_shares_guest_descriptor_table = false;
             config.backend.rediscovers_descriptors_after_exec = false;
+            config.backend.supports_guest_memory_compare_exchange = false;
             assert_eq!(name, golden_name);
             let encoded = dbt_detconfig_json(&config).unwrap();
             assert_eq!(
@@ -3335,25 +3337,31 @@ mod dbt_detconfig_tests {
         // Exercise the real CLI encoder and the admitted standalone JSON
         // reader. In particular, descriptor discovery must not silently
         // opt into host-timed turns or loopback poller yielding.
-        for mask in 0_u8..16 {
-            let mut config = prepare_backend_config(default_config(), Backend::Dbt);
-            config.backend.tool_shares_guest_descriptor_table = mask & 1 != 0;
-            config.backend.rediscovers_descriptors_after_exec = mask & 2 != 0;
-            config.backend.internal_pipe_turns_are_host_timed = mask & 4 != 0;
-            config.backend.loopback_pollers_yield_to_peers = mask & 8 != 0;
-            let encoded = dbt_detconfig_json(&config).unwrap();
-            assert_eq!(
-                detcore::from_legacy_backend_json(&encoded).is_ok(),
-                mask == 0 || mask == 15,
-                "only coupled facts fit the legacy form: mask {mask}"
-            );
-            let decoded = detcore::decode_backend_config_json(&encoded).unwrap();
-            assert_eq!(decoded.backend, config.backend, "capability mask {mask}");
-            assert_eq!(
-                serde_json::to_string(&decoded).unwrap(),
-                serde_json::to_string(&config).unwrap(),
-                "configuration mask {mask}"
-            );
+        for atomic in [false, true] {
+            for mask in 0_u8..16 {
+                let mut config = prepare_backend_config(default_config(), Backend::Dbt);
+                config.backend.supports_guest_memory_compare_exchange = atomic;
+                config.backend.tool_shares_guest_descriptor_table = mask & 1 != 0;
+                config.backend.rediscovers_descriptors_after_exec = mask & 2 != 0;
+                config.backend.internal_pipe_turns_are_host_timed = mask & 4 != 0;
+                config.backend.loopback_pollers_yield_to_peers = mask & 8 != 0;
+                let encoded = dbt_detconfig_json(&config).unwrap();
+                assert_eq!(
+                    detcore::from_legacy_backend_json(&encoded).is_ok(),
+                    !atomic && (mask == 0 || mask == 15),
+                    "only coupled facts without atomic memory fit the legacy form: mask {mask}, atomic {atomic}"
+                );
+                let decoded = detcore::decode_backend_config_json(&encoded).unwrap();
+                assert_eq!(
+                    decoded.backend, config.backend,
+                    "capability mask {mask}, atomic {atomic}"
+                );
+                assert_eq!(
+                    serde_json::to_string(&decoded).unwrap(),
+                    serde_json::to_string(&config).unwrap(),
+                    "configuration mask {mask}, atomic {atomic}"
+                );
+            }
         }
     }
 
@@ -3361,6 +3369,8 @@ mod dbt_detconfig_tests {
     fn representable_descriptor_facts_keep_the_current_config_bytes() {
         for discover in [false, true] {
             let mut config = prepare_backend_config(rich_config(), Backend::Dbt);
+            // This newer capability cannot be represented by the old keys.
+            config.backend.supports_guest_memory_compare_exchange = false;
             config.backend.tool_shares_guest_descriptor_table = discover;
             config.backend.rediscovers_descriptors_after_exec = discover;
             config.backend.internal_pipe_turns_are_host_timed = discover;
@@ -6747,6 +6757,9 @@ mod tests {
         ] {
             config.backend.tool_shares_guest_descriptor_table = false;
             config.backend.rediscovers_descriptors_after_exec = false;
+            // The historical fifteen-key form predates native atomic memory.
+            // Preserve its exact bytes and its false capability on decoding.
+            config.backend.supports_guest_memory_compare_exchange = false;
             assert_eq!(
                 detcore::to_legacy_backend_json(&config).unwrap(),
                 before,
