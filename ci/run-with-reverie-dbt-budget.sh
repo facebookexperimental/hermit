@@ -1525,7 +1525,11 @@ fi
 # native/ (including CMake), the DynamoRIO/vendor and third-party trees, root
 # and DBT manifests, and toolchain are identical. Inventory rises 950 -> 951.
 # Existing SDK budgets carry; no new build timing or runtime artifact is claimed.
-expected_pin=049750ad5bfd93f3a315747cc259b5593f756d75
+# KVM R5 SDK-BUDGET CARRY (2026-10-14): advance from 049750ad to ea20a636c2999320d4d31979f3a6d04577273bae (R5 re-parented by
+# the coordinator onto DBT D1). The added commit changes only reverie-kvm (guest-memory
+# deferred-failure check); every SDK recipe input, build.rs and the vendored DynamoRIO tree are
+# unchanged, and no reverie-dbt file is added, so the budgets above carry.
+expected_pin=ea20a636c2999320d4d31979f3a6d04577273bae
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

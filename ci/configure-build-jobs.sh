@@ -1602,8 +1602,12 @@ fi
 # native/ (including CMake), the DynamoRIO/vendor and third-party trees, root
 # and DBT manifests, and toolchain are identical. Inventory rises 950 -> 951.
 # Existing SDK budgets carry; no new build timing or runtime artifact is claimed.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 049750ad5bfd93f3a315747cc259b5593f756d75 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 049750ad5bfd93f3a315747cc259b5593f756d75 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# KVM R5 SDK-BUDGET CARRY (2026-10-14): advance from 049750ad to ea20a636c2999320d4d31979f3a6d04577273bae (R5 re-parented by
+# the coordinator onto DBT D1). The added commit changes only reverie-kvm (guest-memory
+# deferred-failure check); every SDK recipe input, build.rs and the vendored DynamoRIO tree are
+# unchanged, and no reverie-dbt file is added, so the budgets above carry.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != ea20a636c2999320d4d31979f3a6d04577273bae ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie ea20a636c2999320d4d31979f3a6d04577273bae (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
