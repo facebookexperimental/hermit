@@ -2736,6 +2736,16 @@ pub struct ThreadState<T> {
     #[serde(default)]
     pub(crate) nanosleep_restart: Option<crate::types::LogicalTime>,
 
+    /// This thread claimed a `SIGCHLD` for a sleep (`SleepSignal::Claimed`),
+    /// and the claimed copy's delivery stop has not come yet. That stop places
+    /// the delivery (`ChildExitSigchldControl::ClaimedDelivery`) just before
+    /// it asks for its turn, so the mark the scheduler keeps is bound to that
+    /// copy. A system call, or a copy the ledger drops, clears this once
+    /// SIGCHLD is no longer pending for the thread (the claimed copy was never
+    /// delivered to it; `syscalls::signal::claim_still_pending`).
+    #[serde(default)]
+    pub(crate) claimed_sigchld: bool,
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1151)
     /// Transitions waiting to be committed into the preemption artifact.
@@ -3225,6 +3235,7 @@ impl<T> ThreadState<T> {
             chaos_slowdown_factor: RcbTimeMultiplier::ONE,
             chaos_slowdown_active: false,
             nanosleep_restart: None,
+            claimed_sigchld: false,
             pending_chaos_epochs: Vec::new(),
             max_timeslice_end: None,
             last_grant_deadline: None,

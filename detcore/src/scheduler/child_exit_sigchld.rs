@@ -251,6 +251,15 @@ pub enum ChildExitSigchldControl {
     /// before the window existed (<https://github.com/rrnewton/hermit/issues/4229>).
     /// Appended after `PrivatePending`.
     WindowUnusable,
+    /// The calling thread is at the delivery stop of a `SIGCHLD` it claimed,
+    /// in its own turn, for a sleep it was woken for in a process whose send
+    /// window is unusable (`syscalls::signal::claim_pending_sigchld`,
+    /// `ThreadState::claimed_sigchld`). Sent just before the stop asks for its
+    /// turn, it places that delivery (`sigchld_ready`), so the turn is granted
+    /// rather than deferred behind runnable work, as Linux runs the handler at
+    /// once. Deferred, a sibling that spins until that handler runs held it
+    /// back for ever. Appended after `WindowUnusable`.
+    ClaimedDelivery,
 }
 
 /// What becomes of a `SIGCHLD` the scheduler sent, at its delivery stop.
@@ -850,6 +859,10 @@ impl Scheduler {
             }
             ChildExitSigchldControl::PrivatePending => {
                 ChildExitSigchldAnswer::Placed(self.private_sigchld(dtid) != 0)
+            }
+            ChildExitSigchldControl::ClaimedDelivery => {
+                self.blocked.sigchld_ready.insert(dtid);
+                ChildExitSigchldAnswer::Recorded
             }
             ChildExitSigchldControl::WindowUnusable => ChildExitSigchldAnswer::Placed(
                 self.models_signal_targets

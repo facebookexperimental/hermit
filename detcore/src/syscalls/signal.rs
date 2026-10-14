@@ -2983,6 +2983,9 @@ where
             && state.next_dequeued(state.blocked).map(|(signal, _)| signal) == Some(libc::SIGCHLD)
             && claim_pending_sigchld(guest).await?
         {
+            // Its delivery stop places it, so it is not deferred behind a
+            // runnable sibling (`ThreadState::claimed_sigchld`).
+            guest.thread_state_mut().claimed_sigchld = true;
             return Ok(SleepSignal::Claimed);
         }
         let held_woken = held_woken & !sigchld;
@@ -2996,6 +2999,24 @@ where
     } else {
         SleepSignal::None
     })
+}
+
+/// Whether a `SIGCHLD` this thread claimed (`ThreadState::claimed_sigchld`,
+/// `claimed`) is still claimed at a syscall entry, or after a `SIGCHLD` the
+/// ledger dropped: SIGCHLD is still pending in its queue or its process's,
+/// whatever its mask. The claim may have held another signal instead
+/// (https://github.com/rrnewton/hermit/issues/4346), whose handler can block
+/// SIGCHLD and make syscalls before its `rt_sigreturn` lets SIGCHLD be
+/// delivered (the Codex review of the claimed-delivery fix), or a duplicate
+/// the ledger drops while another copy waits (the Claude review).
+/// Once SIGCHLD is not pending, its delivery never came to this thread. A
+/// state that cannot be read (`read_state`, asked only for a claim) forgets
+/// the claim, so the delivery is deferred as before the claim existed.
+pub(crate) fn claim_still_pending<E>(
+    claimed: bool,
+    read_state: impl FnOnce() -> Result<crate::syscalls::threads::KernelSignalState, E>,
+) -> bool {
+    claimed && read_state().is_ok_and(|state| state.pending & kernel_sigset_bit(libc::SIGCHLD) != 0)
 }
 
 /// Whether `sigchld`, the scheduler's copy a sleep was woken for, is still
@@ -3840,13 +3861,6 @@ mod tests {
         );
     }
 
-    /// Before it parks, a sleep whose private queue already holds a guest's
-    /// thread-directed `SIGCHLD` asks whether the copy is committed, and a
-    /// committed one that is unblocked and caught ends the sleep as pending
-    /// for it: the copy was sent before the sleeper filed its request, so the
-    /// sender's turn had no sleep to wake (the Codex review of
-    /// https://github.com/rrnewton/hermit/pull/4177). Without one, or with no
-    /// wake and nothing private, it asks nothing; blocked, it does not end the
     /// In a process whose send window is unusable, a sleep woken for the
     /// scheduler's `SIGCHLD` ends for it when the copy is still pending, in its
     /// process's queue or its own, and unblocked and caught. It parks again
@@ -3891,6 +3905,56 @@ mod tests {
         assert!(woken_sigchld_pending(&private, chld));
     }
 
+    /// A claimed `SIGCHLD` stays claimed at a syscall while it is pending for
+    /// the thread, in either queue: among them the syscall a held SIGUSR1's
+    /// handler makes while its mask blocks SIGCHLD. It is forgotten once
+    /// SIGCHLD is not pending, or when the state cannot be read, and an
+    /// unclaimed thread reads nothing (the Codex review of the
+    /// claimed-delivery fix; https://github.com/rrnewton/hermit/issues/4346).
+    #[test]
+    fn a_claimed_sigchld_stays_claimed_while_pending() {
+        use crate::syscalls::threads::KernelSignalState;
+        let chld = kernel_sigset_bit(libc::SIGCHLD);
+        let usr1 = kernel_sigset_bit(libc::SIGUSR1);
+        let state = |blocked: KernelSigset, thread_pending: KernelSigset, shared: KernelSigset| {
+            Ok::<_, Errno>(KernelSignalState {
+                caught: chld | usr1,
+                blocked,
+                pending: thread_pending | shared,
+                thread_pending,
+                shared_pending: shared,
+                ..Default::default()
+            })
+        };
+        assert!(claim_still_pending(true, || state(0, 0, chld)));
+        assert!(claim_still_pending(true, || state(0, chld, 0)));
+        assert!(
+            claim_still_pending(true, || state(chld | usr1, 0, chld)),
+            "inside the held SIGUSR1's handler, whose mask holds SIGCHLD"
+        );
+        assert!(
+            !claim_still_pending(true, || state(0, 0, usr1)),
+            "taken elsewhere"
+        );
+        assert!(
+            !claim_still_pending(true, || Err::<KernelSignalState, _>(Errno::ESRCH)),
+            "unreadable"
+        );
+        assert!(
+            !claim_still_pending(false, || -> Result<KernelSignalState, Errno> {
+                panic!("an unclaimed thread reads no state")
+            }),
+            "unclaimed"
+        );
+    }
+
+    /// Before it parks, a sleep whose private queue already holds a guest's
+    /// thread-directed `SIGCHLD` asks whether the copy is committed, and a
+    /// committed one that is unblocked and caught ends the sleep as pending
+    /// for it: the copy was sent before the sleeper filed its request, so the
+    /// sender's turn had no sleep to wake (the Codex review of
+    /// https://github.com/rrnewton/hermit/pull/4177). Without one, or with no
+    /// wake and nothing private, it asks nothing; blocked, it does not end the
     /// sleep.
     #[test]
     fn a_private_sigchld_sent_before_the_sleep_is_filed_ends_it_before_it_parks() {

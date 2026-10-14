@@ -927,6 +927,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                 && self.cfg.backend.reports_child_exit_publication
                 && !self.child_exit_sigchld_delivers(guest).await
             {
+                // A claimed copy that is dropped has no delivery to place, but
+                // the claim may have held this duplicate while the claimed copy
+                // is still pending (`syscalls::signal::claim_still_pending`).
+                let (pid, tid) = (guest.pid(), guest.tid());
+                let claimed = crate::syscalls::claim_still_pending(
+                    guest.thread_state().claimed_sigchld,
+                    || crate::syscalls::read_thread_signal_state(pid, tid),
+                );
+                guest.thread_state_mut().claimed_sigchld = claimed;
                 self.keep_timer_across_dropped_signal(guest);
                 return Ok(None);
             }
@@ -977,6 +986,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await;
             }
 
+            // The delivery of a `SIGCHLD` this thread claimed is placed, so its
+            // turn is not deferred behind runnable work
+            // (`ThreadState::claimed_sigchld`).
+            if signal.signal() == Some(Signal::SIGCHLD)
+                && std::mem::take(&mut guest.thread_state_mut().claimed_sigchld)
+            {
+                tool_global::child_exit_sigchld(
+                    guest,
+                    scheduler::child_exit_sigchld::ChildExitSigchldControl::ClaimedDelivery,
+                )
+                .await;
+            }
             // Read-write marks this as the delivery itself, which the
             // scheduler's write-only wakes of a signaled sleeper are not
             // (`Scheduler::thread_timer_copies`).
@@ -2476,6 +2497,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     chaos_slowdown_factor: RcbTimeMultiplier::ONE,
                     chaos_slowdown_active: false,
                     nanosleep_restart: None,
+                    claimed_sigchld: false,
                     pending_chaos_epochs: Vec::new(),
                     max_timeslice_end: None,
                     last_grant_deadline: None,
@@ -2866,6 +2888,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 signal
             );
         }
+        // A claimed `SIGCHLD` stays claimed only while it is still pending for
+        // this thread (`syscalls::signal::claim_still_pending`).
+        let (pid, tid) = (guest.pid(), guest.tid());
+        let claimed =
+            crate::syscalls::claim_still_pending(guest.thread_state().claimed_sigchld, || {
+                crate::syscalls::read_thread_signal_state(pid, tid)
+            });
+        guest.thread_state_mut().claimed_sigchld = claimed;
         self.pre_handler_hook(guest, false, CheckIn::Event).await;
 
         // Linux's restart of an interrupted wait is the thread's very next syscall,

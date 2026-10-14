@@ -83,7 +83,9 @@
  *                  or the sibling's read, which then interrupts main with
  *                  SIGUSR1. Never both.
  *   sfdheld-pause, sfdheld-nano (with "restart", the handler has SA_RESTART,
- *                  which never restarts these calls after a handler)
+ *                  which never restarts these calls after a handler; with
+ *                  "yield", another thread blocks SIGCHLD and yields until a
+ *                  handler has run, so it is always runnable)
  *                  The process holds a signalfd for SIGCHLD that no thread
  *                  reads, and a sibling that blocks SIGCHLD and SIGUSR2 waits
  *                  in a blocking read of a second signalfd, for SIGUSR2 only.
@@ -112,6 +114,8 @@ static volatile sig_atomic_t handled, got_usr1;
 static volatile int codes[8], vals[8], pids[8];
 static volatile pid_t htid[8];
 static _Atomic int done, ready;
+/* `handled` as another thread may read it (`sigchld_waiting_yielder`). */
+static _Atomic int chld_handled;
 
 static void on_chld(int sig, siginfo_t* info, void* context) {
   (void)sig;
@@ -124,6 +128,7 @@ static void on_chld(int sig, siginfo_t* info, void* context) {
     htid[k] = (pid_t)syscall(SYS_gettid);
   }
   handled++;
+  atomic_fetch_add(&chld_handled, 1);
 }
 
 static void on_usr1(int sig) {
@@ -597,6 +602,30 @@ static int sfdsib(const char* mode, int late, int rt, int poll) {
 
 static int usr2_reader;
 static _Atomic int held_sibling_ready;
+static _Atomic int yielder_gave_up, yielder_ready;
+
+/* Blocks SIGCHLD, says so, and keeps yielding until a SIGCHLD handler has run,
+ * giving up after 10 s of CLOCK_MONOTONIC so that a guest that never sees the
+ * handler still ends. */
+static void* sigchld_waiting_yielder(void* arg) {
+  (void)arg;
+  sigset_t mask;
+  sigemptyset(&mask);
+  sigaddset(&mask, SIGCHLD);
+  pthread_sigmask(SIG_BLOCK, &mask, NULL);
+  atomic_store(&yielder_ready, 1);
+  struct timespec start, now;
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  while (!atomic_load(&chld_handled)) {
+    syscall(SYS_sched_yield);
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (now.tv_sec - start.tv_sec >= 10) {
+      break;
+    }
+  }
+  atomic_store(&yielder_gave_up, !atomic_load(&chld_handled));
+  return NULL;
+}
 
 static void* usr2_sibling(void* arg) {
   (void)arg;
@@ -613,7 +642,7 @@ static void* usr2_sibling(void* arg) {
   return NULL;
 }
 
-static int sfdheld(const char* mode, int restart) {
+static int sfdheld(const char* mode, int restart, int yielding) {
   int pausing = !strcmp(mode, "sfdheld-pause");
   catch_chld();
   if (restart) {
@@ -640,6 +669,15 @@ static int sfdheld(const char* mode, int restart) {
     syscall(SYS_sched_yield);
   }
   msleep(50);
+  pthread_t yielder;
+  if (yielding) {
+    pthread_create(&yielder, NULL, sigchld_waiting_yielder, NULL);
+    /* It blocks SIGCHLD before the child can exit, so it is running, and
+     * cannot take the signal, when the sleep is woken for it. */
+    while (!atomic_load(&yielder_ready)) {
+      syscall(SYS_sched_yield);
+    }
+  }
   pid_t child = spawn(100, 0);
   int ret;
   if (pausing) {
@@ -652,11 +690,18 @@ static int sfdheld(const char* mode, int restart) {
   int in_main = handled;
   pthread_kill(thread, SIGUSR2);
   pthread_join(thread, NULL);
+  if (yielding) {
+    pthread_join(yielder, NULL);
+  }
   waitpid(child, NULL, 0);
   close(held);
-  printf("%s%s: %s %s, main handler %d\n", mode, restart ? " restart" : "",
+  printf("%s%s%s: %s %s, main handler %d", mode, restart ? " restart" : "", yielding ? " yield" : "",
          pausing ? "pause" : "nanosleep", ret == 0 ? "0" : error == EINTR ? "EINTR" : strerror(error),
          in_main);
+  if (yielding) {
+    printf(", yielder gave up %d", atomic_load(&yielder_gave_up));
+  }
+  printf("\n");
   return 0;
 }
 
@@ -718,7 +763,12 @@ int main(int argc, char** argv) {
     return efwide(mode);
   }
   if (!strncmp(mode, "sfdheld-", 8)) {
-    return sfdheld(mode, argc > 2 && !strcmp(argv[2], "restart"));
+    int restart = 0, yielding = 0;
+    for (int i = 2; i < argc; i++) {
+      restart |= !strcmp(argv[i], "restart");
+      yielding |= !strcmp(argv[i], "yield");
+    }
+    return sfdheld(mode, restart, yielding);
   }
   if (!strncmp(mode, "sfdsib-", 7)) {
     int late = 0, rt = 0, poll = 0;

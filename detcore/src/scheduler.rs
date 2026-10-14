@@ -7918,6 +7918,25 @@ impl Scheduler {
             return;
         }
 
+        // A thread whose `SIGCHLD` delivery is deferred (`sigchld_deferred`)
+        // is in the middle of that delivery, waiting for its turn, and the
+        // kernel delivers the new signal after it. So the delivery is
+        // re-admitted at this committed point, as step 2e would, and placed
+        // (`sigchld_ready`) at the front of its band, with its request
+        // untouched. Left deferred, a sibling that never stops running held
+        // back both signals for ever (the Codex review of the fix of
+        // https://github.com/rrnewton/hermit/issues/4229). Before that,
+        // `thread_status` found it in no pool and reported it gone, and the
+        // send panicked.
+        if self.blocked.sigchld_deferred.remove(&dettid) {
+            info!(
+                "[dtid {}] signal {} re-admits its deferred SIGCHLD delivery.",
+                dettid, signal
+            );
+            self.blocked.sigchld_ready.insert(dettid);
+            self.runqueue_push_front(dettid);
+            return;
+        }
         // Now that the thread is signaled, it needs to be runnable for the scheduler to continue it.
         match self.thread_status(dettid) {
             ThreadStatus::Gone => {
@@ -26048,6 +26067,58 @@ mod test {
             ask(&mut scheduler, ChildExitSigchldControl::PrivatePending),
             ChildExitSigchldAnswer::Placed(false),
             "a host-timed source can post SIGCHLD too"
+        );
+    }
+
+    /// A claimed `SIGCHLD` (`ClaimedDelivery`) marks the claiming thread's
+    /// delivery placed, so its turn is granted rather than deferred behind a
+    /// runnable sibling: deferred, a sibling that yields until the handler runs
+    /// held the handler back for ever (the Claude review of
+    /// https://github.com/rrnewton/hermit/issues/4229's fix).
+    #[test]
+    fn a_claimed_sigchld_delivery_is_placed() {
+        use child_exit_sigchld::ChildExitSigchldAnswer;
+        use child_exit_sigchld::ChildExitSigchldControl;
+        let (mut scheduler, _parent, creator, _) = owned_sigchld_family();
+        assert!(!scheduler.blocked.sigchld_ready.contains(&creator));
+        assert_eq!(
+            scheduler.child_exit_sigchld_control(creator, ChildExitSigchldControl::ClaimedDelivery),
+            ChildExitSigchldAnswer::Recorded
+        );
+        assert!(scheduler.blocked.sigchld_ready.contains(&creator));
+    }
+
+    /// A signal sent to a thread whose `SIGCHLD` delivery is deferred
+    /// (`sigchld_deferred`) re-admits that delivery, placed, with its request
+    /// untouched: the kernel delivers the new signal after it, and a sibling
+    /// that never stops running would hold both back for ever. Before, the
+    /// thread was found in no pool, reported gone, and the send panicked.
+    #[test]
+    fn a_signal_to_a_thread_with_a_deferred_sigchld_delivery_readmits_it() {
+        let mut scheduler = gated_scheduler();
+        let target = DetTid::from_raw(100);
+        register_known_thread(&mut scheduler, target);
+        let mut delivery = Resources::new(target);
+        delivery.insert(
+            ResourceID::InboundSignal(SigWrapper(libc::SIGCHLD)),
+            Permission::RW,
+        );
+        scheduler.next_turns.get_mut(&target).unwrap().req = Ivar::full(Ok(delivery));
+        let sibling = DetTid::from_raw(101);
+        register_known_thread(&mut scheduler, sibling);
+        scheduler.runqueue_push_back(sibling);
+        scheduler.blocked.sigchld_deferred.insert(target);
+        // A runnable sibling keeps step 2e from re-admitting it.
+        scheduler.step2e_process_signal_deferred();
+        assert!(scheduler.blocked.sigchld_deferred.contains(&target));
+        scheduler.wake_signaled_guest(target, Signal::SIGALRM);
+        assert!(!scheduler.blocked.sigchld_deferred.contains(&target));
+        assert!(scheduler.blocked.sigchld_ready.contains(&target));
+        assert!(scheduler.run_queue.contains_tid(target));
+        assert_eq!(
+            scheduler.inbound_signals(target),
+            vec![SigWrapper(libc::SIGCHLD)],
+            "the deferred delivery's request is untouched"
         );
     }
 

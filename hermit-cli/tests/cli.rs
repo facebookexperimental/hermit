@@ -26858,6 +26858,21 @@ fn every_sigchld_copy_is_accounted_for_as_on_linux() {
             &["sfdheld-nano", "restart"],
             "sfdheld-nano restart: nanosleep EINTR, main handler 1\n",
         ),
+        // With a sibling that blocks SIGCHLD and keeps yielding until a handler
+        // has run, so it is always runnable: the claimed copy's delivery is
+        // placed rather than deferred behind it. Deferred, the handler waited
+        // for the sibling, which waited for the handler; a nanosleep hung and a
+        // pause hung until a timer reached the deferred thread and the
+        // scheduler panicked (the Claude review of
+        // https://github.com/rrnewton/hermit/issues/4229's fix, at e3bf3e41).
+        (
+            &["sfdheld-pause", "yield"],
+            "sfdheld-pause yield: pause EINTR, main handler 1, yielder gave up 0\n",
+        ),
+        (
+            &["sfdheld-nano", "yield"],
+            "sfdheld-nano yield: nanosleep EINTR, main handler 1, yielder gave up 0\n",
+        ),
         (
             &["efin-priv"],
             "efin-priv: input fault EFAULT; [SI_QUEUE v9] [CLD_EXITED c1 11] \
