@@ -148,6 +148,7 @@ fn report_rpc_failure(error: &reverie_rpc_transport::RpcError) {
         RpcError::Encode(_) => (3, None),
         RpcError::Decode(_) => (4, None),
         RpcError::FrameTooLarge { .. } => (5, None),
+        RpcError::TrailingBytes { .. } => (6, None),
     };
     let mut message = *b"exec-private RPC class=0 errno=00000000\n";
     message[23] = b'0' + class;
