@@ -338,6 +338,11 @@ const LEAF2_CACHES: &str = "06:i:8 08:i:16 09:i:32 0a:d:8 0c:d:16 0d:d:16 0e:d:2
 /// matches no entry of its vulnerability lists, the table enumerates no
 /// IA32_ARCH_CAPABILITIES (leaf 7 EDX bit 29), so every `*_NO` bit is clear,
 /// and it advertises RTM (`taa`) and the hypervisor bit (`bhi`, `its`).
+///
+/// It is a constant, not derived from the table: a CPU profile such as
+/// <https://github.com/rrnewton/hermit/issues/4243> proposes, or any other
+/// table change, must recompute it from Linux's `cpu_set_bug_bits` for the new
+/// vendor, family, model and features.
 const CPUINFO_BUGS: &str = "cpu_meltdown spectre_v1 spectre_v2 spec_store_bypass l1tf mds swapgs taa \
     itlb_multihit bhi spectre_v2_user its";
 

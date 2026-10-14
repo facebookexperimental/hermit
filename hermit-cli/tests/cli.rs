@@ -24512,26 +24512,50 @@ fn a_cpu_set_sized_from_kernel_max_holds_the_one_virtual_cpu() {
 /// the 27 lines were MISMATCH.
 #[test]
 fn cpuinfo_matches_cpuid() {
+    assert_cpuinfo_matches_cpuid(&[]);
+}
+
+/// [`cpuinfo_matches_cpuid`] on the KVM backend, whose guests also get
+/// Detcore's CPUID table: reverie-kvm opens /proc/cpuinfo onto a fixed stub,
+/// which Detcore's procfs snapshot replaces on read. Before
+/// https://github.com/rrnewton/hermit/pull/4264 it read 15/27 MISMATCH here.
+#[test]
+fn run_kvm_cpuinfo_matches_cpuid() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping KVM cpuinfo: /dev/kvm is unavailable");
+        return;
+    }
+    assert_cpuinfo_matches_cpuid(&["--backend=kvm"]);
+}
+
+/// Runs the cpuinfo-vs-CPUID guest under `backend` (global options) with
+/// `--strict --verify --verify-strict` and requires every line to match at
+/// bitwise parity.
+fn assert_cpuinfo_matches_cpuid(backend: &[&str]) {
     let guest = futex_c_guest(&CPUINFO_MATCHES_CPUID_GUEST, "cpuinfo_matches_cpuid")
         .to_str()
         .unwrap()
         .to_owned();
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let verdict = directory.path().join("verify.json");
+    let mut args = vec!["--log=info"];
+    args.extend_from_slice(backend);
+    args.extend_from_slice(&[
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        verdict.to_str().unwrap(),
+    ]);
+    // KVM refuses a `--timeout` it cannot enforce; `run_with_deadline` bounds
+    // the run either way.
+    if backend.is_empty() {
+        args.extend_from_slice(&["--timeout", "60"]);
+    }
+    args.extend_from_slice(&["--", guest.as_str()]);
     let (status, log) = run_with_deadline(
-        hermit_command(&[
-            "--log=info",
-            "run",
-            "--strict",
-            "--verify",
-            "--verify-strict",
-            "--verify-json",
-            verdict.to_str().unwrap(),
-            "--timeout",
-            "60",
-            "--",
-            guest.as_str(),
-        ]),
+        hermit_command(&args),
         directory.path(),
         Duration::from_secs(180),
         false,
@@ -24541,7 +24565,7 @@ fn cpuinfo_matches_cpuid() {
     assert_eq!(
         status.and_then(|status| status.code()),
         Some(0),
-        "stdout:\n{stdout}\nstderr:\n{log}"
+        "{backend:?}\nstdout:\n{stdout}\nstderr:\n{log}"
     );
     let mut expected = String::from(
         "vendor_id: match\n\
@@ -24576,11 +24600,11 @@ fn cpuinfo_matches_cpuid() {
     ] {
         expected += &format!("flag {flag}: match\n");
     }
-    assert_eq!(stdout, expected, "stderr:\n{log}");
+    assert_eq!(stdout, expected, "{backend:?}\nstderr:\n{log}");
     let report: serde_json::Value =
         serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
             .expect("the verdict must be JSON");
-    assert_eq!(report["bitwise_parity"], true, "{report}");
+    assert_eq!(report["bitwise_parity"], true, "{backend:?}: {report}");
 }
 
 /// `/sys/devices/system/cpu` lists only cpu0 however `getdents64` is served

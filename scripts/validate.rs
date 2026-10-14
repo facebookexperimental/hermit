@@ -17377,7 +17377,7 @@ mod nextest_timeout_tests {
             "privileged-only-test.cli_kvm_on_host",
         ] {
             let step = config.steps.iter().find(|step| step.tag() == tag).unwrap();
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "75");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "76");
             // Unwrap the pinned-root shell argument when present, then exercise
             // the actual committed jq predicate without opening /dev/kvm.
             let mut words = shell_words::split(&step.cmd).unwrap();
@@ -17402,10 +17402,12 @@ mod nextest_timeout_tests {
             })
             .collect::<Vec<_>>();
         // 57 at ac74963d, and the seventeen run_kvm_timerfd_virtual_* tests
-        // (https://github.com/rrnewton/hermit/issues/1923): 74.
+        // (https://github.com/rrnewton/hermit/issues/1923): 74. And
+        // run_kvm_cpuinfo_matches_cpuid
+        // (https://github.com/rrnewton/hermit/issues/4161): 75.
         assert_eq!(
             names.len(),
-            74,
+            75,
             "update the exact CI inventory with new KVM tests"
         );
         let required_cases = [
@@ -18455,7 +18457,10 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // The seventeen run_kvm_timerfd_virtual_* tests
         // (https://github.com/rrnewton/hermit/issues/1923): 74 declarations,
         // 75 selected.
-        ("privileged-only-test.cli_kvm", 75usize),
+        // run_kvm_cpuinfo_matches_cpuid
+        // (https://github.com/rrnewton/hermit/issues/4161): 75 declarations,
+        // 76 selected.
+        ("privileged-only-test.cli_kvm", 76usize),
     ] {
         let step = privileged
             .steps
