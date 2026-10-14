@@ -2111,7 +2111,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4132): 1560, listed.
     // And scheduler::test::a_signal_discarded_when_sent_does_not_end_a_futex_wait_a_later_handler_could
     // (the Claude review of https://github.com/rrnewton/hermit/pull/4290): 1561, listed.
-    ("test.detcore_unit", 1561),
+    // Four inherited-terminal provenance regressions: 1565, measured by the
+    // complete Cargo nextest lib/bin selection.
+    ("test.detcore_unit", 1565),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3421,7 +3423,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the nine machine-description tests and the three torn-read and vector-flag tests (B2a, https://github.com/rrnewton/hermit/issues/4266): 1552.
     // And the eight guest private SIGCHLD futex-wait tests: 1560.
     // And the discarded-when-sent futex admission test: 1561.
-    ("test.detcore_unit_on_host", 1561),
+    // The same four inherited-terminal regressions: 1565, measured by the
+    // complete Cargo nextest lib/bin selection; integration cases are separate.
+    ("test.detcore_unit_on_host", 1565),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
