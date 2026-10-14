@@ -2722,6 +2722,7 @@ fn namespace_only_guest_command_preserves_sanitizer_environment() {
     assert!(error.contains("not set in the host environment"), "{error}");
 }
 
+#[cfg(feature = "dbt")]
 #[test]
 fn dbt_rejects_mount_but_accepts_bind_and_workdir() {
     let mut with_mount = run_opts_for(&[
