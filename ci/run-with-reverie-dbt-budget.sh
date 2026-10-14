@@ -1519,7 +1519,13 @@ fi
 # reverie-kvm (entry.rs, executor.rs and the gate type); every SDK recipe input, build.rs and the
 # vendored DynamoRIO tree are unchanged, and no reverie-dbt file is added (inventory 950), so the
 # budgets above carry.
-expected_pin=796c1cb81d1658596c7e41c950cf5c9f46a6986c
+# SHARED RPC CLIENT SDK-BUDGET CARRY (2026-10-14):
+# 796c1cb81d1658596c7e41c950cf5c9f46a6986c -> 049750ad5bfd93f3a315747cc259b5593f756d75.
+# Only Rust RPC clients, shared codec code and their tests change. build.rs,
+# native/ (including CMake), the DynamoRIO/vendor and third-party trees, root
+# and DBT manifests, and toolchain are identical. Inventory rises 950 -> 951.
+# Existing SDK budgets carry; no new build timing or runtime artifact is claimed.
+expected_pin=049750ad5bfd93f3a315747cc259b5593f756d75
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
