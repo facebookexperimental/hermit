@@ -1622,8 +1622,12 @@ fi
 # The added commits change only reverie-kvm (src/entry.rs, src/entry/signal.rs, src/clock.rs, README.md and tests); every SDK recipe
 # input, build.rs and the vendored DynamoRIO tree are unchanged, and no
 # reverie-dbt file is added (inventory 950), so the budgets above carry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 6dd1d62bf71ae171945feed82154a43aedf555bf ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 6dd1d62bf71ae171945feed82154a43aedf555bf (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# DBT D3 SDK-BUDGET CARRY (2026-10-14): advance from 6dd1d62b to e1ecaeb31a0bb1f8b86f36e769296ab6a7de3782 (the DBT lane's inherited-input
+# binding, re-parented by the coordinator onto KVM slice 3). It adds reverie/src/inherited_input.rs and a
+# reverie-dbt launcher test (inventory 951 -> 952) and edits reverie-dbt/src/launcher.rs; no SDK recipe
+# input, build.rs or vendored DynamoRIO file changes, so the budgets above carry.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != e1ecaeb31a0bb1f8b86f36e769296ab6a7de3782 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie e1ecaeb31a0bb1f8b86f36e769296ab6a7de3782 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

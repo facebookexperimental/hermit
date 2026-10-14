@@ -3910,14 +3910,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                     })
                     .map(|n| n as i64)
             }
-            FdType::Regular if descriptor.inherited_terminal().is_some() => {
-                // A host-driven terminal can block after this Device grant.
+            FdType::Regular | FdType::Pipe if descriptor.inherited_external_read().is_some() => {
+                // An authenticated controller input or terminal can block
+                // after this Device grant.
                 // Announce one external kernel read even when our cached flags
                 // say nonblocking: a fork/exec peer can change the shared OFD's
                 // flags while the process-local model remains stale (the
                 // pre-existing https://github.com/rrnewton/hermit/issues/3520).
                 // The kernel keeps its actual O_NONBLOCK semantics, including
-                // immediate EAGAIN. Never fill a terminal short read to len.
+                // immediate EAGAIN. Never fill an external short read to len.
                 self.record_or_replay_blocking(guest, call.into()).await
             }
             FdType::Regular => {
@@ -5071,6 +5072,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 },
                 rng_output,
             )
+        } else if detfd.inherited_external_read().is_some() {
+            // The same one-kernel-read rule as scalar input: preserve the
+            // kernel's iovec/short-read/error semantics and announce blocking.
+            self.record_or_replay_blocking(guest, call.into()).await
         } else if fd_type == FdType::Timerfd && crate::syscalls::timerfd::enabled(guest) {
             // As `read` of a timerfd on virtual time: publish its expirations,
             // retry a logically blocking read in turns, and return the
@@ -6060,8 +6065,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         fd_type: FdType,
         socketpair_endpoint: bool,
         physically_nonblocking: bool,
+        inherited_external_read: bool,
     ) -> bool {
         self.cfg.use_nonblocking_sockets()
+            && !inherited_external_read
             && match fd_type {
                 FdType::Pipe => !self.cfg.recordreplay_modes || physically_nonblocking,
                 FdType::Socket if socketpair_endpoint => {
@@ -6132,18 +6139,20 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
             }
             F_SETFL(flags) => {
-                let (fd_type, socketpair_endpoint, physically_nonblocking) =
+                let (fd_type, socketpair_endpoint, physically_nonblocking, inherited_external_read) =
                     guest.thread_state().with_detfd(fd, |detfd| {
                         (
                             detfd.ty(),
                             detfd.is_socketpair_endpoint(),
                             detfd.physically_nonblocking(),
+                            detfd.inherited_external_read().is_some(),
                         )
                     })?;
                 let force_nonblocking = self.keeps_physically_nonblocking(
                     fd_type,
                     socketpair_endpoint,
                     physically_nonblocking,
+                    inherited_external_read,
                 );
                 let physical_flags = if force_nonblocking {
                     flags | OFlag::O_NONBLOCK.bits()
@@ -6375,18 +6384,20 @@ impl<T: RecordOrReplay> Detcore<T> {
         // ioctl to their proxied pipe fd, and clearing it would violate the scheduler's
         // nonblockize-and-retry invariant. This mirrors F_SETFL's forced state split.
         if let Some(enabled) = nonblocking {
-            let (fd_type, socketpair_endpoint, physically_nonblocking) =
+            let (fd_type, socketpair_endpoint, physically_nonblocking, inherited_external_read) =
                 guest.thread_state().with_detfd(fd, |detfd| {
                     (
                         detfd.ty(),
                         detfd.is_socketpair_endpoint(),
                         detfd.physically_nonblocking(),
+                        detfd.inherited_external_read().is_some(),
                     )
                 })?;
             if self.keeps_physically_nonblocking(
                 fd_type,
                 socketpair_endpoint,
                 physically_nonblocking,
+                inherited_external_read,
             ) && physically_nonblocking
             {
                 guest.thread_state().with_detfd(fd, |detfd| {
@@ -9793,6 +9804,47 @@ mod test {
     use super::terminal_can_become_controlling;
     use crate::test_pages::PAGE;
     use crate::test_pages::Pages;
+
+    #[test]
+    fn inherited_input_status_flags_remain_kernel_owned() {
+        for recordreplay_modes in [false, true] {
+            let tool = crate::Detcore {
+                detpid: crate::types::DetPid::from_raw(3),
+                cfg: crate::Config {
+                    sequentialize_threads: true,
+                    recordreplay_modes,
+                    ..Default::default()
+                },
+                record_or_replay: crate::record_or_replay::NoopTool,
+            };
+            for physically_nonblocking in [false, true] {
+                assert!(!tool.keeps_physically_nonblocking(
+                    crate::fd::FdType::Pipe,
+                    false,
+                    physically_nonblocking,
+                    true
+                ));
+                assert_eq!(
+                    tool.keeps_physically_nonblocking(
+                        crate::fd::FdType::Pipe,
+                        false,
+                        physically_nonblocking,
+                        false
+                    ),
+                    !recordreplay_modes || physically_nonblocking
+                );
+                assert_eq!(
+                    tool.keeps_physically_nonblocking(
+                        crate::fd::FdType::Socket,
+                        true,
+                        physically_nonblocking,
+                        false
+                    ),
+                    !recordreplay_modes || physically_nonblocking
+                );
+            }
+        }
+    }
 
     /// Every `fcntl` and `ioctl` that can make Linux signal a descriptor's
     /// owner at a moment set by host timing names SIGIO and SIGURG, plus the

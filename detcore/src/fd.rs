@@ -92,18 +92,34 @@ pub(crate) enum NetworkSocketKind {
     InetOther,
 }
 
-/// Provenance of a terminal inherited at the container's first image.
+/// Read provenance authenticated at the container's initial image: a terminal
+/// checked with TCGETS, or the launcher's actually created controller input pipe.
 ///
 /// The original open-file identity distinguishes aliases from separate opens
 /// of the same tty. The raw identity is used only to validate an exec handoff;
 /// it is never a guest-visible inode or a scheduler resource.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct InheritedTerminal {
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct InheritedExternalRead {
     pub(crate) origin: OpenFileId,
     pub(crate) dev: u64,
     pub(crate) inode: u64,
     pub(crate) rdev: u64,
+    pub(crate) file_type: u32,
+    pub(crate) access_mode: i32,
     pub(crate) resource: Option<ResourceID>,
+}
+
+impl std::fmt::Debug for InheritedExternalRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Kernel identity authenticates a private handoff; distinct launches
+        // must not compare their host pipe/terminal inode numbers.
+        f.debug_struct("InheritedExternalRead")
+            .field("origin", &self.origin)
+            .field("file_type", &self.file_type)
+            .field("access_mode", &self.access_mode)
+            .field("resource", &self.resource)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Deterministic file descriptor
@@ -305,10 +321,10 @@ struct OpenFileDescription {
     id: OpenFileId,
     /// fd type
     ty: FdType,
-    /// Read provenance for a terminal inherited from the container launcher.
-    /// Guest-created PTYs never acquire this fact merely by becoming stdio.
+    /// Immutable inherited-read provenance. Neither guest-created PTYs nor
+    /// unknown FIFOs acquire it merely by becoming stdio.
     #[serde(default)]
-    inherited_terminal: Option<InheritedTerminal>,
+    inherited_external_read: Option<InheritedExternalRead>,
     /// Process named by a pidfd created through `pidfd_open`.
     ///
     /// This is shared by descriptor aliases just like the kernel pidfd object.
@@ -586,7 +602,7 @@ impl DetFd {
                 id,
                 ty,
                 pidfd_target: None,
-                inherited_terminal: None,
+                inherited_external_read: None,
                 status_flags: bits & !OFlag::O_CLOEXEC.bits(),
                 path: None,
                 inode: None,
@@ -685,12 +701,12 @@ impl DetFd {
         self.with_description(|d| d.resource = resource);
     }
 
-    pub(crate) fn inherited_terminal(&self) -> Option<InheritedTerminal> {
-        self.with_description(|d| d.inherited_terminal.clone())
+    pub(crate) fn inherited_external_read(&self) -> Option<InheritedExternalRead> {
+        self.with_description(|d| d.inherited_external_read.clone())
     }
 
-    pub(crate) fn set_inherited_terminal(&self, terminal: InheritedTerminal) {
-        self.with_description(|d| d.inherited_terminal = Some(terminal));
+    pub(crate) fn set_inherited_external_read(&self, terminal: InheritedExternalRead) {
+        self.with_description(|d| d.inherited_external_read = Some(terminal));
     }
 
     /// If fd is non blocking

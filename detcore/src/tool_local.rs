@@ -190,14 +190,20 @@ pub type ExecFdBlockingOverrides = BTreeSet<RawFd>;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecFdState {
     pub(crate) blocking: ExecFdBlockingOverrides,
-    pub(crate) terminals: BTreeMap<RawFd, crate::fd::InheritedTerminal>,
+    pub(crate) inherited_reads: BTreeMap<RawFd, crate::fd::InheritedExternalRead>,
     /// Set only by the global first-image completion, never by a preparation.
     pub(crate) initialize_inherited_stdio: bool,
+    /// Offered only to the registered root's initial image by its launcher.
+    #[serde(default)]
+    pub(crate) initial_input: Option<reverie::InheritedInputIdentity>,
 }
 
 impl ExecFdState {
     pub(crate) fn is_empty(&self) -> bool {
-        self.blocking.is_empty() && self.terminals.is_empty() && !self.initialize_inherited_stdio
+        self.blocking.is_empty()
+            && self.inherited_reads.is_empty()
+            && !self.initialize_inherited_stdio
+            && self.initial_input.is_none()
     }
 }
 
@@ -728,11 +734,15 @@ impl FileMetadata {
         }
     }
 
-    fn inherited_terminals_for_exec(&self) -> BTreeMap<RawFd, crate::fd::InheritedTerminal> {
+    fn inherited_reads_for_exec(&self) -> BTreeMap<RawFd, crate::fd::InheritedExternalRead> {
         self.file_handles
             .iter()
             .filter(|(_, detfd)| !detfd.is_cloexec())
-            .filter_map(|(&fd, detfd)| detfd.inherited_terminal().map(|terminal| (fd, terminal)))
+            .filter_map(|(&fd, detfd)| {
+                detfd
+                    .inherited_external_read()
+                    .map(|terminal| (fd, terminal))
+            })
             .collect()
     }
 
@@ -753,32 +763,35 @@ impl FileMetadata {
             if unsafe { libc::ioctl(fd, libc::TCGETS, &raw mut settings) } != 0 {
                 continue;
             }
-            detfd.set_inherited_terminal(crate::fd::InheritedTerminal {
+            detfd.set_inherited_external_read(crate::fd::InheritedExternalRead {
                 origin: detfd.open_file_id(),
                 dev: stat.dev,
                 inode: stat.inode,
                 rdev: stat.rdev,
+                file_type: libc::S_IFCHR,
+                access_mode: detfd.status_flags() & libc::O_ACCMODE,
                 resource: detfd.resource(),
             });
         }
     }
 
-    /// Restore only terminals proven to survive the prepared exec. Unknown
+    /// Restore only external-read descriptions proven to survive the prepared exec. Unknown
     /// descriptors and guest-created PTYs are not promoted by rediscovery.
-    fn restore_inherited_terminals(
+    fn restore_inherited_reads(
         &mut self,
         owner: DetTid,
-        terminals: BTreeMap<RawFd, crate::fd::InheritedTerminal>,
+        inherited_reads: BTreeMap<RawFd, crate::fd::InheritedExternalRead>,
     ) -> Result<(), Errno> {
         let mut aliases: HashMap<OpenFileId, DetFd> = HashMap::new();
-        for (fd, terminal) in terminals {
+        for (fd, terminal) in inherited_reads {
             self.discover_fd_from_current_process(owner, fd)?;
             let detfd = self.file_handles.get_mut(&fd).ok_or(Errno::EBADF)?;
             let stat =
                 stat::fstat(unsafe { BorrowedFd::borrow_raw(fd) }).map_err(|_| Errno::last())?;
-            if stat.st_mode & libc::S_IFMT != libc::S_IFCHR
+            if stat.st_mode & libc::S_IFMT != terminal.file_type
                 || (stat.st_dev, stat.st_ino, stat.st_rdev)
                     != (terminal.dev, terminal.inode, terminal.rdev)
+                || detfd.status_flags() & libc::O_ACCMODE != terminal.access_mode
             {
                 return Err(Errno::EIO);
             }
@@ -791,10 +804,35 @@ impl FileMetadata {
                 detfd.share_open_file_with(alias);
             } else {
                 detfd.set_resource(terminal.resource.clone());
-                detfd.set_inherited_terminal(terminal.clone());
+                detfd.set_inherited_external_read(terminal.clone());
                 aliases.insert(terminal.origin, detfd.clone());
             }
         }
+        Ok(())
+    }
+
+    fn install_inherited_input(
+        &mut self,
+        owner: DetTid,
+        input: reverie::InheritedInputIdentity,
+    ) -> Result<(), Errno> {
+        let fd = input.guest_fd();
+        self.discover_fd_from_current_process(owner, fd)?;
+        let stat = stat::fstat(unsafe { BorrowedFd::borrow_raw(fd) }).map_err(|_| Errno::last())?;
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        let detfd = self.file_handles.get(&fd).ok_or(Errno::EBADF)?;
+        if !input.matches(&stat, flags) || detfd.ty() != FdType::Pipe {
+            return Err(Errno::EIO);
+        }
+        detfd.set_inherited_external_read(crate::fd::InheritedExternalRead {
+            origin: detfd.open_file_id(),
+            dev: input.dev(),
+            inode: input.inode(),
+            rdev: input.rdev(),
+            file_type: libc::S_IFIFO,
+            access_mode: input.access_mode(),
+            resource: detfd.resource(),
+        });
         Ok(())
     }
 
@@ -808,10 +846,13 @@ impl FileMetadata {
         if !shared_guest_table {
             return Ok(());
         }
+        if let Some(input) = state.initial_input {
+            self.install_inherited_input(owner, input)?;
+        }
         if state.initialize_inherited_stdio {
             self.discover_inherited_terminals(0..=2);
         } else {
-            self.restore_inherited_terminals(owner, state.terminals)?;
+            self.restore_inherited_reads(owner, state.inherited_reads)?;
         }
         Ok(())
     }
@@ -1290,6 +1331,7 @@ mod resource_limits_tests {
 
 #[cfg(test)]
 mod file_metadata_tests {
+    mod inherited_input;
     use std::os::fd::AsRawFd;
 
     use super::*;
@@ -1350,7 +1392,7 @@ mod file_metadata_tests {
         metadata.discover_inherited_terminals(fds);
         for (index, fd) in fds.into_iter().enumerate() {
             let detfd = &metadata.file_handles[&fd];
-            assert_eq!(detfd.inherited_terminal().is_some(), index == 0);
+            assert_eq!(detfd.inherited_external_read().is_some(), index == 0);
             assert_eq!(
                 detfd.ty(),
                 if index == 4 {
@@ -1395,11 +1437,15 @@ mod file_metadata_tests {
         let encoded = serde_json::to_vec(&child).unwrap();
         let child: FileMetadata = serde_json::from_slice(&encoded).unwrap();
         let state = ExecFdState {
-            terminals: child.inherited_terminals_for_exec(),
+            inherited_reads: child.inherited_reads_for_exec(),
             ..Default::default()
         };
-        assert_eq!(state.terminals.len(), 2, "CLOEXEC alias is not transferred");
-        assert_eq!(state.terminals[&fd], state.terminals[&alias]);
+        assert_eq!(
+            state.inherited_reads.len(),
+            2,
+            "CLOEXEC alias is not transferred"
+        );
+        assert_eq!(state.inherited_reads[&fd], state.inherited_reads[&alias]);
         let mut restored = FileMetadata::new(owner);
         restored
             .apply_exec_fd_state(
@@ -1443,23 +1489,23 @@ mod file_metadata_tests {
             .discover_fd_from_current_process(owner, fd)
             .unwrap();
         guest_created.dup_fd(fd, 0, OFlag::empty()).unwrap();
-        assert!(guest_created.inherited_terminals_for_exec().is_empty());
+        assert!(guest_created.inherited_reads_for_exec().is_empty());
         let mut fresh = FileMetadata::new(owner);
         fresh
             .apply_exec_fd_state(owner, ExecFdState::default(), true)
             .unwrap();
         fresh.discover_fd_from_current_process(owner, fd).unwrap();
-        assert!(fresh.file_handles[&fd].inherited_terminal().is_none());
+        assert!(fresh.file_handles[&fd].inherited_external_read().is_none());
 
         guest_created.discover_inherited_terminals([fd]);
         let state = ExecFdState {
-            terminals: guest_created.inherited_terminals_for_exec(),
+            inherited_reads: guest_created.inherited_reads_for_exec(),
             ..Default::default()
         };
         // Remove the synthetic slot; only the actual owned fd enters this check.
         let state = ExecFdState {
-            terminals: state
-                .terminals
+            inherited_reads: state
+                .inherited_reads
                 .into_iter()
                 .filter(|(number, _)| *number == fd)
                 .collect(),
@@ -1473,7 +1519,7 @@ mod file_metadata_tests {
             reused.apply_exec_fd_state(owner, state, true),
             Err(Errno::EIO)
         );
-        assert!(reused.file_handles[&fd].inherited_terminal().is_none());
+        assert!(reused.file_handles[&fd].inherited_external_read().is_none());
     }
 
     #[test]
@@ -3535,10 +3581,10 @@ impl<T> ThreadState<T> {
         self.metadata().exec_blocking_overrides()
     }
 
-    pub(crate) fn inherited_terminals_for_exec(
+    pub(crate) fn inherited_reads_for_exec(
         &self,
-    ) -> BTreeMap<RawFd, crate::fd::InheritedTerminal> {
-        self.metadata().inherited_terminals_for_exec()
+    ) -> BTreeMap<RawFd, crate::fd::InheritedExternalRead> {
+        self.metadata().inherited_reads_for_exec()
     }
 
     /// Descriptors in this table that Detcore manages as internal pipes: typed
@@ -3557,6 +3603,7 @@ impl<T> ThreadState<T> {
             .iter()
             .filter(|(_, detfd)| {
                 detfd.ty() == FdType::Pipe
+                    && detfd.inherited_external_read().is_none()
                     && detfd.physically_nonblocking()
                     && !detfd.is_nonblocking()
             })

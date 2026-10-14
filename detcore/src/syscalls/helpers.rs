@@ -965,6 +965,13 @@ pub fn syscall_targets_internal_fd<G: Guest<Detcore<T>>, T: RecordOrReplay>(
         Some(fd) => guest
             .thread_state()
             .with_detfd(fd, |detfd| {
+                // This is read-end provenance, not a blanket external-fd
+                // classification: writes and socketpairs retain the guard.
+                if matches!(call, Syscall::Read(_) | Syscall::Readv(_))
+                    && detfd.inherited_external_read().is_some()
+                {
+                    return false;
+                }
                 matches!(detfd.ty(), FdType::Pipe) || detfd.is_socketpair_endpoint()
             })
             .unwrap_or(false),
@@ -4277,6 +4284,91 @@ mod kernel_signal_wait_failures {
             // SAFETY: gettid has no preconditions.
             Self::new(Pid::from_raw(unsafe { libc::gettid() }), mask)
         }
+    }
+
+    #[test]
+    fn inherited_input_exempts_only_authenticated_reads_from_the_internal_guard() {
+        use std::os::fd::AsRawFd;
+        let (mut guest, _) = WaitGuest::live(guest_mask());
+        let slot = tempfile::tempfile().unwrap();
+        let fd = slot.as_raw_fd();
+        let input = reverie::InheritedInput::pipe(fd).unwrap();
+        let identity = input.identity().clone();
+        let (reader, _writer) = input.into_reader_and_writer();
+        assert_eq!(unsafe { libc::dup2(reader.as_raw_fd(), fd) }, fd);
+        guest
+            .thread
+            .add_fd(fd, nix::fcntl::OFlag::O_RDONLY, FdType::Pipe, None)
+            .unwrap();
+        let calls = [
+            Syscall::from(syscalls::Read::new().with_fd(fd)),
+            Syscall::from(syscalls::Readv::new().with_fd(fd)),
+            Syscall::from(syscalls::Write::new().with_fd(fd)),
+            Syscall::from(syscalls::Writev::new().with_fd(fd)),
+        ];
+        for call in calls {
+            assert!(syscall_targets_internal_fd(&mut guest, call));
+        }
+        guest
+            .thread
+            .file_metadata
+            .lock()
+            .unwrap()
+            .apply_exec_fd_state(
+                guest.thread.dettid,
+                crate::tool_local::ExecFdState {
+                    initial_input: Some(identity),
+                    ..Default::default()
+                },
+                true,
+            )
+            .unwrap();
+        for (index, call) in calls.into_iter().enumerate() {
+            assert_eq!(syscall_targets_internal_fd(&mut guest, call), index >= 2);
+        }
+        assert!(
+            !guest
+                .thread
+                .with_detfd(fd, |d| d.physically_nonblocking())
+                .unwrap()
+        );
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_NONBLOCK,
+            0
+        );
+        let (internal, _writer) = nix::unistd::pipe().unwrap();
+        guest
+            .thread
+            .add_fd(
+                internal.as_raw_fd(),
+                nix::fcntl::OFlag::O_RDONLY,
+                FdType::Pipe,
+                None,
+            )
+            .unwrap();
+        assert!(syscall_targets_internal_fd(
+            &mut guest,
+            syscalls::Read::new().with_fd(internal.as_raw_fd()).into()
+        ));
+        // Socketpair ownership remains internal as well.
+        let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        guest
+            .thread
+            .add_fd(
+                socket.as_raw_fd(),
+                nix::fcntl::OFlag::O_RDWR,
+                FdType::Socket,
+                None,
+            )
+            .unwrap();
+        guest
+            .thread
+            .with_detfd(socket.as_raw_fd(), |d| d.set_socketpair_endpoint())
+            .unwrap();
+        assert!(syscall_targets_internal_fd(
+            &mut guest,
+            syscalls::Readv::new().with_fd(socket.as_raw_fd()).into()
+        ));
     }
 
     /// Answer this thread's `/proc` reads from `kernel` until the result drops.

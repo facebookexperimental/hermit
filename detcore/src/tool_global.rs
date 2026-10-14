@@ -325,6 +325,12 @@ struct ChildRegistration {
     parent_is_kernel_blocked: bool,
 }
 
+#[derive(Debug)]
+struct PendingInheritedInput {
+    lease: reverie::InheritedInputLease,
+    root: Option<(DetTid, MmId)>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingExecState {
     caller: DetTid,
@@ -1090,6 +1096,9 @@ pub struct GlobalState {
     past_first_execve: AtomicBool,
     /// Unlike the logging flag above, this changes only at successful image completion.
     initial_descriptor_image_complete: AtomicBool,
+    /// Actual controller input, held only until the registered root image
+    /// consumes it. The lease keeps its raw identity live, not guest-visible.
+    inherited_input: Mutex<Option<PendingInheritedInput>>,
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1154): Review the SaBRe exec descriptor-status handoff.
@@ -1274,6 +1283,7 @@ impl GlobalState {
             open_file_to_port: Mutex::new(HashMap::new()),
             past_first_execve: AtomicBool::new(false),
             initial_descriptor_image_complete: AtomicBool::new(false),
+            inherited_input: Mutex::new(None),
             pending_exec_states: Mutex::new(BTreeMap::new()),
             completed_exec_transfers: Mutex::new(BTreeMap::new()),
             post_exec_fd_blocking: Mutex::new(BTreeMap::new()),
@@ -1733,6 +1743,15 @@ impl GlobalTool for GlobalState {
         // host task's `/proc` signal state for them (`read_kernel_signal_state`).
         crate::syscalls::refuse_host_signal_state_reads(&cfg.backend);
         GlobalState::initialize(cfg, true)
+    }
+
+    fn install_inherited_input(&mut self, input: reverie::InheritedInputLease) {
+        // Called once by the launcher before this global state is published.
+        // All fallible endpoint/lease creation happened before initialization.
+        *self.inherited_input.get_mut().unwrap() = Some(PendingInheritedInput {
+            lease: input,
+            root: None,
+        });
     }
 
     fn install_backend_signal_control(
@@ -2339,7 +2358,10 @@ impl GlobalState {
             }
             GlobalRequest::PrepareExec(process, mm, fd_blocking) => {
                 let mut sched = self.lock_rpc_scheduler(false).await;
-                if mm != request_mm || fd_blocking.initialize_inherited_stdio {
+                if mm != request_mm
+                    || fd_blocking.initialize_inherited_stdio
+                    || fd_blocking.initial_input.is_some()
+                {
                     return (None, R::ThreadExited);
                 }
                 if self.cfg.sequentialize_threads && !sched.prepare_exec_teardown(dtid, process, mm)
@@ -2454,6 +2476,20 @@ impl GlobalState {
                 );
                 overrides.initialize_inherited_stdio =
                     first_image && self.cfg.backend.tool_shares_guest_descriptor_table;
+                if self.cfg.backend.tool_shares_guest_descriptor_table {
+                    let mut input = self.inherited_input.lock().unwrap();
+                    if input
+                        .as_ref()
+                        .is_some_and(|input| input.root == Some((dtid, request_mm)))
+                    {
+                        // Only this registered root/image consumes the launch
+                        // seed. A descendant or later exec cannot acquire it.
+                        // Drop the temporary reader at this handoff; the actual
+                        // root's descriptor remains live until local validation.
+                        overrides.initial_input =
+                            input.take().map(|input| input.lease.identity().clone());
+                    }
+                }
                 R::MarkPastFirstExecve(overrides)
             }
             // Requested by the parent thread:
@@ -3467,6 +3503,19 @@ impl GlobalState {
                     sched.logically_kill_thread(&child_dettid, &child_detpid, child_mm);
                     return SchedulerRpcResult::ThreadExited;
                 }
+            }
+
+            // Bind only the existing root self-registration, after its
+            // registration has succeeded. An arbitrary descendant's first
+            // completion cannot claim a launcher-created input endpoint.
+            if flags.is_none()
+                && parent_dettid == child_dettid
+                && parent_detpid == child_dettid
+                && child_dettid == ROOT_DETPID
+                && let Some(input) = self.inherited_input.lock().unwrap().as_mut()
+                && input.root.is_none()
+            {
+                input.root = Some((child_dettid, child_mm));
             }
 
             // Record this thread in deterministic creation order so a
@@ -5012,8 +5061,9 @@ where
     let detpid = guest.thread_state().detpid.expect("detpid unset");
     let fd_state = ExecFdState {
         blocking: fd_blocking,
-        terminals: guest.thread_state().inherited_terminals_for_exec(),
+        inherited_reads: guest.thread_state().inherited_reads_for_exec(),
         initialize_inherited_stdio: false,
+        initial_input: None,
     };
     let (_, response) =
         send_and_update_time(guest, GlobalRequest::PrepareExec(detpid, mm, fd_state)).await;
@@ -7743,6 +7793,137 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn inherited_input_belongs_only_to_the_registered_root_initial_image() {
+        use super::ChildRegistration;
+        use super::ROOT_DETPID;
+
+        let config = Config {
+            sequentialize_threads: false,
+            ..Config::default()
+        }
+        .with_backend(|backend| backend.tool_shares_guest_descriptor_table = true);
+        let mut state = GlobalState::initialize(&config, false);
+        let pipe = reverie::InheritedInput::pipe(0).unwrap();
+        state.install_inherited_input(pipe.lease().unwrap());
+        let root = ROOT_DETPID;
+        let child = DetTid::from_raw(root.as_raw() + 1);
+        let root_mm = MmId::initial(root);
+        for (parent, task, flags) in [(root, root, None), (root, child, Some(CloneFlags::empty()))]
+        {
+            assert!(matches!(
+                state
+                    .recv_create_child_thread(
+                        Tid::from_raw(parent.as_raw()),
+                        root_mm,
+                        ChildRegistration {
+                            parent_dettid: parent,
+                            parent_detpid: root,
+                            child_dettid: task,
+                            child_tid_addr: 0,
+                            flags,
+                            exit_signal: libc::SIGCHLD,
+                            physical_ids: None,
+                            maybe_priority: Some(DEFAULT_PRIORITY),
+                            parent_is_kernel_blocked: false,
+                        },
+                    )
+                    .await,
+                SchedulerRpcResult::Continue(())
+            ));
+        }
+        assert_eq!(
+            state.inherited_input.lock().unwrap().as_ref().unwrap().root,
+            Some((root, root_mm))
+        );
+
+        // A real descendant may complete first, but cannot consume this seed.
+        let response = state
+            .receive_rpc(
+                Tid::from_raw(child.as_raw()),
+                (
+                    DetTime::new(&config),
+                    MmId::initial(child),
+                    GlobalRequest::MarkPastFirstExecve(child, None),
+                ),
+            )
+            .await
+            .1;
+        let GlobalResponse::MarkPastFirstExecve(child_state) = response else {
+            panic!("{response:?}")
+        };
+        assert!(child_state.initial_input.is_none());
+        assert!(state.inherited_input.lock().unwrap().is_some());
+
+        // Nor can a later root image, even with the correct descriptor slot.
+        let response = state
+            .receive_rpc(
+                Tid::from_raw(root.as_raw()),
+                (
+                    DetTime::new(&config),
+                    root_mm.for_exec(root),
+                    GlobalRequest::MarkPastFirstExecve(root, None),
+                ),
+            )
+            .await
+            .1;
+        // An initial registration has no retired-exec incarnation entry, so
+        // the existing RPC layer returns an empty completion here. The launch
+        // lease's stricter root/image binding must still refuse the seed.
+        assert_eq!(
+            response,
+            GlobalResponse::MarkPastFirstExecve(Default::default())
+        );
+        assert!(state.inherited_input.lock().unwrap().is_some());
+
+        let response = state
+            .receive_rpc(
+                Tid::from_raw(root.as_raw()),
+                (
+                    DetTime::new(&config),
+                    root_mm,
+                    GlobalRequest::MarkPastFirstExecve(root, None),
+                ),
+            )
+            .await
+            .1;
+        let GlobalResponse::MarkPastFirstExecve(root_state) = response else {
+            panic!("{response:?}")
+        };
+        assert_eq!(root_state.initial_input.as_ref(), Some(pipe.identity()));
+        assert!(state.inherited_input.lock().unwrap().is_none());
+        let response = state
+            .receive_rpc(
+                Tid::from_raw(root.as_raw()),
+                (
+                    DetTime::new(&config),
+                    root_mm,
+                    GlobalRequest::MarkPastFirstExecve(root, None),
+                ),
+            )
+            .await
+            .1;
+        let GlobalResponse::MarkPastFirstExecve(repeated) = response else {
+            panic!("{response:?}")
+        };
+        assert!(repeated.initial_input.is_none());
+
+        // An exec preparation is a return of existing OFD state, not an
+        // installation channel for copied launch identities.
+        let response = state
+            .receive_rpc(
+                Tid::from_raw(root.as_raw()),
+                (
+                    DetTime::new(&config),
+                    root_mm,
+                    GlobalRequest::PrepareExec(root, root_mm, root_state),
+                ),
+            )
+            .await
+            .1;
+        assert_eq!(response, GlobalResponse::ThreadExited);
+    }
+
     fn cancellation_test_state() -> (Config, GlobalState, DetTid, DetPid) {
         let config = Config {
             sequentialize_threads: true,
@@ -9746,17 +9927,20 @@ mod tests {
         let total_before = state.global_time.lock().unwrap().as_nanos();
         let fd_blocking = ExecFdState {
             blocking: [42].into_iter().collect(),
-            terminals: std::collections::BTreeMap::from([(
+            inherited_reads: std::collections::BTreeMap::from([(
                 43,
-                crate::fd::InheritedTerminal {
+                crate::fd::InheritedExternalRead {
                     origin: crate::types::OpenFileId::new(leader, 0),
                     dev: 1,
                     inode: 2,
                     rdev: 3,
+                    file_type: libc::S_IFCHR,
+                    access_mode: libc::O_RDONLY,
                     resource: Some(ResourceID::Device(crate::resources::Device::ContainerStdin)),
                 },
             )]),
             initialize_inherited_stdio: false,
+            initial_input: None,
         };
         state.pending_exec_states.lock().unwrap().insert(
             detpid,
