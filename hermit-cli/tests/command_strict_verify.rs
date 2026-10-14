@@ -73,6 +73,16 @@ fn configure_pinned_root(command: &mut Command) {
 }
 
 fn assert_l2_under_strict_verify(case: &StrictCommandCase) {
+    assert_l2_under_strict_verify_with(case, &[]);
+}
+
+/// As [`assert_l2_under_strict_verify`], at the `standard` `/proc` level, for
+/// a command that reads a name only that level has.
+fn assert_l2_under_strict_verify_at_standard(case: &StrictCommandCase) {
+    assert_l2_under_strict_verify_with(case, &["--proc=standard"]);
+}
+
+fn assert_l2_under_strict_verify_with(case: &StrictCommandCase, run_args: &[&str]) {
     let program = required_command(case);
     let home = tempfile::tempdir().expect("failed to create isolated command HOME");
     std::fs::create_dir_all(home.path().join(".config/procps"))
@@ -90,6 +100,7 @@ fn assert_l2_under_strict_verify(case: &StrictCommandCase) {
         ])
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args(["--log=info", "run", "--strict", "--verify"])
+        .args(run_args)
         .arg(format!("--env=HOME={}", home.path().display()))
         .arg(format!(
             "--env=XDG_CONFIG_HOME={}",
@@ -433,12 +444,6 @@ fn process_accounting_commands_are_deterministic_under_strict_verify() {
             stdin: None,
         },
         StrictCommandCase {
-            name: "vmstat -s",
-            candidates: &["/usr/bin/vmstat", "/bin/vmstat"],
-            args: &["-s"],
-            stdin: None,
-        },
-        StrictCommandCase {
             name: "top batch",
             candidates: &["/usr/bin/top", "/bin/top"],
             args: &["-b", "-n", "1", "-p", "1", "-w", "80"],
@@ -448,6 +453,17 @@ fn process_accounting_commands_are_deterministic_under_strict_verify() {
 
     for case in &cases {
         assert_l2_under_strict_verify(case);
+    }
+
+    // These read names only the `standard` /proc level has.
+    let standard_cases = [StrictCommandCase {
+        name: "vmstat -s",
+        candidates: &["/usr/bin/vmstat", "/bin/vmstat"],
+        args: &["-s"],
+        stdin: None,
+    }];
+    for case in &standard_cases {
+        assert_l2_under_strict_verify_at_standard(case);
     }
 }
 
@@ -465,12 +481,6 @@ fn io_accounting_commands_are_deterministic_under_strict_verify() {
             stdin: None,
         },
         StrictCommandCase {
-            name: "vmstat disk",
-            candidates: &["/usr/bin/vmstat"],
-            args: &["-d", "1", "2"],
-            stdin: None,
-        },
-        StrictCommandCase {
             name: "pidstat disk",
             candidates: &["/usr/bin/pidstat"],
             args: &["-d", "-p", "1", "1", "1"],
@@ -480,6 +490,17 @@ fn io_accounting_commands_are_deterministic_under_strict_verify() {
 
     for case in &cases {
         assert_l2_under_strict_verify(case);
+    }
+
+    // These read names only the `standard` /proc level has.
+    let standard_cases = [StrictCommandCase {
+        name: "vmstat disk",
+        candidates: &["/usr/bin/vmstat"],
+        args: &["-d", "1", "2"],
+        stdin: None,
+    }];
+    for case in &standard_cases {
+        assert_l2_under_strict_verify_at_standard(case);
     }
 }
 
@@ -508,16 +529,21 @@ fn kernel_pseudofile_commands_are_deterministic_under_strict_verify() {
             args: &["kernel.random.uuid"],
             stdin: None,
         },
-        StrictCommandCase {
-            name: "sar resource tables",
-            candidates: &["/usr/bin/sar"],
-            args: &["-v", "1", "1"],
-            stdin: None,
-        },
     ];
 
     for case in &cases {
         assert_l2_under_strict_verify(case);
+    }
+
+    // These read names only the `standard` /proc level has.
+    let standard_cases = [StrictCommandCase {
+        name: "sar resource tables",
+        candidates: &["/usr/bin/sar"],
+        args: &["-v", "1", "1"],
+        stdin: None,
+    }];
+    for case in &standard_cases {
+        assert_l2_under_strict_verify_at_standard(case);
     }
 }
 
@@ -542,7 +568,19 @@ fn ionice_query_is_deterministic_under_strict_verify() {
 #[ignore = "e2e: requires hermit + util-linux/sysstat/kmod"]
 fn kernel_activity_commands_are_deterministic_under_strict_verify() {
     let _guard = hermit_run_lock();
-    let cases = [
+    let cases = [StrictCommandCase {
+        name: "lsmod",
+        candidates: &["/usr/sbin/lsmod", "/usr/bin/lsmod"],
+        args: &[],
+        stdin: None,
+    }];
+
+    for case in &cases {
+        assert_l2_under_strict_verify(case);
+    }
+
+    // These read names only the `standard` /proc level has.
+    let standard_cases = [
         StrictCommandCase {
             name: "lsirq",
             candidates: &["/usr/bin/lsirq"],
@@ -559,16 +597,9 @@ fn kernel_activity_commands_are_deterministic_under_strict_verify() {
             args: &["-I", "SCPU", "-P", "0", "1", "1"],
             stdin: None,
         },
-        StrictCommandCase {
-            name: "lsmod",
-            candidates: &["/usr/sbin/lsmod", "/usr/bin/lsmod"],
-            args: &[],
-            stdin: None,
-        },
     ];
-
-    for case in &cases {
-        assert_l2_under_strict_verify(case);
+    for case in &standard_cases {
+        assert_l2_under_strict_verify_at_standard(case);
     }
 }
 

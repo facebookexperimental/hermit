@@ -496,7 +496,14 @@ impl RecordVersion {
 // procfs cannot hold, so its recorded answer is Linux's for a missing name
 // (https://github.com/rrnewton/hermit/issues/4266). An older recording holds
 // the kernel's answer for the name itself.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x152);
+// 0x152 -> 0x153 (taken at land time, as the reservation file's land-time
+// numbering rule gives a ready change HIGHEST_SHIPPED + 1): `minimal` is the
+// default /proc level, and a recording stores its level (`record start
+// --proc`), which its replay runs at
+// (https://github.com/rrnewton/hermit/issues/4266). An older recording ran at
+// `standard` without saying so, and would replay at `minimal`, where the
+// standard level's names are missing.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x153);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -521,7 +528,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x152);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x152;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x153;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -587,6 +594,13 @@ pub struct Metadata {
     /// interfaces and ports they were recorded against.
     #[serde(default)]
     pub local_networking: Option<bool>,
+    /// The `/proc` level the recording ran at (`record start --proc`, or the
+    /// default where the caller names none). Record and replay both run at
+    /// it, so a replay sees the names its recording saw. Every recorder
+    /// writes it; `None` is only a hand-written metadata.json, which takes
+    /// the default.
+    #[serde(default)]
+    pub proc_level: Option<detcore_model::config::ProcLevel>,
 }
 
 impl Metadata {
@@ -642,6 +656,7 @@ impl Metadata {
             mountinfo_mount_ids_captured: false,
             mount_id_assignment_order: Vec::new(),
             local_networking: None,
+            proc_level: None,
         })
     }
 
@@ -1468,6 +1483,14 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_from_before_procfs_levels() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x151)));
+    }
+
+    /// A recording older than 0x153 ran at the `standard` /proc level without
+    /// storing it, and would replay at the new default, `minimal`
+    /// (https://github.com/rrnewton/hermit/issues/4266).
+    #[test]
+    fn record_version_rejects_streams_from_before_the_minimal_default() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x152)));
     }
 
     #[test]

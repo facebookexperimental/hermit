@@ -28,6 +28,8 @@ bucket: compat
 # strict-compat/real-compat-fixtures.
 # `{{XDG_CONFIG_HOME}}` is the cell-owned configuration copy, equalized to
 # /tmp/e2e/xdg-config for verify and kept at its own host path for replay.
+# A row with `proc: standard` runs at that /proc level: its program reads a
+# name Hermit's default level, minimal, omits (/proc/vmstat, /proc/softirqs).
 corpus:
   description: Real program under the portable strict compatibility corpus
   lane: portable
@@ -1788,18 +1790,18 @@ corpus:
     - {label: "users", argv: ["/usr/bin/users"]}
     - {label: "uptime", argv: ["/usr/bin/uptime", "-p"]}
     - {label: "iostat", argv: ["/usr/bin/iostat", "-d", "-x", "1", "1"]}
-    - {label: "vmstat-disk", argv: ["/usr/bin/vmstat", "-d", "1", "2"]}
+    - {label: "vmstat-disk", argv: ["/usr/bin/vmstat", "-d", "1", "2"], proc: standard}
     - {label: "pidstat-disk", argv: ["/usr/bin/pidstat", "-d", "-p", "1", "1", "1"]}
     - {label: "findmnt", argv: ["/usr/bin/findmnt", "--fstab", "--tab-file", "{{ROOT_DIR}}/ci/compat/findmnt.fixture", "--nocanonicalize", "--list", "--output", "TARGET,SOURCE,FSTYPE,OPTIONS"]}
     - {label: "sysctl-random-uuid", argv: ["/usr/sbin/sysctl", "kernel.random.uuid"]}
-    - {label: "sar-resource-tables", argv: ["/usr/bin/sar", "-v", "1", "1"]}
-    - {label: "lsirq", argv: ["/usr/bin/lsirq", "--noheadings", "--output", "IRQ,TOTAL,NAME"]}
-    - {label: "mpstat-softirqs", argv: ["/usr/bin/mpstat", "-I", "SCPU", "1", "1"]}
+    - {label: "sar-resource-tables", argv: ["/usr/bin/sar", "-v", "1", "1"], proc: standard}
+    - {label: "lsirq", argv: ["/usr/bin/lsirq", "--noheadings", "--output", "IRQ,TOTAL,NAME"], proc: standard}
+    - {label: "mpstat-softirqs", argv: ["/usr/bin/mpstat", "-I", "SCPU", "1", "1"], proc: standard}
     - {label: "lsmod", argv: ["/usr/sbin/lsmod"]}
     - {label: "numastat", argv: ["/usr/bin/numastat"]}
     - {label: "numactl-hardware", argv: ["/usr/bin/numactl", "--hardware"]}
     - {label: "ps", argv: ["/usr/bin/ps", "aux"]}
-    - {label: "vmstat", argv: ["/usr/bin/vmstat", "-s"]}
+    - {label: "vmstat", argv: ["/usr/bin/vmstat", "-s"], proc: standard}
     - {label: "top", argv: ["/usr/bin/env", "HOME={{VALIDATE_RUN_STATE}}/strict-compat/top-home", "XDG_CONFIG_HOME={{VALIDATE_RUN_STATE}}/strict-compat/top-home/.config", "/bin/bash", "-c", "set -euo pipefail; LC_ALL=C /usr/bin/top -b -n 1 -p $$ -w 80 >/dev/null; printf \"top-ok\\n\""]}
     - {label: "kill", argv: ["/usr/bin/kill", "-0", "1"]}
     - {label: "pgrep", argv: ["bash", "-c", "set -euo pipefail; /usr/bin/pgrep -x bash | /usr/bin/grep -qx \"$$\"; printf \"pgrep-ok\\n\""]}

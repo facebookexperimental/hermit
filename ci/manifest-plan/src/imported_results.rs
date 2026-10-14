@@ -14,9 +14,9 @@
 //! an executed run:
 //!
 //! - Every row must describe this commit's clean source, this checkout's test
-//!   source, the current timeout policy, and (when the binary was stamped) a
-//!   binary built from this commit. Otherwise the cell is one `import-stale`
-//!   ERROR.
+//!   source, the current timeout policy, the `/proc` level the cell's test
+//!   declares, and (when the binary was stamped) a binary built from this
+//!   commit. Otherwise the cell is one `import-stale` ERROR.
 //! - The cell's rows, in file order, must be a history a producer writes:
 //!   attempts 1, 2, ... within the shared attempt cap, nothing after a PASS,
 //!   and no HOST-INAPPLICABLE row (a producer reports host inapplicability
@@ -69,6 +69,7 @@ use crate::runner::cell_timeouts;
 use crate::runner::host_inapplicable_result;
 use crate::runner::infrastructure_error_result;
 use crate::runner::outcome_after_retries;
+use crate::runner::proc_level_mismatch;
 use crate::runner::test_digest;
 
 pub const IMPORT_RESULTS_ENV: &str = "E2E_IMPORT_RESULTS";
@@ -201,6 +202,11 @@ fn stale_reason(context: &RunContext, cell: &SelectedCell, row: &CellResult) -> 
                 "cannot digest this checkout's test source: {error}"
             ));
         }
+    }
+    if let Some(mismatch) = proc_level_mismatch(row, cell) {
+        return Some(format!(
+            "imported row is not at this cell's /proc level: {mismatch}"
+        ));
     }
     match cell_timeouts(context, cell) {
         Ok(policy)

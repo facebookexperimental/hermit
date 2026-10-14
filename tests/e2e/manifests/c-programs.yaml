@@ -6946,6 +6946,7 @@ test:
       - ptrace
       - cc
     occasional: false
+    proc: standard
     program: tests/c/proc_locks.c
     observation:
       status: true
@@ -7759,6 +7760,7 @@ test:
       - ptrace
       - cc
     occasional: false
+    proc: standard
     program: tests/c/pty_nr_count.c
     observation:
       status: true

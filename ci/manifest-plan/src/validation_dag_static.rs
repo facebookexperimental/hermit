@@ -1040,7 +1040,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And runner::tests::verify_guests_name_fixtures_and_checkout_files_at_fixed_guest_paths
     // (https://github.com/rrnewton/hermit/issues/4337): 1093.
     // And +1 from bd38bb81: 1094.
-    ("test.regular_crates", 1094),
+    // And +4 from f4e27a59: 1098.
+    ("test.regular_crates", 1098),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1504,7 +1505,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4333): 1047, listed.
     // And +1 from 4afd3a3e: 1047.
     // And +1 from bd38bb81: 1048.
-    ("test.hermit_unit", 1048),
+    // And +1 from f4e27a59: 1049.
+    ("test.hermit_unit", 1049),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3779,7 +3781,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the woken-sleep record-version test (https://github.com/rrnewton/hermit/issues/4333): 1047.
     // And +1 from 4afd3a3e: 1047.
     // And +1 from bd38bb81: 1048.
-    ("test.hermit_unit_on_host", 1048),
+    // And +1 from f4e27a59: 1049.
+    ("test.hermit_unit_on_host", 1049),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -3912,7 +3915,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And runner::tests::verify_guests_name_fixtures_and_checkout_files_at_fixed_guest_paths
     // (https://github.com/rrnewton/hermit/issues/4337): 1093.
     // And +1 from bd38bb81: 1094.
-    ("test.regular_crates_on_host", 1094),
+    // And +4 from f4e27a59: 1098.
+    ("test.regular_crates_on_host", 1098),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).

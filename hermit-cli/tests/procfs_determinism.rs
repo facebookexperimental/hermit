@@ -95,6 +95,23 @@ fn read_procfs_at_epoch(path: &str, epoch: Option<&str>) -> Vec<u8> {
     read_procfs_with(path, epoch, |_| {})
 }
 
+/// The files these tests read that only the `standard` /proc level has
+/// (https://github.com/rrnewton/hermit/issues/4266); every other file is
+/// read at the default level.
+const STANDARD_LEVEL_FILES: &[&str] = &[
+    "/proc/diskstats",
+    "/proc/driver/rtc",
+    "/proc/interrupts",
+    "/proc/pressure/cpu",
+    "/proc/pressure/io",
+    "/proc/pressure/memory",
+    "/proc/schedstat",
+    "/proc/softirqs",
+    "/proc/sys/kernel/random/entropy_avail",
+    "/proc/vmstat",
+    "/proc/zoneinfo",
+];
+
 fn read_procfs_with(
     path: &str,
     epoch: Option<&str>,
@@ -108,6 +125,9 @@ fn read_procfs_with(
         "--no-virtualize-cpuid",
         "--max-timeslice=disabled",
     ]);
+    if STANDARD_LEVEL_FILES.contains(&path) {
+        command.arg("--proc=standard");
+    }
     if let Some(epoch) = epoch {
         command.arg(format!("--epoch={epoch}"));
     }
@@ -748,6 +768,7 @@ fn proc_rtc_tracks_custom_epoch_and_virtual_time() {
         "--base-env=minimal",
         "--no-virtualize-cpuid",
         "--max-timeslice=disabled",
+        "--proc=standard",
         "--epoch=2000-12-31T23:59:59+00:00",
         "--",
         "/usr/bin/python3",

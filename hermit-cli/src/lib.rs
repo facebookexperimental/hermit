@@ -3191,10 +3191,12 @@ mod dbt_detconfig_tests {
     /// changes this guest-visible variable, so this test is meant to fail on
     /// it and make that change a deliberate one.
     ///
-    /// One deliberate change since that capture: the empty
+    /// Two deliberate changes since that capture: the empty
     /// `fdinfo_unlisted_mount_ids` key was renamed `mount_id_assignment_order`
     /// when Detcore began numbering mount IDs in first-observation order
-    /// (RECORD_VERSION 0x122). Every other byte is the 806cf2fa output.
+    /// (RECORD_VERSION 0x122), and the `proc_level` key was added by the
+    /// `/proc` levels (https://github.com/rrnewton/hermit/issues/4266), whose
+    /// default is `Minimal`. Every other byte is the 806cf2fa output.
     const GOLDEN: [(&str, &str); 3] = [
         (
             "default",
@@ -4502,7 +4504,8 @@ impl HermitData {
         ptrace_completion::run(None, move |control| async move {
             let data = store.create_recording_dir()?;
             let exit_status =
-                record_to_async(command, data.path(), Vec::new(), None, None, control).await?;
+                record_to_async(command, data.path(), Vec::new(), None, None, None, control)
+                    .await?;
             store.commit_recording(data, exit_status)
         })
     }
@@ -4524,6 +4527,7 @@ impl HermitData {
                 data.path(),
                 mountinfo_root_rewrites,
                 Some(mount_ids),
+                None,
                 None,
                 control,
             )
@@ -4724,18 +4728,20 @@ impl<'a> From<Option<&'a PathBuf>> for HermitData {
 pub fn record_to(command: Command, dir: &Path) -> Result<ExitStatus, Error> {
     let dir = dir.to_owned();
     ptrace_completion::run(None, move |control| async move {
-        record_to_async(command, &dir, Vec::new(), None, None, control).await
+        record_to_async(command, &dir, Vec::new(), None, None, None, control).await
     })
 }
 
 /// Records with producer-owned mountinfo provenance. The directory-lifetime
-/// obligation is the same as [`record_to`]. `local_networking` is stored in
-/// the recording's `metadata.json`, and an autopilot replay uses that network.
+/// obligation is the same as [`record_to`]. `local_networking` and
+/// `proc_level` are stored in the recording's `metadata.json`, and a replay
+/// uses that network and that `/proc` level.
 pub fn record_to_with_mountinfo(
     command: Command,
     dir: &Path,
     mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
     local_networking: bool,
+    proc_level: detcore_model::config::ProcLevel,
 ) -> Result<ExitStatus, Error> {
     let dir = dir.to_owned();
     ptrace_completion::run(None, move |control| async move {
@@ -4746,6 +4752,7 @@ pub fn record_to_with_mountinfo(
             mountinfo_root_rewrites,
             Some(mount_ids),
             Some(local_networking),
+            Some(proc_level),
             control,
         )
         .await
@@ -4758,6 +4765,7 @@ async fn record_to_async(
     mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
     mountinfo_mount_ids: Option<Vec<u64>>,
     local_networking: Option<bool>,
+    proc_level: Option<detcore_model::config::ProcLevel>,
     control: std::rc::Rc<ptrace_completion::Control>,
 ) -> Result<ExitStatus, Error> {
     let report = SkidOvershootReport::begin(true);
@@ -4768,6 +4776,7 @@ async fn record_to_async(
             mountinfo_root_rewrites,
             mountinfo_mount_ids,
             local_networking,
+            proc_level,
         )
         .await?
         .wait(control)
@@ -4782,17 +4791,18 @@ async fn record_to_async(
 pub fn record_with_output(command: Command, dir: &Path) -> Result<Output, Error> {
     let dir = dir.to_owned();
     ptrace_completion::run(None, move |control| async move {
-        record_with_output_async(command, &dir, Vec::new(), None, None, control).await
+        record_with_output_async(command, &dir, Vec::new(), None, None, None, control).await
     })
 }
 
 /// Records with captured output and exact mountinfo provenance.
-/// `local_networking` is as for [`record_to_with_mountinfo`].
+/// `local_networking` and `proc_level` are as for [`record_to_with_mountinfo`].
 pub fn record_with_output_with_mountinfo(
     command: Command,
     dir: &Path,
     mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
     local_networking: bool,
+    proc_level: detcore_model::config::ProcLevel,
 ) -> Result<Output, Error> {
     let dir = dir.to_owned();
     ptrace_completion::run(None, move |control| async move {
@@ -4803,6 +4813,7 @@ pub fn record_with_output_with_mountinfo(
             mountinfo_root_rewrites,
             Some(mount_ids),
             Some(local_networking),
+            Some(proc_level),
             control,
         )
         .await
@@ -4815,6 +4826,7 @@ async fn record_with_output_async(
     mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
     mountinfo_mount_ids: Option<Vec<u64>>,
     local_networking: Option<bool>,
+    proc_level: Option<detcore_model::config::ProcLevel>,
     control: std::rc::Rc<ptrace_completion::Control>,
 ) -> Result<Output, Error> {
     let report = SkidOvershootReport::begin(true);
@@ -4828,6 +4840,7 @@ async fn record_with_output_async(
             mountinfo_root_rewrites,
             mountinfo_mount_ids,
             local_networking,
+            proc_level,
         )
         .await?
         .wait_with_output(control)

@@ -822,15 +822,15 @@ pub struct Config {
     pub memory: u64,
 
     /// How much of `/proc` the guest sees. Every level is the same on every
-    /// backend and host. `standard` shows every system-wide name Detcore
-    /// serves or plans to serve; `minimal` shows a smaller set, modelled on
-    /// gVisor's. A system-wide or `/proc/sys` name outside the chosen level
+    /// backend and host. `minimal` (the default) shows a small set, modelled
+    /// on gVisor's; `standard` shows every system-wide name Detcore serves or
+    /// plans to serve. A system-wide or `/proc/sys` name outside the chosen level
     /// does not exist: lookups give ENOENT and listings leave it out.
     /// Per-process names (`/proc/self`, `/proc/<pid>`) are not yet filtered.
     #[serde(default)]
     #[clap(
         long = "proc",
-        default_value = "standard",
+        default_value = "minimal",
         value_name = "minimal|standard"
     )]
     pub proc_level: ProcLevel,
@@ -1373,8 +1373,8 @@ impl fmt::Display for Config {
             write!(f, " --memory={}", self.memory)?;
         }
         match self.proc_level {
-            ProcLevel::Standard => {}
-            ProcLevel::Minimal => write!(f, " --proc=minimal")?,
+            ProcLevel::Minimal => {}
+            ProcLevel::Standard => write!(f, " --proc=standard")?,
         }
         for (tid, rcb) in &self.interrupt_at {
             write!(f, " --interrupt-at={}:{}", tid, rcb)?;
@@ -1400,9 +1400,9 @@ impl fmt::Display for Config {
 )]
 pub enum ProcLevel {
     /// The names most programs read, modelled on gVisor's `/proc`.
+    #[default]
     Minimal,
     /// Every name Detcore serves or plans to serve.
-    #[default]
     Standard,
 }
 
@@ -4062,15 +4062,15 @@ mod tests {
     }
 
     #[test]
-    fn proc_level_parses_both_levels_defaults_to_standard_and_round_trips() {
-        assert_eq!(Config::default().proc_level, ProcLevel::Standard);
+    fn proc_level_parses_both_levels_defaults_to_minimal_and_round_trips() {
+        assert_eq!(Config::default().proc_level, ProcLevel::Minimal);
         assert!(!Config::default().to_string().contains("--proc"));
-        let minimal = Config::parse_from(["detcore", "--proc=minimal"]);
-        assert_eq!(minimal.proc_level, ProcLevel::Minimal);
-        assert!(minimal.to_string().contains(" --proc=minimal"));
+        let standard = Config::parse_from(["detcore", "--proc=standard"]);
+        assert_eq!(standard.proc_level, ProcLevel::Standard);
+        assert!(standard.to_string().contains(" --proc=standard"));
         assert_eq!(
-            Config::parse_from(["detcore", "--proc=standard"]).proc_level,
-            ProcLevel::Standard
+            Config::parse_from(["detcore", "--proc=minimal"]).proc_level,
+            ProcLevel::Minimal
         );
         assert!(Config::try_parse_from(["detcore", "--proc=host"]).is_err());
         assert!(ProcLevel::Minimal < ProcLevel::Standard);

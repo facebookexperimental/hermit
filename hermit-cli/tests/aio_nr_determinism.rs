@@ -81,6 +81,7 @@ fn aio_nr_consumers_verify() {
                 "--backend=ptrace",
                 "run",
                 "--strict",
+                "--proc=standard",
                 "--verify",
                 "--panic-on-unsupported-syscalls",
                 "--base-env=minimal",

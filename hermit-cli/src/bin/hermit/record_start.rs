@@ -232,6 +232,16 @@ pub struct StartOpts {
     #[clap(long, alias = "net", value_name = "local|host")]
     network: Option<NetworkingMode>,
 
+    /// How much of `/proc` the recorded guest sees, as for `hermit run --proc`
+    /// (`minimal`, the default, or `standard`). The level is stored in the
+    /// recording, and its replay runs at it.
+    #[clap(
+        long = "proc",
+        default_value = "minimal",
+        value_name = "minimal|standard"
+    )]
+    proc: detcore_model::config::ProcLevel,
+
     /// Set the working directory for both recording and replay after mounts apply.
     #[clap(long, value_name = "path")]
     workdir: Option<String>,
@@ -541,6 +551,7 @@ impl StartOpts {
             let hermit = HermitData::from(self.data_dir.as_ref());
             let record_timeout = self.record_timeout();
             let local_networking = self.network() == NetworkingMode::Local;
+            let proc_level = self.proc;
 
             let (mut container, identity_guard) = self.recording_container(global)?;
 
@@ -572,6 +583,7 @@ impl StartOpts {
                                 data.path(),
                                 mountinfo,
                                 local_networking,
+                                proc_level,
                             )
                         }),
                         None => hermit::record_to_with_mountinfo(
@@ -579,6 +591,7 @@ impl StartOpts {
                             data.path(),
                             mountinfo,
                             local_networking,
+                            proc_level,
                         ),
                     }
                 },
@@ -644,6 +657,7 @@ impl StartOpts {
         );
         let record_timeout = self.record_timeout();
         let local_networking = self.network() == NetworkingMode::Local;
+        let proc_level = self.proc;
         let options = self.clone();
         let record_global = global1.clone();
         let (recording, (temp_data_dir, _record_identity, log1, log2)) =
@@ -665,6 +679,7 @@ impl StartOpts {
                                 data.path(),
                                 mountinfo,
                                 local_networking,
+                                proc_level,
                             )
                         }),
                         None => hermit::record_with_output_with_mountinfo(
@@ -672,6 +687,7 @@ impl StartOpts {
                             data.path(),
                             mountinfo,
                             local_networking,
+                            proc_level,
                         ),
                     }
                 },
@@ -796,6 +812,7 @@ impl StartOpts {
         eprintln!(":: {}", "Recording...".yellow().bold());
         let record_timeout = self.record_timeout();
         let local_networking = self.network() == NetworkingMode::Local;
+        let proc_level = self.proc;
         let options = self.clone();
         let record_global = global.clone();
         let data = data.to_owned();
@@ -821,6 +838,7 @@ impl StartOpts {
                             &data,
                             mountinfo,
                             local_networking,
+                            proc_level,
                         )
                     }),
                     None => hermit::record_with_output_with_mountinfo(
@@ -828,6 +846,7 @@ impl StartOpts {
                         &data,
                         mountinfo,
                         local_networking,
+                        proc_level,
                     ),
                 }
             },
@@ -872,6 +891,7 @@ impl StartOpts {
         let temp_data_dir = tempfile::tempdir()?;
         let record_timeout = self.record_timeout();
         let local_networking = self.network() == NetworkingMode::Local;
+        let proc_level = self.proc;
         let options = self.clone();
         let record_global = global.clone();
         let resources = format!(
@@ -896,6 +916,7 @@ impl StartOpts {
                             data.path(),
                             mountinfo,
                             local_networking,
+                            proc_level,
                         )
                     }),
                     None => hermit::record_to_with_mountinfo(
@@ -903,6 +924,7 @@ impl StartOpts {
                         data.path(),
                         mountinfo,
                         local_networking,
+                        proc_level,
                     ),
                 }
             },
@@ -1207,6 +1229,7 @@ mod tests {
             base_env: BaseEnv::Host,
             mount: Vec::new(),
             network: None,
+            proc: Default::default(),
             workdir: None,
             data_dir: None,
             record_timeout: None,
@@ -1491,6 +1514,7 @@ mod tests {
             base_env: BaseEnv::Host,
             mount: Vec::new(),
             network: None,
+            proc: Default::default(),
             workdir: None,
             data_dir: None,
             record_timeout: None,

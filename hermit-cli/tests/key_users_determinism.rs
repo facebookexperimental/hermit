@@ -170,6 +170,7 @@ fn assert_l2(case: &ProgramCase) {
             "ptrace",
             "run",
             "--strict",
+            "--proc=standard",
             "--verify",
             "--verify-logs",
             "--panic-on-unsupported-syscalls",

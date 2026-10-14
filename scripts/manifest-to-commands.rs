@@ -359,6 +359,8 @@ fn guest_with_args(test: &Value, guest: &str, guest_args: &[String]) -> String {
     format!("{guest}{argv0} {rendered}")
 }
 
+/// `proc_level` is the test's `proc`, the `/proc` level every Hermit command
+/// runs the guest at when it is not Hermit's default.
 fn hermit_command(
     mode: &str,
     backend: &str,
@@ -366,24 +368,26 @@ fn hermit_command(
     seed: Option<i64>,
     extra: &[String],
     verify_bitwise_parity: bool,
+    proc_level: Option<&str>,
     guest: &str,
 ) -> String {
     let _lane = lane;
     let profile = "";
+    let level = proc_level.map_or(String::new(), |level| format!(" --proc={level}"));
     let command = match mode {
         "verify" => {
             let _verify_bitwise_parity = verify_bitwise_parity;
             format!(
-                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info --backend {} run --base-env=minimal --strict $run_verify_strict --verify --verify-json \"$cell/captures/verify.json\"{profile} -- {guest}",
+                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info --backend {} run --base-env=minimal --strict{level} $run_verify_strict --verify --verify-json \"$cell/captures/verify.json\"{profile} -- {guest}",
                 shell_quote(backend)
             )
         }
         "replay" => format!(
-            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log info --backend {} record start --base-env=minimal --strict $record_verify_strict --verify --verify-json \"$cell/captures/verify.json\" --data-dir \"$cell/recording\" --record-timeout \"$remaining\" {HERMIT_GUEST_ENV_ARGS} -- {guest}",
+            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log info --backend {} record start --base-env=minimal --strict{level} $record_verify_strict --verify --verify-json \"$cell/captures/verify.json\" --data-dir \"$cell/recording\" --record-timeout \"$remaining\" {HERMIT_GUEST_ENV_ARGS} -- {guest}",
             shell_quote(backend)
         ),
         "chaos" => format!(
-            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info --backend {} run --base-env=minimal --strict $run_verify_strict --verify --verify-allow=both --verify-json \"$cell/captures/verify-seed-{}.json\" --chaos --sched-heuristic=random --seed={}{profile} -- {guest}",
+            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info --backend {} run --base-env=minimal --strict{level} $run_verify_strict --verify --verify-allow=both --verify-json \"$cell/captures/verify-seed-{}.json\" --chaos --sched-heuristic=random --seed={}{profile} -- {guest}",
             shell_quote(backend),
             seed.unwrap_or(0),
             seed.unwrap_or(0)
@@ -396,7 +400,7 @@ fn hermit_command(
                 .join(" ");
             let separator = if extra.is_empty() { "" } else { " " };
             format!(
-                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info --backend {} run{separator}{extra} -- {guest}",
+                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info --backend {} run{level}{separator}{extra} -- {guest}",
                 shell_quote(backend)
             )
         }
@@ -514,6 +518,7 @@ fn commands_for_test(test: &Value, bucket: &str, inherited_timeout_seconds: i64)
                     seed,
                     &extra,
                     verify_bitwise_parity,
+                    test.get("proc").and_then(Value::as_str),
                     &guest,
                 );
                 let runs = if mode == "custom" { custom_runs } else { 1 };
@@ -1251,14 +1256,32 @@ test:
 
     #[test]
     fn generated_mode_commands_match_the_harness_contract() {
-        let replay = hermit_command("replay", "ptrace", "portable", None, &[], false, "guest");
+        let replay = hermit_command(
+            "replay",
+            "ptrace",
+            "portable",
+            None,
+            &[],
+            false,
+            None,
+            "guest",
+        );
         assert!(replay.contains("--data-dir \"$cell/recording\" --record-timeout \"$remaining\""));
         assert!(replay.contains("--strict $record_verify_strict --verify"));
         assert!(replay.contains("--verify-json \"$cell/captures/verify.json\""));
         assert!(replay.contains(HERMIT_GUEST_ENV_ARGS));
         assert!(!replay.contains("--no-virtualize-cpuid"));
 
-        let chaos = hermit_command("chaos", "ptrace", "portable", Some(7), &[], false, "guest");
+        let chaos = hermit_command(
+            "chaos",
+            "ptrace",
+            "portable",
+            Some(7),
+            &[],
+            false,
+            None,
+            "guest",
+        );
         assert!(chaos.contains("run --base-env=minimal"));
         assert!(chaos.contains("--verify --verify-allow=both"));
         assert!(chaos.contains("--strict $run_verify_strict --verify"));
@@ -1274,17 +1297,57 @@ test:
             None,
             &["--base-env=minimal".to_owned()],
             false,
+            None,
             "guest",
         );
         assert!(custom.contains("--backend ptrace run --base-env=minimal -- guest"));
         assert!(!custom.contains("--strict"));
         assert!(!custom.contains("--no-virtualize-cpuid"));
 
-        let verify = hermit_command("verify", "ptrace", "portable", None, &[], true, "guest");
+        let verify = hermit_command(
+            "verify",
+            "ptrace",
+            "portable",
+            None,
+            &[],
+            true,
+            None,
+            "guest",
+        );
         assert!(verify.contains("run --base-env=minimal"));
         assert!(verify.contains(
             "--strict $run_verify_strict --verify --verify-json \"$cell/captures/verify.json\""
         ));
+        assert!(!verify.contains("--proc"));
+
+        // A test's `/proc` level follows `--strict` in every mode.
+        for mode in ["verify", "replay", "chaos"] {
+            let command = hermit_command(
+                mode,
+                "ptrace",
+                "portable",
+                Some(7),
+                &[],
+                false,
+                Some("standard"),
+                "guest",
+            );
+            assert!(command.contains("--strict --proc=standard $"), "{command}");
+        }
+        let custom = hermit_command(
+            "custom",
+            "ptrace",
+            "portable",
+            None,
+            &["--strict".to_owned()],
+            false,
+            Some("standard"),
+            "guest",
+        );
+        assert!(
+            custom.contains("run --proc=standard --strict -- guest"),
+            "{custom}"
+        );
     }
 
     #[test]

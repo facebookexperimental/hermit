@@ -414,6 +414,28 @@ pub struct TestRecipe {
     /// type keeps only its own tests.
     #[serde(default)]
     pub labels: Vec<String>,
+    /// The `/proc` level every Hermit cell runs the guest at (`--proc`),
+    /// when it is not Hermit's default, `minimal`. A level decides which
+    /// system-wide `/proc` names exist; it is not a relaxation.
+    pub proc: Option<ProcLevel>,
+}
+
+/// A `/proc` level, as Hermit's `--proc` spells it.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ProcLevel {
+    Minimal,
+    Standard,
+}
+
+impl ProcLevel {
+    /// The Hermit flag that selects this level.
+    pub fn flag(self) -> &'static str {
+        match self {
+            Self::Minimal => "--proc=minimal",
+            Self::Standard => "--proc=standard",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -4419,6 +4441,55 @@ fn row_copies_its_attempts(result: &CellResult) -> bool {
         && result.first_divergent_right_message == position.right_message
 }
 
+/// Why `row`'s Hermit commands do not run its guest at the `/proc` level
+/// `cell`'s test declares, if they do not. The row's command line and every
+/// attempt's must each end with `--` and its guest argv, and carry before that
+/// exactly the flag the runner writes for that test ([`ProcLevel::flag`]), or
+/// no `--proc` option when the test declares no level. A naked row runs no
+/// Hermit. A row with no command line and no attempt has none to check (an
+/// infrastructure ERROR); one with attempts but no command line is refused.
+pub fn proc_level_mismatch(row: &CellResult, cell: &SelectedCell) -> Option<String> {
+    if row.mode == "naked" {
+        return None;
+    }
+    if row.argv.is_empty() {
+        return (!row.attempts.is_empty())
+            .then(|| "the row records attempts but no command line".into());
+    }
+    let declared: Vec<&str> = cell.test.proc.map(ProcLevel::flag).into_iter().collect();
+    let commands = std::iter::once(("the row".to_owned(), &row.argv, &row.guest_argv)).chain(
+        row.attempts.iter().map(|attempt| {
+            (
+                format!("attempt {}", attempt.index),
+                &attempt.argv,
+                &attempt.guest_argv,
+            )
+        }),
+    );
+    for (whose, argv, guest_argv) in commands {
+        let Some(end) = argv
+            .len()
+            .checked_sub(guest_argv.len() + 1)
+            .filter(|&end| argv[end] == "--" && argv[end + 1..] == guest_argv[..])
+        else {
+            return Some(format!(
+                "{whose}'s argv does not end with `--` and its guest argv"
+            ));
+        };
+        let levels: Vec<&str> = argv[..end]
+            .iter()
+            .map(String::as_str)
+            .filter(|arg| arg.starts_with("--proc"))
+            .collect();
+        if levels != declared {
+            return Some(format!(
+                "{whose} runs with the /proc options {levels:?}, and the cell's test declares {declared:?}"
+            ));
+        }
+    }
+    None
+}
+
 /// Why `result`'s retained command lines are not the verify invocation the
 /// executor writes for a row with its recorded backend, relaxations, expected
 /// guest exit and comparator, or `None` when they are.
@@ -4488,16 +4559,26 @@ pub fn retained_verify_invocation_error(result: &CellResult) -> Option<String> {
     relaxation_flags.sort_unstable();
     let expects_exit = result.expected_guest_exit.is_some();
     let comparator = row_comparator(result);
+    let mut first_level = None;
     for attempt in &result.attempts {
         let index = attempt.index.as_str();
-        if let Err(error) = verify_attempt_invocation_error(
+        let level = match verify_attempt_invocation_error(
             attempt,
             backend,
             &relaxation_flags,
             expects_exit,
             comparator,
         ) {
-            return Some(format!("inner attempt {index}'s command line {error}"));
+            Ok(level) => level,
+            Err(error) => return Some(format!("inner attempt {index}'s command line {error}")),
+        };
+        // Every attempt of one row runs at the one `/proc` level its test
+        // declares.
+        let first = *first_level.get_or_insert(level);
+        if first != level {
+            return Some(format!(
+                "inner attempt {index} runs at the /proc level {level:?}, not the first attempt's {first:?}"
+            ));
         }
         if attempt.shell_command != shell_command(&attempt.cwd, &attempt.env, &attempt.argv) {
             return Some(format!(
@@ -4512,14 +4593,14 @@ pub fn retained_verify_invocation_error(result: &CellResult) -> Option<String> {
 /// verify attempt on `backend` whose row's relaxations record the run flags
 /// `relaxation_flags` (sorted), that expects a guest exit when `expects_exit`
 /// and that is judged by `comparator`, as [`retained_verify_invocation_error`]
-/// defines it.
-fn verify_attempt_invocation_error(
-    attempt: &AttemptResult,
+/// defines it. When it is one, its `/proc` level, if it names one.
+fn verify_attempt_invocation_error<'a>(
+    attempt: &'a AttemptResult,
     backend: &str,
     relaxation_flags: &[&str],
     expects_exit: bool,
     comparator: Comparator,
-) -> Result<(), String> {
+) -> Result<Option<&'a str>, String> {
     // The paired program ([`VERIFY_PAIR_SCRIPT`]): the comparison, then the
     // run command.
     let paired = &attempt.argv;
@@ -4568,6 +4649,14 @@ fn verify_attempt_invocation_error(
     let mut tokens = InvocationTokens(options);
     tokens.require("--base-env=minimal")?;
     tokens.require("--strict")?;
+    let level = tokens.prefixed("--proc=");
+    if let Some(level) = level {
+        if !matches!(level, "minimal" | "standard") {
+            return Err(format!(
+                "selects the /proc level {level:?}, which Hermit lacks"
+            ));
+        }
+    }
     if tokens.flag("--verify-strict") && comparator == Comparator::Stripped {
         return Err(
             "asks for the canonical comparison (`--verify-strict`) under the stripped comparator"
@@ -4626,7 +4715,7 @@ fn verify_attempt_invocation_error(
         Some(token) => Err(format!(
             "carries `{token}` where the executor writes nothing of the kind"
         )),
-        None => Ok(()),
+        None => Ok(level),
     }
 }
 
@@ -5191,6 +5280,7 @@ pub fn build_spec(
                 backend.into(),
                 "run".into(),
             ];
+            argv.extend(cell.test.proc.map(|level| level.flag().to_string()));
             argv.extend(cell.test.modes["custom"].args.clone());
             if isolated {
                 require_minimal_base_env(&mut argv)?;
@@ -5458,6 +5548,7 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
         }
     };
     argv.extend(["--base-env=minimal".into(), "--strict".into()]);
+    argv.extend(cell.test.proc.map(|level| level.flag().to_string()));
     if verify_strict && mode_recipe.comparator != Some(Comparator::Stripped) {
         argv.push("--verify-strict".into());
     }
@@ -9984,6 +10075,7 @@ mod tests {
             modes: BTreeMap::from([("verify".into(), mode)]),
             preprocessors: Vec::new(),
             labels: Vec::new(),
+            proc: None,
         }
     }
 
@@ -10725,6 +10817,37 @@ corpus:
                 capped: false,
             })
         );
+    }
+
+    /// A test's declared `/proc` level reaches the Hermit command of each of
+    /// its cells once, right after `--strict`, and records no relaxation; a
+    /// test that declares none runs at Hermit's default.
+    #[test]
+    fn a_declared_proc_level_reaches_every_hermit_cell_and_relaxes_nothing() {
+        for mut cell in [
+            verify_cell("ptrace", true, BTreeMap::new(), None),
+            ptrace_cell("replay"),
+            ptrace_cell("custom"),
+        ] {
+            let mode = cell.id.mode.clone();
+            let argv = verify_spec_of(cell.clone()).argv;
+            assert!(
+                !argv.iter().any(|arg| arg.starts_with("--proc")),
+                "{mode}: {argv:?}"
+            );
+            let relaxations = cell_relaxations(&cell);
+            cell.test.proc = Some(ProcLevel::Standard);
+            let argv = verify_spec_of(cell.clone()).argv;
+            let levels: Vec<usize> = (0..argv.len())
+                .filter(|&index| argv[index].starts_with("--proc"))
+                .collect();
+            assert_eq!(levels.len(), 1, "{mode}: {argv:?}");
+            assert_eq!(argv[levels[0]], "--proc=standard", "{mode}");
+            if mode != "custom" {
+                assert_eq!(argv[levels[0] - 1], "--strict", "{mode}: {argv:?}");
+            }
+            assert_eq!(cell_relaxations(&cell), relaxations, "{mode}");
+        }
     }
 
     #[test]
@@ -19343,6 +19466,13 @@ exit "$(cat "$PWD/exit-status")"
                 argv[index + 1] = value.clone();
             }
         }
+        fn replace_flag(old: &str, new: &str) -> impl Fn(&mut Vec<String>) {
+            let (old, new) = (old.to_owned(), new.to_owned());
+            move |argv| {
+                let index = at(argv, &old);
+                argv[index] = new.clone();
+            }
+        }
         fn without(token: &str, values: usize) -> impl Fn(&mut Vec<String>) {
             let token = token.to_owned();
             move |argv| {
@@ -19522,6 +19652,75 @@ exit "$(cat "$PWD/exit-status")"
                 .any(|arg| arg.starts_with("--mount="))
         );
         accepted("a DBT row from the hermetic /test root", &dbt_isolated);
+        let standard = {
+            let mut cell = cell_recorded_by(&base);
+            cell.test.proc = Some(ProcLevel::Standard);
+            with_executor_invocation_for(base.clone(), &context(&|_| {}), &cell)
+        };
+        assert!(has(&standard, "--proc=standard"));
+        accepted_skid("a row whose test declares a /proc level", &standard, 2);
+        // An imported row must run at its cell's declared level, and only it.
+        let mut standard_cell = cell_recorded_by(&base);
+        standard_cell.test.proc = Some(ProcLevel::Standard);
+        assert_eq!(proc_level_mismatch(&standard, &standard_cell), None);
+        assert_eq!(proc_level_mismatch(&base, &cell_recorded_by(&base)), None);
+        assert!(proc_level_mismatch(&base, &standard_cell).is_some());
+        assert!(proc_level_mismatch(&standard, &cell_recorded_by(&base)).is_some());
+        assert!(
+            proc_level_mismatch(
+                &with_argv(&standard, replace_flag("--proc=standard", "--proc=minimal")),
+                &standard_cell
+            )
+            .is_some()
+        );
+        // The guest's own arguments are not Hermit's, whatever they spell.
+        let mut odd_guest = standard.clone();
+        odd_guest
+            .guest_argv
+            .extend(["--proc=minimal".into(), "--".into()]);
+        odd_guest
+            .argv
+            .extend(["--proc=minimal".into(), "--".into()]);
+        assert_eq!(proc_level_mismatch(&odd_guest, &standard_cell), None);
+        // A row whose argv does not end with its guest argv is refused, and
+        // so is one that drops its command line but kept its attempts.
+        let mut truncated = standard.clone();
+        truncated.argv.pop();
+        assert!(proc_level_mismatch(&truncated, &standard_cell).is_some());
+        let mut cleared = standard.clone();
+        cleared.argv.clear();
+        assert!(proc_level_mismatch(&cleared, &standard_cell).is_some());
+        // Every attempt is bound, not only the one the row copies.
+        let mut later = two.clone();
+        insert_before("--verify-strict", &["--proc=standard"])(&mut later.attempts[1].argv);
+        assert!(
+            proc_level_mismatch(&later, &cell_recorded_by(&two))
+                .is_some_and(|error| error.starts_with("attempt 2 "))
+        );
+        // The two-word spelling is a level too.
+        assert!(
+            proc_level_mismatch(
+                &with_argv(
+                    &base,
+                    insert_before("--verify-strict", &["--proc", "standard"])
+                ),
+                &cell_recorded_by(&base)
+            )
+            .is_some()
+        );
+        // Replay and custom cells' rows, as the runner writes them.
+        for mode in ["replay", "custom"] {
+            let mut cell = ptrace_cell(mode);
+            cell.test.proc = Some(ProcLevel::Standard);
+            let spec = verify_spec_of(cell.clone());
+            let mut row = standard.clone();
+            row.mode = mode.into();
+            row.argv = spec.argv.clone();
+            row.guest_argv = spec.guest_argv.clone();
+            assert_eq!(proc_level_mismatch(&row, &cell), None, "{mode}");
+            cell.test.proc = None;
+            assert!(proc_level_mismatch(&row, &cell).is_some(), "{mode}");
+        }
 
         // The backend.
         refused(
@@ -19576,6 +19775,32 @@ exit "$(cat "$PWD/exit-status")"
                 argv.swap(env, strict);
             }),
             "lacks `--base-env=minimal`",
+        );
+        refused(
+            "a /proc level Hermit lacks",
+            &with_argv(&base, insert_before("--verify-strict", &["--proc=full"])),
+            "selects the /proc level \"full\", which Hermit lacks",
+        );
+        let mut mixed = two.clone();
+        insert_before("--verify-strict", &["--proc=standard"])(&mut mixed.attempts[1].argv);
+        mixed.attempts[1].shell_command = shell_command(
+            &mixed.attempts[1].cwd,
+            &mixed.attempts[1].env,
+            &mixed.attempts[1].argv,
+        );
+        refused(
+            "a second attempt at another /proc level",
+            &mixed,
+            "inner attempt 2 runs at the /proc level Some(\"standard\")",
+        );
+        refused(
+            "the /proc level after the canonical comparison flag",
+            &with_argv(&standard, |argv| {
+                let level = argv.remove(at(argv, "--proc=standard"));
+                let index = at(argv, "--verify-run");
+                argv.insert(index, level);
+            }),
+            "lacks `--verify-run @VERIFY_RUN_DIR@` where",
         );
         refused(
             "a command line without `--verify-run`",

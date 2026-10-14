@@ -519,6 +519,17 @@ product failure is a replay that diverged from its recording, or a recording
 that did not complete, and a fresh recording on a second attempt does not
 answer for the first.
 
+A test may carry `proc: standard` (or `proc: minimal`), the `/proc` level
+every Hermit cell of the test runs its guest at. The runner writes
+`--proc=<level>` right after `--strict` in verify, chaos and replay cells, and
+first among a custom cell's arguments. A test without the key runs at Hermit's
+default, `minimal`. Declare `standard` for a guest that reads a system-wide
+name only that level has (`/proc/vmstat`, `/proc/interrupts`, `/proc/locks`,
+the `/proc/sys/fs` counters and the rest of `detcore/src/procfs/levels.rs`'s
+`STANDARD` table). A level decides which names exist, so it is not a
+relaxation and is not recorded as one. A corpus row takes the same key and
+passes it to every test it expands to.
+
 A test may carry `labels` (lowercase words joined by `-`, unique), naming the
 run types it belongs to, and a non-naked mode may carry `labels` per enabled
 backend, adding run types to that one cell. A cell's run types are its test's

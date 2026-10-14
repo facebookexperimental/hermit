@@ -1360,6 +1360,7 @@ test:
       - bash
       - cc
     occasional: false
+    proc: standard
     program: tests/e2e/system-utils/procfs-sanitized-paths.sh
     observation:
       status: true

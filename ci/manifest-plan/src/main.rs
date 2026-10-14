@@ -1133,6 +1133,7 @@ fn validate_and_expand(
             "modes",
             "preprocessors",
             "labels",
+            "proc",
         ],
         &id,
     );
@@ -1216,6 +1217,13 @@ fn validate_and_expand(
         let preprocessors = string_array(Some(preprocessors), &format!("{id}.preprocessors"));
         if preprocessors.iter().any(|value| value != "e9patch") {
             die(format!("{id}: the only supported preprocessor is e9patch"));
+        }
+    }
+    if let Some(level) = test.get("proc") {
+        if !matches!(level.as_str(), Some("minimal" | "standard")) {
+            die(format!(
+                "{id}: proc must be minimal|standard, got {level:?}"
+            ));
         }
     }
 
@@ -1740,6 +1748,12 @@ fn validate_mode_with_cpu(
         if args.is_empty() {
             die(format!("{id}: enabled custom mode requires args"));
         }
+        // The test's `proc` key is the one way to choose a /proc level.
+        if let Some(arg) = args.iter().find(|arg| arg.starts_with("--proc")) {
+            die(format!(
+                "{id}: custom args may not choose a /proc level ({arg}); declare the test's proc"
+            ));
+        }
         let assertions = spec
             .get("assert")
             .and_then(Value::as_table)
@@ -2155,6 +2169,36 @@ in-guest-trap = "unsupported"
         );
     }
 
+    #[test]
+    #[should_panic(expected = "custom args may not choose a /proc level (--proc)")]
+    fn rejects_a_proc_level_in_custom_args() {
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "custom",
+            90,
+            &parse_mode(
+                r#"
+ci = true
+backends_enabled = ["ptrace"]
+args = ["--strict", "--proc", "standard"]
+
+[assert]
+runs = 1
+
+[backends_disabled]
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+in-guest-trap = "unsupported"
+"#,
+            ),
+            &mut Vec::new(),
+        );
+    }
+
     /// The first committed util-c test with `labels` added, through the
     /// front door's own test validation.
     fn expand_util_c_with(extra: &str) {
@@ -2181,6 +2225,17 @@ in-guest-trap = "unsupported"
     #[test]
     fn accepts_test_labels() {
         expand_util_c_with("labels: [strict-compat, full]");
+    }
+
+    #[test]
+    fn accepts_a_test_proc_level() {
+        expand_util_c_with("proc: standard");
+    }
+
+    #[test]
+    #[should_panic(expected = "proc must be minimal|standard")]
+    fn rejects_a_proc_level_hermit_lacks() {
+        expand_util_c_with("proc: full");
     }
 
     #[test]

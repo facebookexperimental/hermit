@@ -100,6 +100,9 @@ impl Replay {
         config.mountinfo_mount_ids = metadata.mountinfo_mount_ids.clone();
         config.mountinfo_mount_ids_captured = metadata.mountinfo_mount_ids_captured;
         config.mount_id_assignment_order = metadata.mount_id_assignment_order.clone();
+        // The recording's `/proc` level: a replay sees the names its recording
+        // saw.
+        config.proc_level = metadata.proc_level.unwrap_or_default();
         let sequentialize_threads = config.sequentialize_threads;
 
         let (chroot, bootstrap_program, materialization_scope, replay_mounts) =

@@ -213,6 +213,10 @@ struct CorpusRow {
     /// none: it is always the default (full) validation's.
     #[serde(default)]
     labels: Vec<String>,
+    /// The `/proc` level of every test the row expands to (a test's
+    /// `proc`), when the program reads a name Hermit's default level omits.
+    #[serde(default)]
+    proc: Option<String>,
 }
 
 fn string(value: &str) -> Value {
@@ -1040,7 +1044,7 @@ fn test_recipe(
         enabled.is_empty(),
         "{id}: an expanded test enables a mode outside {MODES:?}"
     );
-    let test = vec![
+    let mut test = vec![
         ("id", string(id)),
         ("description", string(description)),
         ("lane", string(&corpus.lane)),
@@ -1058,6 +1062,9 @@ fn test_recipe(
         ),
         ("modes", mapping(modes)),
     ];
+    if let Some(level) = &row.proc {
+        test.push(("proc", string(level)));
+    }
     mapping(test)
 }
 

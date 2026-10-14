@@ -46,9 +46,13 @@ impl Record {
         mountinfo_root_rewrites: Vec<MountInfoRootRewrite>,
         mountinfo_mount_ids: Option<Vec<u64>>,
         local_networking: Option<bool>,
+        proc_level: Option<detcore_model::config::ProcLevel>,
     ) -> Result<Self, Error> {
         let mut metadata = Metadata::new(&command)?;
         metadata.local_networking = local_networking;
+        // A recording always names its level, so its replay does not depend
+        // on the replaying Hermit's default.
+        metadata.proc_level = Some(proc_level.unwrap_or_default());
         metadata.mountinfo_root_rewrites = mountinfo_root_rewrites;
         metadata.mountinfo_mount_ids_captured = mountinfo_mount_ids.is_some();
         metadata.mountinfo_mount_ids = mountinfo_mount_ids.unwrap_or_default();
@@ -70,6 +74,7 @@ impl Record {
         config.mountinfo_mount_ids = metadata.mountinfo_mount_ids.clone();
         config.mountinfo_mount_ids_captured = metadata.mountinfo_mount_ids_captured;
         config.mount_id_assignment_order = metadata.mount_id_assignment_order.clone();
+        config.proc_level = metadata.proc_level.unwrap_or_default();
 
         let tracer = reverie_ptrace::TracerBuilder::<RecordTool>::new(command)
             .config(config)

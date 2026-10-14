@@ -3275,7 +3275,15 @@ fn record_replay_reads_procfs_files_through_a_symbolic_link() {
         for f in /proc/filesystems /proc/tty/drivers /proc/meminfo /proc/version /proc/uptime; do \
           ln -s $f $d/link; head -c 1 $d/link; echo; cat $d/link; rm $d/link; \
         done; rmdir $d";
-    let args = ["record", "--verify", "--", "/bin/sh", "-c", script];
+    let args = [
+        "record",
+        "--verify",
+        "--proc=standard",
+        "--",
+        "/bin/sh",
+        "-c",
+        script,
+    ];
     let output = hermit(&args);
     assert_success(&output, &args);
     assert!(
@@ -4093,6 +4101,7 @@ fn detcore_fixes_the_virtual_kernel_files_on_every_backend() {
             backend,
             "run",
             "--strict",
+            "--proc=standard",
             "--epoch=2026-01-01T00:00:00Z",
             "--verify",
             "--verify-strict",
@@ -4285,6 +4294,7 @@ fn detcore_omits_the_procfs_names_outside_the_level_on_every_backend() {
         ("kvm", "minimal", Mode::Verified),
         ("ptrace", "standard", Mode::NoMetadata),
         ("ptrace", "standard", Mode::Recorded),
+        ("ptrace", "minimal", Mode::Recorded),
         ("ptrace", "standard", Mode::IntoProc),
         ("dbt", "standard", Mode::IntoProcUnverified),
     ] {
@@ -4330,8 +4340,7 @@ fn detcore_omits_the_procfs_names_outside_the_level_on_every_backend() {
                 "--no-virtualize-metadata",
                 "--base-env=minimal",
             ],
-            // Recording takes the default level, standard.
-            Mode::Recorded => vec!["record", "--verify"],
+            Mode::Recorded => vec!["record", "--verify", &level_arg],
         };
         args.extend(["--", guest.to_str().expect("guest path is UTF-8")]);
         if level == "minimal" {
@@ -4455,6 +4464,7 @@ fn detcore_renders_its_procfs_files_on_every_backend() {
             backend,
             "run",
             "--strict",
+            "--proc=standard",
             "--verify",
             "--verify-strict",
             "--verify-json",
@@ -4512,6 +4522,7 @@ fn detcore_renders_its_procfs_files_on_every_backend() {
                 "dbt",
                 "run",
                 "--strict",
+                "--proc=standard",
                 "--base-env=minimal",
                 "--",
                 guest.to_str().expect("guest path is UTF-8"),
@@ -18921,7 +18932,7 @@ int main(void) {
         String::from_utf8_lossy(&built.stderr)
     );
 
-    let output = hermit_command(&["run", "--strict", "--"])
+    let output = hermit_command(&["run", "--strict", "--proc=standard", "--"])
         .arg(&guest)
         .output()
         .expect("failed to run the pipe-capacity guest under hermit");

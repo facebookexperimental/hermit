@@ -954,6 +954,15 @@ fn build_full_command(
     } else {
         None
     };
+    // The test's `/proc` level, when it declares one, goes first among the
+    // injected flags.
+    let extra: Vec<String> = test
+        .get("proc")
+        .and_then(Value::as_str)
+        .map(|level| format!("--proc={level}"))
+        .into_iter()
+        .chain(args.passthrough.iter().cloned())
+        .collect();
     let run = if mode == "naked" {
         format!("{RUN_ENV} {guest}")
     } else {
@@ -965,7 +974,7 @@ fn build_full_command(
             &mode_args,
             verify_bitwise_parity,
             &log,
-            &args.passthrough,
+            &extra,
             &guest,
         )
     };
