@@ -89,8 +89,8 @@ use crate::types::FutexID;
 use crate::types::LogicalTime;
 use crate::types::SigWrapper;
 
-#[path = "kvm_waitid.rs"]
-mod kvm_waitid;
+#[path = "emulated_waitid.rs"]
+mod emulated_waitid;
 
 // Preserve the historical Detcore ABI while hiding the host's configured CPU
 // count. This represents one virtual CPU in a fixed 128-bit kernel mask.
@@ -589,6 +589,58 @@ pub(super) fn wait4_uses_terminal_selector(
     }
 }
 
+/// The one completion order a backend that emulates child waits
+/// (`BackendCapabilities::emulates_child_waits`) needs for both wait4 and
+/// waitid, split around the backend's exact-child call.
+///
+/// Backend waitability precedes the child's final owner-hook CPU prefix, so
+/// the caller first waits, under its retained grant and birth-owned identity,
+/// for that publication. No new scheduler turn or user-memory identity read
+/// occurs.
+pub(super) async fn await_selected_child_cpu_publication<G, T>(
+    guest: &mut G,
+    child: DetPid,
+    call: &str,
+) -> Result<(), Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if guest
+        .thread_state()
+        .wait_for_child_cpu_publication(child)
+        .await
+    {
+        Ok(())
+    } else {
+        Err(Error::Tool(anyhow::anyhow!(
+            "emulated {call} selected child has no owned final CPU publication"
+        )))
+    }
+}
+
+/// After the backend's exact-child call consumed `child` (it returned the
+/// child, or EFAULT after selecting it), retire it: reap its final CPU time
+/// and consume Detcore's logical wait. Shared by wait4 and waitid.
+pub(super) async fn retire_selected_child<G, T>(
+    guest: &mut G,
+    child: DetPid,
+    call: &str,
+) -> Result<(), Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    guest.thread_state_mut().reap_child_process_cpu_time(child);
+    if consume_child_wait(guest, child).await {
+        Ok(())
+    } else {
+        Err(Error::Tool(anyhow::anyhow!(
+            "emulated {call} selected child was not logically consumed"
+        )))
+    }
+}
+
 pub(super) async fn complete_selected_emulated_wait4<G, T>(
     guest: &mut G,
     call: syscalls::Wait4,
@@ -598,18 +650,7 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    // Backend waitability precedes the child's final owner-hook CPU prefix.
-    // Retain this exact grant and birth-owned identity through that publication
-    // and copyout; no new scheduler turn or user-memory identity read occurs.
-    if !guest
-        .thread_state()
-        .wait_for_child_cpu_publication(child)
-        .await
-    {
-        return Err(Error::Tool(anyhow::anyhow!(
-            "serial KVM wait4 selected child has no owned final CPU publication"
-        )));
-    }
+    await_selected_child_cpu_publication(guest, child, "wait4").await?;
     // Selection already applied `__WNOTHREAD` through the logical owner
     // filter; the backend's raw wait4 accepts only WNOHANG and WUNTRACED.
     // Keep exactly those, as the waitid exact-child completion does.
@@ -626,16 +667,11 @@ where
         Err(Errno::EFAULT) => {}
         unexpected => {
             return Err(Error::Tool(anyhow::anyhow!(
-                "serial KVM wait4 selected-child invariant failed: {unexpected:?} for {child}"
+                "emulated wait4 selected-child invariant failed: {unexpected:?} for {child}"
             )));
         }
     }
-    guest.thread_state_mut().reap_child_process_cpu_time(child);
-    if !consume_child_wait(guest, child).await {
-        return Err(Error::Tool(anyhow::anyhow!(
-            "serial KVM wait4 selected child was not logically consumed"
-        )));
-    }
+    retire_selected_child(guest, child, "wait4").await?;
     result.map_err(Error::from)
 }
 
@@ -3180,7 +3216,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // nonsequential execution retain their existing path.
         if guest.config().backend.emulates_child_waits && guest.config().sequentialize_threads {
             // Its selector reads the guest's pid as a DetPid
-            // (`kvm_waitid::handle`), so a nested caller is refused by name
+            // (`emulated_waitid::handle`), so a nested caller is refused by name
             // (https://github.com/rrnewton/hermit/issues/4155).
             if guest.thread_state().nested_pid_namespace {
                 return Err(self
@@ -3191,7 +3227,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     )
                     .await);
             }
-            return kvm_waitid::handle(guest, call).await;
+            return emulated_waitid::handle(guest, call).await;
         }
         // A nested caller names its children by its own namespace's pids
         // (https://github.com/rrnewton/hermit/issues/4090); its process-group

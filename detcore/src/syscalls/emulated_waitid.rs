@@ -2,11 +2,13 @@
 // All rights reserved.
 // Licensed under the BSD-style license found in the LICENSE file.
 
-//! Terminal waitid completion under Detcore's serial KVM grant.
+//! Terminal waitid completion for a backend that emulates child waits
+//! (`BackendCapabilities::emulates_child_waits`; today KVM), under Detcore's
+//! serial grant.
 //!
 //! Selection and physical-exit waits precede a private exact-child WNOWAIT
 //! proof. From that proof through final injection and logical consumption,
-//! nothing requests another scheduler turn. KVM owns both original output
+//! nothing requests another scheduler turn. The backend owns both original output
 //! pointers, including rusage-first copy faults and the six scalar info stores.
 
 use super::*;
@@ -16,7 +18,7 @@ struct WaitidFailure(String);
 
 impl std::fmt::Display for WaitidFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "serial KVM waitid invariant failed: {}", self.0)
+        write!(f, "emulated waitid invariant failed: {}", self.0)
     }
 }
 
@@ -52,7 +54,7 @@ fn classify(call: syscalls::Waitid) -> Result<Selector, Errno> {
         which if which == libc::P_ALL as i32 => Selector::Any,
         which if which == libc::P_PGID as i32 && call.pid() >= 0 => Selector::Group(call.pid()),
         which if which == libc::P_PIDFD as i32 && call.pid() >= 0 => {
-            // KVM has no pidfd wait implementation. Do not inspect a same-number
+            // No emulating backend has a pidfd wait implementation. Do not inspect a same-number
             // host fd through /proc. This is an unsupported form, not Linux
             // pidfd parity (including the O_NONBLOCK descriptor case).
             return Err(if options & libc::WNOHANG == 0 {
@@ -146,10 +148,7 @@ where
     // Do not read caller memory for the identity or return via `?` on EFAULT.
     let result = checked_final_result(guest.inject(exact).await)?;
     if call.options() & libc::WNOWAIT == 0 {
-        guest.thread_state_mut().reap_child_process_cpu_time(child);
-        if !consume_child_wait(guest, child).await {
-            return Err(failure("proven child was not logically consumed"));
-        }
+        retire_selected_child(guest, child, "waitid").await?;
     }
     result.map_err(Error::from)
 }
@@ -163,16 +162,11 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    // KVM publishes backend waitability before the owner's exit hook inserts
+    // The backend publishes waitability before the owner's exit hook inserts
     // final CPU. Wait only for our registered birth-owned publication; the
     // hook's synchronous prefix does not need another guest scheduler turn.
-    if call.options() & libc::WNOWAIT == 0
-        && !guest
-            .thread_state()
-            .wait_for_child_cpu_publication(child)
-            .await
-    {
-        return Err(failure("proven child has no owned final CPU publication"));
+    if call.options() & libc::WNOWAIT == 0 {
+        await_selected_child_cpu_publication(guest, child, "waitid").await?;
     }
     complete_child(guest, call, child).await
 }
@@ -277,9 +271,9 @@ where
     T: RecordOrReplay,
 {
     match status {
-        ResumeStatus::InGuestFatalAlarm => {
-            Err(failure("in-guest sleep response reached KVM waitid"))
-        }
+        ResumeStatus::InGuestFatalAlarm => Err(failure(
+            "in-guest sleep response reached an emulated waitid",
+        )),
         ResumeStatus::Normal => Ok(None),
         // The capable resource protocol has already selected a real caught
         // signal. Its returning gate protects copyout through frame delivery.
@@ -348,7 +342,7 @@ where
         Selector::Group(group) => ChildWaitSelector::ProcessGroup(DetPid::from_raw(group)),
     };
     let spec = terminal_child_wait_spec(selector, dettid, call.options());
-    // KVM's exact callback boundary supplies disposition exclusion. Preserve
+    // The backend's exact callback boundary supplies disposition exclusion. Preserve
     // the application's mask so a process alarm can interrupt a parked wait.
     wait_terminal(guest, call, spec, rsrc).await
 }
