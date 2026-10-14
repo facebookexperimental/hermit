@@ -4154,14 +4154,16 @@ pub fn run_with_output_backend_timeout(
         let summary_path = print_summary_to_json_file.clone();
         return ptrace_completion::run(timeout, move |control| async move {
             let report = SkidOvershootReport::begin(true);
-            let result = dispatch_output_backend(
+            // Box before the retained operation captures the backend state;
+            // constructing and polling it still happen after admission here.
+            let result = Box::pin(dispatch_output_backend(
                 command,
                 prepare_backend_config(config, backend),
                 print_summary,
                 &summary_path,
                 backend,
                 Some(control),
-            )
+            ))
             .await;
             report.finish(result)
         });
@@ -4197,14 +4199,14 @@ pub fn run_with_output_backend_timeout_and_skid_overshoots(
         let summary_path = print_summary_to_json_file.clone();
         return ptrace_completion::run(timeout, move |control| async move {
             let report = SkidOvershootReport::begin(true);
-            let result = dispatch_output_backend(
+            let result = Box::pin(dispatch_output_backend(
                 command,
                 prepare_backend_config(config, backend),
                 print_summary,
                 &summary_path,
                 backend,
                 Some(control),
-            )
+            ))
             .await;
             report.finish_with_count(result)
         });
@@ -4238,32 +4240,22 @@ async fn run_with_output_backend_inner(
     timeout: Option<Duration>,
 ) -> Result<Output, Error> {
     refuse_in_guest_liteinst_timeout(backend, timeout)?;
-    let Some(limit) = timeout else {
-        return dispatch_output_backend(
-            command,
-            config,
-            print_summary,
-            print_summary_to_json_file,
-            backend,
-            None,
-        )
-        .await;
-    };
-    match tokio::time::timeout(
-        limit,
-        dispatch_output_backend(
-            command,
-            config,
-            print_summary,
-            print_summary_to_json_file,
-            backend,
-            None,
-        ),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(_elapsed) => Err(Error::new(GuestTimedOut { limit })),
+    // Keep the backend state off the caller's stack before Tokio and the
+    // deadline future capture it. Polling and teardown stay on this thread.
+    let guest = Box::pin(dispatch_output_backend(
+        command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+        backend,
+        None,
+    ));
+    match timeout {
+        None => guest.await,
+        Some(limit) => match tokio::time::timeout(limit, guest).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(Error::new(GuestTimedOut { limit })),
+        },
     }
 }
 
