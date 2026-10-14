@@ -119,6 +119,7 @@ static KVM_EXACT_CHILD_WAITS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KVM_GETTIMEOFDAY_EFAULT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KVM_DEADLINE_SPIN_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KVM_TASK_IDS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static KVM_GETPPID_LOOP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_UNSUPPORTED_SYSCALL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static GETTIMEOFDAY_UNREADABLE_BUFFER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_SELF_SIGQUEUE_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1953,6 +1954,153 @@ fn kvm_task_ids_guest() -> &'static Path {
         );
         guest
     })
+}
+
+fn kvm_getppid_loop_guest() -> &'static Path {
+    KVM_GETPPID_LOOP_GUEST.get_or_init(|| {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/kvm_getppid_loop.c");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("kvm-getppid-loop");
+        fs::create_dir_all(&build_root).expect("failed to create KVM getppid-loop directory");
+        let guest = build_root.join("kvm_getppid_loop");
+        let output = Command::new("cc")
+            .args(["-O0", "-Wall", "-Wextra", "-Werror"])
+            .arg(&fixture)
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile KVM getppid-loop guest");
+        assert!(
+            output.status.success(),
+            "KVM getppid-loop guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+/// Runs Hermit with `args` under ptrace, following every thread and child,
+/// and counts the host system calls they enter, as `strace -f -c` does.
+/// Returns the count and Hermit's exit status. The test process must have no
+/// other children while this runs: it waits for any traced task.
+fn count_hermit_host_syscalls(args: &[&str]) -> (u64, i32) {
+    use std::collections::HashMap;
+    use std::collections::HashSet;
+
+    use nix::sys::ptrace;
+    use nix::sys::signal::Signal;
+    use nix::sys::wait::WaitPidFlag;
+    use nix::sys::wait::WaitStatus;
+    use nix::sys::wait::waitpid;
+    use nix::unistd::Pid;
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: PTRACE_TRACEME only marks this child as traced by its parent; it
+    // allocates nothing and is async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            ptrace::traceme().map_err(std::io::Error::from)?;
+            Ok(())
+        });
+    }
+    #[expect(
+        clippy::zombie_processes,
+        reason = "the waitpid loop below reaps the traced child with every task it creates"
+    )]
+    let child = command.spawn().expect("failed to start traced hermit");
+    let root = Pid::from_raw(child.id() as i32);
+    // The exec reports a SIGTRAP stop; set the options from there.
+    match waitpid(root, Some(WaitPidFlag::__WALL)).expect("wait for traced exec") {
+        WaitStatus::Stopped(_, Signal::SIGTRAP) => {}
+        other => panic!("traced hermit did not stop at exec: {other:?}"),
+    }
+    ptrace::setoptions(
+        root,
+        ptrace::Options::PTRACE_O_TRACESYSGOOD
+            | ptrace::Options::PTRACE_O_TRACECLONE
+            | ptrace::Options::PTRACE_O_TRACEFORK
+            | ptrace::Options::PTRACE_O_TRACEVFORK
+            | ptrace::Options::PTRACE_O_EXITKILL,
+    )
+    .expect("set ptrace options");
+    ptrace::syscall(root, None).expect("resume traced hermit");
+    // Whether each task is inside a system call: entries and exits alternate.
+    let mut inside: HashMap<Pid, bool> = HashMap::new();
+    // A new task's first stop is an attach SIGSTOP, not a signal for it. It
+    // can be reported before or after its creator's clone/fork event.
+    let mut seen: HashSet<Pid> = HashSet::from([root]);
+    let mut awaiting_first_stop: HashSet<Pid> = HashSet::new();
+    let mut stopped_before_event: HashSet<Pid> = HashSet::new();
+    let mut entered = 0u64;
+    let mut root_status = None;
+    let mut live = 1usize;
+    while live > 0 {
+        let status = match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::__WALL)) {
+            Ok(status) => status,
+            Err(nix::errno::Errno::ECHILD) => break,
+            Err(error) => panic!("wait for traced task: {error}"),
+        };
+        match status {
+            WaitStatus::PtraceSyscall(pid) => {
+                let inside = inside.entry(pid).or_insert(false);
+                *inside = !*inside;
+                if *inside {
+                    entered += 1;
+                }
+                let _ = ptrace::syscall(pid, None);
+            }
+            WaitStatus::PtraceEvent(pid, _, event)
+                if event == libc::PTRACE_EVENT_CLONE
+                    || event == libc::PTRACE_EVENT_FORK
+                    || event == libc::PTRACE_EVENT_VFORK =>
+            {
+                live += 1;
+                let new = Pid::from_raw(ptrace::getevent(pid).expect("new task id") as i32);
+                seen.insert(new);
+                if !stopped_before_event.remove(&new) {
+                    awaiting_first_stop.insert(new);
+                }
+                let _ = ptrace::syscall(pid, None);
+            }
+            WaitStatus::PtraceEvent(pid, _, _) => {
+                let _ = ptrace::syscall(pid, None);
+            }
+            // Its creator's event came first.
+            WaitStatus::Stopped(pid, Signal::SIGSTOP) if awaiting_first_stop.remove(&pid) => {
+                let _ = ptrace::syscall(pid, None);
+            }
+            // A task never reported before: the event is still to come.
+            WaitStatus::Stopped(pid, Signal::SIGSTOP) if seen.insert(pid) => {
+                stopped_before_event.insert(pid);
+                let _ = ptrace::syscall(pid, None);
+            }
+            WaitStatus::Stopped(pid, signal) => {
+                let _ = ptrace::syscall(pid, Some(signal));
+            }
+            WaitStatus::Exited(pid, code) => {
+                live -= 1;
+                if pid == root {
+                    root_status = Some(code);
+                }
+            }
+            WaitStatus::Signaled(pid, signal, _) => {
+                live -= 1;
+                if pid == root {
+                    root_status = Some(128 + signal as i32);
+                }
+            }
+            _ => {}
+        }
+    }
+    (
+        entered,
+        root_status.expect("traced hermit exited without a status"),
+    )
 }
 
 fn kvm_gettimeofday_efault_guest() -> &'static Path {
@@ -29440,4 +29588,49 @@ fn run_kvm_fifo_with_a_host_peer_waits_in_the_kernel_as_on_linux() {
             "{args:?}: a FIFO was polled on KVM:\n{log}"
         );
     }
+}
+
+/// Regression gate for https://github.com/rrnewton/hermit/issues/4287: every
+/// KVM guest system call that Hermit passes through costs exactly one host
+/// system call, KVM_RUN. The per-entry signal-mask and pending-signal calls
+/// (removed in Reverie d60812b6) and the counter reads (removed by rdpmc)
+/// once made it 42. The count is deterministic, unlike a time threshold: run
+/// the guest with N and with 0 calls under ptrace and divide the difference
+/// in host system calls by N. The budget allows the one rt_sigprocmask that
+/// re-checks the kick signal every 1,024 entries.
+#[test]
+fn run_kvm_costs_one_host_syscall_per_guest_syscall() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping KVM host-syscall budget: /dev/kvm is unavailable");
+        return;
+    }
+    const CALLS: u64 = 20_000;
+    let _guard = hermit_run_guard();
+    let program = kvm_getppid_loop_guest()
+        .to_str()
+        .expect("getppid-loop guest path should be UTF-8");
+    let calls = CALLS.to_string();
+    let run = |count: &str| {
+        let args = ["--backend=kvm", "run", "--", program, count];
+        let (syscalls, status) = count_hermit_host_syscalls(&args);
+        assert_eq!(status, 0, "{args:?} exited {status}");
+        syscalls
+    };
+    let base = run("0");
+    let loaded = run(&calls);
+    let per_call = (loaded as f64 - base as f64) / CALLS as f64;
+    eprintln!(
+        "KVM host syscalls: {base} at 0 guest calls, {loaded} at {CALLS}: {per_call:.4} per guest syscall"
+    );
+    // At least one: every guest system call needs its own KVM_RUN exit.
+    assert!(
+        per_call >= 0.99,
+        "{per_call:.4} host syscalls per guest syscall: the guest's calls did not each exit"
+    );
+    assert!(
+        per_call <= 1.01,
+        "KVM costs {per_call:.4} host syscalls per guest syscall, over the budget of 1 \
+         (KVM_RUN) plus the 1-in-1024 signal re-check; see \
+         https://github.com/rrnewton/hermit/issues/4287"
+    );
 }
