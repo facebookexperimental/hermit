@@ -46,6 +46,7 @@ mod schedule_search;
 mod strace;
 mod tracing;
 mod verify;
+mod verify_inputs;
 mod verify_run;
 mod version;
 use std::fs::File;
@@ -457,6 +458,12 @@ enum Subcommand {
     /// Discover and run OCI images from the local image store.
     #[clap(name = "oci")]
     Oci(Box<OciOpts>),
+
+    /// INTERNAL, the native-exec pairing seam: seal a verification pair's
+    /// inputs once, then exec the pair program with them inherited (see
+    /// `verify_inputs`). Hidden until a native-exec consumer lands.
+    #[clap(name = "verify-inputs", hide = true)]
+    VerifyInputs(verify_inputs::VerifyInputsOpts),
 }
 
 impl Subcommand {
@@ -539,7 +546,8 @@ impl Subcommand {
             | Subcommand::Show(_)
             | Subcommand::Version(_)
             | Subcommand::LogDiff(_)
-            | Subcommand::InstructionMap(_) => false,
+            | Subcommand::InstructionMap(_)
+            | Subcommand::VerifyInputs(_) => false,
         }
     }
 
@@ -600,6 +608,7 @@ impl Subcommand {
             Subcommand::Bisect(x) => x.main(global),
             Subcommand::InstructionMap(x) => x.main(global),
             Subcommand::Oci(x) => x.main(global),
+            Subcommand::VerifyInputs(x) => x.main(),
         }
     }
 }
@@ -618,9 +627,12 @@ fn main() {
             }
         }
     }
-    if let Err(error) = retire_inherited_descriptors(&[]) {
-        let argv = std::env::args_os().collect::<Vec<_>>();
-        std::process::exit(refuse_entry_descriptor_failure(error, &argv));
+    let entry_argv = std::env::args_os().collect::<Vec<_>>();
+    if let Err(error) = verify_inputs::retire_inherited_keeping_shared_inputs(
+        &entry_argv,
+        retire_inherited_descriptors,
+    ) {
+        std::process::exit(refuse_entry_descriptor_failure(error, &entry_argv));
     }
     // ⚠️ BEFORE ANYTHING THAT CAN FORK. The stderr diagnostic deadline is a total
     // for the INVOCATION, and the origin every hermit process measures from is a

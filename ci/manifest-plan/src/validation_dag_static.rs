@@ -1495,7 +1495,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4320): 1042, run.
     // And the robust-word record-version test
     // (https://github.com/rrnewton/hermit/issues/4238): 1043.
-    ("test.hermit_unit", 1043),
+    // And the three verify_inputs unit tests (the native-exec pairing seam,
+    // https://github.com/rrnewton/hermit/issues/4275): 1046, listed.
+    ("test.hermit_unit", 1046),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3007,7 +3009,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And a_timer_armed_by_a_thread_that_blocks_its_signal_wakes_another_thread and
     // a_timer_signal_and_an_rt_sigsuspend_sleeper_verify_under_chaos (Claude review of
     // https://github.com/rrnewton/hermit/pull/4331): 388, by listing.
-    ("test.cli", 388),
+    // And the two verify_inputs CLI tests (the native-exec pairing seam,
+    // https://github.com/rrnewton/hermit/issues/4275): 390, listed.
+    ("test.cli", 390),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3331,7 +3335,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +2 from 74689bb0: 321.
     // And the masked timer signal target test: 322.
     // And the armer-blocks and sleeper timer tests: 324.
-    ("test.cli_on_host", 324),
+    // And the same two verify_inputs CLI tests: 326.
+    ("test.cli_on_host", 326),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -3738,7 +3743,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from 0a80f81a: 1041.
     // And the mask-aware timer target record-epoch test: 1042.
     // And the robust-word record-version test: 1043.
-    ("test.hermit_unit_on_host", 1043),
+    // And the same three verify_inputs unit tests: 1046.
+    ("test.hermit_unit_on_host", 1046),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

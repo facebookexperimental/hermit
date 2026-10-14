@@ -73,6 +73,9 @@ mod nonleader_exec;
 #[path = "common/verify_run.rs"]
 mod verify_run;
 
+#[path = "common/verify_inputs.rs"]
+mod verify_inputs;
+
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs;

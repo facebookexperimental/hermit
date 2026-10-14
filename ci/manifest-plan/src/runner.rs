@@ -5195,7 +5195,10 @@ fn probe_relaxation(cell: &SelectedCell, backend: &str) -> Option<&'static str> 
 /// when a run leaves no
 /// record (Hermit refused it before it started) the attempt ends with that
 /// run's status and output, after the comparison has stamped its report. Each
-/// run's own stderr is passed on, run 1's first. The two runs execute one
+/// run's own stderr is passed on, run 1's first. Each run reads stdin through
+/// its own open file description, a reopening of `/proc/self/fd/0`, so a
+/// frozen stdin (`hermit verify-inputs`) reaches both from its start rather
+/// than through one shared offset. The two runs execute one
 /// after the other, on the same workdir and inputs, as `run --verify`'s do: a
 /// bind source's host path is visible to the guest in /proc/self/mountinfo,
 /// so two concurrent runs could not each have their own without the guest
@@ -5231,7 +5234,7 @@ verify_run() {
     [[ $word == @VERIFY_RUN_DIR@ ]] && word=$staging
     words+=("$word")
   done
-  "${words[@]}" >"$staging.stdout" 2>"$staging.stderr"
+  "${words[@]}" </proc/self/fd/0 >"$staging.stdout" 2>"$staging.stderr"
   status=$?
   mv "$staging.stdout" "$directory.stdout"
   mv "$staging.stderr" "$directory.stderr"

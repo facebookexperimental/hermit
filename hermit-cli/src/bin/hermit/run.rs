@@ -1359,6 +1359,18 @@ pub struct RunOpts {
     )]
     verify_run: Option<PathBuf>,
 
+    /// INTERNAL, the native-exec pairing seam: adopt the sealed input set that
+    /// `hermit verify-inputs` left at this descriptor, the same one in both
+    /// runs of the pair (see `verify_inputs`). Hidden until a native-exec
+    /// consumer lands.
+    #[clap(long, value_name = "FD", requires = "verify_run", hide = true)]
+    native_exec_shared_inputs: Option<std::os::fd::RawFd>,
+
+    /// The inputs adopted from `--native-exec-shared-inputs`, held until the
+    /// run ends.
+    #[clap(skip)]
+    shared_inputs: Option<std::sync::Arc<super::verify_inputs::AdoptedInputs>>,
+
     /// Print a summary of the process tree's execution to stderr before exiting.
     #[clap(long, short = 'u')]
     pub(crate) summary: bool,
@@ -1811,6 +1823,9 @@ impl fmt::Display for RunOpts {
         if let Some(p) = &self.verify_run {
             let s = p.to_str().expect("valid unicode path");
             write!(f, " --verify-run={}", shell_words::quote(s))?;
+        }
+        if let Some(fd) = self.native_exec_shared_inputs {
+            write!(f, " --native-exec-shared-inputs={fd}")?;
         }
         if let Some(p) = &self.tmp {
             let s = p.to_str().expect("valid unicode path");
@@ -5493,6 +5508,11 @@ impl RunOpts {
         // happens-before spec this launch cannot enforce needs neither, so it
         // is refused at once rather than after input or availability checks.
         self.refuse_unenforceable_happens_before()?;
+        // Before stdin or any backend: a pair whose shared inputs are missing,
+        // unsealed or not the manifest's objects is refused before it starts.
+        if let Some(fd) = self.native_exec_shared_inputs {
+            self.shared_inputs = Some(std::sync::Arc::new(super::verify_inputs::take_adopted(fd)?));
+        }
         if self.verify || self.verify_run.is_some() {
             validate_log_level(global)?;
         }

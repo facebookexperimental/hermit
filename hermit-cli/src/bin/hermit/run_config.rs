@@ -1049,6 +1049,12 @@ mod tests {
         ),
         ("verify-json", &["--verify", "--verify-json=/tmp/v.json"]),
         ("verify-run", &["--verify-run=/tmp/vr"]),
+        // Saved as given; a run loaded from a file refuses it, as its
+        // descriptor is adopted only from the command line at entry.
+        (
+            "native-exec-shared-inputs",
+            &["--verify-run=/tmp/vr", "--native-exec-shared-inputs=9"],
+        ),
         ("summary", &["-u"]),
         ("summary-json", &["--summary-json=/tmp/s.json"]),
         (
