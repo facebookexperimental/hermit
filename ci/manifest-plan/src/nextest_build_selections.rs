@@ -153,6 +153,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "key_users_determinism",
             "--test",
+            "kvm_lifecycle_timing_log_level",
+            "--test",
             "leveldb",
             "--test",
             "madvise",
@@ -256,6 +258,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "sockstat_determinism",
             "--test",
             "softnet_stat_determinism",
+            "--test",
+            "sqlite_veryquick",
             "--test",
             "swaps_determinism",
             "--test",
@@ -808,8 +812,9 @@ mod tests {
             // tests of the six DBT binaries that now take the hermetic workdir,
             // plus cppc_feedback_determinism's and meminfo_determinism's one each
             // (https://github.com/rrnewton/hermit/issues/4355), plus redis_strict's
-            // three.
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "405");
+            // three, plus kvm_lifecycle_timing_log_level's and sqlite_veryquick's
+            // one each (https://github.com/rrnewton/hermit/issues/4321).
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "407");
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

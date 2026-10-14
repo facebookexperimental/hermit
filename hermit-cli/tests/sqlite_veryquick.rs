@@ -12,8 +12,14 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::process::Output;
 
+// Separately run Hermit processes are compared, so they share one epoch: a
+// host-drawn one differs per run, and Hermit then reports the recording it
+// saved on stderr (https://github.com/rrnewton/hermit/issues/4321).
+const EPOCH: &str = "--epoch=2026-01-01T00:00:00Z";
+
 fn sqlite3() -> PathBuf {
-    ["/usr/bin/sqlite3", "/usr/local/bin/sqlite3"]
+    // The pinned root has sqlite at /bin only.
+    ["/usr/bin/sqlite3", "/usr/local/bin/sqlite3", "/bin/sqlite3"]
         .into_iter()
         .map(PathBuf::from)
         .find(|path| path.is_file())
@@ -35,7 +41,7 @@ PRAGMA integrity_check;";
     // Compatibility workloads keep deterministic defaults while normal mode reports any
     // unsupported syscalls; strict fail-closed behavior is covered by dedicated tests.
     Command::new(hermit)
-        .args(["--log", "off", "run", "--"])
+        .args(["--log", "off", "run", EPOCH, "--"])
         .arg(sqlite)
         .arg(database)
         .arg(SQL)

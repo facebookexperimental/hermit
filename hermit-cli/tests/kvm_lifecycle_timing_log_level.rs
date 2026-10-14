@@ -21,6 +21,11 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Mutex;
 
+// Separately run Hermit processes are compared, so they share one epoch: a
+// host-drawn one differs per run, and Hermit then reports the recording it
+// saved on stderr (https://github.com/rrnewton/hermit/issues/4321).
+const EPOCH: &str = "--epoch=2026-01-01T00:00:00Z";
+
 static KVM_RUN_LOCK: Mutex<()> = Mutex::new(());
 
 const LIFECYCLE_TIMING_EVENT: &str = "reverie-kvm lifecycle phase timings";
@@ -47,11 +52,17 @@ fn compile_guest() -> PathBuf {
 }
 
 fn run_kvm(binary: &Path, log_level: &str) -> String {
+    // The log goes to its own file: Hermit's controller notices (the epoch
+    // line) stay on stderr, outside the compared record stream.
+    let log_dir = tempfile::tempdir().expect("failed to create KVM log directory");
+    let log_path = log_dir.path().join("kvm.log");
     let output = Command::new("timeout")
         .args(["--kill-after", "10s", "90s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args(["--log", log_level, "--backend", "kvm"])
-        .args(["run", "--strict", "--"])
+        .arg("--log-file")
+        .arg(&log_path)
+        .args(["run", "--strict", EPOCH, "--"])
         .arg(binary)
         .env_remove("HERMIT_LOG")
         .env_remove("HERMIT_LOG_FILE")
@@ -64,7 +75,7 @@ fn run_kvm(binary: &Path, log_level: &str) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
-    String::from_utf8_lossy(&output.stderr).into_owned()
+    fs::read_to_string(&log_path).expect("failed to read the KVM log")
 }
 
 fn canonical_info_from_standalone_log_diff(log: &str) -> String {

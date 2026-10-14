@@ -18,6 +18,11 @@ use std::sync::MutexGuard;
 use std::thread;
 use std::time::Duration;
 
+// Separately run Hermit processes are compared, so they share one epoch: a
+// host-drawn one differs per run, and Hermit then reports the recording it
+// saved on stderr (https://github.com/rrnewton/hermit/issues/4321).
+const EPOCH: &str = "--epoch=2026-01-01T00:00:00Z";
+
 static HERMIT_REDIS_LOCK: Mutex<()> = Mutex::new(());
 
 struct RedisServerGuard {
@@ -124,7 +129,7 @@ fn run_deterministic_workload(
     command
         .arg("90")
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log", "off", "run", "--", "/bin/sh"])
+        .args(["--log", "off", "run", EPOCH, "--", "/bin/sh"])
         .arg(workload)
         .arg(redis_server)
         .arg(redis_cli)
