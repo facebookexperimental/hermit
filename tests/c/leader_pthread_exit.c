@@ -28,6 +28,10 @@
  *   procself16: 16 forked children in turn do `procself`, each worker
  *             exiting 0 only if it saw the leader's exit complete; the parent
  *             counts them.
+ *   joinexec: the worker joins the exited main thread, then execs this
+ *             program (an exec after the leader's exit is complete).
+ *   rawname:  the leader names itself with raw non-UTF-8 bytes before its
+ *             pthread_exit; the worker joins it.
  *   lastexit: the worker, the group's last thread, calls pthread_exit.
  *   exec:     the worker execs this program.
  *   child:    a forked child does `code`; the parent reaps it.
@@ -44,6 +48,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -115,6 +120,13 @@ static void *worker(void *arg) {
            atomic_load(&receiver) == (int)syscall(SYS_gettid) ? "sender" : "other");
   } else if (!strcmp(mode, "join")) {
     printf("join rc=%d\n", pthread_join(main_thread, NULL));
+  } else if (!strcmp(mode, "joinexec")) {
+    printf("joinexec join=%d\n", pthread_join(main_thread, NULL));
+    fflush(stdout);
+    execl(self, self, "after", (char *)NULL);
+    _exit(78);
+  } else if (!strcmp(mode, "rawname")) {
+    printf("rawname join=%d\n", pthread_join(main_thread, NULL));
   } else if (!strcmp(mode, "joinquiet")) {
     exit(pthread_join(main_thread, NULL));
   } else if (!strcmp(mode, "procself")) {
@@ -154,6 +166,9 @@ static int leader_exits(void) {
   }
   pthread_t thread;
   if (pthread_create(&thread, NULL, worker, NULL) != 0) return 70;
+  /* A task name is bytes, not text; the kernel publishes it in its stat
+     file before the state letter. */
+  if (!strcmp(mode, "rawname")) prctl(PR_SET_NAME, "\xff\xfe\x80name", 0, 0, 0);
   pthread_exit(NULL);
 }
 

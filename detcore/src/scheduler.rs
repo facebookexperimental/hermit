@@ -4590,6 +4590,9 @@ impl Scheduler {
         self.logically_killed_threads.remove(&new_leader);
         self.deregistration_accounted.remove(&new_leader);
         self.retired_exited_leaders.remove(&new_leader);
+        // The new incarnation has not exited; whether the old one's exit was
+        // granted decides its run-queue hand-over below.
+        let old_leader_exit_granted = self.committed_exits.remove(&new_leader);
         self.pending_physical_process_exits.remove(&detpid);
         assert!(
             self.next_turns
@@ -4645,7 +4648,27 @@ impl Scheduler {
         // ordinary targets are logically dead, while the replacement key is not
         // runnable until that old slot has been removed and its admission
         // applied. No handler mutates the queue inside a tentative window.
-        self.replace_retired_run_queue_incarnation(new_leader, AdmitIntent::Fixed(AdmitSide::Back));
+        //
+        // A leader retired at its own exit while its group lived on
+        // (`retire_exited_leader`) left the run queue then, and a step2 drain
+        // has usually consumed that removal already: there is no old slot left
+        // to replace, so the new incarnation is only admitted. Its granted
+        // exit (`committed_exits`, cleared only when the tid is registered
+        // again) marks that case; the retirement record itself may already
+        // be consumed by the zombie leader's deregistration, which the exec
+        // delivers (Claude re-check of
+        // https://github.com/rrnewton/hermit/pull/4245).
+        if old_leader_exit_granted
+            && !self.pending_run_queue_removals.contains_key(&new_leader)
+            && !self.run_queue.contains_tid(new_leader)
+        {
+            self.admit_to_run_queue(new_leader, AdmitIntent::Fixed(AdmitSide::Back));
+        } else {
+            self.replace_retired_run_queue_incarnation(
+                new_leader,
+                AdmitIntent::Fixed(AdmitSide::Back),
+            );
+        }
         self.started_up.try_put(());
 
         self.logically_kill_thread(&caller, &detpid, pre_exec_mm);
@@ -5918,15 +5941,13 @@ impl Scheduler {
             return Ok(*state);
         }
         let process = self.sigchld_process(thread);
-        let stat = std::fs::read_to_string(format!(
+        let stat = std::fs::read(format!(
             "/proc/{}/task/{}/stat",
             process.as_raw(),
             thread.as_raw()
         ))
         .map_err(|error| Errno::new(error.raw_os_error().unwrap_or(libc::EIO)))?;
-        stat.rsplit_once(')')
-            .and_then(|(_, rest)| rest.trim_start().chars().next())
-            .ok_or(Errno::EINVAL)
+        task_state_of_stat(&stat).ok_or(Errno::EINVAL)
     }
 
     /// Waits, committing no turn, until every thread released into a
@@ -11735,6 +11756,20 @@ impl Scheduler {
             })
             .unwrap_or(LogicalTime::ZERO)
     }
+}
+
+/// The state letter in the contents of a `/proc/<pid>/task/<tid>/stat` file:
+/// the first non-blank byte after the last `)`. The command name before it is
+/// raw bytes, not necessarily UTF-8 (`PR_SET_NAME`, or a UTF-8 name the
+/// kernel cut at 15 bytes), and may itself contain `)`; only the state letter
+/// is ASCII (Codex review of <https://github.com/rrnewton/hermit/pull/4245>).
+fn task_state_of_stat(stat: &[u8]) -> Option<char> {
+    let close = stat.iter().rposition(|byte| *byte == b')')?;
+    stat[close + 1..]
+        .iter()
+        .find(|byte| !byte.is_ascii_whitespace())
+        .filter(|byte| byte.is_ascii_alphabetic())
+        .map(|byte| *byte as char)
 }
 
 #[cfg(test)]
@@ -23148,6 +23183,73 @@ mod test {
                 && reason.contains("its state is S"),
             "{reason}"
         );
+    }
+
+    /// The state letter of a task's stat file is found after the last `)`,
+    /// whatever bytes the command name holds (Codex review of
+    /// https://github.com/rrnewton/hermit/pull/4245): an ASCII name, a name
+    /// with raw non-UTF-8 bytes, and a name containing `)` itself.
+    #[test]
+    fn a_task_state_is_read_after_any_command_name() {
+        assert_eq!(task_state_of_stat(b"3 (leader) Z 2 3 3 0 -1"), Some('Z'));
+        assert_eq!(
+            task_state_of_stat(b"3 (\xff\xfe\x80) Z 2 3 3 0 -1"),
+            Some('Z')
+        );
+        assert_eq!(task_state_of_stat(b"3 (a) b)) S 2 3 3 0"), Some('S'));
+        assert_eq!(task_state_of_stat(b"3 (no state)"), None);
+        assert_eq!(task_state_of_stat(b"3 leader Z"), None);
+        // The production reader decodes this process's own stat file.
+        let own = std::fs::read(format!(
+            "/proc/{}/task/{}/stat",
+            std::process::id(),
+            unsafe { libc::syscall(libc::SYS_gettid) }
+        ))
+        .unwrap();
+        assert_eq!(task_state_of_stat(&own), Some('R'));
+    }
+
+    /// A surviving thread that execs after its leader was retired at its own
+    /// exit takes over the leader's tid with a plain admission: the retired
+    /// leader's run-queue removal was already drained, so there is no old slot
+    /// to replace (Claude re-check of
+    /// https://github.com/rrnewton/hermit/pull/4245; before, the exec
+    /// hand-over panicked).
+    #[test]
+    fn an_exec_after_the_leader_was_retired_at_exit_admits_the_new_leader() {
+        let mut sched = Scheduler::new(&Config::default());
+        sched.models_signal_targets = true;
+        let leader = DetTid::from_raw(17);
+        let caller = DetTid::from_raw(18);
+        let (detpid, pre_exec_mm, _) = install_runnable_exec_group(&mut sched, leader, caller);
+        sched.committed_exits.insert(leader);
+        assert!(sched.retire_exited_leader(leader, pre_exec_mm));
+        // The step2 drain after the retirement, and the kernel showing the
+        // leader a zombie.
+        sched.drain_pending_run_queue_removals();
+        sched.exited_leader_barriers.clear();
+        assert!(!sched.run_queue.contains_tid(leader));
+
+        // The exec reaps the zombie leader first, whose deregistration
+        // consumes its retirement record.
+        assert!(sched.take_retired_exited_leader(leader));
+
+        assert!(!sched.pending_run_queue_removals.contains_key(&leader));
+        // The exec prepares its teardown, which lists only the registered
+        // siblings: the retired leader is not one.
+        assert!(sched.prepare_exec_teardown(caller, detpid, pre_exec_mm));
+
+        reconnect_nonleader_exec(&mut sched, leader, caller, detpid, pre_exec_mm);
+        // A plain admission: no old slot to replace.
+        assert!(!sched.pending_run_queue_removals.contains_key(&leader));
+        assert!(sched.pending_run_queue_admissions.contains_key(&leader));
+        sched.drain_pending_run_queue_removals();
+        sched.drain_pending_run_queue_admissions();
+        assert!(sched.next_turns.contains_key(&leader));
+        assert!(sched.run_queue.contains_tid(leader));
+        assert!(!sched.next_turns.contains_key(&caller));
+        // The new incarnation has not exited.
+        assert!(!sched.committed_exits.contains(&leader));
     }
 
     /// The late deregistration of a leader retired at its own exit, which

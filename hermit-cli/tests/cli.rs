@@ -26664,6 +26664,12 @@ fn an_exec_with_an_unprovable_timer_copy_pending_is_refused_by_name() {
 /// half-done at host-chosen points: its exe link still readable in 2 of 12
 /// runs (Claude review of https://github.com/rrnewton/hermit/pull/4245), its
 /// `clear_child_tid` word not yet zeroed (`join16` diverged in 5 of 5).
+/// `joinexec` execs only after joining the exited main thread, so its exec
+/// takes over a leader already retired (the exec hand-over panicked;
+/// `exec` alone execs before the leader's exit is granted). `rawname` gives
+/// the leader a non-UTF-8 name, which the zombie wait must still read (it
+/// waited out its 30 s valve). Both from the reviews of
+/// https://github.com/rrnewton/hermit/pull/4245.
 #[test]
 fn a_leader_pthread_exit_leaves_its_group_running_at_bitwise_parity() {
     let guest = leader_pthread_exit_guest().to_str().unwrap().to_owned();
@@ -26680,6 +26686,11 @@ fn a_leader_pthread_exit_leaves_its_group_running_at_bitwise_parity() {
         ("procself16", "procself16 ok=16\n"),
         ("lastexit", "lastexit worker leaving by pthread_exit\n"),
         ("exec", "exec after the leader's exit\n"),
+        (
+            "joinexec",
+            "joinexec join=0\nexec after the leader's exit\n",
+        ),
+        ("rawname", "rawname join=0\n"),
         (
             "child",
             "code worker exits 7\nchild reaped=1 exited=1 code=7\n",
