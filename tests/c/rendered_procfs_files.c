@@ -437,17 +437,22 @@ static void check_path_calls(const char* path, const char* spelling) {
      flags are refused before the name is read; a name is read for at most
      XATTR_NAME_MAX + 1 bytes, so 256 bytes with no NUL before an unmapped
      page are too long, not a fault. */
+  /* The deliberately invalid pointer, read through a volatile so the
+     compiler's access analysis cannot see it (gcc 15 -Werror rejects a
+     constant (void*)1 passed with a nonzero size). The kernel still
+     receives exactly address 1. */
+  char* volatile bad_ptr = (char*)1;
   REFUSED(syscall(SYS_setxattr, spelling, "user.x", "1", 1, 0x100000000UL), EACCES, spelling);
-  REFUSED(syscall(SYS_setxattr, spelling, (char*)1, "1", 1, 4), EINVAL, spelling);
+  REFUSED(syscall(SYS_setxattr, spelling, bad_ptr, "1", 1, 4), EINVAL, spelling);
   if (xattr_arguments_first || (detcore_xattr_order && detcore_resolves(spelling))) {
     /* The name, the size and the value are checked before the path is
        looked up, so a path error (a trailing slash: ENOTDIR) cannot hide
        them. */
     char slashed_spelling[512];
     snprintf(slashed_spelling, sizeof(slashed_spelling), "%s/", spelling);
-    REFUSED(setxattr(slashed_spelling, "user.x", (void*)1, 65537, 0), E2BIG, spelling);
-    REFUSED(setxattr(slashed_spelling, "user.x", (void*)1, 1, 0), EFAULT, spelling);
-    REFUSED(getxattr(slashed_spelling, (char*)1, value, sizeof(value)), EFAULT, spelling);
+    REFUSED(setxattr(slashed_spelling, "user.x", bad_ptr, 65537, 0), E2BIG, spelling);
+    REFUSED(setxattr(slashed_spelling, "user.x", bad_ptr, 1, 0), EFAULT, spelling);
+    REFUSED(getxattr(slashed_spelling, bad_ptr, value, sizeof(value)), EFAULT, spelling);
     REFUSED(removexattr(slashed_spelling, ""), ERANGE, spelling);
   }
   {
