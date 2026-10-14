@@ -26061,6 +26061,17 @@ const SCOPE_REEXEC_HISTORY_ESTIMATE_FILE: &str = "scope-reexec-history-estimate.
 /// forgo a reuse, never manufacture one, and the handed-over text is display
 /// only: no verdict reads it. If it is absent or malformed, the re-exec reads
 /// the ledger for the estimate alone and still does not repeat the lookup.
+///
+/// # A run that cannot be a cache hit does not read the ledger
+///
+/// The rows decide only the tree-keyed cache lookup and the "Estimated time"
+/// line. When the lookup cannot happen (`cache_lookup_admissible` is false:
+/// every `full` run, any dirty tree, `--ignore-cache`, a nested payload), the
+/// read bought only that line. Measured on the coordinator's full validations
+/// of 2026-10-14 (devbig014, a 951 MB ledger): 386 s of one core with the
+/// streamed reader, then 65-80 s with the row replay cache, mostly this
+/// driver parsing 2 GB of projected rows. Such a pass now reads nothing and
+/// prints `LEDGER_NOT_READ_ESTIMATE`; its scope re-exec inherits that text.
 struct PassLedgerHistory {
     rows: Vec<serde_json::Value>,
     /// Whether this pass performs the tree-keyed cache lookup.
@@ -26069,11 +26080,23 @@ struct PassLedgerHistory {
     inherited_estimate: Option<String>,
 }
 
+/// The "Estimated time" text of a run that does not read the ledger.
+const LEDGER_NOT_READ_ESTIMATE: &str = "not computed: this run cannot be served from the \
+result cache, so it skips the run-ledger read that would only estimate its duration";
+
 fn pass_ledger_history(
     verified_scope_reexec: bool,
+    cache_lookup_admissible: bool,
     run_state: &Path,
     read_rows: impl FnOnce() -> Vec<serde_json::Value>,
 ) -> PassLedgerHistory {
+    if !cache_lookup_admissible {
+        return PassLedgerHistory {
+            rows: Vec::new(),
+            run_cache_lookup: false,
+            inherited_estimate: Some(LEDGER_NOT_READ_ESTIMATE.to_string()),
+        };
+    }
     if !verified_scope_reexec {
         return PassLedgerHistory {
             rows: read_rows(),
@@ -26140,7 +26163,7 @@ fn scope_reexec_ledger_history_cases(dir: &Path) -> Result<String, String> {
     // A pass that is not a verified re-exec reads once and performs the lookup,
     // even when a handed-over estimate exists in its run state.
     write_scope_reexec_history_estimate(dir, "~13m49s (median)")?;
-    let first = pass_ledger_history(false, dir, counted);
+    let first = pass_ledger_history(false, true, dir, counted);
     if reads.get() != 1 || !first.run_cache_lookup || first.inherited_estimate.is_some() {
         return Err(
             "scope re-exec ledger history: a pre-scope pass skipped its read or lookup".into(),
@@ -26149,7 +26172,7 @@ fn scope_reexec_ledger_history_cases(dir: &Path) -> Result<String, String> {
 
     // The verified re-exec reads nothing, repeats no lookup, and prints the
     // pre-scope pass's estimate byte for byte.
-    let reexec = pass_ledger_history(true, dir, counted);
+    let reexec = pass_ledger_history(true, true, dir, counted);
     if reads.get() != 1
         || reexec.run_cache_lookup
         || !reexec.rows.is_empty()
@@ -26175,7 +26198,7 @@ fn scope_reexec_ledger_history_cases(dir: &Path) -> Result<String, String> {
                 .map_err(|error| format!("scope re-exec ledger history: {error}"))?;
         }
         let before = reads.get();
-        let fallback = pass_ledger_history(true, dir, counted);
+        let fallback = pass_ledger_history(true, true, dir, counted);
         if reads.get() != before + 1
             || fallback.run_cache_lookup
             || fallback.inherited_estimate.is_some()
@@ -26186,6 +26209,29 @@ fn scope_reexec_ledger_history_cases(dir: &Path) -> Result<String, String> {
             ));
         }
     }
+    // A pass that cannot be a cache hit reads nothing, before or after the
+    // scope re-exec, looks nothing up, and prints the not-read estimate, which
+    // is one line its re-exec can inherit.
+    for verified in [false, true] {
+        let before = reads.get();
+        let skipped = pass_ledger_history(verified, false, dir, counted);
+        if reads.get() != before
+            || skipped.run_cache_lookup
+            || !skipped.rows.is_empty()
+            || skipped.inherited_estimate.as_deref() != Some(LEDGER_NOT_READ_ESTIMATE)
+        {
+            return Err(format!(
+                "scope re-exec ledger history: a pass that cannot be a cache hit read the ledger \
+                 (verified re-exec: {verified})"
+            ));
+        }
+    }
+    write_scope_reexec_history_estimate(dir, LEDGER_NOT_READ_ESTIMATE)?;
+    if read_scope_reexec_history_estimate(dir).as_deref() != Some(LEDGER_NOT_READ_ESTIMATE) {
+        return Err(
+            "scope re-exec ledger history: the not-read estimate does not hand over".into(),
+        );
+    }
     for refused in ["", "a\nb"] {
         if write_scope_reexec_history_estimate(dir, refused).is_ok() {
             return Err(format!(
@@ -26193,7 +26239,7 @@ fn scope_reexec_ledger_history_cases(dir: &Path) -> Result<String, String> {
             ));
         }
     }
-    Ok("scope re-exec ledger history: the pre-scope pass reads and looks up once; its verified re-exec reuses the estimate and reads only when the handover is unusable".into())
+    Ok("scope re-exec ledger history: the pre-scope pass reads and looks up once; its verified re-exec reuses the estimate and reads only when the handover is unusable; a pass that cannot be a cache hit reads nothing".into())
 }
 
 #[cfg(test)]
@@ -27253,13 +27299,22 @@ fn run(
     //
     // A verified cgroup scope re-exec does not read the ledger or repeat the
     // lookup: its pre-scope pass already did both, and reaching the re-exec
-    // means that lookup found no hit. See `PassLedgerHistory`.
+    // means that lookup found no hit. A run that can never be served from the
+    // cache (every `full` run: `plan.cacheable` is false for it) does not read
+    // the ledger at all. See `PassLedgerHistory`.
     let ledger = ledger_path(&root);
+    let cache_lookup_admissible = !nesting.nested
+        && !args.allow_local_off_the_record_run
+        && !args.ignore_cache
+        && plan.cacheable
+        && !wt_dirty
+        && !dirty_at_admission
+        && plan.selection_mode == "full";
     let PassLedgerHistory {
         rows: ledger_rows,
         run_cache_lookup,
         inherited_estimate,
-    } = pass_ledger_history(verified_scope_reexec, &tmp, || {
+    } = pass_ledger_history(verified_scope_reexec, cache_lookup_admissible, &tmp, || {
         validate_history::read_rows(&ledger)
     });
     let tree = git_tree();
@@ -27275,15 +27330,7 @@ fn run(
     };
     // A nested payload never consults the cache: the outer run already did, and a
     // payload that "hit" would report a green for a lane it never ran.
-    if run_cache_lookup
-        && !nesting.nested
-        && !args.allow_local_off_the_record_run
-        && !args.ignore_cache
-        && plan.cacheable
-        && !wt_dirty
-        && !dirty_at_admission
-        && plan.selection_mode == "full"
-    {
+    if run_cache_lookup && cache_lookup_admissible {
         if let Some(hit) =
             validate_history::cache_lookup(&ledger_rows, "pass", &cache_key).filter(|hit| {
                 admitted_context.as_ref().is_none_or(|proof| {
