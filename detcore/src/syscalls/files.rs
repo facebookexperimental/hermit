@@ -454,6 +454,32 @@ pub(crate) fn pipe_capacity_request_exceeds_ceiling(requested: i32) -> bool {
     requested > DETERMINISTIC_PIPE_CAPACITY_BYTES
 }
 
+/// The capacity a guest's `F_GETPIPE_SZ` reports for a pipe or FIFO whose
+/// host capacity is `host`: never more than the deterministic ceiling.
+///
+/// A pipe Hermit did not create (an inherited stdout, a FIFO whose other end
+/// is on the host) keeps the capacity the host gave it: 64 KiB normally, but
+/// two pages (8192) once the user crosses `pipe-user-pages-soft`, which host
+/// load decides. Passed through, that made the same guest read 65536 in one
+/// run of `--verify` and 8192 in the other (`/bin/cat` on DBT, the validate of
+/// hermit 2cd56771). A pipe can never hold more than the ceiling a guest can
+/// raise it to, so above it the ceiling is reported, as `pipe-max-size` is. A
+/// capacity at or below it is the one a pipe Hermit created was pinned to, or
+/// one the guest set itself, and is reported as it is. Host load cannot make
+/// a pipe smaller than the ceiling on Linux 5.14 and later: the quota fallback
+/// is exactly two pages, and past the hard limit Linux refuses the pipe
+/// instead. So an inherited pipe below it is one its creator sized on purpose,
+/// the same in every run. Before 5.14 the fallback was one page; the creation
+/// pin already needs 5.14 there, since under the same quota its growth of a
+/// one-page pipe to the ceiling is refused and the run stops
+/// (`pipe_capacity_failure`).
+///
+/// Only the reported value is made deterministic. A write to a pipe drained on
+/// the host still completes as far as its real capacity and that reader allow.
+pub(crate) fn reported_pipe_capacity(host: i64) -> i64 {
+    host.min(i64::from(DETERMINISTIC_PIPE_CAPACITY_BYTES))
+}
+
 /// SIGIO and SIGURG, the signals Linux sends to a descriptor's owner when
 /// data, out-of-band data, a lease break, or a directory change arrives.
 fn async_io_signals() -> u64 {
@@ -6230,6 +6256,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             // and requires the value to round-trip. Clamping every
             // `F_SETPIPE_SZ` to the pinned capacity would break that contract
             // while fixing nothing that is actually nondeterministic.
+            // A host-backed pipe's capacity is host state
+            // (`reported_pipe_capacity`); the guest reads it no larger than
+            // the ceiling it may raise a pipe to.
+            F_GETPIPE_SZ => Ok(reported_pipe_capacity(
+                self.record_or_replay(guest, call).await?,
+            )),
             F_SETPIPE_SZ(requested) if pipe_capacity_request_exceeds_ceiling(requested) => {
                 trace!(
                     "[detcore] refusing F_SETPIPE_SZ({}) above the deterministic pipe ceiling {}",
@@ -10160,6 +10192,19 @@ mod test {
         assert!(pipe_capacity_request_exceeds_ceiling(
             DETERMINISTIC_PIPE_CAPACITY_BYTES + 1
         ));
+    }
+
+    /// A host pipe's capacity above the ceiling reads as the ceiling, so a
+    /// default 64-KiB pipe and one the host shrank to two pages under
+    /// `pipe-user-pages-soft` read the same. A capacity at or below the ceiling
+    /// (Hermit's pin, or a guest's own shrink) reads as it is.
+    #[test]
+    fn a_host_pipe_capacity_reads_no_larger_than_the_ceiling() {
+        let ceiling = i64::from(DETERMINISTIC_PIPE_CAPACITY_BYTES);
+        assert_eq!(super::reported_pipe_capacity(65536), ceiling);
+        assert_eq!(super::reported_pipe_capacity(1 << 20), ceiling);
+        assert_eq!(super::reported_pipe_capacity(ceiling), ceiling);
+        assert_eq!(super::reported_pipe_capacity(4096), 4096);
     }
 
     /// Shrinking stays legal. `tests/c/pipe_capacity.c`

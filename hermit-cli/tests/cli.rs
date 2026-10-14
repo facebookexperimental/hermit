@@ -18550,6 +18550,119 @@ int main(void) {
     );
 }
 
+/// A guest reads the same capacity for an inherited stdout pipe whatever
+/// capacity the host gave it. A pipe Hermit did not create keeps the host's
+/// capacity: 64 KiB normally, but two pages (8192) once the user crosses
+/// `pipe-user-pages-soft`, which host load decides. Passed through, the same
+/// `/bin/cat` read 65536 in one run of `--verify` and 8192 in the other (DBT,
+/// the validate of hermit 2cd56771), and that run failed. Here the two runs'
+/// stdout pipes are given those two capacities directly, on ptrace and, where
+/// it is available, DBT, and the guest must read 8192 from both.
+#[test]
+fn an_inherited_pipe_reads_the_same_capacity_whatever_the_host_gave_it() {
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+    use std::os::fd::OwnedFd;
+    let build_root = process_build_root("inherited-pipe-capacity");
+    fs::create_dir_all(&build_root).expect("failed to create the inherited-pipe build root");
+    let source = build_root.join("stdoutcap.c");
+    fs::write(
+        &source,
+        r#"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+int main(void) {
+    /* As coreutils' cat does before it splices: try to grow, then ask. */
+    int grow = fcntl(1, F_SETPIPE_SZ, 524288);
+    int grow_errno = grow < 0 ? errno : 0;
+    printf("grow=%d %s, capacity=%d\n", grow, grow < 0 ? strerrorname_np(grow_errno) : "ok",
+           fcntl(1, F_GETPIPE_SZ));
+    return 0;
+}
+"#,
+    )
+    .expect("failed to write the inherited-pipe guest");
+    let guest = build_root.join("stdoutcap");
+    let built = Command::new("cc")
+        .args(["-O2", "-Wall", "-Wextra", "-Werror", "-o"])
+        .arg(&guest)
+        .arg(&source)
+        .output()
+        .expect("failed to invoke cc for the inherited-pipe guest");
+    assert!(
+        built.status.success(),
+        "failed to build the inherited-pipe guest:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let mut backends = vec![None];
+    if !dbt_unavailable("an_inherited_pipe_reads_the_same_capacity_whatever_the_host_gave_it") {
+        backends.push(Some("--backend=dbt"));
+    }
+    let _guard = hermit_run_guard();
+    for backend in backends {
+        for host_capacity in [65536, 8192] {
+            let mut fds = [0; 2];
+            // SAFETY: `fds` has room for both descriptors.
+            assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+            // SAFETY: pipe2 just returned both descriptors, owned by nothing else.
+            let (reader, writer) =
+                unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+            // SAFETY: F_SETPIPE_SZ only resizes the pipe.
+            let set = unsafe { libc::fcntl(fds[1], libc::F_SETPIPE_SZ, host_capacity) };
+            // Under the very `pipe-user-pages-soft` pressure this test is
+            // about, Linux refuses an unprivileged user's growth with EPERM,
+            // and the new pipe stays at two pages: that size cannot be made
+            // here, and the 8192 case still runs.
+            if set < 0
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+                && host_capacity > 8192
+            {
+                eprintln!(
+                    "SKIPPED {backend:?} {host_capacity}: this host refuses to grow a pipe \
+                     (pipe-user-pages-soft is exceeded)"
+                );
+                continue;
+            }
+            assert_eq!(
+                set, host_capacity,
+                "the host pipe must take {host_capacity}"
+            );
+            let mut args = Vec::new();
+            args.extend(backend);
+            args.extend(["run", "--strict", "--"]);
+            let mut command = hermit_command(&args);
+            let child = command
+                .arg(&guest)
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(writer))
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("failed to run the inherited-pipe guest under hermit");
+            // The command holds its copy of the write end until dropped, and
+            // the read below ends only when every write end is closed.
+            drop(command);
+            let mut stdout = String::new();
+            fs::File::from(reader)
+                .read_to_string(&mut stdout)
+                .expect("failed to read the guest's stdout");
+            let output = child.wait_with_output().expect("failed to wait for hermit");
+            assert!(
+                output.status.success(),
+                "{backend:?} {host_capacity}: {:?}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                stdout, "grow=-1 EPERM, capacity=8192\n",
+                "{backend:?}: a {host_capacity}-byte host pipe must read as the ceiling"
+            );
+        }
+    }
+}
+
 /// A guest-side fact must not be reported as a hermit-internal failure — and a
 /// genuine hermit-internal failure must keep saying so.
 ///
