@@ -348,7 +348,7 @@ fn a_guest_that_rebinds_the_path_itself_names_no_host_input_change() {
 #[test]
 fn a_rebinding_through_reverie_private_page_ends_the_run_with_a_refusal() {
     let guest = host_input::private_page_rebinding_guest(&host_input::python_interpreter());
-    let (status, stderr) = host_input::verify_ended_in_run_1(
+    let (status, stderr, report) = host_input::verify_ended_in_run_1(
         Path::new(env!("CARGO_BIN_EXE_hermit")),
         "host-input-private-page",
         &guest,
@@ -364,6 +364,18 @@ fn a_rebinding_through_reverie_private_page_ends_the_run_with_a_refusal() {
         "the refusal must name the stub and its address:\n{stderr}"
     );
     assert!(!stderr.contains("HERMIT_HOST_INPUT_CHANGE"), "{stderr}");
+    assert!(
+        matches!(
+            report.no_result_reason,
+            Some(hermit::canonical_verdict::NoResultReason::RunFailed {
+                run: hermit::canonical_verdict::VerificationRun::Run1,
+                failure: hermit::canonical_verdict::RunFailure::PolicyRefusal,
+                ..
+            })
+        ),
+        "verify.json must record run 1's policy refusal: {:?}\n{stderr}",
+        report.no_result_reason
+    );
 }
 
 /// [`a_rebinding_through_reverie_private_page_ends_the_run_with_a_refusal`]

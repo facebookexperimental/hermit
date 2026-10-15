@@ -1033,13 +1033,18 @@ impl<T: RecordOrReplay> Detcore<T> {
 
             // For `hermit run --verify`: a guest that faulted on an illegal
             // instruction may have run code that made syscalls Detcore never
-            // saw. On ptrace that is the one way past the tracer: a syscall
-            // issued from the untraced stub of Reverie's private page is let
-            // through, and the instruction after it is `ud2`. So the run
-            // reports `/`, the ancestor of every path, and names no host input
-            // change. A false alarm only withholds a name. A guest that first
-            // rewrites or replaces that code is reported when it does so
-            // (`record_untraced_code_change`).
+            // saw, so the run reports `/`, the ancestor of every path, and
+            // names no host input change. A false alarm only withholds a name.
+            // The case this was written for no longer reaches here: on ptrace,
+            // a syscall issued from the untraced stub of Reverie's private page
+            // is followed by a `ud2`, and Reverie now ends the run at that
+            // SIGILL (`UntracedStubSyscall`, a policy refusal) before any Tool
+            // sees it. A stub syscall that never returns to the `ud2` (execve,
+            // exit, rt_sigreturn) raises no SIGILL at all
+            // (https://github.com/rrnewton/reverie/issues/1064). This stays as
+            // the conservative answer for any other illegal instruction. A
+            // guest that first rewrites or replaces the page's code is reported
+            // when it does so (`record_untraced_code_change`).
             if signal.signal() == Some(Signal::SIGILL) && self.cfg.record_host_inputs {
                 tool_global::record_host_mutation(guest, String::from("/")).await;
             }
