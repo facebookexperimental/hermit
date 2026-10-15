@@ -980,7 +980,35 @@ static void on_sigkill_sigchld(int signal) {
  * child's files by the time the kill returns to a sender that waits for the
  * victim, as Hermit's SIGKILL fence makes it, so both counts are 0
  * (https://github.com/rrnewton/hermit/issues/4362). */
+enum sigkill_how {
+  SIGKILL_BY_KILL,
+  /* pidfd_send_signal to a child whose leader thread has exited
+   * (https://github.com/rrnewton/hermit/issues/4411). */
+  SIGKILL_BY_PIDFD_LEADER_EXITED,
+};
+
+static const char* const sigkill_how_names[] = {"", " by pidfd after leader exit"};
+
+static int test_sigkill_observed_how(int threaded, int by_pipe, enum sigkill_how how);
+
 static int test_sigkill_observed(int threaded, int by_pipe) {
+  return test_sigkill_observed_how(threaded, by_pipe, SIGKILL_BY_KILL);
+}
+
+static void* sigkill_leader_exit_waiter(void* ready) {
+  /* Give the leader's pthread_exit time to finish under any schedule before
+   * the parent is told, as the 4400 re-check's probe does. */
+  for (int i = 0; i < 200; ++i) {
+    sched_yield();
+  }
+  atomic_store((_Atomic int*)ready, 1);
+  for (;;) {
+    pause();
+  }
+  return NULL;
+}
+
+static int test_sigkill_observed_how(int threaded, int by_pipe, enum sigkill_how how) {
   int fds[2];
   if (by_pipe && pipe(fds) != 0) {
     perror("pipe");
@@ -1017,6 +1045,13 @@ static int test_sigkill_observed(int threaded, int by_pipe) {
         _exit(2);
       }
     }
+    if (how == SIGKILL_BY_PIDFD_LEADER_EXITED) {
+      pthread_t thread;
+      if (pthread_create(&thread, NULL, sigkill_leader_exit_waiter, (void*)ready) != 0) {
+        _exit(2);
+      }
+      pthread_exit(NULL);
+    }
     atomic_store(ready, 1);
     for (;;) {
       pause();
@@ -1029,7 +1064,14 @@ static int test_sigkill_observed(int threaded, int by_pipe) {
   while (!atomic_load(ready)) {
     sched_yield();
   }
-  if (kill(child, SIGKILL) != 0) {
+  int sent;
+  if (how == SIGKILL_BY_PIDFD_LEADER_EXITED) {
+    int pidfd = (int)syscall(SYS_pidfd_open, child, 0);
+    sent = pidfd < 0 ? -1 : (int)syscall(SYS_pidfd_send_signal, pidfd, SIGKILL, NULL, 0);
+  } else {
+    sent = kill(child, SIGKILL);
+  }
+  if (sent != 0) {
     perror("kill");
     return 1;
   }
@@ -1050,8 +1092,9 @@ static int test_sigkill_observed(int threaded, int by_pipe) {
     return 1;
   }
   printf(
-      "sigkill %s threaded=%d iterations=%ld signaled=%d sig=%d\n",
+      "sigkill %s%s threaded=%d iterations=%ld signaled=%d sig=%d\n",
       by_pipe ? "pipe-eof" : "sigchld",
+      sigkill_how_names[how],
       threaded,
       iterations,
       WIFSIGNALED(status),
@@ -1135,6 +1178,9 @@ int main(int argc, char** argv) {
   }
   if (strcmp(argv[1], "sigkill-threaded-pipe-eof") == 0) {
     return test_sigkill_observed(1, 1);
+  }
+  if (strcmp(argv[1], "sigkill-pidfd-leader-exited-sigchld") == 0) {
+    return test_sigkill_observed_how(1, 0, SIGKILL_BY_PIDFD_LEADER_EXITED);
   }
   fprintf(stderr, "unknown scenario: %s\n", argv[1]);
   return 2;

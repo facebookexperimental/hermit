@@ -2283,7 +2283,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And scheduler::test::a_background_reads_descriptor_replaced_before_it_runs_may_take_sigchld
     // (https://github.com/rrnewton/hermit/issues/4410): 1706, listed.
     // And a_seq_file_refuses_mappings_and_positioned_writes_as_linux (https://github.com/rrnewton/hermit/issues/4213): 1707.
-    ("test.detcore_unit", 1707),
+    // And tool_global::tests::the_dbt_sigkill_fence_refuses_rather_than_leave_the_sender_unfenced
+    // and tool_global::tests::a_dbt_sigkill_notice_past_its_valve_refuses_before_answering
+    // (https://github.com/rrnewton/hermit/issues/4362): 1709, listed.
+    ("test.detcore_unit", 1709),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2566,9 +2569,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And robust_futex_owner_death's two DBT fatal-signal tests in the third
     // shard (https://github.com/rrnewton/hermit/issues/4278): 60 + 169 + 231
     // = 460.
+    // And signal_determinism::dbt_refuses_a_sigkill_whose_sender_cannot_be_held
+    // in the third shard (https://github.com/rrnewton/hermit/issues/4411):
+    // 60 + 169 + 232 = 461.
     ("test.hermit_integration", 60),
     ("test.hermit_integration_2", 169),
-    ("test.hermit_integration_3", 231),
+    ("test.hermit_integration_3", 232),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -3873,7 +3879,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from e45ad547: 1705.
     // And the 4410 replaced-descriptor test: 1706, listed.
     // And a_seq_file_refuses_mappings_and_positioned_writes_as_linux (https://github.com/rrnewton/hermit/issues/4213): 1707.
-    ("test.detcore_unit_on_host", 1707),
+    // And the two fail-closed SIGKILL fence tests: 1709.
+    ("test.detcore_unit_on_host", 1709),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -3939,7 +3946,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the DBT and ptrace SIGKILL tests: 453.
     // And the five process-cgroup tests (https://github.com/rrnewton/hermit/issues/4378): 458.
     // And the two DBT fatal-signal tests: 460.
-    ("test.hermit_integration_on_host", 460),
+    // And the DBT unfenceable-SIGKILL refusal test: 461.
+    ("test.hermit_integration_on_host", 461),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

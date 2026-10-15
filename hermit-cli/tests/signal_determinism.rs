@@ -331,6 +331,66 @@ fn dbt_sigkill_ends_every_thread_of_the_target() {
     }
 }
 
+/// On DBT, a pidfd SIGKILL names the victim's leader. When that leader has
+/// already exited, Hermit cannot find the victim's host process from it, so it
+/// cannot hold the sender until the victim is gone. The run is then refused by
+/// name before the sender is answered, never left to see the death at a
+/// host-chosen moment. Before, it ended in a false deadlock (rc 125)
+/// (https://github.com/rrnewton/hermit/issues/4411; Claude review of
+/// https://github.com/rrnewton/hermit/pull/4423, F2). The refusal must not
+/// depend on how far the victim's exits got before the notice, so chaos
+/// schedules give it too (Claude re-check of 4423, N1).
+#[cfg(feature = "dbt")]
+#[test]
+fn dbt_refuses_a_sigkill_whose_sender_cannot_be_held() {
+    let _guard = hermit_signal_lock();
+    for seed in [None, Some(1), Some(2), Some(3)] {
+        let mut command = Command::new(hermit_test::hermit_binary());
+        command.args([
+            "--backend=dbt",
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--no-virtualize-cpuid",
+        ]);
+        match seed {
+            Some(seed) => command.args(["--chaos", &format!("--sched-seed={seed}")]),
+            None => command.arg("--max-timeslice=disabled"),
+        };
+        command.arg("--");
+        command
+            .arg(signal_guest())
+            .arg("sigkill-pidfd-leader-exited-sigchld");
+        let label =
+            format!("DBT pidfd SIGKILL to a process whose leader exited, chaos seed {seed:?}");
+        let (output, timed_out, elapsed) = bounded_command_output(command, &label);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !timed_out,
+            "{label} hit the host bound after {elapsed:?}\n{stderr}"
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+            "{label} was not refused\nstdout:\n{}\nstderr:\n{stderr}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+        for expected in [
+            "cannot be held until it is gone",
+            "has no registered host process",
+        ] {
+            assert!(
+                stderr.contains(expected),
+                "{label} missing {expected:?}:\n{stderr}"
+            );
+        }
+        assert!(
+            !stderr.contains("HERMIT_DEADLOCK"),
+            "{label} reached the kill notice's false deadlock:\n{stderr}"
+        );
+    }
+}
+
 /// The ptrace control for `dbt_sigkill_ends_every_thread_of_the_target`.
 #[test]
 fn ptrace_sigkill_ends_every_thread_of_the_target() {

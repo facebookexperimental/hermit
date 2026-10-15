@@ -134,6 +134,31 @@ impl std::fmt::Display for SigkillFenceRefusal {
     }
 }
 
+/// A guest SIGKILL whose victim the sender cannot be held for on a backend
+/// that sends process signals to a named thread (DBT): Hermit refuses the run
+/// before answering the sender, rather than let host timing decide when the
+/// sender sees the death (<https://github.com/rrnewton/hermit/issues/4362>;
+/// Codex design review of its part 2, P2-3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnfencedSigkill {
+    /// The victim process.
+    pub process: DetPid,
+    /// Why its death could not be awaited.
+    pub reason: String,
+}
+
+impl std::fmt::Display for UnfencedSigkill {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "hermit refused to continue the run: the sender of a SIGKILL to process {} \
+             cannot be held until it is gone: {}",
+            self.process.as_raw(),
+            self.reason
+        )
+    }
+}
+
 /// Whether a backend lets the scheduler retire a SIGKILL's victims at the
 /// kill turn: ptrace, where the scheduler's record decides waits and each
 /// victim's death reaches it as a deregistration. Backends that cancel killed
@@ -575,26 +600,6 @@ impl Scheduler {
                     .copied()
                     .filter(|process| self.child_exit_publications_pending.contains(process))
                     .collect(),
-                waited,
-            };
-            tracing::error!("[sigkill] {}", refusal);
-            self.sigkill_fence_refusal = Some(refusal);
-        }
-    }
-
-    /// Refuse the run: on a backend that sends process signals to a named
-    /// thread (DBT), a SIGKILL's victim `process` was not gone within the
-    /// valve, so continuing would let host timing decide when the sender sees
-    /// its death (https://github.com/rrnewton/hermit/issues/4362).
-    pub(crate) fn refuse_unsettled_process_sigkill(
-        &mut self,
-        process: DetPid,
-        waited: std::time::Duration,
-    ) {
-        if self.sigkill_fence_refusal.is_none() {
-            let refusal = SigkillFenceRefusal {
-                unaccounted: Vec::new(),
-                unpublished: vec![process],
                 waited,
             };
             tracing::error!("[sigkill] {}", refusal);

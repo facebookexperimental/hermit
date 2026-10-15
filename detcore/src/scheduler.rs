@@ -3694,6 +3694,21 @@ impl Scheduler {
             .map(|(_, physical_pid, ..)| *physical_pid)
     }
 
+    /// Whether the host thread registered for `dettid` has exited, by a
+    /// zero-timeout poll of the `PIDFD_THREAD` pidfd opened when it
+    /// registered; `None` when it has no registration or the poll fails.
+    pub(crate) fn registered_thread_has_exited(&self, dettid: DetTid) -> Option<bool> {
+        let (.., pidfd) = self.physical_thread_pidfds.get(&dettid)?;
+        let mut poll = libc::pollfd {
+            fd: pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd, and a zero timeout never blocks.
+        let ready = unsafe { libc::poll(&mut poll, 1, 0) };
+        (ready >= 0).then_some(ready > 0)
+    }
+
     fn remove_physical_thread(&mut self, dettid: &DetTid, mm: MmId) {
         if self
             .physical_thread_pidfds
