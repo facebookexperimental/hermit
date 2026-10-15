@@ -1483,8 +1483,30 @@ impl<T: RecordOrReplay> Detcore<T> {
             // take went into the guest's own buffer, so the kernel made the
             // copy-out with its own partial-write and EFAULT rules for a kept
             // copy; for a dropped one, the bytes it changed are put back.
-            let discarded = records && self.took_a_discarded_copy(guest, waited, &result).await;
-            if stands && !discarded {
+            let outcome = if records {
+                self.take_outcome_of(guest, waited, &result).await
+            } else {
+                crate::scheduler::posix_timer_coalesce::TakeOutcome {
+                    skip: false,
+                    rewrite: None,
+                }
+            };
+            if stands && !outcome.skip {
+                // A POSIX timer's entry, or a kept signal standing on another
+                // sender's record, is returned with its own siginfo
+                // (<https://github.com/rrnewton/hermit/issues/4262>); the
+                // kernel's copy-out succeeded, so the buffer is writable.
+                if let (Ok(_), Some(info), Some(rewrite)) = (&result, call.info(), outcome.rewrite)
+                    && guest
+                        .memory()
+                        .write_value(info.cast::<[u8; 128]>(), &rewrite.to_user())
+                        .is_err()
+                {
+                    tracing::warn!(
+                        "[dtid {}] rt_sigtimedwait's siginfo keeps the physical record",
+                        guest.thread_state().dettid
+                    );
+                }
                 break result;
             }
             if let (Some(info), Some(bytes)) = (call.info(), before.as_ref()) {
@@ -1505,43 +1527,54 @@ impl<T: RecordOrReplay> Detcore<T> {
         result
     }
 
-    /// Whether the take that ended this thread's `rt_sigtimedwait` for the
-    /// signals `waited` with `result` took a copy Linux discarded when it was
-    /// sent (`DiscardedSignalControl::Take`, and, for an EFAULT, which names no
-    /// signal, `DiscardedSignalControl::TakeFaulted` from the queues after it).
-    async fn took_a_discarded_copy<G: Guest<Self>>(
+    /// What to do with the take that ended this thread's `rt_sigtimedwait`
+    /// for the signals `waited` with `result` (`take_outcome`, from the
+    /// queues read after it; for an EFAULT, which names no signal,
+    /// `DiscardedSignalControl::TakeFaulted`).
+    async fn take_outcome_of<G: Guest<Self>>(
         &self,
         guest: &mut G,
         waited: Option<u64>,
         result: &Result<i64, Error>,
-    ) -> bool {
+    ) -> crate::scheduler::posix_timer_coalesce::TakeOutcome {
+        use crate::scheduler::posix_timer_coalesce::TakeOutcome;
+        let skip = |skip| TakeOutcome {
+            skip,
+            rewrite: None,
+        };
         match result {
             Ok(signal) if (1..32).contains(&(*signal as i32)) => {
-                crate::syscalls::helpers::take_was_discarded(guest, *signal as i32).await
+                let after =
+                    crate::syscalls::threads::read_kernel_signal_state(guest.pid(), guest.tid())
+                        .ok()
+                        .map(|state| (state.thread_pending, state.shared_pending));
+                crate::syscalls::helpers::take_outcome(guest, *signal as i32, after).await
             }
             Err(Error::Errno(Errno::EFAULT)) => {
                 let Some(set) = waited else {
-                    return false;
+                    return skip(false);
                 };
                 let Ok(state) =
                     crate::syscalls::threads::read_kernel_signal_state(guest.pid(), guest.tid())
                 else {
-                    return false;
+                    return skip(false);
                 };
-                matches!(
+                let at = guest.thread_state().thread_logical_time.as_nanos();
+                skip(matches!(
                     crate::tool_global::discarded_signal(
                         guest,
                         DiscardedSignalControl::TakeFaulted {
                             set,
                             thread_pending: state.thread_pending,
                             shared_pending: state.shared_pending,
+                            at,
                         },
                     )
                     .await,
                     DiscardedSignalAnswer::Discarded(true)
-                )
+                ))
             }
-            _ => false,
+            _ => skip(false),
         }
     }
 
@@ -1615,15 +1648,28 @@ impl<T: RecordOrReplay> Detcore<T> {
         // duplicate is: the guest never sees it
         // (`crate::syscalls::helpers::take_was_discarded`,
         // <https://github.com/rrnewton/hermit/issues/4293>).
+        // A POSIX timer's entry, or a kept signal standing on another
+        // sender's record, gets its own record in place of the kernel's
+        // (<https://github.com/rrnewton/hermit/issues/4262>), and a stale
+        // timer entry is dropped as a discarded copy is.
         if crate::scheduler::discarded_at_send::records(guest.config()) {
-            for (record, answer) in bytes.chunks(SIGNALFD_RECORD).zip(answers.iter_mut()) {
+            for (record, answer) in bytes
+                .chunks_mut(SIGNALFD_RECORD)
+                .zip(answers.iter_mut())
+            {
                 let signal = signalfd_field(record, 0) as i32;
-                if (1..32).contains(&signal)
-                    && crate::syscalls::helpers::take_was_discarded(guest, signal).await
-                {
+                if !(1..32).contains(&signal) {
+                    continue;
+                }
+                let outcome = crate::syscalls::helpers::take_outcome(guest, signal, None).await;
+                if outcome.skip {
                     *answer = Some(
                         crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer::Claimed(true),
                     );
+                } else if let Some(rewrite) = outcome.rewrite {
+                    record.copy_from_slice(&crate::scheduler::signal_lists::signalfd_record(
+                        &rewrite,
+                    ));
                 }
             }
         }
@@ -3770,7 +3816,17 @@ fn committed_sigchld_verdict(
 /// The size of a `struct signalfd_siginfo`, which has ssi_signo at 0,
 /// ssi_code at 8, ssi_pid at 12, ssi_uid at 16, ssi_status at 40, ssi_int at
 /// 44, ssi_utime at 56 and ssi_stime at 64.
-const SIGNALFD_RECORD: usize = 128;
+pub(crate) const SIGNALFD_RECORD: usize = 128;
+
+/// The signals signalfd `fd` of process `pid` reads, from its `sigmask:`
+/// line in `/proc/<pid>/fdinfo/<fd>` (a kernel sigset in hex), or `None`
+/// when it cannot be read.
+pub(crate) fn signalfd_mask(pid: i32, fd: i32) -> Option<u64> {
+    let info = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}")).ok()?;
+    info.lines()
+        .find_map(|line| line.strip_prefix("sigmask:"))
+        .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+}
 
 fn signalfd_field(record: &[u8], at: usize) -> u32 {
     u32::from_ne_bytes(record[at..at + 4].try_into().expect("four bytes"))

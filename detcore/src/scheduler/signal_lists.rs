@@ -439,6 +439,31 @@ pub(crate) fn siginfo_code(siginfo: &KernelSiginfo) -> i32 {
     i32::from_ne_bytes(siginfo.0[8..12].try_into().unwrap())
 }
 
+/// The 128-byte `signalfd_siginfo` a signalfd read returns for `info`, as
+/// `signalfd_copyinfo` lays it out (fs/signalfd.c): `SI_TIMER` fills the
+/// timer id, overrun and value; any other negative code (`siginfo_layout`'s
+/// `SIL_RT`, `rt_sigqueueinfo`'s and `tgkill`'s) the sender, uid and value;
+/// a non-negative one the sender and uid. Every other byte is zero.
+pub(crate) fn signalfd_record(info: &KernelSiginfo) -> [u8; 128] {
+    let si = &info.0;
+    let mut record = [0u8; 128];
+    record[0..12].copy_from_slice(&si[0..12]);
+    let code = siginfo_code(info);
+    if code == SI_TIMER {
+        record[24..28].copy_from_slice(&si[16..20]);
+        record[32..36].copy_from_slice(&si[20..24]);
+        record[44..48].copy_from_slice(&si[24..28]);
+        record[48..56].copy_from_slice(&si[24..32]);
+    } else {
+        record[12..20].copy_from_slice(&si[16..24]);
+        if code < 0 {
+            record[44..48].copy_from_slice(&si[24..28]);
+            record[48..56].copy_from_slice(&si[24..32]);
+        }
+    }
+    record
+}
+
 /// The siginfo of an ordinary send of `signal` with `code` (`SI_USER` 0,
 /// `SI_TKILL` -6, `SI_KERNEL` 0x80) from `pid` and `uid` (the `_kill`
 /// member), every other byte zero.
@@ -645,6 +670,29 @@ mod tests {
         assert_eq!(lists.listed().len(), 2);
         assert_eq!(lists.timer_entry(P, 1).map(|(q, ..)| q), Some(private));
         assert!(lists.invariants_hold());
+    }
+
+    #[test]
+    fn a_signalfd_record_lays_out_each_kind_as_signalfd_copyinfo_does() {
+        let timer = signalfd_record(&timer_siginfo(USR1, 3, 4, 0x1122334455667788));
+        assert_eq!(i32::from_ne_bytes(timer[8..12].try_into().unwrap()), SI_TIMER);
+        assert_eq!(u32::from_ne_bytes(timer[24..28].try_into().unwrap()), 3);
+        assert_eq!(u32::from_ne_bytes(timer[32..36].try_into().unwrap()), 4);
+        assert_eq!(i32::from_ne_bytes(timer[44..48].try_into().unwrap()), 0x55667788);
+        assert_eq!(
+            u64::from_ne_bytes(timer[48..56].try_into().unwrap()),
+            0x1122334455667788
+        );
+        assert!(timer[12..24].iter().all(|&byte| byte == 0));
+        let queued = signalfd_record(&queue_info());
+        assert_eq!(
+            u64::from_ne_bytes(queued[48..56].try_into().unwrap()),
+            0x1122334455667788
+        );
+        let killed = signalfd_record(&ordinary_siginfo(USR1, 0, 77, 1000));
+        assert_eq!(u32::from_ne_bytes(killed[12..16].try_into().unwrap()), 77);
+        assert_eq!(u32::from_ne_bytes(killed[16..20].try_into().unwrap()), 1000);
+        assert!(killed[20..].iter().all(|&byte| byte == 0));
     }
 
     #[test]

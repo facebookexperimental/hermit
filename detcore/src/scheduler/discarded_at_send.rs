@@ -859,18 +859,27 @@ pub enum DiscardedSignalControl {
         process_holds: bool,
     },
     /// The calling thread took a copy of `signal` (`rt_sigtimedwait`, a
-    /// signalfd record). Answers whether the copy was one Linux discarded
-    /// (`DiscardedAtSend::take_from`).
-    Take { signal: i32 },
+    /// signalfd record) at its logical time `at`, after which its private and
+    /// its process's shared queues held `after` (when read). Answers whether
+    /// to drop the copy (one Linux discarded, `DiscardedAtSend::take_from`, or
+    /// a stale timer entry) and the siginfo to write in its place
+    /// (`Scheduler::timer_signal_take`).
+    Take {
+        signal: i32,
+        at: crate::types::LogicalTime,
+        after: Option<(u64, u64)>,
+    },
     /// The calling thread's `rt_sigtimedwait` for the signals `set` failed
     /// with EFAULT copying out a signal it had dequeued, after which its
     /// private queue held `thread_pending` and its process's shared queue
-    /// `shared_pending`. Answers whether the copy it took was one Linux
-    /// discarded (`DiscardedAtSend::take_faulted`).
+    /// `shared_pending`. Answers whether to take again: the copy it took was
+    /// one Linux discarded (`DiscardedAtSend::take_faulted`), or a stale timer
+    /// entry Linux would have skipped (`Scheduler::timer_signal_take_faulted`).
     TakeFaulted {
         set: u64,
         thread_pending: u64,
         shared_pending: u64,
+        at: crate::types::LogicalTime,
     },
     /// The calling thread's process changed `signal`'s action to one that
     /// ignores it, and Linux flushed it from every queue of the process.
@@ -900,6 +909,9 @@ pub enum DiscardedSignalControl {
     /// unreported (`Tool::filter_unreported_signal`): as `Dequeue`, for a hook
     /// that cannot replace the siginfo.
     Unreported { signal: i32 },
+    /// The signals with entries in the calling thread's private queue and in
+    /// its process's shared queue (`signal_lists`), as `Bits`.
+    Listed,
     /// `timer_gettime` or `timer_getoverrun` of the calling thread's
     /// process's timer `timer` at the caller's time `now`
     /// (`Scheduler::posix_timer_remaining`, `Scheduler::posix_timer_overrun`).
@@ -907,6 +919,35 @@ pub enum DiscardedSignalControl {
         timer: i32,
         now: crate::types::LogicalTime,
     },
+}
+
+impl DiscardedSignalControl {
+    /// The control with a dequeue's time no earlier than `now`.
+    pub(crate) fn at_least(self, now: crate::types::LogicalTime) -> Self {
+        match self {
+            Self::Dequeue { signal, at } => Self::Dequeue {
+                signal,
+                at: at.max(now),
+            },
+            Self::Take { signal, at, after } => Self::Take {
+                signal,
+                at: at.max(now),
+                after,
+            },
+            Self::TakeFaulted {
+                set,
+                thread_pending,
+                shared_pending,
+                at,
+            } => Self::TakeFaulted {
+                set,
+                thread_pending,
+                shared_pending,
+                at: at.max(now),
+            },
+            other => other,
+        }
+    }
 }
 
 /// The answer to a [`DiscardedSignalControl`].
@@ -927,6 +968,8 @@ pub enum DiscardedSignalAnswer {
         remaining: Option<crate::types::LogicalTime>,
         overrun: i32,
     },
+    /// What a take does with the copy it took (`DiscardedSignalControl::Take`).
+    Taken(super::posix_timer_coalesce::TakeOutcome),
 }
 
 /// A sender's classification of one send, with what it read before the
@@ -1305,19 +1348,20 @@ impl Scheduler {
                 }
                 DiscardedSignalAnswer::Recorded
             }
-            DiscardedSignalControl::Take { signal } => DiscardedSignalAnswer::Discarded(
-                self.discarded_at_send.take_from(dtid, process, signal),
-            ),
+            DiscardedSignalControl::Take { signal, at, after } => {
+                DiscardedSignalAnswer::Taken(self.timer_signal_take(dtid, signal, at, after))
+            }
             DiscardedSignalControl::TakeFaulted {
                 set,
                 thread_pending,
                 shared_pending,
-            } => DiscardedSignalAnswer::Discarded(self.discarded_at_send.take_faulted(
+                at,
+            } => DiscardedSignalAnswer::Discarded(self.timer_signal_take_faulted(
                 dtid,
-                process,
                 set,
                 thread_pending,
                 shared_pending,
+                at,
             )),
             DiscardedSignalControl::Flushed { signal } => {
                 let queues = self.process_queues(process);
@@ -1398,6 +1442,17 @@ impl Scheduler {
             }
             DiscardedSignalControl::Unreported { signal } => {
                 DiscardedSignalAnswer::Delivery(self.timer_signal_dequeue(dtid, signal, None))
+            }
+            DiscardedSignalControl::Listed => {
+                let listed = |queue: QueueId| {
+                    (1..32)
+                        .filter(|&signal| self.discarded_at_send.lists.is_listed(queue, signal))
+                        .fold(0, |bits, signal| bits | kernel_signal_bit(signal))
+                };
+                DiscardedSignalAnswer::Bits {
+                    thread: listed(QueueId::Thread(dtid)),
+                    process: listed(QueueId::Process(process)),
+                }
             }
             DiscardedSignalControl::TimerReadout { timer, now } => {
                 DiscardedSignalAnswer::TimerReadout {

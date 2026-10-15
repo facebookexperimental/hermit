@@ -89,6 +89,18 @@ pub enum DeliveryAnswer {
     Suppress,
 }
 
+/// What a take (`rt_sigtimedwait`, a signalfd record) does with the copy it
+/// took (`Scheduler::timer_signal_take`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TakeOutcome {
+    /// Drop it and take again, as if it had never been queued: a copy Linux
+    /// discarded when it was sent, or a stale timer entry Linux skips inside
+    /// the dequeue.
+    pub skip: bool,
+    /// Return it with this siginfo instead of the physical record's.
+    pub rewrite: Option<KernelSiginfo>,
+}
+
 /// A dequeue identified at a reported stop, popped once the stop's hooks
 /// have read the queues (`Scheduler::finish_timer_signal_dequeue`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -578,6 +590,161 @@ impl Scheduler {
         answer
     }
 
+    /// A take of `signal` by `thread` at its time `at` (4262 design §4.4,
+    /// rev 8 A'): the returned signal is authoritative. With no list for it
+    /// in either queue, 4351's record decides as before (`take_from`).
+    /// Otherwise the entry is identified from the model, private first,
+    /// checked against the queues read after the take, where read (the
+    /// identified queue's bit clear, the other queue's as its model says),
+    /// popped, its timer re-armed, and the next entry promoted before the
+    /// caller takes again.
+    pub(crate) fn timer_signal_take(
+        &mut self,
+        thread: DetTid,
+        signal: i32,
+        at: LogicalTime,
+        after: Option<(u64, u64)>,
+    ) -> TakeOutcome {
+        let process = self.sigchld_process(thread);
+        let listed = if self.coalesces_alarms() && (1..32).contains(&signal) {
+            self.identify_listed_queue(thread, process, signal)
+        } else {
+            None
+        };
+        let Some(queue) = listed else {
+            return TakeOutcome {
+                skip: self.discarded_at_send.take_from(thread, process, signal),
+                rewrite: None,
+            };
+        };
+        if let Some((thread_pending, shared_pending)) = after {
+            let bit = kernel_signal_bit(signal);
+            self.check_taken_queues(
+                thread,
+                queue,
+                signal,
+                thread_pending & bit != 0,
+                shared_pending & bit != 0,
+            );
+        }
+        let (front, class, _) = self
+            .discarded_at_send
+            .lists
+            .front(queue, signal)
+            .expect("an identified queue has a list");
+        let (outcome, reconcile) = match front {
+            Entry::Plain { siginfo, .. } => (
+                TakeOutcome {
+                    skip: false,
+                    rewrite: (class == FrontClass::Proxy).then_some(siginfo),
+                },
+                None,
+            ),
+            Entry::Timer(entry) if !self.timer_entry_valid(&entry) => (
+                TakeOutcome {
+                    skip: true,
+                    rewrite: None,
+                },
+                None,
+            ),
+            Entry::Timer(entry) => {
+                let overrun = self.dequeue_overrun(&entry, at);
+                let info = self.timer_signal_info(signal, &entry, overrun);
+                (
+                    TakeOutcome {
+                        skip: false,
+                        rewrite: Some(KernelSiginfo::from_user(&info)),
+                    },
+                    Some((entry.timer, at, overrun)),
+                )
+            }
+        };
+        self.discarded_at_send.take(queue, signal);
+        self.pop_and_promote(
+            PendingDequeue {
+                queue,
+                signal,
+                reconcile,
+            },
+            thread,
+        );
+        outcome
+    }
+
+    /// A take for the signals `set` by `thread` at `at` failed copying out
+    /// the record it dequeued, which the kernel does not name; afterwards the
+    /// queues held `thread_pending` and `shared_pending` (rev 7 A3, rev 8 A',
+    /// N8-3). A listed (queue, signal) of the set whose bit is now clear is
+    /// the one taken: nothing else consumes in the caller's turn. With none,
+    /// the take was of an unlisted signal, which 4351's record decides
+    /// (`take_faulted`). Two such cannot be told apart, and refuse by name.
+    /// A stale entry is popped and the take repeats, as Linux would have
+    /// skipped it; a valid one is popped, re-armed and promoted, and the
+    /// fault stands. Returns whether to take again.
+    pub(crate) fn timer_signal_take_faulted(
+        &mut self,
+        thread: DetTid,
+        set: u64,
+        thread_pending: u64,
+        shared_pending: u64,
+        at: LogicalTime,
+    ) -> bool {
+        let process = self.sigchld_process(thread);
+        let (private, shared) = (QueueId::Thread(thread), QueueId::Process(process));
+        let mut taken = Vec::new();
+        if self.coalesces_alarms() {
+            for (queue, pending) in [(private, thread_pending), (shared, shared_pending)] {
+                for signal in 1..32 {
+                    let bit = kernel_signal_bit(signal);
+                    if set & bit != 0
+                        && pending & bit == 0
+                        && self.discarded_at_send.lists.is_listed(queue, signal)
+                    {
+                        taken.push((queue, signal));
+                    }
+                }
+            }
+        }
+        let (queue, signal) = match taken.as_slice() {
+            [] => {
+                return self.discarded_at_send.take_faulted(
+                    thread,
+                    process,
+                    set,
+                    thread_pending,
+                    shared_pending,
+                );
+            }
+            [one] => *one,
+            _ => exit_on_scheduler_refusal(&format_args!(
+                "hermit: thread {thread}'s rt_sigtimedwait failed copying out a signal it dequeued, and the entries of {taken:?} all left their queues, so which one Linux took cannot be told; the run is refused (https://github.com/rrnewton/hermit/issues/4262)"
+            )),
+        };
+        let (front, _, _) = self
+            .discarded_at_send
+            .lists
+            .front(queue, signal)
+            .expect("a listed queue has a front");
+        let (skip, reconcile) = match front {
+            Entry::Timer(entry) if !self.timer_entry_valid(&entry) => (true, None),
+            Entry::Timer(entry) => {
+                let overrun = self.dequeue_overrun(&entry, at);
+                (false, Some((entry.timer, at, overrun)))
+            }
+            Entry::Plain { .. } => (false, None),
+        };
+        self.discarded_at_send.take(queue, signal);
+        self.pop_and_promote(
+            PendingDequeue {
+                queue,
+                signal,
+                reconcile,
+            },
+            thread,
+        );
+        skip
+    }
+
     /// The listed queue a dequeue of `signal` by `thread` took from, private
     /// first (Linux's `dequeue_signal`), or `None` when neither queue has a
     /// list for it (the no-list branch) or the private queue's copy is a
@@ -640,9 +807,27 @@ impl Scheduler {
         if pending.signal != signal || how == (Consumption::KeptResume { blocked: true }) {
             return None;
         }
+        self.check_taken_queues(thread, pending.queue, signal, thread_holds, process_holds);
+        Some(pending)
+    }
+
+    /// The check of a dequeue of `signal` from `queue` by `thread` against
+    /// its queues read after it, before any promotion (rev 9 A''): the
+    /// identified queue no longer holds the signal, and the other one holds
+    /// it exactly when its list or its discarded bit says so. A
+    /// contradiction is a producer the schedule does not see, and refuses by
+    /// name.
+    fn check_taken_queues(
+        &self,
+        thread: DetTid,
+        queue: QueueId,
+        signal: i32,
+        thread_holds: bool,
+        process_holds: bool,
+    ) {
         let process = self.sigchld_process(thread);
         let (private, shared) = (QueueId::Thread(thread), QueueId::Process(process));
-        let (other, identified_holds, other_holds) = if pending.queue == private {
+        let (other, identified_holds, other_holds) = if queue == private {
             (shared, thread_holds, process_holds)
         } else {
             (private, process_holds, thread_holds)
@@ -651,13 +836,8 @@ impl Scheduler {
             || self.discarded_at_send.is_discarded(other, signal);
         if identified_holds || other_holds != other_expected {
             exit_on_scheduler_refusal(&format_args!(
-                "hermit: thread {thread} took signal {signal} from {:?}, and afterwards that queue {} the signal and {other:?} {} it, where the model of its pending entries expects {}: a producer the schedule does not see, so the run is refused (https://github.com/rrnewton/hermit/issues/4262)",
-                pending.queue,
-                if identified_holds {
-                    "still held"
-                } else {
-                    "no longer held"
-                },
+                "hermit: thread {thread} took signal {signal} from {queue:?}, and afterwards that queue {} the signal and {other:?} {} it, where the model of its pending entries expects {}: a producer the schedule does not see, so the run is refused (https://github.com/rrnewton/hermit/issues/4262)",
+                if identified_holds { "still held" } else { "no longer held" },
                 if other_holds { "held" } else { "did not hold" },
                 if other_expected {
                     "it held there"
@@ -666,7 +846,6 @@ impl Scheduler {
                 },
             ));
         }
-        Some(pending)
     }
 
     /// Pop `pending`'s front, reconcile its timer, and promote the next entry

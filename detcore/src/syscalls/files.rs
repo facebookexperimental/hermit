@@ -5010,59 +5010,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                     Ok(self.record_or_replay(guest, call).await?)
                 }
             }
-            FdType::Signalfd => loop {
-                trace!("Possibly blocking read call on signalfd {}", call.fd());
-                let extents = [(call.buf().map_or(0, |buf| buf.as_raw()), call.len())];
-                let before =
-                    crate::syscalls::signal::capture_signalfd_buffer(guest, &extents, call.len());
-                let result = self.execute_nonblockable_fd_syscall(guest, call).await;
-                // A SIGCHLD read here goes through the child-exit ledger as
-                // one delivered to a handler does. A read whose every record
-                // was a dropped duplicate reads again, as if those copies had
-                // never been queued.
-                match (result, call.buf()) {
-                    (Ok(read), Some(buf))
-                        if read > 0 && self.cfg.backend.reports_child_exit_publication =>
-                    {
-                        let Some(kept) = self
-                            .reconcile_signalfd_records(guest, buf, read as usize, &before)
-                            .await
-                        else {
-                            break self
-                                .refuse_unrestorable_signalfd_record(guest, Sysno::read)
-                                .await;
-                        };
-                        if self
-                            .settle_faulted_signalfd_record(
-                                guest,
-                                call.fd(),
-                                &extents,
-                                Some(read as usize),
-                            )
-                            .await
-                        {
-                            break self
-                                .refuse_faulted_signalfd_discard(guest, Sysno::read)
-                                .await;
-                        }
-                        if kept > 0 {
-                            break Ok(kept as i64);
-                        }
-                    }
-                    (Err(Error::Errno(Errno::EFAULT)), _) => {
-                        if self
-                            .settle_faulted_signalfd_record(guest, call.fd(), &extents, None)
-                            .await
-                        {
-                            break self
-                                .refuse_faulted_signalfd_discard(guest, Sysno::read)
-                                .await;
-                        }
-                        break Err(Errno::EFAULT.into());
-                    }
-                    (result, _) => break result,
-                }
-            },
+            FdType::Signalfd if call.len() >= 2 * crate::syscalls::signal::SIGNALFD_RECORD
+                && self.signalfd_reads_per_record(guest, call.fd()).await =>
+            {
+                self.read_signalfd_per_record(guest, call).await
+            }
+            FdType::Signalfd => self.read_signalfd(guest, call, true).await,
             FdType::Timerfd => {
                 trace!("Possibly blocking read call on timerfd {}", call.fd());
                 // Expirations up to this thread's virtual now make the host
@@ -5102,6 +5055,136 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         resource_release_all(guest).await;
         res
+    }
+
+    /// One read of signalfd `call`, as the kernel answers it, with each
+    /// record put through the child-exit ledger and the discarded-at-send
+    /// record (`reconcile_signalfd_records`). A read whose every record was
+    /// dropped reads again if `may_read_again`, as if those copies had never
+    /// been queued; otherwise it answers 0.
+    async fn read_signalfd<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Read,
+        may_read_again: bool,
+    ) -> Result<i64, Error> {
+        loop {
+            trace!("Possibly blocking read call on signalfd {}", call.fd());
+            let extents = [(call.buf().map_or(0, |buf| buf.as_raw()), call.len())];
+            let before =
+                crate::syscalls::signal::capture_signalfd_buffer(guest, &extents, call.len());
+            let result = self.execute_nonblockable_fd_syscall(guest, call).await;
+            // A SIGCHLD read here goes through the child-exit ledger as
+            // one delivered to a handler does. A read whose every record
+            // was a dropped duplicate reads again, as if those copies had
+            // never been queued.
+            match (result, call.buf()) {
+                (Ok(read), Some(buf))
+                    if read > 0 && self.cfg.backend.reports_child_exit_publication =>
+                {
+                    let Some(kept) = self
+                        .reconcile_signalfd_records(guest, buf, read as usize, &before)
+                        .await
+                    else {
+                        break self
+                            .refuse_unrestorable_signalfd_record(guest, Sysno::read)
+                            .await;
+                    };
+                    if self
+                        .settle_faulted_signalfd_record(
+                            guest,
+                            call.fd(),
+                            &extents,
+                            Some(read as usize),
+                        )
+                        .await
+                    {
+                        break self
+                            .refuse_faulted_signalfd_discard(guest, Sysno::read)
+                            .await;
+                    }
+                    if kept > 0 {
+                        break Ok(kept as i64);
+                    }
+                }
+                (Err(Error::Errno(Errno::EFAULT)), _) => {
+                    if self
+                        .settle_faulted_signalfd_record(guest, call.fd(), &extents, None)
+                        .await
+                    {
+                        break self
+                            .refuse_faulted_signalfd_discard(guest, Sysno::read)
+                            .await;
+                    }
+                    break Err(Errno::EFAULT.into());
+                }
+                (result, _) => break result,
+            }
+        }
+    }
+
+    /// Whether a signalfd read of `fd` takes one record per kernel read
+    /// (4262 design §4.4): some signal it covers has entries in the calling
+    /// thread's or its process's lists, so a read must dequeue them one at a
+    /// time, sending each list's next entry before the next record, as
+    /// Linux's `signalfd_dequeue` loop takes them in its order.
+    async fn signalfd_reads_per_record<G: Guest<Self>>(&self, guest: &mut G, fd: i32) -> bool {
+        use crate::scheduler::discarded_at_send::DiscardedSignalAnswer;
+        use crate::scheduler::discarded_at_send::DiscardedSignalControl;
+        if !crate::scheduler::discarded_at_send::records(guest.config()) {
+            return false;
+        }
+        let Some(mask) = crate::syscalls::signal::signalfd_mask(guest.pid().as_raw(), fd) else {
+            return false;
+        };
+        matches!(
+            crate::tool_global::discarded_signal(guest, DiscardedSignalControl::Listed).await,
+            DiscardedSignalAnswer::Bits { thread, process } if (thread | process) & mask != 0
+        )
+    }
+
+    /// A signalfd read taken one record at a time
+    /// (`signalfd_reads_per_record`): the first record's read may block, as
+    /// the call would; each later one is read only while a signal the
+    /// descriptor covers is pending, so it never blocks (fs/signalfd.c reads
+    /// later records without waiting). A fault after k records returns
+    /// k records, as the kernel's copy-out does.
+    async fn read_signalfd_per_record<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Read,
+    ) -> Result<i64, Error> {
+        const RECORD: usize = crate::syscalls::signal::SIGNALFD_RECORD;
+        let Some(buf) = call.buf() else {
+            return self.read_signalfd(guest, call, true).await;
+        };
+        let mask = crate::syscalls::signal::signalfd_mask(guest.pid().as_raw(), call.fd());
+        let mut done = 0usize;
+        while done + RECORD <= call.len() {
+            if done > 0 {
+                let pending =
+                    crate::syscalls::threads::read_kernel_signal_state(guest.pid(), guest.tid())
+                        .map(|state| state.thread_pending | state.shared_pending)
+                        .unwrap_or(0);
+                if mask.is_none_or(|mask| pending & mask == 0) {
+                    break;
+                }
+            }
+            // A guest address, never dereferenced here.
+            let at = AddrMut::<u8>::from_raw(buf.as_raw() + done);
+            let record = syscalls::Read::new()
+                .with_fd(call.fd())
+                .with_buf(at)
+                .with_len(RECORD);
+            match self.read_signalfd(guest, record, done == 0).await {
+                Ok(read) if read > 0 => done += read as usize,
+                Ok(read) if done == 0 => return Ok(read),
+                Ok(_) => break,
+                Err(error) if done == 0 => return Err(error),
+                Err(_) => break,
+            }
+        }
+        Ok(done as i64)
     }
 
     /// SYS_pread64 system call.

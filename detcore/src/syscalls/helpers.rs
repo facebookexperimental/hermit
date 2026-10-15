@@ -1617,21 +1617,37 @@ impl TimeoutableSyscall for reverie::syscalls::EpollPwait {
     }
 }
 
-/// Whether the copy of the standard `signal` this thread just took
-/// (`rt_sigtimedwait`, a signalfd record) is one Linux discarded when it was
-/// sent, as the scheduler recorded it; the record forgets it either way
-/// (`DiscardedSignalControl::Take`).
-pub(crate) async fn take_was_discarded<T, G>(guest: &mut G, signal: i32) -> bool
+/// What to do with the copy of the standard `signal` this thread just took
+/// (`rt_sigtimedwait`, a signalfd record), after which its queues held
+/// `after` (when read): drop it, as a copy Linux discarded when it was sent
+/// or a stale POSIX timer entry, or return it with another siginfo
+/// (`DiscardedSignalControl::Take`). The scheduler pops and promotes either
+/// way.
+pub(crate) async fn take_outcome<T, G>(
+    guest: &mut G,
+    signal: i32,
+    after: Option<(u64, u64)>,
+) -> crate::scheduler::posix_timer_coalesce::TakeOutcome
 where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
     use crate::scheduler::discarded_at_send::DiscardedSignalAnswer;
     use crate::scheduler::discarded_at_send::DiscardedSignalControl;
-    matches!(
-        crate::tool_global::discarded_signal(guest, DiscardedSignalControl::Take { signal }).await,
-        DiscardedSignalAnswer::Discarded(true)
+    use crate::scheduler::posix_timer_coalesce::TakeOutcome;
+    let at = guest.thread_state().thread_logical_time.as_nanos();
+    match crate::tool_global::discarded_signal(
+        guest,
+        DiscardedSignalControl::Take { signal, at, after },
     )
+    .await
+    {
+        DiscardedSignalAnswer::Taken(outcome) => outcome,
+        _ => TakeOutcome {
+            skip: false,
+            rewrite: None,
+        },
+    }
 }
 
 async fn zero_timespec<'stack, T: RecordOrReplay, G: Guest<Detcore<T>>>(
