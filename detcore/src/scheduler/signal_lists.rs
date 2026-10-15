@@ -258,7 +258,11 @@ impl SignalLists {
 
     /// Whether the timer has an entry in any list.
     #[cfg(test)]
-    pub(crate) fn timer_entry(&self, process: DetPid, timer: i32) -> Option<(QueueId, i32, TimerEntry)> {
+    pub(crate) fn timer_entry(
+        &self,
+        process: DetPid,
+        timer: i32,
+    ) -> Option<(QueueId, i32, TimerEntry)> {
         self.lists.iter().find_map(|(&(queue, signal), list)| {
             list.entries.iter().find_map(|entry| match entry {
                 Entry::Timer(t) if t.process == process && t.timer == timer => {
@@ -672,10 +676,16 @@ mod tests {
     #[test]
     fn a_signalfd_record_lays_out_each_kind_as_signalfd_copyinfo_does() {
         let timer = signalfd_record(&timer_siginfo(USR1, 3, 4, 0x1122334455667788));
-        assert_eq!(i32::from_ne_bytes(timer[8..12].try_into().unwrap()), SI_TIMER);
+        assert_eq!(
+            i32::from_ne_bytes(timer[8..12].try_into().unwrap()),
+            SI_TIMER
+        );
         assert_eq!(u32::from_ne_bytes(timer[24..28].try_into().unwrap()), 3);
         assert_eq!(u32::from_ne_bytes(timer[32..36].try_into().unwrap()), 4);
-        assert_eq!(i32::from_ne_bytes(timer[44..48].try_into().unwrap()), 0x55667788);
+        assert_eq!(
+            i32::from_ne_bytes(timer[44..48].try_into().unwrap()),
+            0x55667788
+        );
         assert_eq!(
             u64::from_ne_bytes(timer[48..56].try_into().unwrap()),
             0x1122334455667788

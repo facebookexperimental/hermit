@@ -5010,8 +5010,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     Ok(self.record_or_replay(guest, call).await?)
                 }
             }
-            FdType::Signalfd if call.len() >= 2 * crate::syscalls::signal::SIGNALFD_RECORD
-                && self.signalfd_reads_per_record(guest, call.fd()).await =>
+            FdType::Signalfd
+                if call.len() >= 2 * crate::syscalls::signal::SIGNALFD_RECORD
+                    && self.signalfd_reads_per_record(guest, call.fd()).await =>
             {
                 self.read_signalfd_per_record(guest, call).await
             }

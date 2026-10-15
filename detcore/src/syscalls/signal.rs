@@ -572,7 +572,7 @@ where
         // `pidfd_send_signal` queues the caller's siginfo when it passes one,
         // and Linux's `SI_USER` record otherwise.
         syscalls::Syscall::Other(sysno, args) if *sysno == Sysno::pidfd_send_signal => {
-            match AddrMut::<libc::siginfo_t>::from_raw(args.arg2 as usize) {
+            match AddrMut::<libc::siginfo_t>::from_raw(args.arg2) {
                 Some(info) => {
                     return read_siginfo(guest, info).map(|bytes| KernelSiginfo::from_user(&bytes));
                 }
@@ -1683,10 +1683,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // (<https://github.com/rrnewton/hermit/issues/4262>), and a stale
         // timer entry is dropped as a discarded copy is.
         if crate::scheduler::discarded_at_send::records(guest.config()) {
-            for (record, answer) in bytes
-                .chunks_mut(SIGNALFD_RECORD)
-                .zip(answers.iter_mut())
-            {
+            for (record, answer) in bytes.chunks_mut(SIGNALFD_RECORD).zip(answers.iter_mut()) {
                 let signal = signalfd_field(record, 0) as i32;
                 if !(1..32).contains(&signal) {
                     continue;

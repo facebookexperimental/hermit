@@ -914,7 +914,11 @@ impl Scheduler {
         if identified_holds || other_holds != other_expected {
             refuse(format_args!(
                 "hermit: thread {thread} took signal {signal} from {queue:?}, and afterwards that queue {} the signal and {other:?} {} it, where the model of its pending entries expects {}: a producer the schedule does not see, so the run is refused (https://github.com/rrnewton/hermit/issues/4262)",
-                if identified_holds { "still held" } else { "no longer held" },
+                if identified_holds {
+                    "still held"
+                } else {
+                    "no longer held"
+                },
                 if other_holds { "held" } else { "did not hold" },
                 if other_expected {
                     "it held there"

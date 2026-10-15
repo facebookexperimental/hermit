@@ -1490,7 +1490,8 @@ impl Scheduler {
                 nodefer,
             } => {
                 if caught {
-                    self.handler_masks.insert((process, signal), (mask, nodefer));
+                    self.handler_masks
+                        .insert((process, signal), (mask, nodefer));
                 } else {
                     self.handler_masks.remove(&(process, signal));
                 }
@@ -1499,7 +1500,9 @@ impl Scheduler {
             DiscardedSignalControl::Queued => {
                 let listed = |queue: QueueId| {
                     (1..32)
-                        .filter(|&signal| self.discarded_at_send.lists.entries(queue, signal).len() > 1)
+                        .filter(|&signal| {
+                            self.discarded_at_send.lists.entries(queue, signal).len() > 1
+                        })
                         .fold(0, |bits, signal| bits | kernel_signal_bit(signal))
                 };
                 DiscardedSignalAnswer::Bits {

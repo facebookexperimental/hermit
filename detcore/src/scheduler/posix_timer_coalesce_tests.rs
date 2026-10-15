@@ -152,9 +152,9 @@ impl Family {
     /// A reported delivery stop of the leader at `at`, whose hooks then read
     /// the queues as scripted.
     fn stop(&mut self, at: u64, private_after: bool, shared_after: bool) -> DeliveryAnswer {
-        let answer = self
-            .sched
-            .timer_signal_dequeue(self.leader, USR1, Some(LogicalTime::from_nanos(at)));
+        let answer =
+            self.sched
+                .timer_signal_dequeue(self.leader, USR1, Some(LogicalTime::from_nanos(at)));
         self.sched.discarded_signal_control(
             self.leader,
             DiscardedSignalControl::Consumed {
@@ -258,7 +258,11 @@ fn a_periodic_timer_waits_for_its_dequeue_and_reports_the_overrun() {
     assert_eq!(timer_fields(&info).2, 4, "periods at 20, 30, 40, 50 missed");
     assert_eq!(f.sched.posix_timer_overrun(f.process, 0), 4);
     assert_eq!(
-        f.sched.blocked.timed_waiters.signal_timer_state(id).map(|s| s.0),
+        f.sched
+            .blocked
+            .timed_waiters
+            .signal_timer_state(id)
+            .map(|s| s.0),
         Some(LogicalTime::from_nanos(60))
     );
 }
@@ -299,7 +303,10 @@ fn the_stop_read_before_the_promotion_sees_the_identified_queue_clear() {
     f.pop(11);
     f.sent();
     f.queues(0, 0);
-    assert!(matches!(f.stop(20, false, false), DeliveryAnswer::Rewrite(_)));
+    assert!(matches!(
+        f.stop(20, false, false),
+        DeliveryAnswer::Rewrite(_)
+    ));
     assert_eq!(f.sent().len(), 1, "promoted after the read");
     assert_eq!(f.entries(sh).len(), 1, "the promoted entry is the front");
 }
@@ -332,7 +339,8 @@ fn the_other_queue_clear_with_a_list_is_refused() {
     f.guest_send(pr, ordinary_siginfo(USR1, libc::SI_TKILL, 100, 1000));
     f.arm(0, SignalTarget::Process(f.leader), 10, 0);
     f.pop(10);
-    f.sched.timer_signal_dequeue(f.leader, USR1, Some(LogicalTime::from_nanos(20)));
+    f.sched
+        .timer_signal_dequeue(f.leader, USR1, Some(LogicalTime::from_nanos(20)));
     // The private list was dequeued; the shared one still has an entry.
     f.sched.finish_timer_signal_dequeue(
         f.leader,
@@ -363,14 +371,17 @@ fn a_take_rewrites_a_timer_entry_and_promotes() {
     f.queues(0, kernel_signal_bit(USR1));
     f.arm(0, SignalTarget::Process(f.leader), 10, 0);
     f.pop(10);
-    let first = f
-        .sched
-        .timer_signal_take(f.leader, USR1, LogicalTime::from_nanos(20), Some((0, 0)));
-    assert!(!first.skip && first.rewrite.is_none(), "the kill's own record");
+    let first =
+        f.sched
+            .timer_signal_take(f.leader, USR1, LogicalTime::from_nanos(20), Some((0, 0)));
+    assert!(
+        !first.skip && first.rewrite.is_none(),
+        "the kill's own record"
+    );
     assert_eq!(f.sent().len(), 1, "promoted before the next take");
-    let second = f
-        .sched
-        .timer_signal_take(f.leader, USR1, LogicalTime::from_nanos(20), Some((0, 0)));
+    let second =
+        f.sched
+            .timer_signal_take(f.leader, USR1, LogicalTime::from_nanos(20), Some((0, 0)));
     assert_eq!(timer_fields(&second.rewrite.unwrap()).0, SI_TIMER);
     assert!(f.entries(sh).is_empty());
 }
@@ -442,7 +453,9 @@ fn a_plain_appended_before_the_first_timer_is_not_rewritten() {
 fn a_proxy_plain_is_rewritten_from_its_stored_record() {
     let mut f = family();
     let sh = shared(&f);
-    f.sched.discarded_at_send.note_timer_history(f.process, USR1);
+    f.sched
+        .discarded_at_send
+        .note_timer_history(f.process, USR1);
     f.discarded_send(sh, forged_si_timer());
     f.guest_send(sh, queued());
     assert_eq!(
@@ -458,7 +471,9 @@ fn a_proxy_plain_is_rewritten_from_its_stored_record() {
 fn a_proxy_passed_unreported_is_refused() {
     let mut f = family();
     let sh = shared(&f);
-    f.sched.discarded_at_send.note_timer_history(f.process, USR1);
+    f.sched
+        .discarded_at_send
+        .note_timer_history(f.process, USR1);
     f.discarded_send(sh, forged_si_timer());
     f.guest_send(sh, queued());
     f.sched.timer_signal_dequeue(f.leader, USR1, None);
@@ -473,14 +488,20 @@ fn a_proxy_passed_unreported_is_refused() {
 fn exec_resends_a_proxy_plain_and_the_stop_after_it_rewrites() {
     let mut f = family();
     let pr = private(&f);
-    f.sched.discarded_at_send.note_timer_history(f.process, USR1);
+    f.sched
+        .discarded_at_send
+        .note_timer_history(f.process, USR1);
     f.discarded_send(pr, forged_si_timer());
     f.guest_send(pr, queued());
     f.sent();
     let flush = f.sched.take_exec_timer_flush(f.leader, f.process).unwrap();
     assert_eq!((flush.own, flush.shared), (0, 0));
     let sent = f.sent();
-    assert_eq!(sent, vec![(f.leader, USR1, None, Some(f.process))], "one tgkill");
+    assert_eq!(
+        sent,
+        vec![(f.leader, USR1, None, Some(f.process))],
+        "one tgkill"
+    );
     let (front, class, physical_si_timer) =
         f.sched.discarded_at_send.lists.front(pr, USR1).unwrap();
     assert!(matches!(front, Entry::Plain { siginfo, .. } if siginfo == queued()));
@@ -505,16 +526,23 @@ fn exec_pops_every_plain_that_is_not_a_proxy_over_a_flushed_record() {
         let mut f = family();
         let pr = private(&f);
         if history_before {
-            f.sched.discarded_at_send.note_timer_history(f.process, USR1);
+            f.sched
+                .discarded_at_send
+                .note_timer_history(f.process, USR1);
         }
         f.discarded_send(pr, forged_si_timer());
         f.guest_send(pr, if forged { forged_si_timer() } else { queued() });
         if history_after {
-            f.sched.discarded_at_send.note_timer_history(f.process, USR1);
+            f.sched
+                .discarded_at_send
+                .note_timer_history(f.process, USR1);
         }
         f.sent();
         f.sched.take_exec_timer_flush(f.leader, f.process).unwrap();
-        assert!(f.sent().is_empty(), "case {history_before} {history_after} {forged}");
+        assert!(
+            f.sent().is_empty(),
+            "case {history_before} {history_after} {forged}"
+        );
         assert!(f.entries(pr).is_empty());
     }
 }

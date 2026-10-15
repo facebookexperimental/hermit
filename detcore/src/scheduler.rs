@@ -15,12 +15,12 @@ pub(crate) mod exec_teardown_tests;
 pub(crate) mod itimer_coalesce;
 pub(crate) mod parked;
 #[cfg(test)]
-mod posix_timer_coalesce_tests;
-#[cfg(test)]
 mod parked_tests;
 pub(crate) mod pid_namespaces;
 mod pipe_wake;
 pub(crate) mod posix_timer_coalesce;
+#[cfg(test)]
+mod posix_timer_coalesce_tests;
 pub(crate) mod real_timer;
 mod rejoin_log;
 mod replayer;
@@ -1783,8 +1783,7 @@ pub struct Scheduler {
     /// siginfo, `thread_of`) and notes it to the discarded-at-send record as
     /// if it landed, instead of signalling a host task.
     #[cfg(test)]
-    pub(crate) test_sent_signals:
-        Option<Vec<(DetTid, i32, Option<signal_lists::KernelSiginfo>, Option<DetPid>)>>,
+    pub(crate) test_sent_signals: Option<Vec<TestSend>>,
 
     /// The set each thread polling `rt_sigtimedwait` waits for: a signal in
     /// it is taken at the thread's next poll whatever its mask, so the
@@ -3229,6 +3228,16 @@ static REAL_TIME_EXPIRATION_KEPT_PENDING: std::sync::atomic::AtomicBool =
 fn note_real_time_expiration_kept_pending() {
     REAL_TIME_EXPIRATION_KEPT_PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
 }
+
+/// A scheduler send a unit test captured (`Scheduler::test_sent_signals`):
+/// target, signal, siginfo, and the process of a thread-directed send.
+#[cfg(test)]
+pub(crate) type TestSend = (
+    DetTid,
+    i32,
+    Option<signal_lists::KernelSiginfo>,
+    Option<DetPid>,
+);
 
 /// Set once a POSIX timer is set or a timer's copy recorded
 /// (`Scheduler::thread_timer_copies`), so a disposition change that flushes a
