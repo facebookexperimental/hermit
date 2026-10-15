@@ -938,6 +938,13 @@
           "category": "applications",
           "test": "applications/example-timed-progress-bar",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "applications",
+          "test": "applications/example-timed-progress-bar",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -8212,6 +8219,13 @@
           "test": "c-programs/remap-file-pages-memfd-enosys",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/remap-file-pages-tmpfile-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -21306,6 +21320,13 @@
           "category": "language-runtimes",
           "test": "language-runtimes/example-python-random",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/example-python-random",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -30804,6 +30825,13 @@
         {
           "lane": "portable",
           "category": "applications",
+          "test": "applications/example-timed-progress-bar",
+          "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "applications",
           "test": "applications/git-repository-workflow",
           "mode": "verify",
           "backend": "ptrace"
@@ -34454,6 +34482,13 @@
           "test": "c-programs/remap-file-pages-memfd-enosys",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/remap-file-pages-tmpfile-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -38172,6 +38207,13 @@
           "test": "language-runtimes/cpp-stl-determinism",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/example-python-random",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -47067,6 +47109,13 @@
           "category": "applications",
           "test": "applications/example-timed-progress-bar",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "applications",
+          "test": "applications/example-timed-progress-bar",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -54288,6 +54337,13 @@
           "test": "c-programs/remap-file-pages-memfd-enosys",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/remap-file-pages-tmpfile-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -62170,6 +62226,13 @@
           "test": "language-runtimes/cpp-stl-determinism",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/example-python-random",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",

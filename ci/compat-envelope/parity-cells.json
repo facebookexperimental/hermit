@@ -10,20 +10,20 @@
     "all": {
       "cells": 2995,
       "applicable": 1930,
-      "selectable": 1639,
+      "selectable": 1641,
       "population": 2925,
-      "population_candidate_selected": 1639,
-      "population_candidate_not_selected": 280,
+      "population_candidate_selected": 1641,
+      "population_candidate_not_selected": 278,
       "population_candidate_disabled": 1006
     },
     "by_backend": {
       "dbt": {
         "cells": 599,
         "applicable": 254,
-        "selectable": 210,
+        "selectable": 212,
         "population": 585,
-        "population_candidate_selected": 210,
-        "population_candidate_not_selected": 43,
+        "population_candidate_selected": 212,
+        "population_candidate_not_selected": 41,
         "population_candidate_disabled": 332
       },
       "in-guest-trap": {
@@ -1065,7 +1065,7 @@
     {"test_id":"c-programs/remap-file-pages-memfd-enosys","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/remap-file-pages-memfd-enosys","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/remap-file-pages-memfd-enosys","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"c-programs/remap-file-pages-tmpfile-enosys","backend":"dbt","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: dbt verify is not selected by full validation: Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"},
+    {"test_id":"c-programs/remap-file-pages-tmpfile-enosys","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/remap-file-pages-tmpfile-enosys","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/remap-file-pages-tmpfile-enosys","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/remap-file-pages-tmpfile-enosys","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
@@ -2760,7 +2760,7 @@
     {"test_id":"language-runtimes/cpp-stl-determinism","backend":"kvm","category":"language-runtimes","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"language-runtimes/cpp-stl-determinism","backend":"liteinst","category":"language-runtimes","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: LiteInst C++ qualification is tracked by backend compatibility"},
     {"test_id":"language-runtimes/cpp-stl-determinism","backend":"sabre","category":"language-runtimes","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: SaBRe requires its external runtime"},
-    {"test_id":"language-runtimes/example-python-random","backend":"dbt","category":"language-runtimes","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: dbt verify is not selected by full validation: Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"},
+    {"test_id":"language-runtimes/example-python-random","backend":"dbt","category":"language-runtimes","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"language-runtimes/example-python-random","backend":"in-guest-trap","category":"language-runtimes","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"language-runtimes/example-python-random","backend":"kvm","category":"language-runtimes","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"language-runtimes/example-python-random","backend":"liteinst","category":"language-runtimes","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},

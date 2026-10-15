@@ -7994,7 +7994,9 @@ sys.exit(1 if failed else 0)
         // of the 30 SaBRe-run-type-only rows' ptrace cells into full: the 5
         // left are rustc, javac, java and node, whose ptrace cells are the
         // super suite's, and timeout, whose ptrace cell is unselected.
-        assert_eq!(unreported.len(), 2 + 5, "{unreported:?}");
+        // 1 + 5 after example-timed-progress-bar's complete DBT fixture
+        // qualified 20/20 and joined full; its KVM parity cell remains unreported.
+        assert_eq!(unreported.len(), 1 + 5, "{unreported:?}");
         let sabre_only = unreported
             .iter()
             .filter(|cell| cell.starts_with("compat/") && cell.ends_with("@sabre"))

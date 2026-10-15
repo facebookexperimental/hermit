@@ -1,6 +1,5 @@
 # Enabled E2E cells that are not required (ci: false): <test> <mode> <backend>.
 # Generated from tests/e2e/manifests by ci/sync-cell-config.sh; do not edit.
-applications/example-timed-progress-bar verify dbt
 applications/example-timed-progress-bar verify kvm
 applications/example-timed-progress-bar verify ptrace
 applications/kvm-python-examples verify kvm
@@ -46,7 +45,6 @@ c-programs/ptrace-traceme-eperm verify dbt
 c-programs/record-replay-fd-close verify sabre
 c-programs/remap-file-pages-anonymous-enosys verify dbt
 c-programs/remap-file-pages-memfd-enosys verify dbt
-c-programs/remap-file-pages-tmpfile-enosys verify dbt
 c-programs/request-key-enosys verify dbt
 c-programs/sched-yield-progress verify sabre
 c-programs/sigmask-preemption verify sabre
@@ -78,7 +76,6 @@ determinism-stress/order-violation chaos ptrace
 determinism-stress/thread-contention naked -
 language-runtimes/bash-random naked -
 language-runtimes/cpp-stl-determinism naked -
-language-runtimes/example-python-random verify dbt
 language-runtimes/example-python-random verify sabre
 language-runtimes/gawk-random naked -
 language-runtimes/lua-random naked -

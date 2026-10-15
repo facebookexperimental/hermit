@@ -121,7 +121,8 @@ test:
       verify:
         ci:
           ptrace: false
-          dbt: false
+          # DBT timed-progress: 20/20 strict canonical pairs at ed4a5dd9, plus c0216c84 control; full 50 x 20 ms example.
+          dbt: true
           kvm: false
           liteinst: true
           in-guest-trap: true
@@ -143,10 +144,6 @@ test:
               host on 2026-10-05, so full validation does not select it;
               applications/timed-progress-bar runs the 53 x 5 ms variant there
           kvm: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit", "result": "infrastructure-error"}
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
