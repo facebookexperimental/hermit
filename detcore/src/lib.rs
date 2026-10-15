@@ -2535,6 +2535,25 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     pts.1.prepare_child_process_cpu_time(dettid);
                 }
                 let guest_clock = Arc::clone(&pts.1.guest_clock);
+                debug!(
+                    "[init_thread-state, parent dtid = {}] child thread {}, clone_flags = {:x?}",
+                    pts.0, tid, clone_flags
+                );
+                let file_metadata = if clone_flags.contains(CloneFlags::CLONE_FILES) {
+                    pts.1.file_metadata.clone()
+                } else {
+                    Arc::new(Mutex::new(
+                        pts.1.file_metadata.lock().unwrap().fork_for(dettid),
+                    ))
+                };
+                // A thread is of its creator's process. A new process leads a
+                // thread group of its own, whose table is the one it starts
+                // with: its creator's under CLONE_FILES, a copy otherwise.
+                let process_files = if clone_flags.contains(CloneFlags::CLONE_THREAD) {
+                    pts.1.process_files
+                } else {
+                    Some(file_metadata.lock().unwrap().files_id)
+                };
 
                 ThreadState {
                     dettid,
@@ -2562,19 +2581,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     pedigree: child_pedigree.clone(),
                     initialized_random_auxv: None,
                     stats: ThreadStats::new(),
-                    file_metadata: {
-                        debug!(
-                            "[init_thread-state, parent dtid = {}] child thread {}, clone_flags = {:x?}",
-                            pts.0, tid, clone_flags
-                        );
-                        if clone_flags.contains(CloneFlags::CLONE_FILES) {
-                            pts.1.file_metadata.clone()
-                        } else {
-                            Arc::new(Mutex::new(
-                                pts.1.file_metadata.lock().unwrap().fork_for(dettid),
-                            ))
-                        }
-                    },
+                    file_metadata,
+                    process_files,
                     tool_shares_guest_descriptor_table: pts.1.tool_shares_guest_descriptor_table,
                     // Linux copies the creating thread's current timer slack
                     // into both fields of every new task (thread or process).
@@ -2854,6 +2862,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             .load(std::sync::atomic::Ordering::SeqCst);
         guest.thread_state_mut().changed_root =
             Arc::new(std::sync::atomic::AtomicBool::new(changed_root));
+        // The exec'ing thread is its process's only thread now, and leads
+        // it, so the table it holds is the process's. (Where Detcore handles
+        // the execve, `handle_execveat` already installed it; a backend that
+        // runs execve natively, as DBT does, reaches only this callback.)
+        guest.thread_state_mut().adopt_process_files();
         // The guest's first image is entered by an execve. A backend that traces
         // the guest from before it (ptrace) intercepts that execve and counts it
         // as the guest's first syscall. A backend that starts the guest already
@@ -5082,6 +5095,98 @@ mod process_tree_guest_clock_tests {
         );
 
         assert!(Arc::ptr_eq(&parent.guest_clock, &child.guest_clock));
+    }
+}
+
+#[cfg(test)]
+mod process_files_tests {
+    use super::*;
+
+    fn child(
+        tool: &Detcore,
+        parent: &mut ThreadState<()>,
+        tid: i32,
+        clone_flags: CloneFlags,
+    ) -> ThreadState<()> {
+        parent.clone_flags = Some(clone_flags);
+        let mut child = <Detcore as Tool>::init_thread_state(
+            tool,
+            Tid::from_raw(tid),
+            Some((Tid::from_raw(parent.dettid.as_raw()), parent)),
+        );
+        child.detpid = Some(if clone_flags.contains(CloneFlags::CLONE_THREAD) {
+            parent.detpid.unwrap()
+        } else {
+            DetPid::from_raw(tid)
+        });
+        child
+    }
+
+    /// The table a thread group's leader holds, which procfs reads for the
+    /// process's descriptor links, is known to every thread of the group,
+    /// through every way a table is made: the root's, a thread's shared or
+    /// own, a forked process's, a process made with `CLONE_FILES` (whose
+    /// table was made for another process) and its threads, and the table an
+    /// exec gives a thread that did not lead its process.
+    #[test]
+    fn every_thread_knows_the_table_its_process_holds() {
+        let config = Config::default();
+        let tool = <Detcore as Tool>::new(Pid::from_raw(1), &config);
+        let thread = CloneFlags::CLONE_VM
+            | CloneFlags::CLONE_FS
+            | CloneFlags::CLONE_FILES
+            | CloneFlags::CLONE_SIGHAND
+            | CloneFlags::CLONE_THREAD;
+        let mut root = ThreadState::new(DetPid::from_raw(3), &config, ());
+        root.detpid = Some(DetPid::from_raw(3));
+        assert!(root.holds_process_files());
+
+        // A thread that shares the leader's table holds it; one cloned
+        // without CLONE_FILES holds its own.
+        let shared = child(&tool, &mut root, 4, thread);
+        assert_eq!(shared.process_files, root.process_files);
+        assert!(shared.holds_process_files());
+        let split = child(&tool, &mut root, 5, thread - CloneFlags::CLONE_FILES);
+        assert_eq!(split.process_files, root.process_files);
+        assert!(!split.holds_process_files());
+
+        // A forked process holds its copy; its creator's group is unchanged.
+        let mut forked = child(&tool, &mut root, 6, CloneFlags::empty());
+        assert_ne!(forked.process_files, root.process_files);
+        assert!(forked.holds_process_files());
+        assert_eq!(root.process_files, Some(root.files_id()));
+
+        // A process made with CLONE_FILES shares its creator's table, made
+        // for that creator, and leads a group of its own: its thread holds
+        // the process's table although the table's creator is neither the
+        // thread nor its leader.
+        let mut shares_files = child(&tool, &mut forked, 7, CloneFlags::CLONE_FILES);
+        assert_eq!(shares_files.files_id(), forked.files_id());
+        assert_eq!(shares_files.process_files, Some(forked.files_id()));
+        let its_thread = child(&tool, &mut shares_files, 8, thread);
+        assert_ne!(its_thread.files_id().creator(), DetPid::from_raw(7));
+        assert!(its_thread.holds_process_files());
+
+        // A thread that did not lead its process execs, as handle_execveat
+        // gives it its new table: the new table is the process's, and a
+        // thread the new image creates holds it. A failed exec restores
+        // both.
+        let mut worker = child(&tool, &mut root, 9, thread);
+        let old_metadata = Arc::clone(&worker.file_metadata);
+        let old_process_files = worker.process_files;
+        let new_metadata = worker.file_metadata.lock().unwrap().for_exec(worker.dettid);
+        worker.file_metadata = Arc::new(Mutex::new(new_metadata));
+        worker.adopt_process_files();
+        assert_eq!(worker.files_id().creator(), DetPid::from_raw(9));
+        assert!(worker.holds_process_files());
+        assert_ne!(worker.process_files, root.process_files);
+        assert_eq!(root.process_files, Some(root.files_id()));
+        let after_exec = child(&tool, &mut worker, 10, thread);
+        assert!(after_exec.holds_process_files());
+        worker.file_metadata = old_metadata;
+        worker.process_files = old_process_files;
+        assert_eq!(worker.process_files, root.process_files);
+        assert!(worker.holds_process_files());
     }
 }
 

@@ -869,8 +869,10 @@ mod tests {
             };
             // The ten DBT SIGKILL scenarios replace one aggregate test (+9),
             // and container_init_deadline gains the parent-died-before-arming
-            // test (+1).
-            assert_eq!(population, 576);
+            // test (+1). And procfs_determinism's directory-alias
+            // record/replay test (+1,
+            // https://github.com/rrnewton/hermit/issues/4213).
+            assert_eq!(population, 577);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

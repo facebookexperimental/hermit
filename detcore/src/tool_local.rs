@@ -3307,6 +3307,20 @@ pub struct ThreadState<T> {
     #[serde(default)]
     pub(crate) changed_root: Arc<std::sync::atomic::AtomicBool>,
 
+    /// The identity of the descriptor table this thread's process holds:
+    /// the one its thread-group leader holds now, which procfs reads for
+    /// the process's descriptor links (`/proc/self/fd/N`, `/proc/<pid>/fd/N`,
+    /// `/dev/fd/N`). A new process sets it to the table it starts with (its
+    /// creator's under `CLONE_FILES`, a copy otherwise), and an exec to the
+    /// table exec gives it; `unshare` is refused, so a leader's table
+    /// changes at nothing else. A thread (`CLONE_THREAD`) copies its
+    /// creator's. A plain copy suffices: it changes only where the group has
+    /// one thread (a new process, a successful exec), and a failed exec
+    /// restores the exec'ing thread's own copy. `None` where it is not
+    /// known, which only a state serialized before this field restores.
+    #[serde(default)]
+    pub(crate) process_files: Option<FilesId>,
+
     /// POSIX per-process timers created via `timer_create(2)`. Shared among the
     /// threads of a process (`CLONE_THREAD`) and not inherited across `fork`.
     pub(crate) posix_timers: Arc<Mutex<PosixTimers>>,
@@ -3555,6 +3569,7 @@ impl<T> std::fmt::Debug for ThreadState<T> {
             .field("stats", &self.stats)
             .field("clone_flags", &self.clone_flags)
             .field("file_metadata", &self.file_metadata)
+            .field("process_files", &self.process_files)
             .field("posix_timers", &self.posix_timers)
             .field("resource_limits", &self.resource_limits)
             .field("process_cpu_time", &self.process_cpu_time)
@@ -4094,6 +4109,7 @@ impl<T> ThreadState<T> {
         } else {
             FileMetadata::new(pid).setup_stdio(pid.into(), pid)
         };
+        let process_files = Some(file_metadata.files_id);
         ThreadState {
             dettid: pid,
             detpid: None, // Initialized later.
@@ -4111,6 +4127,7 @@ impl<T> ThreadState<T> {
             default_timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
             nested_pid_namespace: false,
             changed_root: Default::default(),
+            process_files,
             posix_timers: Arc::new(Mutex::new(PosixTimers::default())),
             resource_limits: Arc::new(Mutex::new(ResourceLimits::default())),
             process_cpu_time: Arc::new(Mutex::new(ProcessCpuTime::default())),
@@ -4614,6 +4631,20 @@ impl<T> ThreadState<T> {
     /// Identity of this thread's descriptor table.
     pub(crate) fn files_id(&self) -> detcore_model::fd::FilesId {
         self.metadata().files_id
+    }
+
+    /// Whether this thread holds the descriptor table its process holds
+    /// ([`ThreadState::process_files`]), the one procfs reads for the
+    /// process's descriptor links. `false` where that is not known.
+    pub(crate) fn holds_process_files(&self) -> bool {
+        self.process_files == Some(self.files_id())
+    }
+
+    /// Make the descriptor table this thread holds its process's, for a new
+    /// group: after a successful exec the exec'ing thread is its process's
+    /// only thread, and leads it, whether or not it led it before.
+    pub(crate) fn adopt_process_files(&mut self) {
+        self.process_files = Some(self.files_id());
     }
 
     /// Add a new fd, with optional stat data, have side effects on other

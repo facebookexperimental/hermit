@@ -3284,10 +3284,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             Some(OwnerDeathPath::Barrier) | None => None,
         };
         let old_robust_list_head;
+        // The exec'ing thread leads its process after a successful exec, so
+        // the table exec gives it is the process's (`process_files`), also
+        // for a thread that did not lead it before.
+        let old_process_files = guest.thread_state().process_files;
 
         {
             let thread_state = guest.thread_state_mut();
             thread_state.file_metadata = Arc::new(Mutex::new(new_metadata));
+            thread_state.adopt_process_files();
             thread_state.memory_metadata = Arc::new(Mutex::new(MemoryMetadata::new()));
             thread_state.mm_id = old_mm_id.for_exec(detpid);
             old_robust_list_head = thread_state.take_robust_list_for_exec();
@@ -3305,6 +3310,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             let thread_state = guest.thread_state_mut();
             thread_state.file_metadata = old_metadata;
+            thread_state.process_files = old_process_files;
             thread_state.memory_metadata = old_memory_metadata;
             thread_state.mm_id = old_mm_id;
             thread_state.restore_robust_list_after_failed_exec(old_robust_list_head);

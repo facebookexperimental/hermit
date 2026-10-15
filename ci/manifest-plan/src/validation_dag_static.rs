@@ -1615,7 +1615,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // without_a_readable_pid_namespace_launches_stay_on_the_caller): 1130.
     // And metadata::tests::record_version_rejects_streams_from_before_cleartid_wakes_are_admitted
     // (https://github.com/rrnewton/hermit/issues/4362, part 2 step 0b): 1131.
-    ("test.hermit_unit", 1131),
+    // And record_version_rejects_streams_from_before_descriptor_links_record_their_target
+    // (https://github.com/rrnewton/hermit/issues/4213): 1132, listed.
+    ("test.hermit_unit", 1132),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2380,7 +2382,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And scheduler::test::a_cleartid_joiner_is_admitted_in_dettid_order_with_pending_admissions
     // and scheduler::test::unreported_exit_defers_clear_tid_wake_during_tentative_selection
     // (https://github.com/rrnewton/hermit/issues/4362, part 2 step 0b): 1851, listed.
-    ("test.detcore_unit", 1851),
+    // And syscalls::namespace::tests::own_descriptor_links_name_the_callers_descriptor,
+    // syscalls::namespace::tests::caller_selectors_are_the_ones_procfs_resolves_per_caller,
+    // syscalls::files::test::an_open_through_a_descriptor_link_records_the_targets_path and
+    // process_files_tests::every_thread_knows_the_table_its_process_holds
+    // (https://github.com/rrnewton/hermit/issues/4213): 1855, listed.
+    ("test.detcore_unit", 1855),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2690,7 +2697,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // budget: 60 + 263 + 243 = 566.
     // Split the ten DBT SIGKILL scenarios, retaining all five runs per scenario:
     // 60 + 263 + 252 = 575; nine additional independently bounded test IDs.
-    ("test.hermit_integration_3", 252),
+    // And procfs_determinism::a_name_outside_the_level_through_a_directory_alias_is_refused_before_its_turn
+    // in the third shard (https://github.com/rrnewton/hermit/issues/4213):
+    // 61 + 263 + 253 = 577.
+    ("test.hermit_integration_3", 253),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -4098,7 +4108,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the B3a-4c process-group test: 1849.
     // And +1 from 699c6948: 1849.
     // And the two 4362 step-0b clear-TID admission tests: 1851.
-    ("test.detcore_unit_on_host", 1851),
+    // And the four 4213 descriptor-link tests: 1855.
+    ("test.detcore_unit_on_host", 1855),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4175,7 +4186,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Less the ignored no_networking_network_bind_full: 566.
     // Ten DBT SIGKILL scenarios replace one aggregate test: 575.
     // And the container-init parent-died-before-arming test: 576, listed.
-    ("test.hermit_integration_on_host", 576),
+    // And the 4213 directory-alias record/replay test: 577.
+    ("test.hermit_integration_on_host", 577),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
@@ -4368,7 +4380,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (a_child_with_its_parents_pid_in_a_new_pid_namespace_has_its_own_tracer,
     // without_a_readable_pid_namespace_launches_stay_on_the_caller): 1130.
     // And the 4362 step-0b record-version test: 1131.
-    ("test.hermit_unit_on_host", 1131),
+    // And the descriptor-link record-version test: 1132, listed.
+    ("test.hermit_unit_on_host", 1132),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

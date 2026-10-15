@@ -930,6 +930,141 @@ fn proc_loadavg_uses_virtual_values() {
     }
 }
 
+/// A /proc name outside the run's level, reached relative to a /proc
+/// descriptor that was itself opened through a descriptor link
+/// (`openat(open("/proc/self/fd/<a /proc descriptor>"), "kallsyms")`, and the
+/// `/dev/fd/N` spelling), is refused under record and replay as the procfs
+/// name it is: ENOENT at `--proc=minimal`, before the open takes a scheduler
+/// turn or reaches the kernel, and the recording replays bit for bit. Before
+/// Detcore recorded such a descriptor as the path of the descriptor it
+/// reopens, the name was looked up below the link's spelling, which names no
+/// procfs file, so the open took a turn and reached the kernel before it was
+/// refused; that is why RECORD_VERSION moved to 0x167
+/// (https://github.com/rrnewton/hermit/issues/4213).
+///
+/// The opens are made by the root process, by a thread of a process created
+/// with `CLONE_FILES` and without `CLONE_THREAD` (which leads its own group
+/// and holds a table made for its creator), and by a thread of an image a
+/// thread that did not lead its process executed (whose table exec made
+/// before that thread took over as leader). Each of those threads holds the
+/// table its process holds, so `/proc/self/fd/N` is its own descriptor.
+/// The log check's pattern is shown to appear where an open must take a
+/// turn: the guest's `--control`, an existing file named `kallsyms` below a
+/// directory outside `/proc`.
+#[test]
+fn a_name_outside_the_level_through_a_directory_alias_is_refused_before_its_turn() {
+    let _guard = hermit_run_lock();
+    let build = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("create guest directory");
+    let guest = build.path().join("proc-directory-alias-level");
+    compile_c(
+        &Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli must be inside the repository")
+            .join("tests/c/proc_directory_alias_level.c"),
+        &guest,
+    );
+    let expected = "openat(/proc/self/fd/3, \"kallsyms\"): No such file or directory\n\
+                    openat(/dev/fd/3, \"kallsyms\"): No such file or directory\n\
+                    thread of a CLONE_FILES process: \
+                    openat(/proc/self/fd/3, \"kallsyms\"): No such file or directory\n\
+                    thread of a CLONE_FILES process: \
+                    openat(/dev/fd/3, \"kallsyms\"): No such file or directory\n\
+                    thread after a non-leader exec: \
+                    openat(/proc/self/fd/3, \"kallsyms\"): No such file or directory\n\
+                    thread after a non-leader exec: \
+                    openat(/dev/fd/3, \"kallsyms\"): No such file or directory\n";
+    let record = |data_dir: &Path, verify_json: Option<&Path>, control: bool| {
+        let mut command = Command::new(hermit_test::hermit_binary());
+        command.args([
+            "--log=info",
+            "--backend=ptrace",
+            "record",
+            "start",
+            "--strict",
+            "--proc=minimal",
+            "--record-timeout=30",
+        ]);
+        if let Some(verdict) = verify_json {
+            command
+                .args(["--verify", "--verify-strict"])
+                .arg(format!("--verify-json={}", verdict.display()));
+        }
+        command
+            .arg(format!("--data-dir={}", data_dir.display()))
+            .arg("--")
+            .arg(&guest)
+            .args(control.then_some("--control"))
+            .stdin(Stdio::null());
+        let rendered = format!("{command:?}");
+        let output = command
+            .output()
+            .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+        assert!(
+            output.status.success(),
+            "{rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            if control {
+                "openat(<directory>, \"kallsyms\"): opened\n"
+            } else {
+                expected
+            },
+            "{rendered}"
+        );
+        output
+    };
+
+    let data_dir =
+        tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("create recording directory");
+    let verdict = data_dir.path().join("verify.json");
+    record(&data_dir.path().join("verified"), Some(&verdict), false);
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&verdict).expect("record/replay wrote no verify JSON"))
+            .expect("record/replay verify JSON is not JSON");
+    assert_eq!(report["verdict"], serde_json::json!("matched"), "{report}");
+    assert_eq!(
+        report["bitwise_parity"],
+        serde_json::json!(true),
+        "{report}"
+    );
+    for side in ["left", "right"] {
+        assert!(
+            report["compared_log_messages"][side]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "no INFO messages compared on the {side}: {report}"
+        );
+    }
+
+    // The recording's own log: every open is answered, and none takes a
+    // scheduler turn for the name.
+    let turn = "Path(\"kallsyms\")";
+    let output = record(&data_dir.path().join("logged"), None, false);
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        log.matches("\"kallsyms\", OFlag(O_CLOEXEC)) = Err(Errno(ENOENT))")
+            .count(),
+        6,
+        "the recording's log does not show all six refusals:\n{log}"
+    );
+    assert!(
+        !log.contains(turn),
+        "an alias-reached name outside the level took a scheduler turn:\n{log}"
+    );
+    // The pattern is the one an open of the name that takes its turn logs.
+    let output = record(&data_dir.path().join("control"), None, true);
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        log.contains(turn),
+        "an open of an existing file named kallsyms logged no {turn} turn, so the check \
+         above could not see one:\n{log}"
+    );
+}
+
 /// /proc/uptime shows the virtual uptime, and the one of the read: opened,
 /// then read 5 seconds later, it shows the later uptime, as Linux renders it
 /// when it is read (https://github.com/rrnewton/hermit/issues/4213).

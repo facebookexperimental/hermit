@@ -225,6 +225,116 @@ pub(crate) fn proc_fd_target(path: &Path) -> Option<(Option<u32>, i32)> {
     }
 }
 
+/// Whose descriptor table a descriptor link names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DescriptorTable {
+    /// The process's: `/proc/self/fd/N`, `/proc/<pid>/fd/N` and `/dev/fd/N`
+    /// (a symbolic link to `/proc/self/fd`). procfs reads it from the
+    /// thread-group leader, whose table a thread cloned without `CLONE_FILES`
+    /// does not share.
+    Process,
+    /// The calling thread's own: `/proc/thread-self/fd/N` and
+    /// `/proc/<pid>/task/<tid>/fd/N`.
+    Thread,
+}
+
+/// A descriptor that a descriptor link of the caller names, by number, and
+/// the table it is read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DescriptorLink {
+    pub(crate) fd: i32,
+    pub(crate) table: DescriptorTable,
+}
+
+/// The descriptor that the absolute guest path `path` names through one of
+/// the caller's descriptor links, and whose table that is:
+/// `/dev/fd/N`, `/proc/self/fd/N` and `/proc/<pid>/fd/N` for the caller's
+/// own pid name the process's table ([`DescriptorTable::Process`]);
+/// `/proc/thread-self/fd/N` and `/proc/<pid>/task/<tid>/fd/N` (or
+/// `/proc/self/task/<tid>/fd/N`) for its own pid and tid name the calling
+/// thread's ([`DescriptorTable::Thread`]). `own` is the caller's (pid, tid)
+/// as the guest's numeric `/proc` spellings name them (Detcore's, see
+/// `Detcore::procfs_caller_ids`), or `None` where Detcore does not know
+/// those names (in a nested PID namespace), which recognizes only the
+/// spellings without numbers. `None` for a spelling with `..`: the kernel walks it through the
+/// directory the link reaches, not lexically. A sibling thread's directory
+/// is not recognized, since that thread may have a descriptor table of its
+/// own.
+pub(crate) fn own_descriptor_link(path: &Path, own: Option<(i32, i32)>) -> Option<DescriptorLink> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(part) => parts.push(part),
+            Component::ParentDir | Component::Prefix(_) => return None,
+        }
+    }
+    let own_process = |part: &OsStr| {
+        part == "self" || own.is_some_and(|(pid, _)| part.to_str() == Some(&pid.to_string()))
+    };
+    let own_thread =
+        |part: &OsStr| own.is_some_and(|(_, tid)| part.to_str() == Some(&tid.to_string()));
+    let link = |fd: &OsStr, table| decimal_fd(fd).map(|fd| DescriptorLink { fd, table });
+    match parts.as_slice() {
+        [dev, fd_dir, fd] if *dev == "dev" && *fd_dir == "fd" => link(fd, DescriptorTable::Process),
+        [proc, subject, fd_dir, fd]
+            if *proc == "proc" && *fd_dir == "fd" && *subject == "thread-self" =>
+        {
+            link(fd, DescriptorTable::Thread)
+        }
+        [proc, subject, fd_dir, fd]
+            if *proc == "proc" && *fd_dir == "fd" && own_process(subject) =>
+        {
+            link(fd, DescriptorTable::Process)
+        }
+        [proc, subject, task, thread, fd_dir, fd]
+            if *proc == "proc"
+                && *task == "task"
+                && *fd_dir == "fd"
+                && own_process(subject)
+                && own_thread(thread) =>
+        {
+            link(fd, DescriptorTable::Thread)
+        }
+        _ => None,
+    }
+}
+
+/// Whether the absolute guest path `path` names something through a
+/// selector that procfs or `/dev` resolves for whoever looks it up:
+/// `/proc/self`, `/proc/thread-self`, `/proc/mounts` and `/proc/net` (links
+/// into `self`), `/dev/fd`, and `/dev/stdin`, `/dev/stdout` and `/dev/stderr`
+/// (links into `/proc/self/fd`), or anything below them. A descriptor opened
+/// at such a path is the opener's file, so the path cannot stand for that
+/// descriptor in another process or thread. A spelling with `..`, or a
+/// relative one, is treated the same way, since it is not resolved
+/// lexically.
+pub(crate) fn names_through_caller_selector(path: &Path) -> bool {
+    if !path.is_absolute() {
+        return true;
+    }
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(part) => parts.push(part),
+            Component::ParentDir | Component::Prefix(_) => return true,
+        }
+    }
+    match parts.as_slice() {
+        [proc, selector, ..] if *proc == "proc" => {
+            ["self", "thread-self", "mounts", "net"].contains(&selector.to_str().unwrap_or(""))
+        }
+        [dev, selector, ..] if *dev == "dev" => {
+            ["fd", "stdin", "stdout", "stderr"].contains(&selector.to_str().unwrap_or(""))
+        }
+        _ => false,
+    }
+}
+
 /// The optional numeric proc subject and descriptor number of a descriptor
 /// link spelled with leading zeros (`/proc/self/fd/03`, `/dev/fd/03`), which
 /// procfs does not have.
@@ -946,18 +1056,45 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// The calling process's pid as the guest sees it, which a `/proc/<pid>`
     /// spelling names: Detcore's pid for the process outside a nested PID
-    /// namespace (under DBT the kernel's differs), the kernel's answer
-    /// inside one. Detcore's pid is the thread's own record of it, as at
-    /// thread exit: a DBT fork child keeps its parent's tool.
+    /// namespace ([`Self::procfs_caller_ids`]), the kernel's answer inside
+    /// one.
     pub(crate) async fn guest_visible_own_pid<G: Guest<Self>>(
         &self,
         guest: &mut G,
     ) -> Result<i64, Error> {
-        if guest.thread_state().nested_pid_namespace {
-            Ok(guest.inject(syscalls::Getpid::new()).await?)
-        } else {
-            Ok(i64::from(self.own_detpid(guest).as_raw()))
+        match self.procfs_caller_ids(guest) {
+            Some((pid, _)) => Ok(i64::from(pid)),
+            None => Ok(guest.inject(syscalls::Getpid::new()).await?),
         }
+    }
+
+    /// The calling thread's pid and tid as the guest's `/proc` spellings
+    /// name them (`/proc/<pid>/...`, `/proc/<pid>/task/<tid>/...`): Detcore's
+    /// pid for the thread's process and its tid. This is the one rule for
+    /// whether such a spelling is the caller's own, which every check that
+    /// recognizes one uses (the descriptor-link recording of an open, and
+    /// [`Self::guest_visible_own_pid`]'s callers, such as
+    /// `rendered_procfs_at`), so that they cannot disagree.
+    ///
+    /// They are the numbers the guest's own `getpid` and `gettid` return, on
+    /// every backend: measured on ptrace, DBT and KVM for the root process,
+    /// one of its threads and its first fork child, an injected `getpid` and
+    /// `gettid` returned exactly these. And they are the numbers procfs, as
+    /// the guest reaches it, uses for them: ptrace's and KVM's procfs number
+    /// processes as Detcore does, and DBT, whose kernel numbers them
+    /// otherwise, spells each guest number with the kernel's before the
+    /// kernel looks the path up (`Detcore::translates_procfs_numbers`;
+    /// DBT refuses record and replay, the one mode that would leave its
+    /// numbers untranslated). So nothing is injected to learn them.
+    ///
+    /// `None` in a nested PID namespace, whose numbers are its own; a caller
+    /// that needs the namespace's pid there asks the kernel. Detcore's pid is
+    /// the thread's own record of it, as at thread exit: a DBT fork child
+    /// keeps its parent's tool.
+    pub(crate) fn procfs_caller_ids<G: Guest<Self>>(&self, guest: &G) -> Option<(i32, i32)> {
+        let state = guest.thread_state();
+        (!state.nested_pid_namespace)
+            .then(|| (self.own_detpid(guest).as_raw(), state.dettid.as_raw()))
     }
 
     /// Detcore's pid for the calling thread's process.
@@ -1420,6 +1557,112 @@ mod tests {
             host_self_proc_fd_alias(Path::new("/proc/self/fd/7"), 123),
             None
         );
+    }
+
+    /// The caller's own descriptor links, by every spelling procfs and
+    /// `/dev/fd` give them, name its descriptor, in the process's table or
+    /// the thread's; another process's or thread's, a spelling through `..`,
+    /// a relative one, or a name below the link do not.
+    #[test]
+    fn own_descriptor_links_name_the_callers_descriptor() {
+        use DescriptorTable::Process;
+        use DescriptorTable::Thread;
+        let own = Some((3, 5));
+        for (path, fd, table) in [
+            ("/dev/fd/7", 7, Process),
+            ("/proc/self/fd/7", 7, Process),
+            ("/proc/thread-self/fd/7", 7, Thread),
+            ("/proc/3/fd/0", 0, Process),
+            ("/proc/3/task/5/fd/12", 12, Thread),
+            ("/proc/self/task/5/fd/12", 12, Thread),
+            ("/proc/self/fd/7/", 7, Process),
+            ("/proc/./self/fd/7", 7, Process),
+            ("//dev//fd//7", 7, Process),
+            ("/proc/thread-self/fd/7/.", 7, Thread),
+        ] {
+            assert_eq!(
+                own_descriptor_link(Path::new(path), own),
+                Some(DescriptorLink { fd, table }),
+                "{path}"
+            );
+        }
+        for path in [
+            "/proc/4/fd/7",
+            "/proc/3/task/6/fd/7",
+            "/proc/thread-self/task/5/fd/7",
+            "/proc/self/fd/07",
+            "/proc/self/fd/7/stat",
+            "/proc/self/fd",
+            "/proc/self/../self/fd/7",
+            "/dev/fd/../fd/7",
+            "proc/self/fd/7",
+            "/proc/self/fdinfo/7",
+            "/dev/fd/x",
+        ] {
+            assert_eq!(own_descriptor_link(Path::new(path), own), None, "{path}");
+        }
+        // Without the caller's procfs names, only the spellings without
+        // numbers are its own.
+        let fd = |fd, table| Some(DescriptorLink { fd, table });
+        assert_eq!(
+            own_descriptor_link(Path::new("/proc/self/fd/7"), None),
+            fd(7, Process)
+        );
+        assert_eq!(
+            own_descriptor_link(Path::new("/proc/thread-self/fd/7"), None),
+            fd(7, Thread)
+        );
+        assert_eq!(
+            own_descriptor_link(Path::new("/dev/fd/7"), None),
+            fd(7, Process)
+        );
+        assert_eq!(own_descriptor_link(Path::new("/proc/3/fd/7"), None), None);
+        assert_eq!(
+            own_descriptor_link(Path::new("/proc/self/task/5/fd/7"), None),
+            None
+        );
+    }
+
+    /// The paths procfs and `/dev` resolve for whoever looks them up, and
+    /// the ones they do not.
+    #[test]
+    fn caller_selectors_are_the_ones_procfs_resolves_per_caller() {
+        for path in [
+            "/proc/self",
+            "/proc/self/",
+            "/proc/self/task",
+            "/proc/thread-self",
+            "/proc/thread-self/fd",
+            "/proc/mounts",
+            "/proc/net",
+            "/proc/net/tcp",
+            "/dev/fd",
+            "/dev/fd/3",
+            "/dev/stdin",
+            "/dev/stdout",
+            "/dev/stderr",
+            "//proc/./self",
+            "/proc/sys/../self",
+            "/tmp/../proc/stat",
+            "relative/dir",
+        ] {
+            assert!(names_through_caller_selector(Path::new(path)), "{path}");
+        }
+        for path in [
+            "/",
+            "/proc",
+            "/proc/",
+            "/proc/1",
+            "/proc/12/task/13",
+            "/proc/stat",
+            "/proc/sys/kernel",
+            "/proc/selfish",
+            "/dev",
+            "/dev/null",
+            "/tmp/self",
+        ] {
+            assert!(!names_through_caller_selector(Path::new(path)), "{path}");
+        }
     }
 
     #[test]

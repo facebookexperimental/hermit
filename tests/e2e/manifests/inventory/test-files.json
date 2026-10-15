@@ -1543,6 +1543,12 @@
       "why": "tests/c/printf_with_threads.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/proc_directory_alias_level.c",
+      "runner": "hermit-cli/tests/procfs_determinism.rs",
+      "why": "tests/c/proc_directory_alias_level.c is owned by hermit-cli/tests/procfs_determinism.rs: a_name_outside_the_level_through_a_directory_alias_is_refused_before_its_turn records it with --proc=minimal under record start --verify --verify-strict and requires openat(<a /proc descriptor reopened through /proc/self/fd/N or /dev/fd/N>, \"kallsyms\") to fail with ENOENT (in the root process, in a thread of a process created with CLONE_FILES, and in a thread of an image a non-leader thread executed), the recording to replay with bitwise parity, and the recording's log to show no scheduler turn for the name (which the guest's --control shows the log check can see), the change behind RECORD_VERSION 0x164 (https://github.com/rrnewton/hermit/issues/4213); a generic manifest cannot pass the record options or inspect the log, and natively /proc/kallsyms exists."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/proc_fd_link_aliases.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

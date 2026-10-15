@@ -5495,7 +5495,9 @@ fn detcore_lists_procfs_from_its_model_on_every_backend() {
 
 /// Detcore renders `/proc/sys/kernel/random/uuid`, `/proc/sys/kernel/pty/nr`,
 /// `/proc/uptime` and `/proc/stat` without the backend opening them
-/// (https://github.com/rrnewton/hermit/issues/4213).
+/// (https://github.com/rrnewton/hermit/issues/4213), also where the guest
+/// reaches them relative to a `/proc` descriptor it opened through a
+/// descriptor link (`/proc/self/fd/N`, `/dev/fd/N`), as `/proc/loadavg` too.
 /// Every backend gives the guest Linux's answers for these files, which the
 /// memfd standing in for each could not give, reaches bitwise parity, and
 /// shows the same identity: Detcore's procfs device and the inode each path
@@ -5576,8 +5578,13 @@ fn detcore_renders_its_procfs_files_on_every_backend() {
             // which Detcore there, in one guest process, does not know as
             // another process's placeholder.
             // DBT answers MAP_FIXED_NOREPLACE over a mapping with EPERM
-            // (https://github.com/rrnewton/hermit/issues/4429).
+            // (https://github.com/rrnewton/hermit/issues/4429). DBT refuses a
+            // process created with CLONE_FILES and without CLONE_THREAD, and
+            // ends the run; and a blocking FIFO open through a descriptor
+            // link waits in the kernel holding the turn.
             "dbt" => args.extend([
+                "--no-clone-files-process",
+                "--no-fifo-link-open",
                 "--no-foreign-fd-access",
                 "--no-maps-or-chroot",
                 "--noreplace-overlap-eperm",
@@ -5587,6 +5594,11 @@ fn detcore_renders_its_procfs_files_on_every_backend() {
             _ => args.push("--require-chroot"),
         }
         args.push("--detcore-xattr-order");
+        // A file opened relative to a /proc descriptor that was itself opened
+        // through a descriptor link (/proc/self/fd/N, /dev/fd/N) reads the
+        // bytes /proc's own name reads, as Detcore renders them; natively the
+        // host's files change between reads.
+        args.push("--alias-bytes");
         if xattr_arguments_first {
             args.push("--xattr-arguments-first");
         }

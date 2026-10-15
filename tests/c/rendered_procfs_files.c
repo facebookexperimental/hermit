@@ -29,50 +29,98 @@
  *
  * usage: rendered_procfs_files [--no-foreign-fd-links] [--no-foreign-fd-access]
  *                              [--noreplace-overlap-eperm]
+ *                              [--no-clone-files-process] [--no-fifo-link-open]
  *                              [--kvm-local-procfs]
  *                              [--no-maps-or-chroot] [--chroot-only]
  *                              [--require-chroot] [--xattr-arguments-first]
- *                              [--detcore-xattr-order]
+ *                              [--detcore-xattr-order] [--alias-bytes]
  *        rendered_procfs_files --inherited <fd> <duplicate> <ino> <offset> <kvm>
  *                              <stat-fd> <stat-head> <uptime-fd>
+ *        rendered_procfs_files --aliases-in-a-thread <alias-bytes>
  *
  * The program must be started by its absolute path, which it execs again.
- * Two options skip checks that need procfs files other than the two
- * rendered ones, which a backend does not yet serve faithfully; both gaps
- * close when Detcore renders the per-process files too (a later step of the
- * issue above):
- *   --no-foreign-fd-links skips another process's /proc/<pid>/fd/N and a
- *     thread's /proc/self/task/<tid>/fd/N.
- *   --no-foreign-fd-access skips only the `access` check of another
- *     process's link: under DBT it reaches the placeholder's memfd, which
+ * Every check an option skips, or leaves out by its absence, is named on
+ * stderr in a line starting "SKIPPED:", and every answer an option accepts
+ * in place of Linux's in a line starting "ALLOWED:", each with the option
+ * and the reason; stdout, which must be the same on every backend, is
+ * unchanged. Per option, what it skips or accepts:
+ *   --no-foreign-fd-links (a backend whose procfs does not yet serve the
+ *     per-process files faithfully; closes when Detcore renders them too):
+ *     - for each file, this thread's descriptor link /proc/<tid>/fd/N;
+ *     - for each file, another process's descriptor link /proc/<pid>/fd/N;
+ *     - check_selector_aliases_from_a_fork (a parent's /proc/self reopened
+ *       by its fork's child) and _from_a_thread (a thread's
+ *       /proc/thread-self reopened by the leader);
+ *     - accepts, in check_numeric_own_pid_aliases, ENOENT from a fork's
+ *       child's /proc/<pid>/fd/N or /proc/<pid>/task/<tid>/fd/N, or that
+ *       spelling opening its parent's descriptor if names below it then do
+ *       not exist.
+ *   --no-foreign-fd-access: for each file, access(W_OK) of another process's
+ *     descriptor link, which under DBT reaches the placeholder's memfd that
  *     Detcore there, in one guest process, does not know as that process's
  *     placeholder.
- *   --kvm-local-procfs also skips the /proc/self/fd listing and the mode of
- *     a descriptor link, a /proc directory listing, and a symbolic link to
- *     the file, which the KVM backend's own procfs refuses or answers
- *     differently, and chroot, which KVM does not support. It also skips
- *     the device agreement with other procfs files, which KVM's procfs
- *     numbers itself.
- *   --no-maps-or-chroot skips /proc/self/maps and chroot, whose strict
- *     comparison DBT cannot yet make for reasons that predate rendered files
- *     (https://github.com/rrnewton/hermit/issues/4232 and
- *     https://github.com/rrnewton/hermit/issues/4233).
- *   --require-chroot fails a chroot check that could not chroot (EPERM),
- *     which a run without privilege otherwise skips; Hermit's container is
- *     privileged.
+ *   --no-clone-files-process: check_aliases_in_a_clone_files_process (the
+ *     directory aliases from a thread of a process created with CLONE_FILES
+ *     and without CLONE_THREAD), a clone DBT refuses, ending the run, and
+ *     KVM refuses with EOPNOTSUPP.
+ *   --no-fifo-link-open: check_alias_source_replaced_during_a_blocked_open (a
+ *     blocking open of a FIFO through /proc/<pid>/fd/N whose descriptor
+ *     another thread replaces meanwhile): under DBT and KVM the open waits
+ *     in the kernel holding the scheduler turn, so the writer never runs.
+ *   --kvm-local-procfs implies the three options before the previous one
+ *     (--no-foreign-fd-links, --no-clone-files-process, --no-fifo-link-open)
+ *     and skips what the KVM backend's own procfs refuses or answers
+ *     differently (https://github.com/rrnewton/hermit/issues/4282):
+ *     - for each file, the device agreement with /proc and
+ *       /proc/sys/kernel/hostname, which KVM's procfs numbers itself;
+ *     - for each file, the descriptor link read through a symbolic link to
+ *       /proc/self/fd;
+ *     - for each file, the descriptor link's mode and its /proc/self/fd
+ *       listing;
+ *     - for each file, its directory listing, a symbolic link to it, the
+ *       ".." walks through it and /proc/thread-self, a symbolic link to its
+ *       descriptor link, and its reopening as /dev/stdin;
+ *     - after exec, the inherited descriptor through a symbolic link to its
+ *       descriptor link;
+ *     - for each directory alias, /proc/self/fd/N/ opened with
+ *       O_PATH|O_NOFOLLOW (KVM answers ELOOP where Linux follows the link
+ *       for the trailing slash);
+ *     - check_split_table_aliases (KVM refuses clone without CLONE_FILES with
+ *       EINVAL);
+ *     - check_aliases_after_a_thread_exec (KVM refuses an exec from a thread
+ *       that does not lead its process);
+ *     - the process and thread chroot checks (KVM does not support chroot).
+ *   --no-maps-or-chroot: for each file, /proc/self/maps names no
+ *     placeholder (https://github.com/rrnewton/hermit/issues/4232), and the
+ *     process and thread chroot checks
+ *     (https://github.com/rrnewton/hermit/issues/4233), whose strict
+ *     comparison DBT cannot yet make for reasons that predate rendered files.
+ *   --chroot-only runs only the process chroot checks, for a run that
+ *     cannot verify them (see the previous option), and skips every other
+ *     check; not a thread's chroot, which hangs under DBT
+ *     (https://github.com/rrnewton/hermit/issues/4254).
+ *   --noreplace-overlap-eperm accepts EPERM rather than EEXIST from
+ *     MAP_FIXED_NOREPLACE over an existing mapping, as DBT answers it for
+ *     every mapping (https://github.com/rrnewton/hermit/issues/4429); the
+ *     call is still made and the mapping must still survive.
+ * Options that add checks, whose absence skips them:
+ *   --require-chroot fails a chroot check that could not chroot (EPERM);
+ *     without it such a check is skipped. Hermit's container is privileged.
  *   --xattr-arguments-first checks that an extended-attribute call's name,
  *     size and value are refused before its path is looked up, as Linux 6.13
  *     and later do; an older kernel looks the path up first.
  *   --detcore-xattr-order checks the same order only for the spellings
  *     Detcore resolves itself (a rendered file's name, or a descriptor
- *     number), which Detcore answers in that order on any host.
- *   --chroot-only runs only the process chroot checks, for a run that
- *     cannot verify them (see the previous option); not a thread's chroot,
- *     which hangs under DBT (https://github.com/rrnewton/hermit/issues/4254).
- *   --noreplace-overlap-eperm expects EPERM rather than EEXIST from
- *     MAP_FIXED_NOREPLACE over an existing mapping, as DBT answers it for
- *     every mapping (https://github.com/rrnewton/hermit/issues/4429); the
- *     call is still made and the mapping must still survive.
+ *     number), which Detcore answers in that order on any host. Without
+ *     either option, the order is skipped for each spelling.
+ *   --alias-bytes requires a file opened relative to a /proc descriptor that
+ *     was itself opened through a descriptor link to read the bytes /proc's
+ *     own name reads at the same moment (check_directory_aliases), which
+ *     holds where Detcore renders the files; natively the host's files change
+ *     between reads, so only their identity and form are checked. It also
+ *     requires the blocked open of check_alias_source_replaced_during_a_
+ *     blocked_open to have kept its FIFO, as Detcore's deterministic
+ *     schedule ensures.
  * --inherited is the program after it execs itself.
  */
 
@@ -83,7 +131,9 @@
 #include <linux/fiemap.h>
 #include <linux/fs.h>
 #include <linux/stat.h>
+#include <linux/futex.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -118,6 +168,8 @@ static int failures;
 static int kvm_local_procfs;
 static int no_foreign_fd_links;
 static int no_foreign_fd_access;
+static int no_clone_files_process;
+static int no_fifo_link_open;
 static int noreplace_overlap_eperm;
 /* The checks assume none of the capabilities that bypass the refusals they
  * expect; with --no-bypass-capabilities the guest checks that first. */
@@ -127,6 +179,7 @@ static int chroot_only;
 static int require_chroot;
 static int xattr_arguments_first;
 static int detcore_xattr_order;
+static int alias_bytes;
 static const char* program;
 
 #define CHECK(condition, ...)                              \
@@ -149,6 +202,30 @@ static const char* program;
           "%s: %s gave %ld (%s), not %s", (what), #call, refused_result,  \
           strerror(refused_errno), strerror(expected));                   \
   } while (0)
+
+/* Names a check that `flag` skips, and why, on stderr: stdout is compared
+ * across backends, and a skipped check must not pass silently. */
+static void skipped(const char* check, const char* flag, const char* reason) {
+  fprintf(stderr, "SKIPPED: %s (%s: %s)\n", check, flag, reason);
+}
+
+/* skipped(), for a check of one file or spelling. */
+static void skipped_for(const char* subject, const char* check, const char* flag,
+                        const char* reason) {
+  fprintf(stderr, "SKIPPED: %s for %s (%s: %s)\n", check, subject, flag, reason);
+}
+
+/* Names a result that `flag` accepts in place of Linux's, and why, on
+ * stderr: the call is still made and checked against what it accepts. */
+static void allowed_for(const char* subject, const char* what, const char* flag,
+                        const char* reason) {
+  fprintf(stderr, "ALLOWED: %s for %s (%s: %s)\n", what, subject, flag, reason);
+}
+
+/* Whether two stat results name the same file. */
+static int same_file(const struct stat* a, const struct stat* b) {
+  return a->st_dev == b->st_dev && a->st_ino == b->st_ino;
+}
 
 /* Whether this process lacks every capability that would bypass a refusal
  * the checks expect: CAP_DAC_OVERRIDE (1), CAP_DAC_READ_SEARCH (2),
@@ -309,8 +386,44 @@ static int is_stat(const char* text, size_t length) {
          numbers_line(text, length, &at, "softirq ", 11, 11) && at == length;
 }
 
+/* "<a>.<cc> <b>.<cc> <c>.<cc> <running>/<total> <last pid>\n", as
+ * /proc/loadavg reads. */
+static int is_loadavg(const char* text, size_t length) {
+  size_t i = 0;
+  for (int field = 0; field < 5; field++) {
+    size_t start = i;
+    while (i < length && text[i] >= '0' && text[i] <= '9') {
+      i++;
+    }
+    if (i == start || i >= length) {
+      return 0;
+    }
+    if (field < 3) {
+      if (length - i < 4 || text[i] != '.' || text[i + 1] < '0' || text[i + 1] > '9' ||
+          text[i + 2] < '0' || text[i + 2] > '9' || text[i + 3] != ' ') {
+        return 0;
+      }
+      i += 4;
+    } else if (field == 3) {
+      if (text[i] != '/') {
+        return 0;
+      }
+      i++;
+      start = i;
+      while (i < length && text[i] >= '0' && text[i] <= '9') {
+        i++;
+      }
+      if (i == start || i >= length || text[i] != ' ') {
+        return 0;
+      }
+      i++;
+    }
+  }
+  return i + 1 == length && text[i] == '\n';
+}
+
 /* The kinds of file this program checks. */
-enum kind { COUNT, UUID, UPTIME, STAT };
+enum kind { COUNT, UUID, UPTIME, STAT, LOADAVG };
 
 static int has_contents(enum kind kind, const char* text, size_t length) {
   switch (kind) {
@@ -320,6 +433,8 @@ static int has_contents(enum kind kind, const char* text, size_t length) {
       return is_uptime(text, length);
     case STAT:
       return is_stat(text, length);
+    case LOADAVG:
+      return is_loadavg(text, length);
     default:
       return is_count(text, length);
   }
@@ -328,7 +443,7 @@ static int has_contents(enum kind kind, const char* text, size_t length) {
 /* Whether the kind of file is a seq_file (every procfs file outside
  * /proc/sys) rather than a sysctl file. */
 static int is_seq_file(enum kind kind) {
-  return kind == UPTIME || kind == STAT;
+  return kind == UPTIME || kind == STAT || kind == LOADAVG;
 }
 
 /* Prints `label`, then `text` with each newline but its last shown as \n, so
@@ -493,6 +608,11 @@ static void check_descriptor_refusals(const char* path, int fd, enum kind kind) 
   CHECK(page != MAP_FAILED, "%s anonymous page: %s", path, strerror(errno));
   if (page != MAP_FAILED) {
     page[0] = 'p';
+    if (noreplace_overlap_eperm) {
+      allowed_for(path, "EPERM, not EEXIST, from MAP_FIXED_NOREPLACE over a mapping",
+                  "--noreplace-overlap-eperm",
+                  "DBT answers it for every mapping, https://github.com/rrnewton/hermit/issues/4429");
+    }
     REFUSED(mmap(page, 4096, PROT_READ, MAP_PRIVATE | MAP_FIXED_NOREPLACE, fd, 0),
             noreplace_overlap_eperm ? EPERM : EEXIST, path);
     CHECK(msync(page, 4096, MS_ASYNC) == 0 && page[0] == 'p',
@@ -703,6 +823,11 @@ static void check_path_calls(const char* path, const char* spelling) {
     REFUSED(setxattr(slashed_spelling, "user.x", bad_ptr, 1, 0), EFAULT, spelling);
     REFUSED(getxattr(slashed_spelling, bad_ptr, value, sizeof(value)), EFAULT, spelling);
     REFUSED(removexattr(slashed_spelling, ""), ERANGE, spelling);
+  } else {
+    skipped_for(spelling,
+                "an extended-attribute call's name, size and value refused before its path",
+                "no --xattr-arguments-first",
+                "a kernel before Linux 6.13 looks the path up first");
   }
   {
     long page = sysconf(_SC_PAGESIZE);
@@ -787,6 +912,10 @@ static void check_file(const char* path, enum kind kind) {
           "%s device differs from /proc's", path);
     CHECK(stat("/proc/sys/kernel/hostname", &other) == 0 && other.st_dev == by_path.st_dev,
           "%s device differs from /proc/sys/kernel/hostname's", path);
+  } else {
+    skipped_for(path, "the device agreement with /proc and /proc/sys/kernel/hostname",
+                "--kvm-local-procfs", "KVM's own procfs numbers its devices itself, "
+                "https://github.com/rrnewton/hermit/issues/4282");
   }
 
   int fd = open(path, O_RDONLY | O_APPEND);
@@ -837,6 +966,10 @@ static void check_file(const char* path, enum kind kind) {
           (int)(short_length > 0 ? short_length : 0), target);
     unlink(directory_link);
     rmdir(directory);
+  } else {
+    skipped_for(path, "the descriptor link read through a symbolic link to /proc/self/fd",
+                "--kvm-local-procfs", "KVM's own procfs refuses symbolic links into /proc, "
+                "https://github.com/rrnewton/hermit/issues/4282");
   }
   struct statx extended;
   REFUSED(syscall(SYS_statx, AT_FDCWD, path, 0, 0x80000000u, &extended), EINVAL, path);
@@ -872,6 +1005,9 @@ static void check_file(const char* path, enum kind kind) {
     CHECK(short_length == (ssize_t)strlen(path) && memcmp(short_target, path, short_length) == 0 &&
               short_target[short_length] == 'x',
           "%s task link read into %zu bytes: %zd", path, sizeof(short_target), short_length);
+  } else {
+    skipped_for(path, "this thread's descriptor link /proc/<tid>/fd/N", "--no-foreign-fd-links",
+                "the backend's procfs does not serve it, https://github.com/rrnewton/hermit/issues/4282");
   }
   if (!kvm_local_procfs) {
     struct stat link_stat;
@@ -881,6 +1017,10 @@ static void check_file(const char* path, enum kind kind) {
     unsigned long long ino;
     listed("/proc/self/fd", strrchr(self_link, '/') + 1, &type, &ino);
     CHECK(type == DT_LNK, "%s descriptor is not listed as a link", path);
+  } else {
+    skipped_for(path, "the descriptor link's mode and its /proc/self/fd listing",
+                "--kvm-local-procfs", "KVM's own procfs answers them differently, "
+                "https://github.com/rrnewton/hermit/issues/4282");
   }
 
   char* contents = contents_buffer;
@@ -923,6 +1063,10 @@ static void check_file(const char* path, enum kind kind) {
   check_descriptor_refusals(path, fd, kind);
   if (!no_maps_or_chroot) {
     CHECK(!maps_name_placeholder(), "/proc/self/maps names a placeholder");
+  } else {
+    skipped_for(path, "/proc/self/maps names no placeholder", "--no-maps-or-chroot",
+                "DBT cannot yet compare a read of /proc/self/maps strictly, "
+                "https://github.com/rrnewton/hermit/issues/4232");
   }
 
   struct statfs filesystem;
@@ -1045,10 +1189,25 @@ static void check_file(const char* path, enum kind kind) {
     waitpid(reader, &reader_status, 0);
     CHECK(WIFEXITED(reader_status) && WEXITSTATUS(reader_status) == 0,
           "%s reopened as /dev/stdin", path);
+  } else {
+    const char* reason = "KVM's own procfs refuses or answers it differently, "
+                         "https://github.com/rrnewton/hermit/issues/4282";
+    skipped_for(path, "its directory listing", "--kvm-local-procfs", reason);
+    skipped_for(path, "a symbolic link to the file", "--kvm-local-procfs", reason);
+    skipped_for(path, "the \"..\" walks through it and /proc/thread-self", "--kvm-local-procfs",
+                reason);
+    skipped_for(path, "a symbolic link to its descriptor link", "--kvm-local-procfs", reason);
+    skipped_for(path, "its reopening as /dev/stdin", "--kvm-local-procfs", reason);
   }
   if (!no_foreign_fd_links) {
     /* Another process's descriptor link names the file, and reopens it. The
      * process is named as procfs names it (/proc/self). */
+    if (no_foreign_fd_access) {
+      skipped_for(path, "access(W_OK) of another process's descriptor link",
+                  "--no-foreign-fd-access",
+                  "under DBT it reaches the placeholder's memfd, which Detcore there does not "
+                  "know as that process's placeholder");
+    }
     char parent[32];
     ssize_t named = readlink("/proc/self", parent, sizeof(parent) - 1);
     parent[named < 0 ? 0 : named] = '\0';
@@ -1071,6 +1230,10 @@ static void check_file(const char* path, enum kind kind) {
     waitpid(child, &child_status, 0);
     CHECK(WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0,
           "%s another process's descriptor link", path);
+  } else {
+    skipped_for(path, "another process's descriptor link /proc/<pid>/fd/N",
+                "--no-foreign-fd-links",
+                "the backend's procfs does not serve it, https://github.com/rrnewton/hermit/issues/4282");
   }
   close(fd);
   printf("%s dev=%#llx ino=%llu uid=%u\n", path, (unsigned long long)by_path.st_dev,
@@ -1113,6 +1276,9 @@ static void check_chroot(void) {
   CHECK(WIFEXITED(status) &&
             (WEXITSTATUS(status) == 0 || (WEXITSTATUS(status) == 2 && !require_chroot)),
         "a chroot check failed (status %d)", status);
+  if (WIFEXITED(status) && WEXITSTATUS(status) == 2 && !require_chroot) {
+    skipped("the process chroot checks", "no --require-chroot", "chroot failed with EPERM");
+  }
   rmdir(root);
 }
 
@@ -1148,6 +1314,9 @@ static void check_thread_chroot(void) {
   CHECK(WIFEXITED(status) &&
             (WEXITSTATUS(status) == 0 || (WEXITSTATUS(status) == 2 && !require_chroot)),
         "the rendered files exist after a thread's chroot (status %d)", status);
+  if (WIFEXITED(status) && WEXITSTATUS(status) == 2 && !require_chroot) {
+    skipped("the thread chroot checks", "no --require-chroot", "chroot failed with EPERM");
+  }
   rmdir(root);
 }
 
@@ -1195,6 +1364,730 @@ static void check_fork_shares_the_position(void) {
   close(fd);
 }
 
+/* The whole file at `path` as one read returns it into `buffer`, or -1. */
+static ssize_t read_whole(const char* path, char* buffer) {
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return -1;
+  }
+  ssize_t length = read(fd, buffer, READ_CAPACITY);
+  close(fd);
+  return length;
+}
+
+/* The checks of one directory alias of /proc for check_directory_aliases:
+ * the descriptor `spelling` opens with `flags` is /proc, and `name` opened
+ * relative to it is /proc/<name> (`canonical`, whose identity is
+ * `by_path`). Returns the directory descriptor, or -1. */
+static int check_directory_alias(const char* spelling, int flags, const char* name,
+                                 const char* canonical, const struct stat* by_path,
+                                 enum kind kind) {
+  int directory = open(spelling, flags);
+  CHECK(directory >= 0, "open(%s) for %s: %s", spelling, canonical, strerror(errno));
+  if (directory < 0) {
+    return -1;
+  }
+  char* before = rest_buffer;
+  ssize_t before_length = alias_bytes ? read_whole(canonical, before) : 0;
+  if (!alias_bytes && kind != UUID) {
+    skipped_for(spelling, "the bytes below it against the canonical name's", "no --alias-bytes",
+                "natively the host's files change between reads");
+  }
+  int fd = openat(directory, name, O_RDONLY | O_CLOEXEC);
+  CHECK(fd >= 0, "openat(%s, \"%s\"): %s", spelling, name, strerror(errno));
+  if (fd >= 0) {
+    struct stat by_fd;
+    CHECK(fstat(fd, &by_fd) == 0 && by_fd.st_dev == by_path->st_dev &&
+              by_fd.st_ino == by_path->st_ino,
+          "openat(%s, \"%s\") identity %#llx:%llu, %s's %#llx:%llu", spelling, name,
+          (unsigned long long)by_fd.st_dev, (unsigned long long)by_fd.st_ino, canonical,
+          (unsigned long long)by_path->st_dev, (unsigned long long)by_path->st_ino);
+    char* aliased = contents_buffer;
+    ssize_t length = read(fd, aliased, READ_CAPACITY);
+    CHECK(length > 0 && has_contents(kind, aliased, length), "openat(%s, \"%s\") contents %.*s",
+          spelling, name, (int)(length > 0 ? length : 0), aliased);
+    close(fd);
+    if (alias_bytes && kind != UUID && length > 0) {
+      int same = before_length == length && memcmp(before, aliased, length) == 0;
+      if (!same) {
+        char* after = rest_buffer;
+        ssize_t after_length = read_whole(canonical, after);
+        same = after_length == length && memcmp(after, aliased, length) == 0;
+      }
+      CHECK(same, "openat(%s, \"%s\") read other bytes than %s: %.*s", spelling, name,
+            canonical, (int)length, aliased);
+    }
+  }
+  return directory;
+}
+
+/* A file below /proc opened relative to a descriptor for /proc that was
+ * itself opened through a descriptor link (/proc/self/fd/N or /dev/fd/N of a
+ * /proc descriptor, or such a link of such a descriptor) is the file below
+ * /proc: Linux follows the link to the directory, and the name is looked up
+ * there. So it has the identity and the contents of /proc/<name>, on every
+ * backend. With --alias-bytes, where Detcore renders the file as a function
+ * of virtual time, the bytes are also those an open of /proc/<name> reads
+ * just before or just after it (at most one tick of the file's clock can
+ * pass between three adjacent reads); natively the host's files change
+ * between reads. A UUID is new at every open, so only its form is
+ * compared. O_PATH|O_NOFOLLOW opens a link itself, but not where a trailing
+ * slash follows it: /proc/self/fd/N/ so opened is the directory too. */
+static void check_directory_aliases(const char* name, enum kind kind) {
+  char canonical[128];
+  snprintf(canonical, sizeof(canonical), "/proc/%s", name);
+  struct stat by_path;
+  CHECK(stat(canonical, &by_path) == 0, "stat(%s): %s", canonical, strerror(errno));
+  int proc = open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  CHECK(proc >= 0, "open(/proc): %s", strerror(errno));
+  if (proc < 0) {
+    return;
+  }
+  const int directory_flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC;
+  char spelling[64];
+  snprintf(spelling, sizeof(spelling), "/proc/self/fd/%d", proc);
+  int first_alias = check_directory_alias(spelling, directory_flags, name, canonical, &by_path,
+                                          kind);
+  snprintf(spelling, sizeof(spelling), "/dev/fd/%d", proc);
+  int directory = check_directory_alias(spelling, directory_flags, name, canonical, &by_path,
+                                        kind);
+  if (directory >= 0) {
+    close(directory);
+  }
+  if (!kvm_local_procfs) {
+    snprintf(spelling, sizeof(spelling), "/proc/self/fd/%d/", proc);
+    directory = check_directory_alias(spelling, O_PATH | O_NOFOLLOW | O_CLOEXEC, name, canonical,
+                                      &by_path, kind);
+    if (directory >= 0) {
+      close(directory);
+    }
+  } else {
+    /* KVM answers ELOOP where Linux follows the link for the trailing
+     * slash:
+     * https://github.com/rrnewton/hermit/issues/4485 (KVM: ELOOP on a trailing-slash link)
+     */
+    char check[160];
+    snprintf(check, sizeof(check), "/proc/self/fd/N/ opened O_PATH|O_NOFOLLOW, then \"%s\"",
+             name);
+    skipped(check, "--kvm-local-procfs",
+            "KVM answers ELOOP where Linux follows the link for the trailing slash, "
+            "https://github.com/rrnewton/hermit/issues/4485 (KVM trailing-slash ELOOP)");
+  }
+  if (first_alias >= 0) {
+    /* A descriptor link of the descriptor opened through the first. */
+    snprintf(spelling, sizeof(spelling), "/dev/fd/%d", first_alias);
+    directory = check_directory_alias(spelling, directory_flags, name, canonical, &by_path,
+                                      kind);
+    if (directory >= 0) {
+      close(directory);
+    }
+    close(first_alias);
+  }
+  close(proc);
+}
+
+/* The same aliases from a second thread, which shares the descriptor table
+ * of the thread-group leader (pthread_create shares it): /proc/self/fd/N
+ * is the leader's descriptor N, and so the caller's. */
+static void* directory_aliases_thread(void* unused) {
+  (void)unused;
+  check_directory_aliases("stat", STAT);
+  return NULL;
+}
+
+static void check_directory_aliases_in_a_thread(void) {
+  pthread_t thread;
+  CHECK(pthread_create(&thread, NULL, directory_aliases_thread, NULL) == 0 &&
+            pthread_join(thread, NULL) == 0,
+        "directory aliases in a thread");
+}
+
+/* The process's descriptor links (/proc/self/fd/N, /dev/fd/N) name the
+ * thread-group leader's descriptor table, which a thread cloned without
+ * CLONE_FILES does not share; /proc/thread-self/fd/N names the thread's
+ * own. In such a thread, where the leader's descriptor N is an empty
+ * directory and the thread's is /proc, /proc/self/fd/N opens the empty
+ * directory, where "stat" does not exist (to open, or to stat), and
+ * /proc/thread-self/fd/N opens /proc. (Not a rendered file below the
+ * thread's /proc: Detcore reopens its placeholder through the leader's
+ * table there, so the open fails with ENOENT on ptrace, a separate defect:
+ * https://github.com/rrnewton/hermit/issues/4485 (Detcore reopens a rendered placeholder through the
+ * leader's /proc/self/fd table)) Skipped under --kvm-local-procfs: KVM refuses clone without
+ * CLONE_FILES with EINVAL:
+ * https://github.com/rrnewton/hermit/issues/4485 (KVM: EINVAL on a thread clone without CLONE_FILES)
+ */
+struct split_table {
+  int fd;
+  char process_link[64];
+  char thread_link[64];
+  int process_errno;
+  struct stat process_identity;
+  int process_stat_errno;
+  int process_fstatat_errno;
+  int thread_errno;
+  struct stat thread_identity;
+  volatile uint32_t running;
+};
+
+static int split_table_thread(void* argument) {
+  struct split_table* split = argument;
+  int proc = open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (proc < 0 || dup3(proc, split->fd, O_CLOEXEC) < 0) {
+    split->process_errno = split->thread_errno = errno;
+    return 0;
+  }
+  close(proc);
+  int directory = open(split->process_link, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  split->process_errno = directory < 0 ? errno : 0;
+  if (directory >= 0) {
+    fstat(directory, &split->process_identity);
+    int fd = openat(directory, "stat", O_RDONLY | O_CLOEXEC);
+    split->process_stat_errno = fd < 0 ? errno : 0;
+    if (fd >= 0) {
+      close(fd);
+    }
+    struct stat ignored;
+    split->process_fstatat_errno = fstatat(directory, "stat", &ignored, 0) == 0 ? 0 : errno;
+    close(directory);
+  }
+  directory = open(split->thread_link, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  split->thread_errno = directory < 0 ? errno : 0;
+  if (directory >= 0) {
+    fstat(directory, &split->thread_identity);
+    close(directory);
+  }
+  close(split->fd);
+  return 0;
+}
+
+static void check_split_table_aliases(void) {
+  static char stack[1 << 16] __attribute__((aligned(16)));
+  static struct split_table split;
+  char empty[] = "/tmp/rendered-procfs-split-XXXXXX";
+  CHECK(mkdtemp(empty) != NULL, "mkdtemp: %s", strerror(errno));
+  struct stat empty_identity;
+  struct stat proc_identity;
+  CHECK(stat(empty, &empty_identity) == 0 && stat("/proc", &proc_identity) == 0,
+        "stat for the split table: %s", strerror(errno));
+  split.fd = open(empty, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  CHECK(split.fd >= 0, "open(%s): %s", empty, strerror(errno));
+  if (split.fd < 0) {
+    rmdir(empty);
+    return;
+  }
+  snprintf(split.process_link, sizeof(split.process_link), "/proc/self/fd/%d", split.fd);
+  snprintf(split.thread_link, sizeof(split.thread_link), "/proc/thread-self/fd/%d", split.fd);
+  split.running = 1;
+  pid_t tid = clone(split_table_thread, stack + sizeof(stack),
+                    CLONE_VM | CLONE_THREAD | CLONE_SIGHAND | CLONE_CHILD_CLEARTID, &split, NULL,
+                    NULL, &split.running);
+  CHECK(tid > 0, "clone without CLONE_FILES: %s", strerror(errno));
+  while (tid > 0 && __atomic_load_n(&split.running, __ATOMIC_ACQUIRE) != 0) {
+    syscall(SYS_futex, &split.running, FUTEX_WAIT, 1, NULL, NULL, 0);
+  }
+  if (tid > 0) {
+    CHECK(split.process_errno == 0 && split.process_identity.st_dev == empty_identity.st_dev &&
+              split.process_identity.st_ino == empty_identity.st_ino,
+          "%s in a thread with its own table opened %#llx:%llu (%s), not the leader's %s",
+          split.process_link, (unsigned long long)split.process_identity.st_dev,
+          (unsigned long long)split.process_identity.st_ino, strerror(split.process_errno),
+          empty);
+    CHECK(split.process_errno == 0 && split.process_stat_errno == ENOENT,
+          "openat(%s, \"stat\") in a thread with its own table: %s, not ENOENT",
+          split.process_link, strerror(split.process_stat_errno));
+    CHECK(split.process_errno == 0 && split.process_fstatat_errno == ENOENT,
+          "fstatat(%s, \"stat\") in a thread with its own table: %s, not ENOENT",
+          split.process_link, strerror(split.process_fstatat_errno));
+    CHECK(split.thread_errno == 0 && split.thread_identity.st_dev == proc_identity.st_dev &&
+              split.thread_identity.st_ino == proc_identity.st_ino,
+          "%s in a thread with its own table opened %#llx:%llu (%s), not /proc",
+          split.thread_link, (unsigned long long)split.thread_identity.st_dev,
+          (unsigned long long)split.thread_identity.st_ino, strerror(split.thread_errno));
+  }
+  close(split.fd);
+  rmdir(empty);
+}
+
+/* The process (or task) whose /proc/<pid>/stat a "stat" opened relative to
+ * `directory` describes: its first field. -1 if it cannot be read. */
+static long stat_subject(int directory) {
+  char text[128];
+  int fd = openat(directory, "stat", O_RDONLY | O_CLOEXEC);
+  ssize_t length = fd < 0 ? -1 : read(fd, text, sizeof(text) - 1);
+  if (fd >= 0) {
+    close(fd);
+  }
+  if (length <= 0) {
+    return -1;
+  }
+  text[length] = '\0';
+  return strtol(text, NULL, 10);
+}
+
+/* A descriptor for /proc/self or /proc/thread-self is the directory of the
+ * process or thread that opened it, which another process that inherited
+ * it, or another thread, reaches through its descriptor link: a fork's
+ * child reopening its parent's /proc/self through /proc/self/fd/N finds
+ * the parent's "stat", and the leader reopening a thread's
+ * /proc/thread-self finds the thread's. */
+static void check_selector_aliases_from_a_fork(void) {
+  int self = open("/proc/self", O_RDONLY | O_DIRECTORY);
+  CHECK(self >= 0, "open(/proc/self): %s", strerror(errno));
+  if (self < 0) {
+    return;
+  }
+  fflush(stdout);
+  fflush(stderr);
+  pid_t child = fork();
+  if (child == 0) {
+    char spelling[64];
+    snprintf(spelling, sizeof(spelling), "/proc/self/fd/%d", self);
+    int directory = open(spelling, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    long subject = directory < 0 ? -2 : stat_subject(directory);
+    if (subject != (long)getppid()) {
+      fprintf(stderr, "FAIL: openat(%s, \"stat\") in a fork's child names %ld, not its parent %ld\n",
+              spelling, subject, (long)getppid());
+      _exit(1);
+    }
+    _exit(0);
+  }
+  int status = 0;
+  CHECK(child > 0 && waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+            WEXITSTATUS(status) == 0,
+        "the parent's /proc/self reopened by its child (status %d)", status);
+  close(self);
+}
+
+struct thread_self {
+  int fd;
+  long tid;
+  pthread_barrier_t opened;
+  pthread_barrier_t checked;
+};
+
+static void* thread_self_opener(void* argument) {
+  struct thread_self* shared = argument;
+  shared->fd = open("/proc/thread-self", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  shared->tid = (long)gettid();
+  pthread_barrier_wait(&shared->opened);
+  /* Alive until the leader has looked: an exited thread's directory is
+   * empty. */
+  pthread_barrier_wait(&shared->checked);
+  return NULL;
+}
+
+static void check_selector_aliases_from_a_thread(void) {
+  struct thread_self shared = {.fd = -1, .tid = -1};
+  pthread_barrier_init(&shared.opened, NULL, 2);
+  pthread_barrier_init(&shared.checked, NULL, 2);
+  pthread_t thread;
+  int created = pthread_create(&thread, NULL, thread_self_opener, &shared) == 0;
+  CHECK(created, "pthread_create for /proc/thread-self");
+  if (!created) {
+    return;
+  }
+  pthread_barrier_wait(&shared.opened);
+  CHECK(shared.fd >= 0, "open(/proc/thread-self) in a thread");
+  if (shared.fd >= 0) {
+    char spelling[64];
+    snprintf(spelling, sizeof(spelling), "/proc/self/fd/%d", shared.fd);
+    int directory = open(spelling, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    long subject = directory < 0 ? -2 : stat_subject(directory);
+    CHECK(subject == shared.tid, "openat(%s, \"stat\") names %ld, not the thread %ld", spelling,
+          subject, shared.tid);
+    if (directory >= 0) {
+      close(directory);
+    }
+  }
+  pthread_barrier_wait(&shared.checked);
+  pthread_join(thread, NULL);
+  if (shared.fd >= 0) {
+    close(shared.fd);
+  }
+  pthread_barrier_destroy(&shared.opened);
+  pthread_barrier_destroy(&shared.checked);
+}
+
+/* An open of a descriptor link looks the link up once, as it starts. A
+ * thread that blocks opening /proc/<pid>/fd/N for reading, where N is an
+ * O_PATH descriptor of a FIFO, keeps that FIFO when another thread then
+ * replaces descriptor N with /proc, and a name below the descriptor it gets
+ * does not exist there (ENOTDIR), as below any FIFO. Where the replacement
+ * came first, the open reached /proc and "stat" below it is /proc/stat;
+ * natively either order may happen. The writer opens without waiting
+ * (O_NONBLOCK): a reader waiting in the open lets it open, and ENXIO for
+ * half a second, no reader, means the replacement came first, so neither
+ * order leaves a thread waiting. With --alias-bytes (where Detcore
+ * schedules the threads deterministically, and the reader's open has
+ * blocked before the other thread runs on) the reader must have the FIFO. */
+struct blocked_alias {
+  char link[64];
+  int ready[2];
+  int fd;
+  int open_errno;
+  int got_fifo;
+  int stat_errno;
+};
+
+static void* blocked_alias_reader(void* argument) {
+  struct blocked_alias* blocked = argument;
+  char ready = 'r';
+  if (write(blocked->ready[1], &ready, 1) != 1) {
+    blocked->open_errno = errno;
+    return NULL;
+  }
+  blocked->fd = open(blocked->link, O_RDONLY | O_CLOEXEC);
+  blocked->open_errno = blocked->fd < 0 ? errno : 0;
+  if (blocked->fd >= 0) {
+    struct stat opened;
+    blocked->got_fifo = fstat(blocked->fd, &opened) == 0 && S_ISFIFO(opened.st_mode);
+    int fd = openat(blocked->fd, "stat", O_RDONLY | O_CLOEXEC);
+    blocked->stat_errno = fd < 0 ? errno : 0;
+    if (fd >= 0) {
+      close(fd);
+    }
+  }
+  return NULL;
+}
+
+static void check_alias_source_replaced_during_a_blocked_open(void) {
+  /* A blocking FIFO open through a descriptor link hangs the run where
+   * Detcore does not find the guest's FIFO (/proc/self/fd/N on every
+   * backend, any spelling on DBT and KVM, and under record and replay):
+   * https://github.com/rrnewton/hermit/issues/4485 (a blocking FIFO open through a descriptor link hangs)
+   */
+  if (no_fifo_link_open) {
+    skipped("a blocking open of a FIFO through /proc/<pid>/fd/N whose descriptor another thread "
+            "replaces (check_alias_source_replaced_during_a_blocked_open)",
+            "--no-fifo-link-open",
+            "under DBT and KVM that open waits in the kernel holding the scheduler turn, so the "
+            "writer never runs and the run hangs, "
+            "https://github.com/rrnewton/hermit/issues/4485 (FIFO-link open hangs)");
+    return;
+  }
+  char directory[] = "/tmp/rendered-procfs-fifo-XXXXXX";
+  if (mkdtemp(directory) == NULL) {
+    CHECK(0, "mkdtemp: %s", strerror(errno));
+    return;
+  }
+  char fifo[96];
+  snprintf(fifo, sizeof(fifo), "%s/fifo", directory);
+  static struct blocked_alias blocked;
+  blocked.fd = -1;
+  blocked.open_errno = blocked.stat_errno = blocked.got_fifo = 0;
+  int source = -1;
+  int made = mkfifo(fifo, 0600) == 0 && (source = open(fifo, O_PATH | O_CLOEXEC)) >= 0 &&
+             pipe2(blocked.ready, O_CLOEXEC) == 0;
+  CHECK(made, "prepare the FIFO for the blocked alias open: %s", strerror(errno));
+  /* By number: Detcore finds a guest's FIFO through the guest's
+   * /proc/<pid>, where /proc/self would name its own process. */
+  snprintf(blocked.link, sizeof(blocked.link), "/proc/%ld/fd/%d", (long)getpid(), source);
+  pthread_t reader;
+  if (made && pthread_create(&reader, NULL, blocked_alias_reader, &blocked) == 0) {
+    char ready;
+    struct timespec pause = {.tv_sec = 0, .tv_nsec = 100 * 1000 * 1000};
+    int proc = -1;
+    int writer = -1;
+    int writer_errno = 0;
+    if (read(blocked.ready[0], &ready, 1) == 1) {
+      nanosleep(&pause, NULL);
+      proc = open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+      CHECK(proc >= 0 && dup3(proc, source, O_CLOEXEC) == source,
+            "replace descriptor %d with /proc during the blocked open: %s", source,
+            strerror(errno));
+      /* Natively a reader that has followed the link may not yet count as
+       * the FIFO's reader: ENXIO is final only after half a second. */
+      struct timespec retry = {.tv_sec = 0, .tv_nsec = 10 * 1000 * 1000};
+      for (int attempt = 0; attempt < 50; attempt++) {
+        writer = open(fifo, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+        writer_errno = writer < 0 ? errno : 0;
+        if (writer >= 0 || writer_errno != ENXIO) {
+          break;
+        }
+        nanosleep(&retry, NULL);
+      }
+      CHECK(writer >= 0 || writer_errno == ENXIO, "open %s for writing: %s", fifo,
+            strerror(writer_errno));
+    }
+    pthread_join(reader, NULL);
+    CHECK(blocked.open_errno == 0, "the blocked open of %s: %s", blocked.link,
+          strerror(blocked.open_errno));
+    if (blocked.fd >= 0 && blocked.got_fifo) {
+      CHECK(blocked.stat_errno == ENOTDIR,
+            "openat(<the FIFO a blocked open of %s returned>, \"stat\"): %s, not ENOTDIR",
+            blocked.link, blocked.stat_errno == 0 ? "opened" : strerror(blocked.stat_errno));
+      CHECK(writer >= 0, "the blocked open of %s returned the FIFO, which had no reader for "
+            "the writer (%s)", blocked.link, strerror(writer_errno));
+    } else if (blocked.fd >= 0) {
+      CHECK(!alias_bytes, "the blocked open of %s returned the descriptor that replaced %d, not the FIFO",
+            blocked.link, source);
+      CHECK(blocked.stat_errno == 0, "openat(<the /proc a blocked open of %s returned>, \"stat\"): %s",
+            blocked.link, strerror(blocked.stat_errno));
+    }
+    if (blocked.fd >= 0) {
+      close(blocked.fd);
+    }
+    if (writer >= 0) {
+      close(writer);
+    }
+    if (proc >= 0) {
+      close(proc);
+    }
+  } else if (made) {
+    CHECK(0, "pthread_create for the blocked alias open");
+  }
+  if (made) {
+    close(blocked.ready[0]);
+    close(blocked.ready[1]);
+  }
+  if (source >= 0) {
+    close(source);
+  }
+  unlink(fifo);
+  rmdir(directory);
+}
+
+/* The identities check_numeric_alias tells apart. */
+struct numeric_alias_identities {
+  struct stat empty;
+  struct stat proc;
+  struct stat stat_file;
+};
+
+/* In a fork's child whose descriptor N is /proc while its parent's is an
+ * empty directory, the directory `spelling` (a numeric spelling of the
+ * child's own descriptor link N) opens must be the one names are then
+ * looked up below: "stat" below /proc is /proc/stat, and below the
+ * parent's empty directory it does not exist, to open or to stat. getpid()
+ * and gettid() name the child itself, so the directory must be /proc.
+ * Under --no-foreign-fd-links a backend that serves no numeric /proc
+ * subject may refuse the open with ENOENT, which is announced. */
+static void check_numeric_alias(const char* spelling, const struct numeric_alias_identities* ids) {
+  int directory = open(spelling, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (directory < 0) {
+    int error = errno;
+    if (error == ENOENT && no_foreign_fd_links) {
+      char check[160];
+      snprintf(check, sizeof(check), "%s in a fork's child (ENOENT)", spelling);
+      skipped(check, "--no-foreign-fd-links", "the backend serves no numeric /proc subject");
+      return;
+    }
+    CHECK(0, "open(%s) in a fork's child: %s", spelling, strerror(error));
+    return;
+  }
+  struct stat opened;
+  int described = fstat(directory, &opened) == 0;
+  CHECK(described, "fstat(%s): %s", spelling, strerror(errno));
+  if (described && same_file(&opened, &ids->proc)) {
+    int fd = openat(directory, "stat", O_RDONLY | O_CLOEXEC);
+    int error = fd < 0 ? errno : 0;
+    struct stat by_fd;
+    int is_stat_file = fd >= 0 && fstat(fd, &by_fd) == 0 && same_file(&by_fd, &ids->stat_file);
+    CHECK(is_stat_file, "openat(%s, \"stat\") in a fork's child is not /proc/stat (%s)", spelling,
+          fd < 0 ? strerror(error) : "another file");
+    if (fd >= 0) {
+      close(fd);
+    }
+  } else if (described && same_file(&opened, &ids->empty)) {
+    CHECK(no_foreign_fd_links,
+          "%s in a fork's child opened its parent's descriptor, not the child's /proc", spelling);
+    if (no_foreign_fd_links) {
+      allowed_for(spelling, "a fork's child opening its parent's descriptor N, not its own",
+                  "--no-foreign-fd-links",
+                  "the backend's procfs may number processes otherwise; names below it must "
+                  "still not exist");
+    }
+    int fd = openat(directory, "stat", O_RDONLY | O_CLOEXEC);
+    int open_errno = fd < 0 ? errno : 0;
+    if (fd >= 0) {
+      close(fd);
+    }
+    CHECK(fd < 0 && open_errno == ENOENT,
+          "openat(%s, \"stat\") below the parent's empty directory: %s, not ENOENT", spelling,
+          fd < 0 ? strerror(open_errno) : "opened");
+    struct stat ignored;
+    int stat_result = fstatat(directory, "stat", &ignored, 0);
+    int stat_errno = stat_result == 0 ? 0 : errno;
+    CHECK(stat_result == -1 && stat_errno == ENOENT,
+          "fstatat(%s, \"stat\") below the parent's empty directory: %s, not ENOENT", spelling,
+          stat_result == 0 ? "found" : strerror(stat_errno));
+  } else if (described) {
+    CHECK(0, "%s in a fork's child opened %#llx:%llu, neither /proc nor its parent's directory",
+          spelling, (unsigned long long)opened.st_dev, (unsigned long long)opened.st_ino);
+  }
+  close(directory);
+}
+
+/* A numeric spelling of the caller's own descriptor link,
+ * /proc/<getpid()>/fd/N or /proc/<getpid()>/task/<gettid()>/fd/N, names
+ * the caller's descriptor N, as /proc/self/fd/N does. The parent's
+ * descriptor N is an empty directory, and its fork's child replaces its own
+ * N with /proc (check_numeric_alias). Run as the root process's first
+ * fork, before anything else forks, so that the child's pid is the one a
+ * backend whose kernel numbers processes otherwise than Detcore (DBT) gives
+ * the root process: a spelling resolved by Detcore's numbers there reaches
+ * the parent's table, where the kernel's reaches the child's. */
+static void check_numeric_own_pid_aliases(void) {
+  struct numeric_alias_identities ids;
+  /* Named by the pid, not by mkdtemp: this runs before the workload, whose
+   * printed UUIDs come from the random stream mkdtemp may draw from (it did
+   * on KVM for a guest at one path and not at another). */
+  char empty[64];
+  snprintf(empty, sizeof(empty), "/tmp/rendered-procfs-numeric-%ld", (long)getpid());
+  rmdir(empty);
+  if (mkdir(empty, 0700) != 0) {
+    CHECK(0, "mkdir(%s): %s", empty, strerror(errno));
+    return;
+  }
+  /* The identities of what is opened, as the checks then open them (KVM's
+   * own procfs refuses a stat of /proc itself). */
+  int fd = open(empty, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  int proc = open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  int stat_file = open("/proc/stat", O_RDONLY | O_CLOEXEC);
+  int known = fd >= 0 && proc >= 0 && stat_file >= 0 && fstat(fd, &ids.empty) == 0 &&
+              fstat(proc, &ids.proc) == 0 && fstat(stat_file, &ids.stat_file) == 0;
+  CHECK(known, "identities for the numeric aliases: %s", strerror(errno));
+  if (proc >= 0) {
+    close(proc);
+  }
+  if (stat_file >= 0) {
+    close(stat_file);
+  }
+  if (!known) {
+    if (fd >= 0) {
+      close(fd);
+    }
+    rmdir(empty);
+    return;
+  }
+  fflush(stdout);
+  fflush(stderr);
+  pid_t child = fork();
+  if (child == 0) {
+    int inherited_failures = failures;
+    int proc = open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int replaced = proc >= 0 && dup3(proc, fd, O_CLOEXEC) == fd;
+    CHECK(replaced, "replace descriptor %d with /proc in a fork's child: %s", fd,
+          strerror(errno));
+    if (proc >= 0) {
+      close(proc);
+    }
+    if (replaced) {
+      char spelling[96];
+      snprintf(spelling, sizeof(spelling), "/proc/%ld/fd/%d", (long)getpid(), fd);
+      check_numeric_alias(spelling, &ids);
+      snprintf(spelling, sizeof(spelling), "/proc/%ld/task/%ld/fd/%d", (long)getpid(),
+               (long)gettid(), fd);
+      check_numeric_alias(spelling, &ids);
+    }
+    _exit(failures == inherited_failures ? 0 : 1);
+  }
+  int status = 0;
+  CHECK(child > 0 && waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+            WEXITSTATUS(status) == 0,
+        "a numeric spelling of a fork's child's own descriptor link (status %#x)", status);
+  close(fd);
+  rmdir(empty);
+}
+
+/* The directory aliases (check_directory_aliases) from a thread created
+ * now, which shares this process's descriptor table. Returns 0 if every
+ * check passed. */
+static void* alias_checks_thread(void* unused) {
+  (void)unused;
+  check_directory_aliases("stat", STAT);
+  check_directory_aliases("uptime", UPTIME);
+  return NULL;
+}
+
+static int aliases_from_a_new_thread(void) {
+  int before = failures;
+  pthread_t thread;
+  int created = pthread_create(&thread, NULL, alias_checks_thread, NULL) == 0;
+  CHECK(created && pthread_join(thread, NULL) == 0, "directory aliases in a new thread");
+  return failures == before ? 0 : 1;
+}
+
+/* A process created with CLONE_FILES and without CLONE_THREAD shares its
+ * creator's descriptor table and leads a thread group of its own, so a
+ * thread it creates reads that table, its own, through /proc/self/fd/N:
+ * the directory aliases hold there as in the root process. The creator is
+ * a fork's child, so the table is not the root process's. */
+static void check_aliases_in_a_clone_files_process(void) {
+  if (no_clone_files_process) {
+    /* DBT refuses such a clone and stops the run ("copied child cannot share
+     * descriptor-table provenance"); KVM refuses it with EOPNOTSUPP:
+     * https://github.com/rrnewton/hermit/issues/4485 (DBT ends the run; KVM: EOPNOTSUPP)
+     */
+    skipped("the directory aliases from a thread of a process created with CLONE_FILES",
+            "--no-clone-files-process",
+            "DBT refuses such a clone and stops the run; KVM refuses it with EOPNOTSUPP, "
+            "https://github.com/rrnewton/hermit/issues/4485 (CLONE_FILES process refused)");
+    return;
+  }
+  fflush(stdout);
+  fflush(stderr);
+  pid_t child = fork();
+  if (child == 0) {
+    int inherited_failures = failures;
+    long process = syscall(SYS_clone, CLONE_FILES | SIGCHLD, 0, 0, 0, 0);
+    if (process == 0) {
+      _exit(aliases_from_a_new_thread());
+    }
+    int error = errno;
+    int status = 0;
+    CHECK(process > 0 && waitpid((pid_t)process, &status, 0) == (pid_t)process &&
+              WIFEXITED(status) && WEXITSTATUS(status) == 0,
+          "directory aliases from a thread of a process created with CLONE_FILES (%s, status "
+          "%#x)",
+          process < 0 ? strerror(error) : "created", status);
+    _exit(failures == inherited_failures ? 0 : 1);
+  }
+  int status = 0;
+  CHECK(child > 0 && waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+            WEXITSTATUS(status) == 0,
+        "directory aliases in a process created with CLONE_FILES (status %#x)", status);
+}
+
+/* The new image of a thread that is not its process's leader runs this
+ * (--aliases-in-a-thread): exec gave the exec'ing thread a descriptor
+ * table of its own, and the thread leads the process now, so a thread it
+ * creates shares the process's table and reads it through
+ * /proc/self/fd/N. */
+static void* exec_from_a_thread(void* unused) {
+  (void)unused;
+  char* const arguments[] = {(char*)program, "--aliases-in-a-thread", alias_bytes ? "1" : "0",
+                             NULL};
+  execv(program, arguments);
+  fprintf(stderr, "FAIL: exec from a thread: %s\n", strerror(errno));
+  _exit(1);
+}
+
+static void check_aliases_after_a_thread_exec(void) {
+  if (kvm_local_procfs) {
+    skipped("the directory aliases from a thread of an image a non-leader thread executed",
+            "--kvm-local-procfs", "KVM refuses an exec from a thread that does not lead its "
+            "process (NonLeaderExec)");
+    return;
+  }
+  fflush(stdout);
+  fflush(stderr);
+  pid_t child = fork();
+  if (child == 0) {
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, exec_from_a_thread, NULL) == 0) {
+      /* The exec ends this thread. */
+      pthread_join(thread, NULL);
+    }
+    _exit(1);
+  }
+  int status = 0;
+  CHECK(child > 0 && waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+            WEXITSTATUS(status) == 0,
+        "directory aliases from a thread of an image a non-leader thread executed (status %#x)",
+        status);
+}
+
 /* Print the file's contents, as one read returns them, on one line. */
 static void print_contents(const char* path) {
   char* contents = contents_buffer;
@@ -1239,6 +2132,10 @@ static int inherited(int fd, int duplicate, unsigned long long ino, long offset,
           (unsigned long long)by_alias.st_ino);
     unlink(alias_link);
     rmdir(alias);
+  } else {
+    skipped("the inherited descriptor through a symbolic link to its descriptor link",
+            "--kvm-local-procfs", "KVM's own procfs refuses symbolic links into /proc, "
+            "https://github.com/rrnewton/hermit/issues/4282");
   }
   struct stat by_link;
   CHECK(stat(self_link, &by_link) == 0 && by_link.st_ino == ino && by_link.st_size == 0,
@@ -1300,6 +2197,10 @@ static int inherited(int fd, int duplicate, unsigned long long ino, long offset,
 
 int main(int argc, char** argv) {
   program = argv[0];
+  if (argc == 3 && strcmp(argv[1], "--aliases-in-a-thread") == 0) {
+    alias_bytes = atoi(argv[2]);
+    return aliases_from_a_new_thread();
+  }
   if (argc == 10 && strcmp(argv[1], "--inherited") == 0) {
     kvm_local_procfs = atoi(argv[6]);
     return inherited(atoi(argv[2]), atoi(argv[3]), strtoull(argv[4], NULL, 10), atol(argv[5]),
@@ -1309,6 +2210,12 @@ int main(int argc, char** argv) {
     if (strcmp(argv[i], "--kvm-local-procfs") == 0) {
       kvm_local_procfs = 1;
       no_foreign_fd_links = 1;
+      no_clone_files_process = 1;
+      no_fifo_link_open = 1;
+    } else if (strcmp(argv[i], "--no-fifo-link-open") == 0) {
+      no_fifo_link_open = 1;
+    } else if (strcmp(argv[i], "--no-clone-files-process") == 0) {
+      no_clone_files_process = 1;
     } else if (strcmp(argv[i], "--noreplace-overlap-eperm") == 0) {
       noreplace_overlap_eperm = 1;
     } else if (strcmp(argv[i], "--no-foreign-fd-links") == 0) {
@@ -1327,6 +2234,8 @@ int main(int argc, char** argv) {
       detcore_xattr_order = 1;
     } else if (strcmp(argv[i], "--no-bypass-capabilities") == 0) {
       no_bypass_capabilities = 1;
+    } else if (strcmp(argv[i], "--alias-bytes") == 0) {
+      alias_bytes = 1;
     } else {
       program = NULL;
     }
@@ -1334,15 +2243,18 @@ int main(int argc, char** argv) {
   if (program == NULL || program[0] != '/') {
     fprintf(stderr,
             "usage: /path/to/rendered_procfs_files [--no-foreign-fd-links] "
+            "[--no-clone-files-process] [--no-fifo-link-open] "
             "[--kvm-local-procfs] [--no-maps-or-chroot] [--chroot-only] "
             "[--require-chroot] [--no-bypass-capabilities] [--xattr-arguments-first] "
-            "[--detcore-xattr-order]\n");
+            "[--detcore-xattr-order] [--alias-bytes]\n");
     return 2;
   }
   if (no_bypass_capabilities && !lacks_bypass_capabilities()) {
     return 1;
   }
   if (chroot_only) {
+    skipped("every check but the process chroot checks", "--chroot-only",
+            "a run that verifies the other checks runs them");
     /* Not the thread chroot, which hangs under DBT
      * (https://github.com/rrnewton/hermit/issues/4254). */
     check_chroot();
@@ -1353,6 +2265,7 @@ int main(int argc, char** argv) {
    * same UUIDs: each file's contents, a read shared across fork, and the
    * descriptor that survives exec. Its output must be the same on every
    * backend. */
+  check_numeric_own_pid_aliases();
   print_contents("/proc/sys/kernel/random/uuid");
   print_contents("/proc/sys/kernel/pty/nr");
   print_contents("/proc/stat");
@@ -1404,9 +2317,52 @@ int main(int argc, char** argv) {
   check_file("/proc/sys/kernel/pty/nr", COUNT);
   check_file("/proc/uptime", UPTIME);
   check_file("/proc/stat", STAT);
+  check_directory_aliases("stat", STAT);
+  check_directory_aliases("uptime", UPTIME);
+  check_directory_aliases("loadavg", LOADAVG);
+  check_directory_aliases("sys/kernel/pty/nr", COUNT);
+  check_directory_aliases("sys/kernel/random/uuid", UUID);
+  check_directory_aliases_in_a_thread();
+  check_aliases_in_a_clone_files_process();
+  check_aliases_after_a_thread_exec();
+  check_alias_source_replaced_during_a_blocked_open();
+  if (!kvm_local_procfs) {
+    check_split_table_aliases();
+  } else {
+    /* KVM refuses clone without CLONE_FILES with EINVAL:
+     * https://github.com/rrnewton/hermit/issues/4485 (KVM: EINVAL on a thread clone without CLONE_FILES)
+     */
+    skipped("the descriptor links of a thread cloned without CLONE_FILES "
+            "(check_split_table_aliases)",
+            "--kvm-local-procfs",
+            "KVM refuses clone without CLONE_FILES with EINVAL, "
+            "https://github.com/rrnewton/hermit/issues/4485 (KVM thread clone EINVAL)");
+  }
+  if (!no_foreign_fd_links) {
+    check_selector_aliases_from_a_fork();
+    check_selector_aliases_from_a_thread();
+  } else {
+    skipped("a parent's /proc/self reopened by its fork's child through /proc/self/fd/N "
+            "(check_selector_aliases_from_a_fork)",
+            "--no-foreign-fd-links",
+            "KVM's own procfs refuses /proc/self, "
+            "https://github.com/rrnewton/hermit/issues/4282");
+    skipped("a thread's /proc/thread-self reopened by the leader through /proc/self/fd/N "
+            "(check_selector_aliases_from_a_thread)",
+            "--no-foreign-fd-links",
+            "KVM's own procfs refuses /proc/thread-self, "
+            "https://github.com/rrnewton/hermit/issues/4282");
+  }
   if (!kvm_local_procfs && !no_maps_or_chroot) {
     check_chroot();
     check_thread_chroot();
+  } else {
+    skipped("the process and thread chroot checks",
+            kvm_local_procfs ? "--kvm-local-procfs" : "--no-maps-or-chroot",
+            kvm_local_procfs ? "KVM does not support chroot"
+                             : "DBT cannot yet compare a chroot strictly, "
+                               "https://github.com/rrnewton/hermit/issues/4233; the cli test "
+                               "runs the process chroot checks separately");
   }
   if (failures != 0) {
     return 1;
