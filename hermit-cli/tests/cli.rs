@@ -178,6 +178,7 @@ static OWN_PROCESS_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VDSO_SYMBOL_VERSIONS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_SIGEV_THREAD_ID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_EXEC_FLUSH_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static TIMER_COALESCE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LEADER_PTHREAD_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static THREAD_JOIN_AFTER_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUID_PROFILE_V3_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1235,6 +1236,31 @@ fn timer_sigev_thread_id_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "timer-sigev-thread-id guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn timer_coalesce_guest() -> &'static Path {
+    TIMER_COALESCE_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("timer-coalesce");
+        fs::create_dir_all(&build_root).expect("failed to create timer-coalesce directory");
+        let guest = build_root.join("timer_coalesce");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/timer_coalesce.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile timer-coalesce guest");
+        assert!(
+            output.status.success(),
+            "timer-coalesce guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -31741,6 +31767,342 @@ fn a_sigev_thread_id_timer_notifies_exactly_its_thread_at_bitwise_parity() {
                 .expect("the verdict must be JSON");
         assert_eq!(report["bitwise_parity"], true, "{mode}: {report}");
     }
+}
+
+/// POSIX interval timers as Linux coalesces them
+/// (https://github.com/rrnewton/hermit/issues/4262). Each mode of
+/// `tests/c/timer_coalesce.c` is strict-verified at bitwise parity and must
+/// print what Linux printed (5 native runs of each, identical, 2026-10-15).
+/// The rows are the design's (rev 6 §9 and the rev 7 to rev 10 deltas):
+/// T2 (`blocked`: a periodic timer blocked for 5.2 periods is delivered
+/// once, `SI_TIMER` with its id, value and `si_overrun` 4, and
+/// `timer_getoverrun` reads 0 before and 4 after); T3 (`consumer_*`: every
+/// `_timer` field and a 64-bit `sival_ptr` through a handler,
+/// `rt_sigtimedwait` and signalfd); T4 (`parked`); T5 (`flush`); T6
+/// (`stale_*`: an entry made stale by a far re-arm, a disarm or a delete stays
+/// pending and reaches no consumer, and `stale_rearm_near` is refreshed by a
+/// new expiry and delivered once); T7 (`merged_*`: a kill and a timer's
+/// entry, both pending, are two deliveries, two takes, two signalfd records);
+/// T7b (`order_*`: one signalfd read takes two timers' USR1 entries in order,
+/// then a USR2, in the shared and the private queue); A1 (`a1_*`, including a
+/// kill after a stale entry, which the stale entry absorbs); a stale entry
+/// drained, then a kill (`drain_*`); unignore (R3-3, R4-3, R5-3, R5-4, R5-5:
+/// a far re-arm, a near one, a current park with overrun 9, a deleted timer,
+/// the newest park re-queued first whatever the timer ids, the order within
+/// one flush, and periodicity latched at the send); rev 7 C's refresh
+/// (`ref_*`); `si_value` with no sigevent (the timer id); `timer_settime`
+/// resetting `timer_getoverrun`; `timer_gettime`'s armed and popped
+/// classes; and rev 10 J's `forged_timer`, the row that bites: a kept
+/// `SI_QUEUE` send to a parked worker standing on a discarded forged
+/// `SI_TIMER` copy is delivered with its own record, where main delivered
+/// `SI_TIMER` 7. `forged_timer_tgkill` is its `kill` variant (P3-4), and
+/// `forged_exec_*` the exec control, which main passes too. Every wait that
+/// decides an overrun ends 0.2 periods past a grid point: Hermit's
+/// `nanosleep` ends about 0.55 ms past its deadline, Linux's about 0.06 ms.
+#[test]
+fn posix_timer_entries_are_delivered_as_on_linux_at_bitwise_parity() {
+    let guest = timer_coalesce_guest().to_str().unwrap().to_owned();
+    let cases = [
+        (
+            "blocked",
+            "blocked waiting_remaining_within_interval=1 getoverrun_before=0 getoverrun_after=4\nblocked deliveries=1\n  0 sig=10 SI_TIMER timer=0 overrun=4 value=0x1122334455667788\n",
+        ),
+        (
+            "consumer_handler",
+            "consumer_handler deliveries=1\n  0 sig=10 SI_TIMER timer=1 overrun=0 value=0x1122334455667788\n",
+        ),
+        (
+            "consumer_wait",
+            "consumer_wait=10 code=SI_TIMER timer=1 overrun=0 value=0x1122334455667788\n",
+        ),
+        (
+            "consumer_sfd",
+            "consumer_sfd records=1\n  0 sig=10 SI_TIMER timer=1 overrun=0 int=0x55667788 ptr=0x1122334455667788\n",
+        ),
+        (
+            "parked",
+            "parked at_install=1\nparked deliveries=1\n  0 sig=10 SI_TIMER timer=0 overrun=2 value=0x1122334455667788\n",
+        ),
+        (
+            "flush",
+            "flush deliveries=1\n  0 sig=10 SI_TIMER timer=0 overrun=2 value=0x1122334455667788\n",
+        ),
+        (
+            "stale_far_handler",
+            "stale_far_handler pending=1\nstale_far_handler deliveries=0\n",
+        ),
+        (
+            "stale_far_wait",
+            "stale_far_wait pending=1\nstale_far_wait=EAGAIN\n",
+        ),
+        (
+            "stale_far_sfd",
+            "stale_far_sfd pending=1\nstale_far_sfd read=EAGAIN\n",
+        ),
+        (
+            "stale_disarm_handler",
+            "stale_disarm_handler pending=1\nstale_disarm_handler deliveries=0\n",
+        ),
+        (
+            "stale_disarm_wait",
+            "stale_disarm_wait pending=1\nstale_disarm_wait=EAGAIN\n",
+        ),
+        (
+            "stale_disarm_sfd",
+            "stale_disarm_sfd pending=1\nstale_disarm_sfd read=EAGAIN\n",
+        ),
+        (
+            "stale_delete_handler",
+            "stale_delete_handler pending=1\nstale_delete_handler deliveries=0\n",
+        ),
+        (
+            "stale_delete_wait",
+            "stale_delete_wait pending=1\nstale_delete_wait=EAGAIN\n",
+        ),
+        (
+            "stale_delete_sfd",
+            "stale_delete_sfd pending=1\nstale_delete_sfd read=EAGAIN\n",
+        ),
+        (
+            "stale_rearm_near",
+            "stale_rearm_near deliveries=1\n  0 sig=10 SI_TIMER timer=0 overrun=0 value=0x1122334455667788\n",
+        ),
+        (
+            "merged_handler",
+            "merged_handler deliveries=2\n  0 sig=10 code=0 own_pid=1 value=0\n  1 sig=10 SI_TIMER timer=0 overrun=0 value=0x1122334455667788\n",
+        ),
+        (
+            "merged_wait",
+            "merged_wait=10 code=0 own_pid=1 value=0\nmerged_wait=10 code=SI_TIMER timer=0 overrun=0 value=0x1122334455667788\nmerged_wait=EAGAIN\n",
+        ),
+        (
+            "merged_sfd2",
+            "merged_sfd2 records=2\n  0 sig=10 code=0 own_pid=1 ptr=0\n  1 sig=10 SI_TIMER timer=0 overrun=0 int=0x55667788 ptr=0x1122334455667788\n",
+        ),
+        (
+            "merged_sfd3",
+            "merged_sfd3 records=2\n  0 sig=10 code=0 own_pid=1 ptr=0\n  1 sig=10 SI_TIMER timer=0 overrun=0 int=0x55667788 ptr=0x1122334455667788\n",
+        ),
+        (
+            "order_shared",
+            "order_shared records=3\n  0 sig=10 SI_TIMER timer=0 overrun=0 int=0x1 ptr=0x1\n  1 sig=10 SI_TIMER timer=1 overrun=0 int=0x2 ptr=0x2\n  2 sig=12 code=0 own_pid=1 ptr=0\n",
+        ),
+        (
+            "order_private",
+            "order_private records=3\n  0 sig=10 SI_TIMER timer=0 overrun=0 int=0x1 ptr=0x1\n  1 sig=10 SI_TIMER timer=1 overrun=0 int=0x2 ptr=0x2\n  2 sig=12 code=-6 own_pid=1 ptr=0\n",
+        ),
+        (
+            "a1_timer_then_kill",
+            "a1_timer_then_kill deliveries=1\n  0 sig=10 SI_TIMER timer=0 overrun=0 value=0x1122334455667788\n",
+        ),
+        (
+            "a1_kill_then_timer",
+            "a1_kill_then_timer deliveries=2\n  0 sig=10 code=0 own_pid=1 value=0\n  1 sig=10 SI_TIMER timer=0 overrun=0 value=0x1122334455667788\n",
+        ),
+        (
+            "a1_two_kills",
+            "a1_two_kills deliveries=1\n  0 sig=10 code=0 own_pid=1 value=0\n",
+        ),
+        (
+            "a1_stale_far_then_kill",
+            "a1_stale_far_then_kill pending_before_kill=1\na1_stale_far_then_kill deliveries=0\n",
+        ),
+        (
+            "a1_stale_disarm_then_kill",
+            "a1_stale_disarm_then_kill pending_before_kill=1\na1_stale_disarm_then_kill deliveries=0\n",
+        ),
+        (
+            "a1_stale_delete_then_kill",
+            "a1_stale_delete_then_kill pending_before_kill=1\na1_stale_delete_then_kill deliveries=0\n",
+        ),
+        (
+            "drain_far_then_kill",
+            "drain_far_then_kill=EAGAIN\ndrain_far_then_kill=10 code=0 own_pid=1 value=0\n",
+        ),
+        (
+            "drain_disarm_then_kill",
+            "drain_disarm_then_kill=EAGAIN\ndrain_disarm_then_kill=10 code=0 own_pid=1 value=0\n",
+        ),
+        (
+            "drain_delete_then_kill",
+            "drain_delete_then_kill=EAGAIN\ndrain_delete_then_kill=10 code=0 own_pid=1 value=0\n",
+        ),
+        (
+            "unignore_far",
+            "unignore_far pending_before_kill=0\nunignore_far deliveries=1\n  0 sig=10 code=0 own_pid=1 value=0\n",
+        ),
+        (
+            "unignore_near",
+            "unignore_near deliveries=1\n  0 sig=10 SI_TIMER timer=0 overrun=0 value=0x1122334455667788\n",
+        ),
+        (
+            "unignore_current",
+            "unignore_current deliveries=1\n  0 sig=10 SI_TIMER timer=0 overrun=9 value=0x1122334455667788\n",
+        ),
+        (
+            "unignore_deleted",
+            "unignore_deleted deliveries=1\n  0 sig=10 code=0 own_pid=1 value=0\n",
+        ),
+        (
+            "unignore_high_first",
+            "unignore_high_first deliveries=2\n  0 sig=10 SI_TIMER timer=0 overrun=0 value=0\n  1 sig=10 SI_TIMER timer=1 overrun=0 value=0x1\n",
+        ),
+        (
+            "unignore_low_first",
+            "unignore_low_first deliveries=2\n  0 sig=10 SI_TIMER timer=1 overrun=0 value=0x1\n  1 sig=10 SI_TIMER timer=0 overrun=0 value=0\n",
+        ),
+        (
+            "unignore_flush_order",
+            "unignore_flush_order deliveries=2\n  0 sig=10 SI_TIMER timer=1 overrun=0 value=0x1\n  1 sig=10 SI_TIMER timer=0 overrun=0 value=0\n",
+        ),
+        (
+            "unignore_oneshot_rearmed_periodic",
+            "unignore_oneshot_rearmed_periodic deliveries=1\n  0 sig=10 code=0 own_pid=1 value=0\n",
+        ),
+        (
+            "unignore_periodic_rearmed_oneshot",
+            "unignore_periodic_rearmed_oneshot pending_before_kill=1\nunignore_periodic_rearmed_oneshot deliveries=0\n",
+        ),
+        (
+            "ref_os_then_p",
+            "ref_os_then_p=10 code=0 own_pid=1 value=0\nref_os_then_p=10 code=SI_TIMER timer=0 overrun=0 value=0x1122334455667788\nref_os_then_p=10 code=0 own_pid=1 value=0\n",
+        ),
+        (
+            "ref_p_then_os",
+            "ref_p_then_os=10 code=0 own_pid=1 value=0\nref_p_then_os=EAGAIN\nref_p_then_os=10 code=0 own_pid=1 value=0\n",
+        ),
+        (
+            "sival_null",
+            "sival_null take=14 SI_TIMER=1 timer=1 int_is_timer_id=1\n",
+        ),
+        (
+            "settime_resets",
+            "settime_resets after_delivery=2 after_set=0 deliveries=1\n",
+        ),
+        (
+            "gettime",
+            "gettime armed_within=1 popped_zero=1 popped_interval_zero=1\n",
+        ),
+        (
+            "forged_timer",
+            "forged_timer on_worker=1\nforged deliveries=1\n  0 sig=10 code=-1 own_pid=0 value=0x1122334455667788\n",
+        ),
+        (
+            "forged_timer_tgkill",
+            "forged_timer_tgkill on_worker=1\nforged deliveries=1\n  0 sig=10 code=-6 own_pid=1 value=0\n",
+        ),
+        (
+            "forged_exec_timer",
+            "forged_exec pending_after_exec=1\nforged_exec deliveries=1\n  0 sig=10 code=-1 own_pid=0 value=0x1122334455667788\n",
+        ),
+        (
+            "forged_exec_notimer",
+            "forged_exec pending_after_exec=1\nforged_exec deliveries=1\n  0 sig=10 code=-1 own_pid=0 value=0x1122334455667788\n",
+        ),
+    ];
+    for (mode, expected) in cases {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let verdict = directory.path().join("verify.json");
+        let (status, log) = run_with_deadline(
+            hermit_command(&[
+                "run",
+                "--strict",
+                "--verify",
+                "--verify-strict",
+                "--verify-json",
+                verdict.to_str().unwrap(),
+                "--timeout",
+                "60",
+                "--",
+                guest.as_str(),
+                mode,
+            ]),
+            directory.path(),
+            Duration::from_secs(180),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{mode}:\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert_eq!(stdout, expected, "{mode}: stderr:\n{log}");
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
+                .expect("the verdict must be JSON");
+        assert_eq!(report["bitwise_parity"], true, "{mode}: {report}");
+    }
+}
+
+/// What `tests/c/timer_coalesce.c` cannot yet show as on Linux
+/// (https://github.com/rrnewton/hermit/issues/4262). `merged_readv`: a
+/// vectored signalfd read while a covered signal has a timer's entry behind
+/// a kill's would need one record per kernel read into its own sub-extents,
+/// which Detcore does only for `read`, so it is refused by name (native:
+/// both records). `forged_notimer`, a known divergence
+/// (https://github.com/rrnewton/hermit/issues/4293): with no POSIX timer in
+/// the process, a kept `SI_QUEUE` send standing on a discarded forged
+/// `SI_TIMER` copy shows that copy's siginfo (`SI_TIMER`, value 7), as on
+/// main; Linux shows `SI_QUEUE` 0x1122334455667788 (5 native runs,
+/// 2026-10-15). It is asserted as Hermit's present answer, not counted as
+/// parity, so a change to it is seen.
+#[test]
+fn posix_timer_entries_hermit_refuses_or_diverges_on_are_named() {
+    let guest = timer_coalesce_guest().to_str().unwrap().to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "run",
+            "--strict",
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+            "merged_readv",
+        ]),
+        directory.path(),
+        Duration::from_secs(180),
+        false,
+    );
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "merged_readv: {log}"
+    );
+    assert!(
+        log.contains("readv of a signalfd while a signal it covers has a POSIX timer's entry queued behind another is not supported"),
+        "merged_readv: {log}"
+    );
+
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "run",
+            "--strict",
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+            "forged_notimer",
+        ]),
+        directory.path(),
+        Duration::from_secs(180),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "forged_notimer:\nstdout:\n{stdout}\nstderr:\n{log}"
+    );
+    assert_eq!(
+        stdout,
+        "forged_notimer on_worker=1\nforged deliveries=1\n  0 sig=10 SI_TIMER timer=0 overrun=0 value=0x7\n",
+        "forged_notimer: stderr:\n{log}"
+    );
 }
 
 /// Exec discards a POSIX timer's queued signal and keeps every other pending

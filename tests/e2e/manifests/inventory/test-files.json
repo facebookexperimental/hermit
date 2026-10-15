@@ -2617,6 +2617,12 @@
       "why": "tests/c/threads_fd_churn.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace and KVM; ci=true): threads that share one descriptor table keep their descriptors while another thread churns it (a cross-thread pipe EOF, an epoll registration modified and deleted after the table is republished, a dup3 seen across threads), for KVM's copy-only-changed-entries file table (https://github.com/rrnewton/hermit/issues/4287); verify cells on ptrace and KVM, other backends to ratchet against the ptrace reference"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/timer_coalesce.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/timer_coalesce.c is owned by hermit-cli/tests/cli.rs: posix_timer_entries_are_delivered_as_on_linux_at_bitwise_parity runs each mode (a POSIX timer's entry beside an ordinary copy of its signal, overruns, stale entries, parked and unignored expiries, the order of a signalfd read, the forged SI_TIMER rows) and requires Linux's output at bitwise parity, and posix_timer_entries_hermit_refuses_or_diverges_on_are_named requires the named refusal and the known divergence (https://github.com/rrnewton/hermit/issues/4262). It stays a fixture because a generic manifest cannot assert these per-mode outputs."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/timer_create_determinism.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
@@ -2632,7 +2638,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/timer_exec_flush.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/timer_exec_flush.c is owned by hermit-cli/tests/cli.rs: exec_discards_a_posix_timers_pending_signal_at_bitwise_parity runs each mode (a SIGEV_THREAD_ID, a SIGEV_SIGNAL and a real-time SIGEV_SIGNAL timer copy pending at exec, discarded; a kill copy, kept, also beside an overrun and after a taken timer copy) and requires Linux's output at bitwise parity, and an_exec_with_an_unprovable_timer_copy_pending_is_refused_by_name requires the named refusal (https://github.com/rrnewton/hermit/issues/4184). It stays a fixture because a generic manifest cannot assert these per-mode outputs and a refusal."
+      "why": "tests/c/timer_exec_flush.c is owned by hermit-cli/tests/cli.rs: exec_discards_a_posix_timers_pending_signal_at_bitwise_parity runs each mode (a SIGEV_THREAD_ID, a SIGEV_SIGNAL and a real-time SIGEV_SIGNAL timer copy pending at exec, discarded; a kill copy, kept, also beside an overrun and after a taken timer copy) and requires Linux's output at bitwise parity, (https://github.com/rrnewton/hermit/issues/4184), including the six modes that were refused by name until https://github.com/rrnewton/hermit/issues/4262. It stays a fixture because a generic manifest cannot assert these per-mode outputs."
     },
     {
       "disposition": "manifest-test",
