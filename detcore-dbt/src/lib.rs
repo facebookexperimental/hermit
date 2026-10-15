@@ -13,6 +13,8 @@
 
 #![deny(missing_docs)]
 
+mod ofd_channel;
+
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::ffi::c_void;
@@ -1541,6 +1543,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_init(
     else {
         return -1;
     };
+    let _ofd_scope = ofd_channel::Scope::enter(context as usize, invoke_syscall, det_tid);
     let tool = runtime
         .tool
         .get_or_init(|| Detcore::new(det_pid, &runtime.config));
@@ -1589,6 +1592,9 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_init(
         host_tid,
         parent_ref,
     );
+    if inherited_parent.is_some() {
+        state.reset_copied_open_file_locks();
+    }
     if let Some(parent) = &parent {
         state.reseed_child_rngs(&parent.state, parent.rng_entropy);
     } else if let Some(parent) = &inherited_parent {
@@ -1664,6 +1670,11 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_created_v2(
         .get()
         .expect("Detcore DBT tool was initialized");
     let parent = unsafe { &mut *scratch.runtime_state };
+    let _ofd_scope = ofd_channel::Scope::enter(
+        context as usize,
+        invoke_syscall,
+        Tid::from_raw(parent.tid.into()),
+    );
     let flags = CloneFlags::from_bits_truncate(flags);
     parent.state.clone_flags = Some(flags);
     let parent_snapshot = parent.state.clone();
@@ -1753,6 +1764,7 @@ fn process_child_registration(
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ProcessCloneProperties {
+    copies_process: bool,
     blocks_parent: bool,
     shares_files_without_thread: bool,
     shares_memory_without_thread: bool,
@@ -1793,6 +1805,7 @@ fn process_clone_properties(
         return ProcessCloneProperties::default();
     };
     ProcessCloneProperties {
+        copies_process: flags & (libc::CLONE_THREAD | libc::CLONE_VFORK) as u64 == 0,
         blocks_parent: flags & libc::CLONE_VFORK as u64 != 0,
         shares_files_without_thread: flags & libc::CLONE_FILES as u64 != 0
             && flags & libc::CLONE_THREAD as u64 == 0,
@@ -1864,6 +1877,11 @@ pub unsafe extern "C" fn reverie_dbt_runtime_process_clone_result(
     else {
         return -1;
     };
+    let _ofd_scope = ofd_channel::Scope::enter(
+        context as usize,
+        invoke_syscall,
+        Tid::from_raw(parent.tid.into()),
+    );
     let mut guest = DbtGuest::new(
         context as usize,
         parent.tid,
@@ -1956,6 +1974,8 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_exit(
             .tool
             .get()
             .expect("Detcore DBT tool was initialized");
+        let _ofd_scope =
+            ofd_channel::Scope::enter(context as usize, invoke_syscall, Tid::from_raw(tid.into()));
         let _ = reverie_dbt::run_tool_thread_exit_from_guest(
             tool,
             context as usize,
@@ -2001,6 +2021,11 @@ pub unsafe extern "C" fn reverie_dbt_runtime_exec_failed(scratch: *mut c_void, p
         return;
     };
     let (tid, pid) = prepare_exec_guest_identity(thread.tid, pid);
+    let _ofd_scope = ofd_channel::Scope::enter(
+        prepared.context,
+        prepared.invoke_syscall,
+        Tid::from_raw(tid.into()),
+    );
     let mut guest = DbtGuest::<Detcore>::new(
         prepared.context,
         tid,
@@ -2318,6 +2343,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_rdtsc(
     else {
         return -1;
     };
+    let _ofd_scope = ofd_channel::Scope::enter(context as usize, invoke_syscall, det_tid);
     TOTAL_BRANCHES.store(branches, Ordering::Relaxed);
     let host_pid = Pid::from_raw(pid);
     let det_tid = Pid::from_raw(det_tid.into());
@@ -2438,6 +2464,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_signal_event(
     else {
         return -1;
     };
+    let _ofd_scope = ofd_channel::Scope::enter(context as usize, invoke_syscall, det_tid);
     TOTAL_BRANCHES.store(branches, Ordering::Relaxed);
     let host_pid = Pid::from_raw(pid);
     let det_tid = Pid::from_raw(det_tid.into());
@@ -2547,6 +2574,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
         TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
         return 1;
     };
+    let _ofd_scope = ofd_channel::Scope::enter(context as usize, invoke_syscall, det_tid);
     let raw_args = unsafe { std::slice::from_raw_parts(args, 6) };
     let mut dispatch_args: [u64; 6] = raw_args.try_into().expect("six syscall arguments");
     translate_self_identity_targets(
@@ -2670,6 +2698,16 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
     // clone(2) and clone3(2) return in both the parent and child. Injecting
     // either from this callback makes the child return on the client stack.
     if requires_native_lifecycle(sysnum) {
+        if runtime.config.sequentialize_threads
+            && reverie_dbt::sync_rpc::is_active()
+            && !scratch.runtime_state.is_null()
+            && (sysnum == libc::SYS_execve || clone_properties.copies_process)
+        {
+            unsafe { &*scratch.runtime_state }
+                .state
+                .promote_random_open_files()
+                .expect("could not publish random-device OFDs before native lifecycle");
+        }
         if sysnum == libc::SYS_execve {
             // Linux permits a nonleader thread to exec. Detcore's PrepareExec
             // reconnect path accepts that thread's scheduler identity, so
@@ -3575,13 +3613,17 @@ mod tests {
             process_clone_properties(libc::SYS_fork, &empty, |_, _| {
                 panic!("fork has no clone flags in guest memory")
             }),
-            ProcessCloneProperties::default()
+            ProcessCloneProperties {
+                copies_process: true,
+                ..ProcessCloneProperties::default()
+            }
         );
         assert_eq!(
             process_clone_properties(libc::SYS_vfork, &empty, |_, _| {
                 panic!("vfork has no clone flags in guest memory")
             }),
             ProcessCloneProperties {
+                copies_process: false,
                 blocks_parent: true,
                 shares_files_without_thread: false,
                 shares_memory_without_thread: false,

@@ -26,6 +26,12 @@
 //! - Models move in chunks of at most [`CHUNK_LEN`] bytes, because a transport
 //!   frame is bounded and a model (a directory or procfs snapshot) is not.
 //!
+//! Production promotion currently selects random-device descriptions in shared
+//! Detcore; the model and protocol remain generic. Committed models live until
+//! GlobalState teardown, including after their last guest descriptor closes.
+//! Memory therefore scales with distinct promoted OFDs and their model sizes,
+//! not merely with currently open descriptors.
+//!
 //! Every message here is control traffic: it changes no clock, request slot,
 //! scheduler membership or turn.
 
@@ -80,6 +86,12 @@ pub enum OpenFileControl {
         /// Whether this is the last chunk.
         last: bool,
     },
+    /// Reserve a new identity for promotion. The holder publishes its local
+    /// model through the ordinary chunked lease before exposing shared handles.
+    Promote {
+        /// The local description being promoted.
+        id: OpenFileId,
+    },
 }
 
 /// The answer to an [`OpenFileControl`] request.
@@ -101,6 +113,11 @@ pub enum OpenFileControlReply {
     Accepted,
     /// The model was committed and the lease ended.
     Published,
+    /// A promotion lease started. Its initial model is not yet available.
+    Promoting {
+        /// Names the lease in every publish chunk.
+        sequence: u64,
+    },
 }
 
 fn encode_model(model: &OpenFileModel) -> Result<Vec<u8>, SharedOpenFileError> {
@@ -154,7 +171,8 @@ struct Lease {
 
 #[derive(Debug)]
 struct Canonical {
-    model: OpenFileModel,
+    /// Absent only while the initial promotion is being published.
+    model: Option<OpenFileModel>,
     lease: Option<Lease>,
 }
 
@@ -174,7 +192,13 @@ impl SharedOpenFileStore {
         if self.entries.contains_key(&id) {
             return Err(SharedOpenFileError(format!("{id:?} is already shared")));
         }
-        self.entries.insert(id, Canonical { model, lease: None });
+        self.entries.insert(
+            id,
+            Canonical {
+                model: Some(model),
+                lease: None,
+            },
+        );
         Ok(())
     }
 
@@ -188,6 +212,26 @@ impl SharedOpenFileStore {
     ) -> Result<OpenFileControlReply, SharedOpenFileError> {
         let holder = Holder { process, thread };
         match request {
+            OpenFileControl::Promote { id } => {
+                if self.entries.contains_key(&id) {
+                    return Err(SharedOpenFileError(format!("{id:?} is already shared")));
+                }
+                self.next_sequence += 1;
+                let sequence = self.next_sequence;
+                self.entries.insert(
+                    id,
+                    Canonical {
+                        model: None,
+                        lease: Some(Lease {
+                            holder,
+                            sequence,
+                            outgoing: Vec::new(),
+                            incoming: Vec::new(),
+                        }),
+                    },
+                );
+                Ok(OpenFileControlReply::Promoting { sequence })
+            }
             OpenFileControl::Take { id } => {
                 let sequence = self.next_sequence + 1;
                 let canonical = self.entry(id)?;
@@ -197,7 +241,10 @@ impl SharedOpenFileStore {
                         lease.holder.thread, lease.sequence
                     )));
                 }
-                let outgoing = encode_model(&canonical.model)?;
+                let model = canonical.model.as_ref().ok_or_else(|| {
+                    SharedOpenFileError(format!("{id:?} promotion is incomplete"))
+                })?;
+                let outgoing = encode_model(model)?;
                 let length = outgoing.len();
                 let chunk = chunk_at(&outgoing, 0)?;
                 canonical.lease = Some(Lease {
@@ -218,7 +265,13 @@ impl SharedOpenFileStore {
                 sequence,
                 offset,
             } => {
-                let lease = Self::current_lease(self.entry(id)?, id, holder, sequence)?;
+                let canonical = self.entry(id)?;
+                if canonical.model.is_none() {
+                    return Err(SharedOpenFileError(format!(
+                        "{id:?} promotion is incomplete"
+                    )));
+                }
+                let lease = Self::current_lease(canonical, id, holder, sequence)?;
                 Ok(OpenFileControlReply::Chunk(chunk_at(
                     &lease.outgoing,
                     offset,
@@ -231,6 +284,11 @@ impl SharedOpenFileStore {
                 bytes,
                 last,
             } => {
+                if bytes.len() > CHUNK_LEN {
+                    return Err(SharedOpenFileError(format!(
+                        "{id:?}: oversized publish chunk"
+                    )));
+                }
                 let canonical = self.entry(id)?;
                 let lease = Self::current_lease(canonical, id, holder, sequence)?;
                 if offset != lease.incoming.len() {
@@ -250,7 +308,7 @@ impl SharedOpenFileStore {
                         model.id()
                     )));
                 }
-                canonical.model = model;
+                canonical.model = Some(model);
                 canonical.lease = None;
                 Ok(OpenFileControlReply::Published)
             }
@@ -271,6 +329,8 @@ impl SharedOpenFileStore {
                 ended += 1;
             }
         }
+        self.entries
+            .retain(|_, canonical| canonical.model.is_some() || canonical.lease.is_some());
         ended
     }
 
@@ -297,7 +357,7 @@ impl SharedOpenFileStore {
 
     #[cfg(test)]
     fn model(&self, id: OpenFileId) -> &OpenFileModel {
-        &self.entries[&id].model
+        self.entries[&id].model.as_ref().expect("committed model")
     }
 
     #[cfg(test)]
@@ -471,6 +531,17 @@ impl<T: OpenFileControlTransport> std::io::Write for PublishWriter<'_, T> {
 }
 
 impl<T: OpenFileControlTransport> SharedOpenFileChannel for ChunkedOpenFileChannel<T> {
+    fn promote(&self, model: &OpenFileModel) -> Result<(), SharedOpenFileError> {
+        let sequence = match self
+            .transport
+            .call(OpenFileControl::Promote { id: model.id() })?
+        {
+            OpenFileControlReply::Promoting { sequence } => sequence,
+            other => return Err(unexpected(other)),
+        };
+        self.publish_model(model, sequence)
+    }
+
     fn take(&self, id: OpenFileId) -> Result<crate::fd::OpenFileLease, SharedOpenFileError> {
         let (sequence, length, chunk) = match self.transport.call(OpenFileControl::Take { id })? {
             OpenFileControlReply::Taken {
@@ -514,19 +585,26 @@ impl<T: OpenFileControlTransport> SharedOpenFileChannel for ChunkedOpenFileChann
     }
 
     fn publish(&self, lease: crate::fd::OpenFileLease) -> Result<(), SharedOpenFileError> {
+        self.publish_model(&lease.model, lease.sequence)
+    }
+}
+
+impl<T: OpenFileControlTransport> ChunkedOpenFileChannel<T> {
+    fn publish_model(
+        &self,
+        model: &OpenFileModel,
+        sequence: u64,
+    ) -> Result<(), SharedOpenFileError> {
         let mut writer = PublishWriter {
             channel: self,
-            id: lease.id,
-            sequence: lease.sequence,
+            id: model.id(),
+            sequence,
             offset: 0,
             buffer: Vec::new(),
             failure: None,
         };
-        let encoded = bincode::serde::encode_into_std_write(
-            &lease.model,
-            &mut writer,
-            bincode::config::legacy(),
-        );
+        let encoded =
+            bincode::serde::encode_into_std_write(model, &mut writer, bincode::config::legacy());
         if let Some(error) = writer.failure.take() {
             return Err(error);
         }
@@ -586,6 +664,82 @@ mod tests {
         let store = store.lock().unwrap();
         assert!(!store.is_leased(id));
         assert_eq!(store.model(id).path_for_test(), Some("/new".into()));
+    }
+
+    #[test]
+    fn promotion_commits_once_before_another_holder_can_take() {
+        let id = OpenFileId::new(THREAD, 800);
+        let mut store = SharedOpenFileStore::default();
+        let OpenFileControlReply::Promoting { sequence } = store
+            .handle(PROCESS, THREAD, OpenFileControl::Promote { id })
+            .unwrap()
+        else {
+            panic!("promotion reply")
+        };
+        assert!(
+            store
+                .handle(PROCESS, THREAD, OpenFileControl::Promote { id })
+                .is_err()
+        );
+        assert!(
+            store
+                .handle(PROCESS, THREAD, OpenFileControl::Take { id })
+                .is_err()
+        );
+        assert!(
+            store
+                .handle(
+                    PROCESS,
+                    THREAD,
+                    OpenFileControl::TakeChunk {
+                        id,
+                        sequence,
+                        offset: 0
+                    }
+                )
+                .is_err()
+        );
+        let child = DetTid::from_raw(41);
+        let publish = OpenFileControl::PublishChunk {
+            id,
+            sequence,
+            offset: 0,
+            bytes: encode_model(&model(id, "/promoted")).unwrap(),
+            last: true,
+        };
+        assert!(store.handle(child, child, publish.clone()).is_err());
+        store.handle(PROCESS, THREAD, publish.clone()).unwrap();
+        assert!(store.handle(PROCESS, THREAD, publish).is_err());
+        assert_eq!(store.model(id).path_for_test(), Some("/promoted".into()));
+        assert!(matches!(
+            store
+                .handle(child, child, OpenFileControl::Take { id })
+                .unwrap(),
+            OpenFileControlReply::Taken { .. }
+        ));
+        assert_eq!(store.end_leases_of(child), 1);
+        assert_eq!(store.model(id).path_for_test(), Some("/promoted".into()));
+
+        let incomplete = OpenFileId::new(THREAD, 801);
+        store
+            .handle(PROCESS, THREAD, OpenFileControl::Promote { id: incomplete })
+            .unwrap();
+        assert_eq!(store.end_leases_of(PROCESS), 1);
+        assert!(!store.entries.contains_key(&incomplete));
+    }
+
+    #[test]
+    fn promotion_streams_the_existing_model_without_a_second_codec() {
+        let id = OpenFileId::new(THREAD, 802);
+        let store = Mutex::new(SharedOpenFileStore::default());
+        let channel = ChunkedOpenFileChannel::new(Direct(&store));
+        let path = format!("/{}", "p".repeat(CHUNK_LEN + 17));
+        channel.promote(&model(id, &path)).unwrap();
+        assert!(channel.promote(&model(id, "/replacement")).is_err());
+        let lease = channel.take(id).unwrap();
+        assert_eq!(lease.model.path_for_test(), Some(path.into()));
+        channel.publish(lease).unwrap();
+        assert!(channel.peak_buffered.load(Ordering::Relaxed) <= CHUNK_LEN);
     }
 
     /// Calls the store directly and records the largest model chunk any one

@@ -5199,6 +5199,10 @@ pub async fn prepare_exec<G, T>(
         initialize_inherited_stdio: false,
         initial_input: None,
         robust_wakes,
+        open_files: guest
+            .thread_state()
+            .shared_open_files_for_exec()
+            .expect("prepared exec descriptors are no longer live"),
     };
     let (_, response) =
         send_and_update_time(guest, GlobalRequest::PrepareExec(detpid, mm, fd_state)).await;
@@ -5240,6 +5244,11 @@ where
         guest.thread_state_mut().signal_task_identity = signal_identity;
     }
     if !overrides.is_empty() {
+        if let Some(open_files) = &overrides.open_files {
+            guest
+                .thread_state_mut()
+                .set_open_file_creator(open_files.creator);
+        }
         let dettid = guest.thread_state().dettid;
         let metadata = Arc::clone(&guest.thread_state().file_metadata);
         metadata
@@ -10389,6 +10398,7 @@ mod tests {
             initialize_inherited_stdio: false,
             initial_input: None,
             robust_wakes: Vec::new(),
+            open_files: None,
         };
         state.pending_exec_states.lock().unwrap().insert(
             detpid,

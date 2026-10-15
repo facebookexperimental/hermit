@@ -184,20 +184,18 @@ impl ReceiveTimeout {
 /// so a handle's state can change from `Local` to `Shared` under every alias
 /// at once, escaped clones included, because they all hold the same `Arc`.
 // The state always lives inside the one `Arc` allocation its aliases share,
-// and `Local` is every description today, so boxing it would only add a
-// second allocation to every open.
+// so boxing `Local` would add a second allocation to every open.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Serialize, Deserialize)]
 enum OpenFileState {
     /// Only this process can reach the open file description, so the model
-    /// lives here. This is every description today.
+    /// lives here until a copied runtime or new image needs a shared owner.
     Local(OpenFileDescription),
     /// Several guest processes share the open file description, so the one
     /// canonical model lives in Detcore's global state and this handle holds
     /// none. Each access takes the model through the installed
-    /// [`SharedOpenFileChannel`] and publishes it back. Nothing creates this
-    /// state yet; the cross-process promotion that does is a later step of
-    /// https://github.com/rrnewton/hermit/issues/3520.
+    /// [`SharedOpenFileChannel`] and publishes it back. Promotion precedes
+    /// native fork/exec: <https://github.com/rrnewton/hermit/issues/4381>.
     Shared(SharedOpenFile),
 }
 
@@ -266,6 +264,10 @@ impl std::error::Error for SharedOpenFileError {}
 /// each guest process installs an implementation with
 /// [`install_shared_open_file_channel`].
 pub trait SharedOpenFileChannel: Send + Sync {
+    /// Publishes the initial local model. A duplicate identity is refused.
+    /// The caller exposes shared handles only after this succeeds.
+    fn promote(&self, model: &OpenFileModel) -> Result<(), SharedOpenFileError>;
+
     /// Takes the canonical model of `id` and starts a lease on it.
     fn take(&self, id: OpenFileId) -> Result<OpenFileLease, SharedOpenFileError>;
 
@@ -592,6 +594,77 @@ fn oflags_nonblocking(flags: i32) -> bool {
 }
 
 impl DetFd {
+    /// Publish a local description before another process or image can use
+    /// it. Every escaped alias switches together under the existing mutex.
+    /// Failure leaves the local model intact and must stop the lifecycle.
+    pub(crate) fn promote(&self) -> Result<(), SharedOpenFileError> {
+        let mut state = self.open_file.lock().expect("open file mutex poisoned");
+        let OpenFileState::Local(description) = &*state else {
+            return Ok(());
+        };
+        let shared = SharedOpenFile {
+            id: description.id,
+            directory_lock: Arc::clone(&description.directory_lock),
+        };
+        let OpenFileState::Local(description) =
+            std::mem::replace(&mut *state, OpenFileState::Shared(shared))
+        else {
+            unreachable!()
+        };
+        let model = OpenFileModel(description);
+        let result = SHARED_OPEN_FILE_CHANNEL
+            .get()
+            .ok_or_else(|| SharedOpenFileError("no shared open file channel installed".into()))
+            .and_then(|channel| channel.promote(&model));
+        if result.is_err() {
+            *state = OpenFileState::Local(model.0);
+        }
+        result
+    }
+
+    pub(crate) fn is_shared(&self) -> bool {
+        matches!(
+            *self.open_file.lock().expect("open file mutex poisoned"),
+            OpenFileState::Shared(_)
+        )
+    }
+
+    /// A new process needs its own unlocked runtime lock, but the same
+    /// canonical identity. The caller interns aliases after copying the table.
+    pub(crate) fn fork_shared_handle(&self) -> Self {
+        let state = self.open_file.lock().expect("open file mutex poisoned");
+        let mut copied = self.clone();
+        if let OpenFileState::Shared(shared) = &*state {
+            copied.open_file = Arc::new(Mutex::new(OpenFileState::Shared(SharedOpenFile {
+                id: shared.id,
+                directory_lock: Arc::default(),
+            })));
+        }
+        copied
+    }
+
+    /// Restore an authenticated survivor from the existing exec handover.
+    pub(crate) fn shared_survivor(fd: RawFd, id: OpenFileId) -> Self {
+        Self {
+            fd,
+            fd_flags: 0,
+            open_file: Arc::new(Mutex::new(OpenFileState::Shared(SharedOpenFile {
+                id,
+                directory_lock: Arc::default(),
+            }))),
+        }
+    }
+
+    /// Only a copied local flock cache can become stale at fork. Shared
+    /// models retain kernel-observed lock changes without a pre-grant RPC.
+    pub(crate) fn forget_local_flock_mode_at_fork(&self) {
+        let mut state = self.open_file.lock().expect("open file mutex poisoned");
+        if let OpenFileState::Local(description) = &mut *state {
+            description.flock_mode = None;
+            description.flock_mode_known = false;
+        }
+    }
+
     /// create a new detfd from rawfd
     pub fn new(fd: RawFd, flags: OFlag, ty: FdType, id: OpenFileId) -> Self {
         let bits = flags.bits();
@@ -1460,9 +1533,8 @@ impl DetFd {
     /// opposed to having known it and then invalidated it. Used for descriptors
     /// that existed before Detcore began observing the guest.
     pub(crate) fn mark_flock_mode_unobserved(&self) {
+        self.forget_flock_mode();
         self.with_description(|description| {
-            description.flock_mode = None;
-            description.flock_mode_known = false;
             description.flock_mode_ever_known = false;
         })
     }
@@ -1518,7 +1590,7 @@ impl DetFd {
 
     /// Moves this open file description's model out to a test's canonical
     /// store and makes every alias a shared handle, keeping this process's
-    /// directory lock. The real promotion is a later step.
+    /// directory lock. Production promotion uses the acknowledged lease protocol.
     #[cfg(test)]
     fn share_for_test(&self) -> OpenFileModel {
         let mut state = self.open_file.lock().expect("open file mutex poisoned");
@@ -1536,6 +1608,11 @@ impl DetFd {
         };
         OpenFileModel(description)
     }
+}
+
+#[cfg(test)]
+pub(crate) fn install_test_shared_open_file_channel() {
+    let _ = tests::MemoryChannel::installed();
 }
 
 #[cfg(test)]
@@ -1992,7 +2069,7 @@ mod tests {
     /// the channel installed for this test process. Each test uses its own
     /// creator task, so tests running in parallel never share a description.
     #[derive(Default)]
-    struct MemoryChannel {
+    pub(super) struct MemoryChannel {
         store: Mutex<std::collections::HashMap<OpenFileId, Canonical>>,
     }
 
@@ -2006,6 +2083,23 @@ mod tests {
     struct InstalledMemoryChannel(&'static MemoryChannel);
 
     impl SharedOpenFileChannel for InstalledMemoryChannel {
+        fn promote(&self, model: &OpenFileModel) -> Result<(), SharedOpenFileError> {
+            let mut store = self.0.store.lock().unwrap();
+            if store.contains_key(&model.id()) {
+                return Err(SharedOpenFileError("duplicate test promotion".into()));
+            }
+            let copied = serde_json::from_value(serde_json::to_value(model).unwrap()).unwrap();
+            store.insert(
+                model.id(),
+                Canonical {
+                    model: Some(copied),
+                    sequence: 0,
+                    takes: 0,
+                },
+            );
+            Ok(())
+        }
+
         fn take(&self, id: OpenFileId) -> Result<OpenFileLease, SharedOpenFileError> {
             let mut store = self.0.store.lock().unwrap();
             let canonical = store
@@ -2041,7 +2135,7 @@ mod tests {
     }
 
     impl MemoryChannel {
-        fn installed() -> &'static MemoryChannel {
+        pub(super) fn installed() -> &'static MemoryChannel {
             static CHANNEL: OnceLock<MemoryChannel> = OnceLock::new();
             let channel = CHANNEL.get_or_init(MemoryChannel::default);
             // Only the first installation is kept, and it is this channel.
@@ -2098,6 +2192,85 @@ mod tests {
         );
         assert_eq!(channel.takes(id), 4);
         assert_eq!(original.open_file_alias_count(), 3);
+    }
+
+    #[test]
+    fn promoted_fork_handles_keep_one_cursor_without_pregrant_access() {
+        let channel = MemoryChannel::installed();
+        let id = OpenFileId::new(DetTid::from_raw(9010), 0);
+        let parent = DetFd::new(3, OFlag::O_RDONLY, FdType::Rng, id);
+        let alias = parent.clone().with_fd(4).with_fd_flags(OFlag::O_CLOEXEC);
+        parent
+            .with_random_device_stream::<Errno>(|offset| {
+                assert_eq!(offset, 0);
+                Ok(7)
+            })
+            .unwrap();
+        parent.set_flock_mode(Some(libc::LOCK_SH));
+        parent.promote().unwrap();
+        alias.promote().unwrap(); // The escaped alias does not publish twice.
+        let takes = channel.takes(id);
+        let lock = parent.directory_lock();
+        let held = lock.try_lock().unwrap();
+        let child = alias.fork_shared_handle();
+        child.forget_local_flock_mode_at_fork();
+        assert_eq!(
+            channel.takes(id),
+            takes,
+            "child metadata construction must be RPC-free"
+        );
+        assert!(child.directory_lock().try_lock().is_some());
+        assert!(child.is_cloexec());
+        assert_eq!(child.known_flock_mode(), Some(Some(libc::LOCK_SH)));
+        child
+            .with_random_device_stream::<Errno>(|offset| {
+                assert_eq!(offset, 7);
+                Ok(5)
+            })
+            .unwrap();
+        parent
+            .with_random_device_stream::<Errno>(|offset| {
+                assert_eq!(offset, 12);
+                Ok(3)
+            })
+            .unwrap();
+        assert_eq!(
+            child.with_random_device_stream::<Errno>(|offset| {
+                assert_eq!(offset, 15);
+                Err(Errno::EFAULT)
+            }),
+            Err(Errno::EFAULT)
+        );
+        child.set_flock_mode(None);
+        assert_eq!(parent.known_flock_mode(), Some(None));
+        drop(child);
+        let successor = DetFd::shared_survivor(3, id);
+        successor
+            .with_random_device_stream::<Errno>(|offset| {
+                assert_eq!(offset, 15);
+                Ok(0)
+            })
+            .unwrap();
+        let reopened = DetFd::new(
+            3,
+            OFlag::O_RDONLY,
+            FdType::Rng,
+            OpenFileId::new(DetTid::from_raw(9010), 1),
+        );
+        reopened.promote().unwrap();
+        reopened
+            .with_random_device_stream::<Errno>(|offset| {
+                assert_eq!(offset, 0);
+                Ok(1)
+            })
+            .unwrap();
+        successor
+            .with_random_device_stream::<Errno>(|offset| {
+                assert_eq!(offset, 15);
+                Ok(0)
+            })
+            .unwrap();
+        drop(held);
     }
 
     #[test]

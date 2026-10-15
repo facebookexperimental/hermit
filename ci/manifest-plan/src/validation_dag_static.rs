@@ -2241,7 +2241,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and only_a_lone_anonymous_page_is_taken_for_a_staging_page: 1661, by
     // listing.
     // And +26 from the discarded-at-send record (https://github.com/rrnewton/hermit/issues/4293): 1687, listed.
-    ("test.detcore_unit", 1687),
+    // And +6 from a3133b84: 1693.
+    ("test.detcore_unit", 1693),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3765,7 +3766,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the ten polled-FIFO-open scheduler tests and the two staging-page
     // tests: 1661.
     // And +26 from the discarded-at-send record (https://github.com/rrnewton/hermit/issues/4293): 1687, listed.
-    ("test.detcore_unit_on_host", 1687),
+    // And +6 from a3133b84: 1693.
+    ("test.detcore_unit_on_host", 1693),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

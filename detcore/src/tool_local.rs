@@ -87,6 +87,10 @@ pub struct FileMetadata {
     /// Socket-only sequence used for backend-independent socket cookies.
     #[serde(default)]
     next_socket_open_file_sequence: u64,
+    /// A random-device OFD from this table has been promoted. Retain this
+    /// history after its final close so exec cannot reuse a canonical identity.
+    #[serde(default)]
+    has_promoted_random_files: bool,
     /// Track what file handles actually point to (e.g. after dup2).
     /// This includes both the identifying resource (usually inode) and the deterministic file handle.
     /// Deserialization restores aliasing (`crate::fd::intern_open_files`).
@@ -204,6 +208,69 @@ pub struct ExecFdState {
     /// its point of no return (<https://github.com/rrnewton/hermit/issues/4268>).
     #[serde(default)]
     pub(crate) robust_wakes: Vec<(DetTid, FutexID)>,
+    /// Promoted random-device handles and allocator state of a reloaded tool.
+    /// Nonrandom descriptors retain their existing exec restoration paths.
+    #[serde(default)]
+    pub(crate) open_files: Option<ExecOpenFiles>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ExecOpenFiles {
+    pub(crate) creator: DetTid,
+    next_sequence: u64,
+    next_socket_sequence: u64,
+    handles: BTreeMap<RawFd, ExecOpenFile>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ExecOpenFile {
+    id: OpenFileId,
+    dev: u64,
+    ino: u64,
+    rdev: u64,
+    file_type: u32,
+    access: i32,
+}
+
+impl std::fmt::Debug for ExecOpenFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecOpenFile")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ExecOpenFile {
+    fn capture(fd: RawFd, id: OpenFileId) -> Result<Self, Errno> {
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        // Runtime-owned read-only inspection of this process's descriptor table.
+        let result = unsafe {
+            crate::util::raw_syscall(
+                libc::SYS_fstat,
+                [fd as u64, (&raw mut stat) as u64, 0, 0, 0, 0],
+            )
+        };
+        if result < 0 {
+            return Err(Errno::new(-result as i32));
+        }
+        let flags = unsafe {
+            crate::util::raw_syscall(
+                libc::SYS_fcntl,
+                [fd as u64, libc::F_GETFL as u64, 0, 0, 0, 0],
+            )
+        };
+        if flags < 0 {
+            return Err(Errno::new(-flags as i32));
+        }
+        Ok(Self {
+            id,
+            dev: stat.st_dev,
+            ino: stat.st_ino,
+            rdev: stat.st_rdev,
+            file_type: stat.st_mode & libc::S_IFMT,
+            access: flags as i32 & libc::O_ACCMODE,
+        })
+    }
 }
 
 impl ExecFdState {
@@ -212,6 +279,7 @@ impl ExecFdState {
             && self.inherited_reads.is_empty()
             && !self.initialize_inherited_stdio
             && self.initial_input.is_none()
+            && self.open_files.is_none()
     }
 }
 
@@ -579,6 +647,7 @@ impl FileMetadata {
             files_id: FilesId::initial(owner),
             next_open_file_sequence: 0,
             next_socket_open_file_sequence: 0,
+            has_promoted_random_files: false,
             file_handles: HashMap::new(),
             accept_waits: Vec::new(),
             next_accept_wait: 0,
@@ -661,42 +730,25 @@ impl FileMetadata {
 
     fn forget_flock_modes(&self) {
         for detfd in self.file_handles.values() {
-            detfd.forget_flock_mode();
+            detfd.forget_local_flock_mode_at_fork();
         }
     }
 
     // TODO-HUMAN-REVIEW(#2373)
     /// Fork the file table for `child`.
     ///
-    /// FORGETTING IS DELIBERATELY *NOT* DONE HERE, and the reason is that this
-    /// fork does not produce a second copy of the cache. `DetFd` holds its
-    /// `OpenFileDescription` behind an `Arc<Mutex<..>>`, so `file_handles
-    /// .clone()` below hands the child the *same* description objects the
-    /// parent holds. That mirrors the kernel, where `fork(2)` duplicates the
-    /// descriptor table while both tables keep pointing at one open file
-    /// description, and an `flock(2)` lock belongs to that description. A
-    /// `flock` through either task therefore mutates the one shared record and
-    /// both sides observe it; there is no second copy that could go stale, so
-    /// invalidating here destroys correct information and buys nothing.
-    ///
-    /// The case that genuinely needs invalidation is a *separately hosted* tool
-    /// state — a real process clone under DBT, where the in-process runtime is
-    /// copied into a new address space and the `Arc` stops being shared. That
-    /// is handled at its own boundary, by
-    /// `reverie_dbt_runtime_process_clone_result`, which calls
-    /// `forget_flock_modes` only on a clone the kernel reported as successful.
-    ///
-    /// Forgetting here as well was not merely redundant, it was harmful: it
-    /// marked every descriptor unknown on any fork, and
-    /// `has_unsafe_vfork_flock_state` refuses `vfork` on unknown as well as on
-    /// held. So any guest that forked and later vforked was refused even when
-    /// it had never called `flock` at all.
+    /// Local flock caches retain the existing conservative invalidation.
+    /// A promoted description has one canonical model, so copying a table
+    /// neither invalidates that model nor contacts it before child admission.
+    /// Same-process aliases keep their lock; a separately hosted runtime
+    /// resets copied locks at its physical child boundary.
     pub(crate) fn fork_for(&self, child: DetTid) -> Self {
         self.forget_flock_modes();
         Self {
             files_id: FilesId::forked(child),
             next_open_file_sequence: self.next_open_file_sequence,
             next_socket_open_file_sequence: self.next_socket_open_file_sequence,
+            has_promoted_random_files: self.has_promoted_random_files,
             file_handles: self.file_handles.clone(),
             accept_waits: Vec::new(),
             next_accept_wait: 0,
@@ -708,6 +760,7 @@ impl FileMetadata {
             files_id: self.files_id.for_exec(task),
             next_open_file_sequence: self.next_open_file_sequence,
             next_socket_open_file_sequence: self.next_socket_open_file_sequence,
+            has_promoted_random_files: self.has_promoted_random_files,
             file_handles: self
                 .file_handles
                 .iter()
@@ -864,6 +917,19 @@ impl FileMetadata {
         state: ExecFdState,
         shared_guest_table: bool,
     ) -> Result<(), Errno> {
+        // Legacy discovery also allocates IDs. Reserve the complete old
+        // namespace before it can create any nonrandom descriptions, including
+        // same-leader exec where the creator did not change.
+        let owner = if shared_guest_table && let Some(open_files) = &state.open_files {
+            self.next_open_file_sequence =
+                self.next_open_file_sequence.max(open_files.next_sequence);
+            self.next_socket_open_file_sequence = self
+                .next_socket_open_file_sequence
+                .max(open_files.next_socket_sequence);
+            open_files.creator
+        } else {
+            owner
+        };
         self.apply_exec_blocking_overrides(owner, state.blocking);
         if !shared_guest_table {
             return Ok(());
@@ -875,6 +941,21 @@ impl FileMetadata {
             self.discover_inherited_terminals(0..=2);
         } else {
             self.restore_inherited_reads(owner, state.inherited_reads)?;
+        }
+        if let Some(open_files) = state.open_files {
+            let mut handles = HashMap::new();
+            for (fd, survivor) in open_files.handles {
+                if ExecOpenFile::capture(fd, survivor.id)? != survivor {
+                    return Err(Errno::EIO);
+                }
+                handles.insert(fd, DetFd::shared_survivor(fd, survivor.id));
+            }
+            crate::fd::intern_open_files(&mut handles);
+            // Replace only the authenticated random-device survivors. Pipes,
+            // sockets and other descriptors retain the legacy restoration above;
+            // in particular, do not reconnect an old socket's port association.
+            self.file_handles.extend(handles);
+            self.has_promoted_random_files = true;
         }
         Ok(())
     }
@@ -1357,6 +1438,300 @@ mod file_metadata_tests {
     use std::os::fd::AsRawFd;
 
     use super::*;
+
+    #[test]
+    fn shared_exec_survivors_keep_aliases_and_allocator_after_closed_high_ids() {
+        crate::fd::install_test_shared_open_file_channel();
+        let creator = DetTid::from_raw(9011);
+        let leader = DetTid::from_raw(9012);
+        let config = Config::default();
+        let mut parent = ThreadState::new(creator, &config, ());
+        parent.set_open_file_creator(creator);
+        parent.metadata().file_handles.clear();
+        let file = std::fs::File::open("/dev/urandom").unwrap();
+        let alias = nix::unistd::dup(&file).unwrap();
+        let distinct = std::fs::File::open("/dev/urandom").unwrap();
+        let cloexec = nix::unistd::dup(&file).unwrap();
+        let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (fd, alias_fd, distinct_fd, closed_fd, socket_fd) = (
+            file.as_raw_fd(),
+            alias.as_raw_fd(),
+            distinct.as_raw_fd(),
+            cloexec.as_raw_fd(),
+            socket.as_raw_fd(),
+        );
+        for fd in [fd, alias_fd, distinct_fd, socket_fd] {
+            assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }, 0);
+        }
+        parent
+            .add_fd(fd, OFlag::O_RDONLY, FdType::Rng, None)
+            .unwrap();
+        parent.dup_fd(fd, alias_fd, OFlag::empty()).unwrap();
+        parent.dup_fd(fd, closed_fd, OFlag::O_CLOEXEC).unwrap();
+        parent
+            .add_fd(distinct_fd, OFlag::O_RDONLY, FdType::Rng, None)
+            .unwrap();
+        parent
+            .add_fd(socket_fd, OFlag::O_RDWR, FdType::Socket, None)
+            .unwrap();
+        let first_id = parent.metadata().file_handles[&fd].open_file_id();
+        let distinct_id = parent.metadata().file_handles[&distinct_fd].open_file_id();
+        let old_socket_id = parent.metadata().file_handles[&socket_fd].open_file_id();
+        assert_ne!(
+            first_id, distinct_id,
+            "same inode does not identify one OFD"
+        );
+        parent.metadata().file_handles[&fd]
+            .with_random_device_stream::<Errno>(|offset| {
+                assert_eq!(offset, 0);
+                Ok(7)
+            })
+            .unwrap();
+        // Closed and CLOEXEC descriptions still consume allocator identities.
+        let high = parent
+            .metadata()
+            .allocate_open_file_id(creator, FdType::Rng);
+        let high_socket = parent
+            .metadata()
+            .allocate_open_file_id(creator, FdType::Socket);
+        parent.promote_random_open_files().unwrap();
+        assert!(!parent.metadata().file_handles[&socket_fd].is_shared());
+        let transfer = parent.shared_open_files_for_exec().unwrap().unwrap();
+        assert_eq!(transfer.creator, creator);
+        assert!(!transfer.handles.contains_key(&closed_fd));
+        assert!(!transfer.handles.contains_key(&socket_fd));
+        assert_eq!(transfer.handles[&fd].id, transfer.handles[&alias_fd].id);
+        // Dropping a cancelled preparation cannot change any cursor.
+        drop(transfer.clone());
+        parent.metadata().file_handles[&fd]
+            .with_random_device_stream::<Errno>(|offset| {
+                assert_eq!(offset, 7);
+                Ok(0)
+            })
+            .unwrap();
+
+        // A genuinely replaced descriptor must not acquire a survivor's ID.
+        // This owns only a duplicate, never one of the test process's stdio FDs.
+        let replacement = tempfile::tempfile().unwrap();
+        assert_eq!(
+            unsafe { libc::dup2(replacement.as_raw_fd(), alias_fd) },
+            alias_fd
+        );
+        assert_eq!(
+            FileMetadata::new(leader).apply_exec_fd_state(
+                leader,
+                ExecFdState {
+                    open_files: Some(transfer.clone()),
+                    ..ExecFdState::default()
+                },
+                true,
+            ),
+            Err(Errno::EIO),
+        );
+        assert_eq!(unsafe { libc::dup2(fd, alias_fd) }, alias_fd);
+
+        let mut successor = ThreadState::new(leader, &config, ());
+        // Preserve the new image's existing nonrandom association. The handover
+        // must not restore the old socket ID used by ReleasePort bookkeeping.
+        successor
+            .add_fd(socket_fd, OFlag::O_RDWR, FdType::Socket, None)
+            .unwrap();
+        let new_socket_id = successor.metadata().file_handles[&socket_fd].open_file_id();
+        assert_ne!(old_socket_id, new_socket_id);
+        let stdio_ids: Vec<_> = (0..=2)
+            .map(|fd| successor.metadata().file_handles[&fd].open_file_id())
+            .collect();
+        successor.set_open_file_creator(transfer.creator);
+        successor
+            .metadata()
+            .apply_exec_fd_state(
+                creator,
+                ExecFdState {
+                    open_files: Some(transfer),
+                    ..ExecFdState::default()
+                },
+                true,
+            )
+            .unwrap();
+        assert!(!successor.metadata().file_handles.contains_key(&closed_fd));
+        assert_eq!(
+            successor.metadata().file_handles[&socket_fd].open_file_id(),
+            new_socket_id
+        );
+        assert!(!successor.metadata().file_handles[&socket_fd].is_shared());
+        assert_eq!(
+            (0..=2)
+                .map(|fd| successor.metadata().file_handles[&fd].open_file_id())
+                .collect::<Vec<_>>(),
+            stdio_ids
+        );
+        successor.metadata().file_handles[&alias_fd]
+            .with_random_device_stream::<Errno>(|offset| {
+                assert_eq!(offset, 7);
+                Ok(5)
+            })
+            .unwrap();
+        parent.metadata().file_handles[&fd]
+            .with_random_device_stream::<Errno>(|offset| {
+                assert_eq!(offset, 12);
+                Ok(0)
+            })
+            .unwrap();
+        successor.metadata().file_handles[&distinct_fd]
+            .with_random_device_stream::<Errno>(|offset| {
+                assert_eq!(offset, 0);
+                Ok(0)
+            })
+            .unwrap();
+        successor.remove_fd(fd);
+        successor
+            .add_fd(fd, OFlag::O_RDONLY, FdType::Rng, None)
+            .unwrap();
+        let reopened = successor.metadata().file_handles[&fd].open_file_id();
+        assert_ne!(reopened, first_id);
+        assert_ne!(reopened, high);
+        assert_eq!(
+            reopened,
+            OpenFileId::new(creator, successor.metadata().next_open_file_sequence - 1)
+        );
+        assert_ne!(
+            successor
+                .metadata()
+                .allocate_open_file_id(creator, FdType::Socket),
+            high_socket
+        );
+        successor.promote_random_open_files().unwrap();
+        let second = successor.shared_open_files_for_exec().unwrap().unwrap();
+        assert_eq!(
+            second.creator, creator,
+            "nonleader creator survives repeated exec"
+        );
+        let mut again = FileMetadata::new(leader);
+        again
+            .apply_exec_fd_state(
+                creator,
+                ExecFdState {
+                    open_files: Some(second),
+                    ..ExecFdState::default()
+                },
+                true,
+            )
+            .unwrap();
+        assert_eq!(again.file_handles[&fd].open_file_id(), reopened);
+        again.file_handles[&alias_fd]
+            .with_random_device_stream::<Errno>(|offset| {
+                assert_eq!(offset, 12);
+                Ok(0)
+            })
+            .unwrap();
+
+        // No surviving RNG descriptor does not mean its old identities are free.
+        for fd in [fd, alias_fd, distinct_fd] {
+            successor.remove_fd(fd);
+        }
+        let empty = successor.shared_open_files_for_exec().unwrap().unwrap();
+        assert!(empty.handles.is_empty());
+        let next_sequence = empty.next_sequence;
+        let mut after_close = ThreadState::new(leader, &config, ());
+        after_close.set_open_file_creator(empty.creator);
+        after_close
+            .metadata()
+            .apply_exec_fd_state(
+                creator,
+                ExecFdState {
+                    open_files: Some(empty),
+                    ..ExecFdState::default()
+                },
+                true,
+            )
+            .unwrap();
+        after_close
+            .add_fd(fd, OFlag::O_RDONLY, FdType::Rng, None)
+            .unwrap();
+        assert_eq!(
+            after_close.metadata().file_handles[&fd].open_file_id(),
+            OpenFileId::new(creator, next_sequence)
+        );
+        // The canonical store still owns all old models: reusing an ID refuses.
+        after_close.promote_random_open_files().unwrap();
+    }
+
+    #[test]
+    fn shared_random_promotion_leaves_nonrandom_tables_local() {
+        let state = ThreadState::new(DetTid::from_raw(9013), &Config::default(), ());
+        let regular = tempfile::tempfile().unwrap();
+        let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        state
+            .add_fd(regular.as_raw_fd(), OFlag::O_RDWR, FdType::Regular, None)
+            .unwrap();
+        state
+            .add_fd(socket.as_raw_fd(), OFlag::O_RDWR, FdType::Socket, None)
+            .unwrap();
+        let before: HashMap<_, _> = state
+            .metadata()
+            .file_handles
+            .iter()
+            .map(|(&fd, handle)| (fd, handle.open_file_id()))
+            .collect();
+        state.promote_random_open_files().unwrap();
+        assert!(state.shared_open_files_for_exec().unwrap().is_none());
+        for (fd, id) in before {
+            let metadata = state.metadata();
+            let handle = &metadata.file_handles[&fd];
+            assert!(!handle.is_shared());
+            assert_eq!(handle.open_file_id(), id);
+        }
+    }
+
+    #[test]
+    fn shared_exec_restores_allocator_before_legacy_pipe_discovery() {
+        crate::fd::install_test_shared_open_file_channel();
+        let owner = DetTid::from_raw(9014);
+        let config = Config::default();
+        let parent = ThreadState::new(owner, &config, ());
+        let random = std::fs::File::open("/dev/random").unwrap();
+        let fd = random.as_raw_fd();
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }, 0);
+        parent
+            .add_fd(fd, OFlag::O_RDONLY, FdType::Rng, None)
+            .unwrap();
+        parent.promote_random_open_files().unwrap();
+        let transfer = parent.shared_open_files_for_exec().unwrap().unwrap();
+        let random_id = transfer.handles[&fd].id;
+        let old_next = transfer.next_sequence;
+        let (pipe, _writer) = nix::unistd::pipe2(OFlag::O_NONBLOCK).unwrap();
+        let pipe_fd = pipe.as_raw_fd();
+        let successor = ThreadState::new(owner, &config, ());
+        successor
+            .metadata()
+            .apply_exec_fd_state(
+                owner,
+                ExecFdState {
+                    blocking: [pipe_fd].into_iter().collect(),
+                    open_files: Some(transfer),
+                    ..ExecFdState::default()
+                },
+                true,
+            )
+            .unwrap();
+        let mut metadata = successor.metadata();
+        let pipe_id = metadata.file_handles[&pipe_fd].open_file_id();
+        assert_eq!(pipe_id, OpenFileId::new(owner, old_next));
+        assert_ne!(pipe_id, random_id);
+        assert_eq!(metadata.file_handles[&pipe_fd].ty(), FdType::Pipe);
+        assert!(!metadata.file_handles[&pipe_fd].is_nonblocking());
+        assert!(metadata.file_handles[&pipe_fd].physically_nonblocking());
+        assert!(!metadata.file_handles[&pipe_fd].is_shared());
+        assert_eq!(metadata.file_handles[&fd].open_file_id(), random_id);
+        assert_ne!(
+            metadata.allocate_open_file_id(owner, FdType::Regular),
+            pipe_id
+        );
+        // Interning must never merge the unrelated restored pipe and RNG.
+        crate::fd::intern_open_files(&mut metadata.file_handles);
+        assert_eq!(metadata.file_handles[&pipe_fd].ty(), FdType::Pipe);
+        assert_eq!(metadata.file_handles[&fd].ty(), FdType::Rng);
+    }
 
     fn terminal_pair() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
         use std::os::fd::FromRawFd;
@@ -3793,7 +4168,10 @@ impl<T> ThreadState<T> {
     {
         let mut metadata = self.metadata();
         if self.tool_shares_guest_descriptor_table {
-            metadata.discover_fd_from_current_process(self.dettid, fd)?;
+            metadata.discover_fd_from_current_process(
+                self.open_file_creator.unwrap_or(self.dettid),
+                fd,
+            )?;
         }
         metadata.with_detfd(fd, f)
     }
@@ -3802,6 +4180,66 @@ impl<T> ThreadState<T> {
     /// replaces an in-process tool and its descriptor metadata.
     pub fn exec_blocking_overrides(&self) -> ExecFdBlockingOverrides {
         self.metadata().exec_blocking_overrides()
+    }
+
+    /// Promote random-device OFDs before a backend physically copies or
+    /// replaces its in-process Tool. The existing shared model owns their full
+    /// state, including the cursor; this does not promote sockets or other OFDs.
+    /// Call only while this task owns its serial grant, before the native
+    /// lifecycle operation can expose a child/new image. Ptrace's host-side Arc
+    /// needs no promotion. See <https://github.com/rrnewton/hermit/issues/4381>.
+    pub fn promote_random_open_files(&self) -> Result<(), crate::fd::SharedOpenFileError> {
+        let mut metadata = self.metadata();
+        let mut fds: Vec<_> = metadata.file_handles.keys().copied().collect();
+        fds.sort_unstable();
+        for fd in fds {
+            let handle = &metadata.file_handles[&fd];
+            if handle.ty() == FdType::Rng {
+                handle.promote()?;
+                // Keep history even if every promoted descriptor later closes.
+                metadata.has_promoted_random_files = true;
+            }
+        }
+        Ok(())
+    }
+
+    /// Rebuild only process-local locks after a physical process copy. This
+    /// is RPC-free and precedes the child's first scheduler admission. Ordinary
+    /// same-process table clones retain their original shared locks.
+    pub fn reset_copied_open_file_locks(&self) {
+        let mut metadata = self.metadata();
+        let mut handles = metadata
+            .file_handles
+            .iter()
+            .map(|(&fd, handle)| (fd, handle.fork_shared_handle()))
+            .collect();
+        crate::fd::intern_open_files(&mut handles);
+        metadata.file_handles = handles;
+    }
+
+    pub(crate) fn shared_open_files_for_exec(&self) -> Result<Option<ExecOpenFiles>, Errno> {
+        let metadata = self.metadata();
+        if !metadata.has_promoted_random_files {
+            return Ok(None);
+        }
+        let mut handles = BTreeMap::new();
+        for (&fd, handle) in &metadata.file_handles {
+            if !handle.is_shared() || handle.is_cloexec() {
+                continue;
+            }
+            assert_eq!(
+                handle.ty(),
+                FdType::Rng,
+                "only random OFDs are promoted here"
+            );
+            handles.insert(fd, ExecOpenFile::capture(fd, handle.open_file_id())?);
+        }
+        Ok(Some(ExecOpenFiles {
+            creator: self.open_file_creator.unwrap_or(self.dettid),
+            next_sequence: metadata.next_open_file_sequence,
+            next_socket_sequence: metadata.next_socket_open_file_sequence,
+            handles,
+        }))
     }
 
     pub(crate) fn inherited_reads_for_exec(
@@ -3902,7 +4340,10 @@ impl<T> ThreadState<T> {
     ) -> Result<Option<OpenFileId>, Errno> {
         let mut metadata = self.metadata();
         if self.tool_shares_guest_descriptor_table {
-            metadata.discover_fd_from_current_process(self.dettid, oldfd)?;
+            metadata.discover_fd_from_current_process(
+                self.open_file_creator.unwrap_or(self.dettid),
+                oldfd,
+            )?;
         }
         metadata.dup_fd(oldfd, newfd, flags)
     }
@@ -3921,7 +4362,10 @@ impl<T> ThreadState<T> {
     ) -> Result<CapturedDetFd, Errno> {
         let mut metadata = self.metadata();
         if self.tool_shares_guest_descriptor_table {
-            metadata.discover_fd_from_current_process(self.dettid, pidfd)?;
+            metadata.discover_fd_from_current_process(
+                self.open_file_creator.unwrap_or(self.dettid),
+                pidfd,
+            )?;
         }
         let (is_pidfd, target) = metadata.with_detfd(pidfd, |detfd| {
             (matches!(detfd.ty(), FdType::Pidfd), detfd.pidfd_target())
@@ -3933,7 +4377,10 @@ impl<T> ThreadState<T> {
             return Err(Errno::EOPNOTSUPP);
         }
         if self.tool_shares_guest_descriptor_table {
-            metadata.discover_fd_from_current_process(self.dettid, targetfd)?;
+            metadata.discover_fd_from_current_process(
+                self.open_file_creator.unwrap_or(self.dettid),
+                targetfd,
+            )?;
         }
         metadata.capture_fd(targetfd)
     }
