@@ -26068,10 +26068,11 @@ const SCOPE_REEXEC_HISTORY_ESTIMATE_FILE: &str = "scope-reexec-history-estimate.
 /// line. When the lookup cannot happen (`cache_lookup_admissible` is false:
 /// every `full` run, any dirty tree, `--ignore-cache`, a nested payload), the
 /// read bought only that line. Measured on the coordinator's full validations
-/// of 2026-10-14 (devbig014, a 951 MB ledger): 386 s of one core with the
-/// streamed reader, then 65-80 s with the row replay cache, mostly this
-/// driver parsing 2 GB of projected rows. Such a pass now reads nothing and
-/// prints `LEDGER_NOT_READ_ESTIMATE`; its scope re-exec inherits that text.
+/// of 2026-10-14 (a 951 MB ledger; host in docs/TESTING_ENVIRONMENTS.md):
+/// 386 s of one core with the streamed reader, then 65-80 s with the row
+/// replay cache, mostly this driver parsing 2 GB of projected rows. Such a
+/// pass now reads nothing and prints `LEDGER_NOT_READ_ESTIMATE`; its scope
+/// re-exec inherits that text.
 struct PassLedgerHistory {
     rows: Vec<serde_json::Value>,
     /// Whether this pass performs the tree-keyed cache lookup.
