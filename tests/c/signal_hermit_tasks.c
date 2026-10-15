@@ -32,16 +32,21 @@
  *   newborn N    A sibling thread tgkills each of N new threads as soon as the
  *                kernel publishes its tid (CLONE_PARENT_SETTID), before the
  *                creating clone returns; no send may fail. The new threads
- *                start with SIGUSR1 blocked.
+ *                start with SIGUSR1 blocked, and each lives until the send
+ *                to it has been answered and checks that the signal is pending
+ *                for it: a send answered 0 that left nothing pending (dropped
+ *                as one to Hermit) does not count as delivered.
  */
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <errno.h>
+#include <linux/futex.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdatomic.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -263,7 +268,10 @@ static int nested(int with_kill) {
 
 static _Atomic int newborn_tid;
 static _Atomic int round_done;
-static _Atomic int newborn_done;
+/* Nonzero while the round's thread lives; the kernel clears it when the thread
+ * has left user space for good (CLONE_CHILD_CLEARTID) and wakes its futex. */
+static _Atomic int newborn_alive;
+static _Atomic int pending_at_exit;
 static int sent, refused, failed;
 
 static void* newborn_killer(void* arg) {
@@ -287,11 +295,22 @@ static void* newborn_killer(void* arg) {
   return NULL;
 }
 
+/* Lives until the killer has had round `arg`'s answer: a thread that ended
+ * first is gone, and Linux answers a send to it ESRCH. A fixed lifetime was
+ * not enough: a send delayed past it, by host load or by tracing, failed
+ * (https://github.com/rrnewton/hermit/issues/4434). */
 static int newborn_body(void* arg) {
-  (void)arg;
+  int round = (int)(intptr_t)arg;
   struct timespec ts = {0, 20 * 1000 * 1000};
   syscall(SYS_nanosleep, &ts, NULL);
-  atomic_store(&newborn_done, 1);
+  struct timespec tick = {0, 1000 * 1000};
+  while (atomic_load(&round_done) < round) {
+    syscall(SYS_nanosleep, &tick, NULL);
+  }
+  sigset_t pending;
+  if (sigpending(&pending) == 0 && sigismember(&pending, SIGUSR1)) {
+    atomic_fetch_add(&pending_at_exit, 1);
+  }
   return 0;
 }
 
@@ -377,25 +396,27 @@ static int newborn(int rounds) {
   size_t size = 1 << 16;
   char* stack = malloc(size);
   for (int r = 1; r <= rounds; r++) {
-    atomic_store(&newborn_done, 0);
+    atomic_store(&newborn_alive, 1);
     int tid = clone(newborn_body, stack + size,
                     CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD |
-                        CLONE_SYSVSEM | CLONE_PARENT_SETTID,
-                    NULL, (int*)&newborn_tid);
+                        CLONE_SYSVSEM | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID,
+                    (void*)(intptr_t)r, (int*)&newborn_tid, NULL, (int*)&newborn_alive);
     if (tid < 0) {
       report("clone", tid);
       return 1;
     }
     while (atomic_load(&round_done) != r) {
     }
-    while (atomic_load(&newborn_done) == 0) {
+    /* Reuse the stack only once the thread is off it, as pthread_join
+     * waits. */
+    int alive;
+    while ((alive = atomic_load(&newborn_alive)) != 0) {
+      syscall(SYS_futex, (int*)&newborn_alive, FUTEX_WAIT, alive, NULL, NULL, 0);
     }
-    /* Let the thread finish exiting before its stack is reused. */
-    struct timespec ts = {0, 2 * 1000 * 1000};
-    nanosleep(&ts, NULL);
   }
   pthread_join(killer, NULL);
-  printf("tgkill(newborn): sent %d, ESRCH %d, other %d\n", sent, refused, failed);
+  printf("tgkill(newborn): sent %d, ESRCH %d, other %d, pending at exit %d\n", sent, refused,
+         failed, atomic_load(&pending_at_exit));
   return 0;
 }
 

@@ -30114,7 +30114,12 @@ fn a_nested_pid_namespace_signals_its_own_tasks() {
 /// `CLONE_PARENT_SETTID`) before Detcore registers it, and a sibling's
 /// `tgkill` of it in that window must be delivered, not taken for a signal to
 /// Hermit. An earlier fix for https://github.com/rrnewton/hermit/issues/4066
-/// answered about 10 of 200 such sends ESRCH. Each of 200 sends must succeed.
+/// answered about 10 of 200 such sends ESRCH. Each of 200 sends must succeed
+/// and leave the signal pending for its thread, which blocks it: a send taken
+/// for one to Hermit is answered 0 too, but nothing is pending. Each new thread
+/// lives until its send has been answered: with a fixed 20 ms life, a send
+/// delayed past it (host load, or tracing) found the thread gone, which Linux
+/// too answers ESRCH (https://github.com/rrnewton/hermit/issues/4434).
 /// The guest's threads spin, so PMU preemption is off: a late timer interrupt
 /// would refuse the run, and nothing here needs one.
 #[test]
@@ -30124,7 +30129,7 @@ fn a_signal_to_a_newborn_thread_is_never_taken_for_hermits() {
             &["--no-sequentialize-threads", "--max-timeslice=disabled"],
             &["newborn", "200"],
         ),
-        "tgkill(newborn): sent 200, ESRCH 0, other 0\n"
+        "tgkill(newborn): sent 200, ESRCH 0, other 0, pending at exit 200\n"
     );
 }
 
