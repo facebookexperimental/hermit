@@ -368,6 +368,10 @@ fn prctl_keepcaps_round_trips_deterministically() {
     });
 }
 
+#[cfg_attr(
+    fbcode_build,
+    ignore = "fbsource-disabled: sandcastle-env: /proc/<pid>/timerslack_ns is not writable"
+)]
 #[test]
 fn timer_slack_prctl_and_procfs_share_virtual_state() {
     const DEFAULT_TIMER_SLACK_NS: libc::c_int = 50_000;
@@ -497,6 +501,10 @@ fn timer_slack_prctl_and_procfs_share_virtual_state() {
     });
 }
 
+#[cfg_attr(
+    fbcode_build,
+    ignore = "fbsource-disabled: sandcastle-env: /proc/<pid>/timerslack_ns is not writable"
+)]
 #[test]
 fn timer_slack_procfs_vector_io_matches_linux() {
     det_test_fn_sequential_without_pmu_at_standard(|| unsafe {
@@ -683,6 +691,10 @@ fn timer_slack_procfs_vector_io_matches_linux() {
     });
 }
 
+#[cfg_attr(
+    fbcode_build,
+    ignore = "fbsource-disabled: sandcastle-env: /proc/<pid>/timerslack_ns is not writable"
+)]
 #[test]
 fn timer_slack_procfs_binds_target_at_open() {
     det_test_fn_sequential_without_pmu_at_standard(|| unsafe {
@@ -778,6 +790,10 @@ fn timer_slack_procfs_binds_target_at_open() {
     });
 }
 
+#[cfg_attr(
+    fbcode_build,
+    ignore = "fbsource-disabled: sandcastle-env: /proc/<pid>/timerslack_ns is not writable"
+)]
 #[test]
 fn timer_slack_is_mediated_under_passthru_opt() {
     let config = detcore::Config {
