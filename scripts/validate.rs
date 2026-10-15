@@ -12008,7 +12008,12 @@ const EXPECTED_SHARED_INTEGRATION_TESTS: [(&str, &[&str]); 2] = [
         &["privileged-test.pmu_buck_chaos_cases", "test.hermit_modes"],
     ),
 ];
-const SHARED_INTEGRATION_TEST_BUILDER: &str = "privileged-build.privileged_tests";
+// privileged-build.privileged_tests does not hold these tokens. Until the
+// one-build change of 2026-09-30 it relinked the shared cli and hermit_modes
+// integration binaries, which a consumer could be executing; since then it
+// only verifies the binaries build.workspace_in_pinned_root prepared
+// (`nextest-binaries.rs assert privileged`), so excluding it from the
+// consumers only made every privileged test wait behind `test.cli`.
 
 fn assert_committed_shared_integration_test_consumers(steps: &[Step]) -> Result<(), String> {
     let mut by_binary: BTreeMap<&str, Vec<String>> = BTreeMap::new();
@@ -12058,8 +12063,10 @@ fn assert_committed_shared_integration_test_serialization(
     }
     for (binary, consumers) in EXPECTED_SHARED_INTEGRATION_TESTS {
         let resource = format!("integration_test_binaries.{binary}");
-        let mut expected = vec![(SHARED_INTEGRATION_TEST_BUILDER.to_string(), 1)];
-        expected.extend(consumers.iter().map(|tag| ((*tag).to_string(), 1)));
+        let mut expected: Vec<(String, i64)> = consumers
+            .iter()
+            .map(|tag| ((*tag).to_string(), 1))
+            .collect();
         expected.sort();
         let mut actual: Vec<(String, i64)> = steps
             .iter()
@@ -31865,13 +31872,13 @@ mod shared_consumer_tests {
         extra.push(unexpected);
         assert!(assert_committed_shared_integration_test_consumers(&extra).is_err());
 
-        // Keep exact cap/demand equality, including the original shared builder
-        // and consumers as well as the newly enumerated workdir consumer.
+        // Keep exact cap/demand equality over the consumers, including the
+        // newly enumerated workdir consumer. The verifying build node holds
+        // neither token, and holding one is refused like any other change.
         for (resource, tags) in [
             (
                 "integration_test_binaries.cli",
                 vec![
-                    "privileged-build.privileged_tests",
                     "privileged-test.cli_kvm",
                     "privileged-test.pmu_cli_cases",
                     "test.cli",
@@ -31880,13 +31887,25 @@ mod shared_consumer_tests {
             ),
             (
                 "integration_test_binaries.hermit_modes",
-                vec![
-                    "privileged-build.privileged_tests",
-                    "privileged-test.pmu_buck_chaos_cases",
-                    "test.hermit_modes",
-                ],
+                vec!["privileged-test.pmu_buck_chaos_cases", "test.hermit_modes"],
             ),
         ] {
+            let mut builder_holds = full.steps.clone();
+            builder_holds
+                .iter_mut()
+                .find(|step| step.tag() == "privileged-build.privileged_tests")
+                .unwrap()
+                .hint
+                .resources
+                .insert(resource.into(), 1);
+            assert!(
+                assert_committed_shared_integration_test_serialization(
+                    &builder_holds,
+                    &full.resource_caps
+                )
+                .is_err(),
+                "the verifying build node holding {resource} was accepted"
+            );
             for tag in tags {
                 let mut missing = full.steps.clone();
                 missing

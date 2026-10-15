@@ -4015,11 +4015,10 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
             ));
         }
         let resource = format!("integration_test_binaries.{binary}");
-        let mut expected = BTreeMap::from([
-            (builder.tag(), 1),
-            (portable.to_string(), 1),
-            (privileged.to_string(), 1),
-        ]);
+        // The verifying build node holds no token: since the one-build change
+        // of 2026-09-30 it only checks the binaries the workspace prepare node
+        // made, so nothing it does can disturb a consumer.
+        let mut expected = BTreeMap::from([(portable.to_string(), 1), (privileged.to_string(), 1)]);
         if binary == "cli" {
             expected.insert("test.isolated_dbt_workdir".into(), 1);
             expected.insert("privileged-test.pmu_cli_cases".into(), 1);

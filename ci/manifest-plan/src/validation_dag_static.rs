@@ -7211,7 +7211,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"privileged-build"########,
         job: r########"privileged_tests"########,
         desc: r########"Build Hermit and the focused test binaries used by the privileged lane"########,
-        description: r########"MEM-CAP DERIVATION 2026-08-04 (follow-on to task memory-caps-must-scale-with-job-count / #1583, which MISSED this privileged-lane build node): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 on all three Cargo commands (was unset -> cargo defaulted build phases to nproc; that cc1plus fan-out is the OOM class the pin bounds; the job-pin is the actual fix). The final command prebuilds the exact cli and hermit_modes integration binaries consumed by the privileged test nodes, so their wall budgets measure test execution instead of Cargo compilation or target-lock waiting. After the bin build, the content-addressed publisher verifies source type/mode/size, hashes before and after copying, verifies the published hash and atomically updates the pointer before any later Cargo invocation can relink target/debug/hermit. This privileged lane deliberately publishes a binary-only artifact; unlike portable DBT/SaBRe/LiteInst cells, it does not consume install_pkg resources. Cap KEPT at the existing generous 8.0GiB: a warm/incremental measurement read peak_bytes~1.64GiB @j8, but that reused build.workspace artifacts and UNDER-estimates a cold from-scratch privileged build, so the 8.0GiB headroom is retained rather than tightened on an unreliable warm figure. rss_baseline=5.0GiB (scheduling reservation). hermit@b384187e."########,
+        description: r########"MEM-CAP DERIVATION 2026-08-04 (follow-on to task memory-caps-must-scale-with-job-count / #1583, which MISSED this privileged-lane build node): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 on all three Cargo commands (was unset -> cargo defaulted build phases to nproc; that cc1plus fan-out is the OOM class the pin bounds; the job-pin is the actual fix). Since the one-build change of 2026-09-30 it builds nothing: it verifies the published Hermit artifact and asserts that build.workspace_in_pinned_root prepared every integration binary the privileged nodes run (nextest-binaries.rs assert privileged), so it holds neither integration_test_binaries token and no longer waits for test.cli to release the cli one (2026-10-14: that wait put test.cli, 137 s, ahead of test.pmu_integration_cases on the critical path). This privileged lane deliberately publishes a binary-only artifact; unlike portable DBT/SaBRe/LiteInst cells, it does not consume install_pkg resources. Cap KEPT at the existing generous 8.0GiB: a warm/incremental measurement read peak_bytes~1.64GiB @j8, but that reused build.workspace artifacts and UNDER-estimates a cold from-scratch privileged build, so the 8.0GiB headroom is retained rather than tightened on an unreliable warm figure. rss_baseline=5.0GiB (scheduling reservation). hermit@b384187e."########,
         labels: &[r########"full"########],
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null && ./ci/nextest-binaries.rs assert privileged && tests_misc="$(./ci/nextest-binaries.rs executable hermit-detcore tests_misc)" || exit 1"########,
         cmdtype: CmdType::Unknown,
@@ -7223,10 +7223,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         ],
         env: &[],
         hint: HintSpec {
-            resources: &[
-                (r########"integration_test_binaries.cli"########, 1),
-                (r########"integration_test_binaries.hermit_modes"########, 1),
-            ],
+            resources: &[],
             est_duration_s: 60.0,
             rss_baseline_bytes: Some(5368709120),
             hard_mem_max_bytes: Some(8589934592),
