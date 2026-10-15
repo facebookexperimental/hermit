@@ -438,7 +438,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             return self.execute_nonblockable_fd_syscall(guest, call).await;
         }
 
-        let iovecs: Vec<(usize, usize)> = {
+        let mut iovecs: Vec<(usize, usize)> = {
             let mut raw_iovecs = vec![
                 libc::iovec {
                     iov_base: std::ptr::null_mut(),
@@ -452,18 +452,21 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .map(|iovec| (iovec.iov_base as usize, iovec.iov_len))
                 .collect()
         };
+        // Kept as a plain address: an `Addr<iovec>` is not `Send` across the
+        // awaits below.
+        let iov_raw = iov_addr.as_raw();
         let requested = iovecs.iter().try_fold(0usize, |total, (_, length)| {
             total.checked_add(*length).ok_or(Errno::EINVAL)
         })?;
         if requested > isize::MAX as usize {
             return Err(Errno::EINVAL.into());
         }
-        let target = requested.min(MAX_RW_COUNT);
+        let mut target = requested.min(MAX_RW_COUNT);
         if target == 0 {
             return self.execute_nonblockable_fd_syscall(guest, call).await;
         }
 
-        let atomic_pipe_write = target <= PIPE_BUF;
+        let mut atomic_pipe_write = target <= PIPE_BUF;
 
         tracing::trace!(
             "NonblockableSyscall: converting to nonblocking syscall (internal polling): writev"
@@ -495,32 +498,108 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         let blocked_mask_addr = stack.push(blocked_mask);
         let old_mask_addr = stack.reserve::<KernelSigset>();
+        let turn_mask_cell = stack.reserve::<KernelSigset>();
         let action_addr = stack.reserve::<KernelSigaction>();
         let _mask_guard = stack.commit()?;
-        let guest_signal_mask =
-            block_signals_for_disposition(guest, blocked_mask_addr, old_mask_addr).await?;
+        let checks_at_turn = decides_interruption_at_turn(guest, guest_signal_state_task(guest));
+        // Where the turn decides (`read_turn_signals`), the first turn is
+        // granted and read, and the first attempt made, under the guest's own
+        // mask: that attempt is the guest's own `writev`, which the backend
+        // runs as plain ptrace runs it, with every pending signal left queued
+        // in the kernel, and a copy pending at entry ends the call after it
+        // (rules 5 and 6). Only a call that goes on polling installs the
+        // private mask, through `KernelSignalWait::block`, in the same turn
+        // (`install_turn_mask`); no copy that ends the call is pending then,
+        // and one Linux discarded at send is held until the call returns.
+        // Installing it first let two such copies stop the installation, and
+        // the backend's single held slot kept only the second (the Claude
+        // implementation review of R2b-1, F2;
+        // https://github.com/rrnewton/reverie/issues/1012).
+        let mut first_turn = if checks_at_turn {
+            let status = resource_request(guest, resources.clone()).await;
+            let turn = read_turn_signals(
+                guest,
+                None,
+                committed_signals(&status),
+                NamedRealTime::ByDisposition,
+            )
+            .await?;
+            Some((status, turn))
+        } else {
+            None
+        };
+        let mut turn_wait = checks_at_turn
+            .then(|| KernelSignalWait::new(guest, 0, false, call.signal_interrupt_errno()));
+        let mut turn_mask: Option<KernelSigset> = None;
+        let guest_signal_mask = if checks_at_turn {
+            0
+        } else {
+            block_signals_for_disposition(guest, blocked_mask_addr, old_mask_addr).await?
+        };
 
         let result: Result<i64, Error> = loop {
             let written_before = written_total;
             // A cross-task signal can replace the initial scheduler request,
             // before the first physical attempt, as well as a later retry.
-            let status = resource_request(guest, resources.clone()).await;
-            let disposition = match wait_signal_disposition(
-                guest,
-                status.clone(),
-                &guest_signal_mask,
-                action_addr,
-                true,
-            )
-            .await
-            {
-                Ok(disposition) => disposition,
-                Err(error) => break Err(error),
+            let (status, turn) = match first_turn.take() {
+                Some((status, turn)) => (status, Some(turn)),
+                None => {
+                    if let Some(wait) = turn_wait.as_mut()
+                        && turn_mask.is_none()
+                    {
+                        match install_turn_mask(guest, wait, turn_mask_cell).await {
+                            Ok(mask) => turn_mask = Some(mask),
+                            Err(Error::Errno(errno)) => {
+                                break if written_total > 0 {
+                                    Ok(written_total as i64)
+                                } else {
+                                    Err(errno.into())
+                                };
+                            }
+                            Err(error) => break Err(error),
+                        }
+                    }
+                    let status = resource_request(guest, resources.clone()).await;
+                    let turn = if checks_at_turn {
+                        // A named signal counts if the guest's own mask leaves
+                        // it unblocked; the private mask keeps every such
+                        // signal pending until this read.
+                        match read_turn_signals(
+                            guest,
+                            turn_mask,
+                            committed_signals(&status),
+                            NamedRealTime::ByDisposition,
+                        )
+                        .await
+                        {
+                            Ok(turn) => Some(turn),
+                            Err(error) => break Err(error),
+                        }
+                    } else {
+                        None
+                    };
+                    (status, turn)
+                }
             };
-            if matches!(status, ResumeStatus::Signaled(_))
-                && let Some(result) = interrupted_write_result(&call, written_total, disposition)
-            {
-                break result;
+            if turn.is_none() {
+                let disposition = match wait_signal_disposition(
+                    guest,
+                    status.clone(),
+                    &guest_signal_mask,
+                    action_addr,
+                    true,
+                )
+                .await
+                {
+                    Ok(disposition) => disposition,
+                    Err(error) => break Err(error),
+                };
+                if matches!(status, ResumeStatus::Signaled(_))
+                    && let Some(result) =
+                        interrupted_write_result(&call, written_total, disposition)
+                {
+                    break result;
+                }
             }
 
             if resources.poll_attempt > 0
@@ -539,7 +618,41 @@ impl<T: RecordOrReplay> Detcore<T> {
                 };
             }
 
-            let result = if atomic_pipe_write {
+            // The first attempt of a call that decides at its turn runs under
+            // the guest's own mask, where a pending signal would stop a
+            // private injection and the backend's single held slot keeps only
+            // the last of two. So it is always the guest's own `writev`, which
+            // the backend runs with every pending signal left queued in the
+            // kernel (the Claude re-check of R2b-1, N2). Linux copies the iovec
+            // array when the call first runs, so it is read again here, in
+            // this turn, where nothing else runs before the kernel reads it;
+            // if another thread rewrote it since entry, what the later
+            // attempts write follows the array the kernel used (R1).
+            let own_first_attempt = turn_wait.is_some() && turn_mask.is_none();
+            if own_first_attempt
+                && let Some(fresh) = read_guest_iovecs(guest, iov_raw, iovecs.len())
+                && fresh != iovecs
+            {
+                tracing::debug!(
+                    "[tid {}] writev's iovec array changed since entry; its first attempt uses the new one",
+                    guest.tid()
+                );
+                if let Some(requested) = fresh
+                    .iter()
+                    .try_fold(0usize, |total, (_, length)| total.checked_add(*length))
+                    && requested <= isize::MAX as usize
+                {
+                    target = requested.min(MAX_RW_COUNT);
+                    atomic_pipe_write = target <= PIPE_BUF;
+                }
+                if let Some(scratch) = atomic_scratch_iov
+                    && let Err(errno) = write_scratch_iovecs(guest, scratch, &fresh)
+                {
+                    break Err(errno.into());
+                }
+                iovecs = fresh;
+            }
+            let result = if atomic_pipe_write && !own_first_attempt {
                 self.execute_atomic_pipe_writev_attempt(guest, call, &iovecs, atomic_scratch_iov)
                     .await
             } else {
@@ -568,6 +681,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                     if atomic_pipe_write {
                         break Ok(written_total as i64);
                     }
+                    // A short attempt filled the pipe, so the write would wait:
+                    // a wake ends it with the bytes written, decided after the
+                    // attempt, as Linux tests for room first (R2b-1 rule 6).
+                    if turn.is_some_and(|turn| turn.ends(true)) {
+                        break Ok(written_total as i64);
+                    }
                     current = match remaining_writev_segment(
                         call.fd(),
                         &iovecs,
@@ -580,6 +699,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                     };
                 }
                 Ok(0) => break Ok(written_total as i64),
+                Err(Error::Errno(Errno::EAGAIN))
+                    if turn.is_some_and(|turn| turn.ends(written_total > 0)) =>
+                {
+                    break if written_total > 0 {
+                        Ok(written_total as i64)
+                    } else {
+                        Err(call.signal_interrupt_errno().into())
+                    };
+                }
                 Err(Error::Errno(Errno::EAGAIN)) => {
                     if !atomic_pipe_write && matches!(current, Syscall::Writev(_)) {
                         current = match remaining_writev_segment(call.fd(), &iovecs, 0, target) {
@@ -606,8 +734,22 @@ impl<T: RecordOrReplay> Detcore<T> {
             record_retry_event(guest, call).await;
         };
 
-        restore_signals_after_disposition(guest, old_mask_addr).await?;
-        result
+        match turn_wait {
+            Some(mut wait) => {
+                let restored = wait.restore(guest, Some(turn_mask_cell)).await;
+                if turn_mask.is_some() {
+                    crate::tool_global::set_saved_guest_sigmask(guest, None).await;
+                }
+                match result_after_restore(restored, result) {
+                    Ok(result) => refuse_held_signal_loss(guest, Sysno::writev, result).await,
+                    Err(error) => Err(error),
+                }
+            }
+            None => {
+                restore_signals_after_disposition(guest, old_mask_addr).await?;
+                result
+            }
+        }
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -673,6 +815,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let subtool = self.cfg.recordreplay_modes.then_some(self);
         let mut current = call;
         let mut written_total = 0usize;
+        let checks_at_turn = decides_interruption_at_turn(guest, resources.signal_state_task);
 
         loop {
             let written_before = written_total;
@@ -681,17 +824,36 @@ impl<T: RecordOrReplay> Detcore<T> {
             // for a pending signal only when it must wait. After the signal,
             // the bytes written so far are returned, or the restart errno if
             // there are none.
-            let signaled = if resources.poll_attempt > 0 {
-                let status = resource_request(guest, resources.clone()).await;
+            let status = if resources.poll_attempt > 0 {
+                Some(resource_request(guest, resources.clone()).await)
+            } else {
+                None
+            };
+            // Read before every attempt, the turnless first one included
+            // (`read_turn_signals`): a copy pending at the write's own entry
+            // is decided in this slice, before the writer can yield, so a later
+            // `SIG_IGN` and a new handler cannot take it
+            // (https://github.com/rrnewton/hermit/issues/4273, R2b-1 rule 4).
+            let turn = if checks_at_turn {
+                let committed = status.as_ref().map_or(0, committed_signals);
+                Some(read_turn_signals(guest, None, committed, NamedRealTime::Woken).await?)
+            } else {
+                None
+            };
+            let signaled = if turn.is_some() {
+                false
+            } else {
                 match (&status, &disposition_scratch) {
-                    (ResumeStatus::Signaled(_), None) => true,
-                    (ResumeStatus::Signaled(_), Some((mask_addr, action_addr, _))) => {
-                        own_disposition_interrupts(guest, status, *mask_addr, *action_addr).await?
+                    (Some(ResumeStatus::Signaled(_)), None) => true,
+                    (
+                        Some(status @ ResumeStatus::Signaled(_)),
+                        Some((mask_addr, action_addr, _)),
+                    ) => {
+                        own_disposition_interrupts(guest, status.clone(), *mask_addr, *action_addr)
+                            .await?
                     }
                     _ => false,
                 }
-            } else {
-                false
             };
 
             if resources.poll_attempt > 0
@@ -728,7 +890,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                         break Err(Errno::EIO.into());
                     }
                     written_total = written_total.checked_add(written).ok_or(Errno::EIO)?;
-                    if written_total == target || signaled {
+                    // A short attempt filled the pipe, so the write would wait:
+                    // a wake ends it with the bytes written (`TurnSignals::ends`).
+                    if written_total == target || turn.map_or(signaled, |turn| turn.ends(true)) {
                         break Ok(written_total as i64);
                     }
                     let Some(buffer) = call.buf() else {
@@ -749,7 +913,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .with_len(target - written_total);
                 }
                 Ok(0) => break Ok(written_total as i64),
-                Err(Error::Errno(Errno::EAGAIN)) if signaled => {
+                Err(Error::Errno(Errno::EAGAIN))
+                    if turn.map_or(signaled, |turn| turn.ends(written_total > 0)) =>
+                {
                     break if written_total > 0 {
                         Ok(written_total as i64)
                     } else {
@@ -2089,6 +2255,8 @@ where
         // deliver is pending, so a blocked or ignored signal leaves it waiting.
         rsrc.signal_state_task = guest_signal_state_task(guest);
     }
+    let checks_at_turn = rsrc.signal_interrupt_errno() == Some(Errno::ERESTARTSYS.into_raw())
+        && decides_interruption_at_turn(guest, rsrc.signal_state_task);
 
     loop {
         let resumed = match call.into() {
@@ -2096,6 +2264,28 @@ where
                 crate::tool_global::polled_read_request(guest, read, rsrc.clone()).await
             }
             _ => resource_request(guest, rsrc.clone()).await,
+        };
+        // The turn's signals, read before its first injection
+        // (`read_turn_signals`): the timerfd publication and the real-time
+        // action below may inject, and a pending copy could stop that
+        // injection and move into the backend's held slot. Every turn reads,
+        // the first included, since a signal sent before the poll filed its
+        // first request was admitted by no drain
+        // (https://github.com/rrnewton/hermit/issues/4273). A backend's own
+        // observation of a signal (`Signaled(None)`) is trusted as it is: that
+        // signal has already left the kernel's queue.
+        let turn = if checks_at_turn && !matches!(resumed, ResumeStatus::Signaled(None)) {
+            Some(
+                read_turn_signals(
+                    guest,
+                    None,
+                    committed_signals(&resumed),
+                    NamedRealTime::Woken,
+                )
+                .await?,
+            )
+        } else {
+            None
         };
         // A virtual timerfd this probe may observe is readable on the host
         // exactly when its virtual deadline has passed by this turn
@@ -2123,7 +2313,12 @@ where
         // first. The probe below goes through the record/replay path like
         // every attempt (Codex review of
         // https://github.com/rrnewton/hermit/pull/4198).
-        let signaled = matches!(resumed, ResumeStatus::Signaled(_));
+        // This call transfers nothing until it completes, so only a copy still
+        // pending ends it (`TurnSignals::ends`).
+        let signaled = match turn {
+            Some(turn) => turn.ends(false),
+            None => matches!(resumed, ResumeStatus::Signaled(_)),
+        };
         // A pending real-time timer expiration in the set this wait takes
         // (https://github.com/rrnewton/hermit/issues/4089).
         let pending = pending_real_time_among(guest, consumed).await;
@@ -2240,6 +2435,215 @@ fn committed_signals(resumed: &ResumeStatus) -> KernelSigset {
         }),
         _ => 0,
     }
+}
+
+/// What a restartable internal IO poll or a parked pipe write finds at a turn,
+/// read from the thread's own state before the turn's first injection, while it
+/// is still stopped at its request: every signal sent since is still in the
+/// kernel's pending set, and none is yet in the backend's held slot. A copy
+/// the turn's own injections later absorb is counted here
+/// (<https://github.com/rrnewton/hermit/issues/4273>, R2b-1 rules 2-4).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TurnSignals {
+    /// The signals the turn's answer names (`committed_signals`) that the
+    /// call's mask leaves unblocked: a kept send's wake, which Linux's
+    /// `TIF_SIGPENDING` keeps in force until the call returns, whatever a later
+    /// flush does. For `writev`, which the drain never filters, a real-time
+    /// signal, outside the record of copies discarded at send, counts only if
+    /// its disposition delivers it now (`NamedRealTime::ByDisposition`); for
+    /// the generic poll and the scalar writer the drain's own disposition test
+    /// has already decided it, at the wake (R2b-1 rules 1 and 2).
+    named: KernelSigset,
+    /// The kept copies pending now that would end the call: unblocked under the
+    /// call's mask, caught or acting by default, not held (`SIGCHLD` and the
+    /// host-timed signals, except one the scheduler committed:
+    /// `futex_wait_held_after_wake`), and not discarded at send
+    /// (`threads::without_discarded`).
+    pending: KernelSigset,
+}
+
+impl TurnSignals {
+    /// Whether a call that would wait now ends. After progress (`progress`),
+    /// Linux returns the bytes transferred on any wake, so a named wake or a
+    /// pending copy ends the call. With none, Linux returns `-ERESTARTSYS`,
+    /// which delivers a pending copy or restarts invisibly, so only a pending
+    /// copy ends it; otherwise the call keeps polling, which the guest cannot
+    /// tell from that restart (R2b-1 rule 3).
+    fn ends(&self, progress: bool) -> bool {
+        self.pending != 0 || (progress && self.named != 0)
+    }
+}
+
+/// [`TurnSignals`] for a call whose mask is `mask` (the kernel's, by default:
+/// the generic poll and the scalar writer install none) and to which the
+/// scheduler committed `committed` at this wake (`committed_signals`; none
+/// before a turnless first attempt). A thread that is gone ends the call with
+/// `ERESTARTNOINTR`, which nothing observes, and a live one whose state cannot
+/// be read ends the run (`read_wait_signal_state`).
+async fn read_turn_signals<T, G>(
+    guest: &mut G,
+    mask: Option<KernelSigset>,
+    committed: KernelSigset,
+    real_time: NamedRealTime,
+) -> Result<TurnSignals, Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let state = read_wait_signal_state(guest.pid(), guest.tid())?;
+    let mask = mask.unwrap_or(state.blocked);
+    let host_timed = host_timed_signals(guest).await;
+    let before = turn_signals_before_discard(&state, mask, host_timed, committed, real_time);
+    let pending =
+        crate::syscalls::threads::without_discarded(guest, &state, before.pending, committed).await;
+    Ok(TurnSignals { pending, ..before })
+}
+
+/// [`TurnSignals`] from the thread's state (`state`), the call's mask (`mask`),
+/// the host-timed signals (`host_timed`) and the scheduler's commitment
+/// (`committed`), before the record of copies Linux discarded at send is
+/// applied to `pending` (`threads::without_discarded`). The hold leaves out
+/// `SIGCHLD` and every host-timed signal, except a signal the scheduler
+/// committed that no host-timed source can post (`futex_wait_held_after_wake`).
+fn turn_signals_before_discard(
+    state: &KernelSignalState,
+    mask: KernelSigset,
+    host_timed: KernelSigset,
+    committed: KernelSigset,
+    real_time: NamedRealTime,
+) -> TurnSignals {
+    use crate::scheduler::discarded_at_send::STANDARD_SIGNALS;
+    let held = crate::syscalls::threads::futex_wait_held_after_wake(host_timed, committed);
+    let pending = state.pending_interrupting(mask, false) & !held;
+    let counted = match real_time {
+        NamedRealTime::Woken => !0,
+        NamedRealTime::ByDisposition => {
+            STANDARD_SIGNALS | (state.interrupting(mask) & !STANDARD_SIGNALS)
+        }
+    };
+    let named = committed & !mask & counted;
+    TurnSignals { named, pending }
+}
+
+/// How a turn counts a real-time signal its answer names
+/// ([`TurnSignals::named`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NamedRealTime {
+    /// As any named signal: the drain woke the call only for one whose
+    /// disposition delivered it then, and Linux's wake stands after a later
+    /// flush (the generic poll and the scalar writer).
+    Woken,
+    /// Only if its disposition delivers it now: the drain never filters
+    /// `writev` (R2b-1 rule 2).
+    ByDisposition,
+}
+
+/// Whether a poll or a parked pipe write decides interruption at its own turn
+/// (`signals_interrupting_poll`): where the record of copies Linux discarded
+/// at send is kept (`discarded_at_send::records`, ptrace with sequentialized
+/// threads) and the thread's state can be read (`task`, its
+/// `Resources::signal_state_task`, which needs guest thread IDs that name host
+/// tasks). Elsewhere the earlier decision stands: on KVM the backend restarts
+/// the call unless it would deliver a signal, and its polled-read observation
+/// (`Guest::polled_read_signal_site`) takes a caught signal before the turn,
+/// where a `/proc` read could not see it (the Claude re-check of the R2b-1
+/// design, R4-4).
+fn decides_interruption_at_turn<T, G>(guest: &G, task: Option<(i32, i32)>) -> bool
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    task.is_some() && crate::scheduler::discarded_at_send::records(guest.config())
+}
+
+/// The guest's iovec array at `iov_raw`, `count` entries as (base, length)
+/// pairs, or `None` when it cannot be read.
+fn read_guest_iovecs<T, G>(
+    guest: &mut G,
+    iov_raw: usize,
+    count: usize,
+) -> Option<Vec<(usize, usize)>>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let iov_addr = Addr::<libc::iovec>::from_raw(iov_raw)?;
+    let mut raw_iovecs = vec![
+        libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        };
+        count
+    ];
+    guest.memory().read_values(iov_addr, &mut raw_iovecs).ok()?;
+    Some(
+        raw_iovecs
+            .into_iter()
+            .map(|iovec| (iovec.iov_base as usize, iovec.iov_len))
+            .collect(),
+    )
+}
+
+/// Write `iovecs` into the private copy of a pipe `writev`'s iovec array at
+/// `scratch_raw` (`execute_atomic_pipe_writev_attempt`).
+fn write_scratch_iovecs<T, G>(
+    guest: &mut G,
+    scratch_raw: usize,
+    iovecs: &[(usize, usize)],
+) -> Result<(), Errno>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let scratch = AddrMut::<libc::iovec>::from_raw(scratch_raw).ok_or(Errno::EFAULT)?;
+    let raw_iovecs: Vec<libc::iovec> = iovecs
+        .iter()
+        .map(|&(base, length)| libc::iovec {
+            iov_base: base as *mut libc::c_void,
+            iov_len: length,
+        })
+        .collect();
+    guest.memory().write_values(scratch, &raw_iovecs)
+}
+
+/// Install the private mask of a pipe `writev` that decides at its turn
+/// (`decides_interruption_at_turn`) and goes on polling after its first
+/// attempt, through `wait` (`KernelSignalWait::block`, scratch `cell`), and
+/// publish the guest's own mask to the scheduler while it is installed
+/// (`set_saved_guest_sigmask`). Returns the guest's own mask. A signal that
+/// stops the installation is held as `inject_absorbing` holds one, a
+/// host-timed one and a copy Linux discarded at send included
+/// (`hold_until_return`), and one that would replace a
+/// held signal whose loss matters ends the call: with the restart errno, as
+/// `Error::Errno`, when the held one would end it natively, and otherwise with
+/// a [`HeldSignalRefusal`], which the caller turns into the refusal once the
+/// guest's mask is back (`refuse_held_signal_loss`; R2b-1 rule 5). A mask that
+/// cannot be installed ends the call with `EFAULT`, as a failed
+/// scratch-stack commit does.
+async fn install_turn_mask<T, G>(
+    guest: &mut G,
+    wait: &mut KernelSignalWait,
+    cell: AddrMut<'_, KernelSigset>,
+) -> Result<KernelSigset, Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    // A copy Linux discarded at send that the kernel still holds (a traced
+    // task's copy is queued whatever its disposition) is left out of the
+    // turn's `pending` (`without_discarded`), so it must not end the call
+    // here either: it is held until the call returns, where it is delivered
+    // late (https://github.com/rrnewton/hermit/issues/3995), as the turn
+    // decided (the Claude re-check of R2b-1, N1).
+    let state = read_wait_signal_state(guest.pid(), guest.tid())?;
+    let kept = crate::syscalls::threads::without_discarded(guest, &state, state.pending, 0).await;
+    wait.hold_until_return(host_timed_signals(guest).await | (state.pending & !kept));
+    wait.block(guest, Some(cell)).await?;
+    let Some(mask) = wait.effective_mask() else {
+        return Err(Errno::EFAULT.into());
+    };
+    crate::tool_global::set_saved_guest_sigmask(guest, Some(mask)).await;
+    Ok(mask)
 }
 
 /// The waiting thread's mask as last told to the scheduler
@@ -5885,6 +6289,116 @@ mod kernel_signal_wait_failures {
         assert_eq!(
             unblocking.stop_verdict(&before, libc::SIGUSR2),
             StopVerdict::End(Errno::ERESTARTNOHAND)
+        );
+    }
+}
+
+#[cfg(test)]
+mod turn_signal_tests {
+    use super::*;
+
+    fn bit(signal: libc::c_int) -> KernelSigset {
+        kernel_sigset_bit(signal)
+    }
+
+    fn state(
+        pending: KernelSigset,
+        caught: KernelSigset,
+        blocked: KernelSigset,
+    ) -> KernelSignalState {
+        KernelSignalState {
+            pending,
+            thread_pending: pending,
+            caught,
+            blocked,
+            ..Default::default()
+        }
+    }
+
+    /// Rule 3 of R2b-1 (https://github.com/rrnewton/hermit/issues/4273): with
+    /// no progress only a pending copy ends the call; after progress a named
+    /// wake does too.
+    #[test]
+    fn a_named_wake_ends_a_call_only_after_progress() {
+        let named = TurnSignals {
+            named: bit(libc::SIGUSR1),
+            pending: 0,
+        };
+        assert!(!named.ends(false));
+        assert!(named.ends(true));
+        let pending = TurnSignals {
+            named: 0,
+            pending: bit(libc::SIGUSR1),
+        };
+        assert!(pending.ends(false));
+        assert!(pending.ends(true));
+        assert!(!TurnSignals::default().ends(true));
+    }
+
+    /// A caught SIGCHLD pending at a poll's turn is held unless the scheduler
+    /// committed it, and a host-timed signal is held even then (arm A8).
+    #[test]
+    fn the_hold_leaves_out_an_uncommitted_sigchld_and_every_host_timed_signal() {
+        let chld = bit(libc::SIGCHLD);
+        let hup = bit(libc::SIGHUP);
+        let s = state(chld | hup, chld | hup, 0);
+        assert_eq!(
+            turn_signals_before_discard(&s, 0, hup, 0, NamedRealTime::Woken).pending,
+            0
+        );
+        assert_eq!(
+            turn_signals_before_discard(&s, 0, hup, chld, NamedRealTime::Woken).pending,
+            chld
+        );
+        assert_eq!(
+            turn_signals_before_discard(&s, 0, hup, chld | hup, NamedRealTime::Woken).pending,
+            chld
+        );
+    }
+
+    /// A named signal counts only if the call's mask leaves it unblocked
+    /// (rule 2). A real-time one counts only if its disposition delivers it
+    /// for `writev`, which the drain never filters (rule 2), and as woken for
+    /// the generic poll and the scalar writer, whose drain already tested it
+    /// (rule 1), so a flush after the wake does not undo it (the Claude
+    /// implementation review of R2b-1, F1).
+    #[test]
+    fn a_named_signal_counts_only_unblocked_and_a_real_time_one_by_its_call() {
+        use NamedRealTime::ByDisposition;
+        use NamedRealTime::Woken;
+        let usr1 = bit(libc::SIGUSR1);
+        let rt = bit(libc::SIGRTMIN());
+        let s = state(0, usr1, usr1);
+        for real_time in [Woken, ByDisposition] {
+            assert_eq!(
+                turn_signals_before_discard(&s, usr1, 0, usr1, real_time).named,
+                0
+            );
+            assert_eq!(
+                turn_signals_before_discard(&s, 0, 0, usr1, real_time).named,
+                usr1
+            );
+        }
+        let ignored_rt = KernelSignalState {
+            ignored: rt,
+            ..state(0, 0, 0)
+        };
+        assert_eq!(
+            turn_signals_before_discard(&ignored_rt, 0, 0, rt, ByDisposition).named,
+            0
+        );
+        assert_eq!(
+            turn_signals_before_discard(&ignored_rt, 0, 0, rt, Woken).named,
+            rt
+        );
+        assert_eq!(
+            turn_signals_before_discard(&ignored_rt, rt, 0, rt, Woken).named,
+            0
+        );
+        let caught_rt = state(0, rt, 0);
+        assert_eq!(
+            turn_signals_before_discard(&caught_rt, 0, 0, rt, ByDisposition).named,
+            rt
         );
     }
 }

@@ -582,7 +582,15 @@ impl RecordVersion {
 // than the pid of the caller's own zombie child, is refused
 // (https://github.com/rrnewton/hermit/issues/4370). An older recording in
 // which such a clone3 succeeded would replay to the refusal.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x15e);
+// 0x15e -> 0x15f (taken at land time, as the reservation file's land-time
+// numbering rule gives a ready change HIGHEST_SHIPPED + 1): a pipe read, a pipe
+// write or a pipe writev woken by a kept signal ends as Linux's does
+// (https://github.com/rrnewton/hermit/issues/4273, R2b-1): the wake is decided
+// in the sender's turn and stands until the call returns, a copy discarded at
+// send wakes nothing, and a call that made no progress ends only on a copy
+// still there to deliver. Replay recomputes these results, so an older
+// recording of such a wake would replay to another result.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x15f);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -607,7 +615,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x15e);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x15e;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x15f;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1605,6 +1613,16 @@ mod tests {
     fn record_version_rejects_streams_from_before_reused_set_tid_is_refused() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x15d)));
         assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
+    }
+
+    /// A recording older than 0x15f was made when a pipe call woken by a kept
+    /// signal could miss the wake or end on a copy Linux discarded
+    /// (https://github.com/rrnewton/hermit/issues/4273).
+    #[test]
+    fn record_version_rejects_streams_from_before_kept_wakes_stand() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x15d)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x15e)));
+        assert!(RECORD_VERSION.compatible_with(&RecordVersion(0x15f)));
     }
 
     #[test]

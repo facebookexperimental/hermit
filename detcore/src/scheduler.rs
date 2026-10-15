@@ -101,7 +101,6 @@ use crate::scheduler::rejoin_log::RejoinWriter;
 use crate::scheduler::replayer::StopReason;
 use crate::scheduler::replayer::events_consistent;
 use crate::scheduler::replayer::events_match;
-#[cfg(test)]
 use crate::syscalls::KernelSignalState;
 use crate::syscalls::read_kernel_signal_state;
 use crate::syscalls::thread_is_gone;
@@ -472,6 +471,52 @@ fn take_matching_futex_waiters(waiters: &mut Vec<FutexWaiter>, wake_mask: u32) -
     matching
 }
 
+/// The signals that wake a restartable internal IO poll at the drain, from the
+/// thread's kernel state (`state`), before the hold. Where the record of copies
+/// Linux discarded at send is kept (`records`, which equals
+/// `models_signal_targets`), a standard signal's fate was decided in the
+/// sender's turn: admission refused a discarded copy
+/// (`notify_signal_pending`), and a kept one wakes the poll whatever the
+/// disposition is now, since Linux's `TIF_SIGPENDING` is not cleared by a
+/// later flush. So a standard signal is filtered by the mask alone, never by
+/// the disposition read at the drain, which a sender's `SIG_IGN` in the same
+/// slice would otherwise turn against a wake Linux keeps (R2b-1 rule 1,
+/// <https://github.com/rrnewton/hermit/issues/4273>). A real-time signal is
+/// outside the record (<https://github.com/rrnewton/hermit/issues/4319>), so
+/// it keeps the disposition test. The backend's own preemption signal never
+/// wakes a poll.
+fn poll_wake_signals(state: &KernelSignalState, records: bool) -> u64 {
+    if !records {
+        return state.interrupting_wait(state.blocked, false);
+    }
+    let standard = discarded_at_send::STANDARD_SIGNALS
+        & !kernel_signal_bit(reverie::PERF_EVENT_SIGNAL as libc::c_int);
+    (!state.blocked & standard)
+        | (state.interrupting_wait(state.blocked, false) & !discarded_at_send::STANDARD_SIGNALS)
+}
+
+/// The kind of wait the drain of cross-task signals woke (`drain_woken_waiters`),
+/// so that no consumer applies one kind's rules to the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainWokenWaiter {
+    /// A parked precise-mode futex waiter.
+    FutexWaiter,
+    /// A restartable internal IO poll (`restartable_internal_io_signals`).
+    Poll,
+}
+
+/// A waiter the drain of cross-task signals woke, until its turn answers
+/// (`drain_woken_waiters`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrainWoken {
+    /// The kind of wait.
+    pub waiter: DrainWokenWaiter,
+    /// The scheduler sent the waiter a `SIGCHLD` at a commit point since the
+    /// drain woke it (`wake_signaled_guest`, such as a child-exit timer's):
+    /// that one is committed, and the answer names it.
+    pub scheduler_sent: bool,
+}
+
 /// Actions that are blocked on another internal action of the guest, such as a pipe communication,
 /// or are blocked on external conditions such as a network request.  These cannot consume a logical
 /// turn until a matching unblocking action is ready.
@@ -577,18 +622,19 @@ pub struct BlockedPool {
     /// block it (<https://github.com/rrnewton/hermit/issues/4304>).
     pub sigchld_takers: BTreeSet<DetTid>,
 
-    /// Precise futex waiters the drain of cross-task signals woke
-    /// (`drain_pending_cross_task_signals`), until their turn answers. A
-    /// `SIGCHLD` in such a waiter's `WaitidSignals` batch, put there by that
-    /// wake or merged in later, is only a reason to run, never a committed
-    /// signal: `unblock_guest` leaves it out of the answer, so the waiter's
-    /// own check decides it from the schedule's record of a guest's private
-    /// copy (`PrivatePending`), which a flush clears. The value says the
-    /// scheduler sent the waiter a `SIGCHLD` at a commit point since
-    /// (`wake_signaled_guest`, such as a child-exit timer's): that one is
+    /// Precise futex waiters and restartable internal IO polls the drain of
+    /// cross-task signals woke (`drain_pending_cross_task_signals`), until
+    /// their turn answers. A `SIGCHLD` in such a waiter's `WaitidSignals`
+    /// batch, put there by that wake or merged in later, is only a reason to
+    /// run, never a committed signal: `unblock_guest` leaves it out of the
+    /// answer, so the waiter's own check decides it, a futex waiter from the
+    /// schedule's record of a guest's private copy (`PrivatePending`), which
+    /// a flush clears, and a poll from the signals still pending at its turn.
+    /// A `SIGCHLD` the scheduler sent since (`DrainWoken::scheduler_sent`) is
     /// committed, and the answer names it
-    /// (<https://github.com/rrnewton/hermit/issues/4132>).
-    pub drain_woken_futex_waiters: BTreeMap<DetTid, bool>,
+    /// (<https://github.com/rrnewton/hermit/issues/4132>,
+    /// <https://github.com/rrnewton/hermit/issues/4273>).
+    pub drain_woken_waiters: BTreeMap<DetTid, DrainWoken>,
 
     /// Threads in `external_io_blockers` or `rt_sigsuspend_blockers` that the
     /// scheduler signaled at a committed point (`wake_signaled_guest`) while
@@ -5804,7 +5850,7 @@ impl Scheduler {
         self.blocked.sigchld_deferred.remove(dtid);
         self.blocked.sigchld_ready.remove(dtid);
         self.blocked.woken_sleeps.remove(dtid);
-        self.blocked.drain_woken_futex_waiters.remove(dtid);
+        self.blocked.drain_woken_waiters.remove(dtid);
         self.child_exit_sigchld.attributed.remove(dtid);
         self.blocked.signaled_background.remove(dtid);
         let _ = self.blocked.signaled_sigsuspend_requests.remove(dtid);
@@ -8781,15 +8827,13 @@ impl Scheduler {
                     // sibling kept running (the Codex review of
                     // https://github.com/rrnewton/hermit/pull/4131).
                     self.blocked.woken_sleeps.insert(dettid);
-                } else if let Some(scheduler_sent) =
-                    self.blocked.drain_woken_futex_waiters.get_mut(&dettid)
-                {
-                    // A futex waiter the drain woke, still to run its turn: a
-                    // `SIGCHLD` sent now at this commit point is committed to
-                    // it, which the drain's own `SIGCHLD` is not
-                    // (`drain_woken_futex_waiters`). Its turn answers with it.
+                } else if let Some(woken) = self.blocked.drain_woken_waiters.get_mut(&dettid) {
+                    // A futex waiter or poll the drain woke, still to run its
+                    // turn: a `SIGCHLD` sent now at this commit point is
+                    // committed to it, which the drain's own `SIGCHLD` is not
+                    // (`drain_woken_waiters`). Its turn answers with it.
                     if signal.raw() == libc::SIGCHLD {
-                        *scheduler_sent = true;
+                        woken.scheduler_sent = true;
                     }
                 }
                 // TODO(T137242449): other runnable requests could be reprioritized to run
@@ -9185,7 +9229,9 @@ impl Scheduler {
     /// deliver, and the guest would see the restart code itself
     /// (<https://github.com/rrnewton/hermit/issues/4187>). When the state
     /// cannot be read, every signal it does not hold is treated as
-    /// interrupting, as before this filter.
+    /// interrupting, as before this filter. Where the record of copies Linux
+    /// discarded at send is kept, a standard signal is filtered by the mask
+    /// alone (`poll_wake_signals`).
     fn restartable_internal_io_interrupting_signals(
         &self,
         dettid: DetTid,
@@ -9211,7 +9257,7 @@ impl Scheduler {
             self.test_internal_io_signal_state_reads
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             match self.test_kernel_signal_states.get(&dettid) {
-                Some(state) => state.interrupting_wait(state.blocked, false) & !held,
+                Some(state) => poll_wake_signals(state, self.models_signal_targets) & !held,
                 None => !held,
             }
         }
@@ -9222,7 +9268,7 @@ impl Scheduler {
             };
             match read_kernel_signal_state(reverie::Pid::from_raw(pid), reverie::Pid::from_raw(tid))
             {
-                Ok(state) => state.interrupting_wait(state.blocked, false) & !held,
+                Ok(state) => poll_wake_signals(&state, self.models_signal_targets) & !held,
                 Err(errno) => {
                     debug!(
                         "[dtid {}] cannot read the signal state of its internal IO poll ({}); \
@@ -9332,7 +9378,7 @@ impl Scheduler {
     // signal ends the wait, and a wait that checks before it parks asks the
     // schedule's record (`PrivatePending`, `PlacedPending`). A futex waiter's
     // turn after that drain is not committed the signal: its own check decides
-    // from the record, which a flush clears (`drain_woken_futex_waiters`). The
+    // from the record, which a flush clears (`drain_woken_waiters`). The
     // restartable internal IO polls and polling-mode futex waits still hold it
     // (https://github.com/rrnewton/hermit/issues/4132).
     //
@@ -9582,15 +9628,22 @@ impl Scheduler {
     /// mutate beneath a tentative selection. A futex waiter is admitted on its
     /// mask and on what Linux does with the signal as it is sent (it discards
     /// one that is ignored, or ignored by default, then: `discarded_when_sent`),
-    /// and a sleep on its request alone; the drain, the commit point, decides
-    /// on the rest.
+    /// a `waitid` wait and an internal IO poll on that fate, and a sleep on its
+    /// request alone; the drain, the commit point, decides on the rest.
     pub(crate) fn notify_signal_pending(&mut self, dettid: DetTid, signal: SigWrapper) {
         // A waitid wait is decided here too, in the sender's turn: its drain
         // works from a list with no queue identity (Claude N7 of
         // <https://github.com/rrnewton/hermit/issues/4293>).
         if (self.waitid_signal_request(dettid).is_some()
             && !self.discarded_when_sent(dettid, signal))
-            || self.restartable_internal_io_signals(dettid).is_some()
+            // A restartable internal IO poll decides at its own turn which
+            // signals still interrupt it, so a copy Linux discarded at send,
+            // or one the poll's mask blocks, does not end it either way;
+            // refusing it here spares the poll a turn Linux does not have
+            // (https://github.com/rrnewton/hermit/issues/4273, R2b-1 rule 1).
+            || (self.restartable_internal_io_signals(dettid).is_some()
+                && !self.discarded_when_sent(dettid, signal)
+                && self.poll_mask_admits(dettid, signal))
             || (self
                 .parked_futex_unblocked_signals(dettid)
                 .is_some_and(|signals| signals & kernel_signal_bit(signal.raw()) != 0)
@@ -9653,6 +9706,24 @@ impl Scheduler {
         };
         let kept = (state.thread_pending & !thread_bits) | (state.shared_pending & !process_bits);
         kept & bit == 0
+    }
+
+    /// Whether the mask of the restartable internal IO poll `dettid` leaves
+    /// `signal` unblocked, read in the sender's turn: the guest's own mask
+    /// while Detcore holds the thread under a private one, as a pipe `writev`
+    /// does (`saved_guest_sigmasks`), and otherwise the thread's kernel mask,
+    /// which a parked thread cannot change. Where the record of copies Linux
+    /// discarded at send is not kept (`models_signal_targets`), or the mask
+    /// cannot be read, every signal is admitted, as before.
+    fn poll_mask_admits(&self, dettid: DetTid, signal: SigWrapper) -> bool {
+        if !self.models_signal_targets {
+            return true;
+        }
+        let mask = match self.saved_guest_sigmasks.get(&dettid) {
+            Some(saved) => Some(*saved),
+            None => self.read_thread_blocked_mask(dettid),
+        };
+        mask.is_none_or(|mask| mask & kernel_signal_bit(signal.raw()) == 0)
     }
 
     /// Whether `dettid` sleeps in a real `rt_sigsuspend` outside the run queue
@@ -12339,13 +12410,13 @@ impl Scheduler {
         );
         let mut signals = self.inbound_signals(dtid); // Peek before we clear the ivars.
         let signaled = !signals.is_empty();
-        // A precise futex waiter the drain woke: a `SIGCHLD` its batch carries
-        // is not committed to it, unless the scheduler sent one since
-        // (`drain_woken_futex_waiters`). The answer still says it was woken
+        // A precise futex waiter or a poll the drain woke: a `SIGCHLD` its
+        // batch carries is not committed to it, unless the scheduler sent one
+        // since (`drain_woken_waiters`). The answer still says it was woken
         // for a signal, with an empty set if that was the only one.
-        if let Some(scheduler_sent) = self.blocked.drain_woken_futex_waiters.remove(&dtid) {
+        if let Some(woken) = self.blocked.drain_woken_waiters.remove(&dtid) {
             signals.retain(|signal| signal.raw() != libc::SIGCHLD);
-            if scheduler_sent {
+            if woken.scheduler_sent {
                 signals.push(SigWrapper::from(Signal::SIGCHLD));
                 signals.sort_by_key(SigWrapper::raw);
             }
@@ -12975,11 +13046,17 @@ impl Scheduler {
                     // its turn and parks again if nothing is pending for it.
                     // Marked after the unblock, which clears blocking entries:
                     // a `SIGCHLD` this batch carries is not committed to it
-                    // (`drain_woken_futex_waiters`).
+                    // (`drain_woken_waiters`).
                     let mut resources = Resources::new(dettid);
                     resources.insert(ResourceID::WaitidSignals(signals), Permission::W);
                     if self.force_unblock_thread_at(dettid, resources, true) {
-                        self.blocked.drain_woken_futex_waiters.insert(dettid, false);
+                        self.blocked.drain_woken_waiters.insert(
+                            dettid,
+                            DrainWoken {
+                                waiter: DrainWokenWaiter::FutexWaiter,
+                                scheduler_sent: false,
+                            },
+                        );
                     }
                 }
                 None if let Some(sleep) = self.signal_sleep(dettid) => {
@@ -13044,7 +13121,24 @@ impl Scheduler {
                     // same thread's state.
                     resources.signal_state_task = task;
                     resources.decides_signal_interruption_itself = decides_itself;
-                    self.force_unblock_thread(dettid, resources);
+                    // Marked after the unblock, which clears blocking entries,
+                    // as for a futex waiter: a `SIGCHLD` this batch carries is
+                    // not committed to the poll (`drain_woken_waiters`), whose
+                    // turn decides from what is still pending then
+                    // (https://github.com/rrnewton/hermit/issues/4273). It
+                    // keeps its place at the back of the run queue. A parked
+                    // pipe `writev` (`decides_itself`) is not marked: a guest's
+                    // caught `SIGCHLD` still ends it as on Linux, until R2b-2
+                    // decides the private `SIGCHLD` for every call.
+                    if self.force_unblock_thread_at(dettid, resources, false) && !decides_itself {
+                        self.blocked.drain_woken_waiters.insert(
+                            dettid,
+                            DrainWoken {
+                                waiter: DrainWokenWaiter::Poll,
+                                scheduler_sent: false,
+                            },
+                        );
+                    }
                 }
             }
         }
@@ -20609,7 +20703,7 @@ mod test {
                     ),
                     "{case}: woken for a signal, with no SIGCHLD committed"
                 );
-                assert!(scheduler.blocked.drain_woken_futex_waiters.is_empty());
+                assert!(scheduler.blocked.drain_woken_waiters.is_empty());
                 continue;
             }
             assert!(scheduler.is_parked_futex_waiter(target), "{case}");
@@ -20645,7 +20739,7 @@ mod test {
         scheduler.happens_before = Some(hb);
         scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGCHLD));
         scheduler.drain_pending_cross_task_signals();
-        assert!(scheduler.blocked.drain_woken_futex_waiters.is_empty());
+        assert!(scheduler.blocked.drain_woken_waiters.is_empty());
     }
 
     /// A `SIGCHLD` the drain merges into the batch of a futex waiter it
@@ -24114,6 +24208,103 @@ mod test {
 
     /// A restartable internal read poller, as `retry_nonblocking_syscall_helper`
     /// marks one, with SIGUSR1 blocked and SIGUSR2 caught.
+    /// A restartable internal IO poll is admitted, in the sender's turn, only
+    /// for a signal its mask leaves unblocked: the kernel's mask, or the
+    /// guest's own while Detcore holds the thread under a private one, as a
+    /// pipe `writev` does (`saved_guest_sigmasks`; R2b-1 rule 1, the Claude
+    /// implementation review, F5).
+    #[test]
+    fn a_poll_is_admitted_only_for_a_signal_its_mask_leaves_unblocked() {
+        let usr1 = SigWrapper::from(Signal::SIGUSR1);
+        let usr2 = SigWrapper::from(Signal::SIGUSR2);
+        let admitted = |scheduler: &Scheduler, target| {
+            scheduler
+                .pending_cross_task_signals
+                .get(&target)
+                .cloned()
+                .unwrap_or_default()
+        };
+        let mut scheduler = gated_scheduler();
+        let target = restartable_read_poller(&mut scheduler);
+        scheduler.notify_signal_pending(target, usr1);
+        scheduler.notify_signal_pending(target, usr2);
+        assert_eq!(
+            admitted(&scheduler, target),
+            vec![usr2],
+            "the kernel's mask blocks SIGUSR1"
+        );
+
+        let mut scheduler = gated_scheduler();
+        let target = restartable_read_poller(&mut scheduler);
+        assert!(scheduler.set_saved_guest_sigmask(target, Some(kernel_signal_bit(libc::SIGUSR2))));
+        scheduler.notify_signal_pending(target, usr1);
+        scheduler.notify_signal_pending(target, usr2);
+        assert_eq!(
+            admitted(&scheduler, target),
+            vec![usr1],
+            "the guest's saved mask decides while a private one is installed"
+        );
+    }
+
+    /// A poll the drain woke is marked (`DrainWokenWaiter::Poll`): a
+    /// `SIGCHLD` the drain merges into its batch is not committed to it, and
+    /// its turn decides from what is still pending then. A `SIGCHLD` the
+    /// scheduler sends at a commit point (`wake_signaled_guest`, such as a
+    /// child-exit timer's) is committed, to a drain-woken poll and to a queued
+    /// one, and the answer names it (R2b-1 rule 7; the Claude implementation
+    /// review, F4).
+    #[test]
+    fn only_a_scheduler_sent_sigchld_is_committed_to_a_woken_poll() {
+        let chld = kernel_signal_bit(libc::SIGCHLD);
+        let usr2 = kernel_signal_bit(libc::SIGUSR2);
+        let usr2_signal = SigWrapper::from(Signal::SIGUSR2);
+        let chld_signal = SigWrapper::from(Signal::SIGCHLD);
+        for case in ["merged", "woken for SIGUSR2", "queued"] {
+            let mut scheduler = gated_scheduler();
+            let target = restartable_read_poller(&mut scheduler);
+            scheduler.test_kernel_signal_states.insert(
+                target,
+                KernelSignalState {
+                    caught: chld | usr2,
+                    ..Default::default()
+                },
+            );
+            let expected = match case {
+                "merged" => {
+                    scheduler.notify_signal_pending(target, usr2_signal);
+                    scheduler.drain_pending_cross_task_signals();
+                    assert_eq!(
+                        scheduler
+                            .blocked
+                            .drain_woken_waiters
+                            .get(&target)
+                            .map(|woken| woken.waiter),
+                        Some(DrainWokenWaiter::Poll),
+                        "the drain marks the poll it woke"
+                    );
+                    scheduler.notify_signal_pending(target, chld_signal);
+                    scheduler.drain_pending_cross_task_signals();
+                    vec![usr2_signal]
+                }
+                "woken for SIGUSR2" => {
+                    scheduler.notify_signal_pending(target, usr2_signal);
+                    scheduler.drain_pending_cross_task_signals();
+                    scheduler.wake_signaled_guest(target, Signal::SIGCHLD);
+                    vec![usr2_signal, chld_signal]
+                }
+                _ => {
+                    scheduler.wake_signaled_guest(target, Signal::SIGCHLD);
+                    vec![chld_signal]
+                }
+            };
+            let answer = turn_answer(&mut scheduler, target);
+            assert!(
+                matches!(&answer, Some(SchedResponse::Signaled(Some(signals))) if *signals == expected),
+                "{case}: {answer:?}"
+            );
+        }
+    }
+
     fn restartable_read_poller(scheduler: &mut Scheduler) -> DetTid {
         let target = DetTid::from_raw(100);
         register_known_thread(scheduler, target);
@@ -30009,5 +30200,36 @@ mod test {
         assert!(scheduler.sigalrm_pending(target));
         assert!(!scheduler.in_guest_fatal_alarm_pending(target));
         assert_eq!(scheduler.host_signal_attempts, 0);
+    }
+}
+
+#[cfg(test)]
+mod poll_wake_tests {
+    use super::*;
+
+    /// Where the record of copies discarded at send is kept, a standard signal
+    /// wakes a poll at the drain if its mask leaves it unblocked, whatever the
+    /// disposition is now (a sender's `SIG_IGN` in the same slice does not undo
+    /// the wake Linux keeps; arm A1). A real-time signal keeps the disposition
+    /// test (arm A11), and the backend's preemption signal never wakes it
+    /// (R2b-1 rule 1, https://github.com/rrnewton/hermit/issues/4273).
+    #[test]
+    fn a_standard_signal_wakes_a_poll_by_its_mask_alone() {
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        let usr2 = kernel_signal_bit(libc::SIGUSR2);
+        let rt = kernel_signal_bit(libc::SIGRTMIN());
+        let perf = kernel_signal_bit(reverie::PERF_EVENT_SIGNAL as libc::c_int);
+        let state = KernelSignalState {
+            ignored: usr1 | rt,
+            blocked: usr2,
+            ..Default::default()
+        };
+        let wakes = poll_wake_signals(&state, true);
+        assert_ne!(wakes & usr1, 0, "an ignored standard signal still wakes");
+        assert_eq!(wakes & usr2, 0, "a blocked one does not");
+        assert_eq!(wakes & rt, 0, "an ignored real-time one does not");
+        assert_eq!(wakes & perf, 0, "the preemption signal never does");
+        // Without the record, the disposition decides, as before.
+        assert_eq!(poll_wake_signals(&state, false) & usr1, 0);
     }
 }
