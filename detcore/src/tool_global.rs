@@ -1081,7 +1081,7 @@ pub struct GlobalState {
     // The canonical models of open file descriptions that several guest
     // processes share (see `crate::shared_open_files`). Locked after `sched`,
     // never before it.
-    shared_open_files: Mutex<SharedOpenFileStore>,
+    shared_open_files: Arc<Mutex<SharedOpenFileStore>>,
 
     // Optional append-only sink shared by DBT fork descendants.
     unsupported_syscall_report_fd: Option<Mutex<File>>,
@@ -1104,15 +1104,15 @@ pub struct GlobalState {
     // TODO-HUMAN-REVIEW(PR-1154): Review the SaBRe exec descriptor-status handoff.
     /// Pre-exec identity and descriptor state awaiting a successful image transition.
     // TODO-HUMAN-REVIEW(PR-1173): Review SaBRe exec incarnation fencing.
-    pending_exec_states: Mutex<BTreeMap<DetPid, PendingExecState>>,
+    pending_exec_states: Arc<Mutex<BTreeMap<DetPid, PendingExecState>>>,
     /// Successful identity transfers whose RPC acknowledgment may still be in flight.
     /// Nesting either exec map with global_time requires holding sched first;
-    /// the scheduler mutex serializes their inner lock orders. Standalone
-    /// process cleanup drops each map guard before acquiring sched.
-    completed_exec_transfers: Mutex<BTreeMap<DetPid, exec_identity::ExecTransferReceipt>>,
+    /// the scheduler mutex serializes their inner lock orders. Process
+    /// cleanup also holds sched before acquiring these stores.
+    completed_exec_transfers: Arc<Mutex<BTreeMap<DetPid, exec_identity::ExecTransferReceipt>>>,
 
     /// Descriptor state retained after the one-shot scheduler transition is consumed.
-    post_exec_fd_blocking: Mutex<BTreeMap<DetTid, ExecFdState>>,
+    post_exec_fd_blocking: Arc<Mutex<BTreeMap<DetTid, ExecFdState>>>,
 
     sched_handle: Option<tokio::task::JoinHandle<()>>,
 
@@ -1139,6 +1139,69 @@ pub struct GlobalState {
     /// trace mode is configured. Every operation reads global time under this
     /// lock, so an input's release point is fixed by the schedule alone.
     network: Option<Mutex<NetworkEngine>>,
+}
+
+/// The stores a process's physical exit must clean up, shared with the
+/// GlobalState that owns them, so that the cleanup can run as one step under
+/// the scheduler lock. Locked after `sched`, never before it, as every other
+/// nested user of these stores does.
+#[derive(Clone, Debug, Default)]
+struct ProcessExitCleanup {
+    shared_open_files: Arc<Mutex<SharedOpenFileStore>>,
+    pending_exec_states: Arc<Mutex<BTreeMap<DetPid, PendingExecState>>>,
+    completed_exec_transfers: Arc<Mutex<BTreeMap<DetPid, exec_identity::ExecTransferReceipt>>>,
+    post_exec_fd_blocking: Arc<Mutex<BTreeMap<DetTid, ExecFdState>>>,
+}
+
+impl ProcessExitCleanup {
+    /// Complete the exit `watch` observed, unless a later registration has
+    /// replaced it. Nothing calls this in production yet; the daemon-point
+    /// observation of <https://github.com/rrnewton/hermit/issues/4362> part 2
+    /// will (2ee7190125's free-running observer was reverted).
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn complete_observed_locked(
+        &self,
+        sched: &mut Scheduler,
+        watch: &Arc<crate::scheduler::ProcessExitWatch>,
+    ) -> Option<(bool, Option<String>)> {
+        if !sched.process_exit_watch_is_current(watch) {
+            return None;
+        }
+        sched.finish_process_exit_watch(watch);
+        Some(self.complete_locked(sched, watch.process, true))
+    }
+
+    fn complete_locked(
+        &self,
+        sched: &mut Scheduler,
+        process: DetPid,
+        consume_unreported: bool,
+    ) -> (bool, Option<String>) {
+        let loss = (consume_unreported && sched.has_unreported_exit(process)).then(|| {
+            let reason = format!(
+                "process {process} exited without deregistering; its exit was not scheduled"
+            );
+            // Publish refusal before cancellation can wake a request. Normal
+            // deregistration and this entire operation share the sched lock.
+            crate::detlog::record_determinism_loss(&reason);
+            reason
+        });
+        self.pending_exec_states.lock().unwrap().remove(&process);
+        self.completed_exec_transfers
+            .lock()
+            .unwrap()
+            .remove(&process);
+        self.post_exec_fd_blocking.lock().unwrap().remove(&process);
+        if consume_unreported {
+            let consumed = sched.consume_unreported_exit(process);
+            debug_assert_eq!(consumed, loss.is_some());
+        }
+        self.shared_open_files
+            .lock()
+            .unwrap()
+            .end_leases_of(process);
+        (sched.complete_physical_process_exit(process), loss)
+    }
 }
 
 impl Default for GlobalState {
@@ -1225,6 +1288,7 @@ impl GlobalState {
     fn initialize(cfg: &Config, spawn_scheduler: bool) -> Self {
         let sched = Arc::new(Mutex::new(Scheduler::new(cfg)));
         let global_time = Arc::new(Mutex::new(GlobalTime::new(cfg)));
+        let process_exit_cleanup = ProcessExitCleanup::default();
         let handle = if cfg.sequentialize_threads && spawn_scheduler {
             // Announce before spawning, not from inside the spawned task. The
             // task's first poll is unordered with respect to the rest of this
@@ -1276,7 +1340,7 @@ impl GlobalState {
             unsupported_syscalls: Mutex::new(BTreeSet::new()),
             host_inputs: Mutex::new(Vec::new()),
             host_mutations: Mutex::new(BTreeSet::new()),
-            shared_open_files: Mutex::new(SharedOpenFileStore::default()),
+            shared_open_files: process_exit_cleanup.shared_open_files,
             unsupported_syscall_report_fd,
             port_start_range: AtomicU16::new(range[0]),
             port_end_range: AtomicU16::new(range[1]),
@@ -1284,9 +1348,9 @@ impl GlobalState {
             past_first_execve: AtomicBool::new(false),
             initial_descriptor_image_complete: AtomicBool::new(false),
             inherited_input: Mutex::new(None),
-            pending_exec_states: Mutex::new(BTreeMap::new()),
-            completed_exec_transfers: Mutex::new(BTreeMap::new()),
-            post_exec_fd_blocking: Mutex::new(BTreeMap::new()),
+            pending_exec_states: process_exit_cleanup.pending_exec_states,
+            completed_exec_transfers: process_exit_cleanup.completed_exec_transfers,
+            post_exec_fd_blocking: process_exit_cleanup.post_exec_fd_blocking,
             inodes: Arc::new(Mutex::new(InodePool::new())),
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping state.
@@ -1404,20 +1468,13 @@ impl GlobalState {
     /// chose, so the run must not be compared.
     pub fn complete_physical_process_exit(&self, raw_pid: i32) {
         let detpid = DetPid::from_raw(raw_pid);
-        self.pending_exec_states.lock().unwrap().remove(&detpid);
-        self.completed_exec_transfers
-            .lock()
-            .unwrap()
-            .remove(&detpid);
-        self.post_exec_fd_blocking.lock().unwrap().remove(&detpid);
-        let (completed, consumed) = {
+        let (completed, loss) = {
             let mut sched = self.sched.lock().unwrap();
-            let consumed = self.cfg.backend.process_exits_complete_asynchronously
-                && sched.consume_unreported_exit(detpid);
-            // In the same locked step as the retirement: a dead process's
-            // leases end, and their unpublished changes are discarded.
-            self.shared_open_files.lock().unwrap().end_leases_of(detpid);
-            (sched.complete_physical_process_exit(detpid), consumed)
+            self.process_exit_cleanup().complete_locked(
+                &mut sched,
+                detpid,
+                self.cfg.backend.process_exits_complete_asynchronously,
+            )
         };
         if completed {
             trace!(
@@ -1425,10 +1482,17 @@ impl GlobalState {
                 detpid
             );
         }
-        if consumed {
-            crate::detlog::write_loss_notice(&format!(
-                "process {detpid} exited without deregistering; its exit was not scheduled"
-            ));
+        if let Some(loss) = loss {
+            crate::detlog::write_loss_notice(&loss);
+        }
+    }
+
+    fn process_exit_cleanup(&self) -> ProcessExitCleanup {
+        ProcessExitCleanup {
+            shared_open_files: self.shared_open_files.clone(),
+            pending_exec_states: self.pending_exec_states.clone(),
+            completed_exec_transfers: self.completed_exec_transfers.clone(),
+            post_exec_fd_blocking: self.post_exec_fd_blocking.clone(),
         }
     }
 
@@ -5619,7 +5683,7 @@ fn wake_exec_robust_waiters(sched: &mut Scheduler, wakes: &[(DetTid, FutexID)], 
 
 /// A process pidfd for the host process `pid` (`pidfd_open` with no flags),
 /// which reports exit only once the whole thread group has exited.
-fn open_process_pidfd(pid: i32) -> std::io::Result<std::os::fd::OwnedFd> {
+pub(crate) fn open_process_pidfd(pid: i32) -> std::io::Result<std::os::fd::OwnedFd> {
     // SAFETY: pidfd_open takes no pointers.
     let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
     if raw < 0 {
@@ -8227,8 +8291,34 @@ mod tests {
         assert_eq!(pool.determinize(0, None), Some(0));
     }
 
-    #[test]
-    fn completing_an_unreported_exit_retires_it_and_records_determinism_loss() {
+    #[tokio::test]
+    async fn completing_an_unreported_exit_retires_it_and_records_determinism_loss() {
+        if !crate::scheduler::exec_teardown_tests::in_isolated_log_test(
+            module_path!(),
+            "completing_an_unreported_exit_retires_it_and_records_determinism_loss",
+        ) {
+            return;
+        }
+        use std::os::unix::process::ExitStatusExt;
+
+        use super::open_process_pidfd;
+        use super::wait_for_process_exit;
+
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = Reap(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        );
+        let physical_pid = child.0.id() as i32;
+        let pidfd = open_process_pidfd(physical_pid).expect("a live child has a process pidfd");
         let config = Config {
             sequentialize_threads: true,
             ..Config::default()
@@ -8239,9 +8329,15 @@ mod tests {
         });
         let state = GlobalState::initialize(&config, false);
         let dettid = DetTid::from_raw(41);
-        {
+        let mm = MmId::initial(dettid);
+        assert_ne!(dettid.as_raw(), physical_pid);
+        let pending_request = {
             let mut sched = state.sched.lock().unwrap();
             sched.thread_tree.add_child(dettid, dettid, true);
+            sched.record_thread_mm(dettid, mm);
+            sched
+                .register_physical_thread(dettid, mm, physical_pid, physical_pid)
+                .unwrap();
             sched.next_turns.insert(
                 dettid,
                 crate::scheduler::ThreadNextTurn {
@@ -8252,14 +8348,189 @@ mod tests {
                     protocol: Default::default(),
                 },
             );
-        }
-        // The process died without deregistering (no exit hook ran).
-        state.complete_physical_process_exit(41);
+            sched.next_turns[&dettid].req.clone()
+        };
+        assert!(pending_request.is_empty());
+        child.0.kill().unwrap();
+        assert!(
+            wait_for_process_exit(pidfd, Duration::from_secs(5))
+                .await
+                .is_ok()
+        );
+
+        // Physical readiness authenticates death, but cleanup takes the
+        // registered logical process ID and must not reap the parent's child.
+        state.complete_physical_process_exit(dettid.as_raw());
+        assert!(pending_request.get().await.is_err());
         let sched = state.sched.lock().unwrap();
         assert!(!sched.next_turns.contains_key(&dettid));
         assert!(sched.process_physically_gone(DetPid::from_raw(41)));
+        assert!(!sched.process_physically_gone(DetPid::from_raw(physical_pid)));
         drop(sched);
-        assert!(crate::detlog::determinism_loss().is_some());
+        assert_eq!(
+            crate::detlog::determinism_loss().as_deref(),
+            Some("process 41 exited without deregistering; its exit was not scheduled")
+        );
+        let status = child
+            .0
+            .wait()
+            .expect("cleanup must leave the kernel status for the parent");
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert_eq!(status.code(), None);
+    }
+
+    #[tokio::test]
+    async fn stale_process_exit_cannot_clear_replacement_and_normal_exit_adds_no_loss() {
+        if !crate::scheduler::exec_teardown_tests::in_isolated_log_test(
+            module_path!(),
+            "stale_process_exit_cannot_clear_replacement_and_normal_exit_adds_no_loss",
+        ) {
+            return;
+        }
+        use nix::fcntl::OFlag;
+
+        use super::open_process_pidfd;
+        use super::wait_for_process_exit;
+        use crate::fd::DetFd;
+        use crate::fd::FdType;
+        use crate::shared_open_files::OpenFileControl;
+        use crate::types::OpenFileId;
+
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = Reap(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        );
+        let physical_pid = child.0.id() as i32;
+        let pidfd = open_process_pidfd(physical_pid).unwrap();
+        let config = Config {
+            sequentialize_threads: true,
+            backend: reverie::BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config, false);
+        let process = DetPid::from_raw(41);
+        let old_mm = MmId::initial(process);
+        let mm = old_mm.for_exec(process);
+        let (old, current) = {
+            let mut sched = state.sched.lock().unwrap();
+            sched.thread_tree.add_child(process, process, true);
+            sched.record_thread_mm(process, old_mm);
+            sched.next_turns.insert(
+                process,
+                ThreadNextTurn {
+                    dettid: process,
+                    child_tid_addr: 0,
+                    req: Ivar::new(),
+                    resp: Ivar::new(),
+                    protocol: Default::default(),
+                },
+            );
+            sched
+                .register_physical_thread(process, old_mm, physical_pid, physical_pid)
+                .unwrap();
+            let old = sched.arm_process_exit_watch(
+                process,
+                old_mm,
+                physical_pid,
+                open_process_pidfd(physical_pid).unwrap(),
+            );
+            sched.record_thread_mm(process, mm);
+            sched
+                .register_physical_thread(process, mm, physical_pid, physical_pid)
+                .unwrap();
+            let current = sched.arm_process_exit_watch(
+                process,
+                mm,
+                physical_pid,
+                open_process_pidfd(physical_pid).unwrap(),
+            );
+            (old, current)
+        };
+        let pending = PendingExecState {
+            caller: process,
+            process,
+            mm,
+            fd_blocking: Default::default(),
+        };
+        state
+            .pending_exec_states
+            .lock()
+            .unwrap()
+            .insert(process, pending.clone());
+        state
+            .post_exec_fd_blocking
+            .lock()
+            .unwrap()
+            .insert(process, ExecFdState::default());
+        let id = OpenFileId::new(process, 0);
+        {
+            let mut files = state.shared_open_files.lock().unwrap();
+            files
+                .insert(DetFd::new(3, OFlag::O_RDWR, FdType::Regular, id).model_for_test())
+                .unwrap();
+            files
+                .handle(process, process, OpenFileControl::Take { id })
+                .unwrap();
+        }
+        child.0.kill().unwrap();
+        assert!(
+            wait_for_process_exit(pidfd, Duration::from_secs(5))
+                .await
+                .is_ok()
+        );
+        let cleanup = state.process_exit_cleanup();
+        {
+            let mut sched = state.sched.lock().unwrap();
+            assert_eq!(cleanup.complete_observed_locked(&mut sched, &old), None);
+            assert!(sched.next_turns.contains_key(&process));
+            assert_eq!(
+                state.pending_exec_states.lock().unwrap().get(&process),
+                Some(&pending)
+            );
+            assert!(
+                state
+                    .post_exec_fd_blocking
+                    .lock()
+                    .unwrap()
+                    .contains_key(&process)
+            );
+            assert!(state.shared_open_files.lock().unwrap().is_leased(id));
+            assert_eq!(crate::detlog::determinism_loss(), None);
+
+            // Model the normal hook winning the same mutex before the
+            // readiness callback. Its later physical completion is no loss.
+            state.account_deregistered_thread(
+                &mut sched,
+                ThreadDeregistration {
+                    dettid: process,
+                    detpid: process,
+                    mm,
+                    thread_start_entered: true,
+                    timeslice_stats: TimesliceStats::default(),
+                    syscall_count: 0,
+                    chaos_epochs: Vec::new(),
+                },
+            );
+            assert_eq!(
+                cleanup.complete_observed_locked(&mut sched, &current),
+                Some((false, None))
+            );
+            assert_eq!(cleanup.complete_observed_locked(&mut sched, &current), None);
+        }
+        assert!(state.pending_exec_states.lock().unwrap().is_empty());
+        assert!(state.post_exec_fd_blocking.lock().unwrap().is_empty());
+        assert!(!state.shared_open_files.lock().unwrap().is_leased(id));
+        assert_eq!(crate::detlog::determinism_loss(), None);
+        assert!(child.0.wait().unwrap().code().is_none());
     }
 
     /// An admitted process can die before any registration names it. The

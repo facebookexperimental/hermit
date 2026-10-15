@@ -1128,6 +1128,13 @@ pub struct Scheduler {
     /// from removing a replacement image's descriptor.
     physical_thread_pidfds: BTreeMap<DetTid, (MmId, i32, i32, OwnedFd)>,
 
+    /// Whole-process observations, one per process, each bound to the
+    /// registration that armed it. The Arc identity distinguishes reused PIDs
+    /// even when CLONE_VM shares MmId. Nothing arms one yet: the authenticated
+    /// registration of <https://github.com/rrnewton/hermit/issues/4362> part 2
+    /// will be its only caller (`arm_process_exit_watch`).
+    process_exit_watches: BTreeMap<DetPid, Arc<ProcessExitWatch>>,
+
     /// The current set of actions in the background.
     #[allow(dead_code)]
     pub bg_action_pool: HashMap<ActionID, Action>,
@@ -2486,6 +2493,20 @@ impl Default for Backoff {
 
 pub(crate) type SchedulerObserver = Arc<dyn Fn(&'static str) + Send + Sync>;
 
+/// A process pidfd authenticates whole-group death without consuming wait status.
+#[derive(Debug)]
+pub(crate) struct ProcessExitWatch {
+    pub(crate) process: DetPid,
+    mm: MmId,
+    // Held for the watch's lifetime; read by the daemon-point poll and the
+    // exit-status protocol of https://github.com/rrnewton/hermit/issues/4362
+    // part 2, which nothing in this change calls.
+    #[allow(dead_code)]
+    physical_pid: i32,
+    #[allow(dead_code)]
+    pidfd: OwnedFd,
+}
+
 pub(crate) async fn sched_loop(sched: Arc<Mutex<Scheduler>>, timer: Arc<Mutex<GlobalTime>>) {
     sched_loop_inner(sched, timer, false, None).await;
 }
@@ -3482,6 +3503,7 @@ impl Scheduler {
             turn: 0,
             next_turns: Default::default(),
             physical_thread_pidfds: Default::default(),
+            process_exit_watches: Default::default(),
             bg_action_pool: Default::default(),
             committed_time: Default::default(),
             previous_turn_tid: None,
@@ -3685,6 +3707,49 @@ impl Scheduler {
         self.physical_thread_pidfds
             .insert(dettid, (mm, physical_pid, physical_tid, pidfd));
         Ok(())
+    }
+
+    /// Arm `process`'s exit watch on `pidfd`, a process pidfd for its host
+    /// process `physical_pid`, bound to address space `mm`; an earlier watch of
+    /// the process stops being current. Nothing calls this in production yet:
+    /// arming from unauthenticated numbers was the defect that got
+    /// 2ee7190125 reverted, and the authenticated registration of
+    /// <https://github.com/rrnewton/hermit/issues/4362> part 2 will be its caller.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn arm_process_exit_watch(
+        &mut self,
+        process: DetPid,
+        mm: MmId,
+        physical_pid: i32,
+        pidfd: OwnedFd,
+    ) -> Arc<ProcessExitWatch> {
+        let watch = Arc::new(ProcessExitWatch {
+            process,
+            mm,
+            physical_pid,
+            pidfd,
+        });
+        self.process_exit_watches.insert(process, watch.clone());
+        watch
+    }
+
+    /// Called under the same mutex as registration, exec and deregistration.
+    /// Normal leader exit leaves this process watch alive for its siblings.
+    pub(crate) fn process_exit_watch_is_current(&self, watch: &Arc<ProcessExitWatch>) -> bool {
+        self.process_exit_watches
+            .get(&watch.process)
+            .is_some_and(|current| Arc::ptr_eq(current, watch))
+            && self.thread_tree.contains(&watch.process)
+            && self
+                .thread_tree
+                .my_thread_group(&watch.process)
+                .iter()
+                .any(|tid| self.thread_mm(*tid) == Some(watch.mm))
+    }
+
+    pub(crate) fn finish_process_exit_watch(&mut self, watch: &Arc<ProcessExitWatch>) {
+        assert!(self.process_exit_watch_is_current(watch));
+        self.process_exit_watches.remove(&watch.process);
     }
 
     /// The host process ID registered for `dettid`'s host thread, if any.
@@ -5775,6 +5840,13 @@ impl Scheduler {
             self.logically_kill_thread(tid, &detpid, mm);
         }
         !unreported.is_empty()
+    }
+
+    pub(crate) fn has_unreported_exit(&self, detpid: DetPid) -> bool {
+        self.thread_tree.contains(&detpid)
+            && self.thread_tree.my_thread_group(&detpid).iter().any(|tid| {
+                self.next_turns.contains_key(tid) && !self.deregistration_accounted.contains(tid)
+            })
     }
 
     /// Release every physical-exit barrier after the backend supervisor has drained all tracees.
@@ -14067,6 +14139,8 @@ mod test {
         let mm = MmId::initial(detpid);
         let physical_pid = std::process::id() as i32;
         let physical_tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
+        scheduler.thread_tree.add_child(dettid, dettid, true);
+        scheduler.record_thread_mm(dettid, mm);
 
         scheduler
             .register_physical_thread(dettid, mm, physical_pid, physical_tid)
@@ -14078,6 +14152,10 @@ mod test {
             (physical_pid, physical_tid)
         );
         assert!(pidfd.as_raw_fd() >= 0);
+        assert!(
+            scheduler.process_exit_watches.is_empty(),
+            "a scheduler without an internal observer must not open process watches"
+        );
 
         let conflicting = scheduler
             .register_physical_thread(dettid, mm, physical_pid, physical_tid + 1)
@@ -14117,6 +14195,52 @@ mod test {
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert!(scheduler.physical_thread_pidfds.is_empty());
+    }
+
+    /// A process's exit watch stays current through its leader's normal exit,
+    /// for its siblings, and stops being current when a new registration
+    /// replaces it (2ee7190125's test, with the watch armed directly).
+    #[test]
+    fn process_exit_watch_survives_leader_exit_and_rejects_reused_identity() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let leader = DetTid::from_raw(37);
+        let sibling = DetTid::from_raw(38);
+        let mm = MmId::initial(leader);
+        let physical_pid = std::process::id() as i32;
+        let physical_tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
+        let (handle, stop, other_tid) = spawn_host_thread_until_told();
+        scheduler.thread_tree.add_child(leader, leader, true);
+        scheduler.thread_tree.add_child(leader, sibling, false);
+        for (thread, physical) in [(leader, physical_tid), (sibling, other_tid)] {
+            register_known_thread(&mut scheduler, thread);
+            scheduler.record_thread_mm(thread, mm);
+            scheduler
+                .register_physical_thread(thread, mm, physical_pid, physical)
+                .unwrap();
+        }
+        let arm = |scheduler: &mut Scheduler| {
+            let pidfd = crate::tool_global::open_process_pidfd(physical_pid).unwrap();
+            scheduler.arm_process_exit_watch(leader, mm, physical_pid, pidfd)
+        };
+        let old = arm(&mut scheduler);
+        scheduler.logically_kill_thread(&leader, &leader, mm);
+        assert!(scheduler.process_exit_watch_is_current(&old));
+        assert!(scheduler.next_turns.contains_key(&sibling));
+        scheduler.logically_kill_thread(&sibling, &leader, mm);
+        assert!(
+            scheduler.process_exit_watch_is_current(&old),
+            "normal death still needs cleanup"
+        );
+        register_known_thread(&mut scheduler, leader);
+        scheduler
+            .register_physical_thread(leader, mm, physical_pid, physical_tid)
+            .unwrap();
+        let replacement = arm(&mut scheduler);
+        assert!(!Arc::ptr_eq(&old, &replacement));
+        assert!(!scheduler.process_exit_watch_is_current(&old));
+        assert!(scheduler.process_exit_watch_is_current(&replacement));
+        stop.send(()).unwrap();
+        handle.join().unwrap();
     }
 
     /// A host thread that reports its TID and then waits until it is told to
@@ -14242,6 +14366,7 @@ mod test {
             }
         }
         let _reap = Reap(child);
+        let process_pidfd = crate::tool_global::open_process_pidfd(child).unwrap();
         let started = std::time::Instant::now();
         loop {
             let stat = std::fs::read(format!("/proc/{child}/task/{child}/stat")).unwrap();
@@ -14274,6 +14399,19 @@ mod test {
         assert!(scheduler.step2a_wait_for_exited_threads().is_ok());
         assert!(scheduler.exited_thread_barriers.is_empty());
         assert!(scheduler.terminal_deadlock.is_none());
+        let mut process_poll = libc::pollfd {
+            fd: process_pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(
+            unsafe { libc::poll(&mut process_poll, 1, 0) },
+            0,
+            "leader-only exit is not whole-process death"
+        );
+        assert_eq!(unsafe { libc::kill(child, libc::SIGKILL) }, 0);
+        assert_eq!(unsafe { libc::poll(&mut process_poll, 1, 5000) }, 1);
+        assert_ne!(process_poll.revents & libc::POLLIN, 0);
     }
 
     /// An exit_group's grant ends every thread of the group, and the threads it

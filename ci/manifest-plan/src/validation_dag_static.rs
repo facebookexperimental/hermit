@@ -2292,7 +2292,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +4 from b909e36d: 1713.
     // And +7 from R2b-1 of https://github.com/rrnewton/hermit/issues/4273: 1720, listed.
     // The revert of 4273 R2b-1 (ade0e7dd) removes its tests: 1713.
-    ("test.detcore_unit", 1713),
+    // And scheduler::test::process_exit_watch_survives_leader_exit_and_rejects_reused_identity
+    // and tool_global::tests::stale_process_exit_cannot_clear_replacement_and_normal_exit_adds_no_loss
+    // (https://github.com/rrnewton/hermit/issues/4362, part 2 step 0a): 1715, listed.
+    ("test.detcore_unit", 1715),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3913,7 +3916,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +4 from b909e36d: 1713.
     // And +7 from R2b-1 of https://github.com/rrnewton/hermit/issues/4273: 1720, listed.
     // The revert of 4273 R2b-1 (ade0e7dd) removes its tests: 1713.
-    ("test.detcore_unit_on_host", 1713),
+    // And the two 4362 step-0a exit-watch tests: 1715.
+    ("test.detcore_unit_on_host", 1715),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
